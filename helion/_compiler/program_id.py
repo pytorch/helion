@@ -25,8 +25,11 @@ from .cute.grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
 from .cute.strategies import TCGEN05_BATCH_RASTER_DEFAULT
 from .cute.strategies import TCGEN05_BATCH_RASTER_SLOWEST
 from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
+from .cute.strategies import TCGEN05_PERSISTENT_GRID_CAP_DEFAULT
+from .cute.strategies import TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS
 from .cute.strategies import batch_raster_from_config
 from .cute.strategies import l2_swizzle_size_from_config
+from .cute.strategies import persistent_grid_cap_from_config
 from .cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS
 from .cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
@@ -513,6 +516,16 @@ class ProgramIDs(abc.ABC):
             f"({pid.num_pids_expr(is_device=is_device)})" for pid in self.pid_info
         )
 
+    def static_grid_size(self) -> int | None:
+        """The CTA count of the grid ``codegen_grid`` launches, when every
+        extent is static (``None`` otherwise).  The flat and xyz strategies
+        launch one CTA per program id; the wrappers and the persistent
+        strategies override this with what they actually launch."""
+        counts = [pid.static_num_pids() for pid in self.pid_info]
+        if None in counts:
+            return None
+        return math.prod(cast("list[int]", counts))
+
     def setup_persistent_kernel(
         self, device_function: DeviceFunction, total_pids_expr: str | None = None
     ) -> list[ast.stmt] | None:
@@ -697,6 +710,18 @@ class ForEachProgramID(ProgramIDs):
         """Get total PIDs expression for ForEachProgramID (sum of all pids)."""
         cdivs = [pid.total_pids_expr(is_device=is_device) for pid in self.cases]
         return _sum_pids(cdivs)
+
+    def static_grid_size(self) -> int | None:
+        """The launch is the persistent grid when the cases are persistent,
+        else one CTA per program id of every root (``codegen_grid``)."""
+        if not self.cases:
+            return None
+        if self.cases[0]._is_persistent():
+            return self.cases[0].static_grid_size()
+        sizes = [case.static_grid_size() for case in self.cases]
+        if None in sizes:
+            return None
+        return sum(cast("list[int]", sizes))
 
     def codegen(self, state: CodegenState) -> None:
         blocks = self._cdiv_sum(state, exclude_last=True)
@@ -980,6 +1005,10 @@ class WorklistProgramIDs(ProgramIDs):
 
     def codegen_grid(self) -> ast.AST:
         return expr_from_string(f"({self.upper_expr},)")
+
+    def static_grid_size(self) -> int | None:
+        # The compact launcher overrides the grid with the traced work count.
+        return None
 
 
 class CuteProgramIDs(FlatProgramIDs):
@@ -1265,6 +1294,11 @@ class L2GroupingProgramIDs(ProgramIDs):
         assert self.parent_strategy is not None
         return self.parent_strategy.total_pids_expr(is_device=is_device)
 
+    def static_grid_size(self) -> int | None:
+        """Forward to parent strategy (the grouping reorders, never resizes)."""
+        assert self.parent_strategy is not None
+        return self.parent_strategy.static_grid_size()
+
 
 class PersistentProgramIDs(ProgramIDs):
     """Base class for persistent kernels that use num_sms grid size."""
@@ -1321,6 +1355,15 @@ class PersistentProgramIDs(ProgramIDs):
     def codegen_grid(self) -> ast.AST:
         # Use num_sms * multiplier for persistent kernels (multi-occupancy)
         return expr_from_string(f"({self.grid_size_expr},)")
+
+    def static_grid_size(self) -> int | None:
+        """``_NUM_SM * num_sm_multiplier`` CTAs: the SM count the config spec
+        captured for the compile device (the same reserved-adjusted count the
+        host computes), ``None`` when it is unknown."""
+        num_sm = CompileEnvironment.current().config_spec.num_sm
+        if num_sm <= 1:
+            return None
+        return num_sm * self.num_sm_multiplier
 
     def _persistent_setup_statements(self, total_pids_expr: str) -> list[ast.stmt]:
         """Generate the preamble statements for persistent kernel setup."""
@@ -1503,6 +1546,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
     def __init__(self, *, is_blocked: bool) -> None:
         super().__init__(is_blocked=is_blocked)
+
+    def static_grid_size(self) -> int | None:
+        # ``codegen_grid`` launches ``min(work clusters, persistent cluster
+        # capacity)`` clusters, a host-side quantity.
+        return None
 
     def _tcgen05_plan(self) -> CuteTcgen05MatmulPlan | None:
         try:
@@ -1766,6 +1814,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             return TCGEN05_BATCH_RASTER_DEFAULT
         return batch_raster_from_config(config)
 
+    def _tcgen05_persistent_grid_cap(self) -> str:
+        """``tcgen05_persistent_grid_cap``; the default outside a device function."""
+        try:
+            config = DeviceFunction.current().config
+        except NoCurrentFunction:
+            return TCGEN05_PERSISTENT_GRID_CAP_DEFAULT
+        return persistent_grid_cap_from_config(config)
+
     def _tcgen05_scheduler_axes(
         self, *, cluster_n: int | None = None
     ) -> tuple[int, ...]:
@@ -1967,7 +2023,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         than leaving a second hardware wave to re-run the prologue; the
         whole-cluster cap is the device's co-resident cluster count
         (``_MAX_ACTIVE_CLUSTERS``), which for clusters larger than the
-        CtaGroup.TWO pair is below ``_NUM_SM // cluster_size``.
+        CtaGroup.TWO pair is below ``_NUM_SM // cluster_size``.  Plain
+        cluster_n=2 grids take the same whole-cluster cap when the
+        ``tcgen05_persistent_grid_cap=resident_clusters`` knob asks for it
+        (a 2048x4096x2048 GEMM on 256x128 pair tiles launches 64 clusters:
+        two hardware waves of one-tile CTAs under the pair cap, ~2 tiles
+        per persistent CTA under the resident-cluster cap).
         """
         cluster_m = self._tcgen05_cluster_m()
         cluster_n = self._tcgen05_cluster_n()
@@ -1988,6 +2049,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             and plan.row_union is not None
             and plan.row_union.schedule is not None
         ):
+            return self._tcgen05_whole_cluster_capacity_expr()
+        if (
+            cluster_n > 1
+            and self._tcgen05_persistent_grid_cap()
+            == TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS
+        ):
+            # ``tcgen05_persistent_grid_cap=resident_clusters``: a plain
+            # cluster_n=2 grid with more clusters than the device co-schedules
+            # keeps its CTAs persistent over several tiles instead of
+            # launching a second hardware wave of one-tile CTAs (see
+            # ``TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY``).
             return self._tcgen05_whole_cluster_capacity_expr()
         return f"max(1, ({self.grid_size_expr}) // {cluster_m})"
 
@@ -2828,10 +2900,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             and isinstance(stmt, ast.If)
             and ast.unparse(stmt.test) == tma_predicate
         ]
-        assert len(role_indices) == 1, (
-            "tcgen05 TMA-role hoist expects exactly one TMA-load role block "
-            f"after the cluster arrive, found {len(role_indices)}"
-        )
+        if len(role_indices) != 1:
+            # A scheduler full/edge phase split emits two TMA role blocks;
+            # the hoist predicates exclude scheduler warps, so this is a
+            # precondition violation, reported as unsupported rather than
+            # asserted.
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 TMA-role hoist expects exactly one TMA-load role block "
+                f"after the cluster arrive, found {len(role_indices)}",
+            )
         role_block = setup.pop(role_indices[0])
         setup.insert(anchor_index + 1, role_block)
 
@@ -3342,8 +3420,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 "role-local scheduler codegen"
             )
             plan = self._tcgen05_plan()
-            assert plan is not None and plan.is_clc_persistent and plan.cluster_m > 1, (
-                "staged work-tile mailbox is only validated for clustered CLC"
+            assert plan is not None and (
+                (plan.is_clc_persistent and plan.cluster_m > 1)
+                or self._tcgen05_uses_grouped_worklist_nm_scheduler_mailbox()
+            ), (
+                "staged work-tile mailbox is only validated for clustered CLC "
+                "and the grouped N,M worklist scheduler"
             )
             stage_count = self._tcgen05_sched_stage_count()
             alloc_extent = f"cutlass.Int32({field_count * stage_count})"
@@ -3771,6 +3853,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 ),
             ]
         )
+        prelude_wait = device_function.cute_state.tcgen05_tma_role_prelude_wait
+        if (
+            prelude_wait is not None
+            and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+        ):
+            # The hoisted TMA-load role joins the cluster rendezvous here,
+            # after its scheduler setup and ahead of its first mbarrier / TMA
+            # operation (``cute_mma`` ``tcgen05_hoist_row_union_tma_role``).
+            prelude.append(statement_from_string(prelude_wait))
         tile_counter_var, increment_tile_counter_per_tile = (
             self._finish_role_local_prelude(
                 device_function,
@@ -4785,10 +4876,28 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         valid_var = device_function.new_var(f"{scheduler_var_prefix}_valid")
 
         prelude: list[ast.stmt] = []
-        if (
-            emit_pdl_wait
+        # ``cute_pdl``: the epilogue warps wait ahead of their first global
+        # access (the row-union interval read of their prelude, the output
+        # stores) like the MONOLITHIC path's ``general_pdl``; with the TMA
+        # and scheduler warps' own waits every global access of the kernel
+        # then follows a role wait and ``DeviceFunction._cute_pdl_applies``
+        # emits no entry wait.
+        epilogue_pdl = (
+            device_function.config.get("cute_pdl") is True
+            and not device_function.config.get("tcgen05_materialized_pdl", False)
+            and CompileEnvironment.current().cute_fission_plan is None
+            # Only where the TMA-load role waits too (the two-CTA kernels):
+            # the one-CTA scheduler kernel keeps its entry wait, and a role
+            # wait beside it would be redundant.
             and self._tcgen05_is_two_cta()
-            and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+            and role_block.role_predicate == self._tcgen05_epi_role_predicate()
+        )
+        if emit_pdl_wait and (
+            (
+                self._tcgen05_is_two_cta()
+                and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+            )
+            or epilogue_pdl
         ):
             # Same PDL hand-off as the MONOLITHIC path.
             prelude.append(statement_from_string("cute.arch.griddepcontrol_wait()"))
@@ -6056,8 +6165,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # consumer's ``virtual_pid = work_tile_smem[0] // cluster_m``
         # collapse continues to work.
         clc_helper_call = "_cute_issue_clc_query_nomulticast"
+        # Throttled pacing: wait for the TMA-load warp's per-tile credit
+        # (``cute_mma._tcgen05_clc_throttle_credit``) before each query.
+        clc_throttle_barrier = device_function.cute_state.clc_throttle_barrier
         clc_query_block = [
             statement_from_string("cute.arch.sync_warp()"),
+            *(
+                [statement_from_string(f"{clc_throttle_barrier}.arrive_and_wait()")]
+                if clc_throttle_barrier
+                else []
+            ),
             create(
                 ast.If,
                 test=expr_from_string(leader_predicate),

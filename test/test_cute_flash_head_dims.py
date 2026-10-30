@@ -1867,6 +1867,9 @@ def test_direct_store_pins_re_canonicalize_the_staged_store_children() -> None:
     assert not staged_pair.epi_stg and staged_pair.epi_stg_store == "slice"
 
 
+# Rendering the entire normalized space takes nearly a minute even without
+# other xdist workers contending for the CPU.
+@pytest.mark.timeout(180)
 def test_d256_causal_pair_cell_identities_render_distinct_texts() -> None:
     """Every normalized config of the d256 causal cell's exact space renders a
     distinct text: no two identities are one measurement. (Before the

@@ -8,6 +8,7 @@ import helion
 from helion._compiler.autotuner_heuristics.cute import (
     grouped_row_union_paired_clc_carrier,
 )
+from helion._compiler.cute.grouped_row_union import AB_STAGES_KEY
 from helion._compiler.cute.grouped_row_union import STARTUP_PREFILL_KEY
 from helion._testing import skipUnlessBackends
 
@@ -16,9 +17,12 @@ pytestmark = skipUnlessBackends(["cute"])
 CUDA_DEVICE = "cuda"
 
 
+@pytest.mark.parametrize("ab_stages", [None, 4], ids=["own_ring", "ab4"])
 @pytest.mark.parametrize("startup", [False, True])
 @pytest.mark.parametrize("partial", [False, True], ids=["full", "partial_g31"])
-def test_ordinary_paired_profile_cuda(startup: bool, partial: bool) -> None:
+def test_ordinary_paired_profile_cuda(
+    startup: bool, partial: bool, ab_stages: int | None
+) -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("paired tcgen05 profile requires an SM100 CUDA device")
     m, n, k = (640 if partial else 768), 256, 512
@@ -46,6 +50,12 @@ def test_ordinary_paired_profile_cuda(startup: bool, partial: bool) -> None:
         )
     assert config is not None
     config.config[STARTUP_PREFILL_KEY] = startup
+    if ab_stages is not None:
+        # A searched ring depth below the profile's own seven stages.
+        config.config[AB_STAGES_KEY] = ab_stages
+        with bound.env:
+            assert bound.config_spec.normalized_config(config)[AB_STAGES_KEY] == 4
+        assert "PipelineTmaUmma.create(num_stages=4," in bound.to_code(config)
     bound.set_config(config)
     # The public function allocates output on every invocation. The partial case
     # covers [17,617), with empty groups and uncovered prefix/suffix rows; its

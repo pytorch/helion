@@ -375,24 +375,59 @@ def test_actual_interval_normalization_and_dense_guard(case, stride):
         for n in ast.parse(case[3]).body
         if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
     )
-    statements: list[ast.stmt] = [
+    # The interval setup is epilogue-role prelude: it sits inside the
+    # epilogue warps' role block, behind that role's dependent-launch wait
+    # and ahead of its persistent loop (so a ``cute_pdl`` kernel needs no
+    # entry wait and its prologue overlaps the previous kernel).
+    assert not any(
+        isinstance(node, ast.Assign)
+        and ast.unparse(node.targets[0]).startswith("row_union_")
+        for node in device.body
+    )
+    role_block = next(
         node
         for node in device.body
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(child, ast.For)
+            and ast.unparse(child.target) == "row_union_group"
+            for child in node.body
+        )
+    )
+    assert ast.unparse(role_block.test).endswith("< cutlass.Int32(4)")
+    statements: list[ast.stmt] = [
+        node
+        for node in role_block.body
         if (
             isinstance(node, ast.Assign)
             and ast.unparse(node.targets[0])
             in {"row_union_starts", "row_union_ends", "row_union_all_rows"}
         )
         or (
-            isinstance(node, ast.If)
-            and any(
-                isinstance(child, ast.For)
-                and ast.unparse(child.target) == "row_union_group"
-                for child in node.body
-            )
+            isinstance(node, ast.For)
+            and ast.unparse(node.target)
+            in {"row_union_group", "row_union_coverage_group"}
         )
     ]
-    assert len(statements) == 4
+    assert [type(node).__name__ for node in statements] == [
+        "Assign",
+        "Assign",
+        "For",
+        "Assign",
+        "For",
+    ]
+    assert all(
+        role_block.body.index(node) > role_block.body.index(wait)
+        for wait in role_block.body
+        if ast.unparse(wait) == "cute.arch.griddepcontrol_wait()"
+        for node in statements
+    )
+    assert all(
+        role_block.body.index(node) < role_block.body.index(loop)
+        for loop in role_block.body
+        if isinstance(loop, ast.While)
+        for node in statements
+    )
     code = compile(
         ast.Module(body=statements, type_ignores=[]), "<actual-interval-setup>", "exec"
     )
@@ -1028,3 +1063,344 @@ def test_actual_epilogue_cross_lane_publication(case):
                     assert not output_coords.intersection(coordinates)
                     output_coords.update(coordinates)
             assert output_coords == set(itertools.product(range(256), range(80)))
+
+
+def _kernel_body(source: str) -> list[ast.stmt]:
+    return next(
+        n
+        for n in ast.parse(source).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+    ).body
+
+
+def _top_level_lines(source: str) -> list[str]:
+    return [ast.unparse(stmt) for stmt in _kernel_body(source)]
+
+
+def _launched_warps(source: str) -> int:
+    """Warps of the kernel launch (``block=(x, y, z)`` in the wrapper)."""
+    match = re.search(r"block=\((\d+), (\d+), (\d+)\)", source)
+    assert match is not None, source
+    x, y, z = (int(value) for value in match.groups())
+    assert x * y * z % 32 == 0
+    return x * y * z // 32
+
+
+@skipUnlessBackends(["cute"])
+def test_tma_warp_skips_prologue_publication(case):
+    """The row-union prologue publishes the TMEM allocation (and, on the
+    paired profile, the coverage tables) through a named barrier the
+    TMA-load warp does not join: it issues its first loads while the
+    epilogue warps are still inside ``tcgen05.alloc``."""
+    bound, _args, config, source = case
+    lines = _top_level_lines(source)
+    barrier = next(
+        line for line in lines if "tcgen05_row_union_publication_barrier = " in line
+    )
+    assert barrier.endswith("NamedBarrier(barrier_id=4, num_threads=160)")
+    # The count is derived from the launch itself: every launched warp but
+    # the one TMA-load warp.
+    assert _launched_warps(source) == 6
+    skip = lines.index(
+        "if not tcgen05_tma_warp:\n    tcgen05_row_union_publication_barrier.arrive_and_wait()"
+    )
+    allocate = next(i for i, line in enumerate(lines) if ".allocate(" in line)
+    retrieve = next(i for i, line in enumerate(lines) if "wait_for_alloc()" in line)
+    assert allocate < skip < retrieve
+    assert not any("sync_threads()" in line for line in lines[allocate:retrieve])
+    # The paired profile launches eight warps (coverage warp 7 writes the
+    # SMEM tables the epilogue warps read behind the same barrier).
+    paired = deepcopy(config)
+    paired.config[SCHEDULE_KEY] = PAIRED_CLC_SCHEDULE
+    paired_source = bound.to_code(paired)
+    paired_lines = _top_level_lines(paired_source)
+    assert any(
+        line.endswith("NamedBarrier(barrier_id=4, num_threads=224)")
+        for line in paired_lines
+    )
+    assert _launched_warps(paired_source) == 8
+    assert (
+        "if not tcgen05_tma_warp:\n    tcgen05_row_union_publication_barrier.arrive_and_wait()"
+        in paired_lines
+    )
+    assert not any(line == "cute.arch.sync_threads()" for line in paired_lines)
+
+
+@skipUnlessBackends(["cute"])
+def test_dependent_launch_needs_no_entry_wait(case):
+    """Under ``cute_pdl`` the group offsets are read inside the epilogue
+    role behind its own ``griddepcontrol_wait``; nothing reads global memory
+    ahead of a role wait, so the kernel gets no entry wait and its prologue
+    (barrier init, cluster sync, TMEM allocation) overlaps the previous
+    kernel in the stream."""
+    from helion._compiler.cute.pdl_coverage import waits_cover_global_reads
+
+    bound, _args, config, _source = case
+    pdl = deepcopy(config)
+    pdl.config["cute_pdl"] = True
+    assert bound.config_spec.normalized_config(pdl)["cute_pdl"] is True
+    source = bound.to_code(pdl)
+    body = _kernel_body(source)
+    assert ast.unparse(body[0]) != "cute.arch.griddepcontrol_wait()"
+    assert waits_cover_global_reads(body)
+    assert "'use_pdl': True" in source
+    epilogue = next(
+        stmt
+        for stmt in body
+        if isinstance(stmt, ast.If)
+        and ast.unparse(stmt.test).endswith("< cutlass.Int32(4)")
+    )
+    role_lines = [ast.unparse(stmt) for stmt in epilogue.body]
+    assert role_lines[0] == "cute.arch.griddepcontrol_wait()"
+    offsets_read = next(
+        i for i, line in enumerate(role_lines) if "group_offsets.iterator" in line
+    )
+    persistent_loop = next(
+        i for i, stmt in enumerate(epilogue.body) if isinstance(stmt, ast.While)
+    )
+    assert 0 < offsets_read < persistent_loop
+    # Without the knob the epilogue role carries no wait (the two-CTA TMA-load
+    # role keeps its unconditional one).  (``cute_pdl`` defaults to True on
+    # the sm_90+ tcgen05 surface; the knob-off render pins it off.)
+    without_knob = deepcopy(config)
+    without_knob.config["cute_pdl"] = False
+    plain_epilogue = next(
+        stmt
+        for stmt in _kernel_body(bound.to_code(without_knob))
+        if isinstance(stmt, ast.If)
+        and ast.unparse(stmt.test).endswith("< cutlass.Int32(4)")
+    )
+    assert "griddepcontrol_wait" not in ast.unparse(plain_epilogue)
+
+
+@skipUnlessBackends(["cute"])
+def test_tma_load_role_is_hoisted_ahead_of_the_cluster_wait(case):
+    """The transposed profile's TMA-load role block sits right after the
+    cluster ``pipeline_init_arrive``: its scheduler setup overlaps the
+    rendezvous and the warp joins it once, in its prelude ahead of the
+    persistent loop, while every other warp waits in the prefix."""
+    bound, _args, config, source = case
+    body = _kernel_body(source)
+    lines = [ast.unparse(stmt) for stmt in body]
+    arrive = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("cutlass.pipeline.pipeline_init_arrive(")
+    )
+    cluster_wait = "cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=tcgen05_cluster_layout_vmnk)"
+    prefix_wait = lines.index(f"if not tcgen05_tma_warp:\n    {cluster_wait}")
+    tma_role = next(
+        i
+        for i, stmt in enumerate(body)
+        if isinstance(stmt, ast.If)
+        and ast.unparse(stmt.test).endswith("== cutlass.Int32(5)")
+    )
+    assert arrive < tma_role < prefix_wait
+    role_lines = [ast.unparse(stmt) for stmt in body[tma_role].body]
+    scheduler = next(
+        i for i, line in enumerate(role_lines) if "initial_work_tile_info()" in line
+    )
+    loop = next(
+        i for i, stmt in enumerate(body[tma_role].body) if isinstance(stmt, ast.While)
+    )
+    assert role_lines.index(cluster_wait) == scheduler + 1 < loop
+    # No unguarded cluster wait remains at the top level.
+    assert not any(
+        line.startswith("cutlass.pipeline.pipeline_init_wait(") for line in lines
+    )
+    # The CLC-scheduled paired profile keeps the plain prefix wait.
+    paired = deepcopy(config)
+    paired.config[SCHEDULE_KEY] = PAIRED_CLC_SCHEDULE
+    paired_lines = _top_level_lines(bound.to_code(paired))
+    assert cluster_wait in paired_lines
+    assert not any(
+        line.startswith("if not tcgen05_tma_warp:\n    cutlass.pipeline")
+        for line in paired_lines
+    )
+
+
+@skipUnlessBackends(["cute"])
+def test_ab_stage_knob_normalizes_projects_and_launches(case):
+    """``tcgen05_grouped_row_union_ab_stages`` picks the physical AB ring depth
+    of a named profile (``None`` = its own, deepest fitting ring); it is
+    searched beside the schedule, rejected strictly / repaired to ``None``
+    outside a profile's range or without a physical profile, and carried by
+    the wrapper plan so the launcher's descriptor contract follows it."""
+    from helion._compiler.cute.grouped_row_union import AB_STAGES_CHOICES
+    from helion._compiler.cute.grouped_row_union import AB_STAGES_KEY
+    from helion._compiler.cute.grouped_row_union import physical_schedule
+
+    bound, _args, config, source = case
+    spec = bound.config_spec
+    fields = spec._cute_tcgen05_config.optional_fragments(for_search=True)
+    assert tuple(fields[AB_STAGES_KEY].choices) == AB_STAGES_CHOICES
+    assert AB_STAGES_KEY not in spec.normalized_config(config).config
+    for stages in (4, 6, 8, 10):
+        with_knob = deepcopy(config)
+        with_knob.config[AB_STAGES_KEY] = stages
+        normalized = spec.normalized_config(with_knob)
+        assert normalized.config.get(AB_STAGES_KEY) == stages
+        assert physical_schedule(normalized.config).ab_stages == stages
+    for bad in (
+        {AB_STAGES_KEY: 12},
+        # Two (one stage of look-ahead) is neither searched nor accepted.
+        {AB_STAGES_KEY: 2},
+        {AB_STAGES_KEY: 1},
+        {AB_STAGES_KEY: 6, SCHEDULE_KEY: "legacy"},
+        {AB_STAGES_KEY: 6, CONFIG_KEY: False},
+    ):
+        invalid = deepcopy(config)
+        invalid.config.update(bad)
+        with pytest.raises(InvalidConfig):
+            spec.normalized_config(invalid)
+        repaired = deepcopy(invalid.config)
+        spec.normalize(repaired, _fix_invalid=True)
+        assert AB_STAGES_KEY not in repaired
+    # The paired profile's own ring is 7 deep: 8 is out of range for it.
+    paired = deepcopy(config)
+    paired.config[SCHEDULE_KEY] = PAIRED_CLC_SCHEDULE
+    paired.config[AB_STAGES_KEY] = 8
+    with pytest.raises(InvalidConfig):
+        spec.normalized_config(paired)
+    repaired = deepcopy(paired.config)
+    spec.normalize(repaired, _fix_invalid=True)
+    assert AB_STAGES_KEY not in repaired
+    paired.config[AB_STAGES_KEY] = 6
+    assert spec.normalized_config(paired).config[AB_STAGES_KEY] == 6
+    # Codegen with six stages: the ring, its producer/consumer states, the
+    # mbarrier storage and the wrapper plan all follow the knob; the plan
+    # passes the launcher's descriptor contract.
+    six = deepcopy(config)
+    six.config[AB_STAGES_KEY] = 6
+    six_source = bound.to_code(six)
+    assert "PipelineTmaUmma.create(num_stages=6," in six_source
+    assert "PipelineUserType.Producer, 6)" in six_source
+    assert "cutlass.BFloat16, 6, is_k_major=" in six_source
+    assert "alloc_smem(cutlass.Int64, cutlass.Int32(12))" in six_source
+    plan = _plans(six_source)[0]
+    assert (plan["ab_stage_count"], plan["row_union_ab_stages"]) == (6, 6)
+    body: list[str] = []
+    _append_cute_wrapper_plan(body, [], plan)
+    assert any("6" in line and "smem_layout" in line for line in body)
+    tampered = dict(plan)
+    for depth in (12, 2):
+        tampered["row_union_ab_stages"] = depth
+        with pytest.raises(BackendUnsupported):
+            _append_cute_wrapper_plan([], [], tampered)
+    tampered["row_union_ab_stages"] = 6
+    tampered["ab_stage_count"] = 8
+    with pytest.raises(BackendUnsupported):
+        _append_cute_wrapper_plan([], [], tampered)
+    # Ten is the profile's own depth: byte-identical to the knob's absence.
+    ten = deepcopy(config)
+    ten.config[AB_STAGES_KEY] = 10
+    assert bound.to_code(ten) == source
+
+
+@skipUnlessBackends(["cute"])
+def test_tma_role_hoist_fails_closed_without_exactly_one_role_block():
+    """The hoist moves the one TMA-load role block behind its anchor; a
+    setup without it, or with a second one (a scheduler full/edge phase
+    split), is reported as unsupported instead of asserted."""
+    pids = Tcgen05PersistentProgramIDs.__new__(Tcgen05PersistentProgramIDs)
+    predicate = "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)"
+    anchor = ast.parse("anchor()").body[0]
+    other = ast.parse("x = 1").body[0]
+    role = ast.parse(f"if {predicate}:\n    pass").body[0]
+    with patch.object(
+        Tcgen05PersistentProgramIDs,
+        "_tcgen05_plan",
+        return_value=SimpleNamespace(tma_warp_id=5),
+    ):
+        setup = [anchor, other, role]
+        pids._hoist_tcgen05_tma_role_block(setup, anchor)
+        assert setup == [anchor, role, other]
+        for bad in ([anchor, other], [anchor, role, deepcopy(role)]):
+            with pytest.raises(
+                BackendUnsupported, match="exactly one TMA-load role block"
+            ):
+                pids._hoist_tcgen05_tma_role_block(bad, anchor)
+
+
+@skipUnlessBackends(["cute"])
+def test_two_cta_row_union_drains_stores_after_the_tmem_free(case):
+    """The two-CTA row-union teardown issues the store warp's bulk-store drain
+    after the TMEM dealloc handshake so the two overlap (one tile per CTA at
+    the catalogue shapes puts the whole teardown on the critical path); the
+    dense two-CTA kernels keep the drain-then-dealloc order
+    (test_cute_tcgen05_fixed_chain)."""
+    bound, _args, config, source = case
+    lines = _top_level_lines(source)
+    drain = lines.index(
+        "if tcgen05_warp_idx == cutlass.Int32(0):\n    tcgen05_c_pipeline.producer_tail()"
+    )
+    free = next(
+        i for i, line in enumerate(lines) if "tcgen05_tmem_allocator.free(" in line
+    )
+    assert free < drain == len(lines) - 1
+    paired = deepcopy(config)
+    paired.config[SCHEDULE_KEY] = PAIRED_CLC_SCHEDULE
+    paired_lines = _top_level_lines(bound.to_code(paired))
+    paired_drain = next(
+        i
+        for i, line in enumerate(paired_lines)
+        if "tcgen05_c_pipeline.producer_tail()" in line
+    )
+    paired_free = next(
+        i
+        for i, line in enumerate(paired_lines)
+        if "tcgen05_tmem_allocator.free(" in line
+    )
+    assert paired_free < paired_drain
+
+
+@skipUnlessBackends(["cute"])
+def test_mma_warp_owns_tmem_on_the_transposed_profile(case):
+    """The transposed profile's MMA warp allocates TMEM and frees it right
+    after its accumulator ``producer_tail`` (every epilogue release follows a
+    ``fence_view_async_tmem_load``), so the epilogue warps go straight from
+    their last TMEM read to their stores and never meet the MMA warp again;
+    the paired CLC profile keeps the epilogue-warp allocation."""
+    bound, _args, config, source = case
+    lines = _top_level_lines(source)
+    allocators = [line for line in lines if "cutlass.utils.TmemAllocator(" in line]
+    assert len(allocators) == 2
+    assert all("allocator_warp_id=4," in line for line in allocators)
+    allocate = next(i for i, line in enumerate(lines) if ".allocate(" in line)
+    assert lines[allocate].startswith("if tcgen05_exec_active:\n")
+    assert "relinquish_alloc_permit()" in lines[allocate]
+    publication = lines.index(
+        "if not tcgen05_tma_warp:\n    tcgen05_row_union_publication_barrier.arrive_and_wait()"
+    )
+    retrieve = next(i for i, line in enumerate(lines) if "wait_for_alloc()" in line)
+    assert allocate < publication < retrieve
+    acc_tail = next(
+        i
+        for i, line in enumerate(lines)
+        if "tcgen05_acc_pipeline.producer_tail(" in line
+    )
+    free = next(
+        i for i, line in enumerate(lines) if "tcgen05_tmem_allocator.free(" in line
+    )
+    assert lines[free] == (
+        "if tcgen05_exec_active:\n    tcgen05_tmem_allocator.free(tcgen05_exec_acc_tmem_ptr)"
+    )
+    assert retrieve < acc_tail < free
+    # No alloc-barrier meet in the teardown: the only arrive_and_wait on it is
+    # the prologue's ``wait_for_alloc``.
+    assert not any(
+        "tcgen05_tmem_alloc_barrier.arrive" in line for line in lines[acc_tail:]
+    )
+    paired = deepcopy(config)
+    paired.config[SCHEDULE_KEY] = PAIRED_CLC_SCHEDULE
+    paired_lines = _top_level_lines(bound.to_code(paired))
+    assert all(
+        "allocator_warp_id=0," in line
+        for line in paired_lines
+        if "cutlass.utils.TmemAllocator(" in line
+    )
+    assert any(
+        line
+        == "if tcgen05_epi_active:\n    tcgen05_tmem_allocator.free(tcgen05_epi_acc_tmem_ptr)"
+        for line in paired_lines
+    )

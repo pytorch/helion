@@ -11,6 +11,7 @@ import pytest
 
 from helion._compiler.cute.affine_vector_io import _conjunction
 from helion._compiler.cute.affine_vector_io import _pure_boolean_guard
+from helion._compiler.cute.boolean_guards import reassociate_boolean_guards
 
 
 def _expression(source: str) -> ast.expr:
@@ -226,3 +227,35 @@ def test_operator_comparison_guards_preserve_short_circuit_arithmetic(x: float) 
     )
     namespace = _namespace(x=x, operator=operator)
     assert eval(_compile(after), namespace) is eval(_compile(before), namespace)
+
+
+@pytest.mark.parametrize("op", ["and", "or"])
+def test_flat_chains_of_pure_guards_are_reassociated_right(op: str) -> None:
+    # The SDK preprocessor copies the accumulated left operand of a flat
+    # ``and`` / ``or`` four times per term (4^N nodes); both chain kinds of
+    # pure guards are re-nested to the right with their order and values kept.
+    inner = "or" if op == "and" else "and"
+    chain_op = ast.And if op == "and" else ast.Or
+    terms = [f"(s{index} <= r {inner} r < e{index})" for index in range(6)]
+    source = f"sel = {f' {op} '.join(terms)}\nif sel:\n    pass\n"
+    before = ast.parse(source).body
+    after = reassociate_boolean_guards(ast.parse(source).body)
+    assign = after[0]
+    assert isinstance(assign, ast.Assign)
+    cursor = assign.value
+    leaves = []
+    while isinstance(cursor, ast.BoolOp) and type(cursor.op) is chain_op:
+        assert len(cursor.values) == 2
+        leaves.append(ast.unparse(cursor.values[0]))
+        cursor = cursor.values[1]
+    leaves.append(ast.unparse(cursor))
+    assert leaves == [term[1:-1] for term in terms]
+    for node in ast.walk(assign):
+        if isinstance(node, ast.BoolOp):
+            assert len(node.values) == 2
+    for r in range(12):
+        namespace = {"r": r, **{f"s{i}": 2 * i for i in range(6)}}
+        namespace.update({f"e{i}": 2 * i + 1 for i in range(6)})
+        assert eval(_compile(before[0].value), {}, dict(namespace)) == eval(
+            _compile(assign.value), {}, dict(namespace)
+        )

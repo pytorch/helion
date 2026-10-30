@@ -38,94 +38,126 @@ def se_block_fwd(x: Tensor, w: Tensor) -> tuple[Tensor, Tensor]:
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
     s = torch.empty([m, n], dtype=x.dtype, device=x.device)
 
-    for tile_m in hl.tile(m):
-        x_tile = x[tile_m, :]  # [tile_m, n]
-        # No tiling for n - load entire n at once since it's small
-        sigmoid_result = torch.sigmoid(
-            x_tile @ w[:, :]
-        )  # [tile_m, n] @ [n, n] = [tile_m, n]
-        s[tile_m, :] = sigmoid_result
+    # Tile the output columns and the reduction: a whole-row ``x_tile @ w``
+    # needs all of w (n * n elements) on chip at once, which exceeds shared
+    # memory from n = 512 on.
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(n):
+            acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
+        # Match the input-dtype matmul result before applying sigmoid.
+        sigmoid_result = torch.sigmoid(acc.to(x.dtype))
+        s[tile_m, tile_n] = sigmoid_result
         # Compute output: 2 * x * sigmoid, cast to input dtype
-        acc = 2.0 * x_tile.to(torch.float32) * sigmoid_result
-        out[tile_m, :] = acc.to(x.dtype)
+        x_tile = x[tile_m, tile_n].to(torch.float32)
+        out[tile_m, tile_n] = (2.0 * x_tile * sigmoid_result).to(x.dtype)
 
     return out, s
 
 
 # %%
 @helion.kernel(static_shapes=True)
-def se_block_bwd_dx(grad_out: Tensor, x: Tensor, w: Tensor, s: Tensor) -> Tensor:
+def se_block_bwd_grad_to_w(grad_out: Tensor, x: Tensor, s: Tensor) -> Tensor:
     """
-    Compute gradient for x.
-    grad_x = 2 * grad_out * s + (2 * grad_out * x * s * (1 - s)) @ w.T
+    The matmul operand both gradients share:
+    g = 2 * grad_out * x * s * (1 - s), formed in fp32 and rounded once to
+    the input dtype (the reference backward's operand of ``g @ w.T`` and
+    ``x.T @ g``).  Computing it once here, instead of inside each gradient's
+    reduction loop, reads grad_out / x / s once rather than twice.
 
     Args:
         grad_out: Gradient w.r.t output [m, n]
         x: Input tensor [m, n]
+        s: sigmoid(x @ w) from forward pass [m, n]
+
+    Returns:
+        g: [m, n] in x.dtype
+    """
+    m, n = x.size()
+
+    g = torch.empty([m, n], dtype=x.dtype, device=x.device)
+
+    for tile_m, tile_n in hl.tile([m, n]):
+        g[tile_m, tile_n] = (
+            2.0
+            * grad_out[tile_m, tile_n].to(torch.float32)
+            * x[tile_m, tile_n].to(torch.float32)
+            * s[tile_m, tile_n].to(torch.float32)
+            * (1.0 - s[tile_m, tile_n].to(torch.float32))
+        ).to(x.dtype)
+
+    return g
+
+
+# %%
+@helion.kernel(static_shapes=True)
+def se_block_bwd_dx(grad_out: Tensor, g: Tensor, w: Tensor, s: Tensor) -> Tensor:
+    """
+    Compute gradient for x.
+    grad_x = 2 * grad_out * s + g @ w.T
+
+    ``g`` is the shared operand from :func:`se_block_bwd_grad_to_w` (already
+    in the input dtype); ``w`` is read as is, and the products accumulate in
+    fp32.  grad_x is written in the input dtype, so autograd needs no
+    converting copy.
+
+    Args:
+        grad_out: Gradient w.r.t output [m, n]
+        g: 2 * grad_out * x * s * (1 - s) [m, n], in the input dtype
         w: Weight matrix [n, n]
         s: sigmoid(x @ w) from forward pass [m, n]
 
     Returns:
-        grad_x: Gradient w.r.t x [m, n]
+        grad_x: Gradient w.r.t x [m, n], in g.dtype
     """
-    m, n = x.size()
+    m, n = g.size()
 
-    grad_x = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    grad_x = torch.empty([m, n], dtype=g.dtype, device=g.device)
 
     for tile_m, tile_n in hl.tile([m, n]):
-        # 2 * grad_out * s
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        acc += 2.0 * grad_out[tile_m, tile_n] * s[tile_m, tile_n]
-
         for tile_k in hl.tile(n):
-            # 2 * grad_out * x * s * (1-s) for tile_k
-            grad_to_w = (
-                2.0
-                * grad_out[tile_m, tile_k].to(torch.float32)
-                * x[tile_m, tile_k].to(torch.float32)
-                * s[tile_m, tile_k].to(torch.float32)
-                * (1.0 - s[tile_m, tile_k].to(torch.float32))
-            )
-            # grad_to_w @ w.T[tile_k, tile_n] = grad_to_w @ w[tile_n, tile_k].T
-            acc += grad_to_w @ w[tile_n, tile_k].to(torch.float32).T
+            # g @ w.T[tile_k, tile_n] = g @ w[tile_n, tile_k].T
+            acc = torch.addmm(acc, g[tile_m, tile_k], w[tile_n, tile_k].T)
 
-        grad_x[tile_m, tile_n] = acc.to(x.dtype)
+        # + 2 * grad_out * s, added after the contraction so the matmul
+        # pipeline starts from a zero accumulator
+        grad_x[tile_m, tile_n] = (
+            acc + 2.0 * grad_out[tile_m, tile_n] * s[tile_m, tile_n]
+        ).to(g.dtype)
 
     return grad_x
 
 
 # %%
 @helion.kernel(static_shapes=True)
-def se_block_bwd_dw(grad_out: Tensor, x: Tensor, s: Tensor) -> Tensor:
+def se_block_bwd_dw(x: Tensor, g: Tensor) -> Tensor:
     """
     Compute gradient for w.
-    grad_w = x.T @ (2 * grad_out * x * s * (1 - s))
+    grad_w = x.T @ g
+
+    ``g`` is the shared operand from :func:`se_block_bwd_grad_to_w`; ``x.T``
+    is read as is, and the products accumulate in fp32.  Every tile of
+    grad_w is written by exactly one iteration, so it is allocated
+    uninitialized in the input dtype (no memset, no converting copy in
+    autograd).
 
     Args:
-        grad_out: Gradient w.r.t output [m, n]
         x: Input tensor [m, n]
-        s: sigmoid(x @ w) from forward pass [m, n]
+        g: 2 * grad_out * x * s * (1 - s) [m, n], in the input dtype
 
     Returns:
-        grad_w: Gradient w.r.t w [n, n]
+        grad_w: Gradient w.r.t w [n, n], in x.dtype
     """
     m, n = x.size()
 
-    grad_w = torch.zeros([n, n], dtype=torch.float32, device=x.device)
+    grad_w = torch.empty([n, n], dtype=x.dtype, device=x.device)
 
     for tile_n1, tile_n2 in hl.tile([n, n]):
         acc_w = hl.zeros([tile_n1, tile_n2], dtype=torch.float32)
         for tile_m in hl.tile(m):
-            # 2 * grad_out * x * s * (1-s)
-            grad_to_w = (
-                2.0
-                * grad_out[tile_m, tile_n2].to(torch.float32)
-                * x[tile_m, tile_n2].to(torch.float32)
-                * s[tile_m, tile_n2].to(torch.float32)
-                * (1.0 - s[tile_m, tile_n2].to(torch.float32))
-            )
-            # x[tile_m, tile_n1].T @ grad_to_w[tile_m, tile_n2]
-            acc_w += x[tile_m, tile_n1].to(torch.float32).T @ grad_to_w
+            # x[tile_m, tile_n1].T @ g[tile_m, tile_n2]
+            acc_w = torch.addmm(acc_w, x[tile_m, tile_n1].T, g[tile_m, tile_n2])
 
         grad_w[tile_n1, tile_n2] = acc_w.to(x.dtype)
 
@@ -171,8 +203,9 @@ class SEBlockFunction(torch.autograd.Function):
         """Backward pass for se block."""
         x, w, s = ctx.saved_tensors  # type: ignore[attr-defined]
 
-        grad_x = se_block_bwd_dx(grad_out, x, w, s)
-        grad_w = se_block_bwd_dw(grad_out, x, s)
+        g = se_block_bwd_grad_to_w(grad_out, x, s)
+        grad_x = se_block_bwd_dx(grad_out, g, w, s)
+        grad_w = se_block_bwd_dw(x, g)
 
         return grad_x, grad_w
 

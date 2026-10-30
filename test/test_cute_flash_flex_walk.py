@@ -28,6 +28,7 @@ from helion._compiler.cute.attention_plan import FLEX_SCORE_KIND
 from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import FlexKvWalk
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._testing import skipUnlessCuteAvailable
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -887,6 +888,7 @@ def test_flex_coverage_design_covers_the_cooperative_widths() -> None:
             assert rolls == {hook_ops >= 16}
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_codegen_binds_the_cooperative_staging_buffer() -> None:
     """With a cooperative width the fa4 storage grows by the eight softmax
     warps' staging buffers (``flex_coop_bytes``: 32 rows at the widest
@@ -946,6 +948,7 @@ def test_codegen_binds_the_cooperative_staging_buffer() -> None:
     assert "sFlexCoop" not in plain
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_flex_rolled_chunks_knob_rolls_pass1_and_pins_the_register_ring() -> None:
     """``cute_flash_flex_rolled_chunks``: an appended schema axis, default
     on where the score hook renders 16 or more per-element operations
@@ -1054,6 +1057,7 @@ def test_flex_rolled_chunks_knob_rolls_pass1_and_pins_the_register_ring() -> Non
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_codegen_splices_the_cooperative_stream() -> None:
     """With a streamed run the softmax loop (a) issues chunks ``0 .. slots
     - 1`` of the walk's first tile before the KV loop after a full wait and
@@ -1191,6 +1195,7 @@ def _gather_plan() -> AttentionScorePlan:
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_codegen_stages_candidate_tables_in_shared_memory() -> None:
     """With a budget the fa4 storage grows by the padded table (``sFlexAux``),
     the CTA-wide setup binds the typed pointer and fills the copy (every
@@ -1253,6 +1258,7 @@ def test_codegen_stages_candidate_tables_in_shared_memory() -> None:
         assert text not in plain, text
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_codegen_splices_the_next_chunk_prefetch_around_the_t2r_copy() -> None:
     """With a prefetch budget the hook's prefetch block runs (a) before the
     KV loop for the walk's first tile (a peek of the initial words, the
@@ -4384,7 +4390,8 @@ def test_flex_hook_fast_full_knob_is_legal_on_the_list_walk() -> None:
     """``cute_flash_flex_hook_fast_full``: appended last; on the list walk
     (any walk form), off by default and off the list walk."""
     key = cute_flash.FLASH_FLEX_HOOK_FAST_FULL_KEY
-    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-1] == key
+    # Appended after the flex axes (new axes go last; later knobs follow it).
+    assert key in cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
     assert _resolve(BODY).flex_hook_fast_full is False
     assert _resolve({**BODY, key: True}).flex_hook_fast_full is True
     assert (

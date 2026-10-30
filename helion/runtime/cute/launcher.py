@@ -53,7 +53,13 @@ from ..._compiler.cute.grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
 from ..._compiler.cute.grouped_panel_raster import grouped_device_panel_index_domain
 from ..._compiler.cute.grouped_panel_raster import grouped_panel_ratio_index_domain
 from ..._compiler.cute.grouped_row_union import (
+    ab_stages_supported as row_union_ab_stages_supported,
+)
+from ..._compiler.cute.grouped_row_union import (
     schedule_by_name as row_union_schedule_by_name,
+)
+from ..._compiler.cute.grouped_row_union import (
+    with_ab_stages as row_union_with_ab_stages,
 )
 from ..._compiler.cute.grouped_worklist import GroupedWorklistRows
 from ..._compiler.cute.grouped_worklist import Tcgen05GroupedWorklistValidationError
@@ -94,6 +100,7 @@ from ..._compiler.cute.tcgen05_grouped_descriptors import WrappedGroupedDescript
 from ..triton.launcher import get_num_sm
 from .occupancy import get_max_active_clusters
 from .source_dependencies import referenced_helper_sources
+from .source_dependencies import sass_check_source_dependencies
 from .source_dependencies import wrapper_source_dependencies
 
 if TYPE_CHECKING:
@@ -784,15 +791,60 @@ def _append_cute_wrapper_plan(
                 f"epi_aux{index}_idx"
                 for index in range(plan_int("epi_aux_count", default=0))
             )
-            for key in ("q_idx", "k_idx", "v_idx", "o_idx", "lse_idx", *aux_keys):
+            for key in (
+                "q_idx",
+                "k_idx",
+                "v_idx",
+                "o_idx",
+                "lse_idx",
+                "bias_idx",
+                *aux_keys,
+            ):
                 index = plan_optional_int(key)
                 if index is not None and (
                     _cute_schema_pointer_alignment(schema_key[index]) % 16
                 ):
                     raise exc.BackendUnsupported(
                         "cute",
-                        "row_mma flash requires 16-byte-aligned q/k/v/o/lse "
+                        "row_mma flash requires 16-byte-aligned q/k/v/o/lse/bias "
                         "and row-epilogue aux bases",
+                    )
+        body.extend(
+            [
+                f"    grid_x = cutlass.Int32({plan_int('total_tiles')})",
+                "    grid_y = cutlass.Int32(1)",
+                "    grid_z = cutlass.Int32(1)",
+            ]
+        )
+        return
+
+    if kind == "helion_flash_bwd_row_mma":
+        # Register-MMA backward row programs (cute_flash_bwd_row_mma): one
+        # CTA per (KV group, kv_rows) tile, plain tensor arguments, no
+        # host-side descriptors. The body moves 16-byte cp.async packets of
+        # q/k/v/do and of the fp32 lse/delta rows, reduce-adds fp32 pairs
+        # into dq and stores 16-byte dk/dv packets, so a schema that proves
+        # any base under-aligned is refused here rather than faulting.
+        if schema_key is not None:
+            for key in (
+                "q_idx",
+                "k_idx",
+                "v_idx",
+                "do_idx",
+                "lse_idx",
+                "delta_idx",
+                "dq_idx",
+                "dk_idx",
+                "dv_idx",
+            ):
+                index = plan_optional_int(key)
+                if index is not None and (
+                    _cute_schema_pointer_alignment(schema_key[index]) % 16
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "the row_mma flash backward requires 16-byte-aligned "
+                        "q/k/v/do/lse/delta/dq/dk/dv bases",
                     )
         body.extend(
             [
@@ -806,6 +858,16 @@ def _append_cute_wrapper_plan(
     if kind == "helion_mma_dag_alias":
         # cute_mma_dag: launch-time argument metadata for the alias guard
         # (``_MmaDagAliasGuard``); nothing to prepare on the host.
+        return
+
+    if kind == "helion_tcgen05_split_k":
+        # tcgen05 split-K: the partial/counter workspace pointer, a wrapper
+        # host scalar of ``_build_cute_schema_and_args`` passed on to the
+        # kernel after the ordinary arguments (and the tensor maps).
+        param = plan.get("param")
+        if not isinstance(param, str):
+            raise exc.BackendUnsupported("cute", "invalid tcgen05 split-K wrapper plan")
+        call_args.append(param)
         return
 
     if kind == "helion_mma_dag_fixup":
@@ -861,6 +923,18 @@ def _append_cute_wrapper_plan(
         call_args.extend(tma_params)
         return
 
+    if kind == "helion_register_subblocks":
+        # Register sub-block programs: ``warps`` consecutive work items
+        # (batch row, channel tile, independent group) per CTA.
+        body.extend(
+            [
+                f"    grid_x = cutlass.Int32({plan_int('total_ctas')})",
+                "    grid_y = cutlass.Int32(1)",
+                "    grid_z = cutlass.Int32(1)",
+            ]
+        )
+        return
+
     if kind == "helion_warp_mma_gemm":
         # Register-MMA GEMM tiles: one CTA per (batch, m, n) output tile,
         # plain tensor arguments, no host-side descriptors.
@@ -885,6 +959,9 @@ def _append_cute_wrapper_plan(
         o_idx = plan_int("o_idx")
         lse_idx = plan_optional_int("lse_idx")
         bias_idx = plan_optional_int("bias_idx")
+        # The staged bias ring's depth (``cute_flash_bias_stage='tma'``; None
+        # or 0: the softmax warps read the bias from global memory).
+        bias_stage = plan_optional_int("bias_stage")
         alibi_idx = plan_optional_int("alibi_idx")
         document_idx = plan_optional_int("document_idx")
         row_kv_begin_idx = plan_optional_int("row_kv_begin_idx")
@@ -950,7 +1027,11 @@ def _append_cute_wrapper_plan(
         hd = head_dim
         hd_v = head_dim_v
         dtype = str(plan.get("dtype", "cutlass.Float16"))
-        assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
+        assert dtype in ("cutlass.Float16", "cutlass.BFloat16", "cutlass.Float8E4M3FN")
+        # V's storage: a dense ``[kv_batch, head_dim_v, seq]`` buffer is the
+        # K-major (D, S, B) B operand of the PV MMA (the canonical buffer is
+        # MN-major); the plan read it from the host tensor's strides.
+        v_k_major = bool(plan.get("v_k_major"))
         tensor_4d_batch = plan_int("tensor_4d_batch", default=0)
         tensor_4d_heads = plan_int("tensor_4d_heads", default=0)
         use_tensor_4d_tma = (
@@ -958,6 +1039,9 @@ def _append_cute_wrapper_plan(
             and tensor_4d_heads > 0
             and tensor_4d_batch * tensor_4d_heads == batch
         )
+        # The 4-D maps (and the strided flex maps, which imply them) describe
+        # the canonical V alone.
+        assert not (v_k_major and use_tensor_4d_tma)
         # (S, D, B) views over the existing (B, S, D) row-major buffers. The
         # dense FA4 4D-TMA knob instead treats the same flat storage as
         # (S, D, H, Z), matching FA4's tensor-map rank for contiguous q[z,h,s,d].
@@ -1019,8 +1103,14 @@ def _append_cute_wrapper_plan(
                     f"cute.make_layout(({seq}, {hd_v}, {batch}), "
                     f"stride=({hd_v}, 1, {seq * hd_v}))"
                 )
+                # V as the (D, S, B) B operand: the canonical ``[B, S, D]``
+                # buffer is MN-major (D contiguous), the pre-transposed
+                # ``[B, D, S]`` buffer K-major (S contiguous).
                 dsb = (
                     f"cute.make_layout(({hd_v}, {seq}, {batch}), "
+                    f"stride=({seq}, 1, {seq * hd_v}))"
+                    if v_k_major
+                    else f"cute.make_layout(({hd_v}, {seq}, {batch}), "
                     f"stride=(1, {hd_v}, {seq * hd_v}))"
                 )
             # K/V layouts span their own (grouped) batch-head count and length.
@@ -1034,6 +1124,9 @@ def _append_cute_wrapper_plan(
                 )
                 dsb_kv = (
                     f"cute.make_layout(({hd_v}, {kv_seq}, {kv_batch}), "
+                    f"stride=({kv_seq}, 1, {kv_seq * hd_v}))"
+                    if v_k_major
+                    else f"cute.make_layout(({hd_v}, {kv_seq}, {kv_batch}), "
                     f"stride=(1, {hd_v}, {kv_seq * hd_v}))"
                 )
         ssb = (
@@ -1053,11 +1146,11 @@ def _append_cute_wrapper_plan(
         flash_lines = [
             f"_flash_mQ = cute.make_tensor(arg{q_idx}.iterator, {sdb})",
             f"_flash_mK = cute.make_tensor(arg{k_idx}.iterator, {sdb_kv})",
-            # V is MN-major: (D, S, B).
+            # V is the (D, S, B) B operand (MN-major unless ``v_k_major``).
             f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {dsb_kv})",
             f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb_o})",
             f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg}, ({mma_m}, {kv_n}))",
-            f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg}, ({mma_m}, {hd_v}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk if v_k_major else 'cute.nvgpu.OperandMajorMode.MN'}, cutlass.Float32, {cg}, ({mma_m}, {hd_v}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
             f"_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout(({cluster_m}, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
             f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {dtype}, {q_stage})",
             # K/V are multi-stage TMA rings (Stage 3); the stage count must match
@@ -1125,6 +1218,29 @@ def _append_cute_wrapper_plan(
                     f"_flash_score_bias_scale = cutlass.Float32({score_bias_scale!r})",
                 ]
             )
+            if bias_stage:
+                # The staged bias: (128, 64) boxes of the (m, n, bh) view in
+                # the epilogue tile's swizzled smem layout, ``bias_stage``
+                # stages of both query tiles' two halves of a KV tile.
+                flash_lines.extend(
+                    [
+                        (
+                            f"_flash_bsl = {bw}.make_smem_layout_epi("
+                            f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                            f"(128, 64), {bias_stage * q_stage * 2})"
+                        ),
+                        (
+                            "_flash_bias_cta_v = cute.composition("
+                            "cute.make_identity_layout(_flash_mBias.shape), (128, 64))"
+                        ),
+                        (
+                            "_flash_tma_bias, _flash_mBiasT = "
+                            "cute.nvgpu.cpasync.make_tiled_tma_atom("
+                            "cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(), _flash_mBias, "
+                            "cute.select(_flash_bsl, mode=[0, 1]), _flash_bias_cta_v)"
+                        ),
+                    ]
+                )
         if alibi_idx is not None:
             flash_lines.extend(
                 [
@@ -1363,6 +1479,8 @@ def _append_cute_wrapper_plan(
             call_args.append("_flash_mLSE")
         if bias_idx is not None:
             call_args.extend(["_flash_mBias", "_flash_score_bias_scale"])
+            if bias_stage:
+                call_args.extend(["_flash_tma_bias", "_flash_mBiasT", "_flash_bsl"])
         if alibi_idx is not None:
             call_args.extend(["_flash_mAlibi", "_flash_num_alibi"])
         if document_idx is not None:
@@ -2255,6 +2373,12 @@ def _append_cute_wrapper_plan(
     if row_union_schedule is not None and row_profile is None:
         raise exc.BackendUnsupported("cute", "unknown row-union physical descriptor")
     if row_profile is not None:
+        row_union_ab_stages = plan.get("row_union_ab_stages", row_profile.ab_stages)
+        if not row_union_ab_stages_supported(row_profile, row_union_ab_stages):
+            raise exc.BackendUnsupported(
+                "cute", "row-union physical descriptor ring depth"
+            )
+        row_profile = row_union_with_ab_stages(row_profile, row_union_ab_stages)
         expected = {
             "row_union_schedule": row_profile.name,
             "bm": row_profile.mma_m,
@@ -3526,6 +3650,8 @@ class _CompiledCuteLauncher:
         "_compile_options",
         "_compiled",
         "_jit_func",
+        "_kernel_name",
+        "_sass_checks",
     )
 
     def __init__(
@@ -3533,12 +3659,20 @@ class _CompiledCuteLauncher:
         jit_func: object,
         compile_options: str | None,
         cache_key: str | None = None,
+        sass_checks: tuple[str, ...] = (),
+        kernel_name: str = "",
     ) -> None:
         self._jit_func = jit_func
         self._compile_options = compile_options
         self._compiled: object = None
         self._capi_compiled: object = None
         self._cache_key = cache_key
+        # The kernel's ``_helion_cute_sass_checks``: run on the cubin of a
+        # fresh compile before it is persisted or launched (a disk-cache hit
+        # was verified by the process that wrote it, under the checker whose
+        # source ``_cute_disk_cache_key`` folded into the key).
+        self._sass_checks = sass_checks
+        self._kernel_name = kernel_name
 
     def capi_function(self) -> object:
         """The compiled function in its C-API (``JitExecutor``) form.
@@ -3582,6 +3716,10 @@ class _CompiledCuteLauncher:
                         *args,
                         options=self._compile_options,
                     )
+                if self._sass_checks:
+                    from .sass_check import verify_compiled
+
+                    verify_compiled(compiled, self._sass_checks, self._kernel_name)
                 if self._cache_key is not None:
                     self._persist_to_disk(compiled)
             self._compiled = compiled
@@ -3897,7 +4035,13 @@ def _get_compiled_cute_launcher(
         resident_clusters=_cute_resident_clusters(cluster_shape, device),
     )
     launcher = _CompiledCuteLauncher(
-        jit_func, compile_options, cache_key=disk_cache_key
+        jit_func,
+        compile_options,
+        cache_key=disk_cache_key,
+        sass_checks=tuple(
+            getattr(cast("Any", cute_kernel), "_helion_cute_sass_checks", ())
+        ),
+        kernel_name=getattr(cast("Any", cute_kernel), "__name__", "cute_kernel"),
     )
     cache[cache_key] = launcher
     return launcher
@@ -3961,7 +4105,10 @@ def _cute_disk_cache_key(
     with a cluster above two CTAs bakes into that clamp instead
     (``_cute_resident_clusters``): it varies with the GPC floorsweeping of
     same-SM-count devices, so it joins the key where it is not ``None`` (the
-    other kernels' keys are unchanged).
+    other kernels' keys are unchanged).  A kernel that declares SASS checks
+    (``_helion_cute_sass_checks``) adds them and the checker's source
+    fingerprint (``sass_check_source_dependencies``): a cache hit is trusted
+    on its writer's verification, so a stricter rule must re-verify.
     """
     source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
     if source_hash is None:
@@ -3983,6 +4130,15 @@ def _cute_disk_cache_key(
     called_helper_sources = referenced_helper_sources(kernel_globals)
     if called_helper_sources is None:
         return None
+    sass_checks = tuple(
+        getattr(cast("Any", cute_kernel), "_helion_cute_sass_checks", ())
+    )
+    checker: tuple[object, ...] = ()
+    if sass_checks:
+        checker_sources = sass_check_source_dependencies()
+        if checker_sources is None:
+            return None
+        checker = ((sass_checks, checker_sources),)
     try:
         import cutlass
 
@@ -4010,6 +4166,7 @@ def _cute_disk_cache_key(
             num_sm,
             _cute_use_pdl(cute_kernel),
             *(() if resident_clusters is None else (resident_clusters,)),
+            *checker,
         )
     )
     digest = hashlib.sha256(payload.encode("utf-8")).digest()
@@ -4407,9 +4564,16 @@ _CUTE_STAGED_PLAN_OPERANDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] =
         ("q_idx", "k_idx", "v_idx", "bias_idx", "alibi_idx", "document_idx"),
         ("o_idx", "lse_idx"),
     ),
-    "helion_flash_row_mma": (("q_idx", "k_idx", "v_idx"), ("o_idx", "lse_idx")),
+    "helion_flash_row_mma": (
+        ("q_idx", "k_idx", "v_idx", "bias_idx"),
+        ("o_idx", "lse_idx"),
+    ),
     "helion_flash_gated": (("q_idx", "k_idx", "v_idx"), ("o_idx",)),
     "helion_flash_bwd": (
+        ("q_idx", "k_idx", "v_idx", "do_idx", "lse_idx", "delta_idx"),
+        ("dq_idx", "dk_idx", "dv_idx"),
+    ),
+    "helion_flash_bwd_row_mma": (
         ("q_idx", "k_idx", "v_idx", "do_idx", "lse_idx", "delta_idx"),
         ("dq_idx", "dk_idx", "dv_idx"),
     ),
@@ -4541,6 +4705,13 @@ def _tcgen05_grouped_static_plans(cute_kernel: object) -> list[dict[str, object]
         if cast("dict[str, object]", plan).get("kind")
         == "tcgen05_grouped_static_persistent"
     ]
+
+
+def _tcgen05_split_k_plan_present(cute_kernel: object) -> bool:
+    return any(
+        cast("dict[str, object]", plan).get("kind") == "helion_tcgen05_split_k"
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
+    )
 
 
 def _tcgen05_grouped_device_split_sizes(plan: dict[str, object]) -> bool:
@@ -4708,6 +4879,87 @@ def _cuda_stream_capture_context(device: torch.device) -> tuple[int, int | None]
 
 
 _MMA_DAG_FIXUP_WORKSPACE_CACHE_LIMIT = 8
+_TCGEN05_SPLIT_K_WORKSPACE_CACHE_LIMIT = 8
+
+
+def _cached_exchange_workspace(
+    cute_kernel: object,
+    attribute: str,
+    cache_key: tuple[object, ...],
+    *,
+    device: torch.device,
+    nbytes: int,
+    zero_from: int,
+    capture_id: int | None,
+    limit: int,
+) -> torch.Tensor:
+    """A launcher-owned exchange workspace cached on ``cute_kernel`` under
+    ``attribute`` per ``cache_key`` (which ends in the capture id): bytes
+    from ``zero_from`` on are zeroed once at allocation; a captured graph's
+    entry is tracked with the graph, eager entries are bounded by ``limit``.
+    """
+    try:
+        cache = cast(
+            "OrderedDict[tuple[object, ...], torch.Tensor]",
+            getattr(cute_kernel, attribute),
+        )
+    except AttributeError:
+        cache = OrderedDict()
+        setattr(cute_kernel, attribute, cache)
+    workspace = cache.get(cache_key)
+    if workspace is not None:
+        return workspace
+    workspace = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    workspace[zero_from:].zero_()
+    cache[cache_key] = workspace
+    if capture_id is not None:
+        _track_cute_cuda_graph_cache_entry(
+            cute_kernel, attribute, cache_key, workspace, (workspace,)
+        )
+    else:
+        eager_keys = [key for key in cache if key[-1] is None]
+        while len(eager_keys) > limit:
+            cache.pop(eager_keys.pop(0))
+    return workspace
+
+
+def _tcgen05_split_k_workspace(
+    cute_kernel: object,
+    *,
+    device: torch.device,
+    tiles: int,
+    splits: int,
+    tile_elems: int,
+) -> torch.Tensor:
+    """The exchange workspace of a ``tcgen05_split_k`` GEMM: per output tile
+    the ``splits`` fp32 partial slabs of ``tile_elems`` elements, then one
+    u32 arrival counter per tile. The counters are zeroed once (the slabs
+    are written before they are read) and the workspace is kept per
+    (device, geometry, stream, capture): the counters only ever grow (a
+    launch's CTAs derive their base from their ticket's period), so no
+    launch resets them, and the cached pointer stays valid for a captured
+    graph."""
+    partial_bytes = tiles * splits * tile_elems * 4
+    counter_bytes = -(-tiles * 4 // 256) * 256
+    stream_handle, capture_id = _cuda_stream_capture_context(device)
+    return _cached_exchange_workspace(
+        cute_kernel,
+        "_helion_tcgen05_split_k_workspace_cache",
+        (
+            device.type,
+            device.index,
+            tiles,
+            splits,
+            tile_elems,
+            stream_handle,
+            capture_id,
+        ),
+        device=device,
+        nbytes=partial_bytes + counter_bytes,
+        zero_from=partial_bytes,
+        capture_id=capture_id,
+        limit=_TCGEN05_SPLIT_K_WORKSPACE_CACHE_LIMIT,
+    )
 
 
 def _mma_dag_fixup_workspace(
@@ -4729,45 +4981,26 @@ def _mma_dag_fixup_workspace(
     partial_bytes = slabs * tiles * row_tiles * rows * 4
     counter_bytes = -(-row_tiles * 4 // 256) * 256
     stream_handle, capture_id = _cuda_stream_capture_context(device)
-    cache_key = (
-        device.type,
-        device.index,
-        row_tiles,
-        tiles,
-        rounds,
-        slabs,
-        rows,
-        stream_handle,
-        capture_id,
+    return _cached_exchange_workspace(
+        cute_kernel,
+        "_helion_mma_dag_fixup_workspace_cache",
+        (
+            device.type,
+            device.index,
+            row_tiles,
+            tiles,
+            rounds,
+            slabs,
+            rows,
+            stream_handle,
+            capture_id,
+        ),
+        device=device,
+        nbytes=partial_bytes + counter_bytes,
+        zero_from=0,
+        capture_id=capture_id,
+        limit=_MMA_DAG_FIXUP_WORKSPACE_CACHE_LIMIT,
     )
-    try:
-        cache = cast(
-            "OrderedDict[tuple[object, ...], torch.Tensor]",
-            cast("Any", cute_kernel)._helion_mma_dag_fixup_workspace_cache,
-        )
-    except AttributeError:
-        cache = OrderedDict()
-        cast("Any", cute_kernel)._helion_mma_dag_fixup_workspace_cache = cache
-    workspace = cache.get(cache_key)
-    if workspace is not None:
-        return workspace
-    workspace = torch.zeros(
-        partial_bytes + counter_bytes, dtype=torch.uint8, device=device
-    )
-    cache[cache_key] = workspace
-    if capture_id is not None:
-        _track_cute_cuda_graph_cache_entry(
-            cute_kernel,
-            "_helion_mma_dag_fixup_workspace_cache",
-            cache_key,
-            workspace,
-            (workspace,),
-        )
-    else:
-        eager_keys = [key for key in cache if key[-1] is None]
-        while len(eager_keys) > _MMA_DAG_FIXUP_WORKSPACE_CACHE_LIMIT:
-            cache.pop(eager_keys.pop(0))
-    return workspace
 
 
 def _tcgen05_grouped_dynamic_tensormap_workspace(
@@ -5229,6 +5462,22 @@ def _cute_grouped_launch_contexts(
             continue
         if context not in contexts:
             contexts.append(context)
+    if _tcgen05_split_k_plan_present(cute_kernel):
+        # The split-K workspace is cached per (stream, capture)
+        # (``_tcgen05_split_k_workspace``): the same pointers relaunched on
+        # another stream or under capture must miss the last-launch cache
+        # too, or they would reuse the earlier launch's workspace pointer.
+        device = next(
+            (arg.device for arg in args if isinstance(arg, torch.Tensor)), None
+        )
+        if device is not None:
+            context = (
+                device.type,
+                device.index,
+                *_cuda_stream_capture_context(device),
+            )
+            if context not in contexts:
+                contexts.append(context)
     return tuple(contexts)
 
 
@@ -6635,6 +6884,15 @@ def _cute_launch_arg_cache_key(
 ) -> tuple[object, ...]:
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
     key: list[object] = [len(args), grid, _cute_bake_tensor_shapes_guard(cute_kernel)]
+    if _tcgen05_split_k_plan_present(cute_kernel):
+        # The split-K workspace pointer in the launch arguments is cached per
+        # (stream, capture) (``_tcgen05_split_k_workspace``); a captured
+        # graph must not reuse the arguments of an eager launch.
+        device = next(
+            (arg.device for arg in args if isinstance(arg, torch.Tensor)), None
+        )
+        if device is not None:
+            key.append(("workspace_context", *_cuda_stream_capture_context(device)))
     if dynamic_tensormap_contexts is None:
         dynamic_tensormap_contexts = _cute_dynamic_tensormap_contexts(cute_kernel, args)
     if dynamic_tensormap_contexts:
@@ -6789,6 +7047,7 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
         "helion_small_biased_attention",
         "helion_flash_row_mma",
         "helion_warp_mma_gemm",
+        "helion_register_subblocks",
         "chunk_prepare_tma",
         "chunk_recurrence_sm100",
         "chunk_recurrence_warp_dv4",
@@ -7549,6 +7808,43 @@ def _build_cute_schema_and_args(
         schema.append(("wrapper_host_scalar", total_name, "int"))
         launch_args.append(total_clusters)
         owned_tensors.extend(metadata_result.tensors())
+
+    split_k_plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "helion_tcgen05_split_k"
+    ]
+    if len(split_k_plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple tcgen05 split-K wrapper plans")
+    if split_k_plans:
+        plan = split_k_plans[0]
+        splits, tile_elems = (
+            int(cast("int", plan["splits"])),
+            int(cast("int", plan["tile_elems"])),
+        )
+        param = _plan_str_value(plan, "param")
+        tiles = int(cast("int", plan["tiles"]))
+        tensor_args = [arg for arg in args if isinstance(arg, torch.Tensor)]
+        # The kernel baked the counter offset from its tile count: the grid
+        # must be exactly that many tiles times the split.
+        if (
+            not tensor_args
+            or splits <= 1
+            or tile_elems <= 0
+            or tiles <= 0
+            or grid[0] != tiles * splits
+        ):
+            raise exc.BackendUnsupported("cute", "invalid tcgen05 split-K launch")
+        workspace = _tcgen05_split_k_workspace(
+            cute_kernel,
+            device=tensor_args[0].device,
+            tiles=tiles,
+            splits=splits,
+            tile_elems=tile_elems,
+        )
+        schema.append(("wrapper_host_scalar", param, "int"))
+        launch_args.append(int(workspace.data_ptr()))
+        owned_tensors.append(workspace)
 
     fixup_plans = [
         cast("dict[str, object]", plan)

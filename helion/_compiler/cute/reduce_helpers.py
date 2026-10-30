@@ -570,6 +570,7 @@ def _cute_grouped_reduce_shared_columns(
     pre: int,
     group_span: int,
     group_count: int,
+    fold: str = "serial",
 ) -> list:
     """Reduce ``len(values)`` independent per-thread partials across a thread
     group with one shared-memory round trip.
@@ -586,9 +587,22 @@ def _cute_grouped_reduce_shared_columns(
       all of its lanes hold the warp partial and write it to the warp's column
       slot without a lane predicate; after one barrier every thread sums its
       group's ``group_span // 32`` partials per column.
-    * ``pre > 1`` (threads laid out along the vector axis first): every thread
-      writes its partials, and after one barrier every thread sums the
-      ``group_span // pre`` partials of its own sibling coordinate per column.
+    * ``pre > 1`` (threads laid out along the vector axis first),
+      ``fold="serial"``: every thread writes its partials, and after one
+      barrier every thread sums the ``group_span // pre`` partials of its own
+      sibling coordinate per column.
+    * ``pre > 1``, ``fold="warp"`` (``group_span`` a multiple of 32, ``pre``
+      a divisor of 32): every warp first folds each column across the
+      ``32 // pre`` reduction coordinates it holds with a strided shuffle
+      butterfly (xor offsets ``pre .. 16`` keep ``lane % pre`` fixed), the
+      lanes of one sibling class then hold the same warp partial and write it
+      to that class's slot of the warp (same value, same address, no lane
+      predicate); after one barrier every thread sums its sibling class's
+      ``group_span // 32`` warp partials per column.  Against the serial form
+      this trades ``group_span // pre`` staged reads per column for
+      ``log2(32 // pre)`` shuffles plus ``group_span // 32`` reads; the sum
+      order differs (a tree within the warp, then over the warps), so the
+      register-tile emitter only requests it through an autotuner knob.
 
     Either way the whole tile costs two barriers, against one two-stage reduce
     (two barriers, and ``pre`` masked shuffles per stage) per column.  The
@@ -601,11 +615,32 @@ def _cute_grouped_reduce_shared_columns(
     entry = _SERIAL_DISPATCH.get(reduction_type)
     if entry is None:
         raise ValueError(f"unsupported CuTe column reduction type: {reduction_type!r}")
+    if fold not in ("serial", "warp"):
+        raise ValueError(f"unsupported CuTe column reduction fold: {fold!r}")
     warp_fold, combine = entry
     width = len(values)
     dtype = type(identity)
     group_id = lane_var // group_span
     results = []
+    if pre > 1 and fold == "warp":
+        if group_span % 32 or 32 % pre:
+            raise ValueError(
+                "the warp fold of a CuTe column reduction needs a warp-aligned "
+                f"group and a sibling count dividing a warp (pre={pre}, "
+                f"group_span={group_span})"
+            )
+        results = _cute_warp_fold_column_sums(
+            values,
+            combine,
+            identity,
+            lane_var,
+            lane_in_group_var,
+            pre=pre,
+            group_span=group_span,
+            group_count=group_count,
+        )
+        cute.arch.sync_threads()
+        return results
     if pre == 1:
         warps_per_group = group_span // 32
         smem_size = group_count * warps_per_group * width
@@ -648,6 +683,67 @@ def _cute_grouped_reduce_shared_columns(
             )
         results.append(total)
     cute.arch.sync_threads()
+    return results
+
+
+def _cute_warp_fold_column_sums(
+    values: list,
+    combine: object,
+    identity: cute.Numeric,
+    lane_var: cutlass.Int32,
+    lane_in_group_var: cutlass.Int32,
+    *,
+    pre: int,
+    group_span: int,
+    group_count: int,
+) -> list:
+    """``_cute_grouped_reduce_shared_columns(..., fold="warp")`` for ``pre > 1``,
+    up to (not including) the trailing barrier the caller emits before it
+    returns (the barrier that guards the slots' reuse by a persistent CTA's
+    next trip).
+
+    ``pre`` divides 32 and ``group_span`` is a multiple of 32 (checked by the
+    caller), so a warp holds ``32 // pre`` reduction coordinates of every
+    sibling class and the groups are warp aligned.  Plain Python during
+    tracing: no dynamic control flow, so the lanes of one sibling class all
+    write their (identical) warp partial to the class's slot instead of a
+    predicated representative.  Shared memory: ``group_span // 32`` warps x
+    ``pre`` sibling classes x ``len(values)`` columns per group.
+    """
+    width = len(values)
+    dtype = type(identity)
+    warps_per_group = group_span // 32
+    slots = pre * width
+    smem_size = group_count * warps_per_group * slots
+    smem_ptr = cute.arch.alloc_smem(dtype, smem_size)
+    smem = cute.make_tensor(smem_ptr, (smem_size,))
+    group_id = lane_var // group_span
+    warp_in_group = lane_in_group_var // 32
+    lane_mod_pre = lane_in_group_var % pre
+    partials_base = group_id * (warps_per_group * slots)
+    slot_base = partials_base + warp_in_group * slots + lane_mod_pre * width
+    for column, value in enumerate(values):
+        for shift in range(pre.bit_length() - 1, 5):
+            value = combine(
+                value,
+                dtype(
+                    cute.arch.shuffle_sync_bfly(
+                        value, offset=1 << shift, mask=-1, mask_and_clamp=31
+                    )
+                ),
+            )
+        smem[slot_base + column] = value
+    cute.arch.sync_threads()
+    sibling_base = partials_base + lane_mod_pre * width
+    results = []
+    for column in range(width):
+        total = identity
+        for warp_index in range(warps_per_group):
+            total = combine(
+                total,
+                _smem_read(smem, sibling_base + warp_index * slots + column, dtype),
+            )
+        results.append(total)
     return results
 
 

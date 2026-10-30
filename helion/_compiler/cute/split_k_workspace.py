@@ -4,6 +4,11 @@ This envelope contains one direct matrix contraction per disjoint K partition.
 The destination is a fresh zero tensor and has no readers. An optional FP32
 bias addition belongs only to partition zero. Unsupported programs retain the
 ordinary atomic lowering, including its existing FP32 output promotion.
+
+The same producer/reducer schedule also proves the plain GEMM store
+(``out[tile_m, tile_n] = acc`` after a whole-K loop, optionally through a
+bias addition and the output cast): there the kernel has no partition axis,
+so ``cute_split_k_partitions`` names the partition count of the schedule.
 """
 
 from __future__ import annotations
@@ -35,6 +40,8 @@ from ..type_info import CallableType
 from .atomic_output_promotions import fresh_half_atomic_outputs
 from .pipeline_smem import Tcgen05PipelineSmemFacts
 from .pipeline_smem import max_pipeline_ab_stages
+from .split_k_workspace_config import PARTITION_CHOICES
+from .split_k_workspace_config import PARTITIONS_KEY
 from .split_k_workspace_config import STAGES_KEY
 from .split_k_workspace_config import WORKSPACE_CONFIG_KEYS as WORKSPACE_CONFIG_KEYS
 from .split_k_workspace_config import WORKSPACE_KEY as WORKSPACE_KEY
@@ -47,6 +54,28 @@ if TYPE_CHECKING:
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
+
+
+_TORCH_DTYPE_NAMES = {
+    torch.float16: "torch.float16",
+    torch.bfloat16: "torch.bfloat16",
+    torch.float32: "torch.float32",
+}
+_CUTLASS_DTYPE_NAMES = {
+    torch.float16: "cutlass.Float16",
+    torch.bfloat16: "cutlass.BFloat16",
+    torch.float32: "cutlass.Float32",
+}
+
+
+def torch_dtype_name(dtype: torch.dtype) -> str:
+    """``torch.<dtype>`` spelling of a proved split-K output or operand dtype."""
+    return _TORCH_DTYPE_NAMES[dtype]
+
+
+def cutlass_dtype_name(dtype: torch.dtype) -> str:
+    """``cutlass.<Dtype>`` spelling of a proved split-K output or operand dtype."""
+    return _CUTLASS_DTYPE_NAMES[dtype]
 
 
 @dataclass(frozen=True)
@@ -77,8 +106,12 @@ class SplitKWorkspaceProof:
     m_block_id: int
     n_block_id: int
     k_block_id: int
+    # -1 for the plain store pattern, which has no partition axis.
     partition_block_id: int
     chunk: ConfigValueExpression | int
+    # The plain GEMM store pattern: the reducer writes the whole output (the
+    # host keeps its ``torch.empty`` allocation) and no atomic is replaced.
+    store: bool = False
 
     def chunk_size(self, config: Config) -> int:
         return (
@@ -445,10 +478,14 @@ def analyze_split_k_reduction(
     output_node = cast("Node", atomic.args[0])
     output = _tensor(output_node)
     output_name = output_node.args[0]
+    # The destination is either FP32 (a user FP32 output, or a float16 output
+    # the atomic lowering promoted to FP32 storage) or a bfloat16 output, which
+    # the atomic lowering leaves in its requested dtype: the reducer casts the
+    # FP32 partial sum to it once, where the atomics rounded every partition.
     if (
         output is None
         or output.ndim != 2
-        or output.dtype is not torch.float32
+        or output.dtype not in (torch.float32, torch.bfloat16)
         or not isinstance(output_name, str)
         or not output_name.isidentifier()
         or not _fresh_zero_output(host, output_name, env)
@@ -619,13 +656,11 @@ def analyze_split_k_reduction(
     if chunk is None:
         return None
     returns = [stmt for stmt in host.body if isinstance(stmt, ast.Return)]
-    output_dtype = env.cute_half_atomic_output_promotions.get(
-        output_name, torch.float32
-    )
+    output_dtype = env.cute_half_atomic_output_promotions.get(output_name, output.dtype)
     expected_return = (
         output_name
-        if output_dtype is torch.float32
-        else f"{output_name}.to(torch.float16)"
+        if output_dtype is output.dtype
+        else f"{output_name}.to({torch_dtype_name(output_dtype)})"
     )
     if (
         len(returns) != 1
@@ -656,11 +691,429 @@ def analyze_split_k_reduction(
     )
 
 
+_METADATA_ATTRIBUTES = frozenset(
+    (
+        "dtype",
+        "device",
+        "shape",
+        "size",
+        "stride",
+        "ndim",
+        "dim",
+        "numel",
+        "element_size",
+    )
+)
+
+
+def _fresh_store_output(host: HostFunction, name: str) -> bool:
+    """``name`` is bound once to a fresh ``torch`` factory allocation and is
+    only ever stored to by the device loop, read for metadata, or returned."""
+    module = ast.Module(body=host.body, type_ignores=[])
+    assignments = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == name
+    ]
+    if len(assignments) != 1 or assignments[0] not in host.body:
+        return False
+    allocation = assignments[0].value
+    if not (
+        isinstance(allocation, ast.Call)
+        and isinstance(allocation.func, ExtendedAST)
+        and isinstance(allocation.func._type_info, CallableType)
+        and allocation.func._type_info.value
+        in (
+            torch.empty,
+            torch.empty_like,
+            torch.zeros,
+            torch.zeros_like,
+            torch.ones,
+            torch.ones_like,
+            torch.full,
+            torch.full_like,
+        )
+        and not any(kw.arg in (None, "out") for kw in allocation.keywords)
+    ):
+        return False
+    parents = {
+        id(child): parent
+        for parent in ast.walk(module)
+        for child in ast.iter_child_nodes(parent)
+    }
+    device_nodes = {
+        id(node)
+        for statement in host.body
+        if isinstance(statement, ast.For)
+        and isinstance(statement, ExtendedAST)
+        and statement._loop_type is LoopType.GRID
+        for node in ast.walk(statement)
+    }
+    for node in ast.walk(module):
+        if (
+            not isinstance(node, ast.Name)
+            or node.id != name
+            or not isinstance(node.ctx, ast.Load)
+        ):
+            continue
+        parent = parents[id(node)]
+        if isinstance(parent, ast.Return):
+            continue
+        if (
+            isinstance(parent, ast.Subscript)
+            and isinstance(parent.ctx, ast.Store)
+            and id(parent) in device_nodes
+        ):
+            # The device loop's ``out[tile_m, tile_n] = ...`` (the graph proof
+            # pins it to the one tcgen05 store); a host-side element write
+            # would make the allocation observable before the reducer runs.
+            continue
+        if isinstance(parent, ast.Attribute) and parent.attr in _METADATA_ATTRIBUTES:
+            continue
+        return False
+    return True
+
+
+def analyze_split_k_store_reduction(
+    env: CompileEnvironment, ir: DeviceIR
+) -> SplitKWorkspaceProof | None:
+    """The plain GEMM store: ``acc = zeros; for k: acc = addmm(acc, a, b);
+    out[tile_m, tile_n] = (acc [+ bias[tile_n]]) [.to(out.dtype)]`` over the
+    whole K extent, ``out`` a fresh private allocation returned as is."""
+    host = ir.host_function
+    if (
+        env.backend_name != "cute"
+        or host is None
+        or env._is_distributed
+        or env.cute_fission_plan is not None
+        or len(ir.root_ids) != 1
+        or len(ir.grid_block_ids[0]) != 2
+        or env.config_spec.target_device_capability is None
+        or env.config_spec.target_device_capability[0] != 10
+    ):
+        return None
+    if (
+        sum(
+            isinstance(statement, ast.For)
+            and isinstance(statement, ExtendedAST)
+            and statement._loop_type is LoopType.GRID
+            for statement in host.body
+        )
+        != 1
+    ):
+        return None
+    root = ir.graphs[ir.root_ids[0]]
+    calls = [
+        node
+        for info in ir.graphs
+        for node in info.graph.nodes
+        if node.op == "call_function"
+    ]
+    stores = [node for node in calls if node.target is memory_ops.store]
+    contractions = [
+        node for node in calls if node.target is torch.ops.aten.addmm.default
+    ]
+    loops = [node for node in root.graph.nodes if node.target is _tracing_ops._for_loop]
+    if (
+        len(stores) != 1
+        or len(contractions) != 1
+        or len(loops) != 1
+        or _output(root) is not None
+    ):
+        return None
+    store, mm, loop = stores[0], contractions[0], loops[0]
+    if (
+        store.graph is not root.graph
+        or store.users
+        or store.kwargs
+        or len(store.args) != 4
+        or store.args[3] is not None
+        or not _is_call(store.args[0], _tracing_ops._host_tensor)
+        or not isinstance(store.args[1], (tuple, list))
+        or len(store.args[1]) != 2
+        or loop.kwargs
+        or len(loop.args) != 4
+        or type(loop.args[0]) is not int
+        or mm.kwargs
+        or len(mm.args) != 3
+    ):
+        return None
+    output_node = cast("Node", store.args[0])
+    output = _tensor(output_node)
+    output_name = output_node.args[0]
+    if (
+        output is None
+        or output.ndim != 2
+        or output.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or not isinstance(output_name, str)
+        or not output_name.isidentifier()
+        or not _fresh_store_output(host, output_name)
+        or set(output_node.users) != {store}
+    ):
+        return None
+    m_axis, n_axis = (_exact_axis(env, index) for index in store.args[1])
+    if (
+        m_axis is None
+        or n_axis is None
+        or m_axis == n_axis
+        or set(ir.grid_block_ids[0]) != {m_axis, n_axis}
+    ):
+        return None
+    inner = ir.graphs[loop.args[0]]
+    if (
+        not isinstance(inner, ForLoopGraphInfo)
+        or len(inner.block_ids) != 1
+        or mm.graph is not inner.graph
+    ):
+        return None
+    (k_axis,) = inner.block_ids
+    if k_axis in ir.grid_block_ids[0]:
+        return None
+    lhs, rhs = _direct_load(mm.args[1], env), _direct_load(mm.args[2], env)
+    if lhs is None or rhs is None:
+        return None
+    a, a_expression, a_axes = lhs
+    b, b_expression, b_axes = rhs
+    a_shape, b_shape, out_shape = _shape(env, a), _shape(env, b), _shape(env, output)
+    a_strides, b_strides, out_strides = (
+        _strides(env, a),
+        _strides(env, b),
+        _strides(env, output),
+    )
+    # Row-major operands only: the partition producer's batched views of A
+    # and B are proved for K-major A and N-major B (an M-major A or K-major B
+    # fails its proof at codegen); the leading stride is 16-byte aligned.
+    if (
+        a.ndim != 2
+        or b.ndim != 2
+        or a.dtype not in (torch.float16, torch.bfloat16)
+        or b.dtype is not a.dtype
+        or a_axes != (m_axis, k_axis)
+        or b_axes != (k_axis, n_axis)
+        or a_shape is None
+        or b_shape is None
+        or out_shape is None
+        or a_strides is None
+        or b_strides is None
+        or a_strides[1] != 1
+        or b_strides[1] != 1
+        or a_strides[0] < a_shape[1]
+        or b_strides[0] < b_shape[1]
+        or any(
+            stride != 1 and stride * a.element_size() % 16
+            for stride in (*a_strides, *b_strides)
+        )
+    ):
+        return None
+    m, k = a_shape
+    k2, n = b_shape
+    if (
+        k != k2
+        or out_shape != (m, n)
+        or out_strides != (n, 1)
+        or env.specialize_expr(env.block_sizes[m_axis].numel) != m
+        or env.specialize_expr(env.block_sizes[n_axis].numel) != n
+        or env.specialize_expr(env.block_sizes[k_axis].numel) != k
+        or max(m, n, k, m * n) >= 1 << 31
+    ):
+        return None
+    start, stop, carried = loop.args[1:]
+    if any(
+        not isinstance(values, (list, tuple)) or len(values) != 1
+        for values in (start, stop, carried)
+    ):
+        return None
+    begin, end, initial = start[0], stop[0], carried[0]
+    # The loop walks the whole K extent (the schedule partitions it).
+    if (
+        _static(env, begin) != 0
+        or _static(env, end) != k
+        or not _is_call(initial, creation_ops.full)
+        or not isinstance(initial, torch.fx.Node)
+        or len(initial.args) != 4
+        or type(initial.args[1]) not in (int, float)
+        or initial.args[1] != 0
+        or math.copysign(1, initial.args[1]) != 1
+        or initial.args[2:] != (torch.float32, None)
+        or inner.node_args != [initial]
+    ):
+        return None
+    if not isinstance(initial.args[0], (list, tuple)) or tuple(
+        _exact_axis(env, x) for x in initial.args[0]
+    ) != (m_axis, n_axis):
+        return None
+    placeholders = tuple(inner.graph.find_nodes(op="placeholder"))
+    matched: set[Node] = {
+        store,
+        mm,
+        loop,
+        initial,
+        cast("Node", mm.args[1]),
+        cast("Node", mm.args[2]),
+    }
+    if (
+        len(placeholders) != 1
+        or _strip_new_vars(mm.args[0], matched) is not placeholders[0]
+        or _output(inner) != [mm]
+    ):
+        return None
+    loop_values = [
+        node
+        for node in root.graph.nodes
+        if _is_call(node, _tracing_ops._phi)
+        and len(node.args) == 2
+        and node.args[0] is initial
+        and _getitem(node.args[1], loop, 0, matched)
+    ]
+    if len(loop_values) != 1:
+        return None
+    loop_value = loop_values[0]
+    matched.add(loop_value)
+    # The stored value: the accumulator, through an optional row-vector or
+    # matrix bias addition and the optional cast to the output dtype.
+    value = _strip_new_vars(store.args[2], matched)
+    if (
+        _is_call(value, torch.ops.prims.convert_element_type.default)
+        and isinstance(value, torch.fx.Node)
+        and len(value.args) == 2
+        and value.args[1] is output.dtype
+    ):
+        matched.add(value)
+        value = _strip_new_vars(value.args[0], matched)
+    elif output.dtype is not torch.float32:
+        return None
+    bias: SplitKBias | None = None
+    if (
+        _is_call(value, torch.ops.aten.add.Tensor)
+        and isinstance(value, torch.fx.Node)
+        and len(value.args) == 2
+        and _tensor(value) is not None
+        and cast("torch.Tensor", _tensor(value)).dtype is torch.float32
+        and _strip_new_vars(value.args[0], matched) is loop_value
+    ):
+        load = _direct_load(value.args[1], env)
+        if load is None:
+            return None
+        tensor, expression, axes = load
+        shape, strides = _shape(env, tensor), _strides(env, tensor)
+        if (
+            tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or not 1 <= tensor.ndim <= 2
+            or len(set(axes)) != len(axes)
+            or any(axis not in (m_axis, n_axis) for axis in axes)
+            or shape is None
+            or shape != tuple(m if axis == m_axis else n for axis in axes)
+            or strides is None
+            or sum(
+                (size - 1) * stride for size, stride in zip(shape, strides, strict=True)
+            )
+            >= 1 << 31
+        ):
+            return None
+        matched.update((value, cast("Node", value.args[1])))
+        bias = SplitKBias(
+            tensor,
+            expression,
+            tuple(0 if axis == m_axis else 1 for axis in axes),
+            strides,
+        )
+        value = loop_value
+    if value is not loop_value:
+        return None
+    if {root.graph_id, inner.graph_id} != set(range(len(ir.graphs))):
+        return None
+    metadata_calls = {
+        _tracing_ops._host_tensor,
+        _tracing_ops._get_symnode,
+        torch.ops.aten.sym_size.int,
+    }
+    if any(node not in matched and node.target not in metadata_calls for node in calls):
+        return None
+    if any(
+        node is not output_node
+        and node.target is _tracing_ops._host_tensor
+        and node.args == (output_name,)
+        for node in calls
+    ):
+        return None
+    returns = [stmt for stmt in host.body if isinstance(stmt, ast.Return)]
+    if (
+        len(returns) != 1
+        or returns[0].value is None
+        or ast.unparse(returns[0].value) != output_name
+    ):
+        return None
+    return SplitKWorkspaceProof(
+        root.graph_id,
+        a,
+        b,
+        output,
+        a_expression,
+        b_expression,
+        output_name,
+        output.dtype,
+        bias,
+        m,
+        n,
+        k,
+        cast("tuple[int, int]", a_strides),
+        cast("tuple[int, int]", b_strides),
+        m_axis,
+        n_axis,
+        k_axis,
+        -1,
+        ConfigValueExpression(
+            "cdiv", (k, ConfigValueExpression("config", (PARTITIONS_KEY,)))
+        ),
+        store=True,
+    )
+
+
+# Each partition of a plain-store split keeps at least this many whole
+# 64-wide K tiles: shorter partitions spend their pipeline on fill and
+# drain, and 128^3 .. 512^3 GEMMs (whose small grids pass the SM gate)
+# would otherwise take 48 workspace seeds into their initial populations.
+PLAIN_STORE_MIN_PARTITION_K_TILES = 8
+
+
+def plain_store_partition_choices(
+    proof: SplitKWorkspaceProof, num_sm: int | None
+) -> tuple[int, ...]:
+    """``cute_split_k_partitions`` values of a plain store proof: 1 (the plain
+    kernel) and every search choice that cuts K into whole 64-wide tiles of
+    at least ``PLAIN_STORE_MIN_PARTITION_K_TILES`` per partition, for GEMMs
+    whose 256x256 CTA pairs leave at least half the SMs idle (a fuller grid
+    only pays the partial traffic, and the schedule's seeds would displace
+    the random half of the initial population). Empty without an SM count
+    (hosts without a device) or without an admissible split."""
+    if not proof.store or not num_sm:
+        return ()
+    if -(-proof.m // 256) * -(-proof.n // 256) * 2 >= num_sm // 2:
+        return ()
+    splits = tuple(
+        split
+        for split in PARTITION_CHOICES
+        if split > 1
+        and proof.k % (split * 64) == 0
+        and proof.k // (split * 64) >= PLAIN_STORE_MIN_PARTITION_K_TILES
+    )
+    return (1, *splits) if splits else ()
+
+
 def analyze_split_k_workspace(
     env: CompileEnvironment, ir: DeviceIR
 ) -> SplitKWorkspaceProof | None:
     """Keep the original workspace domain while sharing the semantic proof."""
     proof = analyze_split_k_reduction(env, ir)
+    if proof is None:
+        proof = analyze_split_k_store_reduction(env, ir)
+        if proof is not None and not plain_store_partition_choices(
+            proof, env.config_spec.num_sm
+        ):
+            return None
     if proof is None or proof.m % 128 or proof.n % 64 or proof.k % 64:
         return None
     return proof

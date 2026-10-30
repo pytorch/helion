@@ -101,7 +101,9 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
+    from ..language.matmul_ops import CuteTcgen05SearchPlan
     from ..language.matmul_ops import _CuteTcgen05SearchPlanningResult
+    from .cute.cute_mma import _CuteMmaNode
     from .cute.layout import CuTeGridExecutionPlan
     from .device_function import DeviceFunction
     from .device_ir_analysis import DeviceIRAnalysis
@@ -115,6 +117,26 @@ if TYPE_CHECKING:
 tls: _TLS = cast("_TLS", threading.local())
 
 log = logging.getLogger(__name__)
+
+
+def _cute_tcgen05_output_store_facts(
+    device_ir: DeviceIR, node: torch.fx.Node
+) -> tuple[int | None, int]:
+    """``(output dtype width, store count)`` of one MMA, for the SMEM fit estimate."""
+    from .cute.cute_mma import _trace_mma_to_stores
+
+    stores = _trace_mma_to_stores(node, device_ir.graphs)
+    if not stores:
+        return None, 1
+    widths: list[int] = []
+    for store in stores:
+        source = store.args[0] if store.args else None
+        value = source.meta.get("val") if isinstance(source, torch.fx.Node) else None
+        if isinstance(value, torch.Tensor):
+            widths.append(value.dtype.itemsize)
+    if not widths:
+        return None, 1
+    return max(widths), len(stores)
 
 
 def _finalize_cute_tcgen05_search_planning(
@@ -131,6 +153,31 @@ def _finalize_cute_tcgen05_search_planning(
     return (
         all(result.guards_complete for result in planning_results)
         and len(analysis_keys) == 1
+    )
+
+
+def _enable_cute_phase_mma_search(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    planning_results: Sequence[_CuteTcgen05SearchPlanningResult],
+    search_candidates: Sequence[
+        tuple[_CuteMmaNode, torch.Tensor, CuteTcgen05SearchPlan]
+    ],
+    mma_candidates: Sequence[
+        tuple[_CuteMmaNode, torch.Tensor, torch.Tensor, torch.fx.Node]
+    ],
+) -> bool:
+    """Plan an ordered ``hl.barrier()`` chain per phase; False where it declines."""
+    from .cute.materialized_mma import enable_phase_mma_search
+
+    return enable_phase_mma_search(
+        env,
+        device_ir,
+        planning_results,
+        search_candidates,
+        mma_nodes={
+            id(candidate): node for candidate, _lhs, _rhs, node in mma_candidates
+        },
     )
 
 
@@ -3509,14 +3556,34 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 (block_id for ids in device_ir.grid_block_ids for block_id in ids),
                 CompileEnvironment.current(),
             )
-        defer_load_masks = CompileEnvironment.current().backend.name == "pallas"
+        is_pallas = CompileEnvironment.current().backend.name == "pallas"
+        if is_pallas:
+            from .pallas.canonicalize_jagged_bounds import canonicalize_jagged_bounds
+
+            canonicalize_jagged_bounds(device_ir.graphs)
         for graph in device_ir.graphs:
             validate_host_tensor_usage(graph.graph)
             add_tile_with_offset_metadata(graph)
             remove_unnecessary_tile_index(graph.graph)
-            if defer_load_masks:
+            if is_pallas:
                 defer_pallas_load_masks(graph.graph)
             remove_unnecessary_masking(graph.graph)
+
+        warp_specialize_specs = (
+            CompileEnvironment.current().config_spec.range_warp_specialize
+        )
+        if warp_specialize_specs:
+            from .loop_dependency_checker import intra_loop_raw_reread_block_ids
+
+            # A loop that stores and then re-reads the same storage cannot be
+            # warp-specialized (see intra_loop_raw_reread_block_ids); its
+            # slot stays in the config space pinned to None.
+            reread_block_ids = intra_loop_raw_reread_block_ids(
+                device_ir.graphs, device_ir.root_ids, device_ir.grid_block_ids
+            )
+            for spec in warp_specialize_specs:
+                if reread_block_ids.intersection(spec.block_ids):
+                    spec.pinned = True
 
         if CompileEnvironment.current().backend.name == "cute":
             from .cute.dot_scaled_scales import expose_dot_scaled_scales
@@ -3597,18 +3664,49 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         config_spec.epilogue_subtile_candidate_enabled = has_epilogue_subtile_candidate
         config_spec.epilogue_subtile_k_hint = 0
         config_spec.epilogue_subtile_autotune_choices = None
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.collective_matmul import collective_knobs_apply
+            from .cute.collective_matmul import has_k_loop_less_matmul
 
+            env = CompileEnvironment.current()
+            # Knobs no contraction can act on leave the search surface: the
+            # collective marker needs an addmm/dot site with a tiled or a
+            # short full-slice K, and the epilogue store split does not
+            # survive a matmul on the direct/serial path.
+            config_spec.cute_collective_knobs_enabled = collective_knobs_apply(
+                env, device_ir
+            )
+            if has_k_loop_less_matmul(env, device_ir):
+                config_spec.epilogue_subtile_candidate_enabled = False
+
+        env = CompileEnvironment.current()
+        if env.backend.name == "cute" and env.settings.cute_graph_cse:
+            # Duplicate pure nodes (the second amax/exp/sum of a softmax and
+            # log_softmax over one operand) would each roll into their own
+            # sweep and exchange below; merge them while every graph is still
+            # the traced one.  ``cute_graph_cse=False`` (HELION_CUTE_GRAPH_CSE=0)
+            # keeps the traced graph, to bisect a structural matcher against it.
+            from .cute.graph_cse import cse_device_ir
+
+            cse_device_ir(device_ir)
         # Phase 1: roll + register the reduction_loops spec. The ReductionKernelFact is built
         # in Phase 3 (after analysis derives memory_op_facts) so it can read the enriched
         # load/store facts.
         device_ir.register_rollable_reductions()
         if CompileEnvironment.current().backend.name == "cute":
             _register_cute_lane_vector_width_specs(config_spec)
+            from .cute.hoist_loop_invariant_recip import has_hoistable_fp32_divisions
             from .cute.signed_bitfield import has_signed_byte_field
             from .cute.tile_packing import tile_pack_counts
 
             config_spec.cute_tile_pack_counts = tile_pack_counts(
                 CompileEnvironment.current(), device_ir
+            )
+
+            # An fp32 quotient by a scalar or a broadcast row value: the exact
+            # division hoist can apply, so its form is tunable.
+            config_spec.cute_exact_division_sites = has_hoistable_fp32_divisions(
+                info.graph for info in device_ir.graphs
             )
 
             config_spec.cute_signed_bitfield_bf16_available = (
@@ -3647,6 +3745,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     requires_ws_overlap=flash_shape.requires_ws_overlap,
                     small_biased_candidate=flash_shape.small_biased_candidate,
                     standard_dense_output=flash_shape.standard_dense_output,
+                    dense_lse_output=flash_shape.dense_lse_output,
                     standard_causal_output=flash_shape.standard_causal_output,
                     tmem_rowmax_compatible=flash_shape.tmem_rowmax_compatible,
                     causal_resident_compatible=flash_shape.causal_resident_compatible,
@@ -3839,12 +3938,39 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 # set on a later binding. Publish all source-backed guards only
                 # after every candidate has observed the same compile state.
                 env = CompileEnvironment.current()
-                if _finalize_cute_tcgen05_search_planning(
+                single_analysis = _finalize_cute_tcgen05_search_planning(
                     env,
                     planning_results,
                     analysis_keys,
+                )
+                if env.cute_fission_plan is None and (
+                    env.has_barrier
+                    and len(device_ir.root_ids) > 1
+                    and _enable_cute_phase_mma_search(
+                        env,
+                        device_ir,
+                        planning_results,
+                        search_candidates,
+                        mma_candidates,
+                    )
                 ):
+                    # An ordered ``hl.barrier()`` chain plans per phase
+                    # whenever its phases prove out, with one GEMM phase as
+                    # with several: each GEMM launch owns its tile triple,
+                    # budget and per-launch pid type, and the plain phases
+                    # their layout knobs.  A chain the per-phase planner
+                    # declines takes the standalone surface below.
+                    pass
+                elif single_analysis:
                     candidate, lhs, search_plan = search_candidates[0]
+                    output_store_facts = _cute_tcgen05_output_store_facts(
+                        device_ir,
+                        next(
+                            node
+                            for item, _lhs, _rhs, node in mma_candidates
+                            if item is candidate
+                        ),
+                    )
                     config_spec._cute_tcgen05_config.fission_bundle = (
                         env.cute_fission_plan is not None
                     )
@@ -3869,6 +3995,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         # body of ONE GEMM (its root tile loop around its K
                         # loop); kernels with several matmuls keep tcgen05.
                         warp_mma_plain_kernel=len(mma_candidates) == 1,
+                        output_dtype_bytes=output_store_facts[0],
+                        output_stores=output_store_facts[1],
                     )
                     if (
                         len(mma_candidates) == 1
@@ -3892,6 +4020,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                                 candidate,
                                 mma_candidates[0][3],
                                 allocation_graphs,
+                                # A leading batch axis (bmm) rides the same
+                                # static persistent two-CTA schedule: the
+                                # batch coordinate only selects the TMA
+                                # tensors' leading mode and the scheduler's
+                                # extra axis.
+                                allow_leading_passthrough=(
+                                    candidate.operands.has_leading_passthrough
+                                ),
                                 allow_fp8_broadcasts=(
                                     len(device_ir.root_ids) == 1
                                     and env.cute_fission_plan is None
@@ -3965,6 +4101,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             "persistent pid types yet (single-root launch grid)",
                         )
                 config_spec.allowed_pid_types = non_persistent_pid_types
+            if (
+                config_spec.cute_tcgen05_search_enabled
+                and CompileEnvironment.current().has_barrier
+            ):
+                # The flat chain launches every ``hl.barrier()`` phase on its
+                # own; a phase without a matmul keeps the SIMT layout knobs
+                # a fission plan's pointwise region has (``enable_phase_
+                # mma_search`` publishes them itself for multi-GEMM chains).
+                from .cute.materialized_mma import register_plain_barrier_phases
+
+                register_plain_barrier_phases(CompileEnvironment.current(), device_ir)
 
         # Build structural and liveness observations once, after reduction rolling has
         # finalized the graph set. Specialized fact passes consume this shared analysis.

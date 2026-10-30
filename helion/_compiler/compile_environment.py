@@ -26,7 +26,6 @@ from torch._inductor.codegen.wrapper import (
 )
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._subclasses import FakeTensor
-from torch._subclasses import FakeTensorMode
 import torch.distributed as dist
 from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -42,6 +41,7 @@ from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import BackendState
 from .backend_registry import get_backend_class
+from .fake_tensor import create_fake_tensor_mode
 from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
@@ -483,7 +483,7 @@ class CompileEnvironment:
             assume_static_by_default=settings.static_shapes,
         )
         # TODO(jansel): check for guards in the shapeenv
-        self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
+        self.fake_mode = create_fake_tensor_mode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
         self._ambiguous_tensor_input_source_ids: set[int] = set()
         # Positive provenance for host allocations whose layout is fixed by the
@@ -768,12 +768,14 @@ class CompileEnvironment:
         has_direct_source = source is not None and _is_supported_tensor_input_source(
             source
         )
-        # The 16-byte base-address requirement belongs to CUDA TMA. Other
-        # tensor-descriptor backends retain their existing legality checks and
-        # must not acquire a CUDA-specific runtime specialization.
+        # Triton tensor descriptors need a 16-byte aligned base on CUDA (TMA)
+        # and on XPU, where a descriptor over a misaligned base reads from
+        # the address rounded down.  Other tensor-descriptor backends retain
+        # their existing legality checks and must not acquire this runtime
+        # specialization.
         alignment_source = (
             self.tensor_descriptor_alignment_source(fake_tensor)
-            if self.backend_name == "triton" and self.device.type == "cuda"
+            if self.backend_name == "triton" and self.device.type in ("cuda", "xpu")
             else None
         )
         if alignment_source is not None:
@@ -2611,8 +2613,17 @@ def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:
         raise TypeError(f"expected BaseWarning, got {type(warning)}")
 
     # Check if this warning type should be ignored
-    if not isinstance(warning, tuple(env.settings.ignore_warnings)):
-        print(f"WARNING[{type(warning).__name__}]: {warning.args[0]}", file=sys.stderr)
+    if isinstance(warning, tuple(env.settings.ignore_warnings)):
+        return
+    from .ast_extension import ExtendedAST
+
+    if isinstance(warning, exc.TensorOperationInWrapper) and any(
+        node._compiler_inserted for node in ExtendedAST.current()
+    ):
+        # A host tensor operation a backend rewrite inserted (e.g. the CuTe
+        # operand staging copy), not one the user wrote.
+        return
+    print(f"WARNING[{type(warning).__name__}]: {warning.args[0]}", file=sys.stderr)
 
 
 def _symint_sympy_expr(x: torch.SymInt) -> sympy.Expr:

@@ -15,6 +15,7 @@ import dataclasses
 from dataclasses import dataclass
 import math
 import operator
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -82,6 +83,7 @@ from .local_atomic import terminal_loop_symbols
 from .local_atomic import uniform_local_branch_inputs
 from .local_atomic_registers import MAX_SLOTS
 from .local_atomic_registers import local_atomic_register_chains
+from .memory_ops import runtime_tensors_are_proven_disjoint
 from .ordered_selection import is_ordered_selection
 from .ordered_selection import ordered_selection_args
 from .ordered_selection import selection_values_only
@@ -104,12 +106,55 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Generator
     from collections.abc import Iterable
+    from collections.abc import Mapping
 
     from ..autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
+    from .fragment_slab_loads import ScalarLoad
+    from .fragment_slab_loads import SlabGroup
     from .warp_producer_regions import WarpProducerRecorder
+
+
+# The most slots per thread an element loop walks as a constexpr unroll.
+UNROLLED_SLOTS = 16
+
+# ``mma.sync`` helpers of the tf32 fragment contraction (``cute_fp32_dot``).
+_FRAGMENT_MMA_RUNTIME = "_helion_fragment_mma"
+_FRAGMENT_MMA_PREAMBLE = (
+    f"import helion._compiler.cute._mma_dag_runtime as {_FRAGMENT_MMA_RUNTIME}\n"
+)
+
+
+def _mma_operand_conflict_free(layout: tuple[int, int], role: str) -> bool:
+    """Whether one ``mma.sync.m16n8k8`` operand word read from a staged tile
+    of *layout* ``(row bytes, element bytes)`` is bank-conflict-free (lanes
+    that share a bank share the word).  Lane ``(g, c) = (lane // 4, lane %
+    4)`` reads the A word at ``(g, c)`` (the other words shift rows or k by
+    a multiple of 4) and the B word at ``(c, g)``."""
+    row_bytes, itemsize = layout
+    if row_bytes % 4:
+        return False
+    banks: dict[int, set[int]] = {}
+    for lane in range(32):
+        g, c = lane // 4, lane % 4
+        row, col = (g, c) if role == "a" else (c, g)
+        word = (row * row_bytes + col * itemsize) // 4
+        banks.setdefault(word % 32, set()).add(word)
+    return all(len(words) == 1 for words in banks.values())
+
+
+def _mma_row_pad(extent: int, unit: int) -> int:
+    """Elements appended to a staged mma operand row so the row stride is an
+    odd multiple of *unit* words modulo the 32 shared-memory banks.
+
+    A lane fragment of ``mma.sync.m16n8k8`` reads 8 rows x 4 consecutive
+    columns (A, ``unit=4``) or 4 rows x 8 consecutive columns (B, ``unit=8``):
+    with such a stride the 32 addresses of one instruction fall in 32 distinct
+    banks, where a stride that is a multiple of 32 serializes them 8-fold.
+    """
+    return min((residue - extent) % 32 for residue in range(unit, 32, 2 * unit))
 
 
 def _resolve(value: object, values: dict[Node, object]) -> object:
@@ -145,6 +190,18 @@ class Fragment:
     logical_domain: Callable[[tuple[str, ...]], tuple[str, ...]] | None = None
 
     snapshot: SnapshotBinding | None = None
+    # A leaf whose recipe reads no memory at all (``hl.arange``, a tile index,
+    # a constant): any lane may evaluate it at any coordinate for free.
+    pure: bool = False
+    # ``(start, step)`` of a one-dimensional ``hl.arange`` window with static
+    # integer bounds: the index form the row-packet proof understands.
+    affine: tuple[int, int] | None = None
+    # A dtype cast or an order-preserving view of one staged tile: reading
+    # it costs the same shared-memory access as reading the tile itself.
+    cheap: bool = False
+    # ``(row bytes, element bytes)`` of the staged tile this recipe reads,
+    # when it is one tile read in its own element order.
+    physical_row: tuple[int, int] | None = None
 
     def read(self, indices: tuple[str, ...]) -> str:
         assert len(indices) == len(self.shape)
@@ -189,6 +246,27 @@ class HostTensor:
     value: torch.Tensor
 
 
+@dataclass
+class DirectStoreSink:
+    """The host store that consumes a tf32 mma result straight from the lane
+    registers (``emit_tf32_mma``): ``memory`` fills in the window's address
+    recipe without emitting the staged walk, the lane loop writes through it,
+    and the store node itself then lowers to nothing."""
+
+    node: Node
+    shape: tuple[int, ...] | None = None
+    dtype: torch.dtype | None = None
+    address: Callable[[tuple[str, ...]], tuple[str, str]] | None = None
+    # ``cute_fragment_vector_io``'s packet width when the window is proved to
+    # walk whole aligned 16-byte packets: the two adjacent columns of one
+    # lane then leave as one aligned vector store.
+    lanes: int | None = None
+
+
+def _consumed_by_direct_store(_coords: tuple[str, ...]) -> str:
+    raise AssertionError("a dot result stored by its lanes has no other reader")
+
+
 class FragmentOps(GenerateASTFromInductor):
     """Use Inductor's index expressions instead of dropping them as SIMT does."""
 
@@ -208,17 +286,77 @@ class FragmentOps(GenerateASTFromInductor):
         # Inductor indexes the fake input's physical layout, including its
         # transposes and broadcasts. Recover coordinates in that same layout.
         strides = self.compiler.shape(fake.stride())
-        indices = ["0"] * len(value.shape)
-        remaining = self.compiler.sym(index)
-        for dim in sorted(
-            range(len(strides)), key=lambda dim: strides[dim], reverse=True
-        ):
-            if value.shape[dim] == 1 or strides[dim] == 0:
-                continue
-            indices[dim] = f"(({remaining}) // {strides[dim]})"
-            remaining = f"(({remaining}) % {strides[dim]})"
+        indices = self.direct_coordinates(index, strides, value.shape)
+        if indices is None:
+            indices = ["0"] * len(value.shape)
+            remaining = self.compiler.sym(index)
+            for dim in sorted(
+                range(len(strides)), key=lambda dim: strides[dim], reverse=True
+            ):
+                if value.shape[dim] == 1 or strides[dim] == 0:
+                    continue
+                indices[dim] = f"(({remaining}) // {strides[dim]})"
+                remaining = f"(({remaining}) % {strides[dim]})"
         coordinates = self.compiler.coordinate_locals(tuple(indices))
         return self._lift(expr_from_string(value.read(coordinates)))
+
+    def direct_coordinates(
+        self, index: sympy.Expr, strides: tuple[int, ...], shape: tuple[int, ...]
+    ) -> list[str] | None:
+        """The input coordinates when *index* is exactly the layout's affine
+        form ``sum(stride[d] * i_d)`` over the current coordinate symbols:
+        each symbol names one dimension's coordinate outright, so no
+        ``// stride`` / ``% stride`` round trip (which the compiler cannot
+        fold without the symbols' ranges) is emitted.  None when a term is
+        not a plain coordinate symbol, a constant offset remains, or two
+        live dimensions share a stride."""
+        symbols = self.compiler.sym_indices
+        if not symbols:
+            return None
+        indices = ["0"] * len(shape)
+        used: set[int] = set()
+        # A singleton dimension's coordinate is the literal zero: its stride
+        # term (which Inductor keeps when the stride is not zero) vanishes.
+        index = index.xreplace(
+            {
+                symbol: sympy.Integer(0)
+                for symbol, coord in symbols.items()
+                if coord == "0"
+            }
+        )
+        # Stride factors may still be size symbols (``Max(1, u2)``): resolve
+        # them the way the staged shape resolved the strides themselves.
+        resolved: dict[sympy.Basic, sympy.Integer] = {}
+        for symbol in index.free_symbols:
+            if symbol in symbols:
+                continue
+            extent = self.compiler.static_extent(symbol)
+            if extent is None:
+                return None
+            resolved[symbol] = sympy.Integer(extent)
+        index = sympy.expand(index.xreplace(resolved))
+        for term, coefficient in index.as_coefficients_dict().items():
+            if term == 1:
+                if coefficient != 0:
+                    return None
+                continue
+            if not isinstance(term, sympy.Symbol) or term not in symbols:
+                return None
+            if not coefficient.is_Integer:
+                return None
+            candidates = [
+                dim
+                for dim in range(len(shape))
+                if dim not in used
+                and shape[dim] != 1
+                and strides[dim] != 0
+                and strides[dim] == int(coefficient)
+            ]
+            if len(candidates) != 1:
+                return None
+            indices[candidates[0]] = symbols[term]
+            used.add(candidates[0])
+        return indices
 
     def to_dtype(
         self,
@@ -486,6 +624,19 @@ def _static_selection_extent(env: CompileEnvironment, source: Node) -> int | Non
 
 
 class FragmentCompiler:
+    # Tile staging knobs (``cute_fragment_padded_rows``,
+    # ``cute_fragment_unrolled_loops``, ``cute_fragment_vector_io``,
+    # ``cute_fragment_batched_loads``, ``cute_fragment_split_k``,
+    # ``cute_fragment_slab_loads``); the config sets them in ``__init__``.
+    padded_rows = False
+    unrolled_loops = False
+    vector_io = False
+    batched_loads = False
+    split_k = False
+    mma_rows = False
+    pending_barrier = False
+    slab_plan: Mapping[Node, SlabGroup] = MappingProxyType({})
+
     def __init__(self, cg: GenerateAST, graphs: list[GraphInfo] | None = None) -> None:
         self.cg = cg
         self.df = cg.device_function
@@ -499,6 +650,37 @@ class FragmentCompiler:
         self.held: list[object] = []
         self.threads = cast("int", self.df.config.get("cute_fragment_threads", 128))
         self.thread = ""
+        self.padded_rows = bool(self.df.config.get("cute_fragment_padded_rows", False))
+        self.unrolled_loops = bool(
+            self.df.config.get("cute_fragment_unrolled_loops", False)
+        )
+        # Tile transport knobs: 16-byte row packets for proved host windows
+        # (``cute_fragment_vector_io``) and one barrier per run of
+        # independent host loads (``cute_fragment_batched_loads``).
+        self.vector_io = bool(self.df.config.get("cute_fragment_vector_io", False))
+        self.batched_loads = bool(
+            self.df.config.get("cute_fragment_batched_loads", False)
+        )
+        # ``cute_fragment_split_k``: idle warps of a tf32 mma phase take a
+        # share of K (partials summed at the read).
+        self.split_k = bool(self.df.config.get("cute_fragment_split_k", False))
+        # ``cute_fragment_mma_rows``: the tf32 mma lanes walk whole tile rows
+        # and evaluate each row's A words once for all of its column tiles.
+        self.mma_rows = bool(self.df.config.get("cute_fragment_mma_rows", False))
+        # A load phase emitted without its trailing barrier: the next node
+        # that is not another independent host load issues it.
+        self.pending_barrier = False
+        # A tf32 ``mma.sync`` phase was emitted: the generated module needs
+        # the helpers' import, added once the root is committed (a capacity
+        # decline of the scratch body must leave the module untouched).
+        self.wants_mma_preamble = False
+        # Host stores already written by the tf32 mma lanes of the dot they
+        # consume (``DirectStoreSink``): the store node lowers to nothing.
+        self.direct_stores: set[Node] = set()
+        # The graph walk's active atomic-consumer region and producer-cache
+        # nodes: a dot inside either keeps its staged result.
+        self.active_region: AtomicConsumerRegion | None = None
+        self.cache_nodes: frozenset[Node] = frozenset()
         self.sym_indices: dict[sympy.Symbol, str] = {}
         self.expression: FragmentExpression | None = None
         self.lazy_opaque_producers: frozenset[Node] = frozenset()
@@ -508,6 +690,16 @@ class FragmentCompiler:
         self.pending_local_atomics: set[str] = set()
         self.scalar_ordered_tickets: dict[Node, Fragment] = {}
         self.graphs = cg.codegen_graphs if graphs is None else graphs
+        # ``cute_fragment_slab_loads``: repeated static windows of one tensor
+        # read views of a slab staged once at the start of the root.
+        self.slab_plan = {}
+        # The uniform scalar loads (a varlen slab's row offset and limit)
+        # read once per CTA ahead of the slabs: load -> the DSL variable.
+        self.slab_scalars: dict[ScalarLoad, str] = {}
+        if self.df.config.get("cute_fragment_slab_loads", False):
+            from .fragment_slab_loads import plan_slab_loads
+
+            self.slab_plan = plan_slab_loads(self.env, self.graphs)
         self.dead_zero_results = (
             dead_zero_atomic_results(self.graphs, self.env)
             if self.df.config.get("cute_fragment_skip_zero_atomics", False)
@@ -697,6 +889,111 @@ class FragmentCompiler:
     def synchronize(self) -> None:
         self.emit("cute.arch.sync_threads()")
         self.pending_local_atomics.clear()
+        self.pending_barrier = False
+
+    def flush_pending_barrier(self) -> None:
+        """Close a run of batched host loads before anything else reads or
+        recycles shared memory."""
+        if self.pending_barrier:
+            self.synchronize()
+
+    # Targets whose fragment lowering returns a lazy recipe or a scalar and
+    # emits no statement: a run of batched loads may continue across them.
+    _TRANSPARENT_TARGETS = frozenset(
+        {
+            _tracing_ops._host_tensor,
+            _tracing_ops._get_symnode,
+            _tracing_ops._new_var,
+            _tracing_ops._phi,
+            operator.getitem,
+            tile_ops.tile_begin,
+            tile_ops.tile_end,
+            tile_ops.tile_id,
+            tile_ops.tile_index,
+            view_ops.subscript,
+            torch.ops.aten.sym_size.int,
+            torch.ops.prims.iota.default,
+            torch.ops.aten.alias.default,
+            torch.ops.aten.view.dtype,
+            torch.ops.aten.permute.default,
+            torch.ops.aten.expand.default,
+            torch.ops.aten.clone.default,
+            torch.ops.aten.view.default,
+            torch.ops.aten.reshape.default,
+            torch.ops.aten._unsafe_view.default,
+            torch.ops.aten.unsqueeze.default,
+            torch.ops.aten.squeeze.default,
+            torch.ops.aten.squeeze.dim,
+            torch.ops.aten.squeeze.dims,
+            torch.ops.aten.where.self,
+            _tracing_ops._mask_to,
+        }
+    )
+
+    # Targets whose fragment lowering touches no host memory beyond the
+    # transparent ones: another dot, a scan, a local allocation.  Pointwise
+    # and reduction lowerings join them in ``direct_store_in_order``; a host
+    # load, store or atomic needs a storage proof, and everything else (a
+    # nested loop or branch, inline assembly, a gather or selection) is
+    # opaque to the direct lane store.
+    _HOST_MEMORY_FREE_TARGETS = _TRANSPARENT_TARGETS | frozenset(
+        {
+            matmul_ops.dot,
+            scan_ops._associative_scan,
+            creation_ops.full,
+            torch.ops.aten.full.default,
+            torch.ops.aten.scalar_tensor.default,
+            _tracing_ops._constant_tensor,
+        }
+    )
+
+    def transparent_node(self, node: Node) -> bool:
+        """Whether lowering *node* emits nothing (a lazy pointwise recipe, a
+        view, a coordinate function or a scalar), so a pending batched-load
+        barrier may stay pending across it."""
+        if node in self.warp_result_nodes or node in self.local_register_nodes:
+            return False
+        if node.target in self._TRANSPARENT_TARGETS:
+            return True
+        if node.target in (
+            creation_ops.full,
+            torch.ops.aten.full.default,
+            torch.ops.aten.scalar_tensor.default,
+            _tracing_ops._constant_tensor,
+        ):
+            return node not in self.local_allocations
+        lowering = node.meta.get("lowering")
+        return (
+            isinstance(lowering, PointwiseLowering)
+            and not isinstance(lowering, ReductionLowering)
+            and node.target is not matmul_ops.dot
+            and node.target not in (memory_ops.load, memory_ops.store)
+            and node not in self.lazy_opaque_producers
+        )
+
+    def batchable_host_load(self, node: Node, values: dict[Node, object]) -> bool:
+        """Whether *node* is a host load the batched phase may absorb: its
+        address and mask recipes read no shared memory (so no barrier is
+        needed before it) and it publishes through an ordinary staged copy."""
+        if (
+            not self.batched_loads
+            or node.target is not memory_ops.load
+            or self.warp_producer_recorder is not None
+            or node in self.snapshot_loads
+            or not isinstance(values.get(cast("Node", node.args[0])), HostTensor)
+        ):
+            return False
+        inputs = [
+            values.get(index)
+            for index in (*cast("list[object]", node.args[1]), node.args[2])
+            if isinstance(index, Node)
+        ]
+        if any(
+            isinstance(value, Fragment) and value.snapshot is not None
+            for value in inputs
+        ):
+            return False
+        return not self.referenced_buffers(inputs)
 
     def synchronize_local_atomics(self) -> None:
         if self.pending_local_atomics:
@@ -816,8 +1113,23 @@ class FragmentCompiler:
             [*[value for scope in self.scopes for value in scope.values()], *self.held]
         )
 
+    def physical_shape(
+        self, shape: tuple[int, ...], dtype: torch.dtype
+    ) -> tuple[int, ...]:
+        """The staged layout of a *shape* tile: its rows, padded by four
+        32-bit words when the dense row stride is a multiple of the 32 shared
+        memory banks, so that a column walk (a transposed operand read, the
+        lane fragments of an ``mma``) touches 32 distinct banks."""
+        if not self.padded_rows or len(shape) < 2 or math.prod(shape[:-1]) <= 1:
+            return shape
+        row_bytes = shape[-1] * dtype.itemsize
+        if row_bytes % 128 or row_bytes < 128:
+            return shape
+        return (*shape[:-1], shape[-1] + max(1, 16 // dtype.itemsize))
+
     def allocate(self, value: Fragment) -> Fragment:
-        count = math.prod(value.shape)
+        physical = self.physical_shape(value.shape, value.dtype)
+        count = math.prod(physical)
         live = self.live_buffers()
         available = sorted(
             (capacity, name, index)
@@ -850,11 +1162,16 @@ class FragmentCompiler:
         return Fragment(
             value.shape,
             value.dtype,
-            lambda indices: f"{name}[{self.flatten(indices, value.shape)}]",
+            lambda indices: f"{name}[{self.flatten(indices, physical)}]",
             True,
             (),
             name,
             value.logical_domain,
+            physical_row=(
+                (physical[-1] * value.dtype.itemsize, value.dtype.itemsize)
+                if len(physical) >= 2
+                else None
+            ),
         )
 
     @staticmethod
@@ -884,8 +1201,13 @@ class FragmentCompiler:
         synchronize: bool = True,
         register_owned: bool = False,
         iteration_local: bool = False,
+        batched: bool = False,
     ) -> None:
         assert not iteration_local or (len(shape) == 1 and not warp_owned)
+        # Any phase but a batched host load may read or recycle shared
+        # memory: publish the pending batched loads first.
+        if not batched:
+            self.flush_pending_barrier()
         register_owned = register_owned or (
             shape in self.snapshot_shapes
             and not warp_owned
@@ -936,6 +1258,40 @@ class FragmentCompiler:
             threads_per_element = 32
         assert threads_per_element in (1, 32)
         assert self.threads % threads_per_element == 0
+        count = math.prod(shape)
+        slots = -(-count // self.threads)
+        if (
+            self.unrolled_loops
+            and threads_per_element == 1
+            and not iteration_local
+            and self.warp_producer_recorder is None
+            and 0 < slots <= UNROLLED_SLOTS
+        ):
+            # A constexpr walk over the thread's slots: every global load of
+            # the phase is issued before the first shared store consumes one,
+            # where the rolled loop serialized one round trip per slot.
+            slot = self.df.new_var("fragment_slot")
+            index = self.df.new_var("fragment_index")
+            loop = statement_from_string(
+                f"for {slot} in cutlass.range_constexpr({slots}):\n    pass"
+            )
+            assert isinstance(loop, ast.For)
+            loop.body.clear()
+            with self.cg.set_statements(cast("list[ast.AST]", loop.body)):
+                self.emit(f"{index} = {self.thread} + {slot} * {self.threads}")
+                if count % self.threads:
+                    branch = statement_from_string(f"if {index} < {count}:\n    pass")
+                    assert isinstance(branch, ast.If)
+                    branch.body.clear()
+                    with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+                        body(self.coordinates(index, shape))
+                    self.cg.add_statement(branch)
+                else:
+                    body(self.coordinates(index, shape))
+            self.cg.add_statement(loop)
+            if synchronize:
+                self.synchronize()
+            return
         index = self.df.new_var("fragment_index")
         start = (
             self.thread
@@ -969,7 +1325,12 @@ class FragmentCompiler:
             self.synchronize()
 
     def copy(
-        self, source: Fragment, target: Fragment, *, threads_per_element: int = 1
+        self,
+        source: Fragment,
+        target: Fragment,
+        *,
+        threads_per_element: int = 1,
+        batched: bool = False,
     ) -> None:
         assert source.shape == target.shape
 
@@ -988,6 +1349,8 @@ class FragmentCompiler:
             source.shape,
             write,
             threads_per_element=threads_per_element,
+            synchronize=not batched,
+            batched=batched,
         )
         if self.warp_producer_recorder is not None:
             self.warp_producer_recorder.copy(
@@ -995,14 +1358,403 @@ class FragmentCompiler:
             )
 
     def materialize(
-        self, value: Fragment, *, copy: bool = False, threads_per_element: int = 1
+        self,
+        value: Fragment,
+        *,
+        copy: bool = False,
+        threads_per_element: int = 1,
+        batched: bool = False,
     ) -> Fragment:
         if value.resident and not copy:
             return value
         self.held.append(value)
         result = self.allocate(value)
-        self.copy(value, result, threads_per_element=threads_per_element)
+        self.copy(
+            value, result, threads_per_element=threads_per_element, batched=batched
+        )
         self.held.pop()
+        return result
+
+    def materialize_padded(self, value: Fragment, pad: int) -> Fragment:
+        """Copy *value* into a fresh shared buffer whose rows are *pad*
+        elements longer than the tile's.  The returned fragment keeps the
+        tile's shape and reads the padded rows; it lives only as a contraction
+        operand (``emit_tf32_mma``), never as a result."""
+        shape = value.shape
+        padded_shape = (*shape[:-1], shape[-1] + pad)
+        self.held.append(value)
+        padded = self.allocate(Fragment(padded_shape, value.dtype, lambda _: "0"))
+        view = Fragment(
+            shape, value.dtype, padded.read, True, (padded,), padded.storage
+        )
+        self.copy(value, view)
+        self.held.pop()
+        return view
+
+    def row_packet_lanes(
+        self,
+        tensor: HostTensor,
+        indices: list[object],
+        values: dict[Node, object],
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        index_coordinates: list[tuple[int | None, ...]],
+    ) -> int | None:
+        """``cute_fragment_vector_io``: the 16-byte packet width (in elements)
+        when this host window's innermost coordinate is proved to walk whole,
+        aligned, in-bounds packets of a unit-stride dimension; None otherwise.
+        A staged destination must also keep its packets contiguous."""
+        if not self.vector_io:
+            return None
+        from .fragment_vector_io import row_packet_lanes
+
+        lanes = row_packet_lanes(
+            self, tensor, indices, values, shape, dtype, index_coordinates
+        )
+        if lanes is not None and self.physical_shape(shape, dtype)[-1] % lanes:
+            return None
+        return lanes
+
+    def vector_load(
+        self,
+        value: Fragment,
+        shape: tuple[int, ...],
+        lanes: int,
+        address: Callable[[tuple[str, ...]], tuple[str, str]],
+        *,
+        batched: bool = False,
+    ) -> Fragment:
+        """Stage *value* (a host window) through 16-byte packets: one address
+        and one predicate per packet, a vector global load into registers
+        (zeros when the packet is out of bounds, like the scalar walk) and a
+        vector store into the dense staged rows."""
+        from .fragment_vector_io import copy_atom
+
+        self.held.append(value)
+        result = self.allocate(value)
+        self.held.pop()
+        physical = self.physical_shape(shape, value.dtype)
+        scalar = self.dtype(value.dtype)
+        atom = copy_atom(scalar)
+        assert result.storage is not None
+
+        def body(coords: tuple[str, ...]) -> None:
+            inner = self.df.new_var("fragment_packet_inner")
+            self.emit(f"{inner} = ({coords[-1]}) * {lanes}")
+            pointer, mask = address((*coords[:-1], inner))
+            packet = self.df.new_var("fragment_packet")
+            self.emit(
+                f"{packet} = cute.make_rmem_tensor(cute.make_layout(({lanes},)), {scalar})"
+            )
+            self.emit(f"{packet}.fill({scalar}(0))")
+            self.emit(
+                f"if {mask}:\n"
+                f"    cute.copy({atom}, cute.make_tensor({pointer}.align({lanes * value.dtype.itemsize}), cute.make_layout(({lanes},))), {packet})"
+            )
+            flat = self.flatten((*coords[:-1], inner), physical)
+            self.emit(
+                f"cute.copy({atom}, {packet}, cute.make_tensor({result.storage}.iterator + cute.assume({flat}, divby={lanes}), cute.make_layout(({lanes},))))"
+            )
+
+        self.elements(
+            (*shape[:-1], shape[-1] // lanes),
+            body,
+            synchronize=not batched,
+            batched=batched,
+        )
+        return result
+
+    def vector_store(
+        self,
+        tensor: HostTensor,
+        value: object,
+        shape: tuple[int, ...],
+        lanes: int,
+        address: Callable[[tuple[str, ...]], tuple[str, str]],
+    ) -> None:
+        """Store a window through 16-byte packets: the value recipe is
+        evaluated per lane into registers, then one predicated vector store."""
+        from .fragment_vector_io import copy_atom
+
+        scalar = self.dtype(tensor.value.dtype)
+        atom = copy_atom(scalar)
+
+        def body(coords: tuple[str, ...]) -> None:
+            inner = self.df.new_var("fragment_packet_inner")
+            self.emit(f"{inner} = ({coords[-1]}) * {lanes}")
+            pointer, mask = address((*coords[:-1], inner))
+            packet = self.df.new_var("fragment_packet")
+            self.emit(
+                f"{packet} = cute.make_rmem_tensor(cute.make_layout(({lanes},)), {scalar})"
+            )
+            for lane in range(lanes):
+                lane_coords = (*coords[:-1], f"{inner} + {lane}")
+                stored = (
+                    value.broadcast(lane_coords)
+                    if isinstance(value, Fragment)
+                    else self.scalar(value)
+                )
+                self.emit(f"{packet}[{lane}] = {self.cast(stored, tensor.value.dtype)}")
+            self.emit(
+                f"if {mask}:\n"
+                f"    cute.copy({atom}, {packet}, cute.make_tensor({pointer}.align({lanes * tensor.value.dtype.itemsize}), cute.make_layout(({lanes},))))"
+            )
+
+        self.elements((*shape[:-1], shape[-1] // lanes), body)
+
+    def stage_slabs(self) -> None:
+        """``cute_fragment_slab_loads``: stage every planned slab at the start
+        of the root, all loads in flight together, so each member window
+        reads a view of its slab wherever (root body or a conditional tier)
+        it appears."""
+        groups: list[SlabGroup] = []
+        for group in self.slab_plan.values():
+            if all(group is not other for other in groups):
+                groups.append(group)
+        for group in groups:
+            fake = cast("torch.Tensor", group.tensor.meta["val"])
+            # Only the root's own grid blocks have CTA-uniform offsets here;
+            # a window under a device loop's block keeps its own walk.
+            staged = all(
+                (kind != "block" or value in self.offsets)
+                and (kind != "slice" or self.static_extent(fake.shape[dim]) is not None)
+                and (kind != "uniform" or self.uniform_at_root(value))
+                for dim, (kind, value) in enumerate(group.descriptors)
+            ) and all(
+                self.uniform_at_root(expr)
+                for load in (group.offset, group.limit)
+                if load is not None
+                for expr in load.indices
+            )
+            if not staged:
+                for member in group.members:
+                    cast("dict[Node, SlabGroup]", self.slab_plan).pop(member, None)
+                continue
+            for load in (group.offset, group.limit):
+                if load is not None:
+                    self.slab_scalar(load)
+            group.fragment = self.load_slab(group)
+            # Alive for the whole root: no later phase may recycle it.
+            self.held.append(group.fragment)
+        self.flush_pending_barrier()
+
+    def uniform_at_root(self, expr: object) -> bool:
+        """Whether the uniform integer expression ``expr`` is defined at the
+        start of the root: its grid symbols are the root's own blocks (a
+        device loop's tile symbols are not yet bound there)."""
+        if not isinstance(expr, sympy.Expr):
+            return False
+        origins = HostFunction.current().expr_to_origin
+        for symbol in expr.free_symbols:
+            info = origins.get(symbol)
+            origin = info.origin if info is not None else None
+            if isinstance(origin, GridOrigin) and origin.block_id not in self.offsets:
+                return False
+        return True
+
+    def slab_scalar(self, load: ScalarLoad) -> str:
+        """The uniform 0-d integer ``load`` (a slab's row offset or limit) as
+        an Int32 read once per CTA ahead of the slabs: zero when its
+        subscript is outside the tensor, like the body's own load of it.
+        (An int64 table value is narrowed: a row index or count of a static
+        extent below 2**31.)"""
+        if load in self.slab_scalars:
+            return self.slab_scalars[load]
+        fake = cast("torch.Tensor", load.node.meta["val"])
+        tensor = HostTensor(
+            self.df.tensor_arg(fake, prefer_name=load.tensor).name, fake
+        )
+        indices = [self.sym(expr) for expr in load.indices]
+        masks = [
+            f"(({index}) >= 0 and ({index}) < ({self.sym(fake.shape[dim])}))"
+            for dim, index in enumerate(indices)
+        ]
+        offset = (
+            " + ".join(
+                f"cutlass.Int64({index}) * cutlass.Int64({self.host_stride(tensor, dim)})"
+                for dim, index in enumerate(indices)
+            )
+            or "0"
+        )
+        name = self.df.new_var("fragment_slab_scalar")
+        self.emit(f"{name} = cutlass.Int32(0)")
+        self.emit(
+            f"if {self.predicate(masks)}:\n"
+            f"    {name} = cutlass.Int32(({tensor.name}.iterator + ({offset})).load())"
+        )
+        self.slab_scalars[load] = name
+        return name
+
+    def slab_member(
+        self, node: Node, shape: tuple[int, ...], dtype: torch.dtype
+    ) -> Fragment:
+        """The window *node* as a view of its staged slab."""
+        group = self.slab_plan[node]
+        slab = group.fragment
+        assert slab is not None, "slabs are staged before the root body"
+        start, extent = group.members[node]
+        offset = start - group.start
+
+        def view(coords: tuple[str, ...]) -> str:
+            mapped: list[str] = []
+            position = 0
+            for dim, (kind, _value) in enumerate(group.descriptors):
+                if dim == group.window_dim:
+                    if extent == 0:
+                        # An integer index drops the dimension.
+                        mapped.append(str(offset))
+                    else:
+                        mapped.append(f"({coords[position]}) + {offset}")
+                        position += 1
+                elif kind in ("const", "uniform"):
+                    mapped.append("0")
+                else:
+                    mapped.append(coords[position])
+                    position += 1
+            assert position == len(coords)
+            return slab.read(tuple(mapped))
+
+        # The view keeps the slab's row order: a cast of it may be read in
+        # place by the mma lanes like the slab itself.
+        return Fragment(
+            shape,
+            dtype,
+            view,
+            True,
+            (slab,),
+            slab.storage,
+            cheap=True,
+            physical_row=slab.physical_row,
+        )
+
+    def load_slab(self, group: SlabGroup) -> Fragment:
+        """Stage one slab: the member windows' union along the varying
+        dimension, with the shared block / slice / constant indices."""
+        from .fragment_vector_io import host_base_aligned
+        from .fragment_vector_io import packet_lanes
+        from .fragment_vector_io import static_strides
+
+        fake = cast("torch.Tensor", group.tensor.meta["val"])
+        tensor = HostTensor(
+            self.df.tensor_arg(
+                fake, prefer_name=cast("str", group.tensor.args[0])
+            ).name,
+            fake,
+        )
+        shape: list[int] = []
+        for dim, (kind, value) in enumerate(group.descriptors):
+            if dim == group.window_dim:
+                shape.append(group.extent)
+            elif kind == "block":
+                shape.append(
+                    self.extent(self.df.resolved_block_size(cast("int", value)))
+                )
+            elif kind == "slice":
+                shape.append(self.extent(fake.shape[dim]))
+            elif kind in ("const", "uniform"):
+                shape.append(1)
+            else:
+                shape.append(cast("tuple[int, int]", value)[1])
+        slab_shape = tuple(shape)
+        offset_var = None if group.offset is None else self.slab_scalars[group.offset]
+        limit_var = None if group.limit is None else self.slab_scalars[group.limit]
+
+        def address(coords: tuple[str, ...]) -> tuple[str, str]:
+            indices: list[str] = []
+            masks: list[str] = []
+            for dim, (kind, value) in enumerate(group.descriptors):
+                if dim == group.window_dim:
+                    row = f"({group.start}) + ({coords[dim]})"
+                    if offset_var is not None:
+                        # A window at a runtime row offset: live below the
+                        # limit (in the window's own coordinates) and
+                        # inside the tensor; zero past either.
+                        if limit_var is not None:
+                            masks.append(f"(({row}) < ({limit_var}))")
+                        row = f"({offset_var}) + {row}"
+                        masks.append(
+                            f"(({row}) >= 0 and ({row}) < ({self.sym(fake.shape[dim])}))"
+                        )
+                    indices.append(row)
+                elif kind == "block":
+                    block = cast("int", value)
+                    expression = f"({self.offsets[block]}) + ({coords[dim]})"
+                    masks.append(f"(({expression}) < ({self.bounds[block]}))")
+                    indices.append(expression)
+                elif kind == "slice":
+                    indices.append(coords[dim])
+                elif kind == "const":
+                    indices.append(str(value))
+                elif kind == "uniform":
+                    expression = self.sym(value)
+                    masks.append(
+                        f"(({expression}) >= 0 and ({expression}) < ({self.sym(fake.shape[dim])}))"
+                    )
+                    indices.append(expression)
+                else:
+                    indices.append(
+                        f"({cast('tuple[int, int]', value)[0]}) + ({coords[dim]})"
+                    )
+            offset = (
+                " + ".join(
+                    f"cutlass.Int64({index}) * cutlass.Int64({self.host_stride(tensor, dim)})"
+                    for dim, index in enumerate(indices)
+                )
+                or "0"
+            )
+            return f"({tensor.name}.iterator + ({offset}))", self.predicate(masks)
+
+        def load(coords: tuple[str, ...]) -> str:
+            pointer, mask = address(coords)
+            name = self.df.new_var("fragment_load")
+            self.emit(f"{name} = {self.cast('0', fake.dtype)}")
+            loaded = self.cast(f"{pointer}.load()", fake.dtype)
+            self.emit(f"if {mask}:\n    {name} = {loaded}")
+            return name
+
+        value = Fragment(slab_shape, fake.dtype, load)
+        batched = self.batched_loads and self.warp_producer_recorder is None
+        lanes = packet_lanes(fake.dtype)
+        strides = static_strides(fake)
+        # The slab's rows are packets when its last dim is the whole
+        # contiguous dim, or a static window of it at a packet-aligned start
+        # and extent inside the dim (``hl.arange(D)`` over a D-wide dim).
+        # The varying dimension (``("window", None)``: the members' windows
+        # along it) is walked element by element, never packed.
+        inner_size = self.static_extent(fake.shape[-1])
+        inner_kind, inner_value = group.descriptors[-1]
+        if group.window_dim == len(slab_shape) - 1:
+            inner_packets = False
+        elif inner_kind == "slice":
+            inner_packets = True
+        elif inner_kind == "window":
+            inner_start, inner_extent = cast("tuple[int, int]", inner_value)
+            inner_packets = (
+                lanes is not None
+                and inner_size is not None
+                and inner_start % lanes == 0
+                and inner_extent % lanes == 0
+                and inner_start + inner_extent <= inner_size
+            )
+        else:
+            inner_packets = False
+        if (
+            self.vector_io
+            and lanes is not None
+            and strides is not None
+            and inner_packets
+            and strides[-1] == 1
+            and all(stride % lanes == 0 for stride in strides[:-1])
+            and slab_shape[-1] % lanes == 0
+            and self.physical_shape(slab_shape, fake.dtype)[-1] % lanes == 0
+            and host_base_aligned(self.env, fake)
+        ):
+            result = self.vector_load(
+                value, slab_shape, lanes, address, batched=batched
+            )
+        else:
+            result = self.materialize(value, batched=batched)
+        self.pending_barrier = batched
         return result
 
     def aggregate_local_updates(
@@ -1552,7 +2304,11 @@ class FragmentCompiler:
         store: bool,
         deferred_updates: list[tuple[Callable[[tuple[str, ...]], None], bool]]
         | None = None,
+        direct: DirectStoreSink | None = None,
     ) -> object:
+        if store and node in self.direct_stores:
+            # Written by the tf32 mma lanes of the dot it stores.
+            return None
         if deferred_updates is not None:
             values = dict(values)
         tensor = values[cast("Node", node.args[0])]
@@ -1612,6 +2368,8 @@ class FragmentCompiler:
                 logical_domain=lambda coords: tensor.domain(view_coordinates(coords)),
             )
         assert isinstance(tensor, HostTensor)
+        if not store and node in self.slab_plan:
+            return self.slab_member(node, shape, output.dtype)
         index_coordinates = memory_index_coordinates(
             self.env,
             [
@@ -1701,6 +2459,30 @@ class FragmentCompiler:
             return f"({tensor.name}.iterator + ({offset}))", self.predicate(masks)
 
         if store:
+            if direct is not None:
+                # Hand the window's address recipe to the producing dot's lane
+                # loop instead of walking a staged result.  The walks this
+                # method would otherwise choose (deferred region updates,
+                # warp- or register-owned results, an extra mask) keep the
+                # staged path: the sink stays unfilled.
+                if (
+                    deferred_updates is not None
+                    or mask_value is not None
+                    or self.warp_result_nodes.get(node) == math.prod(shape)
+                    or node in self.local_register_nodes
+                ):
+                    return None
+                direct.shape = shape
+                direct.dtype = tensor.value.dtype
+                direct.address = address
+                direct.lanes = (
+                    self.row_packet_lanes(
+                        tensor, indices, values, shape, output.dtype, index_coordinates
+                    )
+                    if self.warp_producer_recorder is None
+                    else None
+                )
+                return None
             value = _resolve(node.args[2], values)
 
             def write(coords: tuple[str, ...]) -> None:
@@ -1719,13 +2501,28 @@ class FragmentCompiler:
 
             if deferred_updates is not None:
                 deferred_updates.append((write, True))
-            else:
-                self.elements(
-                    shape,
-                    write,
-                    warp_owned=self.warp_result_nodes.get(node) == math.prod(shape),
-                    register_owned=node in self.local_register_nodes,
+                return None
+            warp_owned = self.warp_result_nodes.get(node) == math.prod(shape)
+            register_owned = node in self.local_register_nodes
+            lanes = (
+                self.row_packet_lanes(
+                    tensor, indices, values, shape, output.dtype, index_coordinates
                 )
+                if not warp_owned
+                and not register_owned
+                and mask_value is None
+                and self.warp_producer_recorder is None
+                else None
+            )
+            if lanes is not None:
+                self.vector_store(tensor, value, shape, lanes, address)
+                return None
+            self.elements(
+                shape,
+                write,
+                warp_owned=warp_owned,
+                register_owned=register_owned,
+            )
             return None
 
         def load(coords: tuple[str, ...]) -> str:
@@ -1840,6 +2637,20 @@ class FragmentCompiler:
                     self.shape(snapshot_logical_shape(node)),
                 ),
             )
+        batched = self.batchable_host_load(node, values)
+        lanes = (
+            self.row_packet_lanes(
+                tensor, indices, values, shape, output.dtype, index_coordinates
+            )
+            if mask_value is None and self.warp_producer_recorder is None
+            else None
+        )
+        if lanes is not None:
+            result = self.vector_load(
+                loaded_fragment, shape, lanes, address, batched=batched
+            )
+            self.pending_barrier = batched
+            return result
         if self.df.config.get(
             "cute_fragment_packet_loads", False
         ) and host_load_is_readonly(node, self.env, self.graphs):
@@ -1889,7 +2700,9 @@ class FragmentCompiler:
                 True,
                 logical_domain=loaded_fragment.logical_domain,
             )
-        return self.materialize(loaded_fragment)
+        result = self.materialize(loaded_fragment, batched=batched)
+        self.pending_barrier = batched
+        return result
 
     def logical_axis_extent(self, fake: torch.Tensor, dim: int, capacity: int) -> str:
         """Use logical bounds for arithmetic over a padded local allocation."""
@@ -2435,12 +3248,6 @@ class FragmentCompiler:
     def dot(self, node: Node, values: dict[Node, object]) -> Fragment:
         lhs, rhs = (values[cast("Node", x)] for x in node.args[:2])
         assert isinstance(lhs, Fragment) and isinstance(rhs, Fragment)
-        # Operand recipes must finish before the contraction begins: the same
-        # input can have different coordinates in its two operand roles.
-        lhs = self.materialize(lhs)
-        self.held.append(lhs)
-        rhs = self.materialize(rhs)
-        self.held.append(rhs)
         acc = values[node.args[2]] if isinstance(node.args[2], Node) else None
         assert acc is None or isinstance(acc, Fragment)
         out = cast("torch.Tensor", node.meta["val"])
@@ -2456,9 +3263,72 @@ class FragmentCompiler:
             or (out_dtype.is_floating_point and out_dtype.itemsize < 4)
             else out_dtype
         )
+        left_fake = cast("torch.Tensor", cast("Node", node.args[0]).meta["val"])
+        mma_contraction = self.tf32_mma_contraction(
+            node, lhs, rhs, acc, shape, left_fake, compute_dtype
+        )
+        # Operand recipes must finish before the contraction begins: the same
+        # input can have different coordinates in its two operand roles.
+        if mma_contraction is None:
+            lhs = self.materialize(lhs)
+            self.held.append(lhs)
+            rhs = self.materialize(rhs)
+            self.held.append(rhs)
+        else:
+            # An operand every lane fragment reads exactly once (whole tiles,
+            # one tile along the other output axis) whose recipe rests on
+            # staged data is read in place by the mma lanes: no copy, no
+            # barrier, no second buffer; its leaves' padded rows keep the
+            # reads conflict-free.  Otherwise rows are padded to an odd
+            # multiple of 4 (A) / 8 (B) banks so the lane fragments of one
+            # mma read 32 distinct banks.
+            whole = (
+                shape[-2] % 16 == 0
+                and shape[-1] % 8 == 0
+                and mma_contraction % 8 == 0
+                and mma_contraction == lhs.shape[-1]
+            )
+
+            # A recipe that reads no memory at all (an ``hl.arange`` mask, a
+            # constant) is evaluated in place however often it is re-read: a
+            # compare or a literal per operand word costs less than a staging
+            # phase, its barrier and its buffer.  So is a bare cast / view of
+            # one staged tile whose rows already spread the lane reads over
+            # the banks: the padded copy would only repeat the tile.
+            def in_place(operand: Fragment, role: str, read_once: bool) -> bool:
+                if self.pure_recipe(operand):
+                    return True
+                if not self.staged_recipe(operand):
+                    return False
+                if whole and read_once:
+                    return True
+                return (
+                    operand.cheap
+                    and operand.physical_row is not None
+                    and _mma_operand_conflict_free(operand.physical_row, role)
+                )
+
+            if not in_place(lhs, "a", shape[-1] <= 8):
+                lhs = self.materialize_padded(lhs, _mma_row_pad(lhs.shape[-1], 4))
+            self.held.append(lhs)
+            if not in_place(rhs, "b", shape[-2] <= 16):
+                rhs = self.materialize_padded(rhs, _mma_row_pad(rhs.shape[-1], 8))
+            self.held.append(rhs)
+        if mma_contraction is not None:
+            result = self.emit_tf32_mma(
+                lhs,
+                rhs,
+                acc,
+                shape,
+                mma_contraction,
+                out_dtype,
+                sink=self.direct_store_sink(node, values, shape),
+            )
+            self.held.pop()
+            self.held.pop()
+            return result
         result = self.allocate(Fragment(shape, out_dtype, lambda _: "0"))
 
-        left_fake = cast("torch.Tensor", cast("Node", node.args[0]).meta["val"])
         contraction = self.logical_axis_extent(left_fake, -1, lhs.shape[-1])
 
         def contract(coords: tuple[str, ...]) -> None:
@@ -2480,6 +3350,569 @@ class FragmentCompiler:
         self.held.pop()
         return result
 
+    @staticmethod
+    def pure_recipe(value: Fragment) -> bool:
+        """Whether *value*'s recipe reads no memory: every leaf is a pure
+        coordinate function (``hl.arange``, a tile index, a constant) or a
+        scalar, so a lane evaluates it in a few ALU instructions and it needs
+        no staging phase, no barrier and no buffer."""
+        pending = [value]
+        seen: set[int] = set()
+        while pending:
+            fragment = pending.pop()
+            if id(fragment) in seen:
+                continue
+            seen.add(id(fragment))
+            if fragment.resident or fragment.snapshot is not None:
+                return False
+            if not fragment.dependencies:
+                if fragment.shape and not fragment.pure:
+                    return False
+                continue
+            pending.extend(fragment.dependencies)
+        return True
+
+    @staticmethod
+    def staged_recipe(value: Fragment) -> bool:
+        """Whether every leaf of *value*'s recipe is resident (a staged
+        buffer or a scalar) or pure (an ``hl.arange`` row mask, a tile
+        index), so any lane may evaluate it at any coordinate."""
+        pending = [value]
+        seen: set[int] = set()
+        while pending:
+            fragment = pending.pop()
+            if id(fragment) in seen:
+                continue
+            seen.add(id(fragment))
+            if fragment.resident:
+                if fragment.snapshot is not None:
+                    return False
+                continue
+            if not fragment.dependencies and fragment.shape and not fragment.pure:
+                return False
+            pending.extend(fragment.dependencies)
+        return True
+
+    def static_contraction(self, fake: torch.Tensor, capacity: int) -> int | None:
+        """The contraction length when it is a compile-time constant.
+
+        ``logical_axis_extent`` intersects the staged capacity with the live
+        bound of a tiled axis: a per-CTA boundary (``offsets``) is dynamic and
+        declines, a static reduction extent clips the capacity.
+        """
+        bid = self.env.resolve_block_id(fake.shape[-1])
+        if bid is None:
+            return capacity
+        if bid in self.offsets:
+            return None
+        if self.env.block_sizes[bid].reduction:
+            extent = self.static_extent(self.env.block_sizes[bid].numel)
+            return None if extent is None else min(capacity, extent)
+        return capacity
+
+    def tf32_mma_contraction(
+        self,
+        node: Node,
+        lhs: Fragment,
+        rhs: Fragment,
+        acc: Fragment | None,
+        shape: tuple[int, ...],
+        left_fake: torch.Tensor,
+        compute_dtype: torch.dtype,
+    ) -> int | None:
+        """The static K of a dot ``cute_fp32_dot="tf32_mma"`` lowers through
+        ``mma.sync``; None keeps the serial FMA contraction (knob off, half or
+        wide operands, a dynamic contraction bound, a one-warp-short CTA)."""
+        from ..autotuner_heuristics.cute_fp32_dot import fragment_tf32_dot_supported
+
+        if self.df.config.get("cute_fp32_dot", "simt") != "tf32_mma":
+            return None
+        if (
+            compute_dtype != torch.float32
+            or self.threads % 32 != 0
+            or not fragment_tf32_dot_supported(node, self.env)
+            or (acc is not None and acc.dtype != torch.float32)
+            or len(lhs.shape) < 2
+            or len(rhs.shape) < 2
+            or len(shape) < 2
+        ):
+            return None
+        contraction = self.static_contraction(left_fake, lhs.shape[-1])
+        if contraction is None or contraction <= 0:
+            return None
+        return contraction
+
+    def host_storages_disjoint(self, left: torch.Tensor, right: torch.Tensor) -> bool:
+        """Whether two host tensors are proved to view disjoint storage: a
+        different fake storage and either one freshly allocated by a wrapper
+        factory on this call (an in-kernel ``torch.empty``), or the bound
+        dispatch key's alias matrix.  Two inputs with different fake storages
+        alone prove nothing: a caller may pass overlapping views."""
+        if left.untyped_storage() == right.untyped_storage():
+            return False
+        if self.env.tensor_storage_is_compiler_allocated(
+            left
+        ) or self.env.tensor_storage_is_compiler_allocated(right):
+            return True
+        return runtime_tensors_are_proven_disjoint(self.env, left, right)
+
+    def direct_store_in_order(self, node: Node, user: Node) -> bool:
+        """Whether the lanes may write ``user``'s window at ``node``'s position.
+
+        The direct store moves the global write from the store node up to the
+        dot, so every node between them in graph order must be free of host
+        memory effects on the window: lazy recipes, views, coordinate
+        functions, scalars, pointwise and reduction evaluation over
+        fragments, another dot, a scan or a local allocation pass; a host
+        load, store or atomic passes only when its tensor is proved disjoint
+        from the window; a nested loop or branch, inline assembly, a gather
+        or selection and any other opaque lowering keep the staged tile."""
+        target_node = user.args[0]
+        assert isinstance(target_node, Node)
+        window = target_node.meta["val"]
+        assert isinstance(window, torch.Tensor)
+        current = node.next
+        while current is not user:
+            if current.op != "call_function":
+                return False
+            target = current.target
+            if (
+                target in (memory_ops.load, memory_ops.store)
+                or target in atomic_ops.ATOMIC_OPS
+            ):
+                other = current.args[0]
+                if (
+                    not isinstance(other, Node)
+                    or other.target is not _tracing_ops._host_tensor
+                ):
+                    return False
+                fake = other.meta["val"]
+                if not isinstance(
+                    fake, torch.Tensor
+                ) or not self.host_storages_disjoint(window, fake):
+                    return False
+            elif target not in self._HOST_MEMORY_FREE_TARGETS and not isinstance(
+                current.meta.get("lowering"), (PointwiseLowering, ReductionLowering)
+            ):
+                return False
+            current = current.next
+        return True
+
+    def direct_store_sink(
+        self, node: Node, values: dict[Node, object], shape: tuple[int, ...]
+    ) -> DirectStoreSink | None:
+        """The host store a tf32 mma may write from its lanes: the dot's only
+        user, storing the dot itself (no cast or view between them) into a
+        host tensor window of the dot's shape, in the same graph, with every
+        other input of the store already lowered and no host memory effect
+        on the window between the dot and the store in graph order
+        (``direct_store_in_order``).  Anything else -- another reader, an
+        extra mask, a region or producer-cache walk, a warp-result or
+        register-owned chain, a recorder -- keeps the staged result."""
+        if (
+            len(node.users) != 1
+            or self.active_region is not None
+            or node in self.cache_nodes
+            or self.warp_producer_recorder is not None
+        ):
+            return None
+        (user,) = node.users
+        if (
+            user.op != "call_function"
+            or user.target is not memory_ops.store
+            or user.graph is not node.graph
+            or user.args[2] is not node
+            or user.args[3] is not None
+            or user in self.direct_stores
+            or user in self.warp_result_nodes
+            or user in self.local_register_nodes
+            or not self.direct_store_in_order(node, user)
+        ):
+            return None
+        for source in user.all_input_nodes:
+            if source is node or source in values:
+                continue
+            # The store's host tensor (and a size symbol) may follow the dot
+            # in graph order; both lower to a value without emitting anything.
+            if source.target is _tracing_ops._host_tensor:
+                fake = source.meta["val"]
+                assert isinstance(fake, torch.Tensor)
+                values[source] = HostTensor(
+                    self.df.tensor_arg(
+                        fake, prefer_name=cast("str", source.args[0])
+                    ).name,
+                    fake,
+                )
+            elif source.target in (
+                _tracing_ops._get_symnode,
+                torch.ops.aten.sym_size.int,
+            ):
+                values[source] = source.meta.get("val")
+            else:
+                return None
+        if not isinstance(values.get(cast("Node", user.args[0])), HostTensor):
+            return None
+        sink = DirectStoreSink(user)
+        self.memory(user, values, True, direct=sink)
+        if sink.address is None or sink.shape != shape:
+            return None
+        return sink
+
+    def emit_direct_lane_stores(
+        self,
+        sink: DirectStoreSink,
+        batch: tuple[str, ...],
+        slots: tuple[tuple[str, str], ...],
+        accs: list[str],
+        rows: int,
+        cols: int,
+        out_dtype: torch.dtype,
+    ) -> None:
+        """Write one lane's four ``mma.sync`` results through the sink's
+        window: the two adjacent columns of a row leave as one aligned vector
+        store when the window is a proved packet walk, else as two scalar
+        stores.  Each value takes the dot's result dtype and then the
+        tensor's, exactly as the staged tile and its store did."""
+        assert sink.address is not None and sink.dtype is not None
+        itemsize = sink.dtype.itemsize
+        scalar = self.dtype(sink.dtype)
+        paired = sink.lanes is not None and sink.lanes % 2 == 0 and cols % 2 == 0
+
+        def value(name: str) -> str:
+            return self.cast(self.cast(name, out_dtype), sink.dtype)
+
+        for first in (0, 2):
+            (r, c0), (_, c1) = slots[first], slots[first + 1]
+            if not paired:
+                for name, c in zip(accs[first : first + 2], (c0, c1), strict=True):
+                    pointer, mask = sink.address((*batch, r, c))
+                    guard = self.predicate(
+                        [mask, *self.in_bounds(r, rows, 16), *self.in_bounds(c, cols)]
+                    )
+                    self.emit(f"if {guard}:\n    {pointer}.store({value(name)})")
+                continue
+            # ``c0`` is even and the packet proof makes every even column of
+            # the window ``2 * itemsize``-aligned; ``cols`` is even, so the
+            # pair is in bounds together.
+            pointer, mask = sink.address((*batch, r, c0))
+            guard = self.predicate(
+                [mask, *self.in_bounds(r, rows, 16), *self.in_bounds(c0, cols)]
+            )
+            packet = self.df.new_var("fragment_mma_packet")
+            self.emit(
+                f"{packet} = cute.make_rmem_tensor(cute.make_layout((2,)), {scalar})"
+            )
+            self.emit(f"{packet}[0] = {value(accs[first])}")
+            self.emit(f"{packet}[1] = {value(accs[first + 1])}")
+            atom = (
+                "cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), "
+                f"{scalar}, num_bits_per_copy={16 * itemsize})"
+            )
+            self.emit(
+                f"if {guard}:\n"
+                f"    cute.copy({atom}, {packet}, cute.make_tensor({pointer}.align({2 * itemsize}), cute.make_layout((2,))))"
+            )
+
+    def emit_tf32_mma(
+        self,
+        lhs: Fragment,
+        rhs: Fragment,
+        acc: Fragment | None,
+        shape: tuple[int, ...],
+        contraction: int,
+        out_dtype: torch.dtype,
+        sink: DirectStoreSink | None = None,
+    ) -> Fragment:
+        """Contract through ``mma.sync.aligned.m16n8k8`` tf32 (``cute_fp32_dot``).
+
+        Each warp owns whole 16 x 8 output tiles of the (batched) product and
+        walks K in steps of 8: lane ``(g, c) = (lane // 4, lane % 4)`` reads
+        A rows ``g``/``g + 8`` at k ``c``/``c + 4`` and B column ``g`` at the
+        same k straight from the staged fp32 operand buffers (six smem reads
+        per 1024 MACs instead of two per MAC; the padded rows keep the 32
+        reads of one instruction in 32 banks), feeds their bit patterns to the
+        tensor core, which truncates them to tf32, and writes its four fp32
+        results ``(g, 2c)``, ``(g, 2c + 1)``, ``(g + 8, 2c)``, ``(g + 8, 2c + 1)``.
+        Partial tiles (M % 16, N % 8, K % 8) read zeros past the operand and
+        skip the writes past the result, so every qualifying dot of the root
+        takes the mode.
+
+        ``cute_fragment_split_k``: when the dot has fewer tiles than the CTA
+        has warps, the idle warps take a share of K: ``splits`` warps walk
+        disjoint step ranges of one tile (the accumulator joins split 0) and
+        write fp32 partials; the result reads their sum.  Returns the result
+        fragment (a staged tile, or the partial-summing view).
+
+        With a *sink* (the dot's only reader is a host store of this shape)
+        and no K split, the lanes write their results straight into the
+        host window: no staged tile, no barrier before the store walk and no
+        barrier after it.  The store node then lowers to nothing and the
+        returned fragment must never be read.
+        """
+        rows, cols = shape[-2], shape[-1]
+        batch_shape = shape[:-2]
+        tiles_m = -(-rows // 16)
+        tiles_n = -(-cols // 8)
+        tiles = math.prod(batch_shape) * tiles_m * tiles_n
+        warps = self.threads // 32
+        steps = -(-contraction // 8)
+        splits = 1
+        if self.split_k and tiles < warps and steps > 1:
+            splits = max(
+                d for d in range(1, min(warps // tiles, steps) + 1) if steps % d == 0
+            )
+        direct = sink is not None and splits == 1
+        # The lanes read staged operands: batched loads must be published.
+        self.flush_pending_barrier()
+        self.emit_fragment_mma_preamble()
+        rt = _FRAGMENT_MMA_RUNTIME
+        if splits > 1:
+            partials = self.allocate(
+                Fragment((splits, *shape), torch.float32, lambda _: "0")
+            )
+            result = partials
+        elif direct:
+            result = Fragment(shape, out_dtype, _consumed_by_direct_store)
+        else:
+            result = self.allocate(Fragment(shape, out_dtype, lambda _: "0"))
+        # ``cute_fragment_mma_rows``: a warp owns whole 16-row tile rows of
+        # the product and evaluates each row's A words once per K step for
+        # all of the row's column tiles (the words do not depend on the
+        # column).  The same mma sequence per output tile: bitwise identical
+        # to the tile walk.  A K split keeps the (tile, split) unit walk.
+        row_walk = self.mma_rows and splits == 1
+        tile = self.df.new_var("fragment_mma_tile")
+        # Without a split the warp loop walks tiles directly (the established
+        # render); with one it walks (tile, split) units.
+        unit = self.df.new_var("fragment_mma_unit") if splits > 1 else tile
+        split = self.df.new_var("fragment_mma_split") if splits > 1 else ""
+        lane = self.df.new_var("fragment_mma_lane")
+        group = self.df.new_var("fragment_mma_group")
+        quad = self.df.new_var("fragment_mma_quad")
+        row = self.df.new_var("fragment_mma_row")
+        col = self.df.new_var("fragment_mma_col")
+        self.emit(f"{lane} = {self.thread} % 32")
+        self.emit(f"{group} = {lane} // 4")
+        self.emit(f"{quad} = {lane} % 4")
+        f32 = self.dtype(torch.float32)
+        row8 = f"{row} + 8"
+        # Result slots: (row, 2 quad), (row, 2 quad + 1) and the same of
+        # row + 8; a slot's column is relative to the tile's first column.
+        slots = (
+            (row, f"2 * {quad}"),
+            (row, f"2 * {quad} + 1"),
+            (row8, f"2 * {quad}"),
+            (row8, f"2 * {quad} + 1"),
+        )
+
+        def init_accumulators(
+            accs: list[str], batch: tuple[str, ...], col_base: str
+        ) -> None:
+            for name, (r, c) in zip(accs, slots, strict=True):
+                c_abs = f"{col_base} + {c}"
+                if acc is None:
+                    self.emit(f"{name} = {f32}(0)")
+                    continue
+                self.guarded_assign(
+                    name,
+                    self.cast(acc.broadcast((*batch, r, c_abs)), torch.float32),
+                    f"{f32}(0)",
+                    self.in_bounds(r, rows, 16)
+                    + self.in_bounds(c_abs, cols)
+                    + ([f"{split} == 0"] if splits > 1 else []),
+                )
+
+        def operand(
+            fragment: Fragment,
+            coords: tuple[str, str],
+            bounds: list[str],
+            batch: tuple[str, ...],
+        ) -> str:
+            name = self.df.new_var("fragment_mma_operand")
+            self.guarded_assign(
+                name,
+                self.cast(fragment.broadcast((*batch, *coords)), torch.float32),
+                f"{f32}(0)",
+                bounds,
+            )
+            return f"{rt}.f32_bits({name})"
+
+        def a_words(k0: str, k1: str, batch: tuple[str, ...]) -> list[str]:
+            return [
+                operand(
+                    lhs,
+                    (r, k),
+                    self.in_bounds(r, rows, 16) + self.in_bounds(k, contraction),
+                    batch,
+                )
+                for r, k in ((row, k0), (row8, k0), (row, k1), (row8, k1))
+            ]
+
+        def b_words(k0: str, k1: str, batch: tuple[str, ...]) -> list[str]:
+            return [
+                operand(
+                    rhs,
+                    (k, col),
+                    self.in_bounds(k, contraction) + self.in_bounds(col, cols),
+                    batch,
+                )
+                for k in (k0, k1)
+            ]
+
+        def emit_stores(accs: list[str], batch: tuple[str, ...], col_base: str) -> None:
+            if direct:
+                assert sink is not None
+                self.emit_direct_lane_stores(
+                    sink,
+                    batch,
+                    tuple((r, f"{col_base} + {c}") for r, c in slots),
+                    accs,
+                    rows,
+                    cols,
+                    out_dtype,
+                )
+                return
+            for name, (r, c) in zip(accs, slots, strict=True):
+                c_abs = f"{col_base} + {c}"
+                if splits > 1:
+                    store = f"{result.read((split, *batch, r, c_abs))} = {name}"
+                else:
+                    store = f"{result.read((*batch, r, c_abs))} = {self.cast(name, out_dtype)}"
+                bounds = self.in_bounds(r, rows, 16) + self.in_bounds(c_abs, cols)
+                if bounds:
+                    store = f"if {' and '.join(bounds)}:\n    {store}"
+                self.emit(store)
+
+        if row_walk:
+            tile_rows = math.prod(batch_shape) * tiles_m
+            tile_row = self.df.new_var("fragment_mma_tile_row")
+            col_tile = self.df.new_var("fragment_mma_col_tile")
+            loop = statement_from_string(
+                f"for {tile_row} in range({self.thread} // 32, {tile_rows}, {warps}):\n    pass"
+            )
+            assert isinstance(loop, ast.For)
+            loop.body.clear()
+            with self.cg.set_statements(cast("list[ast.AST]", loop.body)):
+                batch = self.coordinate_locals(
+                    self.coordinates(f"({tile_row}) // {tiles_m}", batch_shape)
+                )
+                self.emit(f"{row} = ({tile_row}) % {tiles_m} * 16 + {group}")
+                ks = [
+                    (f"{index * 8} + {quad}", f"{index * 8 + 4} + {quad}")
+                    for index in range(steps)
+                ]
+                hoisted = [a_words(k0, k1, batch) for k0, k1 in ks]
+                n_loop = statement_from_string(
+                    f"for {col_tile} in range({tiles_n}):\n    pass"
+                )
+                assert isinstance(n_loop, ast.For)
+                n_loop.body.clear()
+                with self.cg.set_statements(cast("list[ast.AST]", n_loop.body)):
+                    col_base = f"({col_tile}) * 8"
+                    self.emit(f"{col} = {col_base} + {group}")
+                    accs = [self.df.new_var("fragment_mma_c") for _ in slots]
+                    init_accumulators(accs, batch, col_base)
+                    for (k0, k1), words in zip(ks, hoisted, strict=True):
+                        words = [*words, *b_words(k0, k1, batch)]
+                        self.emit(
+                            f"{', '.join(accs)} = {rt}.mma_tf32({', '.join([*words, *accs])})"
+                        )
+                    emit_stores(accs, batch, col_base)
+                self.cg.add_statement(n_loop)
+            self.cg.add_statement(loop)
+        else:
+            loop = statement_from_string(
+                f"for {unit} in range({self.thread} // 32, {tiles * splits}, {warps}):\n    pass"
+            )
+            assert isinstance(loop, ast.For)
+            loop.body.clear()
+            with self.cg.set_statements(cast("list[ast.AST]", loop.body)):
+                if splits > 1:
+                    self.emit(f"{tile} = {unit} // {splits}")
+                    self.emit(f"{split} = {unit} % {splits}")
+                batch = self.coordinate_locals(
+                    self.coordinates(f"({tile}) // {tiles_m * tiles_n}", batch_shape)
+                )
+                self.emit(f"{row} = ({tile}) // {tiles_n} % {tiles_m} * 16 + {group}")
+                col_base = f"({tile}) % {tiles_n} * 8"
+                self.emit(f"{col} = {col_base} + {group}")
+                accs = [self.df.new_var("fragment_mma_c") for _ in slots]
+                init_accumulators(accs, batch, col_base)
+                step = self.df.new_var("fragment_mma_step")
+                k_loop = statement_from_string(
+                    f"for {step} in cutlass.range_constexpr({steps // splits}):\n    pass"
+                )
+                assert isinstance(k_loop, ast.For)
+                k_loop.body.clear()
+                with self.cg.set_statements(cast("list[ast.AST]", k_loop.body)):
+                    base_step = (
+                        f"({split} * {steps // splits} + {step})"
+                        if splits > 1
+                        else step
+                    )
+                    k0 = f"{base_step} * 8 + {quad}"
+                    k1 = f"{base_step} * 8 + {quad} + 4"
+                    words = [*a_words(k0, k1, batch), *b_words(k0, k1, batch)]
+                    self.emit(
+                        f"{', '.join(accs)} = {rt}.mma_tf32({', '.join([*words, *accs])})"
+                    )
+                self.cg.add_statement(k_loop)
+                emit_stores(accs, batch, col_base)
+            self.cg.add_statement(loop)
+        # The lanes read staged operands a later phase may recycle.
+        self.synchronize()
+        if direct:
+            assert sink is not None
+            self.direct_stores.add(sink.node)
+        if splits == 1:
+            return result
+        partials = result
+
+        def summed(coords: tuple[str, ...]) -> str:
+            terms = " + ".join(
+                partials.read((str(index), *coords)) for index in range(splits)
+            )
+            return self.cast(f"({terms})", out_dtype)
+
+        return Fragment(
+            shape,
+            out_dtype,
+            summed,
+            True,
+            (partials,),
+            partials.storage,
+        )
+
+    @staticmethod
+    def in_bounds(index: str, extent: int, tile: int = 8) -> list[str]:
+        """The predicate keeping *index* inside an axis the mma tiles may
+        overhang (16 rows, 8 columns, 8 k); empty when *tile* divides *extent*."""
+        return [f"({index}) < {extent}"] if extent % tile else []
+
+    def guarded_assign(
+        self, name: str, value: str, fallback: str, bounds: list[str]
+    ) -> None:
+        if not bounds:
+            self.emit(f"{name} = {value}")
+            return
+        self.emit(f"{name} = {fallback}")
+        self.emit(f"if {' and '.join(bounds)}:\n    {name} = {value}")
+
+    def emit_fragment_mma_preamble(self) -> None:
+        """Record that the ``mma.sync`` helpers' import is needed; the root's
+        commit emits it once per generated module (``emit_mma_preamble``)."""
+        self.wants_mma_preamble = True
+
+    def emit_mma_preamble(self) -> None:
+        """Import the ``mma.sync`` helpers once per generated module."""
+        if not self.wants_mma_preamble or getattr(
+            self.cg, "_helion_fragment_mma_module_emitted", False
+        ):
+            return
+        self.cg._helion_fragment_mma_module_emitted = True  # type: ignore[attr-defined]
+        for stmt in ast.parse(_FRAGMENT_MMA_PREAMBLE).body:
+            self.cg.module_statements.append(stmt)
+
     def pointwise(self, node: Node, values: dict[Node, object]) -> Fragment:
         lowering = cast("PointwiseLowering | ReductionLowering", node.meta["lowering"])
         inputs: list[Node] = []
@@ -2497,14 +3930,30 @@ class FragmentCompiler:
         fake = cast("torch.Tensor", node.meta["val"])
         ranges = self.shape(lowering.buffer.data.ranges)
         result_shape = self.shape(fake.shape)
+        # Inductor's iteration ranges usually differ from the fake shape only
+        # by singleton dimensions: pass the live coordinates through instead
+        # of a flatten/unflatten round trip the compiler cannot fold.
+        range_live = [i for i, size in enumerate(ranges) if size != 1]
+        result_live = [i for i, size in enumerate(result_shape) if size != 1]
+        structural_ranges = [ranges[i] for i in range_live] == [
+            result_shape[i] for i in result_live
+        ]
 
         def element(
             coords: tuple[str, ...], reduction_coords: tuple[str, ...] = ()
         ) -> str:
             if ranges != result_shape:
-                coords = self.coordinate_locals(
-                    self.coordinates(self.flatten(coords, result_shape), ranges)
-                )
+                if structural_ranges:
+                    mapped = ["0"] * len(ranges)
+                    for range_dim, result_dim in zip(
+                        range_live, result_live, strict=True
+                    ):
+                        mapped[range_dim] = coords[result_dim]
+                    coords = tuple(mapped)
+                else:
+                    coords = self.coordinate_locals(
+                        self.coordinates(self.flatten(coords, result_shape), ranges)
+                    )
             prior = self.sym_indices
             self.sym_indices = {
                 sympy.Symbol(f"i{i}"): coord
@@ -2809,6 +4258,19 @@ class FragmentCompiler:
             torch.Tag.pointwise in node.target.tags
             or node.target is torch.ops.aten._to_copy.default
         )
+        # A bare dtype cast of one staged tile (or of a cheap view of one)
+        # reads exactly that tile: the mma lanes may read it in place.
+        cheap = (
+            node.target
+            in (
+                torch.ops.aten._to_copy.default,
+                torch.ops.prims.convert_element_type.default,
+            )
+            and len(dependencies) == 1
+            and ranges == result_shape
+            and (dependencies[0].cheap or dependencies[0].physical_row is not None)
+            and dependencies[0].shape == result_shape
+        )
         return Fragment(
             self.shape(fake.shape),
             fake.dtype,
@@ -2825,6 +4287,8 @@ class FragmentCompiler:
             )
             if pointwise_domain and logical_dependencies
             else None,
+            cheap=cheap,
+            physical_row=dependencies[0].physical_row if cheap else None,
         )
 
     def loop(self, node: Node, values: dict[Node, object]) -> list[Fragment]:
@@ -4075,6 +5539,9 @@ class FragmentCompiler:
         region: AtomicConsumerRegion | None = None
         updates: list[tuple[Callable[[tuple[str, ...]], None], bool]] = []
         held: list[object] = []
+        previous_cache_nodes, previous_region = self.cache_nodes, self.active_region
+        self.cache_nodes = frozenset(cache_nodes)
+        self.active_region = None
         self.scopes.append(values)
         try:
             for node in graph.nodes:
@@ -4084,6 +5551,7 @@ class FragmentCompiler:
                     continue
                 if node.op == "output":
                     assert region is None
+                    self.flush_pending_barrier()
                     return _resolve(node.args[0], values)
                 if (
                     node in regions
@@ -4092,6 +5560,7 @@ class FragmentCompiler:
                 ):
                     assert region is None
                     region = regions[node]
+                    self.active_region = region
                     assert not self.iteration_local_returns
                     self.iteration_local_returns = frozenset(region.local_returns)
                     updates, held = [], []
@@ -4126,11 +5595,13 @@ class FragmentCompiler:
                     self.fused_atomic_updates(region, updates)
                     self.held.pop()
                     region = None
+                    self.active_region = None
                     self.iteration_local_returns = frozenset()
         finally:
             self.iteration_local_returns = frozenset()
             self.lazy_opaque_producers = previous_opaque
             self.scan_plans, self.scan_reductions = previous_scans, previous_reductions
+            self.cache_nodes, self.active_region = previous_cache_nodes, previous_region
             self.scopes.pop()
         raise AssertionError("graph has no output")
 
@@ -4142,6 +5613,14 @@ class FragmentCompiler:
         | None = None,
     ) -> object:
         target = node.target
+        # A run of batched host loads ends at the first node that is neither
+        # one of them nor a lazy recipe (which emits nothing until consumed).
+        if (
+            self.pending_barrier
+            and not self.batchable_host_load(node, values)
+            and not self.transparent_node(node)
+        ):
+            self.synchronize()
         args = cast("tuple[object, ...]", _resolve(node.args, values))
         fake = node.meta.get("val")
         if target is _tracing_ops._host_tensor:
@@ -4271,6 +5750,7 @@ class FragmentCompiler:
                 self.shape(fake.shape),
                 fake.dtype,
                 lambda coords: self.cast(f"({offset}) + ({coords[0]})", fake.dtype),
+                pure=True,
             )
         if isinstance(node.meta["lowering"], (PointwiseLowering, ReductionLowering)):
             return self.pointwise(node, values)
@@ -4306,6 +5786,7 @@ class FragmentCompiler:
                 )
                 if declared_shape != shape
                 else None,
+                pure=not isinstance(value, Fragment),
             )
             if node in self.local_allocations:
                 result = self.materialize(result)
@@ -4325,6 +5806,14 @@ class FragmentCompiler:
                     f"{self.scalar(start)} + ({coords[0]}) * {self.scalar(step)}",
                     fake.dtype,
                 ),
+                pure=True,
+                affine=(start, step)
+                if len(shape) == 1
+                and isinstance(start, int)
+                and isinstance(step, int)
+                and not isinstance(start, bool)
+                and not isinstance(step, bool)
+                else None,
             )
         source = args[0]
         assert isinstance(source, Fragment)
@@ -4403,6 +5892,16 @@ class FragmentCompiler:
                     self.coordinate_locals(subscript_coordinates(coords))
                 )
 
+            # ``x[None, :, :]``: new singleton axes and whole slices only keep
+            # the staged tile's row order.
+            cheap_view = (
+                (source.cheap or source.physical_row is not None)
+                and all(item is None or item == slice(None) for item in slices)
+                and len(shape) >= 2
+                and len(source.shape) >= 2
+                and slices[-1] == slice(None)
+                and (len(slices) < 2 or slices[-2] == slice(None))
+            )
             return Fragment(
                 shape,
                 fake.dtype,
@@ -4412,6 +5911,8 @@ class FragmentCompiler:
                 logical_domain=lambda coords: source.domain(
                     subscript_coordinates(coords)
                 ),
+                cheap=cheap_view,
+                physical_row=source.physical_row if cheap_view else None,
             )
         if target is torch.ops.aten.permute.default:
             order = cast("list[int]", args[1])
@@ -4428,6 +5929,13 @@ class FragmentCompiler:
                 ),
             )
         if target in (torch.ops.aten.expand.default, torch.ops.aten.clone.default):
+            # A broadcast of a staged tile (or of a cheap view of one) keeps
+            # the tile's own row order wherever it is not broadcast.
+            cheap_view = (
+                (source.cheap or source.physical_row is not None)
+                and len(shape) >= 2
+                and source.shape[-2:] == shape[-2:]
+            )
             return Fragment(
                 shape,
                 fake.dtype,
@@ -4435,6 +5943,8 @@ class FragmentCompiler:
                 source.resident,
                 (source,),
                 logical_domain=source.broadcast_domain,
+                cheap=cheap_view,
+                physical_row=source.physical_row if cheap_view else None,
             )
         if target in (
             torch.ops.aten.view.default,
@@ -4448,10 +5958,28 @@ class FragmentCompiler:
             # Singleton views preserve logical element order. Read through the
             # source recipe so permuted layouts and resident aliases retain
             # their own physical addressing and shared-buffer lifetimes.
+            source_live = [i for i, size in enumerate(source.shape) if size != 1]
+            target_live = [i for i, size in enumerate(shape) if size != 1]
+            structural = [source.shape[i] for i in source_live] == [
+                shape[i] for i in target_live
+            ]
+
             def view_coordinates(coords: tuple[str, ...]) -> tuple[str, ...]:
+                if structural:
+                    # The view only inserts or drops singleton dimensions:
+                    # each live coordinate passes through unchanged, with no
+                    # flatten/unflatten round trip for the compiler to fold.
+                    mapped = ["0"] * len(source.shape)
+                    for source_dim, target_dim in zip(
+                        source_live, target_live, strict=True
+                    ):
+                        mapped[source_dim] = coords[target_dim]
+                    return tuple(mapped)
                 return self.coordinates(self.flatten(coords, shape), source.shape)
 
             def view_domain(coords: tuple[str, ...]) -> tuple[str, ...]:
+                if structural:
+                    return source.domain(view_coordinates(coords))
                 # Indexing may pad a singleton view without preserving numel.
                 # Bound the flat coordinate before unflattening can wrap it.
                 return (
@@ -4459,6 +5987,17 @@ class FragmentCompiler:
                     *source.domain(view_coordinates(coords)),
                 )
 
+            # A singleton-only view of a staged tile (or of a cheap view of
+            # one) whose last two live dimensions are the tile's keeps the
+            # tile's row order.
+            cheap_view = (
+                structural
+                and (source.cheap or source.physical_row is not None)
+                and len(target_live) >= 2
+                and len(source_live) >= 2
+                and target_live[-1] == len(shape) - 1
+                and source_live[-1] == len(source.shape) - 1
+            )
             return Fragment(
                 shape,
                 fake.dtype,
@@ -4468,6 +6007,8 @@ class FragmentCompiler:
                 source.resident,
                 (source,),
                 logical_domain=view_domain,
+                cheap=cheap_view,
+                physical_row=source.physical_row if cheap_view else None,
             )
         if target is torch.ops.aten.where.self:
             condition, lhs, rhs = cast("tuple[Fragment, Fragment, Fragment]", args)
@@ -5454,7 +6995,9 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     body: list[ast.AST] = []
     with cg.set_statements(body):
         compiler.emit(f"{compiler.thread} = cutlass.Int32(cute.arch.thread_idx()[0])")
+        compiler.stage_slabs()
         compiler.graph(root.graph, {})
+        compiler.flush_pending_barrier()
         # Root lifetime can be nested in an outer generated grid loop.
         compiler.synchronize_local_atomics()
     if compiler.warp_producer_recorder is not None:
@@ -5529,6 +7072,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             )
         )
     cg.device_function.cute_state.owned_root_block_dims = (compiler.threads, 1, 1)
+    compiler.emit_mma_preamble()
     for statement in (*compiler.allocations(), *body):
         cg.add_statement(statement)
     return True

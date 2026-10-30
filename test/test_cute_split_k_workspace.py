@@ -142,6 +142,61 @@ def _nonlinear_partial(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _plain_store_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for row, column in hl.tile((m, n)):
+        accumulator = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            accumulator = torch.addmm(accumulator, a[row, inner], b[inner, column])
+        out[row, column] = accumulator.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _plain_store_bias_matmul(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for row, column in hl.tile((m, n)):
+        accumulator = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            accumulator = torch.addmm(accumulator, a[row, inner], b[inner, column])
+        out[row, column] = (accumulator + bias[column]).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _plain_store_relu_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for row, column in hl.tile((m, n)):
+        accumulator = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            accumulator = torch.addmm(accumulator, a[row, inner], b[inner, column])
+        out[row, column] = torch.relu(accumulator).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _plain_store_into_argument(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    for row, column in hl.tile((m, n)):
+        accumulator = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            accumulator = torch.addmm(accumulator, a[row, inner], b[inner, column])
+        out[row, column] = accumulator.to(out.dtype)
+    return out
+
+
 def _args(
     shape: tuple[int, int, int] = (128, 2048, 128),
     dtype: torch.dtype = torch.float16,
@@ -391,17 +446,33 @@ def test_user_output_atomic_semantics_are_not_replaced() -> None:
     args = (*_args(), torch.empty((128, 128), dtype=torch.float32))
     bound = _bind(_output_argument, args)
     assert _proof(bound) is None
-    with pytest.raises(helion.exc.InvalidConfig, match="private FP32"):
+    with pytest.raises(helion.exc.InvalidConfig, match="proved split-K reduction"):
         bound.to_code(
             helion.Config(block_sizes=[128, 128, 64], cute_split_k_workspace=True)
         )
 
 
-def test_bf16_requested_atomics_are_not_promoted_by_this_optimization() -> None:
+def test_bf16_output_is_proved_without_promotion() -> None:
+    # The atomic lowering keeps a requested bfloat16 destination (no FP32
+    # promotion); the workspace schedule still proves the split and its
+    # reducer casts the FP32 partial sum to bfloat16 once.
     args = _args(dtype=torch.bfloat16)
     bound = _bind(_partitioned_matmul, args)
     assert not bound.env.cute_half_atomic_output_promotions
-    assert _proof(bound) is None
+    proof = _proof(bound)
+    assert proof is not None
+    assert proof.output_dtype is torch.bfloat16
+    source = bound.to_code(_config())
+    producer, reducer = _embedded_sources(source)
+    assert "atomic_add" not in producer + reducer
+    assert "cutlass.BFloat16" in reducer
+    host = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_partitioned_matmul"
+    )
+    assert "dtype=torch.bfloat16" in ast.unparse(host)
+    assert "out.to(" not in ast.unparse(host)
 
 
 @pytest.mark.parametrize("shape", ((128, 192, 128), (256, 4096, 256)))
@@ -521,3 +592,196 @@ def test_real_full_initial_population_reaches_deep_workspace_and_atomic_choices(
     assert {config["cute_split_k_stages"] for config in choices} >= {2, 12, 16}
     for config in choices:
         assert len(_embedded_sources(bound.to_code(config))) == 2
+
+
+def test_plain_store_matmul_is_proved_with_its_partition_knob() -> None:
+    bound = _bind(_plain_store_matmul, _args((128, 16384, 128)))
+    proof = _proof(bound)
+    assert proof is not None
+    assert proof.store and proof.bias is None
+    assert proof.output_dtype is torch.float16
+    spec = bound.config_spec
+    assert spec.cute_split_k_workspace_available
+    # 16384 = 256 K tiles of 64: every search choice cuts it into whole
+    # tiles of at least eight per partition.
+    assert spec.cute_split_k_partition_choices == (1, 2, 4, 8, 16, 32)
+    assert any(
+        seed.get("cute_split_k_workspace")
+        and seed.get("cute_split_k_partitions", 1) > 1
+        for seed in spec.compiler_seed_configs
+    )
+    config = helion.Config(
+        block_sizes=[128, 128, 64],
+        cute_split_k_workspace=True,
+        cute_split_k_partitions=4,
+        cute_split_k_stages=2,
+    )
+    source = bound.to_code(config)
+    producer, reducer = _embedded_sources(source)
+    assert "atomic_add" not in producer + reducer
+    assert "cutlass.Float16" in reducer
+    host = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_plain_store_matmul"
+    )
+    unparsed = ast.unparse(host)
+    # The host keeps a fresh fp16 allocation the reducer fills; partials are
+    # (partitions, m, n) fp32.
+    assert unparsed.count("torch.empty(") == 2
+    assert "dtype=torch.float16" in unparsed
+    assert "out.to(" not in unparsed
+    assert "(4, 128, 128)" in unparsed
+    # One partition is the plain kernel: strict normalization rejects the
+    # schedule and the search's repair pass drops it.
+    plain = helion.Config(
+        block_sizes=[128, 128, 64],
+        cute_split_k_workspace=True,
+        cute_split_k_partitions=1,
+    )
+    with bound.env:
+        with pytest.raises(helion.exc.InvalidConfig, match="partitions > 1"):
+            spec.normalize(plain)
+        plain_normalized = helion.Config(**plain.config)
+        spec.normalize(plain_normalized, _fix_invalid=True)
+    assert plain_normalized.config["cute_split_k_workspace"] is False
+    # The workspace launch supersedes the in-kernel split-K knob.
+    both = helion.Config(
+        block_sizes=[128, 128, 64],
+        cute_split_k_workspace=True,
+        cute_split_k_partitions=4,
+        tcgen05_split_k=4,
+    )
+    with bound.env:
+        spec.normalize(both, _fix_invalid=True)
+    assert both.config["cute_split_k_workspace"] is True
+    assert both.config["tcgen05_split_k"] == 1
+
+
+def test_plain_store_bias_is_reduced_on_partition_zero() -> None:
+    args = (*_args((128, 16384, 128)), torch.empty((128,), dtype=torch.float16))
+    bound = _bind(_plain_store_bias_matmul, args)
+    proof = _proof(bound)
+    assert proof is not None and proof.store
+    assert proof.bias is not None and proof.bias.dimensions == (1,)
+    source = bound.to_code(
+        helion.Config(
+            block_sizes=[128, 128, 64],
+            cute_split_k_workspace=True,
+            cute_split_k_partitions=8,
+            cute_split_k_stages=2,
+        )
+    )
+    _producer, reducer = _embedded_sources(source)
+    assert "if partition == cutlass.Int32(0):" in reducer
+    assert "bias_value" in reducer
+
+
+@pytest.mark.parametrize(
+    "kernel,extra",
+    (
+        (_plain_store_relu_matmul, ()),
+        (_plain_store_into_argument, (torch.empty((128, 128), dtype=torch.float16),)),
+    ),
+)
+def test_plain_store_variants_keep_the_original_path(kernel, extra) -> None:
+    bound = _bind(kernel, (*_args((128, 16384, 128)), *extra))
+    assert _proof(bound) is None
+    assert not bound.config_spec.cute_split_k_workspace_available
+    assert bound.config_spec.cute_split_k_partition_choices == ()
+
+
+@pytest.mark.parametrize(
+    "k,choices",
+    (
+        # 32 K tiles of 64: four partitions keep eight tiles each, eight
+        # would keep four.
+        (2048, (1, 2, 4)),
+        # Eight tiles: no split keeps eight per partition, so the schedule
+        # is not offered at all (a 128^3 .. 512^3 GEMM has a small grid but
+        # nothing to split).
+        (512, ()),
+    ),
+)
+def test_plain_store_partitions_keep_eight_k_tiles(k, choices) -> None:
+    bound = _bind(_plain_store_matmul, _args((128, k, 128)))
+    spec = bound.config_spec
+    assert spec.cute_split_k_partition_choices == choices
+    assert spec.cute_split_k_workspace_available is bool(choices)
+    if not choices:
+        assert _proof(bound) is None
+        assert not any(
+            seed.get("cute_split_k_workspace") for seed in spec.compiler_seed_configs
+        )
+
+
+def test_plain_store_default_config_carries_no_workspace_knobs() -> None:
+    # The schedule is a seeded search alternative; the public default is the
+    # plain kernel whether or not the operands admit the proof (an M-major A
+    # does not: the partition producer views row-major operands only).
+    a, b = _args((128, 16384, 128))
+    row_major = _bind(_plain_store_matmul, (a, b))
+    m_major = _bind(_plain_store_matmul, (a.T.contiguous().T, b))
+    assert _proof(row_major) is not None
+    assert _proof(m_major) is None
+    assert not m_major.config_spec.cute_split_k_workspace_available
+    for bound in (row_major, m_major):
+        default = bound.config_spec.default_config().config
+        assert not any(key.startswith("cute_split_k_") for key in default)
+    assert (
+        row_major.config_spec.default_config() == m_major.config_spec.default_config()
+    )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _plain_store_full_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.full((m, n), fill_value=1.0, dtype=a.dtype, device=a.device)
+    for row, column in hl.tile((m, n)):
+        accumulator = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            accumulator = torch.addmm(accumulator, a[row, inner], b[inner, column])
+        out[row, column] = accumulator.to(out.dtype)
+    return out
+
+
+def test_plain_store_full_factory_keyword_fill_is_dropped() -> None:
+    bound = _bind(_plain_store_full_matmul, _args((128, 16384, 128)))
+    assert _proof(bound) is not None
+    source = bound.to_code(
+        helion.Config(
+            block_sizes=[128, 128, 64],
+            cute_split_k_workspace=True,
+            cute_split_k_partitions=4,
+            cute_split_k_stages=2,
+        )
+    )
+    host = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_plain_store_full_matmul"
+    )
+    unparsed = ast.unparse(host)
+    # The grid writes every output element, so the fill is dropped with the
+    # size kept: ``torch.full((m, n), fill_value=1.0)`` -> ``torch.empty((m, n))``.
+    assert "fill_value" not in unparsed
+    assert "torch.empty((m, n)" in unparsed
+
+
+def test_workspace_knobs_read_their_defaults_when_the_schedule_is_off() -> None:
+    # With the schedule off its stage and partition knobs are inert: samples
+    # read their defaults so the search does not compile one plain kernel per
+    # inert value, and the public default config carries none of them.
+    bound = _bind(_plain_store_matmul, _args((128, 16384, 128)))
+    spec = bound.config_spec
+    assert spec.cute_split_k_workspace_available
+    gen = spec.create_config_generation()
+    with bound.env:
+        for _ in range(100):
+            config = gen.unflatten(gen.random_flat()).config
+            if not config.get("cute_split_k_workspace"):
+                assert config.get("cute_split_k_stages", 2) == 2
+                assert config.get("cute_split_k_partitions", 1) == 1
+    default = spec.default_config().config
+    assert not any(key.startswith("cute_split_k_") for key in default)

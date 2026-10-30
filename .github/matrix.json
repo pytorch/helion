@@ -58,6 +58,18 @@
       "backend": "triton"
     },
     {
+      "runner": "mt-l-x86iamx-22-225-h100",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "nvidia/cuda:13.1.0-devel-ubuntu24.04",
+      "runtime-version": "cu130",
+      "container-options": "--gpus all",
+      "pytorch-version": "pytorch-nightly",
+      "alias": "h100",
+      "backend": "triton",
+      "triton-package": "fbtriton"
+    },
+    {
       "runner": "mt-l-x86iamx-88-900-h100-4",
       "python-version": "3.12",
       "ref-eager": false,
@@ -107,8 +119,8 @@
       "runner": "linux.rocm.gpu.ecosystem.mi350.1",
       "python-version": "3.12",
       "ref-eager": false,
-      "image": "rocm/dev-ubuntu-24.04:10.0.0-full",
-      "runtime-version": "rocm10.0",
+      "image": "rocm/dev-ubuntu-24.04:10.1.0-full",
+      "runtime-version": "rocm10.1",
       "container-options": "--device=/dev/kfd --device=/dev/dri -e HIP_VISIBLE_DEVICES=0 -e ROCR_VISIBLE_DEVICES=0",
       "pytorch-version": "pytorch-nightly",
       "alias": "mi350x",

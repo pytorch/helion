@@ -1852,6 +1852,38 @@ class TestReductions(RefEagerTestBase, TestCase):
                 for actual, reference in zip(out, expected, strict=True):
                     torch.testing.assert_close(actual, reference, equal_nan=True)
 
+    @skipUnlessBackends(["triton"])
+    @skipIfRefEager("codegen pins")
+    def test_fast_math_extrema_drop_nan_propagation(self):
+        """Under fast_math, amax/amin lower to tl.max/tl.min and
+        maximum/minimum to tl.maximum/tl.minimum without NaN propagation."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True, fast_math=True)
+        def extrema(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, _ = x.shape
+            maxes = torch.empty([m], dtype=x.dtype, device=x.device)
+            mins = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :]
+                maxes[tile_m] = torch.maximum(row.amax(-1), y[tile_m])
+                mins[tile_m] = torch.minimum(row.amin(-1), y[tile_m])
+            return maxes, mins
+
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            x = torch.randn([8, 1000], device=DEVICE, dtype=dtype)
+            y = torch.randn([8], device=DEVICE, dtype=dtype)
+            code, (maxes, mins) = code_and_output(extrema, (x, y), block_sizes=[2])
+            self.assertIn("tl.max(", code)
+            self.assertIn("tl.min(", code)
+            self.assertIn("tl.maximum(", code)
+            self.assertIn("tl.minimum(", code)
+            self.assertNotIn("propagate_nan", code)
+            self.assertNotIn("PropagateNan", code)
+            torch.testing.assert_close(maxes, torch.maximum(x.amax(-1), y))
+            torch.testing.assert_close(mins, torch.minimum(x.amin(-1), y))
+
     @skipUnlessBackends(["triton", "cute"])
     @skipIfRefEager(
         "tile positions depend on block_sizes, which ref mode does not apply"

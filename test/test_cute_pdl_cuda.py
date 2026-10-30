@@ -11,7 +11,10 @@ the knob-on module without its wait has to read stale data: that proves the
 producer really overlaps the launch and the wait is load-bearing.  The
 pure-launch chain at the end shows why a kernel that releases its dependents
 at entry has to stay an ordinary launch (the materialized-fission producer,
-which ``_stage_config`` keeps away from the knob).
+which ``_stage_config`` keeps away from the knob).  The release placements
+(``cute_pdl_release``) are told apart by a dependent that does not wait: it
+reaches the kernel's input while the kernel still reads it only when the
+kernel released at entry.
 """
 
 from __future__ import annotations
@@ -52,6 +55,7 @@ _COLUMN = {
     "cute_lane_unroll": 8,
 }
 _WAIT = "cute.arch.griddepcontrol_wait()"
+_RELEASE = "cute.arch.griddepcontrol_launch_dependents()"
 _ATTRIBUTE = "._helion_cute_use_pdl = True"
 _PRODUCER_GRID = 128
 _BLOCK = 1024
@@ -98,6 +102,15 @@ def _middle(flag_ptr, RELEASE_FIRST: tl.constexpr):
     tl.atomic_add(flag_ptr, 1)
     if not RELEASE_FIRST:
         gdc_launch_dependents()
+
+
+@triton.jit
+def _poison_tail_without_wait(x_ptr, first, n, BLOCK: tl.constexpr):
+    """Writes ones over ``x[first:n]`` right away: launched as a programmatic
+    dependent, it runs as soon as its predecessor releases it."""
+    offsets = first + tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    tl.store(x_ptr + offsets, tl.full([BLOCK], 1, tl.bfloat16), mask=mask)
 
 
 @triton.jit
@@ -192,11 +205,8 @@ class TestCutePdl(TestCase):
                 torch.randn(*shape, dtype=torch.bfloat16, device=DEVICE) * 7,
             ]
             bound, off, off_code = _build(kernel, x, **_COLUMN)
-            _bound, on, on_code = _build(kernel, x, **_COLUMN, cute_pdl=True)
             self.assertNotIn(_WAIT, off_code)
             self.assertNotIn(_ATTRIBUTE, off_code)
-            self.assertEqual(on_code.count(_WAIT), 1)
-            self.assertEqual(on_code.count(_ATTRIBUTE), 1)
             references = []
             for source in sources:
                 _produce(source, x)
@@ -204,25 +214,47 @@ class TestCutePdl(TestCase):
                 self.assertTrue(torch.equal(x, source))
                 references.append(off(x).clone())
             self.assertEqual(_stale_runs(off, x, sources, references, iterations), 0)
-            self.assertEqual(_stale_runs(on, x, sources, references, iterations), 0)
-            # One graph holding producer -> kernel -> producer -> kernel: the
-            # launch attribute becomes a programmatic edge inside the graph.
-            side = torch.cuda.Stream()
-            with torch.cuda.stream(side):
-                _produce(sources[0], x)
-                on(x)
-            torch.cuda.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                _produce(sources[0], x)
-                out0 = on(x)
-                _produce(sources[1], x)
-                out1 = on(x)
-            for _ in range(iterations // 4):
-                graph.replay()
+            # The knob with each placement of its own release: ``entry``
+            # lets the next kernel (here the producer of the next source)
+            # launch while this one runs; every placement must still read
+            # the source just produced.
+            for release in (
+                {},
+                {"cute_pdl_release": "none"},
+                {"cute_pdl_release": "exit"},
+                {"cute_pdl_release": "entry"},
+                {"cute_pdl_release": "last_wave"},
+            ):
+                _bound, on, on_code = _build(
+                    kernel, x, **_COLUMN, cute_pdl=True, **release
+                )
+                self.assertEqual(on_code.count(_WAIT), 1)
+                self.assertEqual(on_code.count(_ATTRIBUTE), 1)
+                self.assertEqual(
+                    on_code.count(_RELEASE),
+                    int(release.get("cute_pdl_release", "entry") != "none"),
+                )
+                self.assertEqual(_stale_runs(on, x, sources, references, iterations), 0)
+                # One graph holding producer -> kernel -> producer -> kernel:
+                # the launch attribute becomes a programmatic edge inside the
+                # graph.
+                side = torch.cuda.Stream()
+                with torch.cuda.stream(side):
+                    _produce(sources[0], x)
+                    on(x)
                 torch.cuda.synchronize()
-                self.assertTrue(torch.equal(out0, references[0]))
-                self.assertTrue(torch.equal(out1, references[1]))
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    _produce(sources[0], x)
+                    out0 = on(x)
+                    _produce(sources[1], x)
+                    out1 = on(x)
+                for _ in range(iterations // 4):
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    self.assertTrue(torch.equal(out0, references[0]))
+                    self.assertTrue(torch.equal(out1, references[1]))
+            _bound, on, on_code = _build(kernel, x, **_COLUMN, cute_pdl=True)
             if control:
                 attribute_only = _attribute_only_control(bound, on_code)
                 self.assertGreater(
@@ -236,6 +268,53 @@ class TestCutePdl(TestCase):
                     ),
                     0,
                 )
+
+    def test_only_the_entry_release_lets_a_dependent_run_during_the_kernel(
+        self,
+    ) -> None:
+        # One CTA sums 2^18 rows of zeros serially (hundreds of microseconds)
+        # on a machine with every other SM idle.  A dependent launched behind
+        # it with ``launch_pdl`` and no wait of its own writes ones over the
+        # last rows the moment it is released: at ``entry`` that is while the
+        # sum still has those rows ahead of it, so the sum reads them (the
+        # output is no longer zero); released after the body (``exit``) or
+        # at grid completion (``none``) the sum has finished reading first.
+        rows, cols, tail = 1 << 18, 16, 4096
+        x = torch.zeros(rows, cols, dtype=torch.bfloat16, device=DEVICE)
+        bound = col_reduce_sum_static.bind((x,))
+        iterations = 8
+
+        def dirty_runs(placement: str) -> int:
+            config = bound.config_spec.normalized_config(
+                helion.Config(**_COLUMN, cute_pdl=True, cute_pdl_release=placement)
+            )
+            code = bound.to_code(config)
+            self.assertEqual(code.count(_RELEASE), int(placement != "none"))
+            fn = bound.compile_config(config)
+
+            def run() -> torch.Tensor:
+                x.zero_()
+                out = fn(x)
+                _poison_tail_without_wait[(tail * cols // _BLOCK,)](
+                    x.view(-1),
+                    (rows - tail) * cols,
+                    rows * cols,
+                    BLOCK=_BLOCK,
+                    launch_pdl=True,
+                )
+                torch.cuda.synchronize()
+                return out
+
+            # The first call of either kernel compiles on the host, which can
+            # outlast the sum; count only warm launches.
+            run()
+            return sum(int(bool((run() != 0).any())) for _ in range(iterations))
+
+        self.assertEqual(dirty_runs("none"), 0)
+        self.assertEqual(dirty_runs("exit"), 0)
+        self.assertEqual(dirty_runs("entry"), iterations)
+        # One CTA is one wave: ``last_wave`` is the entry release.
+        self.assertEqual(dirty_runs("last_wave"), iterations)
 
     def test_graph_replay_sees_the_fill_before_the_kernel(self) -> None:
         x = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)

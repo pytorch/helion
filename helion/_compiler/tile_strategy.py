@@ -35,9 +35,10 @@ from .cute.access_regions import new_loop_instance
 from .cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .cute.masked_packet_load_names import MASKED_PACKET_LOAD_HELPER_NAMES
 from .cute.persistent_branch_vec import PACKET_STORE_BYTES
+from .cute.register_tile_admission import RegisterTileOptions
 from .cute.register_tile_admission import RegisterTileUnsupported
 from .cute.scalar_recipe import PURE_HELPERS
-from .cute.scalar_recipe import is_rounded_fp32_multiply
+from .cute.scalar_recipe import is_rounded_multiply
 from .cute.thread_budget import MAX_THREADS_PER_BLOCK
 from .device_function import DeviceFunction
 from .device_function import TensorArg
@@ -828,6 +829,7 @@ def split_lane_loop_reductions(
     scalar_definitions: dict[str, ast.AST] | None = None,
     rename_groups: dict[str, str] | None = None,
     running_sums: set[str] | None = None,
+    register_tile_options: RegisterTileOptions | None = None,
 ) -> list[ast.AST]:
     """Rewrite single-pass lane loops that contain ``_helion_lane_reduce``
     markers into the two-pass accumulate / finalize / consume structure.
@@ -853,6 +855,7 @@ def split_lane_loop_reductions(
         scalar_definitions=scalar_definitions,
         rename_groups=rename_groups,
         running_sums=running_sums,
+        register_tile_options=register_tile_options,
     )
     pin_atomics_left_in_lane_loops(result)
     return result
@@ -868,6 +871,7 @@ def _split_lane_loop_reductions(
     scalar_definitions: dict[str, ast.AST] | None = None,
     rename_groups: dict[str, str] | None = None,
     running_sums: set[str] | None = None,
+    register_tile_options: RegisterTileOptions | None = None,
 ) -> list[ast.AST]:
     if not any(_find_lane_reduce_call(stmt) is not None for stmt in body):
         return body
@@ -889,6 +893,7 @@ def _split_lane_loop_reductions(
                 proven_scalar_definitions,
                 rename_groups or {},
                 running_sums or set(),
+                register_tile_options,
             )
         )
         _update_proven_uniform_names(stmt, proven_uniform)
@@ -944,6 +949,7 @@ def _split_stmt_lane_reductions(
     scalar_definitions: dict[str, ast.AST],
     rename_groups: dict[str, str],
     running_sums: set[str] | None = None,
+    register_tile_options: RegisterTileOptions | None = None,
 ) -> list[ast.AST]:
     # Recurse into any statement-list-bearing fields first so nested lane
     # loops are rewritten before the enclosing one.
@@ -970,6 +976,7 @@ def _split_stmt_lane_reductions(
                     ),
                     rename_groups=rename_groups,
                     running_sums=running_sums,
+                    register_tile_options=register_tile_options,
                 ),
             )
     lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
@@ -990,6 +997,7 @@ def _split_stmt_lane_reductions(
         body_definitions,
         rename_groups,
         running_sums,
+        register_tile_options,
     )
 
 
@@ -1230,6 +1238,7 @@ def _split_one_lane_loop(
     scalar_definitions: dict[str, ast.AST],
     rename_groups: dict[str, str],
     running_sums: set[str] | None = None,
+    register_tile_options: RegisterTileOptions | None = None,
 ) -> list[ast.AST]:
     from .ast_read_writes import ReadWrites
 
@@ -1265,6 +1274,7 @@ def _split_one_lane_loop(
                         thread_axis_names=thread_axis_names,
                         scalar_definitions=scalar_definitions,
                         rename_groups=rename_groups,
+                        options=register_tile_options,
                     )
                 except RegisterTileUnsupported as failure:
                     register_tile_failure = failure
@@ -1288,6 +1298,7 @@ def _split_one_lane_loop(
                 scalar_definitions=dict(scalar_definitions),
                 rename_groups=rename_groups,
                 running_sums=running_sums,
+                register_tile_options=register_tile_options,
             )
         if register_tile_failure is not None:
             # ``generate_ast`` regenerates the kernel with the rolled lane
@@ -2514,12 +2525,16 @@ def _split_staged_matmul_lane_reductions(
             statement, allow_load=True, allow_reduction=True
         ):
             return None
+    first_marker = min(marker_indices)
     collective_indices = [
         index
         for index, statement in enumerate(body)
         if _contains_unduplicatable_op(statement)
+        # A matmul fold ahead of the reductions is computed once per lane
+        # and read back from its stash, never re-run per pass.
+        or (index < first_marker and _is_fold_dot_assignment(statement))
     ]
-    if collective_indices and min(marker_indices) <= max(collective_indices):
+    if collective_indices and first_marker <= max(collective_indices):
         return None
     transformed = [_clone_stmt(statement) for statement in body]
     prefix: list[ast.AST] = []
@@ -2713,6 +2728,10 @@ def _stashed_collective_dtype(value: ast.AST, before: Sequence[ast.AST]) -> str 
     name = _qualified_name(value.func)
     if name in _CHUNK_REDUCTION_HELPERS and len(value.args) >= 3:
         return _dtype_ctor_from_identity(ast.unparse(value.args[2]))
+    if name == _FOLD_DOT_HELPER and len(value.args) >= 6:
+        # ``fold_dot(lhs, step, rhs, step, valid, identity, ...)`` sums in
+        # its identity's dtype.
+        return _dtype_ctor_from_identity(ast.unparse(value.args[5]))
     if name is None or not name.startswith("cute.arch.warp_reduction_"):
         return None
     if not value.args:
@@ -4851,6 +4870,11 @@ _UNDUPLICATABLE_CALLS = (
     "cute.gemm",
     "warp_reduction",
 )
+# The synthetic-lane matmul fold (``fold_helpers.fold_dot``): a pure K loop
+# over operand re-reads.  Duplicating it into every lane pass is correct but
+# repeats the whole contraction per pass, so the staged splitter stashes its
+# per-lane value like a collective's instead.
+_FOLD_DOT_HELPER = "_cute_fold_dot"
 
 
 def _contains_unduplicatable_op(stmt: ast.AST) -> bool:
@@ -4859,6 +4883,16 @@ def _contains_unduplicatable_op(stmt: ast.AST) -> bool:
     second lane pass."""
     src = ast.unparse(stmt)
     return any(call in src for call in _UNDUPLICATABLE_CALLS)
+
+
+def _is_fold_dot_assignment(stmt: ast.AST) -> bool:
+    """``name = _cute_fold_dot(...)``: a stash-worthy pure per-lane value."""
+    return (
+        _plain_assignment_name(stmt) is not None
+        and isinstance(stmt, ast.Assign)
+        and isinstance(stmt.value, ast.Call)
+        and _qualified_name(stmt.value.func) == _FOLD_DOT_HELPER
+    )
 
 
 def _lane_split_reorders_aliasing_memory(
@@ -5430,6 +5464,18 @@ def _interchange_one_lane_loop(
         return [loop]
     mb_loop = cast("ast.For", body[mb_index])
     if getattr(mb_loop, HELION_VECTOR_REDUCTION_OWNER_ATTR, None) == lane_var:
+        if _is_constexpr_lane_iter(loop):
+            # Only ``nest_reduction_lane_outside_vector_tiles`` makes a tile
+            # lane's one-vector wrapper a trace-time loop, so this reduction
+            # over the tile's own axis sits under a register-tile owner, whose
+            # schedule lowers only the markers the synthetic reduction lane
+            # owns (``cute/register_tile_reductions.py``).  ``generate_ast``
+            # regenerates the kernel with the rolled nesting, where the
+            # wrapper is a rolled loop and the flattening below applies.
+            raise RegisterTileUnsupported(
+                f"a reduction over the tile axis of lane {lane_var} is owned "
+                "by that tile lane, not by the register-tile owner"
+            )
         # These slots partition the SAME reduced axis, unlike an independent
         # serial row loop. Reducing each slot separately overwrites the output.
         return [_flatten_vector_reduction_lane(loop, mb_loop, lane_var)]
@@ -5709,9 +5755,10 @@ def _is_proven_relocatable_call(
             return allow_load
         if call.func.attr == "bitcast":
             return True
-    if is_rounded_fp32_multiply(call):
-        # ``mul.rn.f32`` over two registers: a product kept separately rounded
-        # (``scalar_recipe_rounding``), as pure as the ``*`` it replaces.
+    if is_rounded_multiply(call):
+        # ``mul.rn.{f32,f16,bf16}`` over two registers: a product kept
+        # separately rounded (``scalar_recipe_rounding``), as pure as the
+        # ``*`` it replaces.
         return True
     name = _qualified_name(call.func)
     if name is None:
@@ -5755,6 +5802,12 @@ def _is_proven_relocatable_call(
         # ``_cute_store_*`` convention ``_is_store_call`` relies on.
         # Only the listed helpers: the memory passes collect and measure
         # exactly these, so any other ``_cute_load_*`` stays unproven.
+        return allow_load
+    if name == _FOLD_DOT_HELPER:
+        # The synthetic-lane matmul fold: pure arithmetic over reads of
+        # operand tensors the kernel never writes (``_cute_matmul_reread_unsafe``
+        # proved that before the fold was emitted), so it relocates exactly
+        # like a load of the same tensors.
         return allow_load
     return allow_reduction and (
         name in _CHUNK_REDUCTION_HELPERS or name.startswith("cute.arch.warp_reduction")
@@ -9999,6 +10052,14 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             packed = packed_grid_block(CompileEnvironment.current(), fn.config)
             if packed is not None and packed[0] in block_ids:
                 self._cute_pack_by_block[packed[0]] = packed[1]
+                # The packed axis is a thread axis whether or not the body
+                # observes the tile's elements: the pid itself varies per
+                # sub-group.  A one-element axis used only through
+                # ``tile.id`` / ``tile.begin`` arrives here inactive (no graph
+                # distributes over it), which would otherwise leave the pid
+                # reading a thread axis the launch never raises (or one the
+                # next block owns).
+                self.inactive_block_ids = self.inactive_block_ids - {packed[0]}
         # Per-block vec width for the lane loop (1 = scalar).  Populated
         # from the autotuner-selected ``cute_vector_widths`` config when
         # the block has a lane loop and its ``elements_per_thread`` is

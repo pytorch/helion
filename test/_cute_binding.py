@@ -44,8 +44,17 @@ def _codegen_skip_reason(backend: str) -> str | None:
 
 
 def _cpu_bind(
-    kernel, args, *, capability: tuple[int, int] = (10, 0), num_sm: int | None = None
+    kernel,
+    args,
+    *,
+    capability: tuple[int, int] | None = (10, 0),
+    num_sm: int | None = None,
 ):
+    """Bind ``kernel`` for code generation on a CPU-only process.
+
+    ``capability`` is the compute capability the bound kernel targets; ``None``
+    models an unknown target (``target_device_capability`` without CUDA).
+    """
     if reason := _codegen_skip_reason(kernel.settings.backend):
         raise SkipTest(reason)
     with ExitStack() as stack:

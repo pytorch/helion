@@ -126,6 +126,15 @@ class CuteBlockScaledMmaHeuristic(AutotunerHeuristic):
                 Config.from_dict(seed.config | {"cute_scaled_prepare": "fused"})
                 for seed in narrow
             )
+            # ... and fused with 32-column epilogue chunks (the 512x1024x512
+            # and 1024x2048x1024 winners).
+            seeds.extend(
+                Config.from_dict(
+                    seed.config
+                    | {"cute_scaled_prepare": "fused", "cute_scaled_epilogue_n": 32}
+                )
+                for seed in narrow
+            )
         if env.config_spec.cute_mxfp8_fused_scales_available:
             fused_variants = (
                 (2, 32, 256, 4, 64, True),

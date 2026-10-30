@@ -66,6 +66,20 @@ def _biased_gemm(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _masked_gemm(
+    a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    m, k = a.shape
+    n = b.shape[1]
+    for row, col in hl.tile((m, n)):
+        accumulator = hl.zeros([row, col], dtype=torch.float32)
+        for inner in hl.tile(k):
+            accumulator = torch.addmm(accumulator, a[row, inner], b[inner, col])
+        out[row, col] = accumulator.to(out.dtype) * (mask[row, col] > 0)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _fanout_gemm(
     a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, second: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -233,12 +247,33 @@ def test_rejects_unmodelled_or_overfull_configs(invalid: str) -> None:
     overrides = {
         "overfull_ab": {"tcgen05_ab_stages": 14},
         "overfull_c": {"tcgen05_c_stages": 4},
-        "cluster": {"tcgen05_cluster_n": 2},
+        "cluster": {"tcgen05_cluster_n": 4},
         "layout": {"tcgen05_layout_strategy": "explicit_epi_tile"},
         "clc": {"tcgen05_persistence_model": "clc_persistent"},
     }[invalid]
-    with pytest.raises(helion.exc.InvalidConfig, match="shared memory|two-CTA"):
+    with pytest.raises(helion.exc.InvalidConfig, match="shared memory|two-CTA|cluster"):
         bound.to_code(_config(**overrides))
+
+
+def test_pair_cluster_n2_is_a_modelled_paired_configuration() -> None:
+    # The 2x2 cluster of CTA pairs (A multicast across the N neighbours) only
+    # shapes the mainloop and the scheduler; the per-CTA SMEM model is the
+    # same, so the paired family admits it at the same ring depths.
+    bound = _gemm._bind_isolated(_args())
+    with bound.env:
+        spec = bound.config_spec
+        limit = spec._cute_tcgen05_config._paired_pipeline_stage_limit(
+            spec.normalized_config(_config(tcgen05_ab_stages=2)).config
+        )
+        paired = spec.normalized_config(
+            _config(tcgen05_cluster_n=2, tcgen05_ab_stages=2)
+        )
+    assert limit is not None and limit >= 2
+    assert paired.config["tcgen05_cta_group"] == "two"
+    assert paired.config["tcgen05_cluster_n"] == 2
+    source = bound.to_code(paired)
+    assert "_helion_cute_cluster_shape = (2, 2, 1)" in source
+    assert "CtaGroup.TWO" in source
 
 
 @pytest.mark.parametrize("other", ("bias", "fanout", "no_capacity"))
@@ -337,3 +372,33 @@ def test_cold_search_can_encode_and_repair_deep_geometry_seeds() -> None:
         assert requested["tcgen05_ab_stages"] == 12
         assert requested["tcgen05_cta_group"] == "two"
         assert spec.default_config().config.get("tcgen05_cta_group", "auto") == "auto"
+
+
+@pytest.mark.parametrize("placement", ("post_acc_wait", "pre_acc_wait"))
+def test_exact_shape_auxiliary_epilogue_keeps_the_paired_pipeline(
+    placement: str,
+) -> None:
+    """A 16-bit epilogue reading an exact-shape auxiliary tile (a mask, a
+    residual) loads it per subtile into registers: no shared memory beyond
+    the one-ring budget, so the complete allocation proof and the two-CTA
+    paired pipeline (both auxiliary placements seeded) stay available.
+    Broadcast rows (``bias[col]``) still decline the proof (see
+    ``test_unknown_allocations_keep_conservative_profile``)."""
+    a, b, out = _args()
+    mask = torch.empty_like(out)
+    bound = _masked_gemm._bind_isolated((a, b, mask, out))
+    config = bound.config_spec._cute_tcgen05_config
+    facts = config.pipeline_smem_facts
+    assert facts is not None
+    assert facts.has_auxiliary_loads and facts.rows == ()
+    assert config.paired_pipeline_search_enabled()
+    seeds = config._paired_pipeline_seed_configs()
+    assert {seed.config["tcgen05_aux_load_placement"] for seed in seeds} == {
+        "post_acc_wait",
+        "pre_acc_wait",
+    }
+    fragment = config.optional_fragments(for_search=True)["tcgen05_cta_group"]
+    assert fragment.choices == ("auto", "two")  # type: ignore[attr-defined]
+    code = bound.to_code(_config(tcgen05_aux_load_placement=placement))
+    assert "CtaGroup.TWO" in code
+    assert " > 0.0" in code

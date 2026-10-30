@@ -114,6 +114,40 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    the same uniform stream but rejects these other RNG operations. The policy
    is serialized with settings and emitted reproduction decorators.
 
+.. autoattribute:: Settings.cute_graph_cse
+
+   CuTe only. When ``True`` (the default) duplicate reductions of the traced
+   device IR, and the pure chains between them, are merged before code
+   generation: a ``softmax`` and a ``log_softmax`` of one operand share their
+   ``amax``, ``exp`` and ``sum`` sweeps. Two identical pure operators on the
+   same inputs are bitwise identical, so results never change. Set
+   ``cute_graph_cse=False`` or ``HELION_CUTE_GRAPH_CSE=0`` to keep the graph as
+   traced, which bisects a structural-matcher regression against the pass. The
+   two graphs roll different reduction sweeps, so their configs differ in shape;
+   printed repros record the value in their ``@helion.kernel`` decorator and
+   replay the graph they were emitted from whatever the replay environment.
+
+.. autoattribute:: Settings.cute_exact_division
+
+   CuTe only. When ``True`` (the default) an fp32 division by a scalar that is
+   invariant across an element loop (a softmax row sum, a kernel-wide
+   temperature) hoists the divisor's correctly rounded reciprocal and its
+   admission window out of the loop and divides with the Markstein sequence
+   (``q = RN(x*y)``, ``r = RN(x - d*q)``, ``RN(q + r*y)``), speculated over the
+   loop: when some dividend left the window the loop runs again as written,
+   with ``div.rn.f32`` itself. The result is the IEEE round-to-nearest quotient
+   bit for bit (``helion/_compiler/cute/exact_division.py`` states the
+   argument); set ``cute_exact_division=False`` or
+   ``HELION_CUTE_EXACT_DIVISION=0`` to keep one ``div.rn`` expansion per
+   element; the config knob ``cute_exact_div_form`` (``"redo"``, ``"plain"``)
+   picks the form per kernel, so the autotuner can keep the plain division
+   where a kernel sits at the register cap (the knob is exposed for every
+   kernel whose traced graph divides fp32 by a scalar or a broadcast row value;
+   a loop the redo form cannot re-execute keeps its plain division, and where
+   the pass proves no divisor loop-invariant both forms render identically).
+   ``fast_math`` is unaffected: its fp32 division is the approximate
+   ``cute.math.div``.
+
 .. autoattribute:: Settings.static_shapes
 
    When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``True``.
@@ -227,7 +261,9 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_compile_timeout
 
-   Timeout in seconds for Triton compilation during autotuning. Default is ``60``. Controlled by ``HELION_AUTOTUNE_COMPILE_TIMEOUT``.
+   Timeout in seconds for one precompile subprocess during autotuning, and the benchmark worker's deadline for a
+   candidate's compile and first call (never below ``autotune_benchmark_timeout``; a candidate past it is recorded as
+   failed to compile and the search goes on). Default is ``60``. Controlled by ``HELION_AUTOTUNE_COMPILE_TIMEOUT``.
 
 .. autoattribute:: Settings.autotune_precompile
 
@@ -281,6 +317,10 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.autotune_baseline_rtol
 
    Relative tolerance for baseline output comparison during autotune accuracy checks. Default is ``1e-2``.
+
+.. autoattribute:: Settings.autotune_fp8_accuracy
+
+   How autotune accuracy checks compare fp8 output tensors against the baseline. ``"ulp"`` (default) compares dequantized values: each element must lie within one fp8 ulp plus the tolerances, and the one-ulp differences must not be systematically one-directional. ``"bitwise"`` requires identical bytes whenever every output is fp8 and no explicit tolerance is set. Explicit zero tolerances (``autotune_baseline_atol=0`` with ``autotune_baseline_rtol=0``) select ``"bitwise"`` whatever this setting says. Controlled by ``HELION_AUTOTUNE_FP8_ACCURACY``.
 
 .. autoattribute:: Settings.autotune_search_acf
 
@@ -402,7 +442,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. The result is saved to the cache. |
 | ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |
 | ``HELION_DISALLOW_AUTOTUNING`` | ``check_autotuning_disabled`` | Hard-disable autotuning; kernels must supply explicit configs when this is ``1``. |
-| ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds to wait for Triton compilation during autotuning. |
+| ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds for one precompile subprocess, and for a candidate's compile and first call in the benchmark worker (a candidate past it is recorded as failed to compile). |
 | ``HELION_AUTOTUNE_LOG_LEVEL`` | ``autotune_log_level`` | Adjust logging verbosity; accepts names like ``INFO`` or numeric levels. |
 | ``HELION_AUTOTUNE_LOG`` | ``autotune_log`` | Base filename for per-config CSV telemetry and mirrored autotune logs. |
 | ``HELION_AUTOTUNE_LOG_DETAILS`` | ``autotune_log_details`` | Enable cost-model dataset sidecar (``.meta.jsonl``) with full configs map. |
@@ -412,6 +452,8 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_PRECOMPILE`` | ``autotune_precompile`` | Select the autotuner precompile mode (``"fork"`` (default), ``"spawn"``, or disable when empty). |
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |
 | ``HELION_CUTE_RNG_STREAM`` | ``cute_rng_stream`` | CuTe RNG policy: ``auto``, ``word0`` or ``philox4``. |
+| ``HELION_CUTE_GRAPH_CSE`` | ``cute_graph_cse`` | Set to ``0`` to keep duplicate reductions (and the pure chains between them) of the traced device IR as traced on CuTe, for bisecting structural-matcher regressions. Default ``1``; results are bitwise identical either way. |
+| ``HELION_CUTE_EXACT_DIVISION`` | ``cute_exact_division`` | Set to ``0`` to keep one ``div.rn.f32`` per element for fp32 divisions by a loop-invariant scalar on CuTe instead of the hoisted bit-exact Markstein sequence. Default ``1``; results are bitwise identical either way. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |
@@ -427,7 +469,8 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_BEST_AVAILABLE_MAX_CONFIGS`` | ``autotune_best_available_max_configs`` | Maximum cached configs to seed when using ``from_best_available`` strategy. |
 | ``HELION_BEST_AVAILABLE_MAX_CACHE_SCAN`` | ``autotune_best_available_max_cache_scan`` | Maximum cache files to scan when using ``from_best_available`` strategy. |
 | ``HELION_REBENCHMARK_THRESHOLD`` | ``autotune_rebenchmark_threshold`` | Re-run configs whose performance is within a multiplier of the current best. |
-| ``HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS`` | (effort profile ``final_selection``) | Rounds of the full-effort final selection, which picks the returned config with harness-grade windows after the search (and after the finishing phase and any backend refinement): a 5 s thermal warmup, one 500+500 ms screen of the retained shortlist when it is longer than the finalists, then the best 8 survivors plus the best seed and the search's incumbent run 4 rounds of 500+500 ms steady windows in alternating order; the median across rounds decides and a finalist that misses a round cannot win. This adds about 60-150 s to every full-effort autotune on every backend (the search's own 50-200 ms windows mis-rank finalists by 3-6% on power-limited GPUs, and a window needs about 500 ms of warmup after the idle gap between windows before the B200 power limiter settles). ``0`` restores the single-pass final verification and its ``HELION_AUTOTUNE_FINAL_REBENCHMARK_*`` knobs, which the selection otherwise ignores (warned once). Under ``HELION_AUTOTUNE_BUDGET_SECONDS`` the search phase keeps the phase's estimated time back plus the wall time of one search generation (the generation in flight finishes its benchmark pass after the budget check); together they take at most a quarter of the budget, so a long generation shortens the selection rather than the search, except that the selection's smallest plan (up to four finalists: two survivors plus the seed and the incumbent, two rounds, no screen or thermal warmup, about 11-17 s) stays reserved past that generation whenever a quarter of the budget covers it (budgets under about 70 s do not, and skip the selection). The phase is sized to whatever is left when it starts: the screen goes first, then rounds (down to 2), then survivors (down to 2), then the thermal warmup; it is skipped when even that does not fit. |
+| ``HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS`` | (effort profile ``final_selection``) | Rounds of the full-effort final selection, which picks the returned config with harness-grade windows after the search (and after the finishing phase and any backend refinement): a 5 s thermal warmup, one 500+500 ms screen of the retained shortlist when it is longer than the finalists, then the best 8 survivors plus the best seed and the search's incumbent run 4 rounds of 500+500 ms steady windows in alternating order; the median across rounds decides and a finalist that misses a round cannot win. Where the kernel's surface names family knobs (knobs whose value picks a distinct kernel body, such as the CuTe flash pipeline family), the best shortlisted config of up to 2 families the ranking would drop, each within 1.25x of the best reading, joins the shortlist and the survivors (``F`` rows of the final-selection table): the search's short windows run at boost clocks while the steady windows run at the sustained, power-capped clock, which depends on the body's energy per call, so a body the search ranks 1-6% behind can win the windows. This adds about 60-150 s to every full-effort autotune on every backend (the search's own 50-200 ms windows mis-rank finalists by 3-6% on power-limited GPUs, and a window needs about 500 ms of warmup after the idle gap between windows before the B200 power limiter settles). ``0`` restores the single-pass final verification and its ``HELION_AUTOTUNE_FINAL_REBENCHMARK_*`` knobs, which the selection otherwise ignores (warned once). Under ``HELION_AUTOTUNE_BUDGET_SECONDS`` the search phase keeps the phase's estimated time back plus the wall time of one search generation (the generation in flight finishes its benchmark pass after the budget check); together they take at most a quarter of the budget, so a long generation shortens the selection rather than the search, except that the selection's smallest plan (up to four finalists: two survivors plus the seed and the incumbent, two rounds, no screen or thermal warmup, about 11-17 s) stays reserved past that generation whenever a quarter of the budget covers it (budgets under about 70 s do not, and skip the selection). The phase is sized to whatever is left when it starts: the screen goes first, then the second regime's column, then the family quota, then rounds (down to 2), then survivors (down to 2), then the thermal warmup; it is skipped when even that does not fit. |
+| ``HELION_AUTOTUNE_TARGET_REGIME`` | (effort profile ``final_selection``) | The L2 regime the full-effort final selection selects by. The search times candidates in the regime of ``HELION_AUTOTUNE_L2_FLUSH`` (``call``: flush before every timed call, the default; ``replay``: one flush, then a burst of back-to-back calls; ``0``: never flushed) and the final selection in ``HELION_AUTOTUNE_FINAL_L2_FLUSH`` (default: the search's regime, ``replay`` for a resident search). A warm regime dilutes a kernel's cold start to a fraction of a reading, so finalists that differ only in how the first call treats its operands (an L2 eviction hint on a state load, a prefetch, a pipeline depth) tie there while they differ by 20-40% per call flushed. Unset or ``auto``: the finalists tied within the policy's ``tie_tolerance`` (1%) of the best median in a ``replay`` or ``0`` selection are timed again for ``tiebreak_rounds`` (2) rounds of the same windows in the ``call`` regime and the cold medians break the tie (the warm pick stands unless a tied rival is faster cold by more than the tolerance); a ``call`` selection takes no second column. ``call`` / ``replay`` / ``0``: every finalist is timed in that regime as well (when it is not the selection's regime already) and that column selects outright, the finalists' recorded time being its median; set it to the regime the kernel is scored in. The final-selection table reports both columns; the second column costs ``tiebreak_rounds`` windows per finalist timed in it, is the second item shed under a budget, and is reserved for only where the regimes call for one. This is not ``HELION_AUTOTUNE_FINAL_L2_FLUSH``, which moves the whole phase (shortlist screen, survivors and rounds) into one regime: under ``TARGET_REGIME=call`` on a ``replay`` selection the shortlist is still screened warm, so a shortlist member that is good only cold can be screened out before the ``call`` column sees it; ``FINAL_L2_FLUSH=call`` is the cheaper choice when only the per-call flushed pick matters, the target regime the one for seeing both columns. |
 | ``HELION_AUTOTUNE_PROGRESS_BAR`` | ``autotune_progress_bar`` | Enable or disable the progress bar UI during autotuning. |
 | ``HELION_AUTOTUNE_IGNORE_ERRORS`` | ``autotune_ignore_errors`` | Continue autotuning even when recoverable runtime errors occur. |
 | ``HELION_AUTOTUNE_CONFIG_OVERRIDES`` | ``autotune_config_overrides`` | Supply JSON forcing particular autotuner config key/value pairs. |
@@ -438,6 +481,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_CACHE`` | ``autotune_cache`` | Cache class to use (``"LocalAutotuneCache"`` (default), ``"StrictLocalAutotuneCache"``, ``"RemoteAutotuneCache"``, ``"StrictRemoteAutotuneCache"``, ``"AOTAutotuneCache"``). |
 | ``HELION_REMOTE_CACHE_BACKEND`` | (used by ``RemoteAutotuneCache`` and warm-start) | Fully-qualified class path to a ``RemoteCacheBackend`` subclass (e.g. ``mypackage.cache.RedisBackend``); enables remote read-through/write-through caching and, when the backend overrides ``list()``, remote warm-start lookups for ``from_best_available`` / ``helion.from_cache``. |
 | ``HELION_BENCHMARK_CUDAGRAPH`` | (benchmarking) | Wrap ``run_example``'s timing loop in CUDA-graph capture/replay so launch overhead is amortized for both helion and the torch baseline. Defaults on inside ``run_example``, off elsewhere. Set ``0`` to opt out; ``1`` to enable globally. Capture silently falls back to non-CG if unavailable (HIP, no CUDA, nested capture). Note: ``=1`` globally also applies during autotune, which is counterproductive — each of thousands of configs triggers a fresh capture (warmup + sync per config, no reuse across configs since launch parameters differ), captured graphs accumulate memory pool allocations, and many configs raise on capture due to shape/stride differences across the search space. Prefer leaving unset (default off in autotune, on in ``run_example``). When it is on, kernels whose single replay takes under 64 us are timed as one captured graph holding several flushed calls minus a graph of the same flushes, because a lone replay carries the graph launch latency (4-6 us on B200, in ~2 us steps) and would read the same value for every short kernel. |
+| ``HELION_BENCHMARK_GRAPH_WARMUP`` | (benchmarking) | Before the first CUDA graph a benchmark captures, drive the process into its steady graph-dispatch state (16 eager launches on side streams, kept alive; ``steady_graph_dispatch``). A fresh process replays graphs with shorter inter-kernel gaps until it has launched about ten kernels on non-default streams, then every graph of the process replays slower for its lifetime, so without the warm-up the first candidates are ranked in one state and the rest in another. Runs once per device per process; a warm-up that cannot run is skipped (and retried at the next capture), never fatal. Defaults on; set ``0`` to measure the fast state itself (the example catalogue drivers pass this variable through to their workers). Any other value logs a warning and keeps the default. |
 | ``HELION_PRINT_OUTPUT_CODE`` | ``print_output_code`` | Print generated Triton code to stderr for inspection. |
 | ``HELION_PRINT_REPRO`` | ``print_repro`` | Print Helion kernel code, config, and caller code to stderr as a standalone repro script. |
 | ``HELION_OUTPUT_ORIGIN_LINES`` | ``output_origin_lines`` | Include ``# src[...]`` comments in generated Triton code; set to ``0`` to disable. |

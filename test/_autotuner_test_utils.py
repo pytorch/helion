@@ -45,6 +45,7 @@ _FINAL_REBENCHMARK_ENV_KEYS = (
     "HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS",
     "HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED",
     "HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE",
+    "HELION_AUTOTUNE_FINAL_REBENCHMARK_MAX_SPREAD",
 )
 # Pin the architecture and SM count for config-space golden tests. The matmul-seed
 # heuristics are hardware-gated and use the SM count for wave sizing, so which
@@ -406,3 +407,61 @@ class AutotunerTestCase(RefEagerTestDisabled, TestCase):
         )
         search.kernel.compile_config = compile_config  # pyrefly: ignore[bad-assignment]
         return search, args, reference_block, promoted
+
+    @staticmethod
+    def _promoted_baseline_search(
+        promoted_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None,
+        attempted: list[int],
+        reference_error: Exception | None = None,
+    ) -> tuple[FiniteSearch, tuple[torch.Tensor, torch.Tensor], int, int]:
+        """A search whose kernel has a promoted execution default: a compiler
+        default config at another block size than the autotuning reference
+        config's.  The baseline runs the default and then the reference and
+        compares the two (``_compute_reference_baseline``).
+
+        ``promoted_fn`` stands in for the default's compiled kernel (None:
+        the real one); ``reference_error`` makes every compile of the
+        reference config and its shrinks fail.  Returns the search, the
+        arguments, the reference block size and the promoted block size.
+        """
+
+        @helion.kernel(autotune_log_level=0, autotune_benchmark_subprocess=False)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([1024], device=DEVICE),
+            torch.randn([1024], device=DEVICE),
+        )
+        bound = add.bind(args)
+        spec = bound.config_spec
+        reference_block = spec.autotune_reference_config()["block_sizes"][0]
+        promoted_block = reference_block * 2 if reference_block < 512 else 64
+        spec.compiler_default_config = helion.Config(block_sizes=[promoted_block])
+        assert spec.default_config()["block_sizes"][0] == promoted_block
+        assert promoted_block != reference_block
+        original = bound.compile_config
+
+        def compile_config(config: helion.Config, **kwargs: object) -> object:
+            block = config["block_sizes"][0]
+            attempted.append(block)
+            if block == promoted_block:
+                if promoted_fn is not None:
+                    return promoted_fn
+            elif reference_error is not None:
+                raise reference_error
+            return original(config, **kwargs)  # pyrefly: ignore[bad-argument-type]
+
+        search = FiniteSearch(
+            bound,
+            args,
+            configs=[
+                helion.Config(block_sizes=[16], num_warps=4),
+                helion.Config(block_sizes=[32], num_warps=4),
+            ],
+        )
+        search.kernel.compile_config = compile_config  # pyrefly: ignore[bad-assignment]
+        return search, args, reference_block, promoted_block

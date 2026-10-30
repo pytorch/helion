@@ -305,14 +305,17 @@ def test_actual_store_and_bias_addresses_preserve_vector_tail_bounds(n):
         if isinstance(node, ast.If) and "cutlass.Int64(row)" in ast.unparse(node.test)
     ]
     assert len(stores) == 1
-    destination = next(
-        node.value
-        for node in ast.walk(stores[0])
-        if isinstance(node, ast.Assign)
-        and ast.unparse(node.targets[0]) == "destination"
-    )
+    # The store address is one 64-bit base per chunk (the first packet's row)
+    # advanced by a stride multiple per packet; evaluate base + packet * step.
+    rows = next(n for n in kernel.body if isinstance(n, ast.While))
+    assigned = {
+        ast.unparse(node.targets[0]): node.value
+        for node in rows.body
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+    }
     condition = compile(ast.Expression(stores[0].test), "<actual_store_guard>", "eval")
-    address = compile(ast.Expression(destination), "<actual_store_address>", "eval")
+    base = compile(ast.Expression(assigned["destination"]), "<store_base>", "eval")
+    step = compile(ast.Expression(assigned["out_step"]), "<store_step>", "eval")
     bias_loop = next(
         node
         for node in ast.walk(kernel)
@@ -346,11 +349,13 @@ def test_actual_store_and_bias_addresses_preserve_vector_tail_bounds(n):
             scope["n_base"] = nb
             for offset in range(0, length + 128, 128):
                 for t in range(512):
-                    scope.update(t=t, length=length)
+                    scope.update(t=t, length=length, first_row=offset + t // 16)
+                    chunk_base = eval(base, scope)
+                    chunk_step = eval(step, scope)
                     for packet in range(4):
                         scope["row"] = offset + t // 16 + packet * 32
                         if eval(condition, scope):
-                            first = eval(address, scope)
+                            first = chunk_base + packet * chunk_step
                             assert first % 4 == 0
                             got.update(range(first, first + 4))
             for column in range(0, 64, 2):

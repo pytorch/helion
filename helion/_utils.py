@@ -24,9 +24,10 @@ def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
-def prev_power_of_2(n: int) -> int:
-    """Return the largest power of 2 <= n (>= 1). Use this to floor a budget to a valid
-    pow2 tile: ``next_power_of_2`` would round UP past the budget."""
+def prev_power_of_2(n: int, max_value: int | None = None) -> int:
+    """Floor a budget and optional maximum to a power of two (at least 1)."""
+    if max_value is not None:
+        n = min(n, max_value)
     if n <= 1:
         return 1
     return 1 << (n.bit_length() - 1)

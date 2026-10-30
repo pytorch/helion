@@ -20,9 +20,11 @@ from .._compiler.compile_environment import shape_env_var_hints
 from .._compiler.cute.cute_warp_mma_gemm import WARP_MMA_MIN_BM
 from .._compiler.cute.cute_warp_mma_gemm import WARP_MMA_MIN_BN
 from .._compiler.cute.matmul_utils import cute_outer_accumulates_result
+from .._compiler.cute.tcgen05_constants import RAGGED_BATCHED_MIN_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
@@ -303,8 +305,9 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> int:
                     pass
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
             # Let the autotuner try output block sizes larger than a small matmul
-            # dimension: masked rows/cols can map to a more efficient MMA tile.
-            if is_output_dim and env.backend_name == "triton":
+            # dimension: masked rows/cols can map to a more efficient MMA tile
+            # (on the backends whose lowerings pad such tiles).
+            if is_output_dim and env.backend.pads_small_matmul_dims:
                 try:
                     spec = env.config_spec.block_sizes.block_id_lookup(block_idx)
                 except KeyError:
@@ -545,7 +548,19 @@ def _plan_cute_tcgen05_search_candidate(
             and not is_tf32
         )
         or rhs.dtype != lhs.dtype
-        or m_hint < 64
+        # Fewer than 64 static rows run as one zero-filled 64-row tile on the
+        # flat pipeline (decode GEMMs: bf16 16x14336x4096 27 us against the
+        # SIMT fallback's 358 us); a dynamic M keeps the 64-row floor, and a
+        # single row stays SIMT (a TMA box over an extent-1 dimension ran
+        # 1x4096x4096 at 327 us against 20 us for two rows).
+        or (
+            m_hint < 64
+            if static_m is None
+            # Only the memory-bound decode shapes profit from the padded
+            # tile; a tiny GEMM (33^3) keeps the SIMT lowering, which wins
+            # there (2.8 us against the tile's 13.8).
+            else static_m < 2 or (static_m < 64 and (n_hint < 128 or k_hint < 128))
+        )
         # Size-one tile axes are fixed to block size one before this analysis,
         # so they cannot carry the minimum tcgen05 instruction tile.
         or (static_n is not None and static_n < 2)
@@ -625,15 +640,31 @@ def _plan_cute_tcgen05_search_candidate(
         if static_m is not None and static_n is not None and static_k is not None:
             if static_m % min_search_m != 0:
                 min_search_m = 64
-            max_search_m = min(max_search_m, static_m & -static_m)
-            max_search_n = min(max_search_n, static_n & -static_n)
-            max_search_k = min(max_search_k, static_k & -static_k)
             if (
-                max_search_m < min_search_m
-                or max_search_n < min_search_n
-                or max_search_k < mma_k
+                (lhs.ndim < 3 and rhs.ndim < 3)
+                or max_search_n < RAGGED_BATCHED_MIN_BLOCK_N
+                or not env.settings.cute_flat_edge_tma
             ):
-                return reject()
+                # The passthrough axis is the kernel's, not an operand's (a
+                # grouped GEMM whose group tile selects rows through offsets;
+                # its families register whole native tiles), or N admits no
+                # tile the ragged batched pipeline lowers: the search keeps
+                # the power-of-two divisors of the extents.
+                max_search_m = min(max_search_m, static_m & -static_m)
+                max_search_n = min(max_search_n, static_n & -static_n)
+                max_search_k = min(max_search_k, static_k & -static_k)
+                if (
+                    max_search_m < min_search_m
+                    or max_search_n < min_search_n
+                    or max_search_k < mma_k
+                ):
+                    return reject()
+            # Ragged batched extents keep the plain GEMM's search ceilings:
+            # the flat one-CTA pipeline loads partial tiles and the K tail
+            # through TMA and stores them with predicated SIMT copies, as it
+            # does for a rank-2 GEMM (bf16 16x1000^3 ran the SIMT fallback at
+            # 182 us against cuBLAS's 37 us when the tiles had to divide the
+            # extents).
     if (
         static_m is not None
         and static_n is not None
@@ -760,8 +791,14 @@ def enable_cute_tcgen05_search(
     explicit_epi_tile_compatible: bool,
     leading_block_id: int | None = None,
     warp_mma_plain_kernel: bool = True,
+    output_dtype_bytes: int | None = None,
+    output_stores: int = 1,
 ) -> None:
-    """Apply one preflighted tcgen05 search plan to the shared config."""
+    """Apply one preflighted tcgen05 search plan to the shared config.
+
+    ``output_dtype_bytes`` / ``output_stores`` size the TMA-store rings the
+    AB-stage fit estimate charges (``None``: AB-only estimate).
+    """
     env = CompileEnvironment.current()
     spec = env.config_spec
     spec.register_cute_tcgen05_mma_analysis(
@@ -781,6 +818,12 @@ def enable_cute_tcgen05_search(
     max_search_n = plan.max_search_n
     max_search_k = plan.max_search_k
     spec.cute_tcgen05_search_enabled = True
+    if static_m is not None and static_m < plan.min_search_m:
+        # The frontend left the M search ceiling at the extent; the tcgen05
+        # tile needs ``min_search_m`` rows (TMA zero-fills the rows past M
+        # and the SIMT epilogue masks their stores). bf16 16x14336x4096 ran
+        # the SIMT fallback at 358 us against cuBLAS's 25 us without it.
+        spec.block_sizes.block_id_lookup(m_block_id).allow_overshoot(plan.min_search_m)
     max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
     if static_m is None or static_n is None or static_k is None:
         allow_full_tile_persistent_pid_types = False
@@ -889,8 +932,28 @@ def enable_cute_tcgen05_search(
                     work_clusters < num_sms // 4 <= one_wave_work_clusters
                 )
                 work_clusters = max(work_clusters, one_wave_work_clusters)
+            if allow_edge_cluster_m2_search and input_dtype.itemsize == 2:
+                # The 16-bit edge family also runs 128x128 CTA pairs
+                # (``CuteTcgen05Config.plain_edge_pair128_admitted``: each CTA
+                # owns 64 rows), so its work is counted in 128x128 tiles,
+                # partial ones included: a ragged bf16 1000^3 GEMM has 16
+                # 256x256 pairs but 64 of 128x128, enough to keep the two-CTA
+                # search on (cuBLAS runs it as a 2x1-cluster 64x112 kernel;
+                # the 128x128 pair ran 7.2 us against the flat one-CTA
+                # winner's 8.4). fp8 kernels keep the pair count above.
+                # Auxiliary epilogues are detected after planning
+                # (``cute_tcgen05_aux_kernel_detected``), so a 16-bit kernel
+                # with one is admitted on this count too and runs the
+                # family's 256x256 pairs, which the pair-128 gate excludes.
+                edge_work_clusters = (
+                    plan.leading_work_multiplier
+                    * -(-static_m // TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK)
+                    * -(-static_n // TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK)
+                )
+                work_clusters = max(work_clusters, edge_work_clusters)
             if work_clusters < num_sms // 4:
                 allow_cluster_m2_search = False
+                allow_edge_cluster_m2_search = False
                 allow_fp8_small_grid_cluster_m2_search = False
                 allow_one_wave_cluster_m2_search = False
     spec.narrow_tcgen05_autotune_to_validated_configs(
@@ -905,6 +968,8 @@ def enable_cute_tcgen05_search(
         cluster_m2_one_wave_only=one_wave_only_cluster_m2_search,
         ab_stages_three_dtype_bytes=lhs.dtype.itemsize,
         ab_stages_three_device=lhs.device,
+        ab_stages_three_output_dtype_bytes=output_dtype_bytes,
+        ab_stages_three_output_stores=output_stores,
         reason="matmul kernel with CuTe tcgen05 backend",
     )
     if plan.small_n_requires_role_local_tma:

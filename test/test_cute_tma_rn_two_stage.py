@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from helion._testing import skipUnlessCuteAvailable
+
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
@@ -81,6 +83,7 @@ def low_schedule(bound, ctas=1, **changes):
     return flat_grouped_rna_schedule(bound.env, proof, **kwargs)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("operand", ["A", "B"])
 def test_actual_SDK_two_stage_layout_and_TMA_bytes(operand):
     with ir.Context(), ir.Location.unknown():

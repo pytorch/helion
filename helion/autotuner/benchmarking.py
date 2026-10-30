@@ -62,6 +62,12 @@ _REPLAY_BATCH_MAX_CALLS = 256
 # the search regime (see ``final_selection_l2_flush_mode``).
 _FINAL_L2_FLUSH_ENV = "HELION_AUTOTUNE_FINAL_L2_FLUSH"
 _L2_FLUSH_MODES = ("call", "off", "replay")
+# The regime the final selection selects by (see
+# ``final_selection_second_regime``): ``auto`` (unset) ranks in the final
+# selection's regime and, when that is a warm one (``replay`` / ``off``),
+# breaks ties within the policy's noise band by a per-call-flushed column;
+# ``call`` / ``replay`` / ``0`` select by that regime's column outright.
+_TARGET_REGIME_ENV = "HELION_AUTOTUNE_TARGET_REGIME"
 
 
 def _l2_flush_mode() -> str:
@@ -125,6 +131,46 @@ def final_selection_l2_flush_mode() -> str:
         return explicit
     search = _l2_flush_mode()
     return "replay" if search == "off" else search
+
+
+def final_selection_target_regime() -> str:
+    """The regime the final selection selects by: ``auto`` or one of
+    ``_L2_FLUSH_MODES`` (``HELION_AUTOTUNE_TARGET_REGIME``)."""
+    raw = os.environ.get(_TARGET_REGIME_ENV)
+    if raw is None or not raw.strip() or raw.strip().lower() == "auto":
+        return "auto"
+    regime = _l2_flush_mode_from_env(_TARGET_REGIME_ENV)
+    assert regime is not None
+    return regime
+
+
+def final_selection_second_regime(regime: str) -> str | None:
+    """The second regime the final selection times its finalists in when it
+    ranks them in ``regime``, ``None`` when one column decides.
+
+    A warm regime (``replay``: one flush, then a burst of back-to-back
+    calls; ``off``: never flushed) dilutes a kernel's cold start to a
+    fraction of a reading, so finalists that differ only in how they
+    treat the first call's operands (an L2 eviction hint on a state load,
+    a prefetch, a pipeline depth) tie there within the steady windows'
+    noise while they differ by 20-40% per call flushed. Under the default
+    target (``auto``) the final selection therefore times the finalists
+    tied within its tie tolerance in the ``call`` regime as well and lets
+    that cold column break the tie; the per-call flushed regime ranks
+    alone (a cold reading already carries the warm one's steady state).
+    An explicit ``HELION_AUTOTUNE_TARGET_REGIME`` names the regime the
+    kernel is scored in: every finalist is timed in it in addition to
+    ``regime`` and that column selects outright. ``regime`` names a timer
+    that cannot honour the regimes (a backend's own steady bench, a
+    wall-clock bench) when it is not one of ``_L2_FLUSH_MODES``: no
+    second column then.
+    """
+    if regime not in _L2_FLUSH_MODES:
+        return None
+    target = final_selection_target_regime()
+    if target == "auto":
+        return "call" if regime in ("replay", "off") else None
+    return None if target == regime else target
 
 
 _MIRRORED_BENCH_MAX_SWEEPS = 64
@@ -194,9 +240,118 @@ def _cudagraph_unavailable_reason() -> str | None:
     return None
 
 
+# The CUDA graph dispatch state of a process (``steady_graph_dispatch``).
+_GRAPH_WARMUP_ENV = "HELION_BENCHMARK_GRAPH_WARMUP"
+_GRAPH_WARMUP_LAUNCHES = 16
+_GRAPH_WARMUP_NOTE = (
+    f"{_GRAPH_WARMUP_LAUNCHES} eager launches on side streams before the first "
+    "timed graph (helion.autotuner.benchmarking.steady_graph_dispatch)"
+)
+_GRAPH_WARMUP_OPTED_OUT = f"skipped: {_GRAPH_WARMUP_ENV}=0"
+_graph_warmup_kept: list[object] = []
+# Device index -> the note of the warm-up that ran there.
+_graph_warmup_notes: dict[int, str] = {}
+
+
+def _graph_warmup_launch(x: torch.Tensor) -> object:
+    """One eager launch on a fresh side stream of ``x``'s device, ordered
+    after the device's current stream (``x`` is filled there, and side
+    streams do not synchronize with it implicitly) and before its next
+    work.  Returns what must stay alive."""
+    side = torch.cuda.Stream(device=x.device)
+    side.wait_stream(torch.cuda.current_stream(x.device))
+    with torch.cuda.stream(side):
+        y = x * 2
+    torch.cuda.current_stream(x.device).wait_stream(side)
+    torch.cuda.synchronize(x.device)
+    return y
+
+
+def _graph_warmup_enabled() -> bool:
+    """``HELION_BENCHMARK_GRAPH_WARMUP``; a value that is not a boolean
+    literal keeps the default (on) with a warning instead of raising: the
+    read happens inside every graph capture and every worker job, where an
+    exception would silently drop CUDA-graph timing (in-process callers
+    swallow it) or fail every candidate (the worker reports it per job)."""
+    try:
+        return _env_get_bool(_GRAPH_WARMUP_ENV, default=True)
+    except ValueError as error:
+        _log.warning(f"{error}; the CUDA graph dispatch warm-up stays on")
+        return True
+
+
+def _graph_warmup_device_index(device: torch.device | str | int | None) -> int:
+    if device is None:
+        return torch.cuda.current_device()
+    index = torch.device(device).index
+    return torch.cuda.current_device() if index is None else index
+
+
+def steady_graph_dispatch(device: torch.device | str | int | None = None) -> str:
+    """Drive this process into its steady CUDA graph dispatch state, once.
+
+    A fresh process replays CUDA graphs with a shorter gap between kernel
+    nodes (0.37 us against 0.55 us on B200, torch 2.16 / CUDA 13) until it
+    has launched about ten kernels on streams other than the default one;
+    from then on every graph of the process, old or new, replays in the
+    slower steady state for the life of the process (destroying graphs,
+    ``empty_cache``, the replay stream, the number of graphs captured and
+    the memory they hold make no difference; eight launches on one side
+    stream flip it, eight event waits without launches do not).  Every
+    graph capture here warms its callable up on a side stream first, so
+    without this the first two candidates of a benchmark are captured in
+    one state and the rest in another, and a harness's second graph reads
+    faster than its third (a 16-call graph of a 7.7 us call read 7.8 us per
+    call, the 64-call graph after it 9.8).  Any long-running PyTorch process
+    (autograd, data loading, collectives, ``torch.compile`` graph trees all
+    launch on side streams) runs in the steady state, so that is the state
+    to rank candidates in.
+
+    Issues ``_GRAPH_WARMUP_LAUNCHES`` eager launches on fresh side streams of
+    ``device`` (the current device by default; the state was measured per
+    process on one device, so a benchmark whose arguments live elsewhere
+    passes their device and the warm-up runs once per device), keeps their
+    outputs alive, and returns a note describing the warm-up; later calls
+    for that device return the same note without doing anything.  Always
+    returns a description of the state the caller's graphs will run in:
+    the note, ``skipped: HELION_BENCHMARK_GRAPH_WARMUP=0`` (the opt-out, for
+    measuring the fast state itself), ``skipped: <why CUDA graphs are
+    unavailable here>``, or ``failed: <error>`` when the launches raised
+    (never fatal: the process stays in whatever state it is in and the next
+    call tries again, the failure being cheap and immediate).  Every CUDA
+    graph the benchmarking helpers capture (``do_bench``,
+    ``interleaved_bench``, ``do_bench_cuda_graph``) is preceded by this
+    call, as is the catalogue harness's first timed graph.
+    """
+    if not _graph_warmup_enabled():
+        return _GRAPH_WARMUP_OPTED_OUT
+    reason = _cudagraph_unavailable_reason()
+    if reason is not None:
+        return f"skipped: {reason}"
+    try:
+        index = _graph_warmup_device_index(device)
+        note = _graph_warmup_notes.get(index)
+        if note is not None:
+            return note
+        x = torch.ones(1024, device=torch.device("cuda", index))
+        kept = [_graph_warmup_launch(x) for _ in range(_GRAPH_WARMUP_LAUNCHES)]
+    except Exception as error:
+        _log.debug("CUDA graph dispatch warm-up failed; skipping", exc_info=True)
+        return f"failed: {type(error).__name__}: {error}"
+    _graph_warmup_kept.extend(kept)
+    _graph_warmup_notes[index] = _GRAPH_WARMUP_NOTE
+    return _GRAPH_WARMUP_NOTE
+
+
+def _reset_graph_warmup_for_tests() -> None:
+    _graph_warmup_kept.clear()
+    _graph_warmup_notes.clear()
+
+
 def _make_cudagraph_replay(fn: Callable[[], T]) -> Callable[[], T]:
     from ..runtime import cute_cuda_graph
 
+    steady_graph_dispatch()
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         fn()
@@ -425,6 +580,7 @@ def _make_batched_cudagraph_replay(
     """
     from ..runtime import cute_cuda_graph
 
+    steady_graph_dispatch()
     if fn is not None:
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
@@ -1395,6 +1551,10 @@ def do_bench_cuda_graph(
     reason = _cudagraph_unavailable_reason()
     if reason is not None:
         raise RuntimeError(f"GPU-only CUDA graph timing is unavailable: {reason}")
+    # The handoff evaluation times every candidate through this function in
+    # one process; without this its first ~ten candidates would be captured
+    # in the fast dispatch state and the rest in the steady one.
+    steady_graph_dispatch()
     if grad_to_none is not None:
         raise ValueError("CUDA graph timing requires an explicit device reset callback")
     if fixed_repetitions is not None and fixed_repetitions < 1:
