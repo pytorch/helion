@@ -3922,6 +3922,50 @@ class TestPallas(TestCase):
             f"identical jit_fns should give a near-zero paired delta; got {delta_micros!r}",
         )
 
+    def test_wall_clock_benches_time_failed_executions_as_inf(self) -> None:
+        from unittest.mock import patch
+
+        from helion.autotuner import benchmarking
+
+        with patch.object(benchmarking, "_execution_failed", return_value=True):
+            for probe_long_kernel in (False, True):
+                self.assertEqual(
+                    benchmarking.do_bench_generic(
+                        lambda: None,
+                        return_mode="median",
+                        fixed_repetitions=None if probe_long_kernel else 3,
+                        probe_long_kernel=probe_long_kernel,
+                    ),
+                    math.inf,
+                )
+
+        ok_calls = 0
+        failing_calls = 0
+
+        def ok() -> str:
+            nonlocal ok_calls
+            ok_calls += 1
+            return "ok"
+
+        def failing() -> str:
+            nonlocal failing_calls
+            failing_calls += 1
+            return "failed"
+
+        with patch.object(
+            benchmarking,
+            "_execution_failed",
+            side_effect=lambda output: output == "failed",
+        ):
+            timings = benchmarking.interleaved_bench_generic([ok, failing], repeat=5)
+        self.assertTrue(math.isfinite(timings[0]), timings)
+        # Only the candidate whose output fails on the device is scored as inf.
+        self.assertEqual(timings[1], math.inf)
+        # 1 warm-up + 5 timed repeats for ok; 1 warm-up + 1 failed timed run
+        # for failing (not re-run after failing).
+        self.assertEqual(ok_calls, 6)
+        self.assertEqual(failing_calls, 2)
+
     @skipIfPallasInterpret(
         "device-sync semantics need a real TPU; CPU-interpret executes synchronously"
     )
