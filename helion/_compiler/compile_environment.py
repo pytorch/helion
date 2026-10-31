@@ -559,6 +559,11 @@ class CompileEnvironment:
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
+        # The specialized_vars that were 1 at this binding. Unlike
+        # hl.specialize, they can differ between bindings of one signature,
+        # whose dispatch schema the first binding publishes; each stays a
+        # guard fact so it keys every bound kernel.
+        self.singleton_vars: set[sympy.Symbol] = set()
         # Input sizes code generation relied on being equal (a block store
         # bounded by its tensor covering the tile's loop) only at this
         # binding's values; like a guard, each keys the bound kernel.
@@ -2056,6 +2061,7 @@ class CompileEnvironment:
             # cache key. Capture symbols before evaluating the equality, which
             # may replace the backed expression with the constant one.
             self.specialized_vars.update(symbols)
+            self.singleton_vars.update(symbols)
         return singleton
 
     def known_equal(self, a: int | torch.SymInt, b: int | torch.SymInt) -> bool:
@@ -2451,6 +2457,17 @@ class BlockSizeInfo:
     # input size to the literal.  Cleared once a known-equal non-literal size
     # (a full slice of a specialized dim) joins it.
     literal_size: bool = False
+    # Merging can retire an axis while its stable ID must remain addressable.
+    retired: bool = False
+
+    @property
+    def is_tile(self) -> bool:
+        return not self.reduction and not self.retired
+
+    def retire_reduction(self) -> None:
+        assert self.reduction
+        self.reduction = False
+        self.retired = True
 
     def add_debug_name(self, name: str) -> None:
         if not name:

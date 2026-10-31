@@ -58,6 +58,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
+from .aten_lowering import resolve_reduction_sizes
 from .compile_environment import CompileEnvironment
 from .compile_environment import warning
 from .cute.register_tile_admission import register_tile_body_admitted
@@ -68,6 +69,9 @@ from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
+from .merge_reduction_dims import _MERGE_OPS
+from .merge_reduction_dims import chain_reduction_dims
+from .merge_reduction_dims import merge_reduction_dims
 from .node_masking import defer_pallas_load_masks
 from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
@@ -214,6 +218,8 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # node so the cute epilogue chain analyzer can fuse it; the inductor
     # default decomp expands the polynomial form and breaks the chain.
     install_gelu_decomp(decomp_table)
+    for op in _MERGE_OPS.values():
+        decomp_table[op] = chain_reduction_dims(op, decomp_table.get(op))
     return decomp_table
 
 
@@ -295,10 +301,8 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
                 # context. Preserve the proof that a scalar can be lifted as
                 # a uniform runtime argument, rather than a device coordinate.
                 if isinstance(obj, (torch.SymInt, torch.SymFloat)):
-                    origins = HostFunction.current().expr_to_origin
-                    proxy.node.meta["helion_host_scalar"] = all(
-                        symbol in origins and origins[symbol].origin.is_host()
-                        for symbol in obj.node.expr.free_symbols
+                    proxy.node.meta["helion_host_scalar"] = (
+                        HostFunction.current().is_host_scalar_expr(obj.node.expr)
                     )
                 # pyrefly: ignore [missing-attribute]
                 proxy.force = lambda: proxy
@@ -1195,10 +1199,10 @@ class DeviceIR:
             from .cute.flat_gather_lane import (
                 register_flat_gather_factor_specializations,
             )
-            from .cute.memory_ops import register_cute_tensor_alias_specializations
             from .cute.memory_ops import (
                 register_persistent_vec_alignment_specializations,
             )
+            from .runtime_tensor_guards import register_tensor_alias_specializations
 
             # Explicit tile loops can also use vector memory transactions,
             # even when no persistent reduction block or contraction exists.
@@ -1210,7 +1214,7 @@ class DeviceIR:
                 # Reduction kernels reorder input reads across warps. Grid
                 # kernels add these storage-dependent dispatch guards below
                 # only when a scan needs them.
-                register_cute_tensor_alias_specializations(env)
+                register_tensor_alias_specializations(env)
             for tile_spec in env.config_spec.block_sizes:
                 if len(tile_spec.block_ids) == 1 and env.is_jagged_tile(
                     tile_spec.block_id
@@ -1228,8 +1232,8 @@ class DeviceIR:
         if env.backend_name == "cute" and not rdims:
             from ..language.scan_ops import _associative_scan
             from .cute.collective_matmul import has_collective_matmul_candidate
-            from .cute.memory_ops import register_cute_tensor_alias_specializations
             from .cute.memory_ops import stores_into_input_storage
+            from .runtime_tensor_guards import register_tensor_alias_specializations
 
             self._register_cute_tile_vec_slots(env)
             # Grid scans also reorder input reads across warps and need the
@@ -1249,7 +1253,7 @@ class DeviceIR:
                 or has_collective_matmul_candidate(self.graphs)
                 or stores_into_input_storage(self.graphs, env)
             ):
-                register_cute_tensor_alias_specializations(env)
+                register_tensor_alias_specializations(env)
         if not rdims:
             return
         from .inductor_lowering import ReductionLowering
@@ -1470,7 +1474,7 @@ class DeviceIR:
         """
         already_registered = set(env.config_spec.cute_vector_widths.valid_block_ids())
         for tile_bs in env.block_sizes:
-            if tile_bs.reduction or tile_bs.block_id in already_registered:
+            if not tile_bs.is_tile or tile_bs.block_id in already_registered:
                 continue
             # Non-static size (jagged / AutoSize) never forms a lane loop.
             if not isinstance(tile_bs.size, (int, torch.SymInt)):
@@ -1908,7 +1912,7 @@ class DeviceIR:
         configured_block_sizes = {
             info.block_id: info.from_config_assert(config)
             for info in env.block_sizes
-            if not info.reduction
+            if info.is_tile
         }
         descriptor_output_nodes_by_graph: dict[int, set[torch.fx.Node]] = {}
         memory_op_index = 0
@@ -3604,6 +3608,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             raise exc.NoDeviceLoopsInKernel
         from ..language.random_ops import rewrite_implicit_random_ops
 
+        # Resolve source-level sizes before RNG lowering introduces internal
+        # size queries that identify physical tile coordinates.
+        for graph in device_ir.graphs:
+            resolve_reduction_sizes(graph.graph)
+        merged_rdims = merge_reduction_dims(device_ir.graphs)
         if CompileEnvironment.current().settings.cute_rng_stream in ("auto", "philox4"):
             from .cute.philox_stream import rewrite_random_stream
 
@@ -3648,14 +3657,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 promote_cute_root_graph_host_tensors(device_ir.graphs, promotions)
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
-        if scaled_contractions:
-            from .cute.active_blocks import active_block_ids
-
-            device_ir.codegen_active_block_ids = active_block_ids(
-                device_ir.graphs,
-                (block_id for ids in device_ir.grid_block_ids for block_id in ids),
-                CompileEnvironment.current(),
-            )
+        dot_scaled_changed = False
         is_pallas = CompileEnvironment.current().backend.name == "pallas"
         if is_pallas:
             from .pallas.canonicalize_jagged_bounds import canonicalize_jagged_bounds
@@ -3690,16 +3692,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             from .cute.promote_output_axis import promote_partitioned_output_axis
 
             # After validate_host_tensor_usage: the rewired scale is a host tensor.
-            if any(
+            dot_scaled_changed = any(
                 [expose_dot_scaled_scales(graph.graph) for graph in device_ir.graphs]
-            ):
-                from .cute.active_blocks import active_block_ids
-
-                device_ir.codegen_active_block_ids = active_block_ids(
-                    device_ir.graphs,
-                    (block_id for ids in device_ir.grid_block_ids for block_id in ids),
-                    CompileEnvironment.current(),
-                )
+            )
             promote_partitioned_output_axis(func, device_ir, visitor.root_nodes)
 
             if CompileEnvironment.current().cute_fission_plan is not None:
@@ -3789,9 +3784,33 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             from .cute.graph_cse import cse_device_ir
 
             cse_device_ir(device_ir)
+        if scaled_contractions or dot_scaled_changed:
+            from .active_blocks import active_block_ids
+
+            device_ir.codegen_active_block_ids = active_block_ids(
+                device_ir.graphs,
+                (block_id for ids in device_ir.grid_block_ids for block_id in ids),
+                CompileEnvironment.current(),
+            )
         # Phase 1: roll + register the reduction_loops spec. The ReductionKernelFact is built
         # in Phase 3 (after analysis derives memory_op_facts) so it can read the enriched
         # load/store facts.
+        if merged_rdims:
+            # Merged dims can leave their per-dim rdims unused.  Stop treating
+            # them as reductions, or they would gain unused tuning slots and
+            # rolling analysis. CuTe would also claim a thread axis for each.
+            # Only rdims nothing uses are demoted: a later slice of the same
+            # extent would come from a subscript that kept the rdim in use.
+            from .active_blocks import unused_block_ids
+
+            unused_rdims = unused_block_ids(
+                device_ir.graphs,
+                merged_rdims,
+                used_block_ids=device_ir.codegen_active_block_ids,
+            )
+            for block_id in unused_rdims:
+                block = CompileEnvironment.current().block_sizes[block_id]
+                block.retire_reduction()
         device_ir.register_rollable_reductions()
         if CompileEnvironment.current().backend.name == "cute":
             _register_cute_lane_vector_width_specs(config_spec)
@@ -4348,12 +4367,12 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             config_spec.kernel_matmul_fact is not None
             or analysis.writes_input_storage(env)
         ):
-            from .cute.memory_ops import register_cute_tensor_alias_specializations
+            from .runtime_tensor_guards import register_tensor_alias_specializations
 
             # Vectorized writes to inputs and collective matmuls need the same
             # guarded disjoint-input facts as reductions. Fresh grid outputs
             # cannot alias inputs and must not add storage-dependent cache keys.
-            register_cute_tensor_alias_specializations(env)
+            register_tensor_alias_specializations(env)
         # Phase 4: compose a matmul + reduction-over-output epilogue fact when a matmul AND a
         # register-resident epilogue reduction co-occur (matmul_rms_norm etc.).
         device_ir.build_matmul_reduction_epilogue_facts()

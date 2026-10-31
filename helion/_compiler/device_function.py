@@ -2338,7 +2338,7 @@ class DeviceFunction:
         storage they share.  Origin type alone is insufficient: host-local
         ``torch.empty``-family outputs commonly carry ``NameOrigin`` too.
         """
-        from .cute.memory_ops import runtime_tensors_are_proven_disjoint
+        from .runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 
         env = CompileEnvironment.current()
         host_function = HostFunction.current()

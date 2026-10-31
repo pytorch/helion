@@ -175,10 +175,8 @@ def _dependent_tile_end_expr(state: CodegenState, loop_dim_index: int) -> str | 
     source_end = next(arg for arg in expr.args if arg != tile_end_symbol)
     if not isinstance(source_end, sympy.Expr):
         return None
-    for symbol in source_end.free_symbols:
-        origin_info = HostFunction.current().expr_to_origin.get(symbol)
-        if origin_info is None or not origin_info.origin.is_host():
-            return None
+    if not HostFunction.current().is_host_scalar_expr(source_end):
+        return None
     return CompileEnvironment.current().backend.minimum_expr(
         state.sympy_expr(source_end), tile_end_expr
     )

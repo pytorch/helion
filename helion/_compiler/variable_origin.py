@@ -260,6 +260,20 @@ class TensorStrideOrigin(WrappedOrigin):
 
 
 @dataclasses.dataclass
+class FlattenOrigin(WrappedOrigin):
+    """A host tensor with dims ``start..end`` flattened into one (a view)."""
+
+    start: int
+    end: int
+
+    def host_str(self) -> str:
+        return f"{self.value.host_str()}.flatten({self.start}, {self.end})"
+
+    def suggest_var_name(self) -> str:
+        return f"{self.value.suggest_var_name()}_flat"
+
+
+@dataclasses.dataclass
 class ClosureOrigin(WrappedOrigin):
     key: int
 

@@ -287,7 +287,7 @@ def pallas_sum_reduce_multiple(x: torch.Tensor) -> torch.Tensor:
     b, _n, _m = x.size()
     out = torch.empty([b], dtype=x.dtype, device=x.device)
     for tile_b in hl.tile(b):
-        out[tile_b] = x[tile_b, :, :].sum([0, 1])
+        out[tile_b] = x[tile_b, :, :].sum([1, 2])
     return out
 
 
@@ -3222,8 +3222,8 @@ class TestPallas(TestCase):
 
     def test_sum_reduce_multiple(self) -> None:
         x = torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32)
-        with self.assertRaises(NotImplementedError):
-            code_and_output(pallas_sum_reduce_multiple, (x,), block_size=2)
+        _, result = code_and_output(pallas_sum_reduce_multiple, (x,), block_sizes=[2])
+        torch.testing.assert_close(result, x.sum((1, 2)))
 
     def test_max_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)

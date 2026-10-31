@@ -10,8 +10,10 @@ import helion
 from helion._compiler.cute.memory_ops import (
     _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
 )
-from helion._compiler.cute.memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
 from helion._compiler.cute.memory_ops import _persistent_vec_alignment_matrix_signature
+from helion._compiler.runtime_tensor_guards import (
+    _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
+)
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
 import helion.language as hl

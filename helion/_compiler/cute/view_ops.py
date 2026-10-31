@@ -84,7 +84,7 @@ def _tensor_written_anywhere(cg: GenerateAST, load_node: torch.fx.Node) -> bool:
     loaded value that is not a host tensor is treated as written, and so is
     any tensor when the kernel stores through a stack tensor's pointer table.
     """
-    from .memory_ops import runtime_tensors_are_proven_disjoint
+    from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 
     tensor = load_node.args[0]
     if not (isinstance(tensor, torch.fx.Node) and tensor.target is _host_tensor):

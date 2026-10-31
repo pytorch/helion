@@ -6738,9 +6738,9 @@ class CuteTopKHeuristic(AutotunerHeuristic):
     def register_facts(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
-        from ..cute.memory_ops import register_cute_tensor_alias_specializations
         from ..cute.topk import match_topk_root
         from ..cute.topk import topk_tensors_are_proven_disjoint
+        from ..runtime_tensor_guards import register_tensor_alias_specializations
 
         host_function = device_ir.host_function
         if host_function is None or len(device_ir.root_ids) != 1:
@@ -6756,7 +6756,7 @@ class CuteTopKHeuristic(AutotunerHeuristic):
             if plan is not None:
                 # Singleton top-k has no reduction dimension, so the reduction
                 # registration pass may not have installed its alias facts.
-                register_cute_tensor_alias_specializations(env)
+                register_tensor_alias_specializations(env)
                 if topk_tensors_are_proven_disjoint(plan, env, allow_unbound=True):
                     env.config_spec.enable_cute_topk_search(plan.selection_dtype)
                     env.config_spec.cute_topk_coarse_keys_available = (
