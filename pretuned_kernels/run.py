@@ -21,11 +21,10 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
-import re
 import sys
 from typing import TYPE_CHECKING
 
-import torch
+from helion._hardware import get_hardware_info
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -73,7 +72,11 @@ KERNELS = [
 
 # Map a compute capability (heuristic file suffix) to a hardware alias. The
 # nightly runs one GPU per alias.
-_HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200"}
+_HARDWARE_BY_COMPUTE = {
+    "sm90": "h100",
+    "sm100": "b200",
+    "Xe2": "b60",
+}
 
 
 def _kernel_directory(name: str) -> Path:
@@ -98,15 +101,16 @@ def grouped_reference_requirements(value: str) -> dict[str, bool]:
 def _supported_hardware(name: str) -> set[str]:
     """Hardware a kernel is pretuned for, inferred from its checked-in heuristics.
 
-    Each ``_helion_aot_<name>_cuda_sm<NN>.py`` file declares a compute capability
+    Each ``_helion_aot_<name>_<device_kind>_<compute>.py`` file declares a compute capability
     the kernel ships a config for; map those to hardware aliases. This is the
     single source of truth -- no per-kernel declaration to keep in sync.
     """
     hardware = set()
-    for path in _kernel_directory(name).glob(f"_helion_aot_{name}_cuda_sm*.py"):
-        match = re.search(r"_cuda_(sm\d+)\.py$", path.name)
-        if match:
-            hardware.add(_HARDWARE_BY_COMPUTE.get(match.group(1), match.group(1)))
+    device_kind = get_hardware_info().device_kind
+    prefix = f"_helion_aot_{name}_{device_kind}_"
+    for path in _kernel_directory(name).glob(f"{prefix}*.py"):
+        compute = path.stem.removeprefix(prefix)
+        hardware.add(_HARDWARE_BY_COMPUTE.get(compute, compute))
     return hardware
 
 
@@ -124,11 +128,6 @@ def _import_kernel_module(name: str) -> ModuleType:
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
-
-
-def _compute_capability() -> str:
-    major, minor = torch.cuda.get_device_capability()
-    return f"sm{major}{minor}"
 
 
 def run_kernel(name: str, current_hardware: str) -> dict:
@@ -178,24 +177,22 @@ def main() -> None:
         "--hardware",
         default="",
         help="Hardware alias to match against each kernel's checked-in heuristic "
-        "files (default: derived from the GPU's compute capability).",
+        "files (default: derived from the first available GPU compute capability).",
     )
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA device required for pretuned kernel benchmarks.")
-
-    device = torch.cuda.get_device_name()
-    compute = _compute_capability()
+    hardware_info = get_hardware_info()
+    hardware_name = hardware_info.hardware_name
+    compute = hardware_info.compute_capability
     current_hardware = args.hardware or _HARDWARE_BY_COMPUTE.get(compute, compute)
-    print(f"GPU: {device} ({compute}); hardware={current_hardware}")
+    print(f"GPU: {hardware_name} ({compute}); hardware={current_hardware}")
 
     kernels = parse_kernel_names(args.kernels)
     records = []
     for name in kernels:
         print(f"\n{'=' * 60}\nBenchmarking pretuned kernel: {name}\n{'=' * 60}")
         record = run_kernel(name, current_hardware)
-        record["device"] = device
+        record["device"] = hardware_name
         record["compute_capability"] = compute
         records.append(record)
 

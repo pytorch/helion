@@ -1,7 +1,7 @@
 """Correctness and perf tests for kernels under ``pretuned_kernels/``.
 
-Correctness runs on every CUDA / ROCm runner; perf gating runs only on
-the hardware where each kernel's checked-in heuristics apply.
+Correctness runs on supported CUDA / ROCm / XPU devices; perf gating runs only
+on the hardware where each kernel's checked-in heuristics apply.
 """
 
 from __future__ import annotations
@@ -1186,8 +1186,8 @@ class TestPretunedKernelsCorrectness(TestCase):
     """Numerical correctness vs. PyTorch eager."""
 
     def _run_correctness(self, name: str) -> None:
-        if not is_cuda():
-            self.skipTest("Pretuned kernels require CUDA / ROCm.")
+        if not is_cuda() and not torch.xpu.is_available():
+            self.skipTest("No CUDA / ROCm / XPU device is available.")
         module = _import_pretuned_kernel_module(_KERNEL_MODULE_NAMES.get(name, name))
         kernel = getattr(module, name)
         builder = _INPUT_BUILDERS[name]
@@ -1225,9 +1225,9 @@ class TestPretunedKernelsCorrectness(TestCase):
         reason="pretuned sm90 scaled_mm config exceeds device shared memory limit",
     )
     def test_scaled_mm(self):
-        if not is_cuda():
-            self.skipTest("Pretuned kernels require CUDA / ROCm.")
-        if torch.cuda.get_device_capability() < (8, 9):
+        if not is_cuda() and not torch.xpu.is_available():
+            self.skipTest("No CUDA / ROCm / XPU device is available.")
+        if is_cuda() and torch.cuda.get_device_capability() < (8, 9):
             self.skipTest("scaled_mm requires FP8 support (SM89+).")
         module = _import_pretuned_kernel_module("scaled_mm")
         kernel = module.scaled_mm

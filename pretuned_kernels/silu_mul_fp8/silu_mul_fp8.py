@@ -11,6 +11,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 # Optional vLLM baseline: the production kernel this is benchmarked against. The
@@ -108,9 +109,9 @@ def correctness_check() -> None:
     torch.manual_seed(0)
     for num_tokens, intermediate in _bench_shapes():
         x = torch.randn(
-            num_tokens, 2 * intermediate, device="cuda", dtype=torch.bfloat16
+            num_tokens, 2 * intermediate, device=DEVICE, dtype=torch.bfloat16
         )
-        scale = torch.tensor([1.0], device="cuda", dtype=torch.float32)
+        scale = torch.tensor([1.0], device=DEVICE, dtype=torch.float32)
         got = silu_mul_fp8(x, scale).float()
         ref = _silu_mul_fp8_torch(x, scale).float()
         torch.testing.assert_close(got, ref, rtol=0.2, atol=0.2)
@@ -129,9 +130,9 @@ def main(verbose: bool = True) -> dict:
     def make_calls(shape: tuple[int, int]) -> tuple:
         num_tokens, intermediate = shape
         x = torch.randn(
-            num_tokens, 2 * intermediate, device="cuda", dtype=torch.bfloat16
+            num_tokens, 2 * intermediate, device=DEVICE, dtype=torch.bfloat16
         )
-        scale = torch.tensor([1.0], device="cuda", dtype=torch.float32)
+        scale = torch.tensor([1.0], device=DEVICE, dtype=torch.float32)
 
         def helion_call() -> torch.Tensor:
             return silu_mul_fp8(x, scale)
