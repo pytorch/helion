@@ -2512,6 +2512,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
+        # Set by AOT selection when its heuristic was written for another compute
+        # capability; torch.compile then fits the config before rendering it.
+        self._config_from_other_device = False
         self._compiler_seed_specialization_extractors: tuple[
             _CompilerSeedSpecializationExtractor, ...
         ] = ()
@@ -2909,6 +2912,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self._cute_reduction_extents[config] = (
                     _cute_reduction_extent_descriptors(self.env)
                 )
+            if self._needs_launch_contract():
+                from .._compiler.triton.config_fitting import annotate_launch_contract
+
+                annotate_launch_contract(root)
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
             import_lines: list[str] = []
@@ -2999,6 +3006,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             self._normalized_config_copy(self._normalize_config(config))
         ] = code
 
+    def _needs_launch_contract(self) -> bool:
+        return self._config_from_other_device and self.env.backend_name in (
+            "triton",
+            "tileir",
+        )
+
     def compile_config(
         self, config: ConfigLike | None = None, *, allow_print: bool = True
     ) -> CompiledConfig:
@@ -3021,10 +3034,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
         primed = self._primed_renders.pop(config, None)
         if (rv := self._compile_cache.get(config)) is not None:
-            if config in self._render_only_configs and not _SEARCHING_CANDIDATES.get():
-                # Loaded from a render worker's source for a measurement; a
-                # config about to run for real is rendered here so to_code
-                # records its guard facts and CuTe specializations.
+            if (
+                config in self._render_only_configs and not _SEARCHING_CANDIDATES.get()
+            ) or (
+                self._needs_launch_contract()
+                and "_helion_launch_contract" not in rv.__globals__
+            ):
+                # Render worker source needs local guard facts. A config
+                # compiled before AOT selection also needs its launch contract.
                 self._render_only_configs.discard(config)
                 del self._compile_cache[config]
             else:
@@ -3349,6 +3366,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     force=force,
                     **kwargs,
                 )
+        # AOT selection below sets this again if it picks another device's config.
+        self._config_from_other_device = False
         ephemeral = self.env.backend.make_ephemeral_cache()
         ctx = ephemeral if ephemeral is not None else contextlib.nullcontext()
         with ctx:
@@ -3360,7 +3379,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
         if ephemeral is not None:
             self.env.backend.finalize_ephemeral_cache(self, config)
-        self.set_config(config)
+        # A config given with config= or configs= is not adjusted.
+        self._set_config(config, fit_to_device=config not in self.kernel.configs)
         return config
 
     def set_config(self, config: ConfigLike) -> None:
@@ -3372,9 +3392,20 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Args:
             config: The configuration to set.
         """
+        self._set_config(config, fit_to_device=False)
+
+    def _set_config(self, config: ConfigLike, *, fit_to_device: bool) -> None:
         requested_config = config
         config = self._normalize_config(config)
-        self._run = self.compile_config(config)
+        run = self.compile_config(config)
+        if fit_to_device:
+            # A selected config may come from another GPU, so its first launch
+            # may lower it to fit this one.
+            run = cast(
+                "CompiledConfig",
+                self.env.backend.fit_on_first_launch(self, config, run),
+            )
+        self._run = run
         self._config = config
         repro_config = (
             requested_config

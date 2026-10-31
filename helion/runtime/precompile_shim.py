@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from typing import TYPE_CHECKING
+from typing import NoReturn
 from typing import cast
 
 from .._compat import get_triton_find_paths_if
@@ -149,6 +150,46 @@ def make_precompiler(
         return finish_it
 
     return _make_precompiler
+
+
+class _KernelLoaded(Exception):
+    """Raised by ``compile_only_launcher`` once the kernel has loaded.
+
+    Like ``_ExtractedLaunchArgs``, it stops the host code at the launch, so
+    host code that would read the kernel's outputs never runs.
+    """
+
+
+def compile_only_launcher(
+    triton_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    num_warps: int,
+    num_stages: int,
+    ptx_options: str | None = None,
+    launch_cooperative_grid: bool = False,
+    **kwargs: object,
+) -> NoReturn:
+    """Compile and load the kernel ``default_launcher`` would run, without running it.
+
+    Loading raises ``OutOfResources`` when the compiled kernel needs more of a
+    resource, such as shared memory, than the device provides; otherwise this
+    raises ``_KernelLoaded``.
+    """
+    # pyrefly: ignore [bad-argument-type]
+    run_args, run_kwargs = compile_only_launch_args(*args, **kwargs)
+    run_kwargs.update(
+        grid=grid,
+        warmup=True,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        launch_cooperative_grid=launch_cooperative_grid,
+    )
+    if ptx_options is not None:
+        run_kwargs["ptx_options"] = ptx_options
+    compiled_kernel = triton_kernel.run(*run_args, **run_kwargs)  # type: ignore[union-attr]
+    compiled_kernel._init_handles()
+    raise _KernelLoaded
 
 
 def already_compiled() -> bool:

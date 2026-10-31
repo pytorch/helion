@@ -12,7 +12,9 @@ import sys
 import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import ClassVar
 from typing import Sequence
+import weakref
 
 import torch
 
@@ -22,8 +24,11 @@ from ..backend import Backend
 from ..backend import BackendState
 from ..backend import LauncherInfo
 from ..backend import log
+from .config_fitting import FirstLaunchFit
+from .config_fitting import fit_for_rendering
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Generator
 
     from torch._inductor.ops_handler import OpsHandler
@@ -51,6 +56,9 @@ def _triton_jit_supports_do_not_specialize() -> bool:
 
 class TritonBackend(Backend):
     """Triton code generation backend."""
+
+    # Kernels whose selected configs a first-launch fit has already warned about.
+    _fitted_kernels: ClassVar[weakref.WeakSet[object]] = weakref.WeakSet()
 
     def supports_block_ptr_indexing(self) -> bool:
         from ..._compat import supports_block_ptr
@@ -238,6 +246,27 @@ class TritonBackend(Backend):
         )
         if triton_jit_fn is not None and hasattr(triton_jit_fn, "device_caches"):
             triton_jit_fn.device_caches.clear()
+
+    def fit_on_first_launch(
+        self,
+        bound_kernel: BoundKernel[Any],
+        config: Config,
+        compiled: Callable[..., object],
+    ) -> Callable[..., object]:
+        if (
+            not bound_kernel._config_from_other_device
+            or bound_kernel.env.process_group_name is not None
+        ):
+            # Ranks would have to agree on the fitted config.
+            return compiled
+        return FirstLaunchFit(self, bound_kernel, config, compiled)
+
+    def fit_config_for_rendering(
+        self, bound_kernel: BoundKernel[Any], args: Sequence[object]
+    ) -> None:
+        run = bound_kernel._run
+        if isinstance(run, FirstLaunchFit) and bound_kernel._config_from_other_device:
+            fit_for_rendering(run, args)
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object
