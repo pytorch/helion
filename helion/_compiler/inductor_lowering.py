@@ -1490,8 +1490,17 @@ class GenerateASTFromInductor(DefaultHandler):
         if env.settings.fast_math and env.backend.name == "triton":
             # libdevice's fast_dividef / fast_expf exist on the Triton backend
             # only; TileIR shares the Triton codegen and keeps the exact form.
+            # The exponent is of -|x| so it never overflows (``fast_expf`` of a
+            # large argument gave inf, and 1 / inf NaN on XPU): for x >= 0
+            # sigmoid is 1 / (1 + e), for x < 0 it is e / (1 + e) = e * r.
+            exponential = self._lift(
+                expr_from_string(f"fast_expf(-tl.abs({inner_name}))")
+            )
+            reciprocal = self._lift(
+                expr_from_string(f"fast_dividef(1.0, 1.0 + {exponential})")
+            )
             result = expr_from_string(
-                f"fast_dividef(1.0, 1.0 + fast_expf(-{inner_name}))"
+                f"tl.where({inner_name} >= 0, {reciprocal}, {exponential} * {reciprocal})"
             )
         else:
             result = expr_from_string(
