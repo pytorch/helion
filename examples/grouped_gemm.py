@@ -134,8 +134,8 @@ def grouped_gemm_jagged_persistent(
     Returns:
         Output tensor of shape ``[sum(M_i), N]``.
     """
-    # Set worker count to match the backend's persistent worker abstraction.
-    num_workers = helion.runtime.get_num_sm(A_packed.device)
+    # Persistent worker count: one per SM, or a tuned multiple on XPU.
+    num_workers = hl.persistent_num_workers(A_packed.device)
 
     # Define tunable block sizes for M, N dimensions (auto-tuned at runtime)
     BLOCK_M = hl.register_block_size(32, 128)
