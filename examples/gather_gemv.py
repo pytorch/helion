@@ -99,11 +99,10 @@ def check(B: int, S: int, N: int) -> None:
     x = torch.randn((S), device=DEVICE, dtype=HALF_DTYPE)
 
     def baseline_gather_gemv(w: Tensor, idx: Tensor, x: Tensor) -> Tensor:
-        """PyTorch baseline implementation."""
-        outputs = []
-        for idx_val in idx.tolist():
-            outputs.append(w[idx_val].to(x.dtype) @ x)
-        return torch.stack(outputs, dim=0)
+        """PyTorch baseline: gather the matrices on the device, then one batched
+        matrix-vector product (no host loop over ``idx``, so it also runs under
+        CUDA-graph capture)."""
+        return w[idx].to(x.dtype) @ x
 
     run_example(gather_gemv, baseline_gather_gemv, (w, idx, x))
 
