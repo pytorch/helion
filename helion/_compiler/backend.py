@@ -445,8 +445,8 @@ class Backend(abc.ABC):
     ) -> Callable[..., object]:
         """Return the callable that runs *config*, compiled as *compiled*.
 
-        ``BoundKernel.autotune`` selected *config* (from a heuristic, a cache or
-        a search), and it may have been tuned on another device.  A backend can
+        ``BoundKernel.autotune`` selected *config*. If AOT selection marked it
+        as borrowed from another device, a backend can
         return a callable that, when a kernel of the config exceeds this
         device's limits at its first launch, runs a smaller variant of the
         config instead.  The default returns *compiled*.

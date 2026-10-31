@@ -6,18 +6,14 @@ from __future__ import annotations
 import base64
 import contextlib
 import functools
-import inspect
 import math
 import os
-import re
 import sys
 import tempfile
-import threading
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
 from typing import Sequence
-from typing import cast
 import weakref
 
 import torch
@@ -28,13 +24,14 @@ from ..backend import Backend
 from ..backend import BackendState
 from ..backend import LauncherInfo
 from ..backend import log
+from .config_fitting import FirstLaunchFit
+from .config_fitting import fit_for_rendering
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Generator
 
     from torch._inductor.ops_handler import OpsHandler
-    from triton.runtime.errors import OutOfResources
 
     from ...autotuner.config_fragment import ConfigSpecFragment
     from ...runtime.config import Config
@@ -42,346 +39,6 @@ if TYPE_CHECKING:
     from ..device_function import Argument
 
     InductorOpOverrides = OpsHandler[Any]
-
-# Most smaller configs a first-launch fit tries before it gives up.
-_MAX_DEVICE_FIT_ATTEMPTS = 16
-
-# default_launcher arguments that make it set up state (remote-copy signals,
-# barrier pads, scratch, persistent state), check residency or launch a
-# cooperative grid before the kernel runs.  Such launches are not retried.
-_STATEFUL_LAUNCH_ARGS = (
-    "_remote_copy_signal_slots_per_program",
-    "_remote_barrier_signal_slots_per_program",
-    "_remote_copy_scratch_specs",
-    "_persistent_state_specs",
-    "_minimum_resident_programs",
-    "launch_cooperative_grid",
-)
-
-# The launch parameters a fit changes, as the generated host code passes them.
-_LAUNCH_PARAMETERS = re.compile(r"\bnum_(warps|stages)=\d+")
-
-
-def _smaller_config(
-    backend: TritonBackend, config: Config, error: OutOfResources
-) -> Config | None:
-    """The config to try after *config*'s kernel failed to load with *error*.
-
-    Only launch parameters change, never block sizes.  For shared memory, the
-    stage counts are lowered, ``num_stages`` and any larger per-loop
-    ``range_num_stages`` together, since they size the pipelining buffers; the
-    count is estimated from the reported usage, assuming it scales with the
-    stage count minus one, and is at least one lower than before.  For threads,
-    ``num_warps`` is halved.
-    """
-    from ...runtime.config import Config
-
-    if error.name == "shared memory":
-        per_loop = cast("list[int]", config.config.get("range_num_stages", []))
-        stages = max([config.num_stages, *per_loop])
-        if stages > 1:
-            estimate = 1 + (stages - 1) * error.limit // error.required
-            stages = max(1, min(stages - 1, estimate))
-            updates: dict[str, object] = {"num_stages": min(config.num_stages, stages)}
-            if per_loop:
-                updates["range_num_stages"] = [
-                    min(loop_stages, stages) for loop_stages in per_loop
-                ]
-            return Config.from_dict({**config.config, **updates})
-    elif error.name == "threads" and config.num_warps > 1:
-        smaller = Config.from_dict(
-            {**config.config, "num_warps": config.num_warps // 2}
-        )
-        # Warp-specialized loops keep at least 4 warps.
-        if backend.effective_num_warps(smaller) < backend.effective_num_warps(config):
-            return smaller
-    return None
-
-
-def _host_code(compiled: Callable[..., object]) -> str:
-    """The source of a compiled host function, without its launch parameters."""
-    return _LAUNCH_PARAMETERS.sub(r"num_\1=", inspect.getsource(compiled))
-
-
-class _FirstLaunchFit:
-    """Runs a selected config and fits it to this device at its first launch.
-
-    The config may have been tuned on another GPU.  When one of its kernels needs
-    more shared memory or threads than this device has, Triton raises
-    ``OutOfResources`` before launching it, and the kernel is launched as a
-    smaller config (see ``_smaller_config``) would launch it instead, with the
-    grid and arguments the host code already computed, so the host code still
-    runs once.  If the smaller config's host code matches apart from its launch
-    parameters, its own kernel is launched.  Otherwise only ``num_stages`` may
-    differ, and the running kernel is launched with fewer stages, which changes
-    its pipelining but not its results.  (The host code can differ when code
-    generation guarded on input sizes after it generated the running code.)  If
-    no smaller config loads, the original error is raised.  After the first
-    call that validates the current config returns, the bound kernel runs
-    that config directly. Calls that launch nothing leave fitting armed.
-    """
-
-    def __init__(
-        self,
-        backend: TritonBackend,
-        bound_kernel: BoundKernel[Any],
-        config: Config,
-        compiled: Callable[..., object],
-    ) -> None:
-        self.backend = backend
-        self.bound_kernel = bound_kernel
-        self.config = config
-        self.compiled = compiled
-        # The config launches use, its compiled host function, and whether that
-        # host function computes the same grid and arguments as the running one.
-        # A fit replaces them, under the lock, and later launches use them too.
-        self.current: tuple[Config, Callable[..., object], bool] = (
-            config,
-            compiled,
-            True,
-        )
-        self.lock = threading.Lock()
-        self.attempts = 0
-        self.host_code: str | None = None
-        # The resource, usage and limit of the first launch that did not fit.
-        self.first_error: tuple[str, int, int] | None = None
-
-    def __call__(self, *args: object) -> object:
-        if torch.compiler.is_compiling():
-            return self.compiled(*args)
-        # Publish only a launch this call observed. An empty call or another
-        # caller resetting the shared candidate has not verified current.
-        launched: list[tuple[Config, Callable[..., object], bool]] = []
-        result = self.compiled(
-            *args, _launcher=functools.partial(self.launch, launched)
-        )
-        with self.lock:
-            if (
-                self.bound_kernel._run is self
-                and launched
-                and launched[-1] is self.current
-            ):
-                config, compiled, _ = self.current
-                if compiled is self.compiled:
-                    self.bound_kernel._run = compiled
-                else:
-                    self.switch_to(config)
-        return result
-
-    def launch(
-        self,
-        launched: list[tuple[Config, Callable[..., object], bool]],
-        triton_kernel: Any,  # noqa: ANN401
-        grid: tuple[int, ...],
-        *args: object,
-        num_warps: int,
-        num_stages: int,
-        **kwargs: object,
-    ) -> object:
-        """The launcher the first calls pass to the host code."""
-        from triton.runtime.errors import OutOfResources
-
-        tried = self.current
-        if tried[1] is not self.compiled:
-            # Another caller may still be loading this candidate. Establish
-            # this call's original error before joining its fit.
-            tried = (self.config, self.compiled, True)
-        launch = (launched, triton_kernel, grid, args, num_warps, num_stages, kwargs)
-        try:
-            return self.launch_as(tried, *launch)
-        except OutOfResources as error:
-            if any(kwargs.get(arg) for arg in _STATEFUL_LAUNCH_ARGS):
-                raise
-            first_error = last_error = error
-        if self.first_error is None:
-            self.first_error = (
-                first_error.name,
-                first_error.required,
-                first_error.limit,
-            )
-        try:
-            while True:
-                with self.lock:
-                    if self.current is tried:
-                        smaller = self.smaller(tried[0], last_error)
-                        if smaller is None or not (
-                            smaller[2] or self.only_num_stages_changed(smaller[0])
-                        ):
-                            raise first_error
-                        self.current = smaller
-                    tried = self.current
-                try:
-                    return self.launch_as(tried, *launch)
-                except OutOfResources as error:
-                    last_error = error
-        except Exception:
-            # Every terminal failure restores the original launch, including
-            # exhausted candidates and host code that cannot safely be reused.
-            log.debug(
-                "%s: not fitting the config to this device",
-                self.bound_kernel.kernel.name,
-                exc_info=True,
-            )
-            with self.lock:
-                self.current = (self.config, self.compiled, True)
-                self.attempts = _MAX_DEVICE_FIT_ATTEMPTS
-            raise first_error from None
-        except BaseException:
-            # An interrupted fit can be retried, starting from the original.
-            with self.lock:
-                self.current = (self.config, self.compiled, True)
-            raise
-        finally:
-            # The errors' tracebacks refer to this frame and its arguments.
-            first_error = last_error = None
-
-    def launch_as(
-        self,
-        fitted: tuple[Config, Callable[..., object], bool],
-        launched: list[tuple[Config, Callable[..., object], bool]],
-        triton_kernel: Any,  # noqa: ANN401
-        grid: tuple[int, ...],
-        args: tuple[object, ...],
-        num_warps: int,
-        num_stages: int,
-        kwargs: dict[str, object],
-    ) -> object:
-        """Launch the running host code's kernel as the *fitted* config does."""
-        from ...runtime import default_launcher
-
-        config, compiled, same_host_code = fitted
-        if compiled is not self.compiled:
-            if same_host_code:
-                triton_kernel = compiled.__globals__[triton_kernel.__name__]
-                num_warps = self.backend.effective_num_warps(config)
-            num_stages = config.num_stages
-        result = default_launcher(
-            triton_kernel,
-            grid,
-            *args,
-            num_warps=num_warps,
-            num_stages=num_stages,
-            **kwargs,  # pyrefly: ignore [bad-argument-type]
-        )
-        # Only the last successful invocation is needed, even for a host loop.
-        launched[:] = [fitted]
-        return result
-
-    def smaller(
-        self, config: Config, error: OutOfResources
-    ) -> tuple[Config, Callable[..., object], bool] | None:
-        """The next smaller config, its compiled host function, and whether that
-        host function matches the running one apart from launch parameters."""
-        bound_kernel = self.bound_kernel
-        self.attempts += 1
-        if self.attempts > _MAX_DEVICE_FIT_ATTEMPTS:
-            return None
-        try:
-            candidate = _smaller_config(
-                self.backend, bound_kernel._normalized_config_copy(config), error
-            )
-            if candidate is None:
-                return None
-            candidate = bound_kernel._normalized_config_copy(candidate)
-            compiled = bound_kernel.compile_config(candidate, allow_print=False)
-            if self.host_code is None:
-                self.host_code = _host_code(self.compiled)
-            same_host_code = _host_code(compiled) == self.host_code
-        except Exception:
-            # Not a resource limit; the original error is raised as before.
-            log.debug(
-                "%s: not fitting the config to this device",
-                bound_kernel.kernel.name,
-                exc_info=True,
-            )
-            return None
-        return candidate, compiled, same_host_code
-
-    def only_num_stages_changed(self, candidate: Config) -> bool:
-        """Whether *candidate* differs from the original config only in num_stages."""
-        original = self.bound_kernel._normalized_config_copy(self.config)
-        return {**candidate.config, "num_stages": None} == {
-            **original.config,
-            "num_stages": None,
-        }
-
-    def fit_with_example_args(self, args: Sequence[object]) -> None:
-        """Fit the config before torch.compile renders it into its own code.
-
-        Inductor launches the rendered kernel without this wrapper, so the host
-        code runs here on Inductor's example inputs instead, compiling and
-        loading its first kernel without launching it, as the autotuner's
-        precompile does.
-        """
-        from triton.runtime.errors import OutOfResources
-
-        from ...runtime.precompile_shim import _KernelLoaded
-        from ...runtime.precompile_shim import compile_only_launcher
-
-        # Each bound kernel is checked once, whatever the outcome.
-        self.bound_kernel._config_from_other_device = False
-        tried = self.current
-        device = self.bound_kernel.env.device
-        with torch.random.fork_rng(devices=[device], device_type=device.type):
-            for _ in range(_MAX_DEVICE_FIT_ATTEMPTS):
-                try:
-                    tried[1](*args, _launcher=compile_only_launcher)
-                except _KernelLoaded:
-                    break
-                except OutOfResources as error:
-                    if self.first_error is None:
-                        self.first_error = (error.name, error.required, error.limit)
-                    smaller = self.smaller(tried[0], error)
-                    if smaller is None:
-                        return
-                    tried = smaller
-                except Exception:
-                    # Not a resource limit; the kernel reports it as before.
-                    log.debug(
-                        "%s: not fitting the config to this device",
-                        self.bound_kernel.kernel.name,
-                        exc_info=True,
-                    )
-                    return
-                else:
-                    # The host code returned without launching a kernel.
-                    break
-            else:
-                return
-        if tried is not self.current:
-            self.current = tried
-            self.switch_to(tried[0])
-
-    def switch_to(self, config: Config) -> None:
-        """Make the bound kernel run the fitted *config*, and say so."""
-        bound_kernel = self.bound_kernel
-        if bound_kernel.settings.print_output_code:
-            # Compiled without printing during the fit; set_config prints it.
-            bound_kernel._compile_cache.pop(config, None)
-            bound_kernel._cache_path_map.pop(config, None)
-        bound_kernel.set_config(config)
-        assert self.first_error is not None
-        resource, required, limit = self.first_error
-        original = bound_kernel._normalized_config_copy(self.config).config
-        changes = ", ".join(
-            f"{field}={value!r}"
-            for field, value in config.config.items()
-            if original.get(field) != value
-        )
-        fitted_kernels = self.backend._fitted_kernels
-        report = log.debug if bound_kernel.kernel in fitted_kernels else log.warning
-        fitted_kernels.add(bound_kernel.kernel)
-        report(
-            "%s: the selected config exceeds this device's %s limit (%d > %d), "
-            "so it runs with %s instead. Configs for other shapes are adjusted "
-            "the same way. Tuning on this device (for aot_kernel, with "
-            "`python -m helion.autotuner.aot_runner`) can find faster ones.",
-            bound_kernel.kernel.name,
-            resource,
-            required,
-            limit,
-            changes,
-        )
 
 
 @functools.cache
@@ -596,17 +253,20 @@ class TritonBackend(Backend):
         config: Config,
         compiled: Callable[..., object],
     ) -> Callable[..., object]:
-        if bound_kernel.env.process_group_name is not None:
+        if (
+            not bound_kernel._config_from_other_device
+            or bound_kernel.env.process_group_name is not None
+        ):
             # Ranks would have to agree on the fitted config.
             return compiled
-        return _FirstLaunchFit(self, bound_kernel, config, compiled)
+        return FirstLaunchFit(self, bound_kernel, config, compiled)
 
     def fit_config_for_rendering(
         self, bound_kernel: BoundKernel[Any], args: Sequence[object]
     ) -> None:
         run = bound_kernel._run
-        if isinstance(run, _FirstLaunchFit) and bound_kernel._config_from_other_device:
-            run.fit_with_example_args(args)
+        if isinstance(run, FirstLaunchFit) and bound_kernel._config_from_other_device:
+            fit_for_rendering(run, args)
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object

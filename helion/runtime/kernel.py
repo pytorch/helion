@@ -2912,6 +2912,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self._cute_reduction_extents[config] = (
                     _cute_reduction_extent_descriptors(self.env)
                 )
+            if self._needs_launch_contract():
+                from .._compiler.triton.config_fitting import annotate_launch_contract
+
+                annotate_launch_contract(root)
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
             import_lines: list[str] = []
@@ -3002,6 +3006,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             self._normalized_config_copy(self._normalize_config(config))
         ] = code
 
+    def _needs_launch_contract(self) -> bool:
+        return self._config_from_other_device and self.env.backend_name in (
+            "triton",
+            "tileir",
+        )
+
     def compile_config(
         self, config: ConfigLike | None = None, *, allow_print: bool = True
     ) -> CompiledConfig:
@@ -3024,10 +3034,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
         primed = self._primed_renders.pop(config, None)
         if (rv := self._compile_cache.get(config)) is not None:
-            if config in self._render_only_configs and not _SEARCHING_CANDIDATES.get():
-                # Loaded from a render worker's source for a measurement; a
-                # config about to run for real is rendered here so to_code
-                # records its guard facts and CuTe specializations.
+            if (
+                config in self._render_only_configs and not _SEARCHING_CANDIDATES.get()
+            ) or (
+                self._needs_launch_contract()
+                and "_helion_launch_contract" not in rv.__globals__
+            ):
+                # Render worker source needs local guard facts. A config
+                # compiled before AOT selection also needs its launch contract.
                 self._render_only_configs.discard(config)
                 del self._compile_cache[config]
             else:
