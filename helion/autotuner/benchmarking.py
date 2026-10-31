@@ -1220,11 +1220,15 @@ def _pallas_device_micros_for_fn(
             for _ in range(n_calls):
                 last_out = fn()
         finally:
-            # Block on the last output so stop_trace sees every device event.
-            if last_out is not None:
-                with contextlib.suppress(TypeError, AttributeError):
-                    jax.block_until_ready(last_out)
-            jax.profiler.stop_trace()
+            try:
+                # Block on the last output so stop_trace sees every device event.
+                if last_out is not None:
+                    with contextlib.suppress(TypeError, AttributeError):
+                        jax.block_until_ready(last_out)
+                # Wait for queued TorchTPU kernels before stopping the trace.
+                synchronize_device()
+            finally:
+                jax.profiler.stop_trace()
 
         matches = glob.glob(os.path.join(td, "**", "*.xplane.pb"), recursive=True)
         if not matches:
