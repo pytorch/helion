@@ -371,6 +371,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=True,
         )
 
+    @xfailIfPallasTpu(
+        "Mosaic cannot lower the fp16 row-block load: 'Invalid vector type for "
+        "load' on a (16,128)-tiled f16 VMEM ref"
+    )
     def test_layernorm_rows(self):
         # The second launch of ``matmul_layernorm_unfused``.
         args = (
@@ -1898,6 +1902,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="grouped_gemm_jagged",
         )
 
+    @xfailIfPallasInterpret(
+        "the partial last M tile makes emit_pipeline's writeback a dynamic-size "
+        "DMA slice (pl.ds with a traced size) that JAX interpret mode cannot "
+        "discharge"
+    )
     def test_grouped_gemm_shared_weight(self):
         # The shared-weight formulation: one tile space over the packed rows,
         # with ragged groups whose packed total (100 rows) ends in a partial
