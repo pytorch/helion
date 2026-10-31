@@ -14,12 +14,17 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
 from torch.utils._pytree import tree_leaves
 
+from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 from helion._utils import triton_is_available
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from unittest.mock import MagicMock
+
+    from helion.autotuner.config_spec import ConfigSpec
+    from helion.runtime.config import Config
+    from helion.runtime.kernel import BoundKernel
 
 
 def _require_cute_codegen() -> None:
@@ -38,7 +43,13 @@ def _codegen_skip_reason(backend: str) -> str | None:
     return None
 
 
-def _cpu_bind(kernel, args, *, capability: tuple[int, int] | None = (10, 0)):
+def _cpu_bind(
+    kernel,
+    args,
+    *,
+    capability: tuple[int, int] | None = (10, 0),
+    num_sm: int | None = None,
+):
     """Bind ``kernel`` for code generation on a CPU-only process.
 
     ``capability`` is the compute capability the bound kernel targets; ``None``
@@ -53,11 +64,78 @@ def _cpu_bind(kernel, args, *, capability: tuple[int, int] | None = (10, 0)):
                 "helion._compiler.compile_environment.target_device_capability",
                 capability,
             ),
-            ("helion.runtime.get_num_sm", 148),
+            ("helion.runtime.get_num_sm", 148 if num_sm is None else num_sm),
             ("helion._compat._is_hip", False),
         ):
             stack.enter_context(patch(name, return_value=value))
+        if num_sm is not None:
+            stack.enter_context(
+                patch(
+                    "helion.autotuner.config_spec.num_compute_units",
+                    return_value=num_sm,
+                )
+            )
         return kernel._bind_isolated(args)
+
+
+def _legacy_order(
+    spec: ConfigSpec, seeds: list[Config], parameters: tuple[str, ...]
+) -> list[Config]:
+    return seeds
+
+
+def _uninterleaved_registered_seeds(
+    bound: BoundKernel, *, require_no_parameters: bool = False
+) -> list[Config]:
+    """Remove collective interleaving while preserving current copy priority."""
+    assert bound.host_function is not None
+    with (
+        bound.env,
+        patch.object(
+            CuteCollectiveMatmulHeuristic,
+            "_interleave_bounded_k_seeds",
+            side_effect=_legacy_order,
+        ) as interleaved,
+    ):
+        legacy = CuteCollectiveMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+    if require_no_parameters:
+        assert all(not call.args[2] for call in interleaved.call_args_list)
+    # Other registered heuristics retain their original positions. Replace
+    # only this heuristic's permutation when reproducing the old population.
+    members = set(legacy)
+    selected = [
+        seed for seed in bound.config_spec.compiler_seed_configs if seed in members
+    ]
+    assert len(selected) == len(legacy)
+    iterator = iter(legacy)
+    return [
+        next(iterator) if seed in members else seed
+        for seed in bound.config_spec.compiler_seed_configs
+    ]
+
+
+@contextmanager
+def _capture_collective_interleaving() -> Iterator[tuple[list[Config], list[Config]]]:
+    before: list[Config] = []
+    after: list[Config] = []
+    interleave = CuteCollectiveMatmulHeuristic._interleave_bounded_k_seeds
+
+    def capture(
+        spec: ConfigSpec, seeds: list[Config], parameters: tuple[str, ...]
+    ) -> list[Config]:
+        before[:] = seeds
+        after[:] = interleave(spec, seeds, parameters)
+        # get_seed_configs may move a candidate after interleaving.
+        return after.copy()
+
+    with patch.object(
+        CuteCollectiveMatmulHeuristic,
+        "_interleave_bounded_k_seeds",
+        side_effect=capture,
+    ):
+        yield before, after
 
 
 @contextmanager

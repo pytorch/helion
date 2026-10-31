@@ -125,6 +125,7 @@ from ..loop_dependency_checker import intra_loop_raw_reread_block_ids
 from ..utils import compute_slice_size
 from .common import dedupe_configs
 from .common import is_canonical_row_reduction
+from .common import matches_hardware
 from .common import op_name_parts
 from .registry import AutotunerHeuristic
 
@@ -2398,6 +2399,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
     name = "cute_collective_matmul"
     backend = "cute"
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+    CACHE_NAMED_TARGETS = frozenset({("cuda", "NVIDIA H100 PCIe", "sm90")})
 
     @classmethod
     def register_facts(
@@ -2405,8 +2407,20 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
         # Copy legality needs guarded strides even when heuristic seeds are
         # disabled and the caller explicitly selects a collective config.
-        if cls._axes(env, device_ir):
+        axes, sites = cls._placements(env, device_ir)
+        if axes:
             env.config_spec.enable_cute_proven_bounds()
+            if (
+                len(sites) == 1
+                and sites[0][0].lhs_dtype == torch.float16
+                and axes[0][3] == 1
+                and matches_hardware(env, None, named_targets=cls.CACHE_NAMED_TARGETS)
+            ):
+                # Keep the union within the cache-fact literal schema.
+                sm_fact: frozenset[CompilerHeuristicSpecializationFact] = frozenset(
+                    {"config_num_sm"}
+                )
+                return cls.CACHE_SPECIALIZATION_FACTS | sm_fact
             return cls.CACHE_SPECIALIZATION_FACTS
         return frozenset()
 
@@ -2655,9 +2669,10 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         paired copy/recipe choices before repeating geometries. When the TMEM
         storage alternative is present, rotate through complete
         schedules as well as compute/copy/depth/chunk groups, retaining the
-        ranked geometry order within each. This only reorders existing seeds;
-        the first seed, default promotion, other heuristics, and search budget
-        stay unchanged. Unrelated user knobs never supply a grouping dimension.
+        ranked geometry order within each. This step preserves the first seed;
+        the caller may subsequently prioritize an async sibling. Default promotion,
+        other heuristics, and search budget stay unchanged. Unrelated user knobs
+        never supply a grouping dimension.
         """
         tmem_operand_schedules = any(
             seed.get("cute_collective_tmem_a", False) for seed in seeds
@@ -3012,8 +3027,51 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                     and seed.get("cute_collective_compute", "warp") != "tma_gather"
                 ]
             )
-        return cls._interleave_bounded_k_seeds(
+        result = cls._interleave_bounded_k_seeds(
             spec, dedupe_configs(result), bounded_parameters
+        )
+        if (
+            result
+            and len(sites) == 1
+            and cls._prefer_async_copy(env, result[0], axes[0], sites[0][0])
+        ):
+            preferred = Config.from_dict(
+                result[0].config | {"cute_collective_copy": "async"}
+            )
+            index = next(
+                (i for i, seed in enumerate(result) if seed == preferred), None
+            )
+            if index is not None:
+                # Keep the existing candidate's independently owned lists.
+                result.insert(0, result.pop(index))
+        return result
+
+    @classmethod
+    def _prefer_async_copy(
+        cls,
+        env: CompileEnvironment,
+        seed: Config,
+        axes: tuple[int, int, int, int],
+        fact: MatmulFact,
+    ) -> bool:
+        # This measured 114-SM H100 PCIe preference only ranks search seeds.
+        # Block identity also resolves fixed K and nonstandard registration order.
+        m, n, k, factor = axes
+        spec = env.config_spec
+        return (
+            spec.num_sm == 114
+            and fact.lhs_dtype == torch.float16
+            and factor == 1
+            and all(
+                env.known_equal(env.block_sizes[bid].from_config_assert(seed), extent)
+                for bid, extent in zip((m, n, k), (64, 32, 64), strict=True)
+            )
+            and tuple(
+                spec.num_threads.config_get(seed.num_threads, bid, 1)
+                for bid in (m, n, k)
+            )
+            == (4, 32, 1)
+            and matches_hardware(env, None, named_targets=cls.CACHE_NAMED_TARGETS)
         )
 
 
