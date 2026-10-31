@@ -207,7 +207,7 @@ def _load_needs_eviction_tunable(node: torch.fx.Node) -> bool:
 
 
 # Ops that touch no memory: they route tensors through SSA values and subgraphs,
-# read metadata or only debug.
+# read metadata, only debug or only warm a cache (a prefetch orders nothing).
 _TENSOR_ROUTING_OPS = (
     _tracing_ops._phi,
     _tracing_ops._new_var,
@@ -220,6 +220,7 @@ _TENSOR_ROUTING_OPS = (
     torch.ops.aten.sym_stride.int,
     hl.device_print,
     hl.breakpoint,
+    hl.prefetch,
 )
 
 
