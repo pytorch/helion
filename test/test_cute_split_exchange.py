@@ -669,8 +669,11 @@ class TestCuteSplitExchange(TestCase):
         x = torch.randn([128, 256], device=DEVICE)
         with self.assertRaisesRegex(
             exc.BackendUnsupported, r"needs 65536 bytes of shared memory"
-        ):
+        ) as raised:
             code_and_output(interleaved_tiled, (x,), block_sizes=[64, 256])
+        # The refusal is re-raised as itself, never chained from itself
+        # (printing such an exception recurses forever).
+        self.assertIsNot(raised.exception.__cause__, raised.exception)
 
 
 if __name__ == "__main__":
