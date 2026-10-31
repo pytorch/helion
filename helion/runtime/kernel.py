@@ -1105,7 +1105,7 @@ class Kernel(Generic[_R]):
 
             self._capture_op = register_decoration_op(self)
 
-    @functools.cache  # noqa: B019
+    @functools.cached_property
     def kernel_source(self) -> str:
         """
         Return the kernel's source text.

@@ -643,7 +643,7 @@ class BaseSearch(BaseAutotuner):
         kernel_source = ""
         if kernel_obj is not None:
             try:
-                kernel_source = kernel_obj.kernel_source()
+                kernel_source = kernel_obj.kernel_source
             except OSError:
                 self.log.debug("Failed to read Helion kernel source", exc_info=True)
         kernel_name = getattr(kernel_obj, "name", "")

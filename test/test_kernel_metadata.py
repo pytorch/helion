@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
+import weakref
 
 import torch
 
@@ -63,7 +65,7 @@ def _add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 def _metadata() -> KernelMetadata:
     return KernelMetadata(
         kernel_name="_add_kernel",
-        kernel_source=_add_kernel.kernel_source(),
+        kernel_source=_add_kernel.kernel_source,
         input_shapes="[(64,)]",
         dtypes="['torch.float32']",
         hardware="TestGPU",
@@ -306,6 +308,16 @@ class TestIrGraphDegradation(TestCase):
             KernelMetadata(**fields).run_id,
             KernelMetadata(**fields, _device_ir=object()).run_id,
         )
+
+
+class TestKernelSource(TestCase):
+    def test_kernel_source_does_not_keep_kernel_alive(self) -> None:
+        kernel = helion.kernel(_add_kernel.fn)
+        _ = kernel.kernel_source
+        kernel_ref = weakref.ref(kernel)
+        del kernel
+        gc.collect()
+        self.assertIsNone(kernel_ref())
 
 
 if __name__ == "__main__":
