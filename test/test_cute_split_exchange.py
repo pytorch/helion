@@ -57,6 +57,36 @@ def interleaved_tiled(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(static_shapes=True)
+def scaled_halves_roundtrip(x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    """Both halves of a register tile scaled the same way and joined back."""
+    n, d = x.size()
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        acc = x[tile_n, :] * 2.0
+        scale = alpha[tile_n]
+        lo, hi = hl.split(acc.reshape([tile_n, 2, d // 2]).permute(0, 2, 1))
+        lo = lo * scale[:, None]
+        hi = hi * scale[:, None]
+        out[tile_n, :] = hl.join(lo, hi).permute(0, 2, 1).reshape([tile_n, d])
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def swapped_scaled_halves(x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    """The halves scaled, then joined in the other order: not a round trip."""
+    n, d = x.size()
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        acc = x[tile_n, :] * 2.0
+        scale = alpha[tile_n]
+        lo, hi = hl.split(acc.reshape([tile_n, 2, d // 2]).permute(0, 2, 1))
+        lo = lo * scale[:, None]
+        hi = hi * scale[:, None]
+        out[tile_n, :] = hl.join(hi, lo).permute(0, 2, 1).reshape([tile_n, d])
+    return out
+
+
+@helion.kernel(static_shapes=True)
 def halves_full(x: torch.Tensor) -> torch.Tensor:
     """Halves of a ``:`` dim (the rope layout), swapped."""
     n, d = x.size()
@@ -663,6 +693,28 @@ class TestCuteSplitExchange(TestCase):
                 ),
             ):
                 code_and_output(pair_slices, (x,), block_sizes=block_sizes)
+
+    def test_same_op_on_both_halves_needs_no_exchange(self) -> None:
+        # join(f(lo), f(hi)) over one split is f(y): the pair never leaves its
+        # thread, so no shared-memory exchange is staged (elide_split_join).
+        x = torch.randn([64, 128], device=DEVICE)
+        alpha = torch.randn([64], device=DEVICE)
+        code, result = code_and_output(
+            scaled_halves_roundtrip, (x, alpha), block_sizes=[16]
+        )
+        self.assertNotIn("split_smem", code)
+        torch.testing.assert_close(result, x * 2.0 * alpha[:, None])
+
+    def test_halves_joined_in_the_other_order_are_not_elided(self) -> None:
+        # join(f(hi), f(lo)) is not the identity on the pair, so the pattern
+        # stays an exchange, which the lane-loop proof refuses for this tile
+        # (as for halves_full below).
+        x = torch.randn([64, 128], device=DEVICE)
+        alpha = torch.randn([64], device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, r"hl.split of a non-load tile"
+        ):
+            code_and_output(swapped_scaled_halves, (x, alpha), block_sizes=[16])
 
     def test_exchange_over_smem_budget_rejected(self) -> None:
         # A 64 x 256 fp32 tile needs 64 KiB of static shared memory.

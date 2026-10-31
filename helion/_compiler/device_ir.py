@@ -3552,6 +3552,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         scaled_contractions = 0
         if CompileEnvironment.current().backend.name == "cute":
             from .cute.canonicalize_reductions import canonicalize_reductions
+            from .cute.elide_split_join import elide_split_join_roundtrips
             from .cute.fold_noop_stores import fold_noop_stores
             from .cute.fuse_mm_accumulation import fuse_mm_accumulation
             from .cute.fuse_u32_multiply import fuse_u32_multiply
@@ -3561,6 +3562,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             canonicalize_reductions(device_ir)
             scaled_contractions = expose_scaled_contractions(device_ir)
             for graph_info in device_ir.graphs:
+                elide_split_join_roundtrips(graph_info.graph)
                 fold_noop_stores(graph_info.graph)
                 fuse_mm_accumulation(graph_info)
                 fuse_u32_multiply(graph_info.graph)
