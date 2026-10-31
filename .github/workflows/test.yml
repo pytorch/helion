@@ -90,6 +90,10 @@ jobs:
           }
           retry $SUDO apt-get update
           retry $SUDO apt-get install -y --fix-missing libdw1 curl wget git pkg-config zlib1g-dev build-essential
+          if [[ "${{ matrix.runtime-version }}" == "xpu" ]]; then
+            # Triton's XPU runtime compiles a Python extension; images may omit headers.
+            retry $SUDO apt-get install -y --fix-missing "python${{ matrix.python-version }}-dev"
+          fi
 
       - name: Install NVSHMEM
         if: contains(matrix.alias, 'distributed')
