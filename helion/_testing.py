@@ -409,6 +409,21 @@ def skipUnlessCuteAvailable(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: not _has_cute_dsl(), reason)
 
 
+def _tcgen05_runtime_n_ptx_compatible() -> bool:
+    from ._compiler.cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
+
+    return tcgen05_runtime_n_ptx_compatible()
+
+
+# Runtime UMMA-N raw PTX (grouped worklist codegen and its seeds) is enabled only
+# for the exact CuTe DSL release it was validated on; other releases fall back to
+# static-width MMA.
+skipUnlessTcgen05RuntimeNPtx = skipIfFn(
+    lambda: not _tcgen05_runtime_n_ptx_compatible(),
+    "runtime UMMA-N PTX is enabled only for the validated nvidia-cutlass-dsl release",
+)
+
+
 def xfailIfCute(reason: str) -> Callable[[Callable], Callable]:
     """Mark test xfail when CUTLASS CuTe backend is selected."""
     return xfailIfFn(lambda: _get_backend() == "cute", reason)

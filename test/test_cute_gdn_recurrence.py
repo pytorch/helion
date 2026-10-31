@@ -2165,8 +2165,10 @@ def test_gdn_recurrence_wide_token_slices_do_not_spill_cuda(
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    sass_files = sorted(tmp_path.glob("*.sass"))
-    assert len(sass_files) == 1, sass_files
+    # Only the Helion kernel's: the DSL also dumps any other CuTe kernel the
+    # process compiles (e.g. ones PyTorch builds on import).
+    sass_files = sorted(tmp_path.glob("*_helion_cute_launch_*.sass"))
+    assert len(sass_files) == 1, sorted(tmp_path.glob("*.sass"))
     spills = [
         line
         for line in sass_files[0].read_text().splitlines()

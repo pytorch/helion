@@ -638,7 +638,10 @@ class Access:
     """
 
     node: Node
-    fake: torch.Tensor
+    # Excluded from ``__eq__``: from Python 3.13 the generated ``__eq__``
+    # compares field by field, and a tensor ``==`` is elementwise.  The node
+    # determines the fake value anyway.
+    fake: torch.Tensor = dataclasses.field(compare=False)
     name: str
     strides: tuple[int, ...]
     subscripts: tuple[Subscript, ...]
