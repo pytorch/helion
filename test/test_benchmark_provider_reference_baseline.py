@@ -210,3 +210,68 @@ def test_the_reference_config_still_shrinks_its_block_sizes() -> None:
     assert len(compiled) == _MAX_REFERENCE_BASELINE_ATTEMPTS
     assert torch.equal(output, torch.ones(4))
     assert warnings[-1].startswith("Using block sizes [1]")
+
+
+def test_a_refused_reference_falls_back_to_a_sampled_config() -> None:
+    # The compiler refuses the reference config and every shrink of it (a
+    # lowering rule no block size fixes); a config sampled from the search
+    # space that runs becomes the baseline instead of aborting the search.
+    spec = _Spec(
+        {"block_sizes": [8], "mode": "simt"}, {"block_sizes": [8], "mode": "simt"}
+    )
+    provider, compiled, warnings = _provider(
+        spec, lambda config: True, compiles=lambda c: c.config.get("sampled") is True
+    )
+    sampled = [
+        helion.Config(block_sizes=[16], mode="simt"),
+        helion.Config(block_sizes=[32], mode="simt", sampled=True),
+    ]
+    provider._sampled_baseline_configs = lambda count: sampled  # pyrefly: ignore[bad-assignment]
+    output, _args = provider._compute_reference_baseline()
+    assert [c.config["block_sizes"][0] for c in compiled] == [8, 4, 2, 1, 16, 32]
+    assert torch.equal(output, torch.ones(4))
+    assert warnings[-1].startswith("Using the sampled config")
+    assert "is refused at compile time" in warnings[-1]
+
+
+def test_a_refused_reference_without_a_running_sample_raises() -> None:
+    spec = _Spec(
+        {"block_sizes": [8], "mode": "simt"}, {"block_sizes": [8], "mode": "simt"}
+    )
+    provider, compiled, _warnings = _provider(
+        spec, lambda config: True, compiles=lambda c: False
+    )
+    provider._sampled_baseline_configs = lambda count: [  # pyrefly: ignore[bad-assignment]
+        helion.Config(block_sizes=[16], mode="simt")
+    ]
+    try:
+        provider._compute_reference_baseline()
+    except helion.exc.InvalidConfig as error:
+        assert str(error).startswith("Autotuning reference config failed")
+    else:
+        raise AssertionError("the refused reference was not reported")
+    assert [c.config["block_sizes"][0] for c in compiled] == [8, 4, 2, 1, 16]
+
+
+def test_an_unrecoverable_error_from_a_sampled_config_stops_the_search() -> None:
+    spec = _Spec(
+        {"block_sizes": [8], "mode": "simt"}, {"block_sizes": [8], "mode": "simt"}
+    )
+
+    def runs(config: helion.Config) -> bool:
+        if config.config.get("sampled"):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+        return True
+
+    provider, _compiled, _warnings = _provider(
+        spec, runs, compiles=lambda c: c.config.get("sampled") is True
+    )
+    provider._sampled_baseline_configs = lambda count: [  # pyrefly: ignore[bad-assignment]
+        helion.Config(block_sizes=[16], mode="simt", sampled=True)
+    ]
+    try:
+        provider._compute_reference_baseline()
+    except helion.exc.InvalidConfig as error:
+        assert "illegal memory access" in str(error.__cause__)
+    else:
+        raise AssertionError("the unrecoverable error was swallowed")
