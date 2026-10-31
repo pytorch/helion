@@ -1,0 +1,44 @@
+{
+ "mirage_mpk/qwen3_8b": [
+  "Mirage default branch mpk @ 2edbcf40 (2026-10-29) + mirage_mpk_bench.patch (only how many decode steps a launch runs and from which position).",
+  "Graph = Mirage's own sm100 Qwen3 path (demo/qwen3/demo.py == models/qwen3/builder.py): rmsnorm, QKV linear (96 tasks), paged attention with q/k RMSNorm + RoPE (8 tasks, one per KV head, no split-KV = demo default), split-K o_proj into the residual, rmsnorm, gate/up linear (96 tasks), silu_mul, split-K down. KV page size 4096 tokens (demo default), max_seq_length 1024.",
+  "Per-layer = slope over L = 1,2,4,8 (3 builds per L per process, 2 processes per config; process 2 shifts buffer placement). The fixed per-launch work (launch, MPK scheduler start, embedding, per-iteration prepare_next_batch, MPK termination ~100-150 us) is not charged per layer.",
+  "Timing: coldl2 as of 21:32 on 2026-10-29: L2Flusher = the original int32 -> int64 copy + int64 sum (into a preallocated int64 buffer), and graph_of warms up and captures on one side stream. Every process in every fit was started after both changes; runs with the interim float32-sum flush or the older graph_of were discarded, not mixed in. 'loop_us' = the same slope fit on coldl2's profiler-free loop_us of every model.",
+  "MPK's per-launch termination (one scheduler thread posting termination events to 80 schedulers with release atomics) varies by ~+-20-40 us between identical builds and is bimodal within a build; it is the dominant noise in T(L) and cancels in the slope only on average (hence several builds per L).",
+  "Split-KV attention (variant builder-splitkv: paged_attention_split_kv_layer + _merge_layer, exactly as demo/qwen3/demo.py --split-kv-cache builds them) is ~12 us/layer faster (114.6 us) but its output is wrong in this harness: rel L2 15-18% at L=1 (vs ~1% for builder), 35-46% at L=8, at page sizes 4096, 256 and 64 alike; the new K row it writes is right, so the split attention or its merge is off. So it cannot be the headline (summarize.py requires the L=1 models within 5% rel L2); it is listed under alternative_variants with correct=false. Not resolved whether this is a Mirage bug on mpk@2edbcf40 or an interaction with mirage_mpk_bench.patch's mid-sequence admission (the non-split attention, the demo default, is right under the same patch).",
+  "Correctness: output of the whole L-layer stack vs a PyTorch reference: rel L2 ~1% at L=1 growing to ~3% at L=8 (bf16 split-K accumulation); the K row Mirage writes for the new token matches to bf16 rounding; a reference that drops KV row 0 does not match.",
+  "Two configs, each in 2 processes: builder (the demo default: one attention task per KV head; the headline) and builder-splitkv (see above)."
+ ],
+ "mirage_mpk/llama32_1b": [
+  "Mirage default branch mpk @ 2edbcf40 + mirage_mpk_bench.patch.",
+  "Variant builder = Mirage's maintained sm100 dense path (models/qwen3/builder.py, split-K o_proj/down on B200) with enable_qk_norm=False and dummy q/k norm tensors (MPK requires them), 2 processes; variant demo = demo/llama3/demo.py's graph (linear_with_residual o_proj/down, its own grids: QKV 48 tasks), 1 process (clearly slower). The headline is the fastest config run in >= 2 processes. Split-KV is not possible for Llama on mpk (paged_attention_split_kv_layer always applies q/k norm).",
+  "RoPE: plain cos/sin tables (Llama-3 rope scaling only changes table values). Mirage's rmsnorm hard-codes eps 1e-6 (Llama uses 1e-5); the reference uses Mirage's eps.",
+  "Timing: coldl2 as of 21:32 on 2026-10-29: L2Flusher = the original int32 -> int64 copy + int64 sum (into a preallocated int64 buffer), and graph_of warms up and captures on one side stream. Every process in every fit was started after both changes; runs with the interim float32-sum flush or the older graph_of were discarded, not mixed in. 'loop_us' = the same slope fit on coldl2's profiler-free loop_us of every model.",
+  "Per-layer = slope over L = 1,2,4,8 (3 builds per L, 2 processes); fixed per-launch work and MPK termination not charged per layer.",
+  "Previous (superseded) number: 73.3 us/layer from mk-k3-layers, in-launch 64-step steady state, split-K variant."
+ ],
+ "mirage_mpk/qwen3_30b_moe": [
+  "Mirage default branch mpk @ 2edbcf40 + mirage_mpk_bench.patch.",
+  "Graph = demo/qwen3/demo_30B_A3B.py's MoE block layer calls and grids: rmsnorm, router linear_layer (grid 1, demo default without --splitk-gate), moe_topk_softmax_routing (top-8, renormalized), moe_w13_linear (grid 10 x 12), moe_silu_mul, moe_w2_linear (grid 8 x 16), moe_mul_sum_add with the residual. Each layer has its own router and 128-expert banks; the layer input is the previous layer's output, so every layer routes to its own 8 experts (random weights).",
+  "Timing: coldl2 as of 21:32 on 2026-10-29: L2Flusher = the original int32 -> int64 copy + int64 sum (into a preallocated int64 buffer), and graph_of warms up and captures on one side stream. Every process in every fit was started after both changes; runs with the interim float32-sum flush or the older graph_of were discarded, not mixed in. 'loop_us' = the same slope fit on coldl2's profiler-free loop_us of every model.",
+  "Per-layer = slope over L = 1,2,4,8 (3 builds per L, 2 processes).",
+  "Correctness: every layer vs PyTorch given Mirage's own input to that layer (same experts chosen; rel L2 <= ~1.2%)."
+ ],
+ "mirage_mpk/dsv3_mla": [
+  "Mirage default branch mpk @ 2edbcf40 + mirage_mpk_bench.patch (MPK_BENCH_DECODE=1: one query token).",
+  "Kernels = models/deepseek_v3/builder.py's TP8 decode path: mla_mtp_decode_tp8 (16 heads, D_K 576, D_V 512, one 128-row KV tile per split) + mla_mtp_decode_tp8_reduce. The TP8 kernel pads Q_LEN to even, so it computes 2 query rows for the 1 real token, and the reduce writes 2 output rows (a [1, 8192] output buffer would be overrun by 16 KB; our buffers hold 2 rows).",
+  "Favourable to Mirage: the KV is attached already contiguous [1024 rows, 576] per layer and mla_kv_gather (which the builder runs every step to append the new row and copy the paged cache into a contiguous buffer) is not run; max_seq_length = 1024 so the split count is 8 (the builder sizes it from max_seq_length; larger contexts budgets mean more splits).",
+  "Layer chaining: layer i's reduce writes into the first 2 x 8192 elements of layer i+1's query buffer (an MPK view), so layer i+1 starts after layer i's reduce with no extra kernel in the chain (as in a model, where o_proj .. q_proj sit in between).",
+  "Per-layer = slope over L = 1,2,4,8,16 (4 builds per L per process, 4 processes with different placement seeds). Fits that drop small L (where MPK's termination noise dominates) are also reported (per_layer_us_without_L1, per_layer_us_L_ge_4).",
+  "Timing: coldl2 as of 21:32 on 2026-10-29: L2Flusher = the original int32 -> int64 copy + int64 sum (into a preallocated int64 buffer), and graph_of warms up and captures on one side stream. Every process in every fit was started after both changes; runs with the interim float32-sum flush or the older graph_of were discarded, not mixed in. 'loop_us' = the same slope fit on coldl2's profiler-free loop_us of every model.",
+  "Previous (superseded) number: 32.0 us from mk-k3-layers, in-launch steady state (64 steps from 992), which includes MPK's ~15 us per-step scheduler overhead."
+ ],
+ "thunderkittens/llama32_1b": [
+  "HazyResearch Megakernels main @ 7309cec (ThunderKittens submodule 664c108d), demos/low-latency-llama, built per layer count with build_tk.sh (CUDA 12.8, sm_100a).",
+  "A process can load only one build (two builds in one process gave wrong results or hung), so each round runs one process per L (L = 1,2,4,8,16, 2 models each) and the slope is taken across the round's processes; 2 rounds in alternating L order.",
+  "Timing: coldl2 as of 21:32 on 2026-10-29: L2Flusher = the original int32 -> int64 copy + int64 sum (into a preallocated int64 buffer), and graph_of warms up and captures on one side stream. Every process in every fit was started after both changes; runs with the interim float32-sum flush or the older graph_of were discarded, not mixed in. 'loop_us' = the same slope fit on coldl2's profiler-free loop_us of every model.",
+  "Each launch also runs the LM head (vocab 128256); it is a fixed per-launch cost and cancels in the slope. The barrier reset every launch needs runs before the L2 flush, outside the timed span. Embedding and argmax are separate PyTorch ops in TK's generate loop and are not timed.",
+  "Correctness: logits vs megakernels' own PyTorch path for the same decode step: rel L2 ~1% at L=1, up to 4.5% at L=16 (bf16), argmax match; perturbing KV row 0 changes the output, perturbing row 1024 does not (beyond the megakernel's run-to-run noise).",
+  "Previous number: 63.0 us/layer (old driver: (T(16) - T(4)) / 12 of warm back-to-back launches in a CUDA graph of 32 steps at ctx 1024)."
+ ]
+}

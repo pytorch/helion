@@ -1,0 +1,105 @@
+Benchmark-only hook for Mirage MPK (branch mpk, 2edbcf40), used by mirage_layers.py.
+
+It changes neither what Mirage computes nor how it schedules; it only chooses how many decode
+steps one offline-mode launch runs and from which position:
+  * -DMPK_BENCH_DECODE=<Q> (passed through the MPK_EXTRA_NVCC_FLAGS hook in persistent_kernel.py):
+    a newly admitted request starts at step prompt_length - Q, its pages covering
+    [0, prompt_length) (the KV rows before it are taken as already cached), so the first
+    iteration computes the last Q tokens: a decode step at context prompt_length.  Decode
+    iterations then feed Q tokens (Q = 1 here, the stock value).
+  * mpk_bench_set_steps(n) (host function, ctypes): with n > 0 the request finishes after n such
+    steps; n = 0 keeps the stock termination rule (max_seq_length / EOS).
+Apply: git -C <mirage checkout at origin/mpk> apply mirage_mpk_bench.patch
+
+diff --git a/include/mirage/persistent_kernel/persistent_kernel.cuh b/include/mirage/persistent_kernel/persistent_kernel.cuh
+index 873e064b..dd8fd1ff 100644
+--- a/include/mirage/persistent_kernel/persistent_kernel.cuh
++++ b/include/mirage/persistent_kernel/persistent_kernel.cuh
+@@ -279,6 +279,15 @@ __device__ __forceinline__ int
+   return first_live_token / block_size;
+ }
+ 
++#ifdef MPK_BENCH_DECODE
++// Benchmark harness: number of decode steps one launch runs per request
++// (0: the normal termination rules). Set from the host by mpk_bench_set_steps.
++__device__ int mpk_bench_steps = 0;
++extern "C" void mpk_bench_set_steps(int steps) {
++  cudaMemcpyToSymbol(mpk_bench_steps, &steps, sizeof(int));
++}
++#endif
++
+ #ifdef MODE_OFFLINE
+ // TODO: parallelize this processing
+ __device__ __forceinline__ bool
+@@ -331,6 +340,14 @@ __device__ __forceinline__ bool
+ #endif
+ #if defined(MPK_ENABLE_PROFILING) || defined(MPK_TEST_MODE)
+       if (true)
++#elif defined(MPK_BENCH_DECODE)
++      if (mpk_bench_steps > 0
++              ? (step + step_advance >=
++                 prompt_len + (mpk_bench_steps - 1) * MPK_BENCH_DECODE)
++              : ((step + step_advance + 1 >= config.max_seq_length) ||
++                 ((config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step +
++                                 step_advance] == config.eos_token_id) &&
++                  (step + step_advance >= prompt_len))))
+ #else
+       if ((step + step_advance + 1 >= config.max_seq_length) ||
+           ((config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step +
+@@ -398,6 +415,8 @@ __device__ __forceinline__ bool
+         // Eagle3 / spec-decode: feed K+1 candidate tokens (1 bonus + K drafts)
+         // per decode iter. mbt is compile-time set to K+1.
+         num_new_tokens = MPK_TOKEN_ROOM(num_tokens);
++#elif defined(MPK_BENCH_DECODE)
++        num_new_tokens = min(MPK_BENCH_DECODE, MPK_TOKEN_ROOM(num_tokens));
+ #else
+         num_new_tokens = min(1, MPK_TOKEN_ROOM(num_tokens));
+ #endif
+@@ -468,21 +487,30 @@ __device__ __forceinline__ bool
+     }
+     config.request_ids[num_reqs] = next_request_id;
+     config.qo_indptr_buffer[num_reqs] = num_tokens;
++#ifdef MPK_BENCH_DECODE
++    // Benchmark harness: the request's KV cache already holds positions
++    // [0, prompt_length - 1); only the last position is computed (a decode
++    // step at context prompt_length).
++    int bench_start = config.prompt_length[next_request_id] - MPK_BENCH_DECODE;
++    config.step[next_request_id] = bench_start;
++#else
++    int bench_start = 0;
++#endif
+     // Prefill request
+-    int num_new_tokens = min(config.prompt_length[next_request_id],
++    int num_new_tokens = min(config.prompt_length[next_request_id] - bench_start,
+                              MPK_TOKEN_ROOM(num_tokens));
+     // Move tokens to input tokens
+     for (int j = 0; j < num_new_tokens; j++) {
+       config.input_tokens[num_tokens + j] =
+-          config.tokens[next_request_id * MPK_MAX_SEQ_LENGTH + j];
++          config.tokens[next_request_id * MPK_MAX_SEQ_LENGTH + bench_start + j];
+     }
+     // Per-group page allocation for new prefill request
+     for (int g = 0; g < MPK_NUM_KV_GROUPS; g++) {
+       int bs = config.kv_group_block_sizes[g];
+       config.paged_kv_indptr_buffer[g][num_reqs] = num_pages_g[g];
+-      int num_new_pages_g = (num_new_tokens + bs - 1) / bs;
++      int num_new_pages_g = (bench_start + num_new_tokens + bs - 1) / bs;
+       {
+-        int _lpl = num_new_tokens % bs;
++        int _lpl = (bench_start + num_new_tokens) % bs;
+         config.paged_kv_last_page_len_buffer[g][num_reqs] =
+             (_lpl == 0) ? bs : _lpl;
+       }
+diff --git a/python/mirage/mpk/persistent_kernel.py b/python/mirage/mpk/persistent_kernel.py
+index 3fad5e71..d1ba9687 100644
+--- a/python/mirage/mpk/persistent_kernel.py
++++ b/python/mirage/mpk/persistent_kernel.py
+@@ -317,6 +317,8 @@ def get_compile_command(
+     flags = flags + [f"-DMPK_TARGET_CC={target_cc}", "-DMIRAGE_BACKEND_USE_CUDA"]
+     if test_mode:
+         flags = flags + ["-DMPK_TEST_MODE"]
++    # Benchmark harness hook: extra nvcc flags (e.g. -DMPK_BENCH_DECODE).
++    flags = flags + os.environ.get("MPK_EXTRA_NVCC_FLAGS", "").split()
+     if mpk.mode == "offline":
+         flags = flags + ["-DMODE_OFFLINE"]
+     elif mpk.mode == "online":
