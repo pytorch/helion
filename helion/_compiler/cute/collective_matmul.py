@@ -62,7 +62,7 @@ from .matmul_utils import cute_synthetic_lane_k_extent
 from .matmul_utils import loop_carries
 from .matmul_utils import strip_new_vars
 from .mma_support import cute_fp32_dot_uses_tf32
-from .packed_matmul import packed_axis_for_fact
+from .packed_matmul import contraction_axis_for_fact
 from .packed_matmul import packed_matmul_axis
 from .scalar_recipe import ScalarRecipe
 from .scalar_recipe import build_recipe
@@ -215,10 +215,8 @@ def _contraction_k_block_id(
     if not isinstance(fact_id, int):
         return None
     fact = env.config_spec.matmul_facts[fact_id]
-    if fact.k_block_id is not None:
-        return fact.k_block_id
-    packed = packed_axis_for_fact(env, device_ir, fact)
-    return None if packed is None else packed.block_id
+    axis = contraction_axis_for_fact(env, device_ir, fact)
+    return None if axis is None else axis.block_id
 
 
 def has_collective_native_seed_candidate(

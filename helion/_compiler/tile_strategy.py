@@ -8630,6 +8630,10 @@ class BlockSizeTileStrategy(TileStrategy):
 
         env = CompileEnvironment.current()
 
+        sibling_axis = self.fn.tile_strategy.collective_sibling_thread_axis(self)
+        if sibling_axis is not None:
+            return sibling_axis
+
         # Plan-driven path: honor ``block_axis_priority`` so the outer
         # grid loop can reserve an axis for a lower-priority inner tile
         # loop even when that inner loop has not yet entered
@@ -10197,13 +10201,19 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     "cute",
                     "a shared tile thread axis requires an evenly partitioned tile",
                 )
-            self._shared_thread_extents[block_id] = threads
-            elements_per_thread = max(1, size // threads)
-            if elements_per_thread == 1:
-                self._lane_var_by_block.pop(block_id, None)
-            vec = self._cute_lane_vec_width_by_block.get(block_id, 1)
-            if elements_per_thread % vec:
-                self._cute_lane_vec_width_by_block.pop(block_id, None)
+            self._set_shared_thread_extent(block_id, size, threads)
+
+    def _set_shared_thread_extent(self, block_id: int, size: int, threads: int) -> None:
+        self._shared_thread_extents[block_id] = threads
+        elements_per_thread = max(1, size // threads)
+        # Collective caps can narrow a previously scalar tile into lane loops.
+        if elements_per_thread > 1 and block_id not in self._lane_var_by_block:
+            self._lane_var_by_block[block_id] = self.fn.new_var(f"lane_{block_id}")
+        if elements_per_thread == 1:
+            self._lane_var_by_block.pop(block_id, None)
+        vec = self._cute_lane_vec_width_by_block.get(block_id, 1)
+        if elements_per_thread % vec:
+            self._cute_lane_vec_width_by_block.pop(block_id, None)
 
     def thread_extent_for_masking(self, block_id: int, thread_extent: int) -> int:
         """Tile lanes that can own an element when a sibling widens the launch."""
@@ -10243,12 +10253,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     f"thread axis {axis}: block {block_id} needs a static block "
                     "size to run as a lane loop",
                 )
-            self._shared_thread_extents[block_id] = 1
-            if size > 1 and block_id not in self._lane_var_by_block:
-                self._lane_var_by_block[block_id] = self.fn.new_var(f"lane_{block_id}")
-            vec = self._cute_lane_vec_width_by_block.get(block_id, 1)
-            if size % vec:
-                self._cute_lane_vec_width_by_block.pop(block_id, None)
+            self._set_shared_thread_extent(block_id, size, 1)
 
     def _maybe_apply_cute_cluster(
         self, env: CompileEnvironment, state: CodegenState

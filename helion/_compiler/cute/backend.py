@@ -1503,9 +1503,9 @@ def _graph_used_block_ids(
     from ...language import memory_ops
     from ..compile_environment import CompileEnvironment
     from ..device_ir import RootGraphInfo
+    from ..device_ir import control_flow_child_graph_ids
     from ..host_function import HostFunction
     from ..variable_origin import BlockSizeOrigin
-    from .loop_nesting import _child_graph_ids
 
     env = CompileEnvironment.current()
     host_function = HostFunction.current()
@@ -1592,7 +1592,9 @@ def _graph_used_block_ids(
         for node in graph.nodes:
             # A root coordinate can first be read inside a captured device
             # scope. Its thread distribution must remain live there as well.
-            pending.extend(graph_by_id[graph_id] for graph_id in _child_graph_ids(node))
+            pending.extend(
+                graph_by_id[graph_id] for graph_id in control_flow_child_graph_ids(node)
+            )
             if node.target is memory_ops.store:
                 # A store has no value; its index names every tile axis it
                 # writes, including axes a broadcast value does not carry.

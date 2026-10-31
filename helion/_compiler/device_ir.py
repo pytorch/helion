@@ -565,24 +565,59 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         return joins
 
 
+def _control_flow_graph_entries(
+    node: torch.fx.Node,
+) -> tuple[tuple[int, int | None], ...]:
+    """Child IDs and direct capture slots, excluding mutable while state."""
+    if node.op != "call_function":
+        return ()
+    if _tracing_ops.is_for_loop_target(node.target):
+        if len(node.args) >= 4 and isinstance(node.args[0], int):
+            return ((node.args[0], 3),)
+    elif node.target is _tracing_ops._if:
+        if (
+            len(node.args) >= 5
+            and isinstance(node.args[1], int)
+            and isinstance(node.args[2], int)
+        ):
+            return ((node.args[1], 3), (node.args[2], 4))
+    elif node.target is _tracing_ops._while_loop and len(node.args) >= 3:
+        if not isinstance(node.args[0], int) or not isinstance(node.args[1], int):
+            return ()
+        # While inputs are loop-carried state, not invariant captures. Graph
+        # ownership follows these edges, but value-origin proofs must stop here.
+        result = ((node.args[0], None), (node.args[1], None))
+        if len(node.args) > 3 and isinstance(node.args[3], int):
+            result = (*result, (node.args[3], None))
+        return result
+    return ()
+
+
+def control_flow_child_graph_ids(node: torch.fx.Node) -> tuple[int, ...]:
+    return tuple(graph_id for graph_id, _slot in _control_flow_graph_entries(node))
+
+
 def control_flow_parent_entries(
     graphs: Sequence[GraphInfo],
 ) -> dict[int, tuple[torch.fx.Node, int]]:
     """Map child graph IDs to their parent call and captured-argument slot."""
-    result: dict[int, tuple[torch.fx.Node, int]] = {}
+    return {
+        child_id: (node, slot)
+        for info in graphs
+        for node in info.graph.nodes
+        for child_id, slot in _control_flow_graph_entries(node)
+        if slot is not None
+    }
+
+
+def control_flow_parent_ids(graphs: Sequence[GraphInfo]) -> dict[int, int]:
+    result: dict[int, int] = {}
     for info in graphs:
         for node in info.graph.nodes:
-            if node.op != "call_function" or not node.args:
-                continue
-            if _tracing_ops.is_for_loop_target(node.target) and isinstance(
-                node.args[0], int
-            ):
-                result[node.args[0]] = (node, 3)
-            elif node.target is _tracing_ops._if and len(node.args) >= 5:
-                if isinstance(node.args[1], int):
-                    result[node.args[1]] = (node, 3)
-                if isinstance(node.args[2], int):
-                    result[node.args[2]] = (node, 4)
+            for child_id in control_flow_child_graph_ids(node):
+                # Rolling appends graph aliases; the original owner is the one
+                # reachable from the root, not a later bookkeeping copy.
+                result.setdefault(child_id, info.graph_id)
     return result
 
 
