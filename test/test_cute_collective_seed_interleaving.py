@@ -117,8 +117,9 @@ def _initial_population(
         flat = checked_initial_population(search)
         result = [search.config_gen.unflatten(value) for value in flat]
         assert [search.config_gen.flatten(config) for config in result] == flat
+        first = (user_seeds or bound.config_spec.compiler_seed_configs)[0]
         assert result[0] == search.config_gen.unflatten(
-            search.config_gen.default_flat()
+            search.config_gen.flatten(first)
         )
         assert len(result) == len(set(result))
         return result
@@ -159,7 +160,6 @@ def test_full_random_population_reaches_coupled_pipeline_chunk_geometries(
     assert {_schedule(seed) for seed in actual if seed.get("cute_collective_mma")} == {
         _schedule(seed) for seed in legacy if seed.get("cute_collective_mma")
     }
-    assert not actual[0].get("cute_collective_mma", False)
     assert any(seed.get("cute_collective_compute") == "tcgen05" for seed in actual)
 
 
@@ -206,7 +206,7 @@ def test_interleaving_preserves_budget_and_explicit_user_seed_priority(
         normalized = (
             bound.config_spec.create_config_generation().seed_flat_config_pairs()
         )
-        assert population[1] == normalized[-1][1]
+        assert population[0] == normalized[-1][1]
 
 
 @pytest.mark.parametrize(

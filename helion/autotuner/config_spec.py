@@ -513,6 +513,9 @@ class LiveTile(NamedTuple):
     kind: str
     stageable: bool | None = None
     promoted_lhs: bool = False
+    # Present only for carries created by rolling a custom reduction. Persistent
+    # candidates have no such tile; ordinary loop-carried values are unconditional.
+    carried_reduction_block_id: int | None = None
 
 
 class SymbolicLoopBound(NamedTuple):
@@ -778,6 +781,8 @@ class ReductionDescriptor(NamedTuple):
       feeding it.
     - ``fixed_tile_size_hint``: fixed per-iteration width for ``FIXED_TILE``; ``None`` otherwise.
     - ``row_reread`` / ``reread_eviction_index``: per-reduction memory-op signals.
+    - ``is_custom``: whether only user-defined combines own this graph-axis occurrence.
+      Native reductions take scheduling ownership of axes shared within one graph.
     """
 
     category: ReductionCategory
@@ -788,6 +793,8 @@ class ReductionDescriptor(NamedTuple):
     row_reread: bool = False
     reread_eviction_index: int | None = None
     fixed_tile_size_hint: int | None = None
+    # Native scheduling owns an axis shared by native and custom operations.
+    is_custom: bool = False
 
 
 class ReductionKernelFact(NamedTuple):
@@ -2174,7 +2181,9 @@ class ConfigSpec:
         # independent of which heuristic runs.
         self.kernel_matmul_fact: KernelMatmulFact | None = None
         # The Stage-1 categorizing product the reduction seed + allocator consume.
-        self.reduction_kernel_fact: ReductionKernelFact | None = None
+        self._reduction_kernel_fact: ReductionKernelFact | None = None
+        self._native_reduction_block_ids: frozenset[int] = frozenset()
+        self._custom_only_reduction_block_ids: frozenset[int] = frozenset()
         self.matmul_reduction_epilogue_facts: list[MatmulWithReductionEpilogueFact] = []
         self.accumulator_facts: list[AccumulatorFact] = []
         self.pointwise_facts: list[PointwiseElementwiseFact] = []
@@ -8352,6 +8361,43 @@ class ConfigSpec:
                 overrides,
             )
 
+    @property
+    def reduction_kernel_fact(self) -> ReductionKernelFact | None:
+        return self._reduction_kernel_fact
+
+    @reduction_kernel_fact.setter
+    def reduction_kernel_fact(self, fact: ReductionKernelFact | None) -> None:
+        self._reduction_kernel_fact = fact
+        reductions = fact.reductions if fact is not None else ()
+        native = frozenset(r.block_id for r in reductions if not r.is_custom)
+        self._native_reduction_block_ids = native
+        self._custom_only_reduction_block_ids = (
+            frozenset(r.block_id for r in reductions if r.is_custom) - native
+        )
+
+    @property
+    def has_native_reductions(self) -> bool:
+        return bool(self._native_reduction_block_ids)
+
+    @property
+    def custom_only_reduction_block_ids(self) -> frozenset[int]:
+        return self._custom_only_reduction_block_ids
+
+    @property
+    def has_custom_reduction_loops(self) -> bool:
+        """Whether a custom reduction has an available loop-size coordinate.
+
+        Axes shared by native and custom reductions across graphs count here;
+        within one graph, shared axes are classified as native. Persistent
+        defaults use custom_only_reduction_block_ids to preserve native ownership.
+        """
+        fact = self.reduction_kernel_fact
+        rolled_ids = self.reduction_loops.valid_block_ids()
+        return fact is not None and any(
+            reduction.is_custom and reduction.block_id in rolled_ids
+            for reduction in fact.reductions
+        )
+
     def _base_default_config(self) -> helion.Config:
         config = self.flat_config(lambda x: x.default())
         # The additive finalizer choice must not change existing seed configs.
@@ -10058,6 +10104,9 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         if max_chunk is not None:
             if force_threshold is not None and self.size_hint > force_threshold:
                 default = prev_power_of_2(default, max_chunk)
+        if self.block_id in base.custom_only_reduction_block_ids:
+            # Keep custom axes persistent unless a native occurrence shares them.
+            default = high
         if high == self._full_extent_chunk():
             # The full padded chunk now denotes an explicit rolled loop.
             # Reserve the next power of two for None, retaining the old default

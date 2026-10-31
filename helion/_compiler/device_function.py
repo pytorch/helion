@@ -2804,10 +2804,12 @@ class DeviceFunction:
 
     def register_helper_function(
         self, helper_graph_info: HelperFunctionGraphInfo
-    ) -> None:
-        """Register a helper function to be generated at global scope."""
+    ) -> str:
+        """Register a global helper function and return its generated name."""
+        if (name := self.helper_manager.registered_name(helper_graph_info)) is not None:
+            return name
         name = self.namespace.create_name(helper_graph_info.name, None)
-        self.helper_manager.register_helper_function(helper_graph_info, name)
+        return self.helper_manager.register_helper_function(helper_graph_info, name)
 
     def register_triton_outlined_helper(
         self,

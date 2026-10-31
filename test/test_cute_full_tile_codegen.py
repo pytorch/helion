@@ -236,9 +236,18 @@ def _population(bound, *, count=100, explicit=None):
             configs = [search.config_gen.unflatten(flat) for flat in flats]
             assert len(configs) == len(set(configs)) == count
             assert [search.config_gen.flatten(config) for config in configs] == flats
-            assert configs[0] == search.config_gen.unflatten(
-                search.config_gen.default_flat()
+            pairs = (
+                search.config_gen.user_seed_flat_config_pairs(
+                    search._autotune_seed_configs()
+                )
+                + search.config_gen.seed_flat_config_pairs()
             )
+            expected_first = (
+                pairs[0][1]
+                if pairs
+                else search.config_gen.unflatten(search.config_gen.default_flat())
+            )
+            assert configs[0] == expected_first
             seeds = [config for _, config in search.config_gen.seed_flat_config_pairs()]
     return configs, seeds
 
@@ -291,9 +300,9 @@ def test_user_seed_priority_and_budget_are_preserved(count):
     with bound.env:
         generation = ConfigGeneration(bound.config_spec)
         expected = generation.canonicalize_flat(generation.flatten(explicit))[1]
-    assert population[1] == expected
-    retained = min(len(seeds), count - 2)
-    assert population[2 : 2 + retained] == seeds[:retained]
+    assert population[0] == expected
+    retained = min(len(seeds), count - 1)
+    assert population[1 : 1 + retained] == seeds[:retained]
 
 
 def test_true_seed_lists_do_not_alias_prior_or_sibling_configs():

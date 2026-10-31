@@ -575,8 +575,9 @@ def test_real_full_initial_population_reaches_deep_workspace_and_atomic_choices(
         flat = checked_initial_population(search)
         configs = [search.config_gen.unflatten(row) for row in flat]
         assert [search.config_gen.flatten(config) for config in configs] == flat
+        first_seed = search.config_gen.seed_flat_config_pairs()[0][1]
     # The 100-row base and the separate coverage suffix were checked above.
-    assert not configs[0].get("cute_split_k_workspace", False)
+    assert configs[0] == first_seed
     assert any(
         config.get("cute_collective_mma") and not config.get("cute_split_k_workspace")
         for config in configs

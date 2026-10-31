@@ -98,8 +98,9 @@ def _initial_population(
         flats = search._generate_initial_population_flat()
         configs = [search.config_gen.unflatten(flat) for flat in flats]
         assert [search.config_gen.flatten(config) for config in configs] == flats
+        first = explicit or bound.config_spec.compiler_seed_configs[0]
         assert configs[0] == search.config_gen.unflatten(
-            search.config_gen.default_flat()
+            search.config_gen.flatten(first)
         )
     return configs
 
@@ -220,7 +221,7 @@ def test_new_seeds_keep_population_budget_and_user_priority(count: int) -> None:
     with bound.env:
         generation = ConfigGeneration(bound.config_spec)
         _flat, expected = generation.canonicalize_flat(generation.flatten(explicit))
-    assert population[1] == expected
+    assert population[0] == expected
 
 
 @pytest.mark.parametrize("static,flags", [(False, False), (False, True), (True, False)])

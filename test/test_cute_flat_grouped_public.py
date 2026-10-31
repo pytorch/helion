@@ -259,13 +259,10 @@ def test_real_initial_100_reaches_every_new_schedule_and_retains_old_first(
         configs = [search.config_gen.unflatten(row) for row in flat]
         # The 100-row base and the separate coverage suffix were checked above.
         assert [search.config_gen.flatten(config) for config in configs] == flat
-        assert configs[0] == with_flat_min_blocks_default(
-            bound.config_spec, bound.config_spec.default_config()
-        )
         first = search.config_gen.unflatten(
             search.config_gen.flatten(bound.config_spec.compiler_seed_configs[0])
         )
-        assert configs[1] == first
+        assert configs[0] == first
         choices = [config for config in configs if config.get(WARPS_KEY, 0)]
         assert {(config[WARPS_KEY], config[K_KEY]) for config in choices} == {
             (warps, block_k) for block_k in (32, 64) for warps in (1, 2, 4, 8)
@@ -308,9 +305,11 @@ def test_explicit_user_seed_keeps_priority_over_the_new_compiler_family() -> Non
         transferred = generator.unflatten(generator.flatten(explicit))
         population = generator.random_population_flat(100, user_seed_configs=[explicit])
         configs = [generator.unflatten(row) for row in population]
-        assert configs[0] == with_flat_min_blocks_default(spec, spec.default_config())
-        assert configs[1] == transferred
-        assert not configs[1].get(WARPS_KEY, 0)
+        assert configs[0] == transferred
+        assert configs[1] == generator.unflatten(
+            generator.flatten(spec.compiler_seed_configs[0])
+        )
+        assert not configs[0].get(WARPS_KEY, 0)
         assert {
             (config[WARPS_KEY], config[K_KEY])
             for config in configs

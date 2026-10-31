@@ -693,7 +693,9 @@ def test_seed_local_positive_keeps_automatic_pair(value: int, disabled: bool) ->
         "disable_autotuner_heuristics": disabled,
     }
     with patch(REGISTRATION):
-        previous, previous_args = _bind("matmul", **settings)
+        previous, previous_args = _bind(
+            "matmul", **(settings | {"autotune_seed_configs": []})
+        )
     bound, args = _bind("matmul", **settings)
     assert _group(bound).domain == (0, 1)
     old, search = _search(previous, previous_args), _search(bound, args)
@@ -710,21 +712,19 @@ def test_seed_local_positive_keeps_automatic_pair(value: int, disabled: bool) ->
     ):
         random.seed(2026091482)
         rows = checked_initial_population(search)
-        # The old schema drops this explicit value and deduplicates its
-        # ordinary carrier with the default. Retaining the value adds one
-        # explicit seed at row 1, so the existing builder draws one fewer
-        # random padding row. This is the intentional v1 seed behavior;
-        # the v2 global-override repair must not veto local positive seeds.
+        # The explicit seed takes the first slot. Compared with an automatic
+        # population without user seeds, this draws one fewer random padding
+        # row while preserving the compiler-seed and fallback order.
         assert random.getstate() != old_rng
         indices, sequence = search.config_gen._key_to_flat_indices[MIN_BLOCKS_KEY]
         assert not sequence and len(indices) == 1
         assert [
             [entry for index, entry in enumerate(row) if index != indices[0]]
             for row_index, row in enumerate(rows[:100])
-            if row_index != 1
+            if row_index != 0
         ] == old_rows[:99]
         configs = [search.config_gen.unflatten(row) for row in rows]
-    assert configs[1] == bound._normalize_config(seed)
+    assert configs[0] == bound._normalize_config(seed)
     assert bound._normalize_config(seed) in configs
     if disabled:
         assert len(rows) == 100
@@ -910,7 +910,9 @@ def test_materialized_seed_local_positive_keeps_automatic_pair_and_other_groups(
         "disable_autotuner_heuristics": disabled,
     }
     with patch(REGISTRATION):
-        previous, previous_args = _materialized_bind("se", **settings)
+        previous, previous_args = _materialized_bind(
+            "se", **(settings | {"autotune_seed_configs": []})
+        )
     bound, args = _materialized_bind("se", **settings)
     assert _group(bound).domain == (0, 1)
     old_groups = {
@@ -956,21 +958,19 @@ def test_materialized_seed_local_positive_keeps_automatic_pair_and_other_groups(
     ):
         random.seed(2026091482)
         rows = checked_initial_population(search)
-        # The old schema drops this explicit value and deduplicates its
-        # ordinary carrier with the default. Retaining the value adds one
-        # explicit seed at row 1, so the existing builder draws one fewer
-        # random padding row. This is the intentional v1 seed behavior;
-        # the v2 global-override repair must not veto local positive seeds.
+        # The explicit seed takes the first slot. Compared with an automatic
+        # population without user seeds, this draws one fewer random padding
+        # row while preserving the compiler-seed and fallback order.
         assert random.getstate() != old_rng
         indices, sequence = search.config_gen._key_to_flat_indices[MIN_BLOCKS_KEY]
         assert not sequence and len(indices) == 1
         assert [
             [entry for index, entry in enumerate(row) if index != indices[0]]
             for row_index, row in enumerate(rows[:100])
-            if row_index != 1
+            if row_index != 0
         ] == old_rows[:99]
         configs = [search.config_gen.unflatten(row) for row in rows]
-    assert configs[1] == bound._normalize_config(seed)
+    assert configs[0] == bound._normalize_config(seed)
     assert bound._normalize_config(seed) in configs
     if disabled:
         assert len(rows) == 100
