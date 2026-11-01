@@ -91,12 +91,23 @@ def _pure_packet_call(call: ast.Call) -> bool:
         keywords["asm"],
         keywords["constraints"],
     )
-    return (
+    if not (
         isinstance(pure, ast.Constant)
         and isinstance(asm, ast.Constant)
         and isinstance(constraints, ast.Constant)
-        and is_pure_scalar_assembly(asm.value, constraints.value, pure.value)
-    )
+    ):
+        return False
+    from .philox_stream import SCALAR_ASM
+
+    if asm.value == SCALAR_ASM:
+        # The compiler's own uniform stream.  Its lane loop belongs to
+        # ``lower_philox_packets``, which shares one Philox evaluation across
+        # the lanes and then vectorizes the fast path's memory itself (through
+        # this same machinery): packing the memory first would leave the
+        # per-lane RNG loop inside the vector path, where the packet guard's
+        # branches disagree on the collected store list.
+        return False
+    return is_pure_scalar_assembly(asm.value, constraints.value, pure.value)
 
 
 def is_pure_scalar_assembly(asm: object, constraints: object, is_pure: object) -> bool:
@@ -351,7 +362,7 @@ class _PacketVectorizer(_Vectorizer):
         return (
             not self.shadowed
             and isinstance(loop.target, ast.Name)
-            and _range_extent(loop) in (4, 8)
+            and _range_extent(loop) in (4, 8, 16)
             and not loop.orelse
         )
 

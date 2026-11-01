@@ -430,6 +430,8 @@ _VECTOR_FLUSH_MAX_WIDTH = {
     **{helper: 16 // itemsize for helper, itemsize in PACKET_STORE_BYTES.items()},
     "_cute_store_u16x8_l2_evict_last": 8,
     "_cute_store_u32x4_l2_evict_last": 4,
+    "_cute_store_u16x8_streaming": 8,
+    "_cute_store_u32x4_streaming": 4,
 }
 # The generated vector loads besides ``cute.arch.load``: the L2-policy helpers
 # (16- and 8-byte forms), called the same way

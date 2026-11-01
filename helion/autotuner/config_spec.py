@@ -5867,13 +5867,17 @@ class ConfigSpec:
         if key not in config:
             return
         value = config[key]
-        if value not in ("default", "l2_evict_last"):
+        if value not in ("default", "streaming", "l2_evict_last"):
             if not fix_invalid:
                 raise InvalidConfig(
-                    f"{key} must be one of ('default', 'l2_evict_last'), got {value!r}"
+                    f"{key} must be one of ('default', 'streaming', 'l2_evict_last'), "
+                    f"got {value!r}"
                 )
             config[key] = "default"
-        if not self.cute_l2_evict_last_store_policy_supported:
+        if (
+            config[key] == "l2_evict_last"
+            and not self.cute_l2_evict_last_store_policy_supported
+        ):
             config[key] = "default"
 
     def _normalize_cute_exact_div_form(
@@ -8974,11 +8978,15 @@ class ConfigSpec:
                     fields["cute_reduction_pipeline_depth"] = EnumFragment(
                         choices=(2, 4)
                     )
+                # Cache policy of the full 16-byte global packet flushes:
+                # ``streaming`` (``st.global.cs``, evict-first) keeps an
+                # output written once from displacing re-read inputs;
+                # ``l2_evict_last`` needs the validated SM103 descriptor.
                 fields["cute_store_policy"] = EnumFragment(
                     choices=(
-                        ("default", "l2_evict_last")
+                        ("default", "streaming", "l2_evict_last")
                         if self.cute_l2_evict_last_store_policy_supported
-                        else ("default",)
+                        else ("default", "streaming")
                     )
                 )
                 if self.cute_exact_division_sites and not self.matmul_facts:
