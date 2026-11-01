@@ -358,6 +358,10 @@ def _constexpr_decl(name: str, value: object) -> str:
     if isinstance(value, bool):
         return f"constexpr bool {name} = {'true' if value else 'false'};"
     if isinstance(value, int):
+        if not -(2**31) <= value < 2**31:
+            raise exc.BackendUnsupported(
+                "metal", f"kernel argument {name} = {value} does not fit an int"
+            )
         return f"constexpr int {name} = {value};"
     if isinstance(value, float):
         return f"constexpr float {name} = {value!r};"

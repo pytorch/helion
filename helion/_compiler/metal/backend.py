@@ -204,6 +204,30 @@ def _is_threadgroup_too_large(err: BaseException) -> bool:
 _DEFAULT_AUTOTUNE_BUDGET_SECONDS = 300
 
 
+def _config_fixed_scalars() -> set[str]:
+    """Runtime scalar arguments whose expression has only block sizes as free
+    symbols, e.g. a tile count ``cdiv(m, block_m)`` under static shapes: the
+    config fixes their value."""
+    from ..device_function import DeviceFunction
+    from ..device_function import SymbolArgument
+    from ..host_function import HostFunction
+    from ..variable_origin import BlockSizeOrigin
+
+    origins = HostFunction.current().expr_to_origin
+
+    def is_block_size(sym: sympy.Basic) -> bool:
+        info = origins.get(sym)
+        return info is not None and isinstance(info.origin, BlockSizeOrigin)
+
+    return {
+        arg.name
+        for expr, arg in DeviceFunction.current()._expr_args.items()
+        if isinstance(arg, SymbolArgument)
+        and expr.free_symbols
+        and all(is_block_size(sym) for sym in expr.free_symbols)
+    }
+
+
 class MetalBackend(Backend):
     """Metal Shading Language (MSL) code generation backend for macOS."""
 
@@ -232,6 +256,8 @@ class MetalBackend(Backend):
             "num_warps",
             "reduction_loops",
             "reduction_fusion",
+            "pid_type",
+            "num_sm_multiplier",
         }
     )
 
@@ -455,6 +481,13 @@ class MetalBackend(Backend):
 
     def supports_config_key(self, key: str) -> bool:
         return key in self._SUPPORTED_CONFIG_KEYS
+
+    def default_num_sm_multiplier(self) -> int:
+        # A threadgroup doesn't fill an Apple GPU core.  On an M4 Pro (16
+        # cores), persistent matmul and attention tiles ran about 3x slower at
+        # one threadgroup per core than at four, 2 per core left most of the
+        # matmul gain on the table, and 8 slowed memory-bound kernels.
+        return 4
 
     # ------------------------------------------------------------------
     # Reductions.  See ``metal/reduction.py`` for the emitters and
@@ -926,10 +959,11 @@ class MetalBackend(Backend):
         if has_rng_ops:
             raise exc.BackendUnsupported(self.name, "RNG ops")
         keywords = self.launcher_keyword_args(config, has_barrier=has_barrier)
+        fixed = _config_fixed_scalars()
         by_value = tuple(
             i
             for i, arg in enumerate(sorted_args or ())
-            if isinstance(arg, SymbolArgument)
+            if isinstance(arg, SymbolArgument) and arg.name not in fixed
         )
         if by_value:
             keywords.append(f"_by_value={by_value!r}")
