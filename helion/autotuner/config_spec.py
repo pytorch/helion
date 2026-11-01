@@ -220,6 +220,9 @@ from .._compiler.cute.split_k_cluster_config import SCHEDULES as SPLIT_K_SCHEDUL
 from .._compiler.cute.split_k_cluster_config import normalize_cluster_finalizer
 from .._compiler.cute.split_k_cluster_config import normalize_cluster_schedule
 from .._compiler.cute.split_k_workspace_config import (
+    ATOMIC_EPILOGUE_KEY as SPLIT_K_ATOMIC_EPILOGUE_KEY,
+)
+from .._compiler.cute.split_k_workspace_config import (
     PARTITIONS_KEY as SPLIT_K_PARTITIONS_KEY,
 )
 from .._compiler.cute.split_k_workspace_config import STAGES_KEY as SPLIT_K_STAGES_KEY
@@ -1988,6 +1991,10 @@ class ConfigSpec:
         # (``split_k_workspace.plain_store_partition_choices``); empty for
         # the atomic pattern, which partitions through its own tunable.
         self.cute_split_k_partition_choices: tuple[int, ...] = ()
+        # ``cute_split_k_atomic_epilogue`` is offered when the proved split-K
+        # reduction is an atomic add into an output kept in a dtype with a
+        # packed atomic add (``split_k_workspace.atomic_epilogue_admissible``).
+        self.cute_split_k_atomic_epilogue_available: bool = False
         self.cute_materialized_schedule_available: bool = False
         self.cute_materialized_schedule_search_enabled: bool = False
         self.cute_row_matrix_transport_available: bool = False
@@ -7234,6 +7241,7 @@ class ConfigSpec:
                 available=self.cute_split_k_workspace_available,
                 fix_invalid=_fix_invalid,
                 partition_choices=self.cute_split_k_partition_choices,
+                atomic_epilogue_available=self.cute_split_k_atomic_epilogue_available,
             )
             normalize_grouped_rna_config(
                 config,
@@ -8836,6 +8844,7 @@ class ConfigSpec:
                 SPLIT_K_WORKSPACE_KEY,
                 SPLIT_K_STAGES_KEY,
                 SPLIT_K_PARTITIONS_KEY,
+                SPLIT_K_ATOMIC_EPILOGUE_KEY,
             ):
                 config.config.pop(key, None)
 
@@ -9446,7 +9455,10 @@ class ConfigSpec:
                 # collective ``matmul_facts``, so the knobs live outside them.
                 if self.cute_split_k_workspace_available:
                     fields.update(
-                        workspace_search_fields(self.cute_split_k_partition_choices)
+                        workspace_search_fields(
+                            self.cute_split_k_partition_choices,
+                            atomic_epilogue_available=self.cute_split_k_atomic_epilogue_available,
+                        )
                     )
                 if self.matmul_facts:
                     if (

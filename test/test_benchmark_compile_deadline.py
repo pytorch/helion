@@ -111,6 +111,13 @@ class TestWorkerCompileDeadline(unittest.TestCase):
     def test_benchmark_timeout_counts_from_the_compiled_report(self) -> None:
         worker = BenchmarkWorker()
         try:
+            # The compile deadline is armed before a fresh worker's spawned
+            # process has imported torch and unpickled the job (seconds on an
+            # idle machine, far more under xdist contention on CI): warm the
+            # worker so the deadline below measures the job alone.
+            self.assertEqual(
+                worker.run(_ReturnValue(0), timeout=60.0, compile_timeout=60.0), 0
+            )
             # A compile longer than the benchmark timeout is fine when it fits
             # the compile deadline: the timing window opens afterwards.
             self.assertAlmostEqual(
