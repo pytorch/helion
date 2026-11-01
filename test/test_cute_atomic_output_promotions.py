@@ -25,6 +25,25 @@ import helion.language as hl
 
 CUDA_DEVICE = "cuda"
 
+
+@pytest.fixture(autouse=True)
+def _promotion_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests exercise the fp32 promotion; pin it on for the module's
+    kernels (the Setting defaults to accumulating in the half storage)."""
+    for kernel in (
+        _partitioned_matmul,
+        _unhashable_host_factory_output,
+        _metadata_alias_output_matmul,
+        _atomic_into_argument,
+        matmul_split_k,
+    ):
+        monkeypatch.setattr(
+            kernel,
+            "settings",
+            kernel.settings.copy(cute_promote_half_atomic_outputs=True),
+        )
+
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -261,6 +280,7 @@ def test_original_conditional_epilogue_keeps_fp32_output(
         backend="cute",
         static_shapes=static_shapes,
         autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     a, b = _inputs()
     bias = torch.empty(b.size(1), dtype=a.dtype)
@@ -399,6 +419,7 @@ def test_fp32_atomic_original_example_and_poisoned_graph_reset(
         backend="cute",
         static_shapes=False,
         autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     inputs = (a, b, lambda acc, tile: acc + bias[tile[1]]) if with_bias else (a, b)
     bound = kernel._bind_isolated(inputs)
@@ -457,3 +478,29 @@ def test_fp32_atomic_original_example_and_poisoned_graph_reset(
         result, scratch = replay()
         torch.testing.assert_close(result, torch.zeros_like(result), rtol=0, atol=0)
         torch.testing.assert_close(scratch, torch.zeros_like(scratch), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("collective", [False, True])
+@skipUnlessBackends(["cute"])
+def test_promotion_setting_off_keeps_the_requested_half_storage(
+    collective: bool,
+) -> None:
+    """``cute_promote_half_atomic_outputs=False``: the fresh float16 output is
+    neither widened nor cast back; every add rounds to float16 in place, as
+    the program and the Triton backend do."""
+    kernel = helion.kernel(
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=False,
+    )
+    bound = _cpu_bind(kernel, _inputs())
+    assert not bound.env.cute_half_atomic_output_promotions
+    options = _config(collective=collective).config.copy()
+    options["split_k"] = options.pop("partitions")
+    code = bound.to_code(helion.Config.from_dict(options))
+    assert "val=cutlass.Float16(" in code
+    assert "return out.to(" not in code
+    assert "dtype=torch.float32, device=" not in code
+    assert "dtype=torch.promote_types(x.dtype, y.dtype), device=" in code

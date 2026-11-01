@@ -2670,6 +2670,8 @@ class CuteBackend(Backend):
             "_cute_store_fp8e5m2_vec_l2_evict_last": "from helion._compiler.cute.packet_store_helpers import store_fp8e5m2_vec_l2_evict_last as _cute_store_fp8e5m2_vec_l2_evict_last",
             "_cute_store_u32_vec": "from helion._compiler.cute.vec_utils import store_u32_vec as _cute_store_u32_vec",
             "_cute_red_add_f32_vec": "from helion._compiler.cute.vec_utils import red_add_f32_vec as _cute_red_add_f32_vec",
+            "_cute_red_add_f16_vec": "from helion._compiler.cute.vec_utils import red_add_f16_vec as _cute_red_add_f16_vec",
+            "_cute_red_add_bf16_vec": "from helion._compiler.cute.vec_utils import red_add_bf16_vec as _cute_red_add_bf16_vec",
             "_cute_rank1_pack_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_pack_bf16x2 as _cute_rank1_pack_bf16x2",
             "_cute_rank1_mul_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_mul_bf16x2 as _cute_rank1_mul_bf16x2",
             "_cute_rank1_add_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_add_bf16x2 as _cute_rank1_add_bf16x2",

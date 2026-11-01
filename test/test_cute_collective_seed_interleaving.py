@@ -50,6 +50,8 @@ def partitioned_case() -> tuple[BoundKernel, tuple[torch.Tensor, torch.Tensor]]:
     kernel = helion.kernel(
         matmul_split_k.fn,
         backend="cute",
+        # The fp32-promoted atomic output is the form these seeds are stated on.
+        cute_promote_half_atomic_outputs=True,
         static_shapes=True,
         autotune_effort="none",
     )

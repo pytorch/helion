@@ -51,6 +51,14 @@ if TYPE_CHECKING:
 
 # Lane counts of the ``red.global.add.v{N}.f32`` forms (8 and 16 bytes).
 _CUTE_VECTOR_ATOMIC_WIDTHS = (2, 4)
+# A half packet of 2 / 4 / 8 lanes is one ``red.global.add.noftz{,.v2,.v4}.f16x2``
+# (``bf16x2``); the scalar half atomic is a compare-and-swap loop on sm_100.
+_CUTE_VECTOR_HALF_ATOMIC_WIDTHS = (2, 4, 8)
+_CUTE_VECTOR_ATOMIC_HELPERS = {
+    torch.float32: "_cute_red_add_f32_vec",
+    torch.float16: "_cute_red_add_f16_vec",
+    torch.bfloat16: "_cute_red_add_bf16_vec",
+}
 # ``red.global.add.v{2,4}.f32`` is an sm_90+ PTX form.
 _CUTE_VECTOR_ATOMIC_MIN_CAPABILITY = (9, 0)
 
@@ -606,8 +614,9 @@ def _cute_vector_atomic_site(
     atomic_expr: ast.AST,
     predicates: list[str],
 ) -> bool:
-    """Defer a per-lane fp32 ``atomic_add`` along a vectorized tile axis to one
-    ``red.global.add.v{V}.f32`` after the constexpr V-loop.
+    """Defer a per-lane fp32 / half ``atomic_add`` along a vectorized tile axis
+    to one ``red.global.add.v{V}.f32`` (``.noftz{,.v2,.v4}.f16x2`` /
+    ``bf16x2`` for 2 / 4 / 8 half lanes) after the constexpr V-loop.
 
     The site follows the vector store protocol
     (``_cute_register_tile_unroll_vec_store``): the scalar atomic is emitted
@@ -636,7 +645,7 @@ def _cute_vector_atomic_site(
     if (
         fx_node is None
         or len(fx_node.users) != 0
-        or target.dtype is not torch.float32
+        or target.dtype not in _CUTE_VECTOR_ATOMIC_HELPERS
         or len(index) != target.ndim
         or len(index_exprs) != target.ndim
         or "None" in index_exprs
@@ -674,7 +683,11 @@ def _cute_vector_atomic_site(
     if not isinstance(vec_by_block, dict):
         return False
     vec_width = vec_by_block.get(block_id, 1)
-    if vec_width not in _CUTE_VECTOR_ATOMIC_WIDTHS:
+    if vec_width not in (
+        _CUTE_VECTOR_ATOMIC_WIDTHS
+        if target.dtype is torch.float32
+        else _CUTE_VECTOR_HALF_ATOMIC_WIDTHS
+    ):
         return False
     base_index_var = getattr(strategy, "_cute_lane_base_index_var_by_block", {}).get(
         block_id
@@ -754,7 +767,8 @@ def _cute_vector_atomic_site(
         lane_body.insert(
             _cute_lane_vloop_insert_pos(strategy, block_id, lane_body), init_stmt
         )
-        flush = f"_cute_red_add_f32_vec({base_pointer}, {list_var})"
+        helper = _CUTE_VECTOR_ATOMIC_HELPERS[target.dtype]
+        flush = f"{helper}({base_pointer}, {list_var})"
         if guard:
             flush = f"if {guard}:\n    {flush}"
         flush_stmt = statement_from_string(flush)

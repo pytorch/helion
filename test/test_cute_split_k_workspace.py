@@ -46,6 +46,32 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture(autouse=True)
+def _promotion_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests exercise the schedule on the fp32-promoted float16 output;
+    pin the promotion on for the module's kernels (the Setting defaults to
+    accumulating in the half storage)."""
+    for kernel in (
+        _partitioned_matmul,
+        _fp32_bias,
+        _nonzero_output,
+        _nonzero_seed,
+        _output_argument,
+        _output_alias,
+        _nonlinear_partial,
+        _plain_store_matmul,
+        _plain_store_bias_matmul,
+        _plain_store_relu_matmul,
+        _plain_store_into_argument,
+        matmul_split_k,
+    ):
+        monkeypatch.setattr(
+            kernel,
+            "settings",
+            kernel.settings.copy(cute_promote_half_atomic_outputs=True),
+        )
+
+
+@pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
         _cpu_target(),
@@ -293,7 +319,11 @@ def test_original_example_emits_only_two_source_hashed_launches(
         else (lambda acc, tile: acc)
     )
     kernel = helion.kernel(
-        matmul_split_k.fn, backend="cute", static_shapes=True, autotune_effort="none"
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     bound = _bind(kernel, (*args, epilogue))
     source = bound.to_code(
@@ -452,6 +482,36 @@ def test_user_output_atomic_semantics_are_not_replaced() -> None:
         )
 
 
+def test_fp16_output_is_proved_without_promotion() -> None:
+    # ``cute_promote_half_atomic_outputs=False`` keeps a float16 destination
+    # in its requested dtype like bfloat16; the workspace schedule proves the
+    # split and its reducer casts the FP32 partial sum to float16 once.
+    kernel = helion.kernel(
+        _partitioned_matmul.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=False,
+    )
+    bound = _bind(kernel, _args())
+    assert not bound.env.cute_half_atomic_output_promotions
+    proof = _proof(bound)
+    assert proof is not None
+    assert proof.output_dtype is torch.float16
+    source = bound.to_code(_config())
+    producer, reducer = _embedded_sources(source)
+    assert "atomic_add" not in producer + reducer
+    assert "cutlass.Float16" in reducer
+    host = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_partitioned_matmul"
+    )
+    assert "dtype=torch.float16" in ast.unparse(host)
+    assert "torch.float32" not in ast.unparse(host).split("_helion_split_k_partials")[0]
+    assert "out.to(" not in ast.unparse(host)
+
+
 def test_bf16_output_is_proved_without_promotion() -> None:
     # The atomic lowering keeps a requested bfloat16 destination (no FP32
     # promotion); the workspace schedule still proves the split and its
@@ -555,6 +615,7 @@ def test_real_full_initial_population_reaches_deep_workspace_and_atomic_choices(
         backend="cute",
         static_shapes=True,
         autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
         autotune_random_seed=2026091347,
     )
 

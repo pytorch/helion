@@ -479,13 +479,14 @@ def analyze_split_k_reduction(
     output = _tensor(output_node)
     output_name = output_node.args[0]
     # The destination is either FP32 (a user FP32 output, or a float16 output
-    # the atomic lowering promoted to FP32 storage) or a bfloat16 output, which
-    # the atomic lowering leaves in its requested dtype: the reducer casts the
+    # the atomic lowering promoted to FP32 storage) or a half output the
+    # atomic lowering leaves in its requested dtype (bfloat16 always, float16
+    # with ``cute_promote_half_atomic_outputs`` off): the reducer casts the
     # FP32 partial sum to it once, where the atomics rounded every partition.
     if (
         output is None
         or output.ndim != 2
-        or output.dtype not in (torch.float32, torch.bfloat16)
+        or output.dtype not in (torch.float32, torch.bfloat16, torch.float16)
         or not isinstance(output_name, str)
         or not output_name.isidentifier()
         or not _fresh_zero_output(host, output_name, env)

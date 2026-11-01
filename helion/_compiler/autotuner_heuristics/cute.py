@@ -19,6 +19,7 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
+from torch.fx import Node
 
 from ..._utils import prev_power_of_2
 from ...autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
@@ -3013,9 +3014,45 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                     and seed.get("cute_collective_compute", "warp") != "tma_gather"
                 ]
             )
+        if _half_atomic_output(device_ir):
+            # A half output written by atomic adds has no native scalar
+            # atomic on sm_100 (``atom.add.noftz.f16`` is a compare-and-swap
+            # loop there); only the vector epilogue's packed ``f16x2`` /
+            # ``bf16x2`` reductions run at speed, so every warp seed with a
+            # scalar epilogue also carries a vector twin.
+            result.extend(
+                [
+                    Config.from_dict(
+                        seed.config | {"cute_collective_epilogue": epilogue}
+                    )
+                    for seed in result
+                    if seed.get("cute_collective_epilogue", "scalar") == "scalar"
+                    and seed.get("cute_collective_compute", "warp") == "warp"
+                    for epilogue in ("vector_unrolled", "vector")
+                ]
+            )
         return cls._interleave_bounded_k_seeds(
             spec, dedupe_configs(result), bounded_parameters
         )
+
+
+def _half_atomic_output(device_ir: DeviceIR) -> bool:
+    """Whether a device atomic add updates a float16 / bfloat16 tensor (one
+    the fp32 output promotion did not widen)."""
+    from ...language import atomic_add
+
+    for info in device_ir.graphs:
+        for node in info.graph.nodes:
+            if node.op != "call_function" or node.target is not atomic_add:
+                continue
+            target = node.args[0]
+            value = target.meta.get("val") if isinstance(target, Node) else None
+            if isinstance(value, torch.Tensor) and value.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                return True
+    return False
 
 
 def _cute_reread_cache_policies(
