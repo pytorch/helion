@@ -42,6 +42,7 @@ from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
+from .pdl_release import ZERO_FILL_KERNEL_PREFIX
 from .pdl_release import generic_release_rendered
 from .pdl_release import spread_rendered
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
@@ -2458,14 +2459,28 @@ class CuteBackend(Backend):
 
     @staticmethod
     def _compiled_kernels(compiled_fn: object, kernel_name: str) -> tuple[object, ...]:
+        """The CuTe kernel objects the generated host function launches: the
+        kernel proper and the zero-fill kernels its host zero fills launch
+        as under ``cute_pdl`` (``host_zero_fill_launches``, named
+        ``_helion_zero_fill_<n>_helion_<kernel_name>``), or the bundle a
+        multi-stage module declares (``_helion_cute_kernels``)."""
         bundled = getattr(compiled_fn, "_helion_cute_kernels", None)
         if isinstance(bundled, tuple):
             return bundled
         fn_globals = getattr(compiled_fn, "__globals__", None)
         if not isinstance(fn_globals, dict):
             return ()
-        kernel = fn_globals.get(f"_helion_{kernel_name}")
-        return () if kernel is None else (kernel,)
+        name = f"_helion_{kernel_name}"
+        kernel = fn_globals.get(name)
+        if kernel is None:
+            return ()
+        fills = sorted(
+            key
+            for key in fn_globals
+            if key.startswith(ZERO_FILL_KERNEL_PREFIX)
+            and key.endswith(f"_{name.lstrip('_')}")
+        )
+        return (kernel, *(fn_globals[key] for key in fills))
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object
@@ -2517,10 +2532,15 @@ class CuteBackend(Backend):
         if not isinstance(fn_name, str):
             return None
         kernels = self._compiled_kernels(compiled_fn, fn_name)
-        if len(kernels) != 1:
+        # One module, one hash: the kernel proper and its zero-fill kernels
+        # carry the same one (``annotate_compiled_module``).
+        hashes = {
+            getattr(cute_kernel, "_helion_cute_source_hash", None)
+            for cute_kernel in kernels
+        }
+        if len(hashes) != 1:
             return None
-        cute_kernel = kernels[0]
-        source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
+        (source_hash,) = hashes
         return source_hash if isinstance(source_hash, str) else None
 
     def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:

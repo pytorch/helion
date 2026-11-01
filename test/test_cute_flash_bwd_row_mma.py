@@ -13,6 +13,7 @@ per-CTA fixed cost) and 6.1 us for the Triton backward's 16x32 tiles.
 
 from __future__ import annotations
 
+import ast
 import math
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -21,6 +22,7 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.cute.pdl_release import ZERO_FILL_KERNEL_PREFIX
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
@@ -475,6 +477,58 @@ _FAMILY_CONFIGS = (
     (_knobs(16, 4, 64), 128),
     ({"block_sizes": [128, 128]}, 512),
 )
+_WAIT = "cute.arch.griddepcontrol_wait()"
+_RELEASE = "cute.arch.griddepcontrol_launch_dependents()"
+_MAIN = "_helion_attention_backward"
+_FILL = f"{ZERO_FILL_KERNEL_PREFIX}0_helion_attention_backward"
+_ZEROS = "dq = torch.zeros((q.size(0), head_dim), device=q.device, dtype=torch.float32)"
+_EMPTY = "dq = torch.empty((q.size(0), head_dim), device=q.device, dtype=torch.float32)"
+
+
+def _kernel_def(code: str, name: str) -> ast.FunctionDef:
+    (kernel,) = [
+        node
+        for node in ast.parse(code).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == name
+        and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
+    ]
+    return kernel
+
+
+def _host_lines(code: str) -> list[str]:
+    (host,) = [
+        node
+        for node in ast.parse(code).body
+        if isinstance(node, ast.FunctionDef) and node.name == "attention_backward"
+    ]
+    return [ast.unparse(statement) for statement in host.body]
+
+
+def _assert_fill_launch(on: str, off: str) -> None:
+    """The dq fill's form, spelled out: ``_assert_only_the_dependent_launch_differs``
+    compares the whole knob-on module against the knob-off one (the kernel
+    proper's wait, release and launch attribute, the fill kernel, its
+    attribute and its launch stripped, the ``empty`` read as ``zeros``
+    again), so everything else is known equal; what it does not pin down is
+    the fill itself: which tensor (dq: the accumulator the memset node sat
+    on between the preprocess kernel and this one), that its kernel waits
+    and releases at entry, and that its launch follows the allocation and
+    precedes the kernel's own launch."""
+    fill = [ast.unparse(s) for s in _kernel_def(on, _FILL).body]
+    assert fill[:2] == [_WAIT, _RELEASE]
+    assert f"{_FILL}._helion_cute_use_pdl = True" in on
+    assert _ZEROS in _host_lines(off)
+    lines = _host_lines(on)
+    allocation = lines.index(_EMPTY)
+    assert lines[allocation + 1].startswith(
+        f"_launcher({_FILL}, (max(1, min((dq.numel() + 1023) // 1024, "
+    )
+    assert lines[allocation + 1].endswith("),), dq.view(-1), block=(256, 1, 1))")
+    (launch,) = [
+        i for i, line in enumerate(lines) if line.startswith(f"_launcher({_MAIN},")
+    ]
+    assert allocation + 1 < launch
 
 
 def test_the_surface_offers_and_seeds_the_dependent_launch(cpu_only: None) -> None:
@@ -545,11 +599,14 @@ def test_both_families_render_the_generic_dependent_launch(cpu_only: None) -> No
     bound = _kernel()._bind_isolated(_cpu_args((1, 4, 256, 64)))
     for config, threads in _FAMILY_CONFIGS:
         on, off = _on_and_off(bound, config)
+        # Whole module: only the dependent launch and the dq fill differ.
         # The wait is the body's first statement, the release follows it
         # (one wave: 64 CTAs of 128 threads for the rows, 8 of 512 for the
-        # tcgen05 kernel), the launch attribute is set; nothing else changes.
+        # tcgen05 kernel), the launch attribute is set, the dq fill launches
+        # as a dependent kernel.
         assert _assert_only_the_dependent_launch_differs(on, off) == []
         assert _last_wave_guard(on) is None
+        _assert_fill_launch(on, off)
         assert f"block=({threads}, 1, 1)" in on
 
 
@@ -562,8 +619,11 @@ def test_the_row_launch_counts_its_own_ctas(cpu_only: None) -> None:
         bound = _kernel()._bind_isolated(_cpu_args((1, 4, 256, 64)))
         on, off = _on_and_off(bound, _knobs(16, 4, 64))
     assert "'total_tiles': 64" in on
+    # (The fill kernel's launch is capped at four CTAs per SM: eight here.)
+    assert "(dq.numel() + 1023) // 1024, 8)" in on
     assert _assert_only_the_dependent_launch_differs(on, off) == []
     assert _last_wave_guard(on) == "if pdl_cta >= 32:"
+    _assert_fill_launch(on, off)
 
 
 @onlyBackends(["cute"])
@@ -573,7 +633,10 @@ def test_dependent_launch_matches_reference(config: dict[str, object]) -> None:
     code, grads = code_and_output(_kernel(), args, **config, cute_pdl=True)
     assert "cute.arch.griddepcontrol_wait()" in code
     assert "cute.arch.griddepcontrol_launch_dependents()" in code
-    assert "._helion_cute_use_pdl = True" in code
+    assert f"{_MAIN}._helion_cute_use_pdl = True" in code
+    # The dq accumulator's zero fill launches as a dependent fill kernel.
+    assert f"{_FILL}._helion_cute_use_pdl = True" in code
+    assert _EMPTY in code and _ZEROS not in code
     for actual, reference in zip(grads, expected, strict=True):
         torch.testing.assert_close(
             actual.double(), reference, atol=2e-2, rtol=2e-2, check_device=False

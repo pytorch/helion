@@ -52,6 +52,8 @@ from test.test_cute_dynamic_vector_reduction import _rolled_config
 
 import helion
 from helion import exc
+from helion._compiler.cute.host_zero_fill_launches import MAX_FILL_NUMEL
+from helion._compiler.cute.pdl_release import ZERO_FILL_KERNEL_PREFIX
 from helion._compiler.cute.pdl_release import resident_ctas_per_sm
 import helion.language as hl
 
@@ -123,13 +125,18 @@ _MEMORY_TOKENS = (
 
 
 def _launch(code: str) -> tuple[str, int]:
-    """The launcher call's grid expression and its CTA's thread count."""
+    """The kernel's launcher call's grid expression and its CTA's thread
+    count (not the launch of a zero-fill kernel, ``_fill_kernels``)."""
     (call,) = [
         node
         for node in ast.walk(ast.parse(code))
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "_launcher"
+        and not (
+            isinstance(node.args[0], ast.Name)
+            and node.args[0].id.startswith(ZERO_FILL_KERNEL_PREFIX)
+        )
     ]
     (block,) = [keyword.value for keyword in call.keywords if keyword.arg == "block"]
     assert isinstance(block, ast.Tuple)
@@ -141,14 +148,27 @@ def _launch(code: str) -> tuple[str, int]:
 
 
 def _kernel_def(code: str) -> ast.FunctionDef:
+    """The kernel proper (the module may also hold zero-fill kernels)."""
     module = ast.parse(code)
     (kernel,) = [
         node
         for node in module.body
         if isinstance(node, ast.FunctionDef)
         and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
+        and not node.name.startswith(ZERO_FILL_KERNEL_PREFIX)
     ]
     return kernel
+
+
+def _fill_kernels(code: str) -> list[ast.FunctionDef]:
+    """The zero-fill kernels a ``cute_pdl`` kernel's host zero fills launch
+    as (``host_zero_fill_launches``): one per surviving ``torch.zeros``."""
+    return [
+        node
+        for node in ast.parse(code).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name.startswith(ZERO_FILL_KERNEL_PREFIX)
+    ]
 
 
 def _on_and_off(bound: Any, config: dict[str, object]) -> tuple[str, str]:
@@ -165,11 +185,56 @@ def _codes(kernel: helion.Kernel, args: tuple, **config: object) -> tuple[str, s
     return _on_and_off(_cpu_bind(kernel, args), config)
 
 
-def _statements_ahead_of_the_wait(kernel: ast.FunctionDef) -> list[str]:
+def _release_block(kernel: ast.FunctionDef, start: int) -> int:
+    """The number of statements of the entry release at ``start``: the plain
+    release, or ``last_wave``'s CTA index and guard; 0 when none is there."""
+    statements = [ast.unparse(s) for s in kernel.body[start : start + 2]]
+    if statements[:1] == [_RELEASE]:
+        return 1
+    if len(statements) == 2 and statements[0] == _CTA_INDEX:
+        return 2
+    return 0
+
+
+def _late_wait_names(code: str) -> set[str]:
+    """The host names of the zero fills launched as fill kernels: behind
+    them a kernel's wait moves down to the first touch of a filled tensor
+    (``DeviceFunction._place_late_pdl_wait``)."""
+    fills = {fill.name for fill in _fill_kernels(code)}
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(code)):
+        # ``_launcher(fill, (grid,), out.view(-1), block=...)``
+        if not (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and len(node.value.args) >= 3
+            and isinstance(node.value.args[0], ast.Name)
+            and node.value.args[0].id in fills
+        ):
+            continue
+        view = node.value.args[2]
+        if (
+            isinstance(view, ast.Call)
+            and isinstance(view.func, ast.Attribute)
+            and isinstance(view.func.value, ast.Name)
+        ):
+            names.add(view.func.value.id)
+    return names
+
+
+def _statements_ahead_of_the_wait(
+    kernel: ast.FunctionDef, filled: set[str] = frozenset()
+) -> list[str]:
     """The wait is a top-level statement of the kernel body and nothing ahead
     of it touches memory, at any nesting depth: no tensor indexing and no
     call that loads, stores, copies, syncs a barrier or speaks
-    ``griddepcontrol``.  Returns what does precede it."""
+    ``griddepcontrol``.  Returns what does precede it.
+
+    A kernel whose zero fills launch as fill kernels (``filled`` names them)
+    may wait late, below a memory-touching loop, right before the first
+    touch of a filled tensor; its entry release then leads the body.  Such
+    a kernel's statements ahead of the wait may touch memory but never a
+    filled tensor; the release block is left out of the returned list."""
     waits = [
         index
         for index, statement in enumerate(kernel.body)
@@ -177,6 +242,18 @@ def _statements_ahead_of_the_wait(kernel: ast.FunctionDef) -> list[str]:
     ]
     assert len(waits) == 1, ast.unparse(kernel)[:600]
     ahead = kernel.body[: waits[0]]
+    if waits[0] > 0 and _release_block(kernel, 0):
+        # The late form: the entry release leads, a memory-touching loop
+        # runs ahead of the wait and no statement ahead touches a filled
+        # tensor.
+        ahead = ahead[_release_block(kernel, 0) :]
+        for statement in ahead:
+            assert not any(
+                isinstance(node, ast.Name) and node.id in filled
+                for node in ast.walk(statement)
+            ), ast.unparse(statement)
+        assert any(isinstance(statement, (ast.For, ast.While)) for statement in ahead)
+        return [ast.unparse(statement) for statement in ahead]
     for statement in ahead:
         for node in ast.walk(statement):
             assert not isinstance(node, ast.Subscript), ast.unparse(statement)
@@ -189,33 +266,75 @@ def _statements_ahead_of_the_wait(kernel: ast.FunctionDef) -> list[str]:
 
 def _assert_only_the_dependent_launch_differs(on: str, off: str) -> list[str]:
     kernel = _kernel_def(on)
-    ahead = _statements_ahead_of_the_wait(kernel)
-    assert on.count(_WAIT) == 1
-    assert on.count(_ATTRIBUTE) == 1
-    assert f"{kernel.name}{_ATTRIBUTE}" in on
+    ahead = _statements_ahead_of_the_wait(kernel, _late_wait_names(on))
+    main = ast.unparse(kernel)
+    assert main.count(_WAIT) == 1
+    attributes = [
+        ast.unparse(node)
+        for node in ast.parse(on).body
+        if isinstance(node, ast.Assign) and ast.unparse(node).endswith(_ATTRIBUTE)
+    ]
+    assert attributes.count(f"{kernel.name}{_ATTRIBUTE}") == 1
     # The default placement (``auto``) releases the dependents right after
     # the wait while the grid fits in one wave (``_implicit_pdl_release``);
     # a grid that needs more waves, or one sized at runtime, releases from
     # the CTAs of its last wave (``_last_wave_guard``).
-    assert on.count(_RELEASE) == 1
+    assert main.count(_RELEASE) == 1
     _last_wave_guard(on)
+    # A host zero fill the kernel keeps launches as a fill kernel of the
+    # module, itself waiting and releasing at entry, ahead of the kernel.
+    for fill in _fill_kernels(on):
+        assert [ast.unparse(s) for s in fill.body[:2]] == [_WAIT, _RELEASE]
+        assert attributes.count(f"{fill.name}{_ATTRIBUTE}") == 1
     assert _WAIT not in off and _ATTRIBUTE not in off and _RELEASE not in off
+    assert ZERO_FILL_KERNEL_PREFIX not in off
     assert _without_dependent_launch(on) == ast.unparse(ast.parse(off))
     return ahead
 
 
+_ZEROS_OF_EMPTY = {
+    "empty": "zeros",
+    "empty_like": "zeros_like",
+    "new_empty": "new_zeros",
+}
+
+
+def _is_fill_launch(statement: ast.stmt, fills: set[str]) -> bool:
+    """Whether ``statement`` launches one of the ``fills`` kernels: the plain
+    launch, or, for a tensor the host sizes at runtime, the launch behind the
+    host bound on the element count with the memset (``zero_()``) past it
+    (the fill kernel counts in Int32: ``MAX_FILL_NUMEL``)."""
+    if isinstance(statement, ast.If):
+        if len(statement.body) != 1 or not _is_fill_launch(statement.body[0], fills):
+            return False
+        assert ast.unparse(statement.test).endswith(f".numel() < {MAX_FILL_NUMEL}")
+        assert [ast.unparse(s) for s in statement.orelse] == [
+            f"{ast.unparse(statement.test).split('.numel()')[0]}.zero_()"
+        ]
+        return True
+    return (
+        isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Call)
+        and isinstance(statement.value.args[0], ast.Name)
+        and statement.value.args[0].id in fills
+    )
+
+
 def _without_dependent_launch(code: str) -> str:
     """``code`` without the launch attribute, the wait and the release (the
-    plain one or the index and guard of ``last_wave``), unparsed (comments
+    plain one or the index and guard of ``last_wave``), and without the
+    zero-fill kernels (their definitions, attributes and launches; the
+    ``empty`` each launch follows reads ``zeros`` again), unparsed (comments
     dropped) for comparison with the knob-off code."""
     module = ast.parse(code)
     name = _kernel_def(code).name
+    fills = {fill.name for fill in _fill_kernels(code)}
+    attributes = {f"{owner}{_ATTRIBUTE}" for owner in (name, *fills)}
     module.body = [
         node
         for node in module.body
-        if not (
-            isinstance(node, ast.Assign) and ast.unparse(node) == f"{name}{_ATTRIBUTE}"
-        )
+        if not (isinstance(node, ast.Assign) and ast.unparse(node) in attributes)
+        and not (isinstance(node, ast.FunctionDef) and node.name in fills)
     ]
     (kernel,) = [
         node
@@ -224,15 +343,43 @@ def _without_dependent_launch(code: str) -> str:
     ]
     statements = [ast.unparse(s) for s in kernel.body]
     wait = statements.index(_WAIT)
-    end = wait + 2 if statements[wait + 1] == _RELEASE else wait + 3
-    del kernel.body[wait:end]
+    if wait > 0 and _release_block(kernel, 0):
+        # The late wait: the release block leads the body, the wait follows
+        # the loop ahead of the first touch of a filled tensor.
+        del kernel.body[wait]
+        del kernel.body[: _release_block(kernel, 0)]
+    else:
+        del kernel.body[wait : wait + 1 + _release_block(kernel, wait + 1)]
+    if fills:
+        (host,) = [
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name != name
+        ]
+        body: list[ast.stmt] = []
+        for statement in host.body:
+            if not _is_fill_launch(statement, fills):
+                body.append(statement)
+                continue
+            allocation = body[-1]
+            assert isinstance(allocation, ast.Assign)
+            factory = allocation.value
+            assert isinstance(factory, ast.Call) and isinstance(
+                factory.func, ast.Attribute
+            )
+            factory.func.attr = _ZEROS_OF_EMPTY[factory.func.attr]
+        host.body = body
     return ast.unparse(module)
 
 
 def test_the_column_sum_waits_before_its_first_global_access(cpu_only: None) -> None:
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
     on, off = _codes(col_reduce_sum_static, (x,), **_COLUMN_SUM)
-    assert _assert_only_the_dependent_launch_differs(on, off) == []
+    ahead = _assert_only_the_dependent_launch_differs(on, off)
+    # With a fill kernel ahead of it the kernel waits late (its row loop runs
+    # ahead of the wait, which precedes the atomic into ``out``); without one
+    # it waits first.
+    assert (ahead != []) == bool(_fill_kernels(on))
     assert on.count(_RELEASE) == 1  # 64 CTAs: one wave
     assert "_vsink_vec" in on
     # The attribute is set on the kernel object the host code launches.
@@ -245,7 +392,8 @@ def test_dynamic_grids_and_pointwise_kernels_follow_the_grid_rule(
 ) -> None:
     x = torch.empty(1000, 1008, dtype=torch.bfloat16)
     on, off = _codes(col_reduce_sum_dynamic, (x,), **_COLUMN_SUM)
-    assert _assert_only_the_dependent_launch_differs(on, off) == []
+    ahead = _assert_only_the_dependent_launch_differs(on, off)
+    assert (ahead != []) == bool(_fill_kernels(on))
     # A grid the host sizes at runtime releases from its last wave, sized
     # against the launched grid (512-thread CTAs: 4 per SM, 592 slots).
     assert _last_wave_guard(on) == f"if pdl_cta >= {_GRID_CTAS} - 592:"
@@ -280,7 +428,11 @@ def test_column_reductions_take_the_knob_under_their_default_config(
     args = tuple(torch.empty(*shape, dtype=torch.bfloat16) for shape in shapes)
     bound = _cpu_bind(kernel, args)
     on, off = _on_and_off(bound, dict(bound.config_spec.default_config().config))
-    assert _assert_only_the_dependent_launch_differs(on, off) == []
+    ahead = _assert_only_the_dependent_launch_differs(on, off)
+    # A zero-filled accumulator launches as a fill kernel and the wait moves
+    # below the reduction loop, right before the atomic into the filled
+    # tensor; a kernel without one waits first.
+    assert (ahead != []) == bool(_fill_kernels(on))
 
 
 @pytest.mark.parametrize("static_shapes", [False, True])
@@ -639,12 +791,16 @@ def _last_wave_guard(code: str) -> str | None:
     index; the release is the guard's only statement, the else branch is
     empty); ``None`` when the kernel releases at plain entry (the release is
     the statement right after the wait)."""
-    statements = [ast.unparse(s) for s in _kernel_def(code).body]
+    kernel = _kernel_def(code)
+    statements = [ast.unparse(s) for s in kernel.body]
     wait = statements.index(_WAIT)
-    if statements[wait + 1] == _RELEASE:
+    # The release block follows the wait, or leads the body ahead of a late
+    # wait (a kernel whose zero fills launch as fill kernels).
+    start = 0 if wait > 0 and _release_block(kernel, 0) else wait + 1
+    if statements[start] == _RELEASE:
         return None
-    assert statements[wait + 1] == _CTA_INDEX
-    condition, body, orelse, nothing = statements[wait + 2].split("\n")
+    assert statements[start] == _CTA_INDEX
+    condition, body, orelse, nothing = statements[start + 1].split("\n")
     assert (body, orelse, nothing) == (f"    {_RELEASE}", "else:", "    pass")
     return condition
 

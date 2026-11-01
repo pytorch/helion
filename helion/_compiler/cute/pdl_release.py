@@ -148,6 +148,10 @@ def spread_pad_bytes(
 
 _WAIT_CALL = "cute.arch.griddepcontrol_wait()"
 _RELEASE_CALL = "cute.arch.griddepcontrol_launch_dependents()"
+# The fill kernels a ``cute_pdl`` kernel's host zero fills launch as
+# (``host_zero_fill_launches``) always wait and release at entry; the
+# release check below reads the kernel proper, not them.
+ZERO_FILL_KERNEL_PREFIX = "_helion_zero_fill_"
 
 
 def generic_release_rendered(source: str) -> bool:
@@ -187,12 +191,30 @@ def generic_release_rendered(source: str) -> bool:
         for node in module.body
         if isinstance(node, ast.FunctionDef)
         and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
+        and not node.name.startswith(ZERO_FILL_KERNEL_PREFIX)
     ]
     for kernel in kernels:
         statements = [ast.unparse(statement) for statement in kernel.body]
         if _WAIT_CALL not in statements:
             continue
         index = statements.index(_WAIT_CALL)
+        if index > 0:
+            # The late wait behind this kernel's fill kernels: the entry
+            # release (plain, or ``last_wave``'s CTA index and guard) leads
+            # the body, the wait precedes the first touch of a filled tensor.
+            leading = kernel.body[:2]
+            if statements[0] == _RELEASE_CALL:
+                return True
+            if (
+                len(leading) == 2
+                and isinstance(leading[0], ast.Assign)
+                and len(leading[0].targets) == 1
+                and isinstance(leading[0].targets[0], ast.Name)
+                and leading[0].targets[0].id.startswith("pdl_cta")
+                and isinstance(leading[1], ast.If)
+                and [ast.unparse(s) for s in leading[1].body] == [_RELEASE_CALL]
+            ):
+                return True
         following = kernel.body[index + 1 : index + 3]
         if not following:
             continue

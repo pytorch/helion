@@ -3218,6 +3218,22 @@ def _generate_ast(
                 final_host_statements = lower_host_zero_fills(
                     func, final_host_statements, env, codegen.device_function.config
                 )
+                from .cute.host_zero_fill_launches import lower_host_zero_fill_launches
+                from .cute.host_zero_fill_launches import zero_fill_launches_apply
+
+                if zero_fill_launches_apply(
+                    codegen.device_function, env, codegen.device_function.config
+                ):
+                    # The zero fills that survive the elision launch as
+                    # dependent fill kernels ahead of this (``cute_pdl``)
+                    # kernel instead of memset nodes.
+                    final_host_statements, fill_kernels = lower_host_zero_fill_launches(
+                        func,
+                        final_host_statements,
+                        env=env,
+                        kernel_name=codegen.device_function.name,
+                    )
+                    post_kernel_metadata_statements.extend(fill_kernels)
 
             host_def = func.codegen_function_def(
                 final_host_statements,

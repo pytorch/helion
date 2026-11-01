@@ -1452,6 +1452,9 @@ class DeviceFunction:
             ]
         dependent_launch: list[ast.stmt] = []
         dependent_release: list[ast.stmt] = []
+        late_wait_names: set[str] = set()
+        late_wait_release: list[ast.stmt] = []
+        wait: ast.stmt | None = None
         if self._cute_pdl_applies():
             # Programmatic dependent launch (``cute_pdl``): the launch and
             # this prologue overlap the previous kernel in the stream; wait
@@ -1474,9 +1477,20 @@ class DeviceFunction:
             # release follows every wait of the body, this one included
             # (``_tcgen05_early_pdl_release``, below).
             with SyntheticLocation():
-                dependent_launch = [
-                    statement_from_string("cute.arch.griddepcontrol_wait()")
-                ]
+                wait = statement_from_string("cute.arch.griddepcontrol_wait()")
+                dependent_launch = [wait]
+                # Behind the fill kernels of this kernel's own zero fills the
+                # wait may move down to the first statement that touches a
+                # filled tensor (``_place_late_pdl_wait``, on the lowered
+                # body): the fill kernel releases its dependents only after
+                # its own wait, so every earlier kernel of the stream has
+                # completed when this grid starts, and the fill's writes are
+                # confined to the filled tensors.  The operand loads and the
+                # K loop of a split-K kernel then overlap the fill instead of
+                # waiting for it.
+                late_wait_names = self._late_pdl_wait_names()
+                if late_wait_names:
+                    dependent_launch = []
                 placement = (
                     "none"
                     if self.cute_state.cute_pdl_entry_wait
@@ -1495,6 +1509,7 @@ class DeviceFunction:
                     dependent_release = [release]
                 elif placement == "last_wave":
                     dependent_launch.extend(self._last_wave_release(release))
+                late_wait_release = list(dependent_launch) if late_wait_names else []
         env = CompileEnvironment.current()
         if (
             self.triton_persistent_state_specs
@@ -2303,6 +2318,11 @@ class DeviceFunction:
                     argument_names={arg.arg for arg in args},
                     proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
                 )
+        if late_wait_names:
+            assert wait is not None
+            kernel_body = self._place_late_pdl_wait(
+                kernel_body, wait, late_wait_release, late_wait_names
+            )
         definition = ast_rename(
             create(
                 ast.FunctionDef,
@@ -2678,6 +2698,109 @@ class DeviceFunction:
             # CTA index follows it, ahead of the guarded release.
             return [body[0], *prefix, release(), *visit(body[1:])]
         return [*prefix, *visit(body)]
+
+    def _late_pdl_wait_names(self) -> set[str]:
+        """The kernel-argument names through which this ``cute_pdl`` kernel
+        (generic path) can reach a host zero fill that launches as a
+        dependent fill kernel: the filled tensors' own arguments and every
+        argument whose fake tensor shares their storage (a host view or
+        alias, a tensor descriptor built on them).  The first mention of any
+        of these bounds the late wait.  Empty when the wait stays at the top:
+        no fill kernel (none admitted or every fill elided as dead, so the
+        kernel's primary is an unknown predecessor), the tcgen05 entry-wait
+        path, no filled tensor the kernel touches, or a kernel with access
+        paths the names cannot account for (wrapper-only or extra
+        parameters: a lowering's own tensor maps and pointers, the flash
+        backward's ``_fbwd_tma_dq``, which reduce into a tensor without
+        naming it)."""
+        from .compile_environment import CompileEnvironment
+        from .cute.host_zero_fill_launches import zero_fill_launch_tensors
+        from .cute.host_zero_fill_launches import zero_fill_launches_apply
+
+        env = CompileEnvironment.current()
+        if self.cute_state.cute_pdl_entry_wait or not zero_fill_launches_apply(
+            self, env, self.config
+        ):
+            return set()
+        if (
+            self.wrapper_only_params
+            or self.codegen._extra_params
+            or self.sourceless_prologue_params
+        ):
+            return set()
+        host = HostFunction.current()
+        storages = {
+            fake.untyped_storage()
+            for fake in zero_fill_launch_tensors(host, env, self.config)
+        }
+        if not storages:
+            return set()
+        arguments = [
+            *self._tensor_args.values(),
+            *self._tensor_descriptor_args.values(),
+        ]
+        return {
+            argument.name
+            for argument in arguments
+            if argument.fake_value.untyped_storage() in storages
+        }
+
+    @staticmethod
+    def _place_late_pdl_wait(
+        body: list[ast.stmt],
+        wait: ast.stmt,
+        release: list[ast.stmt],
+        names: set[str],
+    ) -> list[ast.stmt]:
+        """Put the ``cute_pdl`` wait of a kernel whose zero fills launch as
+        fill kernels before the first top-level statement of the lowered body
+        that mentions a filled tensor, when a statement touching memory (a
+        subscript, a load / store / copy / barrier call: a split-K kernel's
+        operand pipeline) precedes it; otherwise the kernel keeps the plain
+        form, the wait first and the entry release right after it."""
+
+        def mentions(statement: ast.AST) -> bool:
+            return any(
+                isinstance(node, ast.Name) and node.id in names
+                for node in ast.walk(statement)
+            )
+
+        def touches_memory(statement: ast.AST) -> bool:
+            for node in ast.walk(statement):
+                if isinstance(node, ast.Subscript):
+                    return True
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and any(
+                        token in node.func.attr
+                        for token in (
+                            "load",
+                            "store",
+                            "copy",
+                            "atomic",
+                            "cp_async",
+                            "tma",
+                            "sync",
+                            "barrier",
+                            "red",
+                        )
+                    )
+                ):
+                    return True
+            return False
+
+        release_ids = {id(statement) for statement in release}
+        rest = [statement for statement in body if id(statement) not in release_ids]
+        first = next(
+            (i for i, statement in enumerate(rest) if mentions(statement)), None
+        )
+        if first is not None and any(
+            isinstance(s, (ast.For, ast.While)) and touches_memory(s)
+            for s in rest[:first]
+        ):
+            return [*release, *rest[:first], wait, *rest[first:]]
+        return [wait, *release, *rest]
 
     def _implicit_pdl_release(self, default: str) -> str:
         """The release placement ``cute_pdl_release: auto`` resolves to:
