@@ -180,6 +180,9 @@ from .._compiler.cute.cute_register_subblocks import register_subblocks_repair
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.cutedsl_compat import hinted_cp_async_available
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
+from .._compiler.cute.fragment_mma_dot import FRAGMENT_MMA_K_THREADS
+from .._compiler.cute.fragment_mma_dot import FRAGMENT_MMA_KEY
+from .._compiler.cute.fragment_mma_dot import FRAGMENT_MMA_ROW_THREADS
 from .._compiler.cute.pdl_release import CUTE_PDL_RELEASE_CHOICES
 from .._compiler.cute.pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from .._compiler.cute.pdl_release import CUTE_PDL_SPREAD_KEY
@@ -198,6 +201,15 @@ from .._compiler.cute.radix_selection_config import (
     PIPELINE_CHOICES as RADIX_PIPELINE_CHOICES,
 )
 from .._compiler.cute.radix_selection_config import normalize_radix_selection
+from .._compiler.cute.ring_mma_dot import RING_DEFAULT_SPLIT
+from .._compiler.cute.ring_mma_dot import RING_DEFAULT_STAGES
+from .._compiler.cute.ring_mma_dot import RING_MMA_KEY
+from .._compiler.cute.ring_mma_dot import RING_SPLIT_CHOICES
+from .._compiler.cute.ring_mma_dot import RING_SPLIT_KEY
+from .._compiler.cute.ring_mma_dot import RING_STAGE_CHOICES
+from .._compiler.cute.ring_mma_dot import RING_STAGES_KEY
+from .._compiler.cute.ring_mma_dot import ring_mma_geometry_reason
+from .._compiler.cute.ring_mma_dot import ring_mma_smem_budget
 from .._compiler.cute.split_k_cluster import validate_cluster_config
 from .._compiler.cute.split_k_cluster_config import (
     FINALIZER_KEY as SPLIT_K_FINALIZER_KEY,
@@ -1097,6 +1109,10 @@ _CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
         "cute_register_chain",
         "cute_simt_mma",
         "cute_simt_mma_layout",
+        FRAGMENT_MMA_KEY,
+        RING_MMA_KEY,
+        RING_STAGES_KEY,
+        RING_SPLIT_KEY,
         "cute_pdl",
         "cute_pdl_release",
         "cute_pdl_spread",
@@ -1255,6 +1271,10 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
         "cute_lane_unroll",
+        FRAGMENT_MMA_KEY,
+        RING_MMA_KEY,
+        RING_STAGES_KEY,
+        RING_SPLIT_KEY,
         "cute_pdl",
         "cute_pdl_release",
         "cute_pdl_spread",
@@ -1412,6 +1432,10 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
         "cute_lane_unroll",
+        FRAGMENT_MMA_KEY,
+        RING_MMA_KEY,
+        RING_STAGES_KEY,
+        RING_SPLIT_KEY,
         "cute_pdl",
         "cute_pdl_release",
         "cute_pdl_spread",
@@ -1593,6 +1617,10 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
         "cute_lane_unroll",
+        FRAGMENT_MMA_KEY,
+        RING_MMA_KEY,
+        RING_STAGES_KEY,
+        RING_SPLIT_KEY,
         "cute_pdl",
         "cute_pdl_release",
         "cute_pdl_spread",
@@ -6162,6 +6190,214 @@ class ConfigSpec:
         if "cute_tiles_per_block" in config or pack != 1:
             config["cute_tiles_per_block"] = pack
 
+    def _cute_fragment_mma_fact(self) -> MatmulFact | None:
+        """The contraction ``cute_dot_fragment_mma`` may lower: one dot with a
+        static N of 1 (a GEMV), fp16 or bf16 operands of one dtype and tunable
+        M and K blocks (``cute/fragment_mma_dot.py``)."""
+        for fact in self.matmul_facts:
+            if (
+                fact.static_n == 1
+                and fact.lhs_dtype == fact.rhs_dtype
+                and fact.lhs_dtype in (torch.float16, torch.bfloat16)
+                and fact.m_block_id is not None
+                and fact.k_block_id is not None
+            ):
+                return fact
+        return None
+
+    def _cute_fragment_mma_searchable(self) -> bool:
+        """Whether the fragment-MMA knob is offered to the search: a GEMV dot
+        on a device with ``mma.sync`` (compute capability 8.0 and up)."""
+        capability = self.target_device_capability
+        return (
+            self.supports_config_key(FRAGMENT_MMA_KEY)
+            and self._cute_fragment_mma_fact() is not None
+            and capability is not None
+            and capability >= (8, 0)
+        )
+
+    def _cute_dot_fragment_mma_reason(self, config: dict[str, object]) -> str | None:
+        """Why ``config`` cannot run the GEMV dot on MMA fragments (None: it can).
+
+        The rewrite permutes the lanes of one warp into the ``m16n8k16``
+        fragment layout, so it needs exactly eight threads on the dot's M
+        block and four on its K block, and 16- or 32-byte K packets.
+        """
+        fact = self._cute_fragment_mma_fact()
+        if fact is None or fact.m_block_id is None or fact.k_block_id is None:
+            return "needs a dot with fp16/bf16 operands and a static N of 1"
+        capability = self.target_device_capability
+        if capability is None or capability < (8, 0):
+            return "needs mma.sync (compute capability >= 8.0)"
+        threads = _as_sequence(config.get("num_threads"))
+        m_threads = self.num_threads.config_get(threads, fact.m_block_id, 0)
+        k_threads = self.num_threads.config_get(threads, fact.k_block_id, 0)
+        if (m_threads, k_threads) != (FRAGMENT_MMA_ROW_THREADS, FRAGMENT_MMA_K_THREADS):
+            return (
+                f"needs num_threads of {FRAGMENT_MMA_ROW_THREADS} on the dot's M "
+                f"block and {FRAGMENT_MMA_K_THREADS} on its K block"
+            )
+        widths = _as_sequence(config.get("cute_vector_widths"))
+        k_width = self.cute_vector_widths.config_get(widths, fact.k_block_id, 1)
+        if k_width not in (8, 16):
+            return "needs 16- or 32-byte K packets (cute_vector_widths 8 or 16)"
+        return None
+
+    def _normalize_cute_dot_fragment_mma(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_dot_fragment_mma`` is a boolean; True only where the dot's
+        thread layout fits the fragment rewrite (``_cute_dot_fragment_mma_reason``)."""
+        if FRAGMENT_MMA_KEY not in config:
+            return
+        value = config[FRAGMENT_MMA_KEY]
+        if type(value) is not bool:
+            if not fix_invalid:
+                raise InvalidConfig(f"{FRAGMENT_MMA_KEY} must be a boolean")
+            config[FRAGMENT_MMA_KEY] = False
+            return
+        if not value:
+            return
+        if not self._cute_fragment_mma_searchable():
+            # No dot the rewrite could take: the knob is invalid for the kernel.
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{FRAGMENT_MMA_KEY}=True {self._cute_dot_fragment_mma_reason(config)}"
+                )
+            config[FRAGMENT_MMA_KEY] = False
+            return
+        if self._cute_dot_fragment_mma_reason(config) is not None:
+            # The thread layout cannot take the fragments: the knob is inert
+            # for this config (like ``cute_lane_unroll`` without a lane loop).
+            config[FRAGMENT_MMA_KEY] = False
+
+    def _cute_dot_ring_searchable(self) -> bool:
+        """Whether the ring-MMA knobs (``cute_dot_ring_mma`` and its stage and
+        split knobs) are offered to the search: the GEMV dot of
+        ``_cute_fragment_mma_fact`` with a static K on a device with
+        ``mma.sync`` and ``cp.async`` (compute capability 8.0 and up)."""
+        fact = self._cute_fragment_mma_fact()
+        return (
+            self.supports_config_key(RING_MMA_KEY)
+            and fact is not None
+            and fact.static_k is not None
+            and self._cute_fragment_mma_searchable()
+        )
+
+    def _cute_dot_ring_mma_reason(self, config: dict[str, object]) -> str | None:
+        """Why ``config`` cannot run the GEMV dot through the cp.async ring
+        (None: it can): the rows must be a rolled lane loop (one thread on the
+        dot's M block), the K threads whole warps, and the geometry
+        ``ring_mma_geometry_reason`` accepts (``cute/ring_mma_dot.py``)."""
+        fact = self._cute_fragment_mma_fact()
+        if (
+            fact is None
+            or fact.m_block_id is None
+            or fact.k_block_id is None
+            or fact.static_k is None
+        ):
+            return "needs a dot with fp16/bf16 operands, a static N of 1 and a static K"
+        capability = self.target_device_capability
+        if capability is None or capability < (8, 0):
+            return "needs mma.sync and cp.async (compute capability >= 8.0)"
+        threads = _as_sequence(config.get("num_threads"))
+        m_threads = self.num_threads.config_get(threads, fact.m_block_id, 0)
+        k_threads = self.num_threads.config_get(threads, fact.k_block_id, 0)
+        if m_threads != 1:
+            return "needs one thread on the dot's M block (the rows are a rolled lane loop)"
+        sizes = _as_sequence(config.get("block_sizes"))
+        rows = self.block_sizes.config_get(sizes, fact.m_block_id, None)
+        chunk = self.block_sizes.config_get(sizes, fact.k_block_id, None)
+        if not isinstance(rows, int) or not isinstance(chunk, int):
+            return "needs static M and K blocks"
+        widths = _as_sequence(config.get("cute_vector_widths"))
+        k_width = self.cute_vector_widths.config_get(widths, fact.k_block_id, 1)
+        stages = config.get(RING_STAGES_KEY, RING_DEFAULT_STAGES)
+        split = config.get(RING_SPLIT_KEY, RING_DEFAULT_SPLIT)
+        return ring_mma_geometry_reason(
+            rows=rows,
+            chunk=chunk,
+            threads=int(cast("int", k_threads)),
+            stages=cast("int", stages),
+            split=cast("str", split),
+            elem_bytes=fact.lhs_dtype.itemsize,
+            k_width=int(cast("int", k_width)),
+            smem_budget=ring_mma_smem_budget(self.device),
+        )
+
+    def _normalize_cute_dot_ring_mma(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_dot_ring_mma`` is a boolean; True only where the dot's thread
+        layout and geometry fit the ring (``_cute_dot_ring_mma_reason``); the
+        stage and split knobs are repaired to a fitting value when the ring is
+        on and pinned to their defaults (inert) when it is off; under the ring
+        ``cute_pdl_release`` is pinned to its default (the ring's own
+        placement, after the last MMA, overrides it)."""
+        if not any(
+            key in config for key in (RING_MMA_KEY, RING_STAGES_KEY, RING_SPLIT_KEY)
+        ):
+            return
+        value = config.get(RING_MMA_KEY, False)
+        if type(value) is not bool:
+            if not fix_invalid:
+                raise InvalidConfig(f"{RING_MMA_KEY} must be a boolean")
+            value = False
+        stages = config.get(RING_STAGES_KEY, RING_DEFAULT_STAGES)
+        if type(stages) is not int or stages not in RING_STAGE_CHOICES:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{RING_STAGES_KEY} must be one of {RING_STAGE_CHOICES}"
+                )
+            stages = RING_DEFAULT_STAGES
+        split = config.get(RING_SPLIT_KEY, RING_DEFAULT_SPLIT)
+        if split not in RING_SPLIT_CHOICES:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{RING_SPLIT_KEY} must be one of {RING_SPLIT_CHOICES}"
+                )
+            split = RING_DEFAULT_SPLIT
+        if value and not self._cute_dot_ring_searchable():
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{RING_MMA_KEY}=True {self._cute_dot_ring_mma_reason(config)}"
+                )
+            value = False
+        if value:
+            # The first fitting (split, stages) pair, the requested one first
+            # (fewer stages when the ring would not fit in shared memory, the
+            # other split when the warps cannot divide the requested one);
+            # a layout no pair fits makes the knob inert (like
+            # ``cute_lane_unroll`` without a lane loop).
+            fits = False
+            for candidate_split in (
+                split,
+                *(s for s in RING_SPLIT_CHOICES if s != split),
+            ):
+                for candidate_stages in (
+                    stages,
+                    *sorted(
+                        (s for s in RING_STAGE_CHOICES if s < stages), reverse=True
+                    ),
+                ):
+                    config[RING_STAGES_KEY] = candidate_stages
+                    config[RING_SPLIT_KEY] = candidate_split
+                    if self._cute_dot_ring_mma_reason(config) is None:
+                        fits = True
+                        break
+                if fits:
+                    break
+            if not fits:
+                value = False
+        config[RING_MMA_KEY] = value
+        if not value:
+            config[RING_STAGES_KEY] = RING_DEFAULT_STAGES
+            config[RING_SPLIT_KEY] = RING_DEFAULT_SPLIT
+        elif "cute_pdl_release" in config:
+            # The ring releases its dependents after its last MMA whatever the
+            # placement says (``cute/ring_mma_dot.py``): the key is inert.
+            config["cute_pdl_release"] = CUTE_PDL_RELEASE_DEFAULT
+
     def _normalize_cute_vloop_sink(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -6938,6 +7174,8 @@ class ConfigSpec:
             )
             self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
             self._normalize_cute_pdl(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_dot_fragment_mma(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_dot_ring_mma(config, fix_invalid=_fix_invalid)
             self._normalize_cute_tiles_per_block(config, fix_invalid=_fix_invalid)
             self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
             self._normalize_cute_register_chain(config, fix_invalid=_fix_invalid)
@@ -9158,7 +9396,22 @@ class ConfigSpec:
                             (False, True),
                             search_choices=(False, True) if seeded else (False,),
                         )
-                if len(self.cute_lane_layouts) > 0 and not self.matmul_facts:
+                fragment_mma_searchable = self._cute_fragment_mma_searchable()
+                if fragment_mma_searchable:
+                    # The GEMV dot on mma.sync fragments; configs whose thread
+                    # layout cannot take it normalize to False.
+                    fields[FRAGMENT_MMA_KEY] = EnumFragment((False, True))
+                if self._cute_dot_ring_searchable():
+                    # The GEMV dot through a cp.async ring on mma.sync; the
+                    # normalizer repairs the stage / split knobs to a fitting
+                    # pair and makes the knob inert where the layout cannot
+                    # take the ring.
+                    fields[RING_MMA_KEY] = EnumFragment((False, True))
+                    fields[RING_STAGES_KEY] = EnumFragment(RING_STAGE_CHOICES)
+                    fields[RING_SPLIT_KEY] = EnumFragment(RING_SPLIT_CHOICES)
+                if len(self.cute_lane_layouts) > 0 and (
+                    not self.matmul_facts or fragment_mma_searchable
+                ):
                     sink_seeded = any(
                         seed.config.get("cute_vloop_sink") is True
                         for seed in self.compiler_seed_configs

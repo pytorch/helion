@@ -1857,10 +1857,6 @@ class DeviceFunction:
             # iteration's load, so unsplit loops keep only ONE load in
             # flight per thread; the triton backend and handwritten CuTe
             # kernels both load the whole tile fragment first).
-            from .cute.split_lane_loads import split_lane_loads
-            from .cute.unroll_lane_loads import LaneUnrollNotApplied
-            from .cute.unroll_lane_loads import unroll_lane_loads
-
             # ``cute_lane_unroll`` without vector-loop sinking, or with a sunk
             # nest whose lane loops the sinking pass left rolled (their loads
             # were persistent markers, now packets): unroll the lane loops (of
@@ -1868,6 +1864,93 @@ class DeviceFunction:
             # lane's loads (packets and scalars alike) issued before the first
             # lane's compute.  The knob-off code is regenerated when no loop
             # takes the unroll.
+            # ``cute_dot_fragment_mma``: a GEMV's scalar dot fallback (16-bit
+            # packets, fp32 per-element FMAs, a grouped shuffle sum over the
+            # K threads) on an (8, 4, 1) thread block runs on ``mma.sync``
+            # fragments instead (``cute/fragment_mma_dot.py``); the lane
+            # unroll below then hoists the fragment packets like any other
+            # packet loads.  The knob-off code is regenerated when no dot
+            # takes the rewrite.
+            from .cute.fragment_mma_dot import FRAGMENT_MMA_KEY
+
+            # ``cute_dot_ring_mma``: the same GEMV dot on a ``(T, 1, 1)`` block
+            # streams the row tile through a cp.async ring in shared memory
+            # and multiplies on ``mma.sync`` fragments (``cute/ring_mma_dot.py``).
+            from .cute.ring_mma_dot import RING_MMA_KEY
+            from .cute.split_lane_loads import split_lane_loads
+            from .cute.unroll_lane_loads import LaneUnrollNotApplied
+            from .cute.unroll_lane_loads import unroll_lane_loads
+
+            if self.config.config.get(RING_MMA_KEY) is True:
+                from .cute.memory_ops import cute_tensor_base_is_aligned
+                from .cute.ring_mma_dot import RING_DEFAULT_SPLIT
+                from .cute.ring_mma_dot import RING_DEFAULT_STAGES
+                from .cute.ring_mma_dot import RING_SPLIT_KEY
+                from .cute.ring_mma_dot import RING_STAGES_KEY
+                from .cute.ring_mma_dot import RingMmaNotApplied
+                from .cute.ring_mma_dot import ring_mma_dot
+                from .cute.ring_mma_dot import ring_mma_smem_budget
+
+                ring_fact = env.config_spec._cute_fragment_mma_fact()
+                ring_rows: object = None
+                ring_chunk: object = None
+                ring_k_var: str | None = None
+                if (
+                    ring_fact is not None
+                    and ring_fact.m_block_id is not None
+                    and ring_fact.k_block_id is not None
+                ):
+                    ring_rows = env.block_sizes[ring_fact.m_block_id].from_config(
+                        self.config
+                    )
+                    ring_chunk = env.block_sizes[ring_fact.k_block_id].from_config(
+                        self.config
+                    )
+                    # A cache read only: ``block_size_var`` would lift a new
+                    # constexpr argument after the host call was emitted.
+                    ring_k_var = self.block_size_var_cache.get((ring_fact.k_block_id,))
+                kernel_body, ring_fired = ring_mma_dot(
+                    kernel_body,
+                    thread_block_dims=exact_thread_block_dims,
+                    rows=ring_rows if isinstance(ring_rows, int) else None,
+                    chunk=ring_chunk if isinstance(ring_chunk, int) else None,
+                    stages=cast(
+                        "int",
+                        self.config.config.get(RING_STAGES_KEY, RING_DEFAULT_STAGES),
+                    ),
+                    split=cast(
+                        "str",
+                        self.config.config.get(RING_SPLIT_KEY, RING_DEFAULT_SPLIT),
+                    ),
+                    k_block_var=ring_k_var,
+                    tensors={
+                        arg.name: arg.fake_value
+                        for arg in self.arguments
+                        if isinstance(arg, TensorArg)
+                    },
+                    aligned={
+                        arg.name
+                        for arg in self.arguments
+                        if isinstance(arg, TensorArg)
+                        and cute_tensor_base_is_aligned(env, arg.fake_value, 16)
+                    },
+                    new_var=lambda name: self.new_var(name, dce=False),
+                    rename_groups={k: v[0] for k, v in self._variable_renames.items()},
+                    smem_budget=ring_mma_smem_budget(env.device),
+                )
+                if not ring_fired:
+                    raise RingMmaNotApplied
+            if self.config.config.get(FRAGMENT_MMA_KEY) is True:
+                from .cute.fragment_mma_dot import FragmentMmaNotApplied
+                from .cute.fragment_mma_dot import fragment_mma_dot
+
+                kernel_body, fragment_fired = fragment_mma_dot(
+                    kernel_body,
+                    thread_block_dims=exact_thread_block_dims,
+                    new_var=lambda name: self.new_var(name, dce=False),
+                )
+                if not fragment_fired:
+                    raise FragmentMmaNotApplied
             lane_unroll = cast("int", self.config.config.get("cute_lane_unroll", 1))
             sinking = bool(self.config.config.get("cute_vloop_sink"))
             knob_unroll = (
