@@ -14,6 +14,7 @@ from helion._compiler.metal.mpp_graph_codegen import MPPGraphInfo
 from helion._compiler.metal.mpp_graph_codegen import _mpp_graph
 from helion._compiler.metal.mpp_graph_transform import _classify_mpp_operand
 from helion._compiler.metal.mpp_graph_transform import rewrite_mpp_graphs
+import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language import memory_ops
 
@@ -53,9 +54,7 @@ class TestMetalMPPGraphTransform(unittest.TestCase):
         rhs_load.meta["val"] = torch.empty(64, 4, dtype=torch.float32)
         acc = body_graph.placeholder("acc")
         acc.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
-        mma = body_graph.call_function(
-            torch.ops.aten.addmm.default, args=(acc, lhs_load, rhs_load)
-        )
+        mma = body_graph.call_function(hl.dot, args=(lhs_load, rhs_load, acc, None))
         mma.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
         body_graph.output((mma,))
 
@@ -143,7 +142,7 @@ class TestMetalMPPGraphTransform(unittest.TestCase):
 
         mpp_graph = device_ir.graphs[2]
         assert isinstance(mpp_graph, MPPGraphInfo)
-        self.assertEqual(mpp_graph.result_name, "addmm_default")
+        self.assertEqual(mpp_graph.result_name, "dot")
         self.assertEqual(mpp_graph.k_block_id, 2)
         self.assertEqual(mpp_graph.begin, [0])
         self.assertEqual(mpp_graph.end, [64])

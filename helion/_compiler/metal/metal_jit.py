@@ -195,6 +195,16 @@ def _generate_msl(
     """
     from torch._inductor.codegen.mps import DTYPE_TO_METAL
 
+    from .mpp_matmul import elementize
+
+    body_stmts = elementize(
+        body_stmts,
+        frozenset(
+            k[len(TG_BUFFER_GLOBAL_PREFIX) :]
+            for k in fn_globals
+            if k.startswith(TG_BUFFER_GLOBAL_PREFIX)
+        ),
+    )
     body_stmts = unroll_lane_folds(body_stmts)
     msl_parts: list[str] = [
         "#include <metal_stdlib>",
@@ -342,7 +352,9 @@ def _uses_mpp_markers(body_stmts: list[ast.stmt]) -> bool:
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if isinstance(func, ast.Name) and func.id.startswith("_metal_mpp_"):
+        if isinstance(func, ast.Name) and func.id.startswith(
+            ("_metal_mpp_", "_helion_mpp_")
+        ):
             return True
     return False
 
@@ -457,8 +469,8 @@ def _threadgroup_buffers(
     if used() > MAX_THREADGROUP_MEMORY_BYTES:
         raise exc.BackendUnsupported(
             "metal",
-            f"reduction scratch needs {used()} bytes of threadgroup memory "
-            f"(max {MAX_THREADGROUP_MEMORY_BYTES})",
+            f"reduction scratch and MPP staging need {used()} bytes of "
+            f"threadgroup memory (max {MAX_THREADGROUP_MEMORY_BYTES})",
         )
     return buffers()
 

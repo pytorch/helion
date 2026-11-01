@@ -1,9 +1,10 @@
 """DeviceIR rewrite for Metal MPP matmul lowering.
 
-The pass replaces an eligible K-loop matmul result and optional post-K epilogue
-with an ``MPPGraphInfo`` region.  That synthetic graph owns cooperative MPP
-setup, K iteration, epilogue, and store; the surrounding root graph stays on the
-normal scalar Metal lowering path.
+The pass replaces an eligible K-loop ``hl.dot`` result and optional post-K
+epilogue with an ``MPPGraphInfo`` region.  That synthetic graph owns cooperative
+MPP setup, K iteration, epilogue, and store; the surrounding root graph stays on
+the normal scalar Metal lowering path.  Every ``torch.addmm`` is left to
+``mpp_matmul``.
 
 Recognition is conservative: the K-loop must return a supported 2D matmul
 accumulator, the root graph must have a single owner chain from
@@ -31,6 +32,7 @@ from ..device_ir import DeviceIR
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import RootGraphInfo
 from ..inductor_lowering import APIFuncLowering
+from .factored_dims import factored_size
 from .mpp_graph_codegen import MPPGraphInfo
 from .mpp_graph_codegen import _mpp_graph
 from .mpp_graph_codegen import _MPPOperandLayout
@@ -73,7 +75,6 @@ class _Candidate:
     rhs_view: _MPPLoadView
     lhs_layout: _MPPOperandLayout
     rhs_layout: _MPPOperandLayout
-    bias_view: _MPPLoadView | None
     acc_dtype: torch.dtype
     store_view: _MPPStoreView
     mpp_output_node: Node
@@ -191,11 +192,7 @@ def _mma_output_for_getitem(
 
 def _is_matmul_node(node: Node) -> bool:
     """Return whether *node* is a matmul op supported by MPPGraph matching."""
-    return node.op == "call_function" and node.target in {
-        hl.dot,
-        torch.ops.aten.mm.default,
-        torch.ops.aten.addmm.default,
-    }
+    return node.op == "call_function" and node.target is hl.dot
 
 
 def _is_phi_node(node: Node, value: Node) -> bool:
@@ -230,7 +227,7 @@ def _classify_phi_users(
     operand_info = _mpp_operand_views(mma_node)
     if operand_info is None:
         return None
-    lhs_view, rhs_view, lhs_layout, rhs_layout, bias_view, acc_dtype = operand_info
+    lhs_view, rhs_view, lhs_layout, rhs_layout, acc_dtype = operand_info
     epilogue_nodes: list[Node] = []
     cur = phi_node
     visited: set[Node] = set()
@@ -262,7 +259,6 @@ def _classify_phi_users(
                 rhs_view=rhs_view,
                 lhs_layout=lhs_layout,
                 rhs_layout=rhs_layout,
-                bias_view=bias_view,
                 acc_dtype=acc_dtype,
                 store_view=store_view,
                 mpp_output_node=cur,
@@ -291,7 +287,6 @@ def _classify_phi_users(
                 rhs_view=rhs_view,
                 lhs_layout=lhs_layout,
                 rhs_layout=rhs_layout,
-                bias_view=bias_view,
                 acc_dtype=acc_dtype,
                 store_view=store_view,
                 mpp_output_node=cur,
@@ -356,20 +351,18 @@ def _mpp_operand_views(
         _MPPLoadView,
         _MPPOperandLayout,
         _MPPOperandLayout,
-        _MPPLoadView | None,
         torch.dtype,
     ]
     | None
 ):
-    """Extract validated lhs/rhs/bias views, layouts, and accumulator dtype."""
-    lhs_idx = 1 if mma_node.target is torch.ops.aten.addmm.default else 0
-    rhs_idx = 2 if mma_node.target is torch.ops.aten.addmm.default else 1
-    acc_idx = 0 if mma_node.target is torch.ops.aten.addmm.default else None
-    if len(mma_node.args) <= max(lhs_idx, rhs_idx):
-        return None
-    lhs_node = mma_node.args[lhs_idx]
-    rhs_node = mma_node.args[rhs_idx]
+    """Extract validated lhs/rhs views, layouts, and accumulator dtype."""
+    lhs_node, rhs_node = mma_node.args[0], mma_node.args[1]
     if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
+        return None
+    lhs_val = lhs_node.meta["val"]
+    if isinstance(lhs_val, torch.Tensor) and factored_size(lhs_val.size(-1)):
+        # A K held as per-thread parts (factored_dims), which the region would
+        # read as a plain tile; the MPP planner lowers it.
         return None
     lhs_view = _trace_to_load_view(lhs_node)
     rhs_view = _trace_to_load_view(rhs_node)
@@ -384,12 +377,7 @@ def _mpp_operand_views(
     acc_dtype = _tensor_dtype_from_meta(mma_node)
     if acc_dtype is None:
         return None
-    bias_view = None
-    if acc_idx is not None and len(mma_node.args) > acc_idx:
-        acc_node = mma_node.args[acc_idx]
-        if isinstance(acc_node, Node):
-            bias_view = _trace_to_load_view(acc_node)
-    return lhs_view, rhs_view, lhs_layout, rhs_layout, bias_view, acc_dtype
+    return lhs_view, rhs_view, lhs_layout, rhs_layout, acc_dtype
 
 
 def _trace_to_load_view(node: Node) -> _MPPLoadView | None:
@@ -453,8 +441,7 @@ def _classify_mpp_operand(tensor: torch.Tensor, *, role: str) -> _MPPOperandLayo
     must read the operand transposed.
     Anything else (column strides, broadcasts, negative strides, views with
     symbolic strides) has no MPP handle representation and is refused with
-    the strides named.  Declining the rewrite quietly is not an option:
-    there is no scalar ``addmm`` lowering to fall back to.
+    the strides named.
     """
     rows, cols = tensor.shape
     if not isinstance(tensor.storage_offset(), int):
@@ -618,9 +605,6 @@ def _append_mpp_graph(device_ir: DeviceIR, candidate: _Candidate) -> int:
             result_name=candidate.mma_node.name,
             lhs_tensor=candidate.lhs_view.tensor,
             rhs_tensor=candidate.rhs_view.tensor,
-            bias_tensor=(
-                candidate.bias_view.tensor if candidate.bias_view is not None else None
-            ),
             acc_dtype=candidate.acc_dtype,
             out_tensor=candidate.store_view.tensor,
             out_dtype=candidate.store_view.tensor.dtype,

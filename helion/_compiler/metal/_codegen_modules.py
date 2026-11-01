@@ -16,4 +16,5 @@ from . import aten_lowering  # noqa: F401
 from . import free_arange  # noqa: F401
 from . import matmul_ops  # noqa: F401
 from . import memory_ops  # noqa: F401
+from . import mpp_matmul  # noqa: F401
 from . import tracing_ops  # noqa: F401
