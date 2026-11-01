@@ -43,6 +43,7 @@ from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
 from .pdl_release import generic_release_rendered
+from .pdl_release import spread_rendered
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -1637,7 +1638,11 @@ class CuteBackend(Backend):
         """A kernel that renders the generic early release of its programmatic
         dependents (``cute_pdl`` on the generic path, released at entry or
         from the last wave) ranks ahead of one that does not, among finalists
-        the autotuner's final verification cannot tell apart.
+        the autotuner's final verification cannot tell apart, and one that
+        also pads its shared memory to one wave's density
+        (``cute_pdl_spread``, ``spread_rendered``) ranks ahead of both: an
+        early launch of it never packs its CTAs onto the SMs its primary
+        left idle, while its isolated timing reads the pad as a tie.
 
         The knob's own cost or gain is invisible to the kernel's isolated
         timing whenever a plain launch separates its back-to-back calls (the
@@ -1650,16 +1655,21 @@ class CuteBackend(Backend):
         Whether a config renders that release is read off its generated
         module (``generic_release_rendered``), not off its keys: the tcgen05,
         warp-MMA, collective and block-scaled families own their wait and
-        release (``DeviceFunction._cute_pdl_applies``), so on them the knob
-        and its placement are inert and every config ranks alike; a ranking
-        by keys there would break ties between unrelated knobs (matmul
-        backward s2: a clc-persistent finalist 0.5% behind in the autotuner's
-        regime, 7% behind in the catalogue's).  A config without the knob
-        ranks last without a render.
+        release (``DeviceFunction._cute_pdl_applies``; the tcgen05 kernels
+        take the ``entry`` placement after their own waits,
+        ``DeviceFunction._tcgen05_early_pdl_release``), and on them every
+        config ranks alike: their back-to-back timing sees the knob, and a
+        ranking by the release there would break ties between unrelated
+        knobs (matmul backward s2: a clc-persistent finalist 0.5% behind in
+        the autotuner's regime, 7% behind in the catalogue's).  A config
+        without the knob ranks last without a render.
         """
         if config.config.get("cute_pdl") is not True:
-            return 1
-        return 0 if generic_release_rendered(source()) else 1
+            return 2
+        rendered = source()
+        if not generic_release_rendered(rendered):
+            return 2
+        return 0 if spread_rendered(rendered) else 1
 
     def build_standalone_code(
         self,
@@ -2235,6 +2245,7 @@ class CuteBackend(Backend):
             or key == "cute_lane_unroll"
             or key == "cute_pdl"
             or key == "cute_pdl_release"
+            or key == "cute_pdl_spread"
             or key == "cute_warp_aggregated_atomics"
             or key == "cross_loop_pipeline"
             or key
@@ -2597,6 +2608,7 @@ class CuteBackend(Backend):
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
             "_cute_nan_max": "from helion._compiler.cute.reduce_helpers import _cute_nan_max",
             "_cute_nan_min": "from helion._compiler.cute.reduce_helpers import _cute_nan_min",
+            "_helion_pdl_spread_keep": "from helion._compiler.cute._pdl_spread_runtime import keep_smem_live as _helion_pdl_spread_keep",
             "_cute_aux_copy_layout": "from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout as _cute_aux_copy_layout",
             "_helion_tcgen05_pipeline": (
                 "from helion._compiler.cute import tcgen05_pipeline "
