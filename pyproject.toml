@@ -225,6 +225,9 @@ project-excludes = [
 ]
 python-version = "3.10"
 search-path = ["../pytorch"]
+# MLX only installs on macOS; benchmarks/metal imports it as an optional
+# baseline provider.
+ignore-missing-imports = ["mlx", "mlx.*"]
 
 [tool.codespell]
 ignore-words = "scripts/dictionary.txt"
