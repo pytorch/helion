@@ -38,7 +38,9 @@ from ..device_ir import RootGraphInfo
 from ..device_ir import control_flow_parent_entries
 from ..type_info import TensorType
 from .host_zero_fills import _assigns
+from .host_zero_fills import _combine_coverages
 from .host_zero_fills import _is_load
+from .host_zero_fills import _Range
 from .host_zero_fills import _reads
 from .host_zero_fills import _remainder_fill
 from .host_zero_fills import _store_coverage
@@ -167,7 +169,7 @@ def prove_host_remainder_fills(
         tensors = host_tensors.get(fake, [])
         if not tensors:
             continue
-        coverages: set[tuple[int, ...] | None] = set()
+        coverages: list[tuple[int | _Range, ...] | None] = []
         admitted = True
         for tensor in tensors:
             for user in tensor.users:
@@ -180,18 +182,19 @@ def prove_host_remainder_fills(
                 if _is_load(user, tensor):
                     admitted = False
                     break
-                coverages.add(
+                coverages.append(
                     _store_coverage(
                         user, tensor, fake, env, graphs, parents, roots, host, config
                     )
                 )
             if not admitted:
                 break
-        if not admitted or len(coverages) != 1 or None in coverages:
+        if not admitted or not coverages or None in coverages:
             continue
-        (remainders,) = coverages
-        assert remainders is not None
-        if sum(1 for remainder in remainders if remainder) != 1:
+        remainders = _combine_coverages(
+            [coverage for coverage in coverages if coverage is not None], fake.shape
+        )
+        if remainders is None or sum(1 for remainder in remainders if remainder) != 1:
             continue
         if not _remainder_fill(statement, name, remainders):
             continue
