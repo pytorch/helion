@@ -60,6 +60,8 @@ if TYPE_CHECKING:
     from .device_ir import GraphInfo
     from .generate_ast import GenerateAST
     from .host_function import HostFunction
+    from .inductor_lowering import CodegenState
+    from .reduction_strategy import BlockReductionStrategy
     from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
 
@@ -623,6 +625,13 @@ class Backend(abc.ABC):
         from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
 
         return key not in BACKEND_SPECIFIC_KEYS
+
+    def default_num_sm_multiplier(self) -> int:
+        """``num_sm_multiplier`` of a persistent config that names none, and
+        the value the autotuner's search starts persistent launches from."""
+        from ..autotuner.config_spec import DEFAULT_NUM_SM_MULTIPLIER
+
+        return DEFAULT_NUM_SM_MULTIPLIER
 
     def cross_loop_pipelines(self) -> tuple[str, ...]:
         """``cross_loop_pipeline`` values this backend can lower.
@@ -1544,6 +1553,20 @@ class Backend(abc.ABC):
         if reduction_loop is None:
             return PersistentReductionStrategy(fn, block_id)
         return LoopedReductionStrategy(fn, block_id, reduction_loop)
+
+    def create_block_reduction_strategy(
+        self,
+        state: CodegenState,
+        block_id: int,
+    ) -> BlockReductionStrategy:
+        """Create the strategy for a reduction over a tile block rather than a
+        reduction dimension.
+
+        Backends can override to return a subclass.
+        """
+        from .reduction_strategy import BlockReductionStrategy
+
+        return BlockReductionStrategy(state, block_id)
 
     def autotune(
         self,
