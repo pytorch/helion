@@ -83,7 +83,7 @@ def test_even_fringe_roundtrip_seeds_and_unsplit_codegen(dtype: torch.dtype) -> 
     source = bound.to_code(config)
     assert "cute.make_layout((2, 2, 1))" in source
     assert "CtaGroup.TWO" in source
-    assert "PipelineTmaUmma.create" in source
+    assert "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
     assert "tile_offset_1 < cutlass.Int32(832)" in source
     assert "if tcgen05_full_tile:" in source
@@ -109,7 +109,7 @@ def test_sm103_keeps_even_n_cluster_schedule() -> None:
             assert state.n_edge_cluster_schedule_seed_configs()
         source = bound.to_code(canonical)
         assert "cute.make_layout((2, 2, 1))" in source
-        assert "PipelineTmaUmma.create" in source
+        assert "make_tma_umma_pipeline(" in source
         assert "PipelineTmaStore.create" in source
         assert "tcgen05_sched_pipeline =" not in source
 

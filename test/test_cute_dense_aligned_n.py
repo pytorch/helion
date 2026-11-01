@@ -145,7 +145,7 @@ def test_native_selection_uses_physical_n(mode, acc_stages):
             )
         source = bound.to_code(config)
     assert results and all(result == "tcgen05" for result in results), results
-    assert "PipelineTmaUmma.create" in source
+    assert "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
     assert "(128, 80, 128)" in source
 
@@ -500,7 +500,7 @@ def test_every_advertised_width_emits_native_complete_budget(width, acc_stages):
     assert descriptors[0]["bn"] == width
     assert descriptors[0]["ab_stage_count"] == plan.max_ab_stages
     assert descriptors[1]["epi_tile_raw_expr"] == _d_tile_expr(width)
-    assert "PipelineTmaUmma.create" in source
+    assert "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
     assert "block=(32, 6, 1)" in source
     # The TMEM load atom that the ownership proofs above model.
@@ -570,7 +570,8 @@ def test_explicit_native_implementation_contract(implementation, monkeypatch):
             bound.to_code(_config())
     else:
         assert seeds and fragments["tcgen05_tile_n"].choices == (0, 80, 160)
-        assert "PipelineTmaUmma.create" in bound.to_code(_config())
+        code = bound.to_code(_config())
+        assert "make_tma_umma_pipeline(" in code
     ordinary = _config(tcgen05_tile_n=0, tcgen05_ab_stages=2)
     omitted = helion.Config.from_dict(
         {
@@ -698,7 +699,8 @@ def test_direct_roundtrip_keeps_budget_and_collective_release(
             )
     source = bound.to_code(canonical)
     assert [plan["kind"] for plan in wrapper_plans(source)] == ["tcgen05_ab_tma"]
-    assert "CopyR2GOp" in source and "PipelineTmaUmma.create" in source
+    assert "CopyR2GOp" in source
+    assert "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" not in source
     assert "tcgen05_sD_ptr = cute.arch.alloc_smem" not in source
     assert "tcgen05_tiled_copy_r2s" not in source

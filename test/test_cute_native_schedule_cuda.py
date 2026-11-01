@@ -27,6 +27,7 @@ from helion._compiler.cute.grouped_row_union import AB_STAGES_KEY
 from helion._compiler.cute.grouped_row_union import CONFIG_KEY as ROW_UNION_KEY
 from helion._compiler.cute.grouped_row_union import PAIRED_CLC_SCHEDULE
 from helion._compiler.cute.grouped_row_union import RESIDENT_CTAS_KEY
+from helion._compiler.cute.grouped_row_union import ROUND_SUBTILES_KEY
 from helion._compiler.cute.grouped_row_union import SCHEDULE_KEY
 from helion._compiler.cute.grouped_row_union import TRANSPOSED_SCHEDULE
 from helion._testing import skipUnlessBackends
@@ -139,6 +140,8 @@ def _row_union_bound(
     *,
     ab_stages: int | None = None,
     pdl: bool = False,
+    round_subtiles: int | None = None,
+    register_reallocation: bool = True,
 ) -> tuple[BoundKernel, helion.Config]:
     kernel = helion.kernel(
         grouped_gemm_jagged.fn,
@@ -162,14 +165,38 @@ def _row_union_bound(
             config.config[RESIDENT_CTAS_KEY] = 2
         if ab_stages is not None:
             config.config[AB_STAGES_KEY] = ab_stages
+        if round_subtiles is not None:
+            config.config[ROUND_SUBTILES_KEY] = round_subtiles
+        if not register_reallocation:
+            # The transposed profile's searchable no-``setmaxnreg`` variant
+            # (its six warps hold their registers from launch); the knob
+            # forbids the consumer-register pin.
+            config.config.pop("tcgen05_consumer_regs", None)
+            config.config["tcgen05_warp_register_reallocation"] = False
         # ``cute_pdl`` defaults to True on the sm_90+ tcgen05 surface; the
         # knob-off renders pin it off.
         config.config["cute_pdl"] = bool(pdl)
         normalized = bound.config_spec.normalized_config(config)
     assert normalized[ROW_UNION_KEY] is True
     assert normalized.config.get(AB_STAGES_KEY) == ab_stages
+    assert normalized.config.get(ROUND_SUBTILES_KEY) == round_subtiles
     source = bound.to_code(config)
     assert "cute.gemm(" in source and "row_union_store_pred" in source
+    if schedule != "paired":
+        # The paired profile owns a static register protocol and never emits
+        # the pair; the others emit it unless the knob is off.
+        assert ("cute.arch.setmaxregister_decrease(" in source) is register_reallocation
+    if round_subtiles is not None:
+        # The epilogue in rounds (``tcgen05_epilogue_rounds``): one fence per
+        # round of the five 128x16 subtiles, a buffer per subtile.
+        rounds = -(-5 // round_subtiles)
+        full_tile = source[
+            source.index("if tcgen05_full_tile:") : source.index(
+                "else:", source.index("if tcgen05_full_tile:")
+            )
+        ]
+        assert full_tile.count("cute.arch.fence_view_async_shared()") == rounds
+        assert f"PipelineTmaStore.create(num_stages={rounds}," in source
     ab = _plans(source)[0]
     assert ab["kind"] == "tcgen05_ab_tma"
     if ab_stages is not None:
@@ -179,7 +206,7 @@ def _row_union_bound(
             ab_stages,
             ab_stages,
         )
-        assert f"PipelineTmaUmma.create(num_stages={ab_stages}," in source
+        assert f"make_tma_umma_pipeline(num_stages={ab_stages}," in source
     if pdl:
         # No entry wait: the TMA-load and epilogue roles (and the paired
         # profile's coverage warp) wait themselves ahead of their reads.
@@ -206,11 +233,22 @@ def _row_union_bound(
 
 
 @pytest.mark.parametrize(
-    ("schedule", "ab_stages"),
-    [("cluster4", None), ("cluster4", 4), ("cluster4", 6), ("resident2", None)],
+    ("schedule", "ab_stages", "round_subtiles", "register_reallocation"),
+    [
+        ("cluster4", None, None, True),
+        ("cluster4", 4, None, True),
+        ("cluster4", 6, None, True),
+        ("cluster4", 6, 2, True),
+        ("cluster4", 6, 4, True),
+        ("cluster4", 6, 2, False),
+        ("resident2", None, None, True),
+    ],
 )
 def test_native_row_union_cuda_replay(
-    schedule: Literal["cluster4", "resident2"], ab_stages: int | None
+    schedule: Literal["cluster4", "resident2"],
+    ab_stages: int | None,
+    round_subtiles: int | None,
+    register_reallocation: bool,
 ) -> None:
     _require_sm100()
     device = torch.device("cuda")
@@ -224,7 +262,13 @@ def test_native_row_union_cuda_replay(
     full = [0, 13, 13, 479, 1280, 1280, 3819, 5001, m]
     offsets = torch.tensor(full, device=device, dtype=torch.int32)
     args = (a, b, offsets)
-    bound, config = _row_union_bound(args, schedule, ab_stages=ab_stages)
+    bound, config = _row_union_bound(
+        args,
+        schedule,
+        ab_stages=ab_stages,
+        round_subtiles=round_subtiles,
+        register_reallocation=register_reallocation,
+    )
     bound.set_config(config)
 
     def check(result: torch.Tensor, routing: list[int]) -> None:
@@ -251,6 +295,8 @@ def test_native_row_union_cuda_replay(
         [m - 509, m - 19, 128, 769, 769, 64, 97, 97, 97],
         [-31, 193, 193, m + 67, m + 67, m + 67, -17, -17, -17],
         [7] * 9,
+        # a one-row group, empty groups and a group of exactly one 80-row tile
+        [0, 1, 1, 1, 81, 81, 2560, 2560, m],
         full,
     ):
         a.normal_(std=0.125, generator=generator)
@@ -281,9 +327,13 @@ def _row_union_check(
     torch.testing.assert_close(result[valid], expected[valid], rtol=3e-2, atol=3e-3)
 
 
-@pytest.mark.parametrize("schedule", ["cluster4", "paired"])
+@pytest.mark.parametrize(
+    ("schedule", "round_subtiles"),
+    [("cluster4", None), ("cluster4", 2), ("paired", None)],
+)
 def test_native_row_union_dependent_launch_cuda(
     schedule: Literal["cluster4", "paired"],
+    round_subtiles: int | None,
 ) -> None:
     """``cute_pdl`` on the row-union profiles: the group offsets are read
     behind the epilogue role's wait (the coverage warp's on the paired
@@ -318,7 +368,13 @@ def test_native_row_union_dependent_launch_cuda(
     ]
     offsets = sources[0].clone()
     args = (a, b, offsets)
-    bound, config = _row_union_bound(args, schedule, pdl=True)
+    bound, config = _row_union_bound(
+        args,
+        schedule,
+        pdl=True,
+        ab_stages=6 if round_subtiles is not None else None,
+        round_subtiles=round_subtiles,
+    )
     bound.set_config(config)
     for i in range(16):
         j = i & 1

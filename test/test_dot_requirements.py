@@ -3387,8 +3387,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             "make_trivial_tiled_mma",
             "tcgen05_ab_pipeline_consumer_group =",
             "tcgen05_acc_pipeline_consumer_group =",
-            "PipelineUmmaAsync.create",
-            "PipelineTmaUmma.create",
+            "make_umma_async_pipeline(",
+            "make_tma_umma_pipeline(",
             "PipelineTmaStore.create",
             "PersistentTileSchedulerParams",
             "StaticPersistentTileScheduler.create",
@@ -3415,8 +3415,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         for code in (baseline_code, with_strategy_code):
             self.assertIn("make_trivial_tiled_mma", code)
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
-            self.assertIn("PipelineUmmaAsync.create", code)
-            self.assertIn("PipelineTmaUmma.create", code)
+            self.assertIn("make_umma_async_pipeline(", code)
+            self.assertIn("make_tma_umma_pipeline(", code)
             self.assertIn("PipelineTmaStore.create", code)
 
 

@@ -148,6 +148,34 @@ def spread_pad_bytes(
 
 _WAIT_CALL = "cute.arch.griddepcontrol_wait()"
 _RELEASE_CALL = "cute.arch.griddepcontrol_launch_dependents()"
+
+
+def _is_bare_call(node: ast.AST, dotted_name: str) -> bool:
+    """``node`` is the expression statement ``dotted_name()`` (no arguments)."""
+    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+        return False
+    call = node.value
+    if call.args or call.keywords:
+        return False
+    parts: list[str] = []
+    func: ast.expr = call.func
+    while isinstance(func, ast.Attribute):
+        parts.append(func.attr)
+        func = func.value
+    if not isinstance(func, ast.Name):
+        return False
+    parts.append(func.id)
+    return ".".join(reversed(parts)) == dotted_name
+
+
+def _is_wait(node: ast.AST) -> bool:
+    return _is_bare_call(node, "cute.arch.griddepcontrol_wait")
+
+
+def _is_release(node: ast.AST) -> bool:
+    return _is_bare_call(node, "cute.arch.griddepcontrol_launch_dependents")
+
+
 # The fill kernels a ``cute_pdl`` kernel's host zero fills launch as
 # (``host_zero_fill_launches``) always wait and release at entry; the
 # release check below reads the kernel proper, not them.
@@ -194,16 +222,16 @@ def generic_release_rendered(source: str) -> bool:
         and not node.name.startswith(ZERO_FILL_KERNEL_PREFIX)
     ]
     for kernel in kernels:
-        statements = [ast.unparse(statement) for statement in kernel.body]
-        if _WAIT_CALL not in statements:
+        waits = [i for i, statement in enumerate(kernel.body) if _is_wait(statement)]
+        if not waits:
             continue
-        index = statements.index(_WAIT_CALL)
+        index = waits[0]
         if index > 0:
             # The late wait behind this kernel's fill kernels: the entry
             # release (plain, or ``last_wave``'s CTA index and guard) leads
             # the body, the wait precedes the first touch of a filled tensor.
             leading = kernel.body[:2]
-            if statements[0] == _RELEASE_CALL:
+            if _is_release(kernel.body[0]):
                 return True
             if (
                 len(leading) == 2
@@ -212,13 +240,14 @@ def generic_release_rendered(source: str) -> bool:
                 and isinstance(leading[0].targets[0], ast.Name)
                 and leading[0].targets[0].id.startswith("pdl_cta")
                 and isinstance(leading[1], ast.If)
-                and [ast.unparse(s) for s in leading[1].body] == [_RELEASE_CALL]
+                and len(leading[1].body) == 1
+                and _is_release(leading[1].body[0])
             ):
                 return True
         following = kernel.body[index + 1 : index + 3]
         if not following:
             continue
-        if statements[index + 1] == _RELEASE_CALL:
+        if _is_release(following[0]):
             return True
         first = following[0]
         if (
@@ -228,7 +257,8 @@ def generic_release_rendered(source: str) -> bool:
             and isinstance(first.targets[0], ast.Name)
             and first.targets[0].id.startswith("pdl_cta")
             and isinstance(following[1], ast.If)
-            and [ast.unparse(s) for s in following[1].body] == [_RELEASE_CALL]
+            and len(following[1].body) == 1
+            and _is_release(following[1].body[0])
         ):
             return True
     return False

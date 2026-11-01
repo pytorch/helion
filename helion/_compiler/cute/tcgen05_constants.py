@@ -132,6 +132,9 @@ TCGEN05_TWO_CTA_SEED_PID_TYPE = "persistent_interleaved"
 # acc-stage variant cheaply and ``ptxas: shared > 232KB`` is bad UX during
 # tuning.
 TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES = 28 * 1024
+# The sm_100 opt-in shared memory per block (B200: 233472 B per SM, 232448 per
+# CTA) the static profiles are bounded against.
+SM100_SMEM_PER_BLOCK_OPTIN_BYTES = 232448
 # Static SMEM model of the DEFAULT-layout role-local GEMM
 # (``CuteTcgen05Config.default_layout_smem_bytes``), measured on B200 from the
 # compiled cubins and the kept PTX. Every ``cute.arch.alloc_smem`` becomes one
@@ -564,6 +567,13 @@ def tcgen05_role_launch_n_width(epi_warp_groups: int) -> int:
 # 256-wide CTA-pair tile.
 TCGEN05_EPI_SUBTILE_N_CONFIG_KEY = "tcgen05_epi_subtile_n"
 TCGEN05_EPI_SUBTILE_N_CHOICES = (None, 32, 64)
+# Subtiles of the role-local TMA-store epilogue staged and stored per round
+# (one async-proxy fence, one named barrier and one bulk commit per round;
+# ``tcgen05_epilogue_rounds``).  1 is the per-subtile loop.  The C ring keeps
+# ``tcgen05_c_stages`` subtile buffers, so the value must divide it; the
+# grouped row-union profiles size their ring from it.
+TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY = "tcgen05_epi_round_subtiles"
+TCGEN05_EPI_ROUND_SUBTILES_CHOICES = (1, 2, 4)
 
 
 class Tcgen05RowvecAuxRow(NamedTuple):

@@ -261,6 +261,43 @@ class ResidentPrepLowering:
     tail_fill_value: float
 
 
+# The plain (non-grouped) tcgen05 GEMM wrapper plans: A/B TMA loads and the D
+# TMA store over the problem tensors themselves.  Baking the tensor layouts
+# into the wrapper schema makes the TMA coordinate tensors' strides immediates
+# (the launcher's full-tile guard still decides per plan); with runtime
+# layouts every tcgen05 kernel fetched them from two constant-bank lines (LDCU
+# misses) and multiplied them into its TMA coordinates on the TMA-load warp's
+# post-release critical path.  The grouped variants (device tensormaps, shared
+# RHS, full-allocation operands, device split sizes, bounded output shifts)
+# re-point descriptors in-kernel and keep the runtime layouts.
+_CUTE_PLAIN_TCGEN05_AB_PLAN_GROUPED_KEYS = frozenset(
+    {
+        "shared_rhs",
+        "fixed_ab_tensormaps",
+        "dynamic_ab_tensormaps",
+        "full_allocation_a",
+        "full_allocation_b",
+        "device_split_sizes",
+        "fixed_grouped_b_rank3",
+        "source_m_tile",
+    }
+)
+_CUTE_PLAIN_TCGEN05_D_PLAN_GROUPED_KEYS = frozenset(
+    {"fixed_tensormap", "bounded_output_shift", "dynamic_d_tensormap"}
+)
+
+
+def _cute_plain_tcgen05_plan_bakes(plan: dict[str, object]) -> bool:
+    kind = plan.get("kind")
+    if kind == "tcgen05_ab_tma":
+        return not any(
+            plan.get(key) for key in _CUTE_PLAIN_TCGEN05_AB_PLAN_GROUPED_KEYS
+        )
+    if kind == "tcgen05_d_tma":
+        return not any(plan.get(key) for key in _CUTE_PLAIN_TCGEN05_D_PLAN_GROUPED_KEYS)
+    return False
+
+
 class GenerateAST(NodeVisitor, CodegenInterface):
     def __init__(
         self,
@@ -422,7 +459,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return True
         if self.cute_wrapper_plans:
             return all(
-                plan.get("kind")
+                _cute_plain_tcgen05_plan_bakes(plan)
+                or plan.get("kind")
                 in {
                     "helion_small_biased_attention",
                     "helion_flash_row_mma",

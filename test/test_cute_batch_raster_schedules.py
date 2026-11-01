@@ -225,7 +225,7 @@ def test_scheduler_mailbox_decodes_the_raster() -> None:
         }
         code = _render("batched_matmul", _LOOPING_SHAPE, **config)
         expected = (
-            f"virtual_pid = {slot(2)} + {slot(0)} // cutlass.Int32(2) * 12 "
+            f"virtual_pid = {slot(2)} + ({slot(0)} >> cutlass.Int32(1)) * 12 "
             f"+ {slot(1)} * (12 * {m_tiles})"
         )
         assert _virtual_pid_lines(code) == {expected}
@@ -235,7 +235,7 @@ def test_scheduler_mailbox_decodes_the_raster() -> None:
         # when cluster_n=2 pairs the N tiles on dim 1.
         m_slot, n_slot = (1, 2) if cluster_n == 1 else (2, 1)
         expected = (
-            f"virtual_pid = {slot(0)} // cutlass.Int32(2) + {slot(m_slot)} * 12 "
+            f"virtual_pid = ({slot(0)} >> cutlass.Int32(1)) + {slot(m_slot)} * 12 "
             f"+ {slot(n_slot)} * (12 * {m_tiles})"
         )
         assert _virtual_pid_lines(code) == {expected}

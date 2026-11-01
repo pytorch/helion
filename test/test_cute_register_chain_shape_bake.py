@@ -86,6 +86,42 @@ class TestCuteRegisterChainShapeBake(unittest.TestCase):
         self.codegen.cute_uses_matmul = True
         self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
 
+    def test_plain_tcgen05_plans_bake(self) -> None:
+        """The plain tcgen05 GEMM plans (A/B TMA loads, D TMA store over the
+        problem tensors) bake; the grouped variants keep runtime layouts."""
+        self.codegen.cute_uses_matmul = True
+        ab = {
+            "kind": "tcgen05_ab_tma",
+            "orientation": "nm",
+            "row_union_schedule": "nm_m256_n80_k64",
+        }
+        d = {"kind": "tcgen05_d_tma", "rank3_mnl_tensor": True}
+        self.codegen.cute_wrapper_plans = [ab, d]
+        self.assertTrue(self.codegen._cute_can_bake_tensor_shapes())
+        self.codegen.cute_wrapper_plans = [dict(ab, orientation="mn")]
+        self.assertTrue(self.codegen._cute_can_bake_tensor_shapes())
+        for key in (
+            "shared_rhs",
+            "fixed_ab_tensormaps",
+            "dynamic_ab_tensormaps",
+            "full_allocation_a",
+            "full_allocation_b",
+            "device_split_sizes",
+            "fixed_grouped_b_rank3",
+            "source_m_tile",
+        ):
+            with self.subTest(key=key):
+                self.codegen.cute_wrapper_plans = [{**ab, key: True}, d]
+                self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+        for key in ("fixed_tensormap", "bounded_output_shift", "dynamic_d_tensormap"):
+            with self.subTest(key=key):
+                self.codegen.cute_wrapper_plans = [ab, {**d, key: True}]
+                self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+        for extra in ("tcgen05_grouped_static_persistent", "tcgen05_aux_tma"):
+            with self.subTest(extra=extra):
+                self.codegen.cute_wrapper_plans = [ab, d, {"kind": extra}]
+                self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+
     def test_existing_safe_wrapper_policy_is_unchanged(self) -> None:
         self.codegen.cute_uses_matmul = True
         for kind in (

@@ -884,12 +884,21 @@ class CuteDeviceFunctionState:
         # ``pipeline_init_wait`` the role executes once in its prelude, after
         # its scheduler setup and ahead of its persistent loop.
         self.tcgen05_tma_role_prelude_wait: str | None = None
+        # ``cute_pdl`` on a persistent role-local tcgen05 kernel: the TMA-load
+        # role's ``griddepcontrol_wait`` is emitted per tile right ahead of the
+        # first stage (``cute_mma``), after the tile's address math, so
+        # ``program_id`` leaves the role's prelude without a wait.
+        self.tcgen05_tma_role_wait_per_tile: bool = False
         self._per_tile_stmt_ids: set[int] = set()
         self._post_loop_stmt_ids: set[int] = set()
         self._tma_load_role_stmt_ids: set[int] = set()
         self._mma_exec_role_stmt_ids: set[int] = set()
         self._epi_role_stmt_ids: set[int] = set()
         self._epi_role_prelude_stmt_ids: set[int] = set()
+        # One-shot TMA-load role setup (the once-per-CTA TMA partitions of
+        # the whole tiled operands, ``cute_mma``) that ``program_id`` places
+        # in the role's prelude ahead of its cluster join.
+        self._tma_role_prelude_stmt_ids: set[int] = set()
         self._epi_role_full_tile_stmt_ids: set[int] = set()
         self._epi_role_edge_tile_stmt_ids: set[int] = set()
         self._tcgen05_kloop_owned_stmt_ids_by_loop: dict[int, set[int]] = {}
@@ -1329,6 +1338,14 @@ class CuteDeviceFunctionState:
 
     def is_tcgen05_epi_role_prelude(self, stmt: ast.stmt) -> bool:
         return id(stmt) in self._epi_role_prelude_stmt_ids
+
+    def register_tcgen05_tma_role_prelude_stmts(self, stmts: Sequence[ast.AST]) -> None:
+        """Mark one-shot TMA-load role setup that must stay inside the role,
+        ahead of its persistent loop and its cluster join."""
+        self._tma_role_prelude_stmt_ids.update(id(stmt) for stmt in stmts)
+
+    def is_tcgen05_tma_role_prelude(self, stmt: ast.stmt) -> bool:
+        return id(stmt) in self._tma_role_prelude_stmt_ids
 
     def is_tcgen05_epi_role_full_tile(self, stmt: ast.stmt) -> bool:
         return id(stmt) in self._epi_role_full_tile_stmt_ids
