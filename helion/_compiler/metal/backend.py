@@ -18,6 +18,7 @@ from ..backend import _largest_divisor_at_most
 from ..cute.backend import CuteBackend
 from ._constants import MAX_THREAD_AXES
 from ._constants import MAX_THREADS_PER_THREADGROUP
+from ._constants import SIMD_WIDTH
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
     from ..device_function import Argument
     from ..device_function import DeviceFunction
+    from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
     from ..reduction_strategy import BlockReductionStrategy
@@ -58,6 +60,136 @@ def _reduction_contracted(block_id: int) -> bool:
     # A twin's reductions run on its owner's lanes (``MetalPaddedTwinStrategy``).
     blocks = {block_id, *padded_twins(block_id)}
     return any(reduction.block_id in blocks for reduction in reductions.reductions)
+
+
+def threadgroup_budget(config: Config, device_ir: DeviceIR | None = None) -> int:
+    """The threads a launch may use: ``num_warps`` SIMD groups, at most
+    Metal's 1024, and at least what the reduction dims' lane forms need
+    (``_lane_floor``).  Every block that takes a thread axis gets its threads
+    within it; lanes walk the rest of its extent."""
+    budget = min(MAX_THREADS_PER_THREADGROUP, SIMD_WIDTH * int(config.num_warps))
+    return max(budget, min(MAX_THREADS_PER_THREADGROUP, _lane_floor(config, device_ir)))
+
+
+def budget_note() -> str:
+    """Suffix for a rejection that depends on the launch size: the budget the
+    config's num_warps gave the kernel, when it is below Metal's 1024."""
+    from ..compile_environment import CompileEnvironment
+
+    backend = CompileEnvironment.current().backend
+    assert isinstance(backend, MetalBackend)
+    if backend._thread_budget >= MAX_THREADS_PER_THREADGROUP:
+        return ""
+    return (
+        f" (threadgroup budget {backend._thread_budget} threads from "
+        f"num_warps={backend._num_warps})"
+    )
+
+
+def indexed_reduction_blocks(device_ir: DeviceIR) -> set[int]:
+    """Reduction dims an argmin/argmax contracts; these have no lane form
+    (``MetalPersistentReductionStrategy.codegen_reduction``)."""
+    from ..compile_environment import CompileEnvironment
+    from ..inductor_lowering import ReductionLowering
+
+    backend = CompileEnvironment.current().backend
+    return {
+        lowering.block_index
+        for info in device_ir.graphs
+        for node in info.graph.nodes
+        if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
+        and backend.is_indexed_reduction(lowering.reduction_type)
+    }
+
+
+def _lane_floor(config: Config, device_ir: DeviceIR | None = None) -> int:
+    """The fewest threads at which every persistent reduction dim fits its
+    lane form beside the root tiles that walk no lanes: a fold walks at most
+    ``MAX_LANE_COPIES`` lanes, while an argmin/argmax and a symbolic
+    (non-int) extent walk none."""
+    from torch._inductor.runtime.runtime_utils import next_power_of_2
+
+    from ..compile_environment import CompileEnvironment
+    from ..host_function import HostFunction
+    from .lane_fold import MAX_LANE_COPIES
+    from .padded_twin import padded_twin_owner
+
+    env = CompileEnvironment.current()
+    if device_ir is None:
+        # Inside create_loop_strategy, which has just set the codegen graphs' set.
+        device_ir = HostFunction.current().device_ir
+        assert isinstance(env.backend, MetalBackend)
+        scalar_dots = env.backend._scalar_contraction_blocks
+    else:
+        scalar_dots = scalar_contraction_blocks(device_ir.graphs, live=False)
+    indexed = indexed_reduction_blocks(device_ir)
+    # A literal-size root tile has no num_threads: it runs one thread per
+    # element whatever the budget (_config_with_reduction_thread_budget).
+    tunable = set(env.config_spec.num_threads.valid_block_ids())
+    floor = 1
+    for block_id in {b for ids in device_ir.grid_block_ids for b in ids} - tunable:
+        size = env.block_sizes[block_id].from_config(config)
+        if isinstance(size, int):
+            floor *= size
+    for info in env.block_sizes:
+        if not info.reduction or padded_twin_owner(info.block_id) is not None:
+            continue  # a padded twin walks its owner's lanes
+        block_id = info.block_id
+        if (
+            env.config_spec.reduction_loops.config_get(
+                config.reduction_loops, block_id, None
+            )
+            is not None
+        ):
+            continue  # a rolled chunk steps by its threads (create_reduction_strategy)
+        extent = int(info.size_hint())
+        if not isinstance(info.size, int) or block_id in indexed:
+            floor *= next_power_of_2(max(1, extent))
+        elif _reduction_contracted(block_id) or block_id in scalar_dots:
+            floor *= next_power_of_2(max(1, -(-extent // MAX_LANE_COPIES)))
+    return floor
+
+
+def blocks_reduced_after_loop(device_ir: DeviceIR) -> set[int]:
+    """Tile blocks a reduction contracts outside the loop that walks them."""
+    from ..device_ir import ForLoopGraphInfo
+    from ..inductor_lowering import ReductionLowering
+
+    out: set[int] = set()
+    for info in device_ir.graphs:
+        loop_blocks = info.block_ids if isinstance(info, ForLoopGraphInfo) else []
+        for node in info.graph.nodes:
+            lowering = node.meta.get("lowering")
+            if (
+                isinstance(lowering, ReductionLowering)
+                and lowering.block_index not in loop_blocks
+            ):
+                out.add(lowering.block_index)
+    return out
+
+
+def scalar_contraction_blocks(graphs: list[GraphInfo], live: bool = True) -> set[int]:
+    """K blocks of the hl.dot ops Scalar code contracts (``matmul_ops``): an
+    aten matmul lowers through MPP or is rejected, and an hl.dot does too when
+    the graph pass replaced its K loop (``live_graphs`` skips it) or its K is
+    held as per-thread parts (``plan_mpp_matmuls``).  ``live=False`` scans
+    every graph (no compiling function to tell live ones), which can only add
+    blocks."""
+    from ...language.matmul_ops import dot
+    from ..compile_environment import CompileEnvironment
+    from .factored_dims import factored_size
+    from .free_arange import live_graphs
+
+    env = CompileEnvironment.current()
+    out: set[int] = set()
+    for info in live_graphs(graphs) if live else graphs:
+        for node in info.graph.find_nodes(op="call_function", target=dot):
+            k = node.args[0].meta["val"].size(-1)
+            if factored_size(k) is None:
+                block_id = env.resolve_block_id(k)
+                if block_id is not None:
+                    out.add(block_id)
+    return out
 
 
 def _is_threadgroup_too_large(err: BaseException) -> bool:
@@ -116,6 +248,14 @@ class MetalBackend(Backend):
         # by ``create_loop_strategy`` because strategies of the next config
         # are built, and may read ``force_tile_mask``, before it runs.
         self._uniform_extent: int | None = None
+        # The config's ``threadgroup_budget``, set by ``create_loop_strategy``
+        # for the reduction strategies built after the loop strategies.
+        self._thread_budget = MAX_THREADS_PER_THREADGROUP
+        self._num_warps = MAX_THREADS_PER_THREADGROUP // SIMD_WIDTH
+        self._scalar_contraction_blocks: set[int] = set()
+        # Threads left for the current loop's literal-size tiles when the
+        # kernel's tiles overflow the budget (_serialize_nested_auto_tiles).
+        self._literal_tile_limit: int | None = None
 
     @property
     def name(self) -> str:
@@ -330,6 +470,7 @@ class MetalBackend(Backend):
         config: Config,
         tile_strategy: TileStrategyDispatch,
     ) -> None:
+        from .free_arange import check_free_lanes
         from .free_arange import plan_free_aranges
         from .mpp_matmul import plan_mpp_matmuls
         from .positional_rebind import reject_positional_rebinds
@@ -342,23 +483,30 @@ class MetalBackend(Backend):
         self._tid_axes = set()
         self.free_arange_plan = plan_free_aranges(graphs, config, tile_strategy)
         self.mpp_plan = plan_mpp_matmuls(graphs)
+        check_free_lanes(self.free_arange_plan, self.mpp_plan, graphs)
         self._uniform_extent = self._uniform_thread_extent(graphs, tile_strategy)
 
     def _uniform_thread_extent(
         self, graphs: list[GraphInfo], tile_strategy: TileStrategyDispatch
     ) -> int | None:
         """The one thread extent E of every strategy's thread axes, or
-        ``None`` if their extents differ, or the kernel has an MPP op or a
-        free ``hl.arange``.
+        ``None`` if their extents differ, or the kernel has a free
+        ``hl.arange`` or goes through the MPP graph pass.
 
         The launch is the largest extent of each emitted thread axis, so with
         a single E every launch axis is 1 or E (``launcher_keyword_args``
         asserts it), and no tile runs surplus threads on whichever axis the
         emitted code gives it.  Free aranges and the MPP graph pass claim
-        threads that no strategy owns, and a cooperative MPP matmul result
-        holds its tile in MPP's layout rather than one element per thread.
+        threads that no strategy owns.  The MPP planner launches only the
+        strategies' threads, and an element of a cooperative result is
+        visited at its row and column, which lie inside the op's tile and so
+        inside each block: the shared rule's masks hold there too.
         """
-        if self.free_arange_plan or self._has_mpp_op(graphs):
+        from .mpp_graph_codegen import MPPGraphInfo
+
+        if self.free_arange_plan or any(
+            isinstance(graph, MPPGraphInfo) for graph in graphs
+        ):
             return None
         extents = {
             extent
@@ -369,29 +517,51 @@ class MetalBackend(Backend):
             return None
         return max(extents, default=1)
 
-    def _has_mpp_op(self, graphs: list[GraphInfo]) -> bool:
-        from .mpp_graph_codegen import MPPGraphInfo
-
-        assert self.mpp_plan is not None
-        return bool(self.mpp_plan.by_matmul) or any(
-            isinstance(graph, MPPGraphInfo) for graph in graphs
-        )
-
     def reduction_axis_first(self) -> bool:
         # Metal linearizes ``tid`` with ``tid[0]`` fastest-varying and assigns
         # SIMD groups in that order, so putting the reduction on the lowest
         # axis is what makes its threads a contiguous run of SIMD lanes.
         return True
 
+    def _cute_matmul_contraction_thread_reserve(
+        self, fn: DeviceFunction, tile_block_ids: list[int]
+    ) -> int:
+        """Not a contraction reserve on Metal: this hook carries the thread
+        limit for literal-size tiles into the shared planner.
+
+        The shared planner reserves a matmul's whole contraction extent
+        because CuTe's scalar contraction can't walk it in lanes.  On Metal an
+        MPP op contracts its own K, a scalar hl.dot folds its K lanes
+        (matmul_ops), and the dimensions a reduction combines are reserved by
+        ``_config_with_reduction_thread_budget``, so the reserve is 1.
+
+        A literal-size tile has no ``num_threads`` for the Metal passes to
+        record.  When the kernel's tiles overflow what the reservations leave,
+        ``_serialize_nested_auto_tiles`` sets ``_literal_tile_limit``; this
+        returns ``1024 / limit``, and the shared planner's split (OPTION B)
+        shrinks the call's auto tiles to ``1024 / reserve``.  The limit is
+        rounded down to a power of two so that round trip is exact.  The
+        planner only ever takes the smaller of this and its own limit (which
+        is 256 on its matmul branch), so the hook can shrink tiles, never
+        widen them.
+        """
+        if self._literal_tile_limit is not None:
+            limit = 1 << (self._literal_tile_limit.bit_length() - 1)
+            return MAX_THREADS_PER_THREADGROUP // limit
+        return 1
+
     def adjust_reduction_thread_count(
         self, requested: int, existing_strategies: list[TileStrategy]
     ) -> int:
-        """Shrink the reduction span until the whole threadgroup fits in 1024.
+        """Shrink the reduction span until the whole threadgroup fits the
+        config's budget (``threadgroup_budget``).
 
         Halving preserves the power-of-two span that the SIMD butterflies and
         the two-stage threadgroup reduction both require.
         """
         from ..reduction_strategy import ReductionStrategy
+
+        budget = self._thread_budget
 
         if requested <= 1:
             return requested
@@ -405,7 +575,7 @@ class MetalBackend(Backend):
                 for size in strategy.thread_block_sizes():
                     if size > 1:
                         other_threads *= size
-        while other_threads * requested > MAX_THREADS_PER_THREADGROUP and requested > 1:
+        while other_threads * requested > budget and requested > 1:
             requested //= 2
         return requested
 
@@ -548,6 +718,8 @@ class MetalBackend(Backend):
         product within one threadgroup, making this unreachable; it is
         checked rather than assumed.
         """
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
         from ..compile_environment import CompileEnvironment
         from ..reduction_strategy import LoopedReductionStrategy
         from ..reduction_strategy import PersistentReductionStrategy
@@ -580,6 +752,15 @@ class MetalBackend(Backend):
                 )
             strategy = MetalPersistentReductionStrategy(fn, block_id)
         else:
+            # A rolled chunk wider than the threads the budget leaves it steps
+            # by those threads: thread t visits elements t, t + span, ..., the
+            # order a lane loop over the chunk would give it.
+            span = self.adjust_reduction_thread_count(
+                next_power_of_2(min(reduction_loop, MAX_THREADS_PER_THREADGROUP)),
+                fn.tile_strategy.strategies,
+            )
+            if 1 < span < reduction_loop:
+                reduction_loop = span
             strategy = super().create_reduction_strategy(fn, block_id, reduction_loop)
         # Narrow for the type checker as CuTe does: only reduction strategies
         # carry a thread count; anything else counts zero and returns below.
@@ -624,7 +805,8 @@ class MetalBackend(Backend):
                 return strategy
             raise exc.BackendUnsupported(
                 self.name,
-                f"{what} needs {needed} threads but only {span} are available; {hint}",
+                f"{what} needs {needed} threads but only {span} are available; "
+                f"{hint}{budget_note()}",
             )
         return strategy
 
@@ -771,11 +953,17 @@ class MetalBackend(Backend):
         lower ``num_threads`` or ``block_sizes``.
         """
         self._uniform_extent = None
+        self._literal_tile_limit = None
+        self._scalar_contraction_blocks = scalar_contraction_blocks(
+            fn.codegen.codegen_graphs
+        )
+        self._thread_budget = threadgroup_budget(config)
+        self._num_warps = int(config.num_warps)
         # Claim the MPP matmul's threads before the tiles take the whole budget.
         config = self._config_with_mpp_thread_budget(fn, block_ids, config)
         # Cap tile thread counts so the reduction axes and free hl.arange axes
         # still fit alongside them.
-        config = self._config_with_reduction_thread_budget(block_ids, config)
+        config = self._config_with_reduction_thread_budget(fn, block_ids, config)
         # Re-clamp any count the passes above left not dividing its block size.
         config = self._config_with_divisible_thread_counts(block_ids, config)
         # pyrefly: ignore[bad-argument-type]
@@ -894,7 +1082,12 @@ class MetalBackend(Backend):
                 changed = True
         return self._finalize_thread_config(config, num_threads, changed)
 
-    def _reserved_reduction_threads(self, config: Config) -> int:
+    def _reserved_reduction_threads(
+        self,
+        config: Config,
+        combined: bool = False,
+        device_ir: DeviceIR | None = None,
+    ) -> int:
         """Threads the reduction axes will claim from the threadgroup.
 
         Every element of a persistent reduction should be backed by a live
@@ -903,12 +1096,21 @@ class MetalBackend(Backend):
         of serializing it.  Reduction dimensions too wide for one threadgroup
         are rolled by the config spec (``reduction_loops``), so the span
         needed here is the rolled chunk.
+
+        ``combined`` reserves only the dimensions whose values Scalar code
+        combines, each its share of a full threadgroup scaled to the budget,
+        and the ones that can't walk lanes; without it every reduction
+        dimension reserves its whole extent up to the budget.
         """
         from torch._inductor.runtime.runtime_utils import next_power_of_2
 
         from ..compile_environment import CompileEnvironment
+        from ..host_function import HostFunction
 
         env = CompileEnvironment.current()
+        device_ir = device_ir or HostFunction.current().device_ir
+        budget = threadgroup_budget(config, device_ir)
+        indexed = indexed_reduction_blocks(device_ir)
         reserved = 1
         for block_size_info in env.block_sizes:
             if not block_size_info.reduction:
@@ -917,67 +1119,75 @@ class MetalBackend(Backend):
             rolled = env.config_spec.reduction_loops.config_get(
                 config.reduction_loops, block_id, None
             )
-            extent = rolled if rolled is not None else block_size_info.size_hint()
-            reserved *= next_power_of_2(
-                max(1, min(int(extent), MAX_THREADS_PER_THREADGROUP))
-            )
-        return min(reserved, MAX_THREADS_PER_THREADGROUP)
+            extent = int(rolled if rolled is not None else block_size_info.size_hint())
+            # A rolled chunk steps by its threads (create_reduction_strategy), a
+            # persistent dim walks lanes only over a static extent, and an
+            # argmin/argmax has no lane form.
+            can_lane = (
+                rolled is not None or isinstance(block_size_info.size, int)
+            ) and block_id not in indexed
+            full = next_power_of_2(max(1, min(extent, budget)))
+            if not combined or not can_lane:
+                reserved *= full
+                continue
+            if (
+                not _reduction_contracted(block_id)
+                and block_id not in self._scalar_contraction_blocks
+            ):
+                # A sliced dimension walks lanes as a tile does and takes what
+                # the tiles leave (adjust_reduction_thread_count).
+                continue
+            # A looped reduction needs two threads (LoopedReductionStrategy).
+            least = min(2, next_power_of_2(extent)) if rolled is not None else 1
+            share = next_power_of_2(extent) * budget // MAX_THREADS_PER_THREADGROUP
+            reserved *= min(full, max(least, share))
+        return min(reserved, budget)
 
     def _reserved_free_arange_threads(self, config: Config) -> int:
-        """Threads the free ``hl.arange`` axes will claim: one per element of
-        each free block (``metal/free_arange.py``)."""
-        from .free_arange import free_arange_blocks
-        from .free_arange import free_block_size
+        """Threads the free ``hl.arange`` axes will claim
+        (``free_arange.free_block_threads``)."""
+        from .free_arange import free_block_threads
 
-        return math.prod(
-            free_block_size(block_id, config) for block_id in free_arange_blocks()
-        )
+        return math.prod(threads for threads, _ in free_block_threads(config).values())
 
     def _config_with_reduction_thread_budget(
-        self, block_ids: list[int], config: Config
+        self, fn: DeviceFunction, block_ids: list[int], config: Config
     ) -> Config:
-        """Cap tile thread counts so the reduction axes and the free
-        ``hl.arange`` axes still fit.
+        """Fit the tiles' thread counts to the threadgroup budget
+        (``threadgroup_budget``) beside the reduction axes and the free
+        ``hl.arange`` axes.
 
-        Tile strategies are built before reduction strategies
-        (``TileStrategyDispatch.__init__``), so without this the tiles claim
-        the whole 1024-thread budget and ``adjust_reduction_thread_count``
-        would shrink the reduction below the extent it has to cover, which
-        ``create_reduction_strategy`` then rejects unless the dimension can
-        be walked in lanes.
+        The reduction axes Scalar code combines reserve their share first
+        (``_reserved_reduction_threads``); the tiles then take, in block order,
+        the largest divisor of their requested count (explicit or auto) that
+        fits what is left; the reductions fill the rest
+        (``adjust_reduction_thread_count``).  Tile strategies are built before
+        reduction strategies (``TileStrategyDispatch.__init__``), hence the
+        reservation.
 
-        Autotuning makes that a search-efficiency problem as well as a
-        correctness one: it sets ``num_threads`` explicitly, so capping only
-        the *auto* axes left a slice of the space unable to compile.  Explicit
-        counts are capped too.
-
-        A reservation over 1024 leaves every tile one thread, and
-        ``check_free_arange_launch`` rejects the launch.
+        An explicit ``hl.tile(n, block_size=<int>)`` or an ``hl.grid``
+        allocates no ``NumThreadsSpec``: it runs one thread per element and is
+        charged as such.
         """
-        reserved = self._reserved_reduction_threads(config)
-        reserved *= self._reserved_free_arange_threads(config)
-        if reserved <= 1:
-            return config
-
         from ..compile_environment import CompileEnvironment
 
         env = CompileEnvironment.current()
+        budget = threadgroup_budget(config)
+        tunable = set(env.config_spec.num_threads.valid_block_ids())
+        reserved = self._reserved_reduction_threads(config, combined=True)
+        reserved *= self._reserved_free_arange_threads(config)
+        if reserved <= 1:
+            return self._config_with_auto_threads_shrunk(fn, block_ids, config, budget)
+
         num_threads = self._mutable_num_threads(config)
 
         used = reserved
         changed = False
-        tunable = set(env.config_spec.num_threads.valid_block_ids())
         for block_id in block_ids:
             axis_size = env.block_sizes[block_id].from_config(config)
             if not isinstance(axis_size, int):
                 continue
             if block_id not in tunable:
-                # An explicit ``hl.tile(n, block_size=<int>)`` or an ``hl.grid``
-                # allocates no ``NumThreadsSpec``, so the axis has no
-                # thread-count knob and always runs one thread per element.
-                # Charge it to the budget rather than indexing a map it is not
-                # in; if the total no longer fits, the reduction strategy
-                # walks the reduction in lanes or rejects the config.
                 used *= axis_size
                 continue
             configured = int(
@@ -986,14 +1196,138 @@ class MetalBackend(Backend):
             # 0 means "use the block size"; anything larger than the block size
             # is capped there because the axis has no more work than that.
             requested = min(configured, axis_size) if configured > 0 else axis_size
-            budget = max(1, MAX_THREADS_PER_THREADGROUP // max(1, used))
-            chosen = _largest_divisor_at_most(axis_size, min(requested, budget))
+            budget_left = max(1, budget // max(1, used))
+            chosen = _largest_divisor_at_most(axis_size, min(requested, budget_left))
             used *= chosen
             if configured == 0 and chosen >= axis_size:
                 continue  # leave the auto sentinel alone
             if self._record_thread_count(env, num_threads, block_id, chosen):
                 changed = True
+        changed |= self._serialize_nested_auto_tiles(
+            fn, block_ids, config, num_threads, budget // reserved
+        )
+        return self._finalize_thread_config(config, num_threads, changed)
 
+    def _serialize_nested_auto_tiles(
+        self,
+        fn: DeviceFunction,
+        block_ids: list[int],
+        config: Config,
+        num_threads: list[int],
+        budget: int,
+    ) -> bool:
+        """When the kernel's loop blocks together pass ``budget``, shrink this
+        device loop's auto tiles to the largest divisor that fits; lanes walk
+        the rest.  A tile reduced after its loop needs one element per thread
+        or one thread (``MetalBlockReductionStrategy``), so it goes to one."""
+        from ..backend import _active_loop_block_ids
+        from ..compile_environment import CompileEnvironment
+        from ..host_function import HostFunction
+
+        env = CompileEnvironment.current()
+        spec = env.config_spec.num_threads
+        tunable = set(spec.valid_block_ids())
+        total = 1
+        for block_id in _active_loop_block_ids(fn):
+            info = env.block_sizes[block_id]
+            size = info.from_config(config)
+            if info.reduction or not isinstance(size, int):
+                continue
+            threads = (
+                num_threads[spec.block_id_to_index(block_id)]
+                if block_id in tunable
+                else 0
+            )
+            total *= threads if threads > 0 else size
+        if total <= budget:
+            return False
+        device_ir = HostFunction.current().device_ir
+        grid_ids = {b for ids in device_ir.grid_block_ids for b in ids}
+        after_loop = blocks_reduced_after_loop(device_ir)
+        changed = False
+        for block_id in block_ids:
+            if total <= budget:
+                break
+            if block_id not in tunable or block_id in grid_ids:
+                continue
+            if int(spec.config_get(config.num_threads, block_id, 0)) != 0:
+                continue
+            size = env.block_sizes[block_id].from_config(config)
+            if not isinstance(size, int):
+                continue
+            # The tile pass may already have given the block fewer threads
+            # than its size; that count is its share of ``total``.
+            current = num_threads[spec.block_id_to_index(block_id)] or size
+            rest = total // current
+            if block_id in after_loop:
+                chosen = 1
+            else:
+                chosen = _largest_divisor_at_most(
+                    size, min(current, max(1, budget // rest))
+                )
+            total = rest * chosen
+            changed |= self._record_thread_count(env, num_threads, block_id, chosen)
+        literal = math.prod(
+            size
+            for block_id in block_ids
+            if block_id not in tunable
+            and block_id not in grid_ids
+            and isinstance(size := env.block_sizes[block_id].from_config(config), int)
+        )
+        if total > budget and literal > 1:
+            self._literal_tile_limit = max(1, budget // max(1, total // literal))
+        return changed
+
+    def _config_with_auto_threads_shrunk(
+        self, fn: DeviceFunction, block_ids: list[int], config: Config, budget: int
+    ) -> Config:
+        """With no reduction or free axis, the shared planner shrinks auto
+        tiles to 1024 threads, largest first; shrink them the same way to a
+        budget below that, explicit counts included."""
+        from ..compile_environment import CompileEnvironment
+        from ..host_function import HostFunction
+
+        env = CompileEnvironment.current()
+        tunable = set(env.config_spec.num_threads.valid_block_ids())
+        num_threads = self._mutable_num_threads(config)
+        fixed = 1
+        counts: dict[int, tuple[int, int]] = {}
+        for block_id in block_ids:
+            axis_size = env.block_sizes[block_id].from_config(config)
+            if not isinstance(axis_size, int):
+                continue
+            if block_id not in tunable:
+                fixed *= axis_size
+                continue
+            configured = int(
+                env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
+            )
+            requested = min(configured, axis_size) if configured > 0 else axis_size
+            counts[block_id] = (axis_size, requested)
+        threads = {b: r for b, (_, r) in counts.items()}
+        after_loop = blocks_reduced_after_loop(HostFunction.current().device_ir)
+        while fixed * math.prod(threads.values()) > budget:
+            block_id = max(threads, key=lambda b: threads[b], default=None)
+            if block_id is None or threads[block_id] <= 1:
+                break
+            # A tile reduced after its loop needs one element per thread or
+            # one thread (``MetalBlockReductionStrategy``).
+            threads[block_id] = (
+                1
+                if block_id in after_loop
+                else _largest_divisor_at_most(
+                    counts[block_id][0], threads[block_id] - 1
+                )
+            )
+        changed = False
+        for block_id, chosen in threads.items():
+            if chosen == counts[block_id][1]:
+                continue
+            if self._record_thread_count(env, num_threads, block_id, chosen):
+                changed = True
+        changed |= self._serialize_nested_auto_tiles(
+            fn, block_ids, config, num_threads, budget
+        )
         return self._finalize_thread_config(config, num_threads, changed)
 
     def _config_with_mpp_thread_budget(

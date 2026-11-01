@@ -112,7 +112,15 @@ class MetalRowReductionHeuristic(AutotunerHeuristic):
         assert isinstance(backend, MetalBackend)
         # The threadgroup is the product of its thread axes, so the reduction
         # axes' reservation divides what the row and pass blocks may use.
-        reserved = backend._reserved_reduction_threads(spec.default_config())
+        # Reserved at a full threadgroup: each seed then names the num_warps
+        # its own launch needs.
+        full = Config.from_dict(
+            {
+                **spec.default_config().config,
+                "num_warps": MAX_THREADS_PER_THREADGROUP // SIMD_WIDTH,
+            }
+        )
+        reserved = backend._reserved_reduction_threads(full, device_ir=device_ir)
         budget = MAX_THREADS_PER_THREADGROUP // reserved
         row_fragment = blocks[row_block_id]._fragment(spec)
         floor = row_fragment.low
@@ -145,6 +153,10 @@ class MetalRowReductionHeuristic(AutotunerHeuristic):
             ):
                 continue
             row_threads = 0 if rows * threads <= budget else 1
+            # The seed names its threadgroup: num_warps sizes the launch
+            # (``backend.threadgroup_budget``).
+            launch = (rows if row_threads == 0 else 1) * threads * reserved
+            num_warps = -(-launch // SIMD_WIDTH)
             block_sizes = {row_block_id: rows, **dict.fromkeys(pass_block_ids, width)}
             num_threads = {
                 row_block_id: row_threads,
@@ -154,6 +166,7 @@ class MetalRowReductionHeuristic(AutotunerHeuristic):
                 Config(
                     block_sizes=[block_sizes[i.block_id] for i in spec.block_sizes],
                     num_threads=[num_threads[i.block_id] for i in spec.num_threads],
+                    num_warps=num_warps,
                 )
             )
         return seeds

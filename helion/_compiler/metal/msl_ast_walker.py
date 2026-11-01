@@ -210,7 +210,7 @@ def _emit_stmts(
                 parts.append(f"{pad}{array}[{lane}] = {value};")
             elif _is_call_to(call, "_helion_mpp_stage"):
                 assert isinstance(call, ast.Call)
-                buf, index, value, pred = (_ast_expr_to_msl(a) for a in call.args)
+                buf, index, value, pred = (_ast_expr_to_msl(a) for a in call.args[:4])
                 parts.append(f"{pad}if ({pred}) {{ {buf}[{index}] = {value}; }}")
             elif _is_call_to(call, "_helion_mpp_put"):
                 # An element loop's write of the updated element (mpp_matmul's

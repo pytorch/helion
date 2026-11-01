@@ -79,21 +79,19 @@ class LaneArrayBudget:
         return True
 
 
-def unroll_lane_folds(body: list[ast.stmt]) -> list[ast.stmt]:
+def unroll_lane_folds(
+    body: list[ast.stmt], reads: Callable[[ast.stmt], set[str]]
+) -> list[ast.stmt]:
     """Unroll and jam every lane loop that carries a fold; *body* itself when
-    it has none."""
+    it has none.  *reads* gives the names a statement reads, which for an
+    MPP element loop excludes the names it binds and defines itself."""
     lanes = _fold_lanes(body)
     if not lanes:
         return body
     lane_names: set[str] = set()
     result = _unroll(body, lanes, lane_names)
     assert not _fold_lanes(result), "a lane fold outside its lane loop"
-    leaked = lane_names & {
-        node.id
-        for stmt in result
-        for node in ast.walk(stmt)
-        if isinstance(node, ast.Name)
-    }
+    leaked = lane_names & set().union(*map(reads, result))
     assert not leaked, f"lane-dependent names used outside their lane loop: {leaked}"
     return result
 
@@ -160,11 +158,40 @@ def _writes(tree: ast.AST) -> set[str]:
     }
 
 
+#: The integer-rounded float -> bfloat conversion every lane copy uses
+#: (``metal_jit`` emits its definition when it is referenced).
+BF16_CAST = "helion_bf16_cast"
+
+
 class _RenameLane(ast.NodeTransformer):
     def __init__(self, dependent: set[str], lane: str, index: int) -> None:
         self.dependent = dependent
         self.lane = lane
         self.index = index
+
+    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+        # Metal miscompiles float -> bfloat conversions that lane copies
+        # multiply (exact in float16 and float32 at the same MSL); round
+        # them in integer arithmetic, as the MPP path's float tiles do.
+        self.generic_visit(node)
+        if (
+            isinstance(node.left, ast.Name)
+            and node.left.id == "static_cast"
+            and len(node.ops) == 2
+            and isinstance(node.ops[0], ast.Lt)
+            and isinstance(node.ops[1], ast.Gt)
+            and isinstance(node.comparators[0], ast.Name)
+            and node.comparators[0].id == "bfloat"
+        ):
+            return ast.copy_location(
+                ast.Call(
+                    func=ast.Name(id=BF16_CAST, ctx=ast.Load()),
+                    args=[node.comparators[1]],
+                    keywords=[],
+                ),
+                node,
+            )
+        return node
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         if node.id == self.lane:

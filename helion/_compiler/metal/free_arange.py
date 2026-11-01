@@ -64,9 +64,11 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from ..tile_dispatch import TileStrategyDispatch
     from .factored_dims import FactoredValue
+    from .mpp_matmul import MppPlan
 
-#: Each free block's ``(thread axis, configured size)``, by block id.
-FreeArangePlan = dict[int, tuple[int, int]]
+#: Each free block's ``(thread axis, threads, lanes)``, by block id: element
+#: ``e`` of the block is on thread ``e // lanes``, lane ``e % lanes``.
+FreeArangePlan = dict[int, tuple[int, int, int]]
 
 _IOTA_TARGETS = (torch.ops.prims.iota.default, torch.ops.aten.arange.default)
 
@@ -110,6 +112,49 @@ def free_arange_blocks() -> list[int]:
             ):
                 free.add(block_id)
     return sorted(free)
+
+
+def free_block_threads(config: Config) -> dict[int, tuple[int, int]]:
+    """Each free block's ``(threads, lanes)`` within the threadgroup budget
+    (``threadgroup_budget``): a block's ``num_threads`` is taken first, and
+    blocks left on auto (0) get their size, shrunk largest first as the shared
+    planner shrinks auto tiles, until the product fits; lanes walk the rest."""
+    from ..backend import _largest_divisor_at_most
+    from .backend import threadgroup_budget
+
+    env = CompileEnvironment.current()
+    budget = threadgroup_budget(config)
+    sizes: dict[int, int] = {}
+    threads: dict[int, int] = {}
+    auto: list[int] = []
+    used = 1
+    for block_id in free_arange_blocks():
+        size = sizes[block_id] = free_block_size(block_id, config)
+        configured = int(
+            env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
+        )
+        if configured > 0:
+            threads[block_id] = _largest_divisor_at_most(
+                size, min(configured, size, max(1, budget // used))
+            )
+            used *= threads[block_id]
+        else:
+            threads[block_id] = size
+            auto.append(block_id)
+    while auto and math.prod(threads.values()) > budget:
+        block_id = max(auto, key=lambda b: threads[b])
+        if threads[block_id] <= 1:
+            break
+        threads[block_id] = _largest_divisor_at_most(
+            sizes[block_id], threads[block_id] - 1
+        )
+    return {b: (t, sizes[b] // t) for b, t in threads.items()}
+
+
+def lane_name(block_id: int) -> str:
+    """A free block's lane variable; only element loops bind it
+    (:func:`check_free_lanes`)."""
+    return f"_free_lane_{block_id}"
 
 
 def free_block_size(block_id: int, config: Config) -> int:
@@ -161,7 +206,7 @@ def check_free_arange_launch(
     """
     if not plan:
         return
-    for block_id, (axis, _) in plan.items():
+    for block_id, (axis, _, _) in plan.items():
         if axis in tid_axes:
             raise _unsupported(
                 f"a loop's index code also reads tid[{axis}], block {block_id}'s axis"
@@ -620,14 +665,122 @@ def _assign_axes(
             # Its index is ``pid * 1 + tid[axis]`` even at a thread extent of 1.
             highest = max(highest, strategy._flat_thread_axis())
     plan: FreeArangePlan = {}
+    threads = free_block_threads(config)
     for axis, block_id in enumerate(free, start=highest + 1):
         if axis >= MAX_THREAD_AXES:
             raise _unsupported(
                 f"no thread axis left for block {block_id} (loops claim "
                 f"tid[0..{highest}])"
             )
-        plan[block_id] = (axis, free_block_size(block_id, config))
+        plan[block_id] = (axis, *threads[block_id])
     return plan
+
+
+def check_free_lanes(
+    plan: FreeArangePlan, mpp_plan: MppPlan, graphs: list[GraphInfo]
+) -> None:
+    """A free block walked in lanes needs every value that holds it to be
+    MPP's: a device view, a cooperative value, or an element-loop store, the
+    only code that binds the block's lane (``mpp_matmul._block_layout``).
+    Scalar code evaluating such a value has no lane loop to run in."""
+    laned = [block_id for block_id, (_, _, lanes) in plan.items() if lanes > 1]
+    if not laned:
+        return
+    from .mpp_matmul import _mpp_coop
+    from .mpp_matmul import _operands
+
+    owned: set[Node] = set()
+    staged: set[int] = set()
+    for group in mpp_plan.by_matmul.values():
+        _acc, lhs, rhs = _operands(group.matmul)
+        for node, operand, blocks in (
+            (lhs, group.lhs, (group.m_block, group.k_block)),
+            (rhs, group.rhs, (group.k_block, group.n_block)),
+        ):
+            if operand.view is None:
+                staged.update(blocks)
+                continue
+            owned.add(node)
+            if node.target is torch.ops.aten.permute.default:
+                source = node.args[0]
+                assert isinstance(source, Node)
+                owned.add(source)
+        owned.add(group.matmul)
+        owned.update(n for n in (group.seed, group.upd) if n is not None)
+        owned.update(group.cur, group.derived, group.stores, group.update)
+        for a, b in group.plumbing:
+            owned.update((a, b))
+        for level in group.levels:
+            owned.update((level.arg, level.placeholder, level.exit, level.phi))
+        # A ``_mpp_coop`` seed is staged from the Scalar layout, by thread.
+        if group.seed is not None and group.seed.target is _mpp_coop:
+            owned.discard(group.seed)
+    for block_id in laned:
+        why = (
+            "a staged MPP operand"
+            if block_id in staged
+            else _scalar_reader(block_id, graphs, owned)
+        )
+        if why is not None:
+            threads, lanes = plan[block_id][1:]
+            raise _unsupported(
+                f"block {block_id} on {threads} threads x {lanes} lanes, but "
+                f"{why} reads it in Scalar code, which has no lane loop over a "
+                "free block; give it num_threads equal to its size, or more "
+                "num_warps"
+            )
+
+
+def _scalar_reader(
+    block_id: int, graphs: list[GraphInfo], owned: set[Node]
+) -> str | None:
+    """A node outside *owned* whose value holds *block_id* and that Scalar
+    code evaluates (named), or None.  Iotas, loads and pure element-wise
+    nodes count only through their users: one used only by MPP-owned nodes,
+    shape reads or loop plumbing is never evaluated."""
+    from .mpp_matmul import _carry
+    from .mpp_matmul import _Graphs
+    from .mpp_matmul import _pointwise
+
+    env = CompileEnvironment.current()
+    g = _Graphs(graphs)
+
+    def holds(node: Node) -> bool:
+        val = node.meta.get("val")
+        return isinstance(val, torch.Tensor) and any(
+            env.resolve_block_id(s) == block_id for s in val.shape
+        )
+
+    ordered = [n for n in _nodes(live_graphs(graphs)) if holds(n) and n not in owned]
+    cands = set(ordered)
+    for n in ordered:
+        if n.op == "placeholder":
+            owner = g.owner(n)
+            if owner is None or (
+                _tracing_ops.is_for_loop_target(owner.target)
+                and _carry(n, owner) is not None
+            ):
+                return n.name
+        elif n.target is operator.getitem:
+            if any(u.target is not torch.ops.aten.sym_size.int for u in n.users):
+                return n.name
+            continue
+        elif not (
+            n.target in _IOTA_TARGETS
+            or n.target is load
+            or n.target is _tracing_ops._new_var
+            or _pointwise(n)
+        ):
+            return n.name
+        for u in n.users:
+            if u.target is torch.ops.aten.sym_size.int or u in owned or u in cands:
+                continue
+            if _tracing_ops.is_for_loop_target(u.target) or u.op == "output":
+                continue
+            if u.target is _tracing_ops._if and u.args[0] is not n:
+                continue
+            return u.name
+    return None
 
 
 def _codegen_iota(
@@ -652,10 +805,11 @@ def _codegen_iota(
             "block size that no loop owns (hl.register_block_size), or a tile "
             "widened by a constant c (start c * tile.begin, length c * block_size)",
         )
-    axis, size = planned
+    assert block_id is not None
+    axis, threads, lanes = planned
     assert isinstance(ctx.cg, GenerateAST)
     dims = ctx.cg.max_thread_block_dims
-    dims[axis] = max(dims[axis], size)
+    dims[axis] = max(dims[axis], threads)
     dtype = node.kwargs.get("dtype")
     dtype_str = backend.dtype_str(
         dtype if isinstance(dtype, torch.dtype) else env.index_dtype
@@ -665,6 +819,8 @@ def _codegen_iota(
     # thread index and the sum are cast, keeping a negative start or step
     # signed.
     expr = backend.cast_expr(f"tid[{axis}]", dtype_str)
+    if lanes > 1:
+        expr = backend.cast_expr(f"{expr} * {lanes} + {lane_name(block_id)}", dtype_str)
     if step != 1:
         expr = f"{{step}} * {expr}"
     if start != 0:
