@@ -33,6 +33,17 @@ stored in the body is not otherwise accessed in it, under its own name or any
 other that may share its memory.  :func:`check_schedule` replays the result
 against the original body.  Every other layout raises
 ``BackendUnsupported``.
+
+A lane body that also holds a cooperative MPP op's threadgroup statements
+(staging writes, fences, materializations) is not split: passes can't order
+those against the op and the per-lane reads of its tiles.  Each marker
+becomes a lane fold ``p = _metal_lane_fold(op, x, lane, T)`` followed by its
+combine across threads, and the lane loop stays whole for ``mpp_matmul``'s
+jam, which runs the body once per lane in tile order and turns each fold
+into the combine of its input's lane copies.  The jam removes the lane loop,
+so the thread combine runs as straight-line code that every thread reaches.
+The statement and memory checks are the same on both routes; the jam
+rejects a per-lane value carried across lanes.
 """
 
 from __future__ import annotations
@@ -58,6 +69,9 @@ from ..tile_strategy import DeviceLoopState
 from ..tile_strategy import _clone_lane_loop_with_body
 from ..tile_strategy import _current_rename_groups
 from ..tile_strategy import _merge_carried_names
+from . import mpp_matmul
+from .lane_fold import LANE_FOLD
+from .lane_fold import LaneArrayBudget
 from .msl_reduction import SUPPORTED_REDUCTIONS
 from .reduction import reduction_combine_expr
 
@@ -73,12 +87,6 @@ if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
 
 MARKER = "_metal_lane_reduce"
-
-#: Most bytes of lane arrays one split keeps per thread.  Measured on Apple
-#: GPUs: arrays of 16-bit loads up to 64 bytes were neutral or faster than
-#: reloading, 128 bytes mixed and 256 bytes up to 2.3x slower; 32-bit arrays
-#: were neutral to 5% slower at any size, so only narrower loads are kept.
-MAX_LANE_ARRAY_BYTES = 64
 
 #: A definition no single execution of the original body sees: a lane-variant
 #: value after its pass (the last lane's), or a fold result inside its pass.
@@ -177,6 +185,9 @@ class LaneSplit:
         groups = _merge_carried_names(_current_rename_groups(), loop.carried_names)
         statements: list[ast.AST] = [*lane_loop.body]
         body = _lane_body(statements, self, groups)
+        if any(map(_is_mpp_effect, statements)):
+            lane_loop.body[:] = self._folded(lane_loop)
+            return
         schedule = _schedule(body, groups.get(self.lane_var, self.lane_var))
         check_schedule(body, schedule)
         position = next(i for i, stmt in enumerate(parent) if stmt is lane_loop)
@@ -184,6 +195,32 @@ class LaneSplit:
         # The passes now hold the body; statements added to the loop later go
         # beside them.
         loop.inner_statements = parent
+
+    def _folded(self, lane_loop: ast.For) -> list[ast.stmt]:
+        """The lane body with each marker turned into a lane fold, followed
+        by the fold's combine across threads when the block has threads."""
+        backend = CompileEnvironment.current().backend
+        lane = cast("ast.Name", lane_loop.target).id
+        statements: list[ast.stmt] = []
+        for stmt in lane_loop.body:
+            if (result := _marker_result(stmt)) is None:
+                statements.append(stmt)
+                continue
+            r = self.reductions[result]
+            # Resolved now: the fold is unrolled at launch, with no compile
+            # environment to map the dtype.
+            acc_type = backend.acc_type(r.acc_dtype)
+            statements.append(
+                statement_from_string(
+                    f"{r.partial} = {LANE_FOLD}({r.reduction_type!r}, "
+                    f"{r.input_name}, {lane}, {acc_type!r})"
+                )
+            )
+            if r.thread_combine is not None:
+                statements.append(
+                    statement_from_string(f"{r.result} = {r.thread_combine}")
+                )
+        return statements
 
 
 def lane_split_for(
@@ -270,6 +307,17 @@ def _marker_result(stmt: ast.AST) -> str | None:
     return None
 
 
+def _is_mpp_effect(stmt: ast.AST) -> bool:
+    """Whether *stmt* is a cooperative MPP op's staging write, fence or
+    materialization, which acts on threadgroup memory and writes no name."""
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Name)
+        and stmt.value.func.id in (mpp_matmul.STAGE, mpp_matmul.FENCE, mpp_matmul.MAT)
+    )
+
+
 def _tl_call(node: ast.AST, name: str) -> ast.Call | None:
     if (
         isinstance(node, ast.Call)
@@ -308,7 +356,7 @@ def _lane_body(
     for index, stmt in enumerate(statements):
         if (result := _marker_result(stmt)) is not None:
             reductions[index] = split.reductions[result]
-        elif not (_is_store(stmt) or _is_name_assign(stmt)):
+        elif not (_is_store(stmt) or _is_name_assign(stmt) or _is_mpp_effect(stmt)):
             raise _unsupported(
                 "lane reduction beside a statement the split cannot schedule: "
                 + ast.unparse(stmt).partition("\n")[0]
@@ -497,7 +545,7 @@ def _lane_arrays(
     assert isinstance(lanes, ast.Constant) and isinstance(lanes.value, int)
     tensors = {arg.name: arg for arg in fn.arguments if isinstance(arg, TensorArg)}
     backend = CompileEnvironment.current().backend
-    budget = MAX_LANE_ARRAY_BYTES
+    budget = LaneArrayBudget(lanes.value)
     arrays: dict[int, tuple[str, str]] = {}
     for index in sorted(index for index, count in counts.items() if count > 1):
         stmt = body.statements[index]
@@ -511,10 +559,8 @@ def _lane_arrays(
             node.id for node in ast.walk(load.args[0]) if isinstance(node, ast.Name)
         } & tensors.keys()
         dtype = tensors[tensor].fake_value.dtype
-        size = lanes.value * dtype.itemsize
-        if dtype.itemsize >= 4 or size > budget:
+        if not budget.take(dtype):
             continue
-        budget -= size
         (target,) = stmt.targets
         assert isinstance(target, ast.Name)
         arrays[index] = (

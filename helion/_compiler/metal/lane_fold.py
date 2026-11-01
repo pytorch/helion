@@ -43,6 +43,8 @@ from .reduction import combine_expr
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    import torch
+
 _Node = TypeVar("_Node", bound=ast.AST)
 
 #: The marker ``MetalPersistentReductionStrategy.codegen_reduction`` emits.
@@ -53,6 +55,28 @@ LANE_FOLD = "_metal_lane_fold"
 #: is CuTe's for an unrolled per-thread register tile
 #: (``CUTE_REGISTER_TILE_MAX_ELEMENTS``).
 MAX_LANE_COPIES = 64
+
+#: Most bytes of lane arrays one split keeps per thread.  Measured on Apple
+#: GPUs: arrays of 16-bit loads up to 64 bytes were neutral or faster than
+#: reloading, 128 bytes mixed and 256 bytes up to 2.3x slower; 32-bit arrays
+#: were neutral to 5% slower at any size, so only narrower loads are kept.
+MAX_LANE_ARRAY_BYTES = 64
+
+
+class LaneArrayBudget:
+    """The per-thread lane arrays of one split, ``lanes`` elements each."""
+
+    def __init__(self, lanes: int) -> None:
+        self.lanes = lanes
+        self.left = MAX_LANE_ARRAY_BYTES
+
+    def take(self, dtype: torch.dtype) -> bool:
+        """Whether a load of ``dtype`` gets an array, charging it if so."""
+        size = self.lanes * dtype.itemsize
+        if dtype.itemsize >= 4 or size > self.left:
+            return False
+        self.left -= size
+        return True
 
 
 def unroll_lane_folds(body: list[ast.stmt]) -> list[ast.stmt]:

@@ -7,7 +7,8 @@ the normal scalar Metal lowering path.  Every ``torch.addmm`` is left to
 ``mpp_matmul``.
 
 Recognition is conservative: the K-loop must return a supported 2D matmul
-accumulator, the root graph must have a single owner chain from
+accumulator whose carry starts at a zero fill (the region starts its
+cooperative tensor at zero), the root graph must have a single owner chain from
 ``getitem -> _phi`` to one store, and lhs/rhs/output views must match the canonical
 matmul tile.  Non-fusible same-shape scalar postprocessing is handled by first
 materializing the MPP result, then reloading it in scalar code.
@@ -126,6 +127,8 @@ def _find_root_candidates(
             phi_node = _single_phi_user(getitem_node)
             if phi_node is None:
                 continue
+            if not _starts_at_zero(node, phi_node, mma_node):
+                continue
             candidate = _classify_phi_users(
                 for_loop_node=node,
                 getitem_node=getitem_node,
@@ -213,6 +216,32 @@ def _single_phi_user(getitem_node: Node) -> Node | None:
     if len(phi_users) != 1:
         return None
     return phi_users[0]
+
+
+def _strip_new_var(value: object) -> object:
+    while isinstance(value, Node) and value.target is _tracing_ops._new_var:
+        value = value.args[0]
+    return value
+
+
+def _starts_at_zero(for_loop_node: Node, phi_node: Node, mma_node: Node) -> bool:
+    """Whether the matmul accumulates into the K loop's own carry, seeded by
+    a zero fill (``hl.zeros`` or ``hl.full(..., 0)``).  The region starts its
+    cooperative tensor at zero and never reads the seed, so any other seed,
+    or a matmul with no acc, would be silently dropped."""
+    acc = _strip_new_var(mma_node.args[2])
+    if not (isinstance(acc, Node) and acc.op == "placeholder"):
+        return False
+    loop_args = for_loop_node.args[3]
+    assert isinstance(loop_args, (list, tuple))
+    index = list(acc.graph.find_nodes(op="placeholder")).index(acc)
+    if index >= len(loop_args) or loop_args[index] is not phi_node.args[0]:
+        return False
+    seed = _strip_new_var(phi_node.args[0])
+    if not (isinstance(seed, Node) and seed.target is hl.full):
+        return False
+    fill = seed.args[1]
+    return isinstance(fill, (int, float)) and fill == 0
 
 
 def _classify_phi_users(
