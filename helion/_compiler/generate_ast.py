@@ -430,6 +430,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     "helion_register_subblocks",
                     "helion_flash",
                     "helion_flash_gated",
+                    "helion_flash_gated_row_mma",
                     "chunk_prepare_tma",
                     "chunk_recurrence_sm100",
                     "chunk_recurrence_warp_dv4",
