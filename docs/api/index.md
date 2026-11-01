@@ -73,6 +73,7 @@ runtime
    barrier
    load
    store
+   prefetch
    atomic_add
    atomic_and
    atomic_or

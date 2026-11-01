@@ -195,6 +195,8 @@ def packed_axis_for_fact(
     env: CompileEnvironment, device_ir: DeviceIR, fact: MatmulFact
 ) -> PackedMatmulAxis | None:
     """Recover an unambiguous packed axis from the fact's attributed FX nodes."""
+    # Rolling and fission rewrite/copy graphs after seed registration. Read the
+    # current operands rather than caching a proof against an earlier IR view.
     fact_ids = {
         index
         for index, value in enumerate(env.config_spec.matmul_facts)
@@ -223,3 +225,12 @@ def packed_axis_for_fact(
                 return None
             result = axis
     return result
+
+
+def contraction_axis_for_fact(
+    env: CompileEnvironment, device_ir: DeviceIR, fact: MatmulFact
+) -> PackedMatmulAxis | None:
+    """The physical K block and expansion shared by seeds and code generation."""
+    if fact.k_block_id is not None:
+        return PackedMatmulAxis(fact.k_block_id, 1)
+    return packed_axis_for_fact(env, device_ir, fact)

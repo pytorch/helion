@@ -165,10 +165,21 @@ class TestCuteTcgen05DirectEntryTmaOperands(unittest.TestCase):
         TensorMap alignment proof, so codegen keeps the scalar SMEM producers
         and rejects the seed config. The default config has to fall back to a
         compiling cluster_m=1 config and produce correct results.
+
+        The staging pass (``cute_stage_unaligned_operands``) would relay the
+        operand out to aligned rows before the proof runs; this test pins it
+        off to exercise the unaligned path, and ``test_unaligned_stride_lhs_is_staged``
+        covers the default.
         """
         a = torch.randn([8192, 772], device=DEVICE, dtype=torch.bfloat16)[:, :768]
         b = torch.randn([768, 1024], device=DEVICE, dtype=torch.bfloat16)
-        bound = _ordinary_gemm.bind((a, b))
+        kernel = helion.kernel(
+            _ordinary_gemm.fn,
+            backend="cute",
+            static_shapes=True,
+            cute_stage_unaligned_operands=False,
+        )
+        bound = kernel.bind((a, b))
         spec = bound.config_spec
         self.assertFalse(spec.cute_tcgen05_matmul_operands_tma_provable)
         self.assertFalse(spec._tcgen05_full_tile_direct_entry_seed_eligible())
@@ -176,6 +187,23 @@ class TestCuteTcgen05DirectEntryTmaOperands(unittest.TestCase):
         self.assertIsNot(config.config.get("tcgen05_tvm_ffi_launch"), True)
         self.assertIsNot(config.config.get("tcgen05_flat_role_coordinates"), True)
         self.assertEqual(config.config["tcgen05_cluster_m"], 1)
+        bound.set_config(config)
+        out = bound(a, b)
+        torch.testing.assert_close(out, torch.matmul(a, b), rtol=1e-2, atol=1e-1)
+
+    def test_unaligned_stride_lhs_is_staged(self) -> None:
+        """With the staging pass on, the 772-stride A is relaid out to aligned
+        rows on the host, the operands prove TMA-able and the default config
+        keeps the direct-entry seed."""
+        a = torch.randn([8192, 772], device=DEVICE, dtype=torch.bfloat16)[:, :768]
+        b = torch.randn([768, 1024], device=DEVICE, dtype=torch.bfloat16)
+        bound = _ordinary_gemm.bind((a, b))
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_matmul_operands_tma_provable)
+        self.assertTrue(spec._tcgen05_full_tile_direct_entry_seed_eligible())
+        config = spec.default_config()
+        code = bound.to_code(config)
+        self.assertIn("a = torch.constant_pad_nd(", code)
         bound.set_config(config)
         out = bound(a, b)
         torch.testing.assert_close(out, torch.matmul(a, b), rtol=1e-2, atol=1e-1)

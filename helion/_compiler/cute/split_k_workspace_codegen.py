@@ -33,6 +33,8 @@ from .materialized_fission_codegen import _module_source
 from .memory_ops import tensor_has_specialized_tma_alignment
 from .pipeline_smem import analyze_pipeline_smem_facts
 from .split_k_workspace import analyze_split_k_workspace
+from .split_k_workspace import cutlass_dtype_name
+from .split_k_workspace import torch_dtype_name
 from .split_k_workspace import workspace_schedule
 from .tcgen05_config import CuteTcgen05Config
 
@@ -183,9 +185,7 @@ def _reducer_source(
             "                    loaded[element] = loaded[element] + bias_value\n"
         )
     bits = proof.output_dtype.itemsize * 8
-    output_type = (
-        "cutlass.Float16" if proof.output_dtype is torch.float16 else "cutlass.Float32"
-    )
+    output_type = cutlass_dtype_name(proof.output_dtype)
     return (
         "from __future__ import annotations\n"
         "import cutlass\nimport cutlass.cute as cute\n"
@@ -294,9 +294,7 @@ def generate_split_k_workspace(
     partials = unique("_helion_split_k_partials")
     view_a = unique("_helion_split_k_a")
     view_b = unique("_helion_split_k_b")
-    output_dtype = (
-        "torch.float16" if proof.output_dtype is torch.float16 else "torch.float32"
-    )
+    output_dtype = torch_dtype_name(proof.output_dtype)
     allocation_count = 0
     for stmt in host.body:
         if (
@@ -310,24 +308,52 @@ def generate_split_k_workspace(
             assert isinstance(allocation.func, ExtendedAST)
             assert isinstance(allocation.func._type_info, CallableType)
             factory = allocation.func._type_info.value
-            assert factory in (torch.zeros, torch.zeros_like)
+            if proof.store:
+                # The plain store pattern keeps whatever fresh factory the
+                # host wrote; the reducer writes every element.
+                assert factory in (
+                    torch.empty,
+                    torch.empty_like,
+                    torch.zeros,
+                    torch.zeros_like,
+                    torch.ones,
+                    torch.ones_like,
+                    torch.full,
+                    torch.full_like,
+                )
+            else:
+                assert factory in (torch.zeros, torch.zeros_like)
             lowered_allocation = ast.parse(ast.unparse(allocation), mode="eval").body
             assert isinstance(lowered_allocation, ast.Call)
             # Keep the original allocation's host expressions and evaluation
             # point. A matrix input may be a view bound later in the prelude.
+            like_factory = factory in (
+                torch.zeros_like,
+                torch.empty_like,
+                torch.ones_like,
+                torch.full_like,
+            )
             stmt.value = ast.Call(
                 func=ast.parse(
-                    "torch.empty_like"
-                    if factory is torch.zeros_like
-                    else "torch.empty",
+                    "torch.empty_like" if like_factory else "torch.empty",
                     mode="eval",
                 ).body,
-                args=lowered_allocation.args,
+                args=(
+                    # ``torch.full(size, fill_value)``: the fill is the last
+                    # positional argument unless it was passed by keyword.
+                    lowered_allocation.args[:-1]
+                    if factory in (torch.full, torch.full_like)
+                    and not any(
+                        keyword.arg == "fill_value"
+                        for keyword in lowered_allocation.keywords
+                    )
+                    else lowered_allocation.args
+                ),
                 keywords=[
                     *(
                         keyword
                         for keyword in lowered_allocation.keywords
-                        if keyword.arg != "dtype"
+                        if keyword.arg not in ("dtype", "fill_value")
                     ),
                     ast.keyword(
                         arg="dtype", value=ast.parse(output_dtype, mode="eval").body

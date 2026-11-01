@@ -617,10 +617,17 @@ def test_unproven_outputs_take_the_simt_store(case: str) -> None:
     assert "tcgen05_tma_store_atom" not in kernel
     assert "PipelineTmaStore" not in kernel
     assert "'kind': 'tcgen05_d_tma'" not in source
-    # The SIMT body addresses every element itself (no alignment claim on
-    # an unproven output) ...
+    # The SIMT body addresses every element itself ...
     assert "cute.nvgpu.CopyR2GOp()" in kernel
-    assert "assumed_align=min(" not in kernel
+    if case == "base_8B":
+        # ... claiming no more than the pointer's runtime alignment on an
+        # output whose strides prove the chunk layout (the launcher passes
+        # the 8-byte base as ``assumed_align=8``: 64-bit stores) ...
+        assert "assumed_align=min(out.iterator.alignment, 16)" in kernel
+        assert "gmem, assumed_align=16)" not in kernel
+    else:
+        # ... and with no alignment claim at all on an unproven stride.
+        assert "assumed_align=min(" not in kernel
     # ... while A and B keep their proven TMA loads.
     assert "cute.nvgpu.cpasync.prefetch_descriptor(" in kernel
 

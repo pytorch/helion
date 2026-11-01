@@ -65,12 +65,18 @@ _COORDINATE_CALLS = frozenset(("cute.arch.thread_idx", "cute.arch.block_idx"))
 _COMPARISON_CALLS = frozenset(
     f"operator.{name}" for name in ("lt", "le", "gt", "ge", "eq", "ne")
 )
+# Elementwise ``cute.math`` calls, including the fast-math forms the setting
+# rewrites exp/division into (``exp2(fma(x, log2e, -m), fastmath=True)``,
+# ``div(a, b, approx=True, ftz=True)``): all pure, so a body using them still
+# vectorizes its loads and stores.
 _PURE = frozenset(
     f"cute.math.{name}"
     for name in (
         "abs",
+        "div",
         "exp",
         "exp2",
+        "fma",
         "log",
         "log2",
         "max",

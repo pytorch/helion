@@ -60,6 +60,7 @@ from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .aten_lowering import resolve_reduction_sizes
 from .compile_environment import CompileEnvironment
+from .compile_environment import warning
 from .cute.register_tile_admission import register_tile_body_admitted
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
@@ -569,24 +570,59 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         return joins
 
 
+def _control_flow_graph_entries(
+    node: torch.fx.Node,
+) -> tuple[tuple[int, int | None], ...]:
+    """Child IDs and direct capture slots, excluding mutable while state."""
+    if node.op != "call_function":
+        return ()
+    if _tracing_ops.is_for_loop_target(node.target):
+        if len(node.args) >= 4 and isinstance(node.args[0], int):
+            return ((node.args[0], 3),)
+    elif node.target is _tracing_ops._if:
+        if (
+            len(node.args) >= 5
+            and isinstance(node.args[1], int)
+            and isinstance(node.args[2], int)
+        ):
+            return ((node.args[1], 3), (node.args[2], 4))
+    elif node.target is _tracing_ops._while_loop and len(node.args) >= 3:
+        if not isinstance(node.args[0], int) or not isinstance(node.args[1], int):
+            return ()
+        # While inputs are loop-carried state, not invariant captures. Graph
+        # ownership follows these edges, but value-origin proofs must stop here.
+        result = ((node.args[0], None), (node.args[1], None))
+        if len(node.args) > 3 and isinstance(node.args[3], int):
+            result = (*result, (node.args[3], None))
+        return result
+    return ()
+
+
+def control_flow_child_graph_ids(node: torch.fx.Node) -> tuple[int, ...]:
+    return tuple(graph_id for graph_id, _slot in _control_flow_graph_entries(node))
+
+
 def control_flow_parent_entries(
     graphs: Sequence[GraphInfo],
 ) -> dict[int, tuple[torch.fx.Node, int]]:
     """Map child graph IDs to their parent call and captured-argument slot."""
-    result: dict[int, tuple[torch.fx.Node, int]] = {}
+    return {
+        child_id: (node, slot)
+        for info in graphs
+        for node in info.graph.nodes
+        for child_id, slot in _control_flow_graph_entries(node)
+        if slot is not None
+    }
+
+
+def control_flow_parent_ids(graphs: Sequence[GraphInfo]) -> dict[int, int]:
+    result: dict[int, int] = {}
     for info in graphs:
         for node in info.graph.nodes:
-            if node.op != "call_function" or not node.args:
-                continue
-            if _tracing_ops.is_for_loop_target(node.target) and isinstance(
-                node.args[0], int
-            ):
-                result[node.args[0]] = (node, 3)
-            elif node.target is _tracing_ops._if and len(node.args) >= 5:
-                if isinstance(node.args[1], int):
-                    result[node.args[1]] = (node, 3)
-                if isinstance(node.args[2], int):
-                    result[node.args[2]] = (node, 4)
+            for child_id in control_flow_child_graph_ids(node):
+                # Rolling appends graph aliases; the original owner is the one
+                # reachable from the root, not a later bookkeeping copy.
+                result.setdefault(child_id, info.graph_id)
     return result
 
 
@@ -3487,6 +3523,67 @@ def _install_dependency_phases(
             graph_info.phase_index = phase_index
 
 
+# Operations whose lowering has a faster approximate form under the fast_math
+# setting on the Triton and CuTe backends (``inductor_lowering`` and the cute
+# ``exp2_fastmath`` / ``exact_division`` / gelu templates), by the name the
+# warning reports them under.
+_FAST_MATH_SENSITIVE_TARGETS: dict[object, str] = {
+    torch.ops.aten.reciprocal.default: "reciprocal",
+    torch.ops.aten.exp.default: "exp",
+    torch.ops.aten.exp2.default: "exp2",
+    torch.ops.aten.sigmoid.default: "sigmoid",
+    torch.ops.aten.rsqrt.default: "rsqrt",
+    torch.ops.aten.erf.default: "erf",
+    torch.ops.aten.gelu.default: "gelu",
+}
+# Triton only: under fast_math the max/min reductions and torch.maximum /
+# torch.minimum lower to ``tl.max`` / ``tl.maximum`` without the NaN
+# propagation torch has (``TritonBackend.reduction_expr``, ``overrides.py``);
+# the CuTe backend keeps the NaN-propagating forms either way.
+_FAST_MATH_SENSITIVE_TRITON_TARGETS: dict[object, str] = {
+    torch.ops.aten.amax.default: "max/min reductions",
+    torch.ops.aten.amin.default: "max/min reductions",
+    torch.ops.aten.maximum.default: "maximum/minimum",
+    torch.ops.aten.minimum.default: "maximum/minimum",
+}
+
+
+def fast_math_sensitive_ops(device_ir: DeviceIR, backend: str) -> list[str]:
+    """Names of the floating-point operations in ``device_ir`` that the
+    ``fast_math`` setting would lower to approximate forms on ``backend``,
+    sorted."""
+    from .inductor_lowering import _is_plain_true_division
+
+    targets = dict(_FAST_MATH_SENSITIVE_TARGETS)
+    if backend == "triton":
+        targets.update(_FAST_MATH_SENSITIVE_TRITON_TARGETS)
+    names: set[str] = set()
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            val = node.meta.get("val")
+            if not (isinstance(val, torch.Tensor) and val.dtype.is_floating_point):
+                continue
+            name = targets.get(node.target)
+            if name is None and _is_plain_true_division(node):
+                name = "fp32 division"
+            if name is not None:
+                names.add(name)
+    return sorted(names)
+
+
+def warn_fast_math_unused(device_ir: DeviceIR) -> None:
+    """Warn once per kernel when ``fast_math`` is off and the kernel has
+    operations the setting would speed up (``exc.FastMathUnused``)."""
+    env = CompileEnvironment.current()
+    if env.settings.fast_math or env.backend.name not in ("triton", "cute"):
+        return
+    ops = fast_math_sensitive_ops(device_ir, env.backend.name)
+    if ops:
+        warning(exc.FastMathUnused(", ".join(ops)))
+
+
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     device_ir.host_function = func
@@ -3523,9 +3620,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 rewrite_random_stream(graph.graph)
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
+        warn_fast_math_unused(device_ir)
         scaled_contractions = 0
         if CompileEnvironment.current().backend.name == "cute":
             from .cute.canonicalize_reductions import canonicalize_reductions
+            from .cute.elide_split_join import elide_split_join_roundtrips
             from .cute.fold_noop_stores import fold_noop_stores
             from .cute.fuse_mm_accumulation import fuse_mm_accumulation
             from .cute.fuse_u32_multiply import fuse_u32_multiply
@@ -3535,6 +3634,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             canonicalize_reductions(device_ir)
             scaled_contractions = expose_scaled_contractions(device_ir)
             for graph_info in device_ir.graphs:
+                elide_split_join_roundtrips(graph_info.graph)
                 fold_noop_stores(graph_info.graph)
                 fuse_mm_accumulation(graph_info)
                 fuse_u32_multiply(graph_info.graph)

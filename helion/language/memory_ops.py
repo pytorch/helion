@@ -7,6 +7,7 @@ import logging
 import operator
 import textwrap
 from typing import TYPE_CHECKING
+from typing import cast
 
 import sympy
 import torch
@@ -106,6 +107,8 @@ from . import _decorators
 from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .._compiler.cute.cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
     from .._compiler.cute.cute_epilogue import _AuxiliaryTensorLoadExpr
@@ -4236,6 +4239,53 @@ def _codegen_cute_store_tcgen05_tile(
             f"{indent}        {dst}[_edge_i] = {src}[_edge_i]\n"
         )
 
+    def _simt_edge_vector_copy_source(
+        indent: str, src: str, dst: str, *, n_size_static: int
+    ) -> str:
+        # Fringe tiles of a ragged destination with a proven static layout:
+        # store whole per-thread chunks (the ``num_bits`` vector the interior
+        # tiles use) under one predicate per chunk, and only the chunks that
+        # straddle the N edge element by element. A per-element loop
+        # scattered every warp store over 32 rows (one sector each): bf16
+        # 1000^3 spent 45 us in 15 fringe tiles.
+        vector = f"({num_bits} // {target_dtype}.width)"
+        edge_src = df.new_var("tcgen05_edge_src")
+        edge_dst = df.new_var("tcgen05_edge_dst")
+        edge_coord = df.new_var("tcgen05_edge_coord")
+        edge_pred = df.new_var("tcgen05_edge_pred")
+        tail_src = df.new_var("tcgen05_edge_tail_src")
+        tail_dst = df.new_var("tcgen05_edge_tail_dst")
+        tail_coord = df.new_var("tcgen05_edge_tail_coord")
+        tail_pred = df.new_var("tcgen05_edge_tail_pred")
+        tail_atom = df.new_var("tcgen05_edge_tail_atom")
+        return (
+            _simt_edge_coord_subtile_source(indent)
+            + f"{indent}{edge_src} = cute.logical_divide({src}, cute.make_layout({vector}))\n"
+            f"{indent}{edge_dst} = cute.logical_divide({dst}, cute.make_layout({vector}))\n"
+            f"{indent}{edge_coord} = cute.logical_divide({ttr_cc_subtile}, cute.make_layout({vector}))\n"
+            # ``cute.copy`` wants one predicate per element even under a
+            # vector atom: every element of a chunk takes the chunk's.
+            f"{indent}{edge_pred} = cute.make_rmem_tensor({edge_src}.shape, cutlass.Boolean)\n"
+            f"{indent}for _edge_i in range(cute.size({edge_src}.shape[1])):\n"
+            f"{indent}    _coord = {edge_coord}[0, _edge_i]\n"
+            f"{indent}    _chunk_pred = {_edge_vector_predicate_expr('_coord', vector)}\n"
+            f"{indent}    for _edge_j in range({vector}):\n"
+            f"{indent}        {edge_pred}[_edge_j, _edge_i] = _chunk_pred\n"
+            f"{indent}cute.copy({simt_atom}, {edge_src}, {edge_dst}, pred={edge_pred})\n"
+            f"{indent}if cutlass.const_expr({n_size_static} % {vector} != 0):\n"
+            f"{indent}    {tail_atom} = cute.make_copy_atom(cute.nvgpu.CopyR2GOp(), {target_dtype}, "
+            f"num_bits_per_copy={target_dtype}.width, "
+            f"l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE)\n"
+            f"{indent}    {tail_src} = cute.logical_divide({src}, cute.make_layout(1))\n"
+            f"{indent}    {tail_dst} = cute.logical_divide({dst}, cute.make_layout(1))\n"
+            f"{indent}    {tail_coord} = cute.logical_divide({ttr_cc_subtile}, cute.make_layout(1))\n"
+            f"{indent}    {tail_pred} = cute.make_rmem_tensor((1, {tail_src}.shape[1]), cutlass.Boolean)\n"
+            f"{indent}    for _edge_i in range(cute.size({tail_src}.shape[1])):\n"
+            f"{indent}        _coord = {tail_coord}[0, _edge_i]\n"
+            f"{indent}        {tail_pred}[0, _edge_i] = {_edge_tail_predicate_expr('_coord', vector)}\n"
+            f"{indent}    cute.copy({tail_atom}, {tail_src}, {tail_dst}, pred={tail_pred})\n"
+        )
+
     def _simt_edge_logical_divide_copy_source(
         indent: str,
         src: str,
@@ -5370,6 +5420,19 @@ def _codegen_cute_store_tcgen05_tile(
             f"and {coord}[1] < {grouped_tail_problem_n}"
         )
 
+    def _edge_vector_predicate_expr(coord: str, vector: str) -> str:
+        # A whole per-thread chunk lies inside the destination: its row is
+        # valid and its last column is inside N (chunk starts are multiples
+        # of the vector, as are the tile and subtile column offsets).
+        return f"{coord}[0] < {m_size} and {coord}[1] + {vector} <= {n_size}"
+
+    def _edge_tail_predicate_expr(coord: str, vector: str) -> str:
+        # Elements of the one chunk per row that straddles the N edge.
+        return (
+            f"cute.elem_less({coord}, ({m_size}, {n_size})) and "
+            f"({coord}[1] // {vector}) * {vector} + {vector} > {n_size}"
+        )
+
     def store_common_setup(
         gmem_tensor: str,
         *,
@@ -5377,6 +5440,7 @@ def _codegen_cute_store_tcgen05_tile(
         tma_store: bool = False,
         dynamic_d_tensormap: bool = False,
         rank3_mnl_tensor: bool | None = None,
+        static_strides: tuple[int, ...] | None = None,
     ) -> tuple[list[str], list[str]]:
         if rank3_mnl_tensor is None:
             rank3_mnl_tensor = d_tma_uses_rank3_mnl_tensor
@@ -5409,6 +5473,7 @@ def _codegen_cute_store_tcgen05_tile(
         if include_full_tile:
             tile_setup.append(f"{full_tile} = {full_tile_expr}")
         local_gmem_tensor = gmem_tensor
+        static_view_built = False
         if row_union is not None and not tma_store:
             # The proof establishes a fresh contiguous torch.empty result.
             # Preserve the original pointer/ABI while exposing that allocation
@@ -5423,6 +5488,33 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{local_gmem_tensor} = cute.make_tensor({gmem_tensor}.iterator, "
                 f"cute.make_layout({layout}))"
             )
+        elif static_strides is not None and not tma_store:
+            # Mixed SIMT store over a ragged destination: the launcher keeps
+            # partial-tile kernels on runtime tensor layouts, so the DSL sees
+            # dynamic strides and ``max_common_layout`` admits only element
+            # copies (bf16 1024x1024x1000 stored 1M two-byte scalars: 56 us
+            # against 8.6 us). Re-view the destination with its compile-time
+            # layout; the interior tiles then store 128-bit vectors and the
+            # fringe predicates still come from the identity tensor.
+            local_gmem_tensor = df.new_var("tcgen05_static_output")
+            static_view_built = True
+            static_layout = (
+                f"cute.make_layout(({tensor.shape[-2]}, {tensor.shape[-1]}), "
+                f"stride=({static_strides[-2]}, {static_strides[-1]}))"
+            )
+            if leading_passthrough_output:
+                assert leading_index is not None
+                index_dtype = CompileEnvironment.current().index_type()
+                tile_setup.append(
+                    f"{local_gmem_tensor} = cute.make_tensor("
+                    f"{gmem_tensor}.iterator + {index_dtype}({leading_index}) * "
+                    f"{index_dtype}({static_strides[0]}), {static_layout})"
+                )
+            else:
+                static_setup.append(
+                    f"{local_gmem_tensor} = cute.make_tensor("
+                    f"{gmem_tensor}.iterator, {static_layout})"
+                )
         if leading_passthrough_output and tma_store:
             assert leading_index is not None
             gmem_tile_3d = df.new_var("tcgen05_gC3d")
@@ -5439,7 +5531,7 @@ def _codegen_cute_store_tcgen05_tile(
                 ]
             )
             return static_setup, tile_setup
-        if leading_passthrough_output:
+        if leading_passthrough_output and not static_view_built:
             assert leading_index is not None
             local_gmem_tensor = df.new_var("tcgen05_gmem2d")
             tile_setup.append(
@@ -5592,9 +5684,32 @@ def _codegen_cute_store_tcgen05_tile(
         and static_m_size % tcgen05_value.bm == 0
         and static_n_size % tcgen05_value.bn == 0
     )
+    # The mixed SIMT epilogue: a vector copy on interior tiles, predicated
+    # element copies on fringe tiles (ragged flat tcgen05 kernels).
+    simt_mixed_store = (
+        not simt_edge_only
+        and not direct_full_tile_store
+        and not tcgen05_value.use_tma_store_epilogue
+    )
+    simt_static_strides: tuple[int, ...] | None = None
+    if (
+        simt_mixed_store
+        and tensor.ndim in (2, 3)
+        and not segment_store
+        and not grouped_tail_store
+        and row_union is None
+    ):
+        strides = tuple(tensor.stride())
+        if (
+            all(isinstance(value, int) for value in (*strides, *tensor.shape))
+            and strides[-1] == 1
+            and not tcgen05_value.output_column_major
+        ):
+            simt_static_strides = strides
     simt_static_store_setup, simt_tile_store_setup = store_common_setup(
         tensor_name,
         include_full_tile=not simt_edge_only and not direct_full_tile_store,
+        static_strides=simt_static_strides,
     )
     # Vector width of the direct store.  The DSL only knows the kernel
     # argument's pointer alignment; the tile / thread offsets it adds are
@@ -5608,8 +5723,10 @@ def _codegen_cute_store_tcgen05_tile(
     # (``make_ptr(..., assumed_align=...)`` on the same address: no rounding,
     # so a wrong claim faults loudly instead of corrupting the output) and the
     # copy atom widens to 128-bit stores.
+    # The mixed SIMT epilogue proves the same alignment: its chunk addresses
+    # are identical, and a fringe tile only narrows the predicate.
     direct_store_align_bytes: int | None = None
-    if direct_full_tile_store:
+    if direct_full_tile_store or simt_mixed_store:
         elem_bytes = tensor.element_size()
         strides = tuple(tensor.stride())
         if (
@@ -5899,6 +6016,13 @@ def _codegen_cute_store_tcgen05_tile(
     elif direct_full_tile_store:
         simt_store_copy_source = (
             f"        cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile})\n"
+        )
+    elif simt_static_strides is not None and isinstance(static_n_size, int):
+        simt_store_copy_source = (
+            f"        if {full_tile}:\n"
+            f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile})\n"
+            f"        else:\n"
+            f"{_simt_edge_vector_copy_source('            ', ttr_rd, ttr_gc_subtile, n_size_static=static_n_size)}"
         )
     else:
         simt_store_copy_source = (
@@ -8023,6 +8147,20 @@ def _codegen_cute_store_tcgen05_tile(
             # The first pipeline now owns both copies in each commit group.
             # Its existing wait.read0 precedes the original TMEM teardown.
             post_loop_stmts = []
+    if tcgen05_value.split_k_last:
+        # ``tcgen05_split_k``: the pipeline's exchange reduced the other
+        # splits' partials into this CTA's TMEM accumulator when it arrived
+        # last; every other split released the accumulator and skips the
+        # output stores (the predicate is CTA-uniform).
+        # The post-loop pipeline tails and the TMEM teardown run on every CTA.
+        return [
+            ast.If(
+                test=cast("ast.expr", expr_from_string(tcgen05_value.split_k_last)),
+                body=cast("list[ast.stmt]", main_stmts),
+                orelse=[],
+            ),
+            *post_loop_stmts,
+        ]
     return [*main_stmts, *post_loop_stmts]
 
 
@@ -8333,3 +8471,102 @@ def _(
             valid_mask = valid_mask & in_bounds
 
     return torch.where(valid_mask, values, result)
+
+
+@has_side_effect
+@_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
+def prefetch(
+    tensor: torch.Tensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> None:
+    """Hint that ``tensor[index]`` will be read soon by warming the L2 cache.
+
+    ``index`` and ``extra_mask`` follow :func:`load` (tiles, integers,
+    slices, ``hl.arange`` / integer-tensor gathers).  Nothing is returned and
+    nothing is ordered: a prefetch neither waits for earlier stores nor makes
+    later loads see anything, so dropping it never changes a result.  Unlike
+    :func:`load` it takes no ``indexing``, eviction-policy or cache-modifier
+    config slot, so adding one leaves every load's tunables where they were.
+
+    On NVIDIA GPUs (Triton backend), when the last index is a full slice or a
+    tile of a stride-1 dim and there is no ``extra_mask``, each element of the
+    leading indices issues one ``cp.async.bulk.prefetch.L2`` covering its row
+    segment (sm_90+).  Any other prefetch issues ``prefetch.global.L2`` per
+    element (one 128-byte line each).  Other targets drop it.
+
+    Args:
+        tensor: The tensor to prefetch from
+        index: The indices to use to index into the tensor
+        extra_mask: The extra mask (beyond automatic tile bounds masking) to apply to the tensor
+    Returns:
+        None
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.prepare_args(prefetch)
+def _(
+    tensor: torch.Tensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, list[object], torch.Tensor | None]:
+    from .tile_proxy import Tile
+
+    if not isinstance(tensor, torch.Tensor):
+        raise NotImplementedError(f"Cannot prefetch from type: {type(tensor)}")
+    index = Tile._tiles_to_sizes_for_index(index)
+    return (tensor, normalize_index_slices(tensor.shape, index), extra_mask)
+
+
+def prefetch_is_bulk(
+    tensor: torch.Tensor, index: Sequence[object], has_extra_mask: bool
+) -> bool:
+    """Whether ``hl.prefetch(tensor, index)`` issues one bulk L2 prefetch per
+    element of its leading indices: the last index is a full slice or a tile
+    of a stride-1 dim, there is no extra mask, and the target is sm_90+."""
+    env = CompileEnvironment.current()
+    capability = env.ptx_capability
+    if capability is None or capability < (9, 0) or has_extra_mask:
+        return False
+    if tensor.ndim == 0 or len(index) != tensor.ndim:
+        return False
+    if any(idx is None or idx is Ellipsis for idx in index):
+        return False
+    stride = tensor.stride(-1)
+    if not (isinstance(stride, int) and stride == 1):
+        return False
+    if env.known_equal(tensor.size(-1), 1):
+        return False
+    last = index[-1]
+    if isinstance(last, slice):
+        return last.start is None and last.stop is None and last.step is None
+    return isinstance(last, torch.SymInt) and env.get_block_id(last) is not None
+
+
+@_decorators.register_fake(prefetch)
+def _(
+    tensor: torch.Tensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> None:
+    # Allocate the reduction dims of full slices as ``hl.load`` does, except
+    # a bulk prefetch's row segment, which its byte count covers.
+    if prefetch_is_bulk(tensor, index, extra_mask is not None):
+        index = [*index[:-1], 0]
+    SubscriptIndexing.compute_shape(tensor, index)
+    return None
+
+
+@_decorators.codegen(prefetch, "common")
+def _(state: CodegenState) -> None:
+    return None  # a hint: targets without a prefetch drop it
+
+
+@_decorators.ref(prefetch)
+def _(
+    tensor: torch.Tensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> None:
+    return None

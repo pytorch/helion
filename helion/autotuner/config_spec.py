@@ -206,12 +206,16 @@ from .._compiler.cute.split_k_cluster_config import SCHEDULE_KEY as SPLIT_K_SCHE
 from .._compiler.cute.split_k_cluster_config import SCHEDULES as SPLIT_K_SCHEDULES
 from .._compiler.cute.split_k_cluster_config import normalize_cluster_finalizer
 from .._compiler.cute.split_k_cluster_config import normalize_cluster_schedule
+from .._compiler.cute.split_k_workspace_config import (
+    PARTITIONS_KEY as SPLIT_K_PARTITIONS_KEY,
+)
 from .._compiler.cute.split_k_workspace_config import STAGES_KEY as SPLIT_K_STAGES_KEY
 from .._compiler.cute.split_k_workspace_config import WORKSPACE_CONFIG_KEYS
 from .._compiler.cute.split_k_workspace_config import (
     WORKSPACE_KEY as SPLIT_K_WORKSPACE_KEY,
 )
 from .._compiler.cute.split_k_workspace_config import normalize_workspace_config
+from .._compiler.cute.split_k_workspace_config import workspace_search_fields
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
@@ -1945,6 +1949,10 @@ class ConfigSpec:
         self.cute_pointwise_region_grid_groups: tuple[tuple[int, ...], ...] = ()
         self.cute_split_k_cluster_facts: ClusterKFacts | None = None
         self.cute_split_k_workspace_available: bool = False
+        # ``cute_split_k_partitions`` values of a proved plain GEMM store
+        # (``split_k_workspace.plain_store_partition_choices``); empty for
+        # the atomic pattern, which partitions through its own tunable.
+        self.cute_split_k_partition_choices: tuple[int, ...] = ()
         self.cute_materialized_schedule_available: bool = False
         self.cute_materialized_schedule_search_enabled: bool = False
         self.cute_row_matrix_transport_available: bool = False
@@ -2364,6 +2372,14 @@ class ConfigSpec:
     @cute_tcgen05_aux_kernel_detected.setter
     def cute_tcgen05_aux_kernel_detected(self, value: bool) -> None:
         self._cute_tcgen05_config.aux_kernel_detected = value
+
+    @property
+    def cute_tcgen05_split_k_plain_body(self) -> bool:
+        return self._cute_tcgen05_config.split_k_plain_body
+
+    @cute_tcgen05_split_k_plain_body.setter
+    def cute_tcgen05_split_k_plain_body(self, value: bool) -> None:
+        self._cute_tcgen05_config.split_k_plain_body = value
 
     @property
     def cute_tcgen05_exact_shape_aux_kernel_detected(self) -> bool:
@@ -6788,6 +6804,7 @@ class ConfigSpec:
                 config,
                 available=self.cute_split_k_workspace_available,
                 fix_invalid=_fix_invalid,
+                partition_choices=self.cute_split_k_partition_choices,
             )
             normalize_grouped_rna_config(
                 config,
@@ -8348,6 +8365,7 @@ class ConfigSpec:
             # This optional matmul coordinate has no old default Config key.
             # Keep the public default exact; flat search still represents zero.
             config.config.pop("cute_min_blocks_per_mp", None)
+        self._drop_inert_workspace_knobs(config)
         self._shrink_for_numel_constraints(config)
         return config
 
@@ -8371,8 +8389,24 @@ class ConfigSpec:
         # flatten/unflatten round-trip, which breaks callers that key on the config identity
         # (e.g. benchmark result maps).
         self.normalize(config, _fix_invalid=True)
+        self._drop_inert_workspace_knobs(config)
         self._shrink_for_numel_constraints(config)
         return config
+
+    @staticmethod
+    def _drop_inert_workspace_knobs(config: helion.Config) -> None:
+        """The split-K workspace schedule is a seeded search alternative; the
+        public default is the plain kernel, without the schedule's inert
+        stage and partition knobs (flat search still represents them), so a
+        GEMM's default does not depend on whether its operands admit the
+        schedule's proof."""
+        if config.config.get(SPLIT_K_WORKSPACE_KEY, False) is False:
+            for key in (
+                SPLIT_K_WORKSPACE_KEY,
+                SPLIT_K_STAGES_KEY,
+                SPLIT_K_PARTITIONS_KEY,
+            ):
+                config.config.pop(key, None)
 
     def _shrink_for_numel_constraints(self, config: helion.Config) -> None:
         """Shrink block_sizes in *config* in-place so every tensor numel
@@ -8882,6 +8916,13 @@ class ConfigSpec:
                     )
                 if self.cute_bf16x2_recurrence_enabled:
                     fields["cute_bf16x2_recurrence"] = BooleanFragment()
+                # The split-K workspace proof holds for the atomic example and
+                # for plain tcgen05 GEMM stores alike; the latter has no
+                # collective ``matmul_facts``, so the knobs live outside them.
+                if self.cute_split_k_workspace_available:
+                    fields.update(
+                        workspace_search_fields(self.cute_split_k_partition_choices)
+                    )
                 if self.matmul_facts:
                     if (
                         self.cute_grouped_rna_k_choices
@@ -8925,9 +8966,6 @@ class ConfigSpec:
                     if self.cute_split_k_cluster_facts is not None:
                         fields[SPLIT_K_SCHEDULE_KEY] = EnumFragment(SPLIT_K_SCHEDULES)
                         fields[SPLIT_K_FINALIZER_KEY] = EnumFragment(FINALIZER_WARPS)
-                    if self.cute_split_k_workspace_available:
-                        fields[SPLIT_K_WORKSPACE_KEY] = BooleanFragment()
-                        fields[SPLIT_K_STAGES_KEY] = IntegerFragment(1, 16, 2)
                     if self.cute_collective_knobs_enabled:
                         fields["cute_collective_mma"] = BooleanFragment()
                         fields["cute_collective_static_layouts"] = BooleanFragment()
@@ -9084,11 +9122,8 @@ class ConfigSpec:
                     fields["cute_rng_packet"] = BooleanFragment()
                 if self.cute_packet_prefetch_enabled:
                     fields["cute_packet_prefetch"] = EnumFragment(choices=(0, 2, 4, 8))
-                if (
-                    self.matmul_facts
-                    and self.target_device_capability is not None
-                    and self.target_device_capability[0] >= 8
-                ):
+                capability = self.target_device_capability
+                if self.matmul_facts and capability is not None and capability[0] >= 8:
                     chain_seeded = any(
                         seed.config.get("cute_register_chain") is True
                         for seed in self.compiler_seed_configs

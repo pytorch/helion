@@ -96,23 +96,6 @@ def boundary_only_grid_blocks(
     return inactive
 
 
-def _child_graph_ids(node: torch.fx.Node) -> tuple[int, ...]:
-    from ...language import _tracing_ops
-
-    if node.op != "call_function":
-        return ()
-    if _tracing_ops.is_for_loop_target(node.target):
-        return (cast("int", node.args[0]),)
-    if node.target is _tracing_ops._if:
-        return cast("tuple[int, ...]", node.args[1:3])
-    if node.target is _tracing_ops._while_loop:
-        result = cast("tuple[int, ...]", node.args[:2])
-        if len(node.args) > 3 and isinstance(node.args[3], int):
-            result = (*result, node.args[3])
-        return result
-    return ()
-
-
 def constexpr_live_graph_ids(
     device_ir: DeviceIR,
     graphs: Sequence[GraphInfo],
@@ -129,6 +112,7 @@ def constexpr_live_graph_ids(
     is applied.
     """
     from ...language import _tracing_ops
+    from ..device_ir import control_flow_child_graph_ids
 
     taken_sides: dict[torch.fx.Node, int] = {}
     for info in graphs:
@@ -149,7 +133,7 @@ def constexpr_live_graph_ids(
             if node in taken_sides:
                 pending.append(taken_sides[node])
             else:
-                pending.extend(_child_graph_ids(node))
+                pending.extend(control_flow_child_graph_ids(node))
     return frozenset(live)
 
 
@@ -167,6 +151,7 @@ def tile_loop_paths(
     """
     from ..device_ir import ForLoopGraphInfo
     from ..device_ir import ReductionLoopGraphInfo
+    from ..device_ir import control_flow_child_graph_ids
 
     paths: dict[TileLoopPath, None] = {}
 
@@ -180,7 +165,7 @@ def tile_loop_paths(
             path = (*path, tuple(info.block_ids))
         paths[path] = None
         for node in info.graph.nodes:
-            for child in _child_graph_ids(node):
+            for child in control_flow_child_graph_ids(node):
                 visit(child, path)
 
     for root_id, block_ids in zip(

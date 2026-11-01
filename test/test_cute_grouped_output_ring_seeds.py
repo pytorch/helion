@@ -45,6 +45,7 @@ from helion._compiler.autotuner_heuristics.cute import (
 from helion._compiler.cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessTcgen05RuntimeNPtx
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
@@ -366,6 +367,7 @@ def test_rank3_device_metadata_reuses_the_same_output_ring_family(
 
 
 @skipUnlessBackends(["cute"])
+@skipUnlessTcgen05RuntimeNPtx
 def test_external_worklist_keeps_its_existing_policy() -> None:
     values = (
         torch.empty((448, 128), dtype=torch.bfloat16),

@@ -275,6 +275,7 @@ from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfLowVRAM
+from helion._testing import skipUnlessTcgen05RuntimeNPtx
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -2797,7 +2798,9 @@ class TestCuteLowerings(unittest.TestCase):
         """
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
-        @helion.kernel(backend="cute")
+        # The scalar K-tail producer is the fallback the flat edge TMA path
+        # replaces; pin the legacy path to test it.
+        @helion.kernel(backend="cute", cute_flat_edge_tma=False)
         def cute_matmul_k_tail(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.size()
             _, n = y.size()
@@ -3940,7 +3943,9 @@ class TestCuteLowerings(unittest.TestCase):
     ) -> None:
         """Output-edge ``bk=128`` fallback uses an A layout scalar stores can fill."""
 
-        @helion.kernel(backend="cute")
+        # The scalar edge producer is the fallback the flat edge TMA path
+        # replaces; pin the legacy path to test its layout.
+        @helion.kernel(backend="cute", cute_flat_edge_tma=False)
         def cute_matmul_bk128_edge_codegen(
             x: torch.Tensor, y: torch.Tensor
         ) -> torch.Tensor:
@@ -23915,6 +23920,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             body_src,
         )
 
+    @skipUnlessTcgen05RuntimeNPtx
     def test_tcgen05_runtime_mma_issue_requires_bf16_fp32(self) -> None:
         def build(input_dtype_str: str) -> ast.stmt:
             return _build_tcgen05_mma_issue_stmt(

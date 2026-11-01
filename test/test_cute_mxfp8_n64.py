@@ -70,7 +70,12 @@ def test_cpu_n64_native_pipeline_compiles(
         CUTE_DSL_ARCH="sm_100a",
         CUTE_DSL_CACHE_DIR=str(tmp_path / "cutlass-cache"),
         HELION_BACKEND="cute",
-        PYTHONPATH=str(Path(__file__).resolve().parents[1]),
+    )
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(Path(__file__).resolve().parents[1]),
+            *filter(None, [environment.get("PYTHONPATH")]),
+        ]
     )
     # CUTLASS caches the selected architecture in its process-wide DSL object.
     # A subprocess keeps fake SM100 compilation away from later CUDA tests.

@@ -755,6 +755,7 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _choose_mma_impl
     from .cute_mma import _loop_subrange_parent_block_id
     from .cute_mma import _mma_tiles_are_static_full
+    from .cute_mma import _ragged_batched_tcgen05_config
     from .cute_mma import _tcgen05_epi_warp_groups
     from .cute_mma import analyze_cute_mma_node
     from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
@@ -830,11 +831,15 @@ def _detect_specialized_mma_loop(
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
+    # Ragged batched tiles take the flat one-CTA tcgen05 pipeline (TMA
+    # zero-fill, predicated stores); the launch geometry must agree with
+    # ``_emit_mma_pipeline``'s admission or the MMA warp never exists.
     candidates = [
         (node, candidate)
         for node, candidate in candidates
         if not candidate.operands.has_leading_passthrough
         or _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
+        or _ragged_batched_tcgen05_config(config, bn)
     ]
     if not candidates:
         return False
@@ -1498,9 +1503,9 @@ def _graph_used_block_ids(
     from ...language import memory_ops
     from ..compile_environment import CompileEnvironment
     from ..device_ir import RootGraphInfo
+    from ..device_ir import control_flow_child_graph_ids
     from ..host_function import HostFunction
     from ..variable_origin import BlockSizeOrigin
-    from .loop_nesting import _child_graph_ids
 
     env = CompileEnvironment.current()
     host_function = HostFunction.current()
@@ -1587,7 +1592,9 @@ def _graph_used_block_ids(
         for node in graph.nodes:
             # A root coordinate can first be read inside a captured device
             # scope. Its thread distribution must remain live there as well.
-            pending.extend(graph_by_id[graph_id] for graph_id in _child_graph_ids(node))
+            pending.extend(
+                graph_by_id[graph_id] for graph_id in control_flow_child_graph_ids(node)
+            )
             if node.target is memory_ops.store:
                 # A store has no value; its index names every tile axis it
                 # writes, including axes a broadcast value does not carry.
@@ -1956,6 +1963,9 @@ class CuteBackend(Backend):
             sum-only, then consume).  The 3-pass form's two reductions
             are independent and compile to a more efficient layout on
             the CuTe backend.
+          * ``stage_unaligned_matmul_operands`` pads matmul operands whose
+            strides fail the TensorMap proof through a host copy so the
+            tcgen05 pipeline keeps its TMA producers.
         """
         from .online_to_3pass import rewrite_online_to_3pass
 
@@ -1980,6 +1990,12 @@ class CuteBackend(Backend):
         from .flatten_nested_reductions import flatten_nested_reductions
 
         rewritten |= flatten_nested_reductions(hf) > 0
+
+        # Last: the staging statements it prepends are not part of the pure
+        # host preludes the passes above analyze.
+        from .stage_aligned_operands import stage_unaligned_matmul_operands
+
+        rewritten |= stage_unaligned_matmul_operands(hf)
         return rewritten
 
     def pre_codegen(
@@ -2225,6 +2241,7 @@ class CuteBackend(Backend):
             in (
                 "cute_split_k_workspace",
                 "cute_split_k_stages",
+                "cute_split_k_partitions",
                 "cute_split_k_schedule",
                 "cute_split_k_finalizer_warps",
             )
@@ -2674,6 +2691,7 @@ class CuteBackend(Backend):
             "_cute_store_u16x8_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u16x8_l2_evict_last as _cute_store_u16x8_l2_evict_last",
             "_cute_store_u32x4_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u32x4_l2_evict_last as _cute_store_u32x4_l2_evict_last",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
+            "_cute_tmem_store_atom": "from helion._compiler.cute.split_k_exchange import tmem_store_atom as _cute_tmem_store_atom",
             "_cute_join_cast": "from helion._compiler.cute.join_cast import join_cast as _cute_join_cast",
             "_cute_exact_div_bounds_f32": "from helion._compiler.cute.exact_division import exact_div_bounds_f32 as _cute_exact_div_bounds_f32",
             "_cute_exact_div_fast_f32": "from helion._compiler.cute.exact_division import exact_div_fast_f32 as _cute_exact_div_fast_f32",
@@ -2685,6 +2703,14 @@ class CuteBackend(Backend):
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
+        if dim == 0:
+            from ..device_function import DeviceFunction
+
+            divisor = DeviceFunction.current().cute_state.program_id_divisor
+            if divisor > 1:
+                # ``tcgen05_split_k``: ``divisor`` consecutive CTAs share one
+                # output tile (the split index is ``block_idx % divisor``).
+                return f"{index_dtype}(cute.arch.block_idx()[0] // {divisor})"
         return f"{index_dtype}(cute.arch.block_idx()[{dim}])"
 
     def inductor_op_overrides(self) -> InductorOpOverrides:

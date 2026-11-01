@@ -272,6 +272,22 @@ def test_nonaffine_effectful_or_mixed_width_loops_are_unchanged(
     assert "_helion_affine_load" not in ast.unparse(tree)
 
 
+def test_fast_math_call_forms_still_vectorize() -> None:
+    # The fast_math setting rewrites exp and division into
+    # ``exp2(fma(x, log2e, -m), fastmath=True)`` and
+    # ``div(a, b, approx=True, ftz=True)``; both are pure elementwise calls,
+    # so the loads and stores around them vectorize as before (the aot
+    # row_softmax read 3x slower on B200 when they did not).
+    source = _SOURCE.replace(
+        "result = value * 1.25 + 2",
+        "result = cute.math.div(cute.math.exp2(cute.math.fma(value, 1.25, -2.0), "
+        "fastmath=True), 3.0, approx=True, ftz=True)",
+    )
+    tree, changed = _rewrite(source)
+    assert changed == 1
+    assert "_helion_affine_load" in ast.unparse(tree)
+
+
 @pytest.mark.parametrize("length", [0, 1, 3, 4, 8])
 def test_uniform_inactive_fragments_preserve_reduction_carries(length: int) -> None:
     source = _SOURCE.replace(

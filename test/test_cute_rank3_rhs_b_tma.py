@@ -1018,7 +1018,17 @@ def test_grouped_proof_rejects_unproven_aten_targets(target: Any) -> None:
 @pytest.mark.parametrize(
     ("kernel", "args_fn", "config_fn"),
     [
-        (_rank3_rhs_grouped_nt, _make_non_k_contiguous_args, _rank3_rhs_tma_config),
+        # The staging pass would relay the strided B out into a contiguous
+        # copy; the generic fallback is tested on the operand as passed.
+        (
+            helion.kernel(
+                _rank3_rhs_grouped_nt.fn,
+                backend="cute",
+                cute_stage_unaligned_operands=False,
+            ),
+            _make_non_k_contiguous_args,
+            _rank3_rhs_tma_config,
+        ),
         (_rank3_rhs_grouped_nt, _make_mn_major_args, _grouped_config),
         (
             _bad_mn_tail_zero_store,
