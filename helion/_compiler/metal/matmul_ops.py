@@ -8,8 +8,8 @@ Helion masks every ``hl.dot`` operand to 0 past each block's extent
 
 A canonical K-loop ``hl.dot`` never gets here (``rewrite_mpp_graphs``
 replaces it with an MPP region before codegen), and one the MPP planner
-admits (a K held as per-thread parts) is forwarded to
-``mpp_matmul.codegen_dot_metal``.
+admits (a K held as per-thread parts, or every whole-K ``hl.dot`` of a kernel
+where each is admissible) is forwarded to ``mpp_matmul.codegen_dot_metal``.
 """
 
 from __future__ import annotations

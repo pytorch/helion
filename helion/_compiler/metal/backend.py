@@ -169,12 +169,13 @@ def blocks_reduced_after_loop(device_ir: DeviceIR) -> set[int]:
 
 
 def scalar_contraction_blocks(graphs: list[GraphInfo], live: bool = True) -> set[int]:
-    """K blocks of the hl.dot ops Scalar code contracts (``matmul_ops``): an
-    aten matmul lowers through MPP or is rejected, and an hl.dot does too when
-    the graph pass replaced its K loop (``live_graphs`` skips it) or its K is
-    held as per-thread parts (``plan_mpp_matmuls``).  ``live=False`` scans
-    every graph (no compiling function to tell live ones), which can only add
-    blocks."""
+    """K blocks of the live hl.dot ops whose K is not held as per-thread
+    parts: those the scalar contraction lowers (``matmul_ops``) and the
+    whole-K ones ``plan_mpp_matmuls`` takes, whose ``:`` M or N admission
+    counts on the lane floor's threads for these blocks.  An aten matmul
+    lowers through MPP or is rejected, and the graph pass's K loops are not
+    live (``live_graphs`` skips them).  ``live=False`` scans every graph (no
+    compiling function to tell live ones), which can only add blocks."""
     from ...language.matmul_ops import dot
     from ..compile_environment import CompileEnvironment
     from .factored_dims import factored_size
@@ -503,6 +504,7 @@ class MetalBackend(Backend):
         config: Config,
         tile_strategy: TileStrategyDispatch,
     ) -> None:
+        from ..compile_environment import CompileEnvironment
         from .free_arange import check_free_lanes
         from .free_arange import plan_free_aranges
         from .mpp_matmul import plan_mpp_matmuls
@@ -515,7 +517,12 @@ class MetalBackend(Backend):
         plan_reduced_tile_axes(graphs, tile_strategy)
         self._tid_axes = set()
         self.free_arange_plan = plan_free_aranges(graphs, config, tile_strategy)
-        self.mpp_plan = plan_mpp_matmuls(graphs)
+        threaded = {
+            block
+            for block in range(len(CompileEnvironment.current().block_sizes))
+            if (tile_strategy.thread_extent_for_block_id(block) or 1) > 1
+        }
+        self.mpp_plan = plan_mpp_matmuls(graphs, threaded)
         check_free_lanes(self.free_arange_plan, self.mpp_plan, graphs)
         self._uniform_extent = self._uniform_thread_extent(graphs, tile_strategy)
 

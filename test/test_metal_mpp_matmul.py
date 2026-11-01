@@ -1,11 +1,11 @@
 """Cooperative MPP lowering of K-loop matmul accumulators.
 
 Every ``torch.addmm``, ``torch.mm``, ``torch.bmm`` and ``torch.baddbmm``,
-and every ``hl.dot`` over a K held as per-thread parts, takes
-``metal/mpp_matmul.py``'s path; the MPP graph pass takes only the other
-``hl.dot``s.  Most kernels run their K loop under ``hl.grid`` or
-over free ``hl.arange`` rows (grouped_gemm's layout).  References are float64
-on the CPU.
+every ``hl.dot`` over a K held as per-thread parts, and the other ``hl.dot``
+calls the MPP graph pass leaves when the planner takes all of them, take
+``metal/mpp_matmul.py``'s path.  Most kernels run their K loop under
+``hl.grid`` or over free ``hl.arange`` rows (grouped_gemm's layout).
+References are float64 on the CPU.
 """
 
 from __future__ import annotations
@@ -28,11 +28,23 @@ import torch
 import helion
 from helion import exc
 from helion._compiler.metal import mpp_matmul
+from helion._compiler.metal import tile_sharing
 from helion._testing import import_example
 import helion.language as hl
 
 attention = import_example("attention").attention
+helion_gdn_fwd_h = import_example("gdn_fwd_h").helion_gdn_fwd_h
 matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
+_examples_mamba2_chunk_scan = import_example("mamba2_chunk_scan")
+helion_mamba2_chunk_scan_kernel = (
+    _examples_mamba2_chunk_scan.helion_mamba2_chunk_scan_kernel
+)
+ref_chunk_scan = _examples_mamba2_chunk_scan.ref_chunk_scan
+_examples_mamba2_chunk_state = import_example("mamba2_chunk_state")
+helion_mamba2_chunk_state_kernel = (
+    _examples_mamba2_chunk_state.helion_mamba2_chunk_state_kernel
+)
+ref_chunk_state = _examples_mamba2_chunk_state.ref_chunk_state
 matmul = import_example("matmul").matmul
 
 if TYPE_CHECKING:
@@ -2905,10 +2917,23 @@ _CONVERTED = (
 _BF_CAST = re.compile(
     r"static_cast<bfloat>\((?!\s*(?:-?[\d.]+f?|static_cast<float>\(\s*-?[\d.]+f?\s*\))\s*\))"
 )
+#: An MPP threadgroup tile; tiles that share storage take one of their names.
+_TILE = r"_mpp_(?:tile|mat|seed|vec)\w*"
 #: The value a float32 tile's staging write rounds.
 _FLOAT_WRITE = re.compile(
-    r"_mpp_tile\w*\[[^\]]*\] = static_cast<float>\(helion_bf16_rne\((.*)\)\);"
+    rf"{_TILE}\[[^\]]*\] = static_cast<float>\(helion_bf16_rne\((.*)\)\);"
 )
+
+
+def _staged_as_float(msl: str) -> bool:
+    """Whether some tile takes rounded float32 staging writes, and every such
+    tile is declared float."""
+    tiles = set(
+        re.findall(rf"({_TILE})\[[^\]]*\] = static_cast<float>\(helion_bf16_rne", msl)
+    )
+    return bool(tiles) and all(f"threadgroup float {t}[" in msl for t in tiles)
+
+
 #: An assignment to a name ``[type] name op= value;``, as a declaration, a
 #: reference or a carry's reassignment: (name, value).
 _ASSIGN = re.compile(
@@ -4284,6 +4309,23 @@ class TestMppMatmul(_MppCase):
         out, _, _ = _run(masked_rows, (a3, b3, lim, nbm3, nbn3), config)
         _close(out, torch.zeros(45, 90, dtype=torch.float64))
 
+    def test_wide_tiles_at_four_simdgroups(self) -> None:
+        """One op covers 256 rows or columns on four SIMD groups: a K loop
+        over device views with M = 256, and a ``:`` N of 256 with M and N
+        tails."""
+        x = torch.randn(512, 64, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(64, 48, device=DEVICE, dtype=torch.float16)
+        config = helion.Config(block_sizes=[256, 16, 16], num_threads=[32, 16, 1])
+        out, code, msl = _run(plain_g, (x, y), config)
+        self.assertEqual(_launch(code), (8, 16, 1))
+        self.assertIn("matmul2d_descriptor(256, 16, 16,", msl)
+        _close(out, _mm(x, y))
+        p = torch.randn(40, 72, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(72, 200, device=DEVICE, dtype=torch.bfloat16)
+        out, _, msl = _run(colon_n_kloop, (p, w), None)
+        self.assertIn("matmul2d_descriptor(32, 200,", msl)
+        _close(out, _mm(p, w))
+
 
 @_requires_mps
 class TestMppMatmulRejects(_MppCase):
@@ -4316,11 +4358,21 @@ class TestMppMatmulRejects(_MppCase):
         config = helion.Config(block_sizes=[32, 32, 16], num_threads=[32, 32, 2])
         self._rejects(plain_g, (self.x, self.y), config, message)
 
-    def test_tile_over_128(self) -> None:
+    def test_tile_over_256(self) -> None:
+        x = torch.randn(1024, 64, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(64, 64, device=DEVICE, dtype=torch.float16)
+        config = helion.Config(block_sizes=[512, 16, 16], num_threads=[32, 16, 1])
+        self._rejects(plain_g, (x, y), config, "one op covers M, N <= 256")
+
+    def test_wide_tile_on_few_simdgroups(self) -> None:
+        """An op over 128 rows on one SIMD group, where the hardware
+        miscomputes it."""
         x = torch.randn(512, 64, device=DEVICE, dtype=torch.float16)
         y = torch.randn(64, 64, device=DEVICE, dtype=torch.float16)
-        config = helion.Config(block_sizes=[256, 16, 16], num_threads=[32, 16, 1])
-        self._rejects(plain_g, (x, y), config, "one op covers M, N <= 128")
+        config = helion.Config(block_sizes=[256, 32, 16], num_threads=[8, 4, 1])
+        self._rejects(
+            plain_g, (x, y), config, "an MPP matmul tile 256x32 on 1 SIMD groups"
+        )
 
     def test_tile_span(self) -> None:
         """A column-major lhs whose K stride makes one tile span 2**31
@@ -4451,7 +4503,7 @@ class TestMppStaging(_MppCase):
                 out, _, msl = _run(int4_gemm, (lhs, _pack_int4(w).to(DEVICE)), config)
                 _close(out, (a.double() @ w.double()).to(bf16).double())
                 self._assert_staged(msl, "bfloat")
-                self.assertRegex(msl, r"_mpp_owner_\d+\)\) \{ _mpp_tile")
+                self.assertRegex(msl, r"_mpp_owner\w*\)\) \{ _mpp_tile")
 
     def test_factored_k(self) -> None:
         """A K held as parts beyond int4_gemm: a stacked lhs, c = 3, two
@@ -4866,7 +4918,7 @@ class TestMppFloatStaging(_FloatStagingCase):
                 _close(out, expected(list(blocks)))
                 writes = _FLOAT_WRITE.findall(msl)
                 self.assertTrue(writes)
-                self.assertIn("threadgroup float _mpp_tile", msl)
+                self.assertTrue(_staged_as_float(msl))
                 for expr in writes + _float_slice(msl):
                     self.assertNotRegex(expr, _BF_CAST)
                 if whole:
@@ -5176,7 +5228,7 @@ class TestMppFloatStaging(_FloatStagingCase):
                 _close(out, acc)
                 _close(out2, ref2)
                 self.assertTrue(_FLOAT_WRITE.findall(msl))
-                self.assertIn("threadgroup float _mpp_tile", msl)
+                self.assertTrue(_staged_as_float(msl))
                 self.assertNotRegex(msl[msl.index("kernel void") :], _BF_CAST)
 
     def test_attention(self) -> None:
@@ -6471,7 +6523,7 @@ class TestMppRootAddmmRejects(_MppCase):
             root_plain,
             (x, y),
             helion.Config(block_sizes=[32, 32, 512], num_warps=1),
-            "N <= 128 and K <= 256",
+            "and K <= 256",
         )
         out, _, _ = _run(root_plain, (x, y), helion.Config(block_sizes=[32, 64, 256]))
         _close(out, _mm(x, y))
@@ -7499,7 +7551,7 @@ class TestMppViewsRejects(unittest.TestCase):
                     torch.randn(300, 48, device=DEVICE, dtype=torch.float16),
                     torch.randn(300, 40, device=DEVICE, dtype=torch.float16),
                 ),
-                "N <= 128 and K <= 256",
+                "and K <= 256",
             ),
             (
                 store_base_swapped,
@@ -9188,9 +9240,9 @@ class TestMppColonSlicesRejects(_MppCase):
         p = torch.randn(48, 72, device=DEVICE, dtype=torch.bfloat16)
         self._rejects_at(
             colon_n_kloop,
-            (p, torch.randn(72, 256, device=DEVICE, dtype=torch.bfloat16)),
+            (p, torch.randn(72, 512, device=DEVICE, dtype=torch.bfloat16)),
             (None,),
-            "one op covers M, N <= 128",
+            "one op covers M, N <= 256",
         )
         self._rejects_at(
             chain_colon,
@@ -10744,7 +10796,7 @@ _FENCED = (
     r"threadgroup_barrier\(mem_flags::mem_threadgroup\);"
 )
 #: Of the threads that hold a vector element, one writes it.
-_OWNED = r"_mpp_owner_\d+\)\) \{ _mpp_vec"
+_OWNED = r"_mpp_owner\w*\)\) \{ _mpp_vec"
 
 
 def _vec(dtype: str) -> str:
@@ -11061,7 +11113,8 @@ class TestMppCarryUpdate(unittest.TestCase):
     @_full_threadgroup
     def test_cooperative_operand(self) -> None:
         """An update that reads another op's cooperative result
-        materializes it and stages it as an [M, N] vector."""
+        materializes it and stages it as an [M, N] vector, which reuses the
+        materialization's tile after its last read."""
         p, v = self.p, self.v
         v2 = torch.randn(72, 40, device=DEVICE, dtype=torch.float16)
 
@@ -11079,10 +11132,10 @@ class TestMppCarryUpdate(unittest.TestCase):
                 (p, v, v2),
                 config,
                 ref,
-                _vec("float"),
                 _FENCED,
-                r"auto (_mpp_v_\d+) = [^\n]*_mpp_mat[\s\S]*_mpp_vec\w*\[[^\n]*\] = "
-                r"static_cast<float>\(\1\)",
+                r"auto (_mpp_v_\d+) = [^\n]*_mpp_mat\[[\s\S]*"
+                r"threadgroup_barrier\(mem_flags::mem_threadgroup\);\n[^\n]*"
+                r"\{ _mpp_mat\[[^\n]*\] = static_cast<float>\(\1\)",
             )
 
     def test_sixteen_bit_values(self) -> None:
@@ -11712,11 +11765,11 @@ class TestMppEpilogueVectors(unittest.TestCase):
         vecs: tuple[str, ...] = ("float",),
         mats: int = 0,
         staged_in: str | None = None,
-    ) -> None:
+    ) -> str:
         """Run ``kernel``, compare its outputs with ``refs``, and check its
         MSL stages vectors of the dtypes ``vecs`` that a store's element
         loop reads, inside a loop whose header contains ``staged_in`` if
-        given, and holds ``mats`` materializations."""
+        given, and holds ``mats`` materializations; return the MSL."""
         with self.subTest(kernel=kernel.name, config=config):
             out, _, msl = _run(kernel, args, config)
             outs = out if isinstance(out, tuple) else (out,)
@@ -11733,6 +11786,7 @@ class TestMppEpilogueVectors(unittest.TestCase):
                 assert write is not None
                 loops = _open_loops(msl, write.start())
                 self.assertTrue([h for h in loops if staged_in in h], loops)
+        return msl
 
     def test_row_and_column_vectors(self) -> None:
         """A row carry of the K loop, over N tiles and over a ``:`` N; and
@@ -11789,9 +11843,10 @@ class TestMppEpilogueVectors(unittest.TestCase):
             )
 
     def test_groups(self) -> None:
-        """Two ops in one body, each staging the row vector they share, and a
-        row sum of another op's or the result's own materialization read by
-        the store."""
+        """Two ops in one body, each staging the row vector they share (the
+        two vectors, never live together, share one tile), and a row sum of
+        another op's or the result's own materialization read by the store
+        (another op's sum reuses its materialization's tile)."""
         x = torch.randn(48, 64, device=DEVICE, dtype=torch.float16)
         y, w = (
             torch.randn(64, 40, device=DEVICE, dtype=torch.float16) for _ in range(2)
@@ -11803,18 +11858,20 @@ class TestMppEpilogueVectors(unittest.TestCase):
             None,
             _mm(x, y) * r,
             _mm(x, w) - r,
-            vecs=("float", "float"),
+            vecs=("float",),
         )
         rt = _mm(x, y)
         for bn in (16, 32):
             config = helion.Config(block_sizes=[16, bn], num_threads=[128 // bn, bn])
-            self._check(
+            msl = self._check(
                 other_rownorm,
                 (x, y, w),
                 config,
                 _mm(x, w) / (_tile_row_sums(rt.abs(), bn) + 1),
+                vecs=(),
                 mats=1,
             )
+            self.assertRegex(msl, r"_mpp_owner\)\) \{ _mpp_mat\[")
         self._check(
             own_rownorm, (x, y), None, rt / (rt.abs().sum(-1, keepdim=True) + 1), mats=1
         )
@@ -12863,8 +12920,9 @@ _SEED_CONFIGS = (None, helion.Config(block_sizes=[32, 32, 32]))
 class TestMppGraphPassSeedCodegen(unittest.TestCase):
     """The MPP graph pass starts its cooperative tensor at zero and never
     reads the seed, so it takes an ``hl.dot`` K loop only when the acc is
-    seeded by a zero fill; any other seed leaves the loop to the scalar
-    contraction.  Generated on the CPU."""
+    seeded by a zero fill.  The planner takes any other seed: a constant
+    fill seeds its ``_helion_mpp_acc``, and a loaded seed is staged through
+    ``_mpp_coop``.  Generated on the CPU."""
 
     def test_seeds(self) -> None:
         x = torch.randn(64, 64, dtype=torch.float16)
@@ -12872,8 +12930,13 @@ class TestMppGraphPassSeedCodegen(unittest.TestCase):
         c = torch.randn(64, 64)
         for kernel, args, region, seed in (
             (dot_seed_zeros, (x, y), True, None),
-            (dot_seed_full, (x, y), False, "acc = float(1.5)"),
-            (dot_seed_load, (x, y, c), False, "acc = tl.load(c + "),
+            (dot_seed_full, (x, y), False, r"_helion_mpp_acc\(.*, 1\.5, \["),
+            (
+                dot_seed_load,
+                (x, y, c),
+                False,
+                r"_mpp_coop = _helion_mpp_acc\(.*'_mpp_seed'\)",
+            ),
         ):
             bound = kernel.bind(args)
             for config in _SEED_CONFIGS:
@@ -12886,10 +12949,8 @@ class TestMppGraphPassSeedCodegen(unittest.TestCase):
                     )
                     self.assertEqual("_metal_mpp_setup" in body, region)
                     if seed is not None:
-                        # The scalar K loop starts from the seed and adds
-                        # each tile's product to the carried acc.
-                        self.assertIn(seed, body)
-                        self.assertIn("acc_copy", body)
+                        self.assertIn("_helion_mpp_run(", body)
+                        self.assertRegex(body, seed)
 
 
 @_requires_mps
@@ -12911,6 +12972,1972 @@ class TestMppGraphPassSeed(unittest.TestCase):
                 with self.subTest(kernel=kernel.name, config=config):
                     out, _, _ = _run(kernel, args, config)
                     _close(out, ref)
+
+
+# --- Whole-K hl.dot through the planner -----------------------------------
+
+
+@helion.kernel(**S)
+def dot_scaled_lhs(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """``(x^T * exp(s)) @ w`` over a K loop: a transposed, scaled, cast lhs."""
+    k, m = x.shape
+    n = w.size(1)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            xt = (x[tk, tm].T.to(torch.float32) * torch.exp(s[tk])[None, :]).to(x.dtype)
+            acc = hl.dot(xt, w[tk, tn], acc=acc)
+        out[tm, tn] = acc.to(x.dtype)
+    return out
+
+
+@helion.kernel(**S)
+def dot_two_stage(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, d: torch.Tensor
+) -> torch.Tensor:
+    """``(a @ b^T) * 0.5 + (2c) @ d``: a ``:`` K op seeds a K-loop op."""
+    m, k1 = a.shape
+    n = b.size(0)
+    hl.specialize(k1)
+    out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        acc = hl.dot(a[tm, :], b[tn, :].T, acc=acc)
+        acc = acc * 0.5
+        for tk in hl.tile(c.size(1)):
+            acc = hl.dot(c[tm, tk] * 2.0, d[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_colon_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A computed lhs over a ``:`` K, with no acc."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        out[tm, tn] = hl.dot(x[tm, :] * 2.0, y[:, tn])
+    return out
+
+
+@helion.kernel(**S)
+def dot_colon_m(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A computed lhs over a ``:`` M, so its Scalar work runs in M's lanes."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tn in hl.tile(y.size(1)):
+        acc = hl.zeros([x.size(0), tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[:, tk] * 2.0, y[tk, tn], acc=acc)
+        out[:, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_colon_n(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A computed rhs over a ``:`` N."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, y.size(1)], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk], y[tk, :] * 2.0, acc=acc)
+        out[tm, :] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_colon_n_row_sums(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A ``:`` N summed after the K loop."""
+    out = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, y.size(1)], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk] * 2.0, y[tk, :], acc=acc)
+        out[tm] = acc.sum(-1)
+    return out
+
+
+@helion.kernel(**S)
+def dot_both_computed(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Both operands computed over a ``:`` K, so both are staged whole."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        out[tm, tn] = hl.dot(x[tm, :] * 2.0, y[:, tn] + 1.0)
+    return out
+
+
+@helion.kernel(**S)
+def dot_beside_side_store(
+    x: torch.Tensor, y: torch.Tensor, w: torch.Tensor, side: torch.Tensor
+) -> torch.Tensor:
+    """Scalar work over another ``:`` dim beside the op: a store of ``w * 2``
+    and a row sum the epilogue reads."""
+    hl.specialize(x.size(1))
+    hl.specialize(w.size(1))
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        side[tm, :] = w[tm, :] * 2.0
+        s = w[tm, :].sum(-1)
+        out[tm, tn] = hl.dot(x[tm, :], y[:, tn], out_dtype=torch.float32) + s[:, None]
+    return out
+
+
+@helion.kernel(**S)
+def dot_after_addmm_tiles(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, d: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A ``torch.addmm`` K loop and an ``hl.dot`` K loop in two root loops."""
+    m, n = a.size(0), b.size(1)
+    o1 = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    o2 = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(a.size(1)):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+        o1[tm, tn] = acc
+    for tm, tn in hl.tile([m, n]):
+        acc2 = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(c.size(1)):
+            acc2 = hl.dot(c[tm, tk] * 2.0, d[tk, tn], acc=acc2)
+        o2[tm, tn] = acc2
+    return o1, o2
+
+
+@helion.kernel(**S)
+def dot_after_addmm_loop(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, d: torch.Tensor
+) -> torch.Tensor:
+    """A ``torch.addmm`` K loop, then an ``hl.dot`` K loop on the same acc."""
+    m, n = a.size(0), b.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(a.size(1)):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+        for tk in hl.tile(c.size(1)):
+            acc = hl.dot(c[tm, tk] * 2.0, d[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_if_seed(x: torch.Tensor, w: torch.Tensor, flag: torch.Tensor) -> torch.Tensor:
+    """A K loop whose seed is an ``if``'s output."""
+    out = torch.empty([x.size(0), w.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), w.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        if flag[0] > 0:
+            acc = acc + 1.0
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk], w[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_f16_acc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float16, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float16)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk] * 2.0, y[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_bf16_out(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.bfloat16, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        out[tm, tn] = hl.dot(x[tm, :], y[:, tn], out_dtype=torch.bfloat16)
+    return out
+
+
+@helion.kernel(**S)
+def dot_f16_acc_f32_out(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A float32 result over a float16 acc."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float16)
+        out[tm, tn] = hl.dot(x[tm, :], y[:, tn], acc=acc, out_dtype=torch.float32)
+    return out
+
+
+@helion.kernel(**S)
+def dot_plain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        out[tm, tn] = hl.dot(x[tm, :], y[:, tn])
+    return out
+
+
+@helion.kernel(**S)
+def dot_mixed_dtypes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk] * 2.0, y[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_of_dot(q: torch.Tensor, kt: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """``exp(q k^T / 8) v``: one dot's result is the next dot's lhs."""
+    d = hl.specialize(q.size(1))
+    out = torch.empty([q.size(0), d], dtype=torch.float32, device=q.device)
+    for tm in hl.tile(q.size(0)):
+        acc = hl.zeros([tm, d], dtype=torch.float32)
+        for tn in hl.tile(kt.size(1)):
+            p = torch.exp(hl.dot(q[tm, :], kt[:, tn]) * 0.125)
+            acc = hl.dot(p.to(v.dtype), v[tn, :], acc=acc)
+        out[tm, :] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_of_outer_dot(
+    x: torch.Tensor, u: torch.Tensor, w: torch.Tensor, steps: torch.Tensor
+) -> torch.Tensor:
+    """``p = x @ u`` before a loop whose dot reads ``p`` each step and
+    decays its acc."""
+    hl.specialize(u.size(1))
+    out = torch.empty([x.size(0), w.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), w.size(1)]):
+        p = hl.dot(x[tm, :], u[:, :])
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for _ in hl.tile(steps.size(0)):
+            acc = hl.dot(p.to(w.dtype), w[:, tn], acc=acc * 0.5)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_of_carried_dot(
+    q: torch.Tensor, qt: torch.Tensor, v: torch.Tensor, x0: torch.Tensor
+) -> torch.Tensor:
+    """Per chunk ``q_c @ s``, then ``s += q_c^T v_c``: the first dot's rhs is
+    a carry whose carried-back value is the second dot's result."""
+    hl.specialize(q.size(1))
+    out = torch.empty([q.size(0), v.size(1)], dtype=torch.float32, device=q.device)
+    for tn in hl.tile(v.size(1)):
+        s = x0[:, tn].to(torch.float32)
+        for tc in hl.tile(q.size(0), block_size=16):
+            out[tc, tn] = hl.dot(q[tc, :], s.to(q.dtype))
+            s = hl.dot(qt[:, tc], v[tc, tn], acc=s)
+    return out
+
+
+@helion.kernel(**S)
+def dot_of_loop_dot(x: torch.Tensor, u: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """``(x @ u) @ w``: a K loop's result is the second dot's lhs."""
+    d = hl.specialize(u.size(1))
+    out = torch.empty([x.size(0), w.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), w.size(1)]):
+        acc = hl.zeros([tm, d], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk], u[tk, :], acc=acc)
+        out[tm, tn] = hl.dot(acc.to(w.dtype), w[:, tn])
+    return out
+
+
+@helion.kernel(**S)
+def dot_no_acc_tiled_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Each K tile's product alone: the last tile's is stored."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1), block_size=16):
+            acc = hl.dot(x[tm, tk], y[tk, tn], out_dtype=torch.float32)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_beside_bf16_dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """An admissible dot beside one with a bfloat16 result."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        a = hl.dot(x[tm, :], y[:, tn], out_dtype=torch.float32)
+        b = hl.dot(x[tm, :], y[:, tn], out_dtype=torch.bfloat16)
+        out[tm, tn] = a + b.to(torch.float32)
+    return out
+
+
+@helion.kernel(**S)
+def dot_scaled_by_arg(x: torch.Tensor, y: torch.Tensor, alpha: float) -> torch.Tensor:
+    """A lhs scaled by a float kernel argument."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk] * alpha, y[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_staged_both(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Both operands computed, so both are staged."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(torch.relu(x[tm, tk]), y[tk, tn] * 0.5, acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_views_seeded(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Device views over a K loop seeded by a fill of 1."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.full([tm, tn], 1.0, dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk], y[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_fixed_m(x: torch.Tensor, y: torch.Tensor, bm: torch.Tensor) -> torch.Tensor:
+    """An M tile fixed to ``bm``'s length, over a staged lhs."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)], block_size=[bm.size(0), None]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk] * 2.0, y[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_fixed_n(x: torch.Tensor, y: torch.Tensor, bn: torch.Tensor) -> torch.Tensor:
+    """An N tile fixed to ``bn``'s length, over a staged lhs."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)], block_size=[None, bn.size(0)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk] * 2.0, y[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_fixed_k(x: torch.Tensor, y: torch.Tensor, bk: torch.Tensor) -> torch.Tensor:
+    """A K tile fixed to ``bk``'s length, over a staged lhs."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1), block_size=bk.size(0)):
+            acc = hl.dot(x[tm, tk] * 2.0, y[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_result_scaled(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """The K loop carries the result scaled, not the result itself."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk] * 2.0, y[tk, tn], acc=acc) * 0.5
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_loaded_acc(x: torch.Tensor, y: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """Each K tile's product added to a loaded acc, then summed."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = acc + hl.dot(x[tm, tk] * 2.0, y[tk, tn], acc=c[tm, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_update_read_twice(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """An update of the carry whose intermediate value another carry reads."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        tot = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            t = acc * 0.5
+            tot = tot + t
+            acc = hl.dot(x[tm, tk] * 2.0, y[tk, tn], acc=t + 1.0)
+        out[tm, tn] = acc + tot
+    return out
+
+
+@helion.kernel(**S)
+def dot_update_by_arg(x: torch.Tensor, y: torch.Tensor, alpha: float) -> torch.Tensor:
+    """An update of the carry by a float kernel argument."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk] * 2.0, y[tk, tn], acc=acc * alpha)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_outer_decay(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """An outer loop that decays the K loop's carry between passes."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for _ in hl.grid(3):
+            for tk in hl.tile(x.size(1)):
+                acc = hl.dot(x[tm, tk] * 2.0, y[tk, tn], acc=acc)
+            acc = acc * 0.5
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_colon_carried(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A ``:`` K op whose acc a loop carries."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for _ in hl.grid(3):
+            acc = hl.dot(x[tm, :] * 2.0, y[:, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_shared_zero(x: torch.Tensor, y: torch.Tensor, y2: torch.Tensor) -> torch.Tensor:
+    """Two dots in one K loop whose accs start from one ``hl.zeros``."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        z = hl.zeros([tm, tn], dtype=torch.float32)
+        a = z
+        b = z
+        for tk in hl.tile(x.size(1)):
+            xs = x[tm, tk] * 2.0
+            a = hl.dot(xs, y[tk, tn], acc=a)
+            b = hl.dot(xs, y2[tk, tn], acc=b)
+        out[tm, tn] = a * torch.sigmoid(b)
+    return out
+
+
+@helion.kernel(**S)
+def dot_update_reads_output(
+    x: torch.Tensor, y: torch.Tensor, o: torch.Tensor
+) -> torch.Tensor:
+    """An update of the carry that reads the tensor the kernel writes."""
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk] * 2.0, y[tk, tn], acc=acc + o[tm, tn])
+        o[tm, tn] = acc
+    return o
+
+
+@helion.kernel(**S)
+def dot_bf16_scale_before_loop(
+    x: torch.Tensor, y: torch.Tensor, sv: torch.Tensor
+) -> torch.Tensor:
+    """A bfloat lhs computed in the K loop from a bfloat scale computed
+    before it."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        sc = (sv[tm] * 2.0).to(torch.bfloat16)
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = hl.dot(x[tm, tk] * sc[:, None], y[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_flattened_root(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A ``:`` K op in a one-block root tile with no device loop inside."""
+    n = hl.specialize(y.size(1))
+    out = torch.empty([x.size(0), n], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(x.size(0)):
+        out[tm, :] = hl.dot(x[tm, :] * 2.0, y[:, :])
+    return out
+
+
+@helion.kernel(**S)
+def dot_colon_decayed(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A ``:`` K op whose acc a loop carries and decays."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for _ in hl.grid(3):
+            acc = hl.dot(x[tm, :] * 2.0, y[:, tn], acc=acc * 0.5)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def lin_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Attention without a softmax: the first dot's scaled, rounded result
+    is the second dot's lhs."""
+    m, n, e = q.size(0), k.size(0), v.size(1)
+    out = torch.empty([m, e], dtype=torch.float32, device=q.device)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm, e], dtype=torch.float32)
+        for tn in hl.tile(n):
+            s = hl.dot(q[tm, :], k[tn, :].T)
+            p = (s * 0.125).to(torch.bfloat16)
+            acc = hl.dot(p, v[tn, :], acc=acc)
+        out[tm, :] = acc
+    return out
+
+
+def lin_attn_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    qd, kd, vd = _cpu64(q, k, v)
+    return ((qd @ kd.T) * 0.125).to(torch.bfloat16).double() @ vd
+
+
+@helion.kernel(**S)
+def lin_attn_two_consumers(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, w: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``lin_attn``'s lhs read by two dots."""
+    m, n, e = q.size(0), k.size(0), v.size(1)
+    out_v = torch.empty([m, e], dtype=torch.float32, device=q.device)
+    out_w = torch.empty([m, e], dtype=torch.float32, device=q.device)
+    for tm in hl.tile(m):
+        acc_v = hl.zeros([tm, e], dtype=torch.float32)
+        acc_w = hl.zeros([tm, e], dtype=torch.float32)
+        for tn in hl.tile(n):
+            p = (hl.dot(q[tm, :], k[tn, :].T) * 0.125).to(torch.bfloat16)
+            acc_v = hl.dot(p, v[tn, :], acc=acc_v)
+            acc_w = hl.dot(p, w[tn, :], acc=acc_w)
+        out_v[tm, :] = acc_v
+        out_w[tm, :] = acc_w
+    return out_v, out_w
+
+
+@helion.kernel(**S)
+def lin_attn_loaded_lhs(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The second dot's lhs lies over the first op's M and N but is computed
+    from a load alone."""
+    m, n, e = q.size(0), k.size(0), v.size(1)
+    out = torch.empty([m, e], dtype=torch.float32, device=q.device)
+    scores = torch.empty([m, n], dtype=torch.float32, device=q.device)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm, e], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores[tm, tn] = hl.dot(q[tm, :], k[tn, :].T)
+            acc = hl.dot((x[tm, tn] * 0.5).to(torch.bfloat16), v[tn, :], acc=acc)
+        out[tm, :] = acc
+    return out, scores
+
+
+@helion.kernel(**S)
+def lin_attn_row_sums(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``lin_attn`` that also stores each chunk's row sums of the lhs, a use
+    of it in the Scalar layout."""
+    m, n, e = q.size(0), k.size(0), v.size(1)
+    out = torch.empty([m, e], dtype=torch.float32, device=q.device)
+    sums = torch.empty([m, n // 16], dtype=torch.float32, device=q.device)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm, e], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=16):
+            p = (hl.dot(q[tm, :], k[tn, :].T) * 0.125).to(torch.bfloat16)
+            sums[tm, tn.id] = p.to(torch.float32).sum(-1)
+            acc = hl.dot(p, v[tn, :], acc=acc)
+        out[tm, :] = acc
+    return out, sums
+
+
+@helion.kernel(**S)
+def lin_attn_normalized(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """``lin_attn`` with its rows normalized after the loop."""
+    m, n, e = q.size(0), k.size(0), v.size(1)
+    out = torch.empty([m, e], dtype=torch.float32, device=q.device)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm, e], dtype=torch.float32)
+        for tn in hl.tile(n):
+            p = (hl.dot(q[tm, :], k[tn, :].T) * 0.125).to(torch.bfloat16)
+            acc = hl.dot(p, v[tn, :], acc=acc)
+        out[tm, :] = acc / acc.sum(-1, keepdim=True)
+    return out
+
+
+@helion.kernel(**S)
+def lin_attn_side_rowmax(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``lin_attn`` that also stores the first dot's result less its row
+    max, a reduction over the first op's lanes beside the second op."""
+    m, n, e = q.size(0), k.size(0), v.size(1)
+    out = torch.empty([m, e], dtype=torch.float32, device=q.device)
+    side = torch.empty([m, n], dtype=torch.float32, device=q.device)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm, e], dtype=torch.float32)
+        for tn in hl.tile(n):
+            s = hl.dot(q[tm, :], k[tn, :].T)
+            side[tm, tn] = s - torch.amax(s, dim=-1, keepdim=True)
+            acc = hl.dot((s * 0.125).to(torch.bfloat16), v[tn, :], acc=acc)
+        out[tm, :] = acc
+    return out, side
+
+
+@helion.kernel(**S)
+def lin_attn_reloaded(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
+    """The second dot's lhs re-reads ``c``, which the kernel writes."""
+    m, n, e = q.size(0), k.size(0), v.size(1)
+    out = torch.empty([m, e], dtype=torch.float32, device=q.device)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm, e], dtype=torch.float32)
+        for tn in hl.tile(n):
+            s = hl.dot(q[tm, :], k[tn, :].T)
+            c[tm, tn] = s
+            acc = hl.dot((s * c[tm, tn]).to(torch.bfloat16), v[tn, :], acc=acc)
+        out[tm, :] = acc
+    return out
+
+
+@helion.kernel(**S)
+def lin_attn_transposed(
+    q: torch.Tensor, k: torch.Tensor, w: torch.Tensor
+) -> torch.Tensor:
+    """The second dot reads the first's result transposed."""
+    m, n, e = q.size(0), k.size(0), w.size(1)
+    out = torch.empty([n, e], dtype=torch.float32, device=q.device)
+    for tn in hl.tile(n):
+        acc = hl.zeros([tn, e], dtype=torch.float32)
+        for tm in hl.tile(m):
+            s = hl.dot(q[tm, :], k[tn, :].T)
+            acc = hl.dot(s.to(torch.bfloat16).T, w[tm, :], acc=acc)
+        out[tn, :] = acc
+    return out
+
+
+@helion.kernel(**S)
+def carry_stored_each_step(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A K loop's carry stored at each step, before the dot updates it."""
+    m, k = x.shape
+    n = y.size(1)
+    snap = torch.empty([k // 16, m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k, block_size=16):
+            snap[tk.id, tm, tn] = acc
+            acc = hl.dot(x[tm, tk], y[tk, tn], acc=acc)
+    return snap
+
+
+@helion.kernel(**S)
+def state_scan(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor
+) -> torch.Tensor:
+    """Per 32-step chunk ``o = q @ bf16(S)``, then ``S = S * exp(g) + k^T v``:
+    a carried state read before its update."""
+    t, d = q.shape
+    e = v.size(1)
+    out = torch.empty([t, e], dtype=torch.float32, device=q.device)
+    for tile_e in hl.tile(e):
+        state = hl.zeros([d, tile_e], dtype=torch.float32)
+        for tt in hl.tile(t, block_size=32):
+            out[tt, tile_e] = hl.dot(q[tt, :], state.to(torch.bfloat16))
+            state = state * torch.exp(g[tt.begin])
+            state = hl.dot(k[tt, :].T, v[tt, tile_e], acc=state)
+    return out
+
+
+@helion.kernel(**S)
+def state_read_late(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor
+) -> torch.Tensor:
+    """``state_scan`` whose first dot reads the state after the update and
+    the second dot write it, through a value cast before them."""
+    t, d = q.shape
+    e = v.size(1)
+    out = torch.empty([t, e], dtype=torch.float32, device=q.device)
+    for tile_e in hl.tile(e):
+        state = hl.zeros([d, tile_e], dtype=torch.float32)
+        for tt in hl.tile(t, block_size=32):
+            old = state.to(torch.bfloat16)
+            state = state * torch.exp(g[tt.begin])
+            state = hl.dot(k[tt, :].T, v[tt, tile_e], acc=state)
+            out[tt, tile_e] = hl.dot(q[tt, :], old)
+    return out
+
+
+@helion.kernel(**S)
+def state_read_after_decay(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor
+) -> torch.Tensor:
+    """``state_scan`` whose first dot casts the state from before the decay
+    after the decay, which updates it in place, though before the second
+    dot."""
+    t, d = q.shape
+    e = v.size(1)
+    out = torch.empty([t, e], dtype=torch.float32, device=q.device)
+    for tile_e in hl.tile(e):
+        state = hl.zeros([d, tile_e], dtype=torch.float32)
+        for tt in hl.tile(t, block_size=32):
+            old = state
+            state = state * torch.exp(g[tt.begin])
+            out[tt, tile_e] = hl.dot(q[tt, :], old.to(torch.bfloat16))
+            state = hl.dot(k[tt, :].T, v[tt, tile_e], acc=state)
+    return out
+
+
+@helion.kernel(**S)
+def carry_delta_scaled(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A K loop's carry scaled before the dot, the scaled value read after
+    it."""
+    m, k = x.shape
+    n = y.size(1)
+    out = torch.empty([k // 16, m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k, block_size=16):
+            twice = acc * 2.0
+            acc = hl.dot(x[tm, tk], y[tk, tn], acc=acc)
+            out[tk.id, tm, tn] = acc - twice
+    return out
+
+
+@helion.kernel(**S)
+def carry_stored_after_its_update(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A K loop's carry stored at each step after the dot updates it, from
+    a copy taken before."""
+    m, k = x.shape
+    n = y.size(1)
+    snap = torch.empty([k // 16, m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.full([tm, tn], 0.5, dtype=torch.float32)
+        for tk in hl.tile(k, block_size=16):
+            old = acc
+            acc = hl.dot(x[tm, tk], y[tk, tn], acc=acc)
+            snap[tk.id, tm, tn] = old
+    return snap
+
+
+@helion.kernel(**S)
+def lin_attn_reloaded_nested(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
+    """The second dot's lhs re-reads ``c``, which the kernel writes, inside
+    a function of it."""
+    m, n, e = q.size(0), k.size(0), v.size(1)
+    out = torch.empty([m, e], dtype=torch.float32, device=q.device)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm, e], dtype=torch.float32)
+        for tn in hl.tile(n):
+            s = hl.dot(q[tm, :], k[tn, :].T)
+            c[tm, tn] = s
+            p = (s * torch.sigmoid(c[tm, tn])).to(torch.bfloat16)
+            acc = hl.dot(p, v[tn, :], acc=acc)
+        out[tm, :] = acc
+    return out
+
+
+@helion.kernel(**S)
+def lin_attn_reloaded_outer(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
+    """The second dot's lhs re-reads ``c``, which the kernel writes outside
+    the loop the dots run in."""
+    m, n, e = q.size(0), k.size(0), v.size(1)
+    out = torch.empty([m, e], dtype=torch.float32, device=q.device)
+    for tm in hl.tile(m):
+        c[tm, :] = c[tm, :] + 1.0
+        acc = hl.zeros([tm, e], dtype=torch.float32)
+        for tn in hl.tile(n):
+            s = hl.dot(q[tm, :], k[tn, :].T)
+            acc = hl.dot((s * c[tm, tn]).to(torch.bfloat16), v[tn, :], acc=acc)
+        out[tm, :] = acc
+    return out
+
+
+@helion.kernel(**S)
+def lin_attn_rhs(x: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """The first dot, over the K loop's block and the output's columns, is
+    the second dot's rhs; the output's rows are none of its blocks."""
+    m, k = x.shape
+    n = b.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            s = hl.dot(a[tk, :], b[:, tn])
+            acc = hl.dot(x[tm, tk], (s * 0.5).to(torch.bfloat16), acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def lin_attn_rhs_nested(
+    x: torch.Tensor, a: torch.Tensor, b: torch.Tensor, tag: torch.Tensor
+) -> torch.Tensor:
+    """``lin_attn_rhs`` with its output tile a device loop inside a grid."""
+    m, k = x.shape
+    n = b.size(1)
+    out = torch.empty([tag.size(0), m, n], dtype=torch.float32, device=x.device)
+    for tb in hl.tile(tag.size(0), block_size=1):
+        for tm, tn in hl.tile([m, n]):
+            acc = hl.zeros([tm, tn], dtype=torch.float32)
+            for tk in hl.tile(k):
+                s = hl.dot(a[tk, :], b[:, tn])
+                acc = hl.dot(x[tm, tk], (s * 0.5).to(torch.bfloat16), acc=acc)
+            out[tb, tm, tn] = acc[None, :, :]
+    return out
+
+
+def lin_attn_rhs_ref(x: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    xd, ad, bd = _cpu64(x, a, b)
+    return xd @ _bf(0.5 * (ad @ bd))
+
+
+@helion.kernel(**S)
+def lin_attn_column_tiles(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """``lin_attn`` with the output's columns tiled, a block of the second
+    dot only."""
+    m, n, e = q.size(0), k.size(0), v.size(1)
+    out = torch.empty([m, e], dtype=torch.float32, device=q.device)
+    for tm, tile_e in hl.tile([m, e]):
+        acc = hl.zeros([tm, tile_e], dtype=torch.float32)
+        for tn in hl.tile(n):
+            s = hl.dot(q[tm, :], k[tn, :].T)
+            acc = hl.dot((s * 0.125).to(torch.bfloat16), v[tn, tile_e], acc=acc)
+        out[tm, tile_e] = acc
+    return out
+
+
+@helion.kernel(**S)
+def lin_attn_sibling_loop(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``lin_attn`` beside a loop over a block that no op runs in."""
+    m, n, e = q.size(0), k.size(0), v.size(1)
+    out = torch.empty([m, e], dtype=torch.float32, device=q.device)
+    twice = torch.empty_like(x)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm, e], dtype=torch.float32)
+        for tn in hl.tile(n):
+            s = hl.dot(q[tm, :], k[tn, :].T)
+            acc = hl.dot((s * 0.125).to(torch.bfloat16), v[tn, :], acc=acc)
+        out[tm, :] = acc
+        for tj in hl.tile(x.size(1)):
+            twice[tm, tj] = x[tm, tj] * 2
+    return out, twice
+
+
+@helion.kernel(**S)
+def dot_side_block(x: torch.Tensor, y: torch.Tensor, tag: torch.Tensor) -> torch.Tensor:
+    """A ``:`` K dot beside a grid block it doesn't use."""
+    m, n = x.size(0), y.size(1)
+    out = torch.empty([tag.size(0), m, n], dtype=torch.float32, device=x.device)
+    for tb, tm, tn in hl.tile([tag.size(0), m, n]):
+        out[tb, tm, tn] = hl.dot(x[tm, :], y[:, tn])[None, :, :]
+    return out
+
+
+def state_scan_ref(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor
+) -> torch.Tensor:
+    qd, kd, vd, gd = _cpu64(q, k, v, g)
+    state = torch.zeros(qd.size(1), vd.size(1), dtype=torch.float64)
+    out = torch.empty(qd.size(0), vd.size(1), dtype=torch.float64)
+    for c in range(0, qd.size(0), 32):
+        rows = slice(c, c + 32)
+        out[rows] = qd[rows] @ state.to(torch.bfloat16).double()
+        state = state * torch.exp(gd[c]) + kd[rows].T @ vd[rows]
+    return out
+
+
+gdn_fwd_h = helion.kernel(helion_gdn_fwd_h.fn, **S)
+
+
+def _gdn_inputs(t: int, dk: int, dv: int) -> tuple[object, ...]:
+    """gdn_fwd_h's bfloat16 inputs for one batch and head, chunks of 64,
+    with ``w`` orthonormal per chunk so the carried state stays bounded."""
+    gen = torch.Generator().manual_seed(0)
+    chunks = -(-t // 64)
+    wu, _, wv = torch.linalg.svd(
+        torch.randn(chunks, 64, dk, generator=gen), full_matrices=False
+    )
+    w = (wu @ wv).reshape(chunks * 64, dk)[:t]
+    k, u = torch.randn(t, dk, generator=gen), torch.randn(t, dv, generator=gen)
+    g = torch.cumsum(math.log(1 / 16) * torch.rand(t, generator=gen), dim=0)
+    rows = [x.reshape(1, t, 1, -1).to(torch.bfloat16).to(DEVICE) for x in (k, w, u)]
+    return (*rows, g.reshape(1, t, 1).to(DEVICE), 64)
+
+
+def _gdn_states(*args: object) -> torch.Tensor:
+    """gdn_fwd_h's float32 state at the start of each chunk, in float64,
+    rounding to bfloat16 where the kernel does; a tail chunk takes its live
+    rows only."""
+    k, w, u, g = (a[0, :, 0].cpu().double() for a in args[:4])
+
+    def rounded(x: torch.Tensor) -> torch.Tensor:
+        return x.to(torch.bfloat16).double()
+
+    state = torch.zeros(k.size(1), u.size(1), dtype=torch.float64)
+    out = []
+    for c in range(0, k.size(0), 64):
+        rows = slice(c, c + 64)
+        out.append(state)
+        gc = g[rows]
+        new_v = (u[rows] - w[rows] @ rounded(state)) * torch.exp(gc[-1] - gc)[:, None]
+        state = state * torch.exp(gc[-1]) + k[rows].T @ rounded(new_v)
+    return torch.stack(out)
+
+
+def gdn_ref(*args: object) -> torch.Tensor:
+    return _gdn_states(*args).to(torch.bfloat16).double()[None, :, None]
+
+
+@helion.kernel(**S)
+def gdn_fwd_h_column_sums(
+    k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor, chunk_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """gdn_fwd_h that also stores the column sums of each chunk's starting
+    state, a use of the carry that needs the Scalar layout."""
+    batch, seqlen, nheads, dhead = k.shape
+    dhead = hl.specialize(dhead)
+    chunk_size = hl.specialize(chunk_size)
+    dstate = u.shape[-1]
+    nchunks = (seqlen + chunk_size - 1) // chunk_size
+    h = torch.empty(
+        batch, nchunks, nheads, dhead, dstate, dtype=k.dtype, device=k.device
+    )
+    sums = torch.empty(
+        batch, nchunks, nheads, dstate, dtype=torch.float32, device=k.device
+    )
+    block_v = hl.register_block_size(dstate)
+    for tile_b, tile_h, tile_v in hl.tile(
+        [batch, nheads, dstate], block_size=[1, 1, block_v]
+    ):
+        i_b = tile_b.id
+        i_h = tile_h.id
+        b_h = hl.zeros([dhead, tile_v], dtype=torch.float32)
+        for t_i in hl.tile(seqlen, block_size=chunk_size):
+            h[i_b, t_i.id, i_h, :, tile_v] = b_h.to(k.dtype)
+            sums[i_b, t_i.id, i_h, tile_v] = b_h.sum(0)
+            b_v = hl.dot(w[i_b, t_i, i_h, :], b_h.to(k.dtype), out_dtype=torch.float32)
+            b_v = u[i_b, t_i, i_h, tile_v].to(torch.float32) - b_v
+            t_i_last = min(t_i.begin + chunk_size, seqlen) - 1
+            b_g_last = g[i_b, t_i_last, i_h].to(torch.float32)
+            b_g = g[i_b, t_i, i_h].to(torch.float32)
+            decay = torch.where(t_i.index < seqlen, torch.exp(b_g_last - b_g), 0)
+            b_v *= decay[:, None]
+            b_h *= torch.exp(b_g_last)
+            b_h = hl.dot(k[i_b, t_i, i_h, :].T, b_v.to(k.dtype), acc=b_h)
+    return h, sums
+
+
+mamba2_chunk_scan = helion.kernel(helion_mamba2_chunk_scan_kernel.fn, **S)
+mamba2_chunk_state = helion.kernel(helion_mamba2_chunk_state_kernel.fn, **S)
+
+
+def _randn(*shape: int, dtype: torch.dtype = torch.float16) -> torch.Tensor:
+    return torch.randn(*shape).to(dtype).to(DEVICE)
+
+
+def _decays(*shape: int) -> torch.Tensor:
+    return torch.cumsum(-torch.rand(*shape), dim=-1).half().to(DEVICE)
+
+
+def _scan_args(
+    b: int, nc: int, chunk: int, h: int, p: int, n: int
+) -> tuple[torch.Tensor, ...]:
+    seq = nc * chunk
+    return (
+        _randn(b, nc, 1, chunk, chunk),
+        _randn(b, seq, h, p),
+        torch.rand(b, h, nc, chunk).half().to(DEVICE),
+        _decays(b, h, nc, chunk),
+        _randn(b, seq, 1, n),
+        _randn(b, nc, h, p, n),
+        _randn(h),
+    )
+
+
+def _state_args(
+    b: int, nc: int, chunk: int, h: int, p: int, n: int
+) -> tuple[torch.Tensor, ...]:
+    seq = nc * chunk
+    return (
+        torch.rand(b, seq, 1, n).half().to(DEVICE),
+        torch.rand(b, seq, h, p).half().to(DEVICE),
+        torch.rand(b, h, nc, chunk).half().to(DEVICE),
+        _decays(b, h, nc, chunk),
+    )
+
+
+def _cpu64(*args: torch.Tensor) -> list[torch.Tensor]:
+    return [a.cpu().double() for a in args]
+
+
+def _ops(msl: str) -> int:
+    return msl.count("matmul2d_descriptor(")
+
+
+def _inputs(args: tuple[object, ...]) -> str:
+    """The tensor arguments' shapes and dtypes, to tell subtests apart."""
+    return ", ".join(
+        f"{list(a.shape)} {a.dtype}" for a in args if isinstance(a, torch.Tensor)
+    )
+
+
+class _WholeKDotCase(_MppCase):
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+
+    def _mpp(
+        self,
+        kernel: helion.Kernel,
+        args: tuple[object, ...],
+        config: helion.Config | None,
+        ref: torch.Tensor,
+        ops: int = 1,
+    ) -> tuple[str, str]:
+        code = msl = ""
+        with self.subTest(kernel=kernel.name, config=config, inputs=_inputs(args)):
+            out, code, msl = _run(kernel, args, config)
+            self.assertIn("_helion_mpp_run(", code)
+            self.assertNotIn("dot_product", code)
+            self.assertEqual(_ops(msl), ops)
+            if isinstance(out, tuple):
+                out = torch.cat([o.reshape(-1) for o in out])
+            _close(out, ref)
+        return code, msl
+
+    def _scalar(
+        self,
+        kernel: helion.Kernel,
+        args: tuple[object, ...],
+        config: helion.Config | None,
+        ref: torch.Tensor,
+    ) -> None:
+        with self.subTest(kernel=kernel.name, config=config, inputs=_inputs(args)):
+            out, code, _ = _run(kernel, args, config)
+            self.assertIn("dot_product", code)
+            self.assertNotIn("_helion_mpp_run(", code)
+            if isinstance(out, tuple):
+                out = torch.cat([o.reshape(-1) for o in out])
+            _close(out, ref)
+
+
+@_requires_mps
+class TestMppWholeKDot(_WholeKDotCase):
+    """An ``hl.dot`` over a whole K (a tile K loop or a ``:`` slice) is
+    planned like ``torch.addmm``, or ``torch.mm`` with no acc, when the
+    planner takes every such ``hl.dot`` of the kernel: none rounds its
+    product to another ``out_dtype``, an operand computed from a matmul's
+    result is staged from that matmul's element loop
+    (``TestMppElementStaging``), each dim whose tile no config changes fits
+    one op, each has an acc unless K is a ``:`` slice, and planning them
+    raises nothing."""
+
+    def test_staged_k_loop(self) -> None:
+        """A transposed, scaled, cast lhs is staged per K tile; M = 24 and
+        K = 72 have tails."""
+        for dtype in (torch.float16, torch.bfloat16):
+            x, w = _randn(72, 24, dtype=dtype), _randn(72, 40, dtype=dtype)
+            s = torch.randn(72, device=DEVICE) * 0.1
+            xd, wd, sd = _cpu64(x, w, s)
+            # The kernel rounds the scaled lhs to the operand dtype.
+            xt = (xd.T * sd.exp()[None, :]).to(dtype).double()
+            for config in (None, helion.Config(block_sizes=[32, 16, 16])):
+                self._mpp(dot_scaled_lhs, (x, w, s), config, xt @ wd)
+
+    def test_colon_k_op_seeds_k_loop(self) -> None:
+        """A ``:`` K op over device views, one transposed, seeds a K-loop op
+        over a staged lhs."""
+        a, b = _randn(40, 32), _randn(56, 32)
+        c, d = _randn(40, 72), _randn(72, 56)
+        ad, bd, cd, dd = _cpu64(a, b, c, d)
+        ref = (ad @ bd.T) * 0.5 + (2 * cd) @ dd
+        for config in (None, helion.Config(block_sizes=[32, 32, 32])):
+            self._mpp(dot_two_stage, (a, b, c, d), config, ref, ops=2)
+
+    def test_colon_dims_within_one_op(self) -> None:
+        """A ``:`` K of 9 rounds up to 16 and one of 256 is the table's
+        largest; a ``:`` M or N of 8 is the table's smallest, and one of 64
+        the most lanes the jam holds."""
+        for k in (9, 256):
+            x, y = _randn(40, k), _randn(k, 24)
+            xd, yd = _cpu64(x, y)
+            self._mpp(dot_colon_k, (x, y), None, (2 * xd) @ yd)
+        for length in (8, 64):
+            x, y = _randn(length, 48), _randn(48, 40)
+            xd, yd = _cpu64(x, y)
+            self._mpp(dot_colon_m, (x, y), None, (2 * xd) @ yd)
+            x, y = _randn(40, 48), _randn(48, length)
+            xd, yd = _cpu64(x, y)
+            self._mpp(dot_colon_n, (x, y), None, xd @ (2 * yd))
+
+    def test_replica_threads_on_a_side_dim(self) -> None:
+        """Threads on a ``:`` slice that none of the group's values has as a
+        dim hold the same element of each: a side store and a row sum."""
+        x, y = _randn(48, 64, dtype=torch.float32), _randn(64, 40, dtype=torch.float32)
+        w = _randn(48, 24, dtype=torch.float32)
+        xd, yd, wd = _cpu64(x, y, w)
+        ref = torch.cat(
+            [(xd @ yd + wd.sum(-1, keepdim=True)).reshape(-1), (2 * wd).reshape(-1)]
+        )
+        for config in (None, helion.Config(block_sizes=[16, 16])):
+            with self.subTest(config=config):
+                side = torch.zeros(48, 24, device=DEVICE)
+                out, code, msl = _run(dot_beside_side_store, (x, y, w, side), config)
+                self.assertIn("_helion_mpp_run(", code)
+                self.assertEqual(_ops(msl), 1)
+                _close(torch.cat([out.reshape(-1), side.reshape(-1)]), ref)
+
+    def test_beside_addmm(self) -> None:
+        """An ``hl.dot`` group beside a ``torch.addmm`` group, in another
+        root loop or on the same acc."""
+        a, b = _randn(48, 64), _randn(64, 40)
+        c, d = _randn(48, 32), _randn(32, 40)
+        ad, bd, cd, dd = _cpu64(a, b, c, d)
+        both = torch.cat([(ad @ bd).reshape(-1), ((2 * cd) @ dd).reshape(-1)])
+        self._mpp(dot_after_addmm_tiles, (a, b, c, d), None, both, ops=2)
+        self._mpp(
+            dot_after_addmm_loop, (a, b, c, d), None, ad @ bd + (2 * cd) @ dd, ops=2
+        )
+
+    def test_if_seed(self) -> None:
+        x, w = _randn(64, 32), _randn(32, 48)
+        xd, wd = _cpu64(x, w)
+        flag = torch.ones(1, device=DEVICE)
+        for config in (None, helion.Config(block_sizes=[32, 32, 16])):
+            self._mpp(dot_if_seed, (x, w, flag), config, xd @ wd + 1)
+
+    def test_staging_budget(self) -> None:
+        """Both float32 operands staged over a ``:`` K of 256 fit threadgroup
+        memory at 16 x 16 tiles, not at the default 32 x 32."""
+        x = _randn(64, 256, dtype=torch.float32)
+        y = _randn(256, 64, dtype=torch.float32)
+        xd, yd = _cpu64(x, y)
+        self._mpp(
+            dot_both_computed,
+            (x, y),
+            helion.Config(block_sizes=[16, 16]),
+            (2 * xd) @ (yd + 1),
+        )
+        self._rejects(
+            dot_both_computed,
+            (x, y),
+            None,
+            "reduction scratch and MPP staging need 65536 bytes of threadgroup memory",
+        )
+
+    def test_float_kernel_argument(self) -> None:
+        """A float kernel argument in a staged operand has no block."""
+        x, y = _randn(40, 72), _randn(72, 48)
+        xd, yd = _cpu64(x, y)
+        for config in (None, helion.Config(block_sizes=[32, 16, 16])):
+            self._mpp(dot_scaled_by_arg, (x, y, 0.5), config, (0.5 * xd) @ yd)
+
+    def test_operand_computed_from_a_matmul(self) -> None:
+        """A dot's result is the next dot's lhs, and a carry whose
+        carried-back value is the next dot's result is a dot's rhs."""
+        q, kt, v = _randn(32, 32) / 4, _randn(32, 48) / 4, _randn(48, 32)
+        qd, ktd, vd = _cpu64(q, kt, v)
+        p = torch.exp(qd @ ktd * 0.125).half().double()
+        self._mpp(dot_of_dot, (q, kt, v), None, p @ vd, ops=2)
+        q, qt, v = _randn(64, 16), _randn(16, 64), _randn(64, 32)
+        x0 = _randn(16, 32, dtype=torch.float32)
+        qd, qtd, vd, s = _cpu64(q, qt, v, x0)
+        chunks = []
+        for c in range(0, 64, 16):
+            chunks.append(qd[c : c + 16] @ s.half().double())
+            s = s + qtd[:, c : c + 16] @ vd[c : c + 16]
+        self._mpp(dot_of_carried_dot, (q, qt, v, x0), None, torch.cat(chunks), ops=2)
+
+    def test_tile_of_one_over_views(self) -> None:
+        """An M or N tile that every config makes 1 widens to 8 over device
+        views."""
+        for x, y in ((_randn(1, 64), _randn(64, 48)), (_randn(40, 64), _randn(64, 1))):
+            xd, yd = _cpu64(x, y)
+            self._mpp(dot_views_seeded, (x, y), None, 1 + xd @ yd)
+
+    def test_fixed_tiles_within_one_op(self) -> None:
+        """Fixed M and N tiles of 8 and 256 and K tiles of 16 and 256, the
+        table's bounds."""
+        x, y = _randn(300, 64), _randn(64, 300)
+        xd, yd = _cpu64(x, y)
+        for size in (8, 256):
+            fixed = torch.empty(size, device=DEVICE)
+            self._mpp(dot_fixed_m, (x, y, fixed), None, (2 * xd) @ yd)
+            self._mpp(dot_fixed_n, (x, y, fixed), None, (2 * xd) @ yd)
+        x, y = _randn(40, 512), _randn(512, 48)
+        xd, yd = _cpu64(x, y)
+        for size in (16, 256):
+            fixed = torch.empty(size, device=DEVICE)
+            self._mpp(dot_fixed_k, (x, y, fixed), None, (2 * xd) @ yd)
+
+    def test_mamba2_chunk_scan(self) -> None:
+        """A ``:`` K op seeding a causal K loop that ends at the M tile's end,
+        at a small shape with tails."""
+        args = _scan_args(2, 3, 64, 3, 24, 32)
+        ref = ref_chunk_scan(*_cpu64(*args))
+        for config in (None, helion.Config(block_sizes=[32, 32, 64])):
+            code, _ = self._mpp(mamba2_chunk_scan, args, config, ref, ops=2)
+            with self.subTest(config=config, owner="preamble"):
+                # Owner tests are thread-only, so they are assigned before
+                # the first loop, outside every lane nest.
+                body = code[code.index("def _helion_") :]
+                preamble = body[: body.index("\n    for ")]
+                self.assertRegex(
+                    preamble, r"_mpp_owner\w* = tid\[0\] == 0 and tid\[2\]"
+                )
+
+    def test_mamba2_chunk_state(self) -> None:
+        """A staged, transposed, decayed lhs, at a small shape with tails."""
+        args = _state_args(2, 3, 48, 3, 24, 40)
+        ref = ref_chunk_state(*_cpu64(*args))
+        for config in (None, helion.Config(block_sizes=[32, 32, 32])):
+            self._mpp(mamba2_chunk_state, args, config, ref)
+
+
+@_requires_mps
+class TestMppWholeKDotRejects(_WholeKDotCase):
+    """Every whole-K ``hl.dot`` of a kernel with one the planner can't take
+    keeps the scalar contraction."""
+
+    def test_result_and_operand_dtypes(self) -> None:
+        x, y = _randn(32, 48), _randn(48, 40)
+        xd, yd = _cpu64(x, y)
+        self._scalar(dot_f16_acc, (x, y), None, (2 * xd) @ yd)
+        xb, yb = (
+            _randn(32, 48, dtype=torch.bfloat16),
+            _randn(48, 48, dtype=torch.bfloat16),
+        )
+        self._scalar(dot_bf16_out, (xb, yb), None, _mm(xb, yb))
+        y32 = _randn(48, 40, dtype=torch.float32)
+        self._scalar(dot_mixed_dtypes, (x, y32), None, (2 * xd) @ y32.cpu().double())
+
+    def test_scalar_rejections_keep_their_messages(self) -> None:
+        """A float16 acc under a float32 result, float8 operands and a dim
+        that is no block, which the scalar contraction rejects with its own
+        message."""
+        x, y = torch.randn(32, 48).half(), torch.randn(48, 40).half()
+        bound = dot_f16_acc_f32_out.bind((x, y))
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "pass an out_dtype equal to the acc's dtype"
+        ):
+            bound.to_code(bound.config_spec.default_config())
+        f8 = torch.float8_e4m3fn
+        bound = dot_plain.bind((x.to(f8), y.to(f8)))
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported,
+            "outside an MPP region; only float16, bfloat16 and float32",
+        ):
+            bound.to_code(bound.config_spec.default_config())
+        bound = dot_constant_rows.bind((torch.randn(16, 24),))
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "hl.dot dimension 8 is not a tile or a `:` slice"
+        ):
+            bound.to_code(bound.config_spec.default_config())
+
+    def test_operand_computed_from_a_matmul(self) -> None:
+        """A matmul's result that reaches an operand other than from that
+        matmul's element loop: from the enclosing graph and through a loop's
+        output."""
+        x, u, w = _randn(32, 16), _randn(16, 32), _randn(32, 16)
+        xd, ud, wd = _cpu64(x, u, w)
+        self._scalar(
+            dot_of_outer_dot,
+            (x, u, w, torch.zeros(4, device=DEVICE)),
+            helion.Config(block_sizes=[16, 16, 4], num_warps=32),
+            1.875 * ((xd @ ud).half().double() @ wd),
+        )
+        x, u, w = _randn(48, 64), _randn(64, 32), _randn(32, 40)
+        xd, ud, wd = _cpu64(x, u, w)
+        # With its output columns on one thread the thread rule doesn't
+        # apply, so only the one-graph rule keeps it scalar.
+        one = helion.Config(
+            block_sizes=[16, 16, 16], num_threads=[0, 1, 0], num_warps=4
+        )
+        for config in (None, one):
+            ref = (xd @ ud).half().double() @ wd
+            self._scalar(dot_of_loop_dot, (x, u, w), config, ref)
+
+    def test_colon_dims_past_one_op(self) -> None:
+        """A ``:`` K of 8 is under the table's 16 and one of 257 over its
+        256; a ``:`` M or N of 4 is under the table's 8, and one of 65 past
+        the 64 lanes the jam holds, even where a row sum contracts it."""
+        for k in (8, 257):
+            x, y = _randn(40, k), _randn(k, 24)
+            xd, yd = _cpu64(x, y)
+            self._scalar(dot_colon_k, (x, y), None, (2 * xd) @ yd)
+        for length in (4, 65):
+            x, y = _randn(length, 48), _randn(48, 40)
+            xd, yd = _cpu64(x, y)
+            self._scalar(dot_colon_m, (x, y), None, (2 * xd) @ yd)
+            x, y = _randn(40, 48), _randn(48, length)
+            xd, yd = _cpu64(x, y)
+            self._scalar(dot_colon_n, (x, y), None, xd @ (2 * yd))
+        x, y = _randn(48, 64), _randn(64, 128)
+        xd, yd = _cpu64(x, y)
+        self._scalar(dot_colon_n_row_sums, (x, y), None, ((2 * xd) @ yd).sum(-1))
+
+    def test_no_acc_over_a_tiled_k(self) -> None:
+        x, y = _randn(32, 64, dtype=torch.float32), _randn(64, 48, dtype=torch.float32)
+        xd, yd = _cpu64(x, y)
+        self._scalar(dot_no_acc_tiled_k, (x, y), None, xd[:, 48:] @ yd[48:])
+
+    def test_one_inadmissible_dot_keeps_every_dot(self) -> None:
+        x, y = (
+            _randn(32, 48, dtype=torch.bfloat16),
+            _randn(48, 48, dtype=torch.bfloat16),
+        )
+        mm = _mm(x, y)
+        self._scalar(dot_beside_bf16_dot, (x, y), None, mm + mm.bfloat16().double())
+
+    def test_planner_rejections(self) -> None:
+        """A kernel the planner rejects with its whole-K dots, one per kind
+        of rejection: the K loop's carry, the carry's update, an enclosing
+        loop, two groups on one value, memory order and bfloat staging."""
+        x, y, y2 = _randn(40, 64), _randn(64, 48), _randn(64, 48)
+        c = _randn(40, 48, dtype=torch.float32)
+        xd, yd, y2d, cd = _cpu64(x, y, y2, c)
+        tiles = [((2 * xd[:, k : k + 16]) @ yd[k : k + 16]) for k in range(0, 64, 16)]
+        k16 = helion.Config(block_sizes=[16, 16, 16])
+        scaled = torch.zeros(40, 48, dtype=torch.float64)
+        update = torch.zeros(40, 48, dtype=torch.float64)
+        tot = torch.zeros(40, 48, dtype=torch.float64)
+        for p in tiles:
+            scaled = (scaled + p) * 0.5
+            tot = tot + update * 0.5
+            update = update * 0.5 + 1 + p
+        self._scalar(dot_result_scaled, (x, y), k16, scaled)
+        self._scalar(dot_loaded_acc, (x, y, c), k16, 4 * cd + 2 * xd @ yd)
+        self._scalar(dot_update_read_twice, (x, y), k16, update + tot)
+        self._scalar(dot_update_by_arg, (x, y, 1.0), k16, 2 * xd @ yd)
+        self._scalar(dot_outer_decay, (x, y), None, 0.875 * 2 * xd @ yd)
+        self._scalar(dot_colon_carried, (x, y), None, 6 * xd @ yd)
+        self._scalar(
+            dot_shared_zero,
+            (x, y, y2),
+            None,
+            (2 * xd @ yd) * torch.sigmoid(2 * xd @ y2d),
+        )
+        o = torch.zeros(40, 48, device=DEVICE)
+        self._scalar(dot_update_reads_output, (x, y, o), None, 2 * xd @ yd)
+        xb, yb = (
+            _randn(40, 64, dtype=torch.bfloat16),
+            _randn(64, 48, dtype=torch.bfloat16),
+        )
+        sv = _randn(40, dtype=torch.float32)
+        sc = (sv.cpu() * 2).to(torch.bfloat16)
+        lhs = (xb.cpu() * sc[:, None]).double()
+        self._scalar(
+            dot_bf16_scale_before_loop, (xb, yb, sv), None, lhs @ _cpu64(yb)[0]
+        )
+
+    def test_staged_operand_over_a_tile_of_one(self) -> None:
+        """An operand staged over an M or N tile that every config makes 1,
+        over a K loop and over a ``:`` K."""
+        for x, y in ((_randn(1, 64), _randn(64, 48)), (_randn(40, 64), _randn(64, 1))):
+            xd, yd = _cpu64(x, y)
+            self._scalar(dot_staged_both, (x, y), None, xd.relu() @ (0.5 * yd))
+        x, y = _randn(1, 64), _randn(64, 48)
+        xd, yd = _cpu64(x, y)
+        self._scalar(dot_colon_k, (x, y), None, (2 * xd) @ yd)
+
+    def test_fixed_tiles_past_one_op(self) -> None:
+        """Fixed M and N tiles of 4 and 512, and K tiles of 8 and 512, one
+        step past the table's bounds, and a K tile of 1, which no op widens."""
+        x, y = _randn(600, 64), _randn(64, 600)
+        xd, yd = _cpu64(x, y)
+        for size in (4, 512):
+            fixed = torch.empty(size, device=DEVICE)
+            self._scalar(dot_fixed_m, (x, y, fixed), None, (2 * xd) @ yd)
+            self._scalar(dot_fixed_n, (x, y, fixed), None, (2 * xd) @ yd)
+        x, y = _randn(40, 1024), _randn(1024, 48)
+        xd, yd = _cpu64(x, y)
+        for size in (1, 8, 512):
+            fixed = torch.empty(size, device=DEVICE)
+            self._scalar(dot_fixed_k, (x, y, fixed), None, (2 * xd) @ yd)
+
+    def test_rejected_where_the_scalar_contraction_compiled(self) -> None:
+        """Forms the planner takes that codegen then rejects at configs the
+        scalar contraction compiled: a one-block root tile with no device
+        loop inside, and Scalar work beside a ``:`` K op that a lane jam
+        would copy more than 64 times."""
+        x, y = _randn(40, 72), _randn(72, 32)
+        self._rejects(
+            dot_flattened_root,
+            (x, y),
+            helion.Config(block_sizes=[64], num_threads=[1]),
+            "is a single root hl.tile with no device loop inside",
+        )
+        x, y = _randn(40, 72), _randn(72, 48)
+        self._rejects(
+            dot_colon_decayed,
+            (x, y),
+            None,
+            "a lane loop around an MPP op would run 160 copies",
+        )
+
+
+def _element_loops_with(msl: str, pattern: str) -> list[int]:
+    """Where each element loop over a cooperative tensor whose body matches
+    ``pattern`` starts in ``msl``."""
+    starts = []
+    head = r"for \(auto _it = (\w+)\.begin\(\); _it != \1\.end\(\); _it\+\+\) \{"
+    for loop in re.finditer(head, msl):
+        depth, end = 1, loop.end()
+        while depth:
+            depth += {"{": 1, "}": -1}.get(msl[end], 0)
+            end += 1
+        if re.search(pattern, msl[loop.end() : end]):
+            starts.append(loop.start())
+    return starts
+
+
+_TILE_WRITE = r"\{ _mpp_tile\w* *\["
+
+
+@_requires_mps
+class TestMppElementStaging(_WholeKDotCase):
+    """An operand that is an element-wise function of another op's
+    cooperative value, over that op's M and N, is written into its tile from
+    that op's element loop: each thread writes the elements MPP gives it,
+    with no owner test and no materialization.  The K loop's carry is
+    cooperative for the uses that run before the op writes it."""
+
+    def _staged_from_elements(self, msl: str) -> None:
+        loops = _element_loops_with(msl, _TILE_WRITE)
+        self.assertTrue(loops)
+        self.assertFalse(_element_loops_with(msl, r"_mpp_owner|tid\[\d\] == 0"))
+
+    def test_operand_staged_from_another_ops_elements(self) -> None:
+        """``lin_attn``'s lhs, with tails in M and in the K loop, and at a
+        persistent launch whose threads cover each tile exactly, where the
+        staging write needs no in-tile check."""
+        persistent = helion.Config(
+            block_sizes=[16, 16],
+            num_threads=[0, 128],
+            num_warps=2,
+            pid_type="persistent_interleaved",
+            num_sm_multiplier=128,
+        )
+        for m, n, config in ((48, 80, None), (37, 53, None), (48, 80, persistent)):
+            args = (_randn(m, 64, dtype=torch.bfloat16) * 0.3,)
+            args += (_randn(n, 64, dtype=torch.bfloat16) * 0.3,)
+            args += (_randn(n, 32, dtype=torch.bfloat16),)
+            with self.subTest(m=m, n=n, config=config):
+                ref = lin_attn_ref(*args)
+                code, msl = self._mpp(lin_attn, args, config, ref, ops=2)
+                self.assertNotIn("_helion_mpp_materialize", code)
+                self._staged_from_elements(msl)
+
+    def test_one_value_staged_into_two_ops(self) -> None:
+        """Both dots that read ``lin_attn``'s lhs stage it from the first
+        op's element loop."""
+        q = _randn(48, 64, dtype=torch.bfloat16) * 0.3
+        k = _randn(80, 64, dtype=torch.bfloat16) * 0.3
+        v, w = (
+            _randn(80, 32, dtype=torch.bfloat16),
+            _randn(80, 32, dtype=torch.bfloat16),
+        )
+        ref = torch.cat(
+            [lin_attn_ref(q, k, v).reshape(-1), lin_attn_ref(q, k, w).reshape(-1)]
+        )
+        code, msl = self._mpp(lin_attn_two_consumers, (q, k, v, w), None, ref, ops=3)
+        self.assertNotIn("_helion_mpp_materialize", code)
+        self.assertEqual(len(_element_loops_with(msl, _TILE_WRITE)), 2)
+        self._staged_from_elements(msl)
+
+    def test_carried_state_read_before_its_update(self) -> None:
+        """gdn_fwd_h: the state is a cooperative carry of a 256-row op on
+        four SIMD groups; it is stored, and staged as the first dot's rhs in
+        bfloat16, before the update and the ops change it, and the first
+        dot's computed result is staged as the second dot's rhs."""
+        args = _gdn_inputs(256, 256, 32)
+        code, msl = self._mpp(gdn_fwd_h, args, None, gdn_ref(*args), ops=2)
+        self.assertEqual(_launch(code), (32, 4, 1))
+        self.assertIn("matmul2d_descriptor(256, 32, 64,", msl)
+        self.assertIn("threadgroup bfloat _mpp_tile", msl)
+        self.assertNotIn("_helion_mpp_materialize", code)
+        first_run = msl.index("_mpp_op_0.run(")
+        (store,) = _element_loops_with(msl, r"\bh\[")
+        self.assertLess(store, first_run)
+        self.assertLess(_element_loops_with(msl, _TILE_WRITE)[0], first_run)
+        self._staged_from_elements(msl)
+
+    def test_carried_state_with_tails(self) -> None:
+        """gdn_fwd_h with a last chunk of 8 steps, with a V tail, and with
+        both at a 64-wide V tile, where both ops' N is cut to the 40 live
+        columns."""
+        v_tile = helion.Config(block_sizes=[64], num_warps=4)
+        for t, dk, dv, config in (
+            (200, 256, 32, None),
+            (256, 256, 40, None),
+            (200, 64, 40, v_tile),
+        ):
+            args = _gdn_inputs(t, dk, dv)
+            self._mpp(gdn_fwd_h, args, config, gdn_ref(*args), ops=2)
+
+    def test_carry_stored_before_its_update(self) -> None:
+        """A K loop's carry stored at each step from its element loop, not
+        from a snapshot."""
+        x, y = _randn(48, 64), _randn(64, 40)
+        xd, yd = _cpu64(x, y)
+        ref = torch.stack([xd[:, :c] @ yd[:c] for c in range(0, 64, 16)])
+        code, msl = self._mpp(carry_stored_each_step, (x, y), None, ref)
+        self.assertNotIn("_helion_mpp_materialize", code)
+        self.assertTrue(_element_loops_with(msl, r"\bsnap\["))
+
+    def test_threads_only_on_the_ops_blocks(self) -> None:
+        """At configs whose threads around each op lie on its own blocks:
+        ``lin_attn_rhs`` with its output rows on one thread,
+        ``lin_attn_column_tiles`` at its default, and threads on a block that
+        only a sibling loop runs over."""
+        x = _randn(40, 72, dtype=torch.bfloat16)
+        a = _randn(72, 32, dtype=torch.bfloat16)
+        b = _randn(32, 56, dtype=torch.bfloat16)
+        config = helion.Config(
+            block_sizes=[16, 16, 16], num_threads=[1, 8, 0], num_warps=4, pid_type="xyz"
+        )
+        self._mpp(lin_attn_rhs, (x, a, b), config, lin_attn_rhs_ref(x, a, b), ops=2)
+        q = _randn(48, 64, dtype=torch.bfloat16) * 0.3
+        k = _randn(80, 64, dtype=torch.bfloat16) * 0.3
+        v = _randn(80, 72, dtype=torch.bfloat16)
+        ref = lin_attn_ref(q, k, v)
+        self._mpp(lin_attn_column_tiles, (q, k, v), None, ref, ops=2)
+        v, w = _randn(80, 32, dtype=torch.bfloat16), _randn(48, 40, dtype=torch.float32)
+        ref = torch.cat(
+            [lin_attn_ref(q, k, v).reshape(-1), _cpu64(2 * w)[0].reshape(-1)]
+        )
+        config = helion.Config(
+            block_sizes=[16, 16, 16], num_threads=[1, 1, 8], num_warps=4
+        )
+        self._mpp(lin_attn_sibling_loop, (q, k, v, w), config, ref, ops=2)
+
+    def test_state_scan(self) -> None:
+        """A carried state read before its update as a dot's rhs, beside a
+        device-view rhs, with tails in T and in the state's columns."""
+        for t, e in ((96, 64), (83, 40)):
+            args = (
+                _randn(t, 64, dtype=torch.bfloat16) * 0.3,
+                _randn(t, 64, dtype=torch.bfloat16) * 0.3,
+                _randn(t, e, dtype=torch.bfloat16),
+                -torch.rand(t, device=DEVICE) * 0.1,
+            )
+            with self.subTest(t=t, e=e):
+                ref = state_scan_ref(*args)
+                code, msl = self._mpp(state_scan, args, None, ref, ops=2)
+                self.assertNotIn("_helion_mpp_materialize", code)
+                self._staged_from_elements(msl)
+
+
+@_requires_mps
+class TestMppElementStagingRejects(_WholeKDotCase):
+    """Operands computed from a matmul's result that are not staged from
+    its element loop keep the scalar contraction, or a rejection."""
+
+    def test_state_read_after_its_update(self) -> None:
+        """The carry is cast before the update, but the dot that reads the
+        cast runs after the update and the op write the carry."""
+        args = (
+            _randn(96, 64, dtype=torch.bfloat16) * 0.3,
+            _randn(96, 64, dtype=torch.bfloat16) * 0.3,
+            _randn(96, 64, dtype=torch.bfloat16),
+            -torch.rand(96, device=DEVICE) * 0.1,
+        )
+        q, k, v, g = _cpu64(*args)
+        state = torch.zeros(64, 64, dtype=torch.float64)
+        ref = torch.empty(96, 64, dtype=torch.float64)
+        for c in range(0, 96, 32):
+            rows = slice(c, c + 32)
+            ref[rows] = q[rows] @ state.to(torch.bfloat16).double()
+            state = state * torch.exp(g[c]) + k[rows].T @ v[rows]
+        self._scalar(state_read_late, args, None, ref)
+        self._scalar(state_read_after_decay, args, None, ref)
+
+    def test_scaled_carry_read_after_its_update(self) -> None:
+        """The carry scaled before the dot and read after the dot updates
+        the carry reads a snapshot taken before the update."""
+        x, y = _randn(48, 64), _randn(64, 40)
+        xd, yd = _cpu64(x, y)
+        ref = torch.stack(
+            [
+                xd[:, c : c + 16] @ yd[c : c + 16] - xd[:, :c] @ yd[:c]
+                for c in range(0, 64, 16)
+            ]
+        )
+        out, code, msl = _run(carry_delta_scaled, (x, y), None)
+        self.assertIn("_helion_mpp_materialize", code)
+        self.assertEqual(_ops(msl), 1)
+        _close(out, ref)
+
+    def test_transposed_result(self) -> None:
+        """The second dot reads the first's result transposed."""
+        q = _randn(64, 64, dtype=torch.bfloat16) * 0.3
+        k = _randn(48, 64, dtype=torch.bfloat16) * 0.3
+        w = _randn(64, 32, dtype=torch.bfloat16)
+        qd, kd, wd = _cpu64(q, k, w)
+        ref = (qd @ kd.T).to(torch.bfloat16).double().T @ wd
+        config = helion.Config(block_sizes=[32, 32], num_warps=32)
+        self._scalar(lin_attn_transposed, (q, k, w), config, ref)
+
+    def test_chain_rereads_a_written_tensor(self) -> None:
+        """The second dot's lhs re-reads a tensor the kernel writes, in the
+        dots' loop or outside it, which an element loop would read on another
+        thread than the writer."""
+        q = _randn(48, 64, dtype=torch.bfloat16) * 0.3
+        k = _randn(80, 64, dtype=torch.bfloat16) * 0.3
+        v = _randn(80, 32, dtype=torch.bfloat16)
+        c = torch.zeros(48, 80, device=DEVICE)
+        for kernel in (lin_attn_reloaded, lin_attn_reloaded_nested):
+            self._rejects(
+                kernel,
+                (q, k, v, c),
+                None,
+                "reduction over persistent dim 2 in a lane loop beside other "
+                "reduction dims",
+            )
+        # The tensor may be written in any graph, the root one included.
+        q = _randn(37, 64, dtype=torch.bfloat16) * 0.3
+        k = _randn(53, 64, dtype=torch.bfloat16) * 0.3
+        v = _randn(53, 40, dtype=torch.bfloat16)
+        self._rejects(
+            lin_attn_reloaded_outer,
+            (q, k, v, torch.rand(37, 53, device=DEVICE) + 0.5),
+            helion.Config(block_sizes=[16, 16], num_threads=[16, 16], num_warps=4),
+            "in a lane loop beside other reduction dims",
+        )
+
+    def test_carry_stored_after_its_update(self) -> None:
+        """A copy of the carry stored after the dot updates the carry reads
+        a snapshot taken before the update."""
+        x, y = _randn(40, 80), _randn(80, 48)
+        xd, yd = _cpu64(x, y)
+        ref = torch.stack([0.5 + xd[:, :c] @ yd[:c] for c in range(0, 80, 16)])
+        out, code, msl = _run(carry_stored_after_its_update, (x, y), None)
+        self.assertIn("_helion_mpp_materialize", code)
+        self.assertEqual(_ops(msl), 1)
+        _close(out, ref)
+
+    def test_threads_on_a_block_outside_the_ops(self) -> None:
+        """Where a block that is none of an op's own holds threads around
+        the op, a kernel staging one op's result into another keeps the
+        scalar contraction: ``lin_attn_rhs``'s output rows at its default, a
+        column tile beside ``lin_attn``, and an output tile that a device
+        loop holds.  With no operand computed from a matmul, the op stays on
+        MPP, which rejects it."""
+        x = _randn(40, 72, dtype=torch.bfloat16)
+        a = _randn(72, 32, dtype=torch.bfloat16)
+        b = _randn(32, 56, dtype=torch.bfloat16)
+        ref = lin_attn_rhs_ref(x, a, b)
+        self._scalar(lin_attn_rhs, (x, a, b), None, ref)
+        tag = torch.zeros(2, device=DEVICE)
+        config = helion.Config(
+            block_sizes=[16, 16, 16], num_threads=[16, 0, 64], num_warps=4
+        )
+        self._scalar(lin_attn_rhs_nested, (x, a, b, tag), config, ref.expand(2, -1, -1))
+        q = _randn(48, 64, dtype=torch.bfloat16) * 0.3
+        k = _randn(80, 64, dtype=torch.bfloat16) * 0.3
+        v = _randn(80, 72, dtype=torch.bfloat16)
+        config = helion.Config(
+            block_sizes=[16, 16, 16],
+            num_threads=[8, 4, 0],
+            num_warps=16,
+            pid_type="xyz",
+        )
+        self._scalar(lin_attn_column_tiles, (q, k, v), config, lin_attn_ref(q, k, v))
+        self._rejects(
+            dot_side_block,
+            (_randn(48, 64), _randn(64, 40), torch.zeros(4, device=DEVICE)),
+            None,
+            "block 0 is spread over threads around a cooperative MPP matmul",
+        )
+
+    def test_operand_not_computed_from_the_other_op(self) -> None:
+        """An operand over the first op's M and N that a load alone computes
+        is no element-wise function of the first op's value."""
+        chains: list[object] = []
+        real = mpp_matmul._element_chain
+
+        def spy(*args: object) -> object:
+            chains.append(chain := real(*args))
+            return chain
+
+        q = _randn(48, 64, dtype=torch.bfloat16) * 0.3
+        k = _randn(80, 64, dtype=torch.bfloat16) * 0.3
+        v, x = _randn(80, 32, dtype=torch.bfloat16), _randn(48, 80, dtype=torch.float32)
+        bound = lin_attn_loaded_lhs.bind((q, k, v, x))
+        with patch.object(mpp_matmul, "_element_chain", spy):
+            code = bound.to_code(bound.config_spec.default_config())
+        self.assertIn("_helion_mpp_run(", code)
+        self.assertTrue(chains)
+        self.assertEqual([c for c in chains if c is not None], [])
+
+    def test_value_with_a_scalar_use(self) -> None:
+        """The second dot's lhs also feeds a row sum, so it is computed in
+        the Scalar layout and the kernel keeps the scalar contraction."""
+        q = _randn(48, 64, dtype=torch.bfloat16) * 0.3
+        k = _randn(80, 64, dtype=torch.bfloat16) * 0.3
+        v = _randn(80, 32, dtype=torch.bfloat16)
+        qd, kd, vd = _cpu64(q, k, v)
+        p = ((qd @ kd.T) * 0.125).to(torch.bfloat16).double()
+        ref = torch.cat(
+            [(p @ vd).reshape(-1), p.reshape(48, 5, 16).sum(-1).reshape(-1)]
+        )
+        config = helion.Config(block_sizes=[32], num_warps=32)
+        self._scalar(lin_attn_row_sums, (q, k, v), config, ref)
+
+    def test_source_op_cut_below_the_consumer(self) -> None:
+        """The first op's 72-row K loop takes one 64-row tile of a 128-row
+        block, so its element loop writes fewer rows of the operand tile
+        than the second op reads."""
+        args = (
+            _randn(24, 64, dtype=torch.bfloat16) * 0.3,
+            _randn(72, 64, dtype=torch.bfloat16) * 0.3,
+            _randn(72, 48, dtype=torch.bfloat16),
+        )
+        self._rejects(
+            lin_attn_normalized,
+            args,
+            helion.Config(block_sizes=[32, 32], num_warps=4),
+            "an MPP operand staged from another op's elements over a tile that "
+            "op cuts to its loop's extent",
+        )
+
+    def test_materialized_carry_beside_a_cut_source(self) -> None:
+        """A Scalar use of gdn_fwd_h's carry makes the second op materialize
+        it, so that op's N keeps the whole 64-wide V tile while the first
+        op's N is cut to the 40 live columns: the staged rhs would miss
+        columns the second op reads.  At the default 32-wide tile neither op
+        is cut."""
+        args = _gdn_inputs(200, 64, 40)
+        self._rejects(
+            gdn_fwd_h_column_sums,
+            args,
+            helion.Config(block_sizes=[64], num_warps=4),
+            "an MPP operand staged from another op's elements over a tile that "
+            "op cuts to its loop's extent",
+        )
+        states = _gdn_states(*args)
+        ref = torch.cat(
+            [
+                states.to(torch.bfloat16).double().reshape(-1),
+                states.sum(1).reshape(-1),
+            ]
+        )
+        code, _ = self._mpp(gdn_fwd_h_column_sums, args, None, ref, ops=2)
+        self.assertIn("_helion_mpp_materialize", code)
+
+    def test_fold_over_another_lane_in_a_jam(self) -> None:
+        """A row max of the first dot's result folds the lanes of its N
+        beside the second op, inside the lane loop the second op is jammed
+        across."""
+        args = (
+            _randn(24, 64, dtype=torch.bfloat16) * 0.3,
+            _randn(72, 64, dtype=torch.bfloat16) * 0.3,
+            _randn(72, 48, dtype=torch.bfloat16),
+        )
+        self._rejects(
+            lin_attn_side_rowmax,
+            args,
+            helion.Config(block_sizes=[32, 32], num_warps=4),
+            "a lane loop around an MPP op holds a reduction over another lane loop",
+        )
+
+    def test_batched_chain(self) -> None:
+        """A batched op's result reaches the next op through a
+        materialization."""
+        h = torch.float16
+        x, y, z = _randn(3, 48, 32), _randn(3, 32, 64), _randn(3, 64, 32)
+        xd, yd, zd = _cpu64(x, y, z)
+        out, code, msl = _run(bmm_chain, (x, y, z), None)
+        self.assertIn("_helion_mpp_materialize", code)
+        self.assertEqual(_ops(msl), 2)
+        _close(out, (xd @ yd).to(h).double() @ zd)
+
+    def test_wide_tile_needs_four_simdgroups(self) -> None:
+        """gdn_fwd_h's 256-row op on one or two SIMD groups."""
+        args = _gdn_inputs(256, 256, 32)
+        for warps in (1, 2):
+            self._rejects(
+                gdn_fwd_h,
+                args,
+                helion.Config(block_sizes=[32], num_warps=warps),
+                f"an MPP matmul tile 256x32 on {warps} SIMD groups; over 128 rows "
+                "or columns it needs 4",
+            )
+
+
+@helion.kernel(**S)
+def addmm_reduced_seed(
+    x: torch.Tensor, y: torch.Tensor, w3: torch.Tensor
+) -> torch.Tensor:
+    """A seed reduced over a ``:`` dim."""
+    hl.specialize(w3.size(2))
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = w3[tm, tn, :].sum(-1)
+        for tk in hl.tile(x.size(1)):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def addmm_reduced_update(
+    x: torch.Tensor, y: torch.Tensor, w3: torch.Tensor
+) -> torch.Tensor:
+    """A carry update by a factor reduced over a ``:`` dim."""
+    hl.specialize(w3.size(2))
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1), block_size=16):
+            acc = acc * w3[tm, tn, :].sum(-1)
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def addmm_reduced_epilogue(
+    x: torch.Tensor, y: torch.Tensor, w3: torch.Tensor
+) -> torch.Tensor:
+    """A stored epilogue that reads a value reduced over a ``:`` dim."""
+    hl.specialize(w3.size(2))
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tm, tn] = acc * w3[tm, tn, :].sum(-1)
+    return out
+
+
+@helion.kernel(**S)
+def addmm_side_dim_epilogue(
+    x: torch.Tensor, y: torch.Tensor, w: torch.Tensor
+) -> torch.Tensor:
+    """An epilogue over the ``:`` dim a row sum spreads over threads, which
+    reads the result through its materialization."""
+    j = hl.specialize(w.size(1))
+    out = torch.empty([x.size(0), y.size(1), j], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        s = w[tm, :].sum(-1)
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x.size(1)):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tm, tn, :] = (acc + s[:, None])[:, :, None] * w[tm, :][:, None, :]
+    return out
+
+
+@helion.kernel(**S)
+def addmm_reduced_operand(x3: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A staged operand reduced over a ``:`` dim."""
+    hl.specialize(x3.size(2))
+    out = torch.empty([x3.size(0), y.size(1)], dtype=torch.float32, device=y.device)
+    for tm, tn in hl.tile([x3.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(x3.size(1)):
+            acc = torch.addmm(acc, x3[tm, tk, :].sum(-1), y[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_constant_rows(y: torch.Tensor) -> torch.Tensor:
+    """An ``hl.dot`` whose M is no block."""
+    out = torch.empty([5, y.size(1)], dtype=torch.float32, device=y.device)
+    for tn in hl.tile(y.size(1)):
+        s = hl.full([5, y.size(0)], 1.0, dtype=torch.float32)
+        out[:, tn] = hl.dot(s, y[:, tn])
+    return out
+
+
+_REPLICA_CONFIGS = (None, helion.Config(block_sizes=[16, 16, 16], num_warps=8))
+
+
+@_requires_mps
+class TestMppReplicaThreads(_MppCase):
+    """A ``:`` slice may hold threads around a cooperative op when none of
+    the group's values, nor a value staged into an operand, has it as a dim:
+    threads that differ only on it hold the same element of each."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+
+    def _replicas(
+        self,
+        kernel: helion.Kernel,
+        args: tuple[torch.Tensor, ...],
+        ref: torch.Tensor,
+        configs: tuple[helion.Config | None, ...] = _REPLICA_CONFIGS,
+    ) -> None:
+        for config in configs:
+            with self.subTest(kernel=kernel.name, config=config):
+                out, code, _ = _run(kernel, args, config)
+                self.assertIn("_helion_mpp_run(", code)
+                _close(out, ref)
+
+    def test_reduced_seed_update_and_epilogue(self) -> None:
+        x = torch.randn(32, 64, device=DEVICE)
+        y = torch.randn(64, 48, device=DEVICE)
+        w3 = torch.rand(32, 48, 24, device=DEVICE) / 12
+        xd, yd, w3d = (t.cpu().double() for t in (x, y, w3))
+        s = w3d.sum(-1)
+        self._replicas(addmm_reduced_seed, (x, y, w3), s + xd @ yd)
+        self._replicas(addmm_reduced_epilogue, (x, y, w3), (xd @ yd) * s)
+        acc = torch.zeros(32, 48, dtype=torch.float64)
+        for k in range(0, 64, 16):
+            acc = acc * s + xd[:, k : k + 16] @ yd[k : k + 16]
+        self._replicas(
+            addmm_reduced_update,
+            (x, y, w3),
+            acc,
+            (
+                helion.Config(block_sizes=[16, 16], num_warps=8),
+                helion.Config(block_sizes=[32, 32], num_warps=32),
+            ),
+        )
+
+    def test_epilogue_over_the_side_dim(self) -> None:
+        x = torch.randn(32, 64, device=DEVICE)
+        y = torch.randn(64, 48, device=DEVICE)
+        w = torch.randn(32, 24, device=DEVICE)
+        xd, yd, wd = (t.cpu().double() for t in (x, y, w))
+        acc = xd @ yd + wd.sum(-1, keepdim=True)
+        self._replicas(
+            addmm_side_dim_epilogue, (x, y, w), acc[:, :, None] * wd[:, None, :]
+        )
+
+
+@_requires_mps
+class TestMppReplicaThreadsRejects(_MppCase):
+    def test_reduced_operand(self) -> None:
+        """A staged operand reduced over a ``:`` dim on threads keeps that dim
+        among the group's."""
+        x3 = torch.randn(32, 64, 24, device=DEVICE)
+        y = torch.randn(64, 48, device=DEVICE)
+        self._rejects_at(
+            addmm_reduced_operand,
+            (x3, y),
+            _REPLICA_CONFIGS,
+            "is spread over threads around a cooperative MPP matmul",
+        )
 
 
 # --- Threadgroup budget: num_warps sizes the launch -----------------------
@@ -13891,7 +15918,7 @@ class TestMppUniformLaunch(_MppCase):
                     self._launches(code, launch)
                     self.assertNotRegex(msl, r"\bmask_\d+")
                     self.assertNotIn("? B[", msl)
-                    self.assertRegex(msl, r"if \(_mpp_owner_\d+\) \{ _mpp_tile\[")
+                    self.assertRegex(msl, r"if \(_mpp_owner\w*\) \{ _mpp_tile\[")
                     if launch == (64, 1, 1):
                         self.assertRegex(
                             msl, r"auto b_tile = _mpp_lanes_\d+\[lane_\d+\];"
@@ -14506,6 +16533,790 @@ class TestMppStagingSpreadRule(unittest.TestCase):
         for name, tg_size in (("two_threaded_pins", (8, 32, 4)), ("none", (1, 32, 1))):
             with self.subTest(name=name):
                 self.assertNotIn("tid[", self._lanes(_spread_body(), tg_size))
+
+
+# --- MPP tiles that share storage ------------------------------------------
+
+
+@helion.kernel(**S)
+def mm_softmax_mm(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
+    """Per H tile: ``s = x @ w1``, ``p = exp(s - rowmax(s))``, ``acc += p @ w2``."""
+    b, m, _ = x.size()
+    h = w1.size(2)
+    n = hl.specialize(w2.size(2))
+    out = torch.empty([b, m, n], dtype=torch.float32, device=x.device)
+    for tb, tm in hl.tile([b, m]):
+        acc = hl.zeros([tb, tm, n], dtype=torch.float32)
+        for th in hl.tile(h):
+            s = torch.bmm(x[tb, tm, :], w1[tb, :, th], torch.float32)
+            p = torch.exp(s - torch.amax(s, -1)[:, :, None])
+            acc = torch.baddbmm(acc, p.to(x.dtype), w2[tb, th, :])
+        out[tb, tm, :] = acc
+    return out
+
+
+@helion.kernel(**S)
+def two_mats(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
+    """Two materialized products in one H step."""
+    b, m, _ = x.size()
+    h = w1.size(2)
+    out = torch.empty([b, m], dtype=torch.float32, device=x.device)
+    for tb, tm in hl.tile([b, m]):
+        r = hl.zeros([tb, tm], dtype=torch.float32)
+        for th in hl.tile(h):
+            s1 = torch.bmm(x[tb, tm, :], w1[tb, :, th], torch.float32)
+            s2 = torch.bmm(x[tb, tm, :], w2[tb, :, th], torch.float32)
+            r = r + torch.amax(s1 * s2, -1)
+        out[tb, tm] = r
+    return out
+
+
+@helion.kernel(**S)
+def p_twice(
+    x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, w3: torch.Tensor
+) -> torch.Tensor:
+    """One staged P read by two ops, before the next H step's scores."""
+    b, m, _ = x.size()
+    h = w1.size(2)
+    n = hl.specialize(w2.size(2))
+    out = torch.empty([b, m, n], dtype=torch.float32, device=x.device)
+    for tb, tm in hl.tile([b, m]):
+        acc1 = hl.zeros([tb, tm, n], dtype=torch.float32)
+        acc2 = hl.zeros([tb, tm, n], dtype=torch.float32)
+        for th in hl.tile(h):
+            s = torch.bmm(x[tb, tm, :], w1[tb, :, th], torch.float32)
+            p = torch.exp(s - torch.amax(s, -1)[:, :, None]).to(x.dtype)
+            acc1 = torch.baddbmm(acc1, p, w2[tb, th, :])
+            acc2 = torch.baddbmm(acc2, p, w3[tb, th, :])
+        out[tb, tm, :] = acc1 - 0.5 * acc2
+    return out
+
+
+@helion.kernel(**S)
+def mat_then_seed(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
+    """A product seeded from a value computed from an earlier product's
+    materialization, in one H step."""
+    b, m, _ = x.size()
+    h = w1.size(2)
+    out = torch.empty([b, m], dtype=torch.float32, device=x.device)
+    for tb, tm in hl.tile([b, m]):
+        r = hl.zeros([tb, tm], dtype=torch.float32)
+        for th in hl.tile(h):
+            s = torch.bmm(x[tb, tm, :], w1[tb, :, th], torch.float32)
+            p = torch.exp(s - torch.amax(s, -1)[:, :, None])
+            o = torch.baddbmm(p, x[tb, tm, :], w2[tb, :, th])
+            r = r + torch.amax(o, -1)
+        out[tb, tm] = r
+    return out
+
+
+@helion.kernel(**S)
+def two_staged(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
+    """Two computed lhs operands, each staged for its own op in one K step,
+    with no materialization in the step."""
+    m, k = x.size()
+    n = w1.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc1 = hl.zeros([tm, tn], dtype=torch.float32)
+        acc2 = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc1 = torch.addmm(acc1, torch.relu(x[tm, tk]), w1[tk, tn])
+            acc2 = torch.addmm(acc2, x[tm, tk] * 0.5 + 1.0, w2[tk, tn])
+        out[tm, tn] = acc1 - acc2
+    return out
+
+
+def _h_tiles(h: int, block: int) -> list[slice]:
+    return [slice(h0, min(h0 + block, h)) for h0 in range(0, h, block)]
+
+
+def _softmax_tile(s: torch.Tensor) -> torch.Tensor:
+    return torch.exp(s - s.amax(-1, keepdim=True))
+
+
+def _tiles_declared(msl: str) -> list[tuple[str, str, int]]:
+    """The ``(dtype, name, slots)`` of every MPP threadgroup tile."""
+    return [
+        (dtype, name, int(slots))
+        for dtype, name, slots in re.findall(
+            r"threadgroup (\w+) (_mpp_\w+)\[(\d+)\];", msl
+        )
+    ]
+
+
+def _first_writes_fenced(msl: str, tile: str) -> bool:
+    """Whether every run of consecutive Scalar writes to ``tile`` comes right
+    after a threadgroup barrier."""
+    lines = [line.strip() for line in msl.splitlines()]
+    write = re.compile(rf"\{{ {tile}\[")
+    return all(
+        lines[i - 1] == "threadgroup_barrier(mem_flags::mem_threadgroup);"
+        for i, line in enumerate(lines)
+        if write.search(line) and not write.search(lines[i - 1])
+    )
+
+
+_ATTENTION_SHARED = (
+    helion.Config(block_sizes=[1, 16, 128], num_warps=8, pid_type="xyz"),
+    helion.Config(block_sizes=[1, 16, 128], num_warps=4),
+)
+
+
+@_requires_mps
+class TestMppTileSharing(unittest.TestCase):
+    """MPP threadgroup tiles that are never live together share one tile,
+    with a threadgroup barrier before each later user's first access and,
+    in a loop, after the last user's last access."""
+
+    def _attention(
+        self, shape: tuple[int, ...], dtype: torch.dtype
+    ) -> tuple[torch.Tensor, ...]:
+        torch.manual_seed(0)
+        return tuple(torch.randn(shape, device=DEVICE, dtype=dtype) for _ in range(3))
+
+    def test_attention_scores_and_p_share(self) -> None:
+        """The scores' materialization, the ``acc *= alpha`` row vector and
+        P's staged tile, all float and written and read within one K step,
+        share the scores' tile: P's staging and the vector's come after a
+        barrier, and the K step ends with one after the second op.  The
+        hoisted bfloat Q tile and the ``acc / l_i`` vector after the loop
+        keep their own."""
+        args = self._attention((1, 2, 200, 128), torch.bfloat16)
+        for config in _ATTENTION_SHARED:
+            with self.subTest(config=config):
+                (out, _), _, msl = _run(attention_metal, args, config)
+                _close(out, _attention_ref(*args))
+                self.assertEqual(
+                    _tiles_declared(msl),
+                    [
+                        ("float", "_mpp_mat", 2048),
+                        ("bfloat", "_mpp_tile", 2048),
+                        ("float", "_mpp_vec_1", 16),
+                    ],
+                )
+                self.assertRegex(
+                    msl,
+                    r"\{ _mpp_mat\[[^\n]*\] = static_cast<float>\(helion_bf16_rne\(",
+                )
+                self.assertTrue(_first_writes_fenced(msl, "_mpp_mat"))
+                self.assertRegex(
+                    msl,
+                    r"_mpp_op_1\.run\([^\n]*\n\s*\}\n\s*\}\n"
+                    r"(\s*threadgroup_barrier\(mem_flags::mem_threadgroup\);\n){2}"
+                    r"\s*m_i = ",
+                )
+
+    def test_configs_over_the_budget_fit(self) -> None:
+        """Configs whose separate tiles exceed the 32 KB of threadgroup
+        memory fit once they share.  In f32 attention, the float Q tile
+        hoisted at kernel scope also takes in the ``acc / l_i`` vector after
+        the K loop."""
+        for name, kernel, args, config, ref, tiles in (
+            (
+                "bf16",
+                attention_metal,
+                self._attention((1, 2, 200, 128), torch.bfloat16),
+                helion.Config(block_sizes=[1, 32, 128], num_warps=8),
+                _attention_ref,
+                [
+                    ("float", "_mpp_mat", 4096),
+                    ("bfloat", "_mpp_tile", 4096),
+                    ("float", "_mpp_vec_1", 32),
+                ],
+            ),
+            (
+                "bf16_d64",
+                attention_metal,
+                self._attention((1, 2, 96, 64), torch.bfloat16),
+                helion.Config(block_sizes=[1, 64, 64], num_warps=8),
+                _attention_ref,
+                [
+                    ("float", "_mpp_mat", 4096),
+                    ("bfloat", "_mpp_tile", 4096),
+                    ("float", "_mpp_vec_1", 64),
+                ],
+            ),
+            (
+                "f32",
+                attention_metal,
+                self._attention((1, 2, 200, 128), torch.float32),
+                helion.Config(block_sizes=[1, 32, 64], num_warps=8),
+                _attention_ref,
+                [("float", "_mpp_mat", 2048), ("float", "_mpp_tile", 4096)],
+            ),
+        ):
+            with self.subTest(kernel=name, config=config):
+                (out, _), _, msl = _run(kernel, args, config)
+                _close(out, ref(*args))
+                self.assertEqual(_tiles_declared(msl), tiles)
+        torch.manual_seed(0)
+        x, w1, w2 = (
+            torch.randn(shape, device=DEVICE)
+            for shape in ((2, 64, 128), (2, 128, 160), (2, 160, 64))
+        )
+        config = helion.Config(block_sizes=[1, 32, 128], num_warps=8)
+        with self.subTest(kernel="mm_softmax_mm", config=config):
+            out, _, msl = _run(mm_softmax_mm, (x, w1, w2), config)
+            ref = torch.zeros(2, 64, 64, dtype=torch.float64)
+            for hs in _h_tiles(160, 128):
+                ref += _softmax_tile(_d(x) @ _d(w1)[:, :, hs]) @ _d(w2)[:, hs]
+            _close(out, ref)
+            self.assertEqual(_tiles_declared(msl), [("float", "_mpp_mat", 4096)])
+
+    def test_staged_seed_shares(self) -> None:
+        """A seed staged from values computed from the scores is read by
+        ``_helion_mpp_acc`` under its tile's name, a string: the read counts in its
+        live range, and the name follows the tile into shared storage."""
+        torch.manual_seed(0)
+        bf = torch.bfloat16
+        x, w1, w2 = (
+            torch.randn(shape, device=DEVICE, dtype=bf)
+            for shape in ((2, 64, 64), (2, 64, 96), (2, 64, 96))
+        )
+        config = helion.Config(block_sizes=[1, 16, 32], num_warps=4)
+        out, _, msl = _run(mat_then_seed, (x, w1, w2), config)
+        ref = torch.zeros(2, 64, dtype=torch.float64)
+        for hs in _h_tiles(96, 32):
+            seed = _softmax_tile(_d(x) @ _d(w1)[:, :, hs])
+            ref += (seed + _d(x) @ _d(w2)[:, :, hs]).amax(-1)
+        _close(out, ref)
+        self.assertEqual(_tiles_declared(msl), [("float", "_mpp_mat", 512)])
+        self.assertNotIn("_mpp_seed", msl)
+        self.assertRegex(msl, r"\*_it = _mpp_mat\[_e_m \* 32 \+ _e_n\];")
+
+    def test_staged_runs_fence_a_home(self) -> None:
+        """A K step that materializes nothing still shares: the ops reading
+        its two staged operands fence it, so the second operand takes the
+        first one's tile.  Each run is repeated 20 times."""
+        torch.manual_seed(0)
+        x, w1, w2 = (
+            torch.randn(shape, device=DEVICE)
+            for shape in ((40, 200), (200, 56), (200, 56))
+        )
+        config = helion.Config(block_sizes=[32, 32, 32], num_warps=4)
+        ref = torch.relu(_d(x)) @ _d(w1) - (0.5 * _d(x) + 1.0) @ _d(w2)
+        out, _, msl = _run(two_staged, (x, w1, w2), config)
+        _close(out, ref)
+        self.assertEqual(
+            _tiles_declared(msl),
+            [
+                ("float", "_mpp_mat", 1024),
+                ("float", "_mpp_mat_1", 1024),
+                ("float", "_mpp_tile", 1024),
+            ],
+        )
+        (k_step,) = re.findall(
+            r"\n    for \(int offset_2 .*?\n    \}\n", msl, re.DOTALL
+        )
+        self.assertNotIn("_mpp_mat", k_step)
+        bound = two_staged.bind((x, w1, w2))
+        bound.set_config(config)
+        for _ in range(20):
+            _close(bound(x, w1, w2), ref)
+
+    def test_element_types_never_share(self) -> None:
+        """f16 attention stages P as half: it keeps its own tile beside the
+        float scores, so a 32-row tile stays over the budget."""
+        args = self._attention((1, 2, 200, 128), torch.float16)
+        config = helion.Config(block_sizes=[1, 32, 128], num_warps=8)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported,
+            "reduction scratch and MPP staging need 32904 bytes of threadgroup memory",
+        ):
+            _run(attention_metal, args, config)
+
+    def test_repeated_runs(self) -> None:
+        """Each shared config, run 20 times: attention, two materializations
+        in one step, and one staged P read by two ops."""
+        args = self._attention((1, 2, 200, 128), torch.bfloat16)
+        cases: list[
+            tuple[helion.Kernel, tuple[torch.Tensor, ...], helion.Config, str]
+        ] = [
+            (attention_metal, args, config, "_mpp_tile_1")
+            for config in _ATTENTION_SHARED
+        ]
+        torch.manual_seed(0)
+        bf = torch.bfloat16
+        x, w1, w2 = (
+            torch.randn(shape, device=DEVICE, dtype=bf)
+            for shape in ((2, 48, 64), (2, 64, 200), (2, 64, 200))
+        )
+        w3, w4 = (torch.randn(2, 200, 64, device=DEVICE, dtype=bf) for _ in range(2))
+        for config in (
+            helion.Config(block_sizes=[1, 16, 64], num_warps=4),
+            helion.Config(block_sizes=[1, 32, 64], num_warps=8),
+        ):
+            cases += [
+                (two_mats, (x, w1, w2), config, "_mpp_mat_1"),
+                (p_twice, (x, w1, w3, w4), config, "_mpp_tile_1"),
+            ]
+
+        def reference(kernel: helion.Kernel, bh: int) -> torch.Tensor:
+            if kernel is attention_metal:
+                return _attention_ref(*args)
+            s = _d(x) @ _d(w1)
+            if kernel is two_mats:
+                s = s * (_d(x) @ _d(w2))
+                return sum(s[:, :, hs].amax(-1) for hs in _h_tiles(200, bh))
+            acc1 = acc2 = torch.zeros(2, 48, 64, dtype=torch.float64)
+            for hs in _h_tiles(200, bh):
+                p = _bf(_softmax_tile(s[:, :, hs]))
+                acc1 = acc1 + p @ _d(w3)[:, hs]
+                acc2 = acc2 + p @ _d(w4)[:, hs]
+            return acc1 - 0.5 * acc2
+
+        for kernel, kargs, config, merged in cases:
+            with self.subTest(kernel=kernel.name, config=config):
+                ref = reference(kernel, config.config["block_sizes"][2])
+                _, _, msl = _run(kernel, kargs, config)
+                self.assertNotIn(merged, msl)
+                bound = kernel.bind(kargs)
+                bound.set_config(config)
+                for _ in range(20):
+                    out = bound(*kargs)
+                    _close(out[0] if isinstance(out, tuple) else out, ref)
+
+
+#: An op whose staged operand ``{t}`` the walker fences with barriers.
+_STAGED_RUN = "acc = _helion_mpp_run(acc, {t}, v, spaces=[1, 0])"
+_TILES = [("A", "float", 1024), ("B", "float", 1024), ("H", "bfloat", 1024)]
+
+
+def _share(
+    source: str, tiles: list[tuple[str, str, int | str]] | None = None
+) -> tuple[str, list[tuple[str, str, int | str]]]:
+    """``share_tiles`` on the body ``source``: the body it returns, unparsed,
+    and the declarations it keeps."""
+    body = ast.parse(textwrap.dedent(source)).body
+    body, kept = tile_sharing.share_tiles(body, list(tiles or _TILES))
+    return ast.unparse(ast.fix_missing_locations(ast.Module(body, []))), kept
+
+
+def _unparse(source: str) -> str:
+    return ast.unparse(ast.parse(textwrap.dedent(source)))
+
+
+class TestTileSharingRules(unittest.TestCase):
+    """``tile_sharing.share_tiles`` on hand-built bodies: which tiles may
+    share, how groups form, and where barriers go."""
+
+    def _shares(self, source: str, expected: str) -> None:
+        body, kept = _share(source)
+        self.assertEqual(body, _unparse(expected))
+        self.assertEqual(kept, [("A", "float", 1024), ("H", "bfloat", 1024)])
+
+    def _keeps(self, source: str) -> None:
+        body, kept = _share(source)
+        self.assertEqual(body, _unparse(source))
+        self.assertEqual(kept, _TILES)
+
+    def test_disjoint_tiles_in_a_loop(self) -> None:
+        """B takes A's storage, after a barrier, and the loop body ends with
+        one before the next iteration writes A again."""
+        self._shares(
+            f"""
+            for k in range(4):
+                _helion_mpp_materialize(qk, A, 64)
+                s = A[i]
+                _helion_mpp_stage(B, i, s, True, ())
+                {_STAGED_RUN.format(t="B")}
+            """,
+            f"""
+            for k in range(4):
+                _helion_mpp_materialize(qk, A, 64)
+                s = A[i]
+                _helion_mpp_barrier()
+                _helion_mpp_stage(A, i, s, True, ())
+                {_STAGED_RUN.format(t="A")}
+                _helion_mpp_barrier()
+            """,
+        )
+
+    def test_disjoint_tiles_at_kernel_scope(self) -> None:
+        """At kernel scope a home needs no fenced statement, and no barrier
+        follows the last user: there is no next iteration."""
+        self._shares(
+            """
+            _helion_mpp_stage(A, i, 1.0, True, ())
+            s = A[i]
+            _helion_mpp_stage(B, i, s, True, ())
+            t = B[i]
+            """,
+            """
+            _helion_mpp_stage(A, i, 1.0, True, ())
+            s = A[i]
+            _helion_mpp_barrier()
+            _helion_mpp_stage(A, i, s, True, ())
+            t = A[i]
+            """,
+        )
+
+    def test_home_under_an_if(self) -> None:
+        """A home under an ``if`` gets a barrier after its last user only
+        inside a loop."""
+        for loop in (False, True):
+            outer = "for k in range(4):" if loop else "if d:"
+            with self.subTest(loop=loop):
+                self._shares(
+                    f"""
+                    {outer}
+                        if c:
+                            _helion_mpp_materialize(qk, A, 64)
+                            s = A[i]
+                            _helion_mpp_stage(B, i, s, True, ())
+                            {_STAGED_RUN.format(t="B")}
+                    """,
+                    f"""
+                    {outer}
+                        if c:
+                            _helion_mpp_materialize(qk, A, 64)
+                            s = A[i]
+                            _helion_mpp_barrier()
+                            _helion_mpp_stage(A, i, s, True, ())
+                            {_STAGED_RUN.format(t="A")}
+                            {"_helion_mpp_barrier()" if loop else ""}
+                    """,
+                )
+
+    def test_staged_runs_fence_a_home(self) -> None:
+        """An op whose operand is staged fences its home, as a
+        materialization does: B takes A's storage in a loop body that
+        materializes nothing."""
+        self._shares(
+            f"""
+            for k in range(4):
+                _helion_mpp_stage(A, i, 1.0, True, ())
+                {_STAGED_RUN.format(t="A")}
+                _helion_mpp_stage(B, i, 2.0, True, ())
+                {_STAGED_RUN.format(t="B")}
+            """,
+            f"""
+            for k in range(4):
+                _helion_mpp_stage(A, i, 1.0, True, ())
+                {_STAGED_RUN.format(t="A")}
+                _helion_mpp_barrier()
+                _helion_mpp_stage(A, i, 2.0, True, ())
+                {_STAGED_RUN.format(t="A")}
+                _helion_mpp_barrier()
+            """,
+        )
+
+    def test_storage_is_the_first_users_tile(self) -> None:
+        """A group's storage is the tile its first access names, whatever
+        the names' order: B, written first, keeps its storage and A takes
+        it, after a barrier before A's write."""
+        body, kept = _share(
+            f"""
+            for k in range(4):
+                _helion_mpp_materialize(qk, B, 64)
+                s = B[i]
+                _helion_mpp_stage(A, i, s, True, ())
+                {_STAGED_RUN.format(t="A")}
+            """
+        )
+        self.assertEqual(
+            body,
+            _unparse(
+                f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, B, 64)
+                    s = B[i]
+                    _helion_mpp_barrier()
+                    _helion_mpp_stage(B, i, s, True, ())
+                    {_STAGED_RUN.format(t="B")}
+                    _helion_mpp_barrier()
+                """
+            ),
+        )
+        self.assertEqual(kept, [("B", "float", 1024), ("H", "bfloat", 1024)])
+
+    def test_accesses_in_a_lane_loop(self) -> None:
+        """Accesses in a ``for`` inside the home count at that ``for``, whose
+        body may run no iteration."""
+        self._shares(
+            f"""
+            for k in range(4):
+                _helion_mpp_materialize(qk, A, 64)
+                s = A[i]
+                for lane in range(tid[0], 64, 8):
+                    _helion_mpp_stage(B, lane, s, True, ())
+                {_STAGED_RUN.format(t="B")}
+            """,
+            f"""
+            for k in range(4):
+                _helion_mpp_materialize(qk, A, 64)
+                s = A[i]
+                _helion_mpp_barrier()
+                for lane in range(tid[0], 64, 8):
+                    _helion_mpp_stage(A, lane, s, True, ())
+                {_STAGED_RUN.format(t="A")}
+                _helion_mpp_barrier()
+            """,
+        )
+
+    def test_a_staged_seed_is_read_by_name(self) -> None:
+        """``_helion_mpp_acc`` reads its seed tile by name, a string: the read ends
+        B's live range, and the string is renamed with the tile."""
+        acc = "acc = _helion_mpp_acc(0, 16, 16, 16, (), 0, 0, None, [], 1, 0, 16, 16, {t!r})"
+        self._shares(
+            f"""
+            for k in range(4):
+                _helion_mpp_materialize(qk, A, 64)
+                s = A[i]
+                _helion_mpp_stage(B, i, s, True, ())
+                {acc.format(t="B")}
+            """,
+            f"""
+            for k in range(4):
+                _helion_mpp_materialize(qk, A, 64)
+                s = A[i]
+                _helion_mpp_barrier()
+                _helion_mpp_stage(A, i, s, True, ())
+                {acc.format(t="A")}
+                _helion_mpp_barrier()
+            """,
+        )
+        self._keeps(
+            f"""
+            for k in range(4):
+                _helion_mpp_stage(B, i, 1.0, True, ())
+                _helion_mpp_materialize(qk, A, 64)
+                s = A[i]
+                {acc.format(t="B")}
+            """
+        )
+
+    def test_unsharable_tiles_kept(self) -> None:
+        """Overlapping live ranges, two homes (one tile read in two sibling
+        loops too), a read before the first write (in the same statement too,
+        or by an op), an access under an ``if``, a ``while`` or a loop's
+        ``else``, a use other than a marker's tile argument, an unfenced home
+        in a loop (one fenced only inside a nested loop too), and different
+        element types."""
+        run = _STAGED_RUN.format(t="B")
+        for name, source in {
+            "overlap": f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    _helion_mpp_stage(B, i, 1.0, True, ())
+                    s = A[i]
+                    {run}
+                """,
+            "two_homes": f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                t = s
+                _helion_mpp_stage(B, i, s, True, ())
+                {run}
+                """,
+            "two_loops": """
+                for i in range(2):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                    _helion_mpp_materialize(qk, B, 64)
+                    t = B[i]
+                for j in range(2):
+                    u = A[j]
+                """,
+            "same_statement": f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    _helion_mpp_stage(B, i, A[i], True, ())
+                    {run}
+                """,
+            "read_first": f"""
+                for k in range(4):
+                    s = A[i]
+                    _helion_mpp_materialize(qk, A, 64)
+                    _helion_mpp_stage(B, i, s, True, ())
+                    {run}
+                """,
+            "run_reads_first": f"""
+                for k in range(4):
+                    {run}
+                    _helion_mpp_stage(B, i, 1.0, True, ())
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                """,
+            "under_if": f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                    if c:
+                        _helion_mpp_stage(B, i, s, True, ())
+                    {run}
+                """,
+            "under_while": f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                    while c:
+                        _helion_mpp_stage(B, i, s, True, ())
+                    {run}
+                """,
+            "loop_else": f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                    for j in range(4):
+                        pass
+                    else:
+                        _helion_mpp_stage(B, i, s, True, ())
+                    {run}
+                """,
+            "other_use": f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = helper(A)
+                    _helion_mpp_stage(B, i, s, True, ())
+                    {run}
+                """,
+            "marker_value": f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                    _helion_mpp_stage(B, i, s, B, ())
+                    {run}
+                """,
+            "mat_source": f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                    _helion_mpp_materialize(B, B, 64)
+                    {run}
+                """,
+            "index": f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = X[A]
+                    _helion_mpp_stage(B, i, s, True, ())
+                    {run}
+                """,
+            "seed_elsewhere": f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                    _helion_mpp_stage(B, i, s, True, ())
+                    acc = _helion_mpp_acc(0, 16, 16, 16, (), 0, 0, None, [], 1, 0, 16, "B", None)
+                    {run}
+                """,
+            "read_by_own_write": f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                    _helion_mpp_stage(B, i, B[j], True, ())
+                    {run}
+                """,
+            "read_in_later_loop_else": f"""
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                    _helion_mpp_stage(B, i, s, True, ())
+                    {run}
+                    for j in range(4):
+                        pass
+                    else:
+                        t = A[i]
+                """,
+            "keyword_use": """
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                    _helion_mpp_stage(B, i, s, True, ())
+                    acc = _helion_mpp_run(acc, a, v, spaces=[1, 0], lhs=B)
+                """,
+            "unfenced_loop": """
+                for k in range(4):
+                    _helion_mpp_stage(A, i, 1.0, True, ())
+                    s = A[i]
+                    _helion_mpp_stage(B, i, s, True, ())
+                    acc = _helion_mpp_run(acc, B, v, spaces=[0, 0])
+                """,
+            "fenced_below": """
+                for k in range(4):
+                    _helion_mpp_stage(A, i, 1.0, True, ())
+                    s = A[i]
+                    for j in range(2):
+                        acc = _helion_mpp_run(acc, a, v, spaces=[1, 0])
+                    _helion_mpp_stage(B, i, s, True, ())
+                    t = B[i]
+                """,
+            "element_types": """
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                    _helion_mpp_stage(H, i, s, True, ())
+                    acc = _helion_mpp_run(acc, H, v, spaces=[1, 0])
+                """,
+        }.items():
+            with self.subTest(name=name):
+                self._keeps(source)
+
+    def test_reduction_scratch_never_shares(self) -> None:
+        """Reduction scratch, sized per site, keeps its own storage."""
+        source = f"""
+            for k in range(4):
+                _helion_mpp_materialize(qk, A, 64)
+                s = A[i]
+                _helion_mpp_stage(B, i, s, True, ())
+                {_STAGED_RUN.format(t="B")}
+            """
+        tiles: list[tuple[str, str, int | str]] = [
+            ("A", "float", 1024),
+            ("B", "float", "_red_site"),
+        ]
+        body, kept = _share(source, tiles)
+        self.assertEqual(body, _unparse(source))
+        self.assertEqual(kept, tiles)
+
+    def test_largest_saving_first(self) -> None:
+        """A can share with B or C, which overlap each other: it takes B,
+        the larger, which also sets the storage's slots.  The saving is the
+        smaller tile's slots: C, larger than A and B, which overlap each
+        other, takes B, saving 1024 slots rather than A's 512."""
+        source = """
+            for k in range(4):
+                _helion_mpp_materialize(qk, A, 64)
+                s = A[i]
+                _helion_mpp_stage(B, i, s, True, ())
+                _helion_mpp_stage(C, i, s, True, ())
+                acc = _helion_mpp_run(acc, B, C, spaces=[1, 1])
+            """
+        tiles: list[tuple[str, str, int | str]] = [
+            ("A", "float", 512),
+            ("B", "float", 1024),
+            ("C", "float", 64),
+        ]
+        body, kept = _share(source, tiles)
+        self.assertEqual(kept, [("A", "float", 1024), ("C", "float", 64)])
+        self.assertEqual(
+            body,
+            _unparse(
+                """
+                for k in range(4):
+                    _helion_mpp_materialize(qk, A, 64)
+                    s = A[i]
+                    _helion_mpp_barrier()
+                    _helion_mpp_stage(A, i, s, True, ())
+                    _helion_mpp_stage(C, i, s, True, ())
+                    acc = _helion_mpp_run(acc, A, C, spaces=[1, 1])
+                    _helion_mpp_barrier()
+                """
+            ),
+        )
+        source = """
+            for k in range(4):
+                _helion_mpp_materialize(qk, A, 64)
+                _helion_mpp_materialize(qk, B, 64)
+                s = A[i] + B[i]
+                _helion_mpp_materialize(qk, C, 64)
+                u = C[i]
+            """
+        tiles = [("A", "float", 512), ("B", "float", 1024), ("C", "float", 2048)]
+        _, kept = _share(source, tiles)
+        self.assertEqual(kept, [("A", "float", 512), ("B", "float", 2048)])
 
 
 if __name__ == "__main__":
