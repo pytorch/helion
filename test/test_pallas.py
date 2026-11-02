@@ -6131,7 +6131,9 @@ class TestPallas(TestCase):
         )
         self.assertIn("pltpu.emit_pipeline", code)
         self.assertIn("pl.BlockSpec((1, pl.BoundedSlice", code)
-        self.assertIn("lambda _j: (1, pl.ds(start + _j * _BLOCK_SIZE_1", code)
+        self.assertIn(
+            "lambda _j: (1, pl.ds(jnp.minimum(start + _j * _BLOCK_SIZE_1, 48)", code
+        )
         self.assertIn("pipeline_mode=pl.Buffered", code)
         self.assertIn("_hbm_arg_indices=[1]", code)
         self.assertNotIn("pltpu.make_async_copy", code)
