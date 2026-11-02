@@ -18,6 +18,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 import helion
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.language._tracing_ops import _get_symnode
@@ -278,6 +279,8 @@ def _compile_with_production_hooks(
         return bound.to_triton_code(config)
 
 
+# unittest runners ignore pytestmark.
+@onlyBackends(["cute"])
 class TestCuteSplitSingleTokenRank1Recurrence(unittest.TestCase):
     def _code(
         self,

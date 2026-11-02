@@ -23,9 +23,20 @@ OUTERMOST legal scope, avoiding cascade aliases like
 ``_helion_inv_div_0 = 1.0 * _helion_inv_div_1``.
 
 A name is considered loop-invariant if:
-  - It is read but never written inside the loop body, OR
-  - It IS written inside the loop, but ONLY by Assign statements whose
-    RHS is itself loop-invariant (transitively).
+  - It is read but never written inside the loop body (nested loops
+    included), OR
+  - It is bound exactly ONCE inside the loop, by a plain ``name = expr``
+    assignment reached only through nested ``for`` bodies, every read of
+    the name inside the loop comes after that assignment in the
+    assignment's own statement list (nested reads included), and the RHS
+    is itself loop-invariant (transitively).  The write then runs before
+    each read on every path of one iteration and no read can see the
+    previous iteration's value, so the name is a per-iteration copy of an
+    invariant.  ``d = e`` at the END of a loop that divides by ``d`` is a
+    loop-carried rebinding, not an invariant: the first iteration divides
+    by the value ``d`` had before the loop.  Anything else (several
+    bindings, augmented or destructuring assignments, a binding inside an
+    ``if``/``while``/``with``, a read before the write) is non-invariant.
 
 The rewrite then hoists the reciprocal computation:
 
@@ -98,10 +109,27 @@ from __future__ import annotations
 
 import ast
 import operator
+from typing import TYPE_CHECKING
+from typing import Literal
+from typing import TypeVar
+from typing import cast
 
+import torch
+
+from ..ast_extension import ExtendedAST
+from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ._ast_pass_utils import _names_read
+from .scalar_recipe_rounding import _kind
 from .scaled_sub_fusion import SCALED_SUBTRACTION_ATTR
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
+    from collections.abc import Iterable
+    from collections.abc import Iterator
+    from collections.abc import Mapping
+
+_AstT = TypeVar("_AstT", bound=ast.AST)
 
 _HOIST_COUNTER: list[int] = [0]
 
@@ -153,48 +181,92 @@ def _canonical(name: str) -> str:
 def _collect_assigns_in_body(
     body: list[ast.stmt],
 ) -> tuple[dict[str, list[ast.expr]], set[str]]:
-    """Walk ``body`` recursively and collect:
-      - assigns_by_target: dict[name -> list of RHS expressions assigned]
-      - all_written: set of all names that appear as Assign target anywhere
-                     (including augmented assigns and tuple targets,
-                     conservatively).
+    """Walk the loop body ``body`` recursively and collect:
+      - all_written: every (canonical) name bound anywhere in it -- plain
+        and augmented assignments, destructuring, nested loop targets,
+        ``with`` items, walrus targets -- nested bodies included.
+      - assigns_by_target: ``name -> [rhs]`` for the names whose ONE binding
+        in the body is a plain ``name = rhs`` assignment that provably runs
+        before every read of the name within one iteration: the assignment
+        is reached only through nested ``for`` bodies (no ``if``/``while``/
+        ``with``/``orelse`` between the loop and it) and every read of the
+        name in the whole body sits after it in its own statement list
+        (nested reads included).  A read before the write -- in an earlier
+        statement, in the write's own RHS, or anywhere outside the write's
+        statement list -- is a loop-carried use: it sees the previous
+        iteration's (or the pre-loop) value, so the name is left out of
+        ``assigns_by_target`` and ``_is_loop_invariant`` rejects it.
 
     Names are canonicalized via the rename group map when canonical-aware
-    invariance mode is enabled.
+    invariance mode is enabled, so ``v_9 = e`` with ``v_9`` renaming to
+    ``d`` counts as a binding of ``d``.
 
     Returns both so callers can do transitive invariance analysis.
     """
-    assigns_by_target: dict[str, list[ast.expr]] = {}
     all_written: set[str] = set()
+    # canonical name -> [(statement, its statement list, index, straight)]
+    bindings: dict[str, list[tuple[ast.stmt, list[ast.stmt], int, bool]]] = {}
 
-    def _walk(stmts: list[ast.stmt]) -> None:
-        for stmt in stmts:
-            if isinstance(stmt, ast.Assign):
-                for target in stmt.targets:
-                    if isinstance(target, ast.Name):
-                        canon = _canonical(target.id)
-                        all_written.add(canon)
-                        assigns_by_target.setdefault(canon, []).append(stmt.value)
-                    elif isinstance(target, (ast.Tuple, ast.List)):
-                        # Conservatively mark as non-invariant: we can't
-                        # easily reason about destructuring.
-                        for elt in target.elts:
-                            if isinstance(elt, ast.Name):
-                                all_written.add(_canonical(elt.id))
-                                # Don't add to assigns_by_target -> treated
-                                # as non-invariant.
-            elif isinstance(stmt, ast.AugAssign):
-                target = stmt.target
-                if isinstance(target, ast.Name):
-                    all_written.add(_canonical(target.id))
-                    # AugAssign reads + writes the same name; never invariant.
-            # Recurse into nested for / while / if / with.
-            if isinstance(stmt, (ast.For, ast.While, ast.If, ast.With)):
-                _walk(stmt.body)
-            if isinstance(stmt, (ast.For, ast.While, ast.If)):
-                _walk(stmt.orelse)
+    def _record(name: str, entry: tuple[ast.stmt, list[ast.stmt], int, bool]) -> None:
+        canon = _canonical(name)
+        all_written.add(canon)
+        bindings.setdefault(canon, []).append(entry)
 
-    _walk(body)
+    def _walk(stmts: list[ast.stmt], straight: bool) -> None:
+        for idx, stmt in enumerate(stmts):
+            entry = (stmt, stmts, idx, straight)
+            if isinstance(stmt, (ast.For, ast.While, ast.If, ast.With, ast.Try)):
+                # The header's own bindings (loop target, ``with`` items,
+                # walrus targets in a test or iterator) belong to this
+                # position; the nested bodies are walked below.  Only a
+                # ``for`` body keeps the straight-line property.
+                for child in ast.iter_child_nodes(stmt):
+                    if isinstance(child, (ast.stmt, ast.excepthandler)):
+                        continue
+                    for name in _names_bound_by(child):  # pyrefly: ignore
+                        _record(name, entry)
+                for attr in ("body", "orelse", "finalbody"):
+                    nested = getattr(stmt, attr, None) or []
+                    _walk(
+                        nested,
+                        straight and isinstance(stmt, ast.For) and attr == "body",
+                    )
+                for handler in getattr(stmt, "handlers", None) or []:
+                    _walk(handler.body, False)
+            else:
+                for name in _names_bound_by(stmt):
+                    _record(name, entry)
+
+    _walk(body, True)
+
+    def _reads(node: ast.AST, canon: str) -> int:
+        return sum(
+            1
+            for sub in ast.walk(node)
+            if isinstance(sub, ast.Name)
+            and isinstance(sub.ctx, ast.Load)
+            and _canonical(sub.id) == canon
+        )
+
+    assigns_by_target: dict[str, list[ast.expr]] = {}
+    for canon, entries in bindings.items():
+        if len(entries) != 1:
+            continue
+        stmt, stmts, idx, straight = entries[0]
+        if not (
+            straight
+            and isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and _names_bound_by(stmt) == {stmt.targets[0].id}
+        ):
+            continue
+        # Every read of the name must follow the write in its own list.
+        total_reads = sum(_reads(top, canon) for top in body)
+        dominated_reads = sum(_reads(later, canon) for later in stmts[idx + 1 :])
+        if total_reads != dominated_reads:
+            continue
+        assigns_by_target[canon] = [stmt.value]
     return assigns_by_target, all_written
 
 
@@ -215,10 +287,14 @@ def _is_loop_invariant(
       - The loop's induction variable (``loop_target``) is NEVER invariant.
       - A name not written in the loop is invariant (assumed defined
         outside the loop and not mutated).
-      - A name written exactly N times, where ALL RHS values are
-        invariant, is invariant.
-      - All other names (multiple defs with non-invariant RHS, augassigns,
-        tuple-destructured, etc.) are non-invariant.
+      - A name with exactly one binding in the loop, a plain assignment
+        that runs before every read of the name within one iteration
+        (``_collect_assigns_in_body`` admits it to ``assigns_by_target``
+        only then), whose RHS is invariant, is invariant.
+      - All other names (several bindings, a read before the write such as
+        ``d = e`` at the end of a loop dividing by ``d``, a binding inside
+        an ``if``/``while``/``with``, augassigns, tuple-destructured,
+        etc.) are non-invariant.
 
     Uses memoization to avoid infinite recursion on cycles (cycles are
     treated as non-invariant).
@@ -281,9 +357,12 @@ def _resolve_root_name(
     """Trace a chain of single-assignment ``x_copy = x_root`` aliases back
     to the root name defined OUTSIDE the loop.
 
-    Returns the outermost name (one not in ``all_written``) or None when
-    the chain can't be cleanly resolved (multiple defs, non-Name RHS,
-    cycle, ...).
+    Every link must be in ``assigns_by_target``, i.e. a plain assignment
+    that runs before each of its reads within one iteration
+    (``_collect_assigns_in_body``); a link written anywhere else in the
+    loop, or read before it is written, ends the resolution.  Returns the
+    outermost name (one not in ``all_written``) or None when the chain
+    can't be cleanly resolved (multiple defs, non-Name RHS, cycle, ...).
     """
     canon = _canonical(name)
     if canon in visited:
@@ -1261,6 +1340,1284 @@ def _dce_pure_assigns(body: list[ast.stmt]) -> list[ast.stmt]:
     return body
 
 
+# --------------------------------------------------------------------------
+# Exact loop-invariant fp32 division hoist (the IEEE result, bit for bit)
+# --------------------------------------------------------------------------
+#
+# ``v = x / d`` with an fp32 scalar divisor ``d`` that is invariant across a
+# ``for`` loop becomes, once per divisor above the loop::
+#
+#     _helion_exdiv_y_K = 1.0 / d                                   # RN(1/d)
+#     _helion_exdiv_lo_K, _helion_exdiv_hi_K = _cute_exact_div_bounds_f32(d)
+#
+# and the loop is speculated (the "redo" form)::
+#
+#     _helion_exdiv_min_K = cutlass.Float32(float('inf'))   # running min |x|
+#     _helion_exdiv_max_K = cutlass.Float32(0.0)            # running max |x|
+#     _helion_exdiv_save_K_acc = acc                        # loop-carried values
+#     for ...:                                              # the speculative pass
+#         v = cutlass.Float32(_cute_exact_div_fast_f32(x, d, y))
+#         _helion_exdiv_min_K = cute.arch.fmin(_helion_exdiv_min_K, cute.math.abs(x), nan=True)
+#         _helion_exdiv_max_K = cute.arch.fmax(_helion_exdiv_max_K, cute.math.abs(x), nan=True)
+#     if _cute_exact_div_redo_f32(_helion_exdiv_min_K, _helion_exdiv_max_K, lo, hi):
+#         acc = _helion_exdiv_save_K_acc                    # roll back, then
+#         for ...:                                          # the original loop
+#             v = x / d
+#
+# i.e. the Markstein quotient ``q = RN(x*y); r = RN(x - d*q); RN(q + r*y)``
+# per element plus two FMNMX, and the hard cases (some ``|x|`` outside the
+# hoisted window) re-dividing with ``div.rn.f32`` itself.  Every dividend
+# of the loop inside the window means every speculative quotient was the
+# IEEE one and the pass computed exactly what the original loop computes;
+# otherwise (a NaN dividend makes the maximum NaN and fails the test too)
+# the original loop runs from the restored state and overwrites every
+# store.  That is sound only for loops that read no memory they write
+# (tensor arguments need a disjointness proof, register fragments are per
+# thread), contain nothing but pure arithmetic, plain loads and stores and
+# per-iteration Python lists (no barriers, shuffles, reductions, atomics,
+# async copies, control flow or unknown helpers), take no quotient into an
+# address, array index or trip count, and whose loop-carried values are DSL
+# scalars; ``_redo_eligible`` checks each condition.  The redo form goes on
+# the outermost loop that can be re-executed verbatim, else on the child
+# loops that can; a site in no such loop keeps the plain ``x / d`` (and a
+# divisor none of whose sites is placed is not hoisted at all: the render
+# is the plain render).  A per-element guard (``if not admitted: x / d``,
+# the retired ``guard`` form of ``cute_exact_div_form``) is NOT an option:
+# its branch changes the compiled shape of the loop so much (no unrolling,
+# spills, a BSSY/BRA/BSYNC trio per element) that ptxas contracts the plain
+# lowering's unmarked fp32 ``mul``/``add``/``sub`` chains around the
+# quotient differently, and reductions over the quotients differed from
+# the plain render by 1-2 ulp on ragged shapes.
+# The result equals ``x / d`` bit for bit --
+# ``helion/_compiler/cute/exact_division.py`` states the argument (an
+# exhaustive significand-pair check plus the exponent-scaling lemma) and
+# ``test/test_cute_exact_division.py`` checks it -- so unlike the
+# ``fast_math`` reciprocal hoist this one may depend on the loops a config
+# creates.  Only the generic lowering's ``v_N = a / b`` statements are
+# rewritten (hand-emitted flash/matmul bodies spell their temporaries
+# differently and pin their own sequences), only when both operands are
+# proved fp32 scalars (``cutlass.Float32(...)``, ``.bitcast(cutlass.Float32)``,
+# ``cute.math`` results, fp32 tensor loads, fp32 scalar kernel arguments and
+# arithmetic over them), never when a per-thread select (``... if mask
+# else cutlass.Float32(0)``, the tail of a ragged reduction axis or a
+# partial row block) may reach the dividend (``_select_derived_names``:
+# the masked zero would make the redo fire for the tail threads of every
+# row while the rest keep the speculative pass, and with both loop copies
+# live ptxas contracted the fp32 chains around the quotient differently
+# from the plain kernel -- 1 ulp in a sum of squares), and never for a
+# reciprocal (``1.0 / d`` is already the hoisted form).  Integer ``//``/
+# ``%`` and 16-bit divisions are untouched.
+#
+# Four rules keep the rewrite sound on the bodies codegen produces:
+#
+# * The divisor's loop invariance is the ``_collect_assigns_in_body`` proof:
+#   the root and every alias link are unwritten in the loop (nested loops
+#   included), or written once by a plain assignment that precedes every
+#   read within one iteration.  ``for ...: v = x / d; d = e`` divides by the
+#   pre-loop ``d`` first and by ``e`` afterwards; it is left alone.
+# * Codegen emits a reduction sweep and its rematerialized store sweep with
+#   the same statement objects; ``_dealias_shared_nodes`` gives every
+#   position its own copy before the first in-place rewrite, so each sweep
+#   is rewritten in its own context (its own hoisted names and divisor).
+# * The values the redo copy rolls back are the names the loop rebinds that
+#   were bound when it starts -- under the DSL's staging rules
+#   (``_bound_before`` / ``_is_unrolled_region``): the kernel's parameters,
+#   the statements before the loop, the headers of the loops enclosing it,
+#   the bindings of every unrolled region (``cutlass.range_constexpr``,
+#   ``cutlass.const_expr`` tests, ``with``) that ends before it, and of a
+#   staged region (``range``, a dynamic test) only the names that existed
+#   before that region.  Missing one is unsound (a stale accumulator after
+#   the redo), so where the rule is uncertain the walk keeps the name.
+# * The pass runs after every structural pass (``hoist_exact_invariant_divisions``
+#   is called right before the rename), so the matchers that recognize the
+#   plain ``v = x / d`` sweeps (the independent partial accumulators of
+#   ``split_rolled_vector_sums``, pipelined/packed loads, the cluster pairs,
+#   the scalar epilogue) see what the plain render sees and the redo render
+#   keeps the plain render's structure and summation order.
+
+EXACT_DIV_BOUNDS_HELPER = "_cute_exact_div_bounds_f32"
+EXACT_DIV_PREFIX = "_helion_exdiv_"
+_FP32_DTYPE_STR = "cutlass.Float32"
+_EXACT_COUNTER: list[int] = [0]
+_Kind = Literal["fp32", "literal"] | None
+
+
+def _new_exact_names() -> tuple[str, str, str]:
+    index = _EXACT_COUNTER[0]
+    _EXACT_COUNTER[0] += 1
+    return (
+        f"{EXACT_DIV_PREFIX}y_{index}",
+        f"{EXACT_DIV_PREFIX}lo_{index}",
+        f"{EXACT_DIV_PREFIX}hi_{index}",
+    )
+
+
+# ``ExtendedAST.new`` carries these itself; every other non-field attribute
+# of a node (the ``_helion_*`` markers passes leave on loops and
+# statements) is copied by ``_deep_clone``.
+_EXTENDED_AST_INTERNALS = frozenset(
+    {"_location", "_type_info", "_loop_type", "_is_kernel_call", "_root_id"}
+)
+
+
+def _deep_clone(node: _AstT) -> _AstT:
+    """A fresh copy of ``node``'s whole subtree that also keeps the marker
+    attributes set on its nodes (``scalar_recipe._clone`` copies fields
+    only), so a redo copy or a de-aliased statement is indistinguishable
+    from the original to every later pass."""
+
+    def clone_field(value: object) -> object:
+        if isinstance(value, ast.AST):
+            return _deep_clone(value)
+        if isinstance(value, list):
+            return [clone_field(item) for item in value]
+        return value
+
+    fields = {name: clone_field(value) for name, value in ast.iter_fields(node)}
+    if isinstance(node, ExtendedAST):
+        result = node.new(fields)
+    else:
+        result = ast.copy_location(type(node)(**fields), node)
+    skip = set(node._fields) | set(node._attributes) | _EXTENDED_AST_INTERNALS
+    for key, value in vars(node).items():
+        if key not in skip and key not in vars(result):
+            setattr(result, key, value)
+    return cast("_AstT", result)
+
+
+def _dealias_shared_nodes(body: list[ast.stmt]) -> None:
+    """Give every position in the tree its own node object.
+
+    Helion's codegen reuses statement objects: the rematerialized store
+    sweep of a reduction is emitted with the SAME ``ast.Assign`` (and lane
+    loop body) objects as the reduction sweep.  A rewrite of one occurrence
+    in place is then a rewrite of both, with the other occurrence's context
+    (its own hoisted names, its own divisor) ignored.  Every repeated node
+    reached through a field or a body list is replaced by a deep clone, and
+    a body list held by two nodes by its own list, before the pass rewrites
+    anything; the rendered text is unchanged.
+    """
+    seen: set[int] = set()
+    seen_lists: set[int] = set()
+
+    def visit(node: ast.AST) -> None:
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                if id(value) in seen_lists:
+                    value = list(value)
+                    setattr(node, field, value)
+                seen_lists.add(id(value))
+                for index, item in enumerate(value):
+                    if isinstance(item, ast.AST):
+                        value[index] = fresh(item)
+            elif isinstance(value, ast.AST):
+                setattr(node, field, fresh(value))
+
+    def fresh(node: ast.AST) -> ast.AST:
+        if id(node) in seen:
+            # The clone's subtree is new to the tree; no need to walk it.
+            return _deep_clone(node)
+        seen.add(id(node))
+        visit(node)
+        return node
+
+    for index, stmt in enumerate(body):
+        body[index] = cast("ast.stmt", fresh(stmt))
+
+
+class _CanonicalKinds:
+    """``name -> kind`` keyed by post-rename canonical names (so ``v_8`` and
+    the ``di`` it renames to share one entry); ``_kind`` only calls ``get``.
+    ``selected`` holds the names ``_select_derived_names`` found: a value
+    that may come from a masked select is never a dividend of an exact
+    division."""
+
+    def __init__(self) -> None:
+        self.kinds: dict[str, _Kind] = {}
+        self.selected: set[str] = set()
+
+    def get(self, name: str, default: _Kind = None) -> _Kind:
+        return self.kinds.get(_canonical(name), default)
+
+    def __contains__(self, name: str) -> bool:
+        return _canonical(name) in self.kinds
+
+    def select_derived(self, node: ast.expr) -> bool:
+        """Whether ``node`` is, or reads as a value a name that may hold,
+        the result of a per-thread select."""
+        return _contains_select(node) or any(
+            _canonical(name) in self.selected for name in _value_reads(node)
+        )
+
+
+# Cross-thread reductions: their result is one value for every thread of
+# the group, so whatever a select did to their operands cannot make the
+# redo decision differ between the threads of a row.
+_REDUCTION_CALL_PREFIXES = (
+    "_cute_grouped_reduce_",
+    "_cute_lane_reduce_",
+    "cute.arch.warp_reduction",
+)
+
+
+def _is_pointer_expr(node: ast.AST) -> bool:
+    """``t.iterator + ...``: an address (the clamped operand of a packet
+    load, ``ptr if lane < n else ptr0``, selects no value)."""
+    if isinstance(node, ast.Attribute):
+        return node.attr == "iterator"
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub)):
+        return _is_pointer_expr(node.left) or _is_pointer_expr(node.right)
+    if isinstance(node, ast.IfExp):
+        return _is_pointer_expr(node.body) or _is_pointer_expr(node.orelse)
+    return False
+
+
+def _is_reduction_call(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and ast.unparse(node.func).startswith(
+        _REDUCTION_CALL_PREFIXES
+    )
+
+
+def _value_walk(node: ast.AST) -> Iterator[ast.AST]:
+    """``node``'s subtree minus addresses, subscript indices and the
+    operands of cross-thread reductions: what flows into the VALUE of
+    ``node`` thread by thread."""
+    todo = [node]
+    while todo:
+        sub = todo.pop()
+        if _is_pointer_expr(sub) or _is_reduction_call(sub):
+            continue
+        yield sub
+        if isinstance(sub, ast.Subscript):
+            todo.append(sub.value)
+        else:
+            todo.extend(ast.iter_child_nodes(sub))
+
+
+def _contains_select(node: ast.AST) -> bool:
+    """Whether a conditional expression selects a value of ``node``."""
+    return any(isinstance(sub, ast.IfExp) for sub in _value_walk(node))
+
+
+def _value_reads(node: ast.AST) -> set[str]:
+    return {
+        sub.id
+        for sub in _value_walk(node)
+        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load)
+    }
+
+
+def _select_derived_names(body: list[ast.stmt]) -> set[str]:
+    """Canonical names whose value may come from a per-thread conditional
+    expression (``... if mask else cutlass.Float32(0)``: the packet form of
+    a masked load or register-cache reload, the masked operand of a
+    reduction) -- bound by one, or computed from such a name through
+    arithmetic, a ``cutlass.Float32(...)`` / ``.to(...)`` conversion (which
+    ``_kind`` accepts as fp32 whatever its operand) or a register cache
+    written from one (``cache[k] = ...`` taints ``cache``).  Not through an
+    address (``cute.arch.load(ptr if lane < n else ptr0, ...)`` clamps
+    where the packet is read, not what it holds), a subscript index, or a
+    cross-thread reduction (its result is row-uniform: the first-tile max
+    and the NaN guard of the online softmax select, but every thread of
+    the row then agrees).  Fixpoint over every assignment of the body.
+
+    A division whose DIVIDEND is such a name keeps the plain division: a
+    masked zero makes the redo fire for the tail threads of every row of a
+    ragged reduction axis while the other threads keep the speculative
+    pass, and the kernel with both loop copies live compiled the fp32
+    chains around the quotient differently from the plain kernel (1 ulp in
+    a sum of the quotients' squares, two rows of 53 x 4000).  The divisor
+    is one value for every thread of the sweep (a row sum, a row scale),
+    so a masked divisor fires the redo for all of them alike.  The scalar
+    spelling of a masked load (``(t.iterator + i).load() if mask else 0``)
+    already failed closed because ``_kind`` knows no ``.load()``; this is
+    the same rule for every spelling."""
+    assigns = [
+        node
+        for stmt in body
+        for node in ast.walk(stmt)
+        if isinstance(node, (ast.Assign, ast.AugAssign))
+    ]
+    facts = []
+    for stmt in assigns:
+        bound = {_canonical(name) for name in _names_bound_by(stmt)}
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+        for target in targets:
+            for sub in ast.walk(target):
+                if isinstance(sub, ast.Subscript):
+                    bound.update(_canonical(n) for n in _names_read(sub.value))
+        reads = {_canonical(n) for n in _value_reads(stmt.value)}
+        facts.append((_contains_select(stmt.value), reads, bound))
+    tainted: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for selects, reads, bound in facts:
+            if (selects or reads & tainted) and bound - tainted:
+                tainted |= bound
+                changed = True
+    return tainted
+
+
+def _iterator_tensor(node: ast.AST) -> str | None:
+    """The tensor whose ``.iterator`` a pointer expression offsets."""
+    for sub in ast.walk(node):
+        if (
+            isinstance(sub, ast.Attribute)
+            and sub.attr == "iterator"
+            and isinstance(sub.value, ast.Name)
+        ):
+            return sub.value.id
+    return None
+
+
+def _expression_kind(
+    node: ast.expr, kinds: _CanonicalKinds, tensor_dtypes: Mapping[str, str]
+) -> _Kind:
+    """``_kind`` plus the scalar loads: ``(t.iterator + ...).load()``, whose
+    dtype is the tensor argument's, and the helper forms that spell it."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "load"
+        and not node.args
+        and not node.keywords
+    ):
+        tensor = _iterator_tensor(node.func.value)
+        if tensor is not None and tensor_dtypes.get(tensor) == _FP32_DTYPE_STR:
+            return "fp32"
+        return None
+    if isinstance(node, ast.Call) and len(node.args) >= 2:
+        # ``_cute_scalar_policy_load(ptr, cutlass.Float32, policy)`` and the
+        # scalar ``cute.arch.load(ptr, cutlass.Float32, ...)`` spell their
+        # dtype (the packet form passes an ``ir.VectorType`` instead).
+        path = ast.unparse(node.func)
+        if path in {"_cute_scalar_policy_load", "cute.arch.load"}:
+            return "fp32" if ast.unparse(node.args[1]) == _FP32_DTYPE_STR else None
+    return _kind(node, kinds)  # pyrefly: ignore[bad-argument-type]
+
+
+def _infer_scalar_kinds(
+    body: list[ast.stmt],
+    *,
+    float_scalar_names: Collection[str],
+    tensor_dtypes: Mapping[str, str],
+) -> _CanonicalKinds:
+    """Forward dataflow over every assignment of the kernel body.  A name
+    keeps a kind only if all of its assignments agree (loop-carried fp32
+    accumulators do; anything assigned a non-fp32 value, destructured or
+    augmented is unknown).  The names a masked select may reach are
+    recorded separately (``_select_derived_names``)."""
+    kinds = _CanonicalKinds()
+    kinds.selected = _select_derived_names(body)
+    for name in float_scalar_names:
+        kinds.kinds[_canonical(name)] = "fp32"
+    seeded = set(kinds.kinds)
+    unknown: set[str] = set()
+    assigns = [
+        node for stmt in body for node in ast.walk(stmt) if isinstance(node, ast.stmt)
+    ]
+    # Two rounds: the first defines in program order, the second re-derives
+    # every assignment with the complete map and records disagreements.
+    for _round in range(2):
+        for stmt in assigns:
+            if isinstance(stmt, ast.AugAssign):
+                unknown.update(_canonical(name) for name in _names_bound_by(stmt))
+                continue
+            if not isinstance(stmt, ast.Assign):
+                continue
+            target = stmt.targets[0] if len(stmt.targets) == 1 else None
+            if not isinstance(target, ast.Name):
+                unknown.update(_canonical(name) for name in _names_bound_by(stmt))
+                continue
+            name = _canonical(target.id)
+            if name in seeded:
+                # A reassigned scalar argument is no longer the argument.
+                unknown.add(name)
+                continue
+            kind = _expression_kind(stmt.value, kinds, tensor_dtypes)
+            if name not in kinds.kinds:
+                kinds.kinds[name] = kind
+            elif kinds.kinds[name] != kind:
+                unknown.add(name)
+    for name in unknown:
+        kinds.kinds[name] = None
+    return kinds
+
+
+def _is_unit_constant(node: ast.expr) -> bool:
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, (int, float)) and node.value == 1
+    # ``cutlass.Float32(1.0) / x``: the reciprocal the flash emitters spell.
+    return (
+        isinstance(node, ast.Call)
+        and ast.unparse(node.func) == _FP32_DTYPE_STR
+        and len(node.args) == 1
+        and not node.keywords
+        and _is_unit_constant(node.args[0])
+    )
+
+
+def _exact_division_candidates(
+    loop_body: list[ast.stmt],
+    loop_target: str | None,
+    kinds: _CanonicalKinds,
+) -> dict[str, list[ast.Assign]]:
+    """``v_N = x / d`` statements anywhere in ``loop_body`` whose divisor is
+    loop-invariant and resolves to a root name defined outside the loop,
+    with both operands proved fp32 scalars and a dividend no per-thread
+    select reaches (``_select_derived_names``).  Maps root -> statements."""
+    assigns_by_target, all_written = _collect_assigns_in_body(loop_body)
+    invariant_cache: dict[str, bool] = {}
+    found: dict[str, list[ast.Assign]] = {}
+    for stmt in loop_body:
+        for node in ast.walk(stmt):
+            if not (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id.startswith("v_")
+            ):
+                continue
+            value = node.value
+            if not (
+                isinstance(value, ast.BinOp)
+                and isinstance(value.op, ast.Div)
+                and isinstance(value.right, ast.Name)
+            ):
+                continue
+            if _is_unit_constant(value.left):
+                continue
+            ctx = _EXACT_CTX[0]
+            if ctx is not None and _canonical(node.targets[0].id) not in ctx.reads:
+                continue
+            if not _is_loop_invariant(
+                value.right.id,
+                assigns_by_target,
+                all_written,
+                loop_target,
+                invariant_cache,
+                set(),
+            ):
+                continue
+            root = _resolve_root_name(
+                value.right.id, assigns_by_target, all_written, set()
+            )
+            if root is None or kinds.get(root) != "fp32":
+                continue
+            if _kind(value.left, kinds) != "fp32":  # pyrefly: ignore[bad-argument-type]
+                continue
+            if kinds.select_derived(value.left):
+                continue
+            found.setdefault(root, []).append(node)
+    return found
+
+
+EXACT_DIV_FAST_HELPER = "_cute_exact_div_fast_f32"
+EXACT_DIV_REDO_HELPER = "_cute_exact_div_redo_f32"
+# Marks the ``if`` holding a redo copy so the walks never descend into it.
+EXACT_DIV_REDO_ATTR = "_helion_cute_exact_division_redo"
+_REDO_COUNTER: list[int] = [0]
+
+# Call forms a loop may contain and still be re-executed verbatim: pure
+# arithmetic and conversions, plain loads, plain stores and the per-iteration
+# Python lists the store packets are built from.  Anything else (barriers,
+# shuffles, reductions, atomics, async copies, unknown helpers, any other
+# ``cutlass.`` member such as ``cutlass.printf`` or ``cutlass.inttoptr``)
+# makes the loop ineligible for the redo form; its sites keep the plain
+# division unless a child loop can take them.
+_REDO_PURE_PREFIXES = ("cute.math.",)
+# ``cutlass.<Type>(...)`` conversions plus these lowercase members.
+_REDO_CUTLASS_CALLS = frozenset(
+    {"range", "range_constexpr", "const_expr", "select_", "min", "max"}
+)
+_REDO_IR_CALLS = frozenset({"ir.VectorType.get"})
+_REDO_CUTE_ARCH_CALLS = frozenset(
+    {
+        "load",
+        "fmax",
+        "fmin",
+        "thread_idx",
+        "block_idx",
+        "block_dim",
+        "grid_dim",
+        "rcp_approx",
+        "fma_packed_f32x2",
+        "mul_packed_f32x2",
+        "add_packed_f32x2",
+        "cvt_f32_tf32",
+    }
+)
+_REDO_HELPER_PREFIXES = (
+    "_cute_load_",
+    "_cute_scalar_policy_load",
+    "_cute_store_",
+    "_cute_exact_div_",
+    "_cute_join_cast",
+    "_cute_copysign",
+    "_cute_python_mod",
+    "_cute_fp8",
+    "_cute_float4_",
+    "_cute_bfloat16_",
+    "_cute_signed_bitfield",
+    "_cute_inline_asm_elementwise",
+)
+_REDO_LOAD_HELPER_PREFIXES = ("_cute_load_", "_cute_scalar_policy_load")
+_REDO_STORE_HELPER_PREFIX = "_cute_store_"
+_REDO_PYTHON_BUILTINS = frozenset({"range", "int", "float", "len"})
+_REDO_LIST_MUTATORS = frozenset(
+    {"append", "extend", "insert", "pop", "remove", "clear"}
+)
+_REDO_PURE_METHODS = frozenset({"bitcast", "to"})
+_PYTHON_OBJECT_RHS = (
+    ast.List,
+    ast.Tuple,
+    ast.Dict,
+    ast.Set,
+    ast.ListComp,
+    ast.DictComp,
+    ast.SetComp,
+    ast.GeneratorExp,
+    ast.Lambda,
+)
+
+
+class _ExactContext:
+    """Kernel-level facts the redo eligibility test needs."""
+
+    def __init__(
+        self,
+        body: list[ast.stmt],
+        *,
+        tensor_args: Collection[str],
+        argument_names: Collection[str],
+        disjoint_pairs: Collection[frozenset[str]],
+    ) -> None:
+        self.body = body
+        # Names the kernel reads (canonical): a quotient nobody reads is a
+        # dead pure assignment the DCE sub-pass removes; rewriting it would
+        # keep it alive as a helper call.
+        self.reads = {_canonical(name) for name in _collect_all_name_reads(body)}
+        self.tensor_args = set(tensor_args)
+        self.argument_names = set(argument_names)
+        self.disjoint_pairs = set(disjoint_pairs)
+        self.rmem: set[str] = set()
+        self.python_objects: set[str] = set()
+        for stmt in body:
+            for node in ast.walk(stmt):
+                if not (
+                    isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                ):
+                    continue
+                name = _canonical(node.targets[0].id)
+                value = node.value
+                if (
+                    isinstance(value, ast.Call)
+                    and ast.unparse(value.func) == "cute.make_rmem_tensor"
+                ):
+                    self.rmem.add(name)
+                elif isinstance(value, _PYTHON_OBJECT_RHS):
+                    self.python_objects.add(name)
+
+
+_EXACT_CTX: list[_ExactContext | None] = [None]
+
+
+def _new_redo_names() -> tuple[str, str]:
+    index = _REDO_COUNTER[0]
+    _REDO_COUNTER[0] += 1
+    return f"{EXACT_DIV_PREFIX}min_{index}", f"{EXACT_DIV_PREFIX}max_{index}"
+
+
+# The DSL preprocessor outlines a ``for`` over ``range`` / ``cutlass.range`` /
+# ``range_dynamic`` and an ``if`` / ``while`` on a dynamic test into a region
+# function: the names such a region binds for the first time are not visible
+# after it (only names that already existed are yielded back).  Everything
+# else -- ``cutlass.range_constexpr`` and any non-``range`` iterable, an
+# ``if`` / ``while`` on ``cutlass.const_expr(...)``, a ``with`` -- stays
+# Python, runs while tracing, and keeps its bindings like any Python block.
+_STAGED_RANGE_CALLS = frozenset({"range", "range_dynamic"})
+_UNROLLED_TESTS = frozenset({"const_expr", "target_version"})
+
+
+def _is_unrolled_region(stmt: ast.stmt) -> bool:
+    """Whether Python itself runs ``stmt`` while tracing, so the names it
+    binds stay visible afterwards (see the comment above)."""
+    if isinstance(stmt, ast.With):
+        return True
+    if isinstance(stmt, ast.For):
+        func = stmt.iter.func if isinstance(stmt.iter, ast.Call) else None
+        if isinstance(func, ast.Name):
+            return func.id not in _STAGED_RANGE_CALLS
+        if isinstance(func, ast.Attribute):
+            return func.attr not in _STAGED_RANGE_CALLS
+        return True
+    if isinstance(stmt, (ast.If, ast.While)):
+        func = stmt.test.func if isinstance(stmt.test, ast.Call) else None
+        if isinstance(func, ast.Name):
+            return func.id in _UNROLLED_TESTS
+        if isinstance(func, ast.Attribute):
+            return func.attr in _UNROLLED_TESTS
+    return False
+
+
+def _bound_before(
+    body: list[ast.stmt], target: ast.stmt, *, bound: Collection[str] = ()
+) -> tuple[set[str], bool] | None:
+    """Canonical names defined when ``target`` starts, under the DSL's
+    staging rules: ``bound`` (the kernel's parameters, bound before any
+    statement), the statements before it in program order, the headers of
+    the loops enclosing it, the bindings of every unrolled region
+    (``_is_unrolled_region``) that ends before it, and -- for a staged
+    region that ends before it -- only the names that already existed
+    before that region.  Also reports whether every statement enclosing
+    ``target`` is a ``for``.  ``None`` when ``target`` is not in ``body``.
+
+    Under-approximating this set is unsound (a loop-carried accumulator
+    the redo form would not roll back; a parameter the loop rebinds is one
+    too), over-approximating it fails closed (a save of an unbound name is
+    a trace-time ``NameError``); where the DSL's rule is uncertain the walk
+    keeps the name."""
+
+    def walk(stmts: list[ast.stmt], defined: set[str]) -> tuple[bool, bool]:
+        for stmt in stmts:
+            if stmt is target:
+                return True, True
+            if isinstance(stmt, (ast.For, ast.While, ast.If, ast.With)):
+                # Always a copy: when the target is found inside, this
+                # level's ``defined`` is replaced wholesale by ``inner``
+                # (clearing a shared set would empty both).
+                inner = set(defined)
+                if isinstance(stmt, ast.For):
+                    inner.update(
+                        _canonical(n.id)
+                        for n in ast.walk(stmt.target)
+                        if isinstance(n, ast.Name)
+                    )
+                for nested in (stmt.body, getattr(stmt, "orelse", [])):
+                    found, only_for = walk(nested, inner)
+                    if found:
+                        defined.clear()
+                        defined.update(inner)
+                        return True, only_for and isinstance(stmt, ast.For)
+                if _is_unrolled_region(stmt):
+                    defined.update(inner)
+            else:
+                defined.update(_canonical(n) for n in _names_bound_by(stmt))
+        return False, True
+
+    defined: set[str] = {_canonical(name) for name in bound}
+    found, only_for = walk(body, defined)
+    if not found:
+        return None
+    return defined, only_for
+
+
+def _call_path(node: ast.Call) -> str:
+    return ast.unparse(node.func)
+
+
+def _pointer_tensor(node: ast.expr) -> str | None:
+    """The one tensor a pointer expression offsets (a masked tail spells
+    ``t.iterator + i if ok else t.iterator + 0``), or None."""
+    tensors = {
+        sub.value.id if isinstance(sub.value, ast.Name) else None
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Attribute) and sub.attr == "iterator"
+    }
+    if len(tensors) != 1:
+        return None
+    return next(iter(tensors))
+
+
+def _redo_memory(
+    loop: ast.For, local_names: set[str], ctx: _ExactContext
+) -> tuple[set[str], set[str], list[ast.expr]] | None:
+    """(loaded tensors, stored tensors, address expressions) of ``loop``,
+    or None when some memory access is not a recognized plain load/store."""
+    loads: set[str] = set()
+    stores: set[str] = set()
+    addresses: list[ast.expr] = []
+    recognized: list[ast.AST] = []
+    for node in ast.walk(loop):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "load"
+                and not node.args
+                and not node.keywords
+            ):
+                tensor = _pointer_tensor(func.value)
+                if tensor is None:
+                    return None
+                loads.add(tensor)
+                addresses.append(func.value)
+                recognized.append(func.value)
+            elif (
+                isinstance(func, ast.Attribute)
+                and func.attr == "store"
+                and len(node.args) == 1
+            ):
+                tensor = _pointer_tensor(func.value)
+                if tensor is None:
+                    return None
+                stores.add(tensor)
+                addresses.append(func.value)
+                recognized.append(func.value)
+            else:
+                path = _call_path(node)
+                is_load = path == "cute.arch.load" or path.startswith(
+                    _REDO_LOAD_HELPER_PREFIXES
+                )
+                is_store = path.startswith(_REDO_STORE_HELPER_PREFIX)
+                if is_load or is_store:
+                    if not node.args:
+                        return None
+                    tensor = _pointer_tensor(node.args[0])
+                    if tensor is None:
+                        return None
+                    (loads if is_load else stores).add(tensor)
+                    addresses.append(node.args[0])
+                    recognized.append(node.args[0])
+        elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            base = _canonical(node.value.id)
+            if isinstance(node.ctx, ast.Store):
+                if base not in ctx.rmem:
+                    return None
+                stores.add(base)
+                addresses.append(node.slice)
+            elif base in ctx.rmem:
+                loads.add(base)
+                addresses.append(node.slice)
+            elif base not in local_names:
+                # Shared memory, a Python object from outside the loop, ...
+                return None
+    # Every ``.iterator`` must belong to a recognized access.
+    all_iterators = sum(
+        1
+        for node in ast.walk(loop)
+        if isinstance(node, ast.Attribute) and node.attr == "iterator"
+    )
+    seen_iterators = sum(
+        1
+        for root in recognized
+        for node in ast.walk(root)
+        if isinstance(node, ast.Attribute) and node.attr == "iterator"
+    )
+    if all_iterators != seen_iterators:
+        return None
+    return loads, stores, addresses
+
+
+def _redo_calls_allowed(loop: ast.For, local_names: set[str]) -> bool:
+    for node in ast.walk(loop):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            if func.attr in _REDO_LIST_MUTATORS:
+                if not (
+                    isinstance(func.value, ast.Name)
+                    and _canonical(func.value.id) in local_names
+                ):
+                    return False
+                continue
+            if func.attr in _REDO_PURE_METHODS or func.attr in {"load", "store"}:
+                continue
+        path = _call_path(node)
+        if path.startswith("cute.arch."):
+            if path[len("cute.arch.") :] not in _REDO_CUTE_ARCH_CALLS:
+                return False
+            continue
+        if path.startswith("cutlass."):
+            member = path[len("cutlass.") :]
+            if member in _REDO_CUTLASS_CALLS or (
+                "." not in member and member[:1].isupper()
+            ):
+                continue
+            return False
+        if path.startswith(_REDO_PURE_PREFIXES) or path in _REDO_IR_CALLS:
+            continue
+        if path in _REDO_PYTHON_BUILTINS:
+            continue
+        if path.startswith(_REDO_HELPER_PREFIXES):
+            if path == "_cute_inline_asm_elementwise" and any(
+                keyword.arg == "is_pure"
+                and not (
+                    isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is True
+                )
+                for keyword in node.keywords
+            ):
+                return False
+            continue
+        return False
+    return True
+
+
+def _redo_statements_allowed(loop: ast.For) -> bool:
+    for node in ast.walk(loop):
+        if isinstance(node, ast.stmt) and not isinstance(
+            node, (ast.For, ast.Assign, ast.AugAssign, ast.Expr, ast.Pass)
+        ):
+            return False
+        if isinstance(node, _PYTHON_OBJECT_RHS) and not isinstance(node, ast.List):
+            return False
+        if isinstance(node, (ast.NamedExpr, ast.Yield, ast.YieldFrom, ast.Await)):
+            return False
+        if isinstance(node, ast.For) and (
+            node.orelse or not isinstance(node.target, ast.Name)
+        ):
+            return False
+        if isinstance(node, ast.Expr) and not isinstance(node.value, ast.Call):
+            return False
+    return True
+
+
+def _tainted_names(loop: ast.For, seeds: set[str]) -> set[str]:
+    """Canonical names of ``loop`` whose value depends on a seed."""
+    tainted = set(seeds)
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(loop):
+            if isinstance(node, (ast.Assign, ast.AugAssign)):
+                reads = {_canonical(n) for n in _names_read(node.value)}
+                if isinstance(node, ast.AugAssign):
+                    reads |= {_canonical(n) for n in _names_read(node.target)}
+                if reads & tainted:
+                    for name in _names_bound_by(node):
+                        canon = _canonical(name)
+                        if canon not in tainted:
+                            tainted.add(canon)
+                            changed = True
+    return tainted
+
+
+def _redo_eligible(
+    loop: ast.For,
+    sites: list[ast.Assign],
+    ctx: _ExactContext,
+) -> set[str] | None:
+    """The loop-carried names to roll back when ``loop`` can be re-executed
+    verbatim, or None when it cannot (see the module section comment)."""
+    before = _bound_before(ctx.body, loop, bound=ctx.argument_names)
+    if before is None:
+        return None
+    bound_before, only_for = before
+    if not only_for:
+        return None
+    if not _redo_statements_allowed(loop):
+        return None
+    # An augmented assignment through a subscript (``cache[k] += v``) reads
+    # and rewrites a register fragment: the redo would accumulate into it a
+    # second time and no name identifies it for the rollback.
+    for node in ast.walk(loop):
+        if isinstance(node, ast.AugAssign) and not isinstance(node.target, ast.Name):
+            return None
+    local_names = {_canonical(n) for n in _names_bound_by(loop)}
+    if not _redo_calls_allowed(loop, local_names):
+        return None
+    memory = _redo_memory(loop, local_names, ctx)
+    if memory is None:
+        return None
+    loads, stores, addresses = memory
+    for loaded in loads:
+        for stored in stores:
+            if loaded == stored:
+                return None
+            if loaded in ctx.tensor_args and stored in ctx.tensor_args:
+                if frozenset({loaded, stored}) not in ctx.disjoint_pairs:
+                    return None
+    # A quotient must reach no address, trip count or array index: the
+    # speculative pass may be wrong there and would read or write off the
+    # tensor before the redo could correct it.
+    for site in sites:
+        if not isinstance(site.value, ast.BinOp) or not isinstance(
+            site.value.left, ast.Name
+        ):
+            return None
+    tainted = _tainted_names(
+        loop,
+        {_canonical(site.targets[0].id) for site in sites},  # pyrefly: ignore
+    )
+    guarded: list[ast.expr] = list(addresses)
+    for node in ast.walk(loop):
+        if isinstance(node, ast.For):
+            guarded.append(node.iter)
+    for expression in guarded:
+        if {_canonical(n) for n in _names_read(expression)} & tainted:
+            return None
+    # Roll back what the loop reads and updates (accumulators); its own
+    # loop variables and the temporaries it defines before reading are
+    # re-derived by the redo.
+    loop_targets = {
+        _canonical(name)
+        for node in ast.walk(loop)
+        if isinstance(node, ast.For)
+        for name in _names_bound_by(node.target)  # pyrefly: ignore[bad-argument-type]
+    }
+    read_in_loop = {_canonical(name) for name in _names_read(loop)}
+    # An augmented assignment reads its target (a Store context, which
+    # ``_names_read`` does not count).
+    read_in_loop |= {
+        _canonical(name)
+        for node in ast.walk(loop)
+        if isinstance(node, ast.AugAssign)
+        for name in _names_bound_by(node)
+    }
+    carried = (local_names & bound_before & read_in_loop) - loop_targets
+    if carried & ctx.python_objects:
+        return None
+    return carried
+
+
+def _rewrite_fast_division(
+    stmt: ast.Assign, root: str, y_name: str, tracker: tuple[str, str]
+) -> list[ast.stmt]:
+    """``v = x / d`` -> the unguarded fast quotient plus the two running
+    extrema of ``|x|`` the redo test reads after the loop."""
+    value = stmt.value
+    assert isinstance(value, ast.BinOp) and isinstance(value.left, ast.Name)
+    dividend = value.left.id
+    replacement = expr_from_string(
+        f"{_FP32_DTYPE_STR}({EXACT_DIV_FAST_HELPER}({{left}}, {root}, {y_name}))",
+        left=value.left,
+    )
+    assert isinstance(replacement, ast.expr)
+    stmt.value = ast.copy_location(replacement, value)
+    ast.fix_missing_locations(stmt)
+    min_name, max_name = tracker
+    return [
+        statement_from_string(
+            f"{min_name} = cute.arch.fmin({min_name}, cute.math.abs({dividend}), nan=True)"
+        ),
+        statement_from_string(
+            f"{max_name} = cute.arch.fmax({max_name}, cute.math.abs({dividend}), nan=True)"
+        ),
+    ]
+
+
+def _insert_after(body: list[ast.stmt], anchor: ast.stmt, new: list[ast.stmt]) -> None:
+    """Insert ``new`` right after ``anchor`` in the body list that holds it."""
+    for stmts in _bodies_containing(body, anchor):
+        index = next(i for i, stmt in enumerate(stmts) if stmt is anchor)
+        stmts[index + 1 : index + 1] = new
+        return
+    raise AssertionError("anchor statement not found")
+
+
+def _bodies_containing(
+    body: list[ast.stmt], anchor: ast.stmt
+) -> Iterator[list[ast.stmt]]:
+    if any(stmt is anchor for stmt in body):
+        yield body
+        return
+    for stmt in body:
+        for attr in ("body", "orelse"):
+            nested = getattr(stmt, attr, None)
+            if isinstance(nested, list):
+                yield from _bodies_containing(nested, anchor)
+
+
+def _apply_redo_form(
+    loop: ast.For,
+    parent_body: list[ast.stmt],
+    loop_idx: int,
+    sites_by_root: dict[str, list[ast.Assign]],
+    names_by_root: dict[str, tuple[str, str, str]],
+    carried: set[str],
+) -> int:
+    """Rewrite ``loop`` into its speculative form and append the redo copy.
+    Returns the number of statements inserted before ``loop_idx``."""
+    original = _deep_clone(loop)
+    before: list[ast.stmt] = []
+    tests: list[str] = []
+    for root, sites in sites_by_root.items():
+        y_name, lo_name, hi_name = names_by_root[root]
+        tracker = _new_redo_names()
+        min_name, max_name = tracker
+        before.extend(
+            (
+                statement_from_string(f"{min_name} = cutlass.Float32(float('inf'))"),
+                statement_from_string(f"{max_name} = cutlass.Float32(0.0)"),
+            )
+        )
+        tests.append(
+            f"{EXACT_DIV_REDO_HELPER}({min_name}, {max_name}, {lo_name}, {hi_name})"
+        )
+        for site in sites:
+            trackers = _rewrite_fast_division(site, root, y_name, tracker)
+            _insert_after(loop.body, site, trackers)
+    restores: list[ast.stmt] = []
+    for name in sorted(carried):
+        save = f"{EXACT_DIV_PREFIX}save_{_REDO_COUNTER[0]}_{name}"
+        before.append(statement_from_string(f"{save} = {name}"))
+        restores.append(statement_from_string(f"{name} = {save}"))
+    redo = statement_from_string(f"if {' | '.join(tests)}:\n    pass")
+    assert isinstance(redo, ast.If)
+    redo.body = [*restores, original]
+    setattr(redo, EXACT_DIV_REDO_ATTR, True)
+    ast.fix_missing_locations(redo)
+    parent_body[loop_idx + 1 : loop_idx + 1] = [redo]
+    parent_body[loop_idx:loop_idx] = before
+    return len(before)
+
+
+def _direct_child_loops(loop: ast.For) -> list[ast.For]:
+    return [stmt for stmt in loop.body if isinstance(stmt, ast.For)]
+
+
+def _contains(node: ast.AST, target: ast.AST) -> bool:
+    return any(sub is target for sub in ast.walk(node))
+
+
+_RedoPlan = list[tuple[ast.For, dict[str, list[ast.Assign]], set[str]]]
+
+
+def _plan_redo_loops(
+    loop: ast.For,
+    sites_by_root: dict[str, list[ast.Assign]],
+    ctx: _ExactContext,
+) -> _RedoPlan:
+    """The loops of ``loop``'s nest that take the redo form, each with the
+    sites it covers and the names its redo copy rolls back: ``loop`` itself
+    when it can be re-executed verbatim, else (recursively) the child loops
+    that can.  A site in no such loop keeps the plain division.  Decides
+    only; nothing is rewritten."""
+    all_sites = [site for sites in sites_by_root.values() for site in sites]
+    carried = _redo_eligible(loop, all_sites, ctx)
+    if carried is not None:
+        return [(loop, sites_by_root, carried)]
+    plan: _RedoPlan = []
+    for child in _direct_child_loops(loop):
+        child_sites = {
+            root: [site for site in sites if _contains(child, site)]
+            for root, sites in sites_by_root.items()
+        }
+        child_sites = {root: sites for root, sites in child_sites.items() if sites}
+        if child_sites:
+            plan.extend(_plan_redo_loops(child, child_sites, ctx))
+    return plan
+
+
+def _hoist_exact_divisions_in_for(
+    for_node: ast.For,
+    parent_body: list[ast.stmt],
+    for_idx: int,
+    live: dict[str, tuple[str, str, str]],
+    kinds: _CanonicalKinds,
+) -> int:
+    """Hoist the divisor-only work of every candidate division of one
+    ``for`` loop whose sites some loop of the nest takes in the redo form;
+    ``live`` shares the hoisted names with later sibling loops dividing by
+    the same, not yet rebound, root.  Returns the number of statements
+    inserted before ``for_idx``.  A loop none of whose sites can be placed
+    is left exactly as it is (no hoist, no helper: the plain render)."""
+    loop_target = for_node.target.id if isinstance(for_node.target, ast.Name) else None
+    candidates = _exact_division_candidates(for_node.body, loop_target, kinds)
+    if not candidates:
+        return 0
+    ctx = _EXACT_CTX[0]
+    assert ctx is not None
+    plan = _plan_redo_loops(for_node, candidates, ctx)
+    placed_roots = {
+        root for _loop, sites_by_root, _carried in plan for root in sites_by_root
+    }
+    inserted = 0
+    names_by_root: dict[str, tuple[str, str, str]] = {}
+    for root in candidates:
+        if root not in placed_roots:
+            continue
+        names = live.get(root)
+        if names is None:
+            names = _new_exact_names()
+            y_name, lo_name, hi_name = names
+            for decl in (
+                statement_from_string(f"{y_name} = 1.0 / {root}"),
+                statement_from_string(
+                    f"{lo_name}, {hi_name} = {EXACT_DIV_BOUNDS_HELPER}({root})"
+                ),
+            ):
+                parent_body.insert(for_idx + inserted, decl)
+                inserted += 1
+            live[root] = names
+        names_by_root[root] = names
+    for loop, sites_by_root, carried in plan:
+        # Each rewrite shifts the statements after it in its own body list;
+        # the loop's position is taken when its turn comes.
+        body = next(_bodies_containing(parent_body, loop))
+        loop_idx = next(i for i, stmt in enumerate(body) if stmt is loop)
+        before = _apply_redo_form(
+            loop, body, loop_idx, sites_by_root, names_by_root, carried
+        )
+        if body is parent_body:
+            inserted += before
+    return inserted
+
+
+def _hoist_exact_divisions_in_body(
+    body: list[ast.stmt], kinds: _CanonicalKinds
+) -> list[ast.stmt]:
+    """Outer-in walk (as ``_hoist_in_body``): the outermost ``for`` whose body
+    keeps the divisor invariant receives the hoist, nested bodies are then
+    visited for divisors that are invariant only deeper down."""
+    if _is_placeholder_body(body):
+        return body
+    live: dict[str, tuple[str, str, str]] = {}
+    i = 0
+    while i < len(body):
+        stmt = body[i]
+        if isinstance(stmt, ast.For) and not stmt.orelse:
+            inserted = _hoist_exact_divisions_in_for(stmt, body, i, live, kinds)
+            i += inserted + 1
+        else:
+            i += 1
+        for bound in _names_bound_by(stmt):
+            live.pop(_canonical(bound), None)
+            live.pop(bound, None)
+    for stmt in body:
+        if getattr(stmt, EXACT_DIV_REDO_ATTR, False):
+            # A redo copy re-executes the original loop verbatim.
+            continue
+        if isinstance(stmt, (ast.For, ast.While, ast.If, ast.With, ast.FunctionDef)):
+            stmt.body = _hoist_exact_divisions_in_body(stmt.body, kinds)
+        if isinstance(stmt, (ast.For, ast.While, ast.If)):
+            stmt.orelse = _hoist_exact_divisions_in_body(stmt.orelse, kinds)
+    return body
+
+
+def has_hoistable_fp32_divisions(graphs: Iterable[torch.fx.Graph]) -> bool:
+    """Whether some traced fp32 ``aten.div`` divides by a scalar (a Python
+    float argument, a symbolic float) or by a tensor of fewer elements than
+    its result (a row value broadcast over the row): the divisions the
+    exact hoist can take, so ``cute_exact_div_form`` has something to pick.
+    The AST pass still proves loop invariance per site; this is only the
+    gate that exposes the knob.  A kernel can pass it and still have no
+    eligible site (the divisor is loop-carried at every loop, or the config
+    creates no loop around the division): both forms then render
+    identically and the knob is inert for that kernel -- one more
+    autotuner dimension, never a different result."""
+    for graph in graphs:
+        for node in graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                torch.ops.aten.div.Tensor,
+                torch.ops.aten.div.Scalar,
+            ):
+                continue
+            result = node.meta.get("val")
+            if (
+                not isinstance(result, torch.Tensor)
+                or result.dtype is not torch.float32
+            ):
+                continue
+            if len(node.args) < 2:
+                continue
+            divisor = node.args[1]
+            if not isinstance(divisor, torch.fx.Node):
+                return True  # a Python number
+            value = divisor.meta.get("val")
+            if not isinstance(value, torch.Tensor):
+                return True  # a symbolic float
+            if value.dtype is torch.float32 and (
+                value.ndim < result.ndim
+                or any(
+                    d == 1 and r != 1
+                    for d, r in zip(value.shape, result.shape, strict=False)
+                )
+            ):
+                return True
+    return False
+
+
+def _has_division_statement(body: list[ast.stmt]) -> bool:
+    """Whether some ``v_N = a / name`` statement exists at all: the only
+    shape the exact hoist rewrites, so a body without one is left untouched
+    (not even de-aliased)."""
+    for stmt in body:
+        for node in ast.walk(stmt):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id.startswith("v_")
+                and isinstance(node.value, ast.BinOp)
+                and isinstance(node.value.op, ast.Div)
+                and isinstance(node.value.right, ast.Name)
+            ):
+                return True
+    return False
+
+
+def hoist_exact_invariant_divisions(
+    body: list[ast.stmt],
+    rename_groups: Mapping[str, str] | None = None,
+    *,
+    float_scalar_names: Collection[str] = (),
+    tensor_dtypes: Mapping[str, str] | None = None,
+    argument_names: Collection[str] = (),
+    proven_disjoint_tensor_pairs: Collection[frozenset[str]] = (),
+) -> list[ast.stmt]:
+    """Sub-pass 2' (exact arithmetic): see the section comment above.
+
+    Runs in canonical-aware invariance mode with ``rename_groups`` (the
+    pre-rename -> canonical map ``hoist_loop_invariant_recips`` takes, so a
+    loop-carried update spelled through a to-be-renamed alias counts as a
+    write of the divisor).  ``argument_names`` (every kernel parameter:
+    bound before any statement, so one a sweep rebinds is rolled back) and
+    ``proven_disjoint_tensor_pairs`` feed the redo eligibility test; a
+    division in no loop the redo form can take is left as written.  The
+    ``plain`` form of ``cute_exact_div_form`` skips this pass altogether.
+
+    The caller runs this LAST among the structural passes (right before the
+    rename): the Markstein helper calls, the fmin/fmax trackers and the
+    redo ``if`` are not statement shapes the sweep matchers
+    (``split_rolled_vector_sums``, the pipelined and packed loads, the
+    cluster pairs, the scalar epilogue) recognize, so running earlier would
+    silently switch those passes off for the configs that enable them --
+    and, for ``cute_independent_reduction``, change the summation order.
+    Running last, the redo render keeps the structure the plain render has.
+    ``HELION_DISABLE_HOIST_RECIP`` turns this pass off with the others.
+    """
+    import os
+
+    if os.environ.get("HELION_DISABLE_HOIST_RECIP"):
+        return body
+    if not _has_division_statement(body):
+        return body
+    _EXACT_COUNTER[0] = 0
+    _REDO_COUNTER[0] = 0
+    tensor_dtypes = tensor_dtypes or {}
+    global _RENAME_GROUPS
+    prev_renames = _RENAME_GROUPS
+    prev_canonical = _USE_CANONICAL_INVARIANCE[0]
+    previous = _EXACT_CTX[0]
+    _RENAME_GROUPS = dict(rename_groups or {})
+    _USE_CANONICAL_INVARIANCE[0] = True
+    try:
+        # Codegen shares statement objects between a reduction sweep and
+        # its rematerialized store sweep; each position gets its own copy
+        # before any in-place rewrite.
+        _dealias_shared_nodes(body)
+        kinds = _infer_scalar_kinds(
+            body, float_scalar_names=float_scalar_names, tensor_dtypes=tensor_dtypes
+        )
+        _EXACT_CTX[0] = _ExactContext(
+            body,
+            tensor_args=tensor_dtypes,
+            argument_names=argument_names,
+            disjoint_pairs=proven_disjoint_tensor_pairs,
+        )
+        return _hoist_exact_divisions_in_body(body, kinds)
+    finally:
+        _EXACT_CTX[0] = previous
+        _USE_CANONICAL_INVARIANCE[0] = prev_canonical
+        _RENAME_GROUPS = prev_renames
+
+
 def hoist_loop_invariant_recips(
     body: list[ast.stmt],
     rename_groups: dict[str, str] | None = None,
@@ -1270,7 +2627,9 @@ def hoist_loop_invariant_recips(
     """Apply the hoist passes to a list of kernel-body statements.
 
     Runs four sub-passes (2, 3 and 4 only when ``fast_math``, the setting,
-    allows rounding to depend on the config):
+    allows rounding to depend on the config; the bit-exact fp32 hoist 2',
+    ``hoist_exact_invariant_divisions``, is a separate entry point the
+    caller runs after the structural passes):
 
       1. Inline pure SSA alias chains (``mi_copy_1 = mi`` →
          direct use of ``mi``) so subsequent passes see clean root names.

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from typing import cast
 
+from .tcgen05_constants import SM100_SMEM_PER_BLOCK_OPTIN_BYTES
+from .tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CHOICES
+from .tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 
 if TYPE_CHECKING:
@@ -12,6 +17,22 @@ if TYPE_CHECKING:
 CONFIG_KEY = "tcgen05_grouped_dense_row_union"
 RESIDENT_CTAS_KEY = "tcgen05_grouped_ctas_per_sm"
 SCHEDULE_KEY = "tcgen05_grouped_row_union_schedule"
+# Physical AB ring depth of a named profile (``None`` = the profile's own,
+# deepest fitting ring).  The public ``tcgen05_ab_stages`` stays the search
+# carrier's value so recorded configs keep their meaning.
+AB_STAGES_KEY = "tcgen05_grouped_row_union_ab_stages"
+AB_STAGES_CHOICES: tuple[int | None, ...] = (None, 3, 4, 5, 6, 7, 8, 10)
+# The shallowest depth the search offers; a two-deep ring (one stage of
+# look-ahead) is not searched, tested or accepted.
+AB_STAGES_MIN = 3
+# ``tcgen05_epi_round_subtiles`` on a profile: the epilogue stores its
+# subtiles in rounds of that many (``tcgen05_epilogue_rounds``); the profile's
+# C ring then holds one buffer per subtile of a tile, rounded up to whole
+# rounds, so a CTA's first tile never waits on a bulk-store group.
+ROUND_SUBTILES_KEY = TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY
+ROUND_SUBTILES_CHOICES = TCGEN05_EPI_ROUND_SUBTILES_CHOICES
+# The sm_100 opt-in shared memory per block the profiles are bounded against.
+PROFILE_MAX_SMEM_PER_BLOCK = SM100_SMEM_PER_BLOCK_OPTIN_BYTES
 LEGACY_SCHEDULE = "legacy"
 TRANSPOSED_SCHEDULE = "nm_m256_n80_k64"
 PAIRED_CLC_SCHEDULE = "nm_m256_n192_k64_clc"
@@ -50,6 +71,8 @@ class RowUnionSchedule:
     epi_m: int
     epi_n: int
     paired_protocol: PairedRowUnionProtocol | None = None
+    # Subtile buffers of the TMA-store C ring (two on the per-subtile loop).
+    c_stages: int = 2
 
     @property
     def linear_record_clc(self) -> bool:
@@ -67,7 +90,12 @@ class RowUnionSchedule:
         # its 8B barrier, TMEM publication, at most 63 Int32 coverage/interval
         # words, alignment padding, and the SDK's 1KiB reservation. This is
         # a storage bound, not an occupancy or register-allocation claim.
-        return self.ab_stages * ab + 2 * self.epi_m * self.epi_n * 2 + 2048
+        return self.ab_stages * ab + self.c_stages * self.epi_m * self.epi_n * 2 + 2048
+
+    @property
+    def epilogue_subtiles(self) -> int:
+        """Subtiles of one output tile on the profile's epilogue tile."""
+        return self.mma_n // self.epi_n
 
     @property
     def producer_cluster(self) -> tuple[int, int, int]:
@@ -113,7 +141,7 @@ class RowUnionSchedule:
             "tcgen05_cluster_n": self.cluster_n,
             "tcgen05_ab_stages": self.ab_stages,
             "tcgen05_acc_stages": 2,
-            "tcgen05_c_stages": 2,
+            "tcgen05_c_stages": self.c_stages,
             "tcgen05_num_epi_warps": 4,
             "tcgen05_layout_overrides_epi_tile_m": self.epi_m,
             "tcgen05_layout_overrides_epi_tile_n": self.epi_n,
@@ -143,8 +171,67 @@ def schedule_by_name(name: object) -> RowUnionSchedule | None:
     return None
 
 
+def ab_stages_supported(profile: RowUnionSchedule, value: object) -> bool:
+    """Whether ``value`` is a legal physical ring depth for ``profile``:
+    absent, or an integer between ``AB_STAGES_MIN`` and the profile's own
+    (deepest fitting) depth, so the shared-memory bound only shrinks."""
+    return value is None or (
+        type(value) is int and AB_STAGES_MIN <= value <= profile.ab_stages
+    )
+
+
+def with_ab_stages(profile: RowUnionSchedule, value: object) -> RowUnionSchedule:
+    assert ab_stages_supported(profile, value)
+    if value is None or value == profile.ab_stages:
+        return profile
+    return dataclasses.replace(profile, ab_stages=cast("int", value))
+
+
+def round_subtiles_supported(
+    profile: RowUnionSchedule, value: object, stages: object = None
+) -> bool:
+    """Whether ``value`` subtiles per epilogue round is legal for ``profile``
+    at the physical ring depth ``stages``: 1 always; a searched round size on
+    the transposed profile (the paired protocol keeps its own store tail)
+    whose wider C ring still fits the sm_100 shared memory."""
+    if value == 1:
+        return True
+    if (
+        type(value) is not int
+        or value not in ROUND_SUBTILES_CHOICES
+        or profile.paired_protocol is not None
+        or value > profile.epilogue_subtiles
+        or not ab_stages_supported(profile, stages)
+    ):
+        return False
+    physical = with_round_subtiles(with_ab_stages(profile, stages), value)
+    return physical.shared_upper_bound <= PROFILE_MAX_SMEM_PER_BLOCK
+
+
+def with_round_subtiles(profile: RowUnionSchedule, value: object) -> RowUnionSchedule:
+    """The profile with its C ring sized for rounds of ``value`` subtiles:
+    one buffer per subtile of a tile, whole rounds."""
+    if value == 1:
+        return profile
+    assert type(value) is int and value in ROUND_SUBTILES_CHOICES
+    rounds = -(-profile.epilogue_subtiles // value)
+    return dataclasses.replace(profile, c_stages=rounds * value)
+
+
 def physical_schedule(config: Mapping[str, object]) -> RowUnionSchedule | None:
-    return schedule_by_name(config.get(SCHEDULE_KEY, LEGACY_SCHEDULE))
+    profile = schedule_by_name(config.get(SCHEDULE_KEY, LEGACY_SCHEDULE))
+    if profile is None:
+        return None
+    stages = config.get(AB_STAGES_KEY)
+    if not ab_stages_supported(profile, stages):
+        # Normalization rejects or repairs the knob; an unrepaired config
+        # keeps the profile's own depth here so codegen never overruns smem.
+        return profile
+    physical = with_ab_stages(profile, stages)
+    rounds = config.get(ROUND_SUBTILES_KEY, 1)
+    if not round_subtiles_supported(profile, rounds, stages):
+        return physical
+    return with_round_subtiles(physical, rounds)
 
 
 # Two BF16 AB rings plus a conservative allowance for their four barriers,
@@ -168,19 +255,49 @@ def resident_ctas_supported(value: object, shared_capacity: int) -> bool:
     )
 
 
-def index_domain(groups: int, m: int, n: int, k: int) -> bool:
+LEGACY_BLOCKS = (128, 64, 128)
+# One-CTA dense tiles the legacy carrier may also run: the UMMA M of 64 or
+# 128 rows, N tiles of 16..64 columns and K steps of 64 or 128. Smaller tiles
+# spread a small grouped problem over more CTAs and shrink the per-CTA operand
+# loads and predicated epilogue, which is what bounds the one-K-step shapes.
+LEGACY_BLOCK_M = (64, 128)
+LEGACY_BLOCK_N = (16, 32, 64)
+LEGACY_BLOCK_K = (64, 128)
+
+
+def legacy_blocks_supported(blocks: tuple[int, int, int]) -> bool:
+    bm, bn, bk = blocks
+    return (
+        type(bm) is int
+        and type(bn) is int
+        and type(bk) is int
+        and bm in LEGACY_BLOCK_M
+        and bn in LEGACY_BLOCK_N
+        and bk in LEGACY_BLOCK_K
+    )
+
+
+def index_domain(
+    groups: int,
+    m: int,
+    n: int,
+    k: int,
+    blocks: tuple[int, int, int] = LEGACY_BLOCKS,
+) -> bool:
     """Bound every dense tile/address expression; offsets retain Int32 wrap."""
     limit = (1 << 31) - 1
+    bm, bn, bk = blocks
     return (
         all(type(value) is int and 0 < value <= limit for value in (groups, m, n, k))
-        and m % 128 == n % 64 == k % 128 == 0
+        and legacy_blocks_supported(blocks)
+        and m % bm == n % bn == k % bk == 0
         and m * k <= limit
         and m * n <= limit
         and k * n <= limit
-        and m + 127 <= limit
-        and n + 63 <= limit
+        and m + bm - 1 <= limit
+        and n + bn - 1 <= limit
         # PID decomposition still names the original group axis, fixed to zero.
-        and groups * (m // 128) * (n // 64) <= limit
+        and groups * (m // bm) * (n // bn) <= limit
     )
 
 
@@ -219,10 +336,11 @@ def schedule_supported(
         "tcgen05_diagnostic_invalid_output": False,
     }
     profile = physical_schedule(config)
-    expected_blocks = (128, 64, 128)
+    base_profile = schedule_by_name(config.get(SCHEDULE_KEY, LEGACY_SCHEDULE))
+    expected_blocks = blocks if legacy_blocks_supported(blocks) else LEGACY_BLOCKS
     allowed_layout_keys: tuple[str, ...] = ()
     if profile is not None:
-        expected_blocks = (128, 64, 128)
+        expected_blocks = LEGACY_BLOCKS
         if blocks == profile.source_tile:
             expected_blocks = profile.source_tile
             fixed.update(profile.codegen_values())
@@ -255,6 +373,11 @@ def schedule_supported(
         and (
             not config.get(STARTUP_PREFILL_KEY, False)
             or (profile is not None and profile.linear_record_clc)
+        )
+        and (
+            config.get(AB_STAGES_KEY) is None
+            if base_profile is None
+            else ab_stages_supported(base_profile, config.get(AB_STAGES_KEY))
         )
         and (profile is None or config.get(RESIDENT_CTAS_KEY, 1) == 1)
         and type(config.get(RESIDENT_CTAS_KEY, 1)) is int
@@ -346,15 +469,21 @@ for {p}_coverage_group in cutlass.range({self.groups - 1}, unroll_full=True):
     def coverage_flag(self) -> str:
         return f"{self.prefix}_coverage_flag"
 
-    def cooperative_setup(self, *, warp: str, lane: str) -> str:
+    def cooperative_setup(
+        self, *, warp: str, lane: str, dependent_launch: bool = False
+    ) -> str:
         """Immutable CTA-local tables, published by the existing TMEM join.
 
         The linear-record profile reserves warp 7 and proves G+1<=32. All
         lanes execute both shuffles and the vote; only bounded unique lanes
-        publish the flag and the normalized fallback intervals.
+        publish the flag and the normalized fallback intervals.  Under a
+        programmatic dependent launch the coverage warp waits for the
+        previous kernel itself, right ahead of its offsets read, so the
+        kernel needs no entry wait and the rest of the prologue overlaps.
         """
         assert self.paired_protocol is not None and 1 <= self.groups <= 31
         p = self.prefix
+        wait = "    cute.arch.griddepcontrol_wait()\n" if dependent_launch else ""
         return f"""{p}_coverage_ptr = cute.arch.alloc_smem(cutlass.Int32, 1)
 {self.coverage_flag} = cute.make_tensor({p}_coverage_ptr, cute.make_layout((1,)))
 {p}_starts_ptr = cute.arch.alloc_smem(cutlass.Int32, {self.groups})
@@ -362,7 +491,7 @@ for {p}_coverage_group in cutlass.range({self.groups - 1}, unroll_full=True):
 {self.starts} = cute.make_tensor({p}_starts_ptr, cute.make_layout(({self.groups},)))
 {self.ends} = cute.make_tensor({p}_ends_ptr, cute.make_layout(({self.groups},)))
 if {warp} == cutlass.Int32({self.paired_protocol.coverage_warp}):
-    {p}_coop_raw_start = cutlass.Int32(0)
+{wait}    {p}_coop_raw_start = cutlass.Int32(0)
     if {lane} < cutlass.Int32({self.groups + 1}):
         {p}_coop_raw_start = cutlass.Int32(({self.offsets}.iterator + cutlass.Int64({lane}) * cutlass.Int64({self.offsets}.layout.stride[0])).load())
     {p}_coop_next_lane = min({lane} + cutlass.Int32(1), cutlass.Int32({self.groups}))

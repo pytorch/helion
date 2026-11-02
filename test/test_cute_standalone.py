@@ -15,6 +15,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -62,7 +63,10 @@ def _run_without_helion(tmp_path: Path, body: str) -> None:
     )
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = [
+    skipUnlessBackends(["cute"]),
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+]
 
 
 @pytest.mark.parametrize("layout", ["contiguous", "offset", "transposed"])
@@ -119,6 +123,35 @@ def test_constant_guard(tmp_path: Path, scale: float) -> None:
     torch.testing.assert_close(exported._constant(x, scale), x * scale, equal_nan=True)
     with pytest.raises(ValueError, match="constant"):
         exported._constant(x, 3.0)
+
+
+def test_sass_checked_kernels_are_not_exported() -> None:
+    # The exported launcher has no SASS verification step
+    # (``helion.runtime.cute.sass_check``), so a config whose render needs
+    # one -- hinted mma_dag packets, ``_helion_cute_sass_checks`` -- is
+    # refused at export; the plain config of the same kernel exports.
+    probes = importlib.import_module("test.test_cute_mma_dag")
+    kernel = helion.kernel(
+        probes._head_sum_logits_batched,
+        backend="cute",
+        autotune_effort="none",
+        static_shapes=True,
+    )
+    args = tuple(t.to(DEVICE) for t in probes._head_sum_inputs(h=32))
+    bound = kernel.bind(args)
+    hinted = probes._config(
+        1, 64, warps=4, stages=4, load_eviction_policies=["l2_last"] * 2 + [""] * 5
+    )
+    with bound.env:
+        hinted = bound.config_spec.normalized_config(hinted)
+        plain = bound.config_spec.normalized_config(
+            probes._config(1, 64, warps=4, stages=4)
+        )
+    options = helion.OutputCodeOptions(allow_helion_deps=False)
+    assert "_helion_cute_sass_checks" in bound.to_code(hinted)
+    with pytest.raises(NotImplementedError, match="SASS"):
+        bound.to_code(hinted, options=options)
+    assert "_helion_cute_sass_checks" not in bound.to_code(plain, options=options)
 
 
 def test_dynamic_shapes_rejected() -> None:

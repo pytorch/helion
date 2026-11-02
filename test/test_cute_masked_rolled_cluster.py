@@ -15,6 +15,7 @@ from helion._compiler.autotuner_heuristics.cute import CuteMaskedRolledClusterHe
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import skipIfNotCUDA
+from helion._testing import skipUnlessCuteAvailable
 
 
 def _kernel() -> helion.Kernel:
@@ -73,6 +74,7 @@ def test_masked_cluster_seed_has_a_vectorized_register_slice(columns: int) -> No
             assert "_fuse_cache_0" in code
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @skipIfNotCUDA()
 @pytest.mark.cuda
 @pytest.mark.parametrize("columns", [3584, 4097, 6144])

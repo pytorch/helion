@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import itertools
+import operator
 import os
 import re
 from typing import TYPE_CHECKING
@@ -767,6 +768,87 @@ def _rejected_variant(name: str) -> tuple[Any, tuple[Any, ...]]:
     return _hstu_module()._helion_jagged_attention_kernel, _hstu_args(head_dim=96)
 
 
+@pytest.mark.parametrize("role", ["q", "k", "v", "o"])
+def test_explicit_row_mask_requires_the_gate_sequence_bound(role: str) -> None:
+    with _cpu_codegen_patches():
+        bound = _bind_hstu(_hstu_args())
+        matched = _match(bound)
+        assert matched is not None
+        access = {"q": matched.q, "k": matched.k, "v": matched.v, "o": matched.o}[role]
+        mask = access.extra_mask
+        assert mask is not None
+        predicate = cute_flash_gated._strip_views(mask, matched.scope)
+        assert isinstance(predicate, torch.fx.Node)
+        index, length = predicate.args
+        assert isinstance(length, torch.fx.Node)
+        with access.node.graph.inserting_before(access.node):
+            shortened = access.node.graph.call_function(operator.sub, (length, 1))
+            shortened.meta = dict(length.meta)
+            changed = access.node.graph.call_function(
+                predicate.target, (index, shortened)
+            )
+            changed.meta = dict(predicate.meta)
+            changed_mask = access.node.graph.call_function(
+                torch.ops.aten.unsqueeze.default, (changed, 1)
+            )
+            changed_mask.meta = dict(mask.meta)
+        arguments = list(access.node.args)
+        arguments[3 if role == "o" else 2] = changed_mask
+        access.node.args = tuple(arguments)
+        assert _match(bound) is None
+
+
+@pytest.mark.parametrize("q_tile", [64, 128])
+@pytest.mark.parametrize("kv_tile", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_gated_masked_v_tail_excludes_neighboring_sequence_nan(
+    q_tile: int, kv_tile: int, dtype: torch.dtype
+) -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family gated attention required")
+    q = torch.zeros((72, 2, 64), dtype=dtype, device=DEVICE)
+    k = torch.zeros_like(q)
+    v = torch.ones_like(q)
+    v[33:] = float("nan")
+    offsets = torch.tensor([0, 33, 72], dtype=torch.int64, device=DEVICE)
+    args = (256, 1.0 / 64**2, q, k, v, offsets)
+    bound = _bind_hstu(args)
+    config = helion.Config(
+        block_sizes=[q_tile, kv_tile],
+        cute_flash_kv_stage=2,
+        cute_flash_gate_warpgroups=2,
+    )
+    assert _gated_markers(bound.to_code(config))
+    output = bound.compile_config(config)(*args)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        output[:33], torch.zeros_like(output[:33]), atol=0, rtol=0
+    )
+
+
+def test_gated_masked_v_preserves_the_kv_loop_bound() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family gated attention required")
+    q = torch.zeros((168, 2, 64), dtype=torch.bfloat16, device=DEVICE)
+    k = torch.zeros_like(q)
+    v = torch.ones_like(q)
+    v[64:] = float("nan")
+    offsets = torch.tensor([0, 129, 168], dtype=torch.int64, device=DEVICE)
+    args = (256, 1.0 / 64**2, q, k, v, offsets)
+    bound = _bind_hstu(args)
+    config = helion.Config(
+        block_sizes=[64, 128],
+        cute_flash_kv_stage=2,
+        cute_flash_gate_warpgroups=2,
+    )
+    assert _gated_markers(bound.to_code(config))
+    output = bound.compile_config(config)(*args)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        output[:64], torch.zeros_like(output[:64]), atol=0, rtol=0
+    )
+
+
 # ---------------------------------------------------------------------------
 # CPU codegen tests
 # ---------------------------------------------------------------------------
@@ -785,10 +867,19 @@ def test_hstu_selects_gated_body_at_fused_tiles(head_dim: int) -> None:
             "block_sizes",
             "cute_flash_kv_stage",
             "cute_flash_gate_warpgroups",
+            "cute_flash_gated_row_warps",
         ]
-        seeds = [seed.config for seed in spec.autotune_seed_configs()]
-        assert seeds[0]["block_sizes"] == [128, 128]
-        assert seeds[0]["cute_flash_gate_warpgroups"] == 2
+        all_seeds = [seed.config for seed in spec.autotune_seed_configs()]
+        assert all_seeds[0]["block_sizes"] == [128, 128]
+        assert all_seeds[0]["cute_flash_gate_warpgroups"] == 2
+        # The fused tcgen05 seeds come first; the register-MMA row programs'
+        # seeds (16- and 32-row query tiles) follow (test_cute_flash_gated_row_mma).
+        seeds = [seed for seed in all_seeds if seed["block_sizes"][0] >= 64]
+        row_seeds = [seed for seed in all_seeds if seed["block_sizes"][0] < 64]
+        assert all_seeds == [*seeds, *row_seeds]
+        # This shape (8 sequences x 8 heads x 32 query tiles of 16 rows = 2048
+        # row programs) is past the row programs' seed cap: none here.
+        assert row_seeds == []
         # Every fused tile shape (both query tile heights, every KV tile width)
         # at every legal ring depth and every gate warpgroup count above one is
         # seeded (a count must split a thread's columns into chunks of at least
@@ -1224,9 +1315,28 @@ def test_hstu2_wide_tile_rejected_at_head_dim_128() -> None:
 def test_hstu_other_tiles_keep_scalar_path_and_validate_knob() -> None:
     with _cpu_codegen_patches():
         bound = _bind_hstu(_hstu_args())
+        # The 16-row query tile takes the register-MMA row program, not the
+        # fused body (test_cute_flash_gated_row_mma covers it).
         code = bound.to_code(helion.Config(block_sizes=[16, 16]))
         assert not _gated_markers(code)
         assert "_flash_qk_mma" not in code
+        assert "'kind': 'helion_flash_gated_row_mma'" in code
+        # A tile neither body takes (a 64-row query tile with a 16-key KV
+        # tile) keeps the scalar path.
+        scalar = bound.to_code(helion.Config(block_sizes=[64, 16]))
+        assert not _gated_markers(scalar)
+        assert "_flash_qk_mma" not in scalar
+        assert "'kind': 'helion_flash_gated_row_mma'" not in scalar
+        assert "_cute_grouped_reduce" in scalar or "cute.arch" in scalar
+        # fp32 rows: the fused body runs them as tf32, the row programs
+        # decline them, so the 16-row tile falls back to the scalar path and
+        # the surface has no row tiles (and no warp knob).
+        seq, alpha, q, k, v, seq_offsets = _hstu_args()
+        fp32 = _bind_hstu((seq, alpha, q.float(), k.float(), v.float(), seq_offsets))
+        assert "cute_flash_gated_row_warps" not in fp32.config_spec._flat_fields()
+        scalar32 = fp32.to_code(helion.Config(block_sizes=[16, 16]))
+        assert not _gated_markers(scalar32)
+        assert "'kind': 'helion_flash_gated_row_mma'" not in scalar32
         with pytest.raises(InvalidConfig, match="cute_flash_kv_stage"):
             bound.config_spec.normalize(
                 helion.Config(block_sizes=[128, 128], cute_flash_kv_stage=99)

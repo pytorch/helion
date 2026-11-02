@@ -20,11 +20,16 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.cutedsl_compat import emit_pipeline_advance
 from .cute.device_state import Tcgen05GroupedSchedulerMode
+from .cute.grouped_panel_raster import GROUPED_PANEL_ALTERNATE_KEY
+from .cute.grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
 from .cute.strategies import TCGEN05_BATCH_RASTER_DEFAULT
 from .cute.strategies import TCGEN05_BATCH_RASTER_SLOWEST
 from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
+from .cute.strategies import TCGEN05_PERSISTENT_GRID_CAP_DEFAULT
+from .cute.strategies import TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS
 from .cute.strategies import batch_raster_from_config
 from .cute.strategies import l2_swizzle_size_from_config
+from .cute.strategies import persistent_grid_cap_from_config
 from .cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS
 from .cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
@@ -33,6 +38,8 @@ from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
 from .cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
+from .cute.tcgen05_prologue import inline_floordiv_nonneg_expr
+from .cute.tcgen05_prologue import inline_mod_nonneg_expr
 from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction
@@ -413,6 +420,8 @@ _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_K = 7
 _TCGEN05_GROUPED_SELECTED_MAILBOX_GLOBAL_M_START = 8
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .cute.cute_mma import _Tcgen05SchedPipelinePlan
     from .cute.device_state import CuteTcgen05MatmulPlan
     from .inductor_lowering import CodegenState
@@ -427,6 +436,11 @@ class PIDInfo(NamedTuple):
     block_size_var: str
     numel: sympy.Expr | str  # Can be a sympy.Expr or a string for data-dependent bounds
     block_id: int
+    # ``cute_tiles_per_block``: this axis's tiles are packed ``pack`` per CTA
+    # on thread axis ``pack_axis`` (the pid count shrinks by ``pack``, which
+    # divides the static tile count).
+    pack: int = 1
+    pack_axis: int = 0
 
     def num_pids_expr(self, *, is_device: bool) -> str:
         """Get the number of PIDs expression for device or host."""
@@ -439,6 +453,9 @@ class PIDInfo(NamedTuple):
             numel_str = self.numel
         else:
             numel_str = context.sympy_expr(self.numel)
+        if self.pack > 1:
+            assert self.block_size_var == "1"
+            return f"(({numel_str}) // {self.pack})"
         if self.block_size_var == "1":
             return numel_str
         if not is_device:
@@ -456,6 +473,8 @@ class PIDInfo(NamedTuple):
         ):
             return None
         numel = int(self.numel)
+        if self.pack > 1:
+            return numel // self.pack
         if self.block_size_var == "1":
             return numel
         block_size = DeviceFunction.current().resolved_int_constexpr(
@@ -476,6 +495,11 @@ def _sum_pids(exprs: list[str]) -> str:
 @dataclasses.dataclass
 class ProgramIDs(abc.ABC):
     """Base class for all program ID strategies with common functionality."""
+
+    # The CuTe pid decomposition's division form: shifts / masks for the
+    # non-negative pids of the tcgen05 persistent kernels, ``//`` / ``%``
+    # elsewhere (see ``_decompose_pid_to_statements``).
+    _pid_division_by_shifts: ClassVar[bool] = False
 
     shared_pid_var: str | None = None
     pid_info: list[PIDInfo] = dataclasses.field(default_factory=list)
@@ -500,6 +524,16 @@ class ProgramIDs(abc.ABC):
         return " * ".join(
             f"({pid.num_pids_expr(is_device=is_device)})" for pid in self.pid_info
         )
+
+    def static_grid_size(self) -> int | None:
+        """The CTA count of the grid ``codegen_grid`` launches, when every
+        extent is static (``None`` otherwise).  The flat and xyz strategies
+        launch one CTA per program id; the wrappers and the persistent
+        strategies override this with what they actually launch."""
+        counts = [pid.static_num_pids() for pid in self.pid_info]
+        if None in counts:
+            return None
+        return math.prod(cast("list[int]", counts))
 
     def setup_persistent_kernel(
         self, device_function: DeviceFunction, total_pids_expr: str | None = None
@@ -526,6 +560,17 @@ class ProgramIDs(abc.ABC):
                 *wrapped_body,
             ]
 
+        # One-shot teardown registered by the body's lowering (a tensor
+        # memory dealloc) runs once, after the tile loop.
+        cute_state = device_function.cute_state
+        post_loop: list[ast.stmt] = []
+        if cute_state.has_tcgen05_post_loop_marks:
+            statements = cast("list[ast.stmt]", wrapped_body)
+            post_loop = [s for s in statements if cute_state.is_tcgen05_post_loop(s)]
+            wrapped_body = [
+                s for s in statements if not cute_state.is_tcgen05_post_loop(s)
+            ]
+
         # Create the persistent loop that wraps the entire body
         persistent_loop = create(
             ast.For,
@@ -535,7 +580,7 @@ class ProgramIDs(abc.ABC):
             orelse=[],
             type_comment=None,
         )
-        return [persistent_loop]
+        return [persistent_loop, *post_loop]
 
     @property
     def virtual_program_id(self) -> str:
@@ -558,13 +603,49 @@ class ProgramIDs(abc.ABC):
             statement_from_string(f"{num_block} = {pid.num_pids_expr(is_device=True)}")
             for num_block, pid in zip(num_blocks, self.pid_info[:-1], strict=True)
         ]
+        # Pids are never negative: the tcgen05 persistent kernels divide them
+        # by a static power-of-two pid count with a shift / mask instead of
+        # the DSL's floor-division fix-up chains (``tcgen05_prologue``; the
+        # TMA-load warp's prologue is their critical path).  The other
+        # kernels keep the ``//`` / ``%`` forms their analyses evaluate (the
+        # proven-bounds prover, the gathered-MMA region proof).  Only a real
+        # device function has the environment and PID facts this needs
+        # (tests render the generic form through fakes).
+        nonneg_division = (
+            isinstance(state.device_function, DeviceFunction)
+            and self._pid_division_by_shifts
+            and CompileEnvironment.current().backend_name == "cute"
+        )
+        static_counts = [
+            pid.static_num_pids() if nonneg_division else None for pid in self.pid_info
+        ]
         for i, pid in enumerate(self.pid_info):
             expr = pid_var
             if i > 0:
                 divisor = " * ".join(num_blocks[:i])
-                expr = f"({expr}) // ({divisor})"
+                if nonneg_division:
+                    static_divisor: int | None = 1
+                    for count in static_counts[:i]:
+                        static_divisor = (
+                            None
+                            if static_divisor is None or count is None
+                            else static_divisor * count
+                        )
+                    expr = inline_floordiv_nonneg_expr(expr, divisor, static_divisor)
+                else:
+                    expr = f"({expr}) // ({divisor})"
             if i + 1 < len(self.pid_info):
-                expr = f"({expr}) % ({num_blocks[i]})"
+                if nonneg_division:
+                    expr = inline_mod_nonneg_expr(expr, num_blocks[i], static_counts[i])
+                else:
+                    expr = f"({expr}) % ({num_blocks[i]})"
+            if pid.pack > 1:
+                # Thread sub-group ``pack_axis`` of this CTA owns its own tile.
+                index_dtype = CompileEnvironment.current().index_type()
+                expr = (
+                    f"({expr}) * {pid.pack}"
+                    f" + {index_dtype}(cute.arch.thread_idx()[{pid.pack_axis}])"
+                )
             statements.append(statement_from_string(f"{pid.pid_var} = {expr}"))
         return statements
 
@@ -667,6 +748,18 @@ class ForEachProgramID(ProgramIDs):
         """Get total PIDs expression for ForEachProgramID (sum of all pids)."""
         cdivs = [pid.total_pids_expr(is_device=is_device) for pid in self.cases]
         return _sum_pids(cdivs)
+
+    def static_grid_size(self) -> int | None:
+        """The launch is the persistent grid when the cases are persistent,
+        else one CTA per program id of every root (``codegen_grid``)."""
+        if not self.cases:
+            return None
+        if self.cases[0]._is_persistent():
+            return self.cases[0].static_grid_size()
+        sizes = [case.static_grid_size() for case in self.cases]
+        if None in sizes:
+            return None
+        return sum(cast("list[int]", sizes))
 
     def codegen(self, state: CodegenState) -> None:
         blocks = self._cdiv_sum(state, exclude_last=True)
@@ -950,6 +1043,10 @@ class WorklistProgramIDs(ProgramIDs):
 
     def codegen_grid(self) -> ast.AST:
         return expr_from_string(f"({self.upper_expr},)")
+
+    def static_grid_size(self) -> int | None:
+        # The compact launcher overrides the grid with the traced work count.
+        return None
 
 
 class CuteProgramIDs(FlatProgramIDs):
@@ -1235,6 +1332,11 @@ class L2GroupingProgramIDs(ProgramIDs):
         assert self.parent_strategy is not None
         return self.parent_strategy.total_pids_expr(is_device=is_device)
 
+    def static_grid_size(self) -> int | None:
+        """Forward to parent strategy (the grouping reorders, never resizes)."""
+        assert self.parent_strategy is not None
+        return self.parent_strategy.static_grid_size()
+
 
 class PersistentProgramIDs(ProgramIDs):
     """Base class for persistent kernels that use num_sms grid size."""
@@ -1291,6 +1393,15 @@ class PersistentProgramIDs(ProgramIDs):
     def codegen_grid(self) -> ast.AST:
         # Use num_sms * multiplier for persistent kernels (multi-occupancy)
         return expr_from_string(f"({self.grid_size_expr},)")
+
+    def static_grid_size(self) -> int | None:
+        """``_NUM_SM * num_sm_multiplier`` CTAs: the SM count the config spec
+        captured for the compile device (the same reserved-adjusted count the
+        host computes), ``None`` when it is unknown."""
+        num_sm = CompileEnvironment.current().config_spec.num_sm
+        if num_sm <= 1:
+            return None
+        return num_sm * self.num_sm_multiplier
 
     def _persistent_setup_statements(self, total_pids_expr: str) -> list[ast.stmt]:
         """Generate the preamble statements for persistent kernel setup."""
@@ -1469,10 +1580,23 @@ class PersistentInterleavedProgramIDs(PersistentProgramIDs):
 class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     """tcgen05 persistent scheduler for blocked and interleaved PID orders."""
 
+    _pid_division_by_shifts: ClassVar[bool] = True
+
     _VALIDATED_TWO_CTA_MAX_K_TILES: ClassVar[int] = TCGEN05_TWO_CTA_MAX_K_TILES
+
+    # One-shot TMA-load role setup split out of the body
+    # (``_split_tcgen05_invariant_setup``): the role's prelude.  (A class
+    # default: the splitter's unit tests build the object without
+    # ``__init__``.)
+    _tcgen05_tma_role_prelude_stmts: Sequence[ast.stmt] = ()
 
     def __init__(self, *, is_blocked: bool) -> None:
         super().__init__(is_blocked=is_blocked)
+
+    def static_grid_size(self) -> int | None:
+        # ``codegen_grid`` launches ``min(work clusters, persistent cluster
+        # capacity)`` clusters, a host-side quantity.
+        return None
 
     def _tcgen05_plan(self) -> CuteTcgen05MatmulPlan | None:
         try:
@@ -1564,11 +1688,21 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         plan = self._tcgen05_plan()
         return bool(plan is not None and plan.grouped is not None)
 
+    def _tcgen05_grouped_scheduler_grid_expr(self) -> str:
+        plan = self._tcgen05_plan()
+        assert plan is not None and plan.grouped is not None
+        if plan.grouped.worker_balance is not None:
+            return plan.grouped.worker_balance.grid
+        return "cute.arch.grid_dim()"
+
     def _tcgen05_uses_grouped_worklist_nm_scheduler_mailbox(self) -> bool:
         plan = self._tcgen05_plan()
         return bool(
             plan is not None
-            and plan.accumulator_view == "nm"
+            and (
+                plan.accumulator_view == "nm"
+                or (plan.grouped is not None and plan.grouped.device_split_sizes)
+            )
             and plan.has_scheduler_warp
             and plan.uses_role_local_persistent_body
             and plan.grouped is not None
@@ -1725,6 +1859,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         except NoCurrentFunction:
             return TCGEN05_BATCH_RASTER_DEFAULT
         return batch_raster_from_config(config)
+
+    def _tcgen05_persistent_grid_cap(self) -> str:
+        """``tcgen05_persistent_grid_cap``; the default outside a device function."""
+        try:
+            config = DeviceFunction.current().config
+        except NoCurrentFunction:
+            return TCGEN05_PERSISTENT_GRID_CAP_DEFAULT
+        return persistent_grid_cap_from_config(config)
 
     def _tcgen05_scheduler_axes(
         self, *, cluster_n: int | None = None
@@ -1927,7 +2069,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         than leaving a second hardware wave to re-run the prologue; the
         whole-cluster cap is the device's co-resident cluster count
         (``_MAX_ACTIVE_CLUSTERS``), which for clusters larger than the
-        CtaGroup.TWO pair is below ``_NUM_SM // cluster_size``.
+        CtaGroup.TWO pair is below ``_NUM_SM // cluster_size``.  Plain
+        cluster_n=2 grids take the same whole-cluster cap when the
+        ``tcgen05_persistent_grid_cap=resident_clusters`` knob asks for it
+        (a 2048x4096x2048 GEMM on 256x128 pair tiles launches 64 clusters:
+        two hardware waves of one-tile CTAs under the pair cap, ~2 tiles
+        per persistent CTA under the resident-cluster cap).
         """
         cluster_m = self._tcgen05_cluster_m()
         cluster_n = self._tcgen05_cluster_n()
@@ -1948,6 +2095,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             and plan.row_union is not None
             and plan.row_union.schedule is not None
         ):
+            return self._tcgen05_whole_cluster_capacity_expr()
+        if (
+            cluster_n > 1
+            and self._tcgen05_persistent_grid_cap()
+            == TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS
+        ):
+            # ``tcgen05_persistent_grid_cap=resident_clusters``: a plain
+            # cluster_n=2 grid with more clusters than the device co-schedules
+            # keeps its CTAs persistent over several tiles instead of
+            # launching a second hardware wave of one-tile CTAs (see
+            # ``TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY``).
             return self._tcgen05_whole_cluster_capacity_expr()
         return f"max(1, ({self.grid_size_expr}) // {cluster_m})"
 
@@ -1991,7 +2149,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
     def _tcgen05_logical_m_coord_expr(self, coord: str) -> str:
         if self._tcgen05_is_two_cta():
-            return f"({coord}) // cutlass.Int32({self._tcgen05_cluster_m()})"
+            cluster_m = self._tcgen05_cluster_m()
+            return inline_floordiv_nonneg_expr(
+                coord, f"cutlass.Int32({cluster_m})", cluster_m
+            )
         if self._tcgen05_uses_cluster_m2_one_cta_role_local_bridge():
             # The shared clustered scheduler publishes ``base_m + peer_rank``
             # into each CTA's SMEM slot. The guarded role-local bridge omits
@@ -2418,10 +2579,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         per_tile_names: set[str] = {self.virtual_pid_var}
         hoisted: list[ast.stmt] = []
         epi_role_prelude: list[ast.stmt] = []
+        tma_role_prelude: list[ast.stmt] = []
         wrapped: list[ast.stmt] = []
         for stmt in body:
             if cute_state.is_tcgen05_epi_role_prelude(stmt):
                 epi_role_prelude.append(stmt)
+                continue
+            if cute_state.is_tcgen05_tma_role_prelude(stmt):
+                tma_role_prelude.append(stmt)
                 continue
             reads, writes = _stmt_name_uses(stmt)
             is_per_tile = (
@@ -2434,6 +2599,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 wrapped.append(stmt)
             else:
                 hoisted.append(stmt)
+        self._tcgen05_tma_role_prelude_stmts = tma_role_prelude
         return hoisted, epi_role_prelude, wrapped
 
     def _collect_tcgen05_role_blocks(
@@ -2788,10 +2954,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             and isinstance(stmt, ast.If)
             and ast.unparse(stmt.test) == tma_predicate
         ]
-        assert len(role_indices) == 1, (
-            "tcgen05 TMA-role hoist expects exactly one TMA-load role block "
-            f"after the cluster arrive, found {len(role_indices)}"
-        )
+        if len(role_indices) != 1:
+            # A scheduler full/edge phase split emits two TMA role blocks;
+            # the hoist predicates exclude scheduler warps, so this is a
+            # precondition violation, reported as unsupported rather than
+            # asserted.
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 TMA-role hoist expects exactly one TMA-load role block "
+                f"after the cluster arrive, found {len(role_indices)}",
+            )
         role_block = setup.pop(role_indices[0])
         setup.insert(anchor_index + 1, role_block)
 
@@ -2860,6 +3032,18 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 partition, post_loop_stmts
             )
         )
+        plan = self._tcgen05_plan()
+        if (
+            plan is not None
+            and plan.grouped is not None
+            and plan.grouped.worker_balance is not None
+            and not (omit_shared_loop and use_validated_role_local_body)
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "balanced grouped workers require complete independent warp roles "
+                "without a shared persistent loop",
+            )
         if (
             use_validated_role_local_body
             and not omit_shared_loop
@@ -2968,6 +3152,34 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 )
             )
         setup.extend(post_loop_stmts)
+        if (
+            plan is not None
+            and plan.grouped is not None
+            and plan.grouped.worker_balance is not None
+        ):
+            balance = plan.grouped.worker_balance
+            grid_indices = [
+                index
+                for index, stmt in enumerate(setup)
+                if isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and stmt.targets[0].id == balance.grid
+            ]
+            assert len(grid_indices) == 1
+            boundary = grid_indices[0] + 1
+            # Metadata publication and the uniform count stay outside. DSL
+            # 4.8 rejects dynamic kernel returns, so every MMA resource, role
+            # loop and tail instead lives in one active-cluster branch.
+            setup = [
+                *setup[:boundary],
+                create(
+                    ast.If,
+                    test=expr_from_string(balance.active_predicate),
+                    body=setup[boundary:],
+                    orelse=[],
+                ),
+            ]
         return setup
 
     @dataclasses.dataclass
@@ -3262,8 +3474,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 "role-local scheduler codegen"
             )
             plan = self._tcgen05_plan()
-            assert plan is not None and plan.is_clc_persistent and plan.cluster_m > 1, (
-                "staged work-tile mailbox is only validated for clustered CLC"
+            assert plan is not None and (
+                (plan.is_clc_persistent and plan.cluster_m > 1)
+                or self._tcgen05_uses_grouped_worklist_nm_scheduler_mailbox()
+            ), (
+                "staged work-tile mailbox is only validated for clustered CLC "
+                "and the grouped N,M worklist scheduler"
             )
             stage_count = self._tcgen05_sched_stage_count()
             alloc_extent = f"cutlass.Int32({field_count * stage_count})"
@@ -3639,6 +3855,25 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         tma_load_role = (
             role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
             and not device_function.cute_state.tcgen05_pdl_wait_in_prefetch
+            # The role waits per tile, ahead of its first stage and after the
+            # tile's address math (``cute_mma``), not in its prelude.
+            and not device_function.cute_state.tcgen05_tma_role_wait_per_tile
+        )
+        # ``cute_pdl`` (``cute_mma``'s ``tcgen05_pdl_launch``): the TMA-load
+        # warp waits before its first load and the epilogue warps before
+        # their first auxiliary load; every other global access follows one
+        # of those waits through the pipelines.  (The two-CTA TMA role waits
+        # below regardless; the epilogue-role wait is new for it.)  Kernel
+        # shapes whose reads this does not cover get an entry wait from
+        # ``DeviceFunction._cute_pdl_applies`` instead.
+        general_pdl = (
+            device_function.config.get("cute_pdl") is True
+            and not materialized_pdl
+            and CompileEnvironment.current().cute_fission_plan is None
+            and (
+                tma_load_role
+                or role_block.role_predicate == self._tcgen05_epi_role_predicate()
+            )
         )
         if emit_pdl_wait and (
             (
@@ -3652,8 +3887,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 )
             )
             # The one-CTA family waits only when a materialized producer is
-            # launched ahead of it, so its plain generated code is unchanged.
+            # launched ahead of it (or ``cute_pdl`` asks for the dependent
+            # launch), so its plain generated code is unchanged.
             or (materialized_pdl and tma_load_role)
+            or general_pdl
         ):
             # PDL parity with Quack/CUTLASS: TMA producers wait before
             # touching scheduler state or issuing global-memory TMA work.
@@ -3673,6 +3910,25 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 ),
             ]
         )
+        prelude_wait = device_function.cute_state.tcgen05_tma_role_prelude_wait
+        if (
+            prelude_wait is not None
+            and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+        ):
+            # The hoisted TMA-load role joins the cluster rendezvous here,
+            # after its scheduler setup and ahead of its first mbarrier / TMA
+            # operation (``cute_mma`` ``tcgen05_hoist_row_union_tma_role``).
+            # Its once-per-CTA TMA partitions (the role prelude) run first:
+            # pure address math that overlaps the other warps' barrier inits
+            # and the peer CTAs' arrival instead of following the join.  The
+            # paired profile's startup prefill (TMA issues) is never part of
+            # this prelude: it must follow the rendezvous.
+            assert device_function.cute_state.ab_startup_prefill is None, (
+                "the AB startup prefill cannot be hoisted ahead of the cluster join"
+            )
+            prelude.extend(role_prelude_stmts or ())
+            role_prelude_stmts = None
+            prelude.append(statement_from_string(prelude_wait))
         tile_counter_var, increment_tile_counter_per_tile = (
             self._finish_role_local_prelude(
                 device_function,
@@ -4039,7 +4295,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         plan = self._tcgen05_plan()
         assert plan is not None and plan.grouped is not None
         grouped = plan.grouped
-        assert grouped.valid_m is not None and grouped.store_m is not None
+        assert plan.accumulator_view != "nm" or (
+            grouped.valid_m is not None and grouped.store_m is not None
+        )
         runtime_table = self._tcgen05_uses_grouped_worklist_nm_runtime_table()
         scheduler_mailbox = self._tcgen05_uses_grouped_worklist_nm_scheduler_mailbox()
         runtime_clc = self._tcgen05_uses_grouped_worklist_nm_runtime_clc()
@@ -4257,7 +4515,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 ),
             )
             derived_metadata_stmts: list[ast.stmt] = []
-            if epi_role:
+            if epi_role and plan.accumulator_view == "nm":
                 derived_metadata_stmts.extend(
                     self._grouped_worklist_nm_valid_store_m_stmts(device_function)
                 )
@@ -4267,6 +4525,19 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     statement_from_string(f"pid_1 = {grouped.cta_tile_idx_n}"),
                 )
             )
+            if plan.accumulator_view != "nm":
+                derived_metadata_stmts.extend(
+                    (
+                        statement_from_string(
+                            f"tile_offset_0 = {grouped.global_m_start} + "
+                            f"{grouped.cta_tile_idx_m} * cutlass.Int32({plan.source_tile_m})"
+                        ),
+                        statement_from_string(
+                            f"tile_offset_1 = {grouped.cta_tile_idx_n} * "
+                            f"cutlass.Int32({plan.source_tile_n})"
+                        ),
+                    )
+                )
             derived_metadata_stmts, required_metadata_names = (
                 _prune_dead_side_effect_free_generated_assignments(
                     derived_metadata_stmts, role_reads
@@ -4448,7 +4719,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             statement_from_string(
                 f"{sched_var} = cutlass.utils.StaticPersistentGroupTileScheduler.create("
                 f"{grouped.sched_params}, cute.arch.block_idx(), "
-                f"cute.arch.grid_dim(), ({plan.bm}, {plan.bn}, {plan.bk}), "
+                f"{self._tcgen05_grouped_scheduler_grid_expr()}, ({plan.bm}, {plan.bn * plan.cluster_n if plan.accumulator_view == 'mn' else plan.bn}, {plan.bk}), "
                 "cutlass.utils.create_initial_search_state(), "
                 f"{grouped.count}, {grouped.problem_sizes})"
             ),
@@ -4672,10 +4943,28 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         valid_var = device_function.new_var(f"{scheduler_var_prefix}_valid")
 
         prelude: list[ast.stmt] = []
-        if (
-            emit_pdl_wait
+        # ``cute_pdl``: the epilogue warps wait ahead of their first global
+        # access (the row-union interval read of their prelude, the output
+        # stores) like the MONOLITHIC path's ``general_pdl``; with the TMA
+        # and scheduler warps' own waits every global access of the kernel
+        # then follows a role wait and ``DeviceFunction._cute_pdl_applies``
+        # emits no entry wait.
+        epilogue_pdl = (
+            device_function.config.get("cute_pdl") is True
+            and not device_function.config.get("tcgen05_materialized_pdl", False)
+            and CompileEnvironment.current().cute_fission_plan is None
+            # Only where the TMA-load role waits too (the two-CTA kernels):
+            # the one-CTA scheduler kernel keeps its entry wait, and a role
+            # wait beside it would be redundant.
             and self._tcgen05_is_two_cta()
-            and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+            and role_block.role_predicate == self._tcgen05_epi_role_predicate()
+        )
+        if emit_pdl_wait and (
+            (
+                self._tcgen05_is_two_cta()
+                and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+            )
+            or epilogue_pdl
         ):
             # Same PDL hand-off as the MONOLITHIC path.
             prelude.append(statement_from_string("cute.arch.griddepcontrol_wait()"))
@@ -4860,11 +5149,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             (_TCGEN05_GROUPED_SELECTED_MAILBOX_GROUP_IDX, group_idx_var),
             (
                 _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_M,
-                f"{group_info_var}.problem_shape_n",
+                f"{group_info_var}.problem_shape_{'n' if plan.accumulator_view == 'nm' else 'm'}",
             ),
             (
                 _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_N,
-                f"{group_info_var}.problem_shape_m",
+                f"{group_info_var}.problem_shape_{'m' if plan.accumulator_view == 'nm' else 'n'}",
             ),
             (
                 _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_K,
@@ -4942,6 +5231,183 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 ),
             ]
 
+        def mn_panel_raster_stmts(swizzle: int | None = None) -> list[ast.stmt]:
+            """Permute matched cluster indices without changing group search."""
+            assert plan.accumulator_view == "mn"
+            assert (
+                grouped.device_split_sizes and grouped.device_layout_kind == "offsets"
+            )
+            if swizzle is None:
+                swizzle = self._tcgen05_l2_swizzle_size()
+            if swizzle == 1:
+                # The alternate width can select the legacy AlongM order.
+                return [create(ast.Pass)]
+            assert swizzle > 1
+            backend = CompileEnvironment.current().backend
+            local_index = device_function.new_var("tcgen05_grouped_panel_local_index")
+            if grouped.device_n_size is not None:
+                n_clusters_value = (
+                    grouped.device_n_size + plan.bn * plan.cluster_n - 1
+                ) // (plan.bn * plan.cluster_n)
+                if n_clusters_value <= swizzle:
+                    # One full-width panel: every row walks the same fixed N
+                    # cluster extent, so both divisions have a static divisor.
+                    return [
+                        statement_from_string(
+                            f"{local_index} = {sched_var}._current_work_linear_idx - "
+                            f"{sched_var}.search_state.tile_count_prev_group"
+                        ),
+                        statement_from_string(
+                            f"{cta_tile_idx_m_var} = {local_index} // "
+                            f"cutlass.Int32({n_clusters_value})"
+                        ),
+                        statement_from_string(
+                            f"{cta_tile_idx_n_var} = ({local_index} % "
+                            f"cutlass.Int32({n_clusters_value})) * cutlass.Int32({plan.cluster_n}) + "
+                            f"{cta_tile_idx_n_var} % cutlass.Int32({plan.cluster_n})"
+                        ),
+                    ]
+                if n_clusters_value <= 2 * swizzle:
+                    m_clusters = device_function.new_var(
+                        "tcgen05_grouped_panel_m_clusters"
+                    )
+                    tail_index = device_function.new_var(
+                        "tcgen05_grouped_panel_tail_index"
+                    )
+                    tail_width = n_clusters_value - swizzle
+                    return [
+                        statement_from_string(
+                            f"{local_index} = {sched_var}._current_work_linear_idx - "
+                            f"{sched_var}.search_state.tile_count_prev_group"
+                        ),
+                        statement_from_string(
+                            f"{m_clusters} = "
+                            + backend.cdiv_expr(
+                                f"{group_info_var}.problem_shape_m",
+                                f"cutlass.Int32({plan.bm})",
+                                is_device=True,
+                            )
+                        ),
+                        create(
+                            ast.If,
+                            test=expr_from_string(
+                                f"{local_index} < cutlass.Int32({swizzle}) * {m_clusters}"
+                            ),
+                            body=[
+                                statement_from_string(
+                                    f"{cta_tile_idx_m_var} = {local_index} // cutlass.Int32({swizzle})"
+                                ),
+                                statement_from_string(
+                                    f"{cta_tile_idx_n_var} = ({local_index} % cutlass.Int32({swizzle})) * "
+                                    f"cutlass.Int32({plan.cluster_n}) + {cta_tile_idx_n_var} % cutlass.Int32({plan.cluster_n})"
+                                ),
+                            ],
+                            orelse=[
+                                statement_from_string(
+                                    f"{tail_index} = {local_index} - cutlass.Int32({swizzle}) * {m_clusters}"
+                                ),
+                                statement_from_string(
+                                    f"{cta_tile_idx_m_var} = {m_clusters} - cutlass.Int32(1) - {tail_index} // cutlass.Int32({tail_width})"
+                                ),
+                                statement_from_string(
+                                    f"{cta_tile_idx_n_var} = (cutlass.Int32({swizzle}) + {tail_index} % cutlass.Int32({tail_width})) * "
+                                    f"cutlass.Int32({plan.cluster_n}) + {cta_tile_idx_n_var} % cutlass.Int32({plan.cluster_n})"
+                                ),
+                            ],
+                        ),
+                    ]
+            m_clusters = device_function.new_var("tcgen05_grouped_panel_m_clusters")
+            n_clusters = device_function.new_var("tcgen05_grouped_panel_n_clusters")
+            panel_size = device_function.new_var("tcgen05_grouped_panel_size")
+            panel_span = device_function.new_var("tcgen05_grouped_panel_span")
+            panel_index = device_function.new_var("tcgen05_grouped_panel_index")
+            panel_linear = device_function.new_var("tcgen05_grouped_panel_linear")
+            panel_width = device_function.new_var("tcgen05_grouped_panel_width")
+            return [
+                statement_from_string(
+                    f"{local_index} = {sched_var}._current_work_linear_idx - "
+                    f"{sched_var}.search_state.tile_count_prev_group"
+                ),
+                statement_from_string(
+                    f"{m_clusters} = "
+                    + backend.cdiv_expr(
+                        f"{group_info_var}.problem_shape_m",
+                        f"cutlass.Int32({plan.bm})",
+                        is_device=True,
+                    )
+                ),
+                statement_from_string(
+                    f"{n_clusters} = "
+                    + backend.cdiv_expr(
+                        f"{group_info_var}.problem_shape_n",
+                        f"cutlass.Int32({plan.bn * plan.cluster_n})",
+                        is_device=True,
+                    )
+                ),
+                statement_from_string(
+                    f"{panel_size} = cutlass.min(cutlass.Int32({swizzle}), {n_clusters})"
+                ),
+                statement_from_string(f"{panel_span} = {panel_size} * {m_clusters}"),
+                statement_from_string(f"{panel_index} = {local_index} // {panel_span}"),
+                statement_from_string(f"{panel_linear} = {local_index} % {panel_span}"),
+                statement_from_string(
+                    f"{panel_width} = cutlass.min({panel_size}, {n_clusters} - {panel_index} * {panel_size})"
+                ),
+                statement_from_string(
+                    f"{cta_tile_idx_m_var} = {panel_linear} // {panel_width}"
+                ),
+                statement_from_string(
+                    f"{cta_tile_idx_n_var} = ({panel_index} * {panel_size} + "
+                    f"{panel_linear} % {panel_width}) * cutlass.Int32({plan.cluster_n}) + "
+                    f"{cta_tile_idx_n_var} % cutlass.Int32({plan.cluster_n})"
+                ),
+                create(
+                    ast.If,
+                    test=expr_from_string(
+                        f"{panel_index} % cutlass.Int32(2) == cutlass.Int32(1)"
+                    ),
+                    body=[
+                        statement_from_string(
+                            f"{cta_tile_idx_m_var} = {m_clusters} - cutlass.Int32(1) - {cta_tile_idx_m_var}"
+                        )
+                    ],
+                    orelse=[],
+                ),
+            ]
+
+        def mn_panel_choice_stmts() -> list[ast.stmt]:
+            alternate = device_function.config.get(GROUPED_PANEL_ALTERNATE_KEY)
+            if alternate is None:
+                return mn_panel_raster_stmts()
+            ratio = device_function.config.get(GROUPED_PANEL_RATIO_KEY)
+            assert type(alternate) is int and type(ratio) is int
+            assert grouped.device_n_size is not None
+            n_clusters = (grouped.device_n_size + plan.bn * plan.cluster_n - 1) // (
+                plan.bn * plan.cluster_n
+            )
+            m_clusters = device_function.new_var(
+                "tcgen05_grouped_panel_choice_m_clusters"
+            )
+            backend = CompileEnvironment.current().backend
+            return [
+                statement_from_string(
+                    f"{m_clusters} = "
+                    + backend.cdiv_expr(
+                        f"{group_info_var}.problem_shape_m",
+                        f"cutlass.Int32({plan.bm})",
+                        is_device=True,
+                    )
+                ),
+                create(
+                    ast.If,
+                    test=expr_from_string(
+                        f"{m_clusters} <= cutlass.Int32({ratio * n_clusters})"
+                    ),
+                    body=mn_panel_raster_stmts(self._tcgen05_l2_swizzle_size()),
+                    orelse=mn_panel_raster_stmts(alternate),
+                ),
+            ]
+
         def publish_current_tile_leader_stmts() -> list[ast.stmt]:
             return [
                 statement_from_string(
@@ -4968,13 +5434,40 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     ]
                 ),
                 statement_from_string(
-                    f"{cta_tile_idx_m_var} = {group_info_var}.cta_tile_idx_n"
+                    f"{cta_tile_idx_m_var} = "
+                    + (
+                        f"{group_info_var}.cta_tile_idx_n"
+                        if plan.accumulator_view == "nm"
+                        else self._tcgen05_logical_m_coord_expr(
+                            f"{group_info_var}.cta_tile_idx_m"
+                        )
+                    )
                 ),
                 statement_from_string(
                     f"{cta_tile_idx_n_var} = "
-                    f"{self._tcgen05_logical_m_coord_expr(f'{group_info_var}.cta_tile_idx_m')}"
+                    + (
+                        self._tcgen05_logical_m_coord_expr(
+                            f"{group_info_var}.cta_tile_idx_m"
+                        )
+                        if plan.accumulator_view == "nm"
+                        else f"{group_info_var}.cta_tile_idx_n"
+                    )
                 ),
-                *source_m_fast_raster_stmts(),
+                *(
+                    source_m_fast_raster_stmts()
+                    if plan.accumulator_view == "nm"
+                    else []
+                ),
+                *(
+                    mn_panel_choice_stmts()
+                    if plan.accumulator_view == "mn"
+                    and (
+                        self._tcgen05_l2_swizzle_size() > 1
+                        or device_function.config.get(GROUPED_PANEL_ALTERNATE_KEY)
+                        is not None
+                    )
+                    else []
+                ),
                 *[
                     statement_from_string(f"{slot(field)} = {value}")
                     for field, value in mailbox_values
@@ -5008,7 +5501,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             statement_from_string(
                 f"{sched_var} = cutlass.utils.StaticPersistentGroupTileScheduler.create("
                 f"{grouped.sched_params}, cute.arch.block_idx(), "
-                f"cute.arch.grid_dim(), ({plan.bm}, {plan.bn}, {plan.bk}), "
+                f"{self._tcgen05_grouped_scheduler_grid_expr()}, ({plan.bm}, {plan.bn * plan.cluster_n if plan.accumulator_view == 'mn' else plan.bn}, {plan.bk}), "
                 "cutlass.utils.create_initial_search_state(), "
                 f"{grouped.count}, {grouped.problem_sizes})"
             ),
@@ -5739,8 +6232,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # consumer's ``virtual_pid = work_tile_smem[0] // cluster_m``
         # collapse continues to work.
         clc_helper_call = "_cute_issue_clc_query_nomulticast"
+        # Throttled pacing: wait for the TMA-load warp's per-tile credit
+        # (``cute_mma._tcgen05_clc_throttle_credit``) before each query.
+        clc_throttle_barrier = device_function.cute_state.clc_throttle_barrier
         clc_query_block = [
             statement_from_string("cute.arch.sync_warp()"),
+            *(
+                [statement_from_string(f"{clc_throttle_barrier}.arrive_and_wait()")]
+                if clc_throttle_barrier
+                else []
+            ),
             create(
                 ast.If,
                 test=expr_from_string(leader_predicate),
@@ -7461,6 +7962,19 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     role_prelude_stmts = ast.parse(
                         cute_state.ab_startup_prefill.role_prelude()
                     ).body
+                tma_role_prelude_stmts = self._tcgen05_tma_role_prelude_stmts
+                if (
+                    predicate == self._tcgen05_tma_load_role_predicate()
+                    and tma_role_prelude_stmts
+                    and phase != "edge"
+                ):
+                    # The once-per-CTA TMA partitions (``cute_mma``), ahead of
+                    # the role's loop (and of its cluster join on the static
+                    # persistent builder).
+                    role_prelude_stmts = [
+                        *(role_prelude_stmts or []),
+                        *(_clone_stmt(stmt) for stmt in tma_role_prelude_stmts),
+                    ]
                 suffix = f"_{phase}" if phase else ""
                 # Cycle-94 merge: build the store warp's aux producer body for
                 # injection into the epilogue role-local while. Only on the epi

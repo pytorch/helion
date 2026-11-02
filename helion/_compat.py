@@ -257,6 +257,8 @@ if triton_is_available():
             or hasattr(triton.language, "_experimental_make_tensor_descriptor")
         ):
             return False
+        if torch.xpu.is_available():
+            return False
         try:
             module = importlib.import_module("triton.tools.tensor_descriptor")
         except ImportError:
@@ -642,6 +644,57 @@ def _supports_maxnreg() -> bool:
     )
 
 
+def supported_launch_options() -> frozenset[str] | None:
+    """Names of the compile options the active Triton backend accepts as
+    launch keyword arguments (``num_warps``, ``maxnreg``, fbtriton's
+    ``maxRegAutoWS``, ...), or ``None`` when the backend cannot be probed."""
+    # call private func we can patch in testing
+    return _supported_launch_options()
+
+
+@functools.cache
+def _supported_launch_options() -> frozenset[str] | None:
+    import dataclasses
+
+    if not triton_is_available():
+        return None
+    options: object = None
+    try:
+        # The option dataclasses are plain classes: no driver initialization.
+        if torch.version.hip is not None:
+            from triton.backends.amd.compiler import HIPOptions as options
+        elif torch.version.cuda is not None:
+            from triton.backends.nvidia.compiler import CUDAOptions as options
+        else:
+            from triton.compiler.compiler import make_backend
+            from triton.runtime import driver
+
+            target = driver.active.get_current_target()
+            if target is None:
+                return None
+            options = make_backend(target).parse_options({})
+    except Exception:
+        return None
+    if not dataclasses.is_dataclass(options):
+        return None
+    return frozenset(field.name for field in dataclasses.fields(options))
+
+
+def range_supports_data_partition_factor() -> bool:
+    """Whether ``tl.range`` accepts fbtriton's ``data_partition_factor``."""
+    # call private func we can patch in testing
+    return _range_supports_data_partition_factor()
+
+
+@functools.cache
+def _range_supports_data_partition_factor() -> bool:
+    if not triton_is_available():
+        return False
+    import triton.language as tl
+
+    return "data_partition_factor" in inspect.signature(tl.range.__init__).parameters
+
+
 def fp8_block_ptr_padding_broken() -> bool:
     # call private func we can patch in testing
     return _fp8_block_ptr_padding_broken()
@@ -756,8 +809,6 @@ def supports_torch_compile_template_lowering() -> bool:
     external template kernel and the template buffer fusion flags, without the
     scheduler's prologue/producer fusion hook.
     """
-    if torch.xpu.is_available():
-        return False
     if not requires_torch_version("2.11"):
         return False
     try:

@@ -18,22 +18,64 @@ from ..host_function import HostFunction
 from ..type_info import BarrierResultType
 from ..type_info import BlockSizeType
 from ..type_info import CallableType
+from ..type_info import LiteralType
+from ..type_info import SymIntType
 from ..type_info import TensorAttributeType
 from ..type_info import TensorType
 from .materialized_fission import MaterializedFissionPlan
 from .materialized_fission import _shape_only
 from .materialized_fission_codegen import generate_materialized_fission
 from .promote_output_axis import _fresh_tensors
+from .promote_output_axis import _integer_metadata_call
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from ...runtime.config import Config
+    from ..device_ir import DeviceIR
 
 
 def _require(condition: bool, detail: str) -> None:
     if not condition:
         raise exc.BackendUnsupported("cute", f"ordered grid phases: {detail}")
+
+
+def _pure_host_metadata(node: ast.AST, tensor_names: set[str]) -> bool:
+    """Prove a host prelude value is pure integer metadata.
+
+    Extends the shape-only grammar with the integer-metadata calls the
+    freshness proof admits (``hl.register_tunable`` with its fragment,
+    ``helion.cdiv`` / power-of-two helpers, ``min`` / ``max``). Each ordered
+    stage re-executes the host prelude, and these derive the same value from
+    the same config and shapes in every stage. The value itself must be an
+    integer (symbolic or literal), never a tensor.
+    """
+    if _shape_only(node, tensor_names):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        return _pure_host_metadata(node.operand, tensor_names)
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return all(_pure_host_metadata(item, tensor_names) for item in node.elts)
+    if isinstance(node, ast.BinOp):
+        return (
+            isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod))
+            and _pure_host_metadata(node.left, tensor_names)
+            and _pure_host_metadata(node.right, tensor_names)
+        )
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node, ExtendedAST)
+        and isinstance(node.func, ExtendedAST)
+        and isinstance(node.func._type_info, CallableType)
+        and _integer_metadata_call(node, node.func._type_info)
+    ):
+        return False
+    result = node._type_info
+    if isinstance(result, TensorType) or not isinstance(
+        result, (SymIntType, LiteralType)
+    ):
+        return False
+    return all(_pure_host_metadata(value, tensor_names) for value in node.args)
 
 
 def _contiguous_host_view(node: ast.AST, tensor_names: set[str]) -> bool:
@@ -110,22 +152,10 @@ def _contiguous_host_view(node: ast.AST, tensor_names: set[str]) -> bool:
     return True
 
 
-def generate_ordered_phases(
-    host: HostFunction,
-    config: Config,
-    emit_repro_caller: bool,
-    *,
-    store_transform: Callable[..., ast.AST] | None = None,
-    load_transform: Callable[..., ast.AST] | None = None,
-    extra_params: list[str] | None = None,
-) -> ast.Module:
-    """Bundle one complete root per explicit barrier phase.
-
-    Separate launches implement the existing grid-wide ordering contract.
-    The ordinary compiler has already checked each phase's memory dependencies;
-    this path does not infer additional synchronization for unmarked loops.
-    """
-    ir = host.device_ir
+def _ordered_phase_bundle(
+    host: HostFunction, ir: DeviceIR
+) -> tuple[HostFunction, MaterializedFissionPlan]:
+    """Prove the explicit barrier phases can launch as ordered single roots."""
     _require(not ir.implicit_dependency_starts, "implicit dependency phases")
     _require(
         all(
@@ -193,7 +223,7 @@ def generate_ordered_phases(
         if isinstance(value, torch.Tensor)
     }
     bound_names = set(host.params.arguments)
-    fresh = _fresh_tensors(bundle)
+    fresh = _fresh_tensors(bundle, integer_metadata_calls=True)
     captures = []
     for statement in host.body[:first]:
         if isinstance(statement, ast.Expr) and isinstance(
@@ -232,7 +262,7 @@ def generate_ordered_phases(
         else:
             _require(
                 isinstance(value_type, BlockSizeType)
-                or _shape_only(statement.value, tensor_names),
+                or _pure_host_metadata(statement.value, tensor_names),
                 "host metadata expression is not shape-only",
             )
 
@@ -242,6 +272,34 @@ def generate_ordered_phases(
         materialized_names=tuple(captures),
         region_count=len(roots),
     )
+    return bundle, plan
+
+
+def ordered_phases_supported(host: HostFunction, ir: DeviceIR) -> bool:
+    """Whether ``pid_type="flat"`` can lower these barrier phases."""
+    try:
+        _ordered_phase_bundle(host, ir)
+    except exc.BackendUnsupported:
+        return False
+    return True
+
+
+def generate_ordered_phases(
+    host: HostFunction,
+    config: Config,
+    emit_repro_caller: bool,
+    *,
+    store_transform: Callable[..., ast.AST] | None = None,
+    load_transform: Callable[..., ast.AST] | None = None,
+    extra_params: list[str] | None = None,
+) -> ast.Module:
+    """Bundle one complete root per explicit barrier phase.
+
+    Separate launches implement the existing grid-wide ordering contract.
+    The ordinary compiler has already checked each phase's memory dependencies;
+    this path does not infer additional synchronization for unmarked loops.
+    """
+    bundle, plan = _ordered_phase_bundle(host, host.device_ir)
     return generate_materialized_fission(
         bundle,
         config,

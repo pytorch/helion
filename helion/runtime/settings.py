@@ -51,6 +51,9 @@ if TYPE_CHECKING:
 
 DotPrecision = Literal["tf32", "tf32x3", "ieee", "default", "high", "highest"]
 PrecompileMode = Literal["spawn", "fork"] | None
+# How the autotuner compares fp8 outputs against the baseline: dequantized
+# values within one fp8 ulp plus the tolerances, or exact bytes.
+AutotuneFp8Accuracy = Literal["ulp", "bitwise"]
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
@@ -590,6 +593,14 @@ class _Settings:
     autotune_baseline_fn: Callable[..., object] | None = None
     autotune_baseline_atol: float | None = None
     autotune_baseline_rtol: float | None = None
+    autotune_fp8_accuracy: AutotuneFp8Accuracy = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_literal,
+            "HELION_AUTOTUNE_FP8_ACCURACY",
+            cast("AutotuneFp8Accuracy", "ulp"),
+            mapping={"ulp": "ulp", "bitwise": "bitwise"},
+        )
+    )
     autotune_baseline_accuracy_check_fn: Callable[[object, object], None] | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
     autotune_best_available_max_configs: int = dataclasses.field(
@@ -644,6 +655,29 @@ class _Settings:
     cute_flatten_nested_reductions: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_CUTE_FLATTEN_NESTED_REDUCTIONS", False
+        )
+    )
+    cute_graph_cse: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_CUTE_GRAPH_CSE", True)
+    )
+    cute_stage_unaligned_operands: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_STAGE_UNALIGNED_OPERANDS", True
+        )
+    )
+    cute_flat_edge_tma: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_FLAT_EDGE_TMA", True
+        )
+    )
+    cute_exact_division: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_EXACT_DIVISION", True
+        )
+    )
+    cute_promote_half_atomic_outputs: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_PROMOTE_HALF_ATOMIC_OUTPUTS", False
         )
     )
     triton_do_not_specialize: bool = dataclasses.field(
@@ -751,11 +785,46 @@ class Settings(_Settings):
             "search and export. Default 1500 seconds; override with "
             "HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS."
         ),
-        "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
+        "autotune_compile_timeout": (
+            "Timeout in seconds for one autotune precompile subprocess "
+            "(autotune_precompile); a CuTe render worker past it is given up "
+            "and its config rendered in-process instead (never failed for the "
+            "timeout alone). Also the benchmark worker's deadline for a "
+            "candidate's compile and first call (the backend JIT; never below "
+            "autotune_benchmark_timeout): a candidate past it is killed and "
+            "recorded as failed to compile, and the search goes on. Default "
+            "is 60 seconds. In-process compiles cannot be interrupted by it; "
+            "the autotune budget bounds them instead."
+        ),
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
-        "autotune_benchmark_timeout": "Per-config wall-clock timeout in seconds for the subprocess benchmark phase. Only applies when autotune_benchmark_subprocess is enabled. Default 30 seconds, raised automatically on environments with a heavier subprocess cold-start.",
-        "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",
-        "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
+        "autotune_benchmark_timeout": (
+            "Per-config wall-clock timeout in seconds for the subprocess "
+            "benchmark phase, counted once the candidate's compile and first "
+            "call are done (those have autotune_compile_timeout). Only applies "
+            "when autotune_benchmark_subprocess is enabled. Default 30 seconds, "
+            "raised automatically on environments with a heavier subprocess "
+            "cold-start."
+        ),
+        "autotune_precompile": (
+            "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to "
+            "disable. Defaults to 'fork' on non-Windows platforms. With a pool "
+            "a batch of configs is generated, precompiled in parallel, then "
+            "timed; without one (disabled, or a backend such as CuTe that has "
+            "no pool) each config is compiled and timed in turn, so results "
+            "arrive as the batch runs and the autotune budget can stop it "
+            "between configs. CuTe generates each candidate's code in forked "
+            "workers ahead of its turn in 'fork' mode (its only mode; 'spawn' "
+            "disables the workers), so the serial part per config is the "
+            "module load, the DSL JIT at first call and the timing."
+        ),
+        "autotune_precompile_jobs": (
+            "Maximum concurrent Triton precompile processes, default to cpu "
+            "count. Also the number of CuTe render workers alive at once, "
+            "which default to the CPUs this process may run on, divided by "
+            "the autotuning processes of the host (LOCAL_WORLD_SIZE or the "
+            "process group size), capped at 32. Does not affect results or "
+            "the autotune cache key."
+        ),
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_best_of_k": (
             "When > 1, run autotuning K times with different random seeds and "
@@ -783,18 +852,42 @@ class Settings(_Settings):
         "autotune_budget_seconds": (
             "Wall-clock budget in seconds for the entire autotune. When the "
             "budget is exceeded the search returns the best config found so "
-            "far. Set with HELION_AUTOTUNE_BUDGET_SECONDS=N or "
+            "far. The budget is checked between generations and before each "
+            "config's compile (with a precompile pool also before each "
+            "config's timing; without one a config is timed right after its "
+            "compile). Once it is out nothing further is compiled or timed, "
+            "except that while no config has been measured successfully the "
+            "search still attempts up to 3 more candidates, so a budget that "
+            "runs out early returns a config when one of those works; the "
+            "overrun is bounded by those attempts (and, with a pool, by the "
+            "precompile wait of the batch in flight). Without a precompile "
+            "pool the initial population may take at most half of the search "
+            "phase (the budget minus the time kept for the final selection), "
+            "counted from the start of each of its batches: once a few "
+            "configs have been timed and one has succeeded, the measured cost "
+            "per config decides how many more are attempted and the rest are "
+            "skipped, never below a CuTe flash surface's structural coverage "
+            "rows, so slow-compiling kernels keep time for the search "
+            "generations. A population that fits its share is evaluated in "
+            "full. Set with HELION_AUTOTUNE_BUDGET_SECONDS=N or "
             "@helion.kernel(autotune_budget_seconds=N). Default None "
             "(no budget)."
         ),
         "autotune_ignore_errors": (
             "If True, skip logging and raising autotune errors. "
-            "Set HELION_AUTOTUNE_IGNORE_ERRORS=1 to enable globally."
+            "Set HELION_AUTOTUNE_IGNORE_ERRORS=1 to enable globally. The "
+            "one-line summary of the initial population (configs measured, "
+            "failed, skipped for the budget, and the wall time per config) and "
+            "the end-of-run failure counts are logged either way."
         ),
         "autotune_adaptive_timeout": (
             "If True, set the compile timeout threshold to be smaller for Triton compilation,"
             "based on a quantile of initial compile times (with a lower bound). Lower bound and quantile "
-            "are set by the effort profile. Set HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=0 to disable."
+            "are set by the effort profile. Set HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=0 to disable. "
+            "Applies only to a Triton-style precompile pool: CuTe render workers keep "
+            "the configured autotune_compile_timeout (a worker past it is rendered "
+            "in-process), and a timeout fitted on one shape's render times would be "
+            "shared by every shape of the kernel."
         ),
         "pallas_collective_id": (
             "Optional Pallas collective namespace override. Distributed kernels "
@@ -835,6 +928,54 @@ class Settings(_Settings):
             "If True, flatten proven FP32 joint jagged/feature reductions and "
             "independent fresh-output stores on CuTe. Defaults to "
             "HELION_CUTE_FLATTEN_NESTED_REDUCTIONS (False)."
+        ),
+        "cute_graph_cse": (
+            "If True (the default), merge duplicate reductions and the pure "
+            "chains between them in the traced device IR before CuTe code "
+            "generation (one amax/exp/sum per operand for a softmax and a "
+            "log_softmax of it). Results are bitwise unchanged; set False "
+            "(HELION_CUTE_GRAPH_CSE=0) to bisect a structural-matcher "
+            "regression against the traced graph."
+        ),
+        "cute_stage_unaligned_operands": (
+            "If True (the default), the CuTe backend copies a static-shape "
+            "matmul operand whose outer strides are not 16-byte multiples "
+            "(e.g. odd-sized bf16 rows; a misaligned base offset is not "
+            "visible to the pass) into a padded row-major buffer on the host "
+            "before the launch, so the tcgen05 pipeline keeps its TMA "
+            "producers instead of the scalar shared-memory producers. Set False "
+            "(HELION_CUTE_STAGE_UNALIGNED_OPERANDS=0) to run such operands "
+            "in place."
+        ),
+        "cute_flat_edge_tma": (
+            "If True (the default), flat one-CTA tcgen05 matmul kernels load "
+            "partial output tiles and the K tail through TMA (zero-filled past "
+            "the extents) and store them with predicated vector copies. Set "
+            "False (HELION_CUTE_FLAT_EDGE_TMA=0) for the scalar shared-memory "
+            "edge staging those tiles used before."
+        ),
+        "cute_exact_division": (
+            "If True (the default), an fp32 division by a loop-invariant scalar "
+            "(a row sum, a scalar kernel argument) on CuTe hoists the divisor's "
+            "correctly rounded reciprocal and admission window out of the "
+            "element loop and divides with the Markstein sequence, re-running "
+            "the loop with div.rn when a dividend left the window: the IEEE "
+            "round-to-nearest quotient bit for bit, without one div.rn "
+            "expansion per element. Set False (HELION_CUTE_EXACT_DIVISION=0) "
+            "to keep the plain per-element division; the config knob "
+            "cute_exact_div_form picks the form (redo / plain) per kernel. "
+            "Independent of fast_math, whose fp32 division is approximate."
+        ),
+        "cute_promote_half_atomic_outputs": (
+            "If True, a fresh float16 allocation that the CuTe kernel only "
+            "ever writes through hl.atomic_add is accumulated in a float32 "
+            "twin and cast to float16 once on return (one extra elementwise "
+            "kernel per call). False (the default, "
+            "HELION_CUTE_PROMOTE_HALF_ATOMIC_OUTPUTS=0) adds into the float16 "
+            "storage itself, rounding to float16 on every add as the program "
+            "and the Triton backend do; the vector collective epilogues use "
+            "native packed half atomics, the scalar half atomic is a "
+            "compare-and-swap loop on sm_100."
         ),
         "triton_do_not_specialize": (
             "If True, pass do_not_specialize for every dynamic size/stride/symbol "
@@ -889,15 +1030,30 @@ class Settings(_Settings):
             "Absolute tolerance for baseline output comparison during autotuning accuracy checks. "
             "When unset, defaults to 1e-2 scaled per output tensor by max(1, rms(baseline)) "
             "so large-magnitude reductions tolerate accumulation-order noise, or 0.0 for fp8 "
-            "dtypes (automatic bitwise comparison). Setting an explicit value disables the "
-            "RMS scaling and is applied exactly. "
+            "dtypes under autotune_fp8_accuracy='bitwise'. Setting an explicit value disables the "
+            "RMS scaling and is applied exactly; an explicit 0 together with "
+            "autotune_baseline_rtol=0 compares fp8 outputs bitwise. "
             "Pass as @helion.kernel(..., autotune_baseline_atol=1e-3)."
         ),
         "autotune_baseline_rtol": (
             "Relative tolerance for baseline output comparison during autotuning accuracy checks. "
-            "Defaults to 1e-2, or 0.0 for fp8 dtypes (automatic bitwise comparison). "
+            "Defaults to 1e-2, or 0.0 for fp8 dtypes under autotune_fp8_accuracy='bitwise'. "
             "Pass as @helion.kernel(..., autotune_baseline_rtol=1e-3). "
             "See autotune_baseline_atol for how the absolute-tolerance floor scales when unset."
+        ),
+        "autotune_fp8_accuracy": (
+            "How autotuning accuracy checks compare fp8 output tensors against the baseline. "
+            "'ulp' (default) compares dequantized values: every element must lie within one fp8 "
+            "ulp of max(|actual|, |baseline|) plus the atol/rtol tolerances (atol scaled by the "
+            "baseline RMS as usual), and the one-ulp differences must not be systematically "
+            "one-directional. This admits the one-bucket flips a kernel that quantizes an "
+            "intermediate to fp8 (e.g. an online-softmax P) produces when its reduction blocking "
+            "changes, while still rejecting multi-ulp and biased differences. "
+            "'bitwise' requires identical bytes whenever every output is fp8 and no explicit "
+            "tolerance is set (the previous behavior). "
+            "Explicit zero tolerances (autotune_baseline_atol=0 with autotune_baseline_rtol=0) "
+            "ask for exact outputs and select 'bitwise' whatever this setting says. "
+            "Set HELION_AUTOTUNE_FP8_ACCURACY=bitwise to override."
         ),
         "autotune_baseline_accuracy_check_fn": (
             "Custom accuracy check function for comparing autotuning candidate outputs against the baseline. "
@@ -1017,6 +1173,12 @@ class Settings(_Settings):
 
         if self.autotune_handoff_budget_seconds < 1:
             raise ValueError("autotune_handoff_budget_seconds must be positive")
+
+        if self.autotune_fp8_accuracy not in ("ulp", "bitwise"):
+            raise ValueError(
+                "autotune_fp8_accuracy must be 'ulp' or 'bitwise', "
+                f"got {self.autotune_fp8_accuracy!r}"
+            )
 
         self._check_ref_eager_mode_before_print_output_code()
 

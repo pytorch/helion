@@ -18,6 +18,7 @@ from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandTransf
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandTransformPlan
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandType
 from helion._compiler.cute.tcgen05_operand_transform import prove_operand_stage_span
+from helion._testing import skipUnlessCuteAvailable
 from helion.runtime.cute.launcher import _cute_disk_cache_key
 
 if TYPE_CHECKING:
@@ -92,6 +93,7 @@ def test_separate_operand_spans_and_barrier_units(context: None) -> None:
             replace(plan, converter_warps=unproved_count)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("stages", (1, 2, 3, 6))
 @pytest.mark.parametrize("rhs_k_major", (False, True))
 def test_actual_sdk_has_separate_dense_stage_proofs(
@@ -174,6 +176,7 @@ def _record_stage_addresses(
         output[linear] = cute.crd2idx((base_words + relative) * 4, addresses)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("stages", (1, 3, 6))
 @pytest.mark.parametrize(
     "operand,rhs_k_major",
@@ -289,6 +292,7 @@ def test_descriptor_policy_cannot_substitute_tma_rn(context: None) -> None:
         )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("operand", ("A", "B"))
 def test_actual_raw_tma_descriptor_preserves_tf32_compute_geometry(
     context: None, operand: str

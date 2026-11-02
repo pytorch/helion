@@ -24,6 +24,7 @@ from .row_resident import prove_row_resident
 if TYPE_CHECKING:
     from ...runtime.config import Config
     from ..host_function import HostFunction
+    from .cute_epilogue import _LeafBindings
     from .row_resident import RowResidentPlan
 
 
@@ -185,7 +186,7 @@ for slot in cutlass.range_constexpr(cute.size({p}_acc.shape)):
         return f"{p}_{prefix}_{counter}"
 
     for store in stage.stores:
-        aux_locals = {}
+        aux_locals: _LeafBindings = {}
         for aux in store.chain.auxiliary_tensor_loads:
             node = aux.load_node.args[0]
             assert isinstance(node, torch.fx.Node)

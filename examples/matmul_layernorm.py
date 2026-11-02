@@ -16,6 +16,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from examples.matmul import matmul
+
 import helion
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
@@ -67,6 +69,51 @@ def matmul_layernorm(
         acc = normalized * (weight[:].to(torch.float32)) + (bias[:].to(torch.float32))
         out[tile_m, :] = acc
     return out
+
+
+# %%
+# Unfused Variant
+# ---------------
+
+
+# %%
+@helion.kernel(static_shapes=True)
+def layernorm_rows(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    """Layer-normalize every row of ``x`` (the second launch of
+    ``matmul_layernorm_unfused``). ``examples/layer_norm.py`` keeps the
+    training-oriented forward that also stores mean and rstd; this one
+    returns the normalized rows alone."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        acc = x[tile_m, :].to(torch.float32)
+        eps = 1e-5
+        mean = acc.sum(dim=-1, keepdim=True) / n
+        centered = acc - mean
+        var = (centered * centered).sum(dim=-1, keepdim=True) / n
+        normalized = centered * torch.rsqrt(var + eps)
+        out[tile_m, :] = (
+            normalized * (weight[:].to(torch.float32)) + (bias[:].to(torch.float32))
+        ).to(out.dtype)
+    return out
+
+
+def matmul_layernorm_unfused(
+    x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    """Matrix multiplication and layer normalization as two Helion launches.
+
+    The fused kernel above keeps a ``[tile_m, N]`` fp32 accumulator for the
+    whole row, which caps the GEMM at a narrow M tile and keeps it off the
+    paired tensor-core pipeline the plain ``matmul`` example can take. This
+    version runs the plain ``matmul`` kernel and then ``layernorm_rows`` over
+    its output: one extra read and one extra write of the ``[M, N]`` output in
+    exchange for the GEMM's full search space. Each kernel is autotuned on
+    its own.
+    """
+    return layernorm_rows(matmul(x, y), weight, bias)
 
 
 # %%
@@ -122,6 +169,9 @@ def check(m: int, k: int, n: int) -> None:
     weight = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
     bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
     run_example(matmul_layernorm, matmul_layernorm_pytorch, (x, y, weight, bias))
+    run_example(
+        matmul_layernorm_unfused, matmul_layernorm_pytorch, (x, y, weight, bias)
+    )
 
 
 # %%

@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 from typing import Literal
+from typing import cast
 
 import torch
 
@@ -27,6 +28,7 @@ from .indexing import is_cute_shape_chain_target
 from .scalar_recipe import _MATH_CALLS
 from .scalar_recipe import ROUNDED_FP32_MULTIPLY_ASM
 from .scalar_recipe import ROUNDED_FP32_MULTIPLY_CONSTRAINTS
+from .scalar_recipe import ROUNDED_MULTIPLY_FORMS
 from .scalar_recipe import _clone
 from .scalar_recipe import _path
 
@@ -43,6 +45,27 @@ _FLOAT_MATH_CALLS = _MATH_CALLS - {"isfinite", "isinf", "isnan"}
 # rematerialized collective operand. Its FX dtype facts can prove products
 # whose input is a direct FP32 load, without an explicit generated cast.
 FP32_MULTIPLY_ROUNDING_META_KEY = "cute_preserve_fp32_multiply_rounding"
+# A flagged product whose operands are upcasts of one 16-bit float dtype and
+# whose every use is a cast back to that dtype is rewritten into a multiply of
+# the 16-bit operands (``narrow_exact_products``); the lowering emits it as an
+# explicitly rounded ``mul.rn.bf16`` / ``mul.rn.f16`` so ptxas cannot contract
+# it either.
+NARROW_MULTIPLY_ROUNDING_META_KEY = "cute_narrow_multiply_rounding"
+# ``mul{.rnd}.bf16`` entered PTX with ISA 7.8 for sm_90; ``mul{.rnd}.f16`` is
+# available from sm_53 (``narrow_exact_products``).
+NARROW_BF16_MIN_CAPABILITY = (9, 0)
+# The spellings are shared with ``scalar_recipe.ROUNDED_MULTIPLY_FORMS`` so the
+# recipe purity check admits them (``scalar_recipe.is_rounded_multiply``).
+NARROW_MULTIPLY_ROUNDING_EXPR = {
+    dtype: (
+        "_cute_inline_asm_elementwise("
+        f"(cutlass.{name}({{a}}), cutlass.{name}({{b}})), "
+        f"asm={ROUNDED_MULTIPLY_FORMS[name][0]!r}, "
+        f"constraints={ROUNDED_MULTIPLY_FORMS[name][1]!r}, "
+        f"dtype=cutlass.{name}, is_pure=True)"
+    )
+    for dtype, name in ((torch.bfloat16, "BFloat16"), (torch.float16, "Float16"))
+}
 FP32_MULTIPLY_ROUNDING_EXPR = (
     "_cute_inline_asm_elementwise("
     "(cutlass.Float32({a}), cutlass.Float32({b})), "
@@ -106,6 +129,7 @@ def mark_narrowed_fp32_multiplies(graph: torch.fx.Graph) -> None:
     from ..device_ir_analysis import matmul_operand_positions
 
     operand_positions = matmul_operand_positions()
+    flagged: list[Node] = []
     for node in graph.nodes:
         if not _is_product(node):
             continue
@@ -119,6 +143,128 @@ def mark_narrowed_fp32_multiplies(graph: torch.fx.Graph) -> None:
             for cast in _narrowing_casts(node)
         ):
             node.meta[FP32_MULTIPLY_ROUNDING_META_KEY] = True
+            flagged.append(node)
+    narrow_exact_products(graph, flagged)
+
+
+def _upcast_source(value: object) -> Node | None:
+    """The 16-bit float node ``value`` is the FP32 upcast of, else None."""
+    if not (
+        isinstance(value, torch.fx.Node)
+        and value.op == "call_function"
+        and value.target is _CONVERT
+        and len(value.args) == 2
+        and value.args[1] is torch.float32
+        and isinstance(value.args[0], torch.fx.Node)
+    ):
+        return None
+    source = value.args[0]
+    tensor = source.meta.get("val")
+    if not isinstance(tensor, torch.Tensor) or tensor.dtype not in (
+        torch.bfloat16,
+        torch.float16,
+    ):
+        return None
+    return source
+
+
+def _product_factors(product: Node) -> tuple[object, object] | None:
+    """The two factors of a flagged product, a repeated factor restored.
+
+    ``x ** 2`` is ``pow(x, 2)``; ``inductor_lowering.strip_unused_inputs``
+    masks a repeated operand with None after the lowering (``x * x`` arrives
+    as ``mul(x, None)``), and the masked operand is the node's unique tensor
+    input (``flash_row_epilogue._operands``).
+    """
+    if product.target is _SQUARE:
+        return product.args[0], product.args[0]
+    if product.target is not torch.ops.aten.mul.Tensor or len(product.args) != 2:
+        return None
+    left, right = product.args
+    if right is None and isinstance(left, torch.fx.Node):
+        return left, left
+    if left is None and isinstance(right, torch.fx.Node):
+        return right, right
+    return left, right
+
+
+def narrow_exact_products(graph: torch.fx.Graph, products: Sequence[Node]) -> None:
+    """Multiply 16-bit operands directly where that is bit-identical.
+
+    For ``(a.float() * b.float()).to(a.dtype)`` with ``a`` and ``b`` of one
+    16-bit float dtype, the FP32 product is exact (two 8- or 11-bit
+    significands fit in 24 bits), so its single rounding to that dtype is the
+    rounding of a ``mul.rn`` in the dtype itself.  Each product among
+    ``products`` (already flagged ``FP32_MULTIPLY_ROUNDING_META_KEY``) whose
+    operands are both such upcasts of the same dtype and whose every use is
+    a direct cast back to it is replaced: the casts become one 16-bit
+    ``aten.mul`` of the sources, marked ``NARROW_MULTIPLY_ROUNDING_META_KEY``
+    for the lowering's explicitly rounded ``mul.rn``, and the dead FP32
+    product and upcasts are erased.  A self-product (``f * f``, ``f ** 2``)
+    is the same multiply with one source twice.  The SASS of a rope step then holds one
+    packed-width multiply per element instead of two upcasts, an FP32
+    multiply and a convert (nvfp4-free pointwise kernels are issue-bound at
+    low occupancy: examples/rope.py s2 29.8 vs 31.4 us).  Under fast math
+    the FP32 product is a plain multiply the compiler may narrow itself, so
+    nothing is rewritten.  ``mul.rn.bf16`` is an sm_90+ PTX form (PTX ISA
+    7.8), so a bfloat16 product is rewritten only for a known target of at
+    least that capability and otherwise keeps the FP32 form, which is legal
+    on every CuTe target; ``mul.rn.f16`` needs only sm_53.
+    """
+    from ..compile_environment import CompileEnvironment
+    from ..inductor_lowering import prepare_added_node_lowering
+
+    env = CompileEnvironment.current()
+    if env.settings.fast_math:
+        return
+    capability = env.config_spec.target_device_capability
+    narrowable = {torch.float16}
+    if capability is not None and capability >= NARROW_BF16_MIN_CAPABILITY:
+        narrowable.add(torch.bfloat16)
+    for product in products:
+        factors = _product_factors(product)
+        if factors is None:
+            continue
+        sources = [_upcast_source(factor) for factor in factors]
+        if any(source is None for source in sources):
+            continue
+        left, right = cast("list[Node]", sources)
+        dtype = cast("torch.Tensor", left.meta["val"]).dtype
+        if dtype not in narrowable:
+            continue
+        if cast("torch.Tensor", right.meta["val"]).dtype is not dtype:
+            continue
+        casts = list(product.users)
+        if not casts or not all(
+            user.op == "call_function"
+            and user.target is _CONVERT
+            and len(user.args) == 2
+            and user.args[0] is product
+            and user.args[1] is dtype
+            for user in casts
+        ):
+            continue
+        with graph.inserting_after(product):
+            narrow = graph.call_function(torch.ops.aten.mul.Tensor, (left, right))
+        # The cast's value (shape and 16-bit dtype) and source position; its
+        # lowering-derived keys (``lowering``, ``orig_node``, ``output_index``)
+        # and any value cached on the convert belong to the erased node.
+        for key in ("val", "location", "stack_trace"):
+            if key in casts[0].meta:
+                narrow.meta[key] = casts[0].meta[key]
+        narrow.meta[NARROW_MULTIPLY_ROUNDING_META_KEY] = True
+        # The graph's lowerings are already prepared: give the new node its own.
+        prepare_added_node_lowering(graph, narrow)
+        for user in casts:
+            user.replace_all_uses_with(narrow)
+            graph.erase_node(user)
+        upcasts = dict.fromkeys(
+            factor for factor in factors if isinstance(factor, torch.fx.Node)
+        )
+        graph.erase_node(product)
+        for upcast in upcasts:
+            if not upcast.users:
+                graph.erase_node(upcast)
 
 
 def _is_product(node: Node) -> bool:

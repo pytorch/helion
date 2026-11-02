@@ -242,7 +242,10 @@ def test_missing_bound_proof_declines(missing: str) -> None:
         (torch.float32, True),
         (torch.int16, True),
         (torch.int32, True),
-        (torch.uint8, False),
+        # Byte-packed storage: the literal-offset load merge reads the same
+        # base-alignment fact (``literal_offset_loads``).
+        (torch.uint8, True),
+        (torch.float4_e2m1fn_x2, True),
         (torch.int64, False),
         (torch.bool, False),
     ),

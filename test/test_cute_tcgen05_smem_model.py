@@ -25,6 +25,7 @@ from helion._compiler.cute.tcgen05_constants import Tcgen05RowvecAuxFacts
 from helion._compiler.cute.tcgen05_constants import Tcgen05RowvecAuxRow
 from helion._compiler.cute.tcgen05_constants import tcgen05_fixed_smem_overhead_bytes
 from helion._compiler.cute.tcgen05_constants import tcgen05_round_up_smem_bytes
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_spec import ConfigSpec
 
 # The arena model sizes the epilogue stage through CUTLASS's own helper, so it
@@ -100,6 +101,7 @@ _MEASURED = [
 _FACTS = {"f32row": F32_ROW, "plain": NO_ROWS, "promoted": PROMOTED_ROW}
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize(
     "facts_name,dtype_bytes,bm,bn,bk,cluster_m,ab,c,stage_rows,acc,shared",
     _MEASURED,
@@ -159,6 +161,7 @@ _REJECTED = [
 ]
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize(
     "dtype_bytes,bm,bn,bk,cluster_m,ab,c",
     _REJECTED,
@@ -218,6 +221,7 @@ def test_fixed_overhead_follows_the_arena_layout() -> None:
     assert tcgen05_round_up_smem_bytes(512, 1024) == 1024
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_row_stages_occupy_whole_kib_ahead_of_the_c_ring() -> None:
     # A promoted 16-bit row on a 64-wide tile stages 256 B; the C ring's
     # alignment follows it in the arena, so the plain tile plus one KiB is
@@ -241,6 +245,7 @@ def test_row_stages_occupy_whole_kib_ahead_of_the_c_ring() -> None:
     assert staged - bare == 2048
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_unanalyzed_store_chain_is_judged_at_the_widest_output() -> None:
     # Without store facts a staged row cannot be modelled (fails closed), but
     # a ring-only plan is sized for a 32-bit output instead of being refused.

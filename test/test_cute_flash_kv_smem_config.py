@@ -153,10 +153,25 @@ def test_fragment_depth_domain_tracks_available_instruction_groups(
             pipeline_family_override=family,
         )
         fragment = cast("EnumFragment", fragments[cute_flash.FLASH_KV_STAGE_KEY])
+        # The one-CTA fa4 surface with the staged epilogue also searches the
+        # depth the shared staged output tile (``cute_flash_o_stage`` = 1)
+        # frees, covered only there (``coverage_choices``: the two-tile
+        # depths); the two-CTA layouts' deeper domains already hold it.
+        shared_extra = 1 if output_requires_tma and family == "fa4" else 0
         assert set(fragment.search_choices or ()) == set(
-            range(2, multiplier * local_cap + 1)
+            range(2, multiplier * local_cap + 1 + shared_extra)
         )
+        if shared_extra:
+            assert set(fragment.coverage_choices or ()) == set(
+                range(2, multiplier * local_cap + 1)
+            )
+        else:
+            assert fragment.coverage_choices is None
         assert fragment.default() == 3
+        # The shared tile is offered where a one-CTA fa4 row can reach it:
+        # not on the surface pinned to the two-CTA family.
+        o_stage = cast("EnumFragment", fragments[cute_flash.FLASH_O_STAGE_KEY])
+        assert o_stage.search_choices == ((2,) if family == "fa4_2cta" else (2, 1))
 
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
@@ -281,10 +296,30 @@ def test_structural_pipeline_catalog_retains_new_depth_witnesses() -> None:
             assert generation.canonicalize_flat(generation.flatten(config))[1] == config
         whole_config = witnesses[(whole_row, *key)]
         assert whole_config.config[cute_flash.FLASH_STAT_TRANSPORT_KEY] == "single"
-        # The new acknowledged transport makes deeper whole-row witnesses
-        # legal; the independent two-slot restriction must still hold.
+    # The new acknowledged transport makes deeper whole-row witnesses legal;
+    # the independent two-slot restriction must still hold: a whole-row
+    # config that can carry the two-slot ring (the coverage design's
+    # witnesses pick other exp2 forms as the knob set grows, so the ring2
+    # carrier is looked up rather than assumed) clamps every depth to 2.
+    ring_carrier = None
+    for (leaf, _, _), candidate in witnesses.items():
+        if leaf != whole_row:
+            continue
+        probe = helion.Config.from_dict(
+            {**candidate.config, cute_flash.FLASH_STAT_TRANSPORT_KEY: "ring2"}
+        )
+        spec.normalize(probe)
+        if probe.config[cute_flash.FLASH_STAT_TRANSPORT_KEY] == "ring2":
+            ring_carrier = candidate.config
+            break
+    assert ring_carrier is not None
+    for stage in (3, 4, 5, 6, 7, 8, 9, 10):
         ring_config = helion.Config.from_dict(
-            {**whole_config.config, cute_flash.FLASH_STAT_TRANSPORT_KEY: "ring2"}
+            {
+                **ring_carrier,
+                cute_flash.FLASH_STAT_TRANSPORT_KEY: "ring2",
+                cute_flash.FLASH_KV_STAGE_KEY: stage,
+            }
         )
         spec.normalize(ring_config)
         assert ring_config.config[cute_flash.FLASH_STAT_TRANSPORT_KEY] == "ring2"
@@ -294,3 +329,37 @@ def test_structural_pipeline_catalog_retains_new_depth_witnesses() -> None:
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+@pytest.mark.parametrize("head_dim", (64, 128))
+def test_shared_staged_output_tile_frees_one_kv_slot(head_dim: int) -> None:
+    """``cute_flash_o_stage`` = 1: one staged output tile shared by the two
+    query stages (``output_tiles``) frees one K/V tile, so the aliased ring's
+    depth cap gains a slot (head dim 128: 3 -> 4 at the 227 KB cap); the
+    schedule verifies with the slots' O regions aliased in order (stage 1's
+    staging after stage 0's store, the next item's stage 0 after stage 1's),
+    its bytes are the runtime struct's, and one slot more overflows."""
+    two_tiles = FlashScheduleSpec(head_dim, 2, stage_output=True)
+    shared = dataclasses.replace(two_tiles, output_tiles=1)
+    cap = max_fa4_kv_depth(two_tiles)
+    assert max_fa4_kv_depth(shared) == cap + 1
+    assert (cap, head_dim) in ((3, 128), (10, 64))
+    schedule = verify_flash_schedule(
+        build_fa4_schedule(dataclasses.replace(shared, kv_depth=cap + 1))
+    ).schedule
+    storage = flash_fa4_shared_storage(head_dim, cap + 1, epi_tma=True, o_stage=1)
+    assert schedule.shared_memory_bytes == storage.size_in_bytes()
+    if head_dim == 128:
+        assert storage.size_in_bytes() == 232448
+    regions = {r.name: r for r in schedule.memory_regions}
+    assert regions["O_stage_r0_q0"].offset == regions["O_stage_r0_q1"].offset
+    assert regions["O_stage_r0_q0"].alias_group == "o_stage_shared_r0"
+    with pytest.raises(FlashScheduleError, match="shared-memory capacity"):
+        verify_flash_schedule(
+            build_fa4_schedule(dataclasses.replace(shared, kv_depth=cap + 2))
+        )
+    # Two tiles at the shared tile's depth overflow too: the resolver clamps.
+    with pytest.raises(FlashScheduleError, match="shared-memory capacity"):
+        verify_flash_schedule(
+            build_fa4_schedule(dataclasses.replace(two_tiles, kv_depth=cap + 1))
+        )

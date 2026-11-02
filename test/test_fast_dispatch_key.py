@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import gc
 import types
 from typing import NamedTuple
 import unittest
+import weakref
 
 import torch
 
@@ -326,6 +328,73 @@ class TestFastDispatchKey(unittest.TestCase):
         self.assertFalse(guard(({"pair": [x], "scale": 2},)))
         self.assertFalse(guard(({"pair": [x, y], "other": 2},)))
         self.assertFalse(guard(({"pair": [x, torch.empty_like(x)], "scale": 2},)))
+
+    def test_prepared_guard_does_not_retain_tensors_with_gc_disabled(self) -> None:
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            x = torch.empty(64)
+            y = torch.empty(64)
+            x_ref = weakref.ref(x)
+            y_ref = weakref.ref(y)
+            args = ({"pair": [x, y], "alias": (x,)},)
+            guard = _make_prepared_arg_guard(_static_add1, args)
+            self.assertTrue(guard(args))
+
+            del args, x, y
+            # Check before any cyclic collection, while the guard stays alive.
+            self.assertIsNone(x_ref())
+            self.assertIsNone(y_ref())
+
+            replacement = torch.empty(64)
+            self.assertTrue(
+                guard(
+                    ({"pair": [replacement, torch.empty(64)], "alias": (replacement,)},)
+                )
+            )
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+    def test_prepared_guard_error_does_not_retain_tensors_with_gc_disabled(
+        self,
+    ) -> None:
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            x = torch.empty(64)
+            x_ref = weakref.ref(x)
+            with self.assertRaisesRegex(
+                TypeError, "unsupported prepared-call argument"
+            ):
+                _make_prepared_arg_guard(
+                    _static_add1, ({"tensor": x, "unsupported": object()},)
+                )
+
+            del x
+            self.assertIsNone(x_ref())
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+    def test_prepared_guard_preserves_nested_tensor_identity_relations(self) -> None:
+        x = torch.empty(64)
+        y = torch.empty(64)
+        guard = _make_prepared_arg_guard(
+            _static_add1, ({"pair": [x, y], "alias": (x,)},)
+        )
+
+        replacement = torch.empty_like(x)
+        other = torch.empty_like(y)
+        self.assertTrue(
+            guard(({"pair": [replacement, other], "alias": (replacement,)},))
+        )
+        self.assertFalse(
+            guard(({"pair": [replacement, replacement], "alias": (replacement,)},))
+        )
+        self.assertFalse(
+            guard(({"pair": [replacement, other], "alias": (torch.empty_like(x),)},))
+        )
 
     def test_returns_none_without_tensor_to_pin_device(self) -> None:
         """With no tensor argument there is nothing to pin the device, so the

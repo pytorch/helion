@@ -20,6 +20,7 @@ from helion._compiler.cute import cute_flash
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -147,6 +148,7 @@ def _bind_as_if_sm100(
         return kernel.bind(args)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_rank3_lse_store_is_the_flash_lse_output() -> None:
     bound = _bind_as_if_sm100(_attention_rank3_lse, _meta_args((2, 8, 1024, 64)))
     assert bound.config_spec.cute_flash_search_enabled
@@ -157,12 +159,14 @@ def test_rank3_lse_store_is_the_flash_lse_output() -> None:
     assert plan.output_epilogue == "identity"
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_rank3_store_of_a_non_lse_value_declines() -> None:
     bound = _bind_as_if_sm100(_attention_rank3_not_lse, _meta_args((2, 8, 1024, 64)))
     assert not bound.config_spec.cute_flash_search_enabled
     assert _graph_plan(bound) is None
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_canonical_attention_example_reaches_the_flash_path() -> None:
     from examples.attention import attention
 

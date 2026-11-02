@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test._cute_binding import _forbid_cuda_work
 from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
@@ -61,6 +62,20 @@ def _biased_gemm(
         for inner in hl.tile(k):
             accumulator = torch.addmm(accumulator, a[row, inner], b[inner, col])
         out[row, col] = (accumulator + bias[col]).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _masked_gemm(
+    a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    m, k = a.shape
+    n = b.shape[1]
+    for row, col in hl.tile((m, n)):
+        accumulator = hl.zeros([row, col], dtype=torch.float32)
+        for inner in hl.tile(k):
+            accumulator = torch.addmm(accumulator, a[row, inner], b[inner, col])
+        out[row, col] = accumulator.to(out.dtype) * (mask[row, col] > 0)
     return out
 
 
@@ -197,12 +212,16 @@ def test_ab_full_and_empty_barriers_fit_the_allocation(paired: bool) -> None:
         and len(statement.targets) == 1
         and isinstance(statement.targets[0], ast.Name)
     }
+    # The clustered (paired) kernel builds the ring through the runtime's
+    # no-init constructor, the one-CTA kernel through the DSL constructor.
+    constructor = (
+        "_helion_tc_pro.make_tma_umma_pipeline"
+        if paired
+        else "cutlass.pipeline.PipelineTmaUmma.create"
+    )
     matched = 0
     for call in ast.walk(module):
-        if (
-            not isinstance(call, ast.Call)
-            or ast.unparse(call.func) != "cutlass.pipeline.PipelineTmaUmma.create"
-        ):
+        if not isinstance(call, ast.Call) or ast.unparse(call.func) != constructor:
             continue
         keywords = {keyword.arg: keyword.value for keyword in call.keywords}
         stages = ast.literal_eval(keywords["num_stages"])
@@ -232,15 +251,36 @@ def test_rejects_unmodelled_or_overfull_configs(invalid: str) -> None:
     overrides = {
         "overfull_ab": {"tcgen05_ab_stages": 14},
         "overfull_c": {"tcgen05_c_stages": 4},
-        "cluster": {"tcgen05_cluster_n": 2},
+        "cluster": {"tcgen05_cluster_n": 4},
         "layout": {"tcgen05_layout_strategy": "explicit_epi_tile"},
         "clc": {"tcgen05_persistence_model": "clc_persistent"},
     }[invalid]
-    with pytest.raises(helion.exc.InvalidConfig, match="shared memory|two-CTA"):
+    with pytest.raises(helion.exc.InvalidConfig, match="shared memory|two-CTA|cluster"):
         bound.to_code(_config(**overrides))
 
 
-@pytest.mark.parametrize("other", ("bias", "fanout", "column_major", "no_capacity"))
+def test_pair_cluster_n2_is_a_modelled_paired_configuration() -> None:
+    # The 2x2 cluster of CTA pairs (A multicast across the N neighbours) only
+    # shapes the mainloop and the scheduler; the per-CTA SMEM model is the
+    # same, so the paired family admits it at the same ring depths.
+    bound = _gemm._bind_isolated(_args())
+    with bound.env:
+        spec = bound.config_spec
+        limit = spec._cute_tcgen05_config._paired_pipeline_stage_limit(
+            spec.normalized_config(_config(tcgen05_ab_stages=2)).config
+        )
+        paired = spec.normalized_config(
+            _config(tcgen05_cluster_n=2, tcgen05_ab_stages=2)
+        )
+    assert limit is not None and limit >= 2
+    assert paired.config["tcgen05_cta_group"] == "two"
+    assert paired.config["tcgen05_cluster_n"] == 2
+    source = bound.to_code(paired)
+    assert "_helion_cute_cluster_shape = (2, 2, 1)" in source
+    assert "CtaGroup.TWO" in source
+
+
+@pytest.mark.parametrize("other", ("bias", "fanout", "no_capacity"))
 def test_unknown_allocations_keep_conservative_profile(other: str) -> None:
     a, b, out = args = _args()
     if other == "bias":
@@ -249,9 +289,6 @@ def test_unknown_allocations_keep_conservative_profile(other: str) -> None:
     elif other == "fanout":
         second = torch.empty_like(out)
         bound = _fanout_gemm._bind_isolated((a, b, out, second))
-    elif other == "column_major":
-        out = out.t().contiguous().t()
-        bound = _gemm._bind_isolated((a, b, out))
     else:
         with patch.object(
             CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=0
@@ -266,6 +303,45 @@ def test_unknown_allocations_keep_conservative_profile(other: str) -> None:
     )
     with pytest.raises(helion.exc.InvalidConfig):
         bound.to_code(_config())
+
+
+def test_column_major_output_prices_its_actual_store_ring() -> None:
+    import cutlass
+    from cutlass import cute
+    from cutlass._mlir import ir
+    from cutlass.utils import blackwell_helpers
+    from cutlass.utils.layout import LayoutEnum
+
+    from helion._compiler.cute.tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
+
+    a, b, out = _args()
+    out = out.t().contiguous().t()
+    with _forbid_cuda_work():
+        bound = _gemm._bind_isolated((a, b, out))
+        facts = bound.config_spec._cute_tcgen05_config.pipeline_smem_facts
+        assert facts is not None and facts.output_column_major
+        code = bound.to_code(_config())
+        assert "LayoutEnum.COL_MAJOR" in code
+        assert "PipelineTmaStore.create" in code
+        with ir.Context(), ir.Location.unknown():
+            module = ir.Module.create()
+            with ir.InsertionPoint(module.body):
+                tile = blackwell_helpers.compute_epilogue_tile_shape(
+                    (64, 128), True, LayoutEnum.COL_MAJOR, cutlass.BFloat16
+                )
+                layout = blackwell_helpers.make_smem_layout_epi(
+                    cutlass.BFloat16, LayoutEnum.COL_MAJOR, tile, 2
+                )
+                actual_output_bytes = 2 * cute.cosize(layout.outer)
+        ab_bytes = tcgen05_ab_smem_bytes_per_cta(
+            bm=128, bn=128, bk=64, dtype_bytes=2, ab_stages=13, cluster_m=2
+        )
+        assert (
+            pipeline_smem_bytes(
+                facts, bm=128, bn=128, bk=64, ab_stages=13, c_stages=2, acc_stages=2
+            )
+            == ab_bytes + actual_output_bytes + 2048 + 16 * 13 + 16 * 2
+        )
 
 
 def test_cold_search_can_encode_and_repair_deep_geometry_seeds() -> None:
@@ -300,3 +376,33 @@ def test_cold_search_can_encode_and_repair_deep_geometry_seeds() -> None:
         assert requested["tcgen05_ab_stages"] == 12
         assert requested["tcgen05_cta_group"] == "two"
         assert spec.default_config().config.get("tcgen05_cta_group", "auto") == "auto"
+
+
+@pytest.mark.parametrize("placement", ("post_acc_wait", "pre_acc_wait"))
+def test_exact_shape_auxiliary_epilogue_keeps_the_paired_pipeline(
+    placement: str,
+) -> None:
+    """A 16-bit epilogue reading an exact-shape auxiliary tile (a mask, a
+    residual) loads it per subtile into registers: no shared memory beyond
+    the one-ring budget, so the complete allocation proof and the two-CTA
+    paired pipeline (both auxiliary placements seeded) stay available.
+    Broadcast rows (``bias[col]``) still decline the proof (see
+    ``test_unknown_allocations_keep_conservative_profile``)."""
+    a, b, out = _args()
+    mask = torch.empty_like(out)
+    bound = _masked_gemm._bind_isolated((a, b, mask, out))
+    config = bound.config_spec._cute_tcgen05_config
+    facts = config.pipeline_smem_facts
+    assert facts is not None
+    assert facts.has_auxiliary_loads and facts.rows == ()
+    assert config.paired_pipeline_search_enabled()
+    seeds = config._paired_pipeline_seed_configs()
+    assert {seed.config["tcgen05_aux_load_placement"] for seed in seeds} == {
+        "post_acc_wait",
+        "pre_acc_wait",
+    }
+    fragment = config.optional_fragments(for_search=True)["tcgen05_cta_group"]
+    assert fragment.choices == ("auto", "two")  # type: ignore[attr-defined]
+    code = bound.to_code(_config(tcgen05_aux_load_placement=placement))
+    assert "CtaGroup.TWO" in code
+    assert " > 0.0" in code

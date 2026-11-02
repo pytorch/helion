@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
+import threading
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
@@ -58,6 +60,13 @@ def _execute_preparation(
     *,
     sign_extended_loads: bool = False,
 ) -> _ByteArray:
+    """Run the generated preparation on the CPU, one block at a time.
+
+    Every block runs its 256 threads as Python threads so a tiled side's
+    ``cute.arch.sync_threads()`` barriers and block-shared ``alloc_smem``
+    buffer behave as on the device.
+    """
+
     def uint8(value: int) -> int:
         return int(value) & 255
 
@@ -69,22 +78,30 @@ def _execute_preparation(
         return value if value < 1 << 31 else value - (1 << 32)
 
     def recast(pointer: _ByteArray, *, dtype: Callable[[int], int]) -> _ByteArray:
-        return _ByteArray(
-            pointer.values,
-            pointer.counts,
-            8 if dtype is uint64 else 1,
-            pointer.sign_extend,
-        )
+        width = {uint64: 8, uint32: 4}.get(dtype, 1)
+        return _ByteArray(pointer.values, pointer.counts, width, pointer.sign_extend)
 
-    coordinate = [0]
+    def uint32(value: int) -> int:
+        return int(value) & 0xFFFFFFFF
+
+    local = threading.local()
+    block_state: dict[str, Any] = {}
+
+    def alloc_smem(dtype: Callable[[int], int], size: int) -> _ByteArray:
+        with block_state["lock"]:
+            if "smem" not in block_state:
+                block_state["smem"] = _ByteArray(bytearray(size), [0] * size)
+        return block_state["smem"]
+
     namespace: dict[str, Any] = {
         "cutlass": SimpleNamespace(
             Int64=int,
             Int32=int32,
             Uint8=uint8,
-            Uint32=lambda value: int(value) & 0xFFFFFFFF,
+            Uint32=uint32,
             Uint64=uint64,
             Float32=float,
+            range_constexpr=range,
         ),
         "cute": SimpleNamespace(
             kernel=lambda function: function,
@@ -94,13 +111,17 @@ def _execute_preparation(
             make_tensor=lambda pointer, layout: pointer,
             recast_ptr=recast,
             arch=SimpleNamespace(
-                block_idx=lambda: (coordinate[0] // 256,),
-                thread_idx=lambda: (coordinate[0] % 256,),
+                block_idx=lambda: (block_state["block"],),
+                thread_idx=lambda: (local.thread,),
+                alloc_smem=alloc_smem,
+                sync_threads=lambda: block_state["barrier"].wait(),
+                griddepcontrol_launch_dependents=lambda: None,
             ),
         ),
         "CUstream": object,
     }
-    exec(compile(preparation_source(plan), "<cpu-preparation>", "exec"), namespace)
+    source = preparation_source(plan)
+    exec(compile(source, "<cpu-preparation>", "exec"), namespace)
     arrays = []
     for tensor in inputs[:4]:
         assert isinstance(tensor, torch.Tensor)
@@ -111,10 +132,33 @@ def _execute_preparation(
     size = plan["workspace_bytes"]
     assert isinstance(size, int)
     output = _ByteArray(bytearray([165] * size), [0] * size)
-    # One vector of eight data bytes and one scale byte per invocation.
-    for index in range(size // 9):
-        coordinate[0] = index
-        namespace["_prepare"](*arrays, output)
+    grid = int(re.search(r"launch\(grid=\((\d+),", source).group(1))  # pyrefly: ignore[missing-attribute]
+    threads = 256
+    errors: list[BaseException] = []
+
+    def run(thread: int) -> None:
+        local.thread = thread
+        try:
+            namespace["_prepare"](*arrays, output)
+        except BaseException as error:
+            errors.append(error)
+            # Release the other threads of a block stuck at a barrier.
+            block_state["barrier"].abort()
+
+    for block in range(grid):
+        block_state.clear()
+        block_state.update(
+            block=block, lock=threading.Lock(), barrier=threading.Barrier(threads)
+        )
+        workers = [
+            threading.Thread(target=run, args=(thread,)) for thread in range(threads)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        if errors:
+            raise errors[0]
     return output
 
 
@@ -126,11 +170,12 @@ def _unpack_scales(raw: torch.Tensor, rows: int, groups: int) -> torch.Tensor:
     )
 
 
+@pytest.mark.parametrize("prepare,rows", [("tiled", 32), ("tiled", 16), ("linear", 32)])
 @pytest.mark.parametrize("generic", [False, True])
 @pytest.mark.parametrize("bn", [128, 256])
 @pytest.mark.parametrize("groups,bk", [(1, 64), (3, 64), (5, 64), (5, 256), (17, 256)])
 def test_exact_preparation_covers_every_byte_once_and_zeroes_physical_padding(
-    generic: bool, groups: int, bk: int, bn: int
+    generic: bool, groups: int, bk: int, bn: int, prepare: str, rows: int
 ) -> None:
     m, n = 7, 9
     bound, inputs = _bind_native((m, groups, n), generic=generic, static=False)
@@ -143,8 +188,23 @@ def test_exact_preparation_covers_every_byte_once_and_zeroes_physical_padding(
         )
     with _cpu_target():
         plan = _wrapper_plan(
-            bound.to_code(_native_config(cute_scaled_tile_k=bk, cute_scaled_tile_n=bn))
+            bound.to_code(
+                _native_config(
+                    cute_scaled_tile_k=bk,
+                    cute_scaled_tile_n=bn,
+                    cute_scaled_prepare=prepare,
+                    cute_scaled_prepare_rows=rows,
+                )
+            )
         )
+    assert plan["prepare"] == prepare
+    assert plan["prepare_rows"] == rows
+    source = preparation_source(plan)
+    assert ("alloc_smem" in source) is (prepare == "tiled")
+    assert "griddepcontrol" not in source
+    assert "griddepcontrol_launch_dependents()" in preparation_source(
+        {**plan, "pdl": True}
+    )
     result = _execute_preparation(plan, inputs)
     assert set(result.counts) == {1}
     padded_groups = (groups * 16 + bk - 1) // bk * (bk // 16)
@@ -243,3 +303,43 @@ def test_host_workspace_is_fresh_per_invocation_and_replacement_inputs_are_forwa
     assert calls[0][workspace_index] is not calls[1][workspace_index]
     assert calls[0][lhs_index] is inputs[0]
     assert calls[1][lhs_index] is replacements[0]
+
+
+def test_under_aligned_qword_and_fused_sources_are_staged() -> None:
+    """The linear preparation's qword fast path and the fused consumer's TMA
+    read a side from its base address as 8- or 16-byte words: the launcher
+    stages (clones) such an input when its storage is under-aligned, and
+    leaves the byte-wise sides alone."""
+    from helion.runtime.cute.launcher import _cute_stage_under_aligned_operands
+    from helion.runtime.cute.launcher import _cute_staged_plan_operands
+
+    plan = {
+        "kind": "block_scaled_mma",
+        "lhs_idx": 0,
+        "rhs_idx": 1,
+        "lhs_scale_idx": 2,
+        "rhs_scale_idx": 3,
+        "prepare": "linear",
+        "lhs_qword_address": "cutlass.Int64(row) * 512 + cutlass.Int64(group) * 8",
+        "rhs_qword_address": None,
+    }
+    linear = SimpleNamespace(_helion_cute_wrapper_plans=[plan])
+    assert _cute_staged_plan_operands(linear) == ((0, False),)
+    fused = SimpleNamespace(_helion_cute_wrapper_plans=[dict(plan, prepare="fused")])
+    assert {index for index, _ in _cute_staged_plan_operands(fused)} == {0, 1, 2, 3}
+    tiled = SimpleNamespace(
+        _helion_cute_wrapper_plans=[dict(plan, prepare="tiled", lhs_qword_address=None)]
+    )
+    assert _cute_staged_plan_operands(tiled) == ()
+    base = torch.zeros(64, dtype=torch.uint8)
+    shifted = base[1:]
+    assert shifted.data_ptr() % 8 == 1
+    staged = _cute_stage_under_aligned_operands(linear, (shifted, base, base, base))
+    assert staged is not None
+    arguments, copy_backs = staged
+    assert arguments[0].data_ptr() % 16 == 0 and arguments[0] is not shifted
+    assert arguments[1] is base and copy_backs == []
+    # The byte-wise side needs no alignment.
+    assert (
+        _cute_stage_under_aligned_operands(linear, (base, shifted, base, base)) is None
+    )

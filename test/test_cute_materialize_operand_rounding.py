@@ -95,8 +95,10 @@ def test_materialized_fp32_products_keep_the_halfway_cast_boundary(
     input_dtype: torch.dtype,
     fast_math: bool,
 ) -> None:
+    # 256 rows: the static program's materialization gate wants the recipe
+    # reused across at least two 128-row MMA tiles (``_fused_recompute_pays``).
     args = (
-        torch.ones((13, 40), dtype=torch.bfloat16),
+        torch.ones((256, 40), dtype=torch.bfloat16),
         torch.full((40, 19), -12.125, dtype=input_dtype),
         torch.full((40, 19), -12.125, dtype=input_dtype),
     )

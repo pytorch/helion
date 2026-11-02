@@ -48,6 +48,23 @@ def fixed_l2_evict_last_store_policy_supported(
     )
 
 
+def readonly_packet_load_supported(
+    target_device_capability: tuple[int, int] | None,
+    cuda_version: str | None,
+) -> bool:
+    """Whether the ``nc_l2_first`` packet loads are legal for this target.
+
+    PTX 256-bit ``ld.global.v8.b32`` loads need SM100+ and CUDA 13 or newer.
+    """
+    major = cuda_version.split(".", 1)[0] if cuda_version else ""
+    return (
+        target_device_capability is not None
+        and target_device_capability >= (10, 0)
+        and major.isdigit()
+        and int(major) >= 13
+    )
+
+
 @dataclass(frozen=True)
 class _CuteDSLVersionProbe:
     version: Version | None = None
@@ -66,6 +83,11 @@ def _installed_cute_dsl_version() -> _CuteDSLVersionProbe:
         return _CuteDSLVersionProbe(missing=True)
     except InvalidVersion as error:
         return _CuteDSLVersionProbe(invalid=str(error))
+
+
+def installed_cute_dsl_version() -> Version | None:
+    """The installed ``nvidia-cutlass-dsl`` version; None when missing or invalid."""
+    return _installed_cute_dsl_version().version
 
 
 def tcgen05_runtime_n_ptx_compatible() -> bool:
@@ -194,3 +216,45 @@ def emit_producer_tail_tma_umma(
     if skip_advances:
         return f"{indent}{pipeline_expr}.producer_acquire({state_expr})"
     return f"{indent}{pipeline_expr}.producer_tail({state_expr})"
+
+
+@lru_cache(maxsize=1)
+def nvdisasm_path() -> str | None:
+    """The ``nvdisasm`` binary the SASS checks disassemble with: the one the
+    ``nvidia-cuda-nvdisasm`` wheel ships (a runtime dependency of the CuTe
+    DSL, which dumps SASS through it), else one on ``PATH`` or under
+    ``CUDA_HOME``; None when there is none."""
+    import os
+    import shutil
+
+    try:
+        dist = importlib.metadata.distribution("nvidia-cuda-nvdisasm")
+    except importlib.metadata.PackageNotFoundError:
+        dist = None
+    if dist is not None and dist.files is not None:
+        for entry in dist.files:
+            if entry.name == "nvdisasm":
+                path = str(dist.locate_file(entry))
+                if os.path.isfile(path):
+                    return path
+    found = shutil.which("nvdisasm")
+    if found is not None:
+        return found
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home:
+        candidate = os.path.join(cuda_home, "bin", "nvdisasm")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def hinted_cp_async_available() -> bool:
+    """Whether the mma_dag emitter may hint its staged operand packets
+    (``cp.async.cg.shared.global.L2::cache_hint``).
+
+    The DSL's assembler has misencoded that form (``sass_check.py``), so the
+    launcher verifies every hinted kernel's SASS before it runs; without a
+    disassembler nothing can be verified and the packets stay plain (the
+    normalizer pins every ``load_eviction_policies`` slot to "").
+    """
+    return nvdisasm_path() is not None

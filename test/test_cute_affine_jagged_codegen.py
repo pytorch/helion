@@ -3,6 +3,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from examples.jagged_layer_norm import jagged_layer_norm_kernel
+from examples.jagged_mean import jagged_mean_kernel
 import pytest
 import torch
 
@@ -53,3 +54,42 @@ def test_dynamic_jagged_row_masks_keep_affine_vector_loads(
             )
         )
     assert "_helion_affine_load" in code
+
+
+@pytest.mark.parametrize("static_shapes", [False, True])
+def test_vector_width_on_a_jagged_feature_axis_stays_scalar(
+    static_shapes: bool,
+) -> None:
+    # The feature tile is ``hl.jagged_tile(feature_counts)``: it has no static
+    # extent to prove a whole number of packets, so its loads stay scalar.
+    # The packet check used to read the jagged block's numel and assert.
+    with (
+        _mock_cuda_unavailable(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        patch(
+            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            return_value=232448,
+        ),
+    ):
+        kernel = helion.kernel(
+            jagged_mean_kernel.fn,
+            backend="cute",
+            static_shapes=static_shapes,
+            autotune_effort="none",
+        )
+        args = (
+            torch.empty((731, 128), device=CPU_DEVICE),
+            torch.empty(18, dtype=torch.int64, device=CPU_DEVICE),
+            torch.empty(17, dtype=torch.int32, device=CPU_DEVICE),
+            128,
+        )
+        bound = _cpu_bind(kernel, args)
+        code = bound.to_code(
+            helion.Config(
+                block_sizes=[1, 128, 64],
+                num_threads=[1, 32, 1],
+                cute_vector_widths=[1, 4, 1],
+            )
+        )
+    assert "for vec_lane_1 in cutlass.range_constexpr(4):" in code
+    assert "cute.arch.load(" not in code

@@ -99,6 +99,15 @@ def _cpu_codegen() -> Iterator[None]:
         # CuTe. They do not require the installed runtime DSL or TVM FFI.
         patch("helion._compiler.cute.cutedsl_compat.check_cute_backend_requirements"),
         patch("torch.cuda.is_available", return_value=False),
+        # The capability probes below read torch.cuda.is_available() and are
+        # functools.cache'd for the process: the first ConfigSpec built under
+        # the patch above would otherwise cache "no CUDA" answers that later
+        # tests (test_tensor_descriptor.py) read as "tensor descriptors
+        # unsupported".  Patch the probes themselves, as _mock_cuda_unavailable
+        # in _cute_binding.py does, so nothing is computed under the patch.
+        patch("helion._compat._supports_tensor_descriptor", return_value=False),
+        patch("helion._compat._supports_maxnreg", return_value=False),
+        patch("helion._compat._is_hip", return_value=False),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")),
         patch(
             "helion._compiler.compile_environment.target_device_capability",

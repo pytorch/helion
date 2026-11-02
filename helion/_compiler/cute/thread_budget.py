@@ -31,10 +31,13 @@ MAX_THREAD_BLOCK_DIMS = (1024, 1024, 64)
 # tile, so wider products keep the rolled lane loop.
 CUTE_REGISTER_TILE_MAX_ELEMENTS = 64
 # Largest number of values one register tile keeps live across its unrolled
-# element loops: the intermediates stashed for the consume pass (one entry per
-# lane per element for every stashed name) plus the per-element accumulators of
-# every reduction, one register each.  Three full tiles already approach the
-# 255-register file; wider tiles reject the config instead of spilling.
+# element loops: the intermediates stashed for the later nests (one register
+# per distinct value of every stashed name, i.e. the product of the extents of
+# the loops the value depends on; a per-row value is held once per lane, a
+# per-column value once per element, and the compiler merges the unrolled
+# duplicates) plus the per-element accumulators of every reduction.  Three
+# full tiles already approach the 255-register file; wider tiles reject the
+# config instead of spilling.
 CUTE_REGISTER_TILE_MAX_LIVE_VALUES = 3 * CUTE_REGISTER_TILE_MAX_ELEMENTS
 
 

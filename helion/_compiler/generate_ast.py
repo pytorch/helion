@@ -31,7 +31,11 @@ from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
 from .cute.cute_reshape import run_deferred_rebound_checks
 from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
+from .cute.fragment_mma_dot import FragmentMmaNotApplied
+from .cute.fragment_mma_dot import fragment_mma_off_config
 from .cute.register_tile_admission import RegisterTileUnsupported
+from .cute.ring_mma_dot import RingMmaNotApplied
+from .cute.ring_mma_dot import ring_mma_off_config
 from .cute.thread_budget import thread_idx_axis
 from .cute.unroll_lane_loads import LaneUnrollNotApplied
 from .cute.unroll_lane_loads import lane_unroll_off_config
@@ -56,6 +60,7 @@ if TYPE_CHECKING:
     from torch.fx.node import Node
 
     from .cute.bounded_cache_codegen import BoundedCacheRequest
+    from .cute.host_remainder_fills import RemainderFill
     from .cute.iota_utils import FreeArangeLanes
     from .device_ir import GraphInfo
     from .host_function import HostFunction
@@ -256,6 +261,43 @@ class ResidentPrepLowering:
     tail_fill_value: float
 
 
+# The plain (non-grouped) tcgen05 GEMM wrapper plans: A/B TMA loads and the D
+# TMA store over the problem tensors themselves.  Baking the tensor layouts
+# into the wrapper schema makes the TMA coordinate tensors' strides immediates
+# (the launcher's full-tile guard still decides per plan); with runtime
+# layouts every tcgen05 kernel fetched them from two constant-bank lines (LDCU
+# misses) and multiplied them into its TMA coordinates on the TMA-load warp's
+# post-release critical path.  The grouped variants (device tensormaps, shared
+# RHS, full-allocation operands, device split sizes, bounded output shifts)
+# re-point descriptors in-kernel and keep the runtime layouts.
+_CUTE_PLAIN_TCGEN05_AB_PLAN_GROUPED_KEYS = frozenset(
+    {
+        "shared_rhs",
+        "fixed_ab_tensormaps",
+        "dynamic_ab_tensormaps",
+        "full_allocation_a",
+        "full_allocation_b",
+        "device_split_sizes",
+        "fixed_grouped_b_rank3",
+        "source_m_tile",
+    }
+)
+_CUTE_PLAIN_TCGEN05_D_PLAN_GROUPED_KEYS = frozenset(
+    {"fixed_tensormap", "bounded_output_shift", "dynamic_d_tensormap"}
+)
+
+
+def _cute_plain_tcgen05_plan_bakes(plan: dict[str, object]) -> bool:
+    kind = plan.get("kind")
+    if kind == "tcgen05_ab_tma":
+        return not any(
+            plan.get(key) for key in _CUTE_PLAIN_TCGEN05_AB_PLAN_GROUPED_KEYS
+        )
+    if kind == "tcgen05_d_tma":
+        return not any(plan.get(key) for key in _CUTE_PLAIN_TCGEN05_D_PLAN_GROUPED_KEYS)
+    return False
+
+
 class GenerateAST(NodeVisitor, CodegenInterface):
     def __init__(
         self,
@@ -417,18 +459,22 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return True
         if self.cute_wrapper_plans:
             return all(
-                plan.get("kind")
+                _cute_plain_tcgen05_plan_bakes(plan)
+                or plan.get("kind")
                 in {
                     "helion_small_biased_attention",
                     "helion_flash_row_mma",
                     "helion_warp_mma_gemm",
+                    "helion_register_subblocks",
                     "helion_flash",
                     "helion_flash_gated",
+                    "helion_flash_gated_row_mma",
                     "chunk_prepare_tma",
                     "chunk_recurrence_sm100",
                     "chunk_recurrence_warp_dv4",
                     "gdn_recurrence_sm100",
                     "helion_flash_bwd",
+                    "helion_flash_bwd_row_mma",
                     "gathered_mma_tma",
                     "block_scaled_mma",
                     "helion_mma_dag_tma",
@@ -663,10 +709,51 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             "cute", "warp_mma GEMM family failed late validation"
         )
 
+    def fragment_capacity_failure(
+        self, error: exc.BackendUnsupported
+    ) -> exc.BackendUnsupported | exc.InvalidConfig:
+        """Report a generic-lowering refusal after a fragment capacity decline.
+
+        The computed-fragment owner declines a root whose shared memory exceeds
+        the CTA capacity so the ordinary lowering can own it; when that lowering
+        refuses instead (lane restores, repeated block ids), the config, not the
+        kernel, failed: the overflow is the actionable message. Callers wrap the
+        statement visit and the device function finalization.
+
+        ``RegisterTileUnsupported`` is not a refusal but the register tile's
+        regeneration signal (``generate_ast`` retries with the rolled lane) and
+        passes through unchanged, decline or not.
+        """
+        if isinstance(error, RegisterTileUnsupported):
+            return error
+        if CompileEnvironment.current().backend_name != "cute":
+            return error
+        declined = self.device_function.cute_state.fragment_capacity_decline
+        if declined is None:
+            return error
+        needed, capacity = declined
+        return exc.InvalidConfig(
+            f"computed fragments need {needed} shared bytes, exceeding {capacity}, "
+            f"and no other lowering owns this root: {error}"
+        )
+
     def _try_codegen_computed_fragment_root(self) -> bool:
         from .cute.computed_fragment import codegen_computed_fragment_root
 
         return codegen_computed_fragment_root(self)
+
+    def _try_codegen_register_subblocks_root(self) -> bool:
+        cute_state = self.device_function.cute_state
+        if cute_state.register_subblocks_plan is None:
+            return False
+        from .cute.cute_register_subblocks import codegen_register_subblocks
+
+        if codegen_register_subblocks(self):
+            return True
+        cute_state.register_subblocks_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "register sub-block family failed late validation"
+        )
 
     def _try_codegen_mma_dag_root(self) -> bool:
         cute_state = self.device_function.cute_state
@@ -683,6 +770,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         """Try fragment ownership before other schedules when this root needs it."""
         env = CompileEnvironment.current()
         if env.backend_name != "cute":
+            return False
+        if self.device_function.cute_state.register_subblocks_plan is not None:
+            # The register sub-block family replaces the root.
             return False
         if self.device_function.cute_state.mma_dag_plan is not None:
             # The warp-MMA recurrence owner replaces the root (its captured
@@ -1912,7 +2002,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         root_graph_info.graph_id
                     )
                     if (
-                        not self._try_codegen_radix_selection_root()
+                        not self._try_codegen_register_subblocks_root()
+                        and not self._try_codegen_radix_selection_root()
                         and not (
                             requested_fragment
                             and self._try_codegen_computed_fragment_root()
@@ -2198,6 +2289,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         },
                     )
                     validate_lane_reduce_owners(list(self.device_function.body))
+                    from .cute.register_tile_admission import RegisterTileOptions
+
+                    knobs = self.device_function.config.config
                     self.device_function.body = split_lane_loop_reductions(
                         list(self.device_function.body),
                         uniform_names=lane_uniform_names,
@@ -2210,6 +2304,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             for name, aliases in self.device_function._variable_renames.items()
                         },
                         running_sums=self.device_function.cute_matmul_running_sums,
+                        register_tile_options=RegisterTileOptions(
+                            warp_fold=knobs.get("cute_register_tile_warp_fold") is True,
+                            store_first=knobs.get("cute_register_tile_store_first")
+                            is True,
+                        ),
                     )
                     # Reject any owned marker without a proved lowering, so an
                     # incomplete per-lane input cannot stand in for a reduction.
@@ -2247,10 +2346,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def _sink_grid_vector_loops(self) -> None:
         cute_state = self.device_function.cute_state
         fired = False
+        unrolled = False
         if cute_state.vloop_sink_wrappers:
             from .cute.sink_vector_loops import sink_grid_vector_loops
 
-            self.device_function.body, fired = sink_grid_vector_loops(
+            self.device_function.body, fired, unrolled = sink_grid_vector_loops(
                 list(self.device_function.body),
                 wrappers=cute_state.vloop_sink_wrappers,
                 loads=cute_state.vloop_sink_loads,
@@ -2268,7 +2368,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     for arg in self.device_function.arguments
                     if isinstance(arg, TensorArg)
                 },
+                proven_disjoint_tensor_pairs=(
+                    self.device_function.proven_disjoint_tensor_pairs()
+                ),
+                stores=cute_state.vloop_sink_stores,
             )
+            cute_state.vloop_sink_unrolled = unrolled
         if not fired and cute_state.vloop_sink_layout_applied:
             # The knob shaped the thread layout but nothing was sunk.  The
             # knob must not change the code by itself, so start over with it
@@ -2537,6 +2642,17 @@ def generate_ast(
                     # the caller rebuilds them for the knob-off run.
                     raise
                 config = vloop_sink_off_config(config)
+            except FragmentMmaNotApplied:
+                # The fragment rewrite is a late AST pass like the unroll: the
+                # knob-off run reuses the caller's graphs.
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                config = fragment_mma_off_config(config)
+            except RingMmaNotApplied:
+                # The ring rewrite is a late AST pass like the fragment one.
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                config = ring_mma_off_config(config)
             except LaneUnrollNotApplied:
                 # The unroll is a late AST pass that touches no graph, so
                 # the knob-off run reuses the caller's graphs as they are.
@@ -2592,6 +2708,28 @@ def _generate_ast(
             )
 
             validate_warp_producer_regions(env, func.device_ir, config)
+        if env.backend_name == "cute" and config.get(
+            "tcgen05_grouped_prefix_adaptive_n", False
+        ):
+            from .cute.grouped_prefix_adaptive_n_codegen import (
+                generate_grouped_prefix_adaptive_n_candidate,
+            )
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+                or _codegen_graphs is not None
+                or _memory_counters is not None
+                or _host_prefix is not None
+                or _bounded_cache_request is not None
+            ):
+                raise exc.InvalidConfig(
+                    "grouped prefix-adaptive N requires complete ordinary codegen"
+                )
+            return generate_grouped_prefix_adaptive_n_candidate(
+                func, config, emit_repro_caller
+            )
         if (
             env.backend_name == "cute"
             and config.get("cute_materialized_operand_schedule", "off") != "off"
@@ -2831,7 +2969,17 @@ def _generate_ast(
                 ):
                     _host_prefix.extend(codegen.host_statements)
                     prefix_recorded = True
-                codegen.add_statement(codegen.visit(stmt))
+                try:
+                    codegen.add_statement(codegen.visit(stmt))
+                except exc.BackendUnsupported as error:
+                    # A lane-loop pass after the root dispatch can refuse a
+                    # root the fragment owner declined for capacity.
+                    failure = codegen.fragment_capacity_failure(error)
+                    if failure is error:
+                        # ``raise error from error`` would make the exception
+                        # its own cause and recurse while being printed.
+                        raise
+                    raise failure from error
             codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
             # Re-binding checks deferred from tcgen05 epilogue chains that no
             # store drained (chains ending in an atomic or a specialized
@@ -2843,12 +2991,25 @@ def _generate_ast(
                     codegen.suppressed_lane_names,
                     codegen.device_function.dce_vars,
                 )
-            if _bounded_cache_request is None:
-                kernel_def = codegen.device_function.codegen_function_def()
-            else:
-                kernel_def = codegen.device_function.codegen_function_def(
-                    bounded_cache_request=_bounded_cache_request
-                )
+            remainder_fills: list[RemainderFill] = []
+            if CompileEnvironment.current().backend_name == "cute":
+                from .cute.host_remainder_fills import append_device_remainder_fills
+
+                remainder_fills = append_device_remainder_fills(codegen, func, config)
+            try:
+                if _bounded_cache_request is None:
+                    kernel_def = codegen.device_function.codegen_function_def()
+                else:
+                    kernel_def = codegen.device_function.codegen_function_def(
+                        bounded_cache_request=_bounded_cache_request
+                    )
+            except exc.BackendUnsupported as error:
+                # Lane-loop finalization can refuse a root the fragment owner
+                # declined for capacity (see ``fragment_capacity_failure``).
+                failure = codegen.fragment_capacity_failure(error)
+                if failure is error:
+                    raise
+                raise failure from error
             block_dims = (
                 codegen.device_function.cute_state.collective_register_chain_block_dims
                 or codegen.device_function.cute_state.owned_root_block_dims
@@ -3076,6 +3237,11 @@ def _generate_ast(
             if env.backend_name == "cute":
                 from .cute.host_paired_sum import PAIRED_SUM_KEY
                 from .cute.host_paired_sum import lower_host_sum_pairs
+                from .cute.host_remainder_fills import lower_host_remainder_fills
+
+                final_host_statements = lower_host_remainder_fills(
+                    final_host_statements, remainder_fills
+                )
                 from .cute.host_single_sum import lower_host_single_sum
 
                 final_host_statements = lower_host_sum_pairs(
@@ -3092,6 +3258,36 @@ def _generate_ast(
                         "str", codegen.device_function.config.get(PAIRED_SUM_KEY, "off")
                     ),
                 )
+                from .cute.host_full_sum import lower_host_full_sum
+
+                final_host_statements = lower_host_full_sum(
+                    func,
+                    final_host_statements,
+                    cast(
+                        "str", codegen.device_function.config.get(PAIRED_SUM_KEY, "off")
+                    ),
+                )
+                from .cute.host_zero_fills import lower_host_zero_fills
+
+                final_host_statements = lower_host_zero_fills(
+                    func, final_host_statements, env, codegen.device_function.config
+                )
+                from .cute.host_zero_fill_launches import lower_host_zero_fill_launches
+                from .cute.host_zero_fill_launches import zero_fill_launches_apply
+
+                if zero_fill_launches_apply(
+                    codegen.device_function, env, codegen.device_function.config
+                ):
+                    # The zero fills that survive the elision launch as
+                    # dependent fill kernels ahead of this (``cute_pdl``)
+                    # kernel instead of memset nodes.
+                    final_host_statements, fill_kernels = lower_host_zero_fill_launches(
+                        func,
+                        final_host_statements,
+                        env=env,
+                        kernel_name=codegen.device_function.name,
+                    )
+                    post_kernel_metadata_statements.extend(fill_kernels)
 
             host_def = func.codegen_function_def(
                 final_host_statements,

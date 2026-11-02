@@ -4,6 +4,7 @@ import ast
 import itertools
 import os
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -23,6 +24,9 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -37,6 +41,9 @@ from helion._testing import matchesBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from helion.runtime.kernel import BoundKernel
 
 pytestmark = skipUnlessBackends(["cute"])
 if matchesBackends(["cute"]):
@@ -669,6 +676,12 @@ def test_grouped_device_split_automatic_seed_families_use_mailbox_scheduler() ->
     ):
         bound = _device_split_sizes_kernel.bind(args)
 
+    _assert_device_split_seed_family_policy(bound)
+
+
+def _assert_device_split_seed_family_policy(
+    bound: BoundKernel[torch.Tensor],
+) -> None:
     assert bound.host_function is not None
     analysis = analyze_tcgen05_grouped_worklist(
         bound.env,
@@ -688,27 +701,74 @@ def test_grouped_device_split_automatic_seed_families_use_mailbox_scheduler() ->
         == TCGEN05_GROUPED_MODE_WORKLIST_NM
     ]
     assert seeds
+    nm_seeds = [
+        config
+        for config in seeds
+        if config.get("tcgen05_grouped_worklist_orientation", "nm") == "nm"
+    ]
+    legacy_seeds = [
+        config
+        for config in nm_seeds
+        if config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
+        != TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE
+    ]
     assert {
         config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
-        for config in seeds
+        for config in legacy_seeds
     } == {
         TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
         TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
         TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
     }
     assert (
-        seeds[0].config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
+        legacy_seeds[0].config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
         == TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
     )
+    assert seeds[0] == legacy_seeds[0]
+    # Source128 adds independent NM pipelines; MN geometry/panel recipes are
+    # separate families and do not inherit the old NM raster restriction.
+    source128_seeds = [config for config in nm_seeds if config not in legacy_seeds]
+    assert {
+        config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
+        for config in source128_seeds
+    } == {TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE}
+    mn_seeds = [config for config in seeds if config not in nm_seeds]
+    assert {
+        config.get("tcgen05_grouped_worklist_orientation") for config in mn_seeds
+    } == {"mn"}
+    assert {
+        config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] for config in mn_seeds
+    } == {
+        TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE,
+        TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+    }
     assert all(
         TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY not in config.config
         for config in seeds
     )
     assert all(
         config.config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1) == 1
-        for config in seeds
+        for config in nm_seeds
     )
     assert bound.config_spec.compiler_default_config == seeds[0]
+
+
+def test_grouped_device_split_seed_family_policy_without_gpu() -> None:
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    values = (
+        torch.empty((2048, 64), dtype=torch.bfloat16),
+        torch.empty((8, 512, 64), dtype=torch.bfloat16),
+        torch.empty((8,), dtype=torch.int32),
+    )
+    with (
+        _target(),
+        _mock_cuda_unavailable(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+    ):
+        bound = _device_split_sizes_kernel._bind_isolated(values)
+        _assert_device_split_seed_family_policy(bound)
 
 
 def test_grouped_device_offsets_are_recognized_and_normalized() -> None:

@@ -24,6 +24,34 @@ def _i32_constant(
     )
 
 
+def input_constraint_codes(constraints: str) -> list[str]:
+    """The constraint code of every asm input operand, in operand order.
+
+    An LLVM constraint string lists the outputs (``=`` prefixed, ``&`` for an
+    early clobber) before the inputs, which bind to the call's operands in
+    order; a matching constraint (``0``) ties an input to that output's
+    register class; ``~{...}`` clobbers bind nothing.  GCC's read-write ``+``
+    prefix is not LLVM IR syntax: LLVM parses ``+r`` as a plain input and
+    Clang spells a read-write operand as ``=r`` plus a trailing matching
+    input, so a ``+`` is rejected instead of mis-bound.
+    """
+    items = [item.strip() for item in constraints.split(",") if item.strip()]
+    if any(item.startswith("+") for item in items):
+        raise ValueError(
+            f"'+' is not an LLVM inline asm constraint prefix: {constraints!r}; "
+            "spell a read-write operand as an '=' output plus a matching input"
+        )
+    outputs = [item.lstrip("=&") for item in items if item.startswith("=")]
+    codes = []
+    for item in items[len(outputs) :]:
+        if item.startswith("~"):
+            continue
+        if item.isdigit() and int(item) < len(outputs):
+            item = outputs[int(item)]
+        codes.append(item)
+    return codes
+
+
 def _asm_kwargs(
     is_pure: bool, loc: ir.Location | None, ip: ir.InsertionPoint | None
 ) -> dict[str, Any]:
@@ -96,13 +124,36 @@ def _inline_asm_scalar(
     loc: ir.Location | None,
     ip: ir.InsertionPoint | None,
 ) -> object:
+    # An operand bound to a 16-bit register ("h", directly or through a
+    # matching constraint) stays 16 bits wide (a half or bfloat16 as its
+    # bits); everything narrower than 32 bits otherwise travels zero-extended.
+    inputs = input_constraint_codes(constraints)
     operands = []
-    for arg in args:
+    for index, arg in enumerate(args):
         operand = cast("Any", arg).ir_value(loc=loc, ip=ip)
-        if str(operand.type) in {"i1", "i8", "i16"}:
+        half_register = index < len(inputs) and inputs[index] == "h"
+        if str(operand.type) in {"f16", "bf16"} and half_register:
+            operand = llvm.bitcast(
+                ir.IntegerType.get_signless(16), operand, loc=loc, ip=ip
+            )
+        elif str(operand.type) in {"i1", "i8", "i16"} and not (
+            half_register and str(operand.type) == "i16"
+        ):
             operand = llvm.zext(Int32.mlir_type, operand, loc=loc, ip=ip)
         operands.append(operand)
     kwargs = _asm_kwargs(is_pure, loc, ip)
+    if (
+        not isinstance(dtype, tuple)
+        and str(cast("Any", dtype).mlir_type) in {"f16", "bf16"}
+        and constraints.split(",")[0].strip() == "=h"
+    ):
+        # A 16-bit float result comes back as its bits in a 16-bit register.
+        bits = llvm.inline_asm(
+            ir.IntegerType.get_signless(16), operands, asm, constraints, **kwargs
+        )
+        return cast("Any", dtype)(
+            llvm.bitcast(cast("Any", dtype).mlir_type, bits, loc=loc, ip=ip)
+        )
     if isinstance(dtype, tuple):
         result = llvm.inline_asm(
             llvm.StructType.get_literal(  # pyrefly: ignore[missing-attribute]

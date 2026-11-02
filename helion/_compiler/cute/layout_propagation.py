@@ -77,7 +77,7 @@ def plan_layouts(
         _forward_propagate(graph_info)
         _backward_propagate(graph_info)
         _resolve_layouts(graph_info)
-        _insert_layout_changes(graph_info)
+        _insert_layout_changes(graph_info, tile_strategy)
         _validate_layout_contracts(graph_info)
 
 
@@ -607,7 +607,9 @@ def _resolve_layouts(graph_info: GraphInfo) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _insert_layout_changes(graph_info: GraphInfo) -> None:
+def _insert_layout_changes(
+    graph_info: GraphInfo, tile_strategy: TileStrategyDispatch | None = None
+) -> None:
     """Where a producer and consumer disagree on layout, insert a change node."""
     from .layout_change import _cute_layout_change
 
@@ -653,6 +655,15 @@ def _insert_layout_changes(graph_info: GraphInfo) -> None:
             if not _values_are_scalar(producer_layout, consumer_layout):
                 continue
 
+            # The round trip indexes a buffer of ``tile_numel`` scalars by
+            # the CTA's linear thread index, so it is only defined when the
+            # layouts describe the whole value on this edge with one element
+            # per launch thread.  A layout that left a dim of the value out
+            # (or counts threads the launch does not have) must not become a
+            # shared-memory permutation of a tile that is not there.
+            if not _layout_describes_edge(producer_layout, node, tile_strategy):
+                continue
+
             # Need a layout change between producer and consumer
             with graph_info.graph.inserting_before(user):
                 change_node = graph_info.graph.call_function(
@@ -682,10 +693,12 @@ def _insert_layout_changes(graph_info: GraphInfo) -> None:
 
                 user.replace_input_with(node, change_node)
                 log.debug(
-                    "inserted layout change %s -> %s before %s",
+                    "inserted layout change %s -> %s before %s: %s -> %s",
                     producer_layout.tag.value,
                     consumer_layout.tag.value,
                     user.name,
+                    producer_layout,
+                    consumer_layout,
                 )
 
 
@@ -1040,6 +1053,31 @@ def _is_output_flexible_layout_node(node: torch.fx.Node) -> bool:
 def _is_helion_contraction(node: torch.fx.Node) -> bool:
     """Return whether *node* changes coordinates through a Helion contraction."""
     return node.target in (matmul_ops.dot, matmul_ops.dot_scaled)
+
+
+def _layout_describes_edge(
+    layout: ThreadLayout,
+    node: torch.fx.Node,
+    tile_strategy: TileStrategyDispatch | None,
+) -> bool:
+    """True when *layout* covers *node*'s whole value, one element per thread.
+
+    Seeded layouts are read off a load's subscript and can leave a dim out
+    (a full slice over a reduction dim); inherited layouts carry that gap
+    along.  The scalar layout-change codegen writes ``tile_numel`` slots from
+    every launch thread, so both the value's element count and the launch's
+    thread count have to match the layout before a change is sound.
+    """
+    val = node.meta.get("val")
+    if isinstance(val, torch.Tensor) and not _symbolic_equal(
+        layout.tile_numel(), val.numel()
+    ):
+        return False
+    if tile_strategy is not None:
+        dims = tile_strategy.thread_block_dims()
+        if not _symbolic_equal(layout.num_threads(), dims[0] * dims[1] * dims[2]):
+            return False
+    return True
 
 
 def _tile_numels_match(a: ThreadLayout, b: ThreadLayout) -> bool:

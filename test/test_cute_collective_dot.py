@@ -126,13 +126,11 @@ def test_full_slice_dot_owns_entire_synthetic_k(dtype: torch.dtype, k: int) -> N
         assert "collective_a[collective_m, collective_k] =" in source
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("collective_requested", [False, True])
-@pytest.mark.parametrize("static_shapes", [False, True])
-@skipUnlessBackends(["cute"])
-def test_partial_synthetic_k_cannot_fall_back_to_a_thread_subset(
+def _partial_synthetic_k_render(
     dtype: torch.dtype, collective_requested: bool, static_shapes: bool
-) -> None:
+) -> str:
+    """``_full_slice_dot`` with K (64) on one thread x 64 synthetic lanes:
+    the config that cannot reduce K across a thread subset."""
     inputs = (
         torch.empty((130, 64), dtype=dtype),
         torch.empty((64, 70), dtype=dtype),
@@ -141,8 +139,8 @@ def test_partial_synthetic_k_cannot_fall_back_to_a_thread_subset(
     config["cute_collective_mma"] = collective_requested
     if collective_requested:
         # Vectorized operands do not satisfy the collective staging proof.
-        # A requested-but-ineligible collective must reject the same unsafe
-        # scalar fallback as a configuration that disables it explicitly.
+        # A requested-but-ineligible collective must take the same scalar
+        # path as a configuration that disables it explicitly.
         config["cute_vector_widths"] = [2, 1, 1]
     with (
         _mock_cuda_unavailable(),
@@ -155,8 +153,36 @@ def test_partial_synthetic_k_cannot_fall_back_to_a_thread_subset(
             autotune_effort="none",
         )
         bound = _cpu_bind(kernel, inputs)
-        with pytest.raises(exc.BackendUnsupported, match="K axis split across"):
-            bound.to_code(helion.Config.from_dict(config))
+        return bound.to_code(helion.Config.from_dict(config))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("collective_requested", [False, True])
+@skipUnlessBackends(["cute"])
+def test_partial_synthetic_k_folds_the_full_k_per_thread(
+    dtype: torch.dtype, collective_requested: bool
+) -> None:
+    """A static K extent lets the scalar fallback re-read both operands over
+    the whole K axis in every thread (``_cute_fold_dot``) instead of reducing
+    a partial dot across a thread subset; no collective GEMM is emitted."""
+    source = _partial_synthetic_k_render(dtype, collective_requested, True)
+    ast.parse(source)
+    assert source.count("_cute_fold_dot(") == 1
+    assert "k=64" in source
+    assert "group_span=" not in source
+    assert "cute.gemm(" not in source
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("collective_requested", [False, True])
+@skipUnlessBackends(["cute"])
+def test_partial_synthetic_k_without_a_static_extent_cannot_fall_back(
+    dtype: torch.dtype, collective_requested: bool
+) -> None:
+    """Without ``static_shapes`` the fold has no K extent to re-read, and a
+    reduction over live threads would expose a partial dot: refuse."""
+    with pytest.raises(exc.BackendUnsupported, match="K axis split across"):
+        _partial_synthetic_k_render(dtype, collective_requested, False)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

@@ -233,6 +233,11 @@ def is_cuda() -> bool:
     return _get_triton_backend() == "cuda" and torch.cuda.is_available()
 
 
+def is_xpu() -> bool:
+    """Return True if running on Intel XPU."""
+    return _get_triton_backend() == "xpu" and torch.xpu.is_available()
+
+
 PROJECT_ROOT: Path = Path(__file__).parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
 PRETUNED_KERNELS_DIR: Path = PROJECT_ROOT / "pretuned_kernels"
@@ -404,6 +409,21 @@ def skipUnlessCuteAvailable(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: not _has_cute_dsl(), reason)
 
 
+def _tcgen05_runtime_n_ptx_compatible() -> bool:
+    from ._compiler.cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
+
+    return tcgen05_runtime_n_ptx_compatible()
+
+
+# Runtime UMMA-N raw PTX (grouped worklist codegen and its seeds) is enabled only
+# for the exact CuTe DSL release it was validated on; other releases fall back to
+# static-width MMA.
+skipUnlessTcgen05RuntimeNPtx = skipIfFn(
+    lambda: not _tcgen05_runtime_n_ptx_compatible(),
+    "runtime UMMA-N PTX is enabled only for the validated nvidia-cutlass-dsl release",
+)
+
+
 def xfailIfCute(reason: str) -> Callable[[Callable], Callable]:
     """Mark test xfail when CUTLASS CuTe backend is selected."""
     return xfailIfFn(lambda: _get_backend() == "cute", reason)
@@ -522,7 +542,9 @@ def onlyBackends(
 def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless tensor descriptors are supported."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(lambda: not is_cuda() or not supports_tensor_descriptor(), reason)
+    return skipIfFn(
+        lambda: not (is_cuda() or is_xpu()) or not supports_tensor_descriptor(), reason
+    )
 
 
 def skipUnlessBlockPtr(reason: str) -> Callable[[Callable], Callable]:
@@ -1819,9 +1841,9 @@ class RefEagerTestDisabled:
 
     def setUp(self) -> None:
         """Skip test if ref eager mode is enabled."""
-        super().setUp()  # type: ignore[misc]
         if os.environ.get("HELION_INTERPRET") == "1":
             self.skipTest("Test class disabled in ref eager mode")  # type: ignore[attr-defined]
+        super().setUp()  # type: ignore[misc]
 
 
 class TestCase(unittest.TestCase):
@@ -1855,6 +1877,9 @@ class TestCase(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self._test_stack = contextlib.ExitStack()
+        # unittest does not call tearDown if setUp raises, including SkipTest.
+        # Close contexts even when a subclass skips after calling super().setUp().
+        self.addCleanup(self._test_stack.close)
 
         from torch._inductor.utils import fresh_cache
 

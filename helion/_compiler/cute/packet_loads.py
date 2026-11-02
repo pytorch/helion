@@ -22,10 +22,21 @@ if TYPE_CHECKING:
     from .computed_fragment import HostTensor
 
 KEY = "cute_fragment_packet_loads"
+# Element types of a four-scalar packet: 16 bytes of fp32, 8 bytes of 16-bit.
+PACKET_DTYPES = frozenset({torch.float32, torch.bfloat16, torch.float16})
 _PURE = frozenset(
     [
         f"cutlass.{name}"
-        for name in ("Int32", "Int64", "Uint32", "Uint64", "Float32", "Boolean")
+        for name in (
+            "Int32",
+            "Int64",
+            "Uint32",
+            "Uint64",
+            "Float32",
+            "BFloat16",
+            "Float16",
+            "Boolean",
+        )
     ]
     + [
         f"operator.{name}"
@@ -175,33 +186,41 @@ def materialize_packet_load(
     """Publish the same scalar values at the same dense shared coordinates.
 
     The caller proves the host allocation is readonly for the complete root.
-    Each packet owns four consecutive *logical* slots, independent of pointer
-    strides. Original address/mask code runs first; only four valid consecutive
-    aligned effective addresses select LDG.128. Every other packet scalarizes.
+    Each packet owns four consecutive *logical* slots (16 bytes of fp32, 8
+    bytes of a 16-bit type), independent of pointer strides. Original
+    address/mask code runs first; only four valid consecutive aligned
+    effective addresses select the vector load. Every other packet scalarizes.
     The final existing CTA barrier protects all later cross-thread consumers.
     """
     if (
         not value.shape
-        or value.dtype != torch.float32
+        or value.dtype not in PACKET_DTYPES
         or not tensor_has_specialized_base_alignment(compiler.env, tensor.value, 16)
     ):
         return None
+    # One packet is four scalars: 16 bytes of fp32 or 8 bytes of a 16-bit
+    # type.  Four lanes keep the loop body (and the DSL's AST preprocessing
+    # of its conditionals) the size of the proven fp32 packet; eight 16-bit
+    # lanes doubled the conditionals and the preprocessor no longer finished.
+    lanes = 4
+    packet_bytes = lanes * value.dtype.itemsize
+    scalar = compiler.dtype(value.dtype)
     count = math.prod(value.shape)
-    if count < 4:
+    if count < lanes:
         return None
     packet_index = compiler.df.new_var("fragment_packet_index")
     loop = cast(
         "ast.For",
         statement_from_string(
-            f"for {packet_index} in range({compiler.thread}, {(count + 3) // 4}, {compiler.threads}):\n    pass"
+            f"for {packet_index} in range({compiler.thread}, {(count + lanes - 1) // lanes}, {compiler.threads}):\n    pass"
         ),
     )
     loop.body.clear()
     captures = []
     shared_slots = _published_dependencies(compiler, dependencies)
     shared_reads: set[str] = set()
-    for lane in range(4):
-        index = f"({packet_index} * 4 + {lane})"
+    for lane in range(lanes):
+        index = f"({packet_index} * {lanes} + {lane})"
         coords = compiler.coordinates(index, value.shape)
         statements: list[ast.AST] = []
         with compiler.cg.set_statements(statements):
@@ -231,7 +250,7 @@ def materialize_packet_load(
             names.append(name)
             compiler.emit(f"{address} = cutlass.Int64(0)")
             compiler.emit(f"{predicate} = False")
-            compiler.emit(f"{name} = cutlass.Float32(0)")
+            compiler.emit(f"{name} = {scalar}(0)")
 
             captured = []
             transform = _CaptureAddress(assignment, address, predicate, offset)
@@ -240,7 +259,7 @@ def materialize_packet_load(
                 captured.extend(
                     rewritten if isinstance(rewritten, list) else [rewritten]
                 )
-            if count % 4:
+            if count % lanes:
                 captured = [
                     ast.If(
                         test=ast.parse(f"{index} < {count}", mode="eval").body,
@@ -253,7 +272,7 @@ def materialize_packet_load(
         guard = " and ".join(
             [
                 *predicates,
-                f"{addresses[0]} % 4 == 0",
+                f"{addresses[0]} % {lanes} == 0",
                 *(
                     f"{address} == {addresses[0]} + {lane}"
                     for lane, address in enumerate(addresses[1:], 1)
@@ -262,13 +281,12 @@ def materialize_packet_load(
         )
         packet = compiler.df.new_var("fragment_packet_values")
         source = compiler.df.new_var("fragment_packet_source")
-        fast = f"{packet} = cute.make_rmem_tensor(cute.make_layout((4,)), cutlass.Float32)\n{source} = cute.make_tensor(({tensor.name}.iterator + {addresses[0]}).align(16), cute.make_layout((4,)))\ncute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=128), {source}, {packet})\n"
+        fast = f"{packet} = cute.make_rmem_tensor(cute.make_layout(({lanes},)), {scalar})\n{source} = cute.make_tensor(({tensor.name}.iterator + {addresses[0]}).align({packet_bytes}), cute.make_layout(({lanes},)))\ncute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {scalar}, num_bits_per_copy={packet_bytes * 8}), {source}, {packet})\n"
         fast += "\n".join(
-            f"{name} = cutlass.Float32({packet}[{lane}])"
-            for lane, name in enumerate(names)
+            f"{name} = {scalar}({packet}[{lane}])" for lane, name in enumerate(names)
         )
         slow = "\n".join(
-            f"if {valid}:\n    {name} = cutlass.Float32(({tensor.name}.iterator + {address}).load())"
+            f"if {valid}:\n    {name} = {scalar}(({tensor.name}.iterator + {address}).load())"
             for valid, name, address in zip(predicates, names, addresses, strict=True)
         )
         branch = cast("ast.If", statement_from_string(f"if {guard}:\n    pass"))
@@ -277,7 +295,9 @@ def materialize_packet_load(
         compiler.cg.add_statement(branch)
         for index, coords, name, *_rest in captures:
             store = f"{result.read(coords)} = {name}"
-            compiler.emit(f"if {index} < {count}:\n    {store}" if count % 4 else store)
+            compiler.emit(
+                f"if {index} < {count}:\n    {store}" if count % lanes else store
+            )
     compiler.cg.add_statement(loop)
     compiler.synchronize()
     compiler.held.pop()

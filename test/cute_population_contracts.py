@@ -33,7 +33,7 @@ def with_flat_min_blocks_default(spec: ConfigSpec, config: Config) -> Config:
 
 
 def checked_initial_population(search: PatternSearch) -> list[FlatConfig]:
-    """Keep N exact base rows; account for every later declared witness.
+    """Keep N exact base rows; account for declared and requested seed additions.
 
     The old builder is observed directly before the append. This checks its
     nominal budget, exact prefix, and final RNG state without changing its
@@ -57,17 +57,13 @@ def checked_initial_population(search: PatternSearch) -> list[FlatConfig]:
     assert random.getstate() == state
     generation = search.config_gen
     groups = generation.config_spec.compiler_coverage_groups
-    if not groups or not generation.compiler_coverage_enabled:
-        assert result == base
-        return result
-
     declarations = []
-    for group in groups:
+    for group in groups if generation.compiler_coverage_enabled else ():
         for witness in group.witnesses:
             requested = witness.carrier
             requested.config[group.key] = witness.value
             declarations.append((group, witness, requested))
-    outcomes = search.compiler_coverage_outcomes
+    outcomes = search.compiler_coverage_outcomes if declarations else []
     assert len(outcomes) == len(declarations)
     base_configs = {generation.canonicalize_flat(deepcopy(row))[1] for row in base}
     expected_additions = []
@@ -106,6 +102,23 @@ def checked_initial_population(search: PatternSearch) -> list[FlatConfig]:
             expected_additions.append(flat)
             seen.add(effective)
         assert effective in search._pinned_finalist_configs
+    # The overflow design is independently enumerated from the registry, after
+    # all declared coverage. No nominal/coverage row may be displaced by a seed.
+    if (
+        generation.config_spec.compiler_seed_overflow_requested
+        and search.initial_population > 0
+    ):
+        for seed in generation.config_spec.compiler_seed_configs:
+            try:
+                flat, effective = generation.canonicalize_flat(
+                    generation.flatten(deepcopy(seed))
+                )
+            except (InvalidConfig, ValueError, TypeError, KeyError, AssertionError):
+                continue
+            if effective not in seen:
+                expected_additions.append(flat)
+                seen.add(effective)
+            assert effective in search._pinned_finalist_configs
     assert result[len(base) :] == expected_additions
     assert len(result) == search.initial_population + len(expected_additions)
     return result

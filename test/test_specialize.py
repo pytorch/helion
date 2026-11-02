@@ -846,11 +846,13 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                 y = torch.randn(shape, device=DEVICE)
                 torch.testing.assert_close(compiled(y), y * 2, rtol=0, atol=0)
         for shape in ((48, 4, 32), (48, 8, 16)):
-            with (
-                self.subTest(shape=shape),
-                self.assertRaisesRegex(RuntimeError, "larger bucket"),
-            ):
-                compiled(torch.randn(shape, device=DEVICE))
+            with self.subTest(shape=shape):
+                y = torch.randn(shape, device=DEVICE)
+                if _get_backend() == "cute":
+                    with self.assertRaisesRegex(RuntimeError, "larger bucket"):
+                        compiled(y)
+                else:
+                    torch.testing.assert_close(compiled(y), y * 2, rtol=0, atol=0)
 
         x = torch.randn(64, 1024, device=DEVICE)
         bound = row_sum.bind((x,))

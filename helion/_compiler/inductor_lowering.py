@@ -58,6 +58,7 @@ from .compile_environment import _symint_sympy_expr
 from .cute.cute_reshape import REBOUND_CHECK_TARGETS
 from .cute.cute_reshape import check_pointwise_rebound_block_ids
 from .cute.view_subtile import check_view_coord_consumers
+from .device_function import DeviceFunction
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -74,7 +75,6 @@ if TYPE_CHECKING:
     from .cute.layout import MatmulAxisModel
     from .cute.layout import MatmulExecutionPlan
     from .cute.layout import ThreadLayout
-    from .device_function import DeviceFunction
     from .device_ir import GraphInfo
     from .generate_ast import GenerateAST
     from .helper_function import CodegenInterface
@@ -120,6 +120,18 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
                             # is rejected consistently on every backend, before
                             # any config-specific validation or codegen.
                             lowering._check_reduction_broadcast_keepdim(node)
+
+
+def prepare_added_node_lowering(graph: torch.fx.Graph, node: Node) -> None:
+    """``prepare_graph_lowerings`` for one node added to ``graph`` after the
+    graph's lowerings were prepared (its inputs already carry ``meta["val"]``)."""
+    with compile_lock:
+        graph_lowering = GraphLowering(
+            _LazyGraphModule({}, graph),
+            shape_env=CompileEnvironment.current().shape_env,
+        )
+        with V.set_graph_handler(graph_lowering), node.meta["location"]:
+            prepare_node_lowering(graph_lowering, node)
 
 
 @functools.cache
@@ -1447,6 +1459,23 @@ class GenerateASTFromInductor(DefaultHandler):
                 x=self._to_ast(x),
             )
             return self._lift(cast_expr)
+        if (
+            dtype is torch.float32
+            and CompileEnvironment.current().backend.name == "cute"
+        ):
+            # A 16-bit value the mma_dag emitters hold exactly in fp32 (an
+            # unpacked tile element, a widening side load) widens to that
+            # value, not through a cast pair.  The record lives on the
+            # device function's cute state; a lowering driven by a stand-in
+            # device function (the flex score-mod lowering's tests) has none.
+            device_function = self.cg.device_function
+            x_ast = self._to_ast(x)
+            if isinstance(device_function, DeviceFunction) and isinstance(
+                x_ast, ast.Name
+            ):
+                exact = device_function.cute_state.mma_dag_exact_f32.get(x_ast.id)
+                if exact is not None:
+                    return self._lift(expr_from_string(exact))
         cast_expr = self._create_cast_expr(x, dtype)
         return self._lift(cast_expr)
 
@@ -1461,8 +1490,17 @@ class GenerateASTFromInductor(DefaultHandler):
         if env.settings.fast_math and env.backend.name == "triton":
             # libdevice's fast_dividef / fast_expf exist on the Triton backend
             # only; TileIR shares the Triton codegen and keeps the exact form.
+            # The exponent is of -|x| so it never overflows (``fast_expf`` of a
+            # large argument gave inf, and 1 / inf NaN on XPU): for x >= 0
+            # sigmoid is 1 / (1 + e), for x < 0 it is e / (1 + e) = e * r.
+            exponential = self._lift(
+                expr_from_string(f"fast_expf(-tl.abs({inner_name}))")
+            )
+            reciprocal = self._lift(
+                expr_from_string(f"fast_dividef(1.0, 1.0 + {exponential})")
+            )
             result = expr_from_string(
-                f"fast_dividef(1.0, 1.0 + fast_expf(-{inner_name}))"
+                f"tl.where({inner_name} >= 0, {reciprocal}, {exponential} * {reciprocal})"
             )
         else:
             result = expr_from_string(
@@ -1968,8 +2006,10 @@ def codegen_call_with_graph(
 ) -> list[object]:
     with compile_lock:
         from .cute.cute_mma import prepare_cute_collective_lane_loop_suppression
+        from .cute.simt_gemm import prepare_cute_simt_gemm_loads
 
         prepare_cute_collective_lane_loop_suppression(cg, graph)
+        prepare_cute_simt_gemm_loads(cg, graph)
         new_args = []
         placeholders = graph.find_nodes(op="placeholder")
         for arg, placeholder in zip(args, placeholders, strict=True):

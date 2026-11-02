@@ -406,14 +406,16 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
                     values.update(
                         cute_replicated_reduction=replicate,
                         cute_pdl=True,
+                        cute_pdl_spread=True,
                         load_eviction_policies=policies,
                     )
                 if independent:
                     assert isinstance(pdl, EnumFragment)
-                    values.update(
-                        cute_independent_reduction=True,
-                        cute_pdl=True in (pdl.search_values() or ()),
-                    )
+                    searched = True in (pdl.search_values() or ())
+                    values.update(cute_independent_reduction=True, cute_pdl=searched)
+                    if searched:
+                        # Inert, and dropped by normalization, without the knob.
+                        values["cute_pdl_spread"] = True
                 seed = Config.from_dict(values)
                 if independent:
                     # Use current legal domains, including any caller-imposed

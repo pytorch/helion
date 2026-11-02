@@ -152,6 +152,32 @@ def test_bf16xint16_seeds_match_torch_matmul(
         autotune_effort="none",
         cute_materialize_transformed_operands=True,
     )._bind_isolated((x, w))
+    if bound.env.cute_fission_plan is None:
+        # The latency-bound shape stays one launch: the register-MMA family
+        # converts the int16 packets in registers; every one of its seeds
+        # (and each with the dependent launch) must match torch.
+        with bound.env:
+            spec = bound.config_spec
+            state = spec._cute_tcgen05_config
+            assert state.warp_mma_admitted and not state.tcgen05_family_admitted
+            seeds = [
+                bound._normalized_config_copy(seed)
+                for seed in spec.compiler_seed_configs
+                if seed.config.get("cute_matmul_family") == "warp_mma"
+            ]
+            seeds += [
+                bound._normalized_config_copy(
+                    helion.Config.from_dict({**seed.config, "cute_pdl": True})
+                )
+                for seed in seeds
+            ]
+        assert seeds
+        for config in seeds:
+            bound.set_config(config)
+            torch.testing.assert_close(
+                bound(x, w), expected(x, w), atol=1e-2, rtol=1e-2
+            )
+        return
     for config in _producer_seeds(bound):
         bound.set_config(config)
         torch.testing.assert_close(bound(x, w), expected(x, w), atol=1e-2, rtol=1e-2)

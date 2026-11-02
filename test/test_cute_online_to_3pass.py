@@ -39,7 +39,9 @@ cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
 
 
-@helion.kernel(backend="cute")
+# The pins below count sweeps; the exact division hoist
+# (test_cute_exact_division.py) would add a redo copy of the consume sweep.
+@helion.kernel(backend="cute", cute_exact_division=False)
 def _online_two_pass_kernel(x: torch.Tensor) -> torch.Tensor:
     """The exact canonical online two-pass softmax pattern the rewrite
     detects: outer tile loop holding ``mi`` and ``di``, an online update

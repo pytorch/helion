@@ -23,15 +23,15 @@ from test.test_cute_register_tile_reductions import ROLLED_OWNER
 from test.test_cute_register_tile_reductions import _bind
 from test.test_cute_register_tile_reductions import _cpu_only  # noqa: F401
 
+import helion
 from helion._compiler.autotuner_heuristics import get_heuristics
 from helion._compiler.autotuner_heuristics.cute import CuteColumnReductionHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteRegisterTileHeuristic
 from helion._testing import skipUnlessBackends
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    import helion
 
 
 @skipUnlessBackends(["cute"])
@@ -180,8 +180,8 @@ def test_seed_retries_wide_extents_as_the_looped_reduction(
 
 @skipUnlessBackends(["cute"])
 def test_seed_skips_bodies_outside_the_register_tile_shape() -> None:
-    # A rolled device loop, one reduction feeding another, or a dynamic
-    # reduction extent: the block is not admitted and no seed is offered.
+    # A rolled device loop or a dynamic reduction extent: the block is not
+    # admitted and no seed is offered.
     for kernel, arguments in (
         (
             col_sum_nested,
@@ -190,13 +190,45 @@ def test_seed_skips_bodies_outside_the_register_tile_shape() -> None:
                 torch.empty((4, 1024), dtype=torch.float32),
             ),
         ),
-        (col_softmax, (torch.empty((128, 1024), dtype=torch.float32),)),
         (col_sum_dynamic, (torch.empty((1024, 1024), dtype=torch.float32),)),
     ):
         bound = _cpu_bind(kernel, arguments)
         host = bound.host_function
         assert host is not None
         assert not CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
+
+
+@skipUnlessBackends(["cute"])
+def test_chained_reductions_seed_half_the_lanes_per_level() -> None:
+    # One reduction feeding another (two accumulate nests) stashes more of the
+    # tile between the combines, so the seed halves the lanes per thread:
+    # 128 rows over 16 reduction threads instead of 8, with the same 32-column
+    # tile on 8 vector threads.  The chained body is also the autotune-off
+    # default and renders the two-level register tile.
+    arguments = (torch.empty((128, 1024), dtype=torch.float32),)
+    bound = _cpu_bind(col_softmax, arguments)
+    host = bound.host_function
+    assert host is not None
+    assert CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
+    seeds = CuteRegisterTileHeuristic.get_seed_configs(bound.env, host.device_ir)
+    assert seeds is not None
+    spec = bound.config_spec
+    (reduction,) = [
+        block.block_id for block in bound.env.block_sizes if block.reduction
+    ]
+    thread_ids = spec.num_threads.valid_block_ids()
+    assert [seed.block_sizes for seed in seeds] == [[32], [32], [32]]
+    assert [seed.num_threads[thread_ids.index(reduction)] for seed in seeds] == [
+        16,
+        16,
+        32,
+    ]
+    default = spec.default_config()
+    assert default.num_threads[thread_ids.index(reduction)] == 16
+    code = bound.to_code(default)
+    assert code.count(CONSTEXPR_OWNER) == 3
+    assert "_lane_stash" in code
+    assert "block=(8, 16, 1)" in code
 
 
 @skipUnlessBackends(["cute"])
@@ -218,3 +250,65 @@ def test_register_tile_and_column_reduction_seeds_are_disjoint() -> None:
     assert not bound.config_spec.reduction_loops
     assert CuteColumnReductionHeuristic.is_eligible(bound.env, host.device_ir)
     assert not CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
+
+
+@helion.kernel(
+    backend="cute",
+    static_shapes=True,
+    autotune_effort="none",
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def _col_sum_accumulate(x: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros([x.size(1)], dtype=torch.float32, device=x.device)
+    for tile_n in hl.tile(x.size(1)):
+        out[tile_n] += x[:, tile_n].sum(0)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _col_sum_reload(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty([x.size(1)], dtype=torch.float32, device=x.device)
+    other = torch.empty([x.size(1)], dtype=torch.float32, device=x.device)
+    for tile_n in hl.tile(x.size(1)):
+        out[tile_n] = x[:, tile_n].sum(0)
+        other[tile_n] = out[tile_n] * 2.0
+    return out, other
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _col_sum_scale_in_place(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(1)], dtype=torch.float32, device=x.device)
+    for tile_n in hl.tile(x.size(1)):
+        t = x[:, tile_n]
+        x[:, tile_n] = t * 2.0
+        out[tile_n] = t.sum(0)
+    return out
+
+
+@skipUnlessBackends(["cute"])
+def test_seed_skips_bodies_whose_lane_split_would_order_memory() -> None:
+    # The lane split cannot order two threads' accesses to one tensor: no
+    # barrier fits next to the lane-reduce placeholder, and the RAW barrier
+    # the IR marks cannot be predicated.  An accumulating store (every
+    # reduction thread loads and stores the same ``out[tile]``) and a store
+    # the body reads back get no seed, so the autotune-off default is the
+    # base default, which compiles.  A read-modify-write whose accesses span
+    # the reduction block keeps each element in one thread and keeps the seed.
+    for kernel in (_col_sum_accumulate, _col_sum_reload):
+        arguments = (torch.empty((128, 1024), dtype=torch.float32),)
+        bound = _cpu_bind(kernel, arguments)
+        host = bound.host_function
+        assert host is not None
+        assert not CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
+        assert bound.config_spec.compiler_default_config is None
+        default = bound.config_spec.default_config()
+        assert "num_threads" not in default.config
+        bound.to_code(default)
+    arguments = (torch.empty((128, 1024), dtype=torch.float32),)
+    bound = _cpu_bind(_col_sum_scale_in_place, arguments)
+    host = bound.host_function
+    assert host is not None
+    assert CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
+    default = bound.config_spec.default_config()
+    assert default.num_threads == [8, 8]
+    assert "_lane_stash" in bound.to_code(default)

@@ -427,6 +427,14 @@ class NoTensorArgs(BaseError):
     message = "Kernel took no tensor or device args, unclear what device to use."
 
 
+class CuteSassCheckFailed(BaseError):
+    message = (
+        "The SASS check {1} refused kernel {0!r}: {2}. "
+        "The kernel never launched; the autotuner drops the config (plain "
+        "packets are unaffected)."
+    )
+
+
 class _WrapException(BaseError):
     message = "{name}: {msg}"
 
@@ -480,11 +488,11 @@ Set autotune_ignore_errors=True or HELION_AUTOTUNE_IGNORE_ERRORS=1 to ignore Tri
 
 class TritonUnrecoverableRuntimeError(BaseError):
     message = """\
-An unrecoverable Triton runtime error occurred: {reason}.
-This likely indicates a bug in Triton and cannot be recovered from.
+An unrecoverable device-side error occurred while running a candidate in the autotuning process: {reason}.
+The error is sticky: the CUDA context is poisoned and tuning cannot continue.
 {decorator}
 Original error: {error}
-Set HELION_AUTOTUNE_PRECOMPILE="spawn" to isolate these errors in a subprocess so tuning can continue."""
+Candidates run in this process, not in the killable benchmark worker that would have isolated the fault, because {isolation}."""
 
 
 class BaseWarning(_FixedMessage):
@@ -498,6 +506,13 @@ class BlockPtrIndexingUnavailable(BaseWarning):
     message = (
         "indexing='block_ptr' was requested, but this Triton build has no block "
         "pointers (removed in Triton 3.9); using pointer indexing instead."
+    )
+
+
+class TritonOptionUnavailable(BaseWarning):
+    message = (
+        "The config asks for the Triton option {0!r}, which this Triton build "
+        "does not accept; the kernel runs without it."
     )
 
 
@@ -527,6 +542,18 @@ class WrongDevice(BaseWarning):
 
 class BlockSizeIgnoredInInterpretMode(BaseWarning):
     message = "block_size is specified to be {0}, but in interpret mode, the full dimension size is always used."
+
+
+class FastMathUnused(BaseWarning):
+    message = (
+        "This kernel computes {0}, which the fast_math setting lowers to faster "
+        "approximate forms (approximate fp32 division and reciprocal, ex2.approx "
+        "exponentials, approximate erf/sigmoid/rsqrt, and on Triton max/min without "
+        "NaN propagation) that typically change results by a few ulp, flush denormals "
+        "or drop NaNs; without it the exact forms are used. If the "
+        "kernel's consumers tolerate that, set @helion.kernel(fast_math=True) or "
+        "HELION_FAST_MATH=1. Silence with ignore_warnings=[helion.exc.FastMathUnused]."
+    )
 
 
 class TiledKMatmulAccumulationWarning(BaseWarning):

@@ -10,6 +10,7 @@ import torch
 from test.test_cute_cluster_online_pair import softmax_two_pass_kernel
 
 import helion
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 
 CUDA_DEVICE = "cuda"
@@ -39,6 +40,7 @@ def _check_cluster_rows(actual: torch.Tensor, x: torch.Tensor) -> None:
     assert torch.equal(actual[1:3][empty], torch.zeros_like(actual[1:3][empty]))
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("fast_math", [False, True])
 @pytest.mark.parametrize(

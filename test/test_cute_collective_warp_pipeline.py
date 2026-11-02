@@ -50,10 +50,17 @@ def test_pipeline_preserves_reads_and_consume_order(
     issued: list[tuple[int, int]] = []
     reads: list[int] = []
     consumed: list[int] = []
+    # A stage still being read by a slower thread may only be refilled after
+    # a CTA barrier that every reader has passed; the compute body itself
+    # carries no barrier, so the schedule must place one per iteration.
+    barriers = 0
+    last_read: dict[int, int] = {}
+    barrier_before_consume: list[bool] = []
 
     def issue(k: int, stage: int) -> None:
         assert start <= k < stop
         assert 0 <= stage < stages
+        assert last_read.get(stage, -1) < barriers, "refilled a live stage"
         reads.append(k)
         issued.append((stage, k))
 
@@ -65,8 +72,16 @@ def test_pipeline_preserves_reads_and_consume_order(
         while len(pending) > distance:
             memory.update(pending.pop(0))
 
+    def sync() -> None:
+        nonlocal barriers
+        barriers += 1
+
     def consume(k: int, stage: int) -> None:
         assert memory[stage] == k
+        # The waited copies of this thread become visible to the others only
+        # through a barrier issued after the wait.
+        barrier_before_consume.append(barriers > len(consumed))
+        last_read[stage] = barriers
         consumed.append(k)
 
     namespace = {
@@ -75,7 +90,7 @@ def test_pipeline_preserves_reads_and_consume_order(
             arch=SimpleNamespace(
                 cp_async_commit_group=commit,
                 cp_async_wait_group=wait,
-                sync_threads=lambda: None,
+                sync_threads=sync,
             )
         ),
         "start": start,
@@ -94,6 +109,9 @@ def test_pipeline_preserves_reads_and_consume_order(
     assert consumed == list(range(start, stop, 32))
     assert reads == consumed
     assert not pending and not issued
+    assert all(barrier_before_consume)
+    # One barrier per consumed step plus the drain barrier after the loop.
+    assert barriers == len(consumed) + 1
 
 
 @pytest.mark.parametrize("stages", [2, 3, 4])
@@ -241,7 +259,7 @@ def test_pipeline_codegen_and_config_transfer(stages: int) -> None:
     code = bound.to_code(transferred)
     assert "cute.gemm(" in code
     if stages > 1:
-        assert f"cute.arch.cp_async_wait_group({stages - 1})" in code
+        assert f"cute.arch.cp_async_wait_group({stages - 2})" in code
         assert "collective_prefetch_k" in code
         assert f"(32, 32, {stages})" in code
     else:
@@ -291,7 +309,7 @@ def test_pipeline_gathered_tails_and_graphs(
     bound = _gathered_gemm._bind_isolated((a, b, rows))
     config = _config(stages)
     code = bound.to_code(config)
-    assert f"cute.arch.cp_async_wait_group({stages - 1})" in code
+    assert f"cute.arch.cp_async_wait_group({stages - 2})" in code
     bound.set_config(config)
 
     def run() -> torch.Tensor:

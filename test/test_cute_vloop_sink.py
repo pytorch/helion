@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import builtins
 from contextlib import ExitStack
+import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -94,11 +95,16 @@ def _loop(code: str, target: str) -> ast.For:
 
 
 def _vector_loads(body: list[ast.stmt]) -> list[ast.stmt]:
+    """The packet loads of ``body``: plain ``cute.arch.load`` or, under a
+    guard, the predicated ``_cute_load_v*b_if`` helpers."""
     return [
         stmt
         for stmt in body
         if isinstance(stmt, ast.Assign)
-        and "cute.arch.load(" in ast.unparse(stmt)
+        and (
+            "cute.arch.load(" in ast.unparse(stmt)
+            or "_cute_load_v" in ast.unparse(stmt)
+        )
         and "ir.VectorType.get(" in ast.unparse(stmt)
     ]
 
@@ -298,8 +304,8 @@ def test_dynamic_shapes_guard_whole_vectors_with_a_uniform_mask(
     cpu_only: None,
 ) -> None:
     """With ``n % V == 0`` the column mask is the same for all V lanes: it is
-    evaluated once at the chunk base, guards the vector transaction (masked
-    threads read the tensor's first chunk) and still gates every value."""
+    evaluated once at the chunk base, guards the predicated vector transaction
+    (masked threads load nothing and see zeros) and still gates every value."""
     x = torch.empty(4000, 4000, dtype=torch.bfloat16)
     code = _cpu_code(
         col_reduce_sum_dynamic,
@@ -316,14 +322,18 @@ def test_dynamic_shapes_guard_whole_vectors_with_a_uniform_mask(
     lane_loop = _loop(code, "lane_0")
     loads = _vector_loads(lane_loop.body)
     assert len(loads) == 2
-    assert (
-        "if mask_0_u0 and mask_1 else x.iterator + cutlass.Int32(0), ir.VectorType"
-        in ast.unparse(loads[0])
-    )
+    # Four bf16 lanes: an 8-byte predicated packet at the strength-reduced
+    # row pointer, guarded by the row mask and the chunk-base column mask.
+    assert "_cute_load_v8b_if(_vsink_ptr + " in ast.unparse(loads[0])
+    assert ", mask_0_u0 and mask_1, ir.VectorType" in ast.unparse(loads[0])
     assert "mask_0_u1 = indices_0_u1 < m" in ast.unparse(lane_loop)
-    assert (
-        ".bitcast(cutlass.BFloat16) if mask_0_u1 and mask_1 else cutlass.BFloat16(0)"
-        in ast.unparse(lane_loop)
+    # The predicated load left zeros in the masked lanes; the value needs no
+    # select of its own.
+    assert "_vsink_vec_u1[vec_lane_1]).bitcast(cutlass.BFloat16)" in ast.unparse(
+        lane_loop
+    )
+    assert "if mask_0_u1 and mask_1 else cutlass.BFloat16(0)" not in ast.unparse(
+        lane_loop
     )
     # The finished columns are stored under the same uniform mask.
     assert "if mask_1:" in code
@@ -507,13 +517,17 @@ def test_sibling_row_loops_sink_independently(cpu_only: None) -> None:
     assert len(lane_loops) == 2
     for loop, tensor in zip(lane_loops, ("x", "y"), strict=True):
         statements = [ast.unparse(stmt) for stmt in loop.body]
-        (load,) = [text for text in statements if "cute.arch.load(" in text]
-        assert f"else {tensor}.iterator + cutlass.Int32(0)" in load
+        (load,) = [text for text in statements if "_cute_load_v8b_if(" in text]
+        # The strength-reduced row pointer of this loop's loads starts at
+        # this loop's tensor.
+        (base,) = re.findall(r"_cute_load_v8b_if\((\w+) \+ ", load)
+        assert f"{base} = {tensor}.iterator + " in code
         # The row index and the row mask of this loop come first, in the
         # same lane iteration, ahead of the vector transaction they address
         # and guard.
         (row_index,) = [text for text in statements if text.startswith("indices_")]
         (row_mask,) = [text for text in statements if text.startswith("mask_")]
+        assert f", {row_mask.split(' = ')[0]}, ir.VectorType" in load
         assert statements.index(row_index) < statements.index(row_mask)
         assert statements.index(row_mask) < statements.index(load)
     assert code.count(FRAGMENT_REDUCE) == 2
@@ -834,10 +848,10 @@ def test_lane_unroll_requires_sinking_or_a_grid_lane_loop(cpu_only: None) -> Non
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
     bound = _cpu_bind(col_reduce_sum_static, (x,))
 
-    def normalized_unroll(num_threads: list[int]) -> int:
+    def normalized_unroll(block_sizes: list[int], num_threads: list[int]) -> int:
         config = bound.config_spec.normalized_config(
             helion.Config(
-                block_sizes=[4096, 16],
+                block_sizes=block_sizes,
                 num_threads=num_threads,
                 cute_vector_widths=[1, 4],
                 cute_vloop_sink=False,
@@ -847,10 +861,13 @@ def test_lane_unroll_requires_sinking_or_a_grid_lane_loop(cpu_only: None) -> Non
         return config.config["cute_lane_unroll"]
 
     # Without sinking the unroll belongs to the loads-first lane unroll
-    # (``cute/unroll_lane_loads.py``), which needs a grid lane loop: four
-    # threads over 16 columns form one, sixteen do not.
-    assert normalized_unroll([128, 4]) == 8
-    assert normalized_unroll([128, 16]) == 1
+    # (``cute/unroll_lane_loads.py``), which needs a lane loop on some tile
+    # axis, of the grid or of a device loop: four threads over 16 columns
+    # form one, as do 128 threads over 4096 rows; one thread per element on
+    # every axis does not.
+    assert normalized_unroll([4096, 16], [128, 4]) == 8
+    assert normalized_unroll([4096, 16], [128, 16]) == 8
+    assert normalized_unroll([128, 16], [128, 16]) == 1
     with pytest.raises(helion.exc.InvalidConfig):
         bound.config_spec.normalize(
             helion.Config(

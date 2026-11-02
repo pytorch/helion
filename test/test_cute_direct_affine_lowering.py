@@ -32,6 +32,7 @@ from helion._compiler.cute.direct_affine_replay import DirectAffineStepReplay
 from helion._compiler.cute.direct_affine_replay import DirectAffineValueReplay
 from helion._compiler.device_function import TensorArg
 from helion._testing import DEVICE
+from helion._testing import skipUnlessCuteAvailable
 
 
 def _expression(source: str) -> ast.expr:
@@ -926,6 +927,7 @@ def _reference_fixed_rank1(args: tuple[object, ...]) -> torch.Tensor:
     return result
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
     reason="direct affine MMA requires a Blackwell CUDA device",

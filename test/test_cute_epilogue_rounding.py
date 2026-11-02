@@ -152,3 +152,90 @@ def test_auxiliary_arithmetic_rounds_before_a_later_expression(
     torch.testing.assert_close(
         namespace["result"].to(dtype), (values + 0.03125) * 1.0625, rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "literal"),
+    [
+        (torch.float16, "0.300048828125"),
+        (torch.bfloat16, "0.30078125"),
+        (torch.float32, "0.30000001192092896"),
+    ],
+)
+@pytest.mark.parametrize(
+    "target",
+    [torch.ops.aten.gt.Scalar, torch.ops.aten.eq.Scalar, torch.ops.aten.le.Scalar],
+)
+def test_comparison_scalar_is_rounded_to_the_operand_dtype(
+    dtype: torch.dtype, literal: str, target: object
+) -> None:
+    # torch compares ``fp16_tensor > 0.3`` against fp16(0.3), as do the SIMT
+    # and Triton lowerings; the chain renders that rounded literal.
+    graph = torch.fx.Graph()
+    load = graph.placeholder("load")
+    load.meta["val"] = torch.empty((4, 16), dtype=dtype)
+    compare = _call(graph, target, (load, 0.3), torch.bool)  # type: ignore[arg-type]
+    with patch.object(
+        cute_epilogue,
+        "aux_tensor_load_kind",
+        side_effect=lambda node, **kwargs: ("exact", None) if node is load else None,
+    ):
+        expression = cute_epilogue._classify_auxiliary_tensor_expr(
+            compare,
+            carrier_tile_shape=(4, 16),
+            carrier_tile_index_nodes=None,
+            carrier_global_shape=(4, 16),
+        )
+    assert expression is not None
+    operands = cute_epilogue._auxiliary_tensor_expr_operands(expression)
+    assert len(operands) == 1
+    names = itertools.count()
+    source, result = cute_epilogue._render_auxiliary_tensor_expr(
+        expression,
+        "unused",
+        {operands[0]: "values"},
+        lambda prefix: f"{prefix}_{next(names)}",
+        "",
+    )
+    assert f"({literal})" in source + result
+    assert "(0.3)" not in source + result
+    # The planted value fp16(0.3) itself, its neighbours and a far value.
+    planted = torch.tensor(0.3, dtype=dtype)
+    values = (
+        torch.stack(
+            [
+                planted,
+                torch.nextafter(planted, torch.tensor(0.0, dtype=dtype)),
+                torch.nextafter(planted, torch.tensor(1.0, dtype=dtype)),
+                torch.tensor(-2.0, dtype=dtype),
+            ]
+        )
+        .repeat(16, 1)
+        .T.contiguous()
+    )
+    namespace = {"values": values.float()}
+    exec(source + f"result = {result}\n", namespace)
+    assert isinstance(target, torch._ops.OpOverload)
+    torch.testing.assert_close(namespace["result"], target(values, 0.3))
+
+
+def test_comparison_scalar_outside_the_operand_dtype_declines() -> None:
+    # fp16(1e5) is inf; torch compares against inf, which the chain does not model.
+    graph = torch.fx.Graph()
+    load = graph.placeholder("load")
+    load.meta["val"] = torch.empty((4, 16), dtype=torch.float16)
+    compare = _call(graph, torch.ops.aten.gt.Scalar, (load, 1e5), torch.bool)
+    with patch.object(
+        cute_epilogue,
+        "aux_tensor_load_kind",
+        side_effect=lambda node, **kwargs: ("exact", None) if node is load else None,
+    ):
+        assert (
+            cute_epilogue._classify_auxiliary_tensor_expr(
+                compare,
+                carrier_tile_shape=(4, 16),
+                carrier_tile_index_nodes=None,
+                carrier_global_shape=(4, 16),
+            )
+            is None
+        )

@@ -24,6 +24,8 @@ from ...language import _tracing_ops
 from ...language import memory_ops
 from ...language import tile_ops
 from ...language import view_ops
+from ...language._gelu_tanh_approx import _gelu_erf
+from ...language._gelu_tanh_approx import _gelu_tanh_approx
 
 if TYPE_CHECKING:
     from torch.fx.node import Argument
@@ -32,6 +34,9 @@ _WHERE = torch.ops.aten.where.self
 _AND = torch.ops.aten.logical_and.default
 _PURE_FUNCTIONS = frozenset(
     {
+        # The epilogue chain's Python-level elementwise helpers are pure.
+        _gelu_erf,
+        _gelu_tanh_approx,
         memory_ops.load,
         view_ops.subscript,
         view_ops.split,

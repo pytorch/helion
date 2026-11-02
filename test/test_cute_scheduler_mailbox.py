@@ -10,13 +10,18 @@ from ._cute_aux import _cpu_codegen
 from ._cute_aux import _rank_two_aux
 from ._cute_aux import _rank_two_code
 from ._cute_aux import _rank_two_inputs
+from .test_cute_grouped_gemm_split_sizes import _assert_device_offsets_output
+from .test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
 from .test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
+from .test_cute_grouped_gemm_split_sizes import _make_device_offsets_args
+from .test_cute_grouped_gemm_split_sizes import _require_runtime_cuda13_sm100
 from .test_cute_grouped_gemm_split_sizes import _selected_config
 import helion
 from helion._compiler.program_id import _build_sched_pipeline_consumer_release_block
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
+from helion.exc import InvalidConfig
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -181,6 +186,72 @@ def test_grouped_worklist_mailbox_releases_all_lanes() -> None:
     _assert_all_lane_releases(code, arrivals=6 * 32)
     assert "tcgen05_grouped_selected_sched" in code
     assert "worklist_metadata" in code
+
+
+def _one_cta_worklist_config(sched_stages: int) -> helion.Config:
+    config = _selected_config(64, source_m_tile=16)
+    config.config["tcgen05_cluster_m"] = 1
+    if sched_stages > 1:
+        config.config["tcgen05_sched_stage_count"] = sched_stages
+    return config
+
+
+def test_grouped_worklist_staged_mailbox_releases_all_lanes() -> None:
+    split_sizes = torch.tensor((0, 1, 127, 224, 256, 449, 0, 991), dtype=torch.int32)
+    args = (
+        torch.empty((2048, 128), dtype=torch.bfloat16),
+        torch.empty((8, 224, 128), dtype=torch.bfloat16),
+        split_sizes,
+    )
+    with _cpu_codegen():
+        _device_split_sizes_kernel.reset()
+        code = _device_split_sizes_kernel.bind(args).to_code(
+            _one_cta_worklist_config(2)
+        )
+    _assert_all_lane_releases(code, arrivals=6 * 32)
+    assert "PipelineAsync.create(num_stages=2" in code
+    assert "cute.make_layout((9, 2), stride=(1, 9))" in code
+    assert "tcgen05_sched_pipeline_consumer_state.index]" in code
+    assert "tcgen05_sched_pipeline_producer_state.index]" in code
+
+
+def test_grouped_worklist_staged_mailbox_requires_one_cta() -> None:
+    split_sizes = torch.tensor((0, 1, 127, 224, 256, 449, 0, 991), dtype=torch.int32)
+    args = (
+        torch.empty((2048, 128), dtype=torch.bfloat16),
+        torch.empty((8, 224, 128), dtype=torch.bfloat16),
+        split_sizes,
+    )
+    config = _selected_config(64)
+    config.config["tcgen05_sched_stage_count"] = 2
+    with _cpu_codegen():
+        _device_split_sizes_kernel.reset()
+        bound = _device_split_sizes_kernel.bind(args)
+        with pytest.raises(InvalidConfig, match="tcgen05_sched_stage_count=2"):
+            bound.config_spec.normalize(dict(config.config), _fix_invalid=False)
+
+
+def test_grouped_worklist_staged_mailbox_runtime() -> None:
+    _require_runtime_cuda13_sm100()
+    # Ragged and empty experts over many waves: the producer publishes tiles
+    # into both mailbox stages while consumers release them out of phase.
+    args = _make_device_offsets_args((0, 224, 17, 0, 449, 1, 256, 1101), n=224, k=128)
+    outputs = []
+    for stages in (1, 2):
+        _device_offsets_kernel.reset()
+        bound = _device_offsets_kernel.bind(args)
+        bound.set_config(_one_cta_worklist_config(stages))
+        result = bound(*args)
+        _assert_device_offsets_output(result, args)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = bound(*args)
+        captured.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, result)
+        outputs.append(result)
+    assert torch.equal(outputs[0], outputs[1])
 
 
 @skipUnlessCuteAvailable("requires the supported CuTe runtime")

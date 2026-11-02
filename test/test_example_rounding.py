@@ -6,6 +6,8 @@ from examples.rope import rope_bwd
 from examples.rope import rope_fwd
 from examples.rope import rope_pytorch
 from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_da
+from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_db
+from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_dc
 from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_dx
 from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
@@ -146,16 +148,32 @@ def test_squeeze_excitation_staged_backward_replays_new_inputs(
     b = torch.randn((k, n), device=DEVICE, dtype=dtype)
     c = torch.randn((m, k), device=DEVICE, dtype=dtype)
     d = torch.rand((m, n), device=DEVICE, dtype=dtype)
-    args_x = (grad_out, x, a, b, c, d)
-    args_a = (grad_out, x, b, c, d)
-    bound_x = squeeze_and_excitation_net_bwd_dx.bind(args_x)
-    bound_a = squeeze_and_excitation_net_bwd_da.bind(args_a)
-    config = helion.Config(block_sizes=[16] * 8, pid_type="persistent_blocked")
-    compiled_x = bound_x.compile_config(config)
-    compiled_a = bound_a.compile_config(config)
+    args_dc = (grad_out, x, b, c, d)
+    # The matmuls bind to buffers shaped like the dc kernel's outputs
+    # (grad_c: [m, k], grad_cb: [m, n]); call() feeds them the real ones.
+    bound_dc = squeeze_and_excitation_net_bwd_dc.bind(args_dc)
+    bound_x = squeeze_and_excitation_net_bwd_dx.bind((grad_out, a, d, c))
+    bound_a = squeeze_and_excitation_net_bwd_da.bind((x, c))
+    bound_b = squeeze_and_excitation_net_bwd_db.bind((c, grad_out))
+    compiled_dc = bound_dc.compile_config(
+        helion.Config(block_sizes=[16] * 5, pid_type="persistent_blocked")
+    )
+    # The matmuls launch flat: CuTe runs persistent tcgen05 schedules only for
+    # static full tiles, and these shapes have partial ones.
+    matmul_config = helion.Config(block_sizes=[16] * 3, pid_type="flat")
+    compiled_x = bound_x.compile_config(matmul_config)
+    compiled_a = bound_a.compile_config(matmul_config)
+    compiled_b = bound_b.compile_config(matmul_config)
 
-    def call() -> tuple[torch.Tensor, torch.Tensor]:
-        return compiled_x(*args_x), compiled_a(*args_a)
+    def call() -> tuple[torch.Tensor, ...]:
+        grad_cb, grad_c = compiled_dc(*args_dc)
+        return (
+            grad_cb,
+            grad_c,
+            compiled_x(grad_out, a, d, grad_c),
+            compiled_a(x, grad_c),
+            compiled_b(c, grad_cb),
+        )
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -173,7 +191,13 @@ def test_squeeze_excitation_staged_backward_replays_new_inputs(
         d.uniform_(0.1, 0.9)
         grad_cb = grad_out * x * d * (1.0 - d)
         grad_c = (grad_cb @ b.T) * (c > 0)
-        expected = (grad_out * d + grad_c @ a.T, x.T @ grad_c)
+        expected = (
+            grad_cb,
+            grad_c,
+            grad_out * d + grad_c @ a.T,
+            x.T @ grad_c,
+            c.T @ grad_cb,
+        )
         torch.testing.assert_close(call(), expected, atol=0.05, rtol=0.01)
         graph.replay()
         torch.testing.assert_close(captured, expected, atol=0.05, rtol=0.01)

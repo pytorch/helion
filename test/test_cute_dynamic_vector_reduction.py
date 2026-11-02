@@ -181,11 +181,15 @@ def _rms_norm_into_empty_strided(x: torch.Tensor) -> torch.Tensor:
 def _dynamic_kernel(
     fn: Callable[..., Any], *, static_shapes: bool = False
 ) -> helion.Kernel:
+    # The pins of this file count packet loads and stores; the exact
+    # division hoist (test_cute_exact_division.py) would add a redo copy of
+    # every normalizing sweep.
     return helion.kernel(
         fn,
         backend="cute",
         static_shapes=static_shapes,
         autotune_effort="none",
+        cute_exact_division=False,
         ignore_warnings=[helion.exc.TensorOperationInWrapper],
     )
 

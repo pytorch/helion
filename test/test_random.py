@@ -21,7 +21,6 @@ from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
-from helion._testing import skipIfXPU
 import helion.language as hl
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
@@ -298,7 +297,6 @@ def _hl_randint_outer_loop_expected(
 
 
 @onlyBackends(["triton", "pallas", "cute"])
-@skipIfXPU("hl.rand/hl.randint tests crash XPU workers")
 class TestRandom(RefEagerTestBase, TestCase):
     def test_hl_rand_randint_1d(self):
         """Test hl.rand and hl.randint with 1D output using a single kernel."""

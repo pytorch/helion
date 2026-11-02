@@ -64,23 +64,24 @@ def squeeze_and_excitation_net_fwd(
 
 # %%
 @helion.kernel(static_shapes=True)
-def squeeze_and_excitation_net_bwd_dx(
-    grad_out: Tensor, x: Tensor, a: Tensor, b: Tensor, c: Tensor, d: Tensor
-) -> Tensor:
+def squeeze_and_excitation_net_bwd_dc(
+    grad_out: Tensor, x: Tensor, b: Tensor, c: Tensor, d: Tensor
+) -> tuple[Tensor, Tensor]:
     """
-    Compute grad_x for the squeeze and excitation network.
-    grad_x = grad_out * d + (grad_out * x * d * (1-d) @ b.T * (c>0)) @ a.T
+    Compute the intermediates shared by every weight and input gradient.
+    grad_cb = grad_out * x * d * (1 - d)   (gradient of c @ b, shape [m, n])
+    grad_c = (grad_cb @ b.T) * (c > 0)     (gradient of x @ a, shape [m, k])
 
-    Materialize grad_cb and grad_c once, then use tiled matmuls for the two
-    linear layers. This avoids recomputing the full grad_c reduction for every
-    output tile. Barriers make each intermediate available to the next phase.
+    The pointwise phase materializes grad_cb, a barrier makes it visible, and
+    the tiled matmul phase reduces over n with an fp32 accumulator before the
+    relu-backward mask. Both intermediates are stored in the input dtype so
+    the dx, da and db kernels can each be a single tiled matmul.
     """
     m, n = x.size()
-    k = a.size(1)
+    k = c.size(1)
 
     grad_cb = torch.empty([m, n], dtype=x.dtype, device=x.device)
     grad_c = torch.empty([m, k], dtype=x.dtype, device=x.device)
-    grad_x = torch.empty([m, n], dtype=x.dtype, device=x.device)
 
     for point_m, point_n in hl.tile((m, n)):
         grad_cb[point_m, point_n] = (
@@ -96,14 +97,34 @@ def squeeze_and_excitation_net_bwd_dx(
         for reduce_n in hl.tile(n):
             acc_c = torch.addmm(acc_c, grad_cb[row_c, reduce_n], b[col_c, reduce_n].T)
         grad_c[row_c, col_c] = acc_c.to(x.dtype) * (c[row_c, col_c] > 0)
-    hl.barrier()
+
+    return grad_cb, grad_c
+
+
+# %%
+@helion.kernel(static_shapes=True)
+def squeeze_and_excitation_net_bwd_dx(
+    grad_out: Tensor, a: Tensor, d: Tensor, grad_c: Tensor
+) -> Tensor:
+    """
+    Compute grad_x for the squeeze and excitation network.
+    grad_x = grad_out * d + grad_c @ a.T
+
+    A single tiled matmul over [m, n] reducing over k, with the gating
+    branch's gradient grad_out * d added in the epilogue. grad_c comes from
+    squeeze_and_excitation_net_bwd_dc.
+    """
+    m, n = grad_out.size()
+    k = a.size(1)
+
+    grad_x = torch.empty([m, n], dtype=grad_out.dtype, device=grad_out.device)
 
     for row_x, col_x in hl.tile((m, n)):
         acc_x = hl.zeros([row_x, col_x], dtype=torch.float32)
         for reduce_k in hl.tile(k):
             acc_x = torch.addmm(acc_x, grad_c[row_x, reduce_k], a[col_x, reduce_k].T)
         grad_x[row_x, col_x] = grad_out[row_x, col_x] * d[row_x, col_x] + acc_x.to(
-            x.dtype
+            grad_out.dtype
         )
 
     return grad_x
@@ -111,38 +132,18 @@ def squeeze_and_excitation_net_bwd_dx(
 
 # %%
 @helion.kernel(static_shapes=True)
-def squeeze_and_excitation_net_bwd_da(
-    grad_out: Tensor, x: Tensor, b: Tensor, c: Tensor, d: Tensor
-) -> Tensor:
+def squeeze_and_excitation_net_bwd_da(x: Tensor, grad_c: Tensor) -> Tensor:
     """
     Compute grad_a for the squeeze and excitation network.
-    grad_a = x.T @ (grad_out * x * d * (1-d) @ b.T * (c>0))
+    grad_a = x.T @ grad_c
 
-    Materialize the intermediate gradients so both matmuls have explicit tiled
-    reductions, without a full-row matmul nested inside another reduction.
+    A single tiled matmul over [n, k] reducing over m. grad_c comes from
+    squeeze_and_excitation_net_bwd_dc.
     """
     m, n = x.size()
-    k = c.size(1)
+    k = grad_c.size(1)
 
-    grad_cb = torch.empty([m, n], dtype=x.dtype, device=x.device)
-    grad_c = torch.empty([m, k], dtype=x.dtype, device=x.device)
     grad_a = torch.empty([n, k], dtype=x.dtype, device=x.device)
-
-    for point_m, point_n in hl.tile((m, n)):
-        grad_cb[point_m, point_n] = (
-            grad_out[point_m, point_n]
-            * x[point_m, point_n]
-            * d[point_m, point_n]
-            * (1.0 - d[point_m, point_n])
-        )
-    hl.barrier()
-
-    for row_c, col_c in hl.tile((m, k)):
-        acc_c = hl.zeros([row_c, col_c], dtype=torch.float32)
-        for reduce_n in hl.tile(n):
-            acc_c = torch.addmm(acc_c, grad_cb[row_c, reduce_n], b[col_c, reduce_n].T)
-        grad_c[row_c, col_c] = acc_c.to(x.dtype) * (c[row_c, col_c] > 0)
-    hl.barrier()
 
     for row_a, col_a in hl.tile((n, k)):
         acc_a = hl.zeros([row_a, col_a], dtype=torch.float32)
@@ -155,27 +156,23 @@ def squeeze_and_excitation_net_bwd_da(
 
 # %%
 @helion.kernel(static_shapes=True)
-def squeeze_and_excitation_net_bwd_db(
-    grad_out: Tensor, x: Tensor, d: Tensor, c: Tensor
-) -> Tensor:
+def squeeze_and_excitation_net_bwd_db(c: Tensor, grad_cb: Tensor) -> Tensor:
     """
-    Compute grad_b by fusing grad_d computation inline.
-    grad_b = c.T @ (grad_out * x * d * (1 - d))
+    Compute grad_b for the squeeze and excitation network.
+    grad_b = c.T @ grad_cb
+
+    A single tiled matmul over [k, n] reducing over m. grad_cb comes from
+    squeeze_and_excitation_net_bwd_dc.
     """
-    m, n = grad_out.size()
+    m, n = grad_cb.size()
     k = c.size(1)
-    grad_b = torch.empty([k, n], dtype=grad_out.dtype, device=grad_out.device)
+
+    grad_b = torch.empty([k, n], dtype=grad_cb.dtype, device=grad_cb.device)
 
     for tile_k, tile_n in hl.tile([k, n]):
         acc = hl.zeros([tile_k, tile_n], dtype=torch.float32)
         for tile_m in hl.tile(m):
-            grad_d = (
-                grad_out[tile_m, tile_n]
-                * x[tile_m, tile_n]
-                * d[tile_m, tile_n]
-                * (1.0 - d[tile_m, tile_n])
-            )
-            acc = torch.addmm(acc, c[tile_m, tile_k].T, grad_d)
+            acc = torch.addmm(acc, c[tile_m, tile_k].T, grad_cb[tile_m, tile_n])
         grad_b[tile_k, tile_n] = acc
 
     return grad_b
@@ -220,12 +217,20 @@ class SqueezeAndExcitationNetFunction(torch.autograd.Function):
         ctx: object,
         grad_out: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Backward pass for squeeze and excitation network."""
+        """
+        Backward pass for squeeze and excitation network.
+
+        One pointwise phase plus four matmuls: grad_cb and grad_c are
+        computed once (a pointwise phase and the grad_c matmul, joined by a
+        barrier), then each of grad_x, grad_a and grad_b is a single matmul
+        over the shared intermediates.
+        """
         x, a, b, c, d = ctx.saved_tensors  # type: ignore[attr-defined]
 
-        grad_x = squeeze_and_excitation_net_bwd_dx(grad_out, x, a, b, c, d)
-        grad_a = squeeze_and_excitation_net_bwd_da(grad_out, x, b, c, d)
-        grad_b = squeeze_and_excitation_net_bwd_db(grad_out, x, d, c)
+        grad_cb, grad_c = squeeze_and_excitation_net_bwd_dc(grad_out, x, b, c, d)
+        grad_x = squeeze_and_excitation_net_bwd_dx(grad_out, a, d, grad_c)
+        grad_a = squeeze_and_excitation_net_bwd_da(x, grad_c)
+        grad_b = squeeze_and_excitation_net_bwd_db(c, grad_cb)
         return grad_x, grad_a, grad_b
 
 
@@ -263,12 +268,14 @@ def check(m: int, k: int, n: int) -> None:
             squeeze_and_excitation_net_pytorch,
             (x, a, b),
             bwd=bwd,
-            # The backward kernels are exact given the forward's intermediates,
-            # but c = relu(x @ a) is rounded to half precision after an fp32
+            # The backward kernels are exact given the forward's intermediates
+            # (the shared grad_cb and grad_c are rounded to half precision
+            # once, where the half-precision reference rounds them too), but
+            # c = relu(x @ a) is rounded to half precision after an fp32
             # accumulation whose order differs from cuBLAS, so ~0.1% of its
             # elements differ by one ulp and the full-row reductions in the
             # backward turn each flip into a whole-row shift of grad_x. Judge
-            # gradients by relative L2 instead: measured <= 1.1e-2 up to
+            # gradients by relative L2 instead: measured up to ~1.1e-2 at
             # k=1024, where the half-precision reference is itself ~7e-2 from
             # an fp32 ground truth.
             bwd_relative_l2=3e-2,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 from unittest.mock import patch
@@ -29,12 +30,151 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfNotCUDA
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import NumThreadsSpec
 from helion.autotuner.config_spec import ReductionLoopSpec
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from helion.runtime.kernel import BoundKernel
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _short_row_center(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for rows in hl.tile(x.shape[0]):
+        columns = hl.arange(x.shape[1])
+        values = x[rows, columns].float()
+        maximum = values.amax(-1)
+        out[rows, columns] = (values - maximum[:, None]).to(x.dtype)
+    return out
+
+
+def _full_cta_group_threads(
+    bound: BoundKernel, seeds: list[helion.Config]
+) -> list[int]:
+    spec = bound.config_spec
+    row_block = spec.block_sizes.valid_block_ids()[0]
+    reduction_block = next(
+        block.block_id for block in bound.env.block_sizes if block.reduction
+    )
+    groups = []
+    for seed in seeds:
+        threads = seed.config["num_threads"]
+        assert isinstance(threads, list)
+        group_threads = threads[spec.num_threads.block_id_to_index(reduction_block)]
+        row_threads = threads[spec.num_threads.block_id_to_index(row_block)]
+        if (
+            "cute_store_policy" not in seed.config
+            and row_threads * group_threads == 512
+        ):
+            groups.append(group_threads)
+    return groups
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize("width", (32, 64))
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
+def test_short_row_seeds_use_subwarp_groups(width: int, dtype: torch.dtype) -> None:
+    bound = _short_row_center._bind_isolated((torch.empty(1024, width, dtype=dtype),))
+    host = bound.host_function
+    assert host is not None
+    spec = bound.config_spec
+    spec.target_device_capability = (10, 0)
+    reduction_block = next(
+        block.block_id for block in bound.env.block_sizes if block.reduction
+    )
+    seeds = CutePersistentSubwarpRowsHeuristic.get_seed_configs(
+        bound.env, host.device_ir
+    )
+    assert seeds is not None
+    for seed in seeds:
+        spec.normalized_config(seed)
+        threads = seed.config["num_threads"]
+        vectors = seed.config["cute_vector_widths"]
+        assert isinstance(threads, list)
+        assert isinstance(vectors, list)
+        assert (
+            threads[spec.num_threads.block_id_to_index(reduction_block)]
+            * vectors[spec.cute_vector_widths.block_id_to_index(reduction_block)]
+            == width
+        )
+    # Full CTAs at the planned group size and, with 32-byte packets, at half.
+    planned, halved = _full_cta_group_threads(bound, seeds)
+    assert halved == planned // 2 <= 8
+    assert not CutePersistentSubwarpRowsHeuristic.promote_seed_to_default
+
+
+@onlyBackends(["cute"])
+def test_short_row_32_byte_fragment_seed_requires_sm100() -> None:
+    bound = _short_row_center._bind_isolated(
+        (torch.empty(1024, 64, dtype=torch.bfloat16),)
+    )
+    host = bound.host_function
+    assert host is not None
+    # Below SM100 a 32-byte fragment is loaded and stored as scalars.
+    bound.config_spec.target_device_capability = (9, 0)
+    seeds = CutePersistentSubwarpRowsHeuristic.get_seed_configs(
+        bound.env, host.device_ir
+    )
+    assert seeds is not None
+    assert _full_cta_group_threads(bound, seeds) == [8]
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize("supported", (False, True))
+@pytest.mark.parametrize("width", (32, 64))
+def test_short_row_cache_seeds_require_supported_target(
+    supported: bool, width: int
+) -> None:
+    with patch.object(
+        ConfigSpec, "cute_l2_evict_last_store_policy_supported", supported
+    ):
+        bound = _short_row_center._bind_isolated(
+            (torch.empty(1024, width, dtype=torch.bfloat16),)
+        )
+        host = bound.host_function
+        assert host is not None
+        seeds = CutePersistentSubwarpRowsHeuristic.get_seed_configs(
+            bound.env, host.device_ir
+        )
+        assert seeds is not None
+        cache_seeds = [
+            seed
+            for seed in seeds
+            if seed.config.get("cute_store_policy") == "l2_evict_last"
+        ]
+        if not supported:
+            assert not cache_seeds
+            return
+        assert [seed.config["block_sizes"] for seed in cache_seeds] == [[64], [128]]
+        for seed, rows in zip(cache_seeds, (64, 128), strict=True):
+            normalized = bound.config_spec.normalized_config(seed)
+            assert normalized.config["load_eviction_policies"] == "nc_l2_first"
+            assert normalized.config["cute_store_policy"] == "l2_evict_last"
+            assert normalized.config["num_threads"] == [rows, width // 16]
+            assert normalized.config["cute_vector_widths"] == [16, 1]
+
+
+@onlyBackends(["cute"])
+@skipIfNotCUDA()
+@pytest.mark.parametrize("width", (32, 64))
+def test_short_row_seeds_preserve_tail_rows(width: int) -> None:
+    x = torch.randn(137, width, dtype=torch.bfloat16, device=DEVICE)
+    bound = _short_row_center._bind_isolated((x,))
+    host = bound.host_function
+    assert host is not None
+    seeds = CutePersistentSubwarpRowsHeuristic.get_seed_configs(
+        bound.env, host.device_ir
+    )
+    assert seeds is not None
+    expected = (x.float() - x.float().amax(-1, keepdim=True)).to(x.dtype)
+    for seed in seeds:
+        result = bound.compile_config(seed)(x)
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
 def test_lane_split_without_marker_skips_provenance(

@@ -24,6 +24,9 @@ created from it by calling ``helion.kernel(fn, ...)`` with different settings:
 - **softmax_noopt_acf** — full config pre-pinned with the no-optimization ACF;
   shows worst-case performance.
 
+All four variants set ``fast_math=True`` (approximate exp and division), like
+the other softmax examples.
+
 .. note::
    The ACFs will be available for download in the near future.
 
@@ -86,7 +89,8 @@ def _softmax(x: torch.Tensor) -> torch.Tensor:
 # ------------------------------
 
 # %%
-softmax_default = helion.kernel()(_softmax)
+# fast_math: approximate exp and division.
+softmax_default = helion.kernel(fast_math=True)(_softmax)
 
 # %%
 # Variant 2 — Autotune over ACFs
@@ -97,6 +101,7 @@ softmax_default = helion.kernel()(_softmax)
 
 # %%
 softmax_tune_acf = helion.kernel(
+    fast_math=True,
     autotune_compile_timeout=120,
     autotune_search_acf=list(_ACFS_PATHS.values()),
     static_shapes=True,
@@ -118,6 +123,7 @@ softmax_tune_acf = helion.kernel(
 
 # %%
 softmax_example_acf = helion.kernel(
+    fast_math=True,
     config=helion.Config(
         advanced_controls_file=_ACFS_PATHS[_ACF_EXAMPLE],
         block_sizes=[4],
@@ -145,6 +151,7 @@ softmax_example_acf = helion.kernel(
 
 # %%
 softmax_noopt_acf = helion.kernel(
+    fast_math=True,
     config=helion.Config(
         advanced_controls_file=_ACFS_PATHS[_ACF_NOOPT],
         block_sizes=[4],

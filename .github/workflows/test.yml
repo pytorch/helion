@@ -44,12 +44,15 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.load-matrix.outputs.matrix) }}
 
-    name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.pytorch-version }}-${{ matrix.backend }}-${{ matrix.alias }}
+    name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.pytorch-version }}-${{ matrix.triton-package || matrix.backend }}-${{ matrix.alias }}
 
     container: ${{ matrix.image != '' && fromJSON(format('{{"image":"{0}","options":"{1}"}}', matrix.image, matrix.container-options)) || '' }}
 
     runs-on: ${{ matrix.runner }}
 
+    # Keep ref-eager non-blocking while its intermittent worker exits are
+    # investigated. A worker exit alone does not identify an infrastructure error.
+    continue-on-error: ${{ matrix.ref-eager }}
 
     defaults:
       run:
@@ -87,6 +90,10 @@ jobs:
           }
           retry $SUDO apt-get update
           retry $SUDO apt-get install -y --fix-missing libdw1 curl wget git pkg-config zlib1g-dev build-essential
+          if [[ "${{ matrix.runtime-version }}" == "xpu" ]]; then
+            # Triton's XPU runtime compiles a Python extension; images may omit headers.
+            retry $SUDO apt-get install -y --fix-missing "python${{ matrix.python-version }}-dev"
+          fi
 
       - name: Install NVSHMEM
         if: contains(matrix.alias, 'distributed')
@@ -234,7 +241,7 @@ jobs:
         if: matrix.alias == 'pallas-interpret'
         run: |
           source .venv/bin/activate
-          uv pip install 'jax==0.11.2' 'jaxlib==0.11.2' 'absl-py'
+          uv pip install 'jax==0.12.0.1' 'jaxlib==0.12.0.1' 'absl-py'
 
       - name: Install CUTLASS CuTe DSL
         if: matrix.backend == 'cute'
@@ -244,6 +251,25 @@ jobs:
             "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
           }
           retry ./scripts/install_cute.sh
+
+      - name: Install fbtriton and legacy CUTLASS CuTe DSL
+        if: matrix.triton-package == 'fbtriton'
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          retry () {
+            "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
+          }
+          # https://github.com/facebookexperimental/triton publishes nightly
+          # wheels under fbtriton. Both distributions own the triton/ package.
+          # Replace Triton after all other installs so it cannot be restored
+          # by a dependency on PyTorch's upstream Triton distribution.
+          uv pip uninstall triton pytorch-triton triton-xpu
+          retry env UV_DEFAULT_INDEX= UV_INDEX= uv pip install --pre fbtriton --index-url https://facebookexperimental.github.io/triton/nightly/simple/
+          # Deliberately unsupported: Triton must still work when an older
+          # CuTe DSL is installed, including Helion's import paths.
+          retry uv pip install nvidia-cutlass-dsl==4.4.2
+          python -c "import helion, triton; from importlib.metadata import version; print('fbtriton:', version('fbtriton'), 'triton:', triton.__version__, 'nvidia-cutlass-dsl:', version('nvidia-cutlass-dsl'))"
 
       - name: CUDA Compute Check
         if: startsWith(matrix.image, 'nvidia')
@@ -317,6 +343,13 @@ jobs:
           if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
+          # Ref-eager still exercises torch.compile (test_specialize,
+          # test_compile_capture, test_custom_op, ...); compile in the test
+          # process so Inductor's compile-pool wakeup can't hang and take a
+          # worker down (the MI350X job does the same for that hang).
+          if [[ "${{ matrix.ref-eager }}" == "true" ]]; then
+            export TORCHINDUCTOR_COMPILE_THREADS=1
+          fi
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then export ENABLE_TILE=1; fi
           if [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then export HELION_PALLAS_INTERPRET=1; fi
           export HELION_BACKEND=${{ matrix.backend }}
@@ -398,6 +431,15 @@ jobs:
             # calls os._exit(1), which xdist reports as a crashed worker with
             # no traceback. Give it the same headroom as A10G.
             TIMEOUT=180
+          fi
+          # Ref-eager re-runs each example's reference path eagerly rather than
+          # launching a compiled kernel once; give it headroom on any runner
+          # (the default 60s is too tight for the slowest eager reference pass).
+          if [[ "${{ matrix.ref-eager }}" == "true" ]]; then
+            TIMEOUT=300
+            # Dump stacks before pytest-timeout exits the worker. Its normal
+            # timeout report can be lost with xdist's captured worker output.
+            EXTRA_FLAGS="$EXTRA_FLAGS -o faulthandler_timeout=120 --durations=20"
           fi
           pytest $PARALLEL -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
           # JAX and TorchTPU initialize the TPU runtime differently. Run the

@@ -32,6 +32,8 @@ def _body(source):
 
 
 def _bound(m=32, k=4096, n=64, **settings):
+    # These codegen facts are stated on the fp32-promoted output form.
+    settings.setdefault("cute_promote_half_atomic_outputs", True)
     kernel = helion.kernel(
         matmul_split_k.fn,
         backend="cute",

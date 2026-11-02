@@ -11,6 +11,7 @@ from typing import Any
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch._inductor import config as inductor_config
 from torch._inductor.codecache import FxGraphCache
@@ -5833,6 +5834,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         result_direct = kernel(x.clone(), y.clone())
         torch.testing.assert_close(result_direct, x + y, rtol=1e-4, atol=1e-4)
 
+    # Two real autotunes (unfused, then fused) with a 30 s budget each plus two
+    # torch.compile passes: 30-40 s on an idle B200, so the suite's 60 s limit
+    # kills the xdist worker on a shared or slower runner (XPU).
+    @pytest.mark.timeout(300)
     @skipUnlessBackendFuses
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_no_configs_uses_fusion_context(self):

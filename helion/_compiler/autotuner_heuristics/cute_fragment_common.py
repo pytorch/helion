@@ -24,12 +24,23 @@ if TYPE_CHECKING:
 def fragment_coverage_carrier(
     spec: ConfigSpec, resource_carrier: Config | None = None
 ) -> Config | None:
-    """Strictly admit the carrier before enabling a new search coordinate."""
+    """Strictly admit the carrier before enabling a new search coordinate.
+
+    The fragment knobs belong to the ordinary lowering: where an MMA
+    dataflow mode is promoted to the default, the default drops them as
+    inert, so the carrier is that default with the mode off."""
+    from ..cute.cute_mma_dag import MMA_DAG_KEY
+    from ..cute.cute_mma_dag import MMA_DAG_OFF
+
     generation = spec.create_config_generation()
     try:
         carrier = resource_carrier
         if carrier is None:
             _, carrier = generation.canonicalize_flat(generation.default_flat())
+        if carrier.config.get(MMA_DAG_KEY, MMA_DAG_OFF) != MMA_DAG_OFF:
+            _, carrier = generation.strict_config_pair(
+                Config.from_dict(deepcopy(carrier.config) | {MMA_DAG_KEY: MMA_DAG_OFF})
+            )
         generation.strict_config_pair(carrier)
     except InvalidConfig:
         return None

@@ -163,6 +163,6 @@ def test_vector_ineligible_extent_does_not_invent_packet_geometry():
             CutePointwiseVecHeuristic.get_seed_configs(
                 bound.env, bound.host_function.device_ir
             )
-            is None
+            == []
         )
         assert not bound.config_spec.compiler_seed_configs

@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     asm_str = state.proxy_arg(0)
     constraints_str = state.proxy_arg(1)
+    # The op's fake validates both as strings at trace time.
+    assert isinstance(constraints_str, str)
     dtype = state.proxy_arg(3)
     is_pure = state.proxy_arg(4)
     pack = state.proxy_arg(5)
@@ -37,6 +39,16 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         # times more often than the program specifies.
         raise exc.BackendUnsupported(
             "cute", "hl.inline_asm_elementwise with pack != 1 and is_pure=False"
+        )
+    if any(item.strip().startswith("+") for item in constraints_str.split(",")):
+        # GCC's read-write prefix is not LLVM IR constraint syntax: LLVM binds
+        # "+r" as a plain input (a leading "+r" output crashes the DSL
+        # compiler).  Clang spells such an operand as "=r" plus a matching
+        # "0" input, which ``inline_asm_helpers`` binds correctly.
+        raise exc.BackendUnsupported(
+            "cute",
+            "hl.inline_asm_elementwise with a '+' (read-write) constraint; "
+            "spell the operand as an '=' output plus a matching '0' input",
         )
     raw_args = state.ast_args[2]
     args_list = list(raw_args) if isinstance(raw_args, (list, tuple)) else [raw_args]

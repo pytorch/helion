@@ -107,12 +107,14 @@ def _wide(bound: BoundKernel) -> helion.Config:
 
 def test_physical_profile_keeps_cooperative_domains_and_admits_narrow_one_cta() -> None:
     for width, bk, cluster in itertools.product(
-        (8, 16, 32, 64, 224, 256), (64, 128), (1, 2)
+        (8, 16, 32, 64, 128, 224, 256), (64, 128), (1, 2)
     ):
         expected = None
-        if cluster == 2 and width in (32, 224, 256):
+        if cluster == 2 and width in (32, 128, 224, 256):
             expected = (256, width)
-        elif cluster == 1 and (width in (8, 16, 32) or (width == 64 and bk == 128)):
+        elif cluster == 1 and (
+            width in (8, 16, 32, 128) or (width == 64 and bk == 128)
+        ):
             expected = (128, width)
         assert (
             resolve_tcgen05_grouped_worklist_mma_shape(
@@ -120,7 +122,7 @@ def test_physical_profile_keeps_cooperative_domains_and_admits_narrow_one_cta() 
             )
             == expected
         )
-    for value in (64.0, True, "64", 0, 4, 24, 128):
+    for value in (64.0, True, "64", 0, 4, 24, 96):
         assert (
             resolve_tcgen05_grouped_worklist_mma_shape(
                 source_m_tile=value, block_k=128, cluster_m=1

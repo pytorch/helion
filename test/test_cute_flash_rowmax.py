@@ -425,7 +425,7 @@ def test_frontend_bind_carries_rowmax_proof_without_widening_fused_scope(
         )
         bound = kernel._bind_isolated(inputs)
         spec = bound.config_spec
-        if sequence % 128 or head_dim == 256:
+        if sequence % 128:
             assert not spec.cute_flash_search_enabled
             assert cute_flash.FLASH_ROWMAX_KEY not in spec._flat_fields()
             return
@@ -435,5 +435,19 @@ def test_frontend_bind_carries_rowmax_proof_without_widening_fused_scope(
         config.config[cute_flash.FLASH_ROWMAX_KEY] = "tmem"
         spec.normalize(config)
         source = bound.to_code(config)
+        if head_dim == 256:
+            # The fused scope reaches 256 through the single-tile families
+            # (the cooperative pair is the width's default), not through the
+            # proof: the bind still carries it, but the TMEM rowmax is the
+            # fa4 bodies' resident softmax, which no row of this surface
+            # runs -- the fragment keeps it out of the search and a request
+            # normalizes to the software rowmax.
+            rowmax = spec._cute_flash_autotune_fragments()[cute_flash.FLASH_ROWMAX_KEY]
+            assert tuple(rowmax.search_choices or ()) == ("software",)
+            assert config.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "ws_2cta"
+            assert config.config[cute_flash.FLASH_ROWMAX_KEY] == "software"
+            assert "LdRed32x32bOp" not in source
+            assert "ResidentSoftmaxState.create" not in source
+            return
         assert "LdRed32x32bOp" in source
         assert "disc_rowmax_ldred" in source

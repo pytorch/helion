@@ -81,7 +81,9 @@ class UniformRegionTree:
     )
 
 
-def uniform_region_tree(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
+def uniform_region_tree(
+    graphs: Sequence[GraphInfo], *, readonly_fragments: bool = False
+) -> UniformRegionTree:
     """Validate one actual rooted if/while tree without publishing cached facts.
 
     Sequential calls and nested calls use the same frame representation. Loops
@@ -92,6 +94,23 @@ def uniform_region_tree(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
     def require(condition: bool, reason: str) -> None:
         if not condition:
             raise exc.InvalidConfig(f"uniform region tree: {reason}")
+
+    def tensor_signature(
+        value: Node,
+    ) -> tuple[torch.dtype, tuple[int | torch.SymInt, ...]]:
+        if not readonly_fragments:
+            return _signature(value)
+        fake = value.meta.get("val")
+        require(isinstance(fake, torch.Tensor), "tensor metadata required")
+        fake = cast("torch.Tensor", fake)
+        require(
+            all(
+                type(size) is int and size > 0 or isinstance(size, torch.SymInt)
+                for size in fake.shape
+            ),
+            "positive configured physical shape required",
+        )
+        return fake.dtype, tuple(fake.shape)
 
     roots = [g for g in graphs if isinstance(g, RootGraphInfo)]
     require(len(roots) == 1, "one root required")
@@ -121,7 +140,12 @@ def uniform_region_tree(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                 predicate = node.args[0]
                 require(
                     isinstance(predicate, Node)
-                    and _signature(predicate) == (torch.bool, ()),
+                    and (
+                        isinstance(predicate.meta.get("val"), torch.Tensor)
+                        and tensor_signature(predicate) == (torch.bool, ())
+                        or readonly_fragments
+                        and isinstance(predicate.meta.get("val"), (bool, torch.SymBool))
+                    ),
                     "scalar Boolean predicate required",
                 )
                 children = [
@@ -194,12 +218,13 @@ def uniform_region_tree(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                     "current dominating capture",
                 )
                 require(
-                    _signature(value) == _signature(placeholder),
+                    tensor_signature(value) == tensor_signature(placeholder),
                     "capture physical type/shape",
                 )
             if role == "while_condition":
                 require(
-                    len(outputs) == 1 and _signature(outputs[0]) == (torch.bool, ()),
+                    len(outputs) == 1
+                    and tensor_signature(outputs[0]) == (torch.bool, ()),
                     "condition output",
                 )
                 require(
@@ -212,7 +237,8 @@ def uniform_region_tree(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                     "paired condition identity",
                 )
                 require(
-                    all(_signature(v)[1] == () for v in outputs), "scalar carries only"
+                    all(tensor_signature(v)[1] == () for v in outputs),
+                    "scalar carries only",
                 )
                 carry_map = _carry_map(call, captures, outputs)
         targets: set[Node] = set()
@@ -269,10 +295,10 @@ def uniform_region_tree(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                 "current forward single-tensor scan call ABI",
             )
             source = cast("Node", node.args[1])
-            signature = _signature(source)
+            signature = tensor_signature(source)
             require(
                 bool(signature[1])
-                and _signature(node) == signature
+                and tensor_signature(node) == signature
                 and -len(signature[1]) <= node.args[2] < len(signature[1]),
                 "scan input/output signature and axis",
             )
@@ -295,7 +321,7 @@ def uniform_region_tree(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                 and not rhs.kwargs
                 and not output.kwargs
                 and all(
-                    _signature(value) == (signature[0], (1,))
+                    tensor_signature(value) == (signature[0], (1,))
                     for value in (lhs, rhs, add)
                 ),
                 "closed typed scalar scan helper",
@@ -335,7 +361,7 @@ def uniform_region_tree(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                     "ambiguous unchanged capture",
                 )
                 outer[name] = value
-        join_signatures: list[tuple[torch.dtype, tuple[int, ...]]] = []
+        join_signatures: list[tuple[torch.dtype, tuple[int | torch.SymInt, ...]]] = []
         for pair in cast("list[tuple[int | str, ...]]", info.branches_outputs):
             require(len(pair) == 2, "two branch outcomes required")
             values: list[Node] = []
@@ -350,11 +376,11 @@ def uniform_region_tree(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                     )
                     values.append(outer[cast("str", slot)])
             require(
-                _signature(values[0]) == _signature(values[1])
-                and _signature(values[0])[1] == (),
+                tensor_signature(values[0]) == tensor_signature(values[1])
+                and (readonly_fragments or tensor_signature(values[0])[1] == ()),
                 "compatible scalar join required",
             )
-            join_signatures.append(_signature(values[0]))
+            join_signatures.append(tensor_signature(values[0]))
         call_values = call.meta.get("val")
         require(
             isinstance(call_values, (list, tuple))
@@ -394,7 +420,8 @@ def uniform_region_tree(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                 left.outputs[slot] if type(slot) is int else outer[cast("str", slot)]
             )
             require(
-                _signature(item) == _signature(value), "branch projection signature"
+                tensor_signature(item) == tensor_signature(value),
+                "branch projection signature",
             )
             for phi in item.users:
                 require(
@@ -425,8 +452,42 @@ def uniform_region_tree(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                     sorted(indices) == [index % count, index % count + count],
                     "paired branch phi halves",
                 )
-                require(_signature(phi) == _signature(value), "branch phi signature")
+                require(
+                    tensor_signature(phi) == tensor_signature(value),
+                    "branch phi signature",
+                )
     return UniformRegionTree(tuple(frames), auxiliary, scan_calls=tuple(scan_calls))
+
+
+def uniform_readonly_regions(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
+    """Admit complete readonly fragments with scalar carries and uniform joins.
+
+    Vector branch results keep an exact common physical shape. Their logical
+    shape and fresh output storage are proved separately before emission.
+    Mutation and local atomic epochs retain the narrower existing owner.
+    """
+    from ...language import memory_ops
+
+    tree = uniform_region_tree(graphs, readonly_fragments=True)
+    if not any(f.role == "while_body" for f in tree.frames) or any(
+        f.local_targets for f in tree.frames
+    ):
+        raise exc.InvalidConfig("readonly control requires scalar readonly loops")
+    stores = frozenset(
+        node
+        for frame in tree.frames
+        for node in frame.graph.graph.nodes
+        if node.target is memory_ops.store
+    )
+    if any(
+        not isinstance(node.args[0], Node)
+        or node.args[0].target is not _tracing_ops._host_tensor
+        or len(node.args) != 4
+        or node.kwargs
+        for node in stores
+    ):
+        raise exc.InvalidConfig("readonly control stores require host outputs")
+    return replace(tree, output_stores=stores)
 
 
 def uniform_local_regions(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
@@ -958,7 +1019,12 @@ def uniform_region_domains(
     from .register_loads import host_load_is_readonly
 
     try:
-        tree = uniform_local_regions(graphs)
+        try:
+            tree = uniform_local_regions(graphs)
+            readonly_fragments = False
+        except exc.InvalidConfig:
+            tree = uniform_readonly_regions(graphs)
+            readonly_fragments = True
         if not uniform_output_stores_are_writeonly(
             env, graphs, tree, allow_unbound=allow_unbound
         ):
@@ -1019,6 +1085,7 @@ def uniform_region_domains(
                 if node in children:
                     for child in children[node]:
                         visit(child)
+                    joins: list[tuple[sympy.Expr, ...]] = []
                     if node.target is _tracing_ops._while_loop:
                         body = frames[cast("int", node.args[1])]
                         for index, slot in body.carry_map:
@@ -1033,33 +1100,56 @@ def uniform_region_domains(
                         )
                         trial.resident_whiles.add(node)
                     else:
+                        predicate = cast("Node", node.args[0])
                         require(
-                            shape(cast("Node", node.args[0])) == (),
+                            shape(predicate) == ()
+                            or readonly_fragments
+                            and isinstance(
+                                predicate.meta.get("val"), (bool, torch.SymBool)
+                            ),
                             "scalar branch domain",
                         )
-                        info = cast(
-                            "IfGraphInfo", frames[cast("int", node.args[1])].graph
-                        )
+                        left = frames[cast("int", node.args[1])]
+                        right = frames[cast("int", node.args[2])]
+                        info = cast("IfGraphInfo", left.graph)
+                        outer = {}
+                        for names, branch in (
+                            (cast("list[str]", info.if_arg_names), left),
+                            (cast("list[str]", info.else_arg_names), right),
+                        ):
+                            outer.update(zip(names, branch.captures, strict=True))
                         for pair in cast(
                             "list[tuple[int | str, ...]]", info.branches_outputs
                         ):
-                            for ordinal, index in enumerate(pair):
-                                if type(index) is int:
-                                    require(
-                                        shape(
-                                            frames[
-                                                cast("int", node.args[1 + ordinal])
-                                            ].outputs[index]
-                                        )
-                                        == (),
-                                        "branch result domain",
-                                    )
+                            results = [
+                                branch.outputs[index]
+                                if type(index) is int
+                                else outer[cast("str", index)]
+                                for index, branch in zip(
+                                    pair, (left, right), strict=True
+                                )
+                            ]
+                            logical = shape(results[0])
+                            require(
+                                logical is not None
+                                and logical == shape(results[1])
+                                and (readonly_fragments or logical == ()),
+                                "compatible branch result domain",
+                            )
+                            joins.append(cast("tuple[sympy.Expr, ...]", logical))
                     for item in node.users:
                         require(item.target is operator.getitem, "control projection")
-                        scalar_result(item)
+                        if node.target is _tracing_ops._while_loop:
+                            scalar_result(item)
+                        else:
+                            trial.shapes[item] = joins[
+                                cast("int", item.args[1]) % len(joins)
+                            ]
+                            trial.readonly_ranges.pop(item, None)
                         for phi in item.users:
                             if phi.target is _tracing_ops._phi:
-                                scalar_result(phi)
+                                trial.shapes[phi] = trial.shapes[item]
+                                trial.readonly_ranges.pop(phi, None)
                     continue
                 if node.target is memory_ops.load and node not in local_reads:
                     require(

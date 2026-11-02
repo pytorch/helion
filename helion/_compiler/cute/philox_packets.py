@@ -168,7 +168,7 @@ def _aligned_packet_adjacency(expression: ast.expr, lane: str, known: set[str]) 
 def lower_philox_packets(
     body: list[ast.stmt],
     *,
-    seed_names: set[str],
+    seed_exprs: set[str],
     integer_names: set[str],
     new_name: Callable[[str], str],
     vectorize_packet: Callable[[ast.For, ast.Subscript, frozenset[str]], list[ast.stmt]]
@@ -176,7 +176,9 @@ def lower_philox_packets(
 ) -> list[ast.stmt]:
     """Leave the scalar new stream unchanged whenever a packet proof declines.
 
-    Only immutable compiler-owned seed tensors may move their read. Integer
+    Only the compiler's own seed operands (``seed_exprs``: the ``cutlass.Int64``
+    constants and kernel scalar arguments ``stage_explicit_seed`` emitted,
+    which nothing in the kernel can write) may move their read. Integer
     replay excludes loads, divisions, shifts and conversions from unknown
     scalar types. A narrow cast/add proof can remove redundant equalities;
     other expressions retain runtime checks for narrow-integer wrap behavior.
@@ -204,13 +206,7 @@ def lower_philox_packets(
             return None
         call = calls[0]
         seed, offset = cast("ast.Tuple", call.args[0]).elts
-        if not (
-            isinstance(seed, ast.Subscript)
-            and isinstance(seed.value, ast.Name)
-            and seed.value.id in seed_names
-            and isinstance(seed.slice, ast.Constant)
-            and seed.slice.value == 0
-        ):
+        if ast.unparse(seed) not in seed_exprs:
             return None
         lane = loop.target.id
         definitions: dict[str, ast.expr] = {}

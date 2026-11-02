@@ -33,9 +33,12 @@ from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
 from .cute.access_regions import new_loop_instance
 from .cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from .cute.masked_packet_load_names import MASKED_PACKET_LOAD_HELPER_NAMES
+from .cute.persistent_branch_vec import PACKET_STORE_BYTES
+from .cute.register_tile_admission import RegisterTileOptions
 from .cute.register_tile_admission import RegisterTileUnsupported
 from .cute.scalar_recipe import PURE_HELPERS
-from .cute.scalar_recipe import is_rounded_fp32_multiply
+from .cute.scalar_recipe import is_rounded_multiply
 from .cute.thread_budget import MAX_THREADS_PER_BLOCK
 from .device_function import DeviceFunction
 from .device_function import TensorArg
@@ -70,6 +73,10 @@ if TYPE_CHECKING:
     _T = TypeVar("_T")
     SymIntLike = torch.SymInt | int
     ShapeLike = Sequence[SymIntLike]
+
+
+# Set once the missing ``tl.range(data_partition_factor=...)`` was warned about.
+_warned_data_partition_factor: list[bool] = []
 
 
 class ThreadAxisTracker:
@@ -826,6 +833,7 @@ def split_lane_loop_reductions(
     scalar_definitions: dict[str, ast.AST] | None = None,
     rename_groups: dict[str, str] | None = None,
     running_sums: set[str] | None = None,
+    register_tile_options: RegisterTileOptions | None = None,
 ) -> list[ast.AST]:
     """Rewrite single-pass lane loops that contain ``_helion_lane_reduce``
     markers into the two-pass accumulate / finalize / consume structure.
@@ -851,6 +859,7 @@ def split_lane_loop_reductions(
         scalar_definitions=scalar_definitions,
         rename_groups=rename_groups,
         running_sums=running_sums,
+        register_tile_options=register_tile_options,
     )
     pin_atomics_left_in_lane_loops(result)
     return result
@@ -866,6 +875,7 @@ def _split_lane_loop_reductions(
     scalar_definitions: dict[str, ast.AST] | None = None,
     rename_groups: dict[str, str] | None = None,
     running_sums: set[str] | None = None,
+    register_tile_options: RegisterTileOptions | None = None,
 ) -> list[ast.AST]:
     if not any(_find_lane_reduce_call(stmt) is not None for stmt in body):
         return body
@@ -887,6 +897,7 @@ def _split_lane_loop_reductions(
                 proven_scalar_definitions,
                 rename_groups or {},
                 running_sums or set(),
+                register_tile_options,
             )
         )
         _update_proven_uniform_names(stmt, proven_uniform)
@@ -942,6 +953,7 @@ def _split_stmt_lane_reductions(
     scalar_definitions: dict[str, ast.AST],
     rename_groups: dict[str, str],
     running_sums: set[str] | None = None,
+    register_tile_options: RegisterTileOptions | None = None,
 ) -> list[ast.AST]:
     # Recurse into any statement-list-bearing fields first so nested lane
     # loops are rewritten before the enclosing one.
@@ -968,6 +980,7 @@ def _split_stmt_lane_reductions(
                     ),
                     rename_groups=rename_groups,
                     running_sums=running_sums,
+                    register_tile_options=register_tile_options,
                 ),
             )
     lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
@@ -988,6 +1001,7 @@ def _split_stmt_lane_reductions(
         body_definitions,
         rename_groups,
         running_sums,
+        register_tile_options,
     )
 
 
@@ -1228,6 +1242,7 @@ def _split_one_lane_loop(
     scalar_definitions: dict[str, ast.AST],
     rename_groups: dict[str, str],
     running_sums: set[str] | None = None,
+    register_tile_options: RegisterTileOptions | None = None,
 ) -> list[ast.AST]:
     from .ast_read_writes import ReadWrites
 
@@ -1263,6 +1278,7 @@ def _split_one_lane_loop(
                         thread_axis_names=thread_axis_names,
                         scalar_definitions=scalar_definitions,
                         rename_groups=rename_groups,
+                        options=register_tile_options,
                     )
                 except RegisterTileUnsupported as failure:
                     register_tile_failure = failure
@@ -1286,6 +1302,7 @@ def _split_one_lane_loop(
                 scalar_definitions=dict(scalar_definitions),
                 rename_groups=rename_groups,
                 running_sums=running_sums,
+                register_tile_options=register_tile_options,
             )
         if register_tile_failure is not None:
             # ``generate_ast`` regenerates the kernel with the rolled lane
@@ -2512,12 +2529,16 @@ def _split_staged_matmul_lane_reductions(
             statement, allow_load=True, allow_reduction=True
         ):
             return None
+    first_marker = min(marker_indices)
     collective_indices = [
         index
         for index, statement in enumerate(body)
         if _contains_unduplicatable_op(statement)
+        # A matmul fold ahead of the reductions is computed once per lane
+        # and read back from its stash, never re-run per pass.
+        or (index < first_marker and _is_fold_dot_assignment(statement))
     ]
-    if collective_indices and min(marker_indices) <= max(collective_indices):
+    if collective_indices and first_marker <= max(collective_indices):
         return None
     transformed = [_clone_stmt(statement) for statement in body]
     prefix: list[ast.AST] = []
@@ -2711,6 +2732,10 @@ def _stashed_collective_dtype(value: ast.AST, before: Sequence[ast.AST]) -> str 
     name = _qualified_name(value.func)
     if name in _CHUNK_REDUCTION_HELPERS and len(value.args) >= 3:
         return _dtype_ctor_from_identity(ast.unparse(value.args[2]))
+    if name == _FOLD_DOT_HELPER and len(value.args) >= 6:
+        # ``fold_dot(lhs, step, rhs, step, valid, identity, ...)`` sums in
+        # its identity's dtype.
+        return _dtype_ctor_from_identity(ast.unparse(value.args[5]))
     if name is None or not name.startswith("cute.arch.warp_reduction_"):
         return None
     if not value.args:
@@ -3616,11 +3641,7 @@ def _contains_sync_threads(stmt: ast.AST) -> bool:
 
 
 def _memory_write_calls(stmt: ast.AST) -> list[ast.Call]:
-    helper_stores = {
-        "_cute_store_u16_vec",
-        "_cute_store_u32_vec",
-        "_helion_persistent_branch_vec_store",
-    }
+    helper_stores = {*PACKET_STORE_BYTES, "_helion_persistent_branch_vec_store"}
     helper_atomics = {
         "_cute_atomic_max_float32",
         "_cute_atomic_min_float32",
@@ -3657,14 +3678,14 @@ def _is_persistent_branch_vec_store(call: ast.Call) -> bool:
 
 
 def _is_vector_flush_store(call: ast.Call) -> bool:
-    """``_cute_store_u16_vec(ptr, values)`` / ``_cute_store_u32_vec(ptr, values)``.
+    """A ``_cute_store_*_vec(ptr, values)`` packet flush (``PACKET_STORE_BYTES``).
 
     The flush of a V-loop's collected per-element values into one vector
     store; its destination is the first argument and its value the second.
     """
     return (
         isinstance(call.func, ast.Name)
-        and call.func.id in ("_cute_store_u16_vec", "_cute_store_u32_vec")
+        and call.func.id in PACKET_STORE_BYTES
         and len(call.args) == 2
         and not call.keywords
     )
@@ -4853,6 +4874,11 @@ _UNDUPLICATABLE_CALLS = (
     "cute.gemm",
     "warp_reduction",
 )
+# The synthetic-lane matmul fold (``fold_helpers.fold_dot``): a pure K loop
+# over operand re-reads.  Duplicating it into every lane pass is correct but
+# repeats the whole contraction per pass, so the staged splitter stashes its
+# per-lane value like a collective's instead.
+_FOLD_DOT_HELPER = "_cute_fold_dot"
 
 
 def _contains_unduplicatable_op(stmt: ast.AST) -> bool:
@@ -4861,6 +4887,16 @@ def _contains_unduplicatable_op(stmt: ast.AST) -> bool:
     second lane pass."""
     src = ast.unparse(stmt)
     return any(call in src for call in _UNDUPLICATABLE_CALLS)
+
+
+def _is_fold_dot_assignment(stmt: ast.AST) -> bool:
+    """``name = _cute_fold_dot(...)``: a stash-worthy pure per-lane value."""
+    return (
+        _plain_assignment_name(stmt) is not None
+        and isinstance(stmt, ast.Assign)
+        and isinstance(stmt.value, ast.Call)
+        and _qualified_name(stmt.value.func) == _FOLD_DOT_HELPER
+    )
 
 
 def _lane_split_reorders_aliasing_memory(
@@ -5432,6 +5468,18 @@ def _interchange_one_lane_loop(
         return [loop]
     mb_loop = cast("ast.For", body[mb_index])
     if getattr(mb_loop, HELION_VECTOR_REDUCTION_OWNER_ATTR, None) == lane_var:
+        if _is_constexpr_lane_iter(loop):
+            # Only ``nest_reduction_lane_outside_vector_tiles`` makes a tile
+            # lane's one-vector wrapper a trace-time loop, so this reduction
+            # over the tile's own axis sits under a register-tile owner, whose
+            # schedule lowers only the markers the synthetic reduction lane
+            # owns (``cute/register_tile_reductions.py``).  ``generate_ast``
+            # regenerates the kernel with the rolled nesting, where the
+            # wrapper is a rolled loop and the flattening below applies.
+            raise RegisterTileUnsupported(
+                f"a reduction over the tile axis of lane {lane_var} is owned "
+                "by that tile lane, not by the register-tile owner"
+            )
         # These slots partition the SAME reduced axis, unlike an independent
         # serial row loop. Reducing each slot separately overwrites the output.
         return [_flatten_vector_reduction_lane(loop, mb_loop, lane_var)]
@@ -5711,13 +5759,20 @@ def _is_proven_relocatable_call(
             return allow_load
         if call.func.attr == "bitcast":
             return True
-    if is_rounded_fp32_multiply(call):
-        # ``mul.rn.f32`` over two registers: a product kept separately rounded
-        # (``scalar_recipe_rounding``), as pure as the ``*`` it replaces.
+    if is_rounded_multiply(call):
+        # ``mul.rn.{f32,f16,bf16}`` over two registers: a product kept
+        # separately rounded (``scalar_recipe_rounding``), as pure as the
+        # ``*`` it replaces.
         return True
     name = _qualified_name(call.func)
     if name is None:
         return False
+    if name == "_cute_inline_asm_elementwise":
+        from .cute.pure_lane_packets import _pure_packet_call
+
+        # Reuse the packet pass's scalar-arithmetic proof: declared purity
+        # alone does not exclude hidden memory accesses or synchronization.
+        return _pure_packet_call(call)
     if name in _PURE_RELOCATABLE_NAMES or name in PURE_HELPERS:
         return True
     if name.startswith("cutlass."):
@@ -5741,11 +5796,22 @@ def _is_proven_relocatable_call(
         "cute.arch.warp_idx",
     }:
         return True
-    if name == "cute.arch.load" or name in _CUTE_CACHE_LOAD_HELPER_NAMES:
-        # The packet load and its L2-policy helper forms, the load-side twin
-        # of the ``_cute_store_*`` convention ``_is_store_call`` relies on.
+    if (
+        name == "cute.arch.load"
+        or name in _CUTE_CACHE_LOAD_HELPER_NAMES
+        or name in MASKED_PACKET_LOAD_HELPER_NAMES
+    ):
+        # The packet load, its L2-policy helper forms and the predicated
+        # packet loads of the V-loop sink, the load-side twin of the
+        # ``_cute_store_*`` convention ``_is_store_call`` relies on.
         # Only the listed helpers: the memory passes collect and measure
         # exactly these, so any other ``_cute_load_*`` stays unproven.
+        return allow_load
+    if name == _FOLD_DOT_HELPER:
+        # The synthetic-lane matmul fold: pure arithmetic over reads of
+        # operand tensors the kernel never writes (``_cute_matmul_reread_unsafe``
+        # proved that before the fold was emitted), so it relocates exactly
+        # like a load of the same tensors.
         return allow_load
     return allow_reduction and (
         name in _CHUNK_REDUCTION_HELPERS or name.startswith("cute.arch.warp_reduction")
@@ -7564,6 +7630,11 @@ def _lane_loop_headers(
 class DeviceGridState(DeviceLoopOrGridState):
     lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
     lane_loop_blocks: set[int] = dataclasses.field(default_factory=set)
+    # CuTe: the index variable of the chunk lane loop standing in for a
+    # rolled reduction block outside its loop, per block id
+    # (``memory_ops._cute_make_rolled_replica``).  Per grid, like the lane
+    # loop itself: another root loop sharing the block gets its own.
+    rolled_reduction_replicas: dict[int, str] = dataclasses.field(default_factory=dict)
     # Preserve which logical blocks each synthetic lane variable distributes.
     # The aggregate set above is retained for existing reduction scheduling;
     # late structural lowerings need the exact association to prove coordinate
@@ -8236,7 +8307,14 @@ class TileStrategy:
         dpf_value = config.get("_triton_range_value_data_partition_factor", None)
 
         if dpf_range is not None and dpf_value is not None and dpf_range == block_idx:
-            kwargs.append(f"data_partition_factor={dpf_value}")
+            from .._compat import range_supports_data_partition_factor
+            from .compile_environment import warning
+
+            if range_supports_data_partition_factor():
+                kwargs.append(f"data_partition_factor={dpf_value}")
+            elif not _warned_data_partition_factor:
+                _warned_data_partition_factor.append(True)
+                warning(exc.TritonOptionUnavailable("data_partition_factor"))
 
         return kwargs
 
@@ -8567,6 +8645,10 @@ class BlockSizeTileStrategy(TileStrategy):
         from .reduction_strategy import ReductionStrategy
 
         env = CompileEnvironment.current()
+
+        sibling_axis = self.fn.tile_strategy.collective_sibling_thread_axis(self)
+        if sibling_axis is not None:
+            return sibling_axis
 
         # Plan-driven path: honor ``block_axis_priority`` so the outer
         # grid loop can reserve an axis for a lower-priority inner tile
@@ -9978,6 +10060,26 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         self.mma_mode = mma_mode
         self.inactive_block_ids = inactive_block_ids or set()
         self._lane_var_by_block: dict[int, str] = {}
+        # ``cute_tiles_per_block``: grid axis -> tiles packed per CTA (its
+        # thread axis extent); see ``cute/tile_packing.py``.  Resolved here,
+        # before layout planning, so the planner sees the packed axis as a
+        # multi-row CTA and can order it above the inner tile axes (one warp
+        # per tile when the inner extent is a warp).
+        self._cute_pack_by_block: dict[int, int] = {}
+        if not mma_mode and CompileEnvironment.current().backend_name == "cute":
+            from .cute.tile_packing import packed_grid_block
+
+            packed = packed_grid_block(CompileEnvironment.current(), fn.config)
+            if packed is not None and packed[0] in block_ids:
+                self._cute_pack_by_block[packed[0]] = packed[1]
+                # The packed axis is a thread axis whether or not the body
+                # observes the tile's elements: the pid itself varies per
+                # sub-group.  A one-element axis used only through
+                # ``tile.id`` / ``tile.begin`` arrives here inactive (no graph
+                # distributes over it), which would otherwise leave the pid
+                # reading a thread axis the launch never raises (or one the
+                # next block owns).
+                self.inactive_block_ids = self.inactive_block_ids - {packed[0]}
         # Per-block vec width for the lane loop (1 = scalar).  Populated
         # from the autotuner-selected ``cute_vector_widths`` config when
         # the block has a lane loop and its ``elements_per_thread`` is
@@ -10115,13 +10217,19 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     "cute",
                     "a shared tile thread axis requires an evenly partitioned tile",
                 )
-            self._shared_thread_extents[block_id] = threads
-            elements_per_thread = max(1, size // threads)
-            if elements_per_thread == 1:
-                self._lane_var_by_block.pop(block_id, None)
-            vec = self._cute_lane_vec_width_by_block.get(block_id, 1)
-            if elements_per_thread % vec:
-                self._cute_lane_vec_width_by_block.pop(block_id, None)
+            self._set_shared_thread_extent(block_id, size, threads)
+
+    def _set_shared_thread_extent(self, block_id: int, size: int, threads: int) -> None:
+        self._shared_thread_extents[block_id] = threads
+        elements_per_thread = max(1, size // threads)
+        # Collective caps can narrow a previously scalar tile into lane loops.
+        if elements_per_thread > 1 and block_id not in self._lane_var_by_block:
+            self._lane_var_by_block[block_id] = self.fn.new_var(f"lane_{block_id}")
+        if elements_per_thread == 1:
+            self._lane_var_by_block.pop(block_id, None)
+        vec = self._cute_lane_vec_width_by_block.get(block_id, 1)
+        if elements_per_thread % vec:
+            self._cute_lane_vec_width_by_block.pop(block_id, None)
 
     def thread_extent_for_masking(self, block_id: int, thread_extent: int) -> int:
         """Tile lanes that can own an element when a sibling widens the launch."""
@@ -10161,12 +10269,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     f"thread axis {axis}: block {block_id} needs a static block "
                     "size to run as a lane loop",
                 )
-            self._shared_thread_extents[block_id] = 1
-            if size > 1 and block_id not in self._lane_var_by_block:
-                self._lane_var_by_block[block_id] = self.fn.new_var(f"lane_{block_id}")
-            vec = self._cute_lane_vec_width_by_block.get(block_id, 1)
-            if size % vec:
-                self._cute_lane_vec_width_by_block.pop(block_id, None)
+            self._set_shared_thread_extent(block_id, size, 1)
 
     def _maybe_apply_cute_cluster(
         self, env: CompileEnvironment, state: CodegenState
@@ -10245,6 +10348,8 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         the cluster split)."""
         if block_id in self.inactive_block_ids:
             return 1
+        if block_id in self._cute_pack_by_block:
+            return 1  # every thread sub-group owns one tile of one element
         idx = self.block_ids.index(block_id)
         nt = self._shared_thread_extents.get(block_id, self.num_threads[idx])
         if nt == 0:
@@ -10260,6 +10365,8 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             return 1
         if self.mma_mode:
             return 1  # MMA handles element distribution, no CUDA threads needed
+        if block_id in self._cute_pack_by_block:
+            return self._cute_pack_by_block[block_id]
         idx = self.block_ids.index(block_id)
         nt = self._shared_thread_extents.get(block_id, self.num_threads[idx])
         if nt == 0:
@@ -10428,11 +10535,17 @@ class PerThreadNDTileStrategy(NDTileStrategy):
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
         self._demote_blocks_beyond_thread_axes(state)
-        if not self._lane_var_by_block and not self._shared_thread_extents:
+        env = CompileEnvironment.current()
+        # ``cute_tiles_per_block``: a packed grid axis is a thread axis of
+        # this strategy even when no lane loop is needed.
+        if (
+            not self._lane_var_by_block
+            and not self._shared_thread_extents
+            and not self._cute_pack_by_block
+        ):
             return super().codegen_grid(state)
 
         block_ids = self.block_ids
-        env = CompileEnvironment.current()
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_ids)
         pids = self.select_pid_strategy()
@@ -10477,6 +10590,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
             pid_var = device_function.new_var(f"pid_{i}", dce=True)
+            pack = self._cute_pack_by_block.get(block_idx, 1)
 
             begin_offset_expr = ""
             if begin != 0:
@@ -10517,6 +10631,9 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                 idx_expr = env.backend.lane_index_expr(
                     offset_var, elements_per_thread, axis=axis
                 )
+                if pack > 1:
+                    # The pid already carries this sub-group's tile.
+                    idx_expr = offset_var
                 thread_extent = self._thread_extent_for_axis(block_idx, block_size)
                 static_extent = (
                     thread_extent
@@ -10651,6 +10768,13 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     axis,
                     static_extent,
                 )
+                if pack > 1:
+                    # The body may only name the tile begin (``tile.begin``);
+                    # the launch must still raise the sub-group axis.
+                    self.fn.cute_state.grid_thread_extents[offset_var] = (
+                        axis,
+                        static_extent,
+                    )
 
             # Bound by the *thread* extent rather than the block size: this
             # axis advances ``elements_per_thread`` per thread, so the threads
@@ -10690,9 +10814,12 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                         uniform_vector_mask=isinstance(begin, int)
                         and begin == 0
                         and env.specialized_multiple(numel, vec_width),
+                        chunk_base_aligned=isinstance(begin, int) and begin == 0,
                     )
                 )
             pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
+            if pack > 1:
+                pid = pid._replace(pack=pack, pack_axis=axis)
             pids.append(pid)
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):
@@ -11037,6 +11164,36 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             )
             if mask_statement is not None:
                 index_setup.append(mask_statement)
+            wrapper = vec_wrappers.get(self._lane_var_by_block.get(block_idx, ""))
+            if wrapper is not None and env.backend_name == "cute":
+                from .cute.device_state import CuteVloopWrapperFact
+
+                # The device-loop twin of the grid fact: the V-loop sink
+                # (``cute/sink_vector_loops.py``) finds this loop's constexpr
+                # V-loop wherever it nests.  A chunk base
+                # ``offset + ... * V`` is V-aligned only from a zero origin,
+                # and cannot straddle an extent that is a multiple of V.
+                self.fn.cute_state.vloop_sink_wrappers[wrapper.vec_lane_var] = (
+                    CuteVloopWrapperFact(
+                        block_id=block_idx,
+                        vec_width=self._cute_lane_vec_width_by_block.get(block_idx, 1),
+                        lane_var=self._lane_var_by_block[block_idx],
+                        vec_lane_var=wrapper.vec_lane_var,
+                        base_index_var=wrapper.base_index_var,
+                        index_var=index_var,
+                        mask_var=self.mask_vars.get(block_idx),
+                        uniform_vector_mask=isinstance(begin, int)
+                        and begin == 0
+                        and step in (None, 1)
+                        and env.specialized_multiple(
+                            proxy_end,
+                            self._cute_lane_vec_width_by_block.get(block_idx, 1),
+                        ),
+                        chunk_base_aligned=isinstance(begin, int)
+                        and begin == 0
+                        and step in (None, 1),
+                    )
+                )
             body = [for_node]
         assert for_node is not None
         # Run index/mask setup once per loop-offset and per-lane before user body.

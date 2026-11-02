@@ -256,7 +256,10 @@ def test_wide_seeds_keep_owned_lane_and_tile_constraints(
         assert seed.block_sizes[1] >= 2 * seed.num_threads[1] * vector
         assert seed.block_sizes[1] // seed.num_threads[1] <= 128
         assert seed.num_threads[0] * seed.num_threads[1] <= 1024
-    with patch.object(bound.config_spec.block_sizes[1], "max_size", columns // 2):
+    block = bound.config_spec.block_sizes[1]
+    original_max = block.max_size
+    try:
+        block.max_size = columns // 2
         assert bound.host_function is not None
         with bound.env:
             assert (
@@ -265,6 +268,8 @@ def test_wide_seeds_keep_owned_lane_and_tile_constraints(
                 )
                 is None
             )
+    finally:
+        block.max_size = original_max
 
 
 def test_full_population_reaches_two_level_cache_reload_seed() -> None:

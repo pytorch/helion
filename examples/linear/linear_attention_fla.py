@@ -42,7 +42,9 @@ try:
     from fla.ops.linear_attn import chunk_linear_attn  # pyrefly: ignore[missing-import]
     from fla.ops.retention import chunk_retention  # pyrefly: ignore[missing-import]
     from fla.ops.simple_gla import chunk_simple_gla  # pyrefly: ignore[missing-import]
-except ImportError:
+except Exception:
+    # An FLA release built against a different Triton can fail at import time
+    # with errors other than ImportError (e.g. triton.autotune key checks).
     pass
 else:
 

@@ -301,6 +301,21 @@ def _column_scan(input_t: torch.Tensor) -> torch.Tensor:
     return output
 
 
+def _registered_scan(
+    x: torch.Tensor, reverse: hl.constexpr, dim: hl.constexpr
+) -> torch.Tensor:
+    if reverse:
+        columns = hl.register_block_size(x.size(1))
+        rows = hl.register_block_size(x.size(0))
+    else:
+        rows = hl.register_block_size(x.size(0))
+        columns = hl.register_block_size(x.size(1))
+    output = torch.empty_like(x)
+    for row, col in hl.tile(x.shape, block_size=[rows, columns]):
+        output[row, col] = hl.associative_scan(_add, x[row, col], dim=dim)
+    return output
+
+
 def _pointwise_2d(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile_e, tile_f in hl.tile(x.shape):
@@ -767,6 +782,28 @@ def test_scan_tile_seed_skips_kernels_without_a_scan() -> None:
     assert not _unroll_seeds(bound)
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_scan_tile_seed_follows_grid_order(reverse: bool, transposed: bool) -> None:
+    x = torch.zeros(4096, 128, device=CPU)
+    if transposed:
+        x = x.t()
+    bound = _bind(_registered_scan, (x, reverse, int(transposed)))
+    seeds = _unroll_seeds(bound)
+    if transposed:
+        assert not seeds
+        return
+    assert seeds
+    row, col = (1, 0) if reverse else (0, 1)
+    spec = bound.config_spec
+    for seed in seeds:
+        assert spec.block_sizes.config_get(seed["block_sizes"], col) == 128
+        assert spec.num_threads.config_get(seed["num_threads"], row) == 1
+        assert spec.num_threads.config_get(seed["num_threads"], col) == 32
+        assert spec.cute_vector_widths.config_get(seed["cute_vector_widths"], col) == 4
+        assert LOAD_LIST in bound.to_code(helion.Config(**seed))
+
+
 def test_scan_tile_seed_skips_layouts_the_vector_protocol_cannot_realise() -> None:
     # 98 columns: no 16-byte packet covers the strip.
     assert not _unroll_seeds(
@@ -919,3 +956,25 @@ def test_elided_scatter_matches_the_unelided_sum() -> None:
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-4, equal_nan=True)
     assert torch.equal(torch.isnan(out), torch.isnan(expected))
     assert torch.isnan(out).any() and torch.isinf(out).any()
+
+
+@pytest.mark.parametrize(
+    "dtype,helper",
+    [
+        (torch.float16, "_cute_red_add_f16_vec("),
+        (torch.bfloat16, "_cute_red_add_bf16_vec("),
+    ],
+)
+def test_half_output_vector_lanes_flush_packed_reductions(
+    dtype: torch.dtype, helper: str
+) -> None:
+    """A half output kept in its dtype (no fp32 promotion) takes the same
+    V-loop flush as fp32: four lanes become one ``red.global.add.noftz.v2.f16x2``
+    / ``bf16x2`` instead of four scalar atomics (compare-and-swap loops on
+    sm_100)."""
+    indices, values, num_nodes = _segment_args()
+    args = (indices, values.to(dtype), num_nodes)
+    code = _codegen(_segmented_reduction, args, **STRIP)
+    assert helper in code, code
+    assert "_tile_atomic_vals_1_0.append(cutlass." in code
+    assert VECTOR_ATOMIC not in code

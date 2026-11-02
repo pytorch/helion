@@ -4,7 +4,7 @@ from collections import defaultdict
 import dataclasses
 import enum
 
-from .attention_plan import flash_head_dims_supported
+from .attention_plan import flash_pair_head_dims_supported
 
 
 class FlashScheduleError(ValueError):
@@ -110,6 +110,18 @@ class FlashScheduleSpec:
     # Q, and a non-persistent CTA loads no further Q tile, so both Q stages
     # are dead by then. Needs ``stage_output``; no bytes for the staged tiles.
     output_over_query: bool = False
+    # Staged output tiles per CTA (``cute_flash_o_stage``): None stages one
+    # tile per query slot; 1 shares one tile between the slots (the second
+    # slot's staging waits for the first slot's store to drain), which frees
+    # a tile of shared memory for the K/V ring.
+    output_tiles: int | None = None
+
+
+def _output_tile_count(spec: FlashScheduleSpec) -> int:
+    """Staged output tiles of one CTA (``output_tiles`` or one per slot)."""
+    if spec.output_tiles is None:
+        return spec.query_slots_per_cta
+    return spec.output_tiles
 
 
 @dataclasses.dataclass(frozen=True)
@@ -292,15 +304,42 @@ def _shared_memory_bytes(spec: FlashScheduleSpec) -> int:
         kv_bytes = _aliased_kv_ring_bytes(spec)
     output_tile_bytes = 128 * _value_head_dim(spec) * spec.dtype_bytes
     output_bytes = (
-        spec.query_slots_per_cta * output_tile_bytes
+        _output_tile_count(spec) * output_tile_bytes
         if spec.stage_output and not spec.output_over_query
         else 0
     )
-    # Scale/stat transport plus aligned barrier storage in the current FA4 layout.
-    return q_bytes + kv_bytes + output_bytes + 3072 + spec.aux_smem_bytes
+    return q_bytes + kv_bytes + output_bytes + fa4_header_bytes(spec)
 
 
 _ALT_OVERHEAD_BYTES = 3072
+# The runtime SharedStorage (``_flash_runtime.flash_fa4_shared_storage``)
+# declares its scalars ahead of the 1024-byte aligned tiles: the Q / score /
+# P-chunk / output / epilogue / aux mbarriers, the two statistics handshake
+# rings, the TMEM holding word and the 2-ring x 2-slot x 128-thread fp32
+# scale transport (2308 bytes), plus two 8-byte mbarriers per K/V ring stage
+# (one ring aliased, two separate). The flex hook's staged regions follow at
+# 16-byte alignment and ``sQ`` rounds the whole header up to 1024.
+_FA4_HEADER_FIXED_BYTES = 2308
+_FA4_STAGE_BARRIER_BYTES = 16
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple
+
+
+def fa4_header_bytes(spec: FlashScheduleSpec) -> int:
+    """Bytes ahead of the tiles in the FA4 SharedStorage at ``spec``'s depth.
+
+    3072 up to 47 aliased (23 separate) ring stages; one more kilobyte per
+    further 64 (32) stages, so the depth caps of the narrow widths stay
+    inside the carveout.
+    """
+    rings = 2 if spec.separate_kv else 1
+    barrier_bytes = _round_up(
+        _FA4_HEADER_FIXED_BYTES + _FA4_STAGE_BARRIER_BYTES * rings * spec.kv_depth,
+        16,
+    )
+    return _round_up(barrier_bytes + spec.aux_smem_bytes, 1024)
 
 
 def _alt_tmem_columns(spec: FlashScheduleSpec) -> int:
@@ -317,7 +356,9 @@ def build_fa4_alt_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
     the PV warp issues PV(i) once P(i) is published and O rescaled. The running
     max is handed A -> B inside the pair and B -> A into the next pair; alpha
     goes to the correction warps per step; the even warpgroup hands its partial
-    row sum to the odd one once per work item. K and V have separate rings whose
+    row sum to the odd one once per work item, and the odd one hands the item's
+    row sum to the correction warps' epilogue through its (then dead) max slot.
+    K and V have separate rings whose
     slots are reused by the tile ``depth`` positions later, which is
     ``depth // 2`` pairs after an even step and ``(depth + 1) // 2`` after an
     odd one.
@@ -397,6 +438,7 @@ def build_fa4_alt_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
         FlashBarrier("corr_epi_full_r0", 128, cta),
         FlashBarrier("part_sum_r0", 128, cta),
         FlashBarrier("part_sum_consumed_r0", 128, cta),
+        FlashBarrier("row_sum_r0", 128, cta),
         FlashBarrier("row_sum_consumed_r0", 128, cta),
     ]
     for tag in "ab":
@@ -484,13 +526,22 @@ def build_fa4_alt_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
             barrier="part_sum_consumed_r0",
             arrival_count=128,
         ),
-        # the odd warpgroup's alpha slot carries the item's row sum to the
-        # correction warps; the next item's first alpha is written only after
-        # they read it (the PV chain orders the in-item alpha writes behind the
-        # previous read, but not this write across the item boundary)
+        # the odd warpgroup publishes the item's row sum to the correction
+        # warps' epilogue through its max slot (dead after its last publication
+        # of the item) as soon as it has it, ...
         FlashEdge(
-            "correction_b",
-            "stat_b",
+            "softmax_b",
+            output_stage,
+            barrier="row_sum_r0",
+            arrival_count=128,
+            resource="ROWSUM_r0",
+        ),
+        # ... and starts its next item (whose first max publication rewrites
+        # the slot and arrives on the row-sum barrier again) only after they
+        # read it: nothing else orders that publication behind the read
+        FlashEdge(
+            output_stage,
+            "softmax_b",
             iteration_delta=1,
             barrier="row_sum_consumed_r0",
             arrival_count=128,
@@ -716,9 +767,28 @@ def build_fa4_alt_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                 private,
                 f"stat_{tag}",
                 (f"softmax_{other}",),
+                alias_group="max_b_slot" if tag == "b" else None,
                 cta_rank=0,
             )
         )
+    # the odd warpgroup's max slot carries the item's row sum to the epilogue:
+    # the even warpgroup's last read of the max precedes the row-sum write
+    # (through the max handoff of the pair), the next max publication follows
+    # the epilogue's read (row_sum_consumed_r0)
+    regions.append(
+        FlashMemoryRegion(
+            "ROWSUM_r0",
+            FlashMemorySpace.SMEM,
+            overhead_offset + 1024 + 512,
+            512,
+            16,
+            private,
+            "softmax_b",
+            (output_stage,),
+            alias_group="max_b_slot",
+            cta_rank=0,
+        )
+    )
     phase_cycles: tuple[FlashPhaseCycle, ...] = ()
     if spec.persistent:
         assert spec.kv_iterations is not None
@@ -729,9 +799,9 @@ def build_fa4_alt_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
             "v_ready_r0": steps,
             "v_reuse_r0": steps,
             # the even warpgroup hands alpha over at its steps after the first,
-            # the odd one at every step plus the final row sum
+            # the odd one at every step
             "alpha_a": steps // 2 - 1,
-            "alpha_b": steps // 2 + 1,
+            "alpha_b": steps // 2,
         }
         cycles = []
         for barrier in barriers:
@@ -790,7 +860,14 @@ def max_fa4_kv_depth(
         bytes_per_stage = _k_tile_bytes(spec) + _v_tile_bytes(spec)
     else:
         bytes_per_stage = _kv_slot_bytes(spec)
-    return max(0, (limits.shared_memory_bytes - base_bytes) // bytes_per_stage)
+    depth = max(0, (limits.shared_memory_bytes - base_bytes) // bytes_per_stage)
+    # The header grows with the depth (a barrier pair per stage), so the
+    # zero-depth estimate is an upper bound: step down until the layout fits.
+    while depth > 0 and not fa4_schedule_fits(
+        dataclasses.replace(spec, kv_depth=depth), limits
+    ):
+        depth -= 1
+    return depth
 
 
 def _output_tile(spec: FlashScheduleSpec, cta_rank: int, query_slot: int) -> int:
@@ -829,9 +906,10 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
     Score storage is always two local query slots. With two CTAs this becomes
     four aggregate CTA-local slices; it is not a temporal four-stage score ring.
     """
-    if not flash_head_dims_supported(spec.head_dim, _value_head_dim(spec)):
+    if not flash_pair_head_dims_supported(spec.head_dim, _value_head_dim(spec)):
         raise FlashScheduleError(
-            "FA4 schedule requires head_dim 64 or 128, or the 192/128 pair"
+            "FA4 schedule requires a symmetric head_dim that is a multiple of "
+            "16 up to 128, or the 192/128 pair"
         )
     if spec.head_dim_v is not None and spec.head_dim_v != spec.head_dim:
         if spec.separate_kv or spec.cta_count != 1 or spec.alternating_warpgroups:
@@ -934,9 +1012,15 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
     v_offset = k_offset + (kv_ring_bytes if spec.separate_kv else 0)
     output_offset = q_bytes + (2 if spec.separate_kv else 1) * kv_ring_bytes
     overhead_offset = output_offset + (
-        spec.query_slots_per_cta * output_tile_bytes
+        _output_tile_count(spec) * output_tile_bytes
         if spec.stage_output and not spec.output_over_query
         else 0
+    )
+    # One staged output tile shared by the query slots: their regions alias
+    # and the schedule orders slot 1's staging after slot 0's store (and the
+    # next item's slot 0 after slot 1's store).
+    shared_output_tile = (
+        spec.stage_output and _output_tile_count(spec) < spec.query_slots_per_cta
     )
     if spec.output_over_query:
         # The staged output tiles alias the (dead) Q stages from offset 0.
@@ -1186,6 +1270,18 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                     ),
                 ]
             )
+            if shared_output_tile:
+                # The shared tile: slot ``slot``'s staging waits for the
+                # previous slot's store to leave it (slot 0: the previous
+                # item's last slot).
+                previous_slot = (slot - 1) % spec.query_slots_per_cta
+                edges.append(
+                    FlashEdge(
+                        _node_name("output_store", rank, previous_slot),
+                        output_stage,
+                        iteration_delta=1 if slot == 0 else 0,
+                    )
+                )
             if not spec.final_only_stat_handoff:
                 stat_release_slot = slot
                 stat_release_delta = spec.stat_depth
@@ -1388,14 +1484,17 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                     FlashMemoryRegion(
                         f"O_stage_r{rank}_q{slot}",
                         FlashMemorySpace.SMEM,
-                        output_offset + slot * output_tile_bytes,
+                        output_offset
+                        + (slot % _output_tile_count(spec)) * output_tile_bytes,
                         output_tile_bytes,
                         1024,
                         FlashVisibility.CTA_PRIVATE,
                         output_stage,
                         (output_store,),
                         alias_group=(
-                            None
+                            f"o_stage_shared_r{rank}"
+                            if shared_output_tile
+                            else None
                             if q_alias_group is None
                             else q_alias_group.format(rank=rank)
                         ),
@@ -1913,14 +2012,14 @@ def verify_flash_schedule(
                 ):
                     continue
                 require_consumption_guard(region)
-            # The odd warpgroup's alpha slot doubles as its row-sum slot at the
-            # end of every item. Inside an item each alpha write follows the
-            # correction warps' read of the previous one through the PV chain;
-            # the next item's first alpha has no such order against the
-            # row-sum read, so this slot needs the same guard from the
-            # correction warps back to its writer.
+            # The odd warpgroup's max slot doubles as its row-sum slot at the
+            # end of every item, read by the correction warps' epilogue over a
+            # named barrier. The next item's first max publication has no
+            # order against that read (the max handoffs only alternate between
+            # the two warpgroups), so the row-sum lifetime needs the same
+            # guard from its reader back to its writer.
             for region in schedule.memory_regions:
-                if region.name == "STAT_b":
+                if region.name == "ROWSUM_r0":
                     require_consumption_guard(region)
         elif schedule.spec.separate_kv:
             if (

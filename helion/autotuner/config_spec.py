@@ -76,23 +76,64 @@ from .._compiler.cute.cute_flash import flash_effective_config_values
 from .._compiler.cute.cute_flash import flash_env_fingerprint
 from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_FA4_FAMILY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_FAMILIES
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_FAMILY_KEY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_FAMILY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_KV_CHOICES
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_KV_KEY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_CHUNK_CHOICES
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_CHUNK_KEY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_SPLIT_CHOICES
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_SPLIT_KEY
+from .._compiler.cute.cute_flash_bwd_row_mma import FlashBwdRowFacts
+from .._compiler.cute.cute_flash_bwd_row_mma import flash_bwd_row_legalize
+from .._compiler.cute.cute_flash_bwd_row_mma import flash_bwd_row_search_grid
 from .._compiler.cute.cute_mma_dag import AXIS_LEAD
 from .._compiler.cute.cute_mma_dag import AXIS_LOOP
 from .._compiler.cute.cute_mma_dag import AXIS_ROOT
+from .._compiler.cute.cute_mma_dag import MMA_DAG_AUX_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_AUX_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_AUX_RING
+from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_MAX
 from .._compiler.cute.cute_mma_dag import MMA_DAG_DEFAULT_STAGES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_DEFAULT_WARPS
+from .._compiler.cute.cute_mma_dag import MMA_DAG_DERIVED_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_DERIVED_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_DERIVED_PASS
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_ROW
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_SPLIT
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_STREAMED
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_KEYS
+from .._compiler.cute.cute_mma_dag import MMA_DAG_L2_CANONICAL
+from .._compiler.cute.cute_mma_dag import MMA_DAG_L2_HINTS
 from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_LANE
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_TMA
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
 from .._compiler.cute.cute_mma_dag import MMA_DAG_MODES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_OFF
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_MMA
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
-from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_ON
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PERSISTENT_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PERSISTENT_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_SPLIT_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_SPLIT_CLUSTER
+from .._compiler.cute.cute_mma_dag import MMA_DAG_SPLIT_FIXUP
+from .._compiler.cute.cute_mma_dag import MMA_DAG_SPLIT_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGES_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STORE_CHOICES
@@ -102,9 +143,49 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP
 from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_WARPS_KEY
 from .._compiler.cute.cute_mma_dag import CuteMmaDagFacts
+from .._compiler.cute.cute_mma_dag import apply_mma_dag_cluster
+from .._compiler.cute.cute_mma_dag import epilogue_knob_admitted
+from .._compiler.cute.cute_mma_dag import fixup_admitted
+from .._compiler.cute.cute_mma_dag import mma_dag_aux_reason
+from .._compiler.cute.cute_mma_dag import mma_dag_epilogue_reason
+from .._compiler.cute.cute_mma_dag import mma_dag_lookahead_reason
 from .._compiler.cute.cute_mma_dag import mma_dag_pass_warps_reason
+from .._compiler.cute.cute_mma_dag import mma_dag_persistent_reason
+from .._compiler.cute.cute_mma_dag import mma_dag_ragged_ceilings
+from .._compiler.cute.cute_mma_dag import mma_dag_seed_configs
+from .._compiler.cute.cute_register_subblocks import (
+    COLSIDE_CHOICES as RSB_COLSIDE_CHOICES,
+)
+from .._compiler.cute.cute_register_subblocks import COLSIDE_KEY as RSB_COLSIDE_KEY
+from .._compiler.cute.cute_register_subblocks import COLSIDE_RMW as RSB_COLSIDE_RMW
+from .._compiler.cute.cute_register_subblocks import KEY as RSB_KEY
+from .._compiler.cute.cute_register_subblocks import KEYS as RSB_KEYS
+from .._compiler.cute.cute_register_subblocks import MASK_CHOICES as RSB_MASK_CHOICES
+from .._compiler.cute.cute_register_subblocks import MASK_KEY as RSB_MASK_KEY
+from .._compiler.cute.cute_register_subblocks import MASK_SELECT as RSB_MASK_SELECT
+from .._compiler.cute.cute_register_subblocks import MODE_OFF as RSB_MODE_OFF
+from .._compiler.cute.cute_register_subblocks import MODES as RSB_MODES
+from .._compiler.cute.cute_register_subblocks import (
+    PREFETCH_CHOICES as RSB_PREFETCH_CHOICES,
+)
+from .._compiler.cute.cute_register_subblocks import PREFETCH_KEY as RSB_PREFETCH_KEY
+from .._compiler.cute.cute_register_subblocks import ROLL_CHOICES as RSB_ROLL_CHOICES
+from .._compiler.cute.cute_register_subblocks import ROLL_KEY as RSB_ROLL_KEY
+from .._compiler.cute.cute_register_subblocks import ROLL_UNROLLED as RSB_ROLL_UNROLLED
+from .._compiler.cute.cute_register_subblocks import WARP_CHOICES as RSB_WARP_CHOICES
+from .._compiler.cute.cute_register_subblocks import WARPS_KEY as RSB_WARPS_KEY
+from .._compiler.cute.cute_register_subblocks import RegisterSubblockFacts
+from .._compiler.cute.cute_register_subblocks import register_subblocks_config_reason
+from .._compiler.cute.cute_register_subblocks import register_subblocks_repair
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
+from .._compiler.cute.cutedsl_compat import hinted_cp_async_available
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
+from .._compiler.cute.fragment_mma_dot import FRAGMENT_MMA_K_THREADS
+from .._compiler.cute.fragment_mma_dot import FRAGMENT_MMA_KEY
+from .._compiler.cute.fragment_mma_dot import FRAGMENT_MMA_ROW_THREADS
+from .._compiler.cute.pdl_release import CUTE_PDL_RELEASE_CHOICES
+from .._compiler.cute.pdl_release import CUTE_PDL_RELEASE_DEFAULT
+from .._compiler.cute.pdl_release import CUTE_PDL_SPREAD_KEY
 from .._compiler.cute.radix_selection_config import ALGORITHM_KEY as RADIX_ALGORITHM_KEY
 from .._compiler.cute.radix_selection_config import ALGORITHMS as RADIX_ALGORITHMS
 from .._compiler.cute.radix_selection_config import BOOLEAN_KEYS as RADIX_BOOLEAN_KEYS
@@ -120,6 +201,15 @@ from .._compiler.cute.radix_selection_config import (
     PIPELINE_CHOICES as RADIX_PIPELINE_CHOICES,
 )
 from .._compiler.cute.radix_selection_config import normalize_radix_selection
+from .._compiler.cute.ring_mma_dot import RING_DEFAULT_SPLIT
+from .._compiler.cute.ring_mma_dot import RING_DEFAULT_STAGES
+from .._compiler.cute.ring_mma_dot import RING_MMA_KEY
+from .._compiler.cute.ring_mma_dot import RING_SPLIT_CHOICES
+from .._compiler.cute.ring_mma_dot import RING_SPLIT_KEY
+from .._compiler.cute.ring_mma_dot import RING_STAGE_CHOICES
+from .._compiler.cute.ring_mma_dot import RING_STAGES_KEY
+from .._compiler.cute.ring_mma_dot import ring_mma_geometry_reason
+from .._compiler.cute.ring_mma_dot import ring_mma_smem_budget
 from .._compiler.cute.split_k_cluster import validate_cluster_config
 from .._compiler.cute.split_k_cluster_config import (
     FINALIZER_KEY as SPLIT_K_FINALIZER_KEY,
@@ -129,12 +219,16 @@ from .._compiler.cute.split_k_cluster_config import SCHEDULE_KEY as SPLIT_K_SCHE
 from .._compiler.cute.split_k_cluster_config import SCHEDULES as SPLIT_K_SCHEDULES
 from .._compiler.cute.split_k_cluster_config import normalize_cluster_finalizer
 from .._compiler.cute.split_k_cluster_config import normalize_cluster_schedule
+from .._compiler.cute.split_k_workspace_config import (
+    PARTITIONS_KEY as SPLIT_K_PARTITIONS_KEY,
+)
 from .._compiler.cute.split_k_workspace_config import STAGES_KEY as SPLIT_K_STAGES_KEY
 from .._compiler.cute.split_k_workspace_config import WORKSPACE_CONFIG_KEYS
 from .._compiler.cute.split_k_workspace_config import (
     WORKSPACE_KEY as SPLIT_K_WORKSPACE_KEY,
 )
 from .._compiler.cute.split_k_workspace_config import normalize_workspace_config
+from .._compiler.cute.split_k_workspace_config import workspace_search_fields
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
@@ -176,6 +270,7 @@ from .._compiler.cute.tcgen05_tma_rn import TMA_RN as CUTE_MMA_F32_TMA_RN
 from .._compiler.cute.tcgen05_tma_rn import WARP_RAW as CUTE_MMA_F32_WARP_RAW
 from .._compiler.cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .._utils import indexing_uses_tensor_descriptor
+from .._utils import prev_power_of_2
 from ..exc import InvalidConfig
 from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
@@ -312,6 +407,14 @@ class TensorNumelConstraint(NamedTuple):
     check_fn: Callable[..., bool]
     block_indices: tuple[int, ...]
     expr_str: str
+
+
+# ``cute_exact_div_form`` choices, the default first.  ``plain`` is also the
+# fail-closed repair of an unknown value, and of the retired ``guard`` form
+# (a per-element branch; its code shape changed ptxas's contraction of the
+# surrounding fp32 chains, so it was not bit identical to ``plain``).
+CUTE_EXACT_DIV_FORMS: tuple[str, ...] = ("redo", "plain")
+_CUTE_EXACT_DIV_FORM_RETIRED: frozenset[str] = frozenset({"guard"})
 
 
 class MatmulFact(NamedTuple):
@@ -1004,8 +1107,17 @@ _CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
         "cute_gathered_mma_n",
         "cute_gathered_mma_stages",
         "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
+        FRAGMENT_MMA_KEY,
+        RING_MMA_KEY,
+        RING_STAGES_KEY,
+        RING_SPLIT_KEY,
         "cute_pdl",
+        "cute_pdl_release",
+        "cute_pdl_spread",
         "cute_min_blocks_per_mp",
+        "cute_tiles_per_block",
         "epilogue_subtile",
     }
 )
@@ -1037,9 +1149,27 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | {
         "cross_loop_pipeline",
         "cute_flash_gate_warpgroups",
+        "cute_flash_gated_row_warps",
         "cute_flash_bwd_persistent",
         "cute_flash_bwd_two_cta",
         "cute_flash_bwd_exp2_f32",
+        "cute_flash_bwd_mask_form",
+        "cute_flash_bwd_regs",
+        "cute_flash_bwd_s_first",
+        "cute_flash_bwd_kv_stage",
+        "cute_flash_bwd_hook_cols",
+        "cute_flash_bwd_hook_pin",
+        "cute_flash_bwd_bias_fold",
+        "cute_flash_bwd_tile_group",
+        "cute_flash_bwd_stats_mma",
+        "cute_flash_bwd_aux_smem",
+        "cute_flash_bwd_ds_tmem",
+        "cute_flash_bwd_exp2_emu",
+        "cute_flash_bwd_table_steps",
+        "cute_flash_bwd_family",
+        "cute_flash_bwd_row_kv",
+        "cute_flash_bwd_row_q_split",
+        "cute_flash_bwd_row_q_chunk",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_GDN_RECURRENCE_STAGES_KEY,
@@ -1047,6 +1177,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
         CUTE_GDN_RECURRENCE_MMA_M_KEY,
         *MMA_DAG_KEYS,
+        *RSB_KEYS,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         *CUTE_TOPK_CONFIG_KEYS,
@@ -1067,11 +1198,13 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_materialized_operand_schedule",
         "cute_fragment_scan",
         "cute_fragment_reduction",
+        "cute_fp32_dot",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
         "cute_fragment_topk_network",
+        "cute_fragment_cta_topk",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
         "cute_topk_coarse_keys",
@@ -1088,6 +1221,13 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_pure_producer_regions",
         "cute_integer_loop_reduction",
         "cute_fragment_packet_loads",
+        "cute_fragment_padded_rows",
+        "cute_fragment_unrolled_loops",
+        "cute_fragment_vector_io",
+        "cute_fragment_batched_loads",
+        "cute_fragment_split_k",
+        "cute_fragment_mma_rows",
+        "cute_fragment_slab_loads",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1096,8 +1236,12 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_async_load_group_rows",
         "cute_async_load_cache",
         "cute_async_store_policy",
+        "cute_store_policy",
+        "cute_exact_div_form",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
         "cute_signed_bitfield_bf16",
         "cute_collective_mma",
         "cute_collective_static_layouts",
@@ -1122,15 +1266,24 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_scalar_epilogue_keep_inputs",
         "cute_scalar_epilogue_owner_fold",
         "cute_warp_fp32_redux",
+        "cute_register_tile_warp_fold",
+        "cute_register_tile_store_first",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
         "cute_lane_unroll",
+        FRAGMENT_MMA_KEY,
+        RING_MMA_KEY,
+        RING_STAGES_KEY,
+        RING_SPLIT_KEY,
         "cute_pdl",
+        "cute_pdl_release",
+        "cute_pdl_spread",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
+        "cute_tiles_per_block",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
@@ -1166,6 +1319,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
         CUTE_GDN_RECURRENCE_MMA_M_KEY,
         *MMA_DAG_KEYS,
+        *RSB_KEYS,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         *CUTE_TOPK_CONFIG_KEYS,
@@ -1205,11 +1359,13 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_materialized_operand_schedule",
         "cute_fragment_scan",
         "cute_fragment_reduction",
+        "cute_fp32_dot",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
         "cute_fragment_topk_network",
+        "cute_fragment_cta_topk",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
         "cute_topk_coarse_keys",
@@ -1226,6 +1382,13 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_pure_producer_regions",
         "cute_integer_loop_reduction",
         "cute_fragment_packet_loads",
+        "cute_fragment_padded_rows",
+        "cute_fragment_unrolled_loops",
+        "cute_fragment_vector_io",
+        "cute_fragment_batched_loads",
+        "cute_fragment_split_k",
+        "cute_fragment_mma_rows",
+        "cute_fragment_slab_loads",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1234,8 +1397,12 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_async_load_group_rows",
         "cute_async_load_cache",
         "cute_async_store_policy",
+        "cute_store_policy",
+        "cute_exact_div_form",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
         "cute_signed_bitfield_bf16",
         "cute_collective_mma",
         "cute_collective_static_layouts",
@@ -1260,15 +1427,24 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_scalar_epilogue_keep_inputs",
         "cute_scalar_epilogue_owner_fold",
         "cute_warp_fp32_redux",
+        "cute_register_tile_warp_fold",
+        "cute_register_tile_store_first",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
         "cute_lane_unroll",
+        FRAGMENT_MMA_KEY,
+        RING_MMA_KEY,
+        RING_STAGES_KEY,
+        RING_SPLIT_KEY,
         "cute_pdl",
+        "cute_pdl_release",
+        "cute_pdl_spread",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
+        "cute_tiles_per_block",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
@@ -1279,7 +1455,25 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_persistent",
         "cute_flash_bwd_two_cta",
         "cute_flash_bwd_exp2_f32",
+        "cute_flash_bwd_mask_form",
+        "cute_flash_bwd_regs",
+        "cute_flash_bwd_s_first",
+        "cute_flash_bwd_kv_stage",
+        "cute_flash_bwd_hook_cols",
+        "cute_flash_bwd_hook_pin",
+        "cute_flash_bwd_bias_fold",
+        "cute_flash_bwd_tile_group",
+        "cute_flash_bwd_stats_mma",
+        "cute_flash_bwd_aux_smem",
+        "cute_flash_bwd_ds_tmem",
+        "cute_flash_bwd_exp2_emu",
+        "cute_flash_bwd_table_steps",
+        "cute_flash_bwd_family",
+        "cute_flash_bwd_row_kv",
+        "cute_flash_bwd_row_q_split",
+        "cute_flash_bwd_row_q_chunk",
         "cute_flash_gate_warpgroups",
+        "cute_flash_gated_row_warps",
         *BLOCK_SCALED_CONFIG_KEYS,
         SPLIT_K_SCHEDULE_KEY,
         SPLIT_K_FINALIZER_KEY,
@@ -1313,6 +1507,12 @@ VALID_MAXNREG = AUTOTUNED_MAXNREG
 MIN_MAXNREG = 1
 MAX_MAXNREG = 256
 DEFAULT_MAXNREG = None
+# Schedule knobs of the CuTe register tile (``RegisterTileOptions``); dropped
+# from a config that forms no register tile.
+_CUTE_REGISTER_TILE_KNOBS: tuple[str, ...] = (
+    "cute_register_tile_warp_fold",
+    "cute_register_tile_store_first",
+)
 _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
     {
         *RADIX_CONFIG_KEYS,
@@ -1345,11 +1545,13 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_materialized_operand_schedule",
         "cute_fragment_scan",
         "cute_fragment_reduction",
+        "cute_fp32_dot",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
         "cute_fragment_topk_network",
+        "cute_fragment_cta_topk",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
         "cute_topk_coarse_keys",
@@ -1366,6 +1568,13 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_pure_producer_regions",
         "cute_integer_loop_reduction",
         "cute_fragment_packet_loads",
+        "cute_fragment_padded_rows",
+        "cute_fragment_unrolled_loops",
+        "cute_fragment_vector_io",
+        "cute_fragment_batched_loads",
+        "cute_fragment_split_k",
+        "cute_fragment_mma_rows",
+        "cute_fragment_slab_loads",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1374,8 +1583,12 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_async_load_group_rows",
         "cute_async_load_cache",
         "cute_async_store_policy",
+        "cute_store_policy",
+        "cute_exact_div_form",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
         "cute_signed_bitfield_bf16",
         "cute_collective_mma",
         "cute_collective_static_layouts",
@@ -1400,11 +1613,19 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_scalar_epilogue_keep_inputs",
         "cute_scalar_epilogue_owner_fold",
         "cute_warp_fp32_redux",
+        "cute_register_tile_warp_fold",
+        "cute_register_tile_store_first",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
         "cute_lane_unroll",
+        FRAGMENT_MMA_KEY,
+        RING_MMA_KEY,
+        RING_STAGES_KEY,
+        RING_SPLIT_KEY,
         "cute_pdl",
+        "cute_pdl_release",
+        "cute_pdl_spread",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         *BLOCK_SCALED_CONFIG_KEYS,
@@ -1449,6 +1670,7 @@ def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
             "l2_last",
             "l1_l2_first",
             "l1_l2_last",
+            "nc_l2_first",
         )
     return ("",)
 
@@ -1514,6 +1736,9 @@ class ConfigSpec:
         # separate roots reuse physical axes during CuTe launch planning.
         self.cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
         self.cute_inactive_tile_block_ids: set[int] = set()
+        # Whether fp32 matmuls stay exact (dot_precision ieee / tf32x3): the
+        # SIMT GEMM knob's precondition, recorded by DeviceIR.
+        self.cute_fp32_dot_exact: bool = False
         self.user_defined_tunables = (
             {} if user_defined_tunables is None else dict(user_defined_tunables)
         )
@@ -1565,8 +1790,18 @@ class ConfigSpec:
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
         self.cute_signed_bitfield_bf16_available = False
+        # Set by DeviceIR analysis: an fp32 quotient whose divisor is a
+        # scalar or a broadcast row value (``hoist_loop_invariant_recip``'s
+        # exact hoist can apply), so ``cute_exact_div_form`` is tunable.
+        self.cute_exact_division_sites = False
         self.cute_scaled_mma_available = False
+        self.cute_mxfp8_fused_scales_available = False
+        self.cute_mxfp8_sf_tma_available = False
+        self.cute_mxfp8_problem_shape: tuple[int, int, int] | None = None
+        self.cute_mxfp8_output_element_size = 0
+        self.cute_mxfp8_tma_output_available = False
         self.cute_mxfp8_mma_available = False
+        self.cute_mxfp8_partition_key: str | None = None
         self.cute_proven_bounds_enabled = False
         self.cute_rng_packet_enabled = False
         self.cute_warp_aggregated_atomics_enabled = False
@@ -1587,6 +1822,9 @@ class ConfigSpec:
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         # Why each disabled pid_type was removed, for search-space logging.
         self.disallowed_pid_type_reasons: dict[str, str] = {}
+        # All independent vetoes, including callers without a diagnostic reason.
+        # A backend may restore a restriction it owns only if no other veto exists.
+        self.disallowed_pid_type_causes: dict[str, set[str | None]] = {}
         # (feature, reason) pairs for every non-pid_type search-space restriction
         # (currently the tcgen05 narrowing applied per matmul), for search-space
         # logging. De-duplicated; ordered by first occurrence.
@@ -1624,6 +1862,10 @@ class ConfigSpec:
         self.epilogue_subtile_candidate_enabled: bool = False
         self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
         self.epilogue_subtile_k_hint: int = 0
+        # Cleared by the CuTe DeviceIR pass when no contraction can reach the
+        # collective marker; the ``cute_collective_*`` fragments then stay out
+        # of the search surface while normalization keeps their defaults.
+        self.cute_collective_knobs_enabled: bool = True
         self.has_pallas_inner_loops: bool = False
         # Set by the Pallas graph lowering when an inner-loop dot can consume
         # an f32 producer directly instead of its explicit bf16/f16 cast.
@@ -1680,7 +1922,39 @@ class ConfigSpec:
         self.cute_mma_dag_exchange: EnumFragment | None = None
         self.cute_mma_dag_pass_warps: EnumFragment | None = None
         self.cute_mma_dag_loads: EnumFragment | None = None
+        self.cute_mma_dag_aux: EnumFragment | None = None
+        # How a dot operand that is a pointwise chain over loaded tiles
+        # reaches its tile (``cute_mma_dag_derived``: the exchange of a
+        # derived fragment, or a packet pass from the staged sources).
+        self.cute_mma_dag_derived: EnumFragment | None = None
+        # The tensor-memory region programs' epilogue layout
+        # (``cute_mma_dag_epilogue``: one row per thread on four warps, or
+        # the row's columns split over a warp pair on eight).
+        self.cute_mma_dag_epilogue: EnumFragment | None = None
+        # The region programs' ring-loop schedule (``cute_mma_dag_lookahead``:
+        # the one dot of the loop issued one iteration ahead of its epilogue).
+        self.cute_mma_dag_lookahead: EnumFragment | None = None
+        # The tcgen05 mode's persistent launch (CTAs per SM); None where the
+        # mode or its one-tile-per-CTA region programs leave it no subject.
+        self.cute_mma_dag_persistent: EnumFragment | None = None
+        # The tcgen05 region renderer's thread-block cluster over a
+        # full-slice fragment axis; None where the program has no such axis.
+        self.cute_mma_dag_cluster: EnumFragment | None = None
+        # How the split's CTAs combine their row reductions: one cluster's
+        # distributed shared memory, or the fixup grid's global workspace.
+        self.cute_mma_dag_split: EnumFragment | None = None
         self.cute_mma_dag_facts: CuteMmaDagFacts | None = None
+        # Enabled only when the register sub-block family
+        # (``cute_register_subblocks``, cute_register_subblocks.py) admits
+        # the root: the family switch and its knobs; the facts carry the
+        # register estimates ``normalize`` validates a knob choice against.
+        self.cute_register_subblocks: EnumFragment | None = None
+        self.cute_register_subblocks_warps: EnumFragment | None = None
+        self.cute_register_subblocks_prefetch: EnumFragment | None = None
+        self.cute_register_subblocks_mask: EnumFragment | None = None
+        self.cute_register_subblocks_colside: EnumFragment | None = None
+        self.cute_register_subblocks_roll: EnumFragment | None = None
+        self.cute_register_subblocks_facts: RegisterSubblockFacts | None = None
         # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
         # detected. Choice order defines the default and ranked seed order.
         self.cute_chunk_prepare_schedule: EnumFragment | None = None
@@ -1701,12 +1975,19 @@ class ConfigSpec:
         # Config with a native GEMM. Keep its ordinary SIMT layout knobs in
         # the native search schema; MMA-owned axes retain their auto layout.
         self.cute_pointwise_region_block_ids: frozenset[int] = frozenset()
+        # Root-grid axes fixed at one element per tile -> static tile count
+        # (``cute_tiles_per_block`` packs several of their tiles per CTA).
+        self.cute_tile_pack_counts: dict[int, int] = {}
         # Separately launched pointwise grids whose axes have one root owner.
         # Their search floors use the rank of that launch, independently of
         # any native MMA region sharing the complete kernel configuration.
         self.cute_pointwise_region_grid_groups: tuple[tuple[int, ...], ...] = ()
         self.cute_split_k_cluster_facts: ClusterKFacts | None = None
         self.cute_split_k_workspace_available: bool = False
+        # ``cute_split_k_partitions`` values of a proved plain GEMM store
+        # (``split_k_workspace.plain_store_partition_choices``); empty for
+        # the atomic pattern, which partitions through its own tunable.
+        self.cute_split_k_partition_choices: tuple[int, ...] = ()
         self.cute_materialized_schedule_available: bool = False
         self.cute_materialized_schedule_search_enabled: bool = False
         self.cute_row_matrix_transport_available: bool = False
@@ -1714,6 +1995,9 @@ class ConfigSpec:
         self.cute_fragment_scan_search_enabled = False
         self.cute_fragment_reduction_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_reduction_search_enabled = False
+        self.cute_fp32_dot_root_ids: frozenset[int] = frozenset()
+        self.cute_fp32_dot_search_enabled = False
+        self.cute_fp32_dot_seed_worthy = False
         self.cute_fragment_thread_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_threads_search_enabled = False
         self.cute_fragment_producer_cache_root_ids: frozenset[int] = frozenset()
@@ -1726,6 +2010,8 @@ class ConfigSpec:
         self.cute_fragment_warp_scan_search_enabled = False
         self.cute_fragment_topk_network_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_topk_network_search_enabled = False
+        self.cute_fragment_cta_topk_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_cta_topk_search_enabled = False
         self.cute_fragment_atomic_aggregation_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_integer_atomic_epochs_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_integer_atomic_epochs_search_enabled = False
@@ -1755,6 +2041,20 @@ class ConfigSpec:
         self.cute_fragment_register_snapshot_min_threads = 0
         self.cute_fragment_packet_load_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_packet_loads_search_enabled = False
+        self.cute_fragment_padded_rows_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_padded_rows_search_enabled = False
+        self.cute_fragment_unrolled_loops_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_unrolled_loops_search_enabled = False
+        self.cute_fragment_vector_io_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_vector_io_search_enabled = False
+        self.cute_fragment_batched_loads_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_batched_loads_search_enabled = False
+        self.cute_fragment_split_k_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_split_k_search_enabled = False
+        self.cute_fragment_mma_rows_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_mma_rows_search_enabled = False
+        self.cute_fragment_slab_loads_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_slab_loads_search_enabled = False
         self.cute_fragment_register_loads_search_enabled = False
         self.cute_fragment_warp_result_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_warp_results_search_enabled = False
@@ -1779,6 +2079,12 @@ class ConfigSpec:
         # flash detector fires (see ``lower_to_device_ir``). The shape needed to
         # build the fragments (head_dim / num_kv) is captured at the same time.
         self.cute_flash_search_enabled: bool = False
+        # Knobs whose value picks a distinct kernel body (a pipeline family).
+        # The full-effort final selection keeps the best shortlisted config
+        # of every such family in contention for its steady windows
+        # (``FinalSelectionConfig.family_finalists``); a surface that offers
+        # several bodies names its family knobs when it is enabled.
+        self.final_selection_family_keys: tuple[str, ...] = ()
         # Gated (softmax-free) attention surface: pins the 128x128 tile shape
         # and exposes only the K/V TMA ring depth. See ``cute_flash_gated``.
         self.cute_flash_gated_search_enabled: bool = False
@@ -1794,6 +2100,17 @@ class ConfigSpec:
         self._cute_flash_gated_kv_stage_choices_by_tile: dict[
             tuple[int, int], tuple[int, ...]
         ] = {}
+        # Register-MMA row-program tiles of the gated surface
+        # (``cute_flash_gated_row_mma``): the legal warp counts per (query
+        # rows, KV tile) and the ring depths per (query rows, KV tile, warps).
+        self._cute_flash_gated_row_warp_choices_by_tile: dict[
+            tuple[int, int], tuple[int, ...]
+        ] = {}
+        self._cute_flash_gated_row_stage_choices: dict[
+            tuple[int, int, int], tuple[int, ...]
+        ] = {}
+        # 16-row programs of the grid when known (the row seeds are capped).
+        self._cute_flash_gated_row_seed_programs: int | None = None
         self._cute_flash_head_dim: int | None = None
         # V/O head dim when it differs from the Q/K head dim (MLA prefill).
         self._cute_flash_head_dim_v: int | None = None
@@ -1812,6 +2129,7 @@ class ConfigSpec:
         self._cute_flash_has_list_walk: bool = False
         self._cute_flash_small_biased_candidate: bool = False
         self._cute_flash_standard_dense_output: bool = False
+        self._cute_flash_dense_lse_output: bool = False
         self._cute_flash_standard_causal_output: bool = False
         self._cute_flash_tmem_rowmax_compatible: bool = False
         self._cute_flash_causal_resident_compatible: bool = False
@@ -1863,10 +2181,32 @@ class ConfigSpec:
         # backward-attention detector fires (see cute_flash_bwd.py). Pins the
         # (kv_tile, q_tile) block sizes to the 128x128 flash envelope.
         self.cute_flash_bwd_search_enabled: bool = False
+        self._cute_flash_bwd_aux_smem_candidates: tuple[int, ...] = ()
+        self._cute_flash_bwd_ds_tmem_allowed: bool = False
+        self._cute_flash_bwd_stats_mma_allowed: bool = True
+        self._cute_flash_bwd_s_first_allowed: bool = False
+        self._cute_flash_bwd_kv_stage_allowed: bool = False
+        self._cute_flash_bwd_has_mask: bool = True
+        self._cute_flash_bwd_has_hook: bool = True
+        self._cute_flash_bwd_additive_bias: bool = True
         self._cute_flash_bwd_block_size_targets: dict[int, int] = {}
         self._cute_flash_bwd_two_cta_allowed: bool = False
+        self._cute_flash_bwd_persistent_allowed: bool = True
+        self._cute_flash_bwd_table_step_choices: tuple[int, ...] = (0,)
+        # The 2-CTA pair kernel's automatic step table (0: no pair kernel).
+        self._cute_flash_bwd_two_cta_table_steps: int = 0
+        # The FlexAttention backward envelope: opens the mask-form knob.
+        self._cute_flash_bwd_flex: bool = False
+        self._cute_flash_bwd_tile_groups: tuple[int, ...] = (0,)
+        self._cute_flash_bwd_fast_math: bool = False
+        # The dense backward's register-MMA row family: the plan facts that
+        # legalize its knobs (None off the dense bwd surface).
+        self._cute_flash_bwd_row_facts: FlashBwdRowFacts | None = None
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
+        # A compiler may request complete initial coverage of its normalized
+        # seeds after the unchanged nominal and declared-coverage population.
+        self.compiler_seed_overflow_requested: bool = False
         self._compiler_coverage_groups: tuple[CompilerCoverageGroup, ...] = ()
         self._compiler_coverage_fields: tuple[tuple[str | int, ...], ...] = ()
         self.cute_matmul_min_blocks_search_enabled: bool = False
@@ -2051,6 +2391,7 @@ class ConfigSpec:
         """
 
         newly_disabled = pid_type in self.allowed_pid_types
+        self.disallowed_pid_type_causes.setdefault(pid_type, set()).add(reason)
         if newly_disabled and reason is not None:
             self.disallowed_pid_type_reasons.setdefault(pid_type, reason)
         self.allowed_pid_types = tuple(
@@ -2079,12 +2420,28 @@ class ConfigSpec:
         self._cute_tcgen05_config.aux_kernel_detected = value
 
     @property
+    def cute_tcgen05_split_k_plain_body(self) -> bool:
+        return self._cute_tcgen05_config.split_k_plain_body
+
+    @cute_tcgen05_split_k_plain_body.setter
+    def cute_tcgen05_split_k_plain_body(self, value: bool) -> None:
+        self._cute_tcgen05_config.split_k_plain_body = value
+
+    @property
     def cute_tcgen05_exact_shape_aux_kernel_detected(self) -> bool:
         return self._cute_tcgen05_config.exact_shape_aux_kernel_detected
 
     @cute_tcgen05_exact_shape_aux_kernel_detected.setter
     def cute_tcgen05_exact_shape_aux_kernel_detected(self, value: bool) -> None:
         self._cute_tcgen05_config.exact_shape_aux_kernel_detected = value
+
+    @property
+    def cute_tcgen05_aux_loads_on_every_store(self) -> bool:
+        return self._cute_tcgen05_config.aux_loads_on_every_store
+
+    @cute_tcgen05_aux_loads_on_every_store.setter
+    def cute_tcgen05_aux_loads_on_every_store(self, value: bool) -> None:
+        self._cute_tcgen05_config.aux_loads_on_every_store = value
 
     @property
     def cute_tcgen05_matmul_has_non_tcgen05_operand(self) -> bool:
@@ -2111,6 +2468,14 @@ class ConfigSpec:
     @cute_tcgen05_matmul_operands_tma_provable.setter
     def cute_tcgen05_matmul_operands_tma_provable(self, value: bool) -> None:
         self._cute_tcgen05_config.matmul_operands_tma_provable = value
+
+    @property
+    def cute_tcgen05_exact_aux_tma_provable(self) -> bool:
+        return self._cute_tcgen05_config.exact_aux_tma_provable
+
+    @cute_tcgen05_exact_aux_tma_provable.setter
+    def cute_tcgen05_exact_aux_tma_provable(self, value: bool) -> None:
+        self._cute_tcgen05_config.exact_aux_tma_provable = value
 
     def _cute_flash_autotune_fragments(
         self,
@@ -2160,6 +2525,7 @@ class ConfigSpec:
                 flex_hook_ops=self._cute_flash_flex_hook_ops,
                 small_biased_candidate=self._cute_flash_small_biased_candidate,
                 standard_dense_output=self._cute_flash_standard_dense_output,
+                dense_lse_output=self._cute_flash_dense_lse_output,
                 standard_causal_output=self._cute_flash_standard_causal_output,
                 tmem_rowmax_compatible=self._cute_flash_tmem_rowmax_compatible,
                 causal_resident_compatible=self._cute_flash_causal_resident_compatible,
@@ -2201,6 +2567,7 @@ class ConfigSpec:
             flex_trivial_walk=self._cute_flash_flex_trivial_walk,
             small_biased_candidate=self._cute_flash_small_biased_candidate,
             standard_dense_output=self._cute_flash_standard_dense_output,
+            dense_lse_output=self._cute_flash_dense_lse_output,
             standard_causal_output=self._cute_flash_standard_causal_output,
             tmem_rowmax_compatible=self._cute_flash_tmem_rowmax_compatible,
             causal_resident_compatible=self._cute_flash_causal_resident_compatible,
@@ -2726,6 +3093,7 @@ class ConfigSpec:
         requires_ws_overlap: bool = False,
         small_biased_candidate: bool = False,
         standard_dense_output: bool = False,
+        dense_lse_output: bool = False,
         standard_causal_output: bool = False,
         tmem_rowmax_compatible: bool | None = None,
         causal_resident_compatible: bool = False,
@@ -2753,6 +3121,11 @@ class ConfigSpec:
         self.cute_attention_generic_fallback_enabled = False
         self._cute_attention_generic_fallback_block_size_targets = {}
         self.cute_flash_search_enabled = True
+        # The pipeline family picks the flash body (the alternating-warpgroup
+        # single tile vs the two-tile pair, the 2-CTA cluster, ...; the Q
+        # tiles per CTA follow from it); the bodies' energy per call differs,
+        # so the sustained clock of the final selection's windows does too.
+        self.final_selection_family_keys = (FLASH_PIPELINE_FAMILY_KEY,)
         self._cute_flash_device_sm_count = device_sm_count
         self._cute_flash_fragments_cache.clear()
         self._cute_flash_fragments_env_fingerprint = None
@@ -2771,6 +3144,7 @@ class ConfigSpec:
         self._cute_flash_has_list_walk = has_list_walk
         self._cute_flash_small_biased_candidate = small_biased_candidate
         self._cute_flash_standard_dense_output = standard_dense_output
+        self._cute_flash_dense_lse_output = dense_lse_output
         self._cute_flash_standard_causal_output = standard_causal_output
         self._cute_flash_causal_resident_compatible = causal_resident_compatible
         self._cute_flash_tmem_rowmax_compatible = (
@@ -2798,8 +3172,10 @@ class ConfigSpec:
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
-            spec.autotuner_min = target
-            spec.max_size = target
+            spec.pin_structurally(
+                target,
+                reason="the CuTe fused flash-attention forward (backend 'cute')",
+            )
 
     def enable_cute_flash_gated_search(
         self,
@@ -2814,15 +3190,28 @@ class ConfigSpec:
         kv_stage_choices_by_tile: Mapping[tuple[int, int], Sequence[int]] | None = None,
         q_block_id: int | None = None,
         q_tile_choices: Sequence[int] = (128,),
+        row_warp_choices_by_tile: Mapping[tuple[int, int], Sequence[int]] | None = None,
+        row_stage_choices: Mapping[tuple[int, int, int], Sequence[int]] | None = None,
+        row_seed_programs: int | None = None,
     ) -> None:
         """Enable the gated (softmax-free) fused attention surface.
 
-        Restricts the query block size to the fused body's row tiles (128, or
-        also 64) and the KV block size to its tile widths (the detector fires
-        only there) and exposes the K/V TMA ring depth and the number of gate
-        warpgroups.
+        Restricts the query block size to the gated bodies' row tiles (128 or
+        64 for the fused tcgen05 body; 16 or 32 for the register-MMA row
+        programs, ``row_warp_choices_by_tile``) and the KV block size to their
+        tile widths (the detector fires only there) and exposes the K/V ring
+        depth, the number of gate warpgroups (fused body) and the warp count
+        (row programs).
         """
         self.cute_flash_gated_search_enabled = True
+        self._cute_flash_gated_row_warp_choices_by_tile = {
+            tile: tuple(warps)
+            for tile, warps in (row_warp_choices_by_tile or {}).items()
+        }
+        self._cute_flash_gated_row_stage_choices = {
+            key: tuple(stages) for key, stages in (row_stage_choices or {}).items()
+        }
+        self._cute_flash_gated_row_seed_programs = row_seed_programs
         self._cute_flash_gated_block_size_targets = dict(block_size_targets)
         self._cute_flash_gated_kv_block_id = kv_block_id
         self._cute_flash_gated_q_block_id = q_block_id
@@ -2903,14 +3292,38 @@ class ConfigSpec:
         if not self.cute_flash_gated_search_enabled:
             return []
         from .._compiler.cute.cute_flash_gated import gated_seed_configs
+        from .._compiler.cute.cute_flash_gated_row_mma import gated_row_seed_configs
 
-        return gated_seed_configs(
-            self._cute_flash_gated_block_size_lists(),
+        tiles = self._cute_flash_gated_tiles()
+        block_size_lists = self._cute_flash_gated_block_size_lists()
+        row_tiles = self._cute_flash_gated_row_warp_choices_by_tile
+        fused = [
+            (sizes, tile)
+            for sizes, tile in zip(block_size_lists, tiles, strict=True)
+            if tile not in row_tiles
+        ]
+        rows = [
+            (sizes, tile)
+            for sizes, tile in zip(block_size_lists, tiles, strict=True)
+            if tile in row_tiles
+        ]
+        seeds = gated_seed_configs(
+            [sizes for sizes, _ in fused],
             self._cute_flash_gated_kv_stage_choices,
             self._cute_flash_gated_kv_stage_default,
-            tiles=self._cute_flash_gated_tiles(),
+            tiles=[tile for _, tile in fused],
             kv_stage_choices_by_tile=self._cute_flash_gated_kv_stage_choices_by_tile,
         )
+        seeds.extend(
+            gated_row_seed_configs(
+                [sizes for sizes, _ in rows],
+                tiles=[tile for _, tile in rows],
+                warp_choices_by_tile=row_tiles,
+                stage_choices=self._cute_flash_gated_row_stage_choices,
+                programs=self._cute_flash_gated_row_seed_programs,
+            )
+        )
+        return seeds
 
     def _cute_flash_gated_kv_tile(self, config: dict[str, object]) -> int:
         """The KV tile width of a config on the gated surface."""
@@ -2933,6 +3346,119 @@ class ConfigSpec:
         assert isinstance(q_tile, int)
         return q_tile
 
+    def _normalize_cute_flash_bwd(self, config: dict[str, object]) -> None:
+        """The flex backward's 2-CTA family (``cute_flash_bwd_two_cta`` = 1)
+        has no persistent walk, statistics MMAs, dS^T-through-TMEM dK or
+        staged aux tables: those knobs read 0 under it, so a config that
+        sets them spells the same kernel as one that does not (one autotune
+        identity, no inert combinations in the search). The pair's step
+        table is its own (``flex_bwd_two_cta_table_steps``): a
+        ``cute_flash_bwd_table_steps`` cap at or above its automatic table
+        renders that table, so it reads 0 (the search's caps are the 1-CTA
+        kernel's, mostly far above the pair's 64-128 steps). Where the pair
+        kernel is not legal the knob renders the 1-CTA kernel, whose knobs
+        all apply: the knob itself reads 0 there.
+
+        The dense surface's register-MMA row family (``cute_flash_bwd_family``
+        = "row_mma") is legalized first: its three row knobs read their
+        defaults off the family, and an illegal triple on it moves to the
+        nearest legal one or back to the tcgen05 family (see
+        ``cute_flash_bwd_row_mma.flash_bwd_row_legalize``)."""
+        if self.cute_flash_bwd_search_enabled and not self._cute_flash_bwd_flex:
+            flash_bwd_row_legalize(self._cute_flash_bwd_row_facts, config)
+        if not (self.cute_flash_bwd_search_enabled and self._cute_flash_bwd_flex):
+            return
+        # The first-step order knob reads "auto" wherever it has no effect
+        # (the alias_s and pair plans, the 2-CTA family): one identity.
+        if (
+            not self._cute_flash_bwd_s_first_allowed
+            or config.get("cute_flash_bwd_two_cta") == 1
+        ) and "cute_flash_bwd_s_first" in config:
+            config["cute_flash_bwd_s_first"] = "auto"
+        # A second K / V slot serves the persistent walk alone (a one-tile
+        # CTA loads once), nowhere the storage cannot hold it, and not the
+        # 2-CTA family: it reads 1 there.
+        if (
+            not self._cute_flash_bwd_kv_stage_allowed
+            or config.get("cute_flash_bwd_persistent") != 1
+            or config.get("cute_flash_bwd_two_cta") == 1
+        ) and "cute_flash_bwd_kv_stage" in config:
+            config["cute_flash_bwd_kv_stage"] = 1
+        if config.get("cute_flash_bwd_two_cta") != 1:
+            return
+        if not self._cute_flash_bwd_two_cta_allowed:
+            config["cute_flash_bwd_two_cta"] = 0
+            return
+        for key in (
+            "cute_flash_bwd_persistent",
+            "cute_flash_bwd_stats_mma",
+            "cute_flash_bwd_ds_tmem",
+            "cute_flash_bwd_aux_smem",
+        ):
+            if key in config:
+                config[key] = 0
+        cap = config.get("cute_flash_bwd_table_steps", 0)
+        auto = self._cute_flash_bwd_two_cta_table_steps
+        if isinstance(cap, int) and auto > 0 and cap >= auto:
+            config["cute_flash_bwd_table_steps"] = 0
+        # The pair's register split: the knob's generic default is the 1-CTA
+        # kernel's (FBWD_REG_SPLITS[0]); under the pair it reads as the
+        # pair's first seed split, so a config that pins two_cta without a
+        # split renders the measured kernel (and spells one identity with
+        # the seed).
+        from .._compiler.cute.cute_flash_bwd_flex import FBWD_REG_SPLITS
+
+        if config.get("cute_flash_bwd_regs", FBWD_REG_SPLITS[0]) == FBWD_REG_SPLITS[0]:
+            config["cute_flash_bwd_regs"] = "88/168/88"
+
+    def cute_flash_bwd_seed_configs(self) -> list[helion.Config]:
+        """The flex backward's 2-CTA family as an autotune seed where its
+        kernel is legal: the default config with the pair under each of its
+        two measured register splits (the compute warpgroups spill below 152
+        registers; the MMA and load warps hold their rings at 88 or 104), so
+        a cold search starts from both families instead of finding the pair
+        by chance.
+
+        The dense surface seeds its register-MMA row family on small grids
+        (``cute_flash_bwd_family`` = "row_mma" over the default row knobs:
+        see ``cute_flash_bwd_row_mma``) for the same reason, and, where the
+        search flips ``cute_pdl``, the same seed as a programmatic dependent
+        (the small-grid backward is one kernel of a chain whose launch the
+        knob overlaps with the preprocess kernel ahead of it)."""
+        if not (self.backend_name == "cute" and self.cute_flash_bwd_search_enabled):
+            return []
+        row_facts = self._cute_flash_bwd_row_facts
+        if (
+            not self._cute_flash_bwd_flex
+            and row_facts is not None
+            and flash_bwd_row_search_grid(row_facts)
+        ):
+            seed = self.default_config()
+            seed.config[FLASH_BWD_FAMILY_KEY] = FLASH_BWD_ROW_FAMILY
+            self.normalize(seed, _fix_invalid=True)
+            if seed.config.get(FLASH_BWD_FAMILY_KEY) != FLASH_BWD_ROW_FAMILY:
+                return []
+            seeds = [seed]
+            if self.supports_config_key("cute_pdl") and self._cute_pdl_searched():
+                dependent = helion.Config.from_dict({**seed.config, "cute_pdl": True})
+                self.normalize(dependent, _fix_invalid=True)
+                seeds.append(dependent)
+            return seeds
+        if not (self._cute_flash_bwd_flex and self._cute_flash_bwd_two_cta_allowed):
+            return []
+        # Two register splits: the cold autotunes of the 32K / 128K causal
+        # cells pick 88/168/88 (the dQ-reduce and load warps at 88, the
+        # compute warpgroups at 168), 0.6-1.5% ahead of 104/152/104 on the
+        # 32K proxies; both keep the compute warpgroups free of spills.
+        seeds = []
+        for regs in ("88/168/88", "104/152/104"):
+            seed = self.default_config()
+            seed.config["cute_flash_bwd_two_cta"] = 1
+            seed.config["cute_flash_bwd_regs"] = regs
+            self.normalize(seed, _fix_invalid=True)
+            seeds.append(seed)
+        return seeds
+
     def _normalize_cute_flash_gated(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -2940,10 +3466,11 @@ class ConfigSpec:
         if not self.cute_flash_gated_search_enabled:
             return
         block_size_lists = self._cute_flash_gated_block_size_lists()
-        block_size_targets = block_size_lists[0]
         if fix_invalid:
             if config.get("block_sizes") not in block_size_lists:
-                config["block_sizes"] = list(block_size_targets)
+                config["block_sizes"] = self._cute_flash_gated_nearest_block_sizes(
+                    config.get("block_sizes"), block_size_lists
+                )
             config["pid_type"] = "flat"
             self._normalize_cute_flash_default_sequence(config, "l2_groupings", 1)
             self._normalize_cute_flash_default_sequence(config, "num_threads", 0)
@@ -2960,12 +3487,21 @@ class ConfigSpec:
             return
         from .._compiler.cute.cute_flash_gated import gated_kv_stage_default
 
+        kv_tile = self._cute_flash_gated_kv_tile(config)
+        tile = (self._cute_flash_gated_q_tile(config), kv_tile)
+        row_warp_choices = self._cute_flash_gated_row_warp_choices_by_tile.get(tile)
+        if row_warp_choices is not None:
+            # A register-MMA row-program tile: its warp count and ring depth
+            # are validated by the row normalizer; the gate warpgroup count
+            # has no consumer there (one identity).
+            self._normalize_cute_flash_gated_row(
+                config, tile, row_warp_choices, fix_invalid=fix_invalid
+            )
+            return
         # The legal ring depths depend on the tile shape (shared memory), so
         # validate against the config's own tile.
-        kv_tile = self._cute_flash_gated_kv_tile(config)
         choices = self._cute_flash_gated_kv_stage_choices_by_tile.get(
-            (self._cute_flash_gated_q_tile(config), kv_tile),
-            self._cute_flash_gated_kv_stage_choices,
+            tile, self._cute_flash_gated_kv_stage_choices
         )
         stage_default = (
             self._cute_flash_gated_kv_stage_default
@@ -3007,6 +3543,99 @@ class ConfigSpec:
                     f"for block_sizes {config.get('block_sizes')!r}, got {wgs!r}"
                 )
             config[FLASH_GATE_WARPGROUPS_KEY] = wg_default
+        self._normalize_cute_flash_gated_row(
+            config, tile, None, fix_invalid=fix_invalid
+        )
+
+    def _cute_flash_gated_nearest_block_sizes(
+        self, value: object, block_size_lists: list[list[int]]
+    ) -> list[int]:
+        """The legal gated tile nearest a config's block sizes: the same
+        query tile with the closest legal KV tile when the query tile is
+        legal, else the default tile."""
+        kv_block_id = self._cute_flash_gated_kv_block_id
+        assert kv_block_id is not None
+        kv_index = self.block_sizes.block_id_to_index(kv_block_id)
+        if isinstance(value, (list, tuple)) and len(value) == len(block_size_lists[0]):
+            kv_value = value[kv_index]
+            same_q = [
+                sizes
+                for sizes in block_size_lists
+                if all(
+                    a == b
+                    for i, (a, b) in enumerate(zip(sizes, value, strict=True))
+                    if i != kv_index
+                )
+            ]
+            if same_q and isinstance(kv_value, int):
+                return list(
+                    min(same_q, key=lambda sizes: abs(sizes[kv_index] - kv_value))
+                )
+        return list(block_size_lists[0])
+
+    def _normalize_cute_flash_gated_row(
+        self,
+        config: dict[str, object],
+        tile: tuple[int, int],
+        warp_choices: tuple[int, ...] | None,
+        *,
+        fix_invalid: bool,
+    ) -> None:
+        """The row programs' knob (``cute_flash_gated_row_warps``) and their
+        ring depths, which depend on the warp count; at a fused tile
+        (``warp_choices`` None) the knob reads its default (one identity).
+        At a row tile the gate warpgroup count reads its default."""
+        from .._compiler.cute.cute_flash_gated import FLASH_GATE_WARPGROUPS_KEY
+        from .._compiler.cute.cute_flash_gated_row_mma import GATED_ROW_WARPS_KEY
+        from .._compiler.cute.cute_flash_gated_row_mma import gated_row_kv_stage_default
+        from .._compiler.cute.cute_flash_gated_row_mma import gated_row_warps_default
+
+        if not self._cute_flash_gated_row_warp_choices_by_tile:
+            config.pop(GATED_ROW_WARPS_KEY, None)
+            return
+        if warp_choices is not None:
+            config[FLASH_GATE_WARPGROUPS_KEY] = (
+                self._cute_flash_gated_gate_warpgroup_default
+            )
+        all_warps = tuple(
+            sorted(
+                {
+                    w
+                    for warps in self._cute_flash_gated_row_warp_choices_by_tile.values()
+                    for w in warps
+                }
+            )
+        )
+        if warp_choices is None:
+            config[GATED_ROW_WARPS_KEY] = gated_row_warps_default(all_warps)
+            return
+        default_warps = gated_row_warps_default(warp_choices)
+        warps = config.get(GATED_ROW_WARPS_KEY)
+        if warps is None:
+            warps = default_warps
+        elif warps not in warp_choices:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{GATED_ROW_WARPS_KEY} must be one of {list(warp_choices)!r} "
+                    f"for block_sizes {config.get('block_sizes')!r}, got {warps!r}"
+                )
+            warps = default_warps
+        config[GATED_ROW_WARPS_KEY] = warps
+        assert isinstance(warps, int)
+        stages = self._cute_flash_gated_row_stage_choices.get((*tile, warps), ())
+        if not stages:
+            return
+        stage = config.get(FLASH_KV_STAGE_KEY)
+        if stage is None:
+            config[FLASH_KV_STAGE_KEY] = gated_row_kv_stage_default(stages)
+        elif stage not in stages:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{FLASH_KV_STAGE_KEY} must be one of {list(stages)!r} for "
+                    f"block_sizes {config.get('block_sizes')!r} at {warps} warps, "
+                    f"got {stage!r}"
+                )
+            config[FLASH_KV_STAGE_KEY] = gated_row_kv_stage_default(stages)
 
     def enable_cute_chunk_recurrence_search(self, *, preferred_partitions: int) -> None:
         """Expose the exact BT16 recurrence schedule as CuTe search knobs."""
@@ -3095,6 +3724,37 @@ class ConfigSpec:
             choices=tuple(group_choices)
         )
 
+    def enable_cute_register_subblocks_search(
+        self, facts: RegisterSubblockFacts
+    ) -> None:
+        """Expose the register sub-block family and its knobs.
+
+        ``off`` leads the mode domain so a config that leaves the knob out
+        keeps the ordinary lowering; the seed heuristic (and, on validated
+        targets, the promoted default) selects ``on``.  A knob without a
+        subject (no prefetchable second item, no static mask, no window
+        written twice) stays off the surface and is pinned by ``normalize``.
+        """
+        self.cute_register_subblocks_facts = facts
+        self.cute_register_subblocks = EnumFragment(choices=RSB_MODES)
+        self.cute_register_subblocks_warps = EnumFragment(choices=RSB_WARP_CHOICES)
+        self.cute_register_subblocks_prefetch = (
+            EnumFragment(choices=RSB_PREFETCH_CHOICES)
+            if facts.prefetch_subject
+            else None
+        )
+        self.cute_register_subblocks_mask = (
+            EnumFragment(choices=RSB_MASK_CHOICES) if facts.has_static_mask else None
+        )
+        self.cute_register_subblocks_colside = (
+            EnumFragment(choices=RSB_COLSIDE_CHOICES)
+            if facts.multi_write_windows
+            else None
+        )
+        self.cute_register_subblocks_roll = (
+            EnumFragment(choices=RSB_ROLL_CHOICES) if facts.roll_subject else None
+        )
+
     def enable_cute_mma_dag_search(self, facts: CuteMmaDagFacts) -> None:
         """Expose the warp-MMA recurrence mode, warp count and stage depth.
 
@@ -3103,10 +3763,38 @@ class ConfigSpec:
         targets, the promoted default) selects ``warp``.
         """
         self.cute_mma_dag_facts = facts
+        # A ragged root axis below its MMA atom (M = 8 under the 16-row atom)
+        # is computed at the atom on the warp path, and the seeds walk that
+        # tile: its search ceiling, the extent where the frontend left it,
+        # admits the atom.  The default block size stays clamped to the
+        # extent (``BlockSizeSpec._fragment``); no other block widens.
+        block_ids = self.block_sizes.valid_block_ids()
+        for block_id, atom in mma_dag_ragged_ceilings(facts).items():
+            if block_id in block_ids:
+                self.block_sizes.block_id_lookup(block_id).allow_overshoot(atom)
         modes = MMA_DAG_MODES
         if facts.tcgen05 is not None:
             modes = (*modes, MMA_DAG_TCGEN05)
-        self.cute_mma_dag = EnumFragment(choices=modes)
+        search = modes
+        if facts.split_axis >= 0 and MMA_DAG_TCGEN05 in modes:
+            # A full-slice fragment program: its row reductions over the
+            # whole axis have the region renderer's lowering, while the SIMT
+            # fallback's lane-restore pass declines most tilings (50 of 55
+            # random "off" configs at 2048^3 and 49 of 56 at 512x1024x1024
+            # failed to compile, every tensor-memory config compiled), so
+            # the search samples the tensor-memory mode; "off" stays a legal
+            # value (the repair fallback, explicit configs).  The warp mode
+            # holds the whole axis in one CTA: it is sampled only when some
+            # tile of its seed ladder runs the program (a 2048-column
+            # fragment exceeds its register budget at every tiling, and a
+            # random warp draw would only be repaired away).
+            skipped = {MMA_DAG_OFF}
+            if not mma_dag_seed_configs(facts):
+                skipped.add(MMA_DAG_WARP)
+            search = tuple(mode for mode in modes if mode not in skipped)
+        self.cute_mma_dag = EnumFragment(
+            choices=modes, search_choices=search if search != modes else None
+        )
         self.cute_mma_dag_warps = EnumFragment(
             choices=(
                 MMA_DAG_DEFAULT_WARPS,
@@ -3123,6 +3811,172 @@ class ConfigSpec:
         self.cute_mma_dag_exchange = EnumFragment(choices=MMA_DAG_EXCHANGE_CHOICES)
         self.cute_mma_dag_pass_warps = EnumFragment(choices=MMA_DAG_PASS_WARPS_CHOICES)
         self.cute_mma_dag_loads = EnumFragment(choices=MMA_DAG_LOADS_CHOICES)
+        if facts.aux_candidates:
+            self.cute_mma_dag_aux = EnumFragment(choices=MMA_DAG_AUX_CHOICES)
+        self.cute_mma_dag_derived = EnumFragment(choices=MMA_DAG_DERIVED_CHOICES)
+        # ``streamed`` is offered only where a root block without derived
+        # values stores fragments; elsewhere the knob keeps row / split.
+        self.cute_mma_dag_epilogue = EnumFragment(
+            choices=MMA_DAG_EPILOGUE_CHOICES
+            if epilogue_knob_admitted(facts)
+            else tuple(
+                choice
+                for choice in MMA_DAG_EPILOGUE_CHOICES
+                if choice != MMA_DAG_EPILOGUE_STREAMED
+            )
+        )
+        self.cute_mma_dag_lookahead = EnumFragment(choices=MMA_DAG_LOOKAHEAD_CHOICES)
+        if facts.tcgen05 is not None and (
+            not facts.tcgen05.regions or facts.tcgen05.persistent_reason is None
+        ):
+            # The persistent launch: the single-loop renderer's tile loop,
+            # or a region program's (``cute_mma_dag_tcgen05_regions``;
+            # ``persistent_reason`` names the programs it excludes).
+            self.cute_mma_dag_persistent = EnumFragment(
+                choices=MMA_DAG_PERSISTENT_CHOICES
+            )
+        if (
+            facts.tcgen05 is not None
+            and facts.tcgen05.regions
+            and facts.split_axis >= 0
+        ):
+            # The split count: a portable cluster's (<= 8), and the fixup
+            # grid's wider ones where the program admits the fixup form.
+            admitted = fixup_admitted(facts)
+            self.cute_mma_dag_cluster = EnumFragment(
+                choices=tuple(
+                    choice
+                    for choice in MMA_DAG_CLUSTER_CHOICES
+                    if admitted or choice <= MMA_DAG_CLUSTER_MAX
+                )
+            )
+            self.cute_mma_dag_split = (
+                EnumFragment(choices=MMA_DAG_SPLIT_CHOICES) if admitted else None
+            )
+
+    def _normalize_cute_register_subblocks(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """Validate the register sub-block knobs against the facts (tile,
+        warps, register estimate) and pin the knobs the replaced body
+        ignores to one identity."""
+        facts = self.cute_register_subblocks_facts
+        assert facts is not None
+        mode = config.setdefault(RSB_KEY, RSB_MODE_OFF)
+        if mode not in RSB_MODES or type(mode) is not str:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{RSB_KEY} must be one of {RSB_MODES!r}, got {mode!r}"
+                )
+            config[RSB_KEY] = mode = RSB_MODE_OFF
+        defaults: dict[str, object] = {
+            RSB_WARPS_KEY: RSB_WARP_CHOICES[0],
+            RSB_PREFETCH_KEY: RSB_PREFETCH_CHOICES[0],
+            RSB_MASK_KEY: RSB_MASK_SELECT,
+            RSB_COLSIDE_KEY: RSB_COLSIDE_RMW,
+            RSB_ROLL_KEY: RSB_ROLL_UNROLLED,
+        }
+        fragments = {
+            RSB_WARPS_KEY: self.cute_register_subblocks_warps,
+            RSB_PREFETCH_KEY: self.cute_register_subblocks_prefetch,
+            RSB_MASK_KEY: self.cute_register_subblocks_mask,
+            RSB_COLSIDE_KEY: self.cute_register_subblocks_colside,
+            RSB_ROLL_KEY: self.cute_register_subblocks_roll,
+        }
+        if mode == RSB_MODE_OFF:
+            config.update(defaults)
+            return
+        for key, fragment in fragments.items():
+            value = config.setdefault(key, defaults[key])
+            allowed = (defaults[key],) if fragment is None else fragment.choices
+            if value not in allowed or type(value) is not type(defaults[key]):
+                if not fix_invalid:
+                    raise InvalidConfig(
+                        f"{key} must be one of {allowed!r}, got {value!r}"
+                    )
+                config[key] = defaults[key]
+        block_sizes = config.get("block_sizes")
+        tile_index = None
+        bk: object = None
+        if facts.tile_block_id is not None:
+            tile_index = self.block_sizes.block_id_to_index(facts.tile_block_id)
+            assert isinstance(block_sizes, list)
+            bk = block_sizes[tile_index]
+        reason = register_subblocks_config_reason(
+            facts,
+            bk=bk,
+            warps=config[RSB_WARPS_KEY],
+            prefetch=config[RSB_PREFETCH_KEY],
+            mask=config[RSB_MASK_KEY],
+            colside=config[RSB_COLSIDE_KEY],
+            roll=config[RSB_ROLL_KEY],
+        )
+        if reason is not None:
+            if not fix_invalid:
+                raise InvalidConfig(f"{RSB_KEY}={mode!r}: {reason}")
+            repaired = register_subblocks_repair(
+                facts,
+                bk=bk,
+                warps=config[RSB_WARPS_KEY],
+                prefetch=config[RSB_PREFETCH_KEY],
+                mask=config[RSB_MASK_KEY],
+                colside=config[RSB_COLSIDE_KEY],
+                roll=config[RSB_ROLL_KEY],
+            )
+            if repaired is None:
+                config[RSB_KEY] = RSB_MODE_OFF
+                config.update(defaults)
+                return
+            for key in defaults:
+                config[key] = repaired[key]
+            if tile_index is not None:
+                assert isinstance(block_sizes, list)
+                block_sizes[tile_index] = repaired["bk"]
+        # The replaced body reads no fragment-route knob: pin them so the
+        # search does not sample inert variations of one kernel.
+        for key in (
+            "cute_fp32_dot",
+            "cute_fragment_padded_rows",
+            "cute_fragment_unrolled_loops",
+            "cute_fragment_vector_io",
+            "cute_fragment_batched_loads",
+            "cute_fragment_split_k",
+            "cute_fragment_slab_loads",
+            "cute_fragment_threads",
+            "cute_fragment_mma_rows",
+            "cute_fragment_register_loads",
+            "cute_fragment_producer_cache",
+            "cute_fragment_warp_scan",
+            "cute_fragment_scan",
+            "cute_fragment_reduction",
+            "cute_fragment_pure_producer_regions",
+            "cute_fragment_warp_results",
+            "cute_fragment_warp_producer_regions",
+            "cute_fragment_published_scalars",
+            "cute_fragment_register_producers",
+            "cute_fragment_register_snapshots",
+            "cute_fragment_private_scalar_loops",
+            "cute_fragment_packet_loads",
+            "cute_fragment_bounded_gather",
+        ):
+            config.pop(key, None)
+        for key, identity in (
+            ("cute_vector_widths", 1),
+            ("cute_lane_layouts", "blocked"),
+            ("cute_reduction_reloads", "auto"),
+            ("load_eviction_policies", ""),
+        ):
+            value = config.get(key)
+            if isinstance(value, list):
+                config[key] = [identity] * len(value)
+        orders = config.get("loop_orders")
+        if isinstance(orders, list):
+            config["loop_orders"] = [
+                list(range(len(order))) if isinstance(order, list) else order
+                for order in orders
+            ]
+        if "cute_store_policy" in config:
+            config["cute_store_policy"] = "default"
 
     def _normalize_cute_mma_dag(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -3142,8 +3996,21 @@ class ConfigSpec:
             (MMA_DAG_EXCHANGE_KEY, self.cute_mma_dag_exchange),
             (MMA_DAG_PASS_WARPS_KEY, self.cute_mma_dag_pass_warps),
             (MMA_DAG_LOADS_KEY, self.cute_mma_dag_loads),
+            (MMA_DAG_AUX_KEY, self.cute_mma_dag_aux),
+            (MMA_DAG_DERIVED_KEY, self.cute_mma_dag_derived),
+            (MMA_DAG_EPILOGUE_KEY, self.cute_mma_dag_epilogue),
+            (MMA_DAG_LOOKAHEAD_KEY, self.cute_mma_dag_lookahead),
         ):
-            assert fragment is not None
+            if fragment is None:
+                # The aux / epilogue knob has no subject here: inert, no
+                # choices.
+                assert key in (MMA_DAG_AUX_KEY, MMA_DAG_EPILOGUE_KEY)
+                config[key] = (
+                    MMA_DAG_AUX_CHOICES[0]
+                    if key == MMA_DAG_AUX_KEY
+                    else MMA_DAG_EPILOGUE_ROW
+                )
+                continue
             value = config.setdefault(key, fragment.default())
             if value not in fragment.choices or type(value) is bool:
                 if fix_invalid:
@@ -3152,6 +4019,66 @@ class ConfigSpec:
                     raise InvalidConfig(
                         f"{key} must be one of {fragment.choices!r}, got {value!r}"
                     )
+        persistent_fragment = self.cute_mma_dag_persistent
+        persistent = config.setdefault(MMA_DAG_PERSISTENT_KEY, 0)
+        allowed = (0,) if persistent_fragment is None else persistent_fragment.choices
+        if persistent not in allowed or type(persistent) is not int:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_PERSISTENT_KEY} must be one of {allowed!r}, got {persistent!r}"
+                )
+            config[MMA_DAG_PERSISTENT_KEY] = 0
+        if config[MMA_DAG_KEY] != MMA_DAG_TCGEN05 and config[MMA_DAG_PERSISTENT_KEY]:
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_PERSISTENT_KEY} needs the tcgen05 mode")
+            config[MMA_DAG_PERSISTENT_KEY] = 0
+        cluster_fragment = self.cute_mma_dag_cluster
+        cluster = config.setdefault(MMA_DAG_CLUSTER_KEY, 1)
+        allowed = (1,) if cluster_fragment is None else cluster_fragment.choices
+        if cluster not in allowed or type(cluster) is not int:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_CLUSTER_KEY} must be one of {allowed!r}, got {cluster!r}"
+                )
+            config[MMA_DAG_CLUSTER_KEY] = 1
+        if config[MMA_DAG_KEY] != MMA_DAG_TCGEN05 and config[MMA_DAG_CLUSTER_KEY] != 1:
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_CLUSTER_KEY} needs the tcgen05 mode")
+            config[MMA_DAG_CLUSTER_KEY] = 1
+        split_fragment = self.cute_mma_dag_split
+        split = config.setdefault(MMA_DAG_SPLIT_KEY, MMA_DAG_SPLIT_CLUSTER)
+        split_allowed = (
+            (MMA_DAG_SPLIT_CLUSTER,)
+            if split_fragment is None
+            else split_fragment.choices
+        )
+        if split not in split_allowed:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_SPLIT_KEY} must be one of {split_allowed!r}, got {split!r}"
+                )
+            config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
+        if (
+            config[MMA_DAG_SPLIT_KEY] == MMA_DAG_SPLIT_CLUSTER
+            and cast("int", config[MMA_DAG_CLUSTER_KEY]) > MMA_DAG_CLUSTER_MAX
+        ):
+            # A portable thread-block cluster holds eight CTAs: a wider split
+            # combines its rows through the fixup grid (offered only where
+            # the program admits it; the cluster choices stop at eight
+            # elsewhere, so this is the admitted case).
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_CLUSTER_KEY}={config[MMA_DAG_CLUSTER_KEY]} needs "
+                    f"{MMA_DAG_SPLIT_KEY}={MMA_DAG_SPLIT_FIXUP!r} (a portable cluster "
+                    f"holds at most {MMA_DAG_CLUSTER_MAX} CTAs)"
+                )
+            config[MMA_DAG_SPLIT_KEY] = (
+                MMA_DAG_SPLIT_FIXUP
+                if split_fragment is not None
+                else MMA_DAG_SPLIT_CLUSTER
+            )
+            if split_fragment is None:
+                config[MMA_DAG_CLUSTER_KEY] = 1
         if config[MMA_DAG_KEY] == MMA_DAG_OFF:
             # The warp count, stage depth and data routes are inert without
             # the mode.
@@ -3161,7 +4088,23 @@ class ConfigSpec:
             config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
             config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
             config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+            config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
+            config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+            config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+            config[MMA_DAG_PERSISTENT_KEY] = 0
+            config[MMA_DAG_CLUSTER_KEY] = 1
+            config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
             return
+        # The derived route has a subject only where some dot operand is a
+        # pass chain, and its pass reads the chain's tiles from the ring:
+        # the tensor-memory mode's ``lane`` loads leave them to the lanes.
+        if not facts.pass_chains or (
+            config[MMA_DAG_KEY] == MMA_DAG_TCGEN05
+            and config[MMA_DAG_LOADS_KEY] != MMA_DAG_LOADS_TMA
+        ):
+            config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
+        derived = cast("str", config[MMA_DAG_DERIVED_KEY])
         block_sizes = config.get("block_sizes")
         assert isinstance(block_sizes, list)
         indices = {
@@ -3174,12 +4117,211 @@ class ConfigSpec:
         for axis in facts.axes:
             if axis.kind == AXIS_LEAD and axis.block_id in indices:
                 block_sizes[indices[axis.block_id]] = 1
-        sizes_by_block = {
+        sizes_by_block: dict[int, object] = {
             block_id: block_sizes[index] for block_id, index in indices.items()
         }
         warps, stages = config[MMA_DAG_WARPS_KEY], config[MMA_DAG_STAGES_KEY]
         mode = cast("str", config[MMA_DAG_KEY])
-        reason = mma_dag_config_reason(facts, sizes_by_block, warps, stages, mode)
+        reason = apply_mma_dag_cluster(
+            facts,
+            sizes_by_block,
+            config[MMA_DAG_CLUSTER_KEY],
+            config[MMA_DAG_SPLIT_KEY],
+        )
+        if reason is not None:
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_KEY}={mode!r}: {reason}")
+            config[MMA_DAG_CLUSTER_KEY] = 1
+        # The MMA warp (``cute_mma_dag_pass_warps='mma'``) has a subject
+        # only in the tensor-memory region programs with a streamed K loop
+        # whose operand tiles take a pass (a pass chain's under the pass
+        # route); elsewhere the knob is inert and pinned off here, ahead of
+        # the tile check (the warp's barriers count in the shared memory).
+        # (``on`` is pinned below, once the tile is settled.)
+        if config[MMA_DAG_PASS_WARPS_KEY] == MMA_DAG_PASS_WARPS_MMA and (
+            mma_dag_pass_warps_reason(
+                facts,
+                cast("int", warps),
+                cast("int", stages),
+                mode,
+                MMA_DAG_PASS_WARPS_MMA,
+                derived,
+            )
+            is not None
+        ):
+            config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
+        pass_warps = cast("str", config[MMA_DAG_PASS_WARPS_KEY])
+        # The split epilogue has a subject only in the tensor-memory region
+        # programs without reductions, at eight warps; elsewhere the knob is
+        # inert and pinned to the row layout.
+        if (
+            config[MMA_DAG_EPILOGUE_KEY] == MMA_DAG_EPILOGUE_SPLIT
+            and mma_dag_epilogue_reason(facts, warps, mode) is not None
+        ):
+            config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+        epilogue = cast("str", config[MMA_DAG_EPILOGUE_KEY])
+        # The lookahead schedule has a subject only in the region programs
+        # whose one ring loop is a fresh dot and the derived values over it.
+        if (
+            config[MMA_DAG_LOOKAHEAD_KEY] == MMA_DAG_LOOKAHEAD_ON
+            and mma_dag_lookahead_reason(facts, stages, mode) is not None
+        ):
+            config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+        lookahead = cast("str", config[MMA_DAG_LOOKAHEAD_KEY])
+        # The aux ring has a subject only in the warp mode with a side load
+        # varying with an innermost ring loop of the bound inputs; elsewhere
+        # the knob is inert and pinned to the register prefetch.
+        if (
+            config[MMA_DAG_AUX_KEY] == MMA_DAG_AUX_RING
+            and mma_dag_aux_reason(facts, mode) is not None
+        ):
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+        aux = cast("str", config[MMA_DAG_AUX_KEY])
+        # The persistent launch has a subject only in the tensor-memory mode
+        # (every single-loop program; the region programs whose root loops
+        # have static trips, under the program-order schedule); elsewhere
+        # the knob is inert and pinned to one tile per CTA.
+        if (
+            config[MMA_DAG_PERSISTENT_KEY]
+            and mma_dag_persistent_reason(facts, mode, lookahead) is not None
+        ):
+            config[MMA_DAG_PERSISTENT_KEY] = 0
+        persistent = cast("int", config[MMA_DAG_PERSISTENT_KEY])
+        reason = mma_dag_config_reason(
+            facts,
+            sizes_by_block,
+            warps,
+            stages,
+            mode,
+            derived,
+            epilogue=epilogue,
+            lookahead=lookahead,
+            aux=aux,
+            persistent=persistent > 0,
+            pass_warps=pass_warps,
+        )
+        if (
+            reason is not None
+            and pass_warps == MMA_DAG_PASS_WARPS_MMA
+            and mma_dag_config_reason(
+                facts,
+                sizes_by_block,
+                warps,
+                stages,
+                mode,
+                derived,
+                epilogue=epilogue,
+                lookahead=lookahead,
+                aux=aux,
+                persistent=persistent > 0,
+            )
+            is None
+        ):
+            # The MMA warp's barriers overflow the shared memory the chain
+            # schedule fits, or the streamed loops' accumulators live in
+            # registers at this tile: the tile stays, the warp goes.
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_PASS_WARPS_KEY}={pass_warps!r}: {reason}"
+                )
+            pass_warps = config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
+            reason = None
+        if (
+            reason is not None
+            and persistent
+            and mma_dag_config_reason(
+                facts,
+                sizes_by_block,
+                warps,
+                stages,
+                mode,
+                derived,
+                epilogue=epilogue,
+                lookahead=lookahead,
+                aux=aux,
+            )
+            is None
+        ):
+            # The persistent layout (a region program's root items beside
+            # the frames) overflows the shared memory the one-tile layout
+            # fits: the tile stays, the launch goes.
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_PERSISTENT_KEY}={persistent!r}: {reason}"
+                )
+            persistent = config[MMA_DAG_PERSISTENT_KEY] = 0
+            reason = None
+        if (
+            reason is not None
+            and aux == MMA_DAG_AUX_RING
+            and mma_dag_config_reason(
+                facts,
+                sizes_by_block,
+                warps,
+                stages,
+                mode,
+                derived,
+                epilogue=epilogue,
+                lookahead=lookahead,
+            )
+            is None
+        ):
+            # The aux rings overflow the shared memory (or the per-thread
+            # cap) the register prefetch fits: the tile stays, the route goes.
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_AUX_KEY}={aux!r}: {reason}")
+            aux = config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+            reason = None
+        if (
+            reason is not None
+            and lookahead == MMA_DAG_LOOKAHEAD_ON
+            and mma_dag_config_reason(
+                facts, sizes_by_block, warps, stages, mode, derived, epilogue=epilogue
+            )
+            is None
+        ):
+            # The doubled dot slot overflows the tensor memory the program
+            # order fits: the tile stays, the schedule goes.
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_LOOKAHEAD_KEY}={lookahead!r}: {reason}")
+            lookahead = config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+            reason = None
+        if (
+            reason is not None
+            and epilogue == MMA_DAG_EPILOGUE_SPLIT
+            and mma_dag_config_reason(
+                facts, sizes_by_block, warps, stages, mode, derived
+            )
+            is None
+        ):
+            # The split's budget or tensor-memory layout refuses what the
+            # row layout runs: the tile stays, the layout goes (and the
+            # schedule with it).
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_EPILOGUE_KEY}={epilogue!r}: {reason}")
+            epilogue = config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+            lookahead = config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+            reason = None
+        if (
+            reason is not None
+            and derived == MMA_DAG_DERIVED_PASS
+            and mma_dag_config_reason(
+                facts,
+                sizes_by_block,
+                warps,
+                stages,
+                mode,
+                epilogue=epilogue,
+                lookahead=lookahead,
+            )
+            is None
+        ):
+            # The pass route alone (its ring tiles) overflows the shared
+            # memory the exchange route fits: the tile stays, the route goes.
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_DERIVED_KEY}={derived!r}: {reason}")
+            derived = config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
+            reason = None
         if reason is not None:
             if not fix_invalid:
                 raise InvalidConfig(f"{MMA_DAG_KEY}={mode!r}: {reason}")
@@ -3197,36 +4339,125 @@ class ConfigSpec:
                 config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
                 config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
                 config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+                config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+                config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
+                config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+                config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+                config[MMA_DAG_PERSISTENT_KEY] = 0
+                config[MMA_DAG_CLUSTER_KEY] = 1
+                config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
                 return
             new_sizes, config[MMA_DAG_WARPS_KEY], config[MMA_DAG_STAGES_KEY] = repaired
+            # (The repair searched under the row epilogue, in program order,
+            # with the register prefetch, and -- on a region program, whose
+            # persistent layout is larger -- one tile per CTA.)
+            config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+            config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+            if facts.tcgen05 is not None and facts.tcgen05.regions:
+                config[MMA_DAG_PERSISTENT_KEY] = 0
             for block_id, index in indices.items():
                 block_sizes[index] = new_sizes[block_id]
+            # The repaired split axis slice names the split count (1 when
+            # the repair kept the whole axis, or fell back to the warp mode);
+            # beyond a portable cluster it is the fixup grid's.
+            config[MMA_DAG_CLUSTER_KEY] = facts.cluster_of(new_sizes)
+            if cast("int", config[MMA_DAG_CLUSTER_KEY]) > MMA_DAG_CLUSTER_MAX:
+                config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_FIXUP
+            if derived == MMA_DAG_DERIVED_PASS and (
+                mma_dag_config_reason(
+                    facts,
+                    new_sizes,
+                    config[MMA_DAG_WARPS_KEY],
+                    config[MMA_DAG_STAGES_KEY],
+                    cast("str", config[MMA_DAG_KEY]),
+                    derived,
+                )
+                is not None
+            ):
+                # (The repair searched under the exchange route.)
+                config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
+        if config[MMA_DAG_CLUSTER_KEY] == 1:
+            # The whole axis in one CTA: the combine mode has no subject.
+            config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
+        elif (
+            config[MMA_DAG_SPLIT_KEY] == MMA_DAG_SPLIT_FIXUP
+            and apply_mma_dag_cluster(
+                facts,
+                {},
+                config[MMA_DAG_CLUSTER_KEY],
+                MMA_DAG_SPLIT_FIXUP,
+            )
+            is not None
+        ):
+            # The repaired split does not admit the fixup form (a program
+            # with a leading axis or two root axes, or too many tiles): the
+            # cluster form takes a portable count, else the whole axis.
+            if cast("int", config[MMA_DAG_CLUSTER_KEY]) <= MMA_DAG_CLUSTER_MAX:
+                config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
+            else:
+                config[MMA_DAG_CLUSTER_KEY] = 1
+                config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
         # Knobs without a subject are inert: no fragment read straight as an
         # A operand (only the shared tile can feed a transposed one), no loop
-        # snapshot to stage.
-        if not facts.identity_candidates:
+        # snapshot to stage, no device loop whose ring the stage depth sizes.
+        # (The tensor-memory region programs give the exchange knob a second
+        # subject: the fp32 A operands read from tensor memory and the
+        # ``X @ X`` dots sharing one tile.)
+        tcgen05_exchange = (
+            config[MMA_DAG_KEY] == MMA_DAG_TCGEN05
+            and facts.tcgen05 is not None
+            and facts.tcgen05.tmem_operands > 0
+        )
+        if not facts.identity_candidates and not tcgen05_exchange:
             config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
         if not facts.staging:
             config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
-        if config[MMA_DAG_PASS_WARPS_KEY] == MMA_DAG_PASS_WARPS_ON and (
+        if not facts.aux_candidates:
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+        if not facts.loops:
+            config[MMA_DAG_STAGES_KEY] = MMA_DAG_DEFAULT_STAGES
+        if config[MMA_DAG_PASS_WARPS_KEY] != MMA_DAG_PASS_WARPS_OFF and (
             mma_dag_pass_warps_reason(
                 facts,
                 cast("int", config[MMA_DAG_WARPS_KEY]),
                 cast("int", config[MMA_DAG_STAGES_KEY]),
                 cast("str", config[MMA_DAG_KEY]),
+                cast("str", config[MMA_DAG_PASS_WARPS_KEY]),
+                cast("str", config[MMA_DAG_DERIVED_KEY]),
             )
             is not None
         ):
             config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
-        # The loads route has a subject only in the tensor-memory region
-        # programs whose derived values read tiles.
-        if config[MMA_DAG_KEY] != MMA_DAG_TCGEN05 or not (
-            facts.tcgen05 is not None and facts.tcgen05.aux_items
-        ):
+        # The loads route has a subject in the tensor-memory region programs
+        # whose derived values read tiles, and in the warp mode when a ring
+        # tile's source is one a tensor map can fetch or an epilogue value
+        # reads a loop-invariant tile (staged ahead of the loops).
+        if config[MMA_DAG_KEY] == MMA_DAG_TCGEN05:
+            loads_subject = facts.tcgen05 is not None and bool(facts.tcgen05.aux_items)
+        else:
+            loads_subject = facts.tma_ring or facts.fixed_derived
+        if not loads_subject:
             config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+        if config[MMA_DAG_KEY] == MMA_DAG_TCGEN05:
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+        else:
+            # The epilogue form is the tensor-memory region renderer's.
+            config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
         # Inert knobs: the body is replaced, so equal kernels share one
-        # autotune identity (the occupancy hint stays searchable).
-        config["pid_type"] = "flat"
+        # autotune identity (the occupancy hint stays searchable).  The
+        # persistent tcgen05 launch is the generic persistent_interleaved
+        # program ids at its CTAs per SM.
+        if (
+            config.get(MMA_DAG_KEY) == MMA_DAG_TCGEN05
+            and config[MMA_DAG_PERSISTENT_KEY]
+        ):
+            config["pid_type"] = "persistent_interleaved"
+            config["num_sm_multiplier"] = config[MMA_DAG_PERSISTENT_KEY]
+        else:
+            config[MMA_DAG_PERSISTENT_KEY] = 0
+            config["pid_type"] = "flat"
+            config.pop("num_sm_multiplier", None)
         if "loop_orders" in config:
             config["loop_orders"] = [item._fill_missing() for item in self.loop_orders]
         if "l2_groupings" in config:
@@ -3236,14 +4467,51 @@ class ConfigSpec:
             ("cute_vector_widths", 1),
             ("cute_lane_layouts", "blocked"),
             ("cute_reduction_reloads", "auto"),
-            ("load_eviction_policies", ""),
             ("reduction_loops", None),
             ("flatten_loops", False),
         ):
             value = config.get(key)
             if isinstance(value, list):
                 config[key] = [default for _ in value]
-        for key in ("cute_collective_mma", "cute_register_chain"):
+        # The warp mode's staged tiles carry the L2 policy of their slot
+        # (``MMA_DAG_L2_HINTS``) on their cp.async packets, one canonical
+        # value per packet form; every other slot (the side loads, every load
+        # of the tensor-memory mode) is inert.  The hinted packets exist only
+        # where the launcher can verify their assembly
+        # (``hinted_cp_async_available``): elsewhere every slot pins to "".
+        policies = config.get("load_eviction_policies")
+        if isinstance(policies, list):
+            staged = (
+                set(facts.staged_slots)
+                if config[MMA_DAG_KEY] == MMA_DAG_WARP and hinted_cp_async_available()
+                else set()
+            )
+            canonical = [
+                MMA_DAG_L2_CANONICAL.get(
+                    MMA_DAG_L2_HINTS.get(policy, "") if isinstance(policy, str) else "",
+                    "",
+                )
+                if slot in staged
+                else ""
+                for slot, policy in enumerate(policies)
+            ]
+            config["load_eviction_policies"] = canonical
+            # A hinted tile keeps its cp.async packets under either loads
+            # route (``plan_tma``): a ``lane`` config hinting every tile a
+            # tensor map could fetch renders the ``tma`` config's kernel
+            # when no fixed epilogue tile tells them apart -- one identity.
+            if (
+                config[MMA_DAG_KEY] == MMA_DAG_WARP
+                and config.get(MMA_DAG_LOADS_KEY) == MMA_DAG_LOADS_LANE
+                and facts.tma_slots
+                and not facts.fixed_derived
+                and all(
+                    slot < len(canonical) and canonical[slot]
+                    for slot in facts.tma_slots
+                )
+            ):
+                config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_TMA
+        for key in ("cute_collective_mma", "cute_register_chain", "cute_simt_mma"):
             if key in config:
                 config[key] = False
         for key, field in self._flat_fields().items():
@@ -3317,21 +4585,69 @@ class ConfigSpec:
         *,
         block_size_targets: Mapping[int, int],
         two_cta_allowed: bool = False,
+        persistent_allowed: bool = True,
+        flex: bool = False,
+        tile_groups: tuple[int, ...] = (0,),
+        fast_math: bool = False,
+        aux_smem_candidates: Sequence[int] = (),
+        ds_tmem_allowed: bool = False,
+        stats_mma_allowed: bool = True,
+        s_first_allowed: bool = False,
+        kv_stage_allowed: bool = False,
+        has_mask: bool = True,
+        has_score: bool = True,
+        additive_bias: bool = True,
+        table_step_choices: Sequence[int] = (0,),
+        two_cta_table_steps: int = 0,
+        row_mma_facts: FlashBwdRowFacts | None = None,
     ) -> None:
         """Enable the CuTe flash-attention BACKWARD surface.
 
         Pins the (kv_tile, q_tile) block sizes to the 128x128 envelope the
         fused backward emitter supports. ``two_cta_allowed`` opens the
         ``cute_flash_bwd_two_cta`` knob (cluster-of-2 tcgen05 family) when the
-        problem shape supports 256-row cluster KV tiles.
+        problem shape supports 256-row cluster KV tiles;
+        ``two_cta_table_steps`` is the flex pair kernel's automatic step
+        table (``cute_flash_bwd_table_steps`` caps at or above it render it;
+        see ``_normalize_cute_flash_bwd``). ``row_mma_facts`` (the dense
+        surface) carries the plan facts of the register-MMA row family
+        (``cute_flash_bwd_family`` = "row_mma"; see
+        ``cute_flash_bwd_row_mma``): its knobs are offered where the facts
+        admit the family and searched / seeded on small grids.
         """
         self.cute_flash_bwd_search_enabled = True
+        # The backward family (the tcgen05 pair vs the register-MMA rows)
+        # picks the body the same way the forward's pipeline family does.
+        self.final_selection_family_keys = (FLASH_BWD_FAMILY_KEY,)
+        self._cute_flash_bwd_row_facts = row_mma_facts
         self._cute_flash_bwd_block_size_targets = dict(block_size_targets)
         self._cute_flash_bwd_two_cta_allowed = two_cta_allowed
+        self._cute_flash_bwd_two_cta_table_steps = (
+            two_cta_table_steps if two_cta_allowed else 0
+        )
+        self._cute_flash_bwd_persistent_allowed = persistent_allowed
+        self._cute_flash_bwd_flex = flex
+        self._cute_flash_bwd_tile_groups = tile_groups
+        self._cute_flash_bwd_fast_math = fast_math
+        self._cute_flash_bwd_aux_smem_candidates = tuple(aux_smem_candidates)
+        self._cute_flash_bwd_ds_tmem_allowed = ds_tmem_allowed
+        self._cute_flash_bwd_stats_mma_allowed = stats_mma_allowed
+        self._cute_flash_bwd_s_first_allowed = s_first_allowed
+        self._cute_flash_bwd_kv_stage_allowed = kv_stage_allowed
+        # Which hook knobs have an effect: the mask form needs a mask region,
+        # the hook group width / pin a hook at all, the fold an additive bias.
+        self._cute_flash_bwd_has_mask = has_mask
+        self._cute_flash_bwd_has_hook = has_mask or has_score
+        self._cute_flash_bwd_additive_bias = additive_bias
+        # Steps per step-table buffer of the flex list walk (0 = automatic);
+        # the detector offers the caps that chunk the problem's walk.
+        self._cute_flash_bwd_table_step_choices = tuple(table_step_choices)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
-            spec.autotuner_min = target
-            spec.max_size = target
+            spec.pin_structurally(
+                target,
+                reason="the CuTe fused flash-attention backward (backend 'cute')",
+            )
 
     def enable_cute_attention_generic_fallback(
         self, *, block_size_targets: Mapping[int, int] | None = None
@@ -3413,9 +4729,15 @@ class ConfigSpec:
         if self.cute_flash_search_enabled:
             block_size_targets = self._cute_flash_block_size_target_list()
         elif self.cute_flash_gated_search_enabled:
-            if config["block_sizes"] in self._cute_flash_gated_block_size_lists():
+            block_size_lists = self._cute_flash_gated_block_size_lists()
+            if config["block_sizes"] in block_size_lists:
                 return
-            block_size_targets = self._cute_flash_gated_block_size_target_list()
+            # The legal tile nearest the request (same query tile, closest
+            # KV tile), so a mutation of one block size is not reset to the
+            # default tile.
+            block_size_targets = self._cute_flash_gated_nearest_block_sizes(
+                config["block_sizes"], block_size_lists
+            )
         else:
             return
         value = config["block_sizes"]
@@ -3642,6 +4964,7 @@ class ConfigSpec:
                     flex_trivial_walk=self._cute_flash_flex_trivial_walk,
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
                     standard_dense_output=self._cute_flash_standard_dense_output,
+                    dense_lse_output=self._cute_flash_dense_lse_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
                     tmem_rowmax_compatible=self._cute_flash_tmem_rowmax_compatible,
                     causal_resident_compatible=self._cute_flash_causal_resident_compatible,
@@ -3665,6 +4988,7 @@ class ConfigSpec:
             seeds.extend(flash_seeds)
         if self.backend_name == "cute" and self.cute_flash_gated_search_enabled:
             seeds.extend(self.cute_flash_gated_seed_configs())
+        seeds.extend(self.cute_flash_bwd_seed_configs())
         return seeds
 
     def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
@@ -3773,6 +5097,8 @@ class ConfigSpec:
         cluster_m2_one_wave_only: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
+        ab_stages_three_output_dtype_bytes: int | None = None,
+        ab_stages_three_output_stores: int = 1,
         reason: str | None = None,
     ) -> None:
         self._cute_tcgen05_config.narrow_autotune_to_validated_configs(
@@ -3785,6 +5111,8 @@ class ConfigSpec:
             cluster_m2_one_wave_only=cluster_m2_one_wave_only,
             ab_stages_three_dtype_bytes=ab_stages_three_dtype_bytes,
             ab_stages_three_device=ab_stages_three_device,
+            ab_stages_three_output_dtype_bytes=ab_stages_three_output_dtype_bytes,
+            ab_stages_three_output_stores=ab_stages_three_output_stores,
         )
         _record_restriction(
             self.restriction_reasons,
@@ -3830,7 +5158,7 @@ class ConfigSpec:
 
     @property
     def cute_l2_evict_last_store_policy_supported(self) -> bool:
-        """Whether the fixed async-store policy is valid for this target."""
+        """Whether the fixed store-policy descriptor is valid for this target."""
 
         return fixed_l2_evict_last_store_policy_supported(
             self.target_device_capability,
@@ -3854,6 +5182,37 @@ class ConfigSpec:
         if self.backend_name != "cute":
             raise InvalidConfig("packet prefetch requires CuTe")
         self.cute_packet_prefetch_enabled = True
+
+    def _cute_config_forms_one_vector_lane(
+        self,
+        config: dict[str, object],
+        rl_spec: ReductionLoopSpec,
+        available: int,
+    ) -> bool:
+        """Whether ``config`` spells out one vector per thread for the
+        persistent reduction ``rl_spec``: an explicit thread count that fits
+        the remaining budget and a vector width whose product is the extent
+        (``PersistentReductionStrategy`` keeps a V-wide fragment per thread
+        exactly then).  That lane is the requested geometry (a pointwise
+        kernel's stride-1 slice, rope's half head dim), not a thread count the
+        budget shrank, so it stays persistent beside wide tile axes.
+        """
+        nt_list = cast("list[int]", config.get("num_threads", []) or [])
+        vec_list = cast("list[int]", config.get("cute_vector_widths", []) or [])
+        requested = self.num_threads.config_get(nt_list, rl_spec.block_id, 0)
+        if (
+            not isinstance(requested, int)
+            or requested <= 0
+            or requested > available
+            or rl_spec.size_hint % requested
+        ):
+            return False
+        if rl_spec.block_id not in self.cute_vector_widths.valid_block_ids():
+            return False
+        vec = self.cute_vector_widths.config_get(vec_list, rl_spec.block_id, 1)
+        return (
+            isinstance(vec, int) and vec > 1 and rl_spec.size_hint // requested == vec
+        )
 
     def _cute_config_forms_register_tile(
         self,
@@ -4051,6 +5410,25 @@ class ConfigSpec:
             "a supported complete fragment top-k",
             fix_invalid=fix_invalid,
         )
+
+    def _normalize_cute_fragment_cta_topk(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_cta_topk"
+        self._normalize_cute_fragment_option(
+            config,
+            key,
+            self.cute_fragment_cta_topk_root_ids,
+            "a supported complete Int64 value-only selection",
+            fix_invalid=fix_invalid,
+        )
+        if config.get(key) and config.get("cute_fragment_topk_network") is not True:
+            if fix_invalid:
+                config.pop(key, None)
+            else:
+                raise InvalidConfig(
+                    "CTA selection requires cute_fragment_topk_network=True"
+                )
 
     def _normalize_cute_fragment_atomic_aggregation(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -4287,6 +5665,101 @@ class ConfigSpec:
             fix_invalid=fix_invalid,
         )
 
+    def _normalize_cute_fragment_padded_rows(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_padded_rows",
+            self.cute_fragment_padded_rows_root_ids,
+            "a complete fragment root staging a tile whose rows are a multiple of 128 bytes",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_unrolled_loops(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_unrolled_loops",
+            self.cute_fragment_unrolled_loops_root_ids,
+            "a complete fragment root",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_vector_io(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_vector_io",
+            self.cute_fragment_vector_io_root_ids,
+            "a complete fragment root moving a 16-byte-packetizable host window",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_batched_loads(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_batched_loads",
+            self.cute_fragment_batched_loads_root_ids,
+            "a complete fragment root with two or more host loads",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_split_k(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        # The split rides the tf32 mma phase: without it the knob is inert.
+        if config.get("cute_fragment_split_k") and (
+            config.get("cute_fp32_dot", "simt") != "tf32_mma"
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "cute_fragment_split_k=True requires cute_fp32_dot='tf32_mma'"
+                )
+            config.pop("cute_fragment_split_k", None)
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_split_k",
+            self.cute_fragment_split_k_root_ids,
+            "a complete fragment root with a tf32-eligible fp32 hl.dot",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_mma_rows(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        # The row walk is a form of the tf32 mma phase: inert without it.
+        if config.get("cute_fragment_mma_rows") and (
+            config.get("cute_fp32_dot", "simt") != "tf32_mma"
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "cute_fragment_mma_rows=True requires cute_fp32_dot='tf32_mma'"
+                )
+            config.pop("cute_fragment_mma_rows", None)
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_mma_rows",
+            self.cute_fragment_mma_rows_root_ids,
+            "a complete fragment root with a tf32-eligible fp32 hl.dot",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_slab_loads(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_slab_loads",
+            self.cute_fragment_slab_loads_root_ids,
+            "a complete fragment root with repeated static windows of one tensor",
+            fix_invalid=fix_invalid,
+        )
+
     def _normalize_cute_fragment_register_loads(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4345,7 +5818,19 @@ class ConfigSpec:
             self.cute_fragment_reduction_root_ids,
             "a supported computed scalar reduction",
             fix_invalid=fix_invalid,
-            choices=("serial", "warp"),
+            choices=("serial", "warp", "cta", "cta_unroll"),
+        )
+
+    def _normalize_cute_fp32_dot(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fp32_dot",
+            self.cute_fp32_dot_root_ids,
+            "an fp32 hl.dot in a computed fragment under tf32 dot precision",
+            fix_invalid=fix_invalid,
+            choices=("simt", "tf32_mma"),
         )
 
     def _normalize_cute_fragment_scan(
@@ -4415,7 +5900,8 @@ class ConfigSpec:
         if not self.cute_host_paired_sum_available:
             if value != "off" and not fix_invalid:
                 raise InvalidConfig(
-                    "host sums require a typed independent pair or terminal sum/cast"
+                    "host sums require a typed independent pair, terminal sum/cast "
+                    "or a 1-D sum/mean after the launch"
                 )
             config.pop(key, None)
             return
@@ -4561,6 +6047,57 @@ class ConfigSpec:
                     "CuTe reduction pipeline depth 4 requires the pipelined schedule"
                 )
 
+    def _normalize_cute_store_policy(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_store_policy"
+        if key not in config:
+            return
+        value = config[key]
+        if value not in ("default", "streaming", "l2_evict_last"):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{key} must be one of ('default', 'streaming', 'l2_evict_last'), "
+                    f"got {value!r}"
+                )
+            config[key] = "default"
+        if (
+            config[key] == "l2_evict_last"
+            and not self.cute_l2_evict_last_store_policy_supported
+        ):
+            config[key] = "default"
+
+    def _normalize_cute_exact_div_form(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_exact_div_form`` picks how an fp32 division by a
+        loop-invariant divisor is lowered on CuTe (both forms give the IEEE
+        quotient bit for bit): ``redo`` speculates the Markstein sequence
+        over the loop and re-runs the loop on a hard case, ``plain`` keeps
+        ``div.rn`` per element.  A recorded config carrying the retired
+        ``guard`` form is repaired to ``plain`` (fail closed: the plain
+        division is what every form must equal), as is any unknown value
+        under ``fix_invalid``.  A kernel without such a division has nothing
+        for the knob to choose; it is dropped.  The gate
+        (``has_hoistable_fp32_divisions``) is a graph-level necessary
+        condition: a kernel whose division the AST pass then proves
+        loop-carried at every loop keeps the knob, with both forms rendering
+        identically."""
+        key = "cute_exact_div_form"
+        if key not in config:
+            return
+        value = config[key]
+        if value in _CUTE_EXACT_DIV_FORM_RETIRED:
+            config[key] = value = "plain"
+        if value not in CUTE_EXACT_DIV_FORMS:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{key} must be one of {CUTE_EXACT_DIV_FORMS}, got {value!r}"
+                )
+            config[key] = "plain"
+        if not self.cute_exact_division_sites or self.matmul_facts:
+            config.pop(key, None)
+
     def _normalize_cute_async_load_pipeline(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4690,6 +6227,8 @@ class ConfigSpec:
             "cute_scalar_epilogue_keep_inputs",
             "cute_scalar_epilogue_owner_fold",
             "cute_warp_fp32_redux",
+            "cute_register_tile_warp_fold",
+            "cute_register_tile_store_first",
             "cute_replicated_reduction",
             "cute_vector_packet_unroll",
         ):
@@ -4732,7 +6271,22 @@ class ConfigSpec:
     def _normalize_cute_pdl(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        """``cute_pdl`` is a boolean (programmatic dependent launch)."""
+        """``cute_pdl`` is a boolean (programmatic dependent launch);
+        ``cute_pdl_release`` names where the kernel releases its dependents
+        (``auto`` unless given: ``entry`` or ``none`` by the grid, resolved at
+        codegen so a flat configuration, which always carries the value, and
+        a dict without the key render alike) and only acts when ``cute_pdl``
+        is on; ``cute_pdl_spread`` (a boolean) pads the kernel's shared
+        memory to one wave's density and rides on ``cute_pdl`` the same way.
+        With the knob off a non-default placement stays in the config
+        (inert, like every other knob the kernel does not read) so a flat
+        configuration survives the unflatten/flatten round trip the search
+        relies on; the default placement is dropped there, so the default
+        config and every knob-off config without a placement read alike.
+        Config identity is therefore not canonical for this key: a knob-off
+        config with ``none`` and one without the key, or a knob-on config
+        with ``auto`` and one without the key, hash and compare as different
+        configs while generating the same code."""
         pdl = config.get("cute_pdl", False)
         if type(pdl) is not bool:
             if not fix_invalid:
@@ -4740,6 +6294,268 @@ class ConfigSpec:
             pdl = False
         if "cute_pdl" in config or pdl:
             config["cute_pdl"] = pdl
+        release = config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
+        if release not in CUTE_PDL_RELEASE_CHOICES:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"cute_pdl_release must be one of {CUTE_PDL_RELEASE_CHOICES!r}, "
+                    f"got {release!r}"
+                )
+            release = CUTE_PDL_RELEASE_DEFAULT
+        if not pdl and release == CUTE_PDL_RELEASE_DEFAULT:
+            config.pop("cute_pdl_release", None)
+        elif "cute_pdl_release" in config:
+            config["cute_pdl_release"] = release
+        spread = config.get(CUTE_PDL_SPREAD_KEY, False)
+        if type(spread) is not bool:
+            if not fix_invalid:
+                raise InvalidConfig(f"{CUTE_PDL_SPREAD_KEY} must be a boolean")
+            spread = False
+        if not pdl and spread is False:
+            config.pop(CUTE_PDL_SPREAD_KEY, None)
+        elif CUTE_PDL_SPREAD_KEY in config:
+            config[CUTE_PDL_SPREAD_KEY] = spread
+
+    def _normalize_cute_tiles_per_block(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_tiles_per_block`` packs that many one-element grid tiles per
+        CTA as thread sub-groups: a flat pid type, no CTA cluster split, no L2
+        grouping (its pid decode has no pack term), and a packable root-grid
+        axis whose static tile count it divides."""
+        from .._compiler.cute.tile_packing import TILES_PER_BLOCK_CHOICES
+        from .._compiler.cute.tile_packing import l2_grouped
+
+        pack = config.get("cute_tiles_per_block", 1)
+        if type(pack) is not int or pack not in TILES_PER_BLOCK_CHOICES:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"cute_tiles_per_block must be one of {TILES_PER_BLOCK_CHOICES}"
+                )
+            pack = 1
+        if pack > 1 and not (
+            config.get("pid_type", "flat") == "flat"
+            and config.get("cute_cluster_n", 1) == 1
+            and not l2_grouped(config)
+            and any(count % pack == 0 for count in self.cute_tile_pack_counts.values())
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "cute_tiles_per_block needs a flat pid type, no cluster split, "
+                    "no L2 grouping and a one-element grid axis whose tile count "
+                    "it divides"
+                )
+            pack = 1
+        if "cute_tiles_per_block" in config or pack != 1:
+            config["cute_tiles_per_block"] = pack
+
+    def _cute_fragment_mma_fact(self) -> MatmulFact | None:
+        """The contraction ``cute_dot_fragment_mma`` may lower: one dot with a
+        static N of 1 (a GEMV), fp16 or bf16 operands of one dtype and tunable
+        M and K blocks (``cute/fragment_mma_dot.py``)."""
+        for fact in self.matmul_facts:
+            if (
+                fact.static_n == 1
+                and fact.lhs_dtype == fact.rhs_dtype
+                and fact.lhs_dtype in (torch.float16, torch.bfloat16)
+                and fact.m_block_id is not None
+                and fact.k_block_id is not None
+            ):
+                return fact
+        return None
+
+    def _cute_fragment_mma_searchable(self) -> bool:
+        """Whether the fragment-MMA knob is offered to the search: a GEMV dot
+        on a device with ``mma.sync`` (compute capability 8.0 and up)."""
+        capability = self.target_device_capability
+        return (
+            self.supports_config_key(FRAGMENT_MMA_KEY)
+            and self._cute_fragment_mma_fact() is not None
+            and capability is not None
+            and capability >= (8, 0)
+        )
+
+    def _cute_dot_fragment_mma_reason(self, config: dict[str, object]) -> str | None:
+        """Why ``config`` cannot run the GEMV dot on MMA fragments (None: it can).
+
+        The rewrite permutes the lanes of one warp into the ``m16n8k16``
+        fragment layout, so it needs exactly eight threads on the dot's M
+        block and four on its K block, and 16- or 32-byte K packets.
+        """
+        fact = self._cute_fragment_mma_fact()
+        if fact is None or fact.m_block_id is None or fact.k_block_id is None:
+            return "needs a dot with fp16/bf16 operands and a static N of 1"
+        capability = self.target_device_capability
+        if capability is None or capability < (8, 0):
+            return "needs mma.sync (compute capability >= 8.0)"
+        threads = _as_sequence(config.get("num_threads"))
+        m_threads = self.num_threads.config_get(threads, fact.m_block_id, 0)
+        k_threads = self.num_threads.config_get(threads, fact.k_block_id, 0)
+        if (m_threads, k_threads) != (FRAGMENT_MMA_ROW_THREADS, FRAGMENT_MMA_K_THREADS):
+            return (
+                f"needs num_threads of {FRAGMENT_MMA_ROW_THREADS} on the dot's M "
+                f"block and {FRAGMENT_MMA_K_THREADS} on its K block"
+            )
+        widths = _as_sequence(config.get("cute_vector_widths"))
+        k_width = self.cute_vector_widths.config_get(widths, fact.k_block_id, 1)
+        if k_width not in (8, 16):
+            return "needs 16- or 32-byte K packets (cute_vector_widths 8 or 16)"
+        return None
+
+    def _normalize_cute_dot_fragment_mma(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_dot_fragment_mma`` is a boolean; True only where the dot's
+        thread layout fits the fragment rewrite (``_cute_dot_fragment_mma_reason``)."""
+        if FRAGMENT_MMA_KEY not in config:
+            return
+        value = config[FRAGMENT_MMA_KEY]
+        if type(value) is not bool:
+            if not fix_invalid:
+                raise InvalidConfig(f"{FRAGMENT_MMA_KEY} must be a boolean")
+            config[FRAGMENT_MMA_KEY] = False
+            return
+        if not value:
+            return
+        if not self._cute_fragment_mma_searchable():
+            # No dot the rewrite could take: the knob is invalid for the kernel.
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{FRAGMENT_MMA_KEY}=True {self._cute_dot_fragment_mma_reason(config)}"
+                )
+            config[FRAGMENT_MMA_KEY] = False
+            return
+        if self._cute_dot_fragment_mma_reason(config) is not None:
+            # The thread layout cannot take the fragments: the knob is inert
+            # for this config (like ``cute_lane_unroll`` without a lane loop).
+            config[FRAGMENT_MMA_KEY] = False
+
+    def _cute_dot_ring_searchable(self) -> bool:
+        """Whether the ring-MMA knobs (``cute_dot_ring_mma`` and its stage and
+        split knobs) are offered to the search: the GEMV dot of
+        ``_cute_fragment_mma_fact`` with a static K on a device with
+        ``mma.sync`` and ``cp.async`` (compute capability 8.0 and up)."""
+        fact = self._cute_fragment_mma_fact()
+        return (
+            self.supports_config_key(RING_MMA_KEY)
+            and fact is not None
+            and fact.static_k is not None
+            and self._cute_fragment_mma_searchable()
+        )
+
+    def _cute_dot_ring_mma_reason(self, config: dict[str, object]) -> str | None:
+        """Why ``config`` cannot run the GEMV dot through the cp.async ring
+        (None: it can): the rows must be a rolled lane loop (one thread on the
+        dot's M block), the K threads whole warps, and the geometry
+        ``ring_mma_geometry_reason`` accepts (``cute/ring_mma_dot.py``)."""
+        fact = self._cute_fragment_mma_fact()
+        if (
+            fact is None
+            or fact.m_block_id is None
+            or fact.k_block_id is None
+            or fact.static_k is None
+        ):
+            return "needs a dot with fp16/bf16 operands, a static N of 1 and a static K"
+        capability = self.target_device_capability
+        if capability is None or capability < (8, 0):
+            return "needs mma.sync and cp.async (compute capability >= 8.0)"
+        threads = _as_sequence(config.get("num_threads"))
+        m_threads = self.num_threads.config_get(threads, fact.m_block_id, 0)
+        k_threads = self.num_threads.config_get(threads, fact.k_block_id, 0)
+        if m_threads != 1:
+            return "needs one thread on the dot's M block (the rows are a rolled lane loop)"
+        sizes = _as_sequence(config.get("block_sizes"))
+        rows = self.block_sizes.config_get(sizes, fact.m_block_id, None)
+        chunk = self.block_sizes.config_get(sizes, fact.k_block_id, None)
+        if not isinstance(rows, int) or not isinstance(chunk, int):
+            return "needs static M and K blocks"
+        widths = _as_sequence(config.get("cute_vector_widths"))
+        k_width = self.cute_vector_widths.config_get(widths, fact.k_block_id, 1)
+        stages = config.get(RING_STAGES_KEY, RING_DEFAULT_STAGES)
+        split = config.get(RING_SPLIT_KEY, RING_DEFAULT_SPLIT)
+        return ring_mma_geometry_reason(
+            rows=rows,
+            chunk=chunk,
+            threads=int(cast("int", k_threads)),
+            stages=cast("int", stages),
+            split=cast("str", split),
+            elem_bytes=fact.lhs_dtype.itemsize,
+            k_width=int(cast("int", k_width)),
+            smem_budget=ring_mma_smem_budget(self.device),
+        )
+
+    def _normalize_cute_dot_ring_mma(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_dot_ring_mma`` is a boolean; True only where the dot's thread
+        layout and geometry fit the ring (``_cute_dot_ring_mma_reason``); the
+        stage and split knobs are repaired to a fitting value when the ring is
+        on and pinned to their defaults (inert) when it is off; under the ring
+        ``cute_pdl_release`` is pinned to its default (the ring's own
+        placement, after the last MMA, overrides it)."""
+        if not any(
+            key in config for key in (RING_MMA_KEY, RING_STAGES_KEY, RING_SPLIT_KEY)
+        ):
+            return
+        value = config.get(RING_MMA_KEY, False)
+        if type(value) is not bool:
+            if not fix_invalid:
+                raise InvalidConfig(f"{RING_MMA_KEY} must be a boolean")
+            value = False
+        stages = config.get(RING_STAGES_KEY, RING_DEFAULT_STAGES)
+        if type(stages) is not int or stages not in RING_STAGE_CHOICES:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{RING_STAGES_KEY} must be one of {RING_STAGE_CHOICES}"
+                )
+            stages = RING_DEFAULT_STAGES
+        split = config.get(RING_SPLIT_KEY, RING_DEFAULT_SPLIT)
+        if split not in RING_SPLIT_CHOICES:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{RING_SPLIT_KEY} must be one of {RING_SPLIT_CHOICES}"
+                )
+            split = RING_DEFAULT_SPLIT
+        if value and not self._cute_dot_ring_searchable():
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{RING_MMA_KEY}=True {self._cute_dot_ring_mma_reason(config)}"
+                )
+            value = False
+        if value:
+            # The first fitting (split, stages) pair, the requested one first
+            # (fewer stages when the ring would not fit in shared memory, the
+            # other split when the warps cannot divide the requested one);
+            # a layout no pair fits makes the knob inert (like
+            # ``cute_lane_unroll`` without a lane loop).
+            fits = False
+            for candidate_split in (
+                split,
+                *(s for s in RING_SPLIT_CHOICES if s != split),
+            ):
+                for candidate_stages in (
+                    stages,
+                    *sorted(
+                        (s for s in RING_STAGE_CHOICES if s < stages), reverse=True
+                    ),
+                ):
+                    config[RING_STAGES_KEY] = candidate_stages
+                    config[RING_SPLIT_KEY] = candidate_split
+                    if self._cute_dot_ring_mma_reason(config) is None:
+                        fits = True
+                        break
+                if fits:
+                    break
+            if not fits:
+                value = False
+        config[RING_MMA_KEY] = value
+        if not value:
+            config[RING_STAGES_KEY] = RING_DEFAULT_STAGES
+            config[RING_SPLIT_KEY] = RING_DEFAULT_SPLIT
+        elif "cute_pdl_release" in config:
+            # The ring releases its dependents after its last MMA whatever the
+            # placement says (``cute/ring_mma_dot.py``): the key is inert.
+            config["cute_pdl_release"] = CUTE_PDL_RELEASE_DEFAULT
 
     def _normalize_cute_vloop_sink(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -4762,23 +6578,21 @@ class ConfigSpec:
                     f"cute_lane_unroll must be one of {_CUTE_LANE_UNROLL_CHOICES}"
                 )
             unroll = 1
-        if not sink and not self._cute_config_forms_grid_lane_loop(config):
+        if not sink and not self._cute_config_forms_lane_loop(config):
             unroll = 1
         if "cute_lane_unroll" in config or unroll != 1:
             config["cute_lane_unroll"] = unroll
 
-    def _cute_config_forms_grid_lane_loop(self, config: dict[str, object]) -> bool:
-        """Whether some grid tile axis gets a per-thread lane loop: an explicit
-        thread count below its static block size that divides it (the
-        condition ``PerThreadNDTileStrategy`` allocates a lane variable on)."""
+    def _cute_config_forms_lane_loop(self, config: dict[str, object]) -> bool:
+        """Whether some tile axis (of the grid or of a device loop) gets a
+        per-thread lane loop: an explicit thread count below its static block
+        size that divides it (the condition ``PerThreadNDTileStrategy``
+        allocates a lane variable on)."""
         # Runs before the sequences are normalized: a single-block kernel may
         # still spell them as scalars.
         nt_list = _as_sequence(config.get("num_threads"))
         bs_list = _as_sequence(config.get("block_sizes"))
-        thread_block_ids = self.num_threads.valid_block_ids()
-        for block_id in self.grid_block_ids:
-            if block_id not in thread_block_ids:
-                continue
+        for block_id in self.num_threads.valid_block_ids():
             nt = self.num_threads.config_get(nt_list, block_id, 0)
             bs = self.block_sizes.config_get(bs_list, block_id, 1)
             if (
@@ -4810,6 +6624,48 @@ class ConfigSpec:
                     "cute_register_chain requires a boolean, matrix contractions, "
                     "and CUDA compute capability >= 8.0"
                 )
+
+    def _normalize_cute_simt_mma(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        from .._compiler.cute.simt_gemm import SIMT_MMA_LAYOUTS
+
+        key = "cute_simt_mma"
+        if key in config:
+            value = config[key]
+            if type(value) is not bool or (value and not self.cute_simt_mma_enabled):
+                if fix_invalid:
+                    config[key] = False
+                else:
+                    raise InvalidConfig(
+                        "cute_simt_mma requires a boolean and an fp32 matrix contraction"
+                    )
+        # The layout is inert while the GEMM is off (a flat field keeps its
+        # default there, and the strict coverage round trip must stay the
+        # identity); only an unknown value is invalid.
+        layout_key = "cute_simt_mma_layout"
+        if layout_key not in config:
+            return
+        if config[layout_key] not in SIMT_MMA_LAYOUTS:
+            if fix_invalid:
+                config[layout_key] = SIMT_MMA_LAYOUTS[0]
+            else:
+                raise InvalidConfig(
+                    f"cute_simt_mma_layout must be one of {SIMT_MMA_LAYOUTS}"
+                )
+
+    @property
+    def cute_simt_mma_enabled(self) -> bool:
+        """Whether the exact fp32 SIMT GEMM (``cute_simt_mma``) has a target.
+
+        fp32 contractions under ``dot_precision="tf32"`` belong to the tensor
+        cores; the knob exists only when the kernel's precision keeps them
+        exact (``cute_fp32_dot_exact``, recorded by DeviceIR).
+        """
+        return self.cute_fp32_dot_exact and any(
+            fact.lhs_dtype == torch.float32 and fact.rhs_dtype == torch.float32
+            for fact in self.matmul_facts
+        )
 
     def _normalize_cute_proven_bounds(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -5088,6 +6944,11 @@ class ConfigSpec:
             or config.get("pid_type", self.allowed_pid_types[0]) != "flat"
         ):
             return
+        key = self.cute_mxfp8_partition_key
+        if key is not None and (
+            type(config.get(key)) is not int or config.get(key) != 1
+        ):
+            raise InvalidConfig(f"native complete MXFP8 reduction requires {key}=1")
         fields = self._flat_fields()
         for key in _CUTE_MXFP8_ROOT_LOWERING_KEYS.intersection(config):
             if key in self.user_defined_tunables:
@@ -5271,6 +7132,20 @@ class ConfigSpec:
                         "chunk-recurrence kernels"
                     )
 
+        for rsb_key in RSB_KEYS:
+            if (
+                rsb_key in config
+                and self.cute_register_subblocks is None
+                and self.supports_config_key(rsb_key)
+            ):
+                if _fix_invalid:
+                    config.pop(rsb_key)
+                else:
+                    raise InvalidConfig(
+                        f"{rsb_key} is available only for roots the register "
+                        "sub-block family admits"
+                    )
+
         for dag_key in MMA_DAG_KEYS:
             if (
                 dag_key in config
@@ -5318,6 +7193,12 @@ class ConfigSpec:
         ):
             # Same rule for the gate warpgroup count: only the gated body reads it.
             config.pop(FLASH_GATE_WARPGROUPS_KEY)
+        if (
+            "cute_flash_gated_row_warps" in config
+            and not self.cute_flash_gated_search_enabled
+        ):
+            # ... and for the gated row programs' warp count.
+            config.pop("cute_flash_gated_row_warps")
 
         if unsupported := self.unsupported_config_keys(config):
             # Separate backend-specific keys (e.g. AMD tunables, TileIR tunables)
@@ -5352,6 +7233,7 @@ class ConfigSpec:
                 config,
                 available=self.cute_split_k_workspace_available,
                 fix_invalid=_fix_invalid,
+                partition_choices=self.cute_split_k_partition_choices,
             )
             normalize_grouped_rna_config(
                 config,
@@ -5372,12 +7254,14 @@ class ConfigSpec:
             self._normalize_cute_host_paired_sum(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_scan(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_reduction(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fp32_dot(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_threads(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_producer_cache(
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_warp_scan(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_topk_network(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_cta_topk(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_atomic_aggregation(
                 config, fix_invalid=_fix_invalid
             )
@@ -5400,6 +7284,17 @@ class ConfigSpec:
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_packet_loads(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_padded_rows(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_unrolled_loops(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_vector_io(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_batched_loads(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_split_k(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_mma_rows(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_slab_loads(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_register_loads(
                 config, fix_invalid=_fix_invalid
             )
@@ -5429,6 +7324,8 @@ class ConfigSpec:
             )
             self._normalize_cute_pointwise_pid_type(config, fix_invalid=_fix_invalid)
             self._normalize_cute_async_load_pipeline(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_store_policy(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_exact_div_form(config, fix_invalid=_fix_invalid)
             self._normalize_cute_bf16x2_recurrence(config, fix_invalid=_fix_invalid)
             self._normalize_cute_signed_bitfield_bf16(config, fix_invalid=_fix_invalid)
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
@@ -5442,8 +7339,12 @@ class ConfigSpec:
             )
             self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
             self._normalize_cute_pdl(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_dot_fragment_mma(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_dot_ring_mma(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_tiles_per_block(config, fix_invalid=_fix_invalid)
             self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
             self._normalize_cute_register_chain(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_simt_mma(config, fix_invalid=_fix_invalid)
             if self.matmul_facts:
                 value = config.setdefault("cute_collective_mma", False)
                 if not isinstance(value, bool):
@@ -5703,44 +7604,28 @@ class ConfigSpec:
         # live reduction thread threshold to decide when a persistent reduction
         # must be rolled.
         if self.max_reduction_threads is not None and self.reduction_loops:
-            force_threshold = self.reduction_loop_force_threshold
-            max_loop = self.max_reduction_loop
             reduction_loops = config.get("reduction_loops", [])
-            if force_threshold is not None and isinstance(reduction_loops, list):
+            if isinstance(reduction_loops, list):
                 new_loops = list(reduction_loops)
                 changed = False
                 for i, spec in enumerate(self.reduction_loops):
                     if i >= len(new_loops):
                         break
-                    # Indexed reductions (argmin/argmax) on CuTe must keep
-                    # the persistent thread count or rolled chunk within a
-                    # single warp, since cute.arch.warp_reduction only
-                    # supports threads_in_group<=32.
-                    block_threshold = force_threshold
-                    if (
-                        self.backend_name == "cute"
-                        and spec.block_id in self.cute_indexed_reduction_block_ids
-                    ):
-                        block_threshold = min(block_threshold, 32)
+                    block_threshold, max_chunk = spec._limits(self)
+                    if block_threshold is None:
+                        continue
                     if new_loops[i] is None and spec.size_hint > block_threshold:
                         new_loops[i] = min(spec.size_hint, block_threshold)
                         changed = True
                     elif (
                         new_loops[i] is not None
-                        and max_loop is not None
-                        and (
-                            new_loops[i] > max_loop
-                            or (
-                                self.backend_name == "cute"
-                                and spec.block_id
-                                in self.cute_indexed_reduction_block_ids
-                                and new_loops[i] > 32
-                            )
-                        )
+                        and max_chunk is not None
+                        and new_loops[i] > max_chunk
                     ):
-                        new_loops[i] = min(
-                            new_loops[i] if max_loop is None else max_loop,
-                            block_threshold,
+                        new_loops[i] = (
+                            prev_power_of_2(max_chunk)
+                            if self.backend_name == "cute"
+                            else min(max_chunk, block_threshold)
                         )
                         changed = True
                 if changed:
@@ -5759,6 +7644,7 @@ class ConfigSpec:
         # is regenerated with ``_cute_register_tiles=False`` (the looped
         # reduction this branch chooses without the register tile), and an
         # unproved reordering rejects the config instead of miscompiling.
+        register_tile = False
         if (
             self.backend_name == "cute"
             and self.max_reduction_threads is not None
@@ -5807,20 +7693,56 @@ class ConfigSpec:
                                 f"{other_threads} of {self.max_reduction_threads} "
                                 f"threads)."
                             )
-                        if (
+                        forms_register_tile = (
                             _cute_register_tiles
                             and self._cute_config_forms_register_tile(
                                 config, spec, available
                             )
+                        )
+                        if (
+                            forms_register_tile
+                            or self._cute_config_forms_one_vector_lane(
+                                config, spec, available
+                            )
                         ):
+                            # Only the register tile honours the schedule
+                            # knobs; a one-vector lane that is not one keeps
+                            # its lane loop but drops them below.
+                            register_tile = register_tile or forms_register_tile
                             continue
                         chunk = min(spec.size_hint, available)
                         if self.max_reduction_loop is not None:
                             chunk = min(chunk, self.max_reduction_loop)
                         new_loops[i] = chunk
                         changed = True
+                    elif (
+                        new_loops[i] is None
+                        and _cute_register_tiles
+                        and isinstance(
+                            requested := self.num_threads.config_get(
+                                nt_list, spec.block_id, 0
+                            ),
+                            int,
+                        )
+                        and 0 < requested < spec.size_hint
+                        and self._cute_config_forms_register_tile(
+                            config, spec, available
+                        )
+                    ):
+                        # An explicit reduction thread count below the extent
+                        # within the budget (a lane loop of >= 2 rows per
+                        # thread): the register tile forms here too.
+                        register_tile = True
                 if changed:
                     config["reduction_loops"] = new_loops
+        if self.backend_name == "cute" and not register_tile:
+            # The register-tile schedule knobs mean nothing without the tile
+            # (a one-vector persistent lane over an admitted reduction block);
+            # dropping them keeps the proven schedule and a byte-identical
+            # render, also on the ``_cute_register_tiles=False`` retry.
+            for key in _CUTE_REGISTER_TILE_KNOBS:
+                if config.get(key):
+                    config[key] = False
 
         # Disable range_* configs for static ranges
         static_range_block_ids = [
@@ -5951,6 +7873,9 @@ class ConfigSpec:
                 capability=self.target_device_capability,
                 fix_invalid=_fix_invalid,
                 mxfp8=self.cute_mxfp8_mma_available,
+                fused_scales_available=self.cute_mxfp8_fused_scales_available,
+                sf_tma_available=self.cute_mxfp8_sf_tma_available,
+                tma_output_available=self.cute_mxfp8_tma_output_available,
             )
         cross_loop_pipeline_fragment = self.cross_loop_pipeline
         if cross_loop_pipeline_fragment is not None:
@@ -6103,6 +8028,8 @@ class ConfigSpec:
                     )
         if self.cute_mma_dag is not None:
             self._normalize_cute_mma_dag(config, fix_invalid=_fix_invalid)
+        if self.cute_register_subblocks is not None:
+            self._normalize_cute_register_subblocks(config, fix_invalid=_fix_invalid)
         prepare_schedule_fragment = self.cute_chunk_prepare_schedule
         if prepare_schedule_fragment is not None:
             prepare_schedule = config.setdefault(
@@ -6281,6 +8208,7 @@ class ConfigSpec:
             )
             self._normalize_cute_flash(config, fix_invalid=_fix_invalid)
             self._normalize_cute_flash_gated(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_flash_bwd(config)
 
         if (
             self.backend_name == "cute"
@@ -6484,10 +8412,13 @@ class ConfigSpec:
             preserve_keys = self._cute_tcgen05_config.implicit_default_keys_to_preserve(
                 config
             )
-            if "flat" not in self.allowed_pid_types:
+            if self.allowed_pid_types[0] != "flat":
                 # ``Config.pid_type`` falls back to ``flat`` for a missing key,
                 # so a persistent choice is not an implicit default.
                 preserve_keys = {*preserve_keys, "pid_type"}
+            if config.get(MMA_DAG_PERSISTENT_KEY):
+                # The persistent dag launch's program ids (set by its knob).
+                preserve_keys = {*preserve_keys, "pid_type", "num_sm_multiplier"}
             for key in _CUTE_IMPLICIT_DEFAULT_KEYS - provided_keys - preserve_keys:
                 config.pop(key, None)
 
@@ -6511,9 +8442,18 @@ class ConfigSpec:
         """Raise search floors for grid block dimensions based on problem size.
 
         Very small block sizes produce enormous grids that the autotuner
-        wastes time exploring.  This heuristic sets a floor so the total
-        number of blocks per dimension stays within a reasonable range
-        derived from ``num_compute_units``.
+        wastes time exploring.  This heuristic floors each root grid so its
+        program count (the product of its dimensions' block counts) stays
+        within a budget derived from ``num_compute_units``.
+
+        The budget is shared across the dimensions of one grid by water
+        filling: a dimension that cannot use its even share of the budget
+        (``B=4`` in a ``[B, L]`` grid) is left unfloored and hands its unused
+        share to the remaining dimensions, so ``L`` may still tile down to 1
+        when the whole grid fits the budget.  Each root grid (``KernelGridFact``
+        roots, or the fissioned pointwise launches) owns a full budget; with
+        no recorded grid topology every grid axis belongs to one grid, the
+        legacy rule.
 
         The raised minimum never exceeds the default block size that
         ``_fragment`` would compute, so memory and shared-memory
@@ -6522,33 +8462,64 @@ class ConfigSpec:
         if not self.grid_block_ids:
             return
 
-        n_cus = num_compute_units()
-        n_dims = len(self.grid_block_ids)
-        max_blocks_per_dim = math.ceil((n_cus * 64) ** (1.0 / n_dims))
-        independent_max_blocks: dict[int, int] = {
-            block_id: math.ceil((n_cus * 64) ** (1.0 / len(grid)))
-            for grid in self.cute_pointwise_region_grid_groups
-            for block_id in grid
-        }
+        budget = num_compute_units() * 64
+        for grid in self._grid_floor_groups():
+            specs: list[BlockSizeSpec] = []
+            for grid_bid in grid:
+                try:
+                    spec = self.block_sizes.block_id_lookup(grid_bid)
+                except KeyError:
+                    continue
+                if spec.size_hint > 0:
+                    specs.append(spec)
+            remaining = float(budget)
+            # Smallest dimensions first: they are the ones that may not use
+            # their even share, and the surplus flows to the larger ones.
+            # Dimensions of one extent take the same share at once, so a
+            # symmetric grid floors every axis alike (for a uniform grid this
+            # is exactly the legacy per-axis rule, ceil(budget ** (1 / n))).
+            ordered = sorted(specs, key=lambda s: s.size_hint)
+            index = 0
+            while index < len(ordered):
+                size = ordered[index].size_hint
+                tied = [spec for spec in ordered[index:] if spec.size_hint == size]
+                share = remaining ** (1.0 / (len(ordered) - index))
+                index += len(tied)
+                if size <= share:
+                    # The whole dimension fits in its share at block size 1.
+                    remaining = max(remaining / size ** len(tied), 1.0)
+                    continue
+                max_blocks = math.ceil(share)
+                remaining = max(remaining / max_blocks ** len(tied), 1.0)
+                for spec in tied:
+                    default = spec._fragment(self).default_val
+                    min_block = min(size // max_blocks, default)
+                    if min_block >= 2:
+                        min_block = 1 << (min_block.bit_length() - 1)
+                        min_block = min(min_block, spec.max_size)
+                        spec.autotuner_min = assert_integer_power_of_two(
+                            max(min_block, spec.autotuner_min)
+                        )
 
-        for grid_bid in self.grid_block_ids:
-            try:
-                spec = self.block_sizes.block_id_lookup(grid_bid)
-            except KeyError:
-                continue
-            if spec.size_hint <= 0:
-                continue
-            default = spec._fragment(self).default_val
-            min_block = spec.size_hint // independent_max_blocks.get(
-                grid_bid, max_blocks_per_dim
-            )
-            min_block = min(min_block, default)
-            if min_block >= 2:
-                min_block = 1 << (min_block.bit_length() - 1)
-                min_block = min(min_block, spec.max_size)
-                spec.autotuner_min = assert_integer_power_of_two(
-                    max(min_block, spec.autotuner_min)
-                )
+    def _grid_floor_groups(self) -> list[tuple[int, ...]]:
+        """Root grids for the occupancy floor, each owning a full budget."""
+        independent = [
+            tuple(grid) for grid in self.cute_pointwise_region_grid_groups if grid
+        ]
+        covered = {block_id for grid in independent for block_id in grid}
+        if self.kernel_grid_fact is not None:
+            roots = [
+                tuple(block_id for block_id in root if block_id not in covered)
+                for root in self.kernel_grid_fact.grid_groups
+            ]
+            known = covered | {block_id for root in roots for block_id in root}
+            # Axes added after the topology was recorded (a promoted output
+            # axis) share one grid with every other unassigned axis.
+            rest = tuple(b for b in self.grid_block_ids if b not in known)
+        else:
+            roots = []
+            rest = tuple(b for b in self.grid_block_ids if b not in covered)
+        return [grid for grid in (*independent, *roots, rest) if grid]
 
     def create_config_generation(
         self,
@@ -6670,6 +8641,7 @@ class ConfigSpec:
                 "cute_fragment_register_loads",
                 "cute_fragment_warp_scan",
                 "cute_fragment_topk_network",
+                "cute_fragment_cta_topk",
                 "cute_fragment_atomic_aggregation",
                 "cute_fragment_integer_atomic_epochs",
                 "cute_topk_coarse_keys",
@@ -6685,6 +8657,13 @@ class ConfigSpec:
                 "cute_fragment_pure_producer_regions",
                 "cute_integer_loop_reduction",
                 "cute_fragment_packet_loads",
+                "cute_fragment_padded_rows",
+                "cute_fragment_unrolled_loops",
+                "cute_fragment_vector_io",
+                "cute_fragment_batched_loads",
+                "cute_fragment_split_k",
+                "cute_fragment_mma_rows",
+                "cute_fragment_slab_loads",
             ):
                 return True, False
             if key == "cute_topk_key_recovery":
@@ -6693,8 +8672,12 @@ class ConfigSpec:
                 return True, 128
             if key in ("cute_fragment_scan", "cute_fragment_reduction"):
                 return True, "serial"
+            if key == "cute_fp32_dot":
+                return True, "simt"
             if key == "cute_signed_bitfield_bf16":
                 return True, False
+            if key == "cute_exact_div_form":
+                return True, CUTE_EXACT_DIV_FORMS[0]
             if self.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
                 return True, self._resolve_cute_flash_config(config).pipeline_family
             return self._cute_tcgen05_config.flatten_missing_field_default(key, config)
@@ -6813,6 +8796,7 @@ class ConfigSpec:
             # This optional matmul coordinate has no old default Config key.
             # Keep the public default exact; flat search still represents zero.
             config.config.pop("cute_min_blocks_per_mp", None)
+        self._drop_inert_workspace_knobs(config)
         self._shrink_for_numel_constraints(config)
         return config
 
@@ -6836,8 +8820,24 @@ class ConfigSpec:
         # flatten/unflatten round-trip, which breaks callers that key on the config identity
         # (e.g. benchmark result maps).
         self.normalize(config, _fix_invalid=True)
+        self._drop_inert_workspace_knobs(config)
         self._shrink_for_numel_constraints(config)
         return config
+
+    @staticmethod
+    def _drop_inert_workspace_knobs(config: helion.Config) -> None:
+        """The split-K workspace schedule is a seeded search alternative; the
+        public default is the plain kernel, without the schedule's inert
+        stage and partition knobs (flat search still represents them), so a
+        GEMM's default does not depend on whether its operands admit the
+        schedule's proof."""
+        if config.config.get(SPLIT_K_WORKSPACE_KEY, False) is False:
+            for key in (
+                SPLIT_K_WORKSPACE_KEY,
+                SPLIT_K_STAGES_KEY,
+                SPLIT_K_PARTITIONS_KEY,
+            ):
+                config.config.pop(key, None)
 
     def _shrink_for_numel_constraints(self, config: helion.Config) -> None:
         """Shrink block_sizes in *config* in-place so every tensor numel
@@ -6851,7 +8851,8 @@ class ConfigSpec:
         ):
             return
         min_sizes = [
-            max(self.block_sizes[i].min_size, 1) for i in range(len(block_sizes))
+            max(self.block_sizes[i].min_size, self.block_sizes[i].structural_pin or 1)
+            for i in range(len(block_sizes))
         ]
         shrink_block_sizes_for_numel_constraints(
             self.tensor_numel_constraints, block_sizes, min_sizes
@@ -6872,6 +8873,9 @@ class ConfigSpec:
         best_val = -1
         for i, value in enumerate(block_sizes):
             if not isinstance(value, int):
+                continue
+            if self.block_sizes[i].structural_pin is not None:
+                # Normalization would restore the pinned size: no progress.
                 continue
             if value // 2 >= max(self.block_sizes[i].min_size, 1) and value > best_val:
                 best_val = value
@@ -6914,6 +8918,63 @@ class ConfigSpec:
                     is_sequence=False,
                     num_items=0,
                 )
+
+    def _cute_pdl_searched(self) -> bool:
+        """Whether the search flips ``cute_pdl``: ``griddepcontrol`` exists
+        on sm_90 and up."""
+        return (
+            self.target_device_capability is not None
+            and self.target_device_capability >= (9, 0)
+        )
+
+    def _cute_pdl_fields(
+        self, fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment]
+    ) -> None:
+        """Add the generic dependent-launch knobs: ``cute_pdl`` (a launch
+        attribute plus one wait ahead of the body's first global access,
+        searched where ``griddepcontrol`` exists, sm_90 and up) and
+        ``cute_pdl_release``.
+
+        Where a ``cute_pdl`` kernel releases its own dependents: ``auto``
+        (the default) resolves at codegen to ``entry`` while the launch grid
+        fits in one wave of resident CTAs and to ``last_wave`` past it,
+        ``entry`` right after the wait, so the dependents launch while this
+        kernel runs (their CTAs sit resident at their own wait), ``exit``
+        after the body's last statement, ``none`` leaves the implicit trigger
+        at grid completion, ``last_wave`` releases at entry in the last wave's
+        CTAs only (plain entry for a one-wave grid).  Inert when ``cute_pdl``
+        is off (the default value is then normalized away).  The search
+        leaves the placement at ``auto``: a kernel whose back-to-back calls
+        are separated by a plain launch (the zero fill of an output) cannot
+        observe its own placement in isolation, so a searched placement is a
+        coin flip there, while the kernel's dependent in the real call
+        sequence pays for a non-releasing pick (mamba2_ssd backward: dqkg
+        alone reads 3.66 us under every placement; the sequence reads 11.2 us
+        per call with dqkg at ``none`` and 10.3 at ``entry``).  The explicit
+        values stay valid for pins, seeds and users.
+        """
+        if not self.supports_config_key("cute_pdl"):
+            return
+        fields["cute_pdl"] = EnumFragment(
+            (False, True),
+            search_choices=(False, True) if self._cute_pdl_searched() else (False,),
+        )
+        fields["cute_pdl_release"] = EnumFragment(
+            CUTE_PDL_RELEASE_CHOICES,
+            search_choices=(CUTE_PDL_RELEASE_DEFAULT,),
+        )
+        # Pad the kernel's shared memory to one wave's density so an early
+        # launch cannot pack its CTAs onto the SMs its primary left idle
+        # (``pdl_release.spread_pad_bytes``).  Searched with the knob: the
+        # pad is a tie in the kernel's isolated timing (the dispatcher
+        # spreads a fresh grid the same way) and the final selection prefers
+        # it among ties (``CuteBackend.finalist_preference``), while a kernel
+        # the pad slows (less L1 behind a larger carveout) keeps the knob
+        # without it.
+        fields[CUTE_PDL_SPREAD_KEY] = EnumFragment(
+            (False, True),
+            search_choices=(False, True) if self._cute_pdl_searched() else (False,),
+        )
 
     def _flat_fields(
         self,
@@ -6964,10 +9025,46 @@ class ConfigSpec:
                 fields["cute_fragment_integer_atomic_epochs"] = BooleanFragment()
             if self.cute_fragment_packet_loads_search_enabled:
                 fields["cute_fragment_packet_loads"] = BooleanFragment()
+            if self.cute_fragment_padded_rows_search_enabled:
+                fields["cute_fragment_padded_rows"] = BooleanFragment()
+            if self.cute_fragment_unrolled_loops_search_enabled:
+                fields["cute_fragment_unrolled_loops"] = BooleanFragment()
+            # The tile transport knobs (one statement: this method sits at a
+            # size past which pyrefly drops its narrowing of the fields below).
+            fields.update(
+                {
+                    key: BooleanFragment()
+                    for enabled, key in (
+                        (
+                            self.cute_fragment_vector_io_search_enabled,
+                            "cute_fragment_vector_io",
+                        ),
+                        (
+                            self.cute_fragment_batched_loads_search_enabled,
+                            "cute_fragment_batched_loads",
+                        ),
+                        (
+                            self.cute_fragment_split_k_search_enabled,
+                            "cute_fragment_split_k",
+                        ),
+                        (
+                            self.cute_fragment_mma_rows_search_enabled,
+                            "cute_fragment_mma_rows",
+                        ),
+                        (
+                            self.cute_fragment_slab_loads_search_enabled,
+                            "cute_fragment_slab_loads",
+                        ),
+                    )
+                    if enabled
+                }
+            )
             if self.cute_fragment_warp_scan_search_enabled:
                 fields["cute_fragment_warp_scan"] = BooleanFragment()
             if self.cute_fragment_topk_network_search_enabled:
                 fields["cute_fragment_topk_network"] = BooleanFragment()
+            if self.cute_fragment_cta_topk_search_enabled:
+                fields["cute_fragment_cta_topk"] = BooleanFragment()
             if self.cute_fragment_local_atomic_registers_search_enabled:
                 fields["cute_fragment_local_atomic_registers"] = BooleanFragment()
             if self.cute_integer_loop_reduction_search_enabled:
@@ -7004,9 +9101,16 @@ class ConfigSpec:
                 )
             if self.cute_fragment_reduction_search_enabled:
                 fields["cute_fragment_reduction"] = EnumFragment(
-                    choices=("serial", "warp")
+                    choices=("serial", "warp", "cta", "cta_unroll")
                 )
-            if self.cute_pointwise_region_block_ids:
+            if self.cute_fp32_dot_search_enabled:
+                fields["cute_fp32_dot"] = EnumFragment(choices=("simt", "tf32_mma"))
+            if self.cute_pointwise_region_block_ids and any(
+                pid_type != "flat" for pid_type in self.allowed_pid_types
+            ):
+                # The pointwise launch may go flat while the native launch
+                # stays persistent; when every launch is flat already (ordered
+                # barrier phases) the knob is inert and stays off the surface.
                 fields["cute_pointwise_pid_type"] = EnumFragment(
                     choices=("inherit", "flat")
                 )
@@ -7052,12 +9156,160 @@ class ConfigSpec:
                         ),
                     )
                 )
+                if self._cute_flash_gated_row_warp_choices_by_tile:
+                    from .._compiler.cute.cute_flash_gated_row_mma import (
+                        GATED_ROW_WARPS_KEY,
+                    )
+                    from .._compiler.cute.cute_flash_gated_row_mma import (
+                        gated_row_warps_default,
+                    )
+
+                    row_warps = tuple(
+                        sorted(
+                            {
+                                w
+                                for warps in self._cute_flash_gated_row_warp_choices_by_tile.values()
+                                for w in warps
+                            }
+                        )
+                    )
+                    row_default = gated_row_warps_default(row_warps)
+                    fields[GATED_ROW_WARPS_KEY] = EnumFragment(
+                        choices=(
+                            row_default,
+                            *(w for w in row_warps if w != row_default),
+                        )
+                    )
             elif self.cute_flash_bwd_search_enabled:
-                fields["cute_flash_bwd_persistent"] = EnumFragment(choices=(0, 1))
+                fields["cute_flash_bwd_persistent"] = EnumFragment(
+                    choices=(0, 1) if self._cute_flash_bwd_persistent_allowed else (0,)
+                )
                 fields["cute_flash_bwd_two_cta"] = EnumFragment(
                     choices=(0, 1) if self._cute_flash_bwd_two_cta_allowed else (0,)
                 )
-                fields["cute_flash_bwd_exp2_f32"] = EnumFragment(choices=(0, 1))
+                # The first choice is the default config's: the f32 exp2 pair
+                # measured 2-5% faster on the flex walks (and causal / d64 dense),
+                # the packed f16x2 pair on the dense d128 non-causal shapes.
+                fields["cute_flash_bwd_exp2_f32"] = EnumFragment(
+                    choices=(1, 0) if self._cute_flash_bwd_flex else (0, 1)
+                )
+                row_facts = self._cute_flash_bwd_row_facts
+                if (
+                    not self._cute_flash_bwd_flex
+                    and row_facts is not None
+                    and row_facts.admitted
+                ):
+                    # The register-MMA row programs (cute_flash_bwd_row_mma):
+                    # searched beside the tcgen05 family where its grid is
+                    # small, legal everywhere the knobs divide the shape.
+                    row_search = flash_bwd_row_search_grid(row_facts)
+                    fields[FLASH_BWD_FAMILY_KEY] = EnumFragment(
+                        choices=FLASH_BWD_FAMILIES,
+                        search_choices=(
+                            FLASH_BWD_FAMILIES
+                            if row_search
+                            else (FLASH_BWD_FA4_FAMILY,)
+                        ),
+                    )
+                    for key, choices in (
+                        (FLASH_BWD_ROW_KV_KEY, FLASH_BWD_ROW_KV_CHOICES),
+                        (FLASH_BWD_ROW_Q_SPLIT_KEY, FLASH_BWD_ROW_Q_SPLIT_CHOICES),
+                        (FLASH_BWD_ROW_Q_CHUNK_KEY, FLASH_BWD_ROW_Q_CHUNK_CHOICES),
+                    ):
+                        fields[key] = EnumFragment(
+                            choices=choices,
+                            search_choices=choices if row_search else choices[:1],
+                        )
+                if self._cute_flash_bwd_flex:
+                    if self._cute_flash_bwd_has_mask:
+                        # How the mask_mod predicate reaches the -inf select of
+                        # the flex backward's P pass (see flash_score_mod).
+                        fields["cute_flash_bwd_mask_form"] = EnumFragment(
+                            choices=("bitmask", "element")
+                        )
+                    from .._compiler.cute.cute_flash_bwd_flex import FBWD_REG_SPLITS
+
+                    # Register budget per warp role (reduce / compute / other).
+                    fields["cute_flash_bwd_regs"] = EnumFragment(
+                        choices=FBWD_REG_SPLITS
+                    )
+                    if self._cute_flash_bwd_has_hook:
+                        # Lanes per hook + exp2 group of the P pass (live-range control).
+                        fields["cute_flash_bwd_hook_cols"] = EnumFragment(
+                            choices=(32, 16, 8)
+                        )
+                        # Order the hook coordinate math after the S wait (see fbwd_pin_i32).
+                        fields["cute_flash_bwd_hook_pin"] = EnumFragment(choices=(1, 0))
+                    if self._cute_flash_bwd_additive_bias:
+                        # Fold an additive score bias into the LSE term (see additive_bias_region).
+                        fields["cute_flash_bwd_bias_fold"] = EnumFragment(
+                            choices=(1, 0)
+                        )
+                    # Block-index -> (batch-head, KV tile) walk: heaviest-first
+                    # inside L2-sized batch-head groups (see fbwd_tile_group_choices).
+                    fields["cute_flash_bwd_tile_group"] = EnumFragment(
+                        choices=self._cute_flash_bwd_tile_groups
+                    )
+                    if self._cute_flash_bwd_stats_mma_allowed:
+                        # Per-column LSE / delta terms through K-slice MMAs
+                        # instead of broadcast smem loads in the compute passes
+                        # (see _fit_smem_budget; not on the 2-CTA pair plan).
+                        fields["cute_flash_bwd_stats_mma"] = EnumFragment(
+                            choices=(0, 1)
+                        )
+                    if self._cute_flash_bwd_s_first_allowed:
+                        # The tile's first S MMA ahead of the dO / V waits and
+                        # the first dO load ahead of the stats gather (the plain
+                        # TMEM plans; see emit_flash_bwd_flex_device_body).
+                        # "auto" follows the form (on for the persistent walk,
+                        # off for a one-tile CTA); the search spells it out.
+                        fields["cute_flash_bwd_s_first"] = EnumFragment(
+                            choices=("auto", 0, 1), search_choices=(0, 1)
+                        )
+                    if self._cute_flash_bwd_kv_stage_allowed:
+                        # Two K / V ring slots on the persistent walk: the next
+                        # tile's K / V load while the current tile computes
+                        # (one slot beside the Q / dO rings otherwise; see
+                        # _fit_smem_budget).
+                        fields["cute_flash_bwd_kv_stage"] = EnumFragment(choices=(1, 2))
+                    from .._compiler.cute.cute_flash import flash_flex_aux_smem_choices
+
+                    aux_choices = flash_flex_aux_smem_choices(
+                        self._cute_flash_bwd_aux_smem_candidates
+                    )
+                    if len(aux_choices) > 1:
+                        # Byte budget of the hook's gathered aux tables staged in
+                        # shared memory (0 = global gathers; see fbwd_aux_smem_layout).
+                        fields["cute_flash_bwd_aux_smem"] = EnumFragment(
+                            choices=aux_choices
+                        )
+                    if self._cute_flash_bwd_ds_tmem_allowed:
+                        # The dK MMA's dS^T operand from TMEM (TS mode) instead
+                        # of the smem dS staging (head dim 64).
+                        fields["cute_flash_bwd_ds_tmem"] = EnumFragment(choices=(0, 1))
+                    if len(self._cute_flash_bwd_table_step_choices) > 1:
+                        # Steps per step-table buffer, i.e. per chunk of a KV
+                        # tile's walk (0 = automatic: the whole walk when it fits,
+                        # else the largest table that does); see
+                        # cute_flash_bwd_flex.fbwd_table_step_choices.
+                        fields["cute_flash_bwd_table_steps"] = EnumFragment(
+                            choices=self._cute_flash_bwd_table_step_choices
+                        )
+                    if self._cute_flash_bwd_fast_math:
+                        # Elements of every 16 sent to the polynomial exp2 on the
+                        # FMA pipe (an approximation: fast_math kernels only).
+                        fields["cute_flash_bwd_exp2_emu"] = EnumFragment(
+                            choices=(0, 8, 4)
+                        )
+                # The fused backward bodies (the tcgen05 families and the
+                # register-MMA rows) take the generic dependent launch: the
+                # wait lands ahead of the body's first global access and the
+                # release follows the grid rule, as in any generic kernel.
+                # On the small grids the row family serves, the backward is
+                # one kernel of a chain (a preprocess kernel ahead of it), and
+                # the overlapped launch is worth a few hundred nanoseconds of
+                # a ~6 us kernel.
+                self._cute_pdl_fields(fields)
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
                 # Loop flattening is a real codegen choice on the SIMT path
@@ -7153,6 +9405,24 @@ class ConfigSpec:
                     fields["cute_reduction_pipeline_depth"] = EnumFragment(
                         choices=(2, 4)
                     )
+                # Cache policy of the full 16-byte global packet flushes:
+                # ``streaming`` (``st.global.cs``, evict-first) keeps an
+                # output written once from displacing re-read inputs;
+                # ``l2_evict_last`` needs the validated SM103 descriptor.
+                fields["cute_store_policy"] = EnumFragment(
+                    choices=(
+                        ("default", "streaming", "l2_evict_last")
+                        if self.cute_l2_evict_last_store_policy_supported
+                        else ("default", "streaming")
+                    )
+                )
+                if self.cute_exact_division_sites and not self.matmul_facts:
+                    # How an fp32 quotient by a loop-invariant divisor is
+                    # lowered; bitwise identical forms, see
+                    # ``_normalize_cute_exact_div_form``.
+                    fields["cute_exact_div_form"] = EnumFragment(
+                        choices=CUTE_EXACT_DIV_FORMS
+                    )
                 if self.cute_async_load_pipeline_enabled:
                     fields["cute_async_load_stages"] = EnumFragment(
                         choices=(0, 3, 4, 5)
@@ -7171,6 +9441,13 @@ class ConfigSpec:
                     )
                 if self.cute_bf16x2_recurrence_enabled:
                     fields["cute_bf16x2_recurrence"] = BooleanFragment()
+                # The split-K workspace proof holds for the atomic example and
+                # for plain tcgen05 GEMM stores alike; the latter has no
+                # collective ``matmul_facts``, so the knobs live outside them.
+                if self.cute_split_k_workspace_available:
+                    fields.update(
+                        workspace_search_fields(self.cute_split_k_partition_choices)
+                    )
                 if self.matmul_facts:
                     if (
                         self.cute_grouped_rna_k_choices
@@ -7214,75 +9491,73 @@ class ConfigSpec:
                     if self.cute_split_k_cluster_facts is not None:
                         fields[SPLIT_K_SCHEDULE_KEY] = EnumFragment(SPLIT_K_SCHEDULES)
                         fields[SPLIT_K_FINALIZER_KEY] = EnumFragment(FINALIZER_WARPS)
-                    if self.cute_split_k_workspace_available:
-                        fields[SPLIT_K_WORKSPACE_KEY] = BooleanFragment()
-                        fields[SPLIT_K_STAGES_KEY] = IntegerFragment(1, 16, 2)
-                    fields["cute_collective_mma"] = BooleanFragment()
-                    fields["cute_collective_static_layouts"] = BooleanFragment()
-                    native_collective = (
-                        self.target_device_capability is not None
-                        and self.target_device_capability[0] == 10
-                    )
-                    gathered_collective = native_collective and any(
-                        seed.config.get("cute_collective_compute") == "tma_gather"
-                        for seed in self.compiler_seed_configs
-                    )
-                    fields["cute_collective_compute"] = EnumFragment(
-                        choices=("warp", "tcgen05", "tma_gather")
-                        if native_collective
-                        else ("warp",),
-                        search_choices=("warp", "tcgen05", "tma_gather")
-                        if gathered_collective
-                        else ("warp", "tcgen05")
-                        if native_collective
-                        else ("warp",),
-                    )
-                    fields["cute_collective_native_seeded"] = (
-                        BooleanFragment()
-                        if native_collective
-                        else EnumFragment(choices=(False,))
-                    )
-                    fields["cute_collective_tmem_seed"] = (
-                        BooleanFragment()
-                        if native_collective
-                        else EnumFragment(choices=(False,))
-                    )
-                    fields["cute_collective_tmem_a"] = (
-                        BooleanFragment()
-                        if native_collective
-                        else EnumFragment(choices=(False,))
-                    )
-                    fields["cute_collective_stages"] = EnumFragment(
-                        choices=(1, 2, 3, 4)
-                    )
-                    fields["cute_collective_copy"] = EnumFragment(
-                        choices=("scalar", "async", "async_cached")
-                    )
-                    fields["cute_collective_recipe"] = EnumFragment(
-                        choices=("scalar", "vector", "vector_unrolled")
-                    )
-                    fields["cute_collective_operand_packets"] = EnumFragment(
-                        choices=(False, True),
-                        search_choices=(False, True)
-                        if any(
-                            fact.lhs_dtype == torch.float32
-                            for fact in self.matmul_facts
+                    if self.cute_collective_knobs_enabled:
+                        fields["cute_collective_mma"] = BooleanFragment()
+                        fields["cute_collective_static_layouts"] = BooleanFragment()
+                        capability = self.target_device_capability
+                        native_collective = (
+                            capability is not None and capability[0] == 10
                         )
-                        else (False,),
-                    )
-                    fields["cute_collective_epilogue"] = EnumFragment(
-                        choices=("scalar", "vector", "vector_unrolled")
-                    )
-                    fields["cute_gathered_mma_n"] = EnumFragment(
-                        choices=(256, 128, 512),
-                        search_choices=(256, 128, 512)
-                        if gathered_collective
-                        else (256,),
-                    )
-                    fields["cute_gathered_mma_stages"] = EnumFragment(
-                        choices=(3, 2, 4),
-                        search_choices=(3, 2, 4) if gathered_collective else (3,),
-                    )
+                        gathered_collective = native_collective and any(
+                            seed.config.get("cute_collective_compute") == "tma_gather"
+                            for seed in self.compiler_seed_configs
+                        )
+                        fields["cute_collective_compute"] = EnumFragment(
+                            choices=("warp", "tcgen05", "tma_gather")
+                            if native_collective
+                            else ("warp",),
+                            search_choices=("warp", "tcgen05", "tma_gather")
+                            if gathered_collective
+                            else ("warp", "tcgen05")
+                            if native_collective
+                            else ("warp",),
+                        )
+                        fields["cute_collective_native_seeded"] = (
+                            BooleanFragment()
+                            if native_collective
+                            else EnumFragment(choices=(False,))
+                        )
+                        fields["cute_collective_tmem_seed"] = (
+                            BooleanFragment()
+                            if native_collective
+                            else EnumFragment(choices=(False,))
+                        )
+                        fields["cute_collective_tmem_a"] = (
+                            BooleanFragment()
+                            if native_collective
+                            else EnumFragment(choices=(False,))
+                        )
+                        fields["cute_collective_stages"] = EnumFragment(
+                            choices=(1, 2, 3, 4)
+                        )
+                        fields["cute_collective_copy"] = EnumFragment(
+                            choices=("scalar", "async", "async_cached")
+                        )
+                        fields["cute_collective_recipe"] = EnumFragment(
+                            choices=("scalar", "vector", "vector_unrolled")
+                        )
+                        fields["cute_collective_operand_packets"] = EnumFragment(
+                            choices=(False, True),
+                            search_choices=(False, True)
+                            if any(
+                                fact.lhs_dtype == torch.float32
+                                for fact in self.matmul_facts
+                            )
+                            else (False,),
+                        )
+                        fields["cute_collective_epilogue"] = EnumFragment(
+                            choices=("scalar", "vector", "vector_unrolled")
+                        )
+                        fields["cute_gathered_mma_n"] = EnumFragment(
+                            choices=(256, 128, 512),
+                            search_choices=(256, 128, 512)
+                            if gathered_collective
+                            else (256,),
+                        )
+                        fields["cute_gathered_mma_stages"] = EnumFragment(
+                            choices=(3, 2, 4),
+                            search_choices=(3, 2, 4) if gathered_collective else (3,),
+                        )
                 if self.cute_proven_bounds_enabled:
                     fields["cute_proven_bounds"] = BooleanFragment()
                 if self.cute_warp_aggregated_atomics_enabled:
@@ -7297,6 +9572,8 @@ class ConfigSpec:
                         "cute_scalar_epilogue_keep_inputs",
                         "cute_scalar_epilogue_owner_fold",
                         "cute_warp_fp32_redux",
+                        "cute_register_tile_warp_fold",
+                        "cute_register_tile_store_first",
                         "cute_replicated_reduction",
                         "cute_vector_packet_unroll",
                     ):
@@ -7308,7 +9585,22 @@ class ConfigSpec:
                             (False, True),
                             search_choices=(False, True) if seeded else (False,),
                         )
-                if len(self.cute_lane_layouts) > 0 and not self.matmul_facts:
+                fragment_mma_searchable = self._cute_fragment_mma_searchable()
+                if fragment_mma_searchable:
+                    # The GEMV dot on mma.sync fragments; configs whose thread
+                    # layout cannot take it normalize to False.
+                    fields[FRAGMENT_MMA_KEY] = EnumFragment((False, True))
+                if self._cute_dot_ring_searchable():
+                    # The GEMV dot through a cp.async ring on mma.sync; the
+                    # normalizer repairs the stage / split knobs to a fitting
+                    # pair and makes the knob inert where the layout cannot
+                    # take the ring.
+                    fields[RING_MMA_KEY] = EnumFragment((False, True))
+                    fields[RING_STAGES_KEY] = EnumFragment(RING_STAGE_CHOICES)
+                    fields[RING_SPLIT_KEY] = EnumFragment(RING_SPLIT_CHOICES)
+                if len(self.cute_lane_layouts) > 0 and (
+                    not self.matmul_facts or fragment_mma_searchable
+                ):
                     sink_seeded = any(
                         seed.config.get("cute_vloop_sink") is True
                         for seed in self.compiler_seed_configs
@@ -7327,29 +9619,17 @@ class ConfigSpec:
                         if sink_seeded or unroll_seeded
                         else (1,),
                     )
-                if self.supports_config_key("cute_pdl"):
-                    # A launch attribute plus one wait, live on every kernel
-                    # of this branch (the tcgen05 and flash families, whose
-                    # own waits and plans leave it inert, build their fields
-                    # above) and searched where ``griddepcontrol`` exists,
-                    # sm_90 and up.
-                    pdl_searched = (
-                        self.target_device_capability is not None
-                        and self.target_device_capability >= (9, 0)
-                    )
-                    fields["cute_pdl"] = EnumFragment(
-                        (False, True),
-                        search_choices=(False, True) if pdl_searched else (False,),
-                    )
+                # A launch attribute plus one wait, live on every kernel of
+                # this branch (the tcgen05 family, whose own waits and plans
+                # leave it inert, builds its fields above; the fused flash
+                # backward adds the same two fields to its own branch).
+                self._cute_pdl_fields(fields)
                 if self.cute_rng_packet_enabled:
                     fields["cute_rng_packet"] = BooleanFragment()
                 if self.cute_packet_prefetch_enabled:
                     fields["cute_packet_prefetch"] = EnumFragment(choices=(0, 2, 4, 8))
-                if (
-                    self.matmul_facts
-                    and self.target_device_capability is not None
-                    and self.target_device_capability[0] >= 8
-                ):
+                capability = self.target_device_capability
+                if self.matmul_facts and capability is not None and capability[0] >= 8:
                     chain_seeded = any(
                         seed.config.get("cute_register_chain") is True
                         for seed in self.compiler_seed_configs
@@ -7358,6 +9638,11 @@ class ConfigSpec:
                         (False, True),
                         search_choices=(False, True) if chain_seeded else (False,),
                     )
+                if self.cute_simt_mma_enabled:
+                    from .._compiler.cute.simt_gemm import SIMT_MMA_LAYOUTS
+
+                    fields["cute_simt_mma"] = EnumFragment((False, True))
+                    fields["cute_simt_mma_layout"] = EnumFragment(SIMT_MMA_LAYOUTS)
                 # CuTe's SIMT search normally has no pid_type coordinate.  A
                 # metadata-specialized compiler seed may nevertheless prove one
                 # exact 3-D ``xyz`` launch safe after the earlier, deliberately
@@ -7405,8 +9690,24 @@ class ConfigSpec:
                     fields["cute_min_blocks_per_mp"] = EnumFragment(
                         choices=(0, 1, 2, 3, 4, 6)
                     )
+                # Several one-element grid tiles per CTA (thread sub-groups):
+                # tiny-tile kernels are CTA-dispatch bound.
+                if (
+                    self.supports_config_key("cute_tiles_per_block")
+                    and self.cute_tile_pack_counts
+                    and not self.matmul_facts
+                ):
+                    from .._compiler.cute.tile_packing import TILES_PER_BLOCK_CHOICES
+
+                    fields["cute_tiles_per_block"] = EnumFragment(
+                        choices=TILES_PER_BLOCK_CHOICES
+                    )
+            # The fused flash bodies (forward and backward) emit their own
+            # epilogues; the subtiled store split rewrites the graphs the
+            # attention matchers read, so the knob leaves the search space.
             if (
                 not self.cute_flash_search_enabled
+                and not self.cute_flash_bwd_search_enabled
                 and self.epilogue_subtile_autotune_choices is not None
             ):
                 fields["epilogue_subtile"] = EnumFragment(
@@ -7440,12 +9741,47 @@ class ConfigSpec:
                 assert self.cute_mma_dag_exchange is not None
                 assert self.cute_mma_dag_pass_warps is not None
                 assert self.cute_mma_dag_loads is not None
+                assert self.cute_mma_dag_derived is not None
+                assert self.cute_mma_dag_epilogue is not None
+                lookahead_fragment = self.cute_mma_dag_lookahead
+                assert lookahead_fragment is not None
                 fields[MMA_DAG_WARPS_KEY] = self.cute_mma_dag_warps
                 fields[MMA_DAG_STAGES_KEY] = self.cute_mma_dag_stages
                 fields[MMA_DAG_STORE_KEY] = self.cute_mma_dag_store
                 fields[MMA_DAG_EXCHANGE_KEY] = self.cute_mma_dag_exchange
                 fields[MMA_DAG_PASS_WARPS_KEY] = self.cute_mma_dag_pass_warps
                 fields[MMA_DAG_LOADS_KEY] = self.cute_mma_dag_loads
+                # (Locals: the type checker's attribute narrowing does not
+                # reach this far into the function.)
+                aux_fragment = self.cute_mma_dag_aux
+                if aux_fragment is not None:
+                    fields[MMA_DAG_AUX_KEY] = aux_fragment
+                fields[MMA_DAG_DERIVED_KEY] = self.cute_mma_dag_derived
+                fields[MMA_DAG_EPILOGUE_KEY] = self.cute_mma_dag_epilogue
+                fields[MMA_DAG_LOOKAHEAD_KEY] = lookahead_fragment
+                persistent_fragment = self.cute_mma_dag_persistent
+                if persistent_fragment is not None:
+                    fields[MMA_DAG_PERSISTENT_KEY] = persistent_fragment
+                cluster_fragment = self.cute_mma_dag_cluster
+                if cluster_fragment is not None:
+                    fields[MMA_DAG_CLUSTER_KEY] = cluster_fragment
+                split_fragment = self.cute_mma_dag_split
+                if split_fragment is not None:
+                    fields[MMA_DAG_SPLIT_KEY] = split_fragment
+            rsb_fragment = self.cute_register_subblocks
+            if rsb_fragment is not None:
+                fields[RSB_KEY] = rsb_fragment
+                fields.update(
+                    (rsb_key, rsb_knob)
+                    for rsb_key, rsb_knob in (
+                        (RSB_WARPS_KEY, self.cute_register_subblocks_warps),
+                        (RSB_PREFETCH_KEY, self.cute_register_subblocks_prefetch),
+                        (RSB_MASK_KEY, self.cute_register_subblocks_mask),
+                        (RSB_COLSIDE_KEY, self.cute_register_subblocks_colside),
+                        (RSB_ROLL_KEY, self.cute_register_subblocks_roll),
+                    )
+                    if rsb_knob is not None
+                )
             if self.cute_chunk_prepare_schedule is not None:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
                     self.cute_chunk_prepare_schedule
@@ -7461,7 +9797,16 @@ class ConfigSpec:
                     (
                         key,
                         EnumFragment(
-                            choices=tuple(value for value in choices if value != 64)
+                            choices=(False,)
+                            if key == "cute_scaled_fused_scales"
+                            and not self.cute_mxfp8_fused_scales_available
+                            else (False,)
+                            if key in ("cute_scaled_sf_tma", "cute_scaled_sf_inplace")
+                            and not self.cute_mxfp8_sf_tma_available
+                            else ("default",)
+                            if key == "cute_scaled_epilogue_mode"
+                            and not self.cute_mxfp8_tma_output_available
+                            else tuple(value for value in choices if value != 64)
                             if self.cute_mxfp8_mma_available
                             and key == "cute_scaled_tile_k"
                             else choices
@@ -7476,11 +9821,12 @@ class ConfigSpec:
             if (
                 self.supports_config_key("pid_type")
                 and "pid_type" not in fields
-                and "flat" not in self.allowed_pid_types
+                and self.allowed_pid_types[0] != "flat"
             ):
                 # SIMT normally omits this coordinate and defaults to flat.
                 # Barriers require a persistent launch in the reference and in
-                # every candidate, including after a flatten/unflatten round trip.
+                # every candidate, including after a flatten/unflatten round trip;
+                # CuTe may also search their ordered ``flat`` phase launches.
                 fields["pid_type"] = EnumFragment(self.allowed_pid_types)
             if self.cross_loop_pipeline is not None:
                 fields["cross_loop_pipeline"] = self.cross_loop_pipeline
@@ -7715,9 +10061,16 @@ class ConfigSpec:
         )
         legacy_hash = self._cache_fingerprint_from_structural_hash(structural_hash)
         policy = coverage_policy(self.compiler_coverage_groups)
-        if policy is None:
-            return legacy_hash
-        return hashlib.sha256(repr((legacy_hash, policy)).encode("utf-8")).hexdigest()
+        result = (
+            legacy_hash
+            if policy is None
+            else hashlib.sha256(repr((legacy_hash, policy)).encode("utf-8")).hexdigest()
+        )
+        if self.compiler_seed_overflow_requested and self.compiler_seed_configs:
+            return hashlib.sha256(
+                repr((result, "compiler_seed_overflow:v1")).encode("utf-8")
+            ).hexdigest()
+        return result
 
     def projected_cache_fingerprint_hash(
         self, *, advanced_controls_files: list[str] | None = None
@@ -7950,7 +10303,8 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.dim_max_size: int = (
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
-        self.max_size: int = self.dim_max_size
+        self._max_size: int = self.dim_max_size
+        self._max_size_revision: int = 0
         # A search surface may pin the default (non-autotuned) block size while
         # widening the autotuner's range (see ``_fragment``).
         self.default_size: int | None = None
@@ -7962,6 +10316,13 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.declared_max_size: int | None = None
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
+        # The one block size a fused lowering's envelope admits
+        # (``pin_structurally``): the search sees a single point and a
+        # provided config's other value is normalized onto it (see
+        # ``_normalize``). ``None`` where no surface pinned this block.
+        self.structural_pin: int | None = None
+        self.structural_pin_reason: str = ""
+        self._structural_pin_warned: set[int] = set()
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size
@@ -7982,14 +10343,62 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
 
     def _normalize(self, name: str, value: object) -> int | None:
         result = super()._normalize(name, value)
-        if isinstance(result, int) and result < self.min_size:
+        if not isinstance(result, int):
+            return result
+        pin = self.structural_pin
+        if pin is not None and result != pin:
+            # A decorator / saved config written for another backend (the
+            # examples pin Triton-shaped 64x64 tiles) must not silently pick
+            # the scalar lowering: the fused family is the only one the
+            # surface offers, so the value is normalized onto its envelope.
+            if result not in self._structural_pin_warned:
+                self._structural_pin_warned.add(result)
+                log.warning(
+                    "%s=%d in the provided config is normalized onto %d: "
+                    "%s pins this block size",
+                    name,
+                    result,
+                    pin,
+                    self.structural_pin_reason,
+                )
+            return pin
+        if result < self.min_size:
             result = self.min_size
         return result
+
+    def pin_structurally(self, value: int, *, reason: str) -> None:
+        """Pin this block size to the one value a fused lowering admits.
+
+        The autotuner's range collapses to ``value`` and ``_normalize`` maps
+        any other provided value onto it (with a logged warning naming the
+        key and ``reason``), so a config pinned by a decorator or loaded from
+        a cache written for another backend still reaches the fused family.
+        """
+        self.autotuner_min = value
+        self.max_size = value
+        self.structural_pin = value
+        self.structural_pin_reason = reason
 
     def update_min(self, value: int) -> None:
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))
         if self.max_size < self.min_size:
             self.max_size = self.min_size
+
+    @property
+    def max_size(self) -> int:
+        return self._max_size
+
+    @max_size.setter
+    def max_size(self, value: int) -> None:
+        # Record even an equal assignment: an independent consumer or explicit
+        # user bound may impose the same ceiling as an earlier compiler cap.
+        self._max_size = value
+        self._max_size_revision += 1
+
+    @property
+    def max_size_revision(self) -> int:
+        """Mutation token for a compiler-owned ceiling that may later widen."""
+        return self._max_size_revision
 
     def update_max(self, value: int) -> None:
         clamped = max(value, 1)
@@ -8129,6 +10538,19 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             return next_power_of_2(self.size_hint)
         return None
 
+    def _limits(self, base: ConfigSpec) -> tuple[int | None, int | None]:
+        """Persistent thread threshold and rolled chunk limit for this axis."""
+        threshold = base.reduction_loop_force_threshold
+        max_chunk = base.max_reduction_loop
+        if (
+            base.backend_name == "cute"
+            and self.block_id in base.cute_indexed_reduction_block_ids
+        ):
+            # CuTe argmin/argmax uses warp_reduction (threads_in_group <= 32).
+            threshold = 32 if threshold is None else min(threshold, 32)
+            max_chunk = 32 if max_chunk is None else min(max_chunk, 32)
+        return threshold, max_chunk
+
     def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         # Shared by both directions:
         # - unflatten: flat integer -> Config value via _flat_config()
@@ -8138,10 +10560,10 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         default = min(high, 4096)
         # Cap default at the backend's max reduction loop so that
         # large reductions default to looped rather than persistent.
-        if base.max_reduction_loop is not None:
-            force_threshold = base.reduction_loop_force_threshold
+        force_threshold, max_chunk = self._limits(base)
+        if max_chunk is not None:
             if force_threshold is not None and self.size_hint > force_threshold:
-                default = min(default, base.max_reduction_loop)
+                default = prev_power_of_2(default, max_chunk)
         if high == self._full_extent_chunk():
             # The full padded chunk now denotes an explicit rolled loop.
             # Reserve the next power of two for None, retaining the old default
@@ -8183,6 +10605,21 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # capped at max_reduction_loop and can fall below size_hint, which would
         # round-trip None into a slow looped config (e.g. size_hint=32000 ->
         # default 4096 -> reduction_loops=[4096]).
+        # CuTe flattening repairs search/cache/seed budgets before decoding.
+        if base.backend_name == "cute" and type(value) is int and value > 0:
+            _, max_chunk = self._limits(base)
+            explicit_chunk = value == self._full_extent_chunk() or (
+                self.allow_non_power_of_two
+                and 8 <= value <= self.size_hint
+                and self.size_hint % value == 0
+                and value & (value - 1) != 0
+            )
+            if value >= self.size_hint and not explicit_chunk:
+                value = None
+            elif not explicit_chunk or (max_chunk is not None and value > max_chunk):
+                value = max(
+                    self._flat_fragment(base).low, prev_power_of_2(value, max_chunk)
+                )
         if value is None:
             return self._flat_fragment(base).high
         return value
@@ -8402,7 +10839,21 @@ class RangeUnrollFactorSpec(_OptionalIntSpec):
 
 
 class RangeWarpSpecializeSpec(_OptionalBoolSpec):
-    pass
+    # Set by ``lower_to_device_ir`` (``intra_loop_raw_reread_block_ids``) for
+    # a loop whose region stores and then re-reads the same storage: Triton's
+    # warp specialization splits such a body across partitions and the
+    # re-read observes stale memory.  The slot stays, so the config shape
+    # does not depend on the analysis, but its value is pinned to None.
+    pinned: bool = False
+
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        if self.pinned:
+            return EnumFragment((None,))
+        return super()._fragment(base)
+
+    def _normalize(self, name: str, value: object) -> bool | None:
+        value = super()._normalize(name, value)
+        return None if self.pinned else value
 
 
 class RangeNumStagesSpec(_OptionalIntSpec):

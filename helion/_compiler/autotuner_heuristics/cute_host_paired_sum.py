@@ -22,6 +22,7 @@ class CuteHostPairedSumHeuristic(AutotunerHeuristic):
     def register_facts(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ..cute.host_full_sum import prove_host_full_sum
         from ..cute.host_paired_sum import prove_host_sum_pairs
         from ..cute.host_single_sum import prove_host_single_sum
 
@@ -31,6 +32,7 @@ class CuteHostPairedSumHeuristic(AutotunerHeuristic):
             and (
                 prove_host_sum_pairs(host).pairs
                 or prove_host_single_sum(host).site is not None
+                or prove_host_full_sum(host).sites
             )
         )
         # Rank/dtype and constexpr values already participate in binding.

@@ -27,6 +27,8 @@ from .cutedsl_compat import L2_EVICT_LAST_STORE_ABI_VERSION
 __all__ = [
     "L2_EVICT_LAST_STORE_ABI_VERSION",
     "fixed_l2_evict_last_store_policy_supported",
+    "store_u16x8_streaming",
+    "store_u32x4_streaming",
 ]
 
 
@@ -60,6 +62,10 @@ _ASM_STORE_V4_B32_L2_EVICT_LAST = (
     "st.global.L2::cache_hint.v4.u32 [$0], {$1,$2,$3,$4}, $5;"
 )
 _L2_EVICT_LAST_POLICY = 0x14F0000000000000
+# The ``.cs`` (cache streaming) operator: evict-first at L1 and L2, so an
+# output written once does not displace the inputs the next launch re-reads.
+# Portable PTX (no policy descriptor).
+_ASM_STORE_V4_B32_STREAMING = "st.global.cs.v4.b32 [$0], {$1,$2,$3,$4};"
 
 
 @dsl_user_op
@@ -135,7 +141,7 @@ def _load_vector_with_policy(
     ip: ir.InsertionPoint | None = None,
 ) -> ir.Value:
     """Load ``words`` aligned 32-bit words and bitcast them to the requested
-    vector type (``words`` is 4, 2 or 1: a 16-, 8- or 4-byte packet)."""
+    vector type (``words`` is 8, 4, 2 or 1: a 32-, 16-, 8- or 4-byte packet)."""
     addr = ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
     u32 = cutlass.Uint32.mlir_type
     # One output is the scalar result type; two or more form a struct.
@@ -239,22 +245,56 @@ def _store_u32x4_l2_evict_last(ptr: object, values: list[object]) -> None:
     )
 
 
-def store_u16x8_l2_evict_last(ptr: object, values: list[object]) -> None:
-    """Store one 16-byte Uint16 fragment with an L2 retention hint."""
+def _pack_u16x8(values: list[object]) -> list[object]:
+    """Eight Uint16 lanes as four little-endian Uint32 words."""
 
     assert len(values) == 8
-    words = [
+    return [
         cutlass.Uint32(values[index])
         | (cutlass.Uint32(values[index + 1]) << cutlass.Uint32(16))
         for index in range(0, 8, 2)
     ]
-    _store_u32x4_l2_evict_last(ptr, words)
+
+
+def store_u16x8_l2_evict_last(ptr: object, values: list[object]) -> None:
+    """Store one 16-byte Uint16 fragment with an L2 retention hint."""
+
+    _store_u32x4_l2_evict_last(ptr, _pack_u16x8(values))
 
 
 def store_u32x4_l2_evict_last(ptr: object, values: list[object]) -> None:
     """Store one 16-byte Uint32 fragment with an L2 retention hint."""
 
     _store_u32x4_l2_evict_last(ptr, values)
+
+
+def _store_u32x4_streaming(ptr: object, values: list[object]) -> None:
+    """Store four packed words with the ``.cs`` streaming cache operator."""
+
+    assert len(values) == 4
+    address = ptr.toint().ir_value()
+    words = [cutlass.Uint32(value).ir_value() for value in values]
+    llvm.inline_asm(
+        None,
+        [address, *words],
+        _ASM_STORE_V4_B32_STREAMING,
+        "l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def store_u16x8_streaming(ptr: object, values: list[object]) -> None:
+    """Store one 16-byte Uint16 fragment as a streaming (evict-first) store."""
+
+    _store_u32x4_streaming(ptr, _pack_u16x8(values))
+
+
+def store_u32x4_streaming(ptr: object, values: list[object]) -> None:
+    """Store one 16-byte Uint32 fragment as a streaming (evict-first) store."""
+
+    _store_u32x4_streaming(ptr, values)
 
 
 @dsl_user_op

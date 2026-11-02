@@ -14,6 +14,11 @@ if TYPE_CHECKING:
 
 __all__ = ["barrier"]
 
+BARRIER_PID_TYPE_REASON = (
+    "hl.barrier() forces a persistent kernel (sequential phase "
+    "boundary between top-level loops); this pid_type is incompatible"
+)
+
 
 @_decorators.api(
     is_device_loop=False,
@@ -34,14 +39,15 @@ def _(origin: Origin, **kwargs: object) -> LiteralType:
 
     env = CompileEnvironment.current()
     # A barrier introduces a sequential phase boundary between top-level loops,
-    # so force persistent kernels (other PID choices are incompatible).
+    # so force persistent kernels (other PID choices are incompatible).  CuTe
+    # can instead launch the phases in order with ``pid_type="flat"``; DeviceIR
+    # keeps ``flat`` only once it has proved those launches
+    # (``ordered_phases_supported``).
     env.has_barrier = True
     for disallowed in ("flat", "xyz", "persistent_interleaved"):
-        env.config_spec.disallow_pid_type(
-            disallowed,
-            reason="hl.barrier() forces a persistent kernel (sequential phase "
-            "boundary between top-level loops); this pid_type is incompatible",
-        )
+        if disallowed == "flat" and env.backend_name == "cute":
+            continue
+        env.config_spec.disallow_pid_type(disallowed, reason=BARRIER_PID_TYPE_REASON)
 
     # Return None literal with a dedicated marker type.
     return BarrierResultType(origin=origin, value=None)

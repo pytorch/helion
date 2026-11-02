@@ -17,7 +17,7 @@ GEOMETRY_CHOICES: dict[str, tuple[int, ...]] = {
     "cute_radix_candidate_capacity": (0, 1024, 2048, 4096, 8192, 16384),
 }
 PIPELINE_CHOICES: dict[str, tuple[int, ...]] = {
-    "cute_radix_packet_bits": (128, 256),
+    "cute_radix_packet_bits": (128, 256, 64),
     "cute_radix_scan_unroll": (1, 2, 4),
 }
 HISTOGRAM_KEY = "cute_radix_histogram_mode"
@@ -28,6 +28,10 @@ BOOLEAN_KEYS = (
     "cute_radix_valid_domain",
     "cute_radix_ticket_stores",
     "cute_radix_cached_payload_inverse",
+    "cute_radix_resident_input",
+    "cute_radix_boundary_early_exit",
+    "cute_radix_defer_output",
+    "cute_radix_partial_scan",
 )
 CONFIG_KEYS = frozenset(
     (ALGORITHM_KEY, HISTOGRAM_KEY, *GEOMETRY_CHOICES, *BOOLEAN_KEYS, *PIPELINE_CHOICES)

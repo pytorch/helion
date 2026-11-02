@@ -120,23 +120,25 @@ def recurrent_step_fused(
     q: torch.Tensor,  # [BH, D]
     k: torch.Tensor,  # [BH, D]
     v: torch.Tensor,  # [BH, DV]
-    state: torch.Tensor,  # [BH, D, DV]  (mutated in-place)
+    state: torch.Tensor,  # [BH, D, DV]  (read only)
     alpha: torch.Tensor,  # [BH] scalar or [BH, D] diagonal
-) -> torch.Tensor:  # [BH, DV] output
+) -> tuple[torch.Tensor, torch.Tensor]:  # ([BH, DV] output, [BH, D, DV] new state)
     """Fused recurrent step for no-correction linear attention.
 
     In one kernel launch:
-      state = alpha * state + k^T @ v
-      output = q^T @ state
+      new_state = alpha * state + k^T @ v
+      output = q^T @ new_state
 
     Supports both scalar decay (alpha: [BH]) and diagonal decay (alpha: [BH, D]).
-    state is updated in-place.
+    state is left untouched; the updated state is returned as a new tensor, like
+    recurrent_step_reference.
     """
     BH = q.size(0)
     DV = v.size(1)
     diagonal = alpha.dim() == 2
 
     out = torch.empty([BH, DV], dtype=v.dtype, device=v.device)
+    new_state = torch.empty_like(state)
 
     for tile_bh, tile_dv in hl.tile([BH, DV], block_size=[1, None]):
         idx = tile_bh.id
@@ -157,15 +159,15 @@ def recurrent_step_fused(
         v_vec = v[idx, tile_dv].float()  # [dv_tile]
         s = s + k_vec[:, None] * v_vec[None, :]
 
-        # Write state back
-        state[idx, :, tile_dv] = s.to(state.dtype)
+        # Write the updated state
+        new_state[idx, :, tile_dv] = s.to(new_state.dtype)
 
         # Output: o = q^T s = (q . each col of s)
         q_vec = q[idx, :].float()  # [D]
         o_vec = (q_vec[:, None] * s).sum(0)  # [dv_tile]
         out[idx, tile_dv] = o_vec.to(out.dtype)
 
-    return out
+    return out, new_state
 
 
 @helion.kernel()
@@ -173,26 +175,28 @@ def recurrent_step_correction_fused(
     q: torch.Tensor,  # [BH, D]
     k: torch.Tensor,  # [BH, D]   (correction direction, or key)
     v: torch.Tensor,  # [BH, DV]
-    state: torch.Tensor,  # [BH, D, DV]  (mutated in-place)
+    state: torch.Tensor,  # [BH, D, DV]  (read only)
     alpha: torch.Tensor,  # [BH] scalar or [BH, D] diagonal
     beta: torch.Tensor,  # [BH]  correction strength
-) -> torch.Tensor:  # [BH, DV] output
+) -> tuple[torch.Tensor, torch.Tensor]:  # ([BH, DV] output, [BH, D, DV] new state)
     """Fused recurrent step with rank-1 delta-rule correction.
 
     In one kernel launch:
-      state = alpha * state
-      kts = k^T @ state
-      state -= beta * k @ kts^T
-      state += beta * k @ v^T
-      output = q^T @ state
+      new_state = alpha * state
+      kts = k^T @ new_state
+      new_state -= beta * k @ kts^T
+      new_state += beta * k @ v^T
+      output = q^T @ new_state
 
-    state is updated in-place.
+    state is left untouched; the updated state is returned as a new tensor, like
+    recurrent_step_reference.
     """
     BH = q.size(0)
     DV = v.size(1)
     diagonal = alpha.dim() == 2
 
     out = torch.empty([BH, DV], dtype=v.dtype, device=v.device)
+    new_state = torch.empty_like(state)
 
     for tile_bh, tile_dv in hl.tile([BH, DV], block_size=[1, None]):
         idx = tile_bh.id
@@ -219,15 +223,15 @@ def recurrent_step_correction_fused(
         s = s - b * k_vec[:, None] * kts[None, :]
         s = s + b * k_vec[:, None] * v_vec[None, :]
 
-        # Write state back
-        state[idx, :, tile_dv] = s.to(state.dtype)
+        # Write the updated state
+        new_state[idx, :, tile_dv] = s.to(new_state.dtype)
 
         # Output
         q_vec = q[idx, :].float()
         o_vec = (q_vec[:, None] * s).sum(0)
         out[idx, tile_dv] = o_vec.to(out.dtype)
 
-    return out
+    return out, new_state
 
 
 def recurrent_step(
@@ -241,8 +245,8 @@ def recurrent_step(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Single-step recurrent update using fused Helion kernels.
 
-    Returns (output [B,H,1,DV], new_state [B,H,D,DV]).
-    State is updated in-place for efficiency.
+    Returns (output [B,H,1,DV], new_state [B,H,D,DV]); ``state`` is not
+    modified, matching ``recurrent_step_reference``.
     """
     B, H, _, D = q.shape
     DV = v.shape[-1]
@@ -267,7 +271,7 @@ def recurrent_step(
     if beta_val is not None:
         b_f = beta_val.squeeze(2).reshape(BH)
         a_f = a_val.squeeze(2).reshape(BH, D) if a_val is not None else k_f
-        o_f = recurrent_step_correction_fused(
+        o_f, new_state_f = recurrent_step_correction_fused(
             q_f,
             a_f,
             v_f,
@@ -276,7 +280,7 @@ def recurrent_step(
             b_f,
         )
     else:
-        o_f = recurrent_step_fused(
+        o_f, new_state_f = recurrent_step_fused(
             q_f,
             k_f,
             v_f,
@@ -284,7 +288,7 @@ def recurrent_step(
             alpha_f,
         )
 
-    return o_f.reshape(B, H, 1, DV), state.reshape(B, H, D, DV)
+    return o_f.reshape(B, H, 1, DV), new_state_f.reshape(B, H, D, DV)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -2879,6 +2883,7 @@ def _helion_chunked_fwd_delta(
 def _kda_varlen_chunk_tables(
     cu_seqlens: torch.Tensor,
     C: int,
+    T_total: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Place every chunk: sequence n owns chunk_offsets[n] : chunk_offsets[n + 1], and
     chunk j of it starts at token_base[j] with valid_len[j] rows of its own.
@@ -2897,7 +2902,20 @@ def _kda_varlen_chunk_tables(
     an edited one. Comparing values instead would need the same device-to-host sync
     this exists to skip. FLA holds its own varlen tables under the same rule, in
     fla.utils.tensor_cache.
+
+    The vector is validated here as well, on the same first sight: every kernel
+    indexes tokens through cu_seqlens, so one that does not partition [0, T_total)
+    reads the wrong rows rather than failing (an end below T_total leaves that much
+    of the output at its zero initialization). Reading its ends is a device-to-host
+    sync too, so checking per call would forbid CUDA-graph capture of the forward;
+    a captured forward replays with the cu_seqlens tensor it was captured with.
     """
+    if int(cu_seqlens[-1]) != T_total:
+        raise ValueError(
+            f"cu_seqlens must end at T_total={T_total}, got {int(cu_seqlens[-1])}"
+        )
+    if int(cu_seqlens[0]) != 0 or not bool((cu_seqlens[1:] > cu_seqlens[:-1]).all()):
+        raise ValueError("cu_seqlens must start at 0 and strictly increase")
     N = cu_seqlens.numel() - 1
     device = cu_seqlens.device
     lens = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -2959,7 +2977,9 @@ def _helion_chunked_fwd_kda_varlen(
     DV = v.shape[-1]
     N = cu_seqlens.numel() - 1
 
-    chunk_offsets, token_base, valid_len, NT = _kda_varlen_chunk_tables(cu_seqlens, C)
+    chunk_offsets, token_base, valid_len, NT = _kda_varlen_chunk_tables(
+        cu_seqlens, C, T_total
+    )
 
     HNT = H * NT
     g_cs = torch.empty(HNT, C, D, dtype=torch.float32, device=q.device)
@@ -3188,14 +3208,23 @@ def _helion_chunked_bwd(
     dhf2 = dh_all.reshape(BHN, D, DV)
 
     dq_raw, dk_raw, dg_by_d = chunk_bwd_dqkg_scalar_helion(
-        qb, kb, vb, gc, hb, dob, dhf2, diag_anchored=True, scale=scale
+        qb,
+        kb,
+        vb,
+        gc,
+        hb,
+        dob,
+        dhf2,
+        diag_anchored=True,
+        compute_dg=needs_dg,
+        scale=scale,
     )
 
     dv_raw = chunk_bwd_dv_helion(
         qb, kb, kb, gc, dob, dhf2, A=A, diag_anchored=True, scale=scale
     )
 
-    dg = dg_by_d.reshape(B, H, T, D).to(g.dtype)
+    dg = dg_by_d.reshape(B, H, T, D).to(g.dtype) if needs_dg else None
 
     return (
         dq_raw.reshape(B, H, T, D),
@@ -3842,17 +3871,10 @@ def helion_chunk_kda(
             raise ValueError(
                 f"chunk size C must be {2 * BC_DIAG} or {4 * BC_DIAG} for KDA, got {C}"
             )
-        # Every kernel indexes tokens through cu_seqlens, so a vector that does not
-        # partition [0, T_total) reads the wrong rows rather than failing: an end
-        # below T_total leaves that much of the output at its zero initialization.
-        if int(cu_seqlens[-1]) != q.size(1):
-            raise ValueError(
-                f"cu_seqlens must end at T_total={q.size(1)}, got {int(cu_seqlens[-1])}"
-            )
-        if int(cu_seqlens[0]) != 0 or not bool(
-            (cu_seqlens[1:] > cu_seqlens[:-1]).all()
-        ):
-            raise ValueError("cu_seqlens must start at 0 and strictly increase")
+        # cu_seqlens itself (ends at T_total, starts at 0, strictly increasing) is
+        # checked by _kda_varlen_chunk_tables on the first sight of the tensor: the
+        # check reads device memory, and a per-call read would break CUDA-graph
+        # capture of the forward.
         # Grouped-query: give every query head its own key/value head, matching what
         # chunked_linear_attn does for the dense path.
         H_kv = k.size(2)

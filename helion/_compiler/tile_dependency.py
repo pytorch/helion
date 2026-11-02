@@ -4082,8 +4082,9 @@ def _compose_point_relations(
             for axis, begin, end, step in following_piece.source_bounds_items:
                 if step != 1:
                     return None
-                if begin == 0 and end == following.source_domain.axis_counts[axis]:
-                    continue
+                # A full intermediate-domain guard still clips a point map
+                # that reaches outside that domain. Dropping this guard can
+                # invent source support when the following map projects it away.
                 source_expression = _simplify_logical_expression(
                     first_targets[axis],
                     domain=first.source_domain,

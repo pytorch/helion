@@ -95,7 +95,7 @@ def _constraint_for_load(
     layout = _layout_from_tensor_strides(
         node, tile_strategy=tile_strategy, tag=LayoutTag.COALESCED
     )
-    if layout is None:
+    if layout is None or not _layout_covers_value(layout, node.meta.get("val")):
         return None
     return LayoutConstraint(preferred_output=layout)
 
@@ -113,9 +113,34 @@ def _constraint_for_store(
     layout = _layout_from_tensor_strides(
         node, tile_strategy=tile_strategy, tag=LayoutTag.COALESCED
     )
-    if layout is None:
+    if layout is None or not _layout_covers_value(
+        layout, _resolve_subscript_val(node.args[2]) if len(node.args) > 2 else None
+    ):
         return None
     return LayoutConstraint(preferred_input=layout)
+
+
+def _layout_covers_value(layout: ThreadLayout, value: object) -> bool:
+    """True when *layout* describes every element of the tile *value*.
+
+    ``_layout_from_tensor_strides`` reads the tile dims off the subscript and
+    only models tile indices and unit-stride iota gathers.  A full slice
+    (``x[idx, :]`` over a reduction dim) leaves a dim out, so the layout then
+    speaks for a smaller tile than the one flowing through the graph: for a
+    ``block_size=1`` tile beside such a slice it degenerates to one thread
+    holding one scalar while the launch spreads the slice over its threads.
+    Such a layout is no contract.  Kept as a seed, two of them that differed
+    only in rank made the propagation pass insert a shared-memory round trip
+    sized for the one-element tile, indexed by every launch thread
+    (``recurrent_step_fused`` at ``block_sizes=[1]`` returned garbage).
+    """
+    if not isinstance(value, torch.Tensor):
+        return False
+    numel = value.numel()
+    tile_numel = layout.tile_numel()
+    if isinstance(numel, int) and isinstance(tile_numel, int):
+        return numel == tile_numel
+    return CompileEnvironment.current().known_equal(tile_numel, numel)
 
 
 # ---------------------------------------------------------------------------

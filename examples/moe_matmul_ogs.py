@@ -77,10 +77,15 @@ def moe_matmul_ogs(
                     W_frag = W[e_idx, tile_k, tile_n]
                     acc = torch.addmm(acc, A_frag, W_frag)
                 block_T, block_N = acc.size()
-                existing_values = C[expert_orig_token_indices, tile_n]
                 mask_2d = token_valid.view(block_T, 1).expand(block_T, block_N)
-                C[expert_orig_token_indices, tile_n] = torch.where(
-                    mask_2d, acc.to(C.dtype), existing_values
+                # Padding rows past num_tokens were clamped to the expert's first
+                # token, so they share its output row. Mask them out of the store;
+                # writing back an old value for them races the row's real value.
+                hl.store(
+                    C,
+                    [expert_orig_token_indices, tile_n],
+                    acc.to(C.dtype),
+                    extra_mask=mask_2d,
                 )
     return C
 

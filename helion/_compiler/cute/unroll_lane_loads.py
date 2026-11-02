@@ -1,6 +1,7 @@
 """Trace-time lane unrolling with every unrolled lane's loads issued first.
 
-A synthetic grid lane loop (``DeviceGridState.wrap_body``) walks a thread's
+A synthetic lane loop (``DeviceGridState.wrap_body`` for a grid axis, the
+device-loop body for a ``hl.tile`` axis inside the kernel) walks a thread's
 elements of one tile axis one at a time, and the CuTe DSL lowers its
 ``range(N)`` to an ``scf.for``::
 
@@ -79,6 +80,7 @@ from .lane_loop_distribution import contains_compiler_marker
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Iterable
 
 _LIST_PREFIX = "_lane_unroll_loads_"
@@ -101,6 +103,15 @@ def lane_unroll_off_config(config: Config) -> Config:
 # Trace-time copies of one lane body (unroll factor times the extents of the
 # nested lane loops it hoists from) beyond which the pass declines.
 _MAX_UNROLLED_LANES = 64
+# Vector packets a thread holds live across the load phase (unroll factor
+# times the packet loads of one lane body).  Every hoisted packet stays in
+# registers until its lane computes: rope's 16-head lane with two 16-byte
+# packets per head unrolled 16 ways held 32 packets and cost 206 registers
+# per thread (12% of the SM's warps active, 8-10% slower than Triton under a
+# cold L2), while 8 ways (16 packets) was the fastest layout measured.
+# Larger knob values saturate here instead of spilling; scalar loads (a
+# gathered row index) do not count.
+_MAX_LIVE_PACKETS = 16
 
 
 def _ascending_range_extent(loop: ast.For) -> int | None:
@@ -138,6 +149,21 @@ def _is_load_call(call: ast.Call) -> bool:
         return True
     name = ast.unparse(func)
     return name == "cute.arch.load" or name in _CUTE_CACHE_LOAD_HELPER_NAMES
+
+
+def _is_packet_load(stmt: ast.AST) -> bool:
+    """Whether the hoisted statement loads a vector packet (not a scalar)."""
+    for call in _calls(stmt):
+        if not _is_load_call(call):
+            continue
+        name = ast.unparse(call.func)
+        if name in _CUTE_CACHE_LOAD_HELPER_NAMES:
+            return True
+        if name == "cute.arch.load" and any(
+            "VectorType" in ast.unparse(arg) for arg in call.args[1:]
+        ):
+            return True
+    return False
 
 
 def _has_scalar_policy_load(loop: ast.For) -> bool:
@@ -217,6 +243,16 @@ class _LevelPlan:
             (1 if item.list_index is not None else 0)
             if isinstance(item, _Hoisted)
             else item.load_count()
+            for item in self.items
+        )
+
+    def packet_count(self) -> int:
+        """Hoisted vector loads (``cute.arch.load(..., VectorType)`` and the
+        cache-hinted packet helpers) of one trip of this level."""
+        return sum(
+            (1 if item.list_index is not None and _is_packet_load(item.stmt) else 0)
+            if isinstance(item, _Hoisted)
+            else item.packet_count()
             for item in self.items
         )
 
@@ -413,20 +449,27 @@ def _rewrite_compute_phase(
     plan.loop.iter = iterator
 
 
-def _unroll_factor(extent: int, unroll: int, nested_product: int) -> int:
+def _unroll_factor(
+    extent: int, unroll: int, nested_product: int, packet_count: int = 0
+) -> int:
     factor = 1
     for choice in _CUTE_LANE_UNROLL_CHOICES:
         if (
             choice <= unroll
             and extent % choice == 0
             and choice * nested_product <= _MAX_UNROLLED_LANES
+            and choice * packet_count <= _MAX_LIVE_PACKETS
         ):
             factor = choice
     return factor
 
 
 def _unroll_one(
-    loop: ast.For, unroll: int, new_var: Callable[[str], str]
+    loop: ast.For,
+    unroll: int,
+    new_var: Callable[[str], str],
+    *,
+    require_full: bool = False,
 ) -> list[ast.stmt] | None:
     extent = _ascending_range_extent(loop)
     if (
@@ -440,8 +483,8 @@ def _unroll_one(
     plan, _deps = planner.plan(loop, extent, set(), [])
     if not plan.load_count():
         return None
-    factor = _unroll_factor(extent, unroll, plan.nested_product())
-    if factor < 2:
+    factor = _unroll_factor(extent, unroll, plan.nested_product(), plan.packet_count())
+    if factor < 2 or (require_full and factor != extent):
         return None
     lists = [new_var(f"{_LIST_PREFIX}{i}") for i in range(planner.next_list)]
     lane_var = loop.target.id  # type: ignore[union-attr]
@@ -483,29 +526,94 @@ def _drop_lane_attr(loop: ast.For) -> None:
             delattr(node, HELION_LANE_LOOP_VAR_ATTR)
 
 
+def _force_constexpr(loop: ast.For) -> list[ast.stmt]:
+    """Unroll a lane loop at trace time in place, loads where they are.
+
+    The fallback of a forced unroll (``forced_full``) when the loads-first
+    form declines: a body without hoistable loads, or more packets than
+    ``_MAX_LIVE_PACKETS`` (each fold then re-reads the packets its slice
+    needs rather than holding the whole slice live across the folds).  A
+    body holding compiler markers is rejected: the passes expanding them
+    match the rolled nest.  So is an extent beyond ``_MAX_UNROLLED_LANES``:
+    the trace-time copies of the lane body (and ptxas's time on them) grow
+    with the lane count, and the loads-first form is bounded the same way.
+    """
+    extent = _ascending_range_extent(loop)
+    if extent is None or contains_compiler_marker(list(loop.body)):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"lane loop {loop.target.id} over a vectorized reduction axis "  # type: ignore[union-attr]
+            "cannot be unrolled for its cross-lane fold",
+        )
+    if extent > _MAX_UNROLLED_LANES:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"lane loop {loop.target.id} walks {extent} packets per thread; "  # type: ignore[union-attr]
+            f"the cross-lane fold unrolls at most {_MAX_UNROLLED_LANES}",
+        )
+    iterator = expr_from_string(f"cutlass.range_constexpr({extent})")
+    assert isinstance(iterator, ast.expr)
+    loop.iter = iterator
+    _drop_lane_attr(loop)
+    return [loop]
+
+
 def unroll_lane_loads(
-    body: list[ast.stmt], unroll: int, new_var: Callable[[str], str]
+    body: list[ast.stmt],
+    unroll: int,
+    new_var: Callable[[str], str],
+    *,
+    forced_full: Collection[str] = (),
 ) -> tuple[list[ast.stmt], bool]:
     """Apply the loads-first lane unroll to every lane loop reachable from
-    ``body``; returns the new body and whether any loop was transformed."""
-    fired = False
+    ``body``; returns the new body and whether the knob transformed any loop.
 
-    def visit(statements: list[ast.stmt]) -> list[ast.stmt]:
+    ``forced_full`` names lane variables whose loops are unrolled completely
+    whatever the knob says (the vectorized lane loops of a reduced block,
+    whose per-lane reductions ``cute/fold_lane_reductions.py`` folds across
+    trace-time lanes): loads first when that form applies, in place
+    otherwise.  Those unrolls do not count as the knob firing.
+    """
+    fired = False
+    forced = frozenset(forced_full)
+
+    def visit(statements: list[ast.stmt], knob: int) -> list[ast.stmt]:
         nonlocal fired
         result: list[ast.stmt] = []
         for stmt in statements:
             if _is_lane_loop(stmt):
-                replacement = _unroll_one(stmt, unroll, new_var)  # type: ignore[arg-type]
-                if replacement is not None:
-                    fired = True
+                lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR)
+                extent = _ascending_range_extent(stmt)  # type: ignore[arg-type]
+                if lane_var in forced and extent is not None and extent >= 2:
+                    replacement = _unroll_one(
+                        stmt,  # type: ignore[arg-type]
+                        extent,
+                        new_var,
+                        require_full=True,
+                    )
+                    if replacement is None:
+                        replacement = _force_constexpr(stmt)  # type: ignore[arg-type]
                     result.extend(replacement)
                     continue
+                if knob > 1:
+                    replacement = _unroll_one(stmt, knob, new_var)  # type: ignore[arg-type]
+                    if replacement is not None:
+                        fired = True
+                        result.extend(replacement)
+                        continue
+                # A lane loop kept rolled: the knob unrolls a nest from its
+                # outermost loop only, but a forced loop nested in it (the
+                # vectorized reduction axis under a row lane loop) still
+                # unrolls.
+                if forced:
+                    stmt.body = visit(stmt.body, 1)  # type: ignore[assignment]
+                    stmt.orelse = visit(stmt.orelse, 1)  # type: ignore[assignment]
             elif isinstance(stmt, (ast.For, ast.If, ast.While)):
-                stmt.body = visit(stmt.body)  # type: ignore[assignment]
-                stmt.orelse = visit(stmt.orelse)  # type: ignore[assignment]
+                stmt.body = visit(stmt.body, knob)  # type: ignore[assignment]
+                stmt.orelse = visit(stmt.orelse, knob)  # type: ignore[assignment]
             result.append(stmt)
         return result
 
-    if unroll <= 1:
+    if unroll <= 1 and not forced:
         return body, False
-    return visit(body), fired
+    return visit(body, unroll), fired

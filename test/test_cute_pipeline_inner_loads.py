@@ -56,7 +56,9 @@ def _disable_online_to_3pass(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HELION_DISABLE_ONLINE_TO_3PASS", "1")
 
 
-@helion.kernel(backend="cute")
+# The pins below count pipelined loads; the exact division hoist
+# (test_cute_exact_division.py) would add a redo copy of the consume sweep.
+@helion.kernel(backend="cute", cute_exact_division=False)
 def _reduction_kernel(x: torch.Tensor) -> torch.Tensor:
     m, n = x.size()
     out = torch.empty_like(x)

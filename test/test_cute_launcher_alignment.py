@@ -15,6 +15,7 @@ import weakref
 import pytest
 import torch
 
+from helion._testing import skipUnlessCuteAvailable
 from helion.runtime.cute import launcher
 
 
@@ -427,6 +428,7 @@ def test_fast_relaunch_respects_compiled_alignment_before_patching(
         assert executor.calls == [(initial, 0xD00)]
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("by_reference", [False, True])
 def test_fast_relaunch_enters_capi_executor_with_owned_packed_args(
     fake_runtime: list[_Pointer], monkeypatch: pytest.MonkeyPatch, by_reference: bool
@@ -473,6 +475,7 @@ def test_fast_relaunch_enters_capi_executor_with_owned_packed_args(
     assert len(executor.calls) == 2
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_fast_relaunch_capi_executor_raises_cuda_errors(
     fake_runtime: list[_Pointer], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -564,6 +567,7 @@ def test_fastpath_builder_rehosts_fresh_tvm_ffi_compiles_only_when_eligible(
     assert executor.calls == [(0x2000, 0xD00)]
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_fast_relaunch_wraps_capi_entry_failures_like_run_compiled_program(
     fake_runtime: list[_Pointer], monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -27,13 +27,16 @@ import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
 
+import pytest
 import torch
 
+import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallasTpu
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import PatternSearch
@@ -47,6 +50,7 @@ from helion.autotuner.benchmark_provider import BenchmarkResult
 from helion.autotuner.benchmark_provider import IsolatedBenchmarkFailure
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
+from helion.autotuner.benchmark_worker import _REAP_TIMEOUT_SECONDS
 from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
@@ -66,6 +70,7 @@ from helion.autotuner.process_utils import signal_process_tree
 from helion.autotuner.process_utils import start_isolated_process_group
 from helion.autotuner.random_search import RandomSearch
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
+import helion.language as hl
 from helion.runtime import _create_cute_wrapper
 from helion.runtime.config import Config
 from helion.runtime.settings import Settings
@@ -122,10 +127,25 @@ class _SpawnChildAndSleep:
 
 
 @dataclasses.dataclass
+class _AddInPlace:
+    """``b += a`` returning the baseline's output regardless of ``extra``."""
+
+    extra: float = 0.0
+
+    def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        output = a + b
+        b.add_(a).add_(self.extra)
+        return output
+
+
+@dataclasses.dataclass
 class _ReturnValue:
+    """Compiled-function stand-in: the job calls it once on the kernel's
+    arguments before the (mocked) timers."""
+
     value: object
 
-    def __call__(self) -> object:
+    def __call__(self, *args: object, **kwargs: object) -> object:
         return self.value
 
 
@@ -182,6 +202,12 @@ class TestAutotuneDataclassCompatibility(unittest.TestCase):
         self.assertEqual(metrics.num_successful_candidate_measurements, 0)
 
 
+@skipIfRefEager(
+    "Spawns real benchmark-worker subprocesses and exercises their "
+    "SIGKILL/process-group reaping -- compile-mode machinery that "
+    "HELION_INTERPRET=1 bypasses, and it flakes (crashing the xdist worker "
+    "with no traceback) on the single-GPU A10G ref-eager runner."
+)
 class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_precompile_worker_starts_isolated_process_group(self) -> None:
         with patch("helion.autotuner.process_utils.os.setsid") as setsid:
@@ -422,6 +448,43 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         wall_clock_bench.assert_called_once()
         self.assertIsNone(wall_clock_bench.call_args.kwargs["fixed_repetitions"])
         self.assertIs(wall_clock_bench.call_args.kwargs["probe_long_kernel"], False)
+
+    def test_benchmark_job_warms_the_arguments_device(self) -> None:
+        # The worker warms the current device before every job; a kernel
+        # whose arguments live on another device gets that one warmed too.
+        fn = _ReturnValue(torch.empty(()))
+        args = (3, torch.empty(1, device=torch.device("meta")), torch.ones(1))
+        with (
+            patch("helion.autotuner.benchmark_job._load_compiled_fn", return_value=fn),
+            patch(
+                "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                return_value=args,
+            ),
+            patch("helion.autotuner.benchmark_job.do_bench_generic", return_value=1.0),
+            patch("helion.autotuner.benchmark_job.steady_graph_dispatch") as warmup,
+        ):
+            BenchmarkJob(
+                fn_spec=cast("SerializedCompiledFunction", object()),
+                args_path="/tmp/args.pt",
+                use_wall_clock=True,
+            )()
+        # No CUDA tensor among the arguments: the current device.
+        warmup.assert_called_once_with(device=None)
+        from helion.autotuner.benchmark_job import _cuda_device_of
+
+        self.assertEqual(
+            _cuda_device_of(
+                (3, torch.empty(1, device=torch.device("meta")), [{"k": "cpu"}])
+            ),
+            None,
+        )
+        cuda_like = Mock(spec=torch.Tensor)
+        cuda_like.device = torch.device("cuda", 1)
+        with patch(
+            "helion.autotuner.benchmark_job.tree_flatten",
+            return_value=([3, cuda_like], None),
+        ):
+            self.assertEqual(_cuda_device_of(()), torch.device("cuda", 1))
 
     def test_wall_clock_fixed_repetitions_run_setup_and_measurements(self) -> None:
         invocation_count = 0
@@ -859,6 +922,8 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             autotune_compile_timeout=3,
             autotune_benchmark_timeout=17,
         )
+        provider.mutated_arg_indices = []
+        provider._precompile_baseline_post_args_path = None
         provider._precompile_args_path = "/tmp/args.pt"
         provider._precompile_baseline_path = "/tmp/baseline.pt"
         provider._effective_atol = 0.0
@@ -885,6 +950,8 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     ) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings(autotune_benchmark_timeout=17)
+        provider.mutated_arg_indices = []
+        provider._precompile_baseline_post_args_path = None
         provider._precompile_args_path = "/tmp/args.pt"
         provider._precompile_baseline_path = "/tmp/baseline.pt"
         provider._effective_atol = 0.0
@@ -1253,6 +1320,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_fixed_repetition_job_uses_existing_benchmark_timeout(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings(autotune_benchmark_timeout=17)
+        provider.mutated_arg_indices = []
         provider.config_spec = SimpleNamespace(cute_flash_search_enabled=True)
         provider._precompile_args_path = "/tmp/args.pt"
         provider._benchmark_worker = Mock()
@@ -1301,13 +1369,162 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         )
         self.assertTrue(provider._probe_long_kernel())
 
-    def test_subprocess_accuracy_check_skips_mutated_args(self) -> None:
+    def test_subprocess_paths_take_mutated_arg_kernels(self) -> None:
+        # A kernel that writes into an input is timed and checked in the
+        # killable worker like any other (the jobs clone its mutated
+        # arguments per candidate); only a custom accuracy callback keeps the
+        # check in-process. In-process, a candidate's device-side fault
+        # poisons the autotuning process's CUDA context and ends the search
+        # (the kda WY transform's k_state_out made it an in-process kernel).
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings()
-        provider.mutated_arg_indices = [0]
-        provider._subprocess_benchmark_enabled = lambda: True
+        provider.mutated_arg_indices = [5]
+        provider._args_unpicklable = False
+        provider._subprocess_wrapper_unloadable = False
+        provider.kernel = SimpleNamespace(
+            env=SimpleNamespace(device=torch.device("cpu")),
+            supports_subprocess_benchmark=lambda: True,
+        )
+        provider.config_spec = SimpleNamespace(backend=None)
 
+        self.assertTrue(provider._subprocess_benchmark_enabled())
+        self.assertTrue(provider._subprocess_accuracy_check_enabled())
+        provider.settings.autotune_baseline_accuracy_check_fn = lambda out, ref: None
         self.assertFalse(provider._subprocess_accuracy_check_enabled())
+        self.assertIn(
+            "autotune_baseline_accuracy_check_fn",
+            provider._in_process_benchmark_reason(),
+        )
+        provider.settings.autotune_benchmark_subprocess = False
+        self.assertFalse(provider._subprocess_benchmark_enabled())
+        self.assertIn(
+            "HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0",
+            provider._in_process_benchmark_reason(),
+        )
+
+    def test_subprocess_accuracy_job_carries_mutated_arg_baseline(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(autotune_benchmark_timeout=17)
+        provider.mutated_arg_indices = [1]
+        provider._subprocess_accuracy_check_enabled = lambda: True
+        provider._precompile_args_path = "/tmp/args.pt"
+        provider._precompile_baseline_path = "/tmp/baseline.pt"
+        provider._effective_atol = 0.0
+        provider._effective_rtol = 0.0
+        provider._scale_atol = False
+        provider._benchmark_worker = Mock()
+        provider._benchmark_worker.run.return_value = AccuracyCheckResult(ok=True)
+
+        with patch(
+            "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+            return_value=cast("SerializedCompiledFunction", object()),
+        ):
+            # Without the baseline's post-call arguments the worker cannot
+            # check the mutation: fall back to the in-process check.
+            provider._precompile_baseline_post_args_path = None
+            self.assertIsNone(
+                provider._run_subprocess_accuracy_check_job(
+                    cast("CompiledConfig", object())
+                )
+            )
+            provider._benchmark_worker.run.assert_not_called()
+
+            provider._precompile_baseline_post_args_path = "/tmp/post_args.pt"
+            result = provider._run_subprocess_accuracy_check_job(
+                cast("CompiledConfig", object())
+            )
+
+        assert result is not None
+        self.assertTrue(result.ok)
+        job = provider._benchmark_worker.run.call_args.args[0]
+        self.assertEqual(job.mutated_arg_indices, (1,))
+        self.assertEqual(job.baseline_post_args_path, "/tmp/post_args.pt")
+        self.assertTrue(job.check_input_accuracy)
+
+    def _run_mutating_accuracy_job(
+        self,
+        fn: object,
+        *,
+        baseline_b: float,
+        check_input_accuracy: bool = True,
+    ) -> tuple[AccuracyCheckResult, torch.Tensor]:
+        """Run ``fn(a, b)`` as a mutated-``b`` accuracy job; return the result
+        and the worker's cached ``b`` (which the job must leave untouched)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            baseline_path = Path(tmpdir) / "baseline.pt"
+            post_args_path = Path(tmpdir) / "baseline_post_args.pt"
+            torch.save((torch.tensor([1.0]), torch.tensor([1.0])), args_path)
+            torch.save(torch.tensor([2.0]), baseline_path)
+            torch.save(
+                (torch.tensor([1.0]), torch.tensor([baseline_b])), post_args_path
+            )
+            load_trusted_kernel_args.cache_clear()
+            with patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=fn,
+            ):
+                result = AccuracyCheckJob(
+                    fn_spec=cast("SerializedCompiledFunction", object()),
+                    args_path=str(args_path),
+                    baseline_path=str(baseline_path),
+                    atol=0.0,
+                    rtol=0.0,
+                    mutated_arg_indices=(1,),
+                    baseline_post_args_path=str(post_args_path),
+                    check_input_accuracy=check_input_accuracy,
+                )()
+            cached_b = cast("torch.Tensor", load_trusted_kernel_args(str(args_path))[1])
+            load_trusted_kernel_args.cache_clear()
+        return result, cached_b
+
+    def test_accuracy_check_job_clones_and_checks_mutated_args(self) -> None:
+        result, cached_b = self._run_mutating_accuracy_job(
+            _AddInPlace(), baseline_b=2.0
+        )
+        self.assertTrue(result.ok, result.message)
+        # The kernel ran on a clone: the worker's shared arguments still hold
+        # the original values for the next candidate.
+        torch.testing.assert_close(cached_b, torch.tensor([1.0]))
+
+    def test_accuracy_check_job_rejects_wrong_mutation(self) -> None:
+        # Right output, wrong in-place result: only the post-call argument
+        # comparison can catch this config.
+        result, _ = self._run_mutating_accuracy_job(
+            _AddInPlace(extra=1.0), baseline_b=2.0
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("Tensor-likes are not equal", result.message)
+
+        result, _ = self._run_mutating_accuracy_job(
+            _AddInPlace(extra=1.0), baseline_b=2.0, check_input_accuracy=False
+        )
+        self.assertTrue(result.ok, result.message)
+
+    def test_benchmark_job_times_mutated_args_on_a_clone(self) -> None:
+        # Timing repeats the kernel many times; the worker's cached arguments
+        # must still hold the original values for the accuracy job that
+        # follows (and for every later config).  The timer is Triton's.
+        pytest.importorskip("triton")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            torch.save((torch.tensor([1.0]), torch.tensor([1.0])), args_path)
+            load_trusted_kernel_args.cache_clear()
+            with patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=_AddInPlace(),
+            ):
+                BenchmarkJob(
+                    fn_spec=cast("SerializedCompiledFunction", object()),
+                    args_path=str(args_path),
+                    warmup=1,
+                    rep=1,
+                    fixed_repetitions=3,
+                    mutated_arg_indices=(1,),
+                )()
+            cached_b = cast("torch.Tensor", load_trusted_kernel_args(str(args_path))[1])
+            load_trusted_kernel_args.cache_clear()
+        torch.testing.assert_close(cached_b, torch.tensor([1.0]))
 
     def test_load_trusted_kernel_args_accepts_python_objects(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1447,7 +1664,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             worker.run(_ReturnValue(7), timeout=0.01)
 
         signal_tree.assert_called_once_with(process, signal.SIGKILL)
-        process.join.assert_called_once_with(timeout=5)
+        process.join.assert_called_once_with(timeout=_REAP_TIMEOUT_SECONDS)
         connection.close.assert_called_once_with()
         self.assertIs(worker._process, process)
         self.assertIs(worker._parent_connection, connection)
@@ -1630,6 +1847,49 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             self.assertFalse(worker.alive())
             self.assertEqual(worker.run(_ReturnValue(7), timeout=30.0), 7)
         finally:
+            worker.shutdown()
+
+    def test_watchdog_keeps_connection_open_until_poll_returns(self) -> None:
+        worker = BenchmarkWorker()
+        connection, child_connection = mp.Pipe()
+        process = Mock(pid=123)
+        process.is_alive.side_effect = (True, False)
+        worker._process = process
+        worker._parent_connection = connection
+        watchdog_finished = threading.Event()
+        original_kill = worker._kill_if_current
+        original_poll = connection.poll
+
+        def kill_then_notify(*args: Any, **kwargs: Any) -> None:
+            try:
+                original_kill(*args, **kwargs)
+            finally:
+                watchdog_finished.set()
+
+        def poll_after_watchdog(timeout: float | None = None) -> bool:
+            # Force the watchdog to finish before the waiting thread handles
+            # EOF. Closing this descriptor from the watchdog can lose the
+            # poll wakeup on macOS and hang the caller indefinitely.
+            self.assertTrue(watchdog_finished.wait(timeout=5))
+            self.assertFalse(connection.closed)
+            return original_poll(1.0)
+
+        try:
+            with (
+                patch(
+                    "helion.autotuner.benchmark_worker.signal_process_tree",
+                    side_effect=lambda *_args: child_connection.close(),
+                ),
+                patch.object(worker, "_kill_if_current", kill_then_notify),
+                patch.object(connection, "poll", poll_after_watchdog),
+                self.assertRaises(BenchmarkTimeout),
+            ):
+                worker.run(_ReturnValue(7), timeout=0.1)
+            self.assertTrue(connection.closed)
+            self.assertFalse(worker.alive())
+        finally:
+            connection.close()
+            child_connection.close()
             worker.shutdown()
 
     def test_sticky_error_kills_worker(self) -> None:
@@ -2382,6 +2642,130 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         # continued; random configs can fail compilation before reaching this hook.
         self.assertGreaterEqual(call_count[0], 3)
         self.assertEqual(call_count[1], 1)
+
+    def test_autotune_runs_mutated_arg_kernels_in_the_worker(self) -> None:
+        # A kernel that writes into an input (``out[tile] += ...``) is timed
+        # and checked in the killable worker on fresh copies of that input:
+        # every candidate reads the same ``out`` and the accuracy check
+        # compares the mutated copy against the baseline run's arguments.
+        if not torch.cuda.is_available():
+            self.skipTest("requires CUDA")
+
+        @helion.kernel(
+            configs=[
+                helion.Config(block_sizes=[32], num_warps=4),
+                helion.Config(block_sizes=[64], num_warps=4),
+            ],
+            autotune_log_level=0,
+            autotune_benchmark_subprocess=True,
+        )
+        def inplace_add(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(out.size()):
+                out[tile] += a[tile]
+            return out
+
+        a = torch.full([256], 2.0, device=DEVICE)
+        out = torch.zeros([256], device=DEVICE)
+        bench_jobs: list[tuple[int, ...]] = []
+        check_jobs: list[tuple[tuple[int, ...], str | None]] = []
+        original_bench = LocalBenchmarkProvider._run_subprocess_benchmark_job
+        original_check = LocalBenchmarkProvider._run_subprocess_accuracy_check_job
+
+        def spy_bench(
+            self: LocalBenchmarkProvider, fn: CompiledConfig, **kwargs: object
+        ) -> float | None:
+            bench_jobs.append(tuple(self.mutated_arg_indices))
+            result = original_bench(self, fn, **kwargs)  # pyrefly: ignore[bad-argument-type]
+            assert result is not None, "the candidate fell back in-process"
+            return result
+
+        def spy_check(
+            self: LocalBenchmarkProvider, fn: CompiledConfig
+        ) -> AccuracyCheckResult | None:
+            check_jobs.append(
+                (
+                    tuple(self.mutated_arg_indices),
+                    self._precompile_baseline_post_args_path,
+                )
+            )
+            result = original_check(self, fn)
+            assert result is not None, "the accuracy check fell back in-process"
+            return result
+
+        with (
+            patch.object(
+                LocalBenchmarkProvider, "_run_subprocess_benchmark_job", spy_bench
+            ),
+            patch.object(
+                LocalBenchmarkProvider, "_run_subprocess_accuracy_check_job", spy_check
+            ),
+        ):
+            result = inplace_add(a, out)
+
+        # Both configs were timed and checked in the worker (``out`` is the
+        # flat argument 1); the final selection may time them again.
+        self.assertGreaterEqual(len(bench_jobs), 2)
+        self.assertEqual(set(bench_jobs), {(1,)})
+        self.assertGreaterEqual(len(check_jobs), 2)
+        self.assertEqual({indices for indices, _ in check_jobs}, {(1,)})
+        self.assertTrue(all(path is not None for _, path in check_jobs))
+        # The autotuning runs mutated copies: the real ``out`` saw one call.
+        torch.testing.assert_close(result, torch.full([256], 2.0, device=DEVICE))
+
+    def test_autotune_survives_a_device_fault_in_a_mutated_arg_candidate(
+        self,
+    ) -> None:
+        # The kda forward's cold autotune died when a candidate executed an
+        # illegal instruction: its kernel writes into an input, which kept it
+        # on the in-process path, where the sticky error poisoned the
+        # process's CUDA context. In the worker the fault kills only the
+        # worker: the candidate is dropped, the search continues and the
+        # parent's context is intact.
+        if not torch.cuda.is_available():
+            self.skipTest("requires CUDA")
+
+        @helion.kernel(
+            configs=[
+                helion.Config(block_sizes=[32], num_warps=4),
+                helion.Config(block_sizes=[64], num_warps=4),
+                helion.Config(block_sizes=[128], num_warps=4),
+            ],
+            autotune_log_level=0,
+            autotune_benchmark_subprocess=True,
+        )
+        def inplace_add(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(out.size()):
+                out[tile] += a[tile]
+            return out
+
+        a = torch.full([256], 2.0, device=DEVICE)
+        out = torch.zeros([256], device=DEVICE)
+        original = LocalBenchmarkProvider._run_subprocess_benchmark_job
+        calls = [0]
+
+        def fault_once(
+            self: LocalBenchmarkProvider, fn: CompiledConfig, **kwargs: object
+        ) -> float | None:
+            calls[0] += 1
+            if calls[0] == 2:
+                if self._benchmark_worker is None:
+                    self._benchmark_worker = BenchmarkWorker(device=None)
+                # A sticky error raised inside the worker: the worker is
+                # killed and the error propagates as a device fault would.
+                self._benchmark_worker.run(
+                    _RaiseRuntimeError("an illegal instruction was encountered"),
+                    timeout=float(self.settings.autotune_benchmark_timeout),
+                )
+            return original(self, fn, **kwargs)  # pyrefly: ignore[bad-argument-type]
+
+        with patch.object(
+            LocalBenchmarkProvider, "_run_subprocess_benchmark_job", fault_once
+        ):
+            result = inplace_add(a, out)
+
+        self.assertGreaterEqual(calls[0], 3)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(result, torch.full([256], 2.0, device=DEVICE))
 
 
 if __name__ == "__main__":

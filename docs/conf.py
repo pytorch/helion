@@ -239,6 +239,11 @@ intersphinx_mapping = {
 
 intersphinx_resolve_self = "helion"
 
+# Retry transient HTTP failures (e.g. the conference site returning 504),
+# with a bounded wait per request. Persistent broken links still fail CI.
+linkcheck_retries = 3
+linkcheck_timeout = 30
+
 # Linkcheck configuration - ignore URLs that block automated checkers
 linkcheck_ignore = [
     r"https://pytorchconference.*\.sched\.com/.*",  # Returns 403 to bots

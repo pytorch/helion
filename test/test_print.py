@@ -455,7 +455,8 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             # Check that prints are generated
             self.assert_print_in_code(code, "row sum: ", 1)
 
-            output_lines = [line for line in output.strip().split("\n") if line]
+            # The process may write unrelated lines (e.g. library logging) too.
+            output_lines = [line for line in output.split("\n") if "row sum" in line]
             self.assertGreater(
                 len(output_lines), 0, "Expected print output to be captured"
             )

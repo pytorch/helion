@@ -16,6 +16,7 @@ from test._cute_binding import _mock_cuda_unavailable
 
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._testing import skipUnlessCuteAvailable
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -130,6 +131,7 @@ _FAMILY_DTYPES = tuple(
 )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize(("family", "dtype"), _FAMILY_DTYPES)
 @pytest.mark.parametrize(("sequence", "stages"), ((25600, 3), (32768, 9)))
 @pytest.mark.parametrize("width", (128, 160))

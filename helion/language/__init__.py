@@ -32,6 +32,7 @@ from .loops import tile as tile
 from .matmul_ops import dot as dot
 from .matmul_ops import dot_scaled as dot_scaled
 from .memory_ops import load as load
+from .memory_ops import prefetch as prefetch
 from .memory_ops import store as store
 from .pdl_ops import pdl_launch_dependents as pdl_launch_dependents
 from .pdl_ops import pdl_wait as pdl_wait

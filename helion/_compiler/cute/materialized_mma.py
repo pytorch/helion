@@ -8,11 +8,13 @@ from typing import cast
 
 import torch
 
+from .active_blocks import active_block_ids
 from .materialized_fission_codegen import _region_graph_ids
 from .pipeline_smem import Tcgen05PipelineSmemFacts
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from typing import TypeAlias
 
     from ...language.matmul_ops import CuteTcgen05SearchPlan
     from ...language.matmul_ops import _CuteTcgen05SearchPlanningResult
@@ -21,45 +23,44 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from .cute_mma import _CuteMmaNode
 
+    _Placed: TypeAlias = dict[int, tuple[_CuteMmaNode, CuteTcgen05SearchPlan]]
 
-def _paired_region_smem_facts(
-    candidate: _CuteMmaNode,
-    node: torch.fx.Node,
+
+def _mma_operand_cone(node: torch.fx.Node) -> frozenset[torch.fx.Node]:
+    """The nodes ``node`` consumes, transitively, within its graph."""
+    cone: set[torch.fx.Node] = set()
+    stack = [node]
+    while stack:
+        for operand in stack.pop().all_input_nodes:
+            if operand not in cone:
+                cone.add(operand)
+                stack.append(operand)
+    return frozenset(cone)
+
+
+def _plain_gemm_region_loops(
     graphs: Sequence[GraphInfo],
+    node: torch.fx.Node,
+    stores: set[torch.fx.Node],
     *,
-    capacity_bytes: int,
-) -> Tcgen05PipelineSmemFacts | None:
-    """Prove the complete region has only AB, ACC and two output rings.
+    admitted: frozenset[torch.fx.Node] = frozenset(),
+) -> int | None:
+    """Count the loops of a region holding nothing beside one GEMM's work.
 
-    The later typed fanout proof establishes shared arithmetic and ownership.
-    This separate whole-region check excludes allocations unrelated to that
-    pair: an extra store, reduction, collective or unknown lowering cannot
-    borrow the pair's shared-memory budget.
+    Admits the matmul ``node``, the stores in ``stores`` (its proved epilogue
+    chains), the ``admitted`` nodes (the matmul's operand cone, whose layout
+    ops the candidate analysis proved), tile and loop plumbing, loads and
+    pure pointwise math; any other op -- a store the matmul does not reach,
+    an atomic, a reduction, a collective, an unknown lowering -- returns
+    ``None``.  The tcgen05 region codegen runs only the matmul's fused
+    epilogue per element, so anything else in the region would fail there
+    (or borrow the pipeline's budget).
     """
     from ...language import _tracing_ops
     from ...language import creation_ops
     from ...language import memory_ops
     from ...language import tile_ops
-    from .aux_tensor import analyze_tcgen05_matmul_store_chains
-    from .cute_mma import _tcgen05_tma_matrix_major
 
-    operands = candidate.operands
-    if (
-        capacity_bytes <= 0
-        or operands.has_leading_passthrough
-        or operands.lhs.source_fake.ndim != 2
-        or operands.rhs.source_fake.ndim != 2
-        or operands.lhs.source_fake.dtype not in (torch.float16, torch.bfloat16)
-        or operands.rhs.source_fake.dtype != operands.lhs.source_fake.dtype
-        or operands.lhs.matrix_major != "row"
-        or operands.rhs.matrix_major not in ("row", "col")
-        or candidate.requires_accumulator_seed
-    ):
-        return None
-    chains = analyze_tcgen05_matmul_store_chains(graphs, node)
-    if chains is None or len(chains) != 2:
-        return None
-    stores = {store for store, _chain in chains}
     scalar_ops = {
         _tracing_ops._host_tensor,
         _tracing_ops._get_symnode,
@@ -98,6 +99,8 @@ def _paired_region_smem_facts(
                     return None
             elif other.target in scalar_ops:
                 loops += other.target is _tracing_ops._for_loop
+            elif other in admitted:
+                continue
             elif not (
                 isinstance(other.target, torch._ops.OpOverload)
                 and torch.Tag.pointwise in other.target.tags
@@ -106,7 +109,44 @@ def _paired_region_smem_facts(
                 and not other.is_impure()
             ):
                 return None
-    if loops != 1:
+    return loops
+
+
+def _paired_region_smem_facts(
+    candidate: _CuteMmaNode,
+    node: torch.fx.Node,
+    graphs: Sequence[GraphInfo],
+    *,
+    capacity_bytes: int,
+) -> Tcgen05PipelineSmemFacts | None:
+    """Prove the complete region has only AB, ACC and two output rings.
+
+    The later typed fanout proof establishes shared arithmetic and ownership.
+    This separate whole-region check excludes allocations unrelated to that
+    pair: an extra store, reduction, collective or unknown lowering cannot
+    borrow the pair's shared-memory budget.
+    """
+    from .aux_tensor import analyze_tcgen05_matmul_store_chains
+    from .cute_mma import _tcgen05_tma_matrix_major
+
+    operands = candidate.operands
+    if (
+        capacity_bytes <= 0
+        or operands.has_leading_passthrough
+        or operands.lhs.source_fake.ndim != 2
+        or operands.rhs.source_fake.ndim != 2
+        or operands.lhs.source_fake.dtype not in (torch.float16, torch.bfloat16)
+        or operands.rhs.source_fake.dtype != operands.lhs.source_fake.dtype
+        or operands.lhs.matrix_major != "row"
+        or operands.rhs.matrix_major not in ("row", "col")
+        or candidate.requires_accumulator_seed
+    ):
+        return None
+    chains = analyze_tcgen05_matmul_store_chains(graphs, node)
+    if chains is None or len(chains) != 2:
+        return None
+    stores = {store for store, _chain in chains}
+    if _plain_gemm_region_loops(graphs, node, stores) != 1:
         return None
     for store in stores:
         output_node = store.args[0]
@@ -123,6 +163,137 @@ def _paired_region_smem_facts(
     return Tcgen05PipelineSmemFacts(
         operands.lhs.source_fake.dtype.itemsize, 2, capacity_bytes
     )
+
+
+def _place_region_candidates(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    regions: Sequence[frozenset[int]],
+    candidates: Sequence[tuple[_CuteMmaNode, torch.Tensor, CuteTcgen05SearchPlan]],
+) -> tuple[_Placed, set[int]] | None:
+    """Assign each proved candidate to the one separately launched root it lives in.
+
+    Every admitted contraction is a plain, static, 2-D fp16/bf16 GEMM whose
+    output tile is exactly its root's grid and whose three axes are its own;
+    two candidates in one root, a shared axis, or a small-N / batched operand
+    declines the whole surface.
+    """
+    graph_ids = {id(info.graph): info.graph_id for info in device_ir.graphs}
+    placed: _Placed = {}
+    occupied: set[int] = set()
+    for candidate, lhs, plan in candidates:
+        operands = candidate.operands
+        axes = (operands.m_block_id, operands.n_block_id, operands.k_block_id)
+        graph_id = graph_ids.get(id(candidate.lhs.graph))
+        owners = [i for i, region in enumerate(regions) if graph_id in region]
+        if (
+            len(owners) != 1
+            or owners[0] in placed
+            or operands.has_leading_passthrough
+            or lhs.ndim != 2
+            or operands.lhs.source_fake.dtype not in (torch.float16, torch.bfloat16)
+            or operands.rhs.source_fake.dtype != operands.lhs.source_fake.dtype
+            or tuple(device_ir.grid_block_ids[owners[0]]) != operands.output_block_ids
+            or len(set(axes)) != 3
+            or occupied.intersection(axes)
+            or plan.is_small_n
+            or any(
+                value is None for value in (plan.static_m, plan.static_n, plan.static_k)
+            )
+        ):
+            return None
+        placed[owners[0]] = (candidate, plan)
+        occupied.update(axes)
+    return placed, occupied
+
+
+def _register_region_mma_search(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    regions: Sequence[frozenset[int]],
+    placed: _Placed,
+    *,
+    mma_nodes: dict[int, torch.fx.Node],
+    allow_persistent: bool,
+    reason: str,
+    region_pid_types: bool = False,
+) -> None:
+    """Publish one tile triple, shape and pipeline budget per GEMM launch.
+
+    ``region_pid_types`` marks an ordered barrier chain: its launches are
+    flat, and ``tcgen05_region_pid_types`` may run the GEMM launches as the
+    static persistent two-CTA pipeline (``CuteTcgen05Config``).
+    """
+    from ...language.matmul_ops import _cuda_num_sms_or_zero
+    from .pipeline_smem import analyze_pipeline_smem_facts
+    from .tcgen05_config import CuteTcgen05Config
+
+    spec = env.config_spec
+    state = spec._cute_tcgen05_config
+    state.region_pid_type_search_enabled = region_pid_types
+    state.device_sm_count = _cuda_num_sms_or_zero(
+        placed[min(placed)][0].operands.lhs.source_fake.device
+    )
+    indices = sorted(placed)
+    state.materialized_matmul_shapes = tuple(
+        (
+            cast("int", plan.static_m),
+            cast("int", plan.static_n),
+            cast("int", plan.static_k),
+        )
+        for _candidate, plan in (placed[index] for index in indices)
+    )
+    # Preserve ordinary single-output facts; complete shared-fanout validation
+    # later accounts for its second ring from the typed paired-store proof.
+    facts = []
+    pair_budget_facts = []
+    for index in indices:
+        candidate, _plan = placed[index]
+        capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(
+            candidate.operands.lhs.source_fake.device
+        )
+        region_graphs = [
+            info for info in device_ir.graphs if info.graph_id in regions[index]
+        ]
+        fact = analyze_pipeline_smem_facts(
+            candidate, mma_nodes[id(candidate)], region_graphs, capacity_bytes=capacity
+        )
+        facts.append(fact)
+        pair_budget_facts.append(
+            _paired_region_smem_facts(
+                candidate,
+                mma_nodes[id(candidate)],
+                region_graphs,
+                capacity_bytes=capacity,
+            )
+        )
+    state.materialized_pipeline_facts = tuple(facts)
+    state.materialized_pair_budget_facts = tuple(pair_budget_facts)
+    spec.cute_tcgen05_search_enabled = True
+    state.materialized_matmul_block_ids = tuple(
+        (
+            candidate.operands.m_block_id,
+            candidate.operands.n_block_id,
+            candidate.operands.k_block_id,
+        )
+        for candidate, _plan in (placed[index] for index in indices)
+    )
+    state.materialized_matmul_region_indices = tuple(indices)
+    # Existing one-CTA seeds remain unchanged. Optional paired fanout schedules
+    # use the complete independent region budgets and strict full-tile guards.
+    spec.narrow_tcgen05_autotune_to_validated_configs(
+        allow_persistent_pid_types=allow_persistent,
+        reason=reason,
+    )
+    for candidate, plan in placed.values():
+        operands = candidate.operands
+        for block_id, minimum, maximum in (
+            (operands.m_block_id, plan.min_search_m, min(plan.max_search_m, 256)),
+            (operands.n_block_id, plan.min_search_n, plan.max_search_n),
+            (operands.k_block_id, plan.mma_k, plan.max_search_k),
+        ):
+            env.block_sizes[block_id].update_min_block(minimum, allow_flattened=True)
+            env.block_sizes[block_id].update_max_block(maximum)
 
 
 def enable_materialized_mma_search(
@@ -149,90 +320,18 @@ def enable_materialized_mma_search(
         or not all(result.guards_complete for result in planning_results)
     ):
         return False
-    graph_ids = {id(info.graph): info.graph_id for info in device_ir.graphs}
     regions = [
         _region_graph_ids(device_ir.graphs, root_id) for root_id in device_ir.root_ids
     ]
-    placed: dict[int, tuple[_CuteMmaNode, CuteTcgen05SearchPlan]] = {}
-    occupied: set[int] = set()
-    for candidate, lhs, plan in candidates:
-        operands = candidate.operands
-        axes = (operands.m_block_id, operands.n_block_id, operands.k_block_id)
-        graph_id = graph_ids.get(id(candidate.lhs.graph))
-        owners = [i for i, region in enumerate(regions) if graph_id in region]
-        if (
-            len(owners) != 1
-            or owners[0] in placed
-            or operands.has_leading_passthrough
-            or lhs.ndim != 2
-            or operands.lhs.source_fake.dtype not in (torch.float16, torch.bfloat16)
-            or operands.rhs.source_fake.dtype != operands.lhs.source_fake.dtype
-            or tuple(device_ir.grid_block_ids[owners[0]]) != operands.output_block_ids
-            or len(set(axes)) != 3
-            or occupied.intersection(axes)
-            or plan.is_small_n
-            or any(
-                value is None for value in (plan.static_m, plan.static_n, plan.static_k)
-            )
-        ):
-            return False
-        placed[owners[0]] = (candidate, plan)
-        occupied.update(axes)
+    placement = _place_region_candidates(env, device_ir, regions, candidates)
+    if placement is None:
+        return False
+    placed, occupied = placement
     if len(placed) != len(regions):
         return False
     spec = env.config_spec
     if set(spec.block_sizes.valid_block_ids()) != occupied:
         return False
-
-    from .pipeline_smem import analyze_pipeline_smem_facts
-    from .tcgen05_config import CuteTcgen05Config
-
-    state = spec._cute_tcgen05_config
-    state.materialized_matmul_shapes = tuple(
-        (
-            cast("int", plan.static_m),
-            cast("int", plan.static_n),
-            cast("int", plan.static_k),
-        )
-        for _candidate, plan in (placed[index] for index in range(len(regions)))
-    )
-    # Preserve ordinary single-output facts; complete shared-fanout validation
-    # later accounts for its second ring from the typed paired-store proof.
-    facts = []
-    pair_budget_facts = []
-    for index in range(len(regions)):
-        candidate, _plan = placed[index]
-        capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(
-            candidate.operands.lhs.source_fake.device
-        )
-        region_graphs = [
-            info for info in device_ir.graphs if info.graph_id in regions[index]
-        ]
-        fact = analyze_pipeline_smem_facts(
-            candidate, mma_nodes[id(candidate)], region_graphs, capacity_bytes=capacity
-        )
-        facts.append(fact)
-        pair_budget_facts.append(
-            _paired_region_smem_facts(
-                candidate,
-                mma_nodes[id(candidate)],
-                region_graphs,
-                capacity_bytes=capacity,
-            )
-        )
-    state.materialized_pipeline_facts = tuple(facts)
-    state.materialized_pair_budget_facts = tuple(pair_budget_facts)
-    spec.cute_tcgen05_search_enabled = True
-    spec._cute_tcgen05_config.materialized_matmul_block_ids = tuple(
-        (
-            candidate.operands.m_block_id,
-            candidate.operands.n_block_id,
-            candidate.operands.k_block_id,
-        )
-        for candidate, _plan in (placed[index] for index in range(len(regions)))
-    )
-    # Existing one-CTA seeds remain unchanged. Optional paired fanout schedules
-    # use the complete independent region budgets and strict full-tile guards.
     allow_persistent = all(
         plan.static_m is not None
         and plan.static_n is not None
@@ -242,17 +341,226 @@ def enable_materialized_mma_search(
         and plan.static_k % plan.max_search_k == 0
         for _candidate, plan in placed.values()
     )
-    spec.narrow_tcgen05_autotune_to_validated_configs(
-        allow_persistent_pid_types=allow_persistent,
+    _register_region_mma_search(
+        env,
+        device_ir,
+        regions,
+        placed,
+        mma_nodes=mma_nodes,
+        allow_persistent=allow_persistent,
         reason="independent materialized CuTe MMA regions",
     )
-    for candidate, plan in placed.values():
-        operands = candidate.operands
-        for block_id, minimum, maximum in (
-            (operands.m_block_id, plan.min_search_m, min(plan.max_search_m, 256)),
-            (operands.n_block_id, plan.min_search_n, plan.max_search_n),
-            (operands.k_block_id, plan.mma_k, plan.max_search_k),
-        ):
-            env.block_sizes[block_id].update_min_block(minimum, allow_flattened=True)
-            env.block_sizes[block_id].update_max_block(maximum)
+    return True
+
+
+def enable_phase_mma_search(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    planning_results: Sequence[_CuteTcgen05SearchPlanningResult],
+    candidates: Sequence[tuple[_CuteMmaNode, torch.Tensor, CuteTcgen05SearchPlan]],
+    *,
+    mma_nodes: dict[int, torch.fx.Node],
+) -> bool:
+    """Admit one native contraction per ``hl.barrier()`` phase launched in order.
+
+    Explicit barrier phases lower to ordered per-phase launches under
+    ``pid_type="flat"`` (``generate_ordered_phases``): the same separate
+    device functions a materialized fission plan produces, so every GEMM phase
+    may own its own tile triple, pipeline budget and seeds.  Phases without a
+    matmul keep the ordinary SIMT lowering and its layout knobs
+    (``cute_pointwise_region_block_ids``).  The single persistent launch
+    cannot host the tcgen05 pipeline; enabling this surface makes the
+    multi-root planning veto the persistent pid types, leaving the ordered
+    launches.  Within the flat chain, ``tcgen05_region_pid_types`` may run
+    individual GEMM launches as the static persistent two-CTA pipeline of
+    the standalone single-GEMM surface (``CuteTcgen05Config``), each with
+    its own complete allocation proof and ring depth, and the flat launches
+    keep the one-CTA pipeline at the depth their tile fits.  One GEMM phase
+    beside plain phases is a chain of this kind as well: planned per phase
+    it gets the per-launch pid types and the plain phases their layout
+    knobs, which the standalone single-GEMM surface (a flat-only, cluster-
+    less launch of a multi-root kernel) cannot offer.  Anything unproven
+    declines (the caller falls back to that standalone surface) and the SIMT
+    lowering stays.
+    """
+    from .aux_tensor import analyze_tcgen05_matmul_store_chains
+    from .ordered_phases import ordered_phases_supported
+
+    host = device_ir.host_function
+    spec = env.config_spec
+    if (
+        env.cute_fission_plan is not None
+        or host is None
+        or not env.has_barrier
+        or len(device_ir.root_ids) < 2
+        or len(device_ir.phases) != len(device_ir.root_ids)
+        or "flat" not in spec.allowed_pid_types
+        or not candidates
+        or not all(result.guards_complete for result in planning_results)
+        or not ordered_phases_supported(host, device_ir)
+    ):
+        return False
+    regions = [
+        _region_graph_ids(device_ir.graphs, root_id) for root_id in device_ir.root_ids
+    ]
+    placement = _place_region_candidates(env, device_ir, regions, candidates)
+    if placement is None:
+        return False
+    placed, occupied = placement
+    if not placed:
+        return False
+    # A GEMM phase holds exactly its admitted matmul and its three axes, every
+    # store its result reaches is a chain the tcgen05 epilogue splices, and
+    # nothing else runs beside the matmul (the single-GEMM surface fails
+    # loudly at codegen instead; here the SIMT lowering is the live
+    # alternative, so an unsupported epilogue or side store declines).
+    # A plain phase holds no matmul at all (an unadmitted one would take the
+    # SIMT fallback whose lane-loop suppression the pointwise layout knobs
+    # cannot see) and none of the GEMM axes.
+    matmul_targets = _matmul_targets()
+    plain_block_ids: set[int] = set()
+    plain_grids: list[tuple[int, ...]] = []
+    for index, region in enumerate(regions):
+        region_graphs = [info for info in device_ir.graphs if info.graph_id in region]
+        matmuls = _matmul_nodes(region_graphs, matmul_targets)
+        active = active_block_ids(region_graphs, device_ir.grid_block_ids[index], env)
+        if index in placed:
+            candidate, _plan = placed[index]
+            operands = candidate.operands
+            mma_node = mma_nodes[id(candidate)]
+            if matmuls != [mma_node] or active != {
+                operands.m_block_id,
+                operands.n_block_id,
+                operands.k_block_id,
+            }:
+                return False
+            chains = analyze_tcgen05_matmul_store_chains(region_graphs, mma_node)
+            # Every store the matmul reaches is a spliceable chain, and the
+            # phase holds nothing else: an independent store (or any other
+            # op) beside a collective matmul has no tcgen05 lowering.
+            if chains is None or (
+                _plain_gemm_region_loops(
+                    region_graphs,
+                    mma_node,
+                    {store for store, _chain in chains},
+                    admitted=_mma_operand_cone(mma_node),
+                )
+                is None
+            ):
+                return False
+        else:
+            if matmuls or active & occupied:
+                return False
+            plain_block_ids.update(active)
+            plain_grids.append(tuple(device_ir.grid_block_ids[index]))
+    if set(spec.block_sizes.valid_block_ids()) != occupied | plain_block_ids:
+        return False
+    _register_region_mma_search(
+        env,
+        device_ir,
+        regions,
+        placed,
+        mma_nodes=mma_nodes,
+        allow_persistent=False,
+        reason="independent CuTe MMA barrier phases",
+        region_pid_types=True,
+    )
+    _publish_plain_phases(env, device_ir, plain_block_ids, plain_grids)
+    return True
+
+
+def _matmul_targets() -> tuple[object, ...]:
+    from .aux_tensor import _TCGEN05_AUX_DETECTOR_MMA_TARGETS
+
+    return (
+        *_TCGEN05_AUX_DETECTOR_MMA_TARGETS,
+        torch.ops.aten.mm.dtype,
+        torch.ops.aten.addmm.dtype,
+        torch.ops.aten.bmm.dtype,
+        torch.ops.aten.baddbmm.dtype,
+    )
+
+
+def _matmul_nodes(
+    region_graphs: Sequence[GraphInfo], matmul_targets: tuple[object, ...]
+) -> list[torch.fx.Node]:
+    return [
+        node
+        for info in region_graphs
+        for node in info.graph.nodes
+        if node.op == "call_function" and node.target in matmul_targets
+    ]
+
+
+def _publish_plain_phases(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    plain_block_ids: set[int],
+    plain_grids: Sequence[tuple[int, ...]],
+) -> None:
+    """Keep the SIMT layout knobs of separately launched matmul-free phases."""
+    spec = env.config_spec
+    spec.cute_pointwise_region_block_ids = frozenset(plain_block_ids)
+    # An axis reused by another phase keeps the shared search floor.
+    spec.cute_pointwise_region_grid_groups = tuple(
+        grid
+        for grid in plain_grids
+        if all(
+            sum(block_id in other for other in device_ir.grid_block_ids) == 1
+            for block_id in grid
+        )
+    )
+
+
+def register_plain_barrier_phases(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+    """Publish the matmul-free phases of a native-GEMM barrier chain.
+
+    The single-GEMM tcgen05 surface (``enable_cute_tcgen05_search``) narrows an
+    ``hl.barrier()`` kernel to ``pid_type="flat"``, whose ordered per-phase
+    launches (``generate_ordered_phases``) give every phase its own device
+    function.  A phase without any matmul then runs the ordinary SIMT lowering
+    alone, so its ``num_threads`` / ``cute_vector_widths`` /
+    ``cute_lane_layouts`` knobs apply exactly as they do to a materialized
+    fission plan's pointwise region: the grid vectorizer admits the phase's
+    axes (``cute_pointwise_region_block_ids``) and the knobs join the tcgen05
+    search surface.  Phases that hold a matmul, or share an axis with one,
+    stay as they are.  Returns whether any phase was published.
+    """
+    from .ordered_phases import ordered_phases_supported
+
+    host = device_ir.host_function
+    spec = env.config_spec
+    if (
+        env.cute_fission_plan is not None
+        or host is None
+        or not env.has_barrier
+        or len(device_ir.root_ids) < 2
+        or len(device_ir.phases) != len(device_ir.root_ids)
+        or spec.cute_pointwise_region_block_ids
+        or tuple(spec.allowed_pid_types) != ("flat",)
+        or not ordered_phases_supported(host, device_ir)
+    ):
+        return False
+    regions = [
+        _region_graph_ids(device_ir.graphs, root_id) for root_id in device_ir.root_ids
+    ]
+    matmul_targets = _matmul_targets()
+    phases: list[tuple[frozenset[int], bool]] = []
+    for index, region in enumerate(regions):
+        region_graphs = [info for info in device_ir.graphs if info.graph_id in region]
+        active = active_block_ids(region_graphs, device_ir.grid_block_ids[index], env)
+        phases.append((active, bool(_matmul_nodes(region_graphs, matmul_targets))))
+    occupied = {
+        block_id for active, has_matmul in phases if has_matmul for block_id in active
+    }
+    plain_block_ids: set[int] = set()
+    plain_grids: list[tuple[int, ...]] = []
+    for index, (active, has_matmul) in enumerate(phases):
+        if has_matmul or active & occupied:
+            continue
+        plain_block_ids.update(active)
+        plain_grids.append(tuple(device_ir.grid_block_ids[index]))
+    if not plain_block_ids:
+        return False
+    _publish_plain_phases(env, device_ir, plain_block_ids, plain_grids)
     return True

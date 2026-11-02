@@ -26,6 +26,7 @@ from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandTransf
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandType
 from helion._compiler.cute.tcgen05_operand_transform import prove_operand_stage_span
 from helion._compiler.cute.tcgen05_pipeline import make_pipeline_state
+from helion._testing import skipUnlessCuteAvailable
 from helion.runtime.cute.launcher import _cute_disk_cache_key
 
 if TYPE_CHECKING:
@@ -354,6 +355,7 @@ def _converter_phases(
             output[slot + 2] = state.count
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("warps", (1, 2, 4, 8))
 @pytest.mark.parametrize("stages", (1, 2, 3, 6))
 def test_actual_helion_sdk_has_one_independent_cursor_per_converter_warp(

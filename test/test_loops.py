@@ -189,6 +189,38 @@ def store_with_output_read(x: torch.Tensor, out: torch.Tensor) -> None:
         hl.store(out, [tile], (x[tile] + prior).to(out.dtype))
 
 
+@helion.kernel()
+def reread_in_inner_loop(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    # ``d`` is stored and re-read inside the ``tile_n`` loop: that loop and
+    # the grid loop around it hold the pair; the K loop does not.
+    m, k = x.size()
+    n = w.size(1)
+    d = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
+            d[tile_m, tile_n] = acc.to(x.dtype)
+            out[tile_m, tile_n] = d[tile_m, tile_n] * 2
+    return out
+
+
+@helion.kernel()
+def reread_after_inner_loop(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # The store precedes the inner loop that re-reads it: only the grid
+    # loop's region holds both.
+    m, n = y.size()
+    d = torch.empty_like(x)
+    out = torch.empty_like(y)
+    for tile_m in hl.tile(m):
+        d[tile_m] = x[tile_m] + 1
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = y[tile_m, tile_n] * d[tile_m][:, None]
+    return out
+
+
 @helion.kernel(autotune_effort="none")
 def long_elif_chain(x: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
     out = torch.empty_like(x)
@@ -816,13 +848,17 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, args, block_sizes=[16, 16])
         torch.testing.assert_close(result, args[0] + 1)
 
-    @skipIfRefEager("checks the CuTe lowering's refusal")
+    @skipIfRefEager("checks the CuTe lowering of a block-sized slice reduction")
     @skipUnlessBackends(["cute"])
     def test_full_slice_of_block_sized_buffer_reduction(self):
         """``buf[:, :].sum(-1)`` of a buffer sized by a registered block: the
         slice's reduction dim reuses the block's symbol after its loop ended.
-        CuTe must refuse it rather than reduce it with that dim's synthetic
-        lane loop, which would repeat the tile loop's atomics once per lane."""
+        Where CuTe lowers it, the dim combines across its threads, so each
+        row's total is the tile loop's atomics once, not once per lane. Where
+        CuTe has no lowering (e.g. ``BackendUnsupported: reduction lane owner
+        is not proven``), the refusal is the expected safe outcome: it must
+        refuse rather than reduce with that dim's synthetic lane loop, which
+        would repeat the tile loop's atomics once per lane."""
 
         @helion.kernel(static_shapes=True)
         def row_sums(y: torch.Tensor) -> torch.Tensor:
@@ -840,19 +876,14 @@ class TestLoops(RefEagerTestBase, TestCase):
             return rows
 
         y = torch.randn(64, 128, device=DEVICE)
-        with self.assertRaisesRegex(
-            helion.exc.BackendUnsupported, "reduction lane owner is not proven"
-        ):
-            code_and_output(row_sums, (y,), block_sizes=[128])
+        try:
+            _code, result = code_and_output(row_sums, (y,), block_sizes=[128])
+        except helion.exc.BackendUnsupported as error:
+            self.assertIn("reduction lane owner is not proven", str(error))
+            return
+        torch.testing.assert_close(result, y.sum(dim=-1))
 
     @skipIfTileIR("Result mismatch with tileir backend")
-    @skipIfFn(
-        lambda: _get_backend() == "cute",
-        "CuTe has no lowering for reducing the full slice loss_sum[:, :] of a "
-        "buffer sized by a block: its reduction dim reuses tile_v's block, "
-        "whose loop has ended (BackendUnsupported: reduction lane owner is "
-        "not proven)",
-    )
     def test_register_block_size_codegen_size_hint(self):
         @helion.kernel(static_shapes=True)
         def kernel_fixed_block_size(
@@ -885,7 +916,20 @@ class TestLoops(RefEagerTestBase, TestCase):
         y_true = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
         args = (y_pred, y_true)
 
-        code, result = code_and_output(kernel_fixed_block_size, args, block_sizes=[128])
+        try:
+            code, result = code_and_output(
+                kernel_fixed_block_size, args, block_sizes=[128]
+            )
+        except helion.exc.BackendUnsupported as error:
+            if _get_backend() == "cute" and (
+                "reduction lane owner is not proven" in str(error)
+            ):
+                self.skipTest(
+                    "CuTe has no lowering for reducing the full slice "
+                    "loss_sum[:, :] of a buffer sized by a block: "
+                    f"{error}"
+                )
+            raise
 
         expected = y_true[:, :].sum() / y_pred.size(0)
         torch.testing.assert_close(result, expected)
@@ -1331,6 +1375,38 @@ class TestLoops(RefEagerTestBase, TestCase):
             helion.Config(block_sizes=[16, 16], range_num_stages=[3] * slots)
         )
         self.assertEqual(normalized.range_num_stages, [0] * slots)
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="range_warp_specialize is offered from Blackwell on"
+    )
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_range_warp_specialize_pinned_for_rereads(self):
+        # Triton's warp specialization distributes a loop body over partitions
+        # by data flow, so a store and a later load of the same storage in one
+        # loop region end up unordered (the re-read saw stale memory).  Such a
+        # loop keeps its slot, pinned to None; loops whose region holds only
+        # one side of the pair keep the knob.
+        x = torch.randn([64, 32], device=DEVICE, dtype=torch.float16)
+        w = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        spec = reread_in_inner_loop.bind((x, w)).config_spec
+        self.assertEqual(
+            [item.pinned for item in spec.range_warp_specialize],
+            [True, True, False],
+        )
+        normalized = spec.normalized_config(
+            helion.Config(
+                block_sizes=[16, 16, 16], range_warp_specializes=[True, True, True]
+            )
+        )
+        self.assertEqual(normalized.range_warp_specializes, [None, None, True])
+
+        x = torch.randn([64], device=DEVICE)
+        y = torch.randn([64, 32], device=DEVICE)
+        spec = reread_after_inner_loop.bind((x, y)).config_spec
+        self.assertEqual(
+            [item.pinned for item in spec.range_warp_specialize], [True, False]
+        )
 
     @skipIfRefEager("not supported in ref eager mode")
     def test_range_num_stages_pinned_for_host_aliases(self):

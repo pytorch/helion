@@ -20,6 +20,7 @@ from helion._compiler.cute.flash_row_epilogue import FlashRowEpilogueProgram
 from helion._compiler.cute.flash_row_epilogue import RowEpilogueOp
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
+from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
 pytest.importorskip("cutlass")
@@ -274,6 +275,7 @@ def _graph_plan(
     return plan
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_row_program_detected_for_xsa_like_kernel() -> None:
     bound = _xsa_like.bind((*_meta_args((2, 8, 1024, 64)), 1e-6))
     assert bound.config_spec.cute_flash_search_enabled
@@ -291,11 +293,13 @@ def test_row_program_detected_for_xsa_like_kernel() -> None:
     assert program.op(program.output).op == "sub"
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_row_program_rejects_non_row_local_epilogue() -> None:
     bound = _unsupported_epilogue.bind(_meta_args((2, 8, 1024, 64)))
     assert not bound.config_spec.cute_flash_search_enabled
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize(
     "config",
     (
@@ -335,6 +339,7 @@ def test_row_program_codegen_every_route(config: dict[str, object]) -> None:
         )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_row_epilogue_emitter_hoists_and_unrolls() -> None:
     bound = _xsa_like.bind((*_meta_args((2, 8, 1024, 64)), 1e-6))
     program = _graph_plan(bound).row_epilogue
@@ -666,6 +671,7 @@ def test_row_epilogue_emitter_folds_one_product_per_consumer(
         assert "fma" not in code
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_row_epilogue_emitter_forms_agree_bitwise_on_the_xsa_program() -> None:
     # Same pairs, same accumulators, same folds: the two instruction forms
     # differ only in the instruction spelling.

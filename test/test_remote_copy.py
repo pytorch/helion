@@ -1795,7 +1795,11 @@ def _remote_copy_torch_tpu_worker(rank: int, world_size: int, master_port: int) 
 def _run_torch_tpu_multiprocess() -> None:
     import portpicker  # pyrefly: ignore[missing-import]
     import torch.multiprocessing as mp
-    import torch_tpu  # pyrefly: ignore[missing-import]  # noqa: F401  # isort: skip
+    from torch_tpu import _loader as torch_tpu_loader  # pyrefly: ignore[missing-import]  # isort: skip
+
+    # TORCH_DEVICE_BACKEND_AUTOLOAD=0 keeps `import torch_tpu` from registering
+    # the TPU backend, which set_tpu_launch_env() needs to find the TPUs.
+    torch_tpu_loader.load()
     from torch.tpu import (
         distributed as tt_distributed,  # pyrefly: ignore[missing-import]
     )

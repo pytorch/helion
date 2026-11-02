@@ -47,7 +47,9 @@ cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
 
 
-@helion.kernel(backend="cute")
+# The pins below count sweeps and pipelined loads; the exact division hoist
+# (test_cute_exact_division.py) would add a redo copy of the consume sweep.
+@helion.kernel(backend="cute", cute_exact_division=False)
 def softmax_two_pass_kernel(x: torch.Tensor) -> torch.Tensor:
     """Helion two-pass softmax — the kernel under test.
 
@@ -1026,7 +1028,7 @@ class TestCuteMultiRowInvestigation(TestCase):
 # A second, separately-decorated kernel so the P21 tests below can
 # trigger the rewrite without inheriting the autouse fixture that
 # disables it for the rest of this file.
-@helion.kernel(backend="cute")
+@helion.kernel(backend="cute", cute_exact_division=False)
 def softmax_two_pass_kernel_for_3pass(x: torch.Tensor) -> torch.Tensor:
     m, n = x.size()
     out = torch.empty_like(x)

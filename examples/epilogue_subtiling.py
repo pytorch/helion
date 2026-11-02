@@ -31,7 +31,9 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(static_shapes=True)
+# fast_math: the GELU's erf uses the hardware approximation (the outputs are
+# rounded to half precision, and cuBLASLt / Quack epilogues do the same).
+@helion.kernel(static_shapes=True, fast_math=True)
 def matmul_bias_residual_gelu_cast(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -64,7 +66,7 @@ def matmul_bias_residual_gelu_cast(
 
 
 # %%
-@helion.kernel(static_shapes=True)
+@helion.kernel(static_shapes=True, fast_math=True)
 def matmul_bias_gelu_aux(
     x: torch.Tensor,
     w: torch.Tensor,

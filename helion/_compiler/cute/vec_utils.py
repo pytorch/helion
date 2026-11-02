@@ -7,11 +7,103 @@ directly), so no ``@cute.jit`` wrapper is needed.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import cutlass
 from cutlass._mlir import ir
+from cutlass._mlir.dialects import arith
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import vector as _vector_dialect
 import cutlass.cute as cute
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+def store_u8_vec(
+    ptr: object,
+    vals: list,
+    *,
+    packet_store: Callable[[object, object], None] | None = None,
+) -> None:
+    """Store 2/4/8/16 byte lanes as one naturally aligned integer packet."""
+    store = cute.arch.store if packet_store is None else packet_store
+    if len(vals) == 16:
+        words = []
+        for start in (0, 8):
+            packed = cutlass.Uint64(0)
+            for index, value in enumerate(vals[start : start + 8]):
+                packed = packed | (cutlass.Uint64(value) << (8 * index))
+            words.append(packed.ir_value())
+        packet = _vector_dialect.from_elements(
+            ir.VectorType.get([2], cutlass.Uint64.mlir_type), words
+        )
+        store(ptr, packet)
+        return
+    carrier = {2: cutlass.Uint16, 4: cutlass.Uint32, 8: cutlass.Uint64}[len(vals)]
+    packed = carrier(0)
+    for index, value in enumerate(vals):
+        packed = packed | (carrier(value) << (8 * index))
+    # ``Uint16 << int`` promotes to Int32: store exactly ``len(vals)`` bytes.
+    store(ptr, carrier(packed))
+
+
+def _store_fp8_vec(
+    ptr: object,
+    vals: list,
+    dtype: type,
+    *,
+    packet_store: Callable[[object, object], None] | None = None,
+) -> None:
+    store = cute.arch.store if packet_store is None else packet_store
+    source_dtype = type(vals[0])
+    if source_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16) and all(
+        type(value) is source_dtype and isinstance(value.value, ir.Value)
+        for value in vals
+    ):
+        # For runtime values, one vector truncation lowers to the scalar
+        # constructor's cvt.rn.satfinite, with the lanes converted in pairs.
+        # Literal-backed wrappers still hold the original Python float;
+        # emitting them in the source dtype first would add another rounding.
+        source_type = ir.VectorType.get([len(vals)], source_dtype.mlir_type)
+        values = [value.ir_value() for value in vals]
+        source = _vector_dialect.from_elements(
+            source_type,
+            values,
+        )
+        converted = arith.truncf(
+            ir.VectorType.get([len(vals)], dtype.mlir_type), source
+        )
+        carrier = {
+            2: cutlass.Uint16,
+            4: cutlass.Uint32,
+            8: cutlass.Uint64,
+            16: cutlass.Uint64,
+        }[len(vals)]
+        packed = _vector_dialect.bitcast(
+            ir.VectorType.get([max(1, len(vals) // 8)], carrier.mlir_type), converted
+        )
+        if len(vals) == 16:
+            store(ptr, packed)
+            return
+        scalar = _vector_dialect.extract(packed, [], [0])
+        store(ptr, carrier(scalar))
+    else:
+        store_u8_vec(
+            ptr,
+            [dtype(value).bitcast(cutlass.Uint8) for value in vals],
+            packet_store=packet_store,
+        )
+
+
+def store_fp8e4m3fn_vec(ptr: object, vals: list) -> None:
+    """Convert lanes to E4M3FN and store them as one byte packet."""
+    _store_fp8_vec(ptr, vals, cutlass.Float8E4M3FN)
+
+
+def store_fp8e5m2_vec(ptr: object, vals: list) -> None:
+    """Convert lanes to E5M2 and store them as one byte packet."""
+    _store_fp8_vec(ptr, vals, cutlass.Float8E5M2)
 
 
 def store_u16_vec(ptr: object, vals: list) -> None:
@@ -59,6 +151,47 @@ def red_add_f32_vec(ptr: object, vals: list) -> None:
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+def _red_add_half_vec(ptr: object, vals: list, dtype: object, suffix: str) -> None:
+    width = len(vals)
+    assert width in (2, 4, 8), width
+    i16 = ir.IntegerType.get_signless(16)
+    halves = [arith.bitcast(i16, dtype(v).ir_value()) for v in vals]  # pyrefly: ignore
+    words = width // 2
+    pack = " ".join(
+        f"mov.b32 w{i}, {{${2 * i + 1}, ${2 * i + 2}}};" for i in range(words)
+    )
+    regs = ", ".join(f"w{i}" for i in range(words))
+    vector = "" if words == 1 else f".v{words}"
+    operand = regs if words == 1 else f"{{{regs}}}"
+    llvm.inline_asm(
+        None,
+        [ptr, *halves],
+        f"{{ .reg .b32 {regs}; {pack} "
+        f"red.global.add.noftz{vector}.{suffix} [$0], {operand}; }}",
+        ",".join(["l", *(["h"] * width)]),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def red_add_f16_vec(ptr: object, vals: list) -> None:
+    """``red_add_f32_vec`` for ``cutlass.Float16`` lanes: one
+    ``red.global.add.noftz{.v2,.v4}.f16x2`` of 2 / 4 / 8 consecutive halves
+    at ``ptr`` (4-, 8- or 16-byte aligned).  Each half is added with the
+    same ``noftz`` fp16 arithmetic as the scalar ``atom.add.noftz.f16``, so
+    the per-element result is the one the scalar atomic produces; on sm_100
+    ptxas lowers the scalar form to a compare-and-swap loop, this one to a
+    native ``REDG.E.ADD.F16``.  The ``.v2`` / ``.v4`` forms need sm_90."""
+    _red_add_half_vec(ptr, vals, cutlass.Float16, "f16x2")
+
+
+def red_add_bf16_vec(ptr: object, vals: list) -> None:
+    """``red_add_f16_vec`` for ``cutlass.BFloat16`` lanes
+    (``red.global.add.noftz{.v2,.v4}.bf16x2``, sm_90+)."""
+    _red_add_half_vec(ptr, vals, cutlass.BFloat16, "bf16x2")
 
 
 def signed_bitfield_to_bf16_packed(

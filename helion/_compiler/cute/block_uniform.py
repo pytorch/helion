@@ -246,9 +246,27 @@ def _symbol_block_uniform(symbol: sympy.Basic) -> bool:
     # An ``hl.grid`` index (block size 1 along every dim, never flattened) or
     # a grid tile's begin/end/id.
     return (
-        type(origin) is GridOrigin
-        or isinstance(origin, (TileBeginOrigin, TileEndOrigin, TileIdOrigin))
-    ) and _is_grid_block(origin.block_id)
+        (
+            type(origin) is GridOrigin
+            or isinstance(origin, (TileBeginOrigin, TileEndOrigin, TileIdOrigin))
+        )
+        and _is_grid_block(origin.block_id)
+        and not _is_packed_grid_block(origin.block_id)
+    )
+
+
+def _is_packed_grid_block(block_id: int | None) -> bool:
+    """A grid axis packed several tiles per CTA: its tile values vary per
+    thread sub-group (``cute_tiles_per_block``)."""
+    from ..device_function import DeviceFunction
+    from .tile_packing import packed_grid_block
+
+    if block_id is None:
+        return False
+    packed = packed_grid_block(
+        CompileEnvironment.current(), DeviceFunction.current().config
+    )
+    return packed is not None and packed[0] == block_id
 
 
 def _is_grid_block(block_id: int | None) -> bool:

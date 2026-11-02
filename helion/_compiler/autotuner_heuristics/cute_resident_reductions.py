@@ -10,6 +10,7 @@ from typing import cast
 import sympy
 import torch
 
+from ..._compat import num_compute_units
 from ...runtime.config import Config
 from ..cute.loop_nesting import tile_loop_paths
 from ..cute.thread_budget import MAX_THREADS_PER_BLOCK
@@ -28,6 +29,50 @@ class _ResidentPlan:
     row_block: int
     reduction_block: int
     features: int
+
+
+# (coarse rows per CTA, threads over the features, features per thread,
+# resident row group, schedule): the typed lattice the seeds are drawn from.
+_SEED_LATTICE: tuple[tuple[int, int, int, int, str], ...] = (
+    (32, 256, 8, 2, "pipelined"),
+    (32, 256, 8, 1, "resident"),
+    (32, 128, 4, 1, "pipelined"),
+    (16, 512, 8, 2, "pipelined"),
+    (32, 512, 8, 4, "pipelined"),
+)
+# Feature vectors a seed may carry per thread: 16 bytes of fp32 or more.
+_SEED_VECTORS = (4, 8)
+
+
+def _seed_vector(features: int, threads: int, vector: int) -> int | None:
+    """The feature vector per thread for ``threads`` lanes: the lattice value
+    when it tiles the features exactly, else the exact quotient when it is a
+    seed width (1024 features over 256 threads: 4, not the lattice's 8)."""
+    if features % (threads * vector) == 0:
+        return vector
+    if features % threads == 0 and features // threads in _SEED_VECTORS:
+        return features // threads
+    return None
+
+
+def _occupancy_coarse(rows: int, coarse: int) -> int | None:
+    """The power-of-two coarse tile that gives about one CTA per SM, when the
+    lattice's ``coarse`` would leave SMs idle.
+
+    The lattice tiles 16 or 32 rows per CTA: on 256 rows that is 8 CTAs for
+    148 SMs, and the search has to halve the coarse tile several times from
+    any seed to reach the occupancy-filling geometry (4 rows per CTA won the
+    layer_norm / rms_norm backward kernels at that size). ``None`` when the
+    lattice already fills the machine or the row count is unknown.
+    """
+    if rows <= 0:
+        return None
+    units = max(1, num_compute_units())
+    if -(-rows // coarse) >= units:
+        return None
+    per_cta = max(1, -(-rows // units))
+    occupancy = 1 << (per_cta - 1).bit_length()
+    return occupancy if occupancy < coarse else None
 
 
 class CuteResidentReductionHeuristic(AutotunerHeuristic):
@@ -147,15 +192,29 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
         ):
             return None
         seeds = []
-        for coarse, threads, vector, rows, schedule in (
-            (32, 256, 8, 2, "pipelined"),
-            (32, 256, 8, 1, "resident"),
-            (32, 128, 4, 1, "pipelined"),
-            (16, 512, 8, 2, "pipelined"),
-            (32, 512, 8, 4, "pipelined"),
-        ):
+        lattice = [
+            (coarse, threads, vector, rows, schedule)
+            for coarse, threads, vector, rows, schedule in _SEED_LATTICE
+            if plan.features % (threads * vector) == 0
+        ]
+        # The same thread/row/schedule choices at an occupancy-filling coarse
+        # tile, after the lattice so the existing primaries keep their rank.
+        # Through ``env``: callers hold the environment without entering it.
+        row_size = env.block_sizes[plan.coarse_block].size
+        row_count = (
+            env.size_hint(row_size) if isinstance(row_size, (int, torch.SymInt)) else 0
+        )
+        for coarse, threads, vector, rows, schedule in _SEED_LATTICE:
+            occupancy = _occupancy_coarse(row_count, coarse)
+            seed_vector = _seed_vector(plan.features, threads, vector)
+            if occupancy is None or seed_vector is None:
+                continue
+            entry = (occupancy, threads, seed_vector, rows, schedule)
+            if entry not in lattice:
+                lattice.append(entry)
+        for coarse, threads, vector, rows, schedule in lattice:
             block_sizes = {plan.coarse_block: coarse, plan.row_block: 1}
-            if plan.features % (threads * vector) or any(
+            if any(
                 not item.min_size <= block_sizes[item.block_id] <= item.max_size
                 for item in spec.block_sizes
             ):
@@ -213,6 +272,11 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
             for item in spec.block_sizes
         ):
             return []
+        coarse_index = next(
+            index
+            for index, item in enumerate(spec.block_sizes)
+            if item.block_id == plan.coarse_block
+        )
         result = []
         for seed in cls.get_seed_configs(env, device_ir) or ():
             if (
@@ -220,8 +284,17 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
                 or seed.config["cute_reduction_group_rows"] != 1
             ):
                 continue
+            seed_blocks = cast("list[int]", seed.config["block_sizes"])
+            # An occupancy seed tiles fewer rows per CTA than the lattice;
+            # deepening its prefetch must not undo that, but a four-deep ring
+            # wants at least one row per slot.
+            depth_blocks = blocks | {
+                plan.coarse_block: min(
+                    blocks[plan.coarse_block], max(seed_blocks[coarse_index], 4)
+                )
+            }
             values = deepcopy(seed.config) | {
-                "block_sizes": _seq_config_list(spec.block_sizes, blocks),
+                "block_sizes": _seq_config_list(spec.block_sizes, depth_blocks),
                 "cute_reduction_pipeline_depth": 4,
                 "cute_reduction_sequence": "scalar",
                 "cute_min_blocks_per_mp": 0,
@@ -229,13 +302,21 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
             # SIMT has no PID search coordinate here. Omission already means
             # flat; keeping an explicit key would not survive strict transfer.
             values.pop("pid_type")
-            if spec.cute_host_paired_sum_available:
-                result.extend(
-                    Config.from_dict(deepcopy(values) | {"cute_host_paired_sum": mode})
-                    for mode in ("off", "mapped", "narrow")
-                )
-            else:
-                result.append(Config.from_dict(values))
+            variants = [values]
+            if depth_blocks[plan.coarse_block] == 4:
+                # A four-row occupancy tile fills the four-deep ring as one
+                # group: also hold the whole tile resident at once.
+                variants.append(values | {"cute_reduction_group_rows": 4})
+            for variant in variants:
+                if spec.cute_host_paired_sum_available:
+                    result.extend(
+                        Config.from_dict(
+                            deepcopy(variant) | {"cute_host_paired_sum": mode}
+                        )
+                        for mode in ("off", "mapped", "narrow")
+                    )
+                else:
+                    result.append(Config.from_dict(variant))
         return result
 
     @classmethod

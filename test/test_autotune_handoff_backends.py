@@ -9,6 +9,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import _has_cute_dsl
 from helion._testing import skipIfRefEager
 from helion.autotuner import FiniteSearch
 from helion.autotuner import HandoffPolicy
@@ -28,8 +29,8 @@ if TYPE_CHECKING:
 def test_handoff_validates_generated_kernels(
     backend: str, multi_shape: bool, tmp_path: Path
 ) -> None:
-    if backend == "cute":
-        pytest.importorskip("cutlass.cute")
+    if backend == "cute" and not _has_cute_dsl():
+        pytest.skip("requires the supported CuTe DSL")
 
     @helion.kernel(
         backend=backend,

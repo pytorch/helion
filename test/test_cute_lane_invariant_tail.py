@@ -82,6 +82,17 @@ _TWICE_MYSTERY = "w = v * 2"
 _TWICE_MYSTERY_STORE = "(flags.iterator + i * flags.layout.stride[0]).store(w)"
 _UNRELATED_REGISTER = "k = i * 2"
 _UNRELATED_STORE = "(flags.iterator + i * flags.layout.stride[0]).store(k)"
+_INLINE_ASM = (
+    "packed_code = _cute_inline_asm_elementwise((reduced,), "
+    "asm='{ .reg .b16 code_pair; "
+    "cvt.rp.satfinite.ue8m0x2.f32 code_pair, $1, $1; "
+    "cvt.u32.u16 $0, code_pair; }', "
+    "constraints='=r,f', dtype=cutlass.Int32, is_pure=True)"
+)
+_INLINE_ASM_STORE = (
+    "(out2.iterator + i * out2.layout.stride[0] + lane * out2.layout.stride[1])"
+    ".store(row * cutlass.Float32(packed_code))"
+)
 
 
 def _order(
@@ -244,6 +255,86 @@ def test_thread_geometry_reads_are_ordered_like_registers() -> None:
         consumed={0, 1, 3},
     )
     assert after == set()
+
+
+def test_pure_scalar_inline_asm_can_run_between_the_lane_passes() -> None:
+    after = _order(
+        _ROW_LOAD,
+        _ROW_STORE,
+        _INLINE_ASM,
+        _INLINE_ASM_STORE,
+        invariant={2},
+        accumulated={0},
+        consumed={0, 1, 3},
+    )
+    assert after == set()
+
+
+@pytest.mark.parametrize("purity", ["False", "runtime_purity", "1", "missing"])
+def test_inline_asm_without_proven_purity_keeps_memory_order(purity: str) -> None:
+    statement = (
+        _INLINE_ASM.replace(", is_pure=True", "")
+        if purity == "missing"
+        else _INLINE_ASM.replace("is_pure=True", f"is_pure={purity}")
+    )
+    with pytest.raises(exc.BackendUnsupported, match="between per-lane statements"):
+        _order(
+            _ROW_LOAD,
+            _ROW_STORE,
+            statement,
+            _INLINE_ASM_STORE,
+            invariant={2},
+            accumulated={0},
+            consumed={0, 1, 3},
+        )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "ld.global.u32 $0, [$1];",
+        "mov.u32 $0, %clock;",
+        "bar.sync 0; mov.u32 $0, $1;",
+    ],
+)
+def test_declared_pure_memory_and_synchronization_asm_remain_opaque(
+    replacement: str,
+) -> None:
+    start = _INLINE_ASM.index("asm='") + len("asm='")
+    end = _INLINE_ASM.index("', constraints=")
+    statement = _INLINE_ASM[:start] + replacement + _INLINE_ASM[end:]
+    with pytest.raises(exc.BackendUnsupported, match="between per-lane statements"):
+        _order(
+            _ROW_LOAD,
+            _ROW_STORE,
+            statement,
+            _INLINE_ASM_STORE,
+            invariant={2},
+            accumulated={0},
+            consumed={0, 1, 3},
+        )
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "row",
+        "unknown_call(reduced)",
+        "(out.iterator + i * out.layout.stride[0]).load()",
+    ],
+)
+def test_pure_inline_asm_preserves_argument_dependencies(argument: str) -> None:
+    statement = _INLINE_ASM.replace("(reduced,)", f"({argument},)")
+    with pytest.raises(exc.BackendUnsupported, match="between per-lane statements"):
+        _order(
+            _ROW_LOAD,
+            _ROW_STORE,
+            statement,
+            _INLINE_ASM_STORE,
+            invariant={2},
+            accumulated={0},
+            consumed={0, 1, 3},
+        )
 
 
 def test_persistent_vector_markers_are_loads_and_stores_of_their_tensors() -> None:
@@ -433,6 +524,24 @@ def _softmax_zero_softmax_again(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _reduction_inline_asm(x: torch.Tensor, is_pure: hl.constexpr) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        row = x[tile_m, :]
+        maximum = torch.amax(row, dim=1)
+        scale = hl.inline_asm_elementwise(
+            "mov.f32 $0, $1;",
+            "=f,f",
+            [maximum],
+            dtype=torch.float32,
+            is_pure=is_pure,
+            pack=1,
+        )
+        out[tile_m, :] = row * scale[:, None]
+    return out
+
+
 # One program per row; its 32 (or 8) threads sweep the 256 columns in 8 (or
 # 32) lane iterations, so every tile store of ``out`` is a consume-pass store.
 _CONFIG = {
@@ -516,3 +625,38 @@ def test_store_between_two_per_lane_stores_of_its_tensor_rejects_the_config(
     # element in the body the reduction split rewrites.
     with pytest.raises(exc.BackendUnsupported, match="a body a later pass rewrites"):
         _generate(kernel, _ARGS, **_CONFIG)
+
+
+def test_generated_pure_inline_asm_runs_once_between_lane_passes() -> None:
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(_reduction_inline_asm, (*_ARGS, True))
+        code = bound.to_code(helion.Config.from_dict(_CONFIG_FEW_THREADS))
+    function = _kernel_function(code)
+    passes = _pass_indices(function)
+    (asm_index,) = [
+        index
+        for index, statement in enumerate(function.body)
+        if not isinstance(statement, ast.For)
+        and any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_cute_inline_asm_elementwise"
+            for node in ast.walk(statement)
+        )
+    ]
+    assert passes[0] < asm_index < passes[-1], code
+    calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_cute_inline_asm_elementwise"
+    ]
+    assert len(calls) == 1, code
+
+
+def test_generated_impure_inline_asm_rejects_the_lane_split() -> None:
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(_reduction_inline_asm, (*_ARGS, False))
+        with pytest.raises(exc.BackendUnsupported, match="between per-lane statements"):
+            bound.to_code(helion.Config.from_dict(_CONFIG_FEW_THREADS))

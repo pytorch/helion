@@ -14,6 +14,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 import helion
 from helion._compiler.cute.fx_matcher import _xyz_grid_fits
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
@@ -254,6 +255,8 @@ def _shorten_root_task_extent(device_ir: DeviceIR) -> None:
     )
 
 
+# unittest runners ignore pytestmark.
+@onlyBackends(["cute"])
 class TestCuteSingleTokenRank1Recurrence(unittest.TestCase):
     def _code(
         self,

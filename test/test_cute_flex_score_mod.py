@@ -168,6 +168,8 @@ def _render(
     prefetch_regs: int = 0,
     coalesce: int = 0,
     coop_slots: int = 1,
+    stage_expr: str | None = None,
+    fast_full: bool = False,
 ) -> FlexHookCode:
     return render_flex_hook(
         plan,
@@ -190,6 +192,8 @@ def _render(
         prefetch_regs=prefetch_regs,
         coalesce=coalesce,
         coop_slots=coop_slots,
+        stage_expr=stage_expr,
+        fast_full=fast_full,
     )
 
 
@@ -1160,6 +1164,8 @@ def _render_case(
     coalesce: int = 0,
     coop_slots: int = 1,
     stage: int = 0,
+    stage_expr: str | None = None,
+    fast_full: bool = False,
 ) -> tuple[FlexHookCode, AttentionScorePlan, list[torch.Tensor], list[object]]:
     tables, scalar_values = _case_inputs(case)
     with _environment(fast_math=case.fast_math):
@@ -1177,6 +1183,8 @@ def _render_case(
             prefetch_regs=prefetch_regs,
             coalesce=coalesce,
             coop_slots=coop_slots,
+            stage_expr=stage_expr,
+            fast_full=fast_full,
         )
     return code, plan, tables, scalar_values
 
@@ -1522,6 +1530,38 @@ class TestCuteFlexScoreMod(TestCase):
                         atol=1e-5,
                         msg=f"{name} chunk={chunk_cols} coalesce={coalesce} tile#{index}",
                     )
+
+    def test_shared_region_addresses_the_staging_ring_by_the_runtime_stage(
+        self,
+    ) -> None:
+        """The shared softmax region renders the hook once (stage 0's names)
+        with the stage a device expression: the warp's staging ring is
+        ``(flash_stage * 4 + warp) * ring bytes``, not stage 0's; the digit
+        form keeps the per-stage text."""
+        case = next(c for c in _CASES if c.name == "graphormer_edge")
+        code, _plan, _tables, _values = _render_case(
+            case,
+            with_tail=False,
+            bounds=True,
+            coalesce=128,
+            coop_slots=2,
+            stage=0,
+            stage_expr="flash_stage",
+        )
+        self.assertIn(
+            "flash_flex0_coopbuf = _flash_flex_coop_smem + (cutlass.Int32(flash_stage) "
+            "* cutlass.Int32(4) + cutlass.Int32(tLDcS[0][0]) // cutlass.Int32(32)) * "
+            "cutlass.Int32(34816)",
+            code.item_prelude,
+        )
+        self.assertNotIn("cutlass.Int32(0) + cutlass.Int32(tLDcS", code.item_prelude)
+        digit, _plan, _tables, _values = _render_case(
+            case, with_tail=False, bounds=True, coalesce=128, coop_slots=2, stage=0
+        )
+        self.assertIn(
+            "flash_flex0_coopbuf = _flash_flex_coop_smem + (cutlass.Int32(0) + ",
+            digit.item_prelude,
+        )
 
     def test_cooperative_block_render_and_facts(self) -> None:
         """graphormer-edge at 128 and 32 columns with a two-slot ring: the
@@ -2708,6 +2748,36 @@ class TestCuteFlexScoreMod(TestCase):
         self.assertIn(", 16)", code16.chunk_body)
         self.assertIn("~flash_flex0m_w0 & cutlass.Int32(65535)", code16.chunk_body)
         self.assertIn("* cutlass.Int32(21845)", code16.item_prelude)
+
+    def test_fast_full_hands_back_the_keep_word_chunk_lines(self) -> None:
+        """``fast_full``: a mask-only bitmask hook whose keep word is index
+        math returns the chunk-class lines that build it (every one of them
+        a line of the chunk body, none reading a score) and the word's
+        name; off by default, in the element form, with a score region and
+        when the mask region loads a table."""
+        case = next(c for c in _CASES if c.name == "dilated_sw")
+        plain = _render_case(case, with_tail=False)[0]
+        self.assertEqual((plain.chunk_words, plain.mask_word), ("", ""))
+        code = _render_case(case, with_tail=False, fast_full=True)[0]
+        self.assertEqual(code.chunk_body, plain.chunk_body)
+        self.assertEqual(code.mask_word, "flash_flex0m_w6")
+        words = [line for line in code.chunk_words.splitlines() if line.strip()]
+        self.assertTrue(words)
+        body_lines = [line.strip() for line in plain.chunk_body.splitlines()]
+        for line in words:
+            self.assertIn(line.strip(), body_lines)
+            self.assertNotIn("flash_disc_frg", line)
+            self.assertNotIn("flash_flex_i", line)
+        self.assertTrue(any("_cute_flex_lane_below" in line for line in words))
+        self.assertTrue(any("flash_flex0m_w6 = " in line for line in words))
+        element = _render_case(
+            case, with_tail=False, mask_form="element", fast_full=True
+        )[0]
+        self.assertEqual((element.chunk_words, element.mask_word), ("", ""))
+        for name in ("softcap", "document_table"):
+            other = next(c for c in _CASES if c.name == name)
+            code = _render_case(other, with_tail=False, fast_full=True)[0]
+            self.assertEqual((code.chunk_words, code.mask_word), ("", ""), name)
 
     def test_bitmask_lane_affine_remainder_and_uniform_broadcast(self) -> None:
         """svg-temporal: ``(kv - 128) % 512`` is lane-affine over the tile,

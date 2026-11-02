@@ -27,6 +27,23 @@ if TYPE_CHECKING:
 _MAX_MPP_TILE_EXTENT = 128
 
 
+#: Element types an MSL ``tensor<>`` accepts (``__is_tensor_element_v`` in the
+#: SDK's ``metal_tensor`` header), i.e. what the MPP output view can hold.
+_MSL_TENSOR_ELEMENT_DTYPES: frozenset[torch.dtype] = frozenset(
+    {
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int8,
+        torch.uint8,
+        torch.int16,
+        torch.uint16,
+        torch.int32,
+        torch.uint32,
+    }
+)
+
+
 @dataclasses.dataclass(frozen=True)
 class _MPPOperandLayout:
     """How one MPP matmul operand occupies device memory.
@@ -312,13 +329,19 @@ class MPPGraphInfo(NodeArgsGraphInfo):
         assert self.out_dtype is not None
         from ..backend import MetalBackend
 
-        # 4. Store the cooperative tensor to HBM.
+        # 4. Store the cooperative tensor to HBM.  The cooperative store
+        # requires matching dtypes, so any other output dtype takes a masked
+        # per-element convert-and-store loop instead.
         out_name = codegen.device_function.tensor_arg(self.out_tensor).name
         codegen.device_function.placeholder_args.add(out_name)
         out_dtype = MetalBackend._get_dtype_to_metal()[self.out_dtype]
+        if self.acc_dtype == self.out_dtype:
+            store_marker = "_metal_mpp_coop_store"
+        else:
+            store_marker = "_metal_mpp_scalar_store"
         codegen.add_statement(
             statement_from_string(
-                f'_metal_mpp_coop_store({setup_var}, "{out_name}", "{out_dtype}")'
+                f'{store_marker}({setup_var}, "{out_name}", "{out_dtype}")'
             )
         )
         if emit_store_barrier and self.needs_store_barrier:
@@ -409,11 +432,20 @@ class MPPGraphInfo(NodeArgsGraphInfo):
                 f"unsupported accumulator dtype for MPP matmul: {acc_dtype}",
             )
         assert acc_dtype is not None
-        if self.out_dtype is not None and acc_dtype != self.out_dtype:
+        if (
+            self.out_dtype is not None
+            and self.out_dtype not in _MSL_TENSOR_ELEMENT_DTYPES
+        ):
             raise exc.BackendUnsupported(
                 "metal",
-                "MPP cooperative store requires accumulator dtype to match output "
-                f"dtype; got accumulator {acc_dtype} and output {self.out_dtype}",
+                f"unsupported output dtype for MPP matmul: {self.out_dtype}",
+            )
+        if self.bias_tensor is not None and self.bias_tensor.dtype != acc_dtype:
+            # The bias preload (coop.load) requires matching dtypes.
+            raise exc.BackendUnsupported(
+                "metal",
+                f"MPP matmul bias dtype {self.bias_tensor.dtype} must match the "
+                f"accumulator dtype {acc_dtype}",
             )
         assert self.lhs_tensor.ndim == 2 and self.rhs_tensor.ndim == 2
         assert self.lhs_tensor.dtype == self.rhs_tensor.dtype

@@ -1,6 +1,7 @@
 """Keep CuTe guard preprocessing linear using dominating Boolean type facts.
 
-The SDK duplicates its accumulated left operand when folding a flat ``and``.
+The SDK duplicates its accumulated left operand when folding a flat ``and``
+or ``or`` (four copies per operand, so an N-term chain costs 4^N nodes).
 Reassociate only pure Boolean operands, preserving their values, evaluation
 order and short-circuit boundaries. Definitions supply types, never substituted
 expressions. Run after variable renaming so aliases cannot conceal a write.
@@ -62,11 +63,7 @@ def _single_write_bindings(body: list[ast.stmt]) -> frozenset[str] | None:
     for index, node in enumerate(ast.walk(ast.Module(body=body, type_ignores=[]))):
         if index >= _ANALYSIS_BUDGET or isinstance(node, _OPAQUE_BINDINGS):
             return None
-        has_flat_conjunction |= (
-            isinstance(node, ast.BoolOp)
-            and isinstance(node.op, ast.And)
-            and len(node.values) > 2
-        )
+        has_flat_conjunction |= isinstance(node, ast.BoolOp) and len(node.values) > 2
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             writes[node.id] += 1
         elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(
@@ -101,7 +98,7 @@ class _Reassociate(ast.NodeTransformer):
     def visit_BoolOp(self, node: ast.BoolOp) -> ast.expr:
         self.generic_visit(node)
         if not (
-            isinstance(node.op, ast.And)
+            isinstance(node.op, (ast.And, ast.Or))
             and len(node.values) > 2
             and all(
                 _pure_boolean_guard(value, boolean_names=self.boolean_names)
@@ -112,7 +109,11 @@ class _Reassociate(ast.NodeTransformer):
         result = node.values[-1]
         for value in reversed(node.values[:-1]):
             result = ast.copy_location(
-                ast.BoolOp(op=ast.And(), values=[value, result]), node
+                ast.BoolOp(
+                    op=ast.And() if isinstance(node.op, ast.And) else ast.Or(),
+                    values=[value, result],
+                ),
+                node,
             )
         return result
 

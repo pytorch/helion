@@ -134,9 +134,20 @@ class FinalSelectionConfig:
     flight, though the smallest plan stays reserved past that generation
     whenever a quarter of the budget covers it) and the phase is sized to
     whatever is left when it starts
-    (:meth:`fit_to_seconds`): the screen goes first, then rounds (down to
-    two), then survivors (down to two), then the thermal warmup; the phase
-    is skipped when even that plan does not fit.
+    (:meth:`fit_to_seconds`): the screen goes first, then the second
+    regime's column, then the family quota, then rounds (down to two), then
+    survivors (down to two), then the thermal warmup; the phase is skipped
+    when even that plan does not fit.
+
+    When the kernel's config spec names family knobs
+    (``ConfigSpec.final_selection_family_keys``: knobs whose value picks a
+    distinct kernel body, such as the CuTe flash pipeline family), the
+    shortlist and the survivors of the screen keep the best config of up to
+    ``family_finalists`` families the ranking would otherwise drop, each
+    within ``family_spread`` of the best reading, so the steady windows,
+    which measure the sustained (power-capped) clock, see every body that
+    is in contention and not only the one the search's short windows
+    preferred.
     """
 
     # Survivors of the screen: the harness-best config of every validated
@@ -175,6 +186,43 @@ class FinalSelectionConfig:
     # where the search's own first readings still correlated 0.6-0.95).
     screen_warmup_ms: int = 500
     screen_rep_ms: int = 500
+    # Finalists whose median sits within this fraction of the best median
+    # are a tie the ranking regime cannot resolve (settled 500+500 ms windows
+    # of one config read within 0.35% of each other). When that regime is a
+    # warm one (``replay``: one flush, then a burst of back-to-back calls;
+    # ``off``: never flushed) the tied group is timed again for
+    # ``tiebreak_rounds`` rounds of the same windows in the per-call flushed
+    # regime and the cold medians break the tie, the ranking regime's pick
+    # staying put unless a rival is faster cold by more than the tolerance
+    # (a recurrent-step search had ten finalists tied at 3.055 us in replay
+    # that spanned 3.90-5.41 us cold on one numerics-neutral knob, the L2
+    # eviction hint of the state load; the pick among them was arbitrary).
+    # An explicit HELION_AUTOTUNE_TARGET_REGIME times every finalist in the
+    # named regime for ``tiebreak_rounds`` rounds instead and selects by that
+    # column outright (see ``final_selection_second_regime``). Two rounds
+    # keep the alternating order (the differences the column resolves are
+    # tens of percent); 0 disables the second column. The estimate counts
+    # the column for every finalist, its upper bound; the search sizes the
+    # phase without it where the regimes call for no column
+    # (``PopulationBasedSearch._final_selection_sizing_policy``).
+    tie_tolerance: float = 0.01
+    tiebreak_rounds: int = 2
+    # Family quota. The search ranks its candidates in short windows at
+    # boost clocks; the steady windows run at the sustained clock the power
+    # limiter sets, which depends on the body's energy per call. A
+    # power-efficient body (half the K/V traffic of its rival) that the
+    # search regime ranked 1-6% behind won the sustained windows by 3% on a
+    # power-capped B200, yet never reached them: the shortlist is cut by the
+    # search's readings and the survivors by one screen window. With the
+    # spec's family knobs set (``ConfigSpec.final_selection_family_keys``),
+    # the best shortlisted config of up to ``family_finalists`` families not
+    # represented among the ranked survivors joins them (at the shortlist
+    # cut and at the screen cut), provided it read within ``family_spread``
+    # of the best; ``family_finalists`` 0 disables the quota. The estimate
+    # counts the extra finalists (its upper bound); the search sizes the
+    # phase without them where the spec names no family knob.
+    family_finalists: int = 2
+    family_spread: float = 1.25
 
     # Worker round trip, wrapper load and the timer's estimate pass (measured
     # ~0.15 s per window for CuTe flash kernels on B200).
@@ -195,14 +243,16 @@ class FinalSelectionConfig:
 
     def finalists(self, shortlist: int) -> int:
         """Most finalists the rounds can time: the ``top_k`` best ranked plus
-        the best pinned seed plus the search's incumbent.
+        the best pinned seed plus the search's incumbent plus the
+        ``family_finalists`` family representatives.
 
         The seed and the incumbent survive even when they rank outside the
         ``top_k`` (the incumbent does when a later phase re-timed it above
-        the shortlist's search numbers), so a shortlist of ``top_k + 2`` can
-        reach the rounds whole; the estimate counts that upper bound.
+        the shortlist's search numbers), as do the family representatives,
+        so a shortlist of ``top_k + 2 + family_finalists`` can reach the
+        rounds whole; the estimate counts that upper bound.
         """
-        return min(shortlist, self.top_k + 2)
+        return min(shortlist, self.top_k + 2 + self.family_finalists)
 
     def estimated_seconds(self, shortlist: int) -> float:
         """Wall-clock estimate for a shortlist of ``shortlist`` configs.
@@ -215,19 +265,25 @@ class FinalSelectionConfig:
             screen_window_s = (self.screen_warmup_ms + self.screen_rep_ms) / 1000.0
             screen_s = shortlist * (screen_window_s + self.WINDOW_OVERHEAD_S)
         rounds_s = self.finalists(shortlist) * self.rounds * window_s
+        # the second column, when the regimes call for one, for every finalist
+        tiebreak_s = self.finalists(shortlist) * self.tiebreak_rounds * window_s
         # 1.25x covers the timer sizing its repetitions from an estimate pass
         # (a window runs up to a quarter longer than requested); the 5 s
         # covers one worker spawn with wrapper and argument loads.
-        return 1.25 * (self.thermal_warmup_ms / 1000.0 + screen_s + rounds_s) + 5.0
+        return (
+            1.25 * (self.thermal_warmup_ms / 1000.0 + screen_s + rounds_s + tiebreak_s)
+            + 5.0
+        )
 
     def fit_to_seconds(
         self, seconds: float, shortlist: int
     ) -> FinalSelectionConfig | None:
         """The most complete plan whose estimate fits in ``seconds``.
 
-        Sheds cost in the order: the screen, rounds (two at a time, keeping
-        the count even, down to two), survivors (down to two), then the
-        thermal warmup. Returns None when even the minimum plan does not fit.
+        Sheds cost in the order: the screen, the second regime's column,
+        the family quota, rounds (two at a time, keeping the count even,
+        down to two), survivors (down to two), then the thermal warmup.
+        Returns None when even the minimum plan does not fit.
         """
         for policy in self.budget_ladder():
             if policy.estimated_seconds(shortlist) <= seconds:
@@ -239,6 +295,12 @@ class FinalSelectionConfig:
         ladder: list[FinalSelectionConfig] = [self]
         policy = replace(self, screen_rep_ms=0)
         ladder.append(policy)
+        if policy.tiebreak_rounds > 0:
+            policy = replace(policy, tiebreak_rounds=0)
+            ladder.append(policy)
+        if policy.family_finalists > 0:
+            policy = replace(policy, family_finalists=0)
+            ladder.append(policy)
         while policy.rounds - 2 >= self.MIN_ROUNDS:
             policy = replace(policy, rounds=policy.rounds - 2)
             ladder.append(policy)

@@ -246,8 +246,15 @@ def test_original_jagged_async_copy_retains_alignment_guard(
     )
     source = _cpu_bind(_jagged_kernel(), arguments).to_code(config)
     assert "collective_a_raw" in source and "collective_b_raw" in source
-    assert "cute.arch.cvt_f32_tf32(collective_a_raw[" in source
-    assert "cute.arch.cvt_f32_tf32(collective_b_raw[" in source
+    if compute == "warp":
+        # The warp MMA partitions the raw FP32 ring and rounds in registers.
+        assert "collective_tca.partition_S(collective_a_raw)" in source
+        assert "cute.arch.cvt_f32_tf32(collective_ra_raw[" in source
+        assert "cute.arch.cvt_f32_tf32(collective_rb_raw[" in source
+        assert "cvt_f32_tf32(collective_a_raw[" not in source
+    else:
+        assert "cute.arch.cvt_f32_tf32(collective_a_raw[" in source
+        assert "cute.arch.cvt_f32_tf32(collective_b_raw[" in source
     offsets, a, b, bias = arguments
     unaligned_a = torch.empty(a.numel() + 1, dtype=a.dtype)[1:].view_as(a)
     unaligned = _cpu_bind(_jagged_kernel(), (offsets, unaligned_a, b, bias)).to_code(

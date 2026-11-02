@@ -51,7 +51,7 @@ def _row_ir(
 ) -> DeviceIR:
     ir = DeviceIR()
     root, first, second = (torch.fx.Graph() for _ in range(3))
-    source = root.placeholder("source")
+    source = root.call_function(_tracing_ops._host_tensor, ("source",))
     source.meta["val"] = torch.empty((16, columns), dtype=dtype)
     root.call_function(_tracing_ops._for_loop, (1, [0], [columns], []))
     (first if nested else root).call_function(
@@ -108,6 +108,8 @@ def _context(
             backend_name="cute",
             config_spec=spec,
             known_equal=operator.eq,
+            specialize_expr=lambda expr: expr,
+            shape_env=SimpleNamespace(replace=lambda expr: expr),
             is_jagged_tile=lambda block_id: False,
             block_sizes=[
                 BlockSizeInfo(

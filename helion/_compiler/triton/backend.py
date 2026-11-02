@@ -49,6 +49,10 @@ def _triton_jit_supports_do_not_specialize() -> bool:
     return "do_not_specialize" in params and "do_not_specialize_on_alignment" in params
 
 
+# Triton options a config asked for that this build lacks, warned once each.
+_warned_unavailable_options: set[str] = set()
+
+
 class TritonBackend(Backend):
     """Triton code generation backend."""
 
@@ -65,6 +69,12 @@ class TritonBackend(Backend):
     @property
     def state(self) -> BackendState:
         return BackendState.STABLE
+
+    @property
+    def pads_small_matmul_dims(self) -> bool:
+        # ``tl.dot`` over a masked tile: rows / columns past a small M / N
+        # are loaded as zero and never stored.
+        return True
 
     @property
     def supports_debug_dtype_asserts(self) -> bool:
@@ -471,6 +481,11 @@ class TritonBackend(Backend):
         if reduction_type == "sum":
             return f"tl.sum({input_name}, {dim})"
         if reduction_type in {"max", "min"}:
+            from ..compile_environment import CompileEnvironment
+
+            if CompileEnvironment.current().settings.fast_math:
+                return f"tl.{reduction_type}({input_name}, {dim})"
+
             # tl.max/tl.min drop NaN; torch.amax/amin propagate it.
             return (
                 f"helion_triton_helpers.{reduction_type}_propagate_nan"
@@ -550,17 +565,29 @@ class TritonBackend(Backend):
         return num_warps
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
+        from ..._compat import supported_launch_options
         from ..._compat import supports_maxnreg
+        from ..compile_environment import warning
 
         args = [
             f"num_warps={self.effective_num_warps(config)}",
             f"num_stages={config.num_stages}",
             *(["launch_cooperative_grid=True"] if has_barrier else []),
-        ] + [
-            f"{x.removeprefix('_triton_config_')}={config[x]}"
-            for x in config
-            if x.startswith("_triton_config_")
         ]
+        # Kernels register ``_triton_config_<option>`` tunables for options of
+        # a particular Triton build (fbtriton's ``maxRegAutoWS``); a build
+        # without the option rejects the launch, so such keys are dropped.
+        supported = supported_launch_options()
+        for x in config:
+            if not x.startswith("_triton_config_"):
+                continue
+            option = x.removeprefix("_triton_config_")
+            if supported is not None and option not in supported:
+                if option not in _warned_unavailable_options:
+                    _warned_unavailable_options.add(option)
+                    warning(exc.TritonOptionUnavailable(option))
+                continue
+            args.append(f"{option}={config[x]}")
 
         from ..compile_environment import CompileEnvironment
 
@@ -690,6 +717,11 @@ class TileIRBackend(TritonBackend):
     @property
     def codegen_name(self) -> str:
         return "triton"
+
+    @property
+    def pads_small_matmul_dims(self) -> bool:
+        # The block-size overshoot was never enabled for TileIR.
+        return False
 
     def supports_config_key(self, key: str) -> bool:
         # Override TritonBackend/Backend rejections for tileir-specific tunables

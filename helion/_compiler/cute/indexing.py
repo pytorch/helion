@@ -10,6 +10,7 @@ from torch.fx import Node
 
 from ...language.tile_ops import tile_begin
 from ...language.tile_ops import tile_index
+from ...language.view_ops import subscript
 
 if TYPE_CHECKING:
     import ast
@@ -101,6 +102,50 @@ def is_cute_direct_iota_index(node: object) -> bool:
     start = node.kwargs.get("start", 0)
     step = node.kwargs.get("step", 1)
     return isinstance(start, int) and start == 0 and isinstance(step, int) and step == 1
+
+
+def unwrap_cute_broadcast_index(node: object) -> Node | None:
+    """Recover an integer coordinate through singleton axes and widening casts.
+
+    Adding axes around a vector index does not change its element addresses.
+    An integer widening also preserves them. Narrowing, partial slices and
+    expanded/repeated coordinates retain the scalar access path.
+    """
+    integers = {torch.int8, torch.int16, torch.int32, torch.int64}
+    while isinstance(node, Node) and node.op == "call_function":
+        if node.target is subscript:
+            if len(node.args) != 2 or node.kwargs:
+                return None
+            source, indices = node.args
+            if not isinstance(source, Node) or not isinstance(indices, (list, tuple)):
+                return None
+            value = source.meta.get("val")
+            if (
+                not isinstance(value, torch.Tensor)
+                or sum(index is not None for index in indices) != value.ndim
+                or any(index is not None and index != slice(None) for index in indices)
+            ):
+                return None
+            node = source
+        elif node.target is torch.ops.prims.convert_element_type.default:
+            if len(node.args) != 2 or node.kwargs:
+                return None
+            source, dtype = node.args
+            if not isinstance(source, Node):
+                return None
+            value = source.meta.get("val")
+            if (
+                not isinstance(value, torch.Tensor)
+                or not isinstance(dtype, torch.dtype)
+                or value.dtype not in integers
+                or dtype not in integers
+                or value.dtype.itemsize > dtype.itemsize
+            ):
+                return None
+            node = source
+        else:
+            return node
+    return node if isinstance(node, Node) else None
 
 
 def is_cute_unit_stride_iota_index(node: object) -> bool:

@@ -4,19 +4,65 @@ import contextlib
 import io
 import math
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import helion
+from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import assert_ref_eager_mode
 from helion._testing import onlyBackends
 import helion.language as hl
+from helion.runtime.ref_mode import RefModeContext
 
 
 @onlyBackends(["triton", "cute"])
 class TestRefEagerMisc(TestCase):
+    def test_masked_slice_with_scalar_index(self):
+        @helion.kernel(static_shapes=True, ref_mode=helion.RefMode.EAGER)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.full_like(x, -7)
+            for tile in hl.tile(x.size(0)):
+                mask = tile.index < 3
+                values = hl.load(x, [tile, 1, slice(None)], extra_mask=mask[:, None])
+                hl.store(
+                    out,
+                    [tile, 0, slice(None)],
+                    values + 1,
+                    extra_mask=mask[:, None],
+                )
+            return out
+
+        for shape in ((5, 2, 7), (7, 2, 5)):
+            with self.subTest(shape=shape):
+                x = torch.randn(shape, device=DEVICE)
+                expected = torch.full_like(x, -7)
+                expected[:3, 0, :] = x[:3, 1, :] + 1
+                result = fn.bind((x,)).run_ref(x)
+                torch.testing.assert_close(result, expected)
+
+    def test_context_entry_failure_releases_context(self):
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        x = torch.randn(2, device=DEVICE)
+        bound = fn.bind((x,))
+        default_device = torch.get_default_device()
+        with (
+            patch.object(
+                RefModeContext, "_get_rng_state", side_effect=RuntimeError("RNG probe")
+            ),
+            self.assertRaisesRegex(RuntimeError, "RNG probe"),
+        ):
+            bound.run_ref(x)
+        self.assertFalse(RefModeContext.has_current())
+        self.assertFalse(CompileEnvironment.has_current())
+        self.assertEqual(torch.get_default_device(), default_device)
+        torch.testing.assert_close(bound.run_ref(x), x)
+
     def test_print_intermediate_tensor(self):
         @helion.kernel(ref_mode=helion.RefMode.EAGER)
         def print_intermediate_tensor_kernel(

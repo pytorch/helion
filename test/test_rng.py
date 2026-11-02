@@ -30,6 +30,13 @@ from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
 from helion.runtime.settings import _get_backend
 
+# Recent PyTorch versions reject integer random tensors during FakeTensor
+# tracing, before Helion's implicit RNG rewrite validates the dtype.
+_NON_FLOATING_RNG_ERROR = (
+    "implicit RNG only supports floating-point dtypes"
+    r'|"check_uniform_bounds" not implemented for torch\.int32'
+)
+
 try:
     triton = importlib.import_module("triton")
     tl = importlib.import_module("triton.language")
@@ -568,9 +575,7 @@ class TestRNG(RefEagerTestBase, TestCase):
             return out
 
         x = torch.ones((13, 29), device=DEVICE, dtype=torch.float32)
-        with self.assertRaisesRegex(
-            Exception, "implicit RNG only supports floating-point dtypes"
-        ):
+        with self.assertRaisesRegex(Exception, _NON_FLOATING_RNG_ERROR):
             code_and_output(bad_rand_dtype, (x,), block_sizes=[8, 16])
 
     @skipIfRefEager(
@@ -588,9 +593,7 @@ class TestRNG(RefEagerTestBase, TestCase):
             return out
 
         x = torch.ones((13, 29), device=DEVICE, dtype=torch.int32)
-        with self.assertRaisesRegex(
-            Exception, "implicit RNG only supports floating-point dtypes"
-        ):
+        with self.assertRaisesRegex(Exception, _NON_FLOATING_RNG_ERROR):
             code_and_output(bad_rand_like_dtype, (x,), block_sizes=[8, 16])
 
     @skipIfRefEager(
@@ -611,9 +614,7 @@ class TestRNG(RefEagerTestBase, TestCase):
             return out
 
         x = torch.ones((13, 29), device=DEVICE, dtype=torch.float32)
-        with self.assertRaisesRegex(
-            Exception, "implicit RNG only supports floating-point dtypes"
-        ):
+        with self.assertRaisesRegex(Exception, _NON_FLOATING_RNG_ERROR):
             code_and_output(bad_aten_rand_dtype, (x,), block_sizes=[8, 16])
 
     @skipIfRefEager(

@@ -14,6 +14,7 @@ from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_flatten_nested_reductions import _joint_sum
 from test.test_cute_full_slice_matmul import _matmul
+from test.test_cute_graph_cse import _softmax_pair
 from test.test_cute_materialized_fission import _se_args
 from test.test_cute_shared_rhs_grouped import _offset_mm
 
@@ -40,11 +41,16 @@ _STRUCTURAL_SETTINGS = (
     "cute_flatten_nested_reductions",
     "cute_materialize_transformed_operands",
 )
+# Every setting the cute decorator records because it shapes the config at
+# binding: the structural policy's five and the graph CSE kill switch, which
+# is no policy member (see CUTE_STRUCTURAL_SETTINGS) but decides how many
+# reduction sweeps, and so how many eviction-policy slots, a kernel has.
+_RECORDED_SETTINGS = (*_STRUCTURAL_SETTINGS, "cute_graph_cse")
 
 
 @pytest.fixture(autouse=True)
 def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    for name in _STRUCTURAL_SETTINGS:
+    for name in _RECORDED_SETTINGS:
         monkeypatch.delenv(f"HELION_{name.upper()}", raising=False)
     monkeypatch.delenv("HELION_BACKEND", raising=False)
     previous_threads = torch.get_num_threads()
@@ -126,7 +132,7 @@ def _check_roundtrip(
     config = bound.config_spec.default_config()
     expected_config = json.dumps(config.config, sort_keys=True)
     expected_settings = {
-        name: getattr(bound.settings, name) for name in _STRUCTURAL_SETTINGS
+        name: getattr(bound.settings, name) for name in _RECORDED_SETTINGS
     }
     decorator = bound.format_kernel_decorator(config, bound.settings)
     expected_source = bound.to_code(config)
@@ -137,12 +143,12 @@ def _check_roundtrip(
             monkeypatch.setenv(f"HELION_{name.upper()}", str(int(not enabled)))
     else:
         monkeypatch.delenv("HELION_BACKEND", raising=False)
-        for name in _STRUCTURAL_SETTINGS:
+        for name in _RECORDED_SETTINGS:
             monkeypatch.delenv(f"HELION_{name.upper()}", raising=False)
     replay = _replay(decorator, bound.kernel.fn)
     assert replay.settings.backend == "cute"
     assert {
-        name: getattr(replay.settings, name) for name in _STRUCTURAL_SETTINGS
+        name: getattr(replay.settings, name) for name in _RECORDED_SETTINGS
     } == expected_settings
     assert json.dumps(replay.configs[0].config, sort_keys=True) == expected_config
     rebound = replay._bind_isolated(args)
@@ -176,6 +182,31 @@ def test_structural_binding_and_config_roundtrip(
         assert (bound.env.cute_fission_plan is not None) == enabled
     else:
         assert (marker in _host(bound)) == enabled
+    _check_roundtrip(
+        bound, args, monkeypatch, conflicting_environment=conflicting_environment
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("conflicting_environment", [False, True])
+def test_graph_cse_binding_and_config_roundtrip(
+    enabled: bool, conflicting_environment: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The graph CSE switch is no structural-policy member, yet the merged
+    and the traced graph roll different sweeps (four versus six eviction
+    policy slots for softmax + log_softmax of one operand): the decorator
+    records it, so a replay under the opposite environment binds the graph
+    the config was emitted for."""
+    args = (torch.empty((64, 1000), dtype=torch.float32),)
+    bound = helion.kernel(
+        _softmax_pair,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_graph_cse=enabled,
+    )._bind_isolated(args)
+    default = bound.config_spec.default_config().config
+    assert len(default["load_eviction_policies"]) == (4 if enabled else 6)
     _check_roundtrip(
         bound, args, monkeypatch, conflicting_environment=conflicting_environment
     )
@@ -262,6 +293,7 @@ def test_other_backend_decorators_are_unchanged(
         backend=backend,
         static_shapes=False,
         index_dtype=index_dtype,
+        cute_graph_cse=False,
         **dict.fromkeys(_STRUCTURAL_SETTINGS, True),
     )
     config = helion.Config(block_sizes=[32], num_warps=4)
@@ -287,14 +319,17 @@ def test_decorator_is_an_immutable_config_and_settings_snapshot(
     config.config["loop_orders"][0][0] = 1
     for name in _STRUCTURAL_SETTINGS:
         setattr(_pointwise_bound.settings, name, True)
+    _pointwise_bound.settings.cute_graph_cse = False
     first = _replay(decorator, _pointwise)
     assert json.dumps(first.configs[0].config, sort_keys=True) == expected_config
     first.configs[0].block_sizes[0] = 64
     first.configs[0].config["loop_orders"][0][0] = 2
     first.settings.cute_full_slice_matmul_tiling = True
+    first.settings.cute_graph_cse = False
     second = _replay(decorator, _pointwise)
     assert json.dumps(second.configs[0].config, sort_keys=True) == expected_config
     assert all(not getattr(second.settings, name) for name in _STRUCTURAL_SETTINGS)
+    assert second.settings.cute_graph_cse is True
 
 
 @pytest.mark.parametrize("from_environment", [False, True])

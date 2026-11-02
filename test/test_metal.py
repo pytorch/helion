@@ -848,14 +848,30 @@ class TestMetalMatmul(unittest.TestCase):
                 torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
 
     def test_matmul_float16(self) -> None:
-        """Float16 inputs with float32 accumulation cannot directly store fp16."""
+        """Float16 in/out with float32 accumulation stores via MPP conversion.
+
+        The cooperative store requires matching dtypes, so this mixed pair
+        takes a masked per-element convert-and-store loop instead.
+        """
+        kernel = _make_matmul_kernel([32, 32, 32])
+        for m, k, n in [(64, 64, 64), (128, 64, 256), (70, 70, 73)]:
+            with self.subTest(shape=(m, k, n)):
+                x = torch.randn(m, k, device=DEVICE, dtype=torch.float16)
+                y = torch.randn(k, n, device=DEVICE, dtype=torch.float16)
+                result = kernel(x, y)
+                expected = torch.mm(x, y)
+                torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
+
+    def test_matmul_float16_transposed_operand(self) -> None:
+        """Mixed fp32-acc/fp16-out store with a transposed (TN) operand."""
+        kernel = _make_matmul_kernel([32, 32, 32])
         x = torch.randn(64, 64, device=DEVICE, dtype=torch.float16)
-        y = torch.randn(64, 64, device=DEVICE, dtype=torch.float16)
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported,
-            "requires accumulator dtype to match output dtype",
-        ):
-            matmul_kernel(x, y)
+        y_base = torch.randn(128, 64, device=DEVICE, dtype=torch.float16)
+        y = y_base.t()
+        assert not y.is_contiguous()
+        result = kernel(x, y)
+        expected = torch.mm(x, y)
+        torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
 
     def test_matmul_float16_float32_output(self) -> None:
         cfg = [helion.Config(block_sizes=[32, 32, 32], num_warps=4)]
@@ -886,14 +902,48 @@ class TestMetalMatmul(unittest.TestCase):
         self.assertIn("tensor<device half", msl)
 
     def test_matmul_bfloat16(self) -> None:
-        """Bfloat16 inputs with float32 accumulation cannot directly store bf16."""
-        x = torch.randn(64, 64, device=DEVICE, dtype=torch.bfloat16)
-        y = torch.randn(64, 64, device=DEVICE, dtype=torch.bfloat16)
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported,
-            "requires accumulator dtype to match output dtype",
-        ):
-            matmul_kernel(x, y)
+        """Bfloat16 in/out with float32 accumulation stores via the scalar loop."""
+        kernel = _make_matmul_kernel([32, 32, 32])
+        for m, k, n in [(64, 64, 64), (70, 70, 73)]:
+            with self.subTest(shape=(m, k, n)):
+                x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+                y = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+                result = kernel(x, y)
+                expected = torch.mm(x.float(), y.float()).to(torch.bfloat16)
+                torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+
+    def test_matmul_output_dtypes(self) -> None:
+        """The converting store covers every MSL tensor element type.
+
+        ``tensor<>`` rejects bool and 64-bit elements, so those outputs must
+        fail as unsupported rather than as an MSL compile error.
+        """
+
+        @helion.kernel(
+            backend="metal",
+            configs=[helion.Config(block_sizes=[32, 32, 32], num_warps=4)],
+        )
+        def mm_into(x: torch.Tensor, y: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _k2, n = y.size()
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                o[tile_m, tile_n] = acc.to(o.dtype)
+            return o
+
+        x = torch.randn(64, 64, device=DEVICE) * 4
+        y = torch.randn(64, 64, device=DEVICE) * 4
+        o = torch.empty(64, 64, device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(mm_into(x, y, o), (x @ y).to(torch.int32))
+        for dtype in (torch.int64, torch.bool):
+            with self.subTest(dtype=dtype):
+                o = torch.empty(64, 64, device=DEVICE, dtype=dtype)
+                with self.assertRaisesRegex(
+                    exc.BackendUnsupported, "unsupported output dtype"
+                ):
+                    mm_into(x, y, o)
 
     def test_matmul_codegen_has_mpp(self) -> None:
         """Generated MSL must contain MPP matmul2d constructs."""

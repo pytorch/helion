@@ -113,14 +113,17 @@ def test_actual_bound_host_production_factory_and_pointer_stream_reuse(
     create = launcher._create_cute_wrapper
 
     def factory(*args: object, **kwargs: object) -> object:
-        assert kwargs == {"num_sm": 148}
+        # The production factory passes the SM count and (since the launch
+        # device became explicit) the kernel's device.
+        assert kwargs["num_sm"] == 148
+        assert set(kwargs) <= {"num_sm", "device"}
         wrapper = create(*args, **kwargs)
         factories.append(
             {
                 "kernel": args[0].__name__,
                 "schema": repr(args[1]),
                 "block": args[2],
-                "kwargs": kwargs,
+                "kwargs": {key: str(value) for key, value in kwargs.items()},
                 "wrapper": inspect.getsource(wrapper),
             }
         )

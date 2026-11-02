@@ -9,10 +9,12 @@ import sys
 
 import pytest
 
+from helion._testing import skipUnlessCuteAvailable
 
+
+@skipUnlessCuteAvailable("CuTe disk-cache loading requires the supported CuTe DSL")
 @pytest.mark.parametrize("mode", ("ffi", "plain", "miss", "corrupt"))
 def test_fresh_process_cache_runtime_init(tmp_path: Path, mode: str) -> None:
-    pytest.importorskip("cutlass")
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTE_DSL_ARCH="sm_100a")
     result = subprocess.run(
         [sys.executable, "-B", __file__, "--probe", mode, str(tmp_path)],

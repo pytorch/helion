@@ -72,7 +72,9 @@ def vector_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
 # ============================================================================
 
 
-@helion.aot_kernel(static_shapes=False)
+# fast_math: approximate fp32 division and exp2, as the Triton backend and the
+# library softmax kernels use (exact math costs CuTe ~1.5x on bandwidth-bound rows).
+@helion.aot_kernel(static_shapes=False, fast_math=True)
 def row_softmax(x: torch.Tensor) -> torch.Tensor:
     """
     Row-wise softmax with explicit 2D tiling.
@@ -144,7 +146,7 @@ def col_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 # ============================================================================
 
 
-@helion.aot_kernel(batched=[[0, None], None])
+@helion.aot_kernel(batched=[[0, None], None], fast_math=True)
 def rms_norm_batched(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     """RMS normalization with batch-aware heuristic.
 
@@ -198,6 +200,7 @@ def _rms_norm_oneshot_measure_inputs() -> list[tuple[torch.Tensor, float]]:
     batched=[[0, None], None],
     collect_fn=_rms_norm_oneshot_collect_inputs,
     measure_fn=_rms_norm_oneshot_measure_inputs,
+    fast_math=True,
 )
 def rms_norm_oneshot(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     """RMS normalization with one-shot AOT workflow.

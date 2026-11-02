@@ -321,6 +321,80 @@ def test_row_mma_resolves_its_two_knobs_over_a_fixed_base() -> None:
         (64, 97, torch.float16, {}, True, False),
         (128, 3, torch.bfloat16, {}, True, True),
         (128, 32, torch.float16, {}, True, False),
+        # The square causal mask and the additive tensor bias are the score
+        # modifiers the row programs host (the surface names the kinds); a
+        # causal flag without its kind, an unnamed modifier set, or any other
+        # kind is declined.
+        (
+            64,
+            2,
+            torch.bfloat16,
+            {
+                "is_causal": True,
+                "standard_dense_output": False,
+                "plain_row_body": False,
+                "has_score_modifiers": True,
+                "score_modifier_kinds": ("causal_mask",),
+            },
+            True,
+            True,
+        ),
+        (
+            128,
+            2,
+            torch.float16,
+            {
+                "is_causal": True,
+                "standard_dense_output": False,
+                "standard_causal_output": True,
+                "plain_row_body": False,
+                "has_score_modifiers": True,
+                "score_modifier_kinds": ("causal_mask",),
+            },
+            True,
+            True,
+        ),
+        (
+            64,
+            2,
+            torch.bfloat16,
+            {
+                "standard_dense_output": False,
+                "plain_row_body": False,
+                "has_score_modifiers": True,
+                "score_modifier_kinds": ("tensor_bias",),
+            },
+            True,
+            True,
+        ),
+        (
+            64,
+            2,
+            torch.bfloat16,
+            {
+                "is_causal": True,
+                "standard_dense_output": False,
+                "plain_row_body": False,
+                "has_score_modifiers": True,
+                "score_modifier_kinds": ("causal_mask", "tensor_bias"),
+            },
+            True,
+            True,
+        ),
+        (
+            64,
+            64,
+            torch.bfloat16,
+            {
+                "is_causal": True,
+                "standard_dense_output": False,
+                "plain_row_body": False,
+                "has_score_modifiers": True,
+                "score_modifier_kinds": ("causal_mask",),
+            },
+            True,
+            False,
+        ),
         (
             64,
             2,
@@ -329,9 +403,36 @@ def test_row_mma_resolves_its_two_knobs_over_a_fixed_base() -> None:
             False,
             False,
         ),
-        # A score modifier (plain_row_body False without a row epilogue, or
-        # has_score_modifiers) excludes the family; a fused row epilogue alone
-        # runs in the combine epilogue and is searched like the plain body.
+        (
+            64,
+            2,
+            torch.bfloat16,
+            {
+                "standard_dense_output": False,
+                "plain_row_body": False,
+                "has_score_modifiers": True,
+                "score_modifier_kinds": ("relative_bias",),
+            },
+            False,
+            False,
+        ),
+        (
+            64,
+            2,
+            torch.bfloat16,
+            {
+                "standard_dense_output": False,
+                "plain_row_body": False,
+                "has_score_modifiers": True,
+                "score_modifier_kinds": ("tensor_bias", "softcap"),
+            },
+            False,
+            False,
+        ),
+        # An unnamed modifier set (plain_row_body False without a row
+        # epilogue, or has_score_modifiers without kinds) excludes the
+        # family; a fused row epilogue alone runs in the combine epilogue and
+        # is searched like the plain body.
         (64, 2, torch.bfloat16, {"plain_row_body": False}, False, False),
         (
             64,
@@ -377,6 +478,21 @@ def test_row_mma_resolves_its_two_knobs_over_a_fixed_base() -> None:
             False,
             False,
         ),
+        # A fused row epilogue over biased scores: the bias joins the main
+        # loop, the program the combine epilogue.
+        (
+            64,
+            2,
+            torch.bfloat16,
+            {
+                "has_row_epilogue": True,
+                "plain_row_body": False,
+                "has_score_modifiers": True,
+                "score_modifier_kinds": ("tensor_bias",),
+            },
+            True,
+            True,
+        ),
         (64, 2, torch.bfloat16, {"has_kv_tile_pruning": True}, False, False),
         (64, 2, torch.bfloat16, {"small_biased_candidate": True}, False, False),
         (64, 2, torch.bfloat16, {"requires_ws_overlap": True}, False, False),
@@ -409,6 +525,7 @@ def test_row_mma_legality_is_structural_and_searched_on_small_grids(
         plain_row_body=bool(options.get("plain_row_body", True)),
         has_row_epilogue=bool(options.get("has_row_epilogue")),
         has_score_modifiers=bool(options.get("has_score_modifiers")),
+        score_modifier_kinds=tuple(options.get("score_modifier_kinds", ())),  # type: ignore[arg-type]
     )
     assert (resolved.pipeline_family == "row_mma") == legal
 
@@ -604,6 +721,9 @@ def test_row_mma_seed_covers_every_small_grid_dense_surface() -> None:
         row = [seed for seed in seeds if seed.config.get(FAMILY) == "row_mma"]
         assert len(row) == 1
         assert (row[0].config[WARPS], row[0].config[TILE_M]) == (4, 8)
+    # A causal flag without its modifier kind (an unnamed surface) seeds
+    # nothing for the family; the causal surface proper (the mask named as
+    # a score modifier) seeds the row programs like the dense one.
     causal = cute_flash.flash_attention_seed_configs(
         64,
         2,
@@ -613,6 +733,22 @@ def test_row_mma_seed_covers_every_small_grid_dense_surface() -> None:
         standard_causal_output=True,
     )
     assert not [seed for seed in causal if seed.config.get(FAMILY) == "row_mma"]
+    for kinds in (("causal_mask",), ("tensor_bias",), ("causal_mask", "tensor_bias")):
+        modified = cute_flash.flash_attention_seed_configs(
+            64,
+            2,
+            num_bh=4,
+            dtype=torch.bfloat16,
+            is_causal="causal_mask" in kinds,
+            standard_causal_output=kinds == ("causal_mask",),
+            plain_row_body=False,
+            has_score_modifiers=True,
+            score_modifier_kinds=kinds,
+            device_sm_count=148,
+        )
+        row = [seed for seed in modified if seed.config.get(FAMILY) == "row_mma"]
+        assert len(row) == 1, kinds
+        assert (row[0].config[WARPS], row[0].config[TILE_M]) == (4, 8)
     # Larger grids seed nothing for the family: its cost grows with the
     # sequence while the tcgen05 tiles already fill the device.
     for head_dim, num_kv, num_bh in ((64, 8, 16), (128, 16, 32), (64, 128, 8)):
@@ -1209,10 +1345,11 @@ def test_row_mma_joins_the_fused_row_surface_inside_the_search_bound() -> None:
 
 
 @onlyBackends(["cute"])
-def test_row_mma_is_not_offered_to_a_fused_row_epilogue_over_biased_scores() -> None:
-    # A score modifier next to the row epilogue: the flash surface records it
-    # and the row programs stay out (plain_row_body alone cannot tell a
-    # modifier from a fused epilogue).
+def test_row_mma_joins_a_fused_row_epilogue_over_biased_scores() -> None:
+    # A tensor bias next to the row epilogue: the flash surface records the
+    # modifier kind, the bias tile is staged in the main loop and the program
+    # runs in the combine epilogue, so the row programs are searched and
+    # seeded on this small grid too.
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     bias = torch.randn(1, 4, 256, 256, dtype=torch.bfloat16, device=DEVICE)
     bound = _biased_xsa_like.bind((q, k, v, bias, 1e-6))
@@ -1220,20 +1357,436 @@ def test_row_mma_is_not_offered_to_a_fused_row_epilogue_over_biased_scores() -> 
     assert spec.cute_flash_search_enabled
     assert spec._cute_flash_has_row_epilogue
     assert spec._cute_flash_has_score_modifiers
+    assert spec._cute_flash_score_modifier_kinds == ("tensor_bias",)
     fragments = spec._cute_flash_autotune_fragments()
-    assert "row_mma" not in _active(fragments[FAMILY])
-    assert _active(fragments[WARPS]) == (4,)
-    with pytest.raises(helion.exc.InvalidConfig, match="row_mma"):
-        bound._normalized_config_copy(
-            helion.Config(
-                block_sizes=[1, 128, 128], cute_flash_pipeline_family="row_mma"
-            )
-        )
+    assert "row_mma" in _active(fragments[FAMILY])
+    assert _active(fragments[WARPS]) == (4, 2, 8)
+    assert [
+        seed
+        for seed in spec.compiler_seed_configs
+        if seed.config.get(FAMILY) == "row_mma"
+    ]
     normalized = bound._normalized_config_copy(
-        helion.Config(
-            block_sizes=[1, 128, 128],
-            cute_flash_pipeline_family="ws_overlap",
-            cute_flash_persistent=False,
-        )
+        helion.Config(block_sizes=[1, 128, 128], cute_flash_pipeline_family="row_mma")
     )
-    assert "'kind': 'helion_flash'" in bound.to_code(normalized)
+    assert normalized.config[FAMILY] == "row_mma"
+    code = bound.to_code(normalized)
+    assert "'kind': 'helion_flash_row_mma'" in code
+    assert "'bias_idx': " in code
+    assert "'epi_aux_count': 1" in code
+    out = bound.compile_config(normalized)(q, k, v, bias, 1e-6)
+    y = _biased_attention_fp32(q, k, v, bias)
+    vn = torch.nn.functional.normalize(v.float(), dim=-1, eps=1e-6)
+    expected = (y - (y * vn).sum(dim=-1, keepdim=True) * vn).to(q.dtype)
+    torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+
+def _biased_attention_fp32(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) / math.sqrt(
+        q.size(-1)
+    )
+    return torch.matmul(torch.softmax(scores + bias.float(), dim=-1), v.float())
+
+
+# --------------------------------------------------------------------------
+# Score modifiers: the square causal mask and the additive tensor bias
+# --------------------------------------------------------------------------
+
+
+def _example_kernel(name: str) -> helion.Kernel:
+    import examples.attention as attention_examples
+
+    kernel = getattr(attention_examples, name)
+    return helion.kernel(
+        kernel.fn, backend="cute", static_shapes=True, autotune_effort="none"
+    )
+
+
+def _modified_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    causal: bool = False,
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fp32 reference: output, base-2 LSE (the causal kernels) and natural
+    LSE (the biased kernels)."""
+    scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) / math.sqrt(
+        q.size(-1)
+    )
+    if bias is not None:
+        scores = scores + bias.float()
+    if causal:
+        seq = q.size(-2)
+        keep = torch.ones(seq, seq, dtype=torch.bool, device=q.device).tril()
+        scores = scores.masked_fill(~keep, float("-inf"))
+    out = torch.matmul(torch.softmax(scores, dim=-1), v.float()).to(q.dtype)
+    lse = torch.logsumexp(scores, dim=-1)
+    return out, lse * math.log2(math.e), lse
+
+
+def _bias(batch: int, heads: int, seq: int, dtype: torch.dtype) -> torch.Tensor:
+    torch.manual_seed(1)
+    return torch.randn(batch, heads, seq, seq, dtype=dtype, device=DEVICE)
+
+
+def test_row_mma_score_modifier_admission() -> None:
+    supported = cute_flash_row_mma.row_mma_score_modifiers_supported
+    assert supported(has_score_modifiers=False, score_modifier_kinds=())
+    assert supported(has_score_modifiers=False, score_modifier_kinds=("dense",))
+    assert supported(has_score_modifiers=True, score_modifier_kinds=("causal_mask",))
+    assert supported(has_score_modifiers=True, score_modifier_kinds=("tensor_bias",))
+    assert supported(
+        has_score_modifiers=True, score_modifier_kinds=("causal_mask", "tensor_bias")
+    )
+    # Fail closed: unnamed modifiers, and every kind outside the two.
+    assert not supported(has_score_modifiers=True, score_modifier_kinds=())
+    for kind in ("relative_bias", "alibi_bias", "sliding_window_mask", "flex"):
+        assert not supported(has_score_modifiers=True, score_modifier_kinds=(kind,))
+        assert not supported(
+            has_score_modifiers=True, score_modifier_kinds=("causal_mask", kind)
+        )
+
+
+def test_row_mma_bias_staging_joins_the_shared_memory_plan() -> None:
+    bias_row = cute_flash_row_mma.row_mma_bias_row_bytes
+    assert bias_row(64) == 144 and bias_row(32) == 80 and bias_row(16) == 48
+    smem = cute_flash_row_mma.row_mma_smem_bytes
+    plain = smem(head_dim=64, row_tile_m=8, row_warps=4, chunk=64, stages=1)
+    biased = smem(
+        head_dim=64, row_tile_m=8, row_warps=4, chunk=64, stages=1, bias_rows=True
+    )
+    assert biased - plain == 4 * 8 * 144
+    # The bias tiles fit beside every K/V staging the plain plan picks at the
+    # measured shapes; the widest head with many warps and rows still plans.
+    plan = cute_flash_row_mma.row_mma_plan
+    for seq, head_dim, warps, rows in (
+        (256, 64, 4, 8),
+        (1024, 64, 4, 8),
+        (768, 128, 8, 16),
+        (2048, 128, 8, 16),
+    ):
+        plain_plan = plan(seq=seq, head_dim=head_dim, row_warps=warps, row_tile_m=rows)
+        biased_plan = plan(
+            seq=seq, head_dim=head_dim, row_warps=warps, row_tile_m=rows, bias_rows=True
+        )
+        assert plain_plan is not None and biased_plan is not None
+        assert biased_plan[0] <= plain_plan[0]
+    # The resolver plans the bias tiles for a biased surface.
+    resolved = cute_flash.resolve_flash_config(
+        128,
+        16,
+        {FAMILY: "row_mma", WARPS: 8, TILE_M: 16},
+        dtype=torch.bfloat16,
+        num_bh=1,
+        plain_row_body=False,
+        has_score_modifiers=True,
+        score_modifier_kinds=("tensor_bias",),
+    )
+    assert resolved.pipeline_family == "row_mma"
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize("name", ("causal_attention", "biased_attention"))
+def test_row_mma_joins_the_modifier_surfaces_inside_the_search_bound(
+    name: str,
+) -> None:
+    # The causal and biased attention examples at (1, 4, 256, 64): 128 row
+    # programs, so the family is searched with its two knobs and seeded; the
+    # seed survives normalization and renders the row-program plan.
+    q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
+    args = (
+        (q, k, v, _bias(1, 4, 256, torch.bfloat16)) if "biased" in name else (q, k, v)
+    )
+    bound = _example_kernel(name).bind(args)
+    spec = bound.config_spec
+    assert spec.cute_flash_search_enabled
+    assert spec._cute_flash_has_score_modifiers
+    assert not spec._cute_flash_plain_row_body
+    expected_kinds = ("tensor_bias",) if "biased" in name else ("causal_mask",)
+    assert spec._cute_flash_score_modifier_kinds == expected_kinds
+    fragments = spec._cute_flash_autotune_fragments()
+    assert "row_mma" in _active(fragments[FAMILY])
+    assert _active(fragments[WARPS]) == (4, 2, 8)
+    assert _active(fragments[TILE_M]) == (8, 16)
+    row = [
+        seed
+        for seed in spec.compiler_seed_configs
+        if seed.config.get(FAMILY) == "row_mma"
+    ]
+    assert len(row) == 1
+    (seed,) = row
+    config_gen = spec.create_config_generation()
+    config_gen.validate_flash_structural_coverage()
+    _flat, normalized = config_gen.canonicalize_flat(config_gen.flatten(seed))
+    assert normalized.config[FAMILY] == "row_mma"
+    assert (normalized.config[WARPS], normalized.config[TILE_M]) == (4, 8)
+    code = bound.to_code(normalized)
+    assert "'kind': 'helion_flash_row_mma'" in code
+    assert ("'bias_idx': " in code) == ("biased" in name)
+    assert normalized in config_gen.random_population(100)
+    # The large grids (the campaign's shapes 1 and 2) keep today's surface:
+    # no row programs, pinned knobs, no seed.
+    for shape in ((2, 8, 1024, 64), (2, 16, 2048, 128)):
+        q, k, v = _qkv(*shape, torch.bfloat16)
+        args = (
+            (q, k, v, _bias(shape[0], shape[1], shape[2], torch.bfloat16))
+            if "biased" in name
+            else (q, k, v)
+        )
+        large = _example_kernel(name).bind(args).config_spec
+        fragments = large._cute_flash_autotune_fragments()
+        assert "row_mma" not in _active(fragments[FAMILY])
+        assert _active(fragments[WARPS]) == (4,)
+        assert _active(fragments[TILE_M]) == (8,)
+        assert not [
+            seed
+            for seed in large.compiler_seed_configs
+            if seed.config.get(FAMILY) == "row_mma"
+        ]
+
+
+@onlyBackends(["cute"])
+def test_row_mma_renders_the_causal_mask() -> None:
+    code = _code(
+        _example_kernel("causal_attention"), _qkv(1, 4, 256, 64, torch.bfloat16), **_ROW
+    )
+    runtime = "_helion_flash_rowmma"
+    assert "'kind': 'helion_flash_row_mma'" in code
+    assert "block=(128, 1, 1)" in code
+    # The lane's key row and its two query indices per octet, then one select
+    # per S^T element (4 M-tiles x 4 elements) before the row max.
+    assert "rm_kg = rm_key0 + rm_g" in code
+    assert "rm_qa_0 = rm_row0 + 0 + 2 * rm_c" in code
+    assert "rm_qb_0 = rm_qa_0 + 1" in code
+    assert code.count(f"{runtime}.mask_key_after(") == 16
+    assert f"{runtime}.mask_key_after(rm_s_0_0_0, rm_kk, rm_qa_0)" in code
+    assert f"{runtime}.mask_key_after(rm_s_0_3_3, rm_kk + 8, rm_qb_0)" in code
+    assert code.index(f"{runtime}.mask_key_after(") < code.index("rm_cm_0_a = ")
+    # Masked rows subtract a finite stand-in for a -inf running max.
+    assert code.count(f"{runtime}.finite_or_zero(") == 2
+    assert "rm_neg_0_a = rm_zero - rm_ms_0_a * rm_scale" in code
+    # A single chunk per warp: no chunk loop, no trimmed trip count; the
+    # same instruction counts as the plain body otherwise.
+    assert "cutlass.range(" not in code
+    assert "rm_nchunk" not in code
+    assert code.count(f"{runtime}.mma_bf16(") == 32
+    assert code.count(f"{runtime}.cp_async_16(") == 34
+    assert "rm_bscale" not in code
+
+
+@onlyBackends(["cute"])
+def test_row_mma_renders_the_causal_chunk_loop_trimmed_to_visible_keys() -> None:
+    code = _code(
+        _example_kernel("causal_attention"),
+        _qkv(1, 1, 1024, 64, torch.bfloat16),
+        **_ROW,
+    )
+    # 256 keys per warp as four 64-key chunks; a warp runs the chunks that
+    # hold a key at or below the tile's last query row (at least one).
+    assert "rm_vis = cutlass.max(rm_row0 + 7 - rm_key0, cutlass.Int32(0))" in code
+    assert "rm_nchunk = cutlass.min(rm_vis // 64 + 1, cutlass.Int32(4))" in code
+    assert "if rm_nchunk > 1:" in code
+    assert "for rm_chunk in cutlass.range(1, rm_nchunk):" in code
+    assert "rm_kc = rm_kg + rm_chunk * 64" in code
+    assert "if rm_chunk + 1 < rm_nchunk:" in code
+    assert "rm_kk = rm_kc + 48" in code
+    assert code.count("_helion_flash_rowmma.mask_key_after(") == 32
+    assert "cute.arch.exp2((rm_mo_0_a - rm_ms_0_a) * rm_scale)" in code
+    # The commit after the (guarded) second-chunk prefetch stays unconditional.
+    guard = code.index("if rm_nchunk > 1:")
+    commit = code.index("cute.arch.cp_async_commit_group()", guard)
+    assert code[guard:commit].count("\n    cute.arch.cp_async_commit_group()") == 0
+    assert code[commit - 5 : commit] == "\n    "
+
+
+@onlyBackends(["cute"])
+def test_row_mma_renders_the_staged_tensor_bias() -> None:
+    q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
+    code = _code(
+        _example_kernel("biased_attention"),
+        (q, k, v, _bias(1, 4, 256, torch.bfloat16)),
+        **_ROW,
+    )
+    runtime = "_helion_flash_rowmma"
+    assert "'kind': 'helion_flash_row_mma'" in code
+    assert "'lse_idx': 5, 'bias_idx': 4" in code
+    # The source bias in raw QK units: log2(e) / (log2(e) / sqrt(64)).
+    assert "rm_bscale = cutlass.Float32(8.0)" in code
+    # One (8 rows, 64 keys) padded tile per warp and stage beside the K/V
+    # stages; its corner in the contiguous (B, S, S) bias.
+    assert (
+        "rm_s_bias = cute.arch.alloc_smem(cutlass.BFloat16, 2304, alignment=128)"
+        in code
+    )
+    assert "rm_bias_w = cutlass.Int32(rm_s_bias.toint()) + rm_warp * 1152" in code
+    assert (
+        "rm_bias_tile = bias_view.iterator.toint() + cutlass.Int64(rm_bh) * 131072 "
+        "+ cutlass.Int64(rm_row0) * 512 + cutlass.Int64(rm_key0) * 2"
+    ) in code
+    # 2 bias packets per lane join K's cp.async group (before its commit).
+    assert code.count(f"{runtime}.cp_async_16(") == 36
+    assert code.index("rm_bias_tile + rm_bias_off") < code.index(
+        "cute.arch.cp_async_commit_group()"
+    )
+    # Two ldmatrix.trans x4 per octet cover the four 16-key tiles; every word
+    # unpacks into the two queries' fp32 bias and folds into the fragment.
+    assert code.count(f"{runtime}.ldmatrix_x4_trans(") == 16 + 2
+    assert code.count(f"{runtime}.unpack_bf16x2(") == 8
+    assert (
+        code.count(
+            "cute.arch.fma_packed_f32x2((rm_bl, rm_bh2), (rm_bscale, rm_bscale), "
+        )
+        == 8
+    )
+    assert code.index(f"{runtime}.unpack_bf16x2(") < code.index("rm_cm_0_a = ")
+    assert code.count(f"{runtime}.finite_or_zero(") == 2
+    assert "mask_key_after" not in code
+    # fp16 inputs unpack the f16 halves.
+    q, k, v = _qkv(1, 4, 256, 64, torch.float16)
+    code = _code(
+        _example_kernel("biased_attention"),
+        (q, k, v, _bias(1, 4, 256, torch.float16)),
+        **_ROW,
+    )
+    assert code.count(f"{runtime}.unpack_f16x2(") == 8
+
+
+@onlyBackends(["cute"])
+def test_row_mma_renders_lane_guarded_bias_packets_and_x2_tiles() -> None:
+    # 96 keys per warp of the 128-wide head: 16-key chunks, so a chunk's bias
+    # tile is 16 packets (lanes 0-15 issue it) and one ldmatrix.trans x2.
+    q, k, v = _qkv(1, 3, 768, 128, torch.bfloat16)
+    code = _code(
+        _example_kernel("biased_attention"),
+        (q, k, v, _bias(1, 3, 768, torch.bfloat16)),
+        **_ROW,
+        **{WARPS: 8, TILE_M: 8},
+    )
+    runtime = "_helion_flash_rowmma"
+    assert "rm_bscale = cutlass.Float32(11.313708498984761)" in code
+    assert (
+        "rm_s_bias = cute.arch.alloc_smem(cutlass.BFloat16, 3072, alignment=128)"
+        in code
+    )
+    assert code.count("if rm_bidx < 16:") == 3
+    assert code.count(f"{runtime}.ldmatrix_x2_trans(") == 2
+    assert code.count(f"{runtime}.unpack_bf16x2(") == 4
+    assert "for rm_chunk in cutlass.range(1, 6):" in code
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("shape", "dtype", "warps", "tile_m"),
+    (
+        ((1, 4, 256, 64), torch.bfloat16, 4, 8),
+        ((1, 4, 256, 64), torch.float16, 8, 16),
+        ((2, 2, 128, 64), torch.bfloat16, 2, 8),
+        ((1, 2, 512, 64), torch.bfloat16, 4, 8),
+        # Chunk loops: trimmed trip counts, fully masked warps (8 warps x 8
+        # rows at 1024 keys: warps 1-7 see nothing on the first tile).
+        ((1, 1, 1024, 64), torch.bfloat16, 4, 8),
+        ((1, 1, 1024, 64), torch.bfloat16, 8, 8),
+        ((1, 2, 384, 128), torch.float16, 4, 16),
+        ((1, 3, 768, 128), torch.bfloat16, 8, 16),
+    ),
+)
+def test_row_mma_causal_matches_reference(
+    shape: tuple[int, int, int, int], dtype: torch.dtype, warps: int, tile_m: int
+) -> None:
+    q, k, v = _qkv(*shape, dtype)
+    expected_out, expected_lse, _ = _modified_reference(q, k, v, causal=True)
+    code, (out, lse) = code_and_output(
+        _example_kernel("causal_attention"),
+        (q, k, v),
+        **_ROW,
+        **{WARPS: warps, TILE_M: tile_m},
+    )
+    assert "'kind': 'helion_flash_row_mma'" in code
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, expected_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("shape", "dtype", "warps", "tile_m"),
+    (
+        ((1, 4, 256, 64), torch.bfloat16, 4, 8),
+        ((1, 4, 256, 64), torch.float16, 2, 8),
+        ((1, 4, 256, 64), torch.bfloat16, 4, 16),
+        ((1, 1, 1024, 64), torch.bfloat16, 4, 8),
+        ((1, 2, 384, 128), torch.float16, 4, 16),
+        ((1, 3, 768, 128), torch.bfloat16, 8, 8),
+        ((1, 3, 768, 128), torch.bfloat16, 8, 16),
+    ),
+)
+def test_row_mma_biased_matches_reference(
+    shape: tuple[int, int, int, int], dtype: torch.dtype, warps: int, tile_m: int
+) -> None:
+    q, k, v = _qkv(*shape, dtype)
+    bias = _bias(shape[0], shape[1], shape[2], dtype)
+    expected_out, _, expected_lse = _modified_reference(q, k, v, bias=bias)
+    code, (out, lse) = code_and_output(
+        _example_kernel("biased_attention"),
+        (q, k, v, bias),
+        **_ROW,
+        **{WARPS: warps, TILE_M: tile_m},
+    )
+    assert "'kind': 'helion_flash_row_mma'" in code
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, expected_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+
+@onlyBackends(["cute"])
+def test_row_mma_biased_rows_tolerate_a_fully_masked_warp() -> None:
+    # An additive -inf bias over one warp's whole key range (keys 64-127 of
+    # four 64-key warps): its partial has a -inf max and an empty sum, and
+    # the combine drops it; the reference softmax sees the same scores.
+    q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
+    bias = _bias(1, 4, 256, torch.bfloat16)
+    bias[..., 64:128] = float("-inf")
+    expected_out, _, expected_lse = _modified_reference(q, k, v, bias=bias)
+    _code_, (out, lse) = code_and_output(
+        _example_kernel("biased_attention"), (q, k, v, bias), **_ROW
+    )
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, expected_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    "name",
+    (
+        "causal_attention_output",
+        "causal_attention_relu_output",
+        "biased_attention_output",
+    ),
+)
+def test_row_mma_modifier_output_variants_match_reference(name: str) -> None:
+    q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
+    args: tuple[torch.Tensor, ...] = (q, k, v)
+    if "biased" in name:
+        bias = _bias(1, 4, 256, torch.bfloat16)
+        args = (q, k, v, bias)
+        expected, _, _ = _modified_reference(q, k, v, bias=bias)
+    else:
+        expected, _, _ = _modified_reference(q, k, v, causal=True)
+        if "relu" in name:
+            expected = torch.relu(expected)
+    code, out = code_and_output(_example_kernel(name), args, **_ROW)
+    assert "'kind': 'helion_flash_row_mma'" in code
+    assert ("cute.arch.fmax(rm_acc_0 * rm_inv, rm_zero)" in code) == ("relu" in name)
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+    # Deterministic: a repeat launch is bitwise identical.
+    bound = _example_kernel(name).bind(args)
+    normalized = bound._normalized_config_copy(
+        helion.Config(block_sizes=[1, 128, 128], cute_flash_pipeline_family="row_mma")
+    )
+    repeat = bound.compile_config(normalized)(*args)
+    assert torch.equal(repeat, out)

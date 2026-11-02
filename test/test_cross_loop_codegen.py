@@ -24,6 +24,7 @@ from helion._compiler.cross_loop_codegen import (
 )
 from helion._compiler.cross_loop_codegen import _dry_pass_binds
 from helion._compiler.cross_loop_codegen import _dry_pass_rewrite
+from helion._compiler.cross_loop_codegen import _outline_cross_loop_region
 from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_scope
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.program_id import PIDInfo
@@ -1205,19 +1206,42 @@ class TestCrossLoopCodegenHelpers(TestCase):
         computation = _ast_fingerprint(body)
         environment = SimpleNamespace(backend_name="triton")
         with mock.patch.object(CompileEnvironment, "current", return_value=environment):
-            helper_name, arguments = device_function.register_triton_outlined_helper(
-                "opaque_tile", body, noinline=True
-            )
-            helper = device_function.codegen_helper_functions()[0]
-
-        self.assertEqual(helper_name, "opaque_tile")
-        self.assertEqual(arguments, ())
-        self.assertIsInstance(helper, ast.FunctionDef)
-        assert isinstance(helper, ast.FunctionDef)
-        self.assertEqual(_ast_fingerprint(helper.body), computation)
-        self.assertEqual(
-            ast.unparse(helper.decorator_list[0]), "triton.jit(noinline=True)"
-        )
+            for scheduler in (False, True):
+                for warp_specialize in (False, True):
+                    with self.subTest(
+                        scheduler=scheduler, warp_specialize=warp_specialize
+                    ):
+                        device_function.triton_outlined_helpers = []
+                        device_function.config = helion.Config(
+                            range_warp_specializes=[None, warp_specialize]
+                        )
+                        if scheduler:
+                            call = _outline_cross_loop_region(
+                                device_function,
+                                name_hint="opaque_tile",
+                                body=body,
+                                noinline=True,
+                            )
+                            self.assertEqual(ast.unparse(call), "opaque_tile()")
+                        else:
+                            helper_name, arguments = (
+                                device_function.register_triton_outlined_helper(
+                                    "opaque_tile", body, noinline=True
+                                )
+                            )
+                            self.assertEqual(helper_name, "opaque_tile")
+                            self.assertEqual(arguments, ())
+                        helper = device_function.codegen_helper_functions()[0]
+                        self.assertIsInstance(helper, ast.FunctionDef)
+                        assert isinstance(helper, ast.FunctionDef)
+                        self.assertEqual(_ast_fingerprint(helper.body), computation)
+                        self.assertEqual(helper.args.args, [])
+                        self.assertEqual(
+                            ast.unparse(helper.decorator_list[0]),
+                            "triton.jit"
+                            if scheduler and warp_specialize
+                            else "triton.jit(noinline=True)",
+                        )
 
     def test_outlined_tile_body_captures_compiler_preamble_values(self) -> None:
         device_function = object.__new__(DeviceFunction)

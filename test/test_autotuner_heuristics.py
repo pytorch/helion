@@ -17,11 +17,14 @@ from typing import Any
 from typing import Iterator
 from typing import cast
 from unittest.mock import MagicMock
+from unittest.mock import call
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from test._cute_binding import _cpu_bind
+from test._cute_binding import _forbid_native_compile
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
@@ -37,10 +40,19 @@ from helion._compiler.autotuner_heuristics.cute import (
 )
 from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteFp8GemmSkinnyMHeuristic
+from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteResidentMultiRowHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteResidentRowHeuristic
+from helion._compiler.autotuner_heuristics.cute import (
+    CuteResidentRowWideClusterHeuristic,
+)
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.autotuner_heuristics.cute import (
     CuteTcgen05GroupedWorklistHeuristic,
 )
+from helion._compiler.autotuner_heuristics.cute import CuteTileVecHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteTileVecWarpPerRowHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteTileVecWarpReduceHeuristic
 from helion._compiler.autotuner_heuristics.cute import (
     _bounded_grouped_worklist_seed_families,
 )
@@ -276,8 +288,10 @@ from helion._testing import TestCase
 from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessBackends
 from helion.autotuner import IntegerFragment
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
@@ -288,12 +302,14 @@ from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.config_spec import CuteVectorWidthSpec
 from helion.autotuner.config_spec import DotAxes
 from helion.autotuner.config_spec import DotAxisKind
 from helion.autotuner.config_spec import DotSite
 from helion.autotuner.config_spec import KernelMatmulFact
 from helion.autotuner.config_spec import LiveTile
 from helion.autotuner.config_spec import MatmulFact
+from helion.autotuner.config_spec import NumThreadsSpec
 from helion.autotuner.config_spec import ReductionCategory
 from helion.autotuner.config_spec import ReductionDescriptor
 from helion.autotuner.config_spec import ReductionKernelFact
@@ -1063,7 +1079,8 @@ class TestAutotunerHeuristic(TestCase):
         # The autotuning reference produces the baseline only while it is what
         # the kernel runs by default; a promoted execution default (whose
         # arithmetic the fast candidates share) takes over as soon as it
-        # differs from the reference.
+        # differs from the reference -- which then runs as well, to agree
+        # with it (``_compute_reference_baseline``).
         reference = helion.Config(block_sizes=[32])
         execution_default = helion.Config(block_sizes=[128])
         for default in (reference, execution_default):
@@ -1084,8 +1101,10 @@ class TestAutotunerHeuristic(TestCase):
                 self.assertEqual(output, "baseline")
                 self.assertEqual(mutated, [])
                 self.assertEqual(post_args, ())
-                provider.kernel.compile_config.assert_called_once_with(
-                    default, allow_print=False
+                compiled = [default] if default is reference else [default, reference]
+                self.assertEqual(
+                    provider.kernel.compile_config.call_args_list,
+                    [call(config, allow_print=False) for config in compiled],
                 )
 
     def test_should_promote_gate(self) -> None:
@@ -3075,6 +3094,9 @@ class TestAutotunerHeuristic(TestCase):
         device_ir = MagicMock()
         grouped_fact = spec.matmul_facts[0]
         worklist_analysis = MagicMock()
+        # This fixture represents the external worklist, whose N is opaque.
+        # Device split-size layouts have their own validated static-N path.
+        worklist_analysis.seed_facts.device_split_sizes = False
         worklist_analysis.seed_facts.groups_hint = 1
         worklist_analysis.seed_facts.packed_m_hint = 256
         worklist_analysis.seed_facts.n_hint = 256
@@ -4437,9 +4459,19 @@ class TestMatmulFacts(TestCase):
             {axis.block_id for axis in region.loop_axes}
             for region in fact.pipelined_regions
         ]
-        self.assertTrue(
-            any({query_block_id, key_block_id}.issubset(axes) for axes in nested_axes)
-        )
+        # ``out[batch, :, tile_q, :]`` partitions the fresh output by the
+        # query tile, so the CuTe backend promotes that tile into the launch
+        # grid (promote_partitioned_output_axis); the key loop then nests
+        # directly under the grid.  Triton keeps both as nested loop axes.
+        if query_block_id in spec.grid_block_ids:
+            self.assertTrue(any(key_block_id in axes for axes in nested_axes))
+        else:
+            self.assertTrue(
+                any(
+                    {query_block_id, key_block_id}.issubset(axes)
+                    for axes in nested_axes
+                )
+            )
 
     @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
@@ -5685,6 +5717,12 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
 
     def _make_cute_env(self) -> MagicMock:
         spec = ConfigSpec(backend=CuteBackend())
+        for block_id in (0, 1):
+            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=4096))
+            spec.num_threads.append(NumThreadsSpec(block_id=block_id, size_hint=4096))
+            spec.cute_vector_widths.append(
+                CuteVectorWidthSpec(block_id=block_id, size_hint=4096)
+            )
         env = MagicMock()
         env.backend_name = "cute"
         env.config_spec = spec
@@ -5704,9 +5742,9 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
         return MatmulFact(
             lhs_ndim=2,
             rhs_ndim=2,
-            m_block_id=0,
-            n_block_id=1,
-            k_block_id=2,
+            m_block_id=None,
+            n_block_id=0,
+            k_block_id=1,
             static_m=static_m,
             static_n=static_n,
             static_k=static_k,
@@ -5752,6 +5790,39 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
             seed.config["cute_vector_widths"], _FP8_SKINNY_M_SEED_VECTOR_WIDTHS
         )
 
+    def test_seed_follows_axis_ids_in_each_config_sequence(self) -> None:
+        fact = self._matmul_fact()
+        for layout in (fact, fact._replace(m_block_id=0, n_block_id=1, k_block_id=2)):
+            with self.subTest(fact=layout):
+                env = self._make_cute_env()
+                spec = env.config_spec
+                spec.matmul_facts.append(layout)
+                spec.block_sizes.reverse()
+                spec.cute_vector_widths.reverse()
+                seed = CuteFp8GemmSkinnyMHeuristic.get_seed_config(env, MagicMock())
+                assert seed is not None
+                self.assertEqual(seed.block_sizes, [256, 1])
+                self.assertEqual(seed.config["num_threads"], [0, 32])
+                self.assertEqual(seed.config["cute_vector_widths"], [8, 4])
+
+    def test_seed_skips_unsupported_axis_layouts(self) -> None:
+        fact = self._matmul_fact()
+        for unsupported in (
+            fact._replace(n_block_id=None),
+            fact._replace(k_block_id=None),
+            fact._replace(k_block_id=0),
+            fact._replace(k_block_id=2),
+        ):
+            with self.subTest(fact=unsupported):
+                env = self._make_cute_env()
+                env.config_spec.matmul_facts.append(unsupported)
+                self.assertFalse(
+                    CuteFp8GemmSkinnyMHeuristic.is_eligible(env, MagicMock())
+                )
+                self.assertIsNone(
+                    CuteFp8GemmSkinnyMHeuristic.get_seed_config(env, MagicMock())
+                )
+
     def test_compiler_seed_configs_records_heuristic(self) -> None:
         # The heuristic must be wired into the cute backend registry so the
         # generic compiler_seed_configs() path emits its seed and records it.
@@ -5789,47 +5860,72 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
             y: torch.Tensor,
             scale_a: torch.Tensor,
             scale_b: torch.Tensor,
+            reverse: hl.constexpr,
         ) -> torch.Tensor:
             m, k = x.size()
             _, n = y.size()
+            if reverse:
+                block_k = hl.register_block_size(k)
+                block_n = hl.register_block_size(n)
+            else:
+                block_n = hl.register_block_size(n)
+                block_k = hl.register_block_size(k)
             out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
-            for tile_n in hl.tile(n):
+            for tile_n in hl.tile(n, block_size=block_n):
                 acc = hl.zeros([m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
+                for tile_k in hl.tile(k, block_size=block_k):
                     acc = hl.dot(x[:, tile_k], y[tile_k, tile_n], acc=acc)
                 acc = acc * scale_a[:, tile_n] * scale_b[tile_n]
                 out[:, tile_n] = acc.to(torch.bfloat16)
             return out
 
-        m, k, n = 1, 4096, 4096
-        x = torch.randn([m, k], device=DEVICE, dtype=torch.float32).to(
-            torch.float8_e4m3fn
-        )
+        k, n = 4096, 4096
         y = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(
             torch.float8_e4m3fn
         )
-        scale_a = torch.ones([m, n], device=DEVICE)
         scale_b = torch.ones([n], device=DEVICE)
 
-        with patch_cute_mma_support():
-            bound = fp8_gemm_skinny_m.bind((x, y, scale_a, scale_b))
-
-        device_ir = bound.host_function.device_ir
-        self.assertTrue(CuteFp8GemmSkinnyMHeuristic.is_eligible(bound.env, device_ir))
-        self.assertIn(
-            CuteFp8GemmSkinnyMHeuristic.name,
-            bound.config_spec.autotuner_heuristics,
-        )
-        seed = CuteFp8GemmSkinnyMHeuristic.get_seed_config(bound.env, device_ir)
-        assert seed is not None
-        self.assertEqual(seed.config["block_sizes"], _FP8_SKINNY_M_SEED_BLOCK_SIZES)
-        self.assertIn(
-            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
-            [
-                config.config["block_sizes"]
-                for config in bound.config_spec.compiler_seed_configs
-            ],
-        )
+        for m, reverse in itertools.product((1, 16), (False, True)):
+            x = torch.randn([m, k], device=DEVICE, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            )
+            scale_a = torch.ones([m, n], device=DEVICE)
+            with self.subTest(m=m, reverse=reverse), patch_cute_mma_support():
+                bound = fp8_gemm_skinny_m.bind((x, y, scale_a, scale_b, reverse))
+                device_ir = bound.host_function.device_ir
+                self.assertTrue(
+                    CuteFp8GemmSkinnyMHeuristic.is_eligible(bound.env, device_ir)
+                )
+                self.assertIn(
+                    CuteFp8GemmSkinnyMHeuristic.name,
+                    bound.config_spec.autotuner_heuristics,
+                )
+                seed = CuteFp8GemmSkinnyMHeuristic.get_seed_config(bound.env, device_ir)
+                assert seed is not None
+                expected = [256, 1] if reverse else _FP8_SKINNY_M_SEED_BLOCK_SIZES
+                self.assertEqual(seed.block_sizes, expected)
+                self.assertIn(
+                    expected,
+                    [
+                        config.block_sizes
+                        for config in bound.config_spec.compiler_seed_configs
+                    ],
+                )
+                n_id, k_id = (1, 0) if reverse else (0, 1)
+                spec = bound.config_spec
+                self.assertEqual(len(seed.num_threads), len(spec.num_threads))
+                self.assertEqual(
+                    len(seed.config["cute_vector_widths"]), len(spec.cute_vector_widths)
+                )
+                self.assertEqual(
+                    spec.num_threads.config_get(seed.num_threads, k_id), 32
+                )
+                self.assertEqual(
+                    spec.cute_vector_widths.config_get(
+                        seed.config["cute_vector_widths"], n_id
+                    ),
+                    4,
+                )
 
 
 class TestCuteTcgen05ClusterM2Heuristic(TestCase):
@@ -5855,15 +5951,25 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # Callers decide whether both are expected in the supplied population;
         # every automatic cluster_m=2 seed must match a legacy validated tile
         # envelopes: the canonical 256x256 tile, the M-paired block_m=512 tile
-        # (two 256-row subtiles sharing B; baseline ab=2 only), or the
-        # deep-staged short-K variant (bk=64 with the ab=6 pipeline). At least
-        # one canonical-envelope seed must be present. Explicit paired-CTA
-        # seeds have independent geometry and allocation checks below.
+        # (two 256-row subtiles sharing B; baseline ab=2 at the expected K
+        # step, or its 64-wide deep ring: ab=3 next to a four-deep C ring),
+        # or the deep-staged short-K variant (bk=64 with the ab=6 pipeline).
+        # At least one canonical-envelope seed must be present. Explicit
+        # paired-CTA seeds have independent geometry and allocation checks
+        # below.
         self.assertGreaterEqual(len(seeded), 1)
         canonical: list[dict[str, object]] = []
         for seed in seeded:
             block_sizes = seed["block_sizes"][:3]
             if block_sizes[0] == 2 * TCGEN05_TWO_CTA_BLOCK_M:
+                if block_sizes[2] == 64 and expected_block_k != 64:
+                    self.assertEqual(
+                        block_sizes,
+                        [2 * TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 64],
+                    )
+                    self.assertEqual(seed["tcgen05_ab_stages"], 3)
+                    self.assertEqual(seed["tcgen05_c_stages"], 4)
+                    continue
                 self.assertEqual(
                     block_sizes,
                     [
@@ -6028,7 +6134,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
     def test_cute_flash_accepts_extra_knobs(self) -> None:
         self.assertIn(FLASH_PIPELINE_FAMILY_KEY, FLASH_AUTOTUNE_CONFIG_KEYS)
         self.assertIn(FLASH_PIPELINE_FAMILY_KEY, FLASH_CONFIG_KEYS)
-        self.assertEqual(len(FLASH_PIPELINE_FAMILIES), 17)
+        # 18 with the single-tile cooperative pair (``ws_2cta``: two 128-row
+        # query tiles of one batch head on a 2-CTA tcgen05 MMA, legal at the
+        # head dims above 128 and on request on the flex list walk).
+        self.assertEqual(len(FLASH_PIPELINE_FAMILIES), 18)
         self.assertEqual(
             set(FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS),
             {
@@ -9269,23 +9378,24 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         k_fragment = MagicMock()
         k_fragment.low = 16
         k_fragment.high = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
-        spec = MagicMock()
-        spec._tcgen05_matmul_block_fragments.return_value = (
-            MagicMock(),
-            MagicMock(),
-            k_fragment,
-        )
-        spec._tcgen05_cluster_m2_bk_is_valid.side_effect = (
-            CuteTcgen05Config.cluster_m2_bk_is_valid
-        )
-        spec._tcgen05_cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
+        state = CuteTcgen05Config(MagicMock())
+        state.cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
             static_k=128,
             max_k_tiles=TCGEN05_TWO_CTA_MAX_K_TILES,
             allow_edge_k_tail_family=True,
         )
         env = MagicMock()
-        env.config_spec = spec
-        self.assertIsNone(CuteTcgen05ClusterM2Heuristic._select_bk(env))
+        env.config_spec._cute_tcgen05_config = state
+        with (
+            patch.object(
+                state,
+                "_matmul_block_fragments",
+                return_value=(MagicMock(), MagicMock(), k_fragment),
+            ),
+            patch.object(state, "_matmul_block_indices", return_value=(0, 1, 2)),
+        ):
+            self.assertEqual(state.cluster_m2_seed_bk_choices(), ())
+            self.assertIsNone(CuteTcgen05ClusterM2Heuristic._select_bk(env))
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m2_seed_heuristic_for_edge_k_tail_family(
@@ -10919,13 +11029,25 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             plain_tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"].high,
             TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
         )
-        for tcfg in (bias_tcfg, residual_tcfg):
-            self.assertIsNone(tcfg.pipeline_smem_facts)
-            ab_fragment = tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"]
-            self.assertEqual(
-                ab_fragment.high, CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2)
-            )
-            self.assertEqual(ab_fragment.high, 12)
+        # The broadcast (rowvec) bias keeps the legacy fragment: no allocation
+        # proof, the dtype hard cap. An exact-shape 16-bit auxiliary load is a
+        # register-resident SIMT load that takes no shared memory, so the
+        # residual kernel keeps the complete allocation proof (facts that record
+        # the auxiliary loads) and the same budget-aware ring as the plain GEMM.
+        self.assertIsNone(bias_tcfg.pipeline_smem_facts)
+        bias_ab_fragment = bias_tcfg.optional_fragments(for_search=True)[
+            "tcgen05_ab_stages"
+        ]
+        self.assertEqual(
+            bias_ab_fragment.high, CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2)
+        )
+        self.assertEqual(bias_ab_fragment.high, 12)
+        self.assertIsNotNone(residual_tcfg.pipeline_smem_facts)
+        self.assertTrue(residual_tcfg.pipeline_smem_facts.has_auxiliary_loads)
+        self.assertEqual(
+            residual_tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"].high,
+            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+        )
 
         def _ab3_config(cluster_m: int = 2) -> helion.Config:
             return helion.Config(
@@ -11247,15 +11369,66 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         facts = bound.config_spec._cute_tcgen05_config.pipeline_smem_facts
         self.assertIsNotNone(facts)
         assert facts is not None
+        # The paired seeds are CTA pairs (cluster_n=1); the deepest bk=64
+        # SIMT ring of every 256-row pair tile with whole N-tile pairs also
+        # carries a 2x2 multicast-cluster twin (cluster_n=2) that differs
+        # from its pair in nothing else.  fp16 4096^3 pairs every N tile
+        # width, so each of the three 256-row bk=64 tiles has one twin.
+        paired_by_tile: dict[tuple[int, ...], list[helion.Config]] = {}
+        for config in paired_configs:
+            paired_by_tile.setdefault(tuple(config.block_sizes), []).append(config)
+        self.assertEqual(
+            sorted(
+                tuple(config.block_sizes)
+                for config in paired_configs
+                if config["tcgen05_cluster_n"] == 2
+            ),
+            [
+                (TCGEN05_TWO_CTA_BLOCK_M, 64, 64),
+                (TCGEN05_TWO_CTA_BLOCK_M, 128, 64),
+                (TCGEN05_TWO_CTA_BLOCK_M, 256, 64),
+            ],
+        )
         for config in paired_configs:
             with self.subTest(paired_config=config):
                 self.assertEqual(config["tcgen05_cluster_m"], 2)
-                self.assertEqual(config["tcgen05_cluster_n"], 1)
+                self.assertIn(config["tcgen05_cluster_n"], (1, 2))
                 self.assertEqual(config["pid_type"], "persistent_blocked")
                 self.assertEqual(config["tcgen05_c_stages"], 2)
                 self.assertEqual(config["tcgen05_acc_stages"], 2)
                 self.assertFalse(config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY])
                 bm, bn, bk = config.block_sizes
+                siblings = paired_by_tile[(bm, bn, bk)]
+                deepest = max(
+                    cast("int", sibling["tcgen05_ab_stages"]) for sibling in siblings
+                )
+                if config["tcgen05_cluster_n"] == 2:
+                    # The twin sits on the 256-row pair tile at bk=64, at
+                    # the tile's deepest ring, beside exactly one pair seed
+                    # it matches in every other knob.
+                    self.assertEqual(bm, TCGEN05_TWO_CTA_BLOCK_M)
+                    self.assertEqual(bk, 64)
+                    self.assertEqual(config["tcgen05_ab_stages"], deepest)
+                    pairs = [
+                        sibling
+                        for sibling in siblings
+                        if sibling["tcgen05_cluster_n"] == 1
+                        and sibling["tcgen05_ab_stages"] == deepest
+                    ]
+                    self.assertEqual(len(pairs), 1)
+                    # The twin keeps its CTAs persistent over the co-resident
+                    # clusters; its sibling takes the default pair cap.
+                    self.assertEqual(
+                        config["tcgen05_persistent_grid_cap"], "resident_clusters"
+                    )
+                    self.assertEqual(
+                        {
+                            **config.config,
+                            "tcgen05_cluster_n": 1,
+                            "tcgen05_persistent_grid_cap": "sm_pairs",
+                        },
+                        pairs[0].config,
+                    )
                 self.assertLessEqual(
                     pipeline_smem_bytes(
                         facts,
@@ -11380,8 +11553,10 @@ class TestTritonReductionHeuristic(TestCase):
         from examples.kl_div import kl_div_forward
 
         m, n = 4096, 131072
-        log_q = torch.log_softmax(torch.randn([m, n], device=DEVICE), dim=-1)
-        p = torch.softmax(torch.randn([m, n], device=DEVICE), dim=-1)
+        # Binding only inspects tensor metadata. Keep the wide, contiguous shape
+        # without allocating several GiB of inputs or computing their values.
+        log_q = torch.empty([m, n], device="meta")  # @ignore-device-lint
+        p = torch.empty_like(log_q)
         args = (log_q, p)
         heuristic = TritonReductionHeuristic
 
@@ -11391,9 +11566,12 @@ class TestTritonReductionHeuristic(TestCase):
         # assertIn below fails. Pinning keeps backend_name "triton" on every lane.
         kernel = helion.kernel(kl_div_forward.fn, backend="triton")
 
-        # Force a tuned target so the liveness allocator is exercised on any runner.
+        # Pin the Hopper target and SM count: meta inputs have no physical device.
         # The narrow fallback on other hardware covers only standard reductions.
-        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+        with (
+            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
+            patch("helion.runtime.get_num_sm", return_value=132),
+        ):
             bound = kernel.bind(args)
 
             # The complete timeline captures the carried [M, R] state directly.
@@ -11670,6 +11848,117 @@ class TestTritonReductionHeuristic(TestCase):
             self.assertEqual(seed["num_warps"], 8)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "width,strided",
+    [
+        (1, False),
+        (3, False),
+        (4, False),
+        (8, False),
+        (64, False),
+        (128, False),
+        (256, False),
+        (512, False),
+        (4, True),
+    ],
+)
+def test_cute_narrow_pointwise_seeds_with_safe_loads(
+    dtype: torch.dtype, width: int, strided: bool
+) -> None:
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for rows, columns in hl.tile(x.shape):
+            out[rows, columns] = x[rows, columns] + y[rows, columns]
+        return out
+
+    def thread_count(config: helion.Config) -> int:
+        return math.prod(max(1, n) for n in config.num_threads)
+
+    x = torch.empty(16384, width * (2 if strided else 1), dtype=dtype)
+    args = (x[:, ::2] if strided else x,) * 2
+    with _mock_cuda_unavailable(), _forbid_native_compile():
+        bound = _cpu_bind(add, args)
+        spec = bound.config_spec
+        assert "cute_pointwise_vec" in spec.autotuner_heuristics
+        if width <= 8:
+            assert "cute_resident_row" not in spec.autotuner_heuristics
+        failures: list[str] = []
+        candidates = [
+            config
+            for _, config in ConfigGeneration(spec).seed_flat_config_pairs(
+                failures.append
+            )
+            if any(config.config.get("flatten_loops", [])) == (width > 1)
+            and math.prod(config.block_sizes) >= 512
+            and thread_count(config) >= 128
+        ]
+        assert not failures
+        assert candidates
+        assert thread_count(candidates[0]) == 256
+        assert any(thread_count(config) == 512 for config in candidates)
+        vector = 16 // x.element_size()
+        for threads in (128, 256):
+            for packet_width in (4, 8):
+                if packet_width > vector:
+                    continue
+                assert any(
+                    math.prod(config.block_sizes) == threads * packet_width
+                    and thread_count(config) == threads
+                    and max(config["cute_vector_widths"]) == packet_width
+                    for config in candidates
+                )
+        assert all(max(config["cute_vector_widths"]) <= vector for config in candidates)
+        assert any(config.get("cute_packet_prefetch") == 2 for config in candidates)
+        for config in candidates:
+            code = bound.to_code(config)
+            assert ("ir.VectorType.get([" in code) == (not strided)
+        if not strided:
+            assert f"ir.VectorType.get([{vector}]," in bound.to_code(candidates[0])
+        assert bound.host_function is not None
+        seeds = CutePointwiseVecHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+        lists = [
+            id(value)
+            for seed in seeds
+            for value in seed.config.values()
+            if isinstance(value, list)
+        ]
+        assert len(lists) == len(set(lists))
+
+
+@pytest.mark.parametrize("width", [4095, 4096])
+def test_cute_pointwise_transposed_axis_does_not_flatten(width: int) -> None:
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def add(x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for rows, columns in hl.tile(x.shape):
+            out[rows, columns] = x[rows, columns] + 1
+        return out
+
+    with _mock_cuda_unavailable(), _forbid_native_compile():
+        bound = _cpu_bind(add, (torch.empty(8, width, dtype=torch.bfloat16).T,))
+        assert bound.host_function is not None
+        seeds = CutePointwiseVecHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+        if width % 2:
+            assert seeds == []
+        else:
+            assert seeds
+            assert all(not any(seed.get("flatten_loops", [])) for seed in seeds)
+            assert seeds[0]["cute_vector_widths"] == [8, 1]
+            assert "ir.VectorType.get([8]," in bound.to_code(seeds[0])
+        failures: list[str] = []
+        assert ConfigGeneration(bound.config_spec).seed_flat_config_pairs(
+            failures.append
+        )
+        assert not failures
+        bound.to_code(bound.config_spec.default_config())
+
+
 def _cute_matmul_for_heuristics(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     m, k = a.shape
     _, n = b.shape
@@ -11708,7 +11997,13 @@ def test_cute_heuristics_register_facts_without_cutlass() -> None:
     # heuristic's register_facts. Their planning imports must stay importable
     # without cutlass; only device helper modules may import it at module top.
     root = Path(__file__).resolve().parents[1]
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=str(root))
+    # The child needs the parent's import path too: a packaged test binary has
+    # no site-packages for it to fall back on.
+    environment = dict(
+        os.environ,
+        CUDA_VISIBLE_DEVICES="",
+        PYTHONPATH=os.pathsep.join([str(root), *sys.path]),
+    )
     environment.pop("HELION_BACKEND", None)
     environment.pop("HELION_AUTOTUNE_EFFORT", None)
     # Ref eager binding builds no device IR; the child always binds normally.
@@ -11735,3 +12030,177 @@ def test_cute_heuristics_register_facts_without_cutlass() -> None:
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+_CUTE_ROW_HEURISTICS = (
+    CuteTileVecHeuristic,
+    CuteTileVecWarpReduceHeuristic,
+    CuteTileVecWarpPerRowHeuristic,
+    CuteResidentRowHeuristic,
+    CuteResidentRowWideClusterHeuristic,
+    CuteResidentMultiRowHeuristic,
+)
+
+
+@skipUnlessBackends(["cute"])
+@skipIfNotCUDA()
+@pytest.mark.parametrize("reversed_registration", [False, True])
+def test_cute_row_hints_follow_loop_axes_not_registration_order(
+    reversed_registration: bool,
+) -> None:
+    pytest.importorskip("cutlass.cute")
+
+    def rowsum(x: torch.Tensor, reverse: hl.constexpr) -> torch.Tensor:
+        if reverse:
+            columns = hl.register_block_size(x.size(1))
+            rows = hl.register_block_size(x.size(0))
+        else:
+            rows = hl.register_block_size(x.size(0))
+            columns = hl.register_block_size(x.size(1))
+        out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+        for r in hl.tile(x.size(0), block_size=rows):
+            acc = hl.zeros([r], dtype=torch.float32)
+            for c in hl.tile(x.size(1), block_size=columns):
+                acc += x[r, c].sum(dim=1)
+            out[r] = acc
+        return out
+
+    args = (torch.randn(16, 2048, device=DEVICE), reversed_registration)
+    bound = helion.kernel(rowsum, backend="cute", static_shapes=True).bind(args)
+    outer, inner = (1, 0) if reversed_registration else (0, 1)
+    spec = bound.config_spec
+    for heuristic in _CUTE_ROW_HEURISTICS:
+        with bound.env, bound.host_function:
+            assert heuristic.is_eligible(bound.env, bound.host_function.device_ir)
+            seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
+        assert seed is not None, heuristic.name
+        assert spec.block_sizes.config_get(seed.block_sizes, inner) > 1
+        assert spec.block_sizes.config_get(seed.block_sizes, outer) <= 4
+        assert (
+            spec.cute_vector_widths.config_get(seed.config["cute_vector_widths"], inner)
+            > 1
+        )
+        assert (
+            spec.cute_vector_widths.config_get(seed.config["cute_vector_widths"], outer)
+            == 1
+        )
+        if heuristic is CuteTileVecHeuristic:
+            fn = bound.compile_config(seed, allow_print=False)
+            torch.testing.assert_close(
+                fn(*args), args[0].sum(dim=1), atol=1e-3, rtol=1e-3
+            )
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("reversed_registration", [False, True])
+def test_cute_row_hints_preserve_fixed_leading_axis(
+    reversed_registration: bool,
+) -> None:
+    @helion.kernel(backend="cute", static_shapes=True)
+    def copy(x: torch.Tensor, reverse: hl.constexpr) -> torch.Tensor:
+        if reverse:
+            columns = hl.register_block_size(x.size(2))
+            rows = hl.register_block_size(x.size(1))
+        else:
+            rows = hl.register_block_size(x.size(1))
+            columns = hl.register_block_size(x.size(2))
+        out = torch.empty_like(x)
+        for batch, row, col in hl.tile(x.shape, block_size=[1, rows, columns]):
+            out[batch, row, col] = x[batch, row, col]
+        return out
+
+    with _mock_cuda_unavailable(), patch_cute_mma_support():
+        bound = _cpu_bind(copy, (torch.empty(2, 16, 2048), reversed_registration))
+    row, col = (1, 0) if reversed_registration else (0, 1)
+    spec = bound.config_spec
+    assert len(spec.block_sizes) == 2
+    assert len(bound.host_function.device_ir.grid_block_ids[0]) == 3
+    for heuristic in _CUTE_ROW_HEURISTICS:
+        with bound.env, bound.host_function:
+            assert heuristic.is_eligible(bound.env, bound.host_function.device_ir)
+            seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
+        assert seed is not None, heuristic.name
+        assert spec.block_sizes.config_get(seed.block_sizes, row) <= 4
+        assert spec.block_sizes.config_get(seed.block_sizes, col) > 1
+        assert (
+            spec.cute_vector_widths.config_get(seed.config["cute_vector_widths"], col)
+            > 1
+        )
+        assert (
+            spec.cute_vector_widths.config_get(seed.config["cute_vector_widths"], row)
+            == 1
+        )
+
+
+def test_cute_dot_row_reduction_seed_keeps_the_softmax_axis_in_thread() -> None:
+    """``hl.dot`` over head_dim whose result is reduced (``amax``/``sum``) over
+    the key tile: the key tile's ``num_threads`` slot seeds (and defaults to) 1,
+    so the row statistics and the ``p @ v`` running sum stay in registers."""
+    from examples.fp8_attention import fp8_attention_kernel
+
+    from helion._compiler.autotuner_heuristics.cute_dot_row_reduction import (
+        CuteDotRowReductionHeuristic,
+    )
+
+    kernel = helion.kernel(
+        fp8_attention_kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    batch, heads, seq_len, head_dim = 1, 4, 256, 64
+    q = torch.empty((batch * heads, seq_len, head_dim), dtype=torch.float8_e4m3fn)
+    v = torch.empty((batch * heads, head_dim, seq_len), dtype=torch.float8_e4m3fn)
+    with _mock_cuda_unavailable(), _forbid_native_compile():
+        bound = _cpu_bind(kernel, (q, q, v, batch, heads))
+        assert bound.host_function is not None
+        device_ir = bound.host_function.device_ir
+        assert CuteDotRowReductionHeuristic.is_eligible(bound.env, device_ir)
+        seed = CuteDotRowReductionHeuristic.get_seed_config(bound.env, device_ir)
+        assert seed is not None
+        spec = bound.config_spec
+        key_tile = next(
+            graph.block_ids[0]
+            for graph in device_ir.graphs
+            if type(graph).__name__ == "ForLoopGraphInfo" and len(graph.block_ids) == 1
+        )
+        slot = [item.block_id for item in spec.num_threads].index(key_tile)
+        assert seed["num_threads"][slot] == 1
+        assert sum(seed["num_threads"]) == 1
+        assert "cute_dot_row_reduction" in spec.autotuner_heuristics
+        assert spec.default_config()["num_threads"] == seed["num_threads"]
+        code = bound.to_code(spec.default_config())
+        # The key tile runs as a per-thread lane loop: the row max and sum
+        # accumulate in registers instead of block-wide grouped reductions.
+        assert "qk_max_lane_acc" in code
+        assert "l_ij_lane_acc" in code
+
+
+def test_cute_dot_row_reduction_seed_needs_a_row_reduction() -> None:
+    """A dot whose N axis is only stored (no reduction over it) gets no seed."""
+    from helion._compiler.autotuner_heuristics.cute_dot_row_reduction import (
+        CuteDotRowReductionHeuristic,
+    )
+
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def scores(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        batch_heads, seq_len, _ = q.shape
+        out = torch.empty(
+            [batch_heads, seq_len, seq_len], dtype=torch.float32, device=q.device
+        )
+        for bh in hl.grid(batch_heads):
+            for tile_m in hl.tile(seq_len):
+                q_tile = q[bh, tile_m, :]
+                for tile_n in hl.tile(seq_len):
+                    k_tile = k[bh, tile_n, :]
+                    out[bh, tile_m, tile_n] = hl.dot(q_tile, k_tile.transpose(0, 1))
+        return out
+
+    q = torch.empty(2, 64, 64, dtype=torch.bfloat16)
+    with _mock_cuda_unavailable(), _forbid_native_compile():
+        bound = _cpu_bind(scores, (q, q))
+        assert bound.host_function is not None
+        assert not CuteDotRowReductionHeuristic.is_eligible(
+            bound.env, bound.host_function.device_ir
+        )
+        assert "cute_dot_row_reduction" not in bound.config_spec.autotuner_heuristics

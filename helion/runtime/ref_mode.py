@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import enum
 import threading
 import typing
@@ -22,6 +23,7 @@ from .._utils import convert_size_arg
 from .._utils import create_shape_matching_slices
 
 if TYPE_CHECKING:
+    from types import TracebackType
     from typing_extensions import Self
 
     from torch._prims_common import DeviceLikeType
@@ -150,6 +152,7 @@ class RefModeContext:
         self.ref_impl_depth = 0
         self._initial_rng_state: torch.Tensor | None = None
         self._rng_seed_buffer: torch.Tensor | None = None
+        self._exit_stack = contextlib.ExitStack()
 
     def __enter__(self) -> Self:
         assert getattr(ref_mode_tls, "context", None) is None, (
@@ -157,17 +160,27 @@ class RefModeContext:
         )
         ce_tls.env = self.env
         ref_mode_tls.context = self
-        self.device_ctx.__enter__()
-        self._initial_rng_state = self._get_rng_state().clone()
-        self.func_mode.__enter__()
+        with self._exit_stack as stack:
+            stack.callback(self._clear_current)
+            stack.enter_context(self.device_ctx)
+            self._initial_rng_state = self._get_rng_state().clone()
+            stack.enter_context(self.func_mode)
+            self._exit_stack = stack.pop_all()
         return self
 
-    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> bool:
-        self.func_mode.__exit__(exc_type, exc_val, exc_tb)
-        self.device_ctx.__exit__(exc_type, exc_val, exc_tb)
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool:
+        self._exit_stack.__exit__(exc_type, exc_val, exc_tb)
+        return False
+
+    @staticmethod
+    def _clear_current() -> None:
         ref_mode_tls.context = None
         ce_tls.env = None
-        return False
 
     @staticmethod
     def current() -> RefModeContext:

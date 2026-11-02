@@ -9,6 +9,7 @@ This is a comparison tool, not the historical hillclimb qualification protocol.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 from datetime import datetime
 from datetime import timezone
@@ -19,6 +20,7 @@ import os
 from pathlib import Path
 import random
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -31,6 +33,14 @@ if __name__ == "__main__":
     sys.path.insert(0, str(REPO_ROOT))
 
 SCHEMA = "example-backend-comparison-v1"
+# A single-call CUDA-graph replay carries the graph launch latency quantized
+# to ~2 us steps, so kernels under a few tens of microseconds all read alike.
+# The primary latency is the per-call time of one graph holding this many
+# back-to-back calls, measured after a sustained pre-run so a power-capped GPU
+# sits at its steady clock (readings then agree to ~0.3% across processes,
+# while the L2-flushing cold bench swings 6-12% with the clock state). The
+# single-call replay time and the autotuner's cold bench stay as diagnostics.
+GRAPH_CALLS = 16
 
 
 def write_json(path: Path, value: object) -> None:
@@ -40,6 +50,7 @@ def write_json(path: Path, value: object) -> None:
 def worker(args: argparse.Namespace) -> None:
     from benchmarks.cute import example_baselines as baseline
     from benchmarks.cute.example_cases import collect
+    from benchmarks.cute.example_cases import shape_count
     import torch
     from torch.utils._pytree import tree_map_only
 
@@ -57,6 +68,9 @@ def worker(args: argparse.Namespace) -> None:
     started = time.monotonic()
     try:
         torch.cuda.set_device(0)
+        if args.provider == "inventory" and args.shape >= shape_count(args.module):
+            result.update(status="skipped", cases=[])
+            return
         cases = collect(args.module, args.shape)
         if args.provider == "inventory":
             result.update(
@@ -114,6 +128,17 @@ def worker(args: argparse.Namespace) -> None:
                 call, args.repetitions, expected, case, output_dtype=output_dtype
             )
         )
+        result.update(
+            baseline.measure_batched(
+                call,
+                args.repetitions,
+                GRAPH_CALLS,
+                expected,
+                case,
+                output_dtype=output_dtype,
+            )
+        )
+        result.update(baseline.measure_cold(call, args.repetitions))
         actual = call()
         result["post_measurement_output"] = baseline.metadata(actual)
         baseline.assert_correct(actual, expected, case, output_dtype=output_dtype)
@@ -134,6 +159,37 @@ def worker(args: argparse.Namespace) -> None:
         write_json(args.output, result)
 
 
+# The documented opt-out of the graph dispatch warm-up (``graph_state_regime``)
+# is the one HELION_* variable a sweep's workers inherit from the driver.
+GRAPH_WARMUP_ENV = "HELION_BENCHMARK_GRAPH_WARMUP"
+
+
+def graph_state_regime() -> str:
+    """The CUDA graph dispatch state every job's readings are taken in (the
+    per-job ``graph_state_warmup`` note records what actually ran); see
+    ``example_baselines.graph_state_warmup``.  In the steady state each
+    kernel node of a Helion-launched kernel costs ~0.35-0.4 us more than in a
+    fresh process while torch's cuBLAS kernels barely change, so the
+    ``cute_vs_*`` ratios of sub-10 us units read a few percent lower than in
+    sweeps taken before the warm-up existed; compare sweeps of one regime.
+    ``HELION_BENCHMARK_GRAPH_WARMUP=0`` in the driver's environment reaches
+    the workers and measures the fast state instead."""
+    from helion.runtime.settings import _env_get_bool
+
+    if _env_get_bool(GRAPH_WARMUP_ENV, default=True):
+        return (
+            "steady: every timed reading after helion.autotuner.benchmarking."
+            "steady_graph_dispatch (16 eager launches on side streams, the state "
+            "any long-running PyTorch process runs in and the autotuner ranks in); "
+            "Helion-launched kernel nodes read ~0.35-0.4 us slower per node than "
+            "in a fresh process, torch's cuBLAS kernels barely"
+        )
+    return (
+        f"fast: {GRAPH_WARMUP_ENV}=0, no warm-up; each job's first graphs replay "
+        "in a fresh process's fast dispatch state and later ones may not"
+    )
+
+
 def worker_environment(
     gpu: str, provider: str, cache: Path, seed: int
 ) -> dict[str, str]:
@@ -142,6 +198,8 @@ def worker_environment(
     env = {
         key: value for key, value in os.environ.items() if not key.startswith("HELION_")
     }
+    if GRAPH_WARMUP_ENV in os.environ:
+        env[GRAPH_WARMUP_ENV] = os.environ[GRAPH_WARMUP_ENV]
     env.update(
         CUDA_VISIBLE_DEVICES=gpu,
         HELION_BACKEND=provider if provider in {"cute", "triton"} else "triton",
@@ -149,6 +207,9 @@ def worker_environment(
         HELION_FORCE_AUTOTUNE="1",
         HELION_AUTOTUNE_RANDOM_SEED=str(seed),
         HELION_BENCHMARK_CUDAGRAPH="1",
+        # The catalogue times a 16-call back-to-back graph after an L2 flush;
+        # the autotuner's "replay" mode measures candidates the same way.
+        HELION_AUTOTUNE_L2_FLUSH="replay",
         HELION_CACHE_DIR=str(cache / "helion"),
         TRITON_CACHE_DIR=str(cache / "triton"),
         TORCHINDUCTOR_CACHE_DIR=str(cache / "inductor"),
@@ -162,7 +223,7 @@ def worker_environment(
     return env
 
 
-def check_gpu_idle(gpu: str) -> str:
+def check_gpu_idle(gpu: str, *, grace_seconds: float = 0.0) -> str:
     """Refuse to start a new worker while another GPU process is present."""
     query = subprocess.run(
         ["nvidia-smi", "-i", gpu, "--query-gpu=uuid", "--format=csv,noheader"],
@@ -187,6 +248,10 @@ def check_gpu_idle(gpu: str) -> str:
     if any(
         line.split(",", 1)[0].strip() == uuid for line in processes.stdout.splitlines()
     ):
+        if grace_seconds > 0:
+            # A just-reaped worker's CUDA context can take a moment to go.
+            time.sleep(min(grace_seconds, 5.0))
+            return check_gpu_idle(gpu, grace_seconds=grace_seconds - 5.0)
         raise RuntimeError(f"GPU {gpu} is busy; existing results have been preserved")
     return uuid
 
@@ -237,8 +302,9 @@ def run(args: argparse.Namespace) -> None:
     if len(set(modules)) != len(modules):
         raise ValueError("Duplicate example modules")
     shapes = [int(value) for value in args.shapes.split(",")]
-    if not shapes or len(set(shapes)) != len(shapes) or set(shapes) - {0, 1, 2}:
-        raise ValueError("Shapes must be distinct members of 0,1,2")
+    if not shapes or len(set(shapes)) != len(shapes) or min(shapes) < 0:
+        raise ValueError("Shapes must be distinct non-negative workload indices")
+    cases = set(args.cases.split(",")) if args.cases else set()
     seed = args.seed if args.seed is not None else secrets.randbits(63)
     args.output.mkdir(parents=True, exist_ok=False)
     raw = args.output / "raw"
@@ -261,6 +327,7 @@ def run(args: argparse.Namespace) -> None:
             REPO_ROOT, ("helion", "examples", "benchmarks/cute")
         ),
         "modules": modules,
+        "cases": sorted(cases) or None,
         "shapes": shapes,
         "gpu": args.gpu,
         "gpu_uuid": check_gpu_idle(args.gpu),
@@ -269,14 +336,28 @@ def run(args: argparse.Namespace) -> None:
         "repetitions": args.repetitions,
         "autotune_seed": seed,
         **provenance(args.gpu),
-        "timer": "CUDA graph replay; do_bench(warmup=10, rep=50, return_mode=median)",
+        "timer": (
+            f"graph_calls_ms: per-call time of one CUDA graph of {GRAPH_CALLS} "
+            "back-to-back calls after a 500 ms sustained pre-run, median of "
+            "max(--repetitions, 7) "
+            "do_bench(warmup=10, rep=50, return_mode=median) readings; also bench_ms "
+            "(helion.autotuner.benchmarking.interleaved_bench, L2 flushed before every "
+            "call) and graph_ms (one call); graph_long_ms (primary where present): "
+            "the same reading of a graph grown by powers of two until one replay "
+            "takes >= 400 us (event times are quantized to 1.953 us), with "
+            "graph_long_calls; every reading is taken in the CUDA graph dispatch "
+            "state named by graph_state"
+        ),
+        "graph_calls": GRAPH_CALLS,
+        "autotune_regime": "HELION_AUTOTUNE_L2_FLUSH=replay (flush, then a back-to-back batch)",
+        "graph_state": graph_state_regime(),
         "jobs": [],
     }
 
     def execute(
         module: str, shape: int, provider: str, case: str = "", impl: str = ""
     ) -> dict[str, Any]:
-        check_gpu_idle(args.gpu)
+        check_gpu_idle(args.gpu, grace_seconds=30.0)
         index = len(record["jobs"])
         worker_seed = (seed + index) % (1 << 63)
         output = raw / f"{index:05d}.json"
@@ -304,7 +385,7 @@ def run(args: argparse.Namespace) -> None:
                 str(worker_seed),
             ]
             with log.open("w") as stream:
-                process = subprocess.run(
+                process = subprocess.Popen(
                     command,
                     env=worker_environment(
                         args.gpu, provider, Path(directory), worker_seed
@@ -312,8 +393,15 @@ def run(args: argparse.Namespace) -> None:
                     cwd=REPO_ROOT,
                     stdout=stream,
                     stderr=subprocess.STDOUT,
-                    check=False,
+                    start_new_session=True,
                 )
+                try:
+                    process.wait()
+                finally:
+                    # The autotuner's benchmark subprocess can outlive its
+                    # worker; reap the whole session before the next GPU check.
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
             result = (
                 json.loads(output.read_text())
                 if output.exists()
@@ -352,6 +440,8 @@ def run(args: argparse.Namespace) -> None:
                 if inventory["status"] != "ok":
                     continue
                 for case in inventory["cases"]:
+                    if cases and case["name"] not in cases:
+                        continue
                     jobs = [
                         (provider, name)
                         for provider in ("cute", "triton")
@@ -382,6 +472,11 @@ def main() -> None:
         "--modules", default="", help="Comma-separated module names; default: all"
     )
     runner.add_argument("--shapes", default="0,1,2")
+    runner.add_argument(
+        "--cases",
+        default="",
+        help="Comma-separated case names (e.g. 01_backward); default: all",
+    )
     runner.add_argument("--output", required=True, type=Path)
     runner.add_argument("--repetitions", type=int, default=5)
     child = commands.add_parser("worker", help=argparse.SUPPRESS)

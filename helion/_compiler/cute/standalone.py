@@ -494,6 +494,16 @@ def _capture_launches(
             raise NotImplementedError(
                 "Standalone CuTe export cannot bake this kernel's runtime tensor layouts"
             )
+        if getattr(kernel, "_helion_cute_sass_checks", ()):
+            # The exported launcher has no SASS verification step
+            # (``helion.runtime.cute.sass_check``); a kernel whose
+            # instruction forms need one (hinted mma_dag packets) is not
+            # exported.  Pin the plain config (``load_eviction_policies``
+            # all "") to export this kernel.
+            raise NotImplementedError(
+                "Standalone CuTe export does not support kernels whose SASS "
+                "the launcher must verify (hinted cp.async packets)"
+            )
         plans = getattr(kernel, "_helion_cute_wrapper_plans", ())
         if any(
             plan.get("kind")

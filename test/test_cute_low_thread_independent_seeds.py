@@ -19,6 +19,9 @@ import helion
 from helion._compiler.autotuner_heuristics.cute_full_chunk_row import (
     CuteFullChunkRowHeuristic,
 )
+from helion._compiler.autotuner_heuristics.cute_rolled_cluster_packet import (
+    CuteRolledClusterPacketHeuristic,
+)
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 
@@ -31,7 +34,13 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def cpu_only() -> Iterator[None]:
     initialized = torch.cuda.is_initialized()
-    with _cpu_target(), _forbid_native_compile() as native:
+    with (
+        _cpu_target(),
+        _forbid_native_compile() as native,
+        patch.object(
+            CuteRolledClusterPacketHeuristic, "get_seed_configs", return_value=[]
+        ),
+    ):
         yield
         assert all(mock.call_count == 0 for mock in native)
     assert torch.cuda.is_initialized() == initialized

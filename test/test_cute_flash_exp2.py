@@ -37,6 +37,7 @@ from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
@@ -347,6 +348,7 @@ def _emit_output_epilogue_route_source(route: str, output_epilogue: str | None) 
     return ast.unparse(ast.Module(body=body, type_ignores=[]))
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("is_causal", (False, True))
 @pytest.mark.parametrize(
     ("output_epilogue", "expected_flash"),
@@ -394,6 +396,7 @@ def test_bfloat16_output_epilogue_flash_matcher(
         assert not resolved.epi_stg
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_relu_output_epilogue_is_bfloat16_only() -> None:
     args = tuple(
         torch.empty(
@@ -412,6 +415,7 @@ def test_relu_output_epilogue_is_bfloat16_only() -> None:
     assert not bound.config_spec.cute_flash_search_enabled
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("auxiliary", ("lse", "tensor_bias"))
 def test_relu_output_epilogue_rejects_auxiliary_attention(auxiliary: str) -> None:
     from test.test_cute_backend import cute_biased_attention
@@ -1311,6 +1315,7 @@ def test_serial_disc_forwards_degree2_to_chunk_math(degree2: bool | None) -> Non
         patch.object(_flash_runtime.cute, "make_rmem_tensor"),
         patch.object(_flash_runtime.cute, "copy"),
         patch.object(_flash_runtime.cute.arch, "fence_view_async_tmem_store"),
+        patch.object(_flash_runtime, "tcgen05_fence_before_thread_sync"),
         patch.object(_flash_runtime, "_disc_chunk_exp") as chunk_exp,
         patch.object(_flash_runtime, "_disc_chunk_convert_store"),
         patch.object(_flash_runtime, "_disc_chunk_rowsum", return_value=1.0),
@@ -1573,6 +1578,78 @@ def test_dense_resident_value_graph_selects_registered_shapes(
     )
 
     assert "resident_softmax_value_graph" in source
+
+
+def test_dense_resident_value_graph_stores_the_lse_row() -> None:
+    """The explicit resident lowering on the dense LSE surface: the value
+    graph helper runs the softmax and the LSE row (``m * scale + log2(l)``)
+    is stored from the final statistics right after each stage's row-sum
+    publish, exactly where the standard lowering stores it.  The body is the
+    surface's own two-tile fa4 seed, so the render is the one the autotuner
+    would reach."""
+    facts: dict[str, object] = {
+        "dtype": torch.bfloat16,
+        "num_bh": 32,
+        "is_causal": False,
+        "standard_dense_output": False,
+        "dense_lse_output": True,
+        "target_device_capability": (10, 0),
+    }
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = cute_flash.flash_attention_seed_configs(
+            128,
+            16,
+            num_sm=148,
+            block_size_targets=(1, 128, 128),
+            **facts,  # pyrefly: ignore[bad-argument-type]
+        )
+        seed = next(
+            seed
+            for seed in seeds
+            if seed.config.get(cute_flash.FLASH_SOFTMAX_LOWERING_KEY)
+            == "resident_value_graph"
+        )
+        config = cute_flash.resolve_flash_config(
+            128,
+            16,
+            {key: value for key, value in seed.config.items() if key != "block_sizes"},
+            **facts,  # pyrefly: ignore[bad-argument-type]
+        )
+    assert config.softmax_lowering == "resident_value_graph"
+    assert config.q_tile_count == 2
+    body = cute_flash.emit_flash_fa4_device_body(
+        cast("DeviceFunction", None),
+        head_dim=128,
+        num_kv=16,
+        sequence_extent=2048,
+        num_bh=32,
+        total_tiles=16 * 32,
+        cfg=config,
+        has_lse=True,
+        io_dtype="cutlass.BFloat16",
+        score_plan=dense_score_plan(128),
+        target_device_capability=(10, 0),
+    )
+    source = ast.unparse(ast.Module(body=body, type_ignores=[]))
+    assert source.count("_helion_flash_rt.resident_softmax_value_graph(") == 2
+    assert "fa4_sp_exp_convert_store" not in source
+    lse_stores = [
+        line.strip() for line in source.splitlines() if "_flash_mLSE[" in line
+    ]
+    lse_value = "flash_row_max * _flash_scale_log2 + cute.math.log2(flash_row_sum)"
+    assert lse_stores == [
+        f"_flash_mLSE[flash_m_tile{stage} * 128 + flash_local_tidx, flash_bh] = {lse_value}"
+        for stage in ("0", "1")
+    ]
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        if "_flash_mLSE[" not in line:
+            continue
+        # The store follows the stage's final row-sum publish (the slot
+        # write and its named-barrier arrive) and precedes the next item.
+        preceding = "\n".join(lines[index - 6 : index])
+        assert "= flash_row_sum" in preceding
+        assert "named_barrier_arrive_unaligned" in preceding
 
 
 def test_dense_resident_value_graph_gate_preserves_fallbacks() -> None:
@@ -3123,8 +3200,11 @@ def test_bfloat16_hd128_degree2_seed_is_deterministic_and_matches_sdpa() -> None
         k.mul_(scale)
         out = bound(q, k, v)
         repeated = bound(q, k, v)
-        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        diff = (out.float() - expected.float()).abs()
+        # A bf16 SDPA reference's own rounding error is comparable to the tolerance.
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q.float(), k.float(), v.float()
+        )
+        diff = (out.float() - expected).abs()
         normalized_rmse = torch.sqrt(
             (diff * diff).mean(dtype=torch.float64)
             / (expected.float() * expected.float()).mean(dtype=torch.float64)
@@ -4396,9 +4476,10 @@ def test_withheld_packet_seeds_keep_their_structure_on_exact_packets() -> None:
         )
         for fast_math in (False, True)
     }
-    # 33 on this surface: the hillclimb's 29 plus main's explicit
-    # standard/resident lowering seeds.
-    assert len(dense_seeds[False]) == len(dense_seeds[True]) == 33
+    # 34 on this surface: the hillclimb's 29 plus main's explicit
+    # standard/resident lowering seeds, plus the single-tile issue-stream
+    # seed (the ws body's load warp and extra K ring slot).
+    assert len(dense_seeds[False]) == len(dense_seeds[True]) == 34
     for cadence in ("16/6", "16/8", "8/2"):
         matches = _seed_values(
             dense_seeds[False],
@@ -4423,7 +4504,9 @@ def test_withheld_packet_seeds_keep_their_structure_on_exact_packets() -> None:
         )
         for fast_math in (False, True)
     }
-    assert len(causal_seeds[False]) == len(causal_seeds[True]) == 14
+    # (plus the single-tile issue-stream seed on the causal ws body: load warp,
+    # mask phases and the extra K ring slot: 14 -> 15.)
+    assert len(causal_seeds[False]) == len(causal_seeds[True]) == 15
     split = {
         cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
         cute_flash.FLASH_EXP2_PACKET_KEY: "1x1",
@@ -4502,7 +4585,8 @@ def test_withheld_packet_seeds_keep_their_structure_on_exact_packets() -> None:
         )
         for fast_math in (False, True)
     }
-    assert len(pruned_seeds[False]) == len(pruned_seeds[True]) == 10
+    # 11: the 10 plus the same issue-stream ws_overlap seed (load warp + slot).
+    assert len(pruned_seeds[False]) == len(pruned_seeds[True]) == 11
     variant = _seed_values(
         pruned_seeds[False],
         **{

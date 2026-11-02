@@ -120,6 +120,36 @@ def test_fragment_parallel_carry_aliases_and_lazy_updates(steps):
 
 
 @helion.kernel(backend="cute", autotune_effort="none")
+def _fragment_computed_slice_start(
+    x: torch.Tensor, bias: torch.Tensor, groups: hl.constexpr
+):
+    rows = hl.specialize(x.size(1))
+    out = torch.empty(
+        (x.size(0), rows, x.size(2)), device=x.device, dtype=torch.float32
+    )
+    for tile_r, tile_d in hl.tile([x.size(0), x.size(2)], block_size=[1, None]):
+        index = hl.arange(rows)
+        ltri = (index[:, None] >= index[None, :]).to(torch.float32)
+        head = tile_r.begin // groups
+        # The slice lowers to prims.iota(1, start=head): its start is a
+        # device-computed scalar node.
+        value = x[tile_r.begin, :, tile_d].float() + bias[head : head + 1, tile_d]
+        out[tile_r.begin, :, tile_d] = hl.dot(ltri, value)
+    return out
+
+
+@skipUnlessBackends(["cute"])
+def test_fragment_computed_slice_start():
+    x = torch.randn((6, 16, 8), device=DEVICE, dtype=torch.bfloat16)
+    bias = torch.randn((2, 8), device=DEVICE)
+    expected = torch.tril(torch.ones(16, 16, device=DEVICE)) @ (
+        x.float() + bias.repeat_interleave(3, dim=0)[:, None, :]
+    )
+    actual = _fragment_computed_slice_start(x, bias, 3)
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+@helion.kernel(backend="cute", autotune_effort="none")
 def _fragment_half_carry_dot(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -4606,7 +4636,28 @@ def test_fragment_packet_loads_preserves_old_population_rng(strategy_name):
         assert actual[-1]["cute_fragment_packet_loads"] is True
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float64, torch.int32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fragment_packet_loads_half_types_take_eight_byte_packets(dtype):
+    # Four 16-bit scalars per packet: the same loop body as the fp32 packet
+    # (the DSL's AST preprocessing of its conditionals stays bounded) over an
+    # 8-byte vector copy.
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_uncached_cheap, (torch.ones(3, 17, dtype=dtype),))
+        assert bound.config_spec.cute_fragment_packet_load_root_ids
+        config = bound.config_spec.default_config()
+        config.config["cute_fragment_packet_loads"] = True
+        code = bound.to_code(config)
+    scalar = "cutlass.Float16" if dtype is torch.float16 else "cutlass.BFloat16"
+    assert f"cute.make_rmem_tensor(cute.make_layout((4,)), {scalar})" in code
+    assert ".align(8), cute.make_layout((4,))" in code
+    assert (
+        f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {scalar}, num_bits_per_copy=64)"
+        in code
+    )
+    assert "fragment_packet_address % 4 == 0" in code
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.int32])
 def test_fragment_packet_loads_unsupported_dtype_default_parity(dtype):
     with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
         bound = _cpu_bind(_fragment_uncached_cheap, (torch.ones(3, 17, dtype=dtype),))
@@ -4723,6 +4774,33 @@ def test_fragment_packet_loads_declines_aliasing_host_mutation():
             bound.to_code(config)
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_packet_zero_filled_outputs(x: torch.Tensor, modulus: hl.constexpr):
+    """The masked scan writing ``torch.zeros_like`` outputs: fresh storage
+    with a runtime-strided layout, which no input can alias."""
+    raw = torch.zeros_like(x)
+    out = torch.zeros_like(x)
+    for row in hl.tile(x.size(0)):
+        index = hl.arange(x.size(1))
+        value = hl.load(x, [row, index], extra_mask=index % modulus != 0)
+        raw[row, :] = value
+        out[row, :] = hl.cumsum(value + 1, dim=-1) + value.sum(-1)[:, None]
+    return raw, out
+
+
+def test_fragment_packet_loads_admit_loads_beside_fresh_outputs():
+    # ``torch.zeros_like`` is not a layout-exact factory, but it is a fresh
+    # allocation on every call: the loads beside its stores are readonly.
+    x = torch.arange(3 * 64, dtype=torch.float32).reshape(3, 64)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_packet_zero_filled_outputs, (x, 13))
+        assert bound.config_spec.cute_fragment_packet_load_root_ids
+        config = bound.config_spec.default_config()
+        config.config["block_sizes"] = [2]
+        config.config["cute_fragment_packet_loads"] = True
+        assert "num_bits_per_copy=128" in bound.to_code(config)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_fragment_packet_loads_zero_extent_does_not_issue_packets(dtype):
     x = torch.empty((3, 0), dtype=dtype)
@@ -4730,13 +4808,10 @@ def test_fragment_packet_loads_zero_extent_does_not_issue_packets(dtype):
         bound = _cpu_bind(_fragment_uncached_cheap, (x,))
         config = bound.config_spec.default_config()
         before = bound.to_code(config)
-        assert "num_bits_per_copy=128" not in before
+        assert "num_bits_per_copy=" not in before
         config.config["cute_fragment_packet_loads"] = True
-        if dtype == torch.float32:
-            assert bound.to_code(config) == before
-        else:
-            with pytest.raises(exc.InvalidConfig, match="readonly Float32"):
-                bound.to_code(config)
+        # No element, no packet, for the 16-byte and the 8-byte packet alike.
+        assert bound.to_code(config) == before
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -7594,3 +7669,60 @@ def test_warp_producer_regions_cooperative_publication_declines(mutation):
         _warp_prefix_cooperative_source(x, y, enabled=True)
     assert checked == [True]
     assert _warp_prefix_cooperative_source(x, y, enabled=False) == before
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _grid_row_online_logsumexp(x: torch.Tensor) -> torch.Tensor:
+    batches, rows, columns = x.shape
+    out = torch.empty([batches, rows], dtype=torch.float32, device=x.device)
+    for tile_b, tile_r in hl.tile([batches, rows]):
+        maximum = hl.full([tile_b, tile_r], float("-inf"), dtype=torch.float32)
+        total = hl.zeros([tile_b, tile_r], dtype=torch.float32)
+        for tile_c in hl.tile(columns):
+            values = x[tile_b, tile_r, tile_c].to(torch.float32)
+            next_maximum = torch.maximum(maximum, torch.amax(values, dim=-1))
+            total = total * torch.exp(maximum - next_maximum) + torch.sum(
+                torch.exp(values - next_maximum[:, :, None]), dim=-1
+            )
+            maximum = next_maximum
+        out[tile_b, tile_r] = maximum + torch.log(total)
+    return out
+
+
+def _grid_row_config(bound, block_sizes):
+    config = bound.config_spec.default_config()
+    config.config["block_sizes"][:] = block_sizes
+    return config
+
+
+def test_grid_row_loop_carries_keep_native_path():
+    # Online-softmax state over a 2-D grid tile is one element per grid
+    # coordinate, not a resident matrix: several rows per CTA must keep the
+    # ordinary lowering instead of the shared-memory fragment owner.
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+        patch(
+            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            return_value=232448,
+        ),
+    ):
+        bound = _cpu_bind(_grid_row_online_logsumexp, (torch.ones(4, 16, 256),))
+        assert not bound.config_spec.cute_fragment_thread_root_ids
+        source = bound.to_code(_grid_row_config(bound, [1, 2, 64]))
+    assert "fragment_smem" not in source
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("block_sizes", [[1, 1, 64], [1, 2, 64], [2, 4, 32]])
+def test_grid_row_loop_carries_native_values(block_sizes):
+    x = torch.randn(3, 10, 200, device=DEVICE, dtype=torch.bfloat16)
+    code, out = code_and_output(
+        _grid_row_online_logsumexp, (x,), block_sizes=block_sizes
+    )
+    assert "fragment_smem" not in code
+    torch.testing.assert_close(
+        out, torch.logsumexp(x.float(), dim=-1), rtol=1e-4, atol=1e-4
+    )
