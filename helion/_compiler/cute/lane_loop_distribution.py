@@ -600,17 +600,42 @@ def runs_once_outside_lane(node: ast.AST, lane_var: str) -> bool:
     return _is_movable(node, also=also)
 
 
+def _pointer_strategy_tensor(node: ast.AST) -> str | None:
+    """The tensor an access of the shared pointer indexing strategy
+    (``indexing_strategy.py``) addresses: ``tl.load(x + offset, mask, ...)``,
+    ``tl.store(x + offset, value, mask)`` and ``tl.atomic_add(x + offset,
+    value, ...)`` address ``x``, the base of the sum in their first argument.
+    None for any other node."""
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and (
+            node.func.attr in ("load", "store") or node.func.attr.startswith("atomic_")
+        )
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "tl"
+        and node.args
+    ):
+        return None
+    base = node.args[0]
+    while isinstance(base, ast.BinOp) and isinstance(base.op, ast.Add):
+        base = base.left
+    return base.id if isinstance(base, ast.Name) else None
+
+
 def _mentions(
     node: ast.AST, skip: Callable[[ast.AST], bool] | None = None
 ) -> Iterator[str]:
     """Generated tensor names addressed in ``node``, one per mention.
 
-    ``t.iterator``, ``t.__setitem__`` and ``t[...]`` address ``t``.  A
-    metadata query of the tensor or of a slice of it (``t[...].shape``,
-    ``t[...].layout``, ``t.iterator.alignment``: ``_METADATA_ATTRS``) reads
-    no element and addresses nothing, though an index inside the slice may
-    (a load).  ``skip`` excludes subtrees.  Aliasing kernel arguments have
-    distinct names and are not related here.
+    ``t.iterator``, ``t.__setitem__``, ``t[...]`` and the pointer indexing
+    strategy's accesses (``tl.load(t + offset, ...)``,
+    ``_pointer_strategy_tensor``) address ``t``.  A metadata query of the
+    tensor or of a slice of it (``t[...].shape``, ``t[...].layout``,
+    ``t.iterator.alignment``: ``_METADATA_ATTRS``) reads no element and
+    addresses nothing, though an index inside the slice may (a load).
+    ``skip`` excludes subtrees.  Aliasing kernel arguments have distinct
+    names and are not related here.
     """
     pending = [node]
     while pending:
@@ -635,6 +660,8 @@ def _mentions(
                 yield child.value.id
         elif isinstance(child, ast.Subscript) and isinstance(child.value, ast.Name):
             yield child.value.id
+        elif (tensor := _pointer_strategy_tensor(child)) is not None:
+            yield tensor
         pending.extend(ast.iter_child_nodes(child))
 
 
@@ -727,6 +754,11 @@ def _tensor_accesses(node: ast.AST) -> tuple[set[str], set[str]]:
     read = _tensor_mentions(node)
     written: set[str] = set()
     for call in _memory_write_calls(node):
+        tensor = _pointer_strategy_tensor(call)
+        if tensor is not None and ast.unparse(call.func) == "tl.store":
+            written.add(tensor)
+            read[tensor] -= 1
+            continue
         address = _store_address(call)
         if address is None:
             written |= _tensor_names(call)
@@ -870,10 +902,12 @@ def _access_addresses(
 
     A ``t.iterator`` mention's address is the pointer arithmetic around it
     (``t.iterator + Int32(i) * Int32(t.layout.stride[0])``), a
-    ``t.__setitem__(index, value)`` mention's the index and a ``t[index]``
-    mention's the index, so every mention ``_tensor_mentions`` counts has one
-    address here, with the elements it covers (``_Access``; ``packets`` are
-    the wrappers' packets in view, ``_packets``).
+    ``t.__setitem__(index, value)`` mention's the index, a ``t[index]``
+    mention's the index and a pointer indexing strategy access's
+    (``tl.load(t + offset, ...)``) the pointer ``t + offset``, so every
+    mention ``_tensor_mentions`` counts has one address here, with the
+    elements it covers (``_Access``; ``packets`` are the wrappers' packets
+    in view, ``_packets``).
     """
     parents: dict[ast.AST, ast.AST] = {}
     for parent in ast.walk(node):
@@ -908,6 +942,9 @@ def _access_addresses(
                     addresses[child.value.id].append(_Access(child, True))
         elif isinstance(child, ast.Subscript) and isinstance(child.value, ast.Name):
             addresses[child.value.id].append(_Access(child.slice, True))
+        elif (tensor := _pointer_strategy_tensor(child)) is not None:
+            assert isinstance(child, ast.Call)
+            addresses[tensor].append(_Access(child.args[0], True))
     return addresses
 
 
@@ -2435,7 +2472,8 @@ def _repetition_conflict(
 
 
 def _pointer_tensors(node: ast.AST, renames: Mapping[str, str]) -> frozenset[str]:
-    """The tensors ``node`` addresses through their pointers (``t.iterator``).
+    """The tensors ``node`` addresses through their pointers (``t.iterator``,
+    or the pointer indexing strategy's ``tl.load(t + offset, ...)``).
 
     Those are the kernel's tensors as the memory-op codegen loads and stores
     them; a shared-memory view or register array an emitter builds itself is
@@ -2447,14 +2485,18 @@ def _pointer_tensors(node: ast.AST, renames: Mapping[str, str]) -> frozenset[str
         for child in ast.walk(node)
         if isinstance(child, ast.Attribute) and child.attr in _METADATA_ATTRS
     }
-    return frozenset(
+    tensors = {
         renames.get(child.value.id, child.value.id)
         for child in ast.walk(node)
         if isinstance(child, ast.Attribute)
         and child.attr == "iterator"
         and isinstance(child.value, ast.Name)
         and id(child) not in queried
-    )
+    }
+    for child in ast.walk(node):
+        if (tensor := _pointer_strategy_tensor(child)) is not None:
+            tensors.add(renames.get(tensor, tensor))
+    return frozenset(tensors)
 
 
 def _inexact_repeated_loop(
