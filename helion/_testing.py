@@ -87,6 +87,8 @@ def _strip_launcher_args(value: str) -> str:
             (r", matrix_instr_nonkdim=\d+", ""),
             (r", xcd_remap=(?:True|False)", ""),
         ]
+    if is_xpu():
+        strip_pairs.append((r", grf_mode='\d+'", ""))
     if _get_backend() == "tileir":
         strip_pairs += [(r", num_ctas=\d+", ""), (r", occupancy=\d+", "")]
     for tunable in get_mtia_tunable_fragments():
