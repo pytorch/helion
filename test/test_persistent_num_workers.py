@@ -15,7 +15,7 @@ from helion._testing import skipIfRefEager
 from helion.autotuner import EnumFragment
 from helion.autotuner.config_spec import GRF_MODE_KEY
 import helion.language as hl
-from helion.language.tunable_ops import computes_persistent_num_workers
+from helion.language.persistent_ops import computes_persistent_num_workers
 from helion.runtime.triton.launcher import get_xpu_eu_resources
 from helion.runtime.triton.launcher import get_xpu_grf_modes
 

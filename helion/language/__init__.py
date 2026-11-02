@@ -36,6 +36,7 @@ from .memory_ops import prefetch as prefetch
 from .memory_ops import store as store
 from .pdl_ops import pdl_launch_dependents as pdl_launch_dependents
 from .pdl_ops import pdl_wait as pdl_wait
+from .persistent_ops import persistent_num_workers as persistent_num_workers
 from .quantized_ops import float4_e2m1fn_x2_to_float32 as float4_e2m1fn_x2_to_float32
 from .quantized_ops import load_bfloat16_x16_to_float16 as load_bfloat16_x16_to_float16
 from .quantized_ops import (
@@ -56,7 +57,6 @@ from .tile_ops import tile_end as tile_end
 from .tile_ops import tile_id as tile_id
 from .tile_ops import tile_index as tile_index
 from .tile_proxy import Tile as Tile
-from .tunable_ops import persistent_num_workers as persistent_num_workers
 from .tunable_ops import register_block_size as register_block_size
 from .tunable_ops import register_tunable as register_tunable
 from .view_ops import join as join
