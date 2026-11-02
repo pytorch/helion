@@ -131,7 +131,7 @@ class TritonBackend(Backend):
         if key == "matrix_instr_nonkdim":
             return _compat.supports_amd_cdna_tunables()
         if key == "grf_mode":
-            return _compat.supports_xpu_grf_mode()
+            return _compat.is_xpu()
         if key == "xcd_remap":
             # Accepted on all AMD CDNA.  On single-XCD devices it normalizes to a
             # no-op (ConfigSpec.normalize) and is excluded from the search space
@@ -145,20 +145,16 @@ class TritonBackend(Backend):
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         from ..._compat import get_mtia_tunable_fragments
         from ..._compat import is_hip
+        from ..._compat import is_xpu
         from ..._compat import supports_amd_cdna_tunables
         from ..._compat import supports_mtia_tunables
-        from ..._compat import supports_xpu_grf_mode
         from ...autotuner.config_fragment import EnumFragment
         from ...runtime.triton.launcher import get_xpu_grf_modes
 
-        if (
-            not is_hip()
-            and not supports_mtia_tunables()
-            and not supports_xpu_grf_mode()
-        ):
+        if not is_hip() and not supports_mtia_tunables() and not is_xpu():
             return {}
         fragments: dict[str, ConfigSpecFragment] = {}
-        if supports_xpu_grf_mode():
+        if is_xpu():
             # 0 leaves the GRF size to Triton, which builds at the default size
             # and rebuilds at a larger one when the kernel spills.
             fragments["grf_mode"] = EnumFragment(
