@@ -61,7 +61,7 @@ class TestXPUGRFMode(TestCase):
 
     def test_unsupported_without_xpu(self) -> None:
         with (
-            patch("helion._compat.supports_xpu_grf_mode", return_value=False),
+            patch("helion._compat.is_xpu", return_value=False),
             patch("helion._compat.is_hip", return_value=False),
         ):
             env = CompileEnvironment(DEVICE, helion.Settings(backend="triton"))
