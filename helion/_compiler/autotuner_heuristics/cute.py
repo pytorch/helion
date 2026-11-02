@@ -68,6 +68,7 @@ from ..cute.loop_nesting import tile_loop_paths
 from ..cute.matmul_utils import cute_matmul_root_placements
 from ..cute.mma_support import cute_fp32_dot_uses_tf32
 from ..cute.packed_matmul import contraction_axis_for_fact
+from ..cute.pdl_release import CUTE_PDL_SPREAD_KEY
 from ..cute.register_tile_admission import register_tile_reduction_levels
 from ..cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
@@ -3236,8 +3237,8 @@ class CuteSiblingRowHeuristic(AutotunerHeuristic):
 
 
 def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
-    """``cute_pdl`` (released at entry) for the nested-row seeds where
-    ``griddepcontrol`` exists.
+    """``cute_pdl`` (released at entry, spread to one wave's density) for the
+    nested-row seeds where ``griddepcontrol`` exists.
 
     These kernels run a few microseconds per call in back-to-back streams;
     launching each as a programmatic dependent of the previous kernel overlaps
@@ -3253,6 +3254,10 @@ def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
     of a kernel that never releases starts later than a plain stream edge
     would have launched it (mamba2_ssd s0 forward, 64-call graph: 9.92 us
     per call unreleased, 9.50 without the knob, 9.37 released at entry).
+    ``cute_pdl_spread`` pads the kernel's shared memory to one wave's density
+    so its early launch never packs its CTAs onto the SMs its primary left
+    idle (vanilla linear attention forward: 7.45 us per call packed, 4.1
+    spread); a tie in isolation, it is searched and preferred among ties.
     """
     capability = spec.target_device_capability
     if (
@@ -3260,7 +3265,7 @@ def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
         and capability is not None
         and capability >= (9, 0)
     ):
-        return {"cute_pdl": True}
+        return {"cute_pdl": True, CUTE_PDL_SPREAD_KEY: True}
     return {}
 
 
@@ -4128,6 +4133,7 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
                         # The launch overlaps the output's zero fill (and the
                         # default release lets the next kernel launch early).
                         "cute_pdl": True,
+                        CUTE_PDL_SPREAD_KEY: True,
                     }
                 )
             )

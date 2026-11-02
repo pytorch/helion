@@ -4,13 +4,16 @@ CPU-only (fake CUDA target, the ``test_cute_tcgen05_fixed_chain`` binders and
 fixture): the knob launches the kernel as a programmatic dependent of the
 previous kernel in the stream, waits on that kernel at the top of the body
 (every warp, ahead of every global read of the prologue, the root body and
-the pipelines, on every kernel shape) and releases the dependents once the
-MMA warp has issued its last MMA.
+the pipelines, on every kernel shape), releases the dependents right after
+each of those waits (``cute_pdl_release`` ``entry``, the ``auto`` resolution
+of a one-wave launch) and again once the MMA warp has issued its last MMA
+(the family's own release, the only one under ``exit`` / ``none``).
 """
 
 from __future__ import annotations
 
 import ast
+import re
 from unittest.mock import patch
 
 import pytest
@@ -45,6 +48,20 @@ def _body_statements(body: str) -> list[str]:
 
 def _assert_no_entry_wait(body: str) -> None:
     assert _body_statements(body)[0].strip() != WAIT
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _assert_release_follows_every_wait(body: str) -> None:
+    """``entry`` on the tcgen05 kernels: a release right after each wait of
+    the body, in the wait's own block."""
+    lines = body.splitlines()
+    for index, line in enumerate(lines):
+        if WAIT in line:
+            assert RELEASE in lines[index + 1], lines[index : index + 2]
+            assert _indent(lines[index + 1]) == _indent(line)
 
 
 def _assert_entry_wait(body: str) -> None:
@@ -160,25 +177,34 @@ def test_flat_kernel_waits_before_the_first_load_and_releases_after_the_mma() ->
     source = _source(bound, _flat_config(cute_pdl=True))
     body = _kernel_body(source)
     assert "'use_pdl': True" in source
-    assert body.count(WAIT) == 1 and body.count(RELEASE) == 1
+    assert body.count(WAIT) == 1 and body.count(RELEASE) == 2
     # Every warp passes the wait after the prologue (TMEM allocation,
     # barrier init, descriptor prefetch) and before the first TMA load; the
     # body has no global read ahead of it, so no entry wait is added.
     assert body.index("prefetch_descriptor(") < body.index(WAIT)
     assert body.index(WAIT) < body.index("cute.copy(tma_atom_a")
     _assert_no_entry_wait(body)
-    # The MMA warp releases the dependents right after committing its
-    # accumulator, ahead of the epilogue's CTA-wide syncs.
-    commit = body.index("producer_commit(tcgen05_acc_producer_state)")
-    assert commit < body.index(RELEASE) < body.index("tcgen05_kernel_desc")
     lines = body.splitlines()
-    release_line = next(i for i, line in enumerate(lines) if RELEASE in line)
-    assert lines[release_line - 1].strip() == "if tcgen05_exec_active:"
+    wait_line = next(i for i, line in enumerate(lines) if WAIT in line)
+    releases = [i for i, line in enumerate(lines) if RELEASE in line]
+    # The one-wave grid (16 CTAs) resolves ``auto`` to ``entry``: the
+    # dependents are released right after the wait, in the same block, so
+    # the next kernel's launch overlaps this whole kernel.
+    assert releases[0] == wait_line + 1
+    assert _indent(lines[releases[0]]) == _indent(lines[wait_line])
+    # The MMA warp releases again right after committing its accumulator,
+    # ahead of the epilogue's CTA-wide syncs (a no-op after the first).
+    commit = body.index("producer_commit(tcgen05_acc_producer_state)")
+    assert commit < body.index(RELEASE, body.index(RELEASE) + 1)
+    assert body.index(RELEASE, body.index(RELEASE) + 1) < body.index(
+        "tcgen05_kernel_desc"
+    )
+    assert lines[releases[1] - 1].strip() == "if tcgen05_exec_active:"
     # The knob-off body is otherwise unchanged.
     stripped = [
         line
         for index, line in enumerate(lines)
-        if "griddepcontrol" not in line and index != release_line - 1
+        if "griddepcontrol" not in line and index != releases[1] - 1
     ]
     assert "\n".join(stripped) == _kernel_body(plain)
 
@@ -188,7 +214,7 @@ def test_persistent_kernel_waits_in_the_tma_and_epilogue_roles() -> None:
     source = _source(bound, _persistent_config(cute_pdl=True))
     body = _kernel_body(source)
     assert "'use_pdl': True" in source
-    assert body.count(WAIT) == 2 and body.count(RELEASE) == 1
+    assert body.count(WAIT) == 2 and body.count(RELEASE) == 3
     lines = body.splitlines()
     waits = [i for i, line in enumerate(lines) if WAIT in line]
     roles = [lines[i - 1].strip() for i in waits]
@@ -201,8 +227,11 @@ def test_persistent_kernel_waits_in_the_tma_and_epilogue_roles() -> None:
     ]
     assert waits[0] < body.index("cute.copy(tma_atom_a")
     _assert_no_entry_wait(body)
-    # The release follows the MMA role's tile loop, in the teardown.
-    assert body.index(RELEASE) > body.index("tcgen05_role_local_2_tile_sched")
+    # The persistent launch is one wave: each role releases the dependents
+    # right after its wait, and the MMA role once more after its tile loop,
+    # in the teardown.
+    _assert_release_follows_every_wait(body)
+    assert body.rindex(RELEASE) > body.index("tcgen05_role_local_2_tile_sched")
     plain = _kernel_body(_source(bound, _persistent_config(cute_pdl=False)))
     assert "griddepcontrol" not in plain
 
@@ -227,17 +256,15 @@ def test_persistent_kernel_with_a_scheduler_warp_waits_at_entry() -> None:
     _assert_entry_wait(body)
 
 
-def test_the_entry_wait_path_leaves_the_release_to_the_mma_warp() -> None:
-    # The generic ``cute_pdl`` path owns a release placement
-    # (``cute_pdl_release``); a tcgen05 kernel that gets the generic entry
-    # wait must not also get that release: its MMA warp releases the
-    # dependents after its last MMA, and an earlier one (``auto`` resolving
-    # to ``entry`` on this one-wave persistent grid, or an explicit
-    # placement) would make the dependents' CTAs resident during the GEMM,
-    # which the late placement exists to avoid.  Every placement renders
-    # the same kernel: one wait at the top, one release, the family's.
+def test_the_entry_wait_path_takes_the_release_placement() -> None:
+    # A tcgen05 kernel that gets the generic entry wait takes the release
+    # placement (``cute_pdl_release``) like every other kernel: ``auto``
+    # (this one-wave persistent grid), ``entry`` and ``last_wave`` (plain
+    # entry on one wave) release right after that wait, ahead of the
+    # family's release after the MMA warp's last MMA; ``exit`` and ``none``
+    # leave the family's release as the only trigger.
     bound = _bind_gemm((1024, 1024, 1024), torch.float16)
-    sources: list[str] = []
+    sources: dict[str, str] = {}
     for placement in (None, "auto", "entry", "exit", "none", "last_wave"):
         config = _persistent_config(
             cute_pdl=True,
@@ -253,21 +280,23 @@ def test_the_entry_wait_path_leaves_the_release_to_the_mma_warp() -> None:
         body = _kernel_body(source)
         assert body.count(WAIT) == 1
         _assert_entry_wait(body)
-        assert body.count(RELEASE) == 1
         statements = _body_statements(body)
         wait_index = next(i for i, line in enumerate(statements) if WAIT in line)
-        release_index = next(i for i, line in enumerate(statements) if RELEASE in line)
-        # Not the generic entry release (the statement right after the wait)
-        # nor the generic exit release (a top-level last statement): the
-        # family's, under the MMA warp's role predicate.
-        assert release_index != wait_index + 1
-        release_line = statements[release_index]
-        assert len(release_line) - len(release_line.lstrip()) > len(
-            statements[wait_index]
-        ) - len(statements[wait_index].lstrip())
-        assert statements[release_index - 1].strip().startswith("if ")
-        sources.append(source)
-    assert len(set(sources)) == 1
+        releases = [i for i, line in enumerate(statements) if RELEASE in line]
+        # The family's release: under the MMA warp's role predicate, never a
+        # top-level last statement (the generic ``exit``).
+        family = releases[-1]
+        assert _indent(statements[family]) > _indent(statements[wait_index])
+        assert statements[family - 1].strip().startswith("if ")
+        assert family != len(statements) - 1
+        if placement in ("exit", "none"):
+            assert releases == [family]
+        else:
+            assert releases == [wait_index + 1, family]
+        sources[placement or "default"] = source
+    assert sources["default"] == sources["auto"] == sources["entry"]
+    assert sources["auto"] == sources["last_wave"]
+    assert sources["exit"] == sources["none"] != sources["auto"]
 
 
 def test_two_cta_kernels_add_the_launch_attribute_and_the_epilogue_wait() -> None:
@@ -300,11 +329,13 @@ def test_two_cta_kernels_add_the_launch_attribute_and_the_epilogue_wait() -> Non
     assert "'use_pdl': True" in source
     body = _kernel_body(source)
     # the TMA role's own wait plus the epilogue role's: every global read
-    # sits behind a wait on its warp, so no entry wait is added
-    assert body.count(WAIT) == 2 and body.count(RELEASE) == 1
+    # sits behind a wait on its warp, so no entry wait is added; each wait
+    # is followed by the release (one wave of CTA pairs)
+    assert body.count(WAIT) == 2 and body.count(RELEASE) == 3
     _assert_no_entry_wait(body)
-    assert [line for line in body.splitlines() if WAIT not in line] == [
-        line for line in plain_body.splitlines() if WAIT not in line
+    _assert_release_follows_every_wait(body)
+    assert [line for line in body.splitlines() if "griddepcontrol" not in line] == [
+        line for line in plain_body.splitlines() if "griddepcontrol" not in line
     ]
 
 
@@ -343,8 +374,9 @@ def test_persistent_kernel_binds_device_scalars_per_tile_and_waits_in_the_roles(
     source = _source(bound, _persistent_config(cute_pdl=True))
     body = _kernel_body(source)
     assert "'use_pdl': True" in source
-    assert body.count(WAIT) == 2 and body.count(RELEASE) == 1
+    assert body.count(WAIT) == 2 and body.count(RELEASE) == 3
     _assert_no_entry_wait(body)
+    _assert_release_follows_every_wait(body)
     lines = body.splitlines()
     waits = [i for i, line in enumerate(lines) if WAIT in line]
     assert [lines[i - 1].strip() for i in waits] == [
@@ -465,3 +497,40 @@ for k in cutlass.range(4):
     cute.copy(tma_atom_a, tma_gA[None, k], tma_sA[None, 0], tma_bar_ptr=bar)
     cute.arch.griddepcontrol_wait()
 """)
+
+
+def test_a_multi_wave_flat_grid_releases_from_its_last_wave() -> None:
+    # ``auto`` past one wave: the flat kernel's 64x16 tiles of a 4096x4096
+    # output are 16384 CTAs, one per SM at a time (the operand ring fills
+    # the shared memory), so the release after the wait is guarded to the
+    # CTAs of the last wave (``last_wave``); an explicit ``entry`` releases
+    # from every CTA.
+    bound = _bind_gemm((4096, 4096, 256), torch.float16)
+    source = _source(bound, _flat_config(cute_pdl=True))
+    body = _kernel_body(source)
+    assert body.count(WAIT) == 1 and body.count(RELEASE) == 2
+    _assert_no_entry_wait(body)
+    with bound.env:
+        num_sm = bound.config_spec.num_sm
+    assert num_sm > 1
+    lines = body.splitlines()
+    wait_line = next(i for i, line in enumerate(lines) if WAIT in line)
+    # the CTA index is the body's first statement, the guard follows the wait
+    assert _body_statements(body)[0].strip().startswith("pdl_cta = ")
+    guard = re.fullmatch(r"if pdl_cta >= (\d+):", lines[wait_line + 1].strip())
+    assert guard is not None, lines[wait_line + 1]
+    assert RELEASE in lines[wait_line + 2]
+    assert _indent(lines[wait_line + 1]) == _indent(lines[wait_line])
+    # the capacity is one CTA per SM: the grid minus the SM count
+    grid = int(guard.group(1)) + num_sm
+    assert grid > num_sm and grid % 64 == 0
+    entry = _kernel_body(
+        _source(bound, _flat_config(cute_pdl=True, cute_pdl_release="entry"))
+    )
+    assert "pdl_cta" not in entry
+    _assert_release_follows_every_wait(entry)
+    # ``cute_min_blocks_per_mp`` is the occupancy the config asked for
+    paired = _kernel_body(
+        _source(bound, _flat_config(cute_pdl=True, cute_min_blocks_per_mp=2))
+    )
+    assert f"if pdl_cta >= {grid - 2 * num_sm}:" in paired

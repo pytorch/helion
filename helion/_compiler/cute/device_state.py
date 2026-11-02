@@ -1011,6 +1011,13 @@ class CuteDeviceFunctionState:
         # The fused body may run one CTA per (grid index, lane): the launch
         # grid is the PID strategy's grid times this factor.
         self.launch_grid_multiplier: int = 1
+        # The CTA count of a launch the launcher sizes from a wrapper plan
+        # instead of the program-id grid (the register-MMA flash backward
+        # runs one CTA per ``kv_rows`` KV rows: ``total_tiles`` of its
+        # plan); None when the program-id grid is the launch grid.  The
+        # dependent-launch release rule (``_implicit_pdl_release``) counts
+        # the launch's CTAs from it.
+        self.launch_ctas: int | None = None
         # ``tcgen05_split_k``: the flat grid carries ``divisor`` CTAs per
         # output tile, so the program-id decode reads ``block_idx // divisor``
         # and the launch grid is multiplied by it (``launch_grid_multiplier``).

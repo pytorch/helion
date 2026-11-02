@@ -57,6 +57,13 @@ _GUARD = _module(
     + "    else:\n        pass\n"
     + _BODY
 )
+_SPREAD = _module(
+    _WAIT
+    + _RELEASE
+    + "    pdl_spread_pad = cute.arch.alloc_smem(cutlass.Uint8, 90113, alignment=128)\n"
+    + "    _helion_pdl_spread_keep(pdl_spread_pad.toint())\n"
+    + _BODY
+)
 _NONE = _module(_WAIT + _BODY)
 _EXIT = _module(_WAIT + _BODY + _RELEASE)
 _FAMILY = _module(_WAIT + _BODY + "    if warp_idx == 0:\n    " + _RELEASE)
@@ -98,23 +105,27 @@ def test_the_generic_early_release_is_read_off_the_rendered_module() -> None:
 
 
 def test_cute_prefers_a_kernel_that_renders_the_generic_release() -> None:
+    # The generic early release ranks ahead of none; the release with the
+    # pad of ``cute_pdl_spread`` (an early launch of the kernel then never
+    # packs its CTAs onto the SMs its primary left idle) ranks ahead of both.
     on = helion.Config(block_sizes=[64], cute_pdl=True)
     for source, rank in (
-        (_ENTRY, 0),
-        (_GUARD, 0),
-        (_NONE, 1),
-        (_EXIT, 1),
-        (_FAMILY, 1),
+        (_SPREAD, 0),
+        (_ENTRY, 1),
+        (_GUARD, 1),
+        (_NONE, 2),
+        (_EXIT, 2),
+        (_FAMILY, 2),
     ):
         assert CuteBackend.finalist_preference(on, lambda s=source: s) == rank, source
     # Without the knob the config ranks last and the module is never rendered.
     never = Mock(side_effect=AssertionError("rendered"))
-    assert CuteBackend.finalist_preference(helion.Config(block_sizes=[64]), never) == 1
+    assert CuteBackend.finalist_preference(helion.Config(block_sizes=[64]), never) == 2
     assert (
         CuteBackend.finalist_preference(
             helion.Config(block_sizes=[64], cute_pdl=False), never
         )
-        == 1
+        == 2
     )
 
 
@@ -186,6 +197,18 @@ def test_a_preferred_finalist_within_tolerance_wins_the_tie() -> None:
             )
             is faster_on
         )
+        # A finalist that also spreads its CTAs ranks ahead of the releasing
+        # ones, so it wins the band although it is not the fastest of them.
+        spread_on = _member(
+            3.650, _SPREAD, block_sizes=[4], cute_pdl=True, cute_pdl_spread=True
+        )
+        search = _search("cute", [*live, faster_on, spread_on])
+        assert (
+            search._prefer_backend_preference_within_tolerance(
+                fastest, [*live, faster_on, spread_on]
+            )
+            is spread_on
+        )
 
 
 def test_a_family_that_owns_its_release_stays_a_plain_tie() -> None:
@@ -227,7 +250,8 @@ def test_the_tolerance_is_an_environment_override(raw: str, expected: float) -> 
 @pytest.mark.usefixtures("_cpu_only")
 def test_rendered_kernels_rank_as_their_lowering() -> None:
     # Real renders: a column reduction on the generic path releases at entry
-    # (one wave) and ranks first; a tcgen05 GEMM on the entry-wait path gets
+    # (one wave) and ranks ahead of the families, first with the spread pad;
+    # a tcgen05 GEMM on the entry-wait path gets
     # the generic wait but its MMA warp owns the release, so its configs
     # rank last whatever placement they carry: a pair of them is a tie.
     with _mock_cuda_unavailable():
@@ -239,7 +263,13 @@ def test_rendered_kernels_rank_as_their_lowering() -> None:
         )
         assert (
             CuteBackend.finalist_preference(generic, lambda: bound.to_code(generic))
-            == 0
+            == 1
+        )
+        spread = bound.config_spec.normalized_config(
+            helion.Config(**_COLUMN_SUM, cute_pdl=True, cute_pdl_spread=True)
+        )
+        assert (
+            CuteBackend.finalist_preference(spread, lambda: bound.to_code(spread)) == 0
         )
     gemm = _bind_gemm((1024, 1024, 1024), torch.float16)
     sources = {}
@@ -258,7 +288,7 @@ def test_rendered_kernels_rank_as_their_lowering() -> None:
         assert "_helion_cute_use_pdl = True" in sources[placement]
         assert (
             CuteBackend.finalist_preference(normalized, lambda p=placement: sources[p])
-            == 1
+            == 2
         )
     fastest = SimpleNamespace(
         perf=34.94,

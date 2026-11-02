@@ -79,6 +79,7 @@ class Config(Mapping[str, object]):
         cute_lane_unroll: int | None = None,
         cute_pdl: bool | None = None,
         cute_pdl_release: CutePdlReleaseLiteral | None = None,
+        cute_pdl_spread: bool | None = None,
         cute_warp_aggregated_atomics: bool | None = None,
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
@@ -193,9 +194,24 @@ class Config(Mapping[str, object]):
                 or when the grid is sized at runtime; the search leaves the
                 placement at ``auto``. Every placement reads the same data: a
                 dependent's own wait blocks until this grid has completed and
-                flushed. Inert when ``cute_pdl`` is off and on the
-                tcgen05 GEMM families, whose lowering places its own release
-                after the last MMA.
+                flushed. On the tcgen05 GEMM kernels, whose lowering waits in
+                its warp roles and releases after the last MMA, ``entry`` and
+                ``last_wave`` add the release right after each of those waits
+                and ``exit`` / ``none`` keep the late release alone. Inert when
+                ``cute_pdl`` is off.
+            cute_pdl_spread: Pad a ``cute_pdl`` kernel's shared memory so that
+                at most ``ceil(CTAs / SMs)`` of its CTAs fit on one SM, its
+                density on an idle device. A programmatic dependent launches
+                while its primary runs and the hardware dispatches its CTAs
+                onto whatever SMs have room; when the primary's CTAs leave none
+                beside them, a small dependent's CTAs all land on the few SMs
+                the primary left idle and run packed there once it completes.
+                With the pad the CTAs beyond the idle SMs wait for the
+                primary's to retire and take their SMs one each. Off by
+                default; inert when ``cute_pdl`` is off, when the kernel's own
+                allocation already holds its CTAs to that density, when the
+                grid is sized at runtime, and on the families that own their
+                dependent launch.
             cute_warp_aggregated_atomics: Combine relaxed Int32 zero/one ticket
                 reservations for equal addresses within each active warp. Each
                 lane retains its own valid fetch-add return value. Off by default.
@@ -297,6 +313,7 @@ class Config(Mapping[str, object]):
             "cute_lane_unroll": cute_lane_unroll,
             "cute_pdl": cute_pdl,
             "cute_pdl_release": cute_pdl_release,
+            "cute_pdl_spread": cute_pdl_spread,
             "cute_warp_aggregated_atomics": cute_warp_aggregated_atomics,
             "cute_packet_prefetch": cute_packet_prefetch,
             "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,

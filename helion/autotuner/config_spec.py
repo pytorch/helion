@@ -182,6 +182,7 @@ from .._compiler.cute.cutedsl_compat import hinted_cp_async_available
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
 from .._compiler.cute.pdl_release import CUTE_PDL_RELEASE_CHOICES
 from .._compiler.cute.pdl_release import CUTE_PDL_RELEASE_DEFAULT
+from .._compiler.cute.pdl_release import CUTE_PDL_SPREAD_KEY
 from .._compiler.cute.radix_selection_config import ALGORITHM_KEY as RADIX_ALGORITHM_KEY
 from .._compiler.cute.radix_selection_config import ALGORITHMS as RADIX_ALGORITHMS
 from .._compiler.cute.radix_selection_config import BOOLEAN_KEYS as RADIX_BOOLEAN_KEYS
@@ -1098,6 +1099,7 @@ _CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
         "cute_simt_mma_layout",
         "cute_pdl",
         "cute_pdl_release",
+        "cute_pdl_spread",
         "cute_min_blocks_per_mp",
         "cute_tiles_per_block",
         "epilogue_subtile",
@@ -1255,6 +1257,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_lane_unroll",
         "cute_pdl",
         "cute_pdl_release",
+        "cute_pdl_spread",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
@@ -1411,6 +1414,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_lane_unroll",
         "cute_pdl",
         "cute_pdl_release",
+        "cute_pdl_spread",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
@@ -1591,6 +1595,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_lane_unroll",
         "cute_pdl",
         "cute_pdl_release",
+        "cute_pdl_spread",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         *BLOCK_SCALED_CONFIG_KEYS,
@@ -3338,7 +3343,10 @@ class ConfigSpec:
 
         The dense surface seeds its register-MMA row family on small grids
         (``cute_flash_bwd_family`` = "row_mma" over the default row knobs:
-        see ``cute_flash_bwd_row_mma``) for the same reason."""
+        see ``cute_flash_bwd_row_mma``) for the same reason, and, where the
+        search flips ``cute_pdl``, the same seed as a programmatic dependent
+        (the small-grid backward is one kernel of a chain whose launch the
+        knob overlaps with the preprocess kernel ahead of it)."""
         if not (self.backend_name == "cute" and self.cute_flash_bwd_search_enabled):
             return []
         row_facts = self._cute_flash_bwd_row_facts
@@ -3350,9 +3358,14 @@ class ConfigSpec:
             seed = self.default_config()
             seed.config[FLASH_BWD_FAMILY_KEY] = FLASH_BWD_ROW_FAMILY
             self.normalize(seed, _fix_invalid=True)
-            if seed.config.get(FLASH_BWD_FAMILY_KEY) == FLASH_BWD_ROW_FAMILY:
-                return [seed]
-            return []
+            if seed.config.get(FLASH_BWD_FAMILY_KEY) != FLASH_BWD_ROW_FAMILY:
+                return []
+            seeds = [seed]
+            if self.supports_config_key("cute_pdl") and self._cute_pdl_searched():
+                dependent = helion.Config.from_dict({**seed.config, "cute_pdl": True})
+                self.normalize(dependent, _fix_invalid=True)
+                seeds.append(dependent)
+            return seeds
         if not (self._cute_flash_bwd_flex and self._cute_flash_bwd_two_cta_allowed):
             return []
         # Two register splits: the cold autotunes of the 32K / 128K causal
@@ -6072,7 +6085,9 @@ class ConfigSpec:
         (``auto`` unless given: ``entry`` or ``none`` by the grid, resolved at
         codegen so a flat configuration, which always carries the value, and
         a dict without the key render alike) and only acts when ``cute_pdl``
-        is on.  With the knob off a non-default placement stays in the config
+        is on; ``cute_pdl_spread`` (a boolean) pads the kernel's shared
+        memory to one wave's density and rides on ``cute_pdl`` the same way.
+        With the knob off a non-default placement stays in the config
         (inert, like every other knob the kernel does not read) so a flat
         configuration survives the unflatten/flatten round trip the search
         relies on; the default placement is dropped there, so the default
@@ -6100,6 +6115,15 @@ class ConfigSpec:
             config.pop("cute_pdl_release", None)
         elif "cute_pdl_release" in config:
             config["cute_pdl_release"] = release
+        spread = config.get(CUTE_PDL_SPREAD_KEY, False)
+        if type(spread) is not bool:
+            if not fix_invalid:
+                raise InvalidConfig(f"{CUTE_PDL_SPREAD_KEY} must be a boolean")
+            spread = False
+        if not pdl and spread is False:
+            config.pop(CUTE_PDL_SPREAD_KEY, None)
+        elif CUTE_PDL_SPREAD_KEY in config:
+            config[CUTE_PDL_SPREAD_KEY] = spread
 
     def _normalize_cute_tiles_per_block(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -8488,6 +8512,63 @@ class ConfigSpec:
                     num_items=0,
                 )
 
+    def _cute_pdl_searched(self) -> bool:
+        """Whether the search flips ``cute_pdl``: ``griddepcontrol`` exists
+        on sm_90 and up."""
+        return (
+            self.target_device_capability is not None
+            and self.target_device_capability >= (9, 0)
+        )
+
+    def _cute_pdl_fields(
+        self, fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment]
+    ) -> None:
+        """Add the generic dependent-launch knobs: ``cute_pdl`` (a launch
+        attribute plus one wait ahead of the body's first global access,
+        searched where ``griddepcontrol`` exists, sm_90 and up) and
+        ``cute_pdl_release``.
+
+        Where a ``cute_pdl`` kernel releases its own dependents: ``auto``
+        (the default) resolves at codegen to ``entry`` while the launch grid
+        fits in one wave of resident CTAs and to ``last_wave`` past it,
+        ``entry`` right after the wait, so the dependents launch while this
+        kernel runs (their CTAs sit resident at their own wait), ``exit``
+        after the body's last statement, ``none`` leaves the implicit trigger
+        at grid completion, ``last_wave`` releases at entry in the last wave's
+        CTAs only (plain entry for a one-wave grid).  Inert when ``cute_pdl``
+        is off (the default value is then normalized away).  The search
+        leaves the placement at ``auto``: a kernel whose back-to-back calls
+        are separated by a plain launch (the zero fill of an output) cannot
+        observe its own placement in isolation, so a searched placement is a
+        coin flip there, while the kernel's dependent in the real call
+        sequence pays for a non-releasing pick (mamba2_ssd backward: dqkg
+        alone reads 3.66 us under every placement; the sequence reads 11.2 us
+        per call with dqkg at ``none`` and 10.3 at ``entry``).  The explicit
+        values stay valid for pins, seeds and users.
+        """
+        if not self.supports_config_key("cute_pdl"):
+            return
+        fields["cute_pdl"] = EnumFragment(
+            (False, True),
+            search_choices=(False, True) if self._cute_pdl_searched() else (False,),
+        )
+        fields["cute_pdl_release"] = EnumFragment(
+            CUTE_PDL_RELEASE_CHOICES,
+            search_choices=(CUTE_PDL_RELEASE_DEFAULT,),
+        )
+        # Pad the kernel's shared memory to one wave's density so an early
+        # launch cannot pack its CTAs onto the SMs its primary left idle
+        # (``pdl_release.spread_pad_bytes``).  Searched with the knob: the
+        # pad is a tie in the kernel's isolated timing (the dispatcher
+        # spreads a fresh grid the same way) and the final selection prefers
+        # it among ties (``CuteBackend.finalist_preference``), while a kernel
+        # the pad slows (less L1 behind a larger carveout) keeps the knob
+        # without it.
+        fields[CUTE_PDL_SPREAD_KEY] = EnumFragment(
+            (False, True),
+            search_choices=(False, True) if self._cute_pdl_searched() else (False,),
+        )
+
     def _flat_fields(
         self,
     ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
@@ -8789,6 +8870,15 @@ class ConfigSpec:
                         fields["cute_flash_bwd_exp2_emu"] = EnumFragment(
                             choices=(0, 8, 4)
                         )
+                # The fused backward bodies (the tcgen05 families and the
+                # register-MMA rows) take the generic dependent launch: the
+                # wait lands ahead of the body's first global access and the
+                # release follows the grid rule, as in any generic kernel.
+                # On the small grids the row family serves, the backward is
+                # one kernel of a chain (a preprocess kernel ahead of it), and
+                # the overlapped launch is worth a few hundred nanoseconds of
+                # a ~6 us kernel.
+                self._cute_pdl_fields(fields)
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
                 # Loop flattening is a real codegen choice on the SIMT path
@@ -9079,45 +9169,11 @@ class ConfigSpec:
                         if sink_seeded or unroll_seeded
                         else (1,),
                     )
-                if self.supports_config_key("cute_pdl"):
-                    # A launch attribute plus one wait, live on every kernel
-                    # of this branch (the tcgen05 and flash families, whose
-                    # own waits and plans leave it inert, build their fields
-                    # above) and searched where ``griddepcontrol`` exists,
-                    # sm_90 and up.
-                    pdl_searched = (
-                        self.target_device_capability is not None
-                        and self.target_device_capability >= (9, 0)
-                    )
-                    fields["cute_pdl"] = EnumFragment(
-                        (False, True),
-                        search_choices=(False, True) if pdl_searched else (False,),
-                    )
-                    # Where a ``cute_pdl`` kernel releases its own dependents:
-                    # ``auto`` (the default) resolves at codegen to ``entry``
-                    # while the launch grid fits in one wave of resident CTAs
-                    # and to ``last_wave`` past it, ``entry`` right after the
-                    # wait, so the dependents launch while this kernel runs
-                    # (their CTAs sit resident at their own wait), ``exit``
-                    # after the body's last statement, ``none`` leaves the
-                    # implicit trigger at grid completion, ``last_wave``
-                    # releases at entry in the last wave's CTAs only (plain
-                    # entry for a one-wave grid).  Inert when ``cute_pdl`` is
-                    # off (the default value is then normalized away).  The
-                    # search leaves the placement at ``auto``: a kernel whose
-                    # back-to-back calls are separated by a plain launch (the
-                    # zero fill of an output) cannot observe its own placement
-                    # in isolation, so a searched placement is a coin flip
-                    # there, while the kernel's dependent in the real call
-                    # sequence pays for a non-releasing pick (mamba2_ssd
-                    # backward: dqkg alone reads 3.66 us under every
-                    # placement; the sequence reads 11.2 us per call with dqkg
-                    # at ``none`` and 10.3 at ``entry``).  The explicit values
-                    # stay valid for pins, seeds and users.
-                    fields["cute_pdl_release"] = EnumFragment(
-                        CUTE_PDL_RELEASE_CHOICES,
-                        search_choices=(CUTE_PDL_RELEASE_DEFAULT,),
-                    )
+                # A launch attribute plus one wait, live on every kernel of
+                # this branch (the tcgen05 family, whose own waits and plans
+                # leave it inert, builds its fields above; the fused flash
+                # backward adds the same two fields to its own branch).
+                self._cute_pdl_fields(fields)
                 if self.cute_rng_packet_enabled:
                     fields["cute_rng_packet"] = BooleanFragment()
                 if self.cute_packet_prefetch_enabled:
