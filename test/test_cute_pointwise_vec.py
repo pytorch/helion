@@ -204,6 +204,35 @@ class TestCutePointwiseVec(TestCase):
         self.assertIn("_cute_store_u16_vec", code)
         torch.testing.assert_close(out, x + y)
 
+    def test_streaming_store_policy(self) -> None:
+        """``cute_store_policy="streaming"`` flushes the full 16-byte packets
+        with ``st.global.cs`` (evict-first) for bf16 and fp32; results match."""
+        x = torch.randn(256, 2048, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(256, 2048, device=DEVICE, dtype=torch.bfloat16)
+        code, out = code_and_output(
+            _add2d,
+            (x, y),
+            block_sizes=[1, 2048],
+            num_threads=[1, 256],
+            cute_vector_widths=[1, 8],
+            cute_store_policy="streaming",
+        )
+        self.assertIn("_cute_store_u16x8_streaming(", code)
+        self.assertNotIn("_cute_store_u16_vec(", code)
+        torch.testing.assert_close(out, x + y)
+        a = torch.randn(2**16, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(2**16, device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(
+            _mul1d,
+            (a, b),
+            block_sizes=[1024],
+            num_threads=[256],
+            cute_vector_widths=[4],
+            cute_store_policy="streaming",
+        )
+        self.assertIn("_cute_store_u32x4_streaming(", code)
+        torch.testing.assert_close(out, a * b)
+
     def test_flattened_grid_vec_fp32_u32_store(self) -> None:
         """1D (flattened) grid tile with V=4 fp32: Uint32 vec loads and the
         Uint32-carrier vec-store flush."""

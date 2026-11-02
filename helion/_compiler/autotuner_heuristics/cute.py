@@ -7922,6 +7922,17 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             plain_seed.pop("load_eviction_policies", None)
             with contextlib.suppress(Exception):
                 seeds.append(Config(**plain_seed))
+        # Streaming-store alternate: a pointwise output is written once, so
+        # evict-first packet stores (``cute_store_policy="streaming"``,
+        # ``st.global.cs``) keep a fresh output from displacing the inputs a
+        # back-to-back call re-reads (4096x4096 bf16 add with a new output
+        # per call: 16.5 -> 14.9 us on B200; the default store reads the
+        # same with one reused buffer).  Seed-only alternate.
+        if spec.supports_config_key("cute_store_policy"):
+            streaming_seed: dict[str, Any] = deepcopy(primary.config)
+            streaming_seed["cute_store_policy"] = "streaming"
+            with contextlib.suppress(Exception):
+                seeds.append(Config(**streaming_seed))
         # Resident-input alternate: l2_last only on the inputs that fit in L2
         # (a quarter each, half in total), default on the large streams.
         resident = _resident_input_eviction_policies(env)

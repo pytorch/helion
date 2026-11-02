@@ -2272,7 +2272,7 @@ class DeviceFunction:
 
                 kernel_body = lower_philox_packets(
                     kernel_body,
-                    seed_names=self.cute_state.explicit_rng_seed_names,
+                    seed_exprs=self.cute_state.explicit_rng_seed_exprs,
                     integer_names=set(constexpr_values),
                     new_name=self.unique_name,
                     vectorize_packet=lambda loop, read, known: (

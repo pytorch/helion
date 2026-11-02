@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import ast
 from copy import deepcopy
+import inspect
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -13,14 +13,8 @@ from test._cute_binding import _forbid_native_compile
 from test.test_cute_philox_stream import cpu_only  # noqa: F401
 
 import helion
-from helion._compiler.compile_environment import CompileEnvironment
-from helion._compiler.cute.philox_stream import stage_explicit_seed
-from helion._compiler.host_function import HostFunction
-from helion._compiler.variable_origin import NameOrigin
 from helion._testing import skipUnlessBackends
 import helion.language as hl
-from helion.language import _tracing_ops
-from helion.runtime.cute.rng import stage_explicit_seed as runtime_stage_seed
 
 pytestmark = pytest.mark.usefixtures("cpu_only", "no_native")
 
@@ -151,7 +145,11 @@ def test_actual_failed_random_kernel_codegen(
         **({"reduction_loops": reduction} if reduction is not None else {}),
     )
     source = bound.to_code(config)
-    assert "_cute_stage_explicit_seed(" in source
+    # The host-known seed is a plain ``cutlass.Int64`` kernel argument, not a
+    # device tensor filled before every launch.
+    seed_name = list(inspect.signature(function).parameters)[-1]
+    assert f"cutlass.Int64({seed_name})" in source
+    assert "_cute_stage_explicit_seed" not in source
     assert "shr.s64 counter, $2, 2" in source
     assert bound.settings.cute_rng_stream == "auto"
 
@@ -190,8 +188,9 @@ def test_actual_failed_mixed_rng_keeps_implicit_seed_slots():
         assert len(statements) == 1
         seed_assignments.append(statements)
     assert seed_assignments[0] == seed_assignments[1] == seed_assignments[2]
-    assert "_cute_stage_explicit_seed(" not in sources[0]
-    assert all("_cute_stage_explicit_seed(" in source for source in sources[1:])
+    assert "cutlass.Int64(explicit_seed)" not in sources[0]
+    assert all("cutlass.Int64(explicit_seed)" in source for source in sources[1:])
+    assert not any("_cute_stage_explicit_seed" in source for source in sources)
 
 
 def _no_tensor_input(device: torch.device, seed: int) -> torch.Tensor:
@@ -216,20 +215,14 @@ def _host_replay(source, function_name, args):
         for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == function_name
     )
-    launches, stages = [], []
+    launches = []
 
     def launch(*args, **kwargs):
         launches.append((args, kwargs))
 
-    def stage(seed, like):
-        value = runtime_stage_seed(seed, like)
-        stages.append((seed, like, value))
-        return value
-
     namespace = {
         "torch": torch,
         "_default_cute_launcher": launch,
-        "_cute_stage_explicit_seed": stage,
         **{
             node.name: object()
             for node in tree.body
@@ -241,14 +234,15 @@ def _host_replay(source, function_name, args):
         namespace,
     )
     outputs = [namespace[function_name](*args) for _ in range(2)]
-    assert len(launches) == len(stages) == 2
+    assert len(launches) == 2
     assert outputs[0].data_ptr() != outputs[1].data_ptr()
-    assert stages[0][2].data_ptr() != stages[1][2].data_ptr()
-    for output, (seed, like, value) in zip(outputs, stages, strict=True):
-        assert like is (args[0]["values"][0] if isinstance(args[0], dict) else output)
-        assert value.device == output.device
-        assert value.shape == (1,) and value.dtype == torch.int64
-        assert value.item() == seed == args[-1]
+    # The seed reaches every launch as a scalar argument: no device staging.
+    for launch_args, _kwargs in launches:
+        assert [value for value in launch_args if value is args[-1]] == [args[-1]]
+        assert not any(
+            isinstance(value, torch.Tensor) and value.dtype == torch.int64
+            for value in launch_args
+        )
 
 
 @pytest.mark.parametrize("nested", (False, True))
@@ -265,36 +259,9 @@ def test_no_input_and_nested_shape_only_input_host_lifetimes(nested, seed):
         args
     )
     source = bound.to_code(helion.Config(block_sizes=[128]))
-    witness = "x" if nested else "out"
-    assert f"_cute_stage_explicit_seed(seed, {witness})" in source
+    assert "cutlass.Int64(seed)" in source
+    assert "_cute_stage_explicit_seed" not in source
     _host_replay(source, function.__name__, args)
-
-
-@pytest.mark.parametrize(
-    "target,device", ((torch.neg, "cpu"), (_tracing_ops._host_tensor, "meta"))
-)
-def test_fallback_does_not_choose_device_values_or_unrelated_host_locals(
-    target, device
-):
-    graph = torch.fx.Graph()
-    node = graph.call_function(target, ("other",))
-    node.meta["val"] = torch.empty(1, device=device)
-    rng = graph.call_function(torch.neg, (1,))
-    state = SimpleNamespace(device_function=SimpleNamespace(arguments=[]), fx_node=rng)
-    host = SimpleNamespace(
-        literal_expr=lambda value: str(value),
-        tensor_to_origin={torch.empty(1): NameOrigin("unrelated_later_allocation")},
-    )
-    with (
-        patch.object(
-            CompileEnvironment,
-            "current",
-            return_value=SimpleNamespace(device=torch.device("cpu")),
-        ),
-        patch.object(HostFunction, "current", return_value=host),
-        pytest.raises(helion.exc.BackendUnsupported, match="tensor input device"),
-    ):
-        stage_explicit_seed(state, 123)
 
 
 def _no_device_argument(seed: int) -> torch.Tensor:

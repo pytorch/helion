@@ -22,7 +22,7 @@ LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 CuteAsyncLoadCacheLiteral = Literal["cg", "ca"]
 CuteAsyncStorePolicyLiteral = Literal["default", "l2_evict_last"]
-CuteStorePolicyLiteral = Literal["default", "l2_evict_last"]
+CuteStorePolicyLiteral = Literal["default", "streaming", "l2_evict_last"]
 CuteExactDivFormLiteral = Literal["redo", "plain"]
 CuteAffineScanScheduleLiteral = Literal[
     "ordinary",
@@ -125,7 +125,8 @@ class Config(Mapping[str, object]):
             load_cache_modifiers: Cache modifiers for load operations ("", ".cg").
             store_cache_modifiers: Cache modifiers for store operations ("", ".cs", ".wt").
             cute_store_policy: Cache policy for proven full aligned 16-byte CuTe
-                global store packets ("default" or "l2_evict_last").
+                global store packets ("default", "streaming" = evict-first
+                ``st.global.cs`` for outputs written once, or "l2_evict_last").
             cute_async_load_stages: Shared-memory ring stages for eligible CuTe
                 in-place 16-byte state loads. Zero disables the transformation.
             cute_async_load_lookahead: Async-copy groups kept ahead of compute.

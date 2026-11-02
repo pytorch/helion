@@ -743,7 +743,7 @@ class CuteDeviceFunctionState:
         # launch of an ``hl.barrier()`` kernel.  The launcher rejects a final
         # block shape that differs from them on any axis.
         self.multi_phase_lane_reduce_layouts: list[tuple[str, dict[int, int]]] = []
-        self.explicit_rng_seed_names: set[str] = set()
+        self.explicit_rng_seed_exprs: set[str] = set()
         self.uniform_comparison_marker: str | None = None
         self.signed_byte_packets: dict[Node, SignedBytePacket] = {}
         # SIMT reduction-kernel thread-block cluster width (from the
