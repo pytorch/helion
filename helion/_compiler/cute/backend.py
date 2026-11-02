@@ -2244,6 +2244,10 @@ class CuteBackend(Backend):
             or key == "cute_packet_prefetch"
             or key == "cute_vloop_sink"
             or key == "cute_lane_unroll"
+            or key == "cute_dot_fragment_mma"
+            or key == "cute_dot_ring_mma"
+            or key == "cute_dot_ring_stages"
+            or key == "cute_dot_ring_split"
             or key == "cute_pdl"
             or key == "cute_pdl_release"
             or key == "cute_pdl_spread"
@@ -2642,6 +2646,16 @@ class CuteBackend(Backend):
                 "from helion._compiler.cute.epilogue_helpers import "
                 "sigmoid_approx_ftz_f32 as _cute_sigmoid_approx_ftz_f32"
             ),
+            "_cute_mma_f16": "from helion._compiler.cute._flash_row_mma_runtime import mma_f16 as _cute_mma_f16",
+            "_cute_mma_bf16": "from helion._compiler.cute._flash_row_mma_runtime import mma_bf16 as _cute_mma_bf16",
+            "_cute_ring_cp_async_16": "from helion._compiler.cute._flash_row_mma_runtime import cp_async_16 as _cute_ring_cp_async_16",
+            "_cute_ring_cp_async_16_zfill": "from helion._compiler.cute._mma_dag_runtime import cp_async_16_zfill as _cute_ring_cp_async_16_zfill",
+            "_cute_ring_ldmatrix_x4": "from helion._compiler.cute._flash_row_mma_runtime import ldmatrix_x4 as _cute_ring_ldmatrix_x4",
+            "_cute_ring_lds_b32": "from helion._compiler.cute._mma_dag_runtime import lds_b32 as _cute_ring_lds_b32",
+            "_cute_ring_lds_f32": "from helion._compiler.cute._flash_row_mma_runtime import lds_f32 as _cute_ring_lds_f32",
+            "_cute_ring_sts_f32": "from helion._compiler.cute._flash_row_mma_runtime import sts_f32 as _cute_ring_sts_f32",
+            "_cute_lds_v4_b32": "from helion._compiler.cute._warp_mma_runtime import lds_v4_b32 as _cute_lds_v4_b32",
+            "_cute_sts_v4_b32": "from helion._compiler.cute._warp_mma_runtime import sts_v4_b32 as _cute_sts_v4_b32",
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
             "_cute_grouped_reduce_shared_two_stage_fragment": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage_fragment",

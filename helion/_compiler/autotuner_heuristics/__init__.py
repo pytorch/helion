@@ -162,6 +162,8 @@ from .cute_fragment_warp_scan import CuteFragmentWarpScanHeuristic
 from .cute_fragment_warp_scan import register_fragment_warp_scan_coverage
 from .cute_fragment_warp_scan import register_gather_warp_scan_coverage
 from .cute_full_chunk_row import CuteFullChunkRowHeuristic
+from .cute_gemv_fragment_mma import CuteGemvFragmentMmaHeuristic
+from .cute_gemv_ring_mma import CuteGemvRingMmaHeuristic
 from .cute_grouped_rna import CuteGroupedRnaHeuristic
 from .cute_grouped_rna import interleave_grouped_rna_seeds
 from .cute_host_paired_sum import CuteHostPairedSumHeuristic
@@ -267,6 +269,8 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTileVecWarpReduceHeuristic,
         CuteTileVecWarpPerRowHeuristic,
         CuteTilePackWarpPerRowHeuristic,
+        CuteGemvFragmentMmaHeuristic,
+        CuteGemvRingMmaHeuristic,
         CuteColumnReductionHeuristic,
         CuteSiblingRowHeuristic,
         CuteNestedRowHeuristic,

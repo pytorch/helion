@@ -31,7 +31,11 @@ from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
 from .cute.cute_reshape import run_deferred_rebound_checks
 from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
+from .cute.fragment_mma_dot import FragmentMmaNotApplied
+from .cute.fragment_mma_dot import fragment_mma_off_config
 from .cute.register_tile_admission import RegisterTileUnsupported
+from .cute.ring_mma_dot import RingMmaNotApplied
+from .cute.ring_mma_dot import ring_mma_off_config
 from .cute.thread_budget import thread_idx_axis
 from .cute.unroll_lane_loads import LaneUnrollNotApplied
 from .cute.unroll_lane_loads import lane_unroll_off_config
@@ -2599,6 +2603,17 @@ def generate_ast(
                     # the caller rebuilds them for the knob-off run.
                     raise
                 config = vloop_sink_off_config(config)
+            except FragmentMmaNotApplied:
+                # The fragment rewrite is a late AST pass like the unroll: the
+                # knob-off run reuses the caller's graphs.
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                config = fragment_mma_off_config(config)
+            except RingMmaNotApplied:
+                # The ring rewrite is a late AST pass like the fragment one.
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                config = ring_mma_off_config(config)
             except LaneUnrollNotApplied:
                 # The unroll is a late AST pass that touches no graph, so
                 # the knob-off run reuses the caller's graphs as they are.
