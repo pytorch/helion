@@ -10,14 +10,20 @@ from ...autotuner.compiler_coverage import (
 from ...autotuner.compiler_coverage import CoverageDependency as CoverageDependency
 from ...autotuner.compiler_coverage import CoverageWitness as CoverageWitness
 from ...runtime.config import Config
+from ..cute.grouped_row_union import AB_STAGES_KEY as GROUPED_ROW_UNION_AB_STAGES_KEY
 from ..cute.grouped_row_union import CONFIG_KEY as GROUPED_ROW_UNION_KEY
 from ..cute.grouped_row_union import LEGACY_SCHEDULE
 from ..cute.grouped_row_union import PAIRED_CLC_SCHEDULE
 from ..cute.grouped_row_union import RESIDENT_CTAS_KEY as GROUPED_RESIDENT_CTAS_KEY
+from ..cute.grouped_row_union import (
+    ROUND_SUBTILES_KEY as GROUPED_ROW_UNION_ROUND_SUBTILES_KEY,
+)
 from ..cute.grouped_row_union import SCHEDULE_KEY as GROUPED_ROW_UNION_SCHEDULE_KEY
 from ..cute.grouped_row_union import STARTUP_PREFILL_KEY
 from ..cute.grouped_row_union import TRANSPOSED_SCHEDULE
 from ..cute.split_k_cluster_config import FINALIZER_KEY
+from ..cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
 from .common import dedupe_configs
 from .cute import CuteAffineScanHeuristic
 from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
@@ -524,6 +530,41 @@ def compiler_seed_configs(
         carrier = grouped_row_union_cluster4_carrier(env, device_ir)
         if carrier is not None:
             configs.append(carrier)
+            # The measured best of the transposed profile on a one-wave
+            # grouped GEMM (2560x512x512 bf16, 8 groups): a 6-stage AB ring
+            # with the epilogue stored in rounds of two subtiles
+            # (``tcgen05_epilogue_rounds``), 3.25 -> 3.03 us per call against
+            # cuBLAS's 2.97 in the catalogue's back-to-back graph.
+            configs.append(
+                Config.from_dict(
+                    carrier.config
+                    | {
+                        GROUPED_ROW_UNION_AB_STAGES_KEY: 6,
+                        GROUPED_ROW_UNION_ROUND_SUBTILES_KEY: 2,
+                    }
+                )
+            )
+            # The same twin without the ``setmaxnreg`` pair: at one CTA per SM
+            # the six warps hold their registers from launch and the pair
+            # only lengthens the TMA-load warp's prologue (the critical path
+            # of the CTAs dispatched after the dependent-launch release;
+            # ``_tcgen05_prologue_runtime``).  Drops the consumer-register
+            # pin the knob forbids.
+            no_reallocation = {
+                key: value
+                for key, value in carrier.config.items()
+                if key != TCGEN05_CONSUMER_REGS_CONFIG_KEY
+            }
+            configs.append(
+                Config.from_dict(
+                    no_reallocation
+                    | {
+                        GROUPED_ROW_UNION_AB_STAGES_KEY: 6,
+                        GROUPED_ROW_UNION_ROUND_SUBTILES_KEY: 2,
+                        TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY: False,
+                    }
+                )
+            )
     if env.backend_name == "cute":
         cluster = cluster_carrier(env, device_ir)
         if cluster is not None:

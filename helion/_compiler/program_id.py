@@ -38,6 +38,8 @@ from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
 from .cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
+from .cute.tcgen05_prologue import inline_floordiv_nonneg_expr
+from .cute.tcgen05_prologue import inline_mod_nonneg_expr
 from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction
@@ -418,6 +420,8 @@ _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_K = 7
 _TCGEN05_GROUPED_SELECTED_MAILBOX_GLOBAL_M_START = 8
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .cute.cute_mma import _Tcgen05SchedPipelinePlan
     from .cute.device_state import CuteTcgen05MatmulPlan
     from .inductor_lowering import CodegenState
@@ -491,6 +495,11 @@ def _sum_pids(exprs: list[str]) -> str:
 @dataclasses.dataclass
 class ProgramIDs(abc.ABC):
     """Base class for all program ID strategies with common functionality."""
+
+    # The CuTe pid decomposition's division form: shifts / masks for the
+    # non-negative pids of the tcgen05 persistent kernels, ``//`` / ``%``
+    # elsewhere (see ``_decompose_pid_to_statements``).
+    _pid_division_by_shifts: ClassVar[bool] = False
 
     shared_pid_var: str | None = None
     pid_info: list[PIDInfo] = dataclasses.field(default_factory=list)
@@ -594,13 +603,42 @@ class ProgramIDs(abc.ABC):
             statement_from_string(f"{num_block} = {pid.num_pids_expr(is_device=True)}")
             for num_block, pid in zip(num_blocks, self.pid_info[:-1], strict=True)
         ]
+        # Pids are never negative: the tcgen05 persistent kernels divide them
+        # by a static power-of-two pid count with a shift / mask instead of
+        # the DSL's floor-division fix-up chains (``tcgen05_prologue``; the
+        # TMA-load warp's prologue is their critical path).  The other
+        # kernels keep the ``//`` / ``%`` forms their analyses evaluate (the
+        # proven-bounds prover, the gathered-MMA region proof).  Only a real
+        # device function has the environment and PID facts this needs
+        # (tests render the generic form through fakes).
+        nonneg_division = (
+            isinstance(state.device_function, DeviceFunction)
+            and self._pid_division_by_shifts
+            and CompileEnvironment.current().backend_name == "cute"
+        )
+        static_counts = [
+            pid.static_num_pids() if nonneg_division else None for pid in self.pid_info
+        ]
         for i, pid in enumerate(self.pid_info):
             expr = pid_var
             if i > 0:
                 divisor = " * ".join(num_blocks[:i])
-                expr = f"({expr}) // ({divisor})"
+                if nonneg_division:
+                    static_divisor: int | None = 1
+                    for count in static_counts[:i]:
+                        static_divisor = (
+                            None
+                            if static_divisor is None or count is None
+                            else static_divisor * count
+                        )
+                    expr = inline_floordiv_nonneg_expr(expr, divisor, static_divisor)
+                else:
+                    expr = f"({expr}) // ({divisor})"
             if i + 1 < len(self.pid_info):
-                expr = f"({expr}) % ({num_blocks[i]})"
+                if nonneg_division:
+                    expr = inline_mod_nonneg_expr(expr, num_blocks[i], static_counts[i])
+                else:
+                    expr = f"({expr}) % ({num_blocks[i]})"
             if pid.pack > 1:
                 # Thread sub-group ``pack_axis`` of this CTA owns its own tile.
                 index_dtype = CompileEnvironment.current().index_type()
@@ -1542,7 +1580,15 @@ class PersistentInterleavedProgramIDs(PersistentProgramIDs):
 class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     """tcgen05 persistent scheduler for blocked and interleaved PID orders."""
 
+    _pid_division_by_shifts: ClassVar[bool] = True
+
     _VALIDATED_TWO_CTA_MAX_K_TILES: ClassVar[int] = TCGEN05_TWO_CTA_MAX_K_TILES
+
+    # One-shot TMA-load role setup split out of the body
+    # (``_split_tcgen05_invariant_setup``): the role's prelude.  (A class
+    # default: the splitter's unit tests build the object without
+    # ``__init__``.)
+    _tcgen05_tma_role_prelude_stmts: Sequence[ast.stmt] = ()
 
     def __init__(self, *, is_blocked: bool) -> None:
         super().__init__(is_blocked=is_blocked)
@@ -2103,7 +2149,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
     def _tcgen05_logical_m_coord_expr(self, coord: str) -> str:
         if self._tcgen05_is_two_cta():
-            return f"({coord}) // cutlass.Int32({self._tcgen05_cluster_m()})"
+            cluster_m = self._tcgen05_cluster_m()
+            return inline_floordiv_nonneg_expr(
+                coord, f"cutlass.Int32({cluster_m})", cluster_m
+            )
         if self._tcgen05_uses_cluster_m2_one_cta_role_local_bridge():
             # The shared clustered scheduler publishes ``base_m + peer_rank``
             # into each CTA's SMEM slot. The guarded role-local bridge omits
@@ -2530,10 +2579,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         per_tile_names: set[str] = {self.virtual_pid_var}
         hoisted: list[ast.stmt] = []
         epi_role_prelude: list[ast.stmt] = []
+        tma_role_prelude: list[ast.stmt] = []
         wrapped: list[ast.stmt] = []
         for stmt in body:
             if cute_state.is_tcgen05_epi_role_prelude(stmt):
                 epi_role_prelude.append(stmt)
+                continue
+            if cute_state.is_tcgen05_tma_role_prelude(stmt):
+                tma_role_prelude.append(stmt)
                 continue
             reads, writes = _stmt_name_uses(stmt)
             is_per_tile = (
@@ -2546,6 +2599,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 wrapped.append(stmt)
             else:
                 hoisted.append(stmt)
+        self._tcgen05_tma_role_prelude_stmts = tma_role_prelude
         return hoisted, epi_role_prelude, wrapped
 
     def _collect_tcgen05_role_blocks(
@@ -3801,6 +3855,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         tma_load_role = (
             role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
             and not device_function.cute_state.tcgen05_pdl_wait_in_prefetch
+            # The role waits per tile, ahead of its first stage and after the
+            # tile's address math (``cute_mma``), not in its prelude.
+            and not device_function.cute_state.tcgen05_tma_role_wait_per_tile
         )
         # ``cute_pdl`` (``cute_mma``'s ``tcgen05_pdl_launch``): the TMA-load
         # warp waits before its first load and the epilogue warps before
@@ -3861,6 +3918,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # The hoisted TMA-load role joins the cluster rendezvous here,
             # after its scheduler setup and ahead of its first mbarrier / TMA
             # operation (``cute_mma`` ``tcgen05_hoist_row_union_tma_role``).
+            # Its once-per-CTA TMA partitions (the role prelude) run first:
+            # pure address math that overlaps the other warps' barrier inits
+            # and the peer CTAs' arrival instead of following the join.  The
+            # paired profile's startup prefill (TMA issues) is never part of
+            # this prelude: it must follow the rendezvous.
+            assert device_function.cute_state.ab_startup_prefill is None, (
+                "the AB startup prefill cannot be hoisted ahead of the cluster join"
+            )
+            prelude.extend(role_prelude_stmts or ())
+            role_prelude_stmts = None
             prelude.append(statement_from_string(prelude_wait))
         tile_counter_var, increment_tile_counter_per_tile = (
             self._finish_role_local_prelude(
@@ -7895,6 +7962,19 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     role_prelude_stmts = ast.parse(
                         cute_state.ab_startup_prefill.role_prelude()
                     ).body
+                tma_role_prelude_stmts = self._tcgen05_tma_role_prelude_stmts
+                if (
+                    predicate == self._tcgen05_tma_load_role_predicate()
+                    and tma_role_prelude_stmts
+                    and phase != "edge"
+                ):
+                    # The once-per-CTA TMA partitions (``cute_mma``), ahead of
+                    # the role's loop (and of its cluster join on the static
+                    # persistent builder).
+                    role_prelude_stmts = [
+                        *(role_prelude_stmts or []),
+                        *(_clone_stmt(stmt) for stmt in tma_role_prelude_stmts),
+                    ]
                 suffix = f"_{phase}" if phase else ""
                 # Cycle-94 merge: build the store warp's aux producer body for
                 # injection into the epilogue role-local while. Only on the epi

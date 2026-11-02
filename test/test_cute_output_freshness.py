@@ -193,7 +193,7 @@ def test_expand_preserves_tma_output_proof(
             tcgen05_ab_stages=2,
         )
     )
-    assert "PipelineTmaUmma.create" in source
+    assert "PipelineTmaUmma.create" in source or "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
 
 

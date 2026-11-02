@@ -255,9 +255,20 @@ def test_original_shapes_cover_output_ring_and_preserve_seed_prefix(
         previous_tail, seed_tail = previous_tail[:-2], seed_tail[:-2]
         assert all(seed not in suffix for seed in (*previous_tail, *seed_tail))
     if row_union is not None:
-        assert previous_tail[-1] == seed_tail[-1] == row_union
-        previous_tail, seed_tail = previous_tail[:-1], seed_tail[:-1]
-        assert row_union not in previous_tail and row_union not in seed_tail
+        # The transposed carrier and its measured twin (6-stage ring, epilogue
+        # rounds of two subtiles).
+        twin = copy.deepcopy(row_union)
+        twin.config["tcgen05_grouped_row_union_ab_stages"] = 6
+        twin.config["tcgen05_epi_round_subtiles"] = 2
+        # ... and that twin without the setmaxnreg pair (no consumer-register
+        # pin: the knob forbids it).
+        no_reallocation = copy.deepcopy(twin)
+        no_reallocation.config.pop("tcgen05_consumer_regs", None)
+        no_reallocation.config["tcgen05_warp_register_reallocation"] = False
+        transposed = [row_union, twin, no_reallocation]
+        assert previous_tail[-3:] == seed_tail[-3:] == transposed
+        previous_tail, seed_tail = previous_tail[:-3], seed_tail[:-3]
+        assert all(seed not in transposed for seed in (*previous_tail, *seed_tail))
     if source64 is not None:
         assert previous_tail[-1] == seed_tail[-1] == source64
         previous_tail, seed_tail = previous_tail[:-1], seed_tail[:-1]

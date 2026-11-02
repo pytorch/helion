@@ -13372,8 +13372,8 @@ class TestCuteBackend(TestCase):
                 code,
             )
             self.assertIn(
-                "virtual_pid = tcgen05_role_local_0_work_tile.tile_idx[0] // "
-                "cutlass.Int32(2) + tcgen05_role_local_0_work_tile.tile_idx[2] * 2 + "
+                "virtual_pid = (tcgen05_role_local_0_work_tile.tile_idx[0] >> "
+                "cutlass.Int32(1)) + tcgen05_role_local_0_work_tile.tile_idx[2] * 2 + "
                 "tcgen05_role_local_0_work_tile.tile_idx[1] * (2 * ((256 + "
                 "_BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1))",
                 code,
@@ -13487,11 +13487,11 @@ class TestCuteBackend(TestCase):
                     code,
                 )
                 # The virtual pid reads the coordinates back in (batch, m, n)
-                # PID order; the pair collapse (// 2) moves to the M term.
+                # PID order; the pair collapse (>> 1) moves to the M term.
                 self.assertIn(
                     "virtual_pid = tcgen05_role_local_0_work_tile.tile_idx[2] + "
-                    "tcgen05_role_local_0_work_tile.tile_idx[0] // cutlass.Int32(2) * 2 "
-                    "+ tcgen05_role_local_0_work_tile.tile_idx[1] * (2 * ((512 + "
+                    "(tcgen05_role_local_0_work_tile.tile_idx[0] >> cutlass.Int32(1)) "
+                    "* 2 + tcgen05_role_local_0_work_tile.tile_idx[1] * (2 * ((512 + "
                     "_BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1))",
                     code,
                 )
@@ -14604,8 +14604,12 @@ class TestCuteBackend(TestCase):
         allocate = code.index("tcgen05_tmem_allocator.allocate(")
         self.assertLess(arrive, tma_role)
         self.assertLess(tma_role, allocate)
-        role_wait = code.index("cutlass.pipeline.pipeline_init_wait(", tma_role)
-        self.assertLess(role_wait, code.index("tcgen05_ab_pipeline.producer_acquire("))
+        # The TMA role joins the pipeline-init barrier, acquires stage 0 and
+        # only then waits for the dependent launch.
+        role_wait = code.index("cutlass.pipeline.pipeline_init_wait(")
+        first_acquire = code.index("tcgen05_ab_pipeline.producer_acquire(")
+        self.assertLess(role_wait, first_acquire)
+        self.assertLess(first_acquire, tma_role)
         self.assertIn(
             "if not tcgen05_tma_warp:\n        cutlass.pipeline.pipeline_init_wait(",
             code,
@@ -18258,6 +18262,33 @@ class TestCuteBackend(TestCase):
                     "n_size": 160,
                     "bm": 128,
                     "bn": 32,
+                },
+                False,
+                False,
+            ),
+            # A row-union plan records its extents in MMA order (no N,M swap).
+            (
+                {
+                    **full_tcgen05_plan,
+                    "orientation": "nm",
+                    "row_union_schedule": "nm_m256_n80_k64",
+                    "m_size": 512,
+                    "n_size": 2560,
+                    "bm": 256,
+                    "bn": 80,
+                },
+                False,
+                True,
+            ),
+            (
+                {
+                    **full_tcgen05_plan,
+                    "orientation": "nm",
+                    "row_union_schedule": "nm_m256_n80_k64",
+                    "m_size": 512,
+                    "n_size": 2500,
+                    "bm": 256,
+                    "bn": 80,
                 },
                 False,
                 False,

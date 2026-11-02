@@ -111,7 +111,7 @@ def test_deep_pipeline_all_scales_and_widths(kernel: helion.Kernel, mode: int) -
     source = bound.to_code(config)
     assert "CtaGroup.ONE" in source
     assert "num_stages=16" in source
-    assert "PipelineTmaUmma.create" in source
+    assert "PipelineTmaUmma.create" in source or "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
     assert "aux_smem" not in source
 

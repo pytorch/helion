@@ -7087,9 +7087,12 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
         return False
     if kind != "tcgen05_ab_tma":
         return True
+    # A row-union plan records its extents in MMA order already (``cute_mma``
+    # swaps them with the profile), so only the plain N,M plan pairs the
+    # problem extents crosswise with the MMA tile.
     extent_blocks = (
         (("n_size", "bm"), ("m_size", "bn"), ("k_total_size", "bk"))
-        if _tcgen05_plan_orientation(plan) == "nm"
+        if _tcgen05_plan_orientation(plan) == "nm" and "row_union_schedule" not in plan
         else (("m_size", "bm"), ("n_size", "bn"), ("k_total_size", "bk"))
     )
     for extent_key, block_key in extent_blocks:

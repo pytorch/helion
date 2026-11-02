@@ -78,6 +78,45 @@ def _assert_entry_wait(body: str) -> None:
         assert position == -1 or position > first_wait, marker
 
 
+def _assert_tma_role_waits_before_its_first_stage(body: str) -> None:
+    """The TMA-load role (warp 5) waits inside its persistent loop, after the
+    tile's address math (the TMA partitions) and right ahead of its first
+    stage, so the loads issue as soon as the dependency resolves; the
+    epilogue role (warps 0-3) waits at the top of its block."""
+    lines = body.splitlines()
+    waits = [i for i, line in enumerate(lines) if WAIT in line]
+    assert len(waits) == 2, waits
+    tma_role = next(
+        i
+        for i, line in enumerate(lines)
+        if line.strip()
+        == "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5):"
+    )
+    # (a persistent loop when the grid is smaller than the work; the one-shot
+    # scheduler lays the single tile out in the role prelude)
+    partition = max(
+        i for i in range(tma_role, waits[0]) if "tma_partition(" in lines[i]
+    )
+    assert tma_role < partition < waits[0]
+    first_stage = next(
+        i for i in range(waits[0], len(lines)) if "cute.copy(tma_atom_a" in lines[i]
+    )
+    # The stage-0 gate and the stage-0 acquire (shared-memory only) precede
+    # the wait; the stage's loads follow it.
+    gate = max(
+        i
+        for i in range(tma_role, waits[0])
+        if "tcgen05_tma_initial_full_tile =" in lines[i]
+    )
+    acquire = max(i for i in range(gate, waits[0]) if "producer_acquire(" in lines[i])
+    assert partition < gate < acquire < waits[0] < first_stage
+    assert not any("cute.copy(" in lines[i] for i in range(tma_role, waits[0]))
+    assert (
+        lines[waits[1] - 1].strip()
+        == "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4):"
+    )
+
+
 def _flat_config(**overrides: object) -> helion.Config:
     values: dict[str, object] = {
         "block_sizes": [64, 16, 128],
@@ -215,17 +254,12 @@ def test_persistent_kernel_waits_in_the_tma_and_epilogue_roles() -> None:
     body = _kernel_body(source)
     assert "'use_pdl': True" in source
     assert body.count(WAIT) == 2 and body.count(RELEASE) == 3
-    lines = body.splitlines()
-    waits = [i for i, line in enumerate(lines) if WAIT in line]
-    roles = [lines[i - 1].strip() for i in waits]
-    # The TMA-load warp (warp 5) and the epilogue warps (0-3) wait at the
-    # top of their role blocks; the MMA warp never touches global memory,
-    # and the prologue reads nothing global, so no entry wait is added.
-    assert roles == [
-        "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5):",
-        "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4):",
-    ]
-    assert waits[0] < body.index("cute.copy(tma_atom_a")
+    # The TMA-load warp (warp 5) waits inside its persistent loop, after the
+    # tile's address math and ahead of its first stage; the epilogue warps
+    # (0-3) wait at the top of their role block; the MMA warp never touches
+    # global memory, and the prologue reads nothing global, so no entry wait
+    # is added.
+    _assert_tma_role_waits_before_its_first_stage(body)
     _assert_no_entry_wait(body)
     # The persistent launch is one wave: each role releases the dependents
     # right after its wait, and the MMA role once more after its tile loop,
@@ -334,9 +368,23 @@ def test_two_cta_kernels_add_the_launch_attribute_and_the_epilogue_wait() -> Non
     assert body.count(WAIT) == 2 and body.count(RELEASE) == 3
     _assert_no_entry_wait(body)
     _assert_release_follows_every_wait(body)
-    assert [line for line in body.splitlines() if "griddepcontrol" not in line] == [
-        line for line in plain_body.splitlines() if "griddepcontrol" not in line
-    ]
+    assert _without_pdl_placement(body) == _without_pdl_placement(plain_body)
+
+
+def _without_pdl_placement(body: str) -> list[str]:
+    """The kernel body without what ``cute_pdl`` adds: the griddepcontrol
+    lines and the split of stage 0's acquire ahead of the wait (the acquire
+    line and the duplicated gate header)."""
+    lines: list[str] = []
+    for line in body.splitlines():
+        if "griddepcontrol" in line:
+            continue
+        if "producer_acquire(tcgen05_ab_producer_state" in line:
+            continue
+        if lines and line.strip().startswith("if ") and lines[-1] == line:
+            continue
+        lines.append(line)
+    return lines
 
 
 def _device_scaled_gemm(
@@ -377,12 +425,9 @@ def test_persistent_kernel_binds_device_scalars_per_tile_and_waits_in_the_roles(
     assert body.count(WAIT) == 2 and body.count(RELEASE) == 3
     _assert_no_entry_wait(body)
     _assert_release_follows_every_wait(body)
+    _assert_tma_role_waits_before_its_first_stage(body)
     lines = body.splitlines()
     waits = [i for i, line in enumerate(lines) if WAIT in line]
-    assert [lines[i - 1].strip() for i in waits] == [
-        "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5):",
-        "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4):",
-    ]
     for name in ("scale_a", "scale_b"):
         reads = [i for i, line in enumerate(lines) if f"{name}.iterator.load()" in line]
         assert len(reads) == 1, reads

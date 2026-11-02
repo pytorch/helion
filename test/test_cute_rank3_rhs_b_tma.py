@@ -571,7 +571,7 @@ def test_rank3_rhs_grouped_nt_codegen_uses_nkg_tma_view() -> None:
     assert any(
         re.search(
             r"cute\.local_tile\(tma_tensor_b, \(128, 128\), "
-            r"\([^,]+ // cutlass\.Int32\(128\), None, tcgen05_rhs_safe_group\)\)",
+            r"\((?:[^,]+ // cutlass\.Int32\(128\)|_helion_tc_pro\.floordiv_nonneg\([^,]+, 128\)), None, tcgen05_rhs_safe_group\)\)",
             line.strip(),
         )
         for line in code.splitlines()
@@ -614,7 +614,7 @@ def test_rank3_rhs_grouped_static_codegen_uses_group_scheduler() -> None:
     assert ".layout.iterator" not in code
     assert re.search(
         r"cute\.local_tile\(tma_tensor_b, \(128, 128\), "
-        r"\([^,]+ // cutlass\.Int32\(128\), None, tcgen05_grouped_group_idx\)\)",
+        r"\((?:[^,]+ // cutlass\.Int32\(128\)|_helion_tc_pro\.floordiv_nonneg\([^,]+, 128\)), None, tcgen05_grouped_group_idx\)\)",
         code,
     )
     assert grouped_plan["group_count"] == 4

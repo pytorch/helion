@@ -136,7 +136,7 @@ def test_fp8_ab13_is_native_and_survives_search(placement: str) -> None:
     source = bound.to_code(config)
     assert "CtaGroup.TWO" in source
     assert "num_stages=13" in source
-    assert "PipelineTmaUmma.create" in source
+    assert "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
     assert "aux_smem" not in source
     module = ast.parse(source)
@@ -282,7 +282,7 @@ def test_fp8_paired_k_tail_budget_and_search(rhs_k_major: bool) -> None:
             for seed in state._paired_pipeline_seed_configs()
         )
     source = bound.to_code(canonical)
-    assert "PipelineTmaUmma.create" in source
+    assert "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
     assert "CtaGroup.TWO" in source
     assert "num_stages=13" in source
