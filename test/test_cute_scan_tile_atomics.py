@@ -956,3 +956,25 @@ def test_elided_scatter_matches_the_unelided_sum() -> None:
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-4, equal_nan=True)
     assert torch.equal(torch.isnan(out), torch.isnan(expected))
     assert torch.isnan(out).any() and torch.isinf(out).any()
+
+
+@pytest.mark.parametrize(
+    "dtype,helper",
+    [
+        (torch.float16, "_cute_red_add_f16_vec("),
+        (torch.bfloat16, "_cute_red_add_bf16_vec("),
+    ],
+)
+def test_half_output_vector_lanes_flush_packed_reductions(
+    dtype: torch.dtype, helper: str
+) -> None:
+    """A half output kept in its dtype (no fp32 promotion) takes the same
+    V-loop flush as fp32: four lanes become one ``red.global.add.noftz.v2.f16x2``
+    / ``bf16x2`` instead of four scalar atomics (compare-and-swap loops on
+    sm_100)."""
+    indices, values, num_nodes = _segment_args()
+    args = (indices, values.to(dtype), num_nodes)
+    code = _codegen(_segmented_reduction, args, **STRIP)
+    assert helper in code, code
+    assert "_tile_atomic_vals_1_0.append(cutlass." in code
+    assert VECTOR_ATOMIC not in code

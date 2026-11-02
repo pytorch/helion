@@ -274,8 +274,14 @@ def fallback_case(shape, device):
     m, k, n = shape
     a = torch.empty((m, k), dtype=torch.float16, device=device)
     b = torch.empty((k, n), dtype=torch.float16, device=device)
+    # The fallback under test is the fp32-promoted form of the float16 atomic
+    # output (the Setting defaults to accumulating in float16 in place).
     kernel = helion.kernel(
-        matmul_split_k.fn, backend="cute", static_shapes=True, autotune_effort="none"
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     bound = kernel._bind_isolated((a, b))
     assert not bound.config_spec.cute_split_k_workspace_available

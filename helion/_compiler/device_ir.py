@@ -3638,7 +3638,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
             for graph_info in device_ir.graphs:
                 factor_affine_reductions(graph_info.graph, fast_math=True)
-        if CompileEnvironment.current().backend.name == "cute":
+        if (
+            CompileEnvironment.current().backend.name == "cute"
+            and CompileEnvironment.current().settings.cute_promote_half_atomic_outputs
+        ):
             promotions = collect_cute_half_atomic_output_promotions(device_ir.graphs)
             if promotions:
                 env = CompileEnvironment.current()

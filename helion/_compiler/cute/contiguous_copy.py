@@ -666,6 +666,62 @@ class ContiguousCopy:
         common.append(ast.If(test=condition, body=vector, orelse=scalar))
         return [ast.fix_missing_locations(statement) for statement in common]
 
+    def emit_red_from_registers(
+        self, registers: str, fresh_name: Callable[[str], str], *, helper: str
+    ) -> list[ast.stmt]:
+        """``emit_from_registers`` for a relaxed atomic add: one packed
+        reduction (``helper``: ``_cute_red_add_{f32,f16,bf16}_vec``) of the
+        register vector at the proven address when every lane's predicate
+        holds, else one scalar ``cute.arch.atomic_add`` per active lane."""
+        names = {
+            statement.targets[0].id: _expr(fresh_name(f"{statement.targets[0].id}_red"))
+            for statement in self._statements
+            if isinstance(statement.targets[0], ast.Name)
+        }
+        common: list[ast.stmt] = []
+        for statement in self._statements:
+            target = statement.targets[0]
+            assert isinstance(target, ast.Name)
+            if target.id in self._invariants:
+                copied = _replace(statement, names)
+                assert isinstance(copied, ast.stmt)
+                common.append(copied)
+        low = _replace(self._predicate, names)
+        high = _replace(
+            self._predicate,
+            {**names, self.coordinate: _expr(f"{self.coordinate} + {self.width - 1}")},
+        )
+        pointer = _replace(self._pointer, names)
+        assert isinstance(low, ast.expr) and isinstance(high, ast.expr)
+        condition = (
+            low
+            if ast.dump(low) == ast.dump(high)
+            else ast.BoolOp(op=ast.And(), values=[low, high])
+        )
+        lanes = ", ".join(f"{registers}[{lane}]" for lane in range(self.width))
+        vector = ast.parse(
+            f"{helper}(({ast.unparse(pointer)}).llvm_ptr, [{lanes}])"
+        ).body
+        lane = fresh_name("epilogue_red_lane")
+        replacements = {
+            **names,
+            self.coordinate: _expr(f"{self.coordinate} + {lane}"),
+        }
+        scalar_pointer = _replace(self._pointer, replacements)
+        scalar_predicate = _replace(self._predicate, replacements)
+        if isinstance(condition, ast.Constant) and condition.value is True:
+            # A full tile: no lane is masked, the packet needs no guard.
+            common.extend(vector)
+            return [ast.fix_missing_locations(statement) for statement in common]
+        scalar = ast.parse(
+            f"for {lane} in cutlass.range_constexpr({self.width}):\n"
+            f"    if {ast.unparse(scalar_predicate)}:\n"
+            f"        cute.arch.atomic_add(({ast.unparse(scalar_pointer)}).llvm_ptr, "
+            f"val={registers}[{lane}], sem='relaxed')"
+        ).body
+        common.append(ast.If(test=condition, body=vector, orelse=scalar))
+        return [ast.fix_missing_locations(statement) for statement in common]
+
     def emit_to_registers(
         self, fresh_name: Callable[[str], str]
     ) -> tuple[list[ast.stmt], str]:
@@ -912,12 +968,15 @@ def plan_contiguous_copy(
     coordinate: str,
     tensors: Mapping[str, CopyTensorFacts],
     aligned_names: Mapping[str, int],
+    width: int | None = None,
 ) -> ContiguousCopy | None:
     """Prove a direct FP16/BF16/FP32 load for an aligned vector copy.
 
     ``statements`` and ``value`` are the output of ``ScalarRecipe.emit``.
     Alignment facts are in elements, except tensor base alignments in bytes.
     Unknown transformations, strides, masks, or alignment facts fail closed.
+    ``width`` narrows the packet below the 16-byte default (a power of two
+    dividing it): the proof then asks for that many elements' alignment.
     """
     targets: set[str] = set()
     for statement in statements:
@@ -1021,6 +1080,10 @@ def plan_contiguous_copy(
     ):
         return None
     analysis.width = 16 // _DTYPE_BYTES[facts.dtype]
+    if width is not None:
+        if width <= 0 or analysis.width % width:
+            return None
+        analysis.width = width
     if (
         aligned_names.get(coordinate, 1) % analysis.width
         or analysis.delta(pointer) != 1

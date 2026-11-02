@@ -50,6 +50,7 @@ def _check_cluster(
         backend="cute",
         static_shapes=True,
         autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
         cute_full_slice_matmul_tiling=False,
         cute_region_fission=False,
     )
