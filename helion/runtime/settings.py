@@ -675,6 +675,11 @@ class _Settings:
             _env_get_bool, "HELION_CUTE_EXACT_DIVISION", True
         )
     )
+    cute_promote_half_atomic_outputs: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_PROMOTE_HALF_ATOMIC_OUTPUTS", False
+        )
+    )
     triton_do_not_specialize: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
@@ -960,6 +965,17 @@ class Settings(_Settings):
             "to keep the plain per-element division; the config knob "
             "cute_exact_div_form picks the form (redo / plain) per kernel. "
             "Independent of fast_math, whose fp32 division is approximate."
+        ),
+        "cute_promote_half_atomic_outputs": (
+            "If True, a fresh float16 allocation that the CuTe kernel only "
+            "ever writes through hl.atomic_add is accumulated in a float32 "
+            "twin and cast to float16 once on return (one extra elementwise "
+            "kernel per call). False (the default, "
+            "HELION_CUTE_PROMOTE_HALF_ATOMIC_OUTPUTS=0) adds into the float16 "
+            "storage itself, rounding to float16 on every add as the program "
+            "and the Triton backend do; the vector collective epilogues use "
+            "native packed half atomics, the scalar half atomic is a "
+            "compare-and-swap loop on sm_100."
         ),
         "triton_do_not_specialize": (
             "If True, pass do_not_specialize for every dynamic size/stride/symbol "

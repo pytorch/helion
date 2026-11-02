@@ -14,9 +14,15 @@ typed constexpr branches) that is ``name = torch.sum(x)`` / ``torch.mean(x)``
 / ``x.sum()`` / ``x.mean()`` with no other arguments, or a ``return`` whose
 value is such a call or a tuple of bound names and one such call; ``x`` a
 1-D contiguous FP32 tensor typed as such and the result a 0-d FP32 tensor.
-Shapes, alignment, gradients, dispatch modes and the ATen build are runtime
-guards in the helper. The rewrite is enabled by the ``cute_host_paired_sum``
-knob (any layout), together with the paired and single sum tails.
+A sum may also be divided by a host scalar (``torch.sum(loss) / BT``, the
+``batchmean`` of a loss; ``/ (BT * V)`` for a mean): the divisor is pure
+arithmetic over names, constants and tensor metadata typed as a number, and
+the helper applies ATen's own form of that division (``div_true_kernel_cuda``
+with a CPU scalar multiplies by the FP32 reciprocal), so the result stays
+bit-identical while the separate elementwise launch disappears. Shapes,
+alignment, gradients, dispatch modes and the ATen build are runtime guards
+in the helper. The rewrite is enabled by the ``cute_host_paired_sum`` knob
+(any layout), together with the paired and single sum tails.
 """
 
 from __future__ import annotations
@@ -32,6 +38,8 @@ from ..ast_extension import ExtendedAST
 from ..ast_extension import LoopType
 from ..ast_extension import statement_from_string
 from ..type_info import LiteralType
+from ..type_info import SymFloatType
+from ..type_info import SymIntType
 from ..type_info import TensorAttributeType
 from ..type_info import TensorType
 from .host_paired_sum import PAIRED_SUM_CHOICES
@@ -56,6 +64,8 @@ class FullSumSite:
     # the returned tuple (``()`` for a bare ``return <call>``) and the call's
     # position in that tuple.
     returned: tuple[tuple[str, ...], int] | None
+    # Source of the host scalar a sum is divided by, ``None`` for a bare call.
+    divisor: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +115,73 @@ def _reduction_call(value: ast.AST) -> tuple[str, bool] | None:
     ):
         return None
     return source.id, value.func.attr == "mean"
+
+
+_METADATA_CALLS = frozenset({"size", "numel", "dim", "stride", "ndimension"})
+
+
+def _host_scalar(node: ast.AST) -> bool:
+    """Whether ``node`` is pure arithmetic over names, constants and tensor
+    metadata whose value is a (non-bool) host number: safe to evaluate twice
+    (once for the helper, once for the fallback) and a scalar ATen would wrap
+    as a CPU number."""
+    info = _type(node)
+    if isinstance(info, LiteralType):
+        if type(info.value) not in (int, float):
+            return False
+    elif not isinstance(info, (SymIntType, SymFloatType)):
+        return False
+    for child in ast.walk(node):
+        if isinstance(
+            child,
+            (
+                ast.Name,
+                ast.Constant,
+                ast.BinOp,
+                ast.UnaryOp,
+                ast.Load,
+                ast.operator,
+                ast.unaryop,
+                ast.Attribute,
+                ast.Subscript,
+            ),
+        ):
+            continue
+        if (
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr in _METADATA_CALLS
+            and isinstance(_type(child.func.value), TensorType)
+            and not child.keywords
+            and all(isinstance(arg, (ast.Constant, ast.Name)) for arg in child.args)
+        ):
+            continue
+        return False
+    return True
+
+
+def _scaled_reduction_call(value: ast.AST) -> tuple[str, bool, str | None] | None:
+    """``(source, is_mean, divisor_source)`` for a bare reduction call or a
+    ``torch.sum(x) / scalar`` quotient typed as a 0-d FP32 tensor."""
+    found = _reduction_call(value)
+    if found is not None:
+        return (*found, None)
+    if not (isinstance(value, ast.BinOp) and isinstance(value.op, ast.Div)):
+        return None
+    found = _reduction_call(value.left)
+    result_type = _type(value)
+    if (
+        found is None
+        or found[1]
+        or not _host_scalar(value.right)
+        or not (
+            isinstance(result_type, TensorType)
+            and result_type.fake_value.ndim == 0
+            and result_type.fake_value.dtype == torch.float32
+        )
+    ):
+        return None
+    return found[0], False, ast.unparse(value.right)
 
 
 def _shadows_helper(host: HostFunction, nodes: list[ast.AST]) -> bool:
@@ -172,7 +249,7 @@ def prove_host_full_sum(host: HostFunction) -> HostFullSumProof:
                 calls = [
                     index
                     for index, element in enumerate(expression.elts)
-                    if _reduction_call(element) is not None
+                    if _scaled_reduction_call(element) is not None
                 ]
                 others = [
                     element
@@ -191,7 +268,7 @@ def prove_host_full_sum(host: HostFunction) -> HostFullSumProof:
                 )
                 returned = (names, calls[0])
                 expression = expression.elts[calls[0]]
-            found = _reduction_call(expression)
+            found = _scaled_reduction_call(expression)
             if found is None or found[0] not in defined:
                 continue
             sites.append(
@@ -201,6 +278,7 @@ def prove_host_full_sum(host: HostFunction) -> HostFullSumProof:
                     found[0],
                     found[1],
                     returned,
+                    found[2],
                 )
             )
         elif (
@@ -208,7 +286,7 @@ def prove_host_full_sum(host: HostFunction) -> HostFullSumProof:
             and len(statement.targets) == 1
             and isinstance(target := statement.targets[0], ast.Name)
         ):
-            found = _reduction_call(statement.value)
+            found = _scaled_reduction_call(statement.value)
             if found is not None and found[0] in defined:
                 sites.append(
                     FullSumSite(
@@ -217,6 +295,7 @@ def prove_host_full_sum(host: HostFunction) -> HostFullSumProof:
                         found[0],
                         found[1],
                         None,
+                        found[2],
                     )
                 )
             defined.add(target.id)
@@ -274,11 +353,12 @@ def lower_host_full_sum(
                 elements.insert(position, value)
                 value = ast.Tuple(elements, ast.Load())
             tail = [ast.Return(value)]
+        divisor = f"divisor={site.divisor}, " if site.divisor is not None else ""
         result.extend(
             (
                 statement_from_string(
                     f"{temporary} = {FULL_SUM_HELPER}({site.source}, "
-                    f"mean={site.mean!r}, _launcher=_launcher)"
+                    f"mean={site.mean!r}, {divisor}_launcher=_launcher)"
                 ),
                 ast.If(
                     test=ast.Compare(

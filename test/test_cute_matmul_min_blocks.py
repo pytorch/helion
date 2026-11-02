@@ -615,6 +615,10 @@ def test_global_positive_override_preserves_other_coverage_groups(
         "cute_structural_policy": automatic,
         "autotune_config_overrides": {MIN_BLOCKS_KEY: value},
         "disable_autotuner_heuristics": disabled,
+        # The cluster-K schedule is validated on fp32 destinations only; the
+        # float16 output accumulates in place by default now, so the
+        # unrelated split-K groups need the promoted output here.
+        "cute_promote_half_atomic_outputs": True,
     }
     with patch(REGISTRATION):
         previous, previous_args = _bind("collective", **settings)

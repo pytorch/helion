@@ -27,6 +27,7 @@ from ..cute.cute_mma_dag import MMA_DAG_EXCHANGE_AUTO
 from ..cute.cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from ..cute.cute_mma_dag import MMA_DAG_KEY
 from ..cute.cute_mma_dag import MMA_DAG_LOADS_KEY
+from ..cute.cute_mma_dag import MMA_DAG_LOADS_LANE
 from ..cute.cute_mma_dag import MMA_DAG_LOADS_TMA
 from ..cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
 from ..cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
@@ -162,6 +163,16 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
         return env.config_spec.cute_mma_dag is not None
 
     @classmethod
+    def should_promote(cls, env: CompileEnvironment) -> bool:
+        # A kernel another whole-root owner lowers (the gdn recurrence's
+        # tcgen05 schedule) keeps that owner's promoted default: the dag is
+        # one of the search's choices there (its seeds and the
+        # ``cute_mma_dag`` knob), not the autotune-off lowering.
+        if env.config_spec.cute_gdn_recurrence_stages is not None:
+            return False
+        return super().should_promote(env)
+
+    @classmethod
     def get_seed_configs(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> list[Config] | None:
@@ -219,7 +230,7 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                 *tcgen05_corner_seeds(facts, tcgen05_ranked, tcgen05_top),
             ]
         ]
-        ladder = mma_dag_seed_configs(facts)[: cls.SEED_TILES]
+        ladder, most_cta_ladder = cls.warp_ladder(facts)
         warp = [(MMA_DAG_WARP, seed, MMA_DAG_EXCHANGE_AUTO) for seed in ladder]
         # Measured neighbours of the top warp seed (CTA-rich programs; see
         # ``mma_dag_seed_variants``) follow the ladder: the first seed stays.
@@ -682,6 +693,65 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                     (key + 1 if key >= insert_at else key) for key in aux_twins
                 }
                 hinted = {(key + 1 if key >= insert_at else key) for key in hinted}
+        # A grid short of one wave at the first warp seed's tile (fewer CTAs
+        # than SMs): its rings never reach a steady state, so the TMA ring's
+        # per-tile issue and barrier round trips stay exposed and the lane
+        # route (per-thread packets) can lead -- gdn_fwd_h at (1, 4, 256, 64,
+        # 32, 32), B200: [16] x 4 warps x 4 stages 2.49 us against 2.91 with
+        # the TMA ring pinned, while both cold autotunes of that shape picked
+        # a TMA-ring config.  Both routes are seeded: the first warp seed and
+        # every seed on the ladder's most-CTA tile (``warp_ladder``) get a
+        # lane-route twin behind their other twins; the other seeds keep the
+        # TMA ring.
+        lane_twins: set[int] = set()
+        first_warp = next(
+            (i for i, entry in enumerate(ranked) if entry[0] == MMA_DAG_WARP), None
+        )
+        if first_warp is not None and facts.sm_count > 0:
+            first_sizes = ranked[first_warp][1][0]
+            first_resolved = [
+                cast("int", facts.block_size(i, first_sizes))
+                for i in range(len(facts.axes))
+            ]
+            if mma_dag_cta_count(facts, first_resolved) < facts.sm_count:
+                # The seeds themselves (the first of each ranked entry), not
+                # their twins behind them.
+                seen: list[tuple[object, ...]] = []
+                targets: list[int] = []
+                for i, entry in enumerate(ranked):
+                    if entry in seen or entry[0] != MMA_DAG_WARP:
+                        continue
+                    seen.append(entry)
+                    if i == first_warp or entry[1] in most_cta_ladder:
+                        targets.append(i)
+                # Behind-to-front: an insertion moves only the later ranks.
+                for at in reversed(targets):
+                    # Behind the seed's own twins (the same ranked entry
+                    # again: its derived-route, side-load, hint and occupancy
+                    # twins), ahead of the next seed.
+                    insert_at = at + 1
+                    while insert_at < len(ranked) and ranked[insert_at] == ranked[at]:
+                        insert_at += 1
+                    ranked.insert(insert_at, ranked[at])
+                    persistent, epilogues, lookaheads, derived_variants = _twin_maps(
+                        insert_at - 1,
+                        persistent,
+                        epilogues,
+                        lookaheads,
+                        derived_variants,
+                    )
+                    # A lane twin of the seed itself, not of the twin ahead
+                    # of it: it carries the seed's own entries.
+                    for ranks in (persistent, epilogues, lookaheads, derived_variants):
+                        if at in ranks:
+                            ranks[insert_at] = ranks[at]
+                        else:
+                            ranks.pop(insert_at, None)
+                    aux_twins, hinted, occupancy, lane_twins = (
+                        {key + 1 if key >= insert_at else key for key in group}
+                        for group in (aux_twins, hinted, occupancy, lane_twins)
+                    )
+                    lane_twins.add(insert_at)
         for index, (mode, (sizes, warps, stages), exchange, pass_warps) in enumerate(
             ranked
         ):
@@ -698,7 +768,9 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                     MMA_DAG_STORE_STAGED if mode == MMA_DAG_TCGEN05 else store
                 ),
                 MMA_DAG_PASS_WARPS_KEY: pass_warps,
-                MMA_DAG_LOADS_KEY: MMA_DAG_LOADS_TMA,
+                MMA_DAG_LOADS_KEY: (
+                    MMA_DAG_LOADS_LANE if index in lane_twins else MMA_DAG_LOADS_TMA
+                ),
                 MMA_DAG_DERIVED_KEY: derived_variants.get(
                     index, MMA_DAG_DERIVED_EXCHANGE
                 ),
@@ -762,6 +834,46 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                     continue
             seeds.append(Config.from_dict(config))
         return seeds or None
+
+    @classmethod
+    def warp_ladder(
+        cls, facts: CuteMmaDagFacts
+    ) -> tuple[
+        list[tuple[dict[int, int], int, int]], list[tuple[dict[int, int], int, int]]
+    ]:
+        """The top ``SEED_TILES`` of the ranked warp ladder and, for a grid
+        short of one wave (the device's SM count) at the top seed's tile, up
+        to ``SEED_TILES`` more: the ladder's most-CTA tile, in ladder order.
+        An idle SM costs more than a smaller tile there, but the ranked
+        order (the largest tile first below one wave) is the measured
+        default elsewhere, so those seeds join the list instead of
+        displacing it (gdn_fwd_h at (1, 4, 256, 64, 32, 32), B200: eight
+        CTAs of a 16-column state tile 2.49 us against four of 32 at 3.07;
+        the [16] x 4 warps seeds ranked 10-12 of the ladder).  Returns the
+        ladder and its seeds on that most-CTA tile (ranked or appended;
+        empty at or beyond one wave)."""
+        ranked = mma_dag_seed_configs(facts)
+        ladder = ranked[: cls.SEED_TILES]
+        if not ladder or facts.sm_count <= 0:
+            return ladder, []
+
+        def ctas(seed: tuple[dict[int, int], int, int]) -> int:
+            resolved = [
+                cast("int", facts.block_size(i, seed[0]))
+                for i in range(len(facts.axes))
+            ]
+            return mma_dag_cta_count(facts, resolved)
+
+        if ctas(ladder[0]) >= facts.sm_count:
+            return ladder, []
+        most = max(ctas(seed) for seed in ranked)
+        extra = [
+            seed
+            for seed in ranked[cls.SEED_TILES :]
+            if ctas(seed) == most and seed not in ladder
+        ][: cls.SEED_TILES]
+        ladder = ladder + extra
+        return ladder, [seed for seed in ladder if ctas(seed) == most]
 
     @classmethod
     def wide_epilogue_rows(

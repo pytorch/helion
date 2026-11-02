@@ -61,17 +61,39 @@ def full_sum_plan(numel: int) -> FullSumPlan | None:
     return FullSumPlan(numel, width, factor)
 
 
+def _reciprocal_factor(divisor: object) -> float | None:
+    """ATen's multiplier for ``tensor / divisor`` with a host number.
+
+    ``div_true_kernel_cuda`` turns a CPU scalar divisor into ``a *
+    (opmath_t(1) / scalar_value<opmath_t>(divisor))``, FP32 arithmetic for an
+    FP32 tensor (the wrapped ``int`` or ``float`` is cast to FP32 first).
+    ``None`` for anything that is not a plain Python number.
+    """
+    if not isinstance(divisor, (int, float)) or isinstance(divisor, bool):
+        return None
+    scalar = torch.tensor(float(divisor), dtype=torch.float32)
+    return float((torch.tensor(1.0, dtype=torch.float32) / scalar).item())
+
+
 def try_full_sum(
     tensor: torch.Tensor,
     *,
     mean: bool,
     _launcher: Callable[..., object],
+    divisor: object = None,
 ) -> torch.Tensor | None:
     """Return the sum/mean as a fresh 0-d tensor, or ``None`` to run the original.
 
-    Unsupported dispatch, gradients, dtypes, layouts, alignments, lengths and
-    library builds keep the exact original ``torch.sum`` / ``mean`` call.
+    ``divisor`` is the host number of a ``torch.sum(x) / divisor`` site: the
+    result is ``sum * (1 / divisor)`` in FP32 exactly as ATen computes that
+    quotient. Unsupported dispatch, gradients, dtypes, layouts, alignments,
+    lengths, divisors and library builds keep the exact original call.
     """
+    factor: float | None = None
+    if divisor is not None:
+        factor = _reciprocal_factor(divisor)
+        if mean or factor is None:
+            return None
     if (
         torch._C._is_torch_function_mode_enabled()
         or _get_current_dispatch_mode_stack()
@@ -98,6 +120,10 @@ def try_full_sum(
     from ..._compiler.cute.full_sum_runtime import full_sum_kernel
 
     output = tensor.new_empty((1,))
+    if factor is None:
+        factor = plan.factor if mean else 1.0
+    # ``factor`` is a runtime FP32 scalar of the kernel: every divisor value
+    # shares the one compiled kernel of this ``(numel, width, scale)``.
     _launcher(
         full_sum_kernel,
         (1, 1, 1),
@@ -105,8 +131,8 @@ def try_full_sum(
         output,
         plan.numel,
         plan.width,
-        plan.factor if mean else 1.0,
-        mean,
+        factor,
+        mean or divisor is not None,
         block=(plan.width, 1, 1),
     )
     return output.view(())

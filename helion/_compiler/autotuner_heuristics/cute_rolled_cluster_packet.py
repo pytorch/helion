@@ -258,6 +258,9 @@ class CuteRolledClusterPacketHeuristic(AutotunerHeuristic):
                         "cute_pdl": pdl,
                         "cute_min_blocks_per_mp": min_blocks,
                     }
+                    if pdl:
+                        # Inert, and dropped by normalization, without the knob.
+                        overrides["cute_pdl_spread"] = True
                     if any(
                         not isinstance(field := fields.get(key), EnumFragment)
                         or value not in field.choices
@@ -383,6 +386,7 @@ class CuteRolledClusterPacketHeuristic(AutotunerHeuristic):
             "cute_independent_reduction": True,
             "cute_replicated_reduction": True,
             "cute_pdl": True,
+            "cute_pdl_spread": True,
             "cute_min_blocks_per_mp": 0,
             "cute_vector_packet_unroll": False,
             "cute_vloop_sink": False,

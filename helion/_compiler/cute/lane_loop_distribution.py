@@ -402,7 +402,9 @@ _ATOMIC_HELPERS = frozenset(
 )
 # The relaxed ``red.global.add.v{2,4}.f32`` flush of a vectorized atomic site
 # (``cute/atomic_ops.py``): one packet of consecutive elements.
-_VECTOR_ATOMIC_HELPERS = frozenset({"_cute_red_add_f32_vec"})
+_VECTOR_ATOMIC_HELPERS = frozenset(
+    {"_cute_red_add_f32_vec", "_cute_red_add_f16_vec", "_cute_red_add_bf16_vec"}
+)
 # The vector type argument of a 16-byte ``cute.arch.load``, the store
 # protocol's register-only conversion of a whole byte packet and the layout
 # arithmetic of an atomic's address.

@@ -64,6 +64,9 @@ from .grouped_row_union import STARTUP_PREFILL_KEY
 from .grouped_row_union import TRANSPOSED_SCHEDULE
 from .grouped_row_union import ab_stages_supported as row_union_ab_stages_supported
 from .grouped_row_union import physical_schedule
+from .grouped_row_union import (
+    round_subtiles_supported as row_union_round_subtiles_supported,
+)
 from .grouped_row_union import schedule_by_name as row_union_schedule_by_name
 from .grouped_row_union import schedule_supported as row_union_schedule_supported
 from .one_cta_pipeline import Tcgen05OneCtaPipelineFacts
@@ -183,6 +186,8 @@ from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CHOICES
+from .tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CHOICES
 from .tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPI_WARP_GROUP_CHOICES
@@ -516,6 +521,7 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY,
     TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY,
     TCGEN05_EPI_SUBTILE_N_CONFIG_KEY,
+    TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY,
     TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY,
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
     TCGEN05_C_STORE_MODE_CONFIG_KEY,
@@ -5784,6 +5790,25 @@ class CuteTcgen05Config:
                     f"{AB_STAGES_MIN} and the profile's own"
                 )
             config.pop(GROUPED_ROW_UNION_AB_STAGES_KEY, None)
+        rounds = config.get(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, 1)
+        if value is True and rounds != 1:
+            # A physical profile sizes its C ring from the round
+            # (``with_round_subtiles``): the round must be one of the choices,
+            # the profile must store through the plain tail (the transposed
+            # one) and the wider ring must fit beside the physical AB ring;
+            # the legacy one-CTA schedule keeps the per-subtile loop.
+            if base_profile is None or not row_union_round_subtiles_supported(
+                base_profile,
+                rounds,
+                config.get(GROUPED_ROW_UNION_AB_STAGES_KEY),
+            ):
+                if not fix_invalid:
+                    raise InvalidConfig(
+                        f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}={rounds!r} needs the "
+                        "transposed row-union profile and a C ring that fits "
+                        "beside its AB ring"
+                    )
+                config.pop(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, None)
         prefill = config.get(STARTUP_PREFILL_KEY, False)
         if prefill is False:
             config.pop(STARTUP_PREFILL_KEY, None)
@@ -6251,6 +6276,18 @@ class CuteTcgen05Config:
             and physical_schedule(config) is None
         )
 
+    @classmethod
+    def _row_union_register_reallocation_optional(
+        cls, config: dict[str, object]
+    ) -> bool:
+        """The transposed row-union profile launches six warps at one CTA per
+        SM, so every warp can hold the consumer register budget from launch
+        and the ``setmaxnreg`` pair only lengthens the TMA-load warp's
+        prologue (``_tcgen05_prologue_runtime``): the search may drop it.
+        The paired profile owns its static register protocol instead."""
+        profile = physical_schedule(config)
+        return profile is not None and profile.paired_protocol is None
+
     def _normalize_warp_register_reallocation(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -6264,17 +6301,28 @@ class CuteTcgen05Config:
         if (
             value is not False
             or not self.search_enabled
-            or not self._grouped_static_registers_supported(config)
+            or not (
+                self._grouped_static_registers_supported(config)
+                or self._row_union_register_reallocation_optional(config)
+            )
         ):
             if fix_invalid:
                 config.pop(key)
                 return
             raise InvalidConfig(
                 f"{key}=False requires an independent single-CTA N,M worklist "
-                "with the default physical M128 register profile"
+                "with the default physical M128 register profile, or the "
+                "transposed row-union profile"
             )
         if TCGEN05_CONSUMER_REGS_CONFIG_KEY in config:
-            if fix_invalid:
+            if (
+                config[TCGEN05_CONSUMER_REGS_CONFIG_KEY]
+                == TCGEN05_CONSUMER_REGS_DEFAULT
+                or fix_invalid
+            ):
+                # The default consumer budget is inert without the pair (a
+                # full config materializes it); an explicit other value asks
+                # for a reallocation that is not emitted.
                 config.pop(TCGEN05_CONSUMER_REGS_CONFIG_KEY)
             else:
                 raise InvalidConfig(
@@ -8055,6 +8103,25 @@ class CuteTcgen05Config:
         return 1
 
     @staticmethod
+    def epi_round_subtiles_refusal(config: dict[str, object]) -> str | None:
+        """Why ``tcgen05_epi_round_subtiles`` is refused for ``config``; None if
+        admitted.  The round must be a choice; outside the grouped row-union
+        profiles (whose normalizer sizes the C ring from it) it must divide
+        ``tcgen05_c_stages``, the subtile buffers the bulk-group pipeline is
+        cut into rounds of.  The store lowering refuses the remaining shapes
+        (fan-out, auxiliary chains, store warps, paired tails) when it
+        renders (``tcgen05_epilogue_rounds``)."""
+        value = config.get(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, 1)
+        if type(value) is not int or value not in TCGEN05_EPI_ROUND_SUBTILES_CHOICES:
+            return f"must be one of {TCGEN05_EPI_ROUND_SUBTILES_CHOICES!r}"
+        if value == 1 or config.get(GROUPED_ROW_UNION_KEY, False) is True:
+            return None
+        c_stages = config.get("tcgen05_c_stages", 2)
+        if type(c_stages) is not int or c_stages % value != 0:
+            return f"must divide tcgen05_c_stages={c_stages!r}"
+        return None
+
+    @staticmethod
     def _config_epi_subtile_n(config: dict[str, object]) -> int | None:
         """Configured epilogue subtile width (``tcgen05_epi_subtile_n``)."""
         value = config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY)
@@ -8518,6 +8585,17 @@ class CuteTcgen05Config:
                     f"{TCGEN05_EPI_SUBTILE_N_CONFIG_KEY}="
                     f"{config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY)!r}: {reason}"
                 )
+        reason = self.epi_round_subtiles_refusal(config)
+        if reason is not None:
+            if fix_invalid:
+                config.pop(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, None)
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}="
+                    f"{config.get(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY)!r}: {reason}"
+                )
+        elif config.get(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY) == 1:
+            config.pop(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, None)
         reason = self.epi_warp_groups_refusal(config)
         if reason is not None:
             if fix_invalid:
@@ -10159,6 +10237,14 @@ class CuteTcgen05Config:
             # to ``None`` by normalization.
             fragments[GROUPED_ROW_UNION_AB_STAGES_KEY] = EnumFragment(
                 GROUPED_ROW_UNION_AB_STAGES_CHOICES
+            )
+        if not for_search or self.grouped_row_union_cluster4_eligible:
+            # Subtiles per TMA-store epilogue round (``tcgen05_epilogue_rounds``);
+            # searched where the transposed row-union profile is reachable, an
+            # explicit value is validated on every tcgen05 TMA-store epilogue
+            # (``epi_round_subtiles_refusal``).
+            fragments[TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY] = EnumFragment(
+                TCGEN05_EPI_ROUND_SUBTILES_CHOICES
             )
         if not for_search or self.grouped_row_union_paired_clc_eligible:
             fragments[STARTUP_PREFILL_KEY] = BooleanFragment()
@@ -12025,10 +12111,17 @@ class CuteTcgen05Config:
                 if self.grouped_source128_search_enabled
                 else (None,),
             )
-        if TCGEN05_GROUPED_MODE_WORKLIST_NM in modes:
+        if (
+            TCGEN05_GROUPED_MODE_WORKLIST_NM in modes
+            or self.grouped_row_union_cluster4_eligible
+        ):
+            # Searched on the worklist N,M mode (its static register protocol)
+            # and where the transposed row-union profile is reachable
+            # (``_row_union_register_reallocation_optional``).
             fields[TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY] = EnumFragment(
                 (True, False)
             )
+        if TCGEN05_GROUPED_MODE_WORKLIST_NM in modes:
             fields[TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY] = EnumFragment(
                 (False, True)
             )

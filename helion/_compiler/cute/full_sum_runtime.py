@@ -12,7 +12,11 @@ the first accumulator, the increasing accumulator fold) and
 ``block_x_reduce`` (descending shared-memory halving down to one warp, then
 the descending shuffle tree). The tree is a dataflow; this kernel evaluates
 it in shared memory, so the output is bit-identical to the ATen result.
-``mean`` multiplies by ATen's ``factor``.
+``mean`` multiplies by ATen's ``factor``; a ``torch.sum(x) / n`` site passes
+ATen's FP32 reciprocal of ``n``.  The factor is a runtime scalar (not a
+``Constexpr``): one compiled kernel per ``(numel, width, scale)`` serves every
+divisor value, where a constexpr factor would recompile on the hot path for
+each distinct ``n`` (``/ (BT * V)`` with a varying ``V``, a float argument).
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ def full_sum_kernel(
     result: cute.Tensor,
     numel: cutlass.Constexpr[int],
     width: cutlass.Constexpr[int],
-    factor: cutlass.Constexpr[float],
+    factor: cutlass.Float32,
     scale: cutlass.Constexpr[bool],
 ) -> None:
     lane = cutlass.Int32(cute.arch.thread_idx()[0])
@@ -73,7 +77,7 @@ def full_sum_kernel(
     if lane == 0:
         total = partial[0]
         if cutlass.const_expr(scale):
-            total = total * cutlass.Float32(factor)
+            total = total * factor
         result.iterator.store(total)  # pyrefly: ignore[missing-attribute]
 
 

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 from typing import TYPE_CHECKING
+from typing import cast
 
 from .gathered_mma import _clone
 from .gathered_mma import _conjuncts
@@ -194,6 +196,82 @@ allocator.free(tmem)
 """
 
 
+def _hoist_group_metadata_loads(
+    region: GatheredMmaRegion,
+    site: CollectiveMmaSite,
+    df: DeviceFunction,
+) -> tuple[list[ast.stmt], GatheredMmaRegion]:
+    """Bind the row recipe's per-group metadata loads once per CTA.
+
+    The row recipe and the row predicate read the group's metadata (its
+    token count and offset: ``.load()`` calls whose address does not depend
+    on the row coordinate) at every use.  The epilogue repeats the predicate
+    for each 16-byte packet of the scatter between its global stores, and
+    the compiler cannot prove those stores disjoint from the metadata, so
+    every use re-issued the load: 16 dependent loads per thread on
+    moe_matmul_ogs (256 tokens, 128 x 128, 4 experts), where the scatter of
+    a 128 x 128 tile took 1.1 us of a 3.4 us kernel.  The producer's row
+    chain read the offset and count twice per row as well.  Each distinct
+    coordinate-free load becomes one local ahead of the pipeline (the
+    region's admission proved the metadata tensors are only read), and the
+    recipe, the predicate and the row limit derived from them use the local.
+    When the kernel already binds the value ahead of the region (its
+    ``if count != 0`` guard loaded the group's count and offset; the region's
+    expressions were expanded through those definitions,
+    ``GatheredMmaRegion.scalar_aliases``) the local is that register: a
+    fresh load ahead of the pipeline's barrier init would hold the CTA-wide
+    sync for its latency (0.5 us of the 0.64 us prologue on moe s0).
+    """
+    hoisted: list[ast.stmt] = []
+    values: list[ast.expr] = []
+
+    class Hoist(ast.NodeTransformer):
+        def visit_Call(self, node: ast.Call) -> ast.expr:
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "load"
+                and not node.args
+                and not node.keywords
+                and site.m_index not in _read_names(node)
+            ):
+                index = next(
+                    (i for i, value in enumerate(values) if _same(value, node)),
+                    None,
+                )
+                if index is None:
+                    index = len(values)
+                    values.append(node)
+                    alias = region.scalar_aliases.get(ast.dump(node))
+                    hoisted.append(
+                        ast.Assign(
+                            targets=[
+                                ast.Name(
+                                    id=df.new_var("gathered_group_meta"),
+                                    ctx=ast.Store(),
+                                )
+                            ],
+                            value=ast.Name(id=alias, ctx=ast.Load())
+                            if alias is not None
+                            else _clone(node),
+                        )
+                    )
+                target = cast("ast.Assign", hoisted[index]).targets[0]
+                assert isinstance(target, ast.Name)
+                return ast.Name(id=target.id, ctx=ast.Load())
+            result = self.generic_visit(node)
+            assert isinstance(result, ast.expr)
+            return result
+
+    def hoist(expression: ast.expr) -> ast.expr:
+        result = Hoist().visit(_clone(expression))
+        assert isinstance(result, ast.expr)
+        return result
+
+    row = hoist(region.row)
+    row_predicate = hoist(region.row_predicate)
+    return hoisted, dataclasses.replace(region, row=row, row_predicate=row_predicate)
+
+
 def _row_limit(
     region: GatheredMmaRegion,
     site: CollectiveMmaSite,
@@ -278,6 +356,7 @@ def emit_gathered_mma_region(
     names.update(wrapper_parameters)
     names["_gather_runtime"] = runtime_name
     names["out"] = region.output
+    hoisted, region = _hoist_group_metadata_loads(region, site, df)
     grid_cap = min(
         65535,
         ((1 << 31) - 1) // (region.group_count * ((region.n_size + bn - 1) // bn)),
@@ -321,6 +400,7 @@ def emit_gathered_mma_region(
             return result
 
     Instantiate().visit(module)
+    module.body[:0] = hoisted
     ast.fix_missing_locations(module)
     region.m_parent[region.m_position : region.m_position + 1] = module.body
     parameters = list(wrapper_parameters.values())

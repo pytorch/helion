@@ -46,6 +46,8 @@ from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from ...language.matmul_ops import dot
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import FixedBlockSizeSource
+from .cute_mma_dag import MMA_DAG_KEY
+from .cute_mma_dag import MMA_DAG_OFF
 from .fx_matcher import _canonical_root_axis_ids
 from .fx_matcher import _is_call
 from .fx_matcher import _linear_offsets_fit_i32
@@ -799,6 +801,11 @@ def _plan_gdn_recurrence(
 
     df = DeviceFunction.current()
     if df.config.get("pid_type", "flat") != "flat":
+        return None
+    if df.config.get(MMA_DAG_KEY, MMA_DAG_OFF) not in (MMA_DAG_OFF, None):
+        # The config selects the register-MMA dataflow owner
+        # (``cute_mma_dag``): the search decides between the two whole-root
+        # lowerings of this recurrence, and that knob is its choice.
         return None
     match = _match_gdn_recurrence_graphs(graphs)
     if match is None:

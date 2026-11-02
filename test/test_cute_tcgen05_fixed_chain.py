@@ -748,7 +748,22 @@ def test_two_cta_cluster_keeps_the_cluster_init_protocol() -> None:
     # one-shot hoist / epilogue free are covered on a real device by
     # ``test_matmul_mma_tcgen05_two_cta_one_shot_prologue_teardown``.
     assert "advance_to_next_work()" in kernel
-    assert "if not tcgen05_tma_warp:" not in kernel
+    assert (
+        "if not tcgen05_tma_warp:\n        cutlass.pipeline.pipeline_init_wait("
+        not in kernel
+    )
+    # The one-warp prologue blocks the TMA-load warp skips (the two-CTA TMEM
+    # dealloc barrier init, the pipeline inits, epilogue warp 0's store
+    # descriptor prefetch) sit behind one guard ahead of the cluster arrive.
+    assert kernel.count("initialize_mbarrier=False)") == 2
+    guarded = kernel.index(
+        "if not tcgen05_tma_warp:\n        if tcgen05_warp_idx == cutlass.Int32(0):"
+        "\n            with cute.arch.elect_one():"
+        "\n                cute.arch.mbarrier_init(tcgen05_tmem_dealloc_mbar_ptr, 32)"
+    )
+    assert guarded < kernel.index("cutlass.pipeline.pipeline_init_arrive(")
+    assert kernel.count("prefetch_descriptor(tcgen05_tma_store_atom)") == 1
+    assert guarded < kernel.index("prefetch_descriptor(tcgen05_tma_store_atom)")
     assert kernel.index("cutlass.pipeline.pipeline_init_wait(") < kernel.index(
         "cute.arch.griddepcontrol_wait()"
     )

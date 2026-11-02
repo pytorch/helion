@@ -31,7 +31,11 @@ from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
 from .cute.cute_reshape import run_deferred_rebound_checks
 from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
+from .cute.fragment_mma_dot import FragmentMmaNotApplied
+from .cute.fragment_mma_dot import fragment_mma_off_config
 from .cute.register_tile_admission import RegisterTileUnsupported
+from .cute.ring_mma_dot import RingMmaNotApplied
+from .cute.ring_mma_dot import ring_mma_off_config
 from .cute.thread_budget import thread_idx_axis
 from .cute.unroll_lane_loads import LaneUnrollNotApplied
 from .cute.unroll_lane_loads import lane_unroll_off_config
@@ -257,6 +261,43 @@ class ResidentPrepLowering:
     tail_fill_value: float
 
 
+# The plain (non-grouped) tcgen05 GEMM wrapper plans: A/B TMA loads and the D
+# TMA store over the problem tensors themselves.  Baking the tensor layouts
+# into the wrapper schema makes the TMA coordinate tensors' strides immediates
+# (the launcher's full-tile guard still decides per plan); with runtime
+# layouts every tcgen05 kernel fetched them from two constant-bank lines (LDCU
+# misses) and multiplied them into its TMA coordinates on the TMA-load warp's
+# post-release critical path.  The grouped variants (device tensormaps, shared
+# RHS, full-allocation operands, device split sizes, bounded output shifts)
+# re-point descriptors in-kernel and keep the runtime layouts.
+_CUTE_PLAIN_TCGEN05_AB_PLAN_GROUPED_KEYS = frozenset(
+    {
+        "shared_rhs",
+        "fixed_ab_tensormaps",
+        "dynamic_ab_tensormaps",
+        "full_allocation_a",
+        "full_allocation_b",
+        "device_split_sizes",
+        "fixed_grouped_b_rank3",
+        "source_m_tile",
+    }
+)
+_CUTE_PLAIN_TCGEN05_D_PLAN_GROUPED_KEYS = frozenset(
+    {"fixed_tensormap", "bounded_output_shift", "dynamic_d_tensormap"}
+)
+
+
+def _cute_plain_tcgen05_plan_bakes(plan: dict[str, object]) -> bool:
+    kind = plan.get("kind")
+    if kind == "tcgen05_ab_tma":
+        return not any(
+            plan.get(key) for key in _CUTE_PLAIN_TCGEN05_AB_PLAN_GROUPED_KEYS
+        )
+    if kind == "tcgen05_d_tma":
+        return not any(plan.get(key) for key in _CUTE_PLAIN_TCGEN05_D_PLAN_GROUPED_KEYS)
+    return False
+
+
 class GenerateAST(NodeVisitor, CodegenInterface):
     def __init__(
         self,
@@ -418,7 +459,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return True
         if self.cute_wrapper_plans:
             return all(
-                plan.get("kind")
+                _cute_plain_tcgen05_plan_bakes(plan)
+                or plan.get("kind")
                 in {
                     "helion_small_biased_attention",
                     "helion_flash_row_mma",
@@ -426,6 +468,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     "helion_register_subblocks",
                     "helion_flash",
                     "helion_flash_gated",
+                    "helion_flash_gated_row_mma",
                     "chunk_prepare_tma",
                     "chunk_recurrence_sm100",
                     "chunk_recurrence_warp_dv4",
@@ -2599,6 +2642,17 @@ def generate_ast(
                     # the caller rebuilds them for the knob-off run.
                     raise
                 config = vloop_sink_off_config(config)
+            except FragmentMmaNotApplied:
+                # The fragment rewrite is a late AST pass like the unroll: the
+                # knob-off run reuses the caller's graphs.
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                config = fragment_mma_off_config(config)
+            except RingMmaNotApplied:
+                # The ring rewrite is a late AST pass like the fragment one.
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                config = ring_mma_off_config(config)
             except LaneUnrollNotApplied:
                 # The unroll is a late AST pass that touches no graph, so
                 # the knob-off run reuses the caller's graphs as they are.
@@ -3218,6 +3272,22 @@ def _generate_ast(
                 final_host_statements = lower_host_zero_fills(
                     func, final_host_statements, env, codegen.device_function.config
                 )
+                from .cute.host_zero_fill_launches import lower_host_zero_fill_launches
+                from .cute.host_zero_fill_launches import zero_fill_launches_apply
+
+                if zero_fill_launches_apply(
+                    codegen.device_function, env, codegen.device_function.config
+                ):
+                    # The zero fills that survive the elision launch as
+                    # dependent fill kernels ahead of this (``cute_pdl``)
+                    # kernel instead of memset nodes.
+                    final_host_statements, fill_kernels = lower_host_zero_fill_launches(
+                        func,
+                        final_host_statements,
+                        env=env,
+                        kernel_name=codegen.device_function.name,
+                    )
+                    post_kernel_metadata_statements.extend(fill_kernels)
 
             host_def = func.codegen_function_def(
                 final_host_statements,

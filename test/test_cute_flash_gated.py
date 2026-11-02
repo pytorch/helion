@@ -867,10 +867,19 @@ def test_hstu_selects_gated_body_at_fused_tiles(head_dim: int) -> None:
             "block_sizes",
             "cute_flash_kv_stage",
             "cute_flash_gate_warpgroups",
+            "cute_flash_gated_row_warps",
         ]
-        seeds = [seed.config for seed in spec.autotune_seed_configs()]
-        assert seeds[0]["block_sizes"] == [128, 128]
-        assert seeds[0]["cute_flash_gate_warpgroups"] == 2
+        all_seeds = [seed.config for seed in spec.autotune_seed_configs()]
+        assert all_seeds[0]["block_sizes"] == [128, 128]
+        assert all_seeds[0]["cute_flash_gate_warpgroups"] == 2
+        # The fused tcgen05 seeds come first; the register-MMA row programs'
+        # seeds (16- and 32-row query tiles) follow (test_cute_flash_gated_row_mma).
+        seeds = [seed for seed in all_seeds if seed["block_sizes"][0] >= 64]
+        row_seeds = [seed for seed in all_seeds if seed["block_sizes"][0] < 64]
+        assert all_seeds == [*seeds, *row_seeds]
+        # This shape (8 sequences x 8 heads x 32 query tiles of 16 rows = 2048
+        # row programs) is past the row programs' seed cap: none here.
+        assert row_seeds == []
         # Every fused tile shape (both query tile heights, every KV tile width)
         # at every legal ring depth and every gate warpgroup count above one is
         # seeded (a count must split a thread's columns into chunks of at least
@@ -1306,9 +1315,28 @@ def test_hstu2_wide_tile_rejected_at_head_dim_128() -> None:
 def test_hstu_other_tiles_keep_scalar_path_and_validate_knob() -> None:
     with _cpu_codegen_patches():
         bound = _bind_hstu(_hstu_args())
+        # The 16-row query tile takes the register-MMA row program, not the
+        # fused body (test_cute_flash_gated_row_mma covers it).
         code = bound.to_code(helion.Config(block_sizes=[16, 16]))
         assert not _gated_markers(code)
         assert "_flash_qk_mma" not in code
+        assert "'kind': 'helion_flash_gated_row_mma'" in code
+        # A tile neither body takes (a 64-row query tile with a 16-key KV
+        # tile) keeps the scalar path.
+        scalar = bound.to_code(helion.Config(block_sizes=[64, 16]))
+        assert not _gated_markers(scalar)
+        assert "_flash_qk_mma" not in scalar
+        assert "'kind': 'helion_flash_gated_row_mma'" not in scalar
+        assert "_cute_grouped_reduce" in scalar or "cute.arch" in scalar
+        # fp32 rows: the fused body runs them as tf32, the row programs
+        # decline them, so the 16-row tile falls back to the scalar path and
+        # the surface has no row tiles (and no warp knob).
+        seq, alpha, q, k, v, seq_offsets = _hstu_args()
+        fp32 = _bind_hstu((seq, alpha, q.float(), k.float(), v.float(), seq_offsets))
+        assert "cute_flash_gated_row_warps" not in fp32.config_spec._flat_fields()
+        scalar32 = fp32.to_code(helion.Config(block_sizes=[16, 16]))
+        assert not _gated_markers(scalar32)
+        assert "'kind': 'helion_flash_gated_row_mma'" not in scalar32
         with pytest.raises(InvalidConfig, match="cute_flash_kv_stage"):
             bound.config_spec.normalize(
                 helion.Config(block_sizes=[128, 128], cute_flash_kv_stage=99)

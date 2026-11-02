@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import cast
 
+from .tcgen05_constants import SM100_SMEM_PER_BLOCK_OPTIN_BYTES
+from .tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CHOICES
+from .tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 
 if TYPE_CHECKING:
@@ -22,6 +25,14 @@ AB_STAGES_CHOICES: tuple[int | None, ...] = (None, 3, 4, 5, 6, 7, 8, 10)
 # The shallowest depth the search offers; a two-deep ring (one stage of
 # look-ahead) is not searched, tested or accepted.
 AB_STAGES_MIN = 3
+# ``tcgen05_epi_round_subtiles`` on a profile: the epilogue stores its
+# subtiles in rounds of that many (``tcgen05_epilogue_rounds``); the profile's
+# C ring then holds one buffer per subtile of a tile, rounded up to whole
+# rounds, so a CTA's first tile never waits on a bulk-store group.
+ROUND_SUBTILES_KEY = TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY
+ROUND_SUBTILES_CHOICES = TCGEN05_EPI_ROUND_SUBTILES_CHOICES
+# The sm_100 opt-in shared memory per block the profiles are bounded against.
+PROFILE_MAX_SMEM_PER_BLOCK = SM100_SMEM_PER_BLOCK_OPTIN_BYTES
 LEGACY_SCHEDULE = "legacy"
 TRANSPOSED_SCHEDULE = "nm_m256_n80_k64"
 PAIRED_CLC_SCHEDULE = "nm_m256_n192_k64_clc"
@@ -60,6 +71,8 @@ class RowUnionSchedule:
     epi_m: int
     epi_n: int
     paired_protocol: PairedRowUnionProtocol | None = None
+    # Subtile buffers of the TMA-store C ring (two on the per-subtile loop).
+    c_stages: int = 2
 
     @property
     def linear_record_clc(self) -> bool:
@@ -77,7 +90,12 @@ class RowUnionSchedule:
         # its 8B barrier, TMEM publication, at most 63 Int32 coverage/interval
         # words, alignment padding, and the SDK's 1KiB reservation. This is
         # a storage bound, not an occupancy or register-allocation claim.
-        return self.ab_stages * ab + 2 * self.epi_m * self.epi_n * 2 + 2048
+        return self.ab_stages * ab + self.c_stages * self.epi_m * self.epi_n * 2 + 2048
+
+    @property
+    def epilogue_subtiles(self) -> int:
+        """Subtiles of one output tile on the profile's epilogue tile."""
+        return self.mma_n // self.epi_n
 
     @property
     def producer_cluster(self) -> tuple[int, int, int]:
@@ -123,7 +141,7 @@ class RowUnionSchedule:
             "tcgen05_cluster_n": self.cluster_n,
             "tcgen05_ab_stages": self.ab_stages,
             "tcgen05_acc_stages": 2,
-            "tcgen05_c_stages": 2,
+            "tcgen05_c_stages": self.c_stages,
             "tcgen05_num_epi_warps": 4,
             "tcgen05_layout_overrides_epi_tile_m": self.epi_m,
             "tcgen05_layout_overrides_epi_tile_n": self.epi_n,
@@ -169,6 +187,37 @@ def with_ab_stages(profile: RowUnionSchedule, value: object) -> RowUnionSchedule
     return dataclasses.replace(profile, ab_stages=cast("int", value))
 
 
+def round_subtiles_supported(
+    profile: RowUnionSchedule, value: object, stages: object = None
+) -> bool:
+    """Whether ``value`` subtiles per epilogue round is legal for ``profile``
+    at the physical ring depth ``stages``: 1 always; a searched round size on
+    the transposed profile (the paired protocol keeps its own store tail)
+    whose wider C ring still fits the sm_100 shared memory."""
+    if value == 1:
+        return True
+    if (
+        type(value) is not int
+        or value not in ROUND_SUBTILES_CHOICES
+        or profile.paired_protocol is not None
+        or value > profile.epilogue_subtiles
+        or not ab_stages_supported(profile, stages)
+    ):
+        return False
+    physical = with_round_subtiles(with_ab_stages(profile, stages), value)
+    return physical.shared_upper_bound <= PROFILE_MAX_SMEM_PER_BLOCK
+
+
+def with_round_subtiles(profile: RowUnionSchedule, value: object) -> RowUnionSchedule:
+    """The profile with its C ring sized for rounds of ``value`` subtiles:
+    one buffer per subtile of a tile, whole rounds."""
+    if value == 1:
+        return profile
+    assert type(value) is int and value in ROUND_SUBTILES_CHOICES
+    rounds = -(-profile.epilogue_subtiles // value)
+    return dataclasses.replace(profile, c_stages=rounds * value)
+
+
 def physical_schedule(config: Mapping[str, object]) -> RowUnionSchedule | None:
     profile = schedule_by_name(config.get(SCHEDULE_KEY, LEGACY_SCHEDULE))
     if profile is None:
@@ -178,7 +227,11 @@ def physical_schedule(config: Mapping[str, object]) -> RowUnionSchedule | None:
         # Normalization rejects or repairs the knob; an unrepaired config
         # keeps the profile's own depth here so codegen never overruns smem.
         return profile
-    return with_ab_stages(profile, stages)
+    physical = with_ab_stages(profile, stages)
+    rounds = config.get(ROUND_SUBTILES_KEY, 1)
+    if not round_subtiles_supported(profile, rounds, stages):
+        return physical
+    return with_round_subtiles(physical, rounds)
 
 
 # Two BF16 AB rings plus a conservative allowance for their four barriers,

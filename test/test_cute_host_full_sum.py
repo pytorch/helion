@@ -98,6 +98,46 @@ def _row_sum_shadowed(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return _cute_try_full_sum, out
 
 
+def _row_sum_scaled(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile, :].to(torch.float32).sum(-1)
+    # kl_div's ``batchmean``: ATen multiplies the sum by the FP32 reciprocal.
+    total = torch.sum(out) / x.size(0)
+    return total, out
+
+
+def _row_sum_by_mode(x: torch.Tensor, reduction: str) -> torch.Tensor:
+    out = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile, :].to(torch.float32).sum(-1)
+    if reduction == "batchmean":
+        total = torch.sum(out) / (x.size(0) * 2)
+    elif reduction == "sum":
+        total = torch.sum(out)
+    else:
+        total = out.mean()
+    return total
+
+
+def _row_sum_tensor_divisor(
+    x: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile, :].to(torch.float32).sum(-1)
+    total = torch.sum(out) / scale
+    return total, out
+
+
+def _row_sum_call_divisor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile, :].to(torch.float32).sum(-1)
+    total = torch.sum(out) / float(x.size(0))
+    return total, out
+
+
 def _kernel(fn: Callable[..., Any], **settings: Any) -> Kernel:
     return helion.kernel(
         fn,
@@ -218,15 +258,63 @@ def test_knob_off_keeps_the_host_call_and_is_seeded() -> None:
         }
 
 
+@_requires_pinned_aten_build
+@skipIfRefEager("generates code")
+def test_sum_divided_by_a_host_scalar_passes_the_divisor() -> None:
+    with _mock_cuda_unavailable():
+        bound = _bind(_row_sum_scaled, torch.empty((256, 32)))
+        assert bound.host_function is not None
+        proof = prove_host_full_sum(bound.host_function)
+        assert [(site.source, site.mean, site.divisor) for site in proof.sites] == [
+            ("out", False, "x.size(0)")
+        ]
+        code = _host_code(bound, "mapped")
+        assert (
+            "total = _cute_try_full_sum(out, mean=False, divisor=x.size(0), "
+            "_launcher=_launcher)" in code
+        )
+        assert "if total is None:\n        total = torch.sum(out) / x.size(0)" in code
+        # A ``str`` argument keys the kernel by value: the selected branch is
+        # the only one left, with its own site form.
+        for mode, divisor, original in (
+            ("batchmean", "x.size(0) * 2", "total = torch.sum(out) / (x.size(0) * 2)"),
+            ("sum", None, "total = torch.sum(out)"),
+            ("mean", None, "total = out.mean()"),
+        ):
+            bound = _bind(_row_sum_by_mode, torch.empty((256, 32)), mode)
+            assert bound.host_function is not None
+            proof = prove_host_full_sum(bound.host_function)
+            assert [(site.mean, site.divisor) for site in proof.sites] == [
+                (mode == "mean", divisor)
+            ]
+            code = _host_code(bound, "narrow")
+            assert "if reduction ==" not in code
+            assert f"if total is None:\n        {original}" in code
+
+
 @pytest.mark.parametrize(
-    "fn",
-    [_row_sum_half, _row_sum_dim, _row_sum_shadowed],
-    ids=["fp16 source", "sum over dim", "helper name bound"],
+    "fn,args",
+    [
+        (_row_sum_half, ()),
+        (_row_sum_dim, ()),
+        (_row_sum_shadowed, ()),
+        (_row_sum_tensor_divisor, (torch.empty(()),)),
+        (_row_sum_call_divisor, ()),
+    ],
+    ids=[
+        "fp16 source",
+        "sum over dim",
+        "helper name bound",
+        "tensor divisor",
+        "call in the divisor",
+    ],
 )
 @skipIfRefEager("generates code")
-def test_unproven_sites_keep_the_host_call(fn: Callable[..., object]) -> None:
+def test_unproven_sites_keep_the_host_call(
+    fn: Callable[..., object], args: tuple[object, ...]
+) -> None:
     with _mock_cuda_unavailable():
-        bound = _bind(fn, torch.empty((256, 32)))
+        bound = _bind(fn, torch.empty((256, 32)), *args)
         assert bound.host_function is not None
         assert not prove_host_full_sum(bound.host_function).sites
         assert not bound.config_spec.cute_host_paired_sum_available
@@ -244,6 +332,14 @@ def test_runtime_helper_declines_unsupported_tensors() -> None:
         torch.zeros((2, 64), device=torch.device("meta")),  # rank
     ):
         assert try_full_sum(tensor, mean=False, _launcher=forbidden) is None
+    meta = torch.zeros(128, device=torch.device("meta"))
+    # A divisor ATen would not treat as a CPU scalar, or one on a mean.
+    assert (
+        try_full_sum(meta, mean=False, divisor=torch.tensor(2.0), _launcher=forbidden)
+        is None
+    )
+    assert try_full_sum(meta, mean=False, divisor=True, _launcher=forbidden) is None
+    assert try_full_sum(meta, mean=True, divisor=2, _launcher=forbidden) is None
     if torch.cuda.is_available():
         for tensor in (
             torch.zeros(64, device=DEVICE),  # ATen does not vectorize
@@ -274,6 +370,50 @@ def test_total_is_bit_identical_to_torch(rows: int, mean: bool) -> None:
         expected = out.mean() if mean else torch.sum(out)
         assert total.shape == () and total.dtype == torch.float32
         assert torch.equal(total, expected), (rows, mean, total.item(), expected.item())
+
+
+@_requires_pinned_aten_build
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("rows", [128, 255, 1000, 4096, 16383])
+def test_scaled_total_is_bit_identical_to_torch(rows: int) -> None:
+    torch.manual_seed(rows)
+    x = torch.randn((rows, 64), device=DEVICE, dtype=torch.bfloat16) * 1000
+    config = (
+        _kernel(_row_sum_scaled, autotune_effort="none")
+        .bind((x,))
+        .config_spec.default_config()
+    )
+    config.config["cute_host_paired_sum"] = "mapped"
+    kernel = _kernel(_row_sum_scaled, config=config)
+    for _ in range(3):
+        total, out = kernel(x)
+        expected = torch.sum(out) / rows
+        assert total.shape == () and total.dtype == torch.float32
+        assert torch.equal(total, expected), (rows, total.item(), expected.item())
+
+
+@_requires_pinned_aten_build
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_divisor_values_share_one_compiled_kernel() -> None:
+    from helion._compiler.cute.full_sum_runtime import full_sum_kernel
+    from helion.runtime import default_cute_launcher
+    from helion.runtime.cute.full_sum import try_full_sum
+
+    torch.manual_seed(1037)
+    # A length no other test reduces: its ``(numel, width, scale)`` kernel is
+    # compiled here, once, and the runtime factor serves every divisor.
+    x = torch.randn(1037, device=DEVICE) * 1000
+    compiled = getattr(full_sum_kernel, "_helion_cute_compiled_launchers", {})
+    before = len(compiled)
+    sizes = []
+    for divisor in (3, 7, 0.25, 1037):
+        total = try_full_sum(
+            x, mean=False, divisor=divisor, _launcher=default_cute_launcher
+        )
+        assert total is not None
+        assert torch.equal(total, torch.sum(x) / divisor), divisor
+        sizes.append(len(full_sum_kernel._helion_cute_compiled_launchers))
+    assert sizes == [before + 1] * 4, sizes
 
 
 @_requires_pinned_aten_build

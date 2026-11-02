@@ -66,6 +66,8 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE
+from .._compiler.cute.tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CHOICES
+from .._compiler.cute.tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_ACC_T2R,
@@ -85,6 +87,8 @@ from .._compiler.cute.tcgen05_constants import (
 )
 from .._compiler.cute.tcgen05_constants import tcgen05_default_epilogue_tile_size
 from .._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_store_shape
+from .._compiler.cute.tcgen05_epilogue_rounds import Tcgen05EpilogueRoundNames
+from .._compiler.cute.tcgen05_epilogue_rounds import render_round_subtile_loop
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCoreParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreSubtileLoopParams
@@ -5267,6 +5271,24 @@ def _codegen_cute_store_tcgen05_tile(
     # layout, the kernel descriptor and the wrapper's TMA store box take the
     # whole ``tcgen05_value.c_stage_count`` ring).
     tcgen05_c_stage_count = tcgen05_value.c_stages_per_group
+    # ``tcgen05_epi_round_subtiles``: subtiles staged and stored per round
+    # (``tcgen05_epilogue_rounds``).  The bulk-group pipeline counts rounds,
+    # so it has a stage per round of C buffers; the ring itself keeps
+    # ``c_stage_count`` subtile buffers.
+    tcgen05_epi_round_subtiles = state.device_function.config.get(
+        TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, 1
+    )
+    if (
+        type(tcgen05_epi_round_subtiles) is not int
+        or tcgen05_epi_round_subtiles not in TCGEN05_EPI_ROUND_SUBTILES_CHOICES
+        or tcgen05_c_stage_count % tcgen05_epi_round_subtiles != 0
+    ):
+        raise exc.InvalidConfig(
+            f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}={tcgen05_epi_round_subtiles!r} "
+            f"must be one of {TCGEN05_EPI_ROUND_SUBTILES_CHOICES!r} and divide "
+            f"the {tcgen05_c_stage_count}-stage C ring"
+        )
+    tcgen05_c_pipeline_stage_count = tcgen05_c_stage_count // tcgen05_epi_round_subtiles
     tcgen05_is_two_cta = tcgen05_lifecycle.is_two_cta
     tcgen05_thr_mma = tcgen05_value.thr_mma
     # The bm=128 CtaGroup.TWO family stores through the per-CTA epilogue tile
@@ -6481,7 +6503,7 @@ def _codegen_cute_store_tcgen05_tile(
         ),
         (
             f"{c_pipeline} = cutlass.pipeline.PipelineTmaStore.create("
-            f"num_stages={tcgen05_c_stage_count}, "
+            f"num_stages={tcgen05_c_pipeline_stage_count}, "
             f"producer_group={c_pipeline_producer_group})"
         ),
     ]
@@ -7404,6 +7426,116 @@ def _codegen_cute_store_tcgen05_tile(
             f"{tma_store_module_tail_helper_call()}"
         )
 
+    def _round_subtile_loop() -> str:
+        """The TMA-store epilogue in rounds of ``tcgen05_epi_round_subtiles``
+        subtiles (``tcgen05_epilogue_rounds``): the plain single-output,
+        full-tile, role-local store with the identity epilogue and a tile
+        counter; every other shape of the store refuses the knob."""
+        rounds = tcgen05_epi_round_subtiles
+        refused = (
+            diagnose_split_first_t2r
+            or diagnose_split_acc_t2r_store_tail
+            or diagnose_module_helper_acc_t2r
+            or diagnose_module_helper_store_tail
+            or diagnose_acc_wait_before_subtile_loop
+            or diagnose_first_c_acquire_in_loop
+            or diagnose_later_c_acquire_before_barrier
+            or grouped_epilogue
+            or static_subtile_loop
+            or has_store_warp
+            or paired_row_protocol is not None
+            or fanout_plan is not None
+            or bool(aux_steps_in_chain)
+            or tcgen05_m_subtile_count > 1
+            or grouped_dynamic_d_tensormap_edge_only
+            or grouped_full_coverage_predicate is not None
+            or bool(worklist_nm_segment_valid_m_bound)
+            or not is_final_store
+            or is_secondary_store
+            or fanout_late_c_acquire
+            or paired_row_late_c
+            or not tcgen05_value.use_tma_store_epilogue
+            or not tcgen05_value.role_local_tile_counter
+        )
+        if refused:
+            raise exc.InvalidConfig(
+                f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}={rounds} needs the plain "
+                "single-output role-local TMA-store epilogue (no fan-out, auxiliary "
+                "chain, store warp, paired tail, epilogue groups or diagnostic "
+                "placement) with a tile counter"
+            )
+        if tcgen05_value.has_explicit_epilogue_tile:
+            assert tcgen05_value.explicit_epi_tile_m is not None
+            assert tcgen05_value.explicit_epi_tile_n is not None
+            round_epi_tile_m = tcgen05_value.explicit_epi_tile_m
+            round_epi_tile_n = tcgen05_value.explicit_epi_tile_n
+        else:
+            round_epi_tile_m, round_epi_tile_n = tcgen05_default_epilogue_tile_size(
+                tcgen05_value.bm,
+                tcgen05_value.bn,
+                elem_width_d=tensor.dtype.itemsize * 8,
+                elem_width_c=tensor.dtype.itemsize * 8,
+            )
+        round_rows = tcgen05_value.bm // 2 if tcgen05_is_two_cta else tcgen05_value.bm
+        if round_rows % round_epi_tile_m or tcgen05_value.bn % round_epi_tile_n:
+            raise exc.InvalidConfig(
+                f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}={rounds} needs whole "
+                "epilogue subtiles of the CTA tile"
+            )
+        round_subtile_count = (round_rows // round_epi_tile_m) * (
+            tcgen05_value.bn // round_epi_tile_n
+        )
+        if rounds > round_subtile_count:
+            raise exc.InvalidConfig(
+                f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}={rounds} exceeds the "
+                f"{round_subtile_count} epilogue subtiles of the tile"
+            )
+        early_aux_prelude, late_prelude, rhs = _splice_acc_vec(
+            trs_racc,
+            "        ",
+            safe_direct_aux_with_full_tile=partial_tma_needs_full_tile_guard,
+            coord_layout="trs",
+        )
+        if early_aux_prelude or late_prelude:
+            raise exc.InvalidConfig(
+                f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}={rounds} needs the "
+                "identity epilogue (the accumulator cast to the output dtype)"
+            )
+        assert tcgen05_value.role_local_tile_counter is not None
+        return render_round_subtile_loop(
+            Tcgen05EpilogueRoundNames(
+                epi_active=tcgen05_epi_active,
+                epi_leader_predicate=epi_leader_predicate,
+                acc_pipeline=tcgen05_acc_pipeline,
+                acc_consumer_state=tcgen05_acc_consumer_state,
+                tiled_copy_t2r=tiled_copy_t2r,
+                tiled_copy_r2s=tiled_copy_r2s,
+                ttr_tacc=ttr_tacc,
+                ttr_tacc_mn=ttr_tacc_mn,
+                ttr_racc=ttr_racc,
+                trs_racc=trs_racc,
+                ttr_rd=ttr_rd,
+                trs_rd=trs_rd,
+                trs_sd=trs_sd,
+                acc_vec=acc_vec,
+                c_buffer=c_buffer,
+                epilog_sync_barrier=epilog_sync_barrier,
+                tma_store_atom=tcgen05_tma_store_atom,
+                bsg_sd=bsg_sd,
+                bsg_gd=bsg_gd,
+                c_pipeline=c_pipeline,
+                target_dtype=target_dtype,
+                tile_counter=tcgen05_value.role_local_tile_counter,
+                tma_desc_arg=tma_store_desc_arg,
+            ),
+            subtile_count=round_subtile_count,
+            round_subtiles=rounds,
+            c_stage_count=tcgen05_c_stage_count,
+            acc_rhs=rhs,
+            acc_wait=True,
+            acc_release=True,
+        )
+
     def default_tma_store_subtile_loop(
         tma_desc_arg: str | None = None,
         tma_store_atom: str | None = None,
@@ -7426,6 +7558,8 @@ def _codegen_cute_store_tcgen05_tile(
         # The compact SIMT schedule above owns T2R and never instantiates the
         # same-shape TMA renderer. Avoid eagerly formatting that unused body.
         tma_store_subtile_loop = ""
+    elif tcgen05_epi_round_subtiles > 1:
+        tma_store_subtile_loop = _round_subtile_loop()
     elif diagnose_split_first_t2r:
         tma_store_split_first_subtile_body = tma_store_subtile_body(
             first_subtile_acquire=tma_store_split_first_subtile_acquire,

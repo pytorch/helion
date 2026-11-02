@@ -3647,7 +3647,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
             for graph_info in device_ir.graphs:
                 factor_affine_reductions(graph_info.graph, fast_math=True)
-        if CompileEnvironment.current().backend.name == "cute":
+        if (
+            CompileEnvironment.current().backend.name == "cute"
+            and CompileEnvironment.current().settings.cute_promote_half_atomic_outputs
+        ):
             promotions = collect_cute_half_atomic_output_promotions(device_ir.graphs)
             if promotions:
                 env = CompileEnvironment.current()
@@ -3906,6 +3909,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     kv_stage_choices_by_tile=dict(
                         gated_surface.kv_stage_choices_by_tile
                     ),
+                    row_warp_choices_by_tile=dict(
+                        gated_surface.row_warp_choices_by_tile
+                    ),
+                    row_stage_choices=dict(gated_surface.row_stage_choices),
+                    row_seed_programs=gated_surface.row_programs,
                 )
             else:
                 from ..language.matmul_ops import _plan_cute_tcgen05_search_candidate

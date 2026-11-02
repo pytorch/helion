@@ -1457,7 +1457,7 @@ def _stored_tensor_names(body: list[ast.stmt]) -> set[str]:
                 continue
             func = ast.unparse(node.func)
             if (
-                func.startswith("cute.arch.atomic")
+                func.startswith(("cute.arch.atomic", "_cute_red_add_"))
                 or "atomic" in func.rsplit(".", 1)[-1]
             ):
                 for arg in node.args:

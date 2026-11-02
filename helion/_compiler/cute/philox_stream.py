@@ -2,21 +2,20 @@
 
 from __future__ import annotations
 
-import ast
 from typing import TYPE_CHECKING
 from typing import cast
 
 import torch
 
 from ... import exc
-from ...language import _tracing_ops
 from ...language import random_ops
 from ...language.inline_asm_ops import inline_asm_elementwise
 from ..ast_extension import expr_from_string
-from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
+    import ast
+
     from ...language.ref_tile import RefTile
     from ..inductor_lowering import CodegenState
 
@@ -163,65 +162,21 @@ def rewrite_random_stream(graph: torch.fx.Graph) -> None:
 
 
 def stage_explicit_seed(state: CodegenState, seed: int | torch.SymInt) -> ast.expr:
-    """Create a fresh graph-visible seed argument at the original host launch."""
-    from ..device_function import TensorArg
-    from ..host_function import HostFunction
+    """The host-known seed as a ``cutlass.Int64`` device operand.
 
+    A literal seed is a constant. A host ``SymInt`` seed (an ``int`` kernel
+    argument, or a host expression of such arguments) lifts through the device
+    function's symbol arguments and reaches the launch as a runtime
+    ``cutlass.Int64`` scalar like every other host integer: one compiled kernel
+    serves every seed value and the call adds no device work. (Staging the seed
+    through a one-element tensor filled on every call cost a fill kernel per
+    launch: a separate ~1 us node in a CUDA graph, more than a third of a small
+    dropout kernel's time.)
+    """
     fn = state.device_function
-    env = CompileEnvironment.current()
-    host_seed = HostFunction.current().literal_expr(seed)
-    tensor_inputs = [arg for arg in fn.arguments if isinstance(arg, TensorArg)]
-    if tensor_inputs:
-        device = tensor_inputs[0].host_str()
-    else:
-        # Shape-only inputs may have no device pointer argument yet. Their
-        # original host argument still proves the allocation device and is
-        # available before every generated launch.
-        origins = [
-            origin
-            for tensor, origin in HostFunction.current().tensor_to_origin.items()
-            if origin.is_argument() and tensor.device == env.device
-        ]
-        if origins:
-            device = origins[0].host_str()
-        else:
-            # Host locals replace ArgumentOrigin during type propagation, and
-            # an RNG node may precede every tensor load/store in this graph.
-            # _host_tensor nodes still name tensors available at this launch,
-            # including outputs of kernels with no tensor inputs. Do not scan
-            # arbitrary host locals, which may belong to a different launch.
-            assert state.fx_node is not None
-            host_tensors = [
-                node
-                for node in state.fx_node.graph.nodes
-                if node.target is _tracing_ops._host_tensor
-                and isinstance(value := node.meta.get("val"), torch.Tensor)
-                and value.device == env.device
-            ]
-            if not host_tensors:
-                raise exc.BackendUnsupported(
-                    "cute", "explicit seed staging needs a tensor input device"
-                )
-            device = cast("str", host_tensors[0].args[0])
-    with env.fake_mode:
-        fake = torch.empty((1,), dtype=torch.int64, device=env.device)
-    arg = TensorArg(
-        fn.new_var("explicit_rng_seed"),
-        fake,
-        f"_cute_stage_explicit_seed({host_seed}, {device})",
-    )
-    fn.arguments.append(arg)
-    fn.cute_state.explicit_rng_seed_names.add(arg.name)
-    fn._tensor_args[fake] = arg
-    statement = statement_from_string(
-        "from helion.runtime.cute.rng import stage_explicit_seed as _cute_stage_explicit_seed"
-    )
-    if not any(
-        ast.dump(value) == ast.dump(statement)
-        for value in state.codegen.module_statements
-    ):
-        state.codegen.module_statements.append(statement)
-    return cast("ast.expr", expr_from_string(f"{arg.name}[0]"))
+    expression = f"cutlass.Int64({fn.literal_expr(seed)})"
+    fn.cute_state.explicit_rng_seed_exprs.add(expression)
+    return cast("ast.expr", expr_from_string(expression))
 
 
 def reference_override(

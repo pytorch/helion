@@ -20,7 +20,6 @@ from helion._compiler.cute.philox_stream import SCALAR_ASM
 from helion._compiler.cute.philox_stream import SCALAR_CONSTRAINTS
 from helion._testing import skipUnlessBackends
 import helion.language as hl
-from helion.runtime.cute.rng import stage_explicit_seed
 
 cpu_only = test_cute_philox_policy.cpu_only
 
@@ -167,22 +166,22 @@ def test_distribution_and_repeat_determinism():
 
 
 def _packet_source(width=4):
-    return f"""def kernel(start, length, seed_tensor, out):
+    return f"""def kernel(start, length, seed, out):
     for lane in cutlass.range_constexpr({width}):
         index = cutlass.Int32(start) + cutlass.Int32(lane)
         offset = cutlass.Int64(index)
-        value = _cute_inline_asm_elementwise((seed_tensor[0], offset), asm={SCALAR_ASM!r}, constraints={SCALAR_CONSTRAINTS!r}, dtype=cutlass.Float32, is_pure=True)
+        value = _cute_inline_asm_elementwise((cutlass.Int64(seed), offset), asm={SCALAR_ASM!r}, constraints={SCALAR_CONSTRAINTS!r}, dtype=cutlass.Float32, is_pure=True)
         if index < length:
             out.append((index, value))
 """
 
 
-def _lower(source, seed_names=frozenset({"seed_tensor"})):
+def _lower(source, seed_exprs=frozenset({"cutlass.Int64(seed)"})):
     module = ast.parse(source)
     ids = itertools.count()
     module.body[0].body = lower_philox_packets(
         module.body[0].body,
-        seed_names=set(seed_names),
+        seed_exprs=set(seed_exprs),
         integer_names={"start", "length"},
         new_name=lambda prefix: f"{prefix}_{next(ids)}",
     )
@@ -209,7 +208,7 @@ def _run(module, start, length, seed):
         "_cute_inline_asm_elementwise": asm,
     }
     exec(compile(module, "<packet-proof>", "exec"), namespace)
-    namespace["kernel"](start, length, [seed], out)
+    namespace["kernel"](start, length, seed, out)
     return out, stats
 
 
@@ -248,14 +247,6 @@ def test_nonprivate_seed_and_small_lane_loop_decline():
     assert ast.dump(_lower(source, set())) == ast.dump(ast.parse(source))
     source = _packet_source(2)
     assert ast.dump(_lower(source)) == ast.dump(ast.parse(source))
-
-
-def test_fresh_seed_host_lifetime_and_signed_bits():
-    x = torch.empty(3)
-    outputs = [stage_explicit_seed(seed, x) for seed in SEEDS]
-    assert len({value.data_ptr() for value in outputs}) == len(SEEDS)
-    assert [value.item() for value in outputs] == list(SEEDS)
-    assert all(value.dtype == torch.int64 and value.shape == (1,) for value in outputs)
 
 
 def _config(width, packet):
@@ -342,7 +333,8 @@ def test_original_emission_scalar_packet_normalizer_and_semantic_cache(cpu_only)
     )._bind_isolated(args)
     for width in (1, 4, 8):
         source = bound.to_triton_code(_config(width, True))
-        assert "seed, x_flat)" in source and "_cute_stage_explicit_seed" in source
+        assert "cutlass.Int64(seed)" in source
+        assert "_cute_stage_explicit_seed" not in source
         assert ("philox_packet_" in source) == (width in (4, 8))
         assert SCALAR_ASM in [
             node.value
@@ -400,7 +392,7 @@ def test_explicit_tensor_seed_offsets_reference_and_scalar_fallback(cpu_only):
     )._bind_isolated((seed, offsets))
     source = bound.to_triton_code(_config(4, True))
     assert "philox_packet_" not in source
-    assert "_cute_stage_explicit_seed" not in source
+    assert "cutlass.Int64(seed" not in source
     assert "cute_rng_stream='philox4'" in bound.format_kernel_decorator(
         _config(4, True), bound.settings
     )
@@ -478,8 +470,8 @@ def test_multiple_distinct_rng_sites_keep_their_own_seed_and_offset(cpu_only):
         _multiple_random, backend="cute", static_shapes=False, cute_rng_stream="philox4"
     )._bind_isolated((values, -1, 2**32 + 123))
     source = bound.to_triton_code(_config(4, True))
-    assert "_cute_stage_explicit_seed(first, x)" in source
-    assert "_cute_stage_explicit_seed(second, x)" in source
+    assert "cutlass.Int64(first)" in source
+    assert "cutlass.Int64(second)" in source
     assert "philox_packet_" not in source
 
 

@@ -19,6 +19,7 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
+from torch.fx import Node
 
 from ..._utils import prev_power_of_2
 from ...autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
@@ -68,6 +69,7 @@ from ..cute.loop_nesting import tile_loop_paths
 from ..cute.matmul_utils import cute_matmul_root_placements
 from ..cute.mma_support import cute_fp32_dot_uses_tf32
 from ..cute.packed_matmul import contraction_axis_for_fact
+from ..cute.pdl_release import CUTE_PDL_SPREAD_KEY
 from ..cute.register_tile_admission import register_tile_reduction_levels
 from ..cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
@@ -3012,9 +3014,45 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                     and seed.get("cute_collective_compute", "warp") != "tma_gather"
                 ]
             )
+        if _half_atomic_output(device_ir):
+            # A half output written by atomic adds has no native scalar
+            # atomic on sm_100 (``atom.add.noftz.f16`` is a compare-and-swap
+            # loop there); only the vector epilogue's packed ``f16x2`` /
+            # ``bf16x2`` reductions run at speed, so every warp seed with a
+            # scalar epilogue also carries a vector twin.
+            result.extend(
+                [
+                    Config.from_dict(
+                        seed.config | {"cute_collective_epilogue": epilogue}
+                    )
+                    for seed in result
+                    if seed.get("cute_collective_epilogue", "scalar") == "scalar"
+                    and seed.get("cute_collective_compute", "warp") == "warp"
+                    for epilogue in ("vector_unrolled", "vector")
+                ]
+            )
         return cls._interleave_bounded_k_seeds(
             spec, dedupe_configs(result), bounded_parameters
         )
+
+
+def _half_atomic_output(device_ir: DeviceIR) -> bool:
+    """Whether a device atomic add updates a float16 / bfloat16 tensor (one
+    the fp32 output promotion did not widen)."""
+    from ...language import atomic_add
+
+    for info in device_ir.graphs:
+        for node in info.graph.nodes:
+            if node.op != "call_function" or node.target is not atomic_add:
+                continue
+            target = node.args[0]
+            value = target.meta.get("val") if isinstance(target, Node) else None
+            if isinstance(value, torch.Tensor) and value.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                return True
+    return False
 
 
 def _cute_reread_cache_policies(
@@ -3236,8 +3274,8 @@ class CuteSiblingRowHeuristic(AutotunerHeuristic):
 
 
 def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
-    """``cute_pdl`` (released at entry) for the nested-row seeds where
-    ``griddepcontrol`` exists.
+    """``cute_pdl`` (released at entry, spread to one wave's density) for the
+    nested-row seeds where ``griddepcontrol`` exists.
 
     These kernels run a few microseconds per call in back-to-back streams;
     launching each as a programmatic dependent of the previous kernel overlaps
@@ -3253,6 +3291,10 @@ def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
     of a kernel that never releases starts later than a plain stream edge
     would have launched it (mamba2_ssd s0 forward, 64-call graph: 9.92 us
     per call unreleased, 9.50 without the knob, 9.37 released at entry).
+    ``cute_pdl_spread`` pads the kernel's shared memory to one wave's density
+    so its early launch never packs its CTAs onto the SMs its primary left
+    idle (vanilla linear attention forward: 7.45 us per call packed, 4.1
+    spread); a tie in isolation, it is searched and preferred among ties.
     """
     capability = spec.target_device_capability
     if (
@@ -3260,7 +3302,7 @@ def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
         and capability is not None
         and capability >= (9, 0)
     ):
-        return {"cute_pdl": True}
+        return {"cute_pdl": True, CUTE_PDL_SPREAD_KEY: True}
     return {}
 
 
@@ -4128,6 +4170,7 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
                         # The launch overlaps the output's zero fill (and the
                         # default release lets the next kernel launch early).
                         "cute_pdl": True,
+                        CUTE_PDL_SPREAD_KEY: True,
                     }
                 )
             )
@@ -7879,6 +7922,17 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             plain_seed.pop("load_eviction_policies", None)
             with contextlib.suppress(Exception):
                 seeds.append(Config(**plain_seed))
+        # Streaming-store alternate: a pointwise output is written once, so
+        # evict-first packet stores (``cute_store_policy="streaming"``,
+        # ``st.global.cs``) keep a fresh output from displacing the inputs a
+        # back-to-back call re-reads (4096x4096 bf16 add with a new output
+        # per call: 16.5 -> 14.9 us on B200; the default store reads the
+        # same with one reused buffer).  Seed-only alternate.
+        if spec.supports_config_key("cute_store_policy"):
+            streaming_seed: dict[str, Any] = deepcopy(primary.config)
+            streaming_seed["cute_store_policy"] = "streaming"
+            with contextlib.suppress(Exception):
+                seeds.append(Config(**streaming_seed))
         # Resident-input alternate: l2_last only on the inputs that fit in L2
         # (a quarter each, half in total), default on the large streams.
         resident = _resident_input_eviction_policies(env)

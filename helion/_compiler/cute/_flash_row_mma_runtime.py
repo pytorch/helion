@@ -57,6 +57,34 @@ def cp_async_16(
 
 
 @dsl_user_op
+def cp_async_16_zfill(
+    smem_address: object,
+    gmem_address: object,
+    src_bytes: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """``cp.async.cg.shared.global`` of one 16-byte packet reading
+    ``src_bytes`` (16 or 0) bytes from global memory and zero-filling the
+    rest: a masked row costs no global read."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(src_bytes).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.cg.shared.global [$0], [$1], 16, $2;",
+        "r,l,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+
+
+@dsl_user_op
 def ldmatrix_x4(
     smem_address: object, *, loc: object = None, ip: object = None
 ) -> tuple[object, ...]:
