@@ -143,6 +143,54 @@ def _gdn_fwd_h_with_head_end(
     return h
 
 
+@helion.kernel()
+def _gdn_fwd_h_with_floordiv_gate_index(
+    k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor, chunk_size: int
+) -> torch.Tensor:
+    """``examples/gdn_fwd_h.py`` with the gate's last-token index
+    ``min(t_i.id // 2, 3)``: a min over the chunk loop's index that is not
+    affine in it (a floor division), which the dag's bound fold cannot
+    resolve to one branch.
+    """
+
+    batch, seqlen, nheads, dhead = k.shape
+    dhead = hl.specialize(dhead)
+    chunk_size = hl.specialize(chunk_size)
+    dstate = u.shape[-1]
+
+    acc_dtype = torch.float32
+    dtype = k.dtype
+
+    nchunks = (seqlen + chunk_size - 1) // chunk_size
+    h = torch.empty(batch, nchunks, nheads, dhead, dstate, dtype=dtype, device=k.device)
+    block_v = hl.register_block_size(dstate)
+
+    for tile_b, tile_h, tile_v in hl.tile(
+        [batch, nheads, dstate], block_size=[1, 1, block_v]
+    ):
+        i_b = tile_b.id
+        i_h = tile_h.id
+        b_h = hl.zeros([dhead, tile_v], dtype=acc_dtype)
+        for t_i in hl.tile(seqlen, block_size=chunk_size):
+            h[i_b, t_i.id, i_h, :, tile_v] = b_h.to(dtype)
+            b_w = w[i_b, t_i, i_h, :]
+            c_h = b_h.to(dtype)
+            b_v = hl.dot(b_w, c_h, out_dtype=acc_dtype)
+            p_v = u[i_b, t_i, i_h, tile_v].to(acc_dtype)
+            b_v = p_v - b_v
+            m_t = t_i.index < seqlen
+            t_i_last = min(t_i.id // 2, 3)
+            b_g_last = g[i_b, t_i_last, i_h].to(acc_dtype)
+            b_g = g[i_b, t_i, i_h].to(acc_dtype)
+            b_v *= torch.where(m_t, torch.exp(b_g_last - b_g), 0)[:, None]
+            b_g_last = torch.exp(b_g_last)
+            b_h *= b_g_last
+            b_v = b_v.to(dtype)
+            p_k = k[i_b, t_i, i_h, :]
+            b_h = hl.dot(p_k.T, b_v, acc=b_h)
+    return h
+
+
 @contextlib.contextmanager
 def _sm100_environment(
     capability: tuple[int, int] = _CAPABILITY, num_sm: int = 148
@@ -195,6 +243,13 @@ def _bind(
 def _config(bound: object, block_v: int, **overrides: object) -> helion.Config:
     config = bound.config_spec.default_config()  # type: ignore[attr-defined]
     config.config["block_sizes"] = [block_v]
+    # These renders are the schedule's and the ordinary lowering's unless a
+    # test selects the register-MMA dataflow owner itself: on an SM100 the
+    # dag heuristic promotes its seed to the default where the schedule
+    # declines, and that seed's knobs are sized for its own tile, not for
+    # the ``block_v`` pinned here.
+    if "cute_mma_dag" in config.config and "cute_mma_dag" not in overrides:
+        config.config["cute_mma_dag"] = "off"
     config.config.update(overrides)
     return config
 
@@ -2266,6 +2321,217 @@ def test_gdn_recurrence_unaligned_dstate_falls_back_cuda() -> None:
         block_sizes=[32],
     )
     assert _PLAN_KIND not in code
+    expected = _torch_reference(*args)
+    torch.testing.assert_close(result.float(), expected.float(), atol=1e-1, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# The register-MMA dataflow owner (``cute_mma_dag``) beside the tcgen05 schedule
+# ---------------------------------------------------------------------------
+
+_SMALL_SHAPE = {"batch": 1, "heads": 4, "seqlen": 256, "dhead": 32, "dstate": 32}
+_DAG_WARP: dict[str, object] = {
+    "cute_mma_dag": "warp",
+    "cute_mma_dag_warps": 4,
+    "cute_mma_dag_stages": 2,
+}
+_DAG_MMA = "_helion_mma_dag.mma_bf16("
+
+
+def test_mma_dag_admits_the_fixed_size_chunk_loop() -> None:
+    """``hl.tile(seqlen, block_size=chunk)`` with a specialized ``chunk`` is a
+    tile loop over a fixed block size: the dag owner matches it (the axis is
+    sized by the kernel, not the config) and enters the search beside the
+    tcgen05 schedule, which keeps the promoted default."""
+    with _sm100_environment():
+        bound = cast("Any", _bind(chunk=64, shape=_SMALL_SHAPE))
+        spec = bound.config_spec
+        assert spec.cute_mma_dag is not None
+        assert "warp" in spec.cute_mma_dag.choices
+        facts = spec.cute_mma_dag_facts
+        assert facts is not None
+        (chunk_axis,) = [axis for axis in facts.axes if axis.kind == "loop"]
+        assert (chunk_axis.extent, chunk_axis.fixed, chunk_axis.tunable) == (
+            256,
+            64,
+            False,
+        )
+        # Only the dstate tile is the config's.
+        assert [
+            axis.block_id for axis in facts.axes if axis.tunable
+        ] == spec.block_sizes.valid_block_ids()
+        assert spec.cute_gdn_recurrence_stages is not None
+        assert spec.default_config().config["cute_mma_dag"] == "off"
+
+
+def test_mma_dag_warp_mode_replaces_the_tcgen05_schedule() -> None:
+    code = _code(chunk=64, block_v=32, shape=_SMALL_SHAPE, overrides=_DAG_WARP)
+    assert _PLAN_KIND not in code
+    assert _DAG_MMA in code
+    assert _SIMT_FALLBACK not in code
+    # Four chunks of 64 tokens.  The gate of the chunk's last token,
+    # ``g[b, min(t_i.begin + 64, seqlen) - 1, h]``, is loaded at
+    # ``63 + 64 * i`` (the ``min`` folded: the loop walks ``seqlen`` in whole
+    # blocks) and prefetched for the next chunk inside the loop.
+    assert "for md_i in cutlass.range(0, 4):" in code
+    assert "63 + 64 * 0" in code
+    assert "63 + 64 * (md_i + 1)" in code
+    assert "Min(" not in code
+    # The knob off keeps the tcgen05 schedule.
+    off = _code(
+        chunk=64, block_v=32, shape=_SMALL_SHAPE, overrides={"cute_mma_dag": "off"}
+    )
+    assert _PLAN_KIND in off
+    assert _DAG_MMA not in off
+
+
+def test_mma_dag_declines_a_ragged_chunk_loop() -> None:
+    """A fixed block size that does not divide the extent (a ragged last
+    chunk) is the tcgen05 schedule's alone."""
+    with _sm100_environment():
+        bound = cast("Any", _bind(chunk=64, shape={**_SMALL_SHAPE, "seqlen": 200}))
+        assert bound.config_spec.cute_mma_dag is None
+        assert bound.config_spec.cute_gdn_recurrence_stages is not None
+
+
+def test_mma_dag_declines_a_non_affine_min_over_the_chunk_index() -> None:
+    """``min(t_i.id // 2, 3)`` over the fixed-size chunk loop: the fold has no
+    branch to pick (``sympy.degree`` would raise on the floor division), so
+    the dag declines the kernel instead of failing its compile; the render
+    of the ordinary lowering still goes through."""
+    with _sm100_environment():
+        bound = cast(
+            "Any",
+            _bind(
+                kernel=_gdn_fwd_h_with_floordiv_gate_index, chunk=64, shape=_SMALL_SHAPE
+            ),
+        )
+        assert bound.config_spec.cute_mma_dag is None
+        assert bound.config_spec.cute_mma_dag_facts is None
+    code = _code(
+        kernel=_gdn_fwd_h_with_floordiv_gate_index, chunk=64, shape=_SMALL_SHAPE
+    )
+    assert "def _helion__gdn_fwd_h_with_floordiv_gate_index(" in code
+    assert _DAG_MMA not in code
+
+
+def test_mma_dag_seeds_size_only_the_dstate_tile() -> None:
+    from helion._compiler.autotuner_heuristics.cute_mma_dag import CuteMmaDagHeuristic
+
+    with _sm100_environment():
+        bound = cast("Any", _bind(chunk=64, shape=_SMALL_SHAPE))
+        env, host_function = bound.env, bound.host_function
+        with env, host_function:
+            seeds = CuteMmaDagHeuristic.get_seed_configs(env, host_function.device_ir)
+    assert seeds
+    for seed in seeds:
+        assert seed.config["cute_mma_dag"] in ("warp", "tcgen05")
+        block_sizes = seed.config["block_sizes"]
+        assert isinstance(block_sizes, list)
+        assert len(block_sizes) == 1
+        assert block_sizes[0] in (16, 32)
+    # Eight CTAs are short of one wave: the ladder's most-CTA tile ([16])
+    # joins the ranked seeds at every legal warp count, and both loads
+    # routes are seeded there -- the first warp seed and every [16] seed
+    # have a lane-route twin behind their TMA-ring seed; the measured best
+    # of the shape ([16] x 4 warps x 4 stages, lane) is one of them.
+    warp_seeds = [s.config for s in seeds if s.config["cute_mma_dag"] == "warp"]
+    keys = [
+        (
+            c["block_sizes"][0],
+            c["cute_mma_dag_warps"],
+            c["cute_mma_dag_stages"],
+            c["cute_mma_dag_loads"],
+        )
+        for c in warp_seeds
+    ]
+    assert {(k[0], k[1]) for k in keys} >= {(16, 2), (16, 4), (32, 4)}
+    first = keys[0]
+    assert first[3] == "tma"
+    assert (first[0], first[1], first[2], "lane") in keys
+    for key in keys:
+        if key[0] == 16:
+            assert (key[0], key[1], key[2], "tma") in keys
+            assert (key[0], key[1], key[2], "lane") in keys
+    assert (16, 4, 4, "lane") in keys
+    # (The first seed's eviction-hint and occupancy twins repeat its key.)
+    assert len({str(sorted(c.items())) for c in warp_seeds}) == len(warp_seeds)
+    # Only the twins take the lane route.
+    lane = [k for k in keys if k[3] == "lane"]
+    assert len(lane) == 1 + sum(1 for k in keys if k[0] == 16 and k[3] == "tma")
+
+
+@pytest.mark.parametrize(("block_v", "warps"), [(32, 4), (32, 8), (16, 2)])
+def test_mma_dag_warp_mode_matches_reference_cuda(block_v: int, warps: int) -> None:
+    device = _require_sm100_runtime()
+    module = _example_module()
+    args = _runtime_inputs(
+        device,
+        batch=1,
+        heads=4,
+        seqlen=256,
+        chunk=64,
+        dhead=32,
+        dstate=32,
+        seed=20260931,
+    )
+    code, result = code_and_output(
+        module.helion_gdn_fwd_h,  # type: ignore[attr-defined]
+        args,
+        block_sizes=[block_v],
+        cute_mma_dag="warp",
+        cute_mma_dag_warps=warps,
+        cute_mma_dag_stages=2,
+    )
+    assert _PLAN_KIND not in code
+    assert _DAG_MMA in code
+    expected = _torch_reference(*args)
+    torch.testing.assert_close(result.float(), expected.float(), atol=1e-1, rtol=1e-2)
+
+
+def test_mma_dag_tcgen05_declines_the_loop_axis_tile_index() -> None:
+    """The gate's token mask reads the chunk loop's ``tile.index``: the
+    tensor-memory emitters evaluate derived values ahead of their iteration
+    (with the current iteration's axis base), so only the warp mode is a
+    choice -- for the admitted s0 shape and for a shape the tcgen05 schedule
+    does not admit (dhead 128), where the dag's seed is the promoted default
+    on an SM100."""
+    for shape in (_SMALL_SHAPE, {"batch": 2, "heads": 8, "dhead": 128, "dstate": 128}):
+        with _sm100_environment():
+            bound = cast(
+                "Any", _bind(chunk=128 if shape["dhead"] == 128 else 64, shape=shape)
+            )
+            spec = bound.config_spec
+            assert spec.cute_mma_dag is not None
+            assert spec.cute_mma_dag.choices == ("off", "warp")
+            assert spec.cute_mma_dag_facts is not None
+            assert spec.cute_mma_dag_facts.tcgen05 is None
+    assert bound.config_spec.cute_gdn_recurrence_stages is None
+
+
+def test_mma_dag_default_runs_an_unadmitted_shape_cuda() -> None:
+    """A shape the tcgen05 schedule does not admit (dhead 128): on an SM100
+    the dag heuristic promotes its warp seed to the autotune-off default,
+    which must compile and match the reference."""
+    device = _require_sm100_runtime()
+    module = _example_module()
+    args = _runtime_inputs(
+        device,
+        batch=1,
+        heads=2,
+        seqlen=256,
+        chunk=128,
+        dhead=128,
+        dstate=128,
+        seed=20260932,
+    )
+    kernel = module.helion_gdn_fwd_h  # type: ignore[attr-defined]
+    kernel.reset()
+    default = kernel.bind(args).config_spec.default_config().config
+    assert default["cute_mma_dag"] == "warp"
+    code, result = code_and_output(kernel, args, **default)
+    assert _PLAN_KIND not in code
+    assert _DAG_MMA in code
     expected = _torch_reference(*args)
     torch.testing.assert_close(result.float(), expected.float(), atol=1e-1, rtol=1e-2)
 
