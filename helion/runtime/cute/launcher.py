@@ -818,6 +818,32 @@ def _append_cute_wrapper_plan(
         )
         return
 
+    if kind == "helion_flash_gated_row_mma":
+        # Register-MMA gated attention row programs (cute_flash_gated_row_mma):
+        # the host grid, plain tensor arguments, no descriptors. The body
+        # moves 16-byte cp.async packets of q/k/v rows and 4-byte output
+        # packets. An under-aligned q/k/v/o binding is staged through a
+        # 16-byte-aligned copy at launch (``_CUTE_STAGED_PLAN_OPERANDS``); a
+        # schema that still proves a base under-aligned for its access width
+        # is refused here rather than faulting on the device.
+        if schema_key is not None:
+            for key, width in (
+                ("q_idx", 16),
+                ("k_idx", 16),
+                ("v_idx", 16),
+                ("o_idx", 4),
+            ):
+                index = plan_optional_int(key)
+                if index is not None and (
+                    _cute_schema_pointer_alignment(schema_key[index]) % width
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "the gated row_mma body requires 16-byte-aligned q/k/v "
+                        "and a 4-byte-aligned o base",
+                    )
+        return
+
     if kind == "helion_flash_bwd_row_mma":
         # Register-MMA backward row programs (cute_flash_bwd_row_mma): one
         # CTA per (KV group, kv_rows) tile, plain tensor arguments, no
@@ -4569,6 +4595,7 @@ _CUTE_STAGED_PLAN_OPERANDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] =
         ("o_idx", "lse_idx"),
     ),
     "helion_flash_gated": (("q_idx", "k_idx", "v_idx"), ("o_idx",)),
+    "helion_flash_gated_row_mma": (("q_idx", "k_idx", "v_idx"), ("o_idx",)),
     "helion_flash_bwd": (
         ("q_idx", "k_idx", "v_idx", "do_idx", "lse_idx", "delta_idx"),
         ("dq_idx", "dk_idx", "dv_idx"),

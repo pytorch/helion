@@ -3890,6 +3890,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     kv_stage_choices_by_tile=dict(
                         gated_surface.kv_stage_choices_by_tile
                     ),
+                    row_warp_choices_by_tile=dict(
+                        gated_surface.row_warp_choices_by_tile
+                    ),
+                    row_stage_choices=dict(gated_surface.row_stage_choices),
+                    row_seed_programs=gated_surface.row_programs,
                 )
             else:
                 from ..language.matmul_ops import _plan_cute_tcgen05_search_candidate

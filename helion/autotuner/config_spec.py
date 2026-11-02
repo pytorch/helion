@@ -1149,6 +1149,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | {
         "cross_loop_pipeline",
         "cute_flash_gate_warpgroups",
+        "cute_flash_gated_row_warps",
         "cute_flash_bwd_persistent",
         "cute_flash_bwd_two_cta",
         "cute_flash_bwd_exp2_f32",
@@ -1472,6 +1473,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_row_q_split",
         "cute_flash_bwd_row_q_chunk",
         "cute_flash_gate_warpgroups",
+        "cute_flash_gated_row_warps",
         *BLOCK_SCALED_CONFIG_KEYS,
         SPLIT_K_SCHEDULE_KEY,
         SPLIT_K_FINALIZER_KEY,
@@ -2098,6 +2100,17 @@ class ConfigSpec:
         self._cute_flash_gated_kv_stage_choices_by_tile: dict[
             tuple[int, int], tuple[int, ...]
         ] = {}
+        # Register-MMA row-program tiles of the gated surface
+        # (``cute_flash_gated_row_mma``): the legal warp counts per (query
+        # rows, KV tile) and the ring depths per (query rows, KV tile, warps).
+        self._cute_flash_gated_row_warp_choices_by_tile: dict[
+            tuple[int, int], tuple[int, ...]
+        ] = {}
+        self._cute_flash_gated_row_stage_choices: dict[
+            tuple[int, int, int], tuple[int, ...]
+        ] = {}
+        # 16-row programs of the grid when known (the row seeds are capped).
+        self._cute_flash_gated_row_seed_programs: int | None = None
         self._cute_flash_head_dim: int | None = None
         # V/O head dim when it differs from the Q/K head dim (MLA prefill).
         self._cute_flash_head_dim_v: int | None = None
@@ -3177,15 +3190,28 @@ class ConfigSpec:
         kv_stage_choices_by_tile: Mapping[tuple[int, int], Sequence[int]] | None = None,
         q_block_id: int | None = None,
         q_tile_choices: Sequence[int] = (128,),
+        row_warp_choices_by_tile: Mapping[tuple[int, int], Sequence[int]] | None = None,
+        row_stage_choices: Mapping[tuple[int, int, int], Sequence[int]] | None = None,
+        row_seed_programs: int | None = None,
     ) -> None:
         """Enable the gated (softmax-free) fused attention surface.
 
-        Restricts the query block size to the fused body's row tiles (128, or
-        also 64) and the KV block size to its tile widths (the detector fires
-        only there) and exposes the K/V TMA ring depth and the number of gate
-        warpgroups.
+        Restricts the query block size to the gated bodies' row tiles (128 or
+        64 for the fused tcgen05 body; 16 or 32 for the register-MMA row
+        programs, ``row_warp_choices_by_tile``) and the KV block size to their
+        tile widths (the detector fires only there) and exposes the K/V ring
+        depth, the number of gate warpgroups (fused body) and the warp count
+        (row programs).
         """
         self.cute_flash_gated_search_enabled = True
+        self._cute_flash_gated_row_warp_choices_by_tile = {
+            tile: tuple(warps)
+            for tile, warps in (row_warp_choices_by_tile or {}).items()
+        }
+        self._cute_flash_gated_row_stage_choices = {
+            key: tuple(stages) for key, stages in (row_stage_choices or {}).items()
+        }
+        self._cute_flash_gated_row_seed_programs = row_seed_programs
         self._cute_flash_gated_block_size_targets = dict(block_size_targets)
         self._cute_flash_gated_kv_block_id = kv_block_id
         self._cute_flash_gated_q_block_id = q_block_id
@@ -3266,14 +3292,38 @@ class ConfigSpec:
         if not self.cute_flash_gated_search_enabled:
             return []
         from .._compiler.cute.cute_flash_gated import gated_seed_configs
+        from .._compiler.cute.cute_flash_gated_row_mma import gated_row_seed_configs
 
-        return gated_seed_configs(
-            self._cute_flash_gated_block_size_lists(),
+        tiles = self._cute_flash_gated_tiles()
+        block_size_lists = self._cute_flash_gated_block_size_lists()
+        row_tiles = self._cute_flash_gated_row_warp_choices_by_tile
+        fused = [
+            (sizes, tile)
+            for sizes, tile in zip(block_size_lists, tiles, strict=True)
+            if tile not in row_tiles
+        ]
+        rows = [
+            (sizes, tile)
+            for sizes, tile in zip(block_size_lists, tiles, strict=True)
+            if tile in row_tiles
+        ]
+        seeds = gated_seed_configs(
+            [sizes for sizes, _ in fused],
             self._cute_flash_gated_kv_stage_choices,
             self._cute_flash_gated_kv_stage_default,
-            tiles=self._cute_flash_gated_tiles(),
+            tiles=[tile for _, tile in fused],
             kv_stage_choices_by_tile=self._cute_flash_gated_kv_stage_choices_by_tile,
         )
+        seeds.extend(
+            gated_row_seed_configs(
+                [sizes for sizes, _ in rows],
+                tiles=[tile for _, tile in rows],
+                warp_choices_by_tile=row_tiles,
+                stage_choices=self._cute_flash_gated_row_stage_choices,
+                programs=self._cute_flash_gated_row_seed_programs,
+            )
+        )
+        return seeds
 
     def _cute_flash_gated_kv_tile(self, config: dict[str, object]) -> int:
         """The KV tile width of a config on the gated surface."""
@@ -3416,10 +3466,11 @@ class ConfigSpec:
         if not self.cute_flash_gated_search_enabled:
             return
         block_size_lists = self._cute_flash_gated_block_size_lists()
-        block_size_targets = block_size_lists[0]
         if fix_invalid:
             if config.get("block_sizes") not in block_size_lists:
-                config["block_sizes"] = list(block_size_targets)
+                config["block_sizes"] = self._cute_flash_gated_nearest_block_sizes(
+                    config.get("block_sizes"), block_size_lists
+                )
             config["pid_type"] = "flat"
             self._normalize_cute_flash_default_sequence(config, "l2_groupings", 1)
             self._normalize_cute_flash_default_sequence(config, "num_threads", 0)
@@ -3436,12 +3487,21 @@ class ConfigSpec:
             return
         from .._compiler.cute.cute_flash_gated import gated_kv_stage_default
 
+        kv_tile = self._cute_flash_gated_kv_tile(config)
+        tile = (self._cute_flash_gated_q_tile(config), kv_tile)
+        row_warp_choices = self._cute_flash_gated_row_warp_choices_by_tile.get(tile)
+        if row_warp_choices is not None:
+            # A register-MMA row-program tile: its warp count and ring depth
+            # are validated by the row normalizer; the gate warpgroup count
+            # has no consumer there (one identity).
+            self._normalize_cute_flash_gated_row(
+                config, tile, row_warp_choices, fix_invalid=fix_invalid
+            )
+            return
         # The legal ring depths depend on the tile shape (shared memory), so
         # validate against the config's own tile.
-        kv_tile = self._cute_flash_gated_kv_tile(config)
         choices = self._cute_flash_gated_kv_stage_choices_by_tile.get(
-            (self._cute_flash_gated_q_tile(config), kv_tile),
-            self._cute_flash_gated_kv_stage_choices,
+            tile, self._cute_flash_gated_kv_stage_choices
         )
         stage_default = (
             self._cute_flash_gated_kv_stage_default
@@ -3483,6 +3543,99 @@ class ConfigSpec:
                     f"for block_sizes {config.get('block_sizes')!r}, got {wgs!r}"
                 )
             config[FLASH_GATE_WARPGROUPS_KEY] = wg_default
+        self._normalize_cute_flash_gated_row(
+            config, tile, None, fix_invalid=fix_invalid
+        )
+
+    def _cute_flash_gated_nearest_block_sizes(
+        self, value: object, block_size_lists: list[list[int]]
+    ) -> list[int]:
+        """The legal gated tile nearest a config's block sizes: the same
+        query tile with the closest legal KV tile when the query tile is
+        legal, else the default tile."""
+        kv_block_id = self._cute_flash_gated_kv_block_id
+        assert kv_block_id is not None
+        kv_index = self.block_sizes.block_id_to_index(kv_block_id)
+        if isinstance(value, (list, tuple)) and len(value) == len(block_size_lists[0]):
+            kv_value = value[kv_index]
+            same_q = [
+                sizes
+                for sizes in block_size_lists
+                if all(
+                    a == b
+                    for i, (a, b) in enumerate(zip(sizes, value, strict=True))
+                    if i != kv_index
+                )
+            ]
+            if same_q and isinstance(kv_value, int):
+                return list(
+                    min(same_q, key=lambda sizes: abs(sizes[kv_index] - kv_value))
+                )
+        return list(block_size_lists[0])
+
+    def _normalize_cute_flash_gated_row(
+        self,
+        config: dict[str, object],
+        tile: tuple[int, int],
+        warp_choices: tuple[int, ...] | None,
+        *,
+        fix_invalid: bool,
+    ) -> None:
+        """The row programs' knob (``cute_flash_gated_row_warps``) and their
+        ring depths, which depend on the warp count; at a fused tile
+        (``warp_choices`` None) the knob reads its default (one identity).
+        At a row tile the gate warpgroup count reads its default."""
+        from .._compiler.cute.cute_flash_gated import FLASH_GATE_WARPGROUPS_KEY
+        from .._compiler.cute.cute_flash_gated_row_mma import GATED_ROW_WARPS_KEY
+        from .._compiler.cute.cute_flash_gated_row_mma import gated_row_kv_stage_default
+        from .._compiler.cute.cute_flash_gated_row_mma import gated_row_warps_default
+
+        if not self._cute_flash_gated_row_warp_choices_by_tile:
+            config.pop(GATED_ROW_WARPS_KEY, None)
+            return
+        if warp_choices is not None:
+            config[FLASH_GATE_WARPGROUPS_KEY] = (
+                self._cute_flash_gated_gate_warpgroup_default
+            )
+        all_warps = tuple(
+            sorted(
+                {
+                    w
+                    for warps in self._cute_flash_gated_row_warp_choices_by_tile.values()
+                    for w in warps
+                }
+            )
+        )
+        if warp_choices is None:
+            config[GATED_ROW_WARPS_KEY] = gated_row_warps_default(all_warps)
+            return
+        default_warps = gated_row_warps_default(warp_choices)
+        warps = config.get(GATED_ROW_WARPS_KEY)
+        if warps is None:
+            warps = default_warps
+        elif warps not in warp_choices:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{GATED_ROW_WARPS_KEY} must be one of {list(warp_choices)!r} "
+                    f"for block_sizes {config.get('block_sizes')!r}, got {warps!r}"
+                )
+            warps = default_warps
+        config[GATED_ROW_WARPS_KEY] = warps
+        assert isinstance(warps, int)
+        stages = self._cute_flash_gated_row_stage_choices.get((*tile, warps), ())
+        if not stages:
+            return
+        stage = config.get(FLASH_KV_STAGE_KEY)
+        if stage is None:
+            config[FLASH_KV_STAGE_KEY] = gated_row_kv_stage_default(stages)
+        elif stage not in stages:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{FLASH_KV_STAGE_KEY} must be one of {list(stages)!r} for "
+                    f"block_sizes {config.get('block_sizes')!r} at {warps} warps, "
+                    f"got {stage!r}"
+                )
+            config[FLASH_KV_STAGE_KEY] = gated_row_kv_stage_default(stages)
 
     def enable_cute_chunk_recurrence_search(self, *, preferred_partitions: int) -> None:
         """Expose the exact BT16 recurrence schedule as CuTe search knobs."""
@@ -4576,9 +4729,15 @@ class ConfigSpec:
         if self.cute_flash_search_enabled:
             block_size_targets = self._cute_flash_block_size_target_list()
         elif self.cute_flash_gated_search_enabled:
-            if config["block_sizes"] in self._cute_flash_gated_block_size_lists():
+            block_size_lists = self._cute_flash_gated_block_size_lists()
+            if config["block_sizes"] in block_size_lists:
                 return
-            block_size_targets = self._cute_flash_gated_block_size_target_list()
+            # The legal tile nearest the request (same query tile, closest
+            # KV tile), so a mutation of one block size is not reset to the
+            # default tile.
+            block_size_targets = self._cute_flash_gated_nearest_block_sizes(
+                config["block_sizes"], block_size_lists
+            )
         else:
             return
         value = config["block_sizes"]
@@ -7034,6 +7193,12 @@ class ConfigSpec:
         ):
             # Same rule for the gate warpgroup count: only the gated body reads it.
             config.pop(FLASH_GATE_WARPGROUPS_KEY)
+        if (
+            "cute_flash_gated_row_warps" in config
+            and not self.cute_flash_gated_search_enabled
+        ):
+            # ... and for the gated row programs' warp count.
+            config.pop("cute_flash_gated_row_warps")
 
         if unsupported := self.unsupported_config_keys(config):
             # Separate backend-specific keys (e.g. AMD tunables, TileIR tunables)
@@ -8991,6 +9156,30 @@ class ConfigSpec:
                         ),
                     )
                 )
+                if self._cute_flash_gated_row_warp_choices_by_tile:
+                    from .._compiler.cute.cute_flash_gated_row_mma import (
+                        GATED_ROW_WARPS_KEY,
+                    )
+                    from .._compiler.cute.cute_flash_gated_row_mma import (
+                        gated_row_warps_default,
+                    )
+
+                    row_warps = tuple(
+                        sorted(
+                            {
+                                w
+                                for warps in self._cute_flash_gated_row_warp_choices_by_tile.values()
+                                for w in warps
+                            }
+                        )
+                    )
+                    row_default = gated_row_warps_default(row_warps)
+                    fields[GATED_ROW_WARPS_KEY] = EnumFragment(
+                        choices=(
+                            row_default,
+                            *(w for w in row_warps if w != row_default),
+                        )
+                    )
             elif self.cute_flash_bwd_search_enabled:
                 fields["cute_flash_bwd_persistent"] = EnumFragment(
                     choices=(0, 1) if self._cute_flash_bwd_persistent_allowed else (0,)
