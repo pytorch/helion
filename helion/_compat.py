@@ -523,13 +523,8 @@ def num_compute_units() -> int:
     return 128
 
 
-def supports_xpu_grf_mode() -> bool:
-    """Check if Triton kernels can be compiled with an explicit Intel XPU GRF mode."""
-    return _supports_xpu_grf_mode()
-
-
-@functools.cache
-def _supports_xpu_grf_mode() -> bool:
+def is_xpu() -> bool:
+    """Check if the current device is an Intel XPU."""
     return torch.xpu.is_available()
 
 

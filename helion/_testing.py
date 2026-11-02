@@ -40,7 +40,6 @@ from ._compat import supports_amd_cdna_tunables
 from ._compat import supports_block_ptr
 from ._compat import supports_host_tensor_descriptor
 from ._compat import supports_tensor_descriptor
-from ._compat import supports_xpu_grf_mode
 from ._compat import target_device_capability
 from ._dist_utils import is_master_rank
 from ._dist_utils import sync_object as sync_object
@@ -88,7 +87,7 @@ def _strip_launcher_args(value: str) -> str:
             (r", matrix_instr_nonkdim=\d+", ""),
             (r", xcd_remap=(?:True|False)", ""),
         ]
-    if supports_xpu_grf_mode():
+    if is_xpu():
         strip_pairs.append((r", grf_mode='\d+'", ""))
     if _get_backend() == "tileir":
         strip_pairs += [(r", num_ctas=\d+", ""), (r", occupancy=\d+", "")]
