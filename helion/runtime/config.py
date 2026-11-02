@@ -168,7 +168,12 @@ class Config(Mapping[str, object]):
             cute_pdl: Launch the kernel as a programmatic dependent of the
                 previous kernel in the stream: its launch and prologue overlap
                 that kernel's tail and it waits (``griddepcontrol.wait``) ahead
-                of its first global memory access. Off by default. Kernels that
+                of its first global memory access; when its own host zero fills
+                launch as dependent fill kernels, ahead of its first access to a
+                filled tensor instead (the fill kernel releases only after its
+                own wait, so every earlier kernel has completed), which lets a
+                split-K kernel's operand loads overlap the fill of its atomic
+                output. Off by default. Kernels that
                 already take part in dependent launch (native plans launched
                 with it, bodies with their own wait or release, the
                 materialized-fission producer) and pre-sm_90 targets generate
