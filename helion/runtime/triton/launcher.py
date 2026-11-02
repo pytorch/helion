@@ -5,6 +5,8 @@ Triton code depends on at execution time:
 
 * :func:`default_launcher` -- invokes a compiled ``triton.jit`` kernel.
 * :func:`get_num_sm` -- persistent-kernel grid size (host statement).
+* :func:`get_xpu_programs_per_xecore` -- resident work-groups per Xe-core
+  (host statement for ``hl.persistent_num_workers`` on XPU).
 * :func:`set_triton_allocator` -- installs the scratch allocator used by TMA /
   tensor-descriptor kernels (device-function prefix statement).
 
@@ -123,6 +125,53 @@ def get_xpu_grf_modes(device: torch.device) -> tuple[int, ...]:
     variable register file in blocks of 32, can list more modes here.
     """
     return (256, 128)
+
+
+# GRF registers per hardware thread at which Level Zero reports ``threads_per_eu``.
+XPU_BASE_GRF_MODE = 128
+
+
+def get_xpu_eu_resources(device: torch.device) -> tuple[int, int, int]:
+    """
+    Per-Xe-core resources of XPU ``device`` that bound resident threads.
+
+    Returns:
+        ``(eus_per_xecore, max_threads_per_eu, grf_per_eu)``: EUs in an Xe-core,
+        hardware threads an EU can hold, and GRF registers an EU can split
+        among its threads.
+    """
+    index = device.index if device.index is not None else torch.xpu.current_device()
+    properties = triton.runtime.driver.active.utils.get_device_properties(index)  # pyrefly: ignore[missing-attribute]
+    threads_per_eu = properties["threads_per_eu"]
+    return (
+        properties["eus_per_subslice"],
+        threads_per_eu,
+        threads_per_eu * XPU_BASE_GRF_MODE,
+    )
+
+
+def get_xpu_programs_per_xecore(
+    device: torch.device, *, num_warps: int, grf_mode: int
+) -> int:
+    """
+    Work-groups that can be resident on one Xe-core of XPU ``device`` at once.
+
+    Each sub-group (warp) occupies one hardware thread.  An EU holds as many
+    threads as its GRF registers allow at ``grf_mode`` registers per thread, up
+    to its hardware thread limit.  Shared local memory is not counted.
+
+    Args:
+        device: XPU device to query.
+        num_warps: Sub-groups per work-group.
+        grf_mode: GRF registers per hardware thread, one of
+            :func:`get_xpu_grf_modes`.
+
+    Returns:
+        Resident work-groups per Xe-core.  Always at least 1.
+    """
+    eus, max_threads, grf_per_eu = get_xpu_eu_resources(device)
+    threads = eus * min(max_threads, grf_per_eu // grf_mode)
+    return max(threads // num_warps, 1)
 
 
 # CUs per XCD by base CDNA architecture.  Used to derive the live,
