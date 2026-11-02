@@ -600,11 +600,15 @@ class TritonBackend(Backend):
         ):
             args.append("generate_native_code=True")
 
+        from ...autotuner.config_spec import GRF_MODE_KEY
         from ...autotuner.config_spec import _get_backend_tunable_keys
 
         for key in _get_backend_tunable_keys():
             if key in config:
                 args.append(f"{key}={config[key]!r}")
+        if GRF_MODE_KEY in config:
+            # Set by hl.persistent_num_workers(), whose worker count assumes it.
+            args.append(f"grf_mode='{config[GRF_MODE_KEY]}'")
 
         if "maxnreg" in config and config["maxnreg"] is not None and supports_maxnreg():
             args.append(f"maxnreg={config['maxnreg']}")
