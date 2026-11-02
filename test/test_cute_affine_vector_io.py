@@ -164,6 +164,37 @@ def test_vector_path_and_scalar_tails_preserve_memory_values(
     assert after["scalar_loads"] == length - expected_vectors * 4
 
 
+# A sixteen-lane loop of a 4-byte dtype: four sixteen-byte packets per access
+# site (``cute_vector_widths`` 16 on fp32, or 16 bf16 lanes as two packets).
+_WIDE_SOURCE = (
+    _SOURCE.replace(
+        "range(0, cutlass.Int32(length), 16)", "range(0, cutlass.Int32(length), 64)"
+    )
+    .replace("cutlass.Int32(lane_1) * 4", "cutlass.Int32(lane_1) * 16")
+    .replace("range_constexpr(4)", "range_constexpr(16)")
+)
+
+
+@pytest.mark.parametrize("length", [0, 1, 15, 16, 17, 32, 64])
+@pytest.mark.parametrize("start", [0, 4, 16])
+def test_wide_lane_loop_splits_into_sixteen_byte_packets(
+    length: int, start: int
+) -> None:
+    transformed, changed = _rewrite(_WIDE_SOURCE)
+    assert changed == 1
+    text = ast.unparse(transformed)
+    assert text.count("ir.VectorType.get([4]") == 4
+    assert "ir.VectorType.get([16]" not in text
+    assert "+ 12, ir.VectorType" in text and "_helion_affine_store[12:16]" in text
+    expected, before = _execute(ast.parse(_WIDE_SOURCE), start, length)
+    actual, after = _execute(transformed, start, length)
+    assert actual == expected
+    assert before["scalar_loads"] == length
+    fragments = length // 16 if start % 16 == 0 else 0
+    assert after["vector_loads"] == after["vector_stores"] == 4 * fragments
+    assert after["scalar_loads"] == length - fragments * 16
+
+
 @pytest.mark.parametrize(
     "predicate",
     [
@@ -270,6 +301,22 @@ def test_nonaffine_effectful_or_mixed_width_loops_are_unchanged(
     tree, changed = _rewrite(_SOURCE.replace(before, after))
     assert changed == 0
     assert "_helion_affine_load" not in ast.unparse(tree)
+
+
+def test_fast_math_call_forms_still_vectorize() -> None:
+    # The fast_math setting rewrites exp and division into
+    # ``exp2(fma(x, log2e, -m), fastmath=True)`` and
+    # ``div(a, b, approx=True, ftz=True)``; both are pure elementwise calls,
+    # so the loads and stores around them vectorize as before (the aot
+    # row_softmax read 3x slower on B200 when they did not).
+    source = _SOURCE.replace(
+        "result = value * 1.25 + 2",
+        "result = cute.math.div(cute.math.exp2(cute.math.fma(value, 1.25, -2.0), "
+        "fastmath=True), 3.0, approx=True, ftz=True)",
+    )
+    tree, changed = _rewrite(source)
+    assert changed == 1
+    assert "_helion_affine_load" in ast.unparse(tree)
 
 
 @pytest.mark.parametrize("length", [0, 1, 3, 4, 8])
@@ -713,7 +760,7 @@ for vec_lane_1 in cutlass.range_constexpr(4):
     [
         "value = argument + 1",
         "if condition:\n    value = argument + 1",
-        "for vec_lane_0 in cutlass.range_constexpr(16):\n    value = argument + 1",
+        "for vec_lane_0 in cutlass.range_constexpr(32):\n    value = argument + 1",
         "for scalar_lane in cutlass.range_constexpr(4):\n    value = argument + 1",
         "for vec_lane_0 in range(4):\n    value = argument + 1",
         "for vec_lane_0 in cutlass.range_constexpr(1):\n    value = argument + 1",

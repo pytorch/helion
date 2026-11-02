@@ -275,6 +275,7 @@ from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfLowVRAM
+from helion._testing import skipUnlessTcgen05RuntimeNPtx
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -2797,7 +2798,9 @@ class TestCuteLowerings(unittest.TestCase):
         """
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
-        @helion.kernel(backend="cute")
+        # The scalar K-tail producer is the fallback the flat edge TMA path
+        # replaces; pin the legacy path to test it.
+        @helion.kernel(backend="cute", cute_flat_edge_tma=False)
         def cute_matmul_k_tail(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.size()
             _, n = y.size()
@@ -3314,8 +3317,8 @@ class TestCuteLowerings(unittest.TestCase):
         for marker in (
             "make_trivial_tiled_mma",
             "cute.nvgpu.tcgen05.CtaGroup.TWO",
-            "PipelineUmmaAsync.create",
-            "PipelineTmaUmma.create",
+            "make_umma_async_pipeline(",
+            "make_tma_umma_pipeline(",
             "PipelineTmaStore.create",
             "StaticPersistentTileScheduler.create",
             "tcgen05_role_local_0_work_tile",
@@ -3940,7 +3943,9 @@ class TestCuteLowerings(unittest.TestCase):
     ) -> None:
         """Output-edge ``bk=128`` fallback uses an A layout scalar stores can fill."""
 
-        @helion.kernel(backend="cute")
+        # The scalar edge producer is the fallback the flat edge TMA path
+        # replaces; pin the legacy path to test its layout.
+        @helion.kernel(backend="cute", cute_flat_edge_tma=False)
         def cute_matmul_bk128_edge_codegen(
             x: torch.Tensor, y: torch.Tensor
         ) -> torch.Tensor:
@@ -4731,7 +4736,7 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("cute.nvgpu.OperandMajorMode", code)
         # PipelineTmaUmma marker: pins the role-local TMA + UMMA
         # pipeline pairing, present only on the tcgen05 path.
-        self.assertIn("PipelineTmaUmma", code)
+        self.assertIn("make_tma_umma_pipeline(", code)
 
     def test_tcgen05_with_scheduler_c_input_warp_inert_runtime_correctness(
         self,
@@ -4920,7 +4925,7 @@ class TestCuteLowerings(unittest.TestCase):
         )
         # Launch envelope unchanged (8 warps either way).
         self.assertIn("cute.make_layout((2, 1, 1))", code_store1)
-        self.assertIn("PipelineTmaUmma", code_store1)
+        self.assertIn("make_tma_umma_pipeline(", code_store1)
 
     def test_tcgen05_with_scheduler_store_warp_zero_byte_identical(
         self,
@@ -7288,7 +7293,7 @@ class TestCuteLowerings(unittest.TestCase):
                     )
                     code = bound.to_triton_code(cfg)
                     # Codegen markers: pipeline depth + per-stage prefetch.
-                    self.assertIn("PipelineTmaUmma.create(num_stages=3", code)
+                    self.assertIn("make_tma_umma_pipeline(num_stages=3", code)
                     for k_offset in (0, 1, 2):
                         self.assertIn(f"tma_gA[None, cutlass.Int32({k_offset})]", code)
                         self.assertIn(f"tma_gB[None, cutlass.Int32({k_offset})]", code)
@@ -11018,8 +11023,8 @@ class TestCuteLowerings(unittest.TestCase):
                 code,
             )
             self.assertIn(
-                "virtual_pid = tcgen05_role_local_0_work_tile.tile_idx[0] "
-                "// cutlass.Int32(2)",
+                "virtual_pid = (tcgen05_role_local_0_work_tile.tile_idx[0] "
+                ">> cutlass.Int32(1))",
                 code,
             )
             self.assertIn("StaticPersistentTileScheduler.create", code)
@@ -11036,15 +11041,27 @@ class TestCuteLowerings(unittest.TestCase):
                 "cutlass.pipeline.Agent.Thread, cutlass.Int32(8))",
                 code,
             )
+            # The clustered kernel builds its pipelines without the DSL's
+            # serial warp-0 mbarrier init and spreads the inits over the
+            # epilogue warps ahead of the cluster arrive (prologue trims).
             self.assertIn(
                 "tcgen05_acc_pipeline = "
-                "cutlass.pipeline.PipelineUmmaAsync.create("
+                "_helion_tc_pro.make_umma_async_pipeline("
                 "num_stages=2, "
                 "producer_group=tcgen05_acc_pipeline_producer_group, "
                 "consumer_group=tcgen05_acc_pipeline_consumer_group, "
                 "barrier_storage=tcgen05_acc_pipeline_barriers, "
-                "cta_layout_vmnk=tcgen05_cluster_layout_vmnk, "
-                "defer_sync=True)",
+                "cta_layout_vmnk=tcgen05_cluster_layout_vmnk)",
+                code,
+            )
+            self.assertIn(
+                "_helion_tc_pro.init_pipeline_barriers("
+                "tcgen05_warp_idx, (0,), tcgen05_acc_pipeline)",
+                code,
+            )
+            self.assertIn(
+                "_helion_tc_pro.init_pipeline_barriers_pair("
+                "tcgen05_warp_idx, 1, tcgen05_ab_pipeline)",
                 code,
             )
             self.assertIn(
@@ -11056,14 +11073,13 @@ class TestCuteLowerings(unittest.TestCase):
             )
             self.assertIn(
                 "tcgen05_ab_pipeline = "
-                "cutlass.pipeline.PipelineTmaUmma.create("
+                "_helion_tc_pro.make_tma_umma_pipeline("
                 "num_stages=2, "
                 "producer_group=tcgen05_ab_pipeline_producer_group, "
                 "consumer_group=tcgen05_ab_pipeline_consumer_group, "
                 "tx_count=tcgen05_ab_pipeline_tx_count, "
                 "barrier_storage=tcgen05_ab_pipeline_mbars, "
-                "cta_layout_vmnk=tcgen05_cluster_layout_vmnk, "
-                "defer_sync=True)",
+                "cta_layout_vmnk=tcgen05_cluster_layout_vmnk)",
                 code,
             )
             tmem_arrive_pos = code.index("tcgen05_tmem_alloc_barrier.arrive()")
@@ -11106,13 +11122,13 @@ class TestCuteLowerings(unittest.TestCase):
             init_wait = "cutlass.pipeline.pipeline_init_wait("
             self.assertLess(
                 code.index(
-                    "tcgen05_acc_pipeline = cutlass.pipeline.PipelineUmmaAsync.create("
+                    "tcgen05_acc_pipeline = _helion_tc_pro.make_umma_async_pipeline("
                 ),
                 code.index(init_arrive),
             )
             self.assertLess(
                 code.index(
-                    "tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create("
+                    "tcgen05_ab_pipeline = _helion_tc_pro.make_tma_umma_pipeline("
                 ),
                 code.index(init_arrive),
             )
@@ -12465,7 +12481,7 @@ class TestCuteLowerings(unittest.TestCase):
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
-            self.assertIn("PipelineTmaUmma.create", code)
+            self.assertIn("make_tma_umma_pipeline(", code)
             self.assertIn(
                 "while tcgen05_role_local_0_work_tile.is_valid_tile",
                 code,
@@ -12538,7 +12554,7 @@ class TestCuteLowerings(unittest.TestCase):
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
-            self.assertIn("PipelineTmaUmma.create", code)
+            self.assertIn("make_tma_umma_pipeline(", code)
             self.assertNotIn("PipelineTmaStore.create", code)
             self.assertIn(
                 "while tcgen05_role_local_0_work_tile.is_valid_tile",
@@ -12610,7 +12626,7 @@ class TestCuteLowerings(unittest.TestCase):
                     bound.set_config(cfg)
                     code = bound.to_triton_code(cfg)
                     self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
-                    self.assertIn("PipelineTmaUmma.create", code)
+                    self.assertIn("make_tma_umma_pipeline(", code)
                     if expect_tma_store:
                         self.assertIn("PipelineTmaStore.create", code)
                     else:
@@ -12755,7 +12771,7 @@ class TestCuteLowerings(unittest.TestCase):
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
-            self.assertIn("PipelineTmaUmma.create", code)
+            self.assertIn("make_tma_umma_pipeline(", code)
             self.assertNotIn("PipelineTmaStore.create", code)
             self.assertIn(
                 "while tcgen05_role_local_0_work_tile.is_valid_tile",
@@ -12826,7 +12842,7 @@ class TestCuteLowerings(unittest.TestCase):
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
-            self.assertIn("PipelineTmaUmma.create", code)
+            self.assertIn("make_tma_umma_pipeline(", code)
             self.assertNotIn("PipelineTmaStore.create", code)
             self.assertIn(
                 "while tcgen05_role_local_0_work_tile.is_valid_tile",
@@ -13556,7 +13572,7 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn(
-            "mma_slice_tidx = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) % cutlass.Int32(2)",
+            "mma_slice_tidx = _helion_tc_pro.mod_nonneg(cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()), 2)",
             code,
         )
         self.assertIn("thr_mma = tiled_mma.get_slice(mma_slice_tidx)", code)
@@ -16853,8 +16869,8 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn(
-            "virtual_pid = tcgen05_role_local_0_work_tile.tile_idx[0] "
-            "// cutlass.Int32(2)",
+            "virtual_pid = (tcgen05_role_local_0_work_tile.tile_idx[0] "
+            ">> cutlass.Int32(1))",
             code,
         )
         self.assertIn("tcgen05_role_local_0_tile_sched_params", code)
@@ -20746,8 +20762,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         # ``num_stages=2`` and would mask a regression that
         # silently demoted just the AB pipeline).
         self.assertIn(
-            "tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create("
-            "num_stages=2",
+            "tcgen05_ab_pipeline = _helion_tc_pro.make_tma_umma_pipeline(num_stages=2",
             code,
         )
 
@@ -20810,8 +20825,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertNotIn("tcgen05_aux_pipeline = cutlass.pipeline.PipelineAsync", code)
         self.assertNotIn("tcgen05_aux_pipeline.producer_acquire(", code)
         self.assertIn(
-            "tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create("
-            "num_stages=3",
+            "tcgen05_ab_pipeline = _helion_tc_pro.make_tma_umma_pipeline(num_stages=3",
             code,
         )
 
@@ -23915,6 +23929,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             body_src,
         )
 
+    @skipUnlessTcgen05RuntimeNPtx
     def test_tcgen05_runtime_mma_issue_requires_bf16_fp32(self) -> None:
         def build(input_dtype_str: str) -> ast.stmt:
             return _build_tcgen05_mma_issue_stmt(

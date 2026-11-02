@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Hashable
 import contextlib
+import copy
 import os
 from typing import TYPE_CHECKING
 from typing import Any
@@ -63,6 +64,9 @@ from .grouped_row_union import STARTUP_PREFILL_KEY
 from .grouped_row_union import TRANSPOSED_SCHEDULE
 from .grouped_row_union import ab_stages_supported as row_union_ab_stages_supported
 from .grouped_row_union import physical_schedule
+from .grouped_row_union import (
+    round_subtiles_supported as row_union_round_subtiles_supported,
+)
 from .grouped_row_union import schedule_by_name as row_union_schedule_by_name
 from .grouped_row_union import schedule_supported as row_union_schedule_supported
 from .one_cta_pipeline import Tcgen05OneCtaPipelineFacts
@@ -75,6 +79,10 @@ from .pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
 from .pipeline_smem import Tcgen05PipelineSmemFacts
 from .pipeline_smem import max_pipeline_ab_stages
 from .pipeline_smem import pipeline_smem_bytes
+from .split_k_workspace_config import PARTITIONS_KEY
+from .split_k_workspace_config import STAGES_KEY
+from .split_k_workspace_config import WORKSPACE_KEY
+from .split_k_workspace_config import workspace_search_fields
 from .strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from .strategies import TCGEN05_BATCH_RASTER_CHOICES
 from .strategies import TCGEN05_BATCH_RASTER_CONFIG_KEY
@@ -178,6 +186,8 @@ from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CHOICES
+from .tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CHOICES
 from .tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPI_WARP_GROUP_CHOICES
@@ -241,6 +251,8 @@ from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNTS
 from .tcgen05_constants import TCGEN05_SMALL_GRID_DIRECT_STORE_MAX_BN
 from .tcgen05_constants import TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES
 from .tcgen05_constants import TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES
+from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_SPLIT_K_SEARCH_CHOICES
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -503,11 +515,13 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     "tcgen05_materialized_pdl",
     "tcgen05_acc_stages",
     "tcgen05_c_stages",
+    TCGEN05_SPLIT_K_CONFIG_KEY,
     TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
     TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
     TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY,
     TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY,
     TCGEN05_EPI_SUBTILE_N_CONFIG_KEY,
+    TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY,
     TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY,
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
     TCGEN05_C_STORE_MODE_CONFIG_KEY,
@@ -650,6 +664,12 @@ class CuteTcgen05Config:
         self.matmul_explicit_epi_tile_compatible: bool | None = None
         self.aux_kernel_detected: bool = False
         self.exact_shape_aux_kernel_detected: bool = False
+        # The device program's only side effect is one tile store
+        # (``split_k_exchange.host_function_has_plain_store_body``): the
+        # precondition of ``tcgen05_split_k``, whose last-arriver check
+        # guards that store alone. Set at bind; a spec that never went
+        # through bind keeps the knob off.
+        self.split_k_plain_body: bool = False
         # Every analyzed store chain loads an auxiliary operand
         # (``aux_tensor.host_function_tcgen05_aux_loads_on_every_store``): the
         # proof that ``pre_acc_wait`` renders on the plain (non-fanout)
@@ -1974,6 +1994,27 @@ class CuteTcgen05Config:
                 limit = self._paired_pipeline_stage_limit(config)
                 if limit is not None and limit > 0:
                     return
+            # A sampled pair on a tile the pair cannot run (an odd N or K
+            # tile) joins the ragged edge family's 128-row pair where that
+            # family is admitted, before the pair itself is given up; the
+            # projection is kept only when the pair then has a stage budget
+            # (a failed attempt must not leave the cluster behind).
+            projected = copy.deepcopy(config)
+            if self._project_edge_pair128_search_config(projected):
+                # The search fixer canonicalizes the pair's surface after
+                # this validator runs; price the stage budget on that
+                # surface (a sampled strategy or layout knob is not what the
+                # pair will run with).
+                self._apply_paired_pipeline_surface(projected)
+                for c_stages in dict.fromkeys((projected.get("tcgen05_c_stages"), 2)):
+                    if c_stages is None:
+                        continue
+                    projected["tcgen05_c_stages"] = c_stages
+                    limit = self._paired_pipeline_stage_limit(projected)
+                    if limit is not None and limit > 0:
+                        config.clear()
+                        config.update(projected)
+                        return
             config[TCGEN05_CTA_GROUP_CONFIG_KEY] = "auto"
             return
         raise InvalidConfig(
@@ -2606,6 +2647,88 @@ class CuteTcgen05Config:
                         TCGEN05_C_STORE_MODE_DIRECT
                     )
                     seeds.append(Config(**direct_seed_config))
+        return seeds
+
+    def _split_k_seed_configs(self) -> list[Config]:
+        """Flat one-CTA split-K seeds for problems whose output tiles cannot
+        fill the machine (``tcgen05_split_k``, ``split_k_exchange.py``).
+
+        A GEMM with fewer output tiles than SMs leaves SMs idle however the
+        tiles are cut; splitting the K loop across CTAs is the cuBLAS answer
+        (its heuristic runs 512x512x65536 as 128x128 tiles x split-K plus a
+        reduction kernel). Per admitted tile the seeds take the two smallest
+        splits that bring the grid to at least one wave while every split
+        keeps at least four K tiles, and the ring depth the SMEM budget
+        admits for the tile.
+        """
+        extents = self.matmul_compile_time_static_extents
+        fragments = self._matmul_block_fragments()
+        if (
+            not self.search_enabled
+            or extents is None
+            or fragments is None
+            or any(value is None or value <= 0 for value in extents)
+            or "flat" not in self.allowed_pid_types
+            or self.matmul_leading_work_multiplier != 1
+            or self.grouped_worklist_smem_facts is not None
+        ):
+            return []
+        m, n, k = cast("tuple[int, int, int]", extents)
+        bm_fragment, bn_fragment, bk_fragment = fragments
+        # Without an SM count (hosts without a device) the knob is searched
+        # and seeded as on a small machine.
+        sm_count = self.device_sm_count
+        if sm_count > 0 and -(-m // 128) * -(-n // 128) >= sm_count:
+            return []
+        choices = self.split_k_search_choices()
+        seeds: list[Config] = []
+        for bm, bn in ((128, 128), (128, 256), (64, 128), (64, 64), (64, 32)):
+            if not (
+                bm_fragment.low <= bm <= bm_fragment.high
+                and bn_fragment.low <= bn <= bn_fragment.high
+            ):
+                continue
+            tiles = -(-m // bm) * -(-n // bn)
+            if sm_count > 0 and tiles >= sm_count:
+                continue
+            for bk in (128, 64):
+                if not bk_fragment.low <= bk <= bk_fragment.high:
+                    continue
+                k_tiles = -(-k // bk)
+                splits = [
+                    split
+                    for split in choices
+                    if k_tiles // split >= 4 and tiles * split >= sm_count
+                ][:2]
+                if not splits:
+                    # No split reaches one wave with four tiles per split:
+                    # the deepest split that keeps four tiles.
+                    splits = [split for split in choices if k_tiles // split >= 4][-1:]
+                fit = self.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=1)
+                block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+                assert block_sizes is not None
+                for split in splits:
+                    stages = max(1, min(k_tiles // split, fit if fit > 0 else 2))
+                    seed_config: dict[str, Any] = {
+                        "block_sizes": block_sizes,
+                        "pid_type": "flat",
+                        "tcgen05_cta_group": "auto",
+                        "tcgen05_cluster_m": 1,
+                        "tcgen05_cluster_n": 1,
+                        "tcgen05_ab_stages": stages,
+                        "tcgen05_c_stages": 2,
+                        "tcgen05_acc_stages": 1,
+                        TCGEN05_SPLIT_K_CONFIG_KEY: split,
+                        "tcgen05_persistence_model": "non_persistent",
+                        "tcgen05_strategy": "role_local_monolithic",
+                        "tcgen05_layout_strategy": "default",
+                        **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
+                    }
+                    if bn <= TCGEN05_SMALL_GRID_DIRECT_STORE_MAX_BN:
+                        seed_config[TCGEN05_C_STORE_MODE_CONFIG_KEY] = (
+                            TCGEN05_C_STORE_MODE_DIRECT
+                        )
+                    seeds.append(Config(**seed_config))
         return seeds
 
     def _warp_mma_problem(
@@ -4419,6 +4542,128 @@ class CuteTcgen05Config:
             seed_config["indexing"] = ["tensor_descriptor"] * 3
         return Config(**seed_config)
 
+    def plain_edge_pair128_admitted(self) -> bool:
+        """Whether the ragged edge family may run 128-row CTA pairs
+        (``tcgen05_cta_group="two"`` on ``block_m=128``: each CTA owns 64 rows
+        of a 128 x 128 pair tile): a 16-bit plain GEMM on the edge K-tail
+        family whose 256-row pairs cannot occupy every SM once (fewer pairs
+        than half the SM count; the 256x256 pair is the family's default
+        projection and underfills such grids). Gates the seeds, the sampled
+        ``"two"`` and the search repair
+        that keeps a sampled pair on the 128-row tile.
+        """
+        constraints = self.cluster_m2_search_constraints
+        facts = self.pipeline_smem_facts
+        extents = self.matmul_compile_time_static_extents
+        fragments = self._matmul_block_fragments()
+        if (
+            not self.search_enabled
+            or constraints is None
+            or not constraints.allow_edge_k_tail_family
+            or facts is None
+            or facts.input_dtype_bytes != 2
+            or self.aux_kernel_detected
+            or TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types
+            or extents is None
+            or fragments is None
+            or any(value is None or value <= 0 for value in extents)
+            or self.device_sm_count <= 0
+        ):
+            return False
+        m, n, _k = cast("tuple[int, int, int]", extents)
+        bm_fragment, bn_fragment, _bk_fragment = fragments
+        if not (bm_fragment.low <= 128 and bn_fragment.low <= 128 <= bn_fragment.high):
+            return False
+        # Enough 256-row pairs to put one CTA on every SM: the plain seed and
+        # the 256x256 projection cover it.
+        return -(-m // 256) * -(-n // 256) < self.device_sm_count // 2
+
+    def _project_edge_pair128_search_config(self, config: dict[str, object]) -> bool:
+        """Project a sampled explicit CTA pair (``tcgen05_cta_group="two"``)
+        on a ``bm <= 128`` tile of the ragged edge family onto its validated
+        128x128 pair tile: one N tile per CTA (no N multicast), a K tile the
+        family admits and an AB depth that fits the pair's SMEM. False when
+        the family is not admitted (``plain_edge_pair128_admitted``) or the
+        sample is a 256-row tile, which keeps the 256x256 projection.
+        """
+        if not self.plain_edge_pair128_admitted():
+            return False
+        view = self._matmul_config_view(config)
+        if view is None:
+            return False
+        block_sizes, m_index, n_index, k_index = view
+        bm = block_sizes[m_index]
+        if not isinstance(bm, int) or isinstance(bm, bool) or bm > 128:
+            return False
+        constraints = self.cluster_m2_search_constraints
+        assert constraints is not None
+        bk = block_sizes[k_index]
+        if not (
+            isinstance(bk, int)
+            and not isinstance(bk, bool)
+            and self.cluster_m2_bk_is_valid(bk, constraints)
+        ):
+            bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+        block_sizes[m_index] = 128
+        block_sizes[n_index] = 128
+        block_sizes[k_index] = bk
+        config["tcgen05_cluster_m"] = 2
+        config["tcgen05_cluster_n"] = 1
+        config["tcgen05_acc_stages"] = 2
+        config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
+        fit = self.max_ab_stages_that_fit(bm=128, bn=128, bk=bk, cluster_m=2)
+        stages = config.get("tcgen05_ab_stages", 2)
+        if fit > 0 and (not isinstance(stages, int) or stages > fit):
+            config["tcgen05_ab_stages"] = fit
+        config.pop("epilogue_subtile", None)
+        return True
+
+    def _plain_edge_pair128_seed_configs(self, edge_seed: Config) -> list[Config]:
+        """128-row CTA-pair twins of the plain edge seed
+        (``plain_edge_pair128_admitted``). bf16 1000^3 runs the pair at 7.5 us
+        against the 256-row edge seed's 11.3 and the flat one-CTA winner's 8.4
+        (burst timer; cuBLAS, a 2x1-cluster 64x112 kernel, 6.5 us burst and
+        7.4 us sustained).
+        """
+        if not self.plain_edge_pair128_admitted():
+            return []
+        fragments = self._matmul_block_fragments()
+        assert fragments is not None
+        _bm_fragment, _bn_fragment, bk_fragment = fragments
+        seeds: list[Config] = []
+        constraints = self.cluster_m2_search_constraints
+        assert constraints is not None
+        for bk, stages in ((64, 5), (128, 6)):
+            if not bk_fragment.low <= bk <= bk_fragment.high:
+                continue
+            # The edge family's K-tile rule (a bk the search repair would
+            # rewrite is no seed) and a ring depth that fits the pair.
+            if not self.cluster_m2_bk_is_valid(bk, constraints):
+                continue
+            fit = self.max_ab_stages_that_fit(bm=128, bn=128, bk=bk, cluster_m=2)
+            if fit <= 0:
+                continue
+            seed_config: dict[str, Any] = dict(edge_seed.config)
+            seed_config.update(
+                {
+                    "block_sizes": self._matmul_seed_block_sizes(bm=128, bn=128, bk=bk),
+                    TCGEN05_CTA_GROUP_CONFIG_KEY: "two",
+                    "tcgen05_cluster_m": 2,
+                    "tcgen05_cluster_n": 1,
+                    "tcgen05_ab_stages": min(stages, fit),
+                    "tcgen05_acc_stages": 2,
+                    "tcgen05_c_stages": 2,
+                }
+            )
+            for key in (
+                TCGEN05_STRATEGY_CONFIG_KEY,
+                TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY,
+                TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
+            ):
+                seed_config.pop(key, None)
+            seeds.append(Config(**seed_config))
+        return seeds
+
     def _plain_cluster_n2_seed_config(
         self, *, deep: bool = False, bk: int | None = None
     ) -> Config | None:
@@ -4766,6 +5011,7 @@ class CuteTcgen05Config:
     def autotune_seed_configs(self) -> list[Config]:
         seeds = self._paired_pipeline_seed_configs()
         seeds.extend(self._small_grid_seed_configs())
+        seeds.extend(self._split_k_seed_configs())
         seeds.extend(self._warp_mma_seed_configs())
         seeds.extend(self._one_wave_seed_configs())
         seeds.extend(self._multi_tile_two_cta_seed_configs())
@@ -4776,6 +5022,7 @@ class CuteTcgen05Config:
         plain_edge_seed = self._plain_edge_seed_config()
         if plain_edge_seed is not None:
             seeds.append(plain_edge_seed)
+            seeds.extend(self._plain_edge_pair128_seed_configs(plain_edge_seed))
             # Edge-family 4-CTA multicast variant: with the generalized CLC
             # broadcast this is quack's winning 5000^3 shape (dynamic
             # persistence + cluster 2x2), measured 907 vs the cluster_n=1
@@ -4914,6 +5161,97 @@ class CuteTcgen05Config:
             and capability is not None
             and capability >= (9, 0)
         )
+
+    def split_k_search_choices(self) -> tuple[int, ...]:
+        """The ``tcgen05_split_k`` values the plain GEMM can take: splits no
+        deeper than the K loop of the smallest K tile the search admits,
+        for an unbatched static-shape GEMM (the pipeline reads the operands
+        through TMA on the flat one-CTA path only)."""
+        extents = self.matmul_compile_time_static_extents
+        fragments = self._matmul_block_fragments()
+        if (
+            not self.search_enabled
+            # A tile body with an atomic, a second store or a branch would
+            # run that effect once per split.
+            or not self.split_k_plain_body
+            or extents is None
+            or fragments is None
+            or self.matmul_leading_work_multiplier != 1
+            or self.grouped_worklist_smem_facts is not None
+            or any(value is None or value <= 0 for value in extents)
+        ):
+            return ()
+        m, n, k = cast("tuple[int, int, int]", extents)
+        if (
+            self.device_sm_count > 0
+            and -(-m // 128) * -(-n // 128) >= self.device_sm_count
+        ):
+            # Enough output tiles to fill the machine: splitting only adds
+            # the partial exchange. Without an SM count (hosts without a
+            # device) the knob stays searchable and so do its seeds.
+            return ()
+        k_tiles = -(-k // fragments[2].low)
+        return tuple(
+            split for split in TCGEN05_SPLIT_K_SEARCH_CHOICES if 1 < split <= k_tiles
+        )
+
+    def _fix_split_k_search_config(self, config: dict[str, object]) -> None:
+        """Keep ``tcgen05_split_k`` at 1 unless the sampled config is a flat
+        one-CTA GEMM whose K loop has at least ``split`` tiles."""
+        searched = self.search_enabled and bool(self.split_k_search_choices())
+        split = config.get(TCGEN05_SPLIT_K_CONFIG_KEY, 1)
+        if (
+            not isinstance(split, int)
+            or split <= 1
+            # The workspace schedule replaces the whole GEMM launch.
+            or config.get("cute_split_k_workspace")
+        ):
+            # Off the search surface the knob is absent (a coverage witness
+            # or pinned record must round-trip unchanged); on it, it reads 1.
+            if searched:
+                config[TCGEN05_SPLIT_K_CONFIG_KEY] = 1
+            else:
+                config.pop(TCGEN05_SPLIT_K_CONFIG_KEY, None)
+            return
+        view = self._matmul_config_view(config)
+        extents = self.matmul_compile_time_static_extents
+        valid = (
+            split in self.split_k_search_choices()
+            and view is not None
+            and extents is not None
+            and config.get("pid_type", "flat") == "flat"
+            and config.get("tcgen05_cluster_m", 1) == 1
+            and config.get("tcgen05_cluster_n", 1) == 1
+        )
+        if valid:
+            assert view is not None and extents is not None
+            block_sizes, m_index, _n_index, k_index = view
+            bm, bk = block_sizes[m_index], block_sizes[k_index]
+            k = cast("tuple[int, int, int]", extents)[2]
+            valid = (
+                # The tile must run the one-CTA tcgen05 MMA (a 256-row flat
+                # tile falls off tcgen05 and could not split).
+                bm in (64, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+                and isinstance(bk, int)
+                and bk > 0
+                and -(-k // bk) >= split
+            )
+        if not valid:
+            if searched:
+                config[TCGEN05_SPLIT_K_CONFIG_KEY] = 1
+            else:
+                config.pop(TCGEN05_SPLIT_K_CONFIG_KEY, None)
+
+    def _fix_split_k_workspace_search_config(self, config: dict[str, object]) -> None:
+        """With the workspace schedule off, its stage and partition knobs are
+        inert: a sample reads their defaults so the search does not compile
+        one plain kernel per inert value."""
+        if config.get(WORKSPACE_KEY):
+            return
+        if STAGES_KEY in config:
+            config[STAGES_KEY] = 2
+        if PARTITIONS_KEY in config:
+            config[PARTITIONS_KEY] = 1
 
     def _fix_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         if not (self.search_enabled and config.get("tcgen05_cluster_m") == 2):
@@ -5098,6 +5436,14 @@ class CuteTcgen05Config:
             # this shape (its 256x256 grid would idle most SMs); any other
             # sample keeps its tile on one CTA.
             config["tcgen05_cluster_m"] = 1
+            return
+        if (
+            edge_k_tail_family
+            and config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) == "two"
+            and self._project_edge_pair128_search_config(config)
+        ):
+            # 128-row pair edge family: the sampled explicit pair keeps its
+            # 128x128 tile instead of the 256x256 projection below.
             return
         if (
             block_sizes[m_index] == 2 * TCGEN05_TWO_CTA_BLOCK_M
@@ -5444,6 +5790,25 @@ class CuteTcgen05Config:
                     f"{AB_STAGES_MIN} and the profile's own"
                 )
             config.pop(GROUPED_ROW_UNION_AB_STAGES_KEY, None)
+        rounds = config.get(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, 1)
+        if value is True and rounds != 1:
+            # A physical profile sizes its C ring from the round
+            # (``with_round_subtiles``): the round must be one of the choices,
+            # the profile must store through the plain tail (the transposed
+            # one) and the wider ring must fit beside the physical AB ring;
+            # the legacy one-CTA schedule keeps the per-subtile loop.
+            if base_profile is None or not row_union_round_subtiles_supported(
+                base_profile,
+                rounds,
+                config.get(GROUPED_ROW_UNION_AB_STAGES_KEY),
+            ):
+                if not fix_invalid:
+                    raise InvalidConfig(
+                        f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}={rounds!r} needs the "
+                        "transposed row-union profile and a C ring that fits "
+                        "beside its AB ring"
+                    )
+                config.pop(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, None)
         prefill = config.get(STARTUP_PREFILL_KEY, False)
         if prefill is False:
             config.pop(STARTUP_PREFILL_KEY, None)
@@ -5911,6 +6276,18 @@ class CuteTcgen05Config:
             and physical_schedule(config) is None
         )
 
+    @classmethod
+    def _row_union_register_reallocation_optional(
+        cls, config: dict[str, object]
+    ) -> bool:
+        """The transposed row-union profile launches six warps at one CTA per
+        SM, so every warp can hold the consumer register budget from launch
+        and the ``setmaxnreg`` pair only lengthens the TMA-load warp's
+        prologue (``_tcgen05_prologue_runtime``): the search may drop it.
+        The paired profile owns its static register protocol instead."""
+        profile = physical_schedule(config)
+        return profile is not None and profile.paired_protocol is None
+
     def _normalize_warp_register_reallocation(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -5924,17 +6301,28 @@ class CuteTcgen05Config:
         if (
             value is not False
             or not self.search_enabled
-            or not self._grouped_static_registers_supported(config)
+            or not (
+                self._grouped_static_registers_supported(config)
+                or self._row_union_register_reallocation_optional(config)
+            )
         ):
             if fix_invalid:
                 config.pop(key)
                 return
             raise InvalidConfig(
                 f"{key}=False requires an independent single-CTA N,M worklist "
-                "with the default physical M128 register profile"
+                "with the default physical M128 register profile, or the "
+                "transposed row-union profile"
             )
         if TCGEN05_CONSUMER_REGS_CONFIG_KEY in config:
-            if fix_invalid:
+            if (
+                config[TCGEN05_CONSUMER_REGS_CONFIG_KEY]
+                == TCGEN05_CONSUMER_REGS_DEFAULT
+                or fix_invalid
+            ):
+                # The default consumer budget is inert without the pair (a
+                # full config materializes it); an explicit other value asks
+                # for a reallocation that is not emitted.
                 config.pop(TCGEN05_CONSUMER_REGS_CONFIG_KEY)
             else:
                 raise InvalidConfig(
@@ -7715,6 +8103,25 @@ class CuteTcgen05Config:
         return 1
 
     @staticmethod
+    def epi_round_subtiles_refusal(config: dict[str, object]) -> str | None:
+        """Why ``tcgen05_epi_round_subtiles`` is refused for ``config``; None if
+        admitted.  The round must be a choice; outside the grouped row-union
+        profiles (whose normalizer sizes the C ring from it) it must divide
+        ``tcgen05_c_stages``, the subtile buffers the bulk-group pipeline is
+        cut into rounds of.  The store lowering refuses the remaining shapes
+        (fan-out, auxiliary chains, store warps, paired tails) when it
+        renders (``tcgen05_epilogue_rounds``)."""
+        value = config.get(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, 1)
+        if type(value) is not int or value not in TCGEN05_EPI_ROUND_SUBTILES_CHOICES:
+            return f"must be one of {TCGEN05_EPI_ROUND_SUBTILES_CHOICES!r}"
+        if value == 1 or config.get(GROUPED_ROW_UNION_KEY, False) is True:
+            return None
+        c_stages = config.get("tcgen05_c_stages", 2)
+        if type(c_stages) is not int or c_stages % value != 0:
+            return f"must divide tcgen05_c_stages={c_stages!r}"
+        return None
+
+    @staticmethod
     def _config_epi_subtile_n(config: dict[str, object]) -> int | None:
         """Configured epilogue subtile width (``tcgen05_epi_subtile_n``)."""
         value = config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY)
@@ -8178,6 +8585,17 @@ class CuteTcgen05Config:
                     f"{TCGEN05_EPI_SUBTILE_N_CONFIG_KEY}="
                     f"{config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY)!r}: {reason}"
                 )
+        reason = self.epi_round_subtiles_refusal(config)
+        if reason is not None:
+            if fix_invalid:
+                config.pop(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, None)
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}="
+                    f"{config.get(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY)!r}: {reason}"
+                )
+        elif config.get(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY) == 1:
+            config.pop(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, None)
         reason = self.epi_warp_groups_refusal(config)
         if reason is not None:
             if fix_invalid:
@@ -9725,7 +10143,14 @@ class CuteTcgen05Config:
         fragments: dict[str, ConfigSpecFragment] = {
             TCGEN05_CTA_GROUP_CONFIG_KEY: EnumFragment(
                 TCGEN05_CTA_GROUP_CHOICES
-                if not for_search or (paired_search and two_cta_regions)
+                if not for_search
+                or (paired_search and two_cta_regions)
+                # The ragged edge family's whole 128-row pairs run the 2-CTA
+                # MMA only when asked for explicitly (``auto`` keeps bf16
+                # bm=128 + cluster_m=2 on the CtaGroup.ONE bridge, which the
+                # edge epilogues refuse); let the search ask
+                # (``plain_edge_pair128_admitted``).
+                or (two_cta_regions and self.plain_edge_pair128_admitted())
                 else ("auto",)
             ),
             "tcgen05_cluster_m": EnumFragment(cluster_m_choices),
@@ -9740,6 +10165,17 @@ class CuteTcgen05Config:
             "tcgen05_num_epi_warps": num_epi_warps_fragment,
             TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: EnumFragment(l2_swizzle_choices),
         }
+        split_k_choices = self.split_k_search_choices()
+        if not for_search or split_k_choices:
+            # Flat one-CTA kernels run each output tile's K loop on this
+            # many CTAs and reduce the partials in the last arriver's TMEM
+            # (``_fix_split_k_search_config`` keeps the knob at 1 off the
+            # flat one-CTA family). Searched only where the output tiles
+            # cannot fill the machine; otherwise the knob stays off the
+            # surface (explicit configs may still set it).
+            fragments[TCGEN05_SPLIT_K_CONFIG_KEY] = EnumFragment(
+                TCGEN05_SPLIT_K_SEARCH_CHOICES
+            )
         if not for_search or self.grouped_ab_k_fusion_supported:
             fragments[TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY] = EnumFragment((None, 128))
         if not for_search or self.grouped_d_shift_supported:
@@ -9801,6 +10237,14 @@ class CuteTcgen05Config:
             # to ``None`` by normalization.
             fragments[GROUPED_ROW_UNION_AB_STAGES_KEY] = EnumFragment(
                 GROUPED_ROW_UNION_AB_STAGES_CHOICES
+            )
+        if not for_search or self.grouped_row_union_cluster4_eligible:
+            # Subtiles per TMA-store epilogue round (``tcgen05_epilogue_rounds``);
+            # searched where the transposed row-union profile is reachable, an
+            # explicit value is validated on every tcgen05 TMA-store epilogue
+            # (``epi_round_subtiles_refusal``).
+            fragments[TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY] = EnumFragment(
+                TCGEN05_EPI_ROUND_SUBTILES_CHOICES
             )
         if not for_search or self.grouped_row_union_paired_clc_eligible:
             fragments[STARTUP_PREFILL_KEY] = BooleanFragment()
@@ -10798,7 +11242,7 @@ class CuteTcgen05Config:
                 # that encode a real tcgen05 strategy still fail loudly — the
                 # config cannot be honored and silently changing strategy
                 # could mask a miscompute (see
-                # ``test_batched_two_cta_partial_edge_tiles_rejected``).
+                # ``test_batched_two_cta_partial_edge_tiles_projected_onto_one_cta``).
                 if fix_invalid or config[key] == fragment.default():
                     config.pop(key, None)
                 else:
@@ -11255,6 +11699,50 @@ class CuteTcgen05Config:
             )
 
     def fix_search_config(self, config: dict[str, object]) -> None:
+        self._fix_search_config_body(config)
+        # These repairs read the repaired pid type, cluster and tile, so they
+        # run last, on every path of the body (its early returns included:
+        # the one-CTA pipeline, the dense-N tile, the materialized chains
+        # and the explicit pair): the persistent grid cap is inert once a
+        # projection drops the cluster to one N tile, and the split-K knobs
+        # apply only on the flat one-CTA family.
+        self._fix_persistent_grid_cap_search_config(config)
+        self._fix_split_k_search_config(config)
+        self._fix_split_k_workspace_search_config(config)
+
+    def _apply_paired_pipeline_surface(self, config: dict[str, object]) -> None:
+        """The canonical knobs of a sampled explicit CTA pair: the role-local
+        static-persistent pipeline on the default layout with the
+        direct-entry controls off (in the search schema's representation, so
+        inactive controls cannot survive only one side of flatten) and no
+        scheduler / C-input / store warps."""
+        config["tcgen05_cluster_m"] = 2
+        config[TCGEN05_STRATEGY_CONFIG_KEY] = (
+            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
+        )
+        config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = (
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+        )
+        config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY] = Tcgen05LayoutStrategy.DEFAULT.value
+        search_fields = self.optional_fragments(for_search=True)
+        for key in (
+            TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY,
+            TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
+        ):
+            if key in search_fields:
+                config[key] = False
+            else:
+                config.pop(key, None)
+        for key in TCGEN05_LAYOUT_OVERRIDES_KEYS:
+            config[key] = None
+        for key in (
+            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
+            TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY,
+            TCGEN05_WARP_SPEC_STORE_WARPS_KEY,
+        ):
+            config[key] = 0
+
+    def _fix_search_config_body(self, config: dict[str, object]) -> None:
         if config.get(TILE_N_KEY, 0) != 0:
             self._normalize_dense_aligned_n(config, fix_invalid=True)
             config.pop("epilogue_subtile", None)
@@ -11271,37 +11759,16 @@ class CuteTcgen05Config:
             self._validate_cta_group_config(config, fix_invalid=True)
             return
         if config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) == "two":
-            if self.paired_pipeline_search_enabled():
-                config["tcgen05_cluster_m"] = 2
-                config[TCGEN05_STRATEGY_CONFIG_KEY] = (
-                    Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
-                )
-                config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = (
-                    Tcgen05PersistenceModel.STATIC_PERSISTENT.value
-                )
-                config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY] = (
-                    Tcgen05LayoutStrategy.DEFAULT.value
-                )
-                # The paired pipeline disables direct-entry controls. Repair
-                # must use the search schema's canonical representation, so
-                # inactive controls cannot survive only one side of flatten.
-                search_fields = self.optional_fragments(for_search=True)
-                for key in (
-                    TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY,
-                    TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
-                ):
-                    if key in search_fields:
-                        config[key] = False
-                    else:
-                        config.pop(key, None)
-                for key in TCGEN05_LAYOUT_OVERRIDES_KEYS:
-                    config[key] = None
-                for key in (
-                    TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
-                    TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY,
-                    TCGEN05_WARP_SPEC_STORE_WARPS_KEY,
-                ):
-                    config[key] = 0
+            explicit_pair = self.paired_pipeline_search_enabled()
+            if not explicit_pair and self.plain_edge_pair128_admitted():
+                # The ragged edge family's explicit pair is the 128-row tile
+                # only; a sampled "two" on a wider tile is reset to ``auto``
+                # and repaired by the body as before (its 256-row pair is the
+                # family's own ``auto`` encoding).
+                view = self._matmul_config_view(config)
+                explicit_pair = view is not None and view[0][view[1]] == 128
+            if explicit_pair:
+                self._apply_paired_pipeline_surface(config)
                 self._fix_cluster_m2_search_config(config)
                 self._clamp_l2_swizzle_size_to_shape(config)
                 self._validate_cta_group_config(config, fix_invalid=True)
@@ -11375,7 +11842,6 @@ class CuteTcgen05Config:
         # CLC admission depends on the projected cluster/pid/strategy tuple
         # above, including the scheduler/c-input warp fix-ups.
         self._fix_clc_persistence_search_config(config)
-        self._fix_persistent_grid_cap_search_config(config)
         self._validate_sched_stage_count_config(config, fix_invalid=True)
         self._validate_clc_query_pacing_config(config, fix_invalid=True)
         self._validate_cta_group_config(config, fix_invalid=True)
@@ -11589,6 +12055,10 @@ class CuteTcgen05Config:
         ):
             fields["loop_orders"] = self.config_spec.loop_orders
         fields.update(self.optional_fragments(for_search=True))
+        if self.config_spec.cute_split_k_workspace_available:
+            fields.update(
+                workspace_search_fields(self.config_spec.cute_split_k_partition_choices)
+            )
         seeds = self.config_spec.compiler_seed_configs
         if isinstance(fragment := fields.get("tcgen05_ab_stages"), IntegerFragment):
             fields["tcgen05_ab_stages"] = _integer_fragment_with_seed_values(
@@ -11641,10 +12111,17 @@ class CuteTcgen05Config:
                 if self.grouped_source128_search_enabled
                 else (None,),
             )
-        if TCGEN05_GROUPED_MODE_WORKLIST_NM in modes:
+        if (
+            TCGEN05_GROUPED_MODE_WORKLIST_NM in modes
+            or self.grouped_row_union_cluster4_eligible
+        ):
+            # Searched on the worklist N,M mode (its static register protocol)
+            # and where the transposed row-union profile is reachable
+            # (``_row_union_register_reallocation_optional``).
             fields[TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY] = EnumFragment(
                 (True, False)
             )
+        if TCGEN05_GROUPED_MODE_WORKLIST_NM in modes:
             fields[TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY] = EnumFragment(
                 (False, True)
             )

@@ -13,21 +13,35 @@ per-CTA fixed cost) and 6.1 us for the Triton backward's 16x32 tiles.
 
 from __future__ import annotations
 
+import ast
 import math
+from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 import torch
 
 import helion
+from helion._compiler.cute.pdl_release import ZERO_FILL_KERNEL_PREFIX
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_generation import ConfigGeneration
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
+from test._cute_binding import _mock_cuda_unavailable
+from test.cute_population_contracts import _target
+from test.test_cute_pdl import _assert_only_the_dependent_launch_differs
+from test.test_cute_pdl import _last_wave_guard
+from test.test_cute_pdl import _on_and_off
+
 from helion._compiler.cute import cute_flash_bwd_row_mma as row
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 FAMILY = row.FLASH_BWD_FAMILY_KEY
 KV = row.FLASH_BWD_ROW_KV_KEY
@@ -222,17 +236,19 @@ def test_row_surface_is_searched_and_seeded_on_small_grids() -> None:
     assert fields[CHUNK].choices == (64, 32, 16)
     assert fields[CHUNK]._active_choices() == (64, 32, 16)
     # The default config renders the tcgen05 family; the seed list adds the
-    # row programs over the default row knobs.
+    # row programs over the default row knobs, plain and as a programmatic
+    # dependent (``cute_pdl``).
     assert spec.default_config().config[FAMILY] == "fa4"
     seeds = [
         s for s in spec.autotune_seed_configs() if s.config.get(FAMILY) == "row_mma"
     ]
-    assert len(seeds) == 1
-    assert (seeds[0].config[KV], seeds[0].config[SPLIT], seeds[0].config[CHUNK]) == (
-        16,
-        4,
-        64,
-    )
+    assert [s.config.get("cute_pdl") for s in seeds] == [False, True]
+    for seed in seeds:
+        assert (seed.config[KV], seed.config[SPLIT], seed.config[CHUNK]) == (
+            16,
+            4,
+            64,
+        )
     # Normalization legalizes the triple on the family and pins the knobs off it.
     on = bound._normalized_config_copy(helion.Config(**_knobs(32, 8, 16)))
     assert (on.config[FAMILY], on.config[KV], on.config[SPLIT], on.config[CHUNK]) == (
@@ -423,6 +439,205 @@ def test_row_dk_dv_are_deterministic() -> None:
     assert torch.equal(first[2], second[2])
     torch.testing.assert_close(first[0], second[0], atol=1e-3, rtol=1e-3)
     for actual, reference in zip(first, expected, strict=True):
+        torch.testing.assert_close(
+            actual.double(), reference, atol=2e-2, rtol=2e-2, check_device=False
+        )
+
+
+# --------------------------------------------------------------------------
+# Dependent launch (cute_pdl)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cpu_only() -> Iterator[None]:
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
+        patch(
+            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            return_value=232448,
+        ),
+    ):
+        yield
+
+
+def _cpu_args(shape: tuple[int, int, int, int]) -> tuple[torch.Tensor | float, ...]:
+    """CPU tensors of the example backward's arguments: enough to bind."""
+    torch.manual_seed(0)
+    q, k, v, o, do = (torch.randn(shape, dtype=torch.bfloat16) for _ in range(5))
+    lse, delta = (torch.randn(shape[:-1], dtype=torch.float32) for _ in range(2))
+    sm_scale = 1.0 / math.sqrt(shape[-1])
+    return (q, k * (sm_scale * RCP_LN2), v, o, lse, do, delta, sm_scale)
+
+
+# (config, threads per CTA) of the two dense families at (1, 4, 256, 64).
+_FAMILY_CONFIGS = (
+    (_knobs(16, 4, 64), 128),
+    ({"block_sizes": [128, 128]}, 512),
+)
+_WAIT = "cute.arch.griddepcontrol_wait()"
+_RELEASE = "cute.arch.griddepcontrol_launch_dependents()"
+_MAIN = "_helion_attention_backward"
+_FILL = f"{ZERO_FILL_KERNEL_PREFIX}0_helion_attention_backward"
+_ZEROS = "dq = torch.zeros((q.size(0), head_dim), device=q.device, dtype=torch.float32)"
+_EMPTY = "dq = torch.empty((q.size(0), head_dim), device=q.device, dtype=torch.float32)"
+
+
+def _kernel_def(code: str, name: str) -> ast.FunctionDef:
+    (kernel,) = [
+        node
+        for node in ast.parse(code).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == name
+        and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
+    ]
+    return kernel
+
+
+def _host_lines(code: str) -> list[str]:
+    (host,) = [
+        node
+        for node in ast.parse(code).body
+        if isinstance(node, ast.FunctionDef) and node.name == "attention_backward"
+    ]
+    return [ast.unparse(statement) for statement in host.body]
+
+
+def _assert_fill_launch(on: str, off: str) -> None:
+    """The dq fill's form, spelled out: ``_assert_only_the_dependent_launch_differs``
+    compares the whole knob-on module against the knob-off one (the kernel
+    proper's wait, release and launch attribute, the fill kernel, its
+    attribute and its launch stripped, the ``empty`` read as ``zeros``
+    again), so everything else is known equal; what it does not pin down is
+    the fill itself: which tensor (dq: the accumulator the memset node sat
+    on between the preprocess kernel and this one), that its kernel waits
+    and releases at entry, and that its launch follows the allocation and
+    precedes the kernel's own launch."""
+    fill = [ast.unparse(s) for s in _kernel_def(on, _FILL).body]
+    assert fill[:2] == [_WAIT, _RELEASE]
+    assert f"{_FILL}._helion_cute_use_pdl = True" in on
+    assert _ZEROS in _host_lines(off)
+    lines = _host_lines(on)
+    allocation = lines.index(_EMPTY)
+    assert lines[allocation + 1].startswith(
+        f"_launcher({_FILL}, (max(1, min((dq.numel() + 1023) // 1024, "
+    )
+    assert lines[allocation + 1].endswith("),), dq.view(-1), block=(256, 1, 1))")
+    (launch,) = [
+        i for i, line in enumerate(lines) if line.startswith(f"_launcher({_MAIN},")
+    ]
+    assert allocation + 1 < launch
+
+
+def test_the_surface_offers_and_seeds_the_dependent_launch(cpu_only: None) -> None:
+    bound = _kernel()._bind_isolated(_cpu_args((1, 4, 256, 64)))
+    spec = bound.config_spec
+    assert spec.cute_flash_bwd_search_enabled
+    fields = spec._flat_fields()
+    pdl = fields["cute_pdl"]
+    assert isinstance(pdl, EnumFragment)
+    assert pdl.choices == (False, True)
+    assert pdl._active_choices() == (False, True)
+    release = fields["cute_pdl_release"]
+    assert isinstance(release, EnumFragment)
+    assert release._active_choices() == ("auto",)
+    # A small grid seeds the row family twice: plain and as a dependent.
+    seeds = [
+        s for s in spec.autotune_seed_configs() if s.config.get(FAMILY) == "row_mma"
+    ]
+    assert [s.config.get("cute_pdl") for s in seeds] == [False, True]
+    assert {(s.config[KV], s.config[SPLIT], s.config[CHUNK]) for s in seeds} == {
+        (16, 4, 64)
+    }
+    # The knob survives the surface's flat round trip (a searched key the
+    # normalizer dropped would be benchmarked as its knob-off kernel).
+    with bound.env:
+        generation = ConfigGeneration(spec)
+        flat = generation.flatten(seeds[1])
+        normalized = generation.unflatten(flat)
+        assert normalized.config.get("cute_pdl") is True
+        assert generation.flatten(normalized) == flat
+
+
+def test_the_spread_pad_stays_off_both_families_here(cpu_only: None) -> None:
+    # The surface offers ``cute_pdl_spread`` with the knob (the row family
+    # allocates literally and can take the pad on a smaller tile), but at
+    # (1, 4, 256, 64) neither family renders it: the row kernel's own
+    # 118784 bytes already hold one 128-thread CTA per SM (past the 115713
+    # byte footprint of one wave), and the tcgen05 kernel reserves its
+    # storage through the DSL's ``SmemAllocator`` at the per-block maximum,
+    # which the pad's literal sum cannot see and must not pad on top of (a
+    # pad there failed every launch).  Knob on with the spread renders the
+    # knob-on module.
+    bound = _kernel()._bind_isolated(_cpu_args((1, 4, 256, 64)))
+    spec = bound.config_spec
+    spread = spec._flat_fields()["cute_pdl_spread"]
+    assert isinstance(spread, EnumFragment)
+    assert spread._active_choices() == (False, True)
+    for config, _threads in _FAMILY_CONFIGS:
+        on = bound.to_code(
+            spec.normalized_config(helion.Config(**config, cute_pdl=True))
+        )
+        padded = bound.to_code(
+            spec.normalized_config(
+                helion.Config(**config, cute_pdl=True, cute_pdl_spread=True)
+            )
+        )
+        assert "pdl_spread_pad" not in padded
+        assert padded == on
+    assert "smem.allocate(_fbwd_storage_cls)" in bound.to_code(
+        spec.normalized_config(helion.Config(**_FAMILY_CONFIGS[1][0], cute_pdl=True))
+    )
+    assert "rb_s_stage = cute.arch.alloc_smem(cutlass.BFloat16, 32768" in bound.to_code(
+        spec.normalized_config(helion.Config(**_FAMILY_CONFIGS[0][0], cute_pdl=True))
+    )
+
+
+def test_both_families_render_the_generic_dependent_launch(cpu_only: None) -> None:
+    bound = _kernel()._bind_isolated(_cpu_args((1, 4, 256, 64)))
+    for config, threads in _FAMILY_CONFIGS:
+        on, off = _on_and_off(bound, config)
+        # Whole module: only the dependent launch and the dq fill differ.
+        # The wait is the body's first statement, the release follows it
+        # (one wave: 64 CTAs of 128 threads for the rows, 8 of 512 for the
+        # tcgen05 kernel), the launch attribute is set, the dq fill launches
+        # as a dependent kernel.
+        assert _assert_only_the_dependent_launch_differs(on, off) == []
+        assert _last_wave_guard(on) is None
+        _assert_fill_launch(on, off)
+        assert f"block=({threads}, 1, 1)" in on
+
+
+def test_the_row_launch_counts_its_own_ctas(cpu_only: None) -> None:
+    # The launcher sizes the row kernel's grid from its plan (64 CTAs of one
+    # 16-row KV tile each), not from the 128-row program-id grid (8 CTAs):
+    # on a device of two SMs (32 resident 128-thread CTAs) the release comes
+    # from the last wave, guarded against the plan's count.
+    with patch("helion.runtime.get_num_sm", return_value=2):
+        bound = _kernel()._bind_isolated(_cpu_args((1, 4, 256, 64)))
+        on, off = _on_and_off(bound, _knobs(16, 4, 64))
+    assert "'total_tiles': 64" in on
+    # (The fill kernel's launch is capped at four CTAs per SM: eight here.)
+    assert "(dq.numel() + 1023) // 1024, 8)" in on
+    assert _assert_only_the_dependent_launch_differs(on, off) == []
+    assert _last_wave_guard(on) == "if pdl_cta >= 32:"
+    _assert_fill_launch(on, off)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize("config", [config for config, _ in _FAMILY_CONFIGS])
+def test_dependent_launch_matches_reference(config: dict[str, object]) -> None:
+    args, expected = _inputs((1, 4, 256, 64))
+    code, grads = code_and_output(_kernel(), args, **config, cute_pdl=True)
+    assert "cute.arch.griddepcontrol_wait()" in code
+    assert "cute.arch.griddepcontrol_launch_dependents()" in code
+    assert f"{_MAIN}._helion_cute_use_pdl = True" in code
+    # The dq accumulator's zero fill launches as a dependent fill kernel.
+    assert f"{_FILL}._helion_cute_use_pdl = True" in code
+    assert _EMPTY in code and _ZEROS not in code
+    for actual, reference in zip(grads, expected, strict=True):
         torch.testing.assert_close(
             actual.double(), reference, atol=2e-2, rtol=2e-2, check_device=False
         )

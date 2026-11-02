@@ -23,16 +23,25 @@ from test.test_cute_collective_chunk_seeds import _partitioned_matmul
 from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
+from helion._compiler.autotuner_heuristics.cute_split_k_workspace import (
+    CuteSplitKWorkspaceHeuristic,
+)
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.split_k_workspace import analyze_split_k_workspace
+from helion._compiler.cute.split_k_workspace import atomic_epilogue_geometry
 from helion._compiler.cute.split_k_workspace import workspace_schedule
 from helion._compiler.cute.split_k_workspace_codegen import _reducer_source
+from helion._compiler.cute.split_k_workspace_codegen import (
+    _rewrite_producer_for_atomic_epilogue,
+)
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
+from helion.exc import BackendUnsupported
+from helion.exc import InvalidConfig
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -43,6 +52,32 @@ if TYPE_CHECKING:
 
     from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import Kernel
+
+
+@pytest.fixture(autouse=True)
+def _promotion_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests exercise the schedule on the fp32-promoted float16 output;
+    pin the promotion on for the module's kernels (the Setting defaults to
+    accumulating in the half storage)."""
+    for kernel in (
+        _partitioned_matmul,
+        _fp32_bias,
+        _nonzero_output,
+        _nonzero_seed,
+        _output_argument,
+        _output_alias,
+        _nonlinear_partial,
+        _plain_store_matmul,
+        _plain_store_bias_matmul,
+        _plain_store_relu_matmul,
+        _plain_store_into_argument,
+        matmul_split_k,
+    ):
+        monkeypatch.setattr(
+            kernel,
+            "settings",
+            kernel.settings.copy(cute_promote_half_atomic_outputs=True),
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -142,6 +177,61 @@ def _nonlinear_partial(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _plain_store_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for row, column in hl.tile((m, n)):
+        accumulator = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            accumulator = torch.addmm(accumulator, a[row, inner], b[inner, column])
+        out[row, column] = accumulator.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _plain_store_bias_matmul(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for row, column in hl.tile((m, n)):
+        accumulator = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            accumulator = torch.addmm(accumulator, a[row, inner], b[inner, column])
+        out[row, column] = (accumulator + bias[column]).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _plain_store_relu_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for row, column in hl.tile((m, n)):
+        accumulator = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            accumulator = torch.addmm(accumulator, a[row, inner], b[inner, column])
+        out[row, column] = torch.relu(accumulator).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _plain_store_into_argument(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    for row, column in hl.tile((m, n)):
+        accumulator = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            accumulator = torch.addmm(accumulator, a[row, inner], b[inner, column])
+        out[row, column] = accumulator.to(out.dtype)
+    return out
+
+
 def _args(
     shape: tuple[int, int, int] = (128, 2048, 128),
     dtype: torch.dtype = torch.float16,
@@ -220,10 +310,10 @@ def test_fp32_destination_with_permuted_root_and_bias_is_proved(
     assert "CtaGroup.TWO" in producer
     assert "num_stages=2" in producer
     assert "cutlass.Float32" in reducer and "cutlass.Float16" not in reducer
-    assert "if partition == cutlass.Int32(0):" in reducer
+    assert "if partition_lane == cutlass.Int32(0):" in reducer
     assert reducer.index(
-        "loaded[element] = loaded[element] + bias_value"
-    ) < reducer.index("values.store(values.load() + loaded.load())")
+        "loaded_0[element] = loaded_0[element] + cutlass.Float32(bias_scalar[0])"
+    ) < reducer.index("values.store(loaded_0.load()")
 
 
 @pytest.mark.parametrize("with_bias", (False, True))
@@ -238,7 +328,11 @@ def test_original_example_emits_only_two_source_hashed_launches(
         else (lambda acc, tile: acc)
     )
     kernel = helion.kernel(
-        matmul_split_k.fn, backend="cute", static_shapes=True, autotune_effort="none"
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     bound = _bind(kernel, (*args, epilogue))
     source = bound.to_code(
@@ -391,17 +485,63 @@ def test_user_output_atomic_semantics_are_not_replaced() -> None:
     args = (*_args(), torch.empty((128, 128), dtype=torch.float32))
     bound = _bind(_output_argument, args)
     assert _proof(bound) is None
-    with pytest.raises(helion.exc.InvalidConfig, match="private FP32"):
+    with pytest.raises(helion.exc.InvalidConfig, match="proved split-K reduction"):
         bound.to_code(
             helion.Config(block_sizes=[128, 128, 64], cute_split_k_workspace=True)
         )
 
 
-def test_bf16_requested_atomics_are_not_promoted_by_this_optimization() -> None:
+def test_fp16_output_is_proved_without_promotion() -> None:
+    # ``cute_promote_half_atomic_outputs=False`` keeps a float16 destination
+    # in its requested dtype like bfloat16; the workspace schedule proves the
+    # split and its reducer casts the FP32 partial sum to float16 once.
+    kernel = helion.kernel(
+        _partitioned_matmul.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=False,
+    )
+    bound = _bind(kernel, _args())
+    assert not bound.env.cute_half_atomic_output_promotions
+    proof = _proof(bound)
+    assert proof is not None
+    assert proof.output_dtype is torch.float16
+    source = bound.to_code(_config())
+    producer, reducer = _embedded_sources(source)
+    assert "atomic_add" not in producer + reducer
+    assert "cutlass.Float16" in reducer
+    host = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_partitioned_matmul"
+    )
+    assert "dtype=torch.float16" in ast.unparse(host)
+    assert "torch.float32" not in ast.unparse(host).split("_helion_split_k_partials")[0]
+    assert "out.to(" not in ast.unparse(host)
+
+
+def test_bf16_output_is_proved_without_promotion() -> None:
+    # The atomic lowering keeps a requested bfloat16 destination (no FP32
+    # promotion); the workspace schedule still proves the split and its
+    # reducer casts the FP32 partial sum to bfloat16 once.
     args = _args(dtype=torch.bfloat16)
     bound = _bind(_partitioned_matmul, args)
     assert not bound.env.cute_half_atomic_output_promotions
-    assert _proof(bound) is None
+    proof = _proof(bound)
+    assert proof is not None
+    assert proof.output_dtype is torch.bfloat16
+    source = bound.to_code(_config())
+    producer, reducer = _embedded_sources(source)
+    assert "atomic_add" not in producer + reducer
+    assert "cutlass.BFloat16" in reducer
+    host = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_partitioned_matmul"
+    )
+    assert "dtype=torch.bfloat16" in ast.unparse(host)
+    assert "out.to(" not in ast.unparse(host)
 
 
 @pytest.mark.parametrize("shape", ((128, 192, 128), (256, 4096, 256)))
@@ -469,8 +609,8 @@ def test_partition_zero_bias_rounds_before_any_partial_reduction() -> None:
         )
     assert schedule is not None
     source = _reducer_source(proof, schedule)
-    assert source.index("if partition == cutlass.Int32(0)") < source.index(
-        "values.store(values.load() + loaded.load())"
+    assert source.index("if partition_lane == cutlass.Int32(0)") < source.index(
+        "values.store(loaded_0.load()"
     )
     assert source.count(".to(cutlass.Float32)") == 1
 
@@ -484,6 +624,7 @@ def test_real_full_initial_population_reaches_deep_workspace_and_atomic_choices(
         backend="cute",
         static_shapes=True,
         autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
         autotune_random_seed=2026091347,
     )
 
@@ -521,3 +662,638 @@ def test_real_full_initial_population_reaches_deep_workspace_and_atomic_choices(
     assert {config["cute_split_k_stages"] for config in choices} >= {2, 12, 16}
     for config in choices:
         assert len(_embedded_sources(bound.to_code(config))) == 2
+
+
+def test_plain_store_matmul_is_proved_with_its_partition_knob() -> None:
+    bound = _bind(_plain_store_matmul, _args((128, 16384, 128)))
+    proof = _proof(bound)
+    assert proof is not None
+    assert proof.store and proof.bias is None
+    assert proof.output_dtype is torch.float16
+    spec = bound.config_spec
+    assert spec.cute_split_k_workspace_available
+    # 16384 = 256 K tiles of 64: every search choice cuts it into whole
+    # tiles of at least eight per partition.
+    assert spec.cute_split_k_partition_choices == (1, 2, 4, 8, 16, 32)
+    assert any(
+        seed.get("cute_split_k_workspace")
+        and seed.get("cute_split_k_partitions", 1) > 1
+        for seed in spec.compiler_seed_configs
+    )
+    config = helion.Config(
+        block_sizes=[128, 128, 64],
+        cute_split_k_workspace=True,
+        cute_split_k_partitions=4,
+        cute_split_k_stages=2,
+    )
+    source = bound.to_code(config)
+    producer, reducer = _embedded_sources(source)
+    assert "atomic_add" not in producer + reducer
+    assert "cutlass.Float16" in reducer
+    host = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_plain_store_matmul"
+    )
+    unparsed = ast.unparse(host)
+    # The host keeps a fresh fp16 allocation the reducer fills; partials are
+    # (partitions, m, n) fp32.
+    assert unparsed.count("torch.empty(") == 2
+    assert "dtype=torch.float16" in unparsed
+    assert "out.to(" not in unparsed
+    assert "(4, 128, 128)" in unparsed
+    # One partition is the plain kernel: strict normalization rejects the
+    # schedule and the search's repair pass drops it.
+    plain = helion.Config(
+        block_sizes=[128, 128, 64],
+        cute_split_k_workspace=True,
+        cute_split_k_partitions=1,
+    )
+    with bound.env:
+        with pytest.raises(helion.exc.InvalidConfig, match="partitions > 1"):
+            spec.normalize(plain)
+        plain_normalized = helion.Config(**plain.config)
+        spec.normalize(plain_normalized, _fix_invalid=True)
+    assert plain_normalized.config["cute_split_k_workspace"] is False
+    # The workspace launch supersedes the in-kernel split-K knob.
+    both = helion.Config(
+        block_sizes=[128, 128, 64],
+        cute_split_k_workspace=True,
+        cute_split_k_partitions=4,
+        tcgen05_split_k=4,
+    )
+    with bound.env:
+        spec.normalize(both, _fix_invalid=True)
+    assert both.config["cute_split_k_workspace"] is True
+    assert both.config["tcgen05_split_k"] == 1
+
+
+def test_plain_store_bias_is_reduced_on_partition_zero() -> None:
+    args = (*_args((128, 16384, 128)), torch.empty((128,), dtype=torch.float16))
+    bound = _bind(_plain_store_bias_matmul, args)
+    proof = _proof(bound)
+    assert proof is not None and proof.store
+    assert proof.bias is not None and proof.bias.dimensions == (1,)
+    source = bound.to_code(
+        helion.Config(
+            block_sizes=[128, 128, 64],
+            cute_split_k_workspace=True,
+            cute_split_k_partitions=8,
+            cute_split_k_stages=2,
+        )
+    )
+    _producer, reducer = _embedded_sources(source)
+    assert "if partition_lane == cutlass.Int32(0):" in reducer
+    assert "bias_scalar" in reducer
+
+
+@pytest.mark.parametrize(
+    "kernel,extra",
+    (
+        (_plain_store_relu_matmul, ()),
+        (_plain_store_into_argument, (torch.empty((128, 128), dtype=torch.float16),)),
+    ),
+)
+def test_plain_store_variants_keep_the_original_path(kernel, extra) -> None:
+    bound = _bind(kernel, (*_args((128, 16384, 128)), *extra))
+    assert _proof(bound) is None
+    assert not bound.config_spec.cute_split_k_workspace_available
+    assert bound.config_spec.cute_split_k_partition_choices == ()
+
+
+@pytest.mark.parametrize(
+    "k,choices",
+    (
+        # 32 K tiles of 64: four partitions keep eight tiles each, eight
+        # would keep four.
+        (2048, (1, 2, 4)),
+        # Eight tiles: no split keeps eight per partition, so the schedule
+        # is not offered at all (a 128^3 .. 512^3 GEMM has a small grid but
+        # nothing to split).
+        (512, ()),
+    ),
+)
+def test_plain_store_partitions_keep_eight_k_tiles(k, choices) -> None:
+    bound = _bind(_plain_store_matmul, _args((128, k, 128)))
+    spec = bound.config_spec
+    assert spec.cute_split_k_partition_choices == choices
+    assert spec.cute_split_k_workspace_available is bool(choices)
+    if not choices:
+        assert _proof(bound) is None
+        assert not any(
+            seed.get("cute_split_k_workspace") for seed in spec.compiler_seed_configs
+        )
+
+
+def test_plain_store_default_config_carries_no_workspace_knobs() -> None:
+    # The schedule is a seeded search alternative; the public default is the
+    # plain kernel whether or not the operands admit the proof (an M-major A
+    # does not: the partition producer views row-major operands only).
+    a, b = _args((128, 16384, 128))
+    row_major = _bind(_plain_store_matmul, (a, b))
+    m_major = _bind(_plain_store_matmul, (a.T.contiguous().T, b))
+    assert _proof(row_major) is not None
+    assert _proof(m_major) is None
+    assert not m_major.config_spec.cute_split_k_workspace_available
+    for bound in (row_major, m_major):
+        default = bound.config_spec.default_config().config
+        assert not any(key.startswith("cute_split_k_") for key in default)
+    assert (
+        row_major.config_spec.default_config() == m_major.config_spec.default_config()
+    )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _plain_store_full_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.full((m, n), fill_value=1.0, dtype=a.dtype, device=a.device)
+    for row, column in hl.tile((m, n)):
+        accumulator = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            accumulator = torch.addmm(accumulator, a[row, inner], b[inner, column])
+        out[row, column] = accumulator.to(out.dtype)
+    return out
+
+
+def test_plain_store_full_factory_keyword_fill_is_dropped() -> None:
+    bound = _bind(_plain_store_full_matmul, _args((128, 16384, 128)))
+    assert _proof(bound) is not None
+    source = bound.to_code(
+        helion.Config(
+            block_sizes=[128, 128, 64],
+            cute_split_k_workspace=True,
+            cute_split_k_partitions=4,
+            cute_split_k_stages=2,
+        )
+    )
+    host = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_plain_store_full_matmul"
+    )
+    unparsed = ast.unparse(host)
+    # The grid writes every output element, so the fill is dropped with the
+    # size kept: ``torch.full((m, n), fill_value=1.0)`` -> ``torch.empty((m, n))``.
+    assert "fill_value" not in unparsed
+    assert "torch.empty((m, n)" in unparsed
+
+
+def test_workspace_knobs_read_their_defaults_when_the_schedule_is_off() -> None:
+    # With the schedule off its stage and partition knobs are inert: samples
+    # read their defaults so the search does not compile one plain kernel per
+    # inert value, and the public default config carries none of them.
+    bound = _bind(_plain_store_matmul, _args((128, 16384, 128)))
+    spec = bound.config_spec
+    assert spec.cute_split_k_workspace_available
+    gen = spec.create_config_generation()
+    with bound.env:
+        for _ in range(100):
+            config = gen.unflatten(gen.random_flat()).config
+            if not config.get("cute_split_k_workspace"):
+                assert config.get("cute_split_k_stages", 2) == 2
+                assert config.get("cute_split_k_partitions", 1) == 1
+    default = spec.default_config().config
+    assert not any(key.startswith("cute_split_k_") for key in default)
+
+
+@pytest.mark.parametrize("partitions", (2, 4, 16))
+def test_reducer_issues_every_partial_load_before_the_first_sum(
+    partitions: int,
+) -> None:
+    args = _args((128, 64 * partitions, 128))
+    bound = _bind(_direct_chunk_matmul, args)
+    proof = _proof(bound)
+    assert proof is not None
+    config = helion.Config(block_sizes=[128, 128, 64], tile_extent=64)
+    with bound.env:
+        schedule = workspace_schedule(proof, bound.env, config, capacity_bytes=232448)
+    assert schedule is not None and schedule.partitions == partitions
+    source = _reducer_source(proof, schedule)
+    lines = source.splitlines()
+    assert lines[5].strip() == "cute.arch.griddepcontrol_wait()"
+    loads = [index for index, line in enumerate(lines) if "cute.copy(load_atom" in line]
+    assert len(loads) == (partitions + 3) // 4
+    (first_sum,) = [
+        index for index, line in enumerate(lines) if "values.store(" in line
+    ]
+    assert max(loads) < first_sum
+    assert "values.load() + loaded" not in source
+    # A ragged last step zeroes the lanes without a partition.
+    assert (".fill(cutlass.Float32(0))" in source) == bool(partitions % 4)
+    assert ("if partition_lane + cutlass.Int32(0) < cutlass.Int32(2):" in source) == (
+        partitions == 2
+    )
+
+
+def test_reducer_launches_as_a_programmatic_dependent() -> None:
+    bound = _bind(_partitioned_matmul, _args())
+    source = bound.to_code(_config())
+    assert (
+        "_helion_split_k_reduce._reduce_partitions._helion_cute_use_pdl = True"
+        in source
+    )
+    _producer, reducer = _embedded_sources(source)
+    assert reducer.index("griddepcontrol_wait()") < reducer.index("cute.copy(load_atom")
+
+
+@pytest.mark.parametrize(
+    "arguments,expected",
+    (
+        # The s2 winner (64x64 CTA tiles, (2, 2) warps): one 64x64 subtile,
+        # 16 lanes per row, 8 instructions per warp.
+        (
+            {"rows": 64, "cta_m": 64, "cta_n": 64, "use_2cta_instrs": True},
+            (64, 64, 1, 4, 16, 8, 32, 32),
+        ),
+        # 64x128 CTA tiles: 64-column subtiles made of two interleaved
+        # 32-column runs 64 columns apart.
+        (
+            {"rows": 64, "cta_m": 64, "cta_n": 128, "use_2cta_instrs": True},
+            (64, 64, 1, 4, 16, 8, 32, 64),
+        ),
+        # fp32 output: two values (8 bytes) per lane.
+        (
+            {
+                "rows": 64,
+                "cta_m": 64,
+                "cta_n": 64,
+                "use_2cta_instrs": True,
+                "itemsize": 4,
+            },
+            (64, 64, 1, 2, 32, 16, 32, 32),
+        ),
+        # The lowering's 256-row pair form: a 256x128 CTA shape with a
+        # source-C description, (4, 1) warps, 128x16 subtiles (4 lanes per
+        # row, 8 rows per warp instruction).
+        (
+            {
+                "rows": 128,
+                "cta_m": 256,
+                "cta_n": 128,
+                "use_2cta_instrs": False,
+                "elem_width_c": 32,
+                "c_is_m_major": False,
+            },
+            (128, 16, 1, 4, 4, 4, 16, 128),
+        ),
+    ),
+)
+def test_atomic_epilogue_geometry(arguments, expected) -> None:
+    geometry = atomic_epilogue_geometry(
+        **{
+            "elem_width_c": None,
+            "d_is_m_major": False,
+            "c_is_m_major": True,
+            "itemsize": 2,
+        }
+        | arguments
+    )
+    assert geometry is not None
+    assert (
+        geometry.tile_m,
+        geometry.tile_n,
+        geometry.m_subtiles,
+        geometry.width,
+        geometry.chunks_per_row,
+        geometry.iterations,
+        geometry.run,
+        geometry.run_stride,
+    ) == expected
+    assert geometry.lane_column_fixed
+    cta_n = arguments["cta_n"]
+    columns = [
+        eval(geometry.column_expression(str(subtile), str(column)))
+        for subtile in range(cta_n // geometry.tile_n)
+        for column in range(geometry.tile_n)
+    ]
+    # Every CTA tile column exactly once over the N subtiles.
+    assert sorted(columns) == list(range(cta_n))
+    assert geometry.subtile_expressions("s") == ("0", "s")
+    assert geometry.row_expression("0", "r") == "r"
+
+
+def test_atomic_epilogue_geometry_with_several_m_subtiles() -> None:
+    geometry = atomic_epilogue_geometry(
+        rows=256,
+        cta_m=256,
+        cta_n=128,
+        use_2cta_instrs=False,
+        elem_width_c=32,
+        d_is_m_major=False,
+        c_is_m_major=False,
+        itemsize=2,
+    )
+    assert geometry is not None and geometry.m_subtiles == 2
+    assert geometry.subtile_expressions("s") == ("s % 2", "s // 2")
+    assert geometry.row_expression("s % 2", "r") == "s % 2 * 128 + r"
+    rows = [
+        eval(geometry.row_expression(str(subtile % 2), str(row)))
+        for subtile in range(4)
+        for row in range(geometry.tile_m)
+    ]
+    assert sorted(rows) == sorted(list(range(256)) * 2)
+    # A packed width that does not tile the run is declined.
+    assert (
+        atomic_epilogue_geometry(
+            rows=64,
+            cta_m=64,
+            cta_n=64,
+            use_2cta_instrs=True,
+            elem_width_c=None,
+            d_is_m_major=False,
+            c_is_m_major=True,
+            itemsize=16,
+        )
+        is None
+    )
+
+
+def test_atomic_epilogue_is_offered_for_outputs_kept_in_their_dtype() -> None:
+    # The module fixture pins the fp32 promotion on: the promoted float16
+    # output keeps fp32 storage and a host cast, which the reducer form serves.
+    promoted = _bind(_partitioned_matmul, _args())
+    assert promoted.config_spec.cute_split_k_workspace_available
+    assert not promoted.config_spec.cute_split_k_atomic_epilogue_available
+    with pytest.raises(InvalidConfig, match="cute_split_k_atomic_epilogue"):
+        promoted.config_spec.normalize(
+            _config(cute_split_k_atomic_epilogue=True).config, _fix_invalid=False
+        )
+    relaxed = _config(cute_split_k_atomic_epilogue=True).config
+    promoted.config_spec.normalize(relaxed, _fix_invalid=True)
+    assert "cute_split_k_atomic_epilogue" not in relaxed
+    assert not any(
+        seed.get("cute_split_k_atomic_epilogue")
+        for seed in promoted.config_spec.compiler_seed_configs
+    )
+    # A bfloat16 output is kept in its dtype: the knob is offered and seeded.
+    kept = _bind(_partitioned_matmul, _args(dtype=torch.bfloat16))
+    assert kept.config_spec.cute_split_k_atomic_epilogue_available
+    normalized = _config(cute_split_k_atomic_epilogue=True).config
+    kept.config_spec.normalize(normalized, _fix_invalid=False)
+    assert normalized["cute_split_k_atomic_epilogue"] is True
+    # Inert without the workspace schedule.
+    with pytest.raises(InvalidConfig, match="requires cute_split_k_workspace"):
+        kept.config_spec.normalize(
+            _config(
+                cute_split_k_workspace=False, cute_split_k_atomic_epilogue=True
+            ).config,
+            _fix_invalid=False,
+        )
+    assert kept.host_function is not None
+    with kept.env:
+        seeds = CuteSplitKWorkspaceHeuristic.get_seed_configs(
+            kept.env, kept.host_function.device_ir
+        )
+    twins = [seed for seed in seeds if seed.get("cute_split_k_atomic_epilogue")]
+    assert twins and len(twins) < len(seeds)
+    for twin in twins:
+        assert twin["cute_split_k_workspace"] is True
+    # The plain store has no zero-filled destination to add into.
+    store = _bind(_plain_store_matmul, _args((128, 16384, 128)))
+    assert store.config_spec.cute_split_k_workspace_available
+    assert not store.config_spec.cute_split_k_atomic_epilogue_available
+
+
+def _kernel_source(module_source: str, name: str) -> str:
+    return ast.unparse(
+        next(
+            node
+            for node in ast.parse(module_source).body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+    )
+
+
+@pytest.mark.parametrize("with_bias", (False, True))
+def test_atomic_epilogue_emits_one_producer_and_a_fill_kernel(with_bias: bool) -> None:
+    args = _args((128, 32768, 256))
+    bias = torch.empty((256,), dtype=torch.float16)
+    epilogue = (
+        (lambda acc, tile: acc + bias[tile[1]])
+        if with_bias
+        else (lambda acc, tile: acc)
+    )
+    kernel = helion.kernel(
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=False,
+    )
+    bound = _bind(kernel, (*args, epilogue))
+    assert bound.config_spec.cute_split_k_atomic_epilogue_available
+    source = bound.to_code(
+        helion.Config(
+            block_sizes=[128, 64, 128],
+            split_k=16,
+            cute_split_k_workspace=True,
+            cute_split_k_stages=6,
+            cute_split_k_atomic_epilogue=True,
+        )
+    )
+    (producer,) = _embedded_sources(source)
+    host = _kernel_source(source, "matmul_split_k")
+    # One launch of the producer behind the fill kernel; no partials, no reducer.
+    assert "_reduce_partitions" not in source and "_helion_split_k_partials" not in host
+    assert host.count("torch.empty(") == 1 and "torch.zeros" not in host
+    assert "_launcher(_helion_zero_fill_split_k, " in host
+    assert "_helion_zero_fill_split_k._helion_cute_use_pdl = True" in source
+    fill = _kernel_source(source, "_helion_zero_fill_split_k")
+    assert fill.index("griddepcontrol_wait()") < fill.index("launch_dependents()")
+    assert "'epilogue': 'atomic'" in source
+    call = next(line for line in host.splitlines() if "_native_partition_gemm(" in line)
+    positional = call.split("(", 1)[1].rsplit(", _launcher=", 1)[0].split(", ")
+    assert positional[:3] == ["_helion_split_k_a", "_helion_split_k_b", "out"]
+    assert len(positional) == (4 if with_bias else 3)
+    # The producer: packed half reductions from the staged tile, no TMA store.
+    kernel_def = _kernel_source(producer, "_helion__native_partition_gemm")
+    parameters = next(
+        line for line in kernel_def.splitlines() if line.startswith("def ")
+    )
+    assert parameters.startswith(
+        "def _helion__native_partition_gemm(a, b, out, bias, tma_atom_a, "
+        if with_bias
+        else "def _helion__native_partition_gemm(a, b, out, tma_atom_a, "
+    )
+    assert "tcgen05_tma_store" not in parameters
+    assert "cute.copy(tcgen05_tma_store_atom" not in producer
+    assert "prefetch_descriptor(tcgen05_tma_store_atom)" not in producer
+    assert "'tcgen05_d_tma'" not in producer
+    assert producer.count("_cute_red_add_f16_vec(") == 1
+    assert "red_add_f16_vec as _cute_red_add_f16_vec" in producer
+    assert (
+        "tcgen05_sD[tcgen05_red_row, tcgen05_red_col + cutlass.Int32(3), tcgen05_c_buffer]"
+        in producer
+    )
+    assert ("tcgen05_red_bias_3" in producer) == with_bias
+    assert ("if tile_offset_0 == cutlass.Int32(0):" in producer) == with_bias
+    # The TMA warp issues its loads under the fill; the epilogue warps wait.
+    assert kernel_def.count("cute.arch.griddepcontrol_wait()") == 1
+    tma_warp = kernel_def.index("== cutlass.Int32(5):")
+    epilogue_warps = kernel_def.index("< cutlass.Int32(4):")
+    wait = kernel_def.index("cute.arch.griddepcontrol_wait()")
+    assert tma_warp < epilogue_warps < wait
+    assert hashlib.sha256(producer.encode()).hexdigest() in source
+    wrapper = _kernel_source(producer, "_native_partition_gemm")
+    assert ("a, b, out, bias, block=" in wrapper) == with_bias
+    assert ("a, b, out, block=" in wrapper) == (not with_bias)
+    assert "return out" in wrapper
+
+
+def _atomic_rewrite_inputs(
+    with_bias: bool = True,
+) -> tuple[ast.Module, Any, Any, list[dict[str, object]]]:
+    """The TMA-store producer module the reducer form emits for the example
+    at s2 (the input of the atomic rewrite), with its proof, schedule and
+    wrapper plans."""
+    args = _args((128, 32768, 256))
+    bias = torch.empty((256,), dtype=torch.float16)
+    epilogue = (
+        (lambda acc, tile: acc + bias[tile[1]])
+        if with_bias
+        else (lambda acc, tile: acc)
+    )
+    kernel = helion.kernel(
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=False,
+    )
+    bound = _bind(kernel, (*args, epilogue))
+    config = helion.Config(
+        block_sizes=[128, 64, 128],
+        split_k=16,
+        cute_split_k_workspace=True,
+        cute_split_k_stages=6,
+    )
+    (producer, _reducer) = _embedded_sources(bound.to_code(config))
+    module = ast.parse(producer)
+    plans = next(
+        ast.literal_eval(node.value)
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Attribute)
+        and node.targets[0].attr == "_helion_cute_wrapper_plans"
+    )
+    proof = _proof(bound)
+    assert proof is not None
+    with bound.env:
+        schedule = workspace_schedule(
+            proof,
+            bound.env,
+            helion.Config.from_dict(
+                config.config | {"cute_split_k_atomic_epilogue": True}
+            ),
+            capacity_bytes=232448,
+        )
+    assert schedule is not None and schedule.atomic_epilogue
+    return module, proof, schedule, plans
+
+
+def _kernel_def(module: ast.Module) -> ast.FunctionDef:
+    return next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_helion__native_partition_gemm"
+    )
+
+
+def _drop_statements(node: ast.AST, text: str) -> int:
+    """Delete every statement unparsing to ``text`` under ``node``."""
+    removed = 0
+    for child in ast.walk(node):
+        for field in ("body", "orelse"):
+            statements = getattr(child, field, None)
+            if isinstance(statements, list):
+                kept = [s for s in statements if ast.unparse(s) != text]
+                removed += len(statements) - len(kept)
+                statements[:] = kept or [ast.Pass()]
+    return removed
+
+
+def test_atomic_rewrite_checks_the_emitted_tiler_in_the_kernel() -> None:
+    module, proof, schedule, plans = _atomic_rewrite_inputs()
+    _rewrite_producer_for_atomic_epilogue(module, proof, schedule, plans)
+    kernel = ast.unparse(_kernel_def(module))
+    check = (
+        "_helion_split_k_atomic.check_epilogue_tiler(tcgen05_store_epi_tile, "
+        "rows=64, tile_m=64, tile_n=64, run=32, run_stride=32)"
+    )
+    assert kernel.count(check) == 1
+    assert (
+        kernel.index("tcgen05_store_epi_tile = ")
+        < kernel.index(check)
+        < kernel.index("_cute_red_add_f16_vec(")
+    )
+    assert (
+        "import helion._compiler.cute._split_k_atomic_runtime as _helion_split_k_atomic"
+        in ast.unparse(module)
+    )
+
+
+def test_atomic_rewrite_refuses_a_producer_without_the_epilogue_wait() -> None:
+    module, proof, schedule, plans = _atomic_rewrite_inputs()
+    kernel = _kernel_def(module)
+    # The epilogue role (warps 0-3) waits right after its entry; the TMA warp's
+    # wait is the one the rewrite drops. Remove the epilogue one.
+    epilogue = next(
+        statement
+        for statement in kernel.body
+        if isinstance(statement, ast.If)
+        and ast.unparse(statement.test)
+        == "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4)"
+    )
+    assert _drop_statements(epilogue, "cute.arch.griddepcontrol_wait()") == 1
+    with pytest.raises(BackendUnsupported, match="wait ahead of the first reduction"):
+        _rewrite_producer_for_atomic_epilogue(module, proof, schedule, plans)
+
+
+def test_atomic_rewrite_refuses_a_producer_without_any_tma_wait() -> None:
+    module, proof, schedule, plans = _atomic_rewrite_inputs()
+    kernel = _kernel_def(module)
+    tma = next(
+        statement
+        for statement in kernel.body
+        if isinstance(statement, ast.If)
+        and ast.unparse(statement.test)
+        == "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)"
+    )
+    assert _drop_statements(tma, "cute.arch.griddepcontrol_wait()") == 1
+    with pytest.raises(BackendUnsupported, match="TMA warp's dependent-launch wait"):
+        _rewrite_producer_for_atomic_epilogue(module, proof, schedule, plans)
+
+
+@pytest.mark.parametrize(
+    "mutation,message",
+    (
+        (
+            ("cute.nvgpu.tcgen05.CtaGroup.TWO", "cute.nvgpu.tcgen05.CtaGroup.ONE"),
+            "two-CTA tcgen05 MMA",
+        ),
+        (
+            (
+                "(128, 64), cute.nvgpu.tcgen05.OperandSource",
+                "(256, 64), cute.nvgpu.tcgen05.OperandSource",
+            ),
+            "two-CTA tcgen05 MMA",
+        ),
+        (
+            (
+                "_helion_tc_pro.mod_nonneg(cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()), 2)",
+                "cutlass.Int32(0)",
+            ),
+            "cluster rank MMA slice",
+        ),
+    ),
+)
+def test_atomic_rewrite_refuses_other_producer_pairings(mutation, message) -> None:
+    module, proof, schedule, plans = _atomic_rewrite_inputs()
+    source = ast.unparse(module)
+    before, after = mutation
+    assert source.count(before) >= 1
+    module = ast.parse(source.replace(before, after))
+    with pytest.raises(BackendUnsupported, match=message):
+        _rewrite_producer_for_atomic_epilogue(module, proof, schedule, plans)

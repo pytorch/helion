@@ -148,6 +148,30 @@ Least recently used entries are evicted when a write would exceed the budget. Se
    printed repros record the value in their ``@helion.kernel`` decorator and
    replay the graph they were emitted from whatever the replay environment.
 
+.. autoattribute:: Settings.cute_promote_half_atomic_outputs
+
+   CuTe only. ``hl.atomic_add`` into a float16 tensor rounds to float16 on
+   every add (the reference semantics, what the Triton backend emits). When
+   ``True`` the CuTe backend instead accumulates a *fresh* float16 allocation
+   that the kernel only ever writes through ``hl.atomic_add`` in a float32
+   twin and casts it to float16 once on return: more accurate (one rounding
+   instead of one per add), at the price of one extra elementwise kernel per
+   call (about 1.5 us in a CUDA graph) and results that differ from the other
+   backends. ``False`` (the default, ``HELION_CUTE_PROMOTE_HALF_ATOMIC_OUTPUTS=0``)
+   keeps the requested float16 storage; the collective vector epilogues then
+   use native packed ``f16x2`` / ``bf16x2`` reductions (the scalar half atomic
+   is a compare-and-swap loop on sm_100, so a lane-loop fallback is slow).
+
+   With the promotion off, a split-K kernel's rounding depends on the config
+   the autotuner picks: the atomic routes (the collective vector epilogue,
+   and the split-K workspace schedule's reducer-free epilogue,
+   ``cute_split_k_atomic_epilogue``) round each K partition's fp32 partial to
+   float16 as it is added, while the workspace schedule's reducer form sums
+   the fp32 partials and rounds once; two configs of the same kernel can thus
+   differ by a few float16 ulps on large-K outputs. ``True`` restores
+   config-independent fp32 accumulation (every route accumulates the fp32
+   twin and casts once) at the cost of the extra cast kernel.
+
 .. autoattribute:: Settings.cute_exact_division
 
    CuTe only. When ``True`` (the default) an fp32 division by a scalar that is
@@ -475,6 +499,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_CUTE_RNG_STREAM`` | ``cute_rng_stream`` | CuTe RNG policy: ``auto``, ``word0`` or ``philox4``. |
 | ``HELION_CUTE_GRAPH_CSE`` | ``cute_graph_cse`` | Set to ``0`` to keep duplicate reductions (and the pure chains between them) of the traced device IR as traced on CuTe, for bisecting structural-matcher regressions. Default ``1``; results are bitwise identical either way. |
 | ``HELION_CUTE_EXACT_DIVISION`` | ``cute_exact_division`` | Set to ``0`` to keep one ``div.rn.f32`` per element for fp32 divisions by a loop-invariant scalar on CuTe instead of the hoisted bit-exact Markstein sequence. Default ``1``; results are bitwise identical either way. |
+| ``HELION_CUTE_PROMOTE_HALF_ATOMIC_OUTPUTS`` | ``cute_promote_half_atomic_outputs`` | Set to ``1`` to accumulate a fresh float16 ``hl.atomic_add`` output in float32 and cast once on return (more accurate, one extra kernel per call, differs from the Triton backend). Default ``0``: add into the float16 storage with native packed half reductions. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |

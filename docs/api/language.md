@@ -98,6 +98,12 @@ lets Helion apply the masking implicitly for indices beyond each lane's true len
 .. autofunction:: store
 ```
 
+### prefetch()
+
+```{eval-rst}
+.. autofunction:: prefetch
+```
+
 ### atomic_add()
 
 ```{eval-rst}

@@ -18,13 +18,17 @@ Key ideas used in this implementation:
 - Use data-dependent tiling over the concatenated row dimension to efficiently
   support jagged group sizes (different ``M_i`` per group) without padding.
 
-Two kernels are provided:
+Three kernels are provided:
 
 1) ``grouped_gemm_jagged`` - a simple kernel that iterates groups and tiles
    dynamically.
 
 2) ``grouped_gemm_jagged_persistent`` - a persistent kernel with dynamic tile
    assignment for better load balancing across streaming multiprocessors (SMs).
+
+3) ``grouped_gemm_shared_weight`` - the shared-weight product as one static
+   tile space over the packed rows, with persistence left to the autotuner
+   (the plain GEMM formulation, which gets the autotuner's GEMM search).
 """
 
 # %%
@@ -226,6 +230,61 @@ def grouped_gemm_jagged_persistent(
 
 
 # %%
+# Grouped GEMM Kernel - Shared Weight, Backend-Scheduled
+# -------------------------------------------------------
+
+
+# %%
+@helion.kernel(static_shapes=True)
+def grouped_gemm_shared_weight(
+    A_packed: torch.Tensor,  # [total_M, K]
+    B: torch.Tensor,  # [K, N], shared by every group
+    group_offsets: torch.Tensor,  # [G+1], kept for the grouped-GEMM interface
+) -> torch.Tensor:
+    """
+    Grouped GEMM over packed rows with one weight matrix shared by every group.
+
+    With a single ``B`` the grouped product ``cat([A_i @ B])`` is the dense
+    GEMM over ``A_packed``: no row needs to know its group, so the output
+    tiles may cross group boundaries and the whole product is one static
+    tile space. Persistence, tile order and the tensor-core pipeline are
+    left to the autotuner's GEMM search (the body is the plain ``matmul``
+    example's; that example additionally pins two range knobs). The two
+    kernels above keep the group structure in the program:
+    ``grouped_gemm_jagged_persistent`` schedules tiles itself (register-index
+    tiles under data-dependent branches, a structure the CuTe backend
+    lowers as scalar loops), and ``grouped_gemm_jagged`` tiles each group
+    on its own (a data-dependent M extent per group). This kernel lives
+    beside them to show that, for a shared weight, the grouping adds
+    nothing the dense product does not already compute.
+
+    Args:
+        A_packed: Row-wise concatenation of the groups' inputs, ``[sum(M_i), K]``.
+        B: Shared weight matrix, ``[K, N]``.
+        group_offsets: Row offsets delimiting the groups; unused by the math,
+            kept so the three kernels share one calling convention.
+
+    Returns:
+        ``A_packed @ B`` of shape ``[sum(M_i), N]``.
+    """
+    total_M, K = A_packed.shape
+    K2, N = B.shape
+    assert K == K2, "K dimension mismatch between A_packed and B"
+    out = torch.empty(
+        total_M,
+        N,
+        dtype=torch.promote_types(A_packed.dtype, B.dtype),
+        device=A_packed.device,
+    )
+    for tile_m, tile_n in hl.tile([total_M, N]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(K):
+            acc = torch.addmm(acc, A_packed[tile_m, tile_k], B[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+# %%
 # Data Preparation Utilities
 # --------------------------
 
@@ -282,6 +341,14 @@ def grouped_gemm_jagged_tritonbench(
         return grouped_gemm_jagged(A_packed, B_shared, group_offsets)
 
     return inner
+
+
+def grouped_gemm_shared_weight_example(
+    group_A: list[torch.Tensor], group_B: list[torch.Tensor]
+) -> torch.Tensor:
+    """Runs the shared-weight kernel on packed inputs."""
+    A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, group_B)
+    return grouped_gemm_shared_weight(A_packed, B_shared, group_offsets)
 
 
 def grouped_gemm_jagged_persistent_tritonbench(
@@ -367,6 +434,15 @@ def main() -> None:
         atol=1e-2,
     )
     print("✓ Non-persistent kernel passed")
+
+    run_example(
+        grouped_gemm_shared_weight_example,
+        _reference_grouped_gemm,
+        (group_A, group_B),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    print("✓ Shared-weight kernel passed")
 
     run_example(
         grouped_gemm_jagged_persistent_example,

@@ -670,9 +670,24 @@ class _Settings:
     cute_graph_cse: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_CUTE_GRAPH_CSE", True)
     )
+    cute_stage_unaligned_operands: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_STAGE_UNALIGNED_OPERANDS", True
+        )
+    )
+    cute_flat_edge_tma: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_FLAT_EDGE_TMA", True
+        )
+    )
     cute_exact_division: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_CUTE_EXACT_DIVISION", True
+        )
+    )
+    cute_promote_half_atomic_outputs: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_PROMOTE_HALF_ATOMIC_OUTPUTS", False
         )
     )
     triton_do_not_specialize: bool = dataclasses.field(
@@ -945,6 +960,23 @@ class Settings(_Settings):
             "(HELION_CUTE_GRAPH_CSE=0) to bisect a structural-matcher "
             "regression against the traced graph."
         ),
+        "cute_stage_unaligned_operands": (
+            "If True (the default), the CuTe backend copies a static-shape "
+            "matmul operand whose outer strides are not 16-byte multiples "
+            "(e.g. odd-sized bf16 rows; a misaligned base offset is not "
+            "visible to the pass) into a padded row-major buffer on the host "
+            "before the launch, so the tcgen05 pipeline keeps its TMA "
+            "producers instead of the scalar shared-memory producers. Set False "
+            "(HELION_CUTE_STAGE_UNALIGNED_OPERANDS=0) to run such operands "
+            "in place."
+        ),
+        "cute_flat_edge_tma": (
+            "If True (the default), flat one-CTA tcgen05 matmul kernels load "
+            "partial output tiles and the K tail through TMA (zero-filled past "
+            "the extents) and store them with predicated vector copies. Set "
+            "False (HELION_CUTE_FLAT_EDGE_TMA=0) for the scalar shared-memory "
+            "edge staging those tiles used before."
+        ),
         "cute_exact_division": (
             "If True (the default), an fp32 division by a loop-invariant scalar "
             "(a row sum, a scalar kernel argument) on CuTe hoists the divisor's "
@@ -956,6 +988,17 @@ class Settings(_Settings):
             "to keep the plain per-element division; the config knob "
             "cute_exact_div_form picks the form (redo / plain) per kernel. "
             "Independent of fast_math, whose fp32 division is approximate."
+        ),
+        "cute_promote_half_atomic_outputs": (
+            "If True, a fresh float16 allocation that the CuTe kernel only "
+            "ever writes through hl.atomic_add is accumulated in a float32 "
+            "twin and cast to float16 once on return (one extra elementwise "
+            "kernel per call). False (the default, "
+            "HELION_CUTE_PROMOTE_HALF_ATOMIC_OUTPUTS=0) adds into the float16 "
+            "storage itself, rounding to float16 on every add as the program "
+            "and the Triton backend do; the vector collective epilogues use "
+            "native packed half atomics, the scalar half atomic is a "
+            "compare-and-swap loop on sm_100."
         ),
         "triton_do_not_specialize": (
             "If True, pass do_not_specialize for every dynamic size/stride/symbol "

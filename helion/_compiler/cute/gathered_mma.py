@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from dataclasses import field
 import itertools
 from typing import TYPE_CHECKING
 
@@ -53,6 +54,13 @@ class GatheredMmaRegion:
     n_size: int
     k_size: int
     tensor_reads: frozenset[str]
+    # The kernel's own scalar bindings that dominate the region and hold a
+    # value the row recipe or the row predicate re-expand: ``ast.dump`` of the
+    # expanded expression -> the bound name.  The emitter reuses the register
+    # the kernel already waited for (its ``if count != 0`` branch) instead of
+    # re-issuing the load ahead of the pipeline's CTA-wide sync, which would
+    # stall on it.
+    scalar_aliases: Mapping[str, str] = field(default_factory=dict)
 
 
 def _same(left: ast.AST, right: ast.AST) -> bool:
@@ -1072,6 +1080,9 @@ def analyze_gathered_mma_region(
         ReadWrites.from_ast(m_loop).writes
     ):
         return None
+    scalar_aliases = _dominating_scalar_aliases(
+        dominating, scalar_boundaries, m_loop, (row, row_predicate)
+    )
     return GatheredMmaRegion(
         a_name,
         b_name,
@@ -1087,4 +1098,63 @@ def analyze_gathered_mma_region(
         n_size,
         k_size,
         frozenset(reads),
+        scalar_aliases,
     )
+
+
+def _dominating_scalar_aliases(
+    dominating: Sequence[ast.stmt],
+    boundaries: set[str],
+    m_loop: ast.For,
+    expressions: Sequence[ast.expr],
+) -> dict[str, str]:
+    """Names the kernel binds once ahead of the region whose expansion is a
+    coordinate-free ``.load()`` the recipe or the predicate re-expands (the
+    group's token count and offset: the kernel loaded them for its
+    ``if count != 0`` guard, and the region's expressions were expanded
+    through those very definitions)."""
+    loads = {
+        ast.dump(node)
+        for expression in expressions
+        for node in ast.walk(expression)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "load"
+    }
+    if not loads:
+        return {}
+    assigned: dict[str, int] = {}
+    for statement in dominating:
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    assigned[target.id] = assigned.get(target.id, 0) + 1
+    loop_writes = set(ReadWrites.from_ast(m_loop).writes)
+    aliases: dict[str, str] = {}
+    for statement in dominating:
+        if not (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+        ):
+            continue
+        name = statement.targets[0].id
+        if (
+            assigned[name] != 1
+            or name in loop_writes
+            or name in boundaries
+            or not any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "load"
+                for node in ast.walk(statement.value)
+            )
+        ):
+            continue
+        expanded = _expanded(_expr(name), dominating, boundaries)
+        if expanded is None:
+            continue
+        key = ast.dump(expanded)
+        if key in loads:
+            aliases.setdefault(key, name)
+    return aliases

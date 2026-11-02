@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import math
 from unittest.mock import patch
 
 import pytest
@@ -44,21 +45,47 @@ def _assert_full_empty_storage(code: str) -> dict[str, int]:
         ):
             continue
         allocations[node.targets[0].id] = _literal_int(node.value.args[1])
+    # The AB / accumulator pipelines' constructor follows the launch: a
+    # clustered kernel (its ``_helion_cute_cluster_shape`` attribute names a
+    # cluster of more than one CTA) builds them through the runtime's no-init
+    # constructors (``_tcgen05_prologue_runtime``), a one-CTA kernel through
+    # the DSL constructors; the other pipelines keep the DSL constructors.
+    cluster_shape = next(
+        (
+            ast.literal_eval(node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Attribute)
+            and node.targets[0].attr == "_helion_cute_cluster_shape"
+        ),
+        (1, 1, 1),
+    )
+    clustered = math.prod(cluster_shape) > 1
+    ab_acc_constructors = (
+        {
+            "_helion_tc_pro.make_tma_umma_pipeline",
+            "_helion_tc_pro.make_umma_async_pipeline",
+        }
+        if clustered
+        else {
+            "cutlass.pipeline.PipelineTmaUmma.create",
+            "cutlass.pipeline.PipelineUmmaAsync.create",
+        }
+    )
+    accepted = ab_acc_constructors | {
+        f"cutlass.pipeline.{kind}.create"
+        for kind in ("PipelineAsync", "PipelineTmaAsync")
+    }
     pipelines = {}
+    seen_ab_acc = False
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         constructor = ast.unparse(node.func)
-        if constructor not in {
-            f"cutlass.pipeline.{kind}.create"
-            for kind in (
-                "PipelineTmaUmma",
-                "PipelineUmmaAsync",
-                "PipelineAsync",
-                "PipelineTmaAsync",
-            )
-        }:
+        if constructor not in accepted:
             continue
+        seen_ab_acc = seen_ab_acc or constructor in ab_acc_constructors
         kwargs = {keyword.arg: keyword.value for keyword in node.keywords}
         storage = kwargs["barrier_storage"]
         assert isinstance(storage, ast.Name)
@@ -70,6 +97,7 @@ def _assert_full_empty_storage(code: str) -> dict[str, int]:
         )
         pipelines[storage.id] = stages
     assert pipelines
+    assert seen_ab_acc, (clustered, sorted(pipelines))
     return pipelines
 
 

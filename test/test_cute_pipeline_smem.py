@@ -212,12 +212,16 @@ def test_ab_full_and_empty_barriers_fit_the_allocation(paired: bool) -> None:
         and len(statement.targets) == 1
         and isinstance(statement.targets[0], ast.Name)
     }
+    # The clustered (paired) kernel builds the ring through the runtime's
+    # no-init constructor, the one-CTA kernel through the DSL constructor.
+    constructor = (
+        "_helion_tc_pro.make_tma_umma_pipeline"
+        if paired
+        else "cutlass.pipeline.PipelineTmaUmma.create"
+    )
     matched = 0
     for call in ast.walk(module):
-        if (
-            not isinstance(call, ast.Call)
-            or ast.unparse(call.func) != "cutlass.pipeline.PipelineTmaUmma.create"
-        ):
+        if not isinstance(call, ast.Call) or ast.unparse(call.func) != constructor:
             continue
         keywords = {keyword.arg: keyword.value for keyword in call.keywords}
         stages = ast.literal_eval(keywords["num_stages"])

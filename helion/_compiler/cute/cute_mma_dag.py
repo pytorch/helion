@@ -63,6 +63,7 @@ import dataclasses
 import itertools
 import operator
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 import sympy
@@ -575,6 +576,9 @@ class Axis:
     kind: str
     extent: int
     loop: int = -1
+    # A tile loop over a fixed block size (``hl.tile(n, block_size=C)`` with
+    # a specialized ``C``): the size is the kernel's, not the config's.
+    size: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -638,7 +642,10 @@ class Access:
     """
 
     node: Node
-    fake: torch.Tensor
+    # Excluded from ``__eq__``: from Python 3.13 the generated ``__eq__``
+    # compares field by field, and a tensor ``==`` is elementwise.  The node
+    # determines the fake value anyway.
+    fake: torch.Tensor = dataclasses.field(compare=False)
     name: str
     strides: tuple[int, ...]
     subscripts: tuple[Subscript, ...]
@@ -1383,6 +1390,15 @@ class AxisFacts:
     # the last CTA's rows past the extent are zero-filled operand rows and
     # zero side loads, their stores dropped).  See ``ragged_root_axes``.
     ragged: bool = False
+    # The block size of a fixed-size tile loop axis (``Axis.size``); None
+    # for an axis the config sizes.
+    fixed: int | None = None
+
+    @property
+    def tunable(self) -> bool:
+        """Whether the config sizes this axis (a root or loop tile without
+        a fixed block size)."""
+        return self.kind in (AXIS_ROOT, AXIS_LOOP) and self.fixed is None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1605,6 +1621,8 @@ class CuteMmaDagFacts:
         if facts.kind == AXIS_RDIM:
             value = sizes.get(facts.block_id)
             return value if type(value) is int else facts.extent
+        if facts.fixed is not None:
+            return facts.fixed
         value = sizes.get(facts.block_id)
         return value if type(value) is int else None
 
@@ -3159,6 +3177,21 @@ def mma_dag_ragged_ceilings(facts: CuteMmaDagFacts) -> dict[int, int]:
     }
 
 
+def _fixed_sizes(facts: CuteMmaDagFacts) -> dict[int, int]:
+    """Block id -> size of every axis the config does not size: one for a
+    lead, the extent for an rdim, the kernel's block size for a fixed-size
+    tile loop."""
+    sizes: dict[int, int] = {}
+    for axis in facts.axes:
+        if axis.tunable:
+            continue
+        if axis.fixed is not None:
+            sizes[axis.block_id] = axis.fixed
+        else:
+            sizes[axis.block_id] = 1 if axis.kind == AXIS_LEAD else axis.extent
+    return sizes
+
+
 def mma_dag_repair(
     facts: CuteMmaDagFacts,
     sizes: Mapping[int, object],
@@ -3173,14 +3206,8 @@ def mma_dag_repair(
         from .cute_mma_dag_tcgen05 import tcgen05_repair
 
         return tcgen05_repair(facts, sizes, warps, stages)
-    tunable = [
-        axis.block_id for axis in facts.axes if axis.kind in (AXIS_ROOT, AXIS_LOOP)
-    ]
-    fixed = {
-        axis.block_id: 1 if axis.kind == AXIS_LEAD else axis.extent
-        for axis in facts.axes
-        if axis.kind not in (AXIS_ROOT, AXIS_LOOP)
-    }
+    tunable = [axis.block_id for axis in facts.axes if axis.tunable]
+    fixed = _fixed_sizes(facts)
     current: dict[int, int] = dict(fixed)
     for block_id in tunable:
         value = sizes.get(block_id)
@@ -3422,12 +3449,8 @@ def mma_dag_seed_configs(
     exchange-free warps, two CTAs per SM of shared memory (when the grid
     exceeds the SM count), the largest loop tile, stages, warps.
     """
-    tunable = [axis for axis in facts.axes if axis.kind in (AXIS_ROOT, AXIS_LOOP)]
-    fixed = {
-        axis.block_id: 1 if axis.kind == AXIS_LEAD else axis.extent
-        for axis in facts.axes
-        if axis.kind not in (AXIS_ROOT, AXIS_LOOP)
-    }
+    tunable = [axis for axis in facts.axes if axis.tunable]
+    fixed = _fixed_sizes(facts)
     ladders = [mma_dag_seed_ladder(axis) for axis in tunable]
     cta_rich = _cta_rich(facts)
     ranked: list[tuple[tuple[int, ...], tuple[dict[int, int], int, int]]] = []
@@ -4227,6 +4250,98 @@ class _NotMine(Exception):
     """Raised inside the matcher for any shape it does not own."""
 
 
+def _fold_tile_loop_bounds(
+    expr: sympy.Expr, matcher: _Matcher, loops: Sequence[int]
+) -> sympy.Expr:
+    """``Min`` / ``Max`` terms over a fixed-size tile loop's index that one
+    branch always wins (``min(tile.begin + C, n)`` where the loop walks
+    ``n`` in whole blocks) folded to that branch: the index of a fixed-size
+    loop over a static extent ranges over ``[0, extent // size)``, and an
+    affine argument is extreme at the ends."""
+    if not expr.has(sympy.Min, sympy.Max):
+        return expr
+    ranges: dict[sympy.Basic, tuple[int, int]] = {}
+    for loop in loops:
+        symbol = matcher.loop_symbols.get(loop)
+        if symbol is None:
+            continue
+        axes = [
+            axis
+            for axis in matcher.axis_list
+            if axis.kind == AXIS_LOOP and axis.loop == loop and axis.size is not None
+        ]
+        if len(axes) == 1:
+            size = axes[0].size
+            assert size is not None
+            ranges[symbol] = (0, axes[0].extent // size - 1)
+    if not ranges:
+        return expr
+
+    def affine(term: sympy.Basic, symbol: sympy.Basic) -> bool:
+        # ``sympy.degree`` raises on a non-polynomial term (``floor``, ``Mod``,
+        # a nested Min / Max this fold left alone): ask first.
+        if not isinstance(term, sympy.Expr) or not term.is_polynomial(symbol):
+            return False
+        try:
+            return sympy.degree(term, symbol) <= 1
+        except sympy.PolynomialError:
+            return False
+
+    def fold(node: sympy.Basic) -> sympy.Basic:
+        if isinstance(node, (sympy.Min, sympy.Max)):
+            args = [fold(a) for a in node.args]
+            symbols = sorted(
+                {s for a in args for s in a.free_symbols}, key=lambda s: str(s)
+            )
+            over_loop = any(s in ranges for s in symbols)
+            if over_loop and not (
+                all(s in ranges for s in symbols)
+                and all(affine(a, s) for a in args for s in symbols)
+            ):
+                # A min / max over the loop index that is not affine in it
+                # (``min(tile.id // 2, 3)``) has no closed form the emitter
+                # renders per iteration: not this owner's.
+                raise _NotMine
+            if over_loop:
+                # Every argument at every corner of the loop index box; an
+                # affine argument is extreme at a corner.
+                corners: list[dict[sympy.Basic, sympy.Integer]] = [{}]
+                for s in symbols:
+                    lo, hi = ranges[s]
+                    corners = [
+                        {**c, s: sympy.Integer(b)} for c in corners for b in (lo, hi)
+                    ]
+                values = [[a.xreplace(c) for c in corners] for a in args]
+                for i, candidate in enumerate(args):
+                    wins = True
+                    for j in range(len(args)):
+                        if j == i:
+                            continue
+                        for v, o in zip(values[i], values[j], strict=True):
+                            mine, other = cast("Any", v), cast("Any", o)
+                            if (
+                                not (mine.is_number and other.is_number)
+                                or (isinstance(node, sympy.Min) and other < mine)
+                                or (isinstance(node, sympy.Max) and other > mine)
+                            ):
+                                wins = False
+                                break
+                        if not wins:
+                            break
+                    if wins:
+                        return candidate
+                # No branch wins over the whole index range (``min(tile.begin
+                # + C, n)`` with a ragged last block): the emitter renders
+                # no per-iteration min / max.
+                raise _NotMine
+            return type(node)(*args, evaluate=False)
+        if node.args:
+            return node.func(*[fold(a) for a in node.args])
+        return node
+
+    return cast("sympy.Expr", fold(expr))
+
+
 @dataclasses.dataclass
 class _LoopBuild:
     """A device loop under construction (registered before its body is
@@ -4304,6 +4419,8 @@ class _Matcher:
         self.vec_positions: dict[Node, set[int]] = {}
         # One-dim load -> the 2-D dims a subscript reads it along.
         self.aux_positions: dict[Node, set[int]] = {}
+        # Tile loops over a fixed block size: canonical block id -> size.
+        self.fixed_sizes: dict[int, int] = {}
 
     # -- axes ------------------------------------------------------------------
 
@@ -4335,7 +4452,10 @@ class _Matcher:
                 raise _NotMine
             if kind == AXIS_RDIM and (extent & (extent - 1) or extent % MMA_DAG_K_STEP):
                 raise _NotMine
-            axis = Axis(len(self.axis_list), block_id, kind, extent, loop)
+            size = self.fixed_sizes.get(block_id) if kind == AXIS_LOOP else None
+            if size is not None and extent % size:
+                raise _NotMine
+            axis = Axis(len(self.axis_list), block_id, kind, extent, loop, size)
             self.axes[block_id] = axis
             self.axis_list.append(axis)
         return axis
@@ -4522,11 +4642,13 @@ class _Matcher:
         from ..variable_origin import GridOrigin
         from ..variable_origin import TensorSizeOrigin
         from ..variable_origin import TileBeginOrigin
+        from ..variable_origin import TileIdOrigin
 
         if not isinstance(expr, sympy.Expr):
             raise _NotMine
         expr_to_origin = HostFunction.current().expr_to_origin
         loops: list[int] = []
+        tile_subs: dict[sympy.Symbol, sympy.Expr] = {}
         for symbol in expr.free_symbols:
             info = expr_to_origin.get(cast("sympy.Symbol", symbol))
             if info is None:
@@ -4552,6 +4674,31 @@ class _Matcher:
                     raise _NotMine
                 if loop not in loops:
                     loops.append(loop)
+            elif (
+                isinstance(origin, (TileBeginOrigin, TileIdOrigin))
+                and self.canonical(origin.block_id) in self.loop_blocks
+            ):
+                # A tile loop's begin or id: uniform per iteration.  The
+                # loop's symbol is its iteration index (the emitter's loop
+                # variable); the begin is that index times the block size,
+                # known statically only for a fixed-size tile loop.
+                loop = self.loop_blocks[self.canonical(origin.block_id)]
+                axis = self.axis_of_block(origin.block_id)
+                if axis.size is None:
+                    raise _NotMine
+                known = self.loop_symbols.setdefault(
+                    loop,
+                    sympy.Symbol(
+                        f"_mma_dag_loop_{loop}", integer=True, nonnegative=True
+                    ),
+                )
+                tile_subs[cast("sympy.Symbol", symbol)] = (
+                    sympy.Mul(known, sympy.Integer(axis.size))
+                    if isinstance(origin, TileBeginOrigin)
+                    else known
+                )
+                if loop not in loops:
+                    loops.append(loop)
             elif type(origin) is GridOrigin:
                 raise _NotMine
             elif self.lead_coordinate(origin):
@@ -4560,6 +4707,10 @@ class _Matcher:
                 # (A host value -- a tensor size, an int argument -- is one
                 # value for the whole grid.)
                 raise _NotMine
+        if tile_subs:
+            expr = _fold_tile_loop_bounds(
+                cast("sympy.Expr", expr.xreplace(tile_subs)), self, loops
+            )
         return expr, tuple(sorted(loops))
 
     def tile_offset(
@@ -5754,10 +5905,18 @@ class _Matcher:
                     raise _NotMine
                 source = self.env.block_sizes[block_id].block_size_source
                 if isinstance(source, FixedBlockSizeSource):
-                    self.grid_blocks[block_id] = index
-                else:
-                    self.loop_blocks[block_id] = index
-                    self.axis_of_block(block_id, AXIS_LOOP, loop=index)
+                    fixed = _static_int(source.value)
+                    if fixed is None or fixed < 1:
+                        raise _NotMine
+                    if fixed == 1:
+                        # ``hl.grid`` / a Python ``range``: one index, step one.
+                        self.grid_blocks[block_id] = index
+                        continue
+                    # ``hl.tile(n, block_size=C)`` with a specialized ``C``:
+                    # a tile loop whose block size is the kernel's.
+                    self.fixed_sizes[block_id] = fixed
+                self.loop_blocks[block_id] = index
+                self.axis_of_block(block_id, AXIS_LOOP, loop=index)
 
         # The dots tell which root blocks tile fragments; the rest are leads.
         dot_nodes = [
@@ -6049,10 +6208,9 @@ class _Matcher:
         for block_id, lo, hi in zip(block_ids, begins, ends, strict=True):
             if block_id in self.root_block_ids:
                 raise _NotMine
-            source = self.env.block_sizes[block_id].block_size_source
-            if isinstance(source, FixedBlockSizeSource):
+            if block_id in self.grid_blocks:
                 # ``hl.grid`` / a Python ``range``: one index, step one.
-                if source.value != 1 or len(block_ids) != 1:
+                if len(block_ids) != 1:
                     raise _NotMine
                 for bound in (lo, hi):
                     if isinstance(bound, torch.fx.Node):
@@ -7256,7 +7414,7 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
     aux_loads = mma_dag_aux_loads(env, program)
     return CuteMmaDagFacts(
         axes=tuple(
-            AxisFacts(a.block_id, a.kind, a.extent, a.loop, a.index in ragged)
+            AxisFacts(a.block_id, a.kind, a.extent, a.loop, a.index in ragged, a.size)
             for a in program.axes
         ),
         frags=tuple((rows.index, cols.index) for rows, cols in program.slots),

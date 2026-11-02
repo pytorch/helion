@@ -85,6 +85,11 @@ def _installed_cute_dsl_version() -> _CuteDSLVersionProbe:
         return _CuteDSLVersionProbe(invalid=str(error))
 
 
+def installed_cute_dsl_version() -> Version | None:
+    """The installed ``nvidia-cutlass-dsl`` version; None when missing or invalid."""
+    return _installed_cute_dsl_version().version
+
+
 def tcgen05_runtime_n_ptx_compatible() -> bool:
     """Whether the installed DSL matches the raw runtime-N PTX validation."""
 

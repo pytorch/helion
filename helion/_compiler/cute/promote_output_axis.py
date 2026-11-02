@@ -79,7 +79,9 @@ _FRESH_FACTORIES = frozenset(
 # only dtype/device defaults (``register_tensor_factory_layout`` records them
 # the same way).  Freshness is about storage; the layout proofs read the
 # result's strides and storage offset themselves.
-_FRESH_STRIDED_FACTORIES = frozenset((torch.empty_strided,))
+# ``torch.constant_pad_nd`` always allocates its padded result (the CuTe
+# ``stage_aligned_operands`` pass relays unaligned matmul operands through it).
+_FRESH_STRIDED_FACTORIES = frozenset((torch.empty_strided, torch.constant_pad_nd))
 _FRESH_TENSOR_METHODS = frozenset({"new_empty", "new_zeros", "new_ones", "new_full"})
 _READ_ONLY_HOST_CALLS = _FRESH_FACTORIES | frozenset(
     (
@@ -287,8 +289,9 @@ def _fresh_tensors(
 ) -> set[torch.Tensor]:
     """Prove that factory storage survives all host-side operations.
 
-    Fresh storage comes from the ``torch.*`` factories, ``torch.empty_strided``
-    and the ``Tensor.new_*`` methods.  Host tracing can mutate the same
+    Fresh storage comes from the ``torch.*`` factories, ``torch.empty_strided``,
+    ``torch.constant_pad_nd`` (the operand staging copy) and the
+    ``Tensor.new_*`` methods.  Host tracing can mutate the same
     FakeTensor retained by an allocation's type metadata. After
     ``out.set_(input)``, even that allocation node then names input storage.
     Unknown calls or host writes therefore invalidate the entire proof; a

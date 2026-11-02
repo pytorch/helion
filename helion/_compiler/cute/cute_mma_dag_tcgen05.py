@@ -517,6 +517,16 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
         from .cute_mma_dag_tcgen05_regions import region_facts
 
         return region_facts(program)
+    if any(axis.kind == AXIS_LOOP for axis in program.tile_index_loads.values()):
+        # A derived value reads a loop axis's ``tile.index`` (gdn_fwd_h's
+        # token mask ``t_i.index < seqlen``).  This emitter evaluates the
+        # loop's derived values ahead of the loop (the table prologue) and
+        # one iteration ahead inside it with the current iteration's loop
+        # axis base (``axis_base``): the position would be undefined there
+        # and off by one tile here.  The warp emitter evaluates them inside
+        # their iteration (the region renderer, dispatched above, walks the
+        # iteration it evaluates).
+        return None
     # A loop output computed in another slot (a no-acc dot over the carry,
     # a rescaled accumulator whose leaf an operand reads) is copied back into
     # the carry's registers at the iteration end by the warp emitter; this

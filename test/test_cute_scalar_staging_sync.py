@@ -22,7 +22,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+@helion.kernel(
+    backend="cute", cute_flat_edge_tma=False, static_shapes=True, autotune_effort="none"
+)
 def _native_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     m, k = a.shape
     n = b.size(1)
@@ -65,6 +67,7 @@ def test_edge_scalar_staging_is_ordered(
     kernel = (
         helion.kernel(
             matmul_custom_key.fn,
+            cute_flat_edge_tma=False,
             key=matmul_custom_key._key_fn,
             backend="cute",
             static_shapes=False,

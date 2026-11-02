@@ -173,13 +173,15 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
             from benchmarks.cute.cute_pointwise_manual import make_manual_fn
 
             operation = "exp" if module == "exp" else "add"
-            call, out, config, seconds = make_manual_fn(
-                operation, case.args, sweep=True
+            # The handwritten kernel allocates its output per call like every
+            # other implementation (the batched-graph timer keeps each call's
+            # output alive; a reused buffer would stay L2-resident).
+            call, _out, config, seconds = make_manual_fn(
+                operation, case.args, sweep=True, allocate_output=True
             )
 
             def invoke(*inputs: Any) -> torch.Tensor:
-                call()
-                return out
+                return call()
 
             return PreparedCandidate(
                 invoke, {"config": config, "tune_seconds": seconds}
@@ -205,11 +207,15 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
                 Softmax = importlib.import_module("quack.softmax").Softmax
 
                 x = case.args[0]
-                out = torch.empty_like(x)
                 dtype = torch2cute_dtype_map[x.dtype]
                 kernel = Softmax.compile(dtype, dtype, x.shape[-1])
 
                 def call(x: torch.Tensor) -> torch.Tensor:
+                    # Allocate per call like every other implementation: the
+                    # batched-graph timer keeps each call's output alive, and a
+                    # buffer reused across calls would keep its stores
+                    # L2-resident (see helion/autotuner/benchmarking.py).
+                    out = torch.empty_like(x)
                     kernel(x.reshape(-1, x.shape[-1]), out.reshape(-1, out.shape[-1]))
                     return out
 
@@ -260,9 +266,9 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
             kernel = _compile_rmsnorm_fwd(
                 dt, dt, None, wdt, bdt, None, x.shape[-1], False, False, layer, False
             )
-            out = torch.empty_like(x)
 
             def call(*a: Any) -> torch.Tensor:
+                out = torch.empty_like(a[0])
                 kernel(
                     a[0],
                     a[2] if layer else a[1],
@@ -286,9 +292,9 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
             ).rmsnorm_fwd_tuned
 
             layer = module == "layer_norm"
-            out = torch.empty_like(case.args[0])
 
             def call(*a: Any) -> torch.Tensor:
+                out = torch.empty_like(a[0])
                 rmsnorm_fwd_tuned(
                     a[0],
                     a[2] if layer else a[1],
@@ -858,7 +864,12 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
 
             return call
 
+        # The flash backend has no additive-bias (attn_mask) kernel, so it is
+        # not offered for the biased case (its fourth argument is the bias).
+        biased = len(case.args) == 4
         for kind in ["flash", "cudnn", "efficient"]:
+            if kind == "flash" and biased:
+                continue
             result[f"aten.sdpa.{kind}"] = lambda kind=kind: selected_sdpa(kind)
     if module == "fp8_attention":
 

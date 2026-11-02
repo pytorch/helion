@@ -42,7 +42,9 @@ from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
+from .pdl_release import ZERO_FILL_KERNEL_PREFIX
 from .pdl_release import generic_release_rendered
+from .pdl_release import spread_rendered
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -755,6 +757,7 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _choose_mma_impl
     from .cute_mma import _loop_subrange_parent_block_id
     from .cute_mma import _mma_tiles_are_static_full
+    from .cute_mma import _ragged_batched_tcgen05_config
     from .cute_mma import _tcgen05_epi_warp_groups
     from .cute_mma import analyze_cute_mma_node
     from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
@@ -830,11 +833,15 @@ def _detect_specialized_mma_loop(
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
+    # Ragged batched tiles take the flat one-CTA tcgen05 pipeline (TMA
+    # zero-fill, predicated stores); the launch geometry must agree with
+    # ``_emit_mma_pipeline``'s admission or the MMA warp never exists.
     candidates = [
         (node, candidate)
         for node, candidate in candidates
         if not candidate.operands.has_leading_passthrough
         or _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
+        or _ragged_batched_tcgen05_config(config, bn)
     ]
     if not candidates:
         return False
@@ -1498,9 +1505,9 @@ def _graph_used_block_ids(
     from ...language import memory_ops
     from ..compile_environment import CompileEnvironment
     from ..device_ir import RootGraphInfo
+    from ..device_ir import control_flow_child_graph_ids
     from ..host_function import HostFunction
     from ..variable_origin import BlockSizeOrigin
-    from .loop_nesting import _child_graph_ids
 
     env = CompileEnvironment.current()
     host_function = HostFunction.current()
@@ -1587,7 +1594,9 @@ def _graph_used_block_ids(
         for node in graph.nodes:
             # A root coordinate can first be read inside a captured device
             # scope. Its thread distribution must remain live there as well.
-            pending.extend(graph_by_id[graph_id] for graph_id in _child_graph_ids(node))
+            pending.extend(
+                graph_by_id[graph_id] for graph_id in control_flow_child_graph_ids(node)
+            )
             if node.target is memory_ops.store:
                 # A store has no value; its index names every tile axis it
                 # writes, including axes a broadcast value does not carry.
@@ -1630,7 +1639,11 @@ class CuteBackend(Backend):
         """A kernel that renders the generic early release of its programmatic
         dependents (``cute_pdl`` on the generic path, released at entry or
         from the last wave) ranks ahead of one that does not, among finalists
-        the autotuner's final verification cannot tell apart.
+        the autotuner's final verification cannot tell apart, and one that
+        also pads its shared memory to one wave's density
+        (``cute_pdl_spread``, ``spread_rendered``) ranks ahead of both: an
+        early launch of it never packs its CTAs onto the SMs its primary
+        left idle, while its isolated timing reads the pad as a tie.
 
         The knob's own cost or gain is invisible to the kernel's isolated
         timing whenever a plain launch separates its back-to-back calls (the
@@ -1643,16 +1656,21 @@ class CuteBackend(Backend):
         Whether a config renders that release is read off its generated
         module (``generic_release_rendered``), not off its keys: the tcgen05,
         warp-MMA, collective and block-scaled families own their wait and
-        release (``DeviceFunction._cute_pdl_applies``), so on them the knob
-        and its placement are inert and every config ranks alike; a ranking
-        by keys there would break ties between unrelated knobs (matmul
-        backward s2: a clc-persistent finalist 0.5% behind in the autotuner's
-        regime, 7% behind in the catalogue's).  A config without the knob
-        ranks last without a render.
+        release (``DeviceFunction._cute_pdl_applies``; the tcgen05 kernels
+        take the ``entry`` placement after their own waits,
+        ``DeviceFunction._tcgen05_early_pdl_release``), and on them every
+        config ranks alike: their back-to-back timing sees the knob, and a
+        ranking by the release there would break ties between unrelated
+        knobs (matmul backward s2: a clc-persistent finalist 0.5% behind in
+        the autotuner's regime, 7% behind in the catalogue's).  A config
+        without the knob ranks last without a render.
         """
         if config.config.get("cute_pdl") is not True:
-            return 1
-        return 0 if generic_release_rendered(source()) else 1
+            return 2
+        rendered = source()
+        if not generic_release_rendered(rendered):
+            return 2
+        return 0 if spread_rendered(rendered) else 1
 
     def build_standalone_code(
         self,
@@ -1956,6 +1974,9 @@ class CuteBackend(Backend):
             sum-only, then consume).  The 3-pass form's two reductions
             are independent and compile to a more efficient layout on
             the CuTe backend.
+          * ``stage_unaligned_matmul_operands`` pads matmul operands whose
+            strides fail the TensorMap proof through a host copy so the
+            tcgen05 pipeline keeps its TMA producers.
         """
         from .online_to_3pass import rewrite_online_to_3pass
 
@@ -1980,6 +2001,12 @@ class CuteBackend(Backend):
         from .flatten_nested_reductions import flatten_nested_reductions
 
         rewritten |= flatten_nested_reductions(hf) > 0
+
+        # Last: the staging statements it prepends are not part of the pure
+        # host preludes the passes above analyze.
+        from .stage_aligned_operands import stage_unaligned_matmul_operands
+
+        rewritten |= stage_unaligned_matmul_operands(hf)
         return rewritten
 
     def pre_codegen(
@@ -2217,14 +2244,21 @@ class CuteBackend(Backend):
             or key == "cute_packet_prefetch"
             or key == "cute_vloop_sink"
             or key == "cute_lane_unroll"
+            or key == "cute_dot_fragment_mma"
+            or key == "cute_dot_ring_mma"
+            or key == "cute_dot_ring_stages"
+            or key == "cute_dot_ring_split"
             or key == "cute_pdl"
             or key == "cute_pdl_release"
+            or key == "cute_pdl_spread"
             or key == "cute_warp_aggregated_atomics"
             or key == "cross_loop_pipeline"
             or key
             in (
                 "cute_split_k_workspace",
                 "cute_split_k_stages",
+                "cute_split_k_partitions",
+                "cute_split_k_atomic_epilogue",
                 "cute_split_k_schedule",
                 "cute_split_k_finalizer_warps",
             )
@@ -2430,14 +2464,28 @@ class CuteBackend(Backend):
 
     @staticmethod
     def _compiled_kernels(compiled_fn: object, kernel_name: str) -> tuple[object, ...]:
+        """The CuTe kernel objects the generated host function launches: the
+        kernel proper and the zero-fill kernels its host zero fills launch
+        as under ``cute_pdl`` (``host_zero_fill_launches``, named
+        ``_helion_zero_fill_<n>_helion_<kernel_name>``), or the bundle a
+        multi-stage module declares (``_helion_cute_kernels``)."""
         bundled = getattr(compiled_fn, "_helion_cute_kernels", None)
         if isinstance(bundled, tuple):
             return bundled
         fn_globals = getattr(compiled_fn, "__globals__", None)
         if not isinstance(fn_globals, dict):
             return ()
-        kernel = fn_globals.get(f"_helion_{kernel_name}")
-        return () if kernel is None else (kernel,)
+        name = f"_helion_{kernel_name}"
+        kernel = fn_globals.get(name)
+        if kernel is None:
+            return ()
+        fills = sorted(
+            key
+            for key in fn_globals
+            if key.startswith(ZERO_FILL_KERNEL_PREFIX)
+            and key.endswith(f"_{name.lstrip('_')}")
+        )
+        return (kernel, *(fn_globals[key] for key in fills))
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object
@@ -2489,10 +2537,15 @@ class CuteBackend(Backend):
         if not isinstance(fn_name, str):
             return None
         kernels = self._compiled_kernels(compiled_fn, fn_name)
-        if len(kernels) != 1:
+        # One module, one hash: the kernel proper and its zero-fill kernels
+        # carry the same one (``annotate_compiled_module``).
+        hashes = {
+            getattr(cute_kernel, "_helion_cute_source_hash", None)
+            for cute_kernel in kernels
+        }
+        if len(hashes) != 1:
             return None
-        cute_kernel = kernels[0]
-        source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
+        (source_hash,) = hashes
         return source_hash if isinstance(source_hash, str) else None
 
     def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
@@ -2580,6 +2633,7 @@ class CuteBackend(Backend):
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
             "_cute_nan_max": "from helion._compiler.cute.reduce_helpers import _cute_nan_max",
             "_cute_nan_min": "from helion._compiler.cute.reduce_helpers import _cute_nan_min",
+            "_helion_pdl_spread_keep": "from helion._compiler.cute._pdl_spread_runtime import keep_smem_live as _helion_pdl_spread_keep",
             "_cute_aux_copy_layout": "from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout as _cute_aux_copy_layout",
             "_helion_tcgen05_pipeline": (
                 "from helion._compiler.cute import tcgen05_pipeline "
@@ -2593,6 +2647,16 @@ class CuteBackend(Backend):
                 "from helion._compiler.cute.epilogue_helpers import "
                 "sigmoid_approx_ftz_f32 as _cute_sigmoid_approx_ftz_f32"
             ),
+            "_cute_mma_f16": "from helion._compiler.cute._flash_row_mma_runtime import mma_f16 as _cute_mma_f16",
+            "_cute_mma_bf16": "from helion._compiler.cute._flash_row_mma_runtime import mma_bf16 as _cute_mma_bf16",
+            "_cute_ring_cp_async_16": "from helion._compiler.cute._flash_row_mma_runtime import cp_async_16 as _cute_ring_cp_async_16",
+            "_cute_ring_cp_async_16_zfill": "from helion._compiler.cute._mma_dag_runtime import cp_async_16_zfill as _cute_ring_cp_async_16_zfill",
+            "_cute_ring_ldmatrix_x4": "from helion._compiler.cute._flash_row_mma_runtime import ldmatrix_x4 as _cute_ring_ldmatrix_x4",
+            "_cute_ring_lds_b32": "from helion._compiler.cute._mma_dag_runtime import lds_b32 as _cute_ring_lds_b32",
+            "_cute_ring_lds_f32": "from helion._compiler.cute._flash_row_mma_runtime import lds_f32 as _cute_ring_lds_f32",
+            "_cute_ring_sts_f32": "from helion._compiler.cute._flash_row_mma_runtime import sts_f32 as _cute_ring_sts_f32",
+            "_cute_lds_v4_b32": "from helion._compiler.cute._warp_mma_runtime import lds_v4_b32 as _cute_lds_v4_b32",
+            "_cute_sts_v4_b32": "from helion._compiler.cute._warp_mma_runtime import sts_v4_b32 as _cute_sts_v4_b32",
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
             "_cute_grouped_reduce_shared_two_stage_fragment": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage_fragment",
@@ -2641,6 +2705,8 @@ class CuteBackend(Backend):
             "_cute_store_fp8e5m2_vec_l2_evict_last": "from helion._compiler.cute.packet_store_helpers import store_fp8e5m2_vec_l2_evict_last as _cute_store_fp8e5m2_vec_l2_evict_last",
             "_cute_store_u32_vec": "from helion._compiler.cute.vec_utils import store_u32_vec as _cute_store_u32_vec",
             "_cute_red_add_f32_vec": "from helion._compiler.cute.vec_utils import red_add_f32_vec as _cute_red_add_f32_vec",
+            "_cute_red_add_f16_vec": "from helion._compiler.cute.vec_utils import red_add_f16_vec as _cute_red_add_f16_vec",
+            "_cute_red_add_bf16_vec": "from helion._compiler.cute.vec_utils import red_add_bf16_vec as _cute_red_add_bf16_vec",
             "_cute_rank1_pack_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_pack_bf16x2 as _cute_rank1_pack_bf16x2",
             "_cute_rank1_mul_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_mul_bf16x2 as _cute_rank1_mul_bf16x2",
             "_cute_rank1_add_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_add_bf16x2 as _cute_rank1_add_bf16x2",
@@ -2673,7 +2739,12 @@ class CuteBackend(Backend):
             "_cute_load_l1_l2_evict_last_4b": "from helion._compiler.cute.l2_policy import load_v4b_l1_l2_evict_last as _cute_load_l1_l2_evict_last_4b",
             "_cute_store_u16x8_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u16x8_l2_evict_last as _cute_store_u16x8_l2_evict_last",
             "_cute_store_u32x4_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u32x4_l2_evict_last as _cute_store_u32x4_l2_evict_last",
+            "_cute_store_u16x8_streaming": "from helion._compiler.cute.l2_policy import store_u16x8_streaming as _cute_store_u16x8_streaming",
+            "_cute_store_u32x4_streaming": "from helion._compiler.cute.l2_policy import store_u32x4_streaming as _cute_store_u32x4_streaming",
+            "_cute_store_fp8e4m3fn_vec_streaming": "from helion._compiler.cute.packet_store_helpers import store_fp8e4m3fn_vec_streaming as _cute_store_fp8e4m3fn_vec_streaming",
+            "_cute_store_fp8e5m2_vec_streaming": "from helion._compiler.cute.packet_store_helpers import store_fp8e5m2_vec_streaming as _cute_store_fp8e5m2_vec_streaming",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
+            "_cute_tmem_store_atom": "from helion._compiler.cute.split_k_exchange import tmem_store_atom as _cute_tmem_store_atom",
             "_cute_join_cast": "from helion._compiler.cute.join_cast import join_cast as _cute_join_cast",
             "_cute_exact_div_bounds_f32": "from helion._compiler.cute.exact_division import exact_div_bounds_f32 as _cute_exact_div_bounds_f32",
             "_cute_exact_div_fast_f32": "from helion._compiler.cute.exact_division import exact_div_fast_f32 as _cute_exact_div_fast_f32",
@@ -2685,6 +2756,14 @@ class CuteBackend(Backend):
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
+        if dim == 0:
+            from ..device_function import DeviceFunction
+
+            divisor = DeviceFunction.current().cute_state.program_id_divisor
+            if divisor > 1:
+                # ``tcgen05_split_k``: ``divisor`` consecutive CTAs share one
+                # output tile (the split index is ``block_idx % divisor``).
+                return f"{index_dtype}(cute.arch.block_idx()[0] // {divisor})"
         return f"{index_dtype}(cute.arch.block_idx()[{dim}])"
 
     def inductor_op_overrides(self) -> InductorOpOverrides:

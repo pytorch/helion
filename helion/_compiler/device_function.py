@@ -43,8 +43,15 @@ from .backend_registry import all_reserved_launch_param_names
 from .compile_environment import CompileEnvironment
 from .cute.device_state import CuteDeviceFunctionState
 from .cute.pdl_release import CUTE_PDL_RELEASE_DEFAULT
+from .cute.pdl_release import CUTE_PDL_SPREAD_KEY
+from .cute.pdl_release import DEFAULT_MAX_SMEM_PER_BLOCK
 from .cute.pdl_release import DEFAULT_RESIDENT_THREADS_PER_SM
+from .cute.pdl_release import DEFAULT_SMEM_PER_SM
+from .cute.pdl_release import SPREAD_KEEP_HELPER
+from .cute.pdl_release import SPREAD_PAD_NAME
 from .cute.pdl_release import resident_ctas_per_sm
+from .cute.pdl_release import spread_pad_bytes
+from .cute.tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .output_header import reserved_names
@@ -57,6 +64,8 @@ from .variable_origin import TileBeginOrigin
 from .variable_origin import TileExtentOrigin
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ..runtime.config import Config
     from .cross_loop_codegen import PeerState
     from .cute.bounded_cache_codegen import BoundedCacheRequest
@@ -284,6 +293,102 @@ def _resident_threads_per_sm(device: torch.device) -> int:
     return DEFAULT_RESIDENT_THREADS_PER_SM
 
 
+def _smem_per_sm(device: torch.device) -> int:
+    """The shared memory of one SM of ``device`` (what ``cute_pdl_spread``
+    sizes its pad against), queried from the device when it is a live CUDA
+    device and the sm_90+ default otherwise."""
+    if device.type == "cuda" and torch.cuda.is_available():
+        capacity = getattr(
+            torch.cuda.get_device_properties(device),
+            "shared_memory_per_multiprocessor",
+            0,
+        )
+        if isinstance(capacity, int) and capacity > 0:
+            return capacity
+    return DEFAULT_SMEM_PER_SM
+
+
+def _max_smem_per_block(device: torch.device) -> int:
+    """The opt-in shared memory one block of ``device`` may allocate."""
+    if device.type == "cuda" and torch.cuda.is_available():
+        properties = torch.cuda.get_device_properties(device)
+        capacity = max(
+            int(getattr(properties, "shared_memory_per_block_optin", 0) or 0),
+            int(properties.shared_memory_per_block),
+        )
+        if capacity > 0:
+            return capacity
+    return DEFAULT_MAX_SMEM_PER_BLOCK
+
+
+# Element widths of the ``cutlass`` numeric types a generated body allocates
+# shared memory in (``cute.arch.alloc_smem(cutlass.<type>, count, ...)``).
+_CUTLASS_TYPE_BYTES: dict[str, int] = {
+    "cutlass.Int8": 1,
+    "cutlass.Uint8": 1,
+    "cutlass.Int16": 2,
+    "cutlass.Uint16": 2,
+    "cutlass.Float16": 2,
+    "cutlass.BFloat16": 2,
+    "cutlass.Int32": 4,
+    "cutlass.Uint32": 4,
+    "cutlass.Float32": 4,
+    "cutlass.TFloat32": 4,
+    "cutlass.Int64": 8,
+    "cutlass.Uint64": 8,
+    "cutlass.Float64": 8,
+}
+
+
+# Calls through which a body reserves shared memory the literal sum cannot
+# see: the DSL's ``SmemAllocator`` (its ``allocate`` / ``allocate_tensor`` /
+# ``allocate_array`` carve a struct or a layout's bytes out of the kernel's
+# allocation at trace time; the fa4 flash families and the tcgen05 GEMMs
+# hold their rings this way, at the per-block maximum already) and the
+# dynamic shared memory base.
+_OPAQUE_SMEM_CALLS = frozenset(
+    {
+        "SmemAllocator",
+        "allocate",
+        "allocate_tensor",
+        "allocate_array",
+        "get_dyn_smem",
+    }
+)
+
+
+def _literal_smem_bytes(statements: Sequence[ast.AST]) -> int | None:
+    """A lower bound of the shared memory ``statements`` allocate themselves:
+    the sum over their ``cute.arch.alloc_smem(<cutlass type>, <literal>, ...)``
+    calls (without alignment padding); ``None`` when a call's size or type is
+    not a literal the sum can account for, or when the body reserves shared
+    memory through a call the sum cannot see (``_OPAQUE_SMEM_CALLS``), so no
+    pad is sized against storage of unknown size."""
+    total = 0
+    for statement in statements:
+        for node in ast.walk(statement):
+            if not (
+                isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            ):
+                continue
+            if node.func.attr in _OPAQUE_SMEM_CALLS:
+                return None
+            if ast.unparse(node.func) != "cute.arch.alloc_smem":
+                continue
+            if len(node.args) < 2:
+                return None
+            width = _CUTLASS_TYPE_BYTES.get(ast.unparse(node.args[0]))
+            count = node.args[1]
+            if (
+                width is None
+                or not isinstance(count, ast.Constant)
+                or type(count.value) is not int
+            ):
+                return None
+            total += width * count.value
+    return total
+
+
 def _is_literal_constexpr(arg: ConstExprArg) -> bool:
     """Check if a constexpr arg has a known literal value that can be inlined at module level."""
     host_str = arg.host_str()
@@ -395,6 +500,18 @@ class DeviceFunction:
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
         self._cute_state = CuteDeviceFunctionState()
+        split_k = config.get(TCGEN05_SPLIT_K_CONFIG_KEY, 1)
+        if (
+            CompileEnvironment.current().backend_name == "cute"
+            and isinstance(split_k, int)
+            and split_k > 1
+        ):
+            # ``tcgen05_split_k``: the flat grid holds ``split_k`` CTAs per
+            # output tile (``block_idx // split_k`` is the tile's program id);
+            # the tcgen05 pipeline marks the config applied or the launch
+            # codegen rejects it (``codegen_function_call``).
+            self._cute_state.program_id_divisor = split_k
+            self._cute_state.launch_grid_multiplier = split_k
 
         from .helper_function import HelperFunctionManager
 
@@ -1335,6 +1452,9 @@ class DeviceFunction:
             ]
         dependent_launch: list[ast.stmt] = []
         dependent_release: list[ast.stmt] = []
+        late_wait_names: set[str] = set()
+        late_wait_release: list[ast.stmt] = []
+        wait: ast.stmt | None = None
         if self._cute_pdl_applies():
             # Programmatic dependent launch (``cute_pdl``): the launch and
             # this prologue overlap the previous kernel in the stream; wait
@@ -1353,13 +1473,24 @@ class DeviceFunction:
             # The dependents still wait for this grid's completion and memory
             # flush at their own wait, so the placement never changes what
             # they read.  A tcgen05 kernel on the entry-wait path
-            # (``cute_pdl_entry_wait``) gets only the wait: its lowering
-            # releases the dependents itself after the MMA warp's last MMA,
-            # and an earlier release would defeat that late placement.
+            # (``cute_pdl_entry_wait``) gets only the wait here: its early
+            # release follows every wait of the body, this one included
+            # (``_tcgen05_early_pdl_release``, below).
             with SyntheticLocation():
-                dependent_launch = [
-                    statement_from_string("cute.arch.griddepcontrol_wait()")
-                ]
+                wait = statement_from_string("cute.arch.griddepcontrol_wait()")
+                dependent_launch = [wait]
+                # Behind the fill kernels of this kernel's own zero fills the
+                # wait may move down to the first statement that touches a
+                # filled tensor (``_place_late_pdl_wait``, on the lowered
+                # body): the fill kernel releases its dependents only after
+                # its own wait, so every earlier kernel of the stream has
+                # completed when this grid starts, and the fill's writes are
+                # confined to the filled tensors.  The operand loads and the
+                # K loop of a split-K kernel then overlap the fill instead of
+                # waiting for it.
+                late_wait_names = self._late_pdl_wait_names()
+                if late_wait_names:
+                    dependent_launch = []
                 placement = (
                     "none"
                     if self.cute_state.cute_pdl_entry_wait
@@ -1378,6 +1509,7 @@ class DeviceFunction:
                     dependent_release = [release]
                 elif placement == "last_wave":
                     dependent_launch.extend(self._last_wave_release(release))
+                late_wait_release = list(dependent_launch) if late_wait_names else []
         env = CompileEnvironment.current()
         if (
             self.triton_persistent_state_specs
@@ -1402,6 +1534,8 @@ class DeviceFunction:
                 *[statement_from_string(pdl[op]) for op in env.pdl_exit],
             ],
         )
+        if self.cute_state.cute_pdl_entry_wait:
+            kernel_body = self._tcgen05_early_pdl_release(kernel_body)
         constexpr_values: dict[str, int] = {}
         if backend.name == "cute":
             from .cute.fuse_two_pass_loads import fuse_two_pass_loads
@@ -1723,10 +1857,6 @@ class DeviceFunction:
             # iteration's load, so unsplit loops keep only ONE load in
             # flight per thread; the triton backend and handwritten CuTe
             # kernels both load the whole tile fragment first).
-            from .cute.split_lane_loads import split_lane_loads
-            from .cute.unroll_lane_loads import LaneUnrollNotApplied
-            from .cute.unroll_lane_loads import unroll_lane_loads
-
             # ``cute_lane_unroll`` without vector-loop sinking, or with a sunk
             # nest whose lane loops the sinking pass left rolled (their loads
             # were persistent markers, now packets): unroll the lane loops (of
@@ -1734,6 +1864,93 @@ class DeviceFunction:
             # lane's loads (packets and scalars alike) issued before the first
             # lane's compute.  The knob-off code is regenerated when no loop
             # takes the unroll.
+            # ``cute_dot_fragment_mma``: a GEMV's scalar dot fallback (16-bit
+            # packets, fp32 per-element FMAs, a grouped shuffle sum over the
+            # K threads) on an (8, 4, 1) thread block runs on ``mma.sync``
+            # fragments instead (``cute/fragment_mma_dot.py``); the lane
+            # unroll below then hoists the fragment packets like any other
+            # packet loads.  The knob-off code is regenerated when no dot
+            # takes the rewrite.
+            from .cute.fragment_mma_dot import FRAGMENT_MMA_KEY
+
+            # ``cute_dot_ring_mma``: the same GEMV dot on a ``(T, 1, 1)`` block
+            # streams the row tile through a cp.async ring in shared memory
+            # and multiplies on ``mma.sync`` fragments (``cute/ring_mma_dot.py``).
+            from .cute.ring_mma_dot import RING_MMA_KEY
+            from .cute.split_lane_loads import split_lane_loads
+            from .cute.unroll_lane_loads import LaneUnrollNotApplied
+            from .cute.unroll_lane_loads import unroll_lane_loads
+
+            if self.config.config.get(RING_MMA_KEY) is True:
+                from .cute.memory_ops import cute_tensor_base_is_aligned
+                from .cute.ring_mma_dot import RING_DEFAULT_SPLIT
+                from .cute.ring_mma_dot import RING_DEFAULT_STAGES
+                from .cute.ring_mma_dot import RING_SPLIT_KEY
+                from .cute.ring_mma_dot import RING_STAGES_KEY
+                from .cute.ring_mma_dot import RingMmaNotApplied
+                from .cute.ring_mma_dot import ring_mma_dot
+                from .cute.ring_mma_dot import ring_mma_smem_budget
+
+                ring_fact = env.config_spec._cute_fragment_mma_fact()
+                ring_rows: object = None
+                ring_chunk: object = None
+                ring_k_var: str | None = None
+                if (
+                    ring_fact is not None
+                    and ring_fact.m_block_id is not None
+                    and ring_fact.k_block_id is not None
+                ):
+                    ring_rows = env.block_sizes[ring_fact.m_block_id].from_config(
+                        self.config
+                    )
+                    ring_chunk = env.block_sizes[ring_fact.k_block_id].from_config(
+                        self.config
+                    )
+                    # A cache read only: ``block_size_var`` would lift a new
+                    # constexpr argument after the host call was emitted.
+                    ring_k_var = self.block_size_var_cache.get((ring_fact.k_block_id,))
+                kernel_body, ring_fired = ring_mma_dot(
+                    kernel_body,
+                    thread_block_dims=exact_thread_block_dims,
+                    rows=ring_rows if isinstance(ring_rows, int) else None,
+                    chunk=ring_chunk if isinstance(ring_chunk, int) else None,
+                    stages=cast(
+                        "int",
+                        self.config.config.get(RING_STAGES_KEY, RING_DEFAULT_STAGES),
+                    ),
+                    split=cast(
+                        "str",
+                        self.config.config.get(RING_SPLIT_KEY, RING_DEFAULT_SPLIT),
+                    ),
+                    k_block_var=ring_k_var,
+                    tensors={
+                        arg.name: arg.fake_value
+                        for arg in self.arguments
+                        if isinstance(arg, TensorArg)
+                    },
+                    aligned={
+                        arg.name
+                        for arg in self.arguments
+                        if isinstance(arg, TensorArg)
+                        and cute_tensor_base_is_aligned(env, arg.fake_value, 16)
+                    },
+                    new_var=lambda name: self.new_var(name, dce=False),
+                    rename_groups={k: v[0] for k, v in self._variable_renames.items()},
+                    smem_budget=ring_mma_smem_budget(env.device),
+                )
+                if not ring_fired:
+                    raise RingMmaNotApplied
+            if self.config.config.get(FRAGMENT_MMA_KEY) is True:
+                from .cute.fragment_mma_dot import FragmentMmaNotApplied
+                from .cute.fragment_mma_dot import fragment_mma_dot
+
+                kernel_body, fragment_fired = fragment_mma_dot(
+                    kernel_body,
+                    thread_block_dims=exact_thread_block_dims,
+                    new_var=lambda name: self.new_var(name, dce=False),
+                )
+                if not fragment_fired:
+                    raise FragmentMmaNotApplied
             lane_unroll = cast("int", self.config.config.get("cute_lane_unroll", 1))
             sinking = bool(self.config.config.get("cute_vloop_sink"))
             knob_unroll = (
@@ -2138,7 +2355,7 @@ class DeviceFunction:
 
                 kernel_body = lower_philox_packets(
                     kernel_body,
-                    seed_names=self.cute_state.explicit_rng_seed_names,
+                    seed_exprs=self.cute_state.explicit_rng_seed_exprs,
                     integer_names=set(constexpr_values),
                     new_name=self.unique_name,
                     vectorize_packet=lambda loop, read, known: (
@@ -2184,6 +2401,11 @@ class DeviceFunction:
                     argument_names={arg.arg for arg in args},
                     proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
                 )
+        if late_wait_names:
+            assert wait is not None
+            kernel_body = self._place_late_pdl_wait(
+                kernel_body, wait, late_wait_release, late_wait_names
+            )
         definition = ast_rename(
             create(
                 ast.FunctionDef,
@@ -2250,6 +2472,14 @@ class DeviceFunction:
                 cuda_version=torch.version.cuda,
             )
         result = [*prefix, definition]
+        if self._cute_pdl_applies() and self.config.config.get(CUTE_PDL_SPREAD_KEY):
+            # ``cute_pdl_spread``: pad the body's shared memory so that an
+            # early launch of this kernel cannot pack its CTAs denser than
+            # one wave on an idle device (``_pdl_spread_statements``).  The
+            # pad goes in after every body pass, sized against the body
+            # they left (a fused two-pass cache allocates late).
+            index = self._pdl_spread_index(definition.body)
+            definition.body[index:index] = self._pdl_spread_statements(definition.body)
         if (
             CompileEnvironment.current().backend.name == "cute"
             and self.cute_state.resident_reduction_layouts
@@ -2471,12 +2701,198 @@ class DeviceFunction:
                 )
         return result
 
+    def _tcgen05_early_pdl_release(self, body: list[ast.stmt]) -> list[ast.stmt]:
+        """``cute_pdl_release`` on a tcgen05 kernel launched as a programmatic
+        dependent (``cute_pdl_entry_wait``).
+
+        The lowering waits where it knows each warp's first global read (the
+        TMA-load role, the epilogue role, the flat kernel's all-warp wait, or
+        the entry wait ``_cute_pdl_applies`` adds when those do not cover the
+        body) and releases the dependents after the MMA warp's last MMA.  That
+        late release leaves the next kernel's launch to the epilogue tail: in
+        a back-to-back sequence of short GEMMs the dependent's launch is
+        processed in the ~0.3 us the primary still runs, and its cold launch
+        state (the catalogue replays after an L2 flush) is exposed on every
+        node.  ``entry`` (``auto`` on a one-wave launch) puts a release right
+        after every one of the lowering's waits, so the dependents launch as
+        soon as this kernel's predecessor is done and overlap this whole
+        kernel: fp8 256^3 GEMM nodes (64 CTAs, 16-call graphs replayed
+        after an L2 flush) drop from 1.42-1.72 us (bimodal across processes)
+        to a steady 1.44 us, cuBLAS 1.49 us.  A release ahead of the waits
+        (the kernel's first statement) launches the dependents' dependents
+        too, a cascade of parked CTAs that measured 1.54-1.68 us on the same
+        nodes, so the release follows the wait as on the generic path.  ``last_wave`` guards that release to the last
+        wave's CTAs, ``exit`` and ``none`` leave the family's late release as
+        the only trigger (a second trigger from a CTA is a no-op, so the late
+        one stays on every placement).
+        """
+        placement = self.config.config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
+        if placement == "auto":
+            placement = self._implicit_pdl_release("entry")
+        if placement not in ("entry", "last_wave"):
+            return body
+        release_call = "cute.arch.griddepcontrol_launch_dependents()"
+        prefix: list[ast.stmt] = []
+        guard: str | None = None
+        if placement == "last_wave":
+            with SyntheticLocation():
+                statements = self._last_wave_release(
+                    statement_from_string(release_call)
+                )
+            if len(statements) == 2:
+                prefix = statements[:1]
+                guard = ast.unparse(cast("ast.If", statements[1]).test)
+
+        def release() -> ast.stmt:
+            with SyntheticLocation():
+                if guard is None:
+                    return statement_from_string(release_call)
+                return create(
+                    ast.If,
+                    test=expr_from_string(guard),
+                    body=[statement_from_string(release_call)],
+                    orelse=[create(ast.Pass)],
+                )
+
+        def is_wait(statement: ast.stmt) -> bool:
+            return (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Call)
+                and ast.unparse(statement.value) == "cute.arch.griddepcontrol_wait()"
+            )
+
+        def visit(statements: list[ast.stmt]) -> list[ast.stmt]:
+            result: list[ast.stmt] = []
+            for statement in statements:
+                result.append(statement)
+                if is_wait(statement):
+                    result.append(release())
+                    continue
+                for field in ("body", "orelse", "finalbody"):
+                    nested = getattr(statement, field, None)
+                    if isinstance(nested, list) and nested:
+                        setattr(statement, field, visit(nested))
+                for handler in getattr(statement, "handlers", None) or ():
+                    handler.body = visit(handler.body)
+            return result
+
+        if body and is_wait(body[0]):
+            # The entry wait stays the body's first statement; the guard's
+            # CTA index follows it, ahead of the guarded release.
+            return [body[0], *prefix, release(), *visit(body[1:])]
+        return [*prefix, *visit(body)]
+
+    def _late_pdl_wait_names(self) -> set[str]:
+        """The kernel-argument names through which this ``cute_pdl`` kernel
+        (generic path) can reach a host zero fill that launches as a
+        dependent fill kernel: the filled tensors' own arguments and every
+        argument whose fake tensor shares their storage (a host view or
+        alias, a tensor descriptor built on them).  The first mention of any
+        of these bounds the late wait.  Empty when the wait stays at the top:
+        no fill kernel (none admitted or every fill elided as dead, so the
+        kernel's primary is an unknown predecessor), the tcgen05 entry-wait
+        path, no filled tensor the kernel touches, or a kernel with access
+        paths the names cannot account for (wrapper-only or extra
+        parameters: a lowering's own tensor maps and pointers, the flash
+        backward's ``_fbwd_tma_dq``, which reduce into a tensor without
+        naming it)."""
+        from .compile_environment import CompileEnvironment
+        from .cute.host_zero_fill_launches import zero_fill_launch_tensors
+        from .cute.host_zero_fill_launches import zero_fill_launches_apply
+
+        env = CompileEnvironment.current()
+        if self.cute_state.cute_pdl_entry_wait or not zero_fill_launches_apply(
+            self, env, self.config
+        ):
+            return set()
+        if (
+            self.wrapper_only_params
+            or self.codegen._extra_params
+            or self.sourceless_prologue_params
+        ):
+            return set()
+        host = HostFunction.current()
+        storages = {
+            fake.untyped_storage()
+            for fake in zero_fill_launch_tensors(host, env, self.config)
+        }
+        if not storages:
+            return set()
+        arguments = [
+            *self._tensor_args.values(),
+            *self._tensor_descriptor_args.values(),
+        ]
+        return {
+            argument.name
+            for argument in arguments
+            if argument.fake_value.untyped_storage() in storages
+        }
+
+    @staticmethod
+    def _place_late_pdl_wait(
+        body: list[ast.stmt],
+        wait: ast.stmt,
+        release: list[ast.stmt],
+        names: set[str],
+    ) -> list[ast.stmt]:
+        """Put the ``cute_pdl`` wait of a kernel whose zero fills launch as
+        fill kernels before the first top-level statement of the lowered body
+        that mentions a filled tensor, when a statement touching memory (a
+        subscript, a load / store / copy / barrier call: a split-K kernel's
+        operand pipeline) precedes it; otherwise the kernel keeps the plain
+        form, the wait first and the entry release right after it."""
+
+        def mentions(statement: ast.AST) -> bool:
+            return any(
+                isinstance(node, ast.Name) and node.id in names
+                for node in ast.walk(statement)
+            )
+
+        def touches_memory(statement: ast.AST) -> bool:
+            for node in ast.walk(statement):
+                if isinstance(node, ast.Subscript):
+                    return True
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and any(
+                        token in node.func.attr
+                        for token in (
+                            "load",
+                            "store",
+                            "copy",
+                            "atomic",
+                            "cp_async",
+                            "tma",
+                            "sync",
+                            "barrier",
+                            "red",
+                        )
+                    )
+                ):
+                    return True
+            return False
+
+        release_ids = {id(statement) for statement in release}
+        rest = [statement for statement in body if id(statement) not in release_ids]
+        first = next(
+            (i for i, statement in enumerate(rest) if mentions(statement)), None
+        )
+        if first is not None and any(
+            isinstance(s, (ast.For, ast.While)) and touches_memory(s)
+            for s in rest[:first]
+        ):
+            return [*release, *rest[:first], wait, *rest[first:]]
+        return [wait, *release, *rest]
+
     def _implicit_pdl_release(self, default: str) -> str:
         """The release placement ``cute_pdl_release: auto`` resolves to:
         ``entry`` (``default``) while the kernel's launch is known to fit in
         one wave of CTAs, ``last_wave`` past it and for a grid the host
         sizes at runtime (``_last_wave_release`` then compares against the
-        launched grid).
+        launched grid).  A persistent launch sized to the resident capacity
+        (``_NUM_SM * num_sm_multiplier``, or the tcgen05 schedulers'
+        ``min(work, capacity)`` clusters) is one wave by construction.
 
         A release right after the wait lets the dependents' CTAs become
         resident while this kernel runs.  PTX launches the dependent grid
@@ -2497,7 +2913,7 @@ class DeviceFunction:
         strategy's static grid (``ProgramIDs.static_grid_size``: the sum
         over the roots of a multi-root kernel, the parent of an L2-grouped
         one, ``num_sm * num_sm_multiplier`` for a persistent one) times the
-        fused-body grid multiplier and the cluster size.  The resident
+        fused-body or split-K grid multiplier and the cluster size.  The resident
         capacity is the SM count times the CTAs an SM holds, estimated from
         the launch block (``resident_ctas_per_sm``: the thread limit, or
         ``cute_min_blocks_per_mp`` when the config asked for an occupancy).
@@ -2509,13 +2925,33 @@ class DeviceFunction:
         ctas = self._pdl_launch_ctas()
         if ctas is not None and ctas <= capacity:
             return default
+        if ctas is None and self._pdl_launch_is_persistent():
+            return default
         return "last_wave"
+
+    def _pdl_launch_is_persistent(self) -> bool:
+        """Whether the program-id strategy launches a persistent grid (one
+        sized to the device: ``_NUM_SM * num_sm_multiplier`` CTAs, or the
+        tcgen05 schedulers' ``min(work, capacity)`` clusters, whose count
+        ``static_grid_size`` cannot give)."""
+        from .program_id import ForEachProgramID
+
+        pid = self.pid
+        if pid is None:
+            return False
+        if isinstance(pid, ForEachProgramID):
+            return bool(pid.cases) and pid.cases[0]._is_persistent()
+        return pid._is_persistent()
 
     def _pdl_launch_ctas(self) -> int | None:
         """The CTA count of this kernel's launch when it is static: the
         program-id strategy's grid (``ProgramIDs.static_grid_size``) times the
-        fused-body grid multiplier and the cluster size; ``None`` for a grid
-        the host sizes at runtime."""
+        fused-body or split-K grid multiplier and the cluster size, or the
+        count a wrapper plan launches (``cute_state.launch_ctas``) where the
+        launcher sizes the grid from the plan; ``None`` for a grid the host
+        sizes at runtime."""
+        if self.cute_state.launch_ctas is not None:
+            return self.cute_state.launch_ctas
         if self.pid is None:
             return None
         grid = self.pid.static_grid_size()
@@ -2538,10 +2974,18 @@ class DeviceFunction:
         if num_sm <= 1:
             return None
         min_blocks = self.config.config.get("cute_min_blocks_per_mp", 0)
+        if not isinstance(min_blocks, int):
+            min_blocks = 0
+        if self.cute_state.cute_pdl_entry_wait:
+            # A tcgen05 GEMM kernel fills the SM's shared memory with its
+            # operand ring: one CTA per SM unless the config asked ptxas for
+            # an occupancy (the thread limit would call a 1024-CTA flat grid
+            # of 192-thread CTAs one wave).
+            return num_sm * max(1, min_blocks)
         launch_block = self.cute_state.launch_block
         per_sm = resident_ctas_per_sm(
             math.prod(launch_block) if launch_block is not None else None,
-            min_blocks if isinstance(min_blocks, int) else 0,
+            min_blocks,
             max_threads_per_sm=_resident_threads_per_sm(env.device),
         )
         return num_sm * per_sm
@@ -2572,6 +3016,8 @@ class DeviceFunction:
         ctas = self._pdl_launch_ctas()
         if ctas is not None and ctas <= capacity:
             return [release]
+        if ctas is None and self._pdl_launch_is_persistent():
+            return [release]
         cta = self.new_var("pdl_cta")
         grid_dim = "cutlass.Int32(cute.arch.grid_dim()[{}])"
         block_idx = "cutlass.Int32(cute.arch.block_idx()[{}])"
@@ -2598,6 +3044,81 @@ class DeviceFunction:
         )
         return statements
 
+    def _pdl_spread_statements(self, body: Sequence[ast.AST]) -> list[ast.stmt]:
+        """The statements of ``cute_pdl_spread``: one shared allocation that
+        raises the kernel's footprint to the smallest one at which more
+        CTAs than ``ceil(CTAs / SMs)`` no longer fit on an SM
+        (``spread_pad_bytes``), kept live by ``_helion_pdl_spread_keep``;
+        nothing for a grid the host sizes at runtime, a body whose own
+        allocations already enforce that density or reserve shared memory
+        the sum cannot account for (a non-literal size, or the storage a
+        family allocates through the DSL's ``SmemAllocator``: the fa4 flash
+        backward holds the per-block maximum that way, and a pad on top of
+        it would fail every launch), a density the pad cannot hold with the
+        slack it keeps per CTA, or an SM count codegen cannot know.
+
+        A programmatic dependent launches while its primary runs and the
+        hardware dispatches its CTAs onto whatever SMs have room: when the
+        primary's CTAs leave none beside them, every CTA of a small
+        dependent lands on the few SMs the primary left idle and runs
+        packed there once the primary completes (vanilla linear attention
+        forward: the 128 one-warp CTAs of the chunk state kernel on the
+        20 SMs the 128-CTA, 164 KB output kernel leaves idle, 7.45 us per
+        call against 4.1 spread).  At one wave's density the CTAs beyond
+        the idle SMs wait for the primary's to retire and take their SMs
+        one each, which costs nothing on an idle device (the dispatcher
+        spreads a fresh grid the same way) and lets the search's isolated
+        timing read the knob as a tie.
+        """
+        env = CompileEnvironment.current()
+        num_sm = env.config_spec.num_sm
+        ctas = self._pdl_launch_ctas()
+        own = _literal_smem_bytes(body)
+        if num_sm <= 1 or ctas is None or own is None:
+            return []
+        pad = spread_pad_bytes(
+            ctas,
+            num_sm,
+            own,
+            smem_per_sm=_smem_per_sm(env.device),
+            max_smem_per_block=_max_smem_per_block(env.device),
+        )
+        if pad is None:
+            return []
+        with SyntheticLocation():
+            return [
+                statement_from_string(
+                    f"{SPREAD_PAD_NAME} = cute.arch.alloc_smem("
+                    f"cutlass.Uint8, {pad}, alignment=128)"
+                ),
+                statement_from_string(
+                    f"{SPREAD_KEEP_HELPER}({SPREAD_PAD_NAME}.toint())"
+                ),
+            ]
+
+    @staticmethod
+    def _pdl_spread_index(body: Sequence[ast.AST]) -> int:
+        """Where the pad of ``cute_pdl_spread`` goes: right after the
+        kernel's own wait and release (the plain release, or the
+        ``last_wave`` CTA index and guard), which the final selection reads
+        as the two statements after the wait (``generic_release_rendered``);
+        after the wait alone when the kernel does not release early."""
+        statements = [ast.unparse(statement) for statement in body]
+        index = statements.index("cute.arch.griddepcontrol_wait()") + 1
+        if index < len(statements) and statements[index] == (
+            "cute.arch.griddepcontrol_launch_dependents()"
+        ):
+            return index + 1
+        if index + 1 < len(body):
+            guard_index = body[index]
+            if (
+                isinstance(guard_index, ast.Assign)
+                and ast.unparse(guard_index.targets[0]).startswith("pdl_cta")
+                and isinstance(body[index + 1], ast.If)
+            ):
+                return index + 2
+        return index
+
     def _cute_pdl_applies(self) -> bool:
         """Whether ``cute_pdl`` shapes this kernel.
 
@@ -2609,7 +3130,8 @@ class DeviceFunction:
         hoist register or shared allocations above it, never a memory
         access.  The generic path also places the kernel's own release
         (``cute_pdl_release``); the tcgen05 entry-wait path below gets the
-        wait alone, its lowering owns the release.  It stays out of kernels
+        wait alone here, its early release follows every wait of the body
+        (``_tcgen05_early_pdl_release``).  It stays out of kernels
         that already take part in dependent launch, which generate exactly
         the knob-off code: native plans launched with ``use_pdl``, and
         bodies that wait on or release their dependents themselves.  A release ahead of the knob's wait
@@ -2674,6 +3196,14 @@ class DeviceFunction:
         assert pid is not None
 
         call_grid_expr = pid.codegen_grid()
+        if (
+            self.cute_state.program_id_divisor > 1
+            and not self.cute_state.tcgen05_split_k_applied
+        ):
+            raise exc.InvalidConfig(
+                f"{TCGEN05_SPLIT_K_CONFIG_KEY} > 1 requires the flat one-CTA "
+                "tcgen05 GEMM pipeline, which this kernel did not take"
+            )
         grid_multiplier = self.cute_state.launch_grid_multiplier
         if grid_multiplier != 1:
             # A fused body running one CTA per (grid index, lane).

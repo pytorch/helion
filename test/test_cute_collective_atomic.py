@@ -320,3 +320,269 @@ def test_tile_counter_beside_a_collective_matmul_counts_each_tile_once(
     # 64 x 64 tiles of a 256 x 256 output.
     assert tiles.item() == 16
     assert rows.tolist() == [4] * 256
+
+
+def _vector_epilogue_config() -> helion.Config:
+    """The 32x64 warp-MMA split-K config of the catalogue's s1 winner with the
+    vector epilogue (one 128-thread packet loop over the output tile)."""
+    return helion.Config(
+        block_sizes=[32, 64, 64],
+        num_threads=[2, 64, 1],
+        cute_vector_widths=[1, 1, 1, 1],
+        cute_collective_mma=True,
+        cute_collective_compute="warp",
+        cute_collective_copy="async",
+        cute_collective_stages=4,
+        cute_collective_epilogue="vector",
+        split_k=16,
+    )
+
+
+def _red_helper(dtype: torch.dtype, promoted: bool) -> str:
+    if promoted:
+        return "_cute_red_add_f32_vec("
+    return (
+        "_cute_red_add_f16_vec("
+        if dtype is torch.float16
+        else "_cute_red_add_bf16_vec("
+    )
+
+
+@pytest.mark.parametrize("promote", [True, False])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@skipUnlessBackends(["cute"])
+def test_split_k_vector_epilogue_packs_the_atomic_add(
+    promote: bool, bias: bool, dtype: torch.dtype
+) -> None:
+    """The vector collective epilogue rewrites a relaxed atomic-add terminal
+    into one packed ``red`` per lane packet: ``red.global.add.v4.f32`` into
+    the promoted fp32 output, ``red.global.add.noftz.f16x2`` / ``bf16x2``
+    into a half output (the scalar half atomic is a CAS loop on sm_100).
+    The epilogue's ``if outer_k.begin == 0`` bias branch runs per lane; the
+    original lane loop stays as the fallback behind the stride guard."""
+    kernel = helion.kernel(
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=promote,
+    )
+    x = torch.empty((64, 1024), dtype=dtype)
+    y = torch.empty((1024, 128), dtype=dtype)
+    b = torch.empty((128,), dtype=dtype)
+    args = (x, y, lambda acc, tiles: acc + b[tiles[1]]) if bias else (x, y)
+    with _mock_cuda_unavailable(), _cpu_target():
+        bound = kernel._bind_isolated(args)
+        code = bound.to_code(_vector_epilogue_config())
+    # Only float16 outputs are promoted; a bfloat16 output always keeps its dtype.
+    promoted = promote and dtype is torch.float16
+    assert bound.env.cute_half_atomic_output_promotions == (
+        {"out": torch.float16} if promoted else {}
+    )
+    assert code.count(_red_helper(dtype, promoted)) == 1
+    assert "cute.gemm(" in code
+    # 32x64 elements over 128 threads: packets of 4 fp32 / 2 halves.
+    assert (
+        "cutlass.range(4, unroll=1)" if promoted else "cutlass.range(8, unroll=1)"
+    ) in code
+    # The guarded fallback keeps the scalar lane loop and its atomic.
+    assert code.count("cute.arch.atomic_add(") == 1
+    assert ("return out.to(torch.float16)" in code) == promoted
+    # The bias epilogue runs under its partition-zero branch inside the
+    # per-lane value loop of the packet.
+    assert ("epilogue_value_lane" in code) and (
+        code.count(".load()" if bias else "_cute_join_cast(") >= 1
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("promote", [True, False])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@skipUnlessBackends(["cute"])
+def test_split_k_vector_epilogue_atomics_match_the_reference(
+    promote: bool, bias: bool, dtype: torch.dtype
+) -> None:
+    torch.manual_seed(2026)
+    x = torch.randn((64, 2048), device=CUDA_DEVICE, dtype=dtype) * 0.05
+    y = torch.randn((2048, 128), device=CUDA_DEVICE, dtype=dtype) * 0.05
+    b = torch.randn((128,), device=CUDA_DEVICE, dtype=dtype) * 0.05
+    kernel = helion.kernel(
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=promote,
+    )
+    args = (x, y, lambda acc, tiles: acc + b[tiles[1]]) if bias else (x, y)
+    bound = kernel._bind_isolated(args)
+    config = _vector_epilogue_config()
+    promoted = promote and dtype is torch.float16
+    code = bound.to_code(config)
+    assert code.count(_red_helper(dtype, promoted)) == 1
+    bound.set_config(config)
+
+    def run() -> torch.Tensor:
+        return bound(*args)
+
+    def expected() -> torch.Tensor:
+        result = x.float() @ y.float()
+        if bias:
+            result += b.float()
+        return result.to(dtype)
+
+    # The half output accumulates 16 partitions in its own dtype when the
+    # promotion is off: allow the rounding of that many adds.
+    tolerance = (
+        {"atol": 2e-3, "rtol": 1e-2} if promoted else {"atol": 1e-2, "rtol": 2e-2}
+    )
+    torch.testing.assert_close(run(), expected(), **tolerance)
+    replay = _make_cudagraph_replay(run)
+    for _iteration in range(2):
+        x.uniform_(-0.05, 0.05)
+        y.uniform_(-0.05, 0.05)
+        b.uniform_(-0.05, 0.05)
+        torch.testing.assert_close(run(), expected(), **tolerance)
+        torch.testing.assert_close(replay(), expected(), **tolerance)
+
+
+@pytest.mark.parametrize("promote", [True, False])
+@skipUnlessBackends(["cute"])
+def test_half_atomic_output_seeds_carry_the_vector_epilogue(promote: bool) -> None:
+    """With the promotion off the output stays float16 and every warp seed
+    with a scalar epilogue gets a vector twin (the scalar half atomic is a
+    CAS loop); with it on the fp32 output keeps the ordinary seed set."""
+    from helion.autotuner.config_generation import ConfigGeneration
+
+    kernel = helion.kernel(
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=promote,
+    )
+    x = torch.empty((64, 1024), dtype=torch.float16)
+    y = torch.empty((1024, 128), dtype=torch.float16)
+    with _mock_cuda_unavailable(), _cpu_target():
+        bound = kernel._bind_isolated((x, y))
+        with bound.env:
+            seeds = [
+                config
+                for _flat, config in ConfigGeneration(
+                    bound.config_spec
+                ).seed_flat_config_pairs()
+            ]
+    warp = [
+        seed
+        for seed in seeds
+        if seed.get("cute_collective_mma")
+        and seed.get("cute_collective_compute", "warp") == "warp"
+    ]
+    assert warp
+    scalar = [
+        s for s in warp if s.get("cute_collective_epilogue", "scalar") == "scalar"
+    ]
+    vector = [
+        s
+        for s in warp
+        if s.get("cute_collective_epilogue") in ("vector", "vector_unrolled")
+    ]
+    if promote:
+        assert len(vector) < len(scalar)
+    else:
+        assert len(vector) >= len(scalar)
+        twins = {
+            tuple(
+                sorted(
+                    (k, repr(v))
+                    for k, v in s.config.items()
+                    if k != "cute_collective_epilogue"
+                )
+            )
+            for s in vector
+            if s.get("cute_collective_epilogue") == "vector_unrolled"
+        }
+        for s in scalar:
+            key = tuple(
+                sorted(
+                    (k, repr(v))
+                    for k, v in s.config.items()
+                    if k != "cute_collective_epilogue"
+                )
+            )
+            assert key in twins
+
+
+@pytest.mark.parametrize(
+    "capability,dtype,packed",
+    [
+        ((8, 0), torch.float16, True),
+        ((8, 0), torch.bfloat16, False),
+        ((8, 6), torch.float32, False),
+        ((9, 0), torch.bfloat16, True),
+        ((9, 0), torch.float32, True),
+        (None, torch.float16, False),
+    ],
+)
+@skipUnlessBackends(["cute"])
+def test_packed_atomic_epilogue_respects_the_target_capability(
+    capability: tuple[int, int] | None, dtype: torch.dtype, packed: bool
+) -> None:
+    """``red.global.add.noftz.f16x2`` needs sm_70, the ``bf16x2`` and
+    ``v4.f32`` forms sm_90; an unknown or older target keeps the scalar
+    atomic lane loop."""
+    from test._cute_binding import _cpu_bind
+
+    kernel = helion.kernel(
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=dtype is torch.float32,
+    )
+    x = torch.empty(
+        (64, 1024), dtype=torch.float16 if dtype is torch.float32 else dtype
+    )
+    y = torch.empty((1024, 128), dtype=x.dtype)
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(kernel, (x, y), capability=capability)
+        code = bound.to_code(_vector_epilogue_config())
+    assert ("_cute_red_add_" in code) == packed
+    assert "cute.arch.atomic_add(" in code
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_half_output_vector_lanes_match_the_reference(dtype: torch.dtype) -> None:
+    """GPU: the generic V-loop flush of a half output (segmented reduction, one
+    thread per 4-wide strip) packs the lanes into one red and matches an fp32
+    index_add rounded once (at most 64 fp16 adds per node)."""
+    from test.test_cute_scan_tile_atomics import STRIP
+    from test.test_cute_scan_tile_atomics import _segmented_reduction
+
+    from helion._testing import DEVICE
+
+    torch.manual_seed(7)
+    num_elements, num_features, num_nodes = 4096, 128, 64
+    indices = torch.sort(
+        torch.randint(0, num_nodes, (num_elements,), device=DEVICE)
+    ).values
+    values = (torch.randn(num_elements, num_features, device=DEVICE) * 0.05).to(dtype)
+    kernel = helion.kernel(
+        _segmented_reduction, backend="cute", static_shapes=True, autotune_effort="none"
+    )
+    bound = kernel._bind_isolated((indices, values, num_nodes))
+    config = helion.Config(**{**bound.config_spec.default_config().config, **STRIP})
+    code = bound.to_code(config)
+    assert (
+        "_cute_red_add_f16_vec("
+        if dtype is torch.float16
+        else "_cute_red_add_bf16_vec("
+    ) in code
+    bound.set_config(config)
+    out = bound(indices, values, num_nodes)
+    expected = torch.zeros(num_nodes, num_features, device=DEVICE).index_add_(
+        0, indices, values.float()
+    )
+    torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)

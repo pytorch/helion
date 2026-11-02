@@ -163,3 +163,59 @@ def test_gathered_mode_rejects_unaligned_input_after_binding() -> None:
                 cute_collective_compute="tma_gather",
             )
         )
+
+
+@skipUnlessBackends(["cute"])
+def test_group_metadata_loads_are_bound_once_ahead_of_the_pipeline() -> None:
+    # The row recipe reads the group's offset and the row predicate its
+    # token count; both are coordinate-free, so the pipeline binds each once
+    # (the producer's row chain used to load them twice per row, the
+    # epilogue's scatter once per 16-byte packet between its global stores,
+    # which the compiler cannot reorder: 1.1 us of a 3.4 us kernel on the
+    # 256 x 128 x 128 x 4 shape), to the kernel's own bindings when it has
+    # them. The gather of the row index itself keeps its load: it depends on
+    # the row.
+    bound = _bound((256, 128, 128, 4), torch.float16, False)
+    source = bound.to_code(
+        helion.Config(
+            block_sizes=[128, 32, 64],
+            num_threads=[4, 32, 1],
+            cute_vector_widths=[1, 1, 1, 1],
+            cute_collective_mma=True,
+            cute_collective_compute="tma_gather",
+            cute_gathered_mma_n=128,
+            cute_gathered_mma_stages=2,
+        )
+    )
+    kernel = source[
+        source.index("@cute.kernel") : source.index("_helion_cute_wrapper_plans")
+    ]
+    lines = [line.strip() for line in kernel.splitlines()]
+    bound_meta = [line for line in lines if line.startswith("gathered_group_meta")]
+    # The kernel loaded the group's offset and count for its ``if count != 0``
+    # guard (``start`` / ``num_tokens``): the region reuses those registers
+    # instead of re-issuing the loads ahead of its CTA-wide sync.
+    assert bound_meta == [
+        "gathered_group_meta = start",
+        "gathered_group_meta_1 = num_tokens",
+    ]
+    region = kernel.index("gathered_group_meta")
+    for name in ("expert_token_offsets", "expert_token_counts"):
+        assert kernel.count(f"({name}.iterator", region) == 0, name
+    # the gathered row index is the region's only load: it depends on the row
+    assert kernel.count(").load()", region) == 1
+    predicate = next(
+        line
+        for line in lines
+        if line.startswith("if (operator.lt(gathered_logical_row")
+    )
+    assert ".load()" not in predicate
+    assert "gathered_group_meta_1" in predicate
+    row = next(line for line in lines if line.startswith("gathered_row = "))
+    assert "sorted_to_orig_token_idx.iterator" in row and ".load()" in row
+    assert "gathered_group_meta" in row
+    live = next(line for line in lines if line.startswith("gathered_live_rows = "))
+    assert ".load()" not in live and "gathered_group_meta_1" in live
+    # the bindings precede the pipeline's first barrier
+    assert kernel.index("gathered_group_meta") < kernel.index("mbarrier_init")
+    ast.parse(source)

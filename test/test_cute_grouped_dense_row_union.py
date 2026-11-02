@@ -107,6 +107,16 @@ def test_dense_plan_uses_original_allocation_and_ordinary_wrapper(case: tuple) -
         )
 
     old_host, new_host = host(old), host(new)
+    # The dense plan is a plain tcgen05 plan, so the launcher bakes its tensor
+    # layouts (static TMA coordinate strides); the legacy grouped schedule
+    # keeps the runtime layouts and its host carries the disable guard.
+    bake_guard = (
+        "_helion_grouped_gemm_jagged._helion_cute_disable_bake_tensor_shapes = True"
+    )
+    assert bake_guard in old and bake_guard not in new
+    old_host.body = [
+        child for child in old_host.body if ast.unparse(child) != bake_guard
+    ]
     # Only launch geometry and physical block roles change in the public host.
     for node in (old_host, new_host):
         launch = next(

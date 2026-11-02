@@ -101,7 +101,7 @@ def test_exact_tile_is_reachable_and_emits_native_pipeline(
         source = bound.to_code(config)
         # The search-normalized schedule emits the same kernel.
         assert bound.to_code(canonical) == source
-    assert "PipelineTmaUmma.create" in source
+    assert "PipelineTmaUmma.create" in source or "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
     assert "StaticPersistentTileScheduler.create" in source
     assert f"CtaGroup.{'TWO' if cluster_m == 2 else 'ONE'}" in source
@@ -323,7 +323,9 @@ def test_paired_k_tail_survives_search_and_emits_tma(
             for seed in seeds
         )
     source = bound.to_code(canonical)
-    assert "PipelineTmaUmma.create" in source
+    # The split-barrier-init prologue builds the pipeline through the runtime
+    # helper instead of the DSL constructor.
+    assert "PipelineTmaUmma.create" in source or "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
     assert "StaticPersistentTileScheduler.create" in source
     assert "CtaGroup.TWO" in source

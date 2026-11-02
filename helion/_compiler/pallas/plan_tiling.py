@@ -120,7 +120,10 @@ def plan_tiling(
     tile_strategy: TileStrategyDispatch,
 ) -> None:
     graph_lookup = {graph_info.graph_id: graph_info for graph_info in graphs}
-    parent_ids = _collect_control_flow_parent_ids(graphs)
+    # DeviceIR imports the runtime while backend modules are initialized.
+    from ..device_ir import control_flow_parent_ids
+
+    parent_ids = control_flow_parent_ids(graphs)
     for graph_info in graphs:
         local_access_keys = _collect_local_access_keys_with_ancestors(
             graph_info, graph_lookup, parent_ids
@@ -284,34 +287,6 @@ def _collect_local_access_keys(graph: torch.fx.Graph) -> set[str | int]:
             if isinstance(tensor, torch.Tensor):
                 local_access_keys.add(tensor_origin_key(tensor))
     return local_access_keys
-
-
-def control_flow_child_graph_ids(node: torch.fx.Node) -> tuple[object, ...]:
-    """The graph ids ``node`` traces into, or ``()`` if it is not control flow."""
-    from ...language import _tracing_ops
-
-    if _tracing_ops.is_for_loop_target(node.target):
-        # args[0] is the loop body graph_id for both for-loop variants.
-        return node.args[:1]
-    if node.target is _tracing_ops._if:
-        # args[1] and args[2] are if_graph_id and else_graph_id; args[0] is the test.
-        return node.args[1:3]
-    if node.target is _tracing_ops._while_loop:
-        # args[0] and args[1] are cond_graph_id and body_graph_id.
-        return node.args[:2]
-    return ()
-
-
-def _collect_control_flow_parent_ids(graphs: list[GraphInfo]) -> dict[int, int]:
-    parent_ids: dict[int, int] = {}
-    for graph_info in graphs:
-        for node in graph_info.graph.nodes:
-            if node.op != "call_function":
-                continue
-            for child_id in control_flow_child_graph_ids(node):
-                if isinstance(child_id, int):
-                    parent_ids.setdefault(child_id, graph_info.graph_id)
-    return parent_ids
 
 
 def _collect_local_access_keys_with_ancestors(

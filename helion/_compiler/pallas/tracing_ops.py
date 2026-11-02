@@ -1048,7 +1048,7 @@ def _descendant_memory_accesses(
     visited once, depth-first; the order does not matter because every access is
     collected.
     """
-    from .plan_tiling import control_flow_child_graph_ids
+    from ..device_ir import control_flow_child_graph_ids
 
     accesses: LoopAccesses = []
     seen: set[int] = set()
