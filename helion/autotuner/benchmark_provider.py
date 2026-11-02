@@ -3140,7 +3140,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         # still unsafe, so remove it from contention.
                         timings.append(IsolatedBenchmarkFailure("error"))
                         continue
-                    self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
+                    # A finalist re-timed here was measured before, so its
+                    # failure is the worker's, and worth seeing.
+                    self.log.warning(
+                        f"{self._isolated_failure_subject(fn, desc)}: "
+                        f"{type(e).__name__}: {e}"
+                    )
                     timing = None
                 # A wrapper-load failure disables the worker because later
                 # candidates may depend on the same unavailable source module.
