@@ -219,6 +219,8 @@ def _execute_reducer(source, partial_values, output_dtype, bias_storage=None):
                 thread_idx=lambda: (np.arange(128, dtype=np.int32), 0, 0),
                 block_idx=lambda: (state["block"], 0, 0),
                 shuffle_sync_bfly=lambda value, offset: value[np.arange(128) ^ offset],
+                # The reducer is a programmatic dependent of the producer.
+                griddepcontrol_wait=lambda: None,
             ),
         ),
     }

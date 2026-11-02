@@ -2258,6 +2258,7 @@ class CuteBackend(Backend):
                 "cute_split_k_workspace",
                 "cute_split_k_stages",
                 "cute_split_k_partitions",
+                "cute_split_k_atomic_epilogue",
                 "cute_split_k_schedule",
                 "cute_split_k_finalizer_warps",
             )

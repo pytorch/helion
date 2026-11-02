@@ -61,6 +61,7 @@ __all__ = [
     "MAX_FILL_NUMEL",
     "lower_host_zero_fill_launches",
     "static_numel",
+    "zero_fill_kernel_launch",
     "zero_fill_launch_tensors",
     "zero_fill_launches_apply",
 ]
@@ -111,7 +112,7 @@ def _admitted_fill(
     fill the fill kernel can take: a contiguous strided tensor on the
     kernel's device of a dtype the kernel spells, of fewer than
     ``MAX_FILL_NUMEL`` elements when its element count is static (a dynamic
-    count is checked on the host at launch)."""
+    count is checked on the host at launch, ``zero_fill_kernel_launch``)."""
     found = _zero_factory(statement)
     if found is None:
         return None
@@ -184,6 +185,47 @@ def _fill_kernel_source(name: str, dtype: torch.dtype) -> str:
     )
 
 
+def zero_fill_kernel_launch(
+    name: str,
+    dtype: torch.dtype,
+    target: str,
+    *,
+    num_sm: int | None,
+    numel: int | None,
+    launcher: str = "_launcher",
+) -> tuple[list[ast.stmt], ast.stmt]:
+    """The module statements defining the fill kernel ``name`` for a
+    contiguous ``dtype`` tensor (a programmatic dependent: it waits, releases
+    its own dependents and stores) and the host statement launching it over
+    ``target`` (a tensor expression) through ``launcher``.
+
+    ``numel`` is the tensor's static element count, or None when the host
+    sizes it at runtime.  The kernel counts in Int32, so a count the codegen
+    cannot bound below ``MAX_FILL_NUMEL`` launches behind a host check that
+    falls back to the memset (``zero_()``) past the bound; a static count at
+    or past it is the caller's to decline (``_admitted_fill``) and gets the
+    checked form as well.
+    """
+    module = ast.parse(_fill_kernel_source(name, dtype)).body
+    module.append(statement_from_string(f"{name}._helion_cute_use_pdl = True"))
+    max_ctas = _CTAS_PER_SM * max(1, num_sm or 1)
+    per_cta = _THREADS * (_PACKET_BYTES // dtype.itemsize)
+    call = (
+        f"{launcher}({name}, (max(1, min(({target}.numel() + "
+        f"{per_cta - 1}) // {per_cta}, {max_ctas})),), {target}.view(-1), "
+        f"block=({_THREADS}, 1, 1))"
+    )
+    if numel is not None and numel < MAX_FILL_NUMEL:
+        return module, statement_from_string(call)
+    (launch,) = ast.parse(
+        f"if {target}.numel() < {MAX_FILL_NUMEL}:\n"
+        f"    {call}\n"
+        "else:\n"
+        f"    {target}.zero_()\n"
+    ).body
+    return module, launch
+
+
 def lower_host_zero_fill_launches(
     host: HostFunction,
     body: list[ast.AST],
@@ -221,7 +263,6 @@ def lower_host_zero_fill_launches(
     if not admitted:
         return body, []
     num_sm = env.config_spec.num_sm
-    max_ctas = _CTAS_PER_SM * (max(1, num_sm))
     result: list[ast.AST] = []
     module: list[ast.AST] = []
     index = 0
@@ -240,30 +281,16 @@ def lower_host_zero_fill_launches(
         assert isinstance(call, ast.Call)
         fill_name = f"{ZERO_FILL_KERNEL_PREFIX}{index}_{kernel_name.lstrip('_')}"
         index += 1
-        module.extend(ast.parse(_fill_kernel_source(fill_name, dtype)).body)
-        module.append(statement_from_string(f"{fill_name}._helion_cute_use_pdl = True"))
-        per_cta = _THREADS * (_PACKET_BYTES // dtype.itemsize)
-        launch = (
-            f"{launcher}({fill_name}, (max(1, min(({target}.numel() + "
-            f"{per_cta - 1}) // {per_cta}, {max_ctas})),), {target}.view(-1), "
-            f"block=({_THREADS}, 1, 1))"
+        definitions, launch = zero_fill_kernel_launch(
+            fill_name, dtype, target, num_sm=num_sm, numel=numel, launcher=launcher
         )
-        if numel is None or numel >= MAX_FILL_NUMEL:
-            # The kernel counts in Int32: a count the codegen cannot bound
-            # below MAX_FILL_NUMEL launches behind a host check that falls
-            # back to the memset past the bound.
-            launch = (
-                f"if {target}.numel() < {MAX_FILL_NUMEL}:\n"
-                f"    {launch}\n"
-                "else:\n"
-                f"    {target}.zero_()\n"
-            )
+        module.extend(definitions)
         result.extend(
             (
                 statement_from_string(
                     f"{target} = {_factory_call_source(call, _EMPTY_FACTORY[factory])}"
                 ),
-                ast.parse(launch).body[0],
+                launch,
             )
         )
     return result, module

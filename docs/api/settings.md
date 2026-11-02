@@ -141,6 +141,16 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    use native packed ``f16x2`` / ``bf16x2`` reductions (the scalar half atomic
    is a compare-and-swap loop on sm_100, so a lane-loop fallback is slow).
 
+   With the promotion off, a split-K kernel's rounding depends on the config
+   the autotuner picks: the atomic routes (the collective vector epilogue,
+   and the split-K workspace schedule's reducer-free epilogue,
+   ``cute_split_k_atomic_epilogue``) round each K partition's fp32 partial to
+   float16 as it is added, while the workspace schedule's reducer form sums
+   the fp32 partials and rounds once; two configs of the same kernel can thus
+   differ by a few float16 ulps on large-K outputs. ``True`` restores
+   config-independent fp32 accumulation (every route accumulates the fp32
+   twin and casts once) at the cost of the extra cast kernel.
+
 .. autoattribute:: Settings.cute_exact_division
 
    CuTe only. When ``True`` (the default) an fp32 division by a scalar that is
