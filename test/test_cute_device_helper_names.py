@@ -10,9 +10,6 @@ sweep cannot see those names, so this module checks, without a GPU:
 * every ``<alias>.<name>`` an emitter can render -- each composed placeholder
   expanded over the values its selector table / assignments admit -- resolves
   to an attribute of the runtime module behind that alias;
-* a module defining a ``@cute.struct`` carries no ``from __future__ import
-  annotations`` (it stringifies the struct field types; see the header of
-  ``_flash_runtime.py``), and the ``device`` package imports with CUDA hidden;
 * every ``FlashAttentionConfig`` field is read (``cfg.`` / ``config.`` /
   ``self.``) by some module;
 * every ``device/ptx.py`` row, through every runtime module re-exporting it,
@@ -33,7 +30,6 @@ from typing import TYPE_CHECKING
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
     from collections.abc import Iterator
     from collections.abc import Sequence
 
@@ -45,7 +41,6 @@ from cutlass._mlir.dialects import func
 
 import helion._compiler.cute as cute_package
 from helion._compiler.cute.cute_flash import FlashAttentionConfig
-from helion._testing.cute_codegen import mock_cuda_unavailable
 
 CUTE_ROOT = Path(cute_package.__file__).parent
 CUTE_PACKAGE = cute_package.__name__
@@ -603,46 +598,6 @@ def test_every_rendered_helper_name_resolves() -> None:
     assert not failures, "\n".join(failures)
     missing = [pin for pin in COMPOSED_NAME_PINS if pin not in resolved]
     assert not missing, f"composed names no longer seen by the sweep: {missing}"
-
-
-def _struct_modules() -> Iterable[tuple[Path, bool]]:
-    for path in sorted(CUTE_ROOT.rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
-        tree = ast.parse(path.read_text(), filename=str(path))
-        has_struct = any(
-            isinstance(decorator, ast.Attribute)
-            and decorator.attr == "struct"
-            and isinstance(decorator.value, ast.Name)
-            and decorator.value.id == "cute"
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ClassDef)
-            for decorator in node.decorator_list
-        )
-        future_annotations = any(
-            isinstance(node, ast.ImportFrom)
-            and node.module == "__future__"
-            and any(alias.name == "annotations" for alias in node.names)
-            for node in tree.body
-        )
-        if has_struct:
-            yield path, future_annotations
-
-
-def test_struct_modules_have_no_future_annotations() -> None:
-    modules = list(_struct_modules())
-    assert modules, "no @cute.struct module found"
-    offenders = [str(path) for path, future in modules if future]
-    assert not offenders, offenders
-
-
-def test_device_package_imports_without_cuda() -> None:
-    with mock_cuda_unavailable():
-        package = importlib.import_module(f"{CUTE_PACKAGE}.device")
-        root = Path(package.__file__).parent  # type: ignore[arg-type]
-        for path in sorted(root.glob("*.py")):
-            if path.name != "__init__.py":
-                importlib.import_module(f"{CUTE_PACKAGE}.device.{path.stem}")
 
 
 # The ``device/ptx.py`` rows each runtime module re-exports (every row is

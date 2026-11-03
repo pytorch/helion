@@ -117,7 +117,7 @@ class TestCuteReshapeStoreReread(TestCase):
         with self.assertRaisesRegex(
             helion.exc.BackendUnsupported, "moves elements between threads"
         ):
-            merge_store_dyn.bind((x,)).to_triton_code(config)
+            merge_store_dyn.bind((x,)).to_code(config)
 
     def test_specialized_dynamic_merge_store_is_reused_exactly(self) -> None:
         config = helion.Config(
@@ -129,9 +129,9 @@ class TestCuteReshapeStoreReread(TestCase):
         )
         x = torch.randn(48, 4, 16, device=DEVICE)
         bound = merge_store_specialized_dyn.bind((x,))
-        code = bound.to_triton_code(config)
+        code = bound.to_code(config)
         compiled = bound.compile_config(config)
-        self.assertEqual(bound.to_triton_code(config), code)
+        self.assertEqual(bound.to_code(config), code)
         torch.testing.assert_close(compiled(x), x.reshape(48, -1), rtol=0, atol=0)
         # Another (non power of two, partial last tile) row count reuses the
         # kernel and stays exact.

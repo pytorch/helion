@@ -24,6 +24,9 @@ import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
 
+# Backend-independent (runs under every HELION_BACKEND, like a non-cute test);
+# the conftest gate over test_cute_* files leaves it alone.
+
 cpu_only = test_cute_philox_policy.cpu_only
 
 SEEDS = (
@@ -336,7 +339,7 @@ def test_original_emission_scalar_packet_normalizer_and_semantic_cache(cpu_only)
         cute_rng_stream="philox4",
     )._bind_isolated(args)
     for width in (1, 4, 8):
-        source = bound.to_triton_code(_config(width, True))
+        source = bound.to_code(_config(width, True))
         assert "cutlass.Int64(seed)" in source
         assert "_cute_stage_explicit_seed" not in source
         assert ("philox_packet_" in source) == (width in (4, 8))
@@ -345,13 +348,13 @@ def test_original_emission_scalar_packet_normalizer_and_semantic_cache(cpu_only)
             for node in ast.walk(ast.parse(source))
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
         ]
-    scalar = bound.to_triton_code(_config(4, False))
+    scalar = bound.to_code(_config(4, False))
     assert "philox_packet_" not in scalar
     original = helion.kernel(
         low_mem_dropout.fn, backend="cute", static_shapes=False, cute_rng_stream="word0"
     )._bind_isolated(args)
     with pytest.raises(helion.exc.InvalidConfig):
-        original.to_triton_code(_config(4, True))
+        original.to_code(_config(4, True))
     assert bound.settings.to_dict()["cute_rng_stream"] == "philox4"
     assert original.settings.to_dict()["cute_rng_stream"] == "word0"
 
@@ -394,7 +397,7 @@ def test_explicit_tensor_seed_offsets_reference_and_scalar_fallback(cpu_only):
         static_shapes=False,
         cute_rng_stream="philox4",
     )._bind_isolated((seed, offsets))
-    source = bound.to_triton_code(_config(4, True))
+    source = bound.to_code(_config(4, True))
     assert "philox_packet_" not in source
     assert "cutlass.Int64(seed" not in source
     assert "cute_rng_stream='philox4'" in bound.format_kernel_decorator(
@@ -473,7 +476,7 @@ def test_multiple_distinct_rng_sites_keep_their_own_seed_and_offset(cpu_only):
     bound = helion.kernel(
         _multiple_random, backend="cute", static_shapes=False, cute_rng_stream="philox4"
     )._bind_isolated((values, -1, 2**32 + 123))
-    source = bound.to_triton_code(_config(4, True))
+    source = bound.to_code(_config(4, True))
     assert "cutlass.Int64(first)" in source
     assert "cutlass.Int64(second)" in source
     assert "philox_packet_" not in source
@@ -531,7 +534,7 @@ def test_device_derived_seed_keeps_scalar_new_stream(cpu_only):
     bound = helion.kernel(
         _grid_seed, backend="cute", static_shapes=False, cute_rng_stream="philox4"
     )._bind_isolated(args)
-    source = bound.to_triton_code(_config(4, True))
+    source = bound.to_code(_config(4, True))
     assert "_cute_stage_explicit_seed" not in source
     assert "philox_packet_" not in source
     assert "shr.s64 counter" in source

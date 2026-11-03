@@ -2,7 +2,9 @@
 
 Every module here is imported by generated code (or by the runtime modules
 generated code imports) and traced inline, so it follows the device-module
-rules ``test/test_cute_device_helper_names.py`` checks:
+rules ``test/test_cute_device_helper_names.py`` (the exported-name and
+cache-key rules) and ``test/test_cute_device_modules.py`` (the CPU import
+and struct-annotation rules) check:
 
 * importable without CUDA -- it depends on ``cutlass`` only, never on the
   compiler, the launcher or torch;

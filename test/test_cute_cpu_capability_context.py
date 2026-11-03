@@ -24,6 +24,9 @@ pytestmark = pytest.mark.cpu_only
 
 pytest.importorskip("triton")
 
+# Backend-independent (runs under every HELION_BACKEND, like a non-cute test);
+# the conftest gate over test_cute_* files leaves it alone.
+
 
 def _cached_capabilities():
     return (

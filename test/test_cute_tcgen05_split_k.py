@@ -15,6 +15,8 @@ import unittest
 
 import torch
 
+from test._cute_kernels import _gemm
+
 import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
@@ -22,19 +24,6 @@ from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 import helion.language as hl
-
-
-@helion.kernel(static_shapes=True)
-def _gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    m, k = a.size()
-    _, n = b.size()
-    out = torch.empty([m, n], dtype=a.dtype, device=a.device)
-    for tile_m, tile_n in hl.tile([m, n]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
-        out[tile_m, tile_n] = acc.to(out.dtype)
-    return out
 
 
 @helion.kernel(static_shapes=True)

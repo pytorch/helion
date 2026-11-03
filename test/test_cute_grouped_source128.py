@@ -17,14 +17,6 @@ from test.test_autotuner_heuristics import _grouped_worklist_kernel_body
 from test.test_cute_grouped_fp32_output import _grouped_fp32_output
 
 import helion
-
-# Imported before any test patches ``cutedsl_compat._installed_cute_dsl_version``:
-# the runtime computes ``SPLIT_BARRIER_INIT_SUPPORTED`` once, at import, from the
-# installed DSL version, and a worker whose first import of it happened inside
-# this module's "newer DSL" patch would keep the DSL-constructor prologue for
-# every later tcgen05 render it dumps (the clustered-kernel barrier-init
-# variant pair seen between sweeps).
-import helion._compiler.cute._tcgen05_prologue_runtime  # noqa: F401
 from helion._compiler.cute.autotune.heuristics import cute as heuristics
 from helion._compiler.cute.autotune.heuristics.cute import (
     CuteTcgen05GroupedWorklistHeuristic,
