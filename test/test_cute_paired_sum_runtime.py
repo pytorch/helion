@@ -10,8 +10,6 @@ import torch
 from torch.overrides import TorchFunctionMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from helion._testing.cute_codegen import mock_cuda_unavailable
-
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
@@ -23,11 +21,10 @@ from helion.runtime.cute.paired_sum import plan_for_pair
 from helion.runtime.cute.paired_sum import sum_plan
 from helion.runtime.cute.paired_sum import try_paired_sum_cast
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [pytest.mark.cpu_only, pytest.mark.cpu_render]
+
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from test._cute_paired_sum_model import Value
 
 
@@ -35,15 +32,6 @@ _requires_pinned_aten_build = pytest.mark.skipif(
     torch.version.git_version != paired_sum._ATEN_SUM_GIT,
     reason="host sum ATen reuse requires the pinned PyTorch build",
 )
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
 
 
 @pytest.mark.parametrize("layout", ("mapped", "narrow"))

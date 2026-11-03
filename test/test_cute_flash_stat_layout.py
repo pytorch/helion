@@ -14,8 +14,7 @@ import torch
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.attention_plan import dense_score_plan
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing import cpu_render_target
 
 pytestmark = pytest.mark.cpu_only
 
@@ -34,9 +33,7 @@ def _cpu_only() -> Iterator[None]:
     initialized = torch.cuda.is_initialized()
     with (
         patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}, clear=True),
-        mock_cuda_unavailable(),
-        forbid_native_compile(),
-        patch.object(torch.cuda, "_lazy_init", side_effect=AssertionError("CPU-only")),
+        cpu_render_target(),
         ir.Context(),
         ir.Location.unknown(),
     ):

@@ -96,7 +96,6 @@
  "test/test_cute_chunk_recurrence.py": 32.2,
  "test/test_cute_chunk_unbind.py": 6.8,
  "test/test_cute_cluster_fma_pair.py": 0.1,
- "test/test_cute_cluster_fma_pair_cuda.py": 5.0,
  "test/test_cute_cluster_online_pair.py": 17.3,
  "test/test_cute_cluster_outer_aliases.py": 0.2,
  "test/test_cute_cluster_tail_native.py": 6.5,

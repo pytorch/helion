@@ -2,13 +2,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 from typing import cast
-from unittest.mock import patch
 
 import numpy as np
 import pytest
 import torch
-
-from helion._testing.cute_codegen import mock_cuda_unavailable
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
@@ -21,21 +18,11 @@ from helion.runtime.cute.paired_sum import plan_for_pair
 from helion.runtime.cute.paired_sum import sum_plan
 from helion.runtime.cute.paired_sum import try_paired_sum_cast
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [pytest.mark.cpu_only, pytest.mark.cpu_render]
+
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from test._cute_paired_sum_model import Value
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
 
 
 @pytest.mark.parametrize("layout", ("mapped", "narrow"))

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from test.test_cute_cluster_online_pair import softmax_two_pass_kernel
+from test._cute_kernels import softmax_two_pass_kernel
 from test.test_cute_persistent_reduction import _persistent_shifted_direct_update
 from test.test_cute_persistent_reduction import _persistent_state_update
 

@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 import pytest
-import torch
 
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandDescriptorPlan
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandTransformKind
@@ -17,8 +16,10 @@ from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandTransf
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandType
 from helion._compiler.cute.tcgen05_operand_transform import prove_operand_stage_span
 from helion._testing import skipUnlessCuteAvailable
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.runtime.cute.launcher import _cute_disk_cache_key
+
+# The SDK swizzle checks compile through the CuTe DSL on the host.
+pytestmark = pytest.mark.cpu_render(forbid_native=False)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -27,17 +28,6 @@ cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
 ir = pytest.importorskip("cutlass._mlir.ir")
 sm100 = pytest.importorskip("cutlass.utils.blackwell_helpers")
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    with mock_cuda_unavailable():
-
-        def forbidden(*args: object, **kwargs: object) -> None:
-            raise AssertionError("GPU forbidden in the operand plan proof")
-
-        monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
-        yield
 
 
 @pytest.fixture
