@@ -4056,12 +4056,18 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
     CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
     # Fires arch-agnostically (is_eligible keys only on the pointwise fact), but
     # its byte/register constants were hill-climbed and validated on H100 (sm90).
-    # Promote to the autotune-off default ONLY on the arches the correctness hunt
-    # has cleared — sm90 (H100) and sm100 (B200) — so a non-validated arch keeps
-    # the conservative base default while still getting the seed as a search
-    # candidate. The seed keeps firing everywhere; only PROMOTION is gated.
+    # Promote to the autotune-off default ONLY on the arches below, so an
+    # unchecked arch keeps the conservative base default while still getting
+    # the seed as a search candidate. The seed keeps firing everywhere; only
+    # PROMOTION is gated.
+    # - sm90 (H100) and sm100 (B200): cleared by the correctness hunt (#3053).
+    # - sm120: every sm120 part (RTX 50-series, RTX PRO Blackwell), not one
+    #   product. Checked on an RTX 5080 only, with the Triton test lane and
+    #   targeted pointwise checks with autotuning off. sm120 is not in
+    #   TUNED_TARGETS, so the seed uses the sm90 constants and sizes its grid
+    #   from the device SM count.
     promote_seed_to_default = True
-    PROMOTE_TARGETS = (("cuda", "sm90"), ("cuda", "sm100"))
+    PROMOTE_TARGETS = (("cuda", "sm90"), ("cuda", "sm100"), ("cuda", "sm120"))
 
     # Arches whose pointwise constants have been measured. An allow-list, not a
     # ``>= sm100`` compare: an unmeasured arch (including a same-generation consumer

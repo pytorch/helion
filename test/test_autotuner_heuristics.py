@@ -390,6 +390,12 @@ A100_HARDWARE = HardwareInfo(
     runtime_version="12.8",
     compute_capability="sm80",
 )
+RTX5080_HARDWARE = HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA GeForce RTX 5080",
+    runtime_version="13.0",
+    compute_capability="sm120",
+)
 
 
 def _grouped_worklist_with_viewed_inputs(
@@ -4230,9 +4236,9 @@ class TestAutotunerHeuristic(TestCase):
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_pointwise_seed_promotes_only_on_target_arch(self) -> None:
         # The pointwise seed fires arch-agnostically but its PROMOTION to the
-        # autotune-off default is gated to PROMOTE_TARGETS (sm90/sm100). On a
-        # target arch the promoted seed replaces the base default; off-target it
-        # is still offered as a search candidate but the base default is kept.
+        # autotune-off default is gated to PROMOTE_TARGETS. On a target arch the
+        # promoted seed replaces the base default; off-target it is still
+        # offered as a search candidate but the base default is kept.
         def make_add() -> object:
             @helion.kernel(backend="triton")
             def triton_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -4246,15 +4252,15 @@ class TestAutotunerHeuristic(TestCase):
         x = torch.empty([1024, 1024], device=DEVICE, dtype=torch.float32)
         y = torch.empty([1024, 1024], device=DEVICE, dtype=torch.float32)
 
-        self.assertIn(("cuda", "sm90"), TritonPointwiseSeedHeuristic.PROMOTE_TARGETS)
-        self.assertIn(("cuda", "sm100"), TritonPointwiseSeedHeuristic.PROMOTE_TARGETS)
-
         # A fresh kernel object per arch: bind() caches by args, so reusing one
         # kernel would return the first arch's config on the second bind.
         for name, hardware, promotes in (
             ("sm90", HOPPER_HARDWARE, True),
             ("sm100", BLACKWELL_HARDWARE, True),
+            ("sm120", RTX5080_HARDWARE, True),
+            ("sm103", GB300_HARDWARE, False),
             ("sm80", A100_HARDWARE, False),
+            ("gfx950", MI350_HARDWARE, False),
         ):
             with (
                 self.subTest(arch=name),
@@ -4268,8 +4274,16 @@ class TestAutotunerHeuristic(TestCase):
                 seed = spec.compiler_seed_configs[0]
                 if promotes:
                     self.assertEqual(spec.compiler_default_config, seed)
+                    self.assertEqual(
+                        spec.default_config().config["block_sizes"],
+                        seed.config["block_sizes"],
+                    )
                 else:
                     self.assertIsNone(spec.compiler_default_config)
+                    self.assertNotEqual(
+                        spec.default_config().config["block_sizes"],
+                        seed.config["block_sizes"],
+                    )
 
 
 # Matmul and pointwise facts come from backend-independent device IR analysis:
@@ -5967,6 +5981,7 @@ class TestTritonReductionHeuristicUnit(TestCase):
                 ),
                 TritonNarrowReductionHeuristic,
             ),
+            (RTX5080_HARDWARE, TritonNarrowReductionHeuristic),
         ]
         tracks = [
             TritonReductionHeuristic,
@@ -5988,6 +6003,12 @@ class TestTritonReductionHeuristicUnit(TestCase):
                 self.assertIsNotNone(seed)
                 self.assertEqual(len(seed.config["block_sizes"]), 1)
                 self.assertGreaterEqual(seed.config["block_sizes"][0], 1)
+                # Only the tuned track becomes the autotune-off default. The
+                # narrow fallback is never promoted, on any arch.
+                self.assertIs(
+                    expected.should_promote(env),
+                    expected is TritonReductionHeuristic,
+                )
 
 
 _FP8_SKINNY_M_SEED_BLOCK_SIZES = [1, 256]
