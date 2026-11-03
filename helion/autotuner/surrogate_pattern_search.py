@@ -33,9 +33,6 @@ CUTE_FLASH_LANE_POLICY_VERSION = 17
 # the effective (normalized) CuTe-flash search space (0.4 s for 1024 at the
 # d256 pair cell); larger spaces stay sampled.
 FLASH_EXACT_SPACE_RAW_FLOOR = 1024
-# The names the tests import.
-_CUTE_FLASH_LANE_POLICY_VERSION = CUTE_FLASH_LANE_POLICY_VERSION
-_FLASH_EXACT_SPACE_RAW_FLOOR = FLASH_EXACT_SPACE_RAW_FLOOR
 _FLASH_TERMINAL_REFINEMENT_SCHEMA_VERSION = 2
 _FLASH_TERMINAL_REFINEMENT_POLICY_VERSION = 2
 _FLASH_TERMINAL_COORDINATE_POLICY = "same_leaf_full_surface_normalized_coordinate_v2"

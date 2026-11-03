@@ -39,6 +39,7 @@ from ..pdl_release import SPREAD_KEEP_HELPER
 from ..pdl_release import SPREAD_PAD_NAME
 from ..pdl_release import resident_ctas_per_sm
 from ..pdl_release import spread_pad_bytes
+from ..state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -731,7 +732,9 @@ def pdl_applies(fn: DeviceFunction) -> bool:
         from ..pdl_coverage import waits_cover_global_reads
 
         return not waits_cover_global_reads([*fn.preamble, *fn.body])
-    if any(plan.get("use_pdl") for plan in fn.codegen.cute_wrapper_plans):
+    if any(
+        plan.get("use_pdl") for plan in cute_codegen_state(fn.codegen).wrapper_plans
+    ):
         return False
     return not any(
         isinstance(node, ast.Call)

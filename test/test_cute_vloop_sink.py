@@ -51,6 +51,7 @@ from helion._compiler.cute import sink_vector_loops
 from helion._compiler.cute.autotune.heuristics.cute import CuteColumnReductionHeuristic
 from helion._compiler.cute.lane_loops import root_passes
 from helion._compiler.cute.sink_vector_loops import VloopSinkNotApplied
+from helion._compiler.cute.state import cute_env_state
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -720,7 +721,7 @@ def test_fission_stages_regenerate_the_knob_off_code_when_nothing_sinks(
             cute_full_slice_matmul_tiling=False,
         )
         bound = kernel._bind_isolated((torch.empty(64, 256, dtype=torch.bfloat16),))
-        assert bound.env.cute_fission_plan is not None
+        assert cute_env_state(bound.env).fission_plan is not None
         spec = bound.config_spec
         base = spec.default_config().config
 

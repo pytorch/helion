@@ -28,7 +28,6 @@ from helion._compiler.cute.philox_stream import PACKET_ASM
 from helion._compiler.cute.philox_stream import SCALAR_ASM
 from helion._compiler.cute.philox_stream import SCALAR_CONSTRAINTS
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 
 pytestmark = pytest.mark.cpu_only
 
@@ -205,7 +204,6 @@ def test_packet_tuple_grant_does_not_allow_other_reads_or_calls(extra):
     "geometry", ((1024, 128, 4), (512, 128, 4), (1024, 256, 4), (1024, 128, 8))
 )
 @pytest.mark.usefixtures("cpu_only")
-@skipUnlessBackends(["cute"])
 def test_original_dynamic_cpu_emission_composes_packet_and_vector_io(geometry):
     low_mem_dropout = import_example("low_mem_dropout").low_mem_dropout
 

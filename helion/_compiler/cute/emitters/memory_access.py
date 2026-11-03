@@ -36,6 +36,7 @@ from ..access_regions import access_address
 from ..access_regions import block_size_symbol
 from ..access_regions import tile_begin_symbol
 from ..cache_policy_loads import CachePolicy
+from ..state import cute_codegen_state
 from ..tile_ops import cute_masked_block_end
 
 if TYPE_CHECKING:
@@ -328,13 +329,18 @@ def _cute_tile_begin_var_or_lifted(
 
 
 def _cute_unique_graph_block_id(state: CodegenState) -> int | None:
+    # ``device_ir`` imports this package's emitters while it initializes, so
+    # the graph-info class is imported here, not at module level.
+    from ...device_ir import ForLoopGraphInfo
+
     fx_node = state.fx_node
     if fx_node is None:
         return None
     graph_block_ids = [
         graph_info.block_ids
         for graph_info in state.codegen.codegen_graphs
-        if graph_info.graph is fx_node.graph and hasattr(graph_info, "block_ids")
+        if graph_info.graph is fx_node.graph
+        and isinstance(graph_info, ForLoopGraphInfo)
     ]
     if len(graph_block_ids) != 1 or len(graph_block_ids[0]) != 1:
         return None
@@ -1524,11 +1530,12 @@ def _cute_synthetic_arange_lane_bound(
         return None
     cg = state.codegen
     # A free arange maps onto a synthetic thread axis either directly
-    # (``cute_synthetic_arange_axes`` key -> axis, coord ``thread_idx()[axis]``)
+    # (``synthetic_arange_axes`` key -> axis, coord ``thread_idx()[axis]``)
     # or, when it overflows the thread budget, onto a lane loop whose coordinate
-    # is cached in ``cute_synthetic_arange_lane_exprs``.
-    axes = getattr(cg, "cute_synthetic_arange_axes", None) or {}
-    lane_exprs = getattr(cg, "cute_synthetic_arange_lane_exprs", None) or {}
+    # is cached in ``synthetic_arange_lane_exprs``.
+    codegen_state = cute_codegen_state(cg)
+    axes = codegen_state.synthetic_arange_axes
+    lane_exprs = codegen_state.synthetic_arange_lane_exprs
     if not axes and not lane_exprs:
         return None
     fx_node = getattr(state, "fx_node", None)

@@ -15,6 +15,8 @@ import itertools
 from typing import TYPE_CHECKING
 
 from ..ast_read_writes import ReadWrites
+from ._ast_pass_utils import flatten_addition
+from ._ast_pass_utils import same_expr as _same
 from .scalar_recipe import _clone
 from .scalar_recipe import _read_names
 from .scalar_recipe import build_recipe
@@ -61,10 +63,6 @@ class GatheredMmaRegion:
     # re-issuing the load ahead of the pipeline's CTA-wide sync, which would
     # stall on it.
     scalar_aliases: Mapping[str, str] = field(default_factory=dict)
-
-
-def _same(left: ast.AST, right: ast.AST) -> bool:
-    return ast.dump(left) == ast.dump(right)
 
 
 def _expr(source: str) -> ast.expr:
@@ -158,14 +156,6 @@ def _pointer_indices(
     tensors: Mapping[str, GatherTensorFacts],
 ) -> tuple[str, tuple[ast.expr, ...]] | None:
     """Match the compiler's explicit per-dimension pointer arithmetic."""
-    terms: list[ast.expr] = []
-
-    def flatten(value: ast.expr) -> None:
-        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
-            flatten(value.left)
-            flatten(value.right)
-        else:
-            terms.append(value)
 
     def uncast(value: ast.expr) -> ast.expr:
         while (
@@ -177,7 +167,7 @@ def _pointer_indices(
             value = value.args[0]
         return value
 
-    flatten(pointer)
+    terms = flatten_addition(pointer)
     bases = [
         value
         for value in terms

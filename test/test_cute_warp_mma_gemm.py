@@ -31,6 +31,7 @@ from test.test_cute_tcgen05_fixed_cost import _row_bias_gemm
 
 import helion
 from helion._compiler.cute import cute_warp_mma_gemm as family
+from helion._compiler.cute.state import cute_env_state
 from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_config import surface
 from helion._testing import DEVICE
@@ -888,7 +889,7 @@ def test_cast_operand_kernel_stays_fused_and_converts_in_registers() -> None:
     with bound.env:
         spec = bound.config_spec
         state = spec._cute_tcgen05_config
-        assert bound.env.cute_fission_plan is None
+        assert cute_env_state(bound.env).fission_plan is None
         assert len(bound.host_function.device_ir.graphs) == 2
         assert state.warp_mma_admitted and not state.tcgen05_family_admitted
         search = surface.optional_fragments(state, for_search=True)[FAMILY].choices
@@ -986,7 +987,7 @@ def test_fissioned_kernel_region_renders_the_family() -> None:
     )
     with bound.env:
         spec = bound.config_spec
-        assert bound.env.cute_fission_plan is not None
+        assert cute_env_state(bound.env).fission_plan is not None
         assert len(bound.host_function.device_ir.graphs) == 3
         assert spec._cute_tcgen05_config.warp_mma_admitted
         assert spec._cute_tcgen05_config.tcgen05_family_admitted

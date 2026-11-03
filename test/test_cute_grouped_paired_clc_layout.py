@@ -13,7 +13,6 @@ import torch
 
 from helion._compiler.cute.grouped_row_union import PAIRED_CLC
 from helion._compiler.cute.grouped_row_union import GroupedRowUnionPlan
-from helion._testing import skipUnlessBackends
 
 pytestmark = pytest.mark.cpu_only
 
@@ -126,7 +125,6 @@ def _partition(
     return partition, planned
 
 
-@skipUnlessBackends(["cute"])
 def test_paired_ab_stage_payload() -> None:
     with _sdk() as sdk:
         c, cute = sdk.cutlass, sdk.cute
@@ -154,7 +152,6 @@ def test_paired_ab_stage_payload() -> None:
         assert str(explicit_b) == str(layouts[1])
 
 
-@skipUnlessBackends(["cute"])
 def test_all_fallback_coordinates_and_membership_projection() -> None:
     emitted = ast.parse(
         _plan().masked_copy(
@@ -215,7 +212,6 @@ def test_all_fallback_coordinates_and_membership_projection() -> None:
         assert len(cells) == 256 * 192 and set(cells.values()) == {1}
 
 
-@skipUnlessBackends(["cute"])
 def test_emitted_scalar_membership_view_roundtrip() -> None:
     with _sdk() as sdk:
         c, cute, ir = sdk.cutlass, sdk.cute, sdk.ir
@@ -311,7 +307,6 @@ def test_emitted_scalar_membership_view_roundtrip() -> None:
         ]
 
 
-@skipUnlessBackends(["cute"])
 def test_two_tma_issuers_and_original_tail_packets() -> None:
     with _sdk() as sdk:
         cute = sdk.cute

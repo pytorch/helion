@@ -21,7 +21,6 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
@@ -94,7 +93,6 @@ def _run(
     return code, x, weight, out, inv
 
 
-@skipUnlessBackends(["cute"])
 @skipIfNotCUDA()
 @pytest.mark.parametrize(
     "width,threads,vec",
@@ -113,7 +111,6 @@ def test_whole_warp_thread_request_matches_the_full_row_reference(
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("policy", ["l2_last", "l1_l2_first", "l1_l2_last"])
 @pytest.mark.parametrize(
     "dtype,threads,vec,suffix",
@@ -161,7 +158,6 @@ def _row_sumsq_per_arange_row(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@skipUnlessBackends(["cute"])
 def test_free_arange_rows_reduce_in_separate_groups() -> None:
     # A multi-warp row reduce beside a free arange(4) launches as
     # block=(128, 4, 1); the four arange rows must not share one group's
@@ -199,7 +195,6 @@ def test_free_arange_rows_reduce_in_separate_groups() -> None:
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-4)
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("threads,vec", [(128, 8), (256, 4), (512, 2)])
 def test_launch_sized_reduction_matches_the_reference(threads: int, vec: int) -> None:
     # One group spanning the CTA: the serial fold at 4 and 8 warps, the

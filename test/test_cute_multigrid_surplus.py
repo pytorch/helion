@@ -14,10 +14,7 @@ from .test_cute_grid_launch_extents import _single_thread_axis
 import helion
 from helion import exc
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
 import helion.language as hl
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

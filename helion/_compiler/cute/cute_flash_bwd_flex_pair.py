@@ -66,6 +66,7 @@ from .cute_flash_bwd_flex import flex_bwd_pair_table_steps
 from .cute_flash_bwd_flex import flex_bwd_wrapper_plan
 from .flash_score_mod import render_flex_hook
 from .flex_bwd_match import flex_bwd_tmem_plan
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -1609,10 +1610,11 @@ def codegen_flex_bwd_pair(
         total_tiles=batch * kv_heads * plan.num_kv_tiles,
         family="flex_pair",
     )
-    cg.cute_wrapper_plans.append(wrapper_plan)  # type: ignore[attr-defined]
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(wrapper_plan)
     df.wrapper_only_params.extend(_FLASH_BWD_FLEX_PAIR_KERNEL_PARAMS)
     df.placeholder_args.update(a.name for a in args.values())
-    cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+    codegen_state.declare_matmul()
     df.cute_state.flash.threads = 512
     df.cute_state.tcgen05.cluster_shape = (2, 1, 1)
     df.cute_state.lanes.launch_grid_multiplier = grid_multiplier

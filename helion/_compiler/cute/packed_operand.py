@@ -41,6 +41,7 @@ from .signed_bitfield import _binary
 from .signed_bitfield import _cast_input
 from .signed_bitfield import _dtype
 from .signed_bitfield import match_signed_byte_field
+from .state import cute_env_state
 
 if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
@@ -230,7 +231,7 @@ def _aligned(
 def prove_packed_operand(
     env: CompileEnvironment, host: HostFunction, *, binding: bool = False
 ) -> PackedOperandPlan | None:
-    fission = env.cute_fission_plan
+    fission = cute_env_state(env).fission_plan
     ir = host.device_ir
     if (
         env.backend_name != "cute"

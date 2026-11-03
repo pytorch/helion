@@ -119,10 +119,6 @@ class BackendDispatchTable(dict[str, _CodegenT]):
             raise exc.BackendImplementationMissing(backend_name, what) from None
 
 
-# The ``APIFunc._codegen`` registries' former name.
-CodegenDict = BackendDispatchTable
-
-
 class APIFunc(Protocol):
     """Protocol for Helion API functions that define operations within kernel code.
 

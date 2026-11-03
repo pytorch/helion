@@ -18,6 +18,7 @@ from test.test_cute_materialized_fission import _sources
 
 import helion
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
+from helion._compiler.cute.state import cute_env_state
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
@@ -113,7 +114,7 @@ def _materialized_bound(dtype: torch.dtype) -> BoundKernel:
             torch.empty((512, 512), dtype=torch.int8),
         )
     )
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     return bound
 
 

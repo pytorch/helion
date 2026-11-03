@@ -17,7 +17,6 @@ and runs the bodies).
 
 from __future__ import annotations
 
-import contextlib
 import math
 from typing import TYPE_CHECKING
 from typing import Any
@@ -38,7 +37,7 @@ from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
 from helion._testing import skipUnlessBackends
-from helion._testing.cute_aux import cpu_codegen
+from helion._testing.cute_aux import as_sm100
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -46,8 +45,6 @@ import helion.language as hl
 from helion.runtime.kernel import Kernel
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from helion.runtime.kernel import BoundKernel
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
@@ -358,25 +355,8 @@ def bmm_attention_post_dot_scale(
 # ---------------------------------------------------------------------------
 # Helpers.
 # ---------------------------------------------------------------------------
-@contextlib.contextmanager
-def _as_sm100() -> Iterator[None]:
-    """CPU codegen with the flash gate forced on (as the flex matcher tests)."""
-    with (
-        cpu_codegen(),
-        patch(
-            "helion._compiler.cute.analysis.attention_match._attention_flash_supported",
-            return_value=True,
-        ),
-        patch(
-            "helion._compiler.cute.analysis.attention_match._attention_flash_gate_enabled",
-            return_value=True,
-        ),
-    ):
-        yield
-
-
 def _bind(kernel: Kernel, args: tuple[Any, ...]) -> BoundKernel:
-    with _as_sm100():
+    with as_sm100():
         return kernel._bind_isolated(args)
 
 
@@ -418,7 +398,7 @@ def _pattern(bound: BoundKernel) -> _attention_match.AttentionSoftmaxPattern | N
 
 def _surface(bound: BoundKernel) -> _attention_match.FlashSearchSurface | None:
     device_ir = bound.host_function.device_ir
-    with _as_sm100(), bound.env, bound.host_function:
+    with as_sm100(), bound.env, bound.host_function:
         return _attention_match.detect_flash_search_surface(device_ir)
 
 

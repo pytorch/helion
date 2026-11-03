@@ -15,5 +15,5 @@ rules ``test/test_cute_device_helper_names.py`` checks:
   rename is a render change, a body edit is picked up through the module's
   path in ``helion.runtime.cute.source_dependencies``.
 
-Role: device helper (section 8 of ``../README.md``).
+Role: device helper (``../README.md``, "Device helpers and byte-pinned paths").
 """

@@ -24,7 +24,6 @@ import helion.language as hl
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
-
 pytestmark = skipUnlessBackends(["cute"])
 
 

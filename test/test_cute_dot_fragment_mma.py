@@ -17,7 +17,6 @@ import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
 pytestmark = skipUnlessBackends(["cute"])
 
 

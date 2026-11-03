@@ -298,7 +298,7 @@ FLASH_ROLE_MAP_CHOICES: tuple[str, ...] = ("helion", "fa4")
 # Autotune surface for the flash-attention config.
 #
 # Mirrors the ``Tcgen05WarpSpec`` pattern in ``strategies.py`` /
-# ``tcgen05_config.py``. Independent arithmetic fields retain individual keys;
+# ``tcgen05_config/``. Independent arithmetic fields retain individual keys;
 # structural scheduling is represented by one compound pipeline-family key.
 # ``FLASH_CONFIG_KEYS`` aggregates the active and legacy inputs, and
 # ``flash_config_from_config`` reconstructs the effective dataclass.

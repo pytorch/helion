@@ -10,6 +10,7 @@ from test.test_cute_collective_effects import _lower
 import helion
 from helion import exc
 from helion._compiler.cute.collective_matmul import _region_write_roots
+from helion._compiler.cute.state import cute_env_state
 from helion._testing import import_example
 from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_codegen import mock_cuda_unavailable
@@ -372,7 +373,7 @@ def test_split_k_vector_epilogue_packs_the_atomic_add(
         code = bound.to_code(_vector_epilogue_config())
     # Only float16 outputs are promoted; a bfloat16 output always keeps its dtype.
     promoted = promote and dtype is torch.float16
-    assert bound.env.cute_half_atomic_output_promotions == (
+    assert cute_env_state(bound.env).half_atomic_output_promotions == (
         {"out": torch.float16} if promoted else {}
     )
     assert code.count(_red_helper(dtype, promoted)) == 1

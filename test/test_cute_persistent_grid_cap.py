@@ -17,8 +17,6 @@ import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-
-
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 

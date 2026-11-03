@@ -20,7 +20,6 @@ from test.test_autotuner_heuristics import _grouped_worklist_args
 from test.test_autotuner_heuristics import _grouped_worklist_bind_patches
 
 import helion
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 
@@ -75,7 +74,6 @@ _worklist_matmul = helion.kernel(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(("source_m_tile", "b_major"), [(32, "k"), (256, "n")])
-@skipUnlessBackends(["cute"])
 def test_promoted_grouped_worklist_seed_runs_exactly(
     source_m_tile: int, b_major: str
 ) -> None:
@@ -110,7 +108,6 @@ def test_promoted_grouped_worklist_seed_runs_exactly(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@skipUnlessBackends(["cute"])
 def test_side_store_of_rewritten_worklist_scaffolding_is_refused() -> None:
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family")

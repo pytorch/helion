@@ -8,7 +8,6 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -17,8 +16,6 @@ _examples_nvfp4_gemv = import_example("nvfp4_gemv")
 _nvfp4_gemv_fp4in_body = _examples_nvfp4_gemv._nvfp4_gemv_fp4in_body
 make_fp8_scales = _examples_nvfp4_gemv.make_fp8_scales
 reference_nvfp4_gemv_fp4in = _examples_nvfp4_gemv.reference_nvfp4_gemv_fp4in
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 def _gemv_args(rows: int, kbytes: int) -> tuple[tuple[object, ...], torch.Tensor]:
@@ -92,7 +89,7 @@ def test_packed_tiles_share_a_cta(pack: int) -> None:
         config=_config(16, 16, pack),
     )
     bound = kernel.bind(args)
-    source = bound.to_triton_code(_config(16, 16, pack))
+    source = bound.to_code(_config(16, 16, pack))
     assert (
         f"pid_0 = cutlass.Int32(cute.arch.block_idx()[0]) * {pack}"
         " + cutlass.Int32(cute.arch.thread_idx()[0])"
@@ -114,7 +111,7 @@ def test_unpacked_config_is_unchanged() -> None:
         static_shapes=True,
         config=_config(16, 16, 1),
     )
-    source = kernel.bind(args).to_triton_code(_config(16, 16, 1))
+    source = kernel.bind(args).to_code(_config(16, 16, 1))
     assert "pid_0 = cutlass.Int32(cute.arch.block_idx()[0])\n" in source
     assert re.search(rf"_launcher\(.*\({rows},\).*block=\(16, 1, 1\)", source)
     kernel(*args)
@@ -135,7 +132,7 @@ def test_warp_wide_tiles_pack_one_warp_per_row(pack: int) -> None:
         config=_config(32, 32, pack),
     )
     bound = kernel.bind(args)
-    source = bound.to_triton_code(_config(32, 32, pack))
+    source = bound.to_code(_config(32, 32, pack))
     assert (
         f"pid_0 = cutlass.Int32(cute.arch.block_idx()[0]) * {pack}"
         " + cutlass.Int32(cute.arch.thread_idx()[1])"

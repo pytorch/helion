@@ -2221,7 +2221,7 @@ class CuteBackend(Backend):
         rewritten = rewrite_online_to_3pass(hf)
         from ..compile_environment import CompileEnvironment
 
-        plan = CompileEnvironment.current().cute_fission_plan
+        plan = cute_env_state(CompileEnvironment.current()).fission_plan
         if plan is not None:
             from .materialized_fission import apply_materialized_fission
 
@@ -2336,9 +2336,7 @@ class CuteBackend(Backend):
                 direct_affine_candidates
             )
             if not CompileEnvironment.current().settings.fast_math:
-                raise exc.BackendUnsupported(
-                    "cute", "direct affine scan requires fast_math=True"
-                )
+                raise self.unsupported("direct affine scan requires fast_math=True")
             root_graphs = tuple(
                 graph for graph in graphs if isinstance(graph, RootGraphInfo)
             )
@@ -2347,8 +2345,7 @@ class CuteBackend(Backend):
                 or len(root_graphs) != 1
                 or direct_affine_candidates[0].graph_id != root_graphs[0].graph_id
             ):
-                raise exc.BackendUnsupported(
-                    "cute",
+                raise self.unsupported(
                     "direct affine scan requires one compatible single-root region",
                 )
             annotate_view_subtiles(graphs, config)
@@ -2491,9 +2488,7 @@ class CuteBackend(Backend):
         from ..compile_environment import CompileEnvironment
 
         if CompileEnvironment.current().settings.cute_rng_stream == "philox4":
-            raise exc.BackendUnsupported(
-                "cute", "philox4 supports explicit uniform hl.rand only"
-            )
+            raise self.unsupported("philox4 supports explicit uniform hl.rand only")
 
     def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
         # Imported here: the heuristics pull the config spec and most of the
@@ -3975,8 +3970,7 @@ class CuteBackend(Backend):
                     else None
                 )
                 if launched != sized_for:
-                    raise exc.BackendUnsupported(
-                        "cute",
+                    raise self.unsupported(
                         f"shared reductions were sized for block={sized_for} "
                         f"but the kernel launches with {block_arg}",
                     )
@@ -4004,14 +3998,11 @@ class CuteBackend(Backend):
                     device_function.cute_state.root_plans.chunk_recurrence_plan
                 )
                 if recurrence_plan is None or type(recurrence_register_cap) is not int:
-                    raise exc.BackendUnsupported(
-                        "cute", "invalid matched recurrence register cap"
-                    )
+                    raise self.unsupported("invalid matched recurrence register cap")
                 if not _cute_chunk_recurrence_config_is_safe(
                     recurrence_plan.dv_partitions, recurrence_register_cap
                 ):
-                    raise exc.BackendUnsupported(
-                        "cute",
+                    raise self.unsupported(
                         "register caps are unsafe for the TMEM DV2 recurrence "
                         "schedule's dynamic register allocation",
                     )
@@ -4047,8 +4038,7 @@ class CuteBackend(Backend):
                     )
                     != "tcgen05"
                 ):
-                    raise exc.BackendUnsupported(
-                        "cute",
+                    raise self.unsupported(
                         f"{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY}=True requires "
                         "tcgen05 CuTe lowering",
                     )
@@ -4318,7 +4308,9 @@ class CuteBackend(Backend):
                 mma=kernel_has_mma,
                 tcgen05=tcgen05,
                 reduction=reduction_strategies,
-                synthetic_axes=bool(codegen.cute_synthetic_arange_axis_sizes),
+                synthetic_axes=bool(
+                    cute_codegen_state(codegen).synthetic_arange_axis_sizes
+                ),
                 symbolic_axes=bool(symbolic_axes),
                 pointwise_fact=bool(
                     CompileEnvironment.current().config_spec.pointwise_facts
@@ -4418,7 +4410,7 @@ class CuteBackend(Backend):
             # Synthetic free-``hl.arange`` thread axes are real launch lanes that
             # the strategy's ``static_dims`` does not know about, so do not fall
             # back to ``static_dims`` (which would drop them) when they are live.
-            and not codegen.cute_synthetic_arange_axis_sizes
+            and not cute_codegen_state(codegen).synthetic_arange_axis_sizes
             # Nor when it is narrower than the root tile's live threads: the
             # final launch guard below would refuse it.
             and launch_drops_root_threads(static_dims, root_read_axes) is None
@@ -4431,7 +4423,7 @@ class CuteBackend(Backend):
             # has no entry for synthetic free-``hl.arange`` axes, so adopting it
             # wholesale would shrink those axes back to 1. Skip it when they are
             # live (the synthetic extents are already folded into ``dims``).
-            and not codegen.cute_synthetic_arange_axis_sizes
+            and not cute_codegen_state(codegen).synthetic_arange_axis_sizes
         ):
             if all(expr.isdigit() for expr in dim_exprs):
                 expr_dims = tuple(int(expr) for expr in dim_exprs)
@@ -4472,7 +4464,9 @@ class CuteBackend(Backend):
                 CompileEnvironment.current().config_spec.pointwise_facts
             ),
             has_nested_device_loops=has_nested_device_loops,
-            has_synthetic_free_axes=bool(codegen.cute_synthetic_arange_axis_sizes),
+            has_synthetic_free_axes=bool(
+                cute_codegen_state(codegen).synthetic_arange_axis_sizes
+            ),
         )
         if pointwise_dims is not None:
             # Register broadcasts can create reduction strategies without an
@@ -4488,8 +4482,7 @@ class CuteBackend(Backend):
             required > actual
             for required, actual in zip(exact_grid_thread_dims, dims, strict=True)
         ):
-            raise exc.BackendUnsupported(
-                "cute",
+            raise self.unsupported(
                 "grid thread extents cannot fit the launch thread budget",
             )
         # Detect the silent-truncation case: codegen has already emitted

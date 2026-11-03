@@ -951,7 +951,6 @@ class _FakeCuteReductionCodegen(GenerateAST):
         }
         self.current_grid_state = None
         self.max_thread_block_dims = [3, 16, 1]
-        self.cute_synthetic_arange_axis_sizes: dict[int, int] = {}
         self.statements: list[object] = []
 
     def add_statement(self, stmt: object) -> None:

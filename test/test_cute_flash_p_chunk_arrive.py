@@ -21,6 +21,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test._cute_kernels import _attention_with_lse
+
 import helion
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute.attention_plan import dense_score_plan
@@ -30,9 +32,7 @@ from helion._compiler.cute.flash_schedule import FlashSyncScope
 from helion._compiler.cute.flash_schedule import build_fa4_schedule
 from helion._compiler.cute.flash_schedule import verify_flash_schedule
 from helion._testing import DEVICE
-from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
-import helion.language as hl
 
 if TYPE_CHECKING:
     from helion._compiler.device_function import DeviceFunction
@@ -89,49 +89,6 @@ _WINNER_2CTA: dict[str, object] = {
     "cute_flash_other_regs": 64,
     "cute_flash_corr_tile_size": 16,
 }
-
-
-@helion.kernel(backend="cute", static_shapes=True)
-def _attention_with_lse(
-    q_in: torch.Tensor,
-    k_in: torch.Tensor,
-    v_in: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    m_dim = q_in.size(-2)
-    n_dim = k_in.size(-2)
-    head_dim = hl.specialize(q_in.size(-1))
-    q_view = q_in.reshape([-1, m_dim, head_dim])
-    v_view = v_in.reshape([-1, n_dim, head_dim])
-    k_view = k_in.reshape([-1, n_dim, head_dim])
-    out = torch.empty_like(q_view)
-    lse = torch.empty(
-        [q_view.size(0), m_dim, 1], device=q_in.device, dtype=torch.float32
-    )
-    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
-    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
-        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
-        l_i = torch.full_like(m_i, 1.0)
-        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
-        q = q_view[tile_b, tile_m, :]
-        for tile_n in hl.tile(v_view.size(1)):
-            q_scaled = q * qk_scale
-            k = k_view[tile_b, tile_n, :]
-            qk = torch.bmm(q_scaled, k.transpose(1, 2), torch.float32)
-            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
-            qk = qk - m_ij[:, :, None]
-            p = torch.exp2(qk)
-            l_ij = torch.sum(p, -1)
-            alpha = torch.exp2(m_i - m_ij)
-            l_i = l_i * alpha + l_ij
-            acc = acc * alpha[:, :, None]
-            v = v_view[tile_b, tile_n, :]
-            p = p.to(v.dtype)
-            acc = torch.baddbmm(acc, p, v)
-            m_i = m_ij
-        acc = acc / l_i[:, :, None]
-        lse[tile_b, tile_m, :] = (m_i + torch.log2(l_i))[:, :, None]
-        out[tile_b, tile_m, :] = acc.to(out.dtype)
-    return out.view(q_in.size()), lse.reshape(q_in.size()[:-1])
 
 
 def _fragments(
@@ -400,7 +357,6 @@ def _reference(
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     ("base", "persistent", "shape", "dtype"),
     (

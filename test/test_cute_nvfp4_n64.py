@@ -12,7 +12,6 @@ import helion
 from helion._compiler.cute.block_scaled_config import normalize_block_scaled_config
 from helion._testing import DEVICE
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 
 _examples_nvfp4_gemm = import_example("nvfp4_gemm")
 _nvfp4_w4a4_matmul_kernel = _examples_nvfp4_gemm._nvfp4_w4a4_matmul_kernel
@@ -21,8 +20,6 @@ pack_fp4_last_dim = _examples_nvfp4_gemm.pack_fp4_last_dim
 quantize_fp4_e2m1 = _examples_nvfp4_gemm.quantize_fp4_e2m1
 reference_nvfp4_w4a4_matmul = _examples_nvfp4_gemm.reference_nvfp4_w4a4_matmul
 swizzle_fp8_scales = _examples_nvfp4_gemm.swizzle_fp8_scales
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 def test_n64_is_an_nvfp4_tile_choice() -> None:
@@ -81,7 +78,7 @@ def test_cuda_n64_observes_both_weight_scale_halves(
         out,
         1.0,
     )
-    assert _wrapper_plan(kernel.bind(args).to_triton_code(config))["bn"] == 64
+    assert _wrapper_plan(kernel.bind(args).to_code(config))["bn"] == 64
     kernel(*args)
     torch.cuda.synchronize()
     torch.testing.assert_close(out.float(), expected.float(), rtol=2e-2, atol=2e-2)

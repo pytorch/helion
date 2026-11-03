@@ -50,6 +50,7 @@ from .direct_affine_replay_core import _clone_ast
 from .direct_affine_replay_core import _dump
 from .direct_affine_replay_core import resolve_direct_affine_coordinates
 from .direct_affine_replay_core import resolve_direct_affine_replay
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -434,7 +435,10 @@ def _source_cta_shape(
     grid: DeviceGridState,
 ) -> tuple[int, int, int] | None:
     sizes = [1, 1, 1]
-    for mapping in (grid.thread_axis_sizes, codegen.cute_synthetic_arange_axis_sizes):
+    for mapping in (
+        grid.thread_axis_sizes,
+        cute_codegen_state(codegen).synthetic_arange_axis_sizes,
+    ):
         for axis, extent in mapping.items():
             if (
                 not isinstance(axis, int)

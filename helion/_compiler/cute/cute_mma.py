@@ -127,6 +127,8 @@ from .simt_gemm import simt_mma_requested
 from .simt_gemm import simt_owned_loop_declined
 from .split_k_exchange import render_split_k_exchange
 from .split_k_exchange import render_split_k_prologue
+from .state import cute_codegen_state
+from .state import cute_env_state
 from .strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
 from .strategies import Tcgen05LayoutStrategy
@@ -705,7 +707,7 @@ class _Tcgen05AuxPipelinePlan:
     ``CuteTcgen05MatmulPlan.aux_tensor_descriptors`` exposes them.
     The producer body indexes by position; the consumer side
     looks up by ``load_node`` identity (see
-    ``memory_ops._codegen_cute_store_tcgen05_tile``'s
+    ``store_epilogue._codegen_cute_store_tcgen05_tile``'s
     ``aux_ring_index_by_step``) so multi-step chains within one
     store map cleanly onto the descriptor order.
 
@@ -1205,7 +1207,7 @@ def _tcgen05_tma_tensor_is_aligned(
     from .memory_ops import tensor_has_specialized_tma_alignment
     from .promote_output_axis import _fresh_tensors
 
-    if tensor in env.cute_proven_tma_inputs:
+    if tensor in cute_env_state(env).proven_tma_inputs:
         return True
     if env.tensor_input_source(tensor) is not None:
         return tensor_has_specialized_tma_alignment(env, tensor)
@@ -8187,7 +8189,7 @@ def plan_tcgen05_pipeline(
     # silently miscompiles those paths.  Mirror the flag set in
     # ``_emit_cute_matmul`` so the host-side launcher disables the bake.
     if analysis is None:
-        cg.cute_uses_matmul = True
+        cute_codegen_state(cg).declare_matmul()
     lhs_operand = lhs_info
     rhs_operand = rhs_info
     lhs_m_size = lhs_operand.matrix_rows
@@ -8977,7 +8979,7 @@ def plan_tcgen05_pipeline(
     # Non-tcgen05 paths inspect runtime layouts. tcgen05 wrapper schemas are
     # specialized by shape and stride, so they can keep tensor layouts baked.
     if analysis is not None and mma_impl != "tcgen05":
-        cg.cute_uses_matmul = True
+        cute_codegen_state(cg).declare_matmul()
     tcgen05_requested_flat_role_coordinates = knobs.flat_role_coordinates
     if tcgen05_requested_flat_role_coordinates and mma_impl != "tcgen05":
         return refused(
@@ -9347,7 +9349,7 @@ def plan_tcgen05_pipeline(
         and not knobs.materialized_pdl
         # A materialized-fission bundle's stages carry their own protocol
         # (``tcgen05_materialized_pdl``); the knob stays inert on them.
-        and CompileEnvironment.current().cute_fission_plan is None
+        and cute_env_state(CompileEnvironment.current()).fission_plan is None
     )
     # The two-CTA kernel releases after its MMAs through
     # ``Tcgen05LifecycleContext.is_two_cta``; the one-CTA flat kernel's
@@ -13878,7 +13880,7 @@ def _emit_mma_pipeline(
                         aux_tensor_name = df.tensor_arg(desc.host_tensor_val).name
                         df.placeholder_args.add(aux_tensor_name)
                         df.wrapper_only_params.extend([tma_atom, tma_tensor])
-                        cg.cute_wrapper_plans.append(
+                        cute_codegen_state(cg).wrapper_plans.append(
                             {
                                 "kind": "tcgen05_aux_tma",
                                 "c_name": aux_tensor_name,
@@ -13997,7 +13999,7 @@ def _emit_mma_pipeline(
                 aux_tensor_name = df.tensor_arg(desc.host_tensor_val).name
                 df.placeholder_args.add(aux_tensor_name)
                 df.wrapper_only_params.extend([tma_atom, tma_tensor])
-                cg.cute_wrapper_plans.append(
+                cute_codegen_state(cg).wrapper_plans.append(
                     {
                         "kind": "tcgen05_aux_tma",
                         "c_name": aux_tensor_name,
@@ -14534,7 +14536,7 @@ def _emit_mma_pipeline(
                             ),
                         }
                     }
-                cg.cute_wrapper_plans.append(
+                cute_codegen_state(cg).wrapper_plans.append(
                     _grouped_static_persistent_wrapper_plan(
                         plan,
                         grouped_plan=grouped_plan,
@@ -14545,7 +14547,7 @@ def _emit_mma_pipeline(
             df.wrapper_only_params.extend(
                 [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b]
             )
-            cg.cute_wrapper_plans.append(
+            cute_codegen_state(cg).wrapper_plans.append(
                 _ab_tma_wrapper_plan(
                     plan,
                     matmul_plan=tcgen05_matmul_plan,
@@ -16585,7 +16587,7 @@ def _emit_mma_pipeline(
                 for exchange_stmt in ast.parse(exchange_src).body:
                     suffix.append(exchange_stmt)
                     emitted.per_tile.append(exchange_stmt)
-                cg.cute_wrapper_plans.append(
+                cute_codegen_state(cg).wrapper_plans.append(
                     {
                         "kind": "helion_tcgen05_split_k",
                         "param": tcgen05_split_k_workspace,
@@ -17733,7 +17735,7 @@ def _tcgen05_aux_pipeline_stage_count_from_config(
 
     Bad values raise via the downstream
     ``_new_tcgen05_aux_pipeline_plan`` assert; the validator gate
-    (``_validate_int_enum_config`` in ``tcgen05_config.py``) is the
+    (``_validate_int_enum_config`` in ``tcgen05_config/repair.py``) is the
     single source of truth that rejects out-of-range values before
     they reach codegen, so any value seen here that fails the
     downstream assert is a programmer bug, not user input.
@@ -17756,7 +17758,7 @@ def _tcgen05_consumer_regs_from_config(config: object) -> int:
 
     Lower values force ``ptxas`` to cap the consumer-warp per-thread register
     count. The validator
-    (``_validate_int_enum_config`` in ``tcgen05_config.py``) is the
+    (``_validate_int_enum_config`` in ``tcgen05_config/repair.py``) is the
     single source of truth that rejects out-of-range values before
     they reach codegen; values seen here that are outside
     ``TCGEN05_CONSUMER_REGS_CHOICES`` are programmer bugs, not user

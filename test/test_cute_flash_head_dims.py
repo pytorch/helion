@@ -1781,7 +1781,7 @@ def test_cooperative_pair_cell_space_enumerates_under_the_qualification_floor() 
     exhausted (an unenumerated space left the lanes "incomplete" and aborted
     the autotune of the cell)."""
     from helion.autotuner.config_generation import ConfigGeneration
-    from helion.autotuner.surrogate_pattern_search import _FLASH_EXACT_SPACE_RAW_FLOOR
+    from helion.autotuner.surrogate_pattern_search import FLASH_EXACT_SPACE_RAW_FLOOR
 
     torch.manual_seed(0)
     q, k, v = (torch.randn(4, 8, 4096, 256, dtype=torch.bfloat16) for _ in range(3))
@@ -1791,12 +1791,12 @@ def test_cooperative_pair_cell_space_enumerates_under_the_qualification_floor() 
         gen = ConfigGeneration(bound.config_spec)
         assert gen.extension.flash_structural_coverage_uncovered_values() == []
         space = gen.extension.exact_effective_search_space_configs(
-            _FLASH_EXACT_SPACE_RAW_FLOOR
+            FLASH_EXACT_SPACE_RAW_FLOOR
         )
     assert space is not None
     families = {c.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] for c in space}
     assert families == {"ws_2cta", "ws_overlap"}
-    assert 30 <= len(space) <= _FLASH_EXACT_SPACE_RAW_FLOOR
+    assert 30 <= len(space) <= FLASH_EXACT_SPACE_RAW_FLOOR
 
 
 def test_mixed_pair_surface_pins_the_score_stage() -> None:
@@ -1977,7 +1977,7 @@ def test_d256_causal_pair_cell_identities_render_distinct_texts(chunk: str) -> N
     group's strategy names does not occur. Each case renders one chunk of
     the space (``_D256_PAIR_CELL_CHUNKS``) and checks the chunk's markers."""
     from helion.autotuner.config_generation import ConfigGeneration
-    from helion.autotuner.surrogate_pattern_search import _FLASH_EXACT_SPACE_RAW_FLOOR
+    from helion.autotuner.surrogate_pattern_search import FLASH_EXACT_SPACE_RAW_FLOOR
 
     arg_key = (4, 8, 4096, 256, torch.bfloat16)
     make_args = functools.partial(_dense_args, 4, 8, 4096, 256)
@@ -1985,7 +1985,7 @@ def test_d256_causal_pair_cell_identities_render_distinct_texts(chunk: str) -> N
     with cpu_codegen():
         gen = ConfigGeneration(bound.config_spec)
         space = gen.extension.exact_effective_search_space_configs(
-            _FLASH_EXACT_SPACE_RAW_FLOOR
+            FLASH_EXACT_SPACE_RAW_FLOOR
         )
         assert space is not None
         identities: dict[tuple[tuple[str, str], ...], helion.Config] = {}

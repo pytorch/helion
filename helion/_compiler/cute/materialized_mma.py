@@ -12,6 +12,7 @@ from ..active_blocks import active_block_ids
 from . import target_facts
 from .materialized_fission_codegen import _region_graph_ids
 from .pipeline_smem import Tcgen05PipelineSmemFacts
+from .state import cute_env_state
 from .tcgen05_config import surface
 
 if TYPE_CHECKING:
@@ -314,7 +315,7 @@ def enable_materialized_mma_search(
     Single-matrix projection rules stay disabled: no one region's shape may
     silently determine another region's cluster or shared-memory layout.
     """
-    fission = env.cute_fission_plan
+    fission = cute_env_state(env).fission_plan
     if (
         fission is None
         or len(candidates) != fission.region_count
@@ -391,7 +392,7 @@ def enable_phase_mma_search(
     host = device_ir.host_function
     spec = env.config_spec
     if (
-        env.cute_fission_plan is not None
+        cute_env_state(env).fission_plan is not None
         or host is None
         or not env.has_barrier
         or len(device_ir.root_ids) < 2
@@ -533,7 +534,7 @@ def register_plain_barrier_phases(env: CompileEnvironment, device_ir: DeviceIR) 
     host = device_ir.host_function
     spec = env.config_spec
     if (
-        env.cute_fission_plan is not None
+        cute_env_state(env).fission_plan is not None
         or host is None
         or not env.has_barrier
         or len(device_ir.root_ids) < 2

@@ -93,6 +93,7 @@ from .flash_score_mod import flex_aux_smem_candidates
 from .flash_score_mod import flex_aux_smem_layout
 from .flash_score_mod import render_flex_hook
 from .flex_bwd_match import flex_bwd_tmem_plan
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -2658,7 +2659,8 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
         wrapper_plan["flex_batch"] = batch
         wrapper_plan["flex_heads"] = heads
         wrapper_plan["flex_kv_heads"] = kv_heads
-    cg.cute_wrapper_plans.append(wrapper_plan)  # type: ignore[attr-defined]
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(wrapper_plan)
     df.wrapper_only_params.extend(_FLASH_BWD_KERNEL_PARAMS)
     if plan.head_dim_v != _fbwd_padded(plan.head_dim_v):
         df.wrapper_only_params.append("_fbwd_ts_mma_x")
@@ -2671,7 +2673,7 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
     if smem.aug_stages:
         df.wrapper_only_params.extend(_FLASH_BWD_FLEX_AUG_PARAMS)
     df.placeholder_args.update(a.name for a in args.values())
-    cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+    codegen_state.declare_matmul()
     df.cute_state.flash.threads = 512
     # The table / aux bindings are CTA-wide names: emit them before the warp
     # roles (the compute blocks re-bind nothing).

@@ -18,9 +18,7 @@ import helion.language as hl
 helion_mamba2_chunk_scan_kernel = import_example(
     "mamba2_chunk_scan"
 ).helion_mamba2_chunk_scan_kernel
-
 pytestmark = skipUnlessBackends(["cute"])
-
 CUDA_DEVICE = "cuda"
 
 

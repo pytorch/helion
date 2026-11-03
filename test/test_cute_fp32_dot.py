@@ -6,20 +6,17 @@ tests check the numerics of whole, partial and accumulated tiles.
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 
 import helion
 from helion import exc
 from helion._testing import DEVICE
+from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 
@@ -89,12 +86,7 @@ def _chunk_cumsum_ieee(g: torch.Tensor) -> torch.Tensor:
 
 @pytest.fixture
 def _cpu_only():
-    with (
-        mock_cuda_unavailable(),
-        _target(),
-        forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
 
 

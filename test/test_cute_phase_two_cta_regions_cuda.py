@@ -23,22 +23,18 @@ from test._cute_se_bwd_chains import se_bwd_da_chain
 from test._cute_se_bwd_chains import se_bwd_dx_chain
 
 import helion
+from helion._compiler.cute.state import cute_env_state
 from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_config import surface
 from helion._testing import DEVICE
 from helion._testing import import_example
+from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotCUDA
 import helion.language as hl
 
 squeeze_and_excitation_net_bwd_dc = import_example(
     "squeeze_and_excitation_net"
 ).squeeze_and_excitation_net_bwd_dc
-
-
-def _requires_sm100() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("requires SM100-family")
 
 
 def _inputs(
@@ -100,6 +96,8 @@ def _chain_config(
     return result
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 @pytest.mark.parametrize("pdl", [False, True], ids=["serial", "pdl"])
 @pytest.mark.parametrize(
     "region_pid_types",
@@ -115,6 +113,8 @@ def test_bwd_dx_two_cta_region_launches(region_pid_types: list[str], pdl: bool) 
     _check_bwd_dx(region_pid_types, pdl, {})
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 def test_bwd_dx_inherit_launch_keeps_the_flat_recipe() -> None:
     """The campaign's flat winner recipe (a scheduler warp, a one-slot
     accumulator ring) stays on the ``inherit`` launch while grad_c runs the
@@ -133,7 +133,6 @@ def test_bwd_dx_inherit_launch_keeps_the_flat_recipe() -> None:
 def _check_bwd_dx(
     region_pid_types: list[str], pdl: bool, recipe: dict[str, object]
 ) -> None:
-    _requires_sm100()
     t = _inputs()
     args = (t["grad_out"], t["x"], t["a"], t["b"], t["c"], t["d"])
     grad_x_ref, _grad_a_ref = _reference(t)
@@ -174,9 +173,10 @@ def _check_bwd_dx(
     torch.testing.assert_close(two_cta_out, flat_out, atol=0, rtol=0)
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 @pytest.mark.parametrize("pdl", [False, True], ids=["serial", "pdl"])
 def test_bwd_da_two_cta_region_launches(pdl: bool) -> None:
-    _requires_sm100()
     t = _inputs()
     args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
     _grad_x_ref, grad_a_ref = _reference(t)
@@ -206,12 +206,13 @@ def test_bwd_da_two_cta_region_launches(pdl: bool) -> None:
     torch.testing.assert_close(two_cta_out, flat_out, atol=0, rtol=0)
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 @pytest.mark.parametrize("pdl", [False, True], ids=["serial", "pdl"])
 def test_bwd_dc_one_gemm_chain_region_launches(pdl: bool) -> None:
     """One GEMM phase beside a pointwise phase is planned per phase: grad_c
     runs as a CtaGroup.TWO persistent launch while grad_cb renders 16-byte
     packets, and the flat launch's ring reaches the depth its tile fits."""
-    _requires_sm100()
     t = _inputs()
     args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
     grad_cb = (t["grad_out"].float() * t["x"].float() * t["d"].float()) * (
@@ -299,6 +300,8 @@ def test_bwd_dc_one_gemm_chain_region_launches(pdl: bool) -> None:
     torch.testing.assert_close(two_cta_out, flat_out, atol=0, rtol=0)
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 def test_bwd_dx_flat_ring_bound_at_bk128() -> None:
     """At bm=128/bk=128 a flat launch's 16-bit ring stops at the standalone
     surface's admission (4 stages of 128x32x128, a 160 KiB ring), as the
@@ -306,7 +309,6 @@ def test_bwd_dx_flat_ring_bound_at_bk128() -> None:
     depth is bitwise equal to the shallow ring.  The deeper rings the bare
     one-CTA capacity would hold (ab5, 200 KiB) changed grad_x's rounding in
     about 0.1 % of its elements and are refused."""
-    _requires_sm100()
     t = _inputs((1024, 512, 256))
     args = (t["grad_out"], t["x"], t["a"], t["b"], t["c"], t["d"])
     grad_x_ref, _grad_a_ref = _reference(t)
@@ -360,10 +362,11 @@ def test_bwd_dx_flat_ring_bound_at_bk128() -> None:
     torch.testing.assert_close(mixed_out, flat_out, atol=0, rtol=0)
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 def test_chain_seeds_compile_and_match() -> None:
     """The heuristic's two-CTA chain seeds (``region_two_cta_seed_configs``)
     strict-normalize, compile and match the flat default bitwise."""
-    _requires_sm100()
     t = _inputs()
     args = (t["grad_out"], t["x"], t["a"], t["b"], t["c"], t["d"])
     kernel = helion.kernel(
@@ -428,12 +431,13 @@ def _chain_with_vector_phase(
     return grad_x, w
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 def test_chain_with_a_vector_phase_binds_clustered_rasters_by_block_ids() -> None:
     """Behind a 1-D phase the clustered GEMM launches' ``loop_orders`` entries
     are found by block ids: a swapped GEMM raster is refused and repaired to
     the default, the pointwise phase keeps its own order, and the chain runs
     bitwise-equal to the flat chain."""
-    _requires_sm100()
     t = _inputs()
     v = torch.randn(
         777, generator=torch.Generator().manual_seed(9), dtype=torch.float16
@@ -497,12 +501,13 @@ def _masked_gemm(
     return grad_c
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 @pytest.mark.parametrize("placement", ["post_acc_wait", "pre_acc_wait"])
 def test_standalone_masked_gemm_paired_pipeline(placement: str) -> None:
     """A single 16-bit GEMM with an exact-shape auxiliary epilogue now owns
     the complete allocation proof: the paired two-CTA pipeline renders and
     matches the one-CTA flat schedule bitwise."""
-    _requires_sm100()
     t = _inputs()
     grad_cb = (t["grad_out"].float() * t["x"].float()).to(torch.float16)
     args = (grad_cb, t["b"], t["c"])
@@ -558,12 +563,13 @@ def _plain_fission_pair(
     return middle, out
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 def test_plain_fission_plan_two_cta_schedule() -> None:
     """A fission plan of plain single-output GEMMs (no shared fanout) is
     budgeted per region from its complete facts: the static persistent
     two-CTA schedule is admitted, each region renders the CtaGroup.TWO
     cluster pipeline, and the plan matches the flat plan bitwise."""
-    _requires_sm100()
     generator = torch.Generator().manual_seed(3)
     rows, inner, mid, cols = 1024, 512, 512, 1024
     left = torch.randn((rows, inner), generator=generator, dtype=torch.float16)
@@ -573,7 +579,7 @@ def test_plain_fission_plan_two_cta_schedule() -> None:
     bound = _plain_fission_pair._bind_isolated(args)
     spec = bound.config_spec
     state = spec._cute_tcgen05_config
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     assert len(state.materialized_matmul_block_ids) == 2
     default = dict(spec.default_config().config)
     blocks = list(cast("list[int]", default["block_sizes"]))
@@ -634,9 +640,10 @@ _AUX_MECHANISMS: dict[str, dict[str, object]] = {
 }
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 @pytest.mark.parametrize("mechanism", sorted(_AUX_MECHANISMS))
 def test_bwd_dc_pair_launch_aux_mechanisms_match_bitwise(mechanism: str) -> None:
-    _requires_sm100()
     t = _inputs()
     args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
     grad_cb = (t["grad_out"].float() * t["x"].float() * t["d"].float()) * (
@@ -682,6 +689,8 @@ def test_bwd_dc_pair_launch_aux_mechanisms_match_bitwise(mechanism: str) -> None
     torch.testing.assert_close(staged_out, plain_out, atol=0, rtol=0)
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 @pytest.mark.parametrize("mechanism", sorted(_AUX_MECHANISMS))
 def test_bwd_dc_pair_launch_aux_mechanisms_wrap_rings_across_tiles(
     mechanism: str,
@@ -689,7 +698,6 @@ def test_bwd_dc_pair_launch_aux_mechanisms_wrap_rings_across_tiles(
     """The same mechanisms under persistent reuse: more pair tiles than CTA
     pairs on the device, at the chain seeds' deepest bk=64 region ring, so
     every ring (AB, C, the aux ring) wraps its phase across tiles."""
-    _requires_sm100()
     t = _inputs((8192, 512, 512))
     args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
     grad_cb = (t["grad_out"].float() * t["x"].float() * t["d"].float()) * (
@@ -736,10 +744,11 @@ def test_bwd_dc_pair_launch_aux_mechanisms_wrap_rings_across_tiles(
     torch.testing.assert_close(staged_out, plain_out, atol=0, rtol=0)
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 def test_bwd_dc_128_row_pair_fragment_hoist_matches_bitwise() -> None:
     """The hoist on the chain's own 128x256 pair tile (a 64-row per-CTA
     fragment of the relu mask, 256 B per epilogue thread)."""
-    _requires_sm100()
     t = _inputs()
     args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
     kernel = helion.kernel(
@@ -775,11 +784,12 @@ def test_bwd_dc_128_row_pair_fragment_hoist_matches_bitwise() -> None:
     torch.testing.assert_close(hoisted_out, plain_out, atol=0, rtol=0)
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 def test_bwd_dc_flat_launch_epi_tma_matches_bitwise() -> None:
     """A GEMM launch left flat (the one-CTA pipeline) takes the
     epilogue-issued aux ring as well, priced by the one-CTA model; the
     register prefetch ring and the warp groups are refused there."""
-    _requires_sm100()
     t = _inputs()
     args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
     kernel = helion.kernel(

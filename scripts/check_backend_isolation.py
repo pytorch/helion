@@ -62,9 +62,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     "helion/_compiler/backend_registry.py": {
         "import": 1,
     },
-    "helion/_compiler/compile_environment.py": {
-        "type_import": 1,
-    },
     "helion/_compiler/device_function.py": {
         "type_import": 2,
     },

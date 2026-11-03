@@ -48,6 +48,7 @@ import torch
 from ... import exc
 from ..compile_environment import CompileEnvironment
 from ..emitter_protocols import statements_adapter
+from .state import cute_codegen_state
 from .tcgen05.knobs import non_bool_int_knob
 
 if TYPE_CHECKING:
@@ -1088,7 +1089,7 @@ def codegen_warp_mma_gemm(cg: GenerateAST) -> bool:
     )
     if pdl:
         plan["use_pdl"] = True
-    cg.cute_wrapper_plans.append(plan)
+    cute_codegen_state(cg).wrapper_plans.append(plan)
     df.body = emit_warp_mma_gemm_body(
         df,
         match,

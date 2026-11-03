@@ -60,8 +60,7 @@ _FLAT_GATHER_SINK_MAX_BYTES = 64
 
 # Dtype -> (cutlass scalar type name, max vector width) of the explicit
 # ``cute.arch.load(ptr, ir.VectorType.get([V], elem.mlir_type))`` packet
-# loads (the retired ``vec`` reduction mode folded them with a
-# ``_cute_pre_vec_fold`` helper that no longer exists).
+# loads.
 _CUTE_VECTOR_DTYPES: dict[torch.dtype, tuple[str, int]] = {
     torch.float32: ("cutlass.Float32", _CUTE_VECTOR_MAX_BYTES // 4),
     torch.float16: ("cutlass.Float16", _CUTE_VECTOR_MAX_BYTES // 2),
@@ -71,9 +70,8 @@ _CUTE_VECTOR_DTYPES: dict[torch.dtype, tuple[str, int]] = {
 # ``unroll`` mode loads inputs as same-width INTEGER vectors (Uint16 for
 # bf16/fp16/int16, Uint32 for fp32/int32) and bitcasts each extracted lane
 # back to the original dtype.  This avoids the CuTe DSL crash that fires when
-# subscripting a bf16/fp16 vector value, and for fp32 sidesteps the retired
-# explicit-vec mode (see ``_cute_vec_kernel_mode``).  Signed 16/32-bit
-# integer inputs (an int16 weight cast to bf16 inside the kernel) take the
+# subscripting a bf16/fp16 vector value.  Signed 16/32-bit integer inputs
+# (an int16 weight cast to bf16 inside the kernel) take the
 # same carrier packets; the lane bitcast is exact and the program's own cast
 # runs on the extracted scalar unchanged.  Maps the tensor dtype to the
 # cutlass scalar type of the extracted lane.

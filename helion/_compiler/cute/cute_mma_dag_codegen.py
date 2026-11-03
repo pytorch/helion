@@ -118,6 +118,7 @@ from .cute_mma_dag_emitter_base import _TmaMap
 from .cute_mma_dag_emitter_base import _transposed_swizzle
 from .cute_mma_dag_emitter_base import tma_wrapper_plan
 from .cute_warp_mma_gemm import _swizzled_chunk
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -160,6 +161,7 @@ def codegen_mma_dag(cg: GenerateAST) -> bool:
         codegen_mma_dag_tcgen05(cg, plan)
         return True
     emit_mma_dag_module_statements(cg)
+    wrapper_plans = cute_codegen_state(cg).wrapper_plans
     emitter = WarpMmaDagEmitter(cg, plan)
     source = emitter.render()
     if emitter.tma_maps:
@@ -169,14 +171,14 @@ def codegen_mma_dag(cg: GenerateAST) -> bool:
     if emitter.tma_maps:
         # The host builds one tensor map per entry over the tensor views and
         # passes them as grid constants after the ordinary arguments.
-        cg.cute_wrapper_plans.append(
+        wrapper_plans.append(
             tma_wrapper_plan(
                 df,
                 emitter.tma_maps,
                 lambda access: df.tensor_arg(access.fake, prefer_name=access.name).name,
             )
         )
-    cg.cute_wrapper_plans.append(mma_dag_alias_plan(df, plan.program))
+    wrapper_plans.append(mma_dag_alias_plan(df, plan.program))
     df.cute_state.lanes.owned_root_block_dims = (plan.launch_threads, 1, 1)
     return True
 

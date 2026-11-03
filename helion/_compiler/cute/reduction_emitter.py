@@ -98,6 +98,7 @@ from .resident_reductions import ResidentReductionLayout
 from .resident_reductions import feature_index_expression
 from .resident_reductions import supports_resident_threads
 from .resident_sequence import sequence_reduction_expr
+from .state import cute_env_state
 from .synthetic_axes import record_strategy_axis_branch_path
 from .thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -838,7 +839,9 @@ class CutePersistentReductionEmitter(
         if isinstance(extent, sympy.Expr) and extent.free_symbols:
             # The same layout follows a dynamic tensor size only within the
             # hint's power-of-2 bucket; the bound kernel keys that bucket.
-            CompileEnvironment.current().cute_hint_sized_reduction_extents.add(extent)
+            cute_env_state(
+                CompileEnvironment.current()
+            ).hint_sized_reduction_extents.add(extent)
             return next_power_of_2(size_hint)
         return None
 

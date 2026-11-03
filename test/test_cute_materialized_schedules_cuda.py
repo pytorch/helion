@@ -9,13 +9,9 @@ import torch
 
 import helion
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
-
-pytestmark = skipUnlessBackends(["cute"])
-
 if TYPE_CHECKING:
     from collections.abc import Callable
 

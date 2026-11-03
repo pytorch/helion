@@ -11,20 +11,18 @@ code; the GPU tests check the numerics against torch.
 from __future__ import annotations
 
 import re
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 
 import helion
 from helion import exc
 from helion._testing import DEVICE
+from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import BooleanFragment
 import helion.language as hl
 
@@ -33,7 +31,6 @@ UNROLL = "cute_fragment_unrolled_loops"
 PACKETS = "cute_fragment_packet_loads"
 DOT = "cute_fp32_dot"
 MMA = "_helion_fragment_mma.mma_tf32("
-
 pytestmark = skipUnlessBackends(["cute"])
 
 
@@ -136,12 +133,7 @@ def _sliced_gram_adjoint_reference(
 
 @pytest.fixture
 def _cpu_only():
-    with (
-        mock_cuda_unavailable(),
-        _target(),
-        forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
 
 

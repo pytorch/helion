@@ -10,9 +10,6 @@ from test.test_cute_mxfp8_packed_provenance import _packed_mxfp8
 
 from helion._compiler.cute.block_scaled_config import MXFP8_EPILOGUE_MODES
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @pytest.mark.parametrize("m,n", [(128, 256), (257, 264)])
