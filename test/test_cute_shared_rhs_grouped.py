@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
@@ -24,6 +23,7 @@ import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.cute_mma import analyze_tcgen05_grouped_worklist
 from helion._hardware import HardwareInfo
+from helion._testing import import_example
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
@@ -32,6 +32,8 @@ from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.cute.launcher import _validate_tcgen05_grouped_dynamic_ab_tensormaps
 from helion.runtime.ref_mode import RefMode
 from helion.runtime.ref_mode import RefModeContext
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if TYPE_CHECKING:
     from collections.abc import Callable

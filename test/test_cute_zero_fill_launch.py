@@ -29,6 +29,7 @@ from helion._compiler.cute.pdl_release import ZERO_FILL_KERNEL_PREFIX
 from helion._compiler.cute.pdl_release import generic_release_rendered
 from helion._testing import DEVICE
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
 import helion.language as hl
 
@@ -288,7 +289,7 @@ _SPLIT_K = {
 
 
 def _split_k_kernel() -> helion.Kernel:
-    from examples.matmul_split_k import matmul_split_k
+    matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
     return helion.kernel(
         matmul_split_k.fn, backend="cute", static_shapes=True, autotune_effort="none"

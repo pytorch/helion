@@ -9,8 +9,8 @@ L2-normalized constant, so only q and v carry gradients.
 
 from __future__ import annotations
 
-from .linear_attention_engine import LinearAttentionVariant
-from .linear_attention_harness import LinearAttentionExampleHarness
+from helion._testing.linear_attention_harness import LinearAttentionExampleHarness
+from helion.experimental.linear_attention import LinearAttentionVariant
 
 HARNESS = LinearAttentionExampleHarness(variant=LinearAttentionVariant.KDA)
 

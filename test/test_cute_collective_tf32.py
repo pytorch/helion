@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
-from examples.jagged_dense_bmm import jagged_dense_bmm
 import pytest
 import torch
 
@@ -11,9 +10,12 @@ from test._cute_binding import _cpu_bind
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
+
+jagged_dense_bmm = import_example("jagged_dense_bmm").jagged_dense_bmm
 
 pytestmark = skipUnlessBackends(["cute"])
 

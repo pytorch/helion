@@ -4,14 +4,16 @@ import json
 import os
 from pathlib import Path
 
-from examples.aot_example import row_softmax
-from examples.welford import welford
 import pytest
 import torch
 import torch.nn.functional as F
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+row_softmax = import_example("aot_example").row_softmax
+welford = import_example("welford").welford
 
 pytestmark = skipUnlessBackends(["cute"])
 

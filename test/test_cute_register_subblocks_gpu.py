@@ -38,7 +38,7 @@ TF32_REL = 3e-3
 
 
 def _engine():
-    from examples.linear import linear_attention_engine
+    from helion.experimental import linear_attention as linear_attention_engine
 
     return linear_attention_engine
 

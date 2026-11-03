@@ -52,9 +52,10 @@ from typing import Sequence
 from typing import cast
 
 if TYPE_CHECKING:
-    from examples.linear.linear_attention_harness import Inputs
-    from examples.linear.linear_attention_harness import LinearAttentionExampleHarness
     import torch
+
+    from helion._testing.linear_attention_harness import Inputs
+    from helion._testing.linear_attention_harness import LinearAttentionExampleHarness
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if __name__ == "__main__":
@@ -62,11 +63,12 @@ if __name__ == "__main__":
 
 SCHEMA = "linattn-backend-comparison-v1"
 INPUT_SEED = 20261011
-ENGINE_MODULE = "examples.linear.linear_attention_engine"
+ENGINE_MODULE = "helion.experimental.linear_attention"
+# Example scripts by name under examples/ (loaded with import_example).
 VARIANTS = {
-    "vanilla": "examples.linear.example_vanilla_linear_attn",
-    "delta_rule": "examples.linear.example_delta_rule",
-    "gated_delta_rule": "examples.linear.example_gated_delta_rule",
+    "vanilla": "linear.example_vanilla_linear_attn",
+    "delta_rule": "linear.example_delta_rule",
+    "gated_delta_rule": "linear.example_gated_delta_rule",
 }
 SHAPES: dict[str, tuple[int, ...]] = {
     "s0": (8, 8, 1024, 64, 64),
@@ -97,9 +99,10 @@ def make_forward(
     impl: str, harness: LinearAttentionExampleHarness, inputs: Inputs
 ) -> Callable[[Inputs], torch.Tensor]:
     """Forward of one implementation in its native layout, taking an Inputs."""
-    from examples.linear.linear_attention_harness import BENCH_C
-    from examples.linear.linear_attention_utils import chunked_linear_attn_reference
     import torch
+
+    from helion._testing.linear_attention_harness import BENCH_C
+    from helion._testing.linear_attention_utils import chunked_linear_attn_reference
 
     if impl in HELION_IMPLS:
 
@@ -131,13 +134,14 @@ def make_forward(
 
 def worker(args: argparse.Namespace) -> None:
     from benchmarks.cute.compare_example_backends import write_json
-    from examples.linear import linear_attention_harness as lah
-    from examples.linear.linear_attention_utils import ACC_BWD_TOL
-    from examples.linear.linear_attention_utils import ACC_FWD_TOL
     import torch
     import triton.testing
 
     import helion
+    from helion._testing import import_example
+    from helion._testing import linear_attention_harness as lah
+    from helion._testing.linear_attention_utils import ACC_BWD_TOL
+    from helion._testing.linear_attention_utils import ACC_FWD_TOL
     from helion.autotuner.metrics import register_post_autotune_hook
 
     dims = tuple(int(value) for value in args.dims.split(","))
@@ -157,7 +161,7 @@ def worker(args: argparse.Namespace) -> None:
     try:
         torch.cuda.set_device(0)
         result["device"] = torch.cuda.get_device_name(0)
-        harness = importlib.import_module(VARIANTS[args.variant]).HARNESS
+        harness = import_example(VARIANTS[args.variant]).HARNESS
         engine = importlib.import_module(ENGINE_MODULE)
         kernels = {
             obj.name: obj

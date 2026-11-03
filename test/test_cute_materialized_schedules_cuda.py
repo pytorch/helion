@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from examples.int4_gemm import matmul_bf16_int4
 import pytest
 import torch
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
 
 pytestmark = skipUnlessBackends(["cute"])
 

@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.jagged_dense_bmm import jagged_dense_bmm
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -20,8 +19,11 @@ from test._cute_binding import _mock_cuda_unavailable
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.memory_ops import _cute_stack_tensor_mask_expr
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.language.memory_ops import _cute_combined_mask
+
+jagged_dense_bmm = import_example("jagged_dense_bmm").jagged_dense_bmm
 
 if TYPE_CHECKING:
     from helion._compiler.inductor_lowering import CodegenState

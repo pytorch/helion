@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import re
 
-from examples.nvfp4_gemv import _nvfp4_gemv_fp4in_body
-from examples.nvfp4_gemv import make_fp8_scales
-from examples.nvfp4_gemv import reference_nvfp4_gemv_fp4in
 import pytest
 import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 import helion.language as hl
+
+_examples_nvfp4_gemv = import_example("nvfp4_gemv")
+_nvfp4_gemv_fp4in_body = _examples_nvfp4_gemv._nvfp4_gemv_fp4in_body
+make_fp8_scales = _examples_nvfp4_gemv.make_fp8_scales
+reference_nvfp4_gemv_fp4in = _examples_nvfp4_gemv.reference_nvfp4_gemv_fp4in
 
 pytestmark = skipUnlessBackends(["cute"])
 

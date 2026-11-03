@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 
@@ -44,11 +43,14 @@ from helion._compiler.autotuner_heuristics.cute import (
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessTcgen05RuntimeNPtx
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if TYPE_CHECKING:
     from collections.abc import Callable

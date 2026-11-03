@@ -18,10 +18,10 @@ next to this file.
 The standalone file is a drop-in replacement::
 
     # before  (needs helion installed)
-    from examples.aot_compile_example import add_2d
+    from aot_compile_example import add_2d
 
     # after   (pure triton — no helion)
-    from examples.aot_compile_example_add_2d_standalone import add_2d
+    from aot_compile_example_add_2d_standalone import add_2d
 """
 
 from __future__ import annotations

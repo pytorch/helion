@@ -11,6 +11,7 @@ import pytest
 import torch
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -21,8 +22,8 @@ pytestmark = skipUnlessBackends(["cute"])
 def test_graph_reduction_covers_extent_beyond_hardware_thread_cap(
     name: str, width: int
 ) -> None:
-    from examples.layer_norm import layer_norm_bwd
-    from examples.rms_norm import rms_norm_bwd
+    layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
+    rms_norm_bwd = import_example("rms_norm").rms_norm_bwd
 
     x = torch.empty(64, width, dtype=torch.float16)
     weight = torch.empty(width, dtype=torch.float16)
@@ -403,7 +404,7 @@ def _assert_fragment_norm_coverage(source: str, rows: int, width: int):
 
 @pytest.fixture(scope="module")
 def _partial_fragment_norm_source():
-    from examples.layer_norm import layer_norm_bwd
+    layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
 
     from test._cute_binding import _forbid_native_compile
     from test._cute_binding import _mock_cuda_unavailable

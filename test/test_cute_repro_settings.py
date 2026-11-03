@@ -5,8 +5,6 @@ import json
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.int4_gemm import matmul_bf16_int4
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 
@@ -19,9 +17,15 @@ from test.test_cute_materialized_fission import _se_args
 from test.test_cute_shared_rhs_grouped import _offset_mm
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.runtime.settings import Settings
+
+matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
+squeeze_and_excitation_net_fwd = import_example(
+    "squeeze_and_excitation_net"
+).squeeze_and_excitation_net_fwd
 
 pytestmark = skipUnlessBackends(["cute"])
 

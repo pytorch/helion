@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 
@@ -10,7 +9,10 @@ from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
 pytestmark = skipUnlessBackends(["cute"])
 

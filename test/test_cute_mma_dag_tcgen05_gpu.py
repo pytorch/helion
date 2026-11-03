@@ -72,6 +72,7 @@ from test.test_cute_mma_dag_tcgen05 import _store_first
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.exc import InvalidConfig
 
@@ -442,8 +443,11 @@ def test_the_chunk_state_example_matches_the_reference(
 ) -> None:
     # examples/mamba2_chunk_state.py: the chunk offset of the x / B tiles and
     # the leading tiles' begins as coordinates (4 heads per group).
-    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
-    from examples.mamba2_chunk_state import ref_chunk_state
+    _examples_mamba2_chunk_state = import_example("mamba2_chunk_state")
+    helion_mamba2_chunk_state_kernel = (
+        _examples_mamba2_chunk_state.helion_mamba2_chunk_state_kernel
+    )
+    ref_chunk_state = _examples_mamba2_chunk_state.ref_chunk_state
 
     torch.manual_seed(0)
     batch, seqlen, nheads, ngroups = 2, 1024, 8, 2
@@ -473,7 +477,9 @@ def test_the_region_renderer_stages_the_chunk_scan_epilogue_tile() -> None:
     # from shared memory behind the root's staged barrier; the ``lane`` mode
     # keeps the per-lane global loads.  Both reach the same values (the same
     # bf16 pairs feed the same arithmetic), matching the Triton backend.
-    from examples.mamba2_chunk_scan import helion_mamba2_chunk_scan_kernel
+    helion_mamba2_chunk_scan_kernel = import_example(
+        "mamba2_chunk_scan"
+    ).helion_mamba2_chunk_scan_kernel
 
     fn = helion_mamba2_chunk_scan_kernel.fn
     g = torch.Generator(device=DEVICE).manual_seed(0)
@@ -1843,8 +1849,9 @@ def test_the_split_epilogue_keeps_the_row_layouts_bits() -> None:
     # carry update runs in the same order under both layouts, so the split
     # renders (128 x 128 at eight warps, the tile the row budget refuses)
     # are bitwise the row render's (the campaign's 64 x 64 at four).
-    from examples.sparse_attn_indexer import indexer_inputs
-    from examples.sparse_attn_indexer import mqa_logits
+    _examples_sparse_attn_indexer = import_example("sparse_attn_indexer")
+    indexer_inputs = _examples_sparse_attn_indexer.indexer_inputs
+    mqa_logits = _examples_sparse_attn_indexer.mqa_logits
 
     torch.manual_seed(20260913)
     args = indexer_inputs(512, 4096)
@@ -1999,8 +2006,9 @@ def test_the_lookahead_schedule_keeps_the_program_orders_bits() -> None:
     # The example's prefill shape with random bf16 inputs: the schedule
     # moves the dot, not the carry's per-column update order, so every
     # lookahead render is bitwise the campaign's row render.
-    from examples.sparse_attn_indexer import indexer_inputs
-    from examples.sparse_attn_indexer import mqa_logits
+    _examples_sparse_attn_indexer = import_example("sparse_attn_indexer")
+    indexer_inputs = _examples_sparse_attn_indexer.indexer_inputs
+    mqa_logits = _examples_sparse_attn_indexer.mqa_logits
 
     torch.manual_seed(20260913)
     args = indexer_inputs(512, 4096)

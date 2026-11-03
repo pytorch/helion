@@ -15,6 +15,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
@@ -955,7 +956,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         code, (loss, _) = code_and_output(jsd_forward_kernel, (log_q, log_p))
         torch.accelerator.synchronize()
 
-        from examples.jsd import TorchJSDBaseline
+        TorchJSDBaseline = import_example("jsd").TorchJSDBaseline
 
         baseline = TorchJSDBaseline(beta=0.5, ignore_index=-100).to(DEVICE)
         baseline_loss = baseline(log_q, log_p)

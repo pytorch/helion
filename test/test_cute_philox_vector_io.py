@@ -27,6 +27,7 @@ from helion._compiler.cute.philox_packets import lower_philox_packets
 from helion._compiler.cute.philox_stream import PACKET_ASM
 from helion._compiler.cute.philox_stream import SCALAR_ASM
 from helion._compiler.cute.philox_stream import SCALAR_CONSTRAINTS
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 
 
@@ -204,7 +205,7 @@ def test_packet_tuple_grant_does_not_allow_other_reads_or_calls(extra):
 @pytest.mark.usefixtures("cpu_only")
 @skipUnlessBackends(["cute"])
 def test_original_dynamic_cpu_emission_composes_packet_and_vector_io(geometry):
-    from examples.low_mem_dropout import low_mem_dropout
+    low_mem_dropout = import_example("low_mem_dropout").low_mem_dropout
 
     block, threads, width = geometry
     bound = helion.kernel(

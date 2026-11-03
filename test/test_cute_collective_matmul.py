@@ -4,7 +4,6 @@ import ast
 import itertools
 from types import SimpleNamespace
 
-from examples.moe_matmul_ogs import moe_matmul_ogs
 import pytest
 import torch
 
@@ -12,8 +11,11 @@ from test._cute_binding import _cpu_bind
 
 import helion
 from helion._compiler.cute.collective_matmul import _uniform_reuse_names
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+moe_matmul_ogs = import_example("moe_matmul_ogs").moe_matmul_ogs
 
 CUDA_DEVICE = "cuda"
 

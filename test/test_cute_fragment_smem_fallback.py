@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.layer_norm import layer_norm_bwd
 import pytest
 import torch
 
@@ -13,7 +12,10 @@ from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

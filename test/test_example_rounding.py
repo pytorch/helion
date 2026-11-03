@@ -2,24 +2,38 @@ from __future__ import annotations
 
 from functools import partial
 
-from examples.rope import rope_bwd
-from examples.rope import rope_fwd
-from examples.rope import rope_pytorch
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_da
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_db
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_dc
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_dx
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion.runtime import default_cute_launcher
 from helion.runtime import default_launcher
+
+_examples_rope = import_example("rope")
+rope_bwd = _examples_rope.rope_bwd
+rope_fwd = _examples_rope.rope_fwd
+rope_pytorch = _examples_rope.rope_pytorch
+_examples_squeeze_and_excitation_net = import_example("squeeze_and_excitation_net")
+squeeze_and_excitation_net_bwd_da = (
+    _examples_squeeze_and_excitation_net.squeeze_and_excitation_net_bwd_da
+)
+squeeze_and_excitation_net_bwd_db = (
+    _examples_squeeze_and_excitation_net.squeeze_and_excitation_net_bwd_db
+)
+squeeze_and_excitation_net_bwd_dc = (
+    _examples_squeeze_and_excitation_net.squeeze_and_excitation_net_bwd_dc
+)
+squeeze_and_excitation_net_bwd_dx = (
+    _examples_squeeze_and_excitation_net.squeeze_and_excitation_net_bwd_dx
+)
+squeeze_and_excitation_net_fwd = (
+    _examples_squeeze_and_excitation_net.squeeze_and_excitation_net_fwd
+)
 
 pytestmark = skipUnlessBackends(["triton", "cute"])
 

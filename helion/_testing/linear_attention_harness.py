@@ -17,9 +17,6 @@ import warnings
 import torch
 import torch.nn.functional as F
 
-from .linear_attention_engine import LinearAttentionVariant
-from .linear_attention_engine import get_helion_fwd_kernel
-from .linear_attention_engine import recurrent_step
 from .linear_attention_fla import get_fla_fwd_kernel
 from .linear_attention_flashkda import flashkda_supports
 from .linear_attention_flashkda import get_flashkda_fwd_kernel
@@ -32,6 +29,9 @@ from .linear_attention_utils import naive_recurrent_reference
 from .linear_attention_utils import rel_error as _rel_error
 from helion._testing import DEVICE
 from helion._testing import do_bench
+from helion.experimental.linear_attention import LinearAttentionVariant
+from helion.experimental.linear_attention import get_helion_fwd_kernel
+from helion.experimental.linear_attention import recurrent_step
 
 # Test/benchmark config
 DTYPE = torch.bfloat16

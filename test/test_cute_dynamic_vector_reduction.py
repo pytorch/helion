@@ -41,7 +41,6 @@ from typing import Callable
 from typing import cast
 from unittest.mock import patch
 
-from examples.aot_example import rms_norm_batched
 import pytest
 import sympy
 import torch
@@ -57,8 +56,11 @@ from helion._compiler.cute.memory_ops import cute_known_multiple
 from helion._compiler.cute.pipeline_inner_loads import pipeline_inner_loads
 from helion._compiler.host_function import HostFunction
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+rms_norm_batched = import_example("aot_example").rms_norm_batched
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

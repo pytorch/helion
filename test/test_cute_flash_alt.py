@@ -24,7 +24,6 @@ from typing import Any
 from typing import cast
 from unittest.mock import patch
 
-from examples.attention import attention_relu_output
 import pytest
 import torch
 
@@ -40,11 +39,14 @@ from helion._compiler.cute.flash_schedule import FlashScheduleSpec
 from helion._compiler.cute.flash_schedule import build_fa4_alt_schedule
 from helion._compiler.cute.flash_schedule import verify_flash_schedule
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
+
+attention_relu_output = import_example("attention").attention_relu_output
 
 if TYPE_CHECKING:
     from helion.autotuner.config_fragment import ConfigSpecFragment
