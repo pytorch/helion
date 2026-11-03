@@ -123,6 +123,39 @@ def test_disjoint_memory_does_not_require_expanding_unrelated_arithmetic() -> No
     )
 
 
+def test_packed_word_load_without_a_write_has_nothing_to_reorder() -> None:
+    # The FP4 decode helpers load a byte-packed word whose element count the
+    # access proof cannot see.  With no write in the lane body there is still
+    # nothing for the split to reorder; with one, the split stays refused.
+    marker = _LaneReduceMarker(
+        "reduced", "value", "sum", "0.0", 32, "__HELION_FINALIZED__"
+    )
+    load = (
+        "w = cute.arch.load(x.iterator + lane * 8, cutlass.Uint64)\n"
+        "value = cutlass.Float32(w)\n"
+        "reduced = value\n"
+    )
+    for source, reorders in (
+        (load, False),
+        (load + "(x.iterator + lane).store(reduced)\n", True),
+        ("(x.iterator + lane).store(cutlass.Float32(0))\n" + load, True),
+    ):
+        body = ast.parse(source).body
+        index = next(
+            i
+            for i, stmt in enumerate(body)
+            if isinstance(stmt, ast.Assign)
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == "reduced"
+        )
+        assert (
+            _lane_split_reorders_aliasing_memory(
+                body, [(index, marker)], set(), "lane", 2, {}
+            )
+            is reorders
+        )
+
+
 @pytest.mark.parametrize(
     "store_offset, reorders", [("lane", False), ("lane + 1", True)]
 )
