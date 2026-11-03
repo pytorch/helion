@@ -3726,6 +3726,13 @@ class PopulationBasedSearch(BaseSearch):
                 "keeping the search's best config."
             )
             live = [member for member in members if math.isfinite(member.perf)]
+        elif len(live) < len(members):
+            # finalists rarely fail here: they all ran in the search
+            self.log.warning(
+                f"Final selection took no complete steady-window readings for "
+                f"{len(members) - len(live)} of {len(members)} finalists; "
+                "selecting among the rest."
+            )
         if not live:
             raise exc.NoConfigFound
         after = self._prefer_pinned_within_tolerance(
