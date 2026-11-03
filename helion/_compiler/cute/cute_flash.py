@@ -4932,14 +4932,14 @@ def resolve_flash_config(
         else {}
     )
 
-    def _cfg(key: str) -> object | None:
-        if key in resident_overrides:
-            return resident_overrides[key]
-        if key in compound_packet_overrides:
-            return compound_packet_overrides[key]
-        if config is None:
-            return None
-        return config.get(key)
+    # The resident pins win over the compound-packet pins, which win over the
+    # config; read through one merged view rather than three lookups per key.
+    pinned_config: dict[str, object] = {
+        **({} if config is None else config),
+        **compound_packet_overrides,
+        **resident_overrides,
+    }
+    _cfg = pinned_config.get
 
     s_stage = _flash_s_stage()
     kv_stage = _flash_kv_stage(head_dim)
