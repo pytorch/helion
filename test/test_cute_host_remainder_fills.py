@@ -94,6 +94,48 @@ def _wrong_remainder(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _fill_under_true(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0) + 1, x.size(1)], dtype=x.dtype, device=x.device)
+    for i, j in hl.tile([x.size(0), x.size(1)]):
+        out[i, j] = x[i, j] + 1
+    if True:
+        out[-1, :] = 0
+    return out
+
+
+def _fill_under_constexpr(
+    x: torch.Tensor, fill_tail: hl.constexpr = True
+) -> torch.Tensor:
+    out = torch.empty([x.size(0) + 1, x.size(1)], dtype=x.dtype, device=x.device)
+    for i, j in hl.tile([x.size(0), x.size(1)]):
+        out[i, j] = x[i, j] + 1
+    if fill_tail:
+        out[-1, :] = 0
+    return out
+
+
+def _fill_in_constexpr_else(
+    x: torch.Tensor, skip_tail: hl.constexpr = False
+) -> torch.Tensor:
+    out = torch.empty([x.size(0) + 1, x.size(1)], dtype=x.dtype, device=x.device)
+    for i, j in hl.tile([x.size(0), x.size(1)]):
+        out[i, j] = x[i, j] + 1
+    if skip_tail:
+        out[-1, :] = 1
+    else:
+        out[-1, :] = 0
+    return out
+
+
+def _fill_under_runtime_flag(x: torch.Tensor, flag: int) -> torch.Tensor:
+    out = torch.empty([x.size(0) + 1, x.size(1)], dtype=x.dtype, device=x.device)
+    for i, j in hl.tile([x.size(0), x.size(1)]):
+        out[i, j] = x[i, j] + 1
+    if flag:
+        out[-1, :] = 0
+    return out
+
+
 def _kernel(fn: Callable[..., Any], **settings: Any) -> Kernel:
     return helion.kernel(
         fn,
@@ -104,7 +146,7 @@ def _kernel(fn: Callable[..., Any], **settings: Any) -> Kernel:
     )
 
 
-def _code(fn: Callable[..., Any], *args: torch.Tensor) -> tuple[BoundKernel, str]:
+def _code(fn: Callable[..., Any], *args: object) -> tuple[BoundKernel, str]:
     bound = cpu_bind(_kernel(fn, autotune_effort="full"), args)
     return bound, bound.to_code(bound.config_spec.default_config())
 
@@ -216,8 +258,65 @@ def test_unproven_fills_stay_on_the_host(fn: Callable[..., Any], fill: str) -> N
         assert "_cute_remainder_fill" not in code
 
 
+@skipIfRefEager("generates code")
+@pytest.mark.parametrize(
+    "fn,branch",
+    [
+        (_fill_under_true, "if True:\n        pass\n"),
+        (_fill_under_constexpr, "if True:\n        pass\n"),
+        (_fill_in_constexpr_else, "if False:\n        out[-1, :] = 1\n"),
+    ],
+    ids=["if True", "constexpr argument", "constexpr else branch"],
+)
+def test_fill_under_a_constexpr_branch_moves_into_the_kernel(
+    fn: Callable[..., Any], branch: str
+) -> None:
+    """The proof reads the host body through its constexpr branches, so the
+    lowering drops the fill from the generated ``if``'s branch (an emptied
+    body keeps a ``pass``; the untaken branch's statements stay)."""
+    with mock_cuda_unavailable():
+        bound, code = _code(fn, torch.empty((64, 128)))
+        assert bound.host_function is not None
+        with bound.env:
+            proof = prove_host_remainder_fills(
+                bound.host_function, bound.env, bound.config_spec.default_config()
+            )
+        assert [
+            (site.name, site.dim, site.remainder, site.value) for site in proof
+        ] == [("out", 0, 1, 0)]
+        host = _host(code)
+        assert "out[-1, :] = 0" not in host
+        assert branch in host
+        kernel, _host_def = _defs(code)
+        assert ast.unparse(kernel.body[-1]) == (
+            "_cute_remainder_fill(out, dim=0, remainder=1, value=0, is_float=True)"
+        )
+        assert code.count("_cute_remainder_fill(") == 1
+
+
+@skipIfRefEager("generates code")
+def test_fill_under_a_runtime_branch_stays_on_the_host() -> None:
+    """A branch the specialization key does not fix is not folded: the fill
+    under it is not a statement of every call, so it stays where it is."""
+    with mock_cuda_unavailable():
+        bound, code = _code(_fill_under_runtime_flag, torch.empty((64, 128)), 1)
+        assert bound.host_function is not None
+        with bound.env:
+            assert not prove_host_remainder_fills(
+                bound.host_function, bound.env, bound.config_spec.default_config()
+            )
+        assert "if flag:\n        out[-1, :] = 0\n" in _host(code)
+        assert "_cute_remainder_fill" not in code
+
+
 def _reference(fn: Callable[..., Any], x: torch.Tensor) -> torch.Tensor:
-    if fn in (_rows_plus_one, _rows_plus_one_zeros):
+    if fn in (
+        _rows_plus_one,
+        _rows_plus_one_zeros,
+        _fill_under_true,
+        _fill_under_constexpr,
+        _fill_in_constexpr_else,
+    ):
         return torch.cat([x + 1, torch.zeros_like(x[:1])])
     if fn is _cols_tail_int:
         tail = torch.full((x.size(0), 3), 7, dtype=torch.int32, device=x.device)
@@ -237,6 +336,9 @@ def _reference(fn: Callable[..., Any], x: torch.Tensor) -> torch.Tensor:
         (_cols_tail_int, (64, 128), torch.float32),
         (_three_dim_tail, (2, 16, 64), torch.float32),
         (_three_dim_tail, (1, 64, 1024), torch.bfloat16),
+        (_fill_under_true, (64, 128), torch.float32),
+        (_fill_under_constexpr, (33, 1000), torch.bfloat16),
+        (_fill_in_constexpr_else, (5, 7), torch.float16),
     ],
 )
 def test_device_fill_matches_the_reference(

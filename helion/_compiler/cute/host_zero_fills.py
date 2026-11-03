@@ -62,6 +62,8 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from typing import Protocol
+from typing import TypeVar
 from typing import cast
 
 import sympy
@@ -85,6 +87,8 @@ from .host_sum_site import _constant_condition
 from .host_sum_site import fold_constexpr_branches
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ...runtime.config import Config
@@ -106,6 +110,9 @@ class ZeroFill:
     statement: str
     target: str
     factory: str
+
+
+_F = TypeVar("_F", bound="_ProvenFill")
 
 
 def _zero_factory(statement: ast.AST) -> tuple[str, str, ast.Call] | None:
@@ -806,12 +813,27 @@ def lower_host_zero_fills(
     return _rewrite_fills(body, proven)
 
 
-def _rewrite_fills(
-    body: Sequence[ast.AST], proven: dict[SourceLocation, ZeroFill]
+class _ProvenFill(Protocol):
+    @property
+    def statement(self) -> str: ...
+
+
+def walk_proven_fills(
+    body: Sequence[ast.AST],
+    proven: Mapping[SourceLocation, _F],
+    replace: Callable[[ast.AST, _F], Sequence[ast.AST]],
 ) -> list[ast.AST]:
-    """Replace the proven fills in ``body`` and, in place, in the branches of
-    its ``if`` statements (a proven fill under a constexpr branch is matched by
-    its own location and text; the other branch's statements never match)."""
+    """``body`` with every proven fill replaced by ``replace(statement, fill)``.
+
+    A statement is a proven fill when ``proven`` has its ``_location`` and the
+    fill's recorded text is the statement's unparsed text; the walk descends in
+    place into both branches of every ``if`` (a fill under a constexpr branch
+    is matched by its own location and text, the other branch never matches),
+    padding a branch the replacement emptied with ``pass``.  The remainder
+    fills (``host_remainder_fills``) and the zero fills share this traversal so
+    the matching rule stays in step with ``fold_constexpr_branches`` in one
+    place.
+    """
     result: list[ast.AST] = []
     for statement in body:
         fill = (
@@ -819,25 +841,37 @@ def _rewrite_fills(
             if isinstance(statement, ExtendedAST)
             else None
         )
-        if fill is None or ast.unparse(statement) != fill.statement:
-            if isinstance(statement, ast.If):
-                statement.body = cast(
-                    "list[ast.stmt]", _rewrite_fills(statement.body, proven)
-                )
-                statement.orelse = cast(
-                    "list[ast.stmt]", _rewrite_fills(statement.orelse, proven)
-                )
-            result.append(statement)
+        if fill is not None and ast.unparse(statement) == fill.statement:
+            result.extend(replace(statement, fill))
             continue
+        if isinstance(statement, ast.If):
+            statement.body = cast(
+                "list[ast.stmt]", walk_proven_fills(statement.body, proven, replace)
+            ) or [ast.Pass()]
+            statement.orelse = cast(
+                "list[ast.stmt]", walk_proven_fills(statement.orelse, proven, replace)
+            )
+        result.append(statement)
+    return result
+
+
+def _rewrite_fills(
+    body: Sequence[ast.AST], proven: dict[SourceLocation, ZeroFill]
+) -> list[ast.AST]:
+    """Replace the proven fills in ``body`` (and under its ``if`` branches) by
+    their empty-factory form."""
+
+    def replace(statement: ast.AST, fill: ZeroFill) -> list[ast.AST]:
         assert isinstance(statement, ast.Assign)
         value = statement.value
         assert isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
-        result.append(
+        return [
             statement_from_string(
                 f"{fill.target} = {_factory_call_source(value, _EMPTY_FACTORY[fill.factory])}"
             )
-        )
-    return result
+        ]
+
+    return walk_proven_fills(body, proven, replace)
 
 
 def _factory_call_source(call: ast.Call, attr: str) -> str:

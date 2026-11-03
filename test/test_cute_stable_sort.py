@@ -13,8 +13,8 @@ from test.test_cute_topk import _has_register_selection
 from test.test_cute_topk import _simulate_network_topk_fragment
 
 import helion
-from helion._compiler.cute.ordered_selection import ordered_selection_args
-from helion._compiler.cute.ordered_selection import selection_args
+from helion._compiler.cute.selection.ordered_selection import ordered_selection_args
+from helion._compiler.cute.selection.ordered_selection import selection_args
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile

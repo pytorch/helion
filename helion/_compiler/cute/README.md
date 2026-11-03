@@ -341,7 +341,8 @@ Classify a module by grep before moving it.
 * Registry pins: `test/test_cute_root_emitters.py`,
   `test/test_cute_pass_pipeline.py`, `test/test_backend_capabilities.py` (the
   no-op defaults of every hook), `test/test_backend_registry.py`,
-  `test/test_cute_device_state.py`, `test/test_cute_launch_shape.py`.
+  `test/test_cute_device_state.py`, `test/test_cute_device_helper_names.py`,
+  `test/test_cute_launch_shape.py`.
 * Render identity: the refactor's gate is a CPU render dump of
   `BoundKernel.to_code()` for every test on a base tree and a tip tree,
   compared file by file (a pytest plugin that records every render or its
@@ -426,11 +427,6 @@ Module docstrings carry a `Role:` line using one of these words:
   `new_*_state` defaults are `None` (section 5), and the register-tile gate
   and shared-memory budget the reduction strategies call are
   `thread_budget.register_tile_shape` / `shared_memory_budget_bytes`.
-* **Pending retirements in this stack.** The pre-move copies beside
-  `selection/` (`topk.py`, `row_topk*.py`, `selection_*.py`,
-  `ordered_selection.py`, `sorting_networks.py`) and the scan / reduction
-  scaffolds (`completed_scan.py`, `scan_helper.py`, `free_iota_reduction.py`)
-  have no importer left and go in the next commit.
 * **Decision-gated retirements.** The legacy single-warpgroup flash body
   (`emit_flash_device_body`, `ws_overlap` with `s_stage == 1`) is the only
   body at `num_kv == 1` and stays; the `ws_overlap` family stays (it wins the
