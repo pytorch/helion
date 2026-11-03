@@ -472,13 +472,15 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
             PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
         ):
             _bound(x, config=first, autotuner_fn=selector).autotune((x, 2), force=False)
-            fresh = _bound(x, config=second, autotuner_fn=selector)
             with patch.object(
                 KernelCompiler,
                 "compile",
                 autospec=True,
                 side_effect=KernelCompiler.compile,
             ) as compile_fn:
+                # Changing the configured candidates invalidates the manifest
+                # during binding, before autotune selects the explicit config.
+                fresh = _bound(x, config=second, autotuner_fn=selector)
                 self.assertEqual(fresh.autotune((x, 2), force=False), second)
             self.assertEqual(compile_fn.call_count, 1)
         self.assertNotEqual(sources[0], sources[1])

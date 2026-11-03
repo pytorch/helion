@@ -455,9 +455,31 @@ class TestGeneratedCodeDispatch(TestCase):
             # y has the size-1 binding's saved guard values but not its fact.
             torch.testing.assert_close(kernel(y, 2), y * 2)
             self.assertEqual(compile_fn.call_count, 2)
-        self.assertEqual(
-            len(list((self.root / "generated_code" / "bindings").glob("*.json"))), 2
-        )
+        # Source-discovery variants share the binding envelope/directory.
+        # Count the actual frontend artifacts separately rather than treating
+        # those codegen-only links as additional frontend bindings.
+        source_links: set[str] = set()
+        for value in (one, y):
+            bound = _runner(kernel, (value, 2))
+            normalized = bound._normalized_config_copy(_CONFIG)
+            lookup = cache._generated_code_cache_key(
+                bound, normalized, include_guard_facts=False
+            )
+            self.assertIsNotNone(lookup)
+            schema = cache.load_binding_schema(lookup)
+            self.assertIsNotNone(schema)
+            params = tuple(kernel.signature.parameters)
+            results = tuple(
+                _guard_extractor(guard, params)((value, 2))
+                for guard in schema["guards"]
+            )
+            source_links.add(cache.binding_variant_key(lookup, schema, results, ()))
+        entries = {
+            path.stem
+            for path in (self.root / "generated_code" / "bindings").glob("*.json")
+        }
+        self.assertTrue(source_links.issubset(entries))
+        self.assertEqual(len(entries - source_links), 2)
         # A later process serves each input from its own binding.
         warm = self._kernel(_specialized_rows)
         with patch.object(
