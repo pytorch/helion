@@ -596,6 +596,70 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertIs(pointer_bound, pointer_copy_view.bind((unaligned,)))
 
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    @skipIfRefEager("Test checks keyed dispatch specialization")
+    def test_keyed_dispatch_rechecks_descriptor_alignment_every_call(self):
+        def make_copy(view_input: bool):
+            settings = {
+                "autotune_effort": "none",
+                "static_shapes": False,
+                "key": lambda x: x.size(0) > 16,
+                "config": helion.Config(
+                    block_sizes=[16, 16],
+                    indexing=["tensor_descriptor", "pointer"],
+                    host_tensor_descriptors=True,
+                ),
+            }
+
+            @helion.kernel(**settings)
+            def copy(x: torch.Tensor) -> torch.Tensor:
+                out = torch.empty_like(x)
+                for tile in hl.tile(x.size()):
+                    out[tile] = x[tile]
+                return out
+
+            @helion.kernel(**{**settings, "static_shapes": True})
+            def copy_view(x: torch.Tensor) -> torch.Tensor:
+                # A view has no direct source: its guard also requires a zero
+                # storage offset.
+                view = x.view(32, 64)
+                out = torch.empty_like(view)
+                for tile in hl.tile(view.size()):
+                    out[tile] = view[tile]
+                return out
+
+            return copy_view if view_input else copy
+
+        aligned = torch.randn([32, 64], device=DEVICE)
+        storage = torch.randn(32 * 64 + 4, device=DEVICE)
+        unaligned = storage[1 : 32 * 64 + 1].view(32, 64)
+        aligned_offset = storage[4:].view(32, 64)
+        self.assertNotEqual(unaligned.data_ptr() % 16, 0)
+        self.assertEqual(aligned_offset.data_ptr() % 16, 0)
+        for view_input in (False, True):
+            copy = make_copy(view_input)
+            inputs = (aligned, unaligned, aligned_offset)
+            # Identical exact metadata: only the base pointer (and storage
+            # offset) tells the inputs apart on a warm keyed dispatch.
+            for _ in range(3):
+                for x in inputs:
+                    torch.testing.assert_close(copy(x), x)
+            keys = [copy._fast_dispatch_key((x,)) for x in inputs]
+            self.assertEqual(len({key[:-1] for key in keys}), 1)
+            self.assertEqual(len(copy._fast_dispatch_schemas), 1)
+            bounds = [copy._dispatch_cache[key] for key in keys]
+            self.assertIsNot(bounds[0], bounds[1])
+            self.assertIn(
+                "_helion_tensor_descriptor(",
+                bounds[0].to_triton_code(bounds[0]._config),
+            )
+            self.assertNotIn(
+                "_helion_tensor_descriptor(",
+                bounds[1].to_triton_code(bounds[1]._config),
+            )
+            # A nonzero storage offset only matters without a direct source.
+            self.assertIs(bounds[2], bounds[1] if view_input else bounds[0])
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     def test_host_tensor_descriptor_dynamic_output_falls_back(self):
         @helion.kernel(
             static_shapes=False,
