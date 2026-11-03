@@ -553,9 +553,13 @@ def _load_vllm_fallback_ops() -> tuple[Callable, Callable, Callable]:
         return _VLLM_FALLBACK_OPS
 
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
-    from vllm.third_party.flash_linear_attention.ops.fused_norm_gate import (
-        rms_norm_gated,
-    )
+
+    # vLLM 0.29 registers the CustomOp ``fused_rms_norm_gated`` in both
+    # ``ops.fused_norm_gate`` and ``ops.kda``, so importing both asserts, and
+    # the Kimi package imported below loads ``ops.kda``. Take ``rms_norm_gated``
+    # from ``ops.kda``, the copy vLLM's Kimi o_norm uses: same math, launched
+    # without PDL.
+    from vllm.third_party.flash_linear_attention.ops.kda import rms_norm_gated
 
     try:
         module = importlib.import_module(
