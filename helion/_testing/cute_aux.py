@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import os
 from typing import TYPE_CHECKING
 from typing import Any
 from unittest.mock import patch
@@ -141,4 +142,14 @@ def as_sm100() -> Generator[None, None, None]:
             return_value=True,
         ),
     ):
+        yield
+
+
+@contextmanager
+def flash_env(overrides: dict[str, str] | None = None) -> Generator[None, None, None]:
+    """``os.environ`` without the ``HELION_CUTE_FLASH*`` channel (the flash
+    resolver reads it once per binding), plus ``overrides``; everything else
+    stays so the DSL and torch still find their paths."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HELION_CUTE_FLASH")}
+    with patch.dict(os.environ, {**env, **(overrides or {})}, clear=True):
         yield
