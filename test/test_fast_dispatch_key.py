@@ -1683,6 +1683,36 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
         with self.assertRaises(KeyError):
             _unmemoized_key(add, (x,))
 
+    def test_prepared_guards_keep_facts_exact_metadata_does_not_imply(
+        self,
+    ) -> None:
+        """The prepared argument guard pins sizes and strides, not storage
+        offsets: a guard fact over a storage offset is checked every call."""
+        params = ("x",)
+        size = sympy.Symbol("x_size0", integer=True)
+        size_fact = _PreparedMetadataSpecializationExtractor(
+            _GuardedInputFact(
+                size,
+                sympy.Integer(1),
+                (
+                    (
+                        size,
+                        TensorPropertySource(LocalSource("x"), TensorProperty.SIZE, 0),
+                    ),
+                ),
+                False,
+                True,
+                params,
+            )
+        )
+        offset_fact = _storage_offset_is_zero_fact("x", params)
+        args = (torch.empty(64),)
+        always_check, fact_guards = kernel_module._partition_prepared_extra_guards(
+            args, ((size_fact, size_fact(args)), (offset_fact, offset_fact(args)))
+        )
+        self.assertEqual(always_check, ((offset_fact, True),))
+        self.assertEqual(fact_guards, ())
+
     def test_prepared_guards_look_through_omitted_default_alias(self) -> None:
         x = torch.empty(64)
         size = _PreparedMetadataSpecializationExtractor(

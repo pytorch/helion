@@ -545,7 +545,11 @@ class _SpecializationAlias:
 
 @dataclasses.dataclass(frozen=True)
 class _PreparedMetadataSpecializationExtractor:
-    """Specialization already implied by ``_make_prepared_arg_guard``."""
+    """Specialization read from input tensor metadata.
+
+    Exact metadata, which ``_make_prepared_arg_guard`` checks, implies its
+    result unless it reads a storage offset (``_implied_by_exact_metadata``).
+    """
 
     extractor: Callable[[Sequence[object]], Hashable]
 
@@ -754,8 +758,8 @@ def _partition_prepared_extra_guards(
     """Split guards into always-check classifiers and prepared fact guards.
 
     Tensor type/shape/stride/dtype/device facts are already checked by the
-    prepared argument guard, so metadata extractors are dropped, and an
-    omitted-default alias keeps only its per-call part
+    prepared argument guard, so extractors exact metadata implies are
+    dropped, and an omitted-default alias keeps only its per-call part
     (``_prepared_alias_guard``).  A runtime input specialization may supply a
     ``prepared_guard_factory`` that turns its expected result into a direct
     check of the pointer/storage facts those pins leave open, so repeat calls
@@ -772,7 +776,7 @@ def _partition_prepared_extra_guards(
             if alias_guard is not None:
                 always_check.append((alias_guard, expected))
             continue
-        if isinstance(extractor, _PreparedMetadataSpecializationExtractor):
+        if _implied_by_exact_metadata(extractor):
             continue
         guard = (
             _build_prepared_fact_guard(extractor, expected, args)
