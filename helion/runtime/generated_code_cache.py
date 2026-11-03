@@ -14,10 +14,10 @@ import os
 from pathlib import Path
 import re
 import sys
-import tempfile
 import types
 from typing import TYPE_CHECKING
 from typing import cast
+import uuid
 
 from filelock import FileLock
 from filelock import Timeout
@@ -95,6 +95,23 @@ _DEFAULT_CACHE_LIMIT = 1 << 30
 _OBJECT_ADDRESS = re.compile(r" at 0x[0-9a-fA-F]+")
 
 
+@functools.cache
+def _warn_cache_unavailable_once(module: str, name: str, reason: str) -> None:
+    log.warning(
+        "Generated-code cache unavailable for %s.%s: %s; using normal compilation",
+        module,
+        name,
+        reason,
+    )
+
+
+def _warn_cache_unavailable(kernel: Kernel, reason: str) -> None:
+    if kernel.settings.cache_level == "code":
+        # Cache only strings: retaining a Kernel here would keep its bindings,
+        # compiled modules and captured input objects alive indefinitely.
+        _warn_cache_unavailable_once(kernel.fn.__module__, kernel.name, reason)
+
+
 def _without_addresses(value: object) -> str:
     return _OBJECT_ADDRESS.sub("", value if isinstance(value, str) else repr(value))
 
@@ -146,16 +163,27 @@ def _code_key(code: types.CodeType) -> tuple[object, ...]:
     )
 
 
-def _global_names(code: types.CodeType) -> set[str]:
+def _global_names(code: types.CodeType) -> set[str] | None:
     """Include globals loaded only by nested functions and comprehensions."""
+    instructions = tuple(dis.get_instructions(code))
+    if any(instruction.opname == "IMPORT_NAME" for instruction in instructions):
+        # A function-local import can read constants or helpers which do not
+        # appear in its globals. Resolving it here would execute lazy imports
+        # before the frontend (including imports in untaken branches). Until
+        # those dependencies can be tracked without changing import semantics,
+        # use the ordinary frontend rather than reuse potentially stale code.
+        return None
     names = {
         cast("str", instruction.argval)
-        for instruction in dis.get_instructions(code)
+        for instruction in instructions
         if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}
     }
     for constant in code.co_consts:
         if isinstance(constant, types.CodeType):
-            names.update(_global_names(constant))
+            nested = _global_names(constant)
+            if nested is None:
+                return None
+            names.update(nested)
     return names
 
 
@@ -165,8 +193,11 @@ def _function_dependencies(fn: types.FunctionType) -> object:
     except ValueError:
         # A deleted nonlocal leaves an empty closure cell.
         return _UNCACHEABLE
+    names = _global_names(fn.__code__)
+    if names is None:
+        return _UNCACHEABLE
     dependencies: dict[str, object] = {}
-    for name in sorted(_global_names(fn.__code__)):
+    for name in sorted(names):
         if name in fn.__globals__:
             dependencies[name] = fn.__globals__[name]
         elif name in fn.__builtins__:
@@ -289,7 +320,8 @@ def _argument_key(value: object) -> object:
     if type(value) in (int, float, bool):
         return type(value).__name__
     if isinstance(value, ConstExpr):
-        return "constexpr", _dependency_key(value.value)
+        key = _dependency_key(value.value)
+        return _UNCACHEABLE if key is _UNCACHEABLE else ("constexpr", key)
     if type(value) in (tuple, list, dict):
         items = (
             value.items()
@@ -317,7 +349,15 @@ def binding_input_key(kernel: Kernel, args: Sequence[object]) -> str | None:
         return None
     dependencies = _dependency_key(kernel.fn)
     inputs = _argument_key(tuple(args))
-    if dependencies is _UNCACHEABLE or inputs is _UNCACHEABLE:
+    if dependencies is _UNCACHEABLE:
+        _warn_cache_unavailable(
+            kernel,
+            "Python dependencies cannot be fingerprinted safely "
+            "(including function-local imports)",
+        )
+        return None
+    if inputs is _UNCACHEABLE:
+        _warn_cache_unavailable(kernel, "arguments contain an unsupported value")
         return None
     return hashlib.sha256(repr((dependencies, inputs)).encode("utf-8")).hexdigest()
 
@@ -353,22 +393,31 @@ def compiled_kernel_cache_key(
         return None
     settings = _compilation_settings_key(kernel.settings)
     if settings is _UNCACHEABLE:
+        _warn_cache_unavailable(
+            kernel, "compilation settings contain an unsupported value"
+        )
+        return None
+    configs = _dependency_key(tuple(dict(config) for config in kernel.configs))
+    if configs is _UNCACHEABLE:
+        _warn_cache_unavailable(
+            kernel, "configured candidates contain an unsupported value"
+        )
         return None
     device = _find_argument_device(args)
     hardware: tuple[object, ...]
-    if device is not None and device.type == "cuda":
+    if device.type == "cuda":
         # The source key bakes in the compute capability and SM count; devices
         # sharing a name can differ in both (partitioned or cloud SKUs).
         capability = target_device_capability(device)
         if capability is None:
             return None
         hardware = (get_device_name(device), capability, device_num_sm(device))
-    elif device is not None and device.type == "xpu":
+    elif device.type == "xpu":
         hardware = (get_device_name(device),)
     else:
         hardware = (str(device),)
     payload = (
-        "helion-bound-source-v3",
+        "helion-bound-source-v4",
         sys.version_info[:3],
         helion_key(),
         torch_key_wrapper(),
@@ -377,19 +426,32 @@ def compiled_kernel_cache_key(
         _without_addresses(base_spec_key),
         hardware,
         settings,
+        # The manifest stores a selected winner. Removing or changing pinned
+        # configs must not let it override the new selection policy, especially
+        # when autotune_effort="none" selects the frontend's default config.
+        configs,
         kernel.settings.autotune_effort,
         str(torch.get_default_dtype()),
         str(torch.get_default_device()),
         torch.get_float32_matmul_precision(),
         torch.is_grad_enabled(),
         torch.is_inference_mode_enabled(),
-        torch.is_autocast_enabled("cuda"),
-        str(torch.get_autocast_dtype("cuda")),
+        torch.is_autocast_enabled(device.type),
+        str(torch.get_autocast_dtype(device.type)),
     )
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
 
 def load_compiled_kernel(key: str) -> tuple[Config, Config, str] | None:
+    artifact = _load_compiled_kernel_entry(key)
+    if artifact is None:
+        return None
+    config, normalized, _, source = artifact
+    counters["generated_code_cache"]["frontend_hit"] += 1
+    return config, normalized, source
+
+
+def _load_compiled_kernel_entry(key: str) -> tuple[Config, Config, str, str] | None:
     path = get_helion_cache_dir() / "generated_code" / "bindings" / f"{key}.json"
     try:
         envelope = json.loads(path.read_text(encoding="utf-8"))
@@ -415,8 +477,7 @@ def load_compiled_kernel(key: str) -> tuple[Config, Config, str] | None:
     if source is None:
         return None
     _mark_used(path)
-    counters["generated_code_cache"]["frontend_hit"] += 1
-    return config, normalized, source
+    return config, normalized, source_key, source
 
 
 def save_compiled_kernel(
@@ -563,6 +624,19 @@ def load_binding_schema(key: str) -> dict[str, list[object]] | None:
     return schema
 
 
+def save_binding_schema(key: str, schema: dict[str, list[object]]) -> None:
+    """Publish a checked guard schema shared by binding and source lookups."""
+    _save_entry(
+        _schema_path(key),
+        {
+            "payload": schema,
+            "sha256": hashlib.sha256(
+                json.dumps(schema, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+        },
+    )
+
+
 def binding_variant_key(
     key: str,
     schema: dict[str, list[object]],
@@ -619,15 +693,7 @@ def save_binding(
             for extractor in bound._compiler_seed_specialization_extractors
         ],
     }
-    _save_entry(
-        _schema_path(key),
-        {
-            "payload": schema,
-            "sha256": hashlib.sha256(
-                json.dumps(schema, sort_keys=True).encode("utf-8")
-            ).hexdigest(),
-        },
-    )
+    save_binding_schema(key, schema)
     save_compiled_kernel(
         binding_variant_key(
             key,
@@ -648,20 +714,35 @@ def generated_code_cache_key(bound: BoundKernel, config: Config) -> str | None:
     guards. Other backends, distributed kernels and descriptor
     configs retain their ordinary codegen path.
     """
+    return _generated_code_cache_key(bound, config, include_guard_facts=True)
+
+
+def _generated_code_cache_key(
+    bound: BoundKernel,
+    config: Config,
+    *,
+    include_guard_facts: bool,
+    guard_facts: tuple[tuple[str, Hashable], ...] | None = None,
+) -> str | None:
     state = bound._generated_code
     if (
         bound.settings.cache_level != "code"
         or should_skip_cache()
         or bound.settings.backend != "triton"
-        or bound.env._is_distributed
-        or bound.env.runtime_input_specializations
         or state is None
     ):
+        return None
+    if bound.env._is_distributed:
+        _warn_cache_unavailable(bound.kernel, "distributed kernels")
+        return None
+    if bound.env.runtime_input_specializations:
+        _warn_cache_unavailable(bound.kernel, "runtime input specialization")
         return None
     if any(
         indexing_uses_tensor_descriptor(indexing)
         for indexing in (config.indexing, config.atomic_indexing)
     ):
+        _warn_cache_unavailable(bound.kernel, "tensor-descriptor indexing")
         return None
     fn = bound.kernel.fn
     host_function = bound.host_function
@@ -669,11 +750,19 @@ def generated_code_cache_key(bound: BoundKernel, config: Config) -> str | None:
     with bound.env:
         frontend = _without_addresses(host_function.debug_str())
     settings = _compilation_settings_key(bound.settings)
-    facts = bound._guard_fact_results()
-    if settings is _UNCACHEABLE or facts is None:
+    facts = bound._guard_fact_results() if guard_facts is None else guard_facts
+    if settings is _UNCACHEABLE:
+        _warn_cache_unavailable(
+            bound.kernel, "compilation settings contain an unsupported value"
+        )
+        return None
+    if facts is None:
+        _warn_cache_unavailable(bound.kernel, "unserializable codegen guard facts")
         return None
     payload = (
-        "helion-generated-code-v1",
+        "helion-generated-code-v1"
+        if include_guard_facts
+        else "helion-generated-code-discovery-v1",
         helion_key(),
         torch_key_wrapper(),
         triton_key_wrapper(),
@@ -690,7 +779,7 @@ def generated_code_cache_key(bound: BoundKernel, config: Config) -> str | None:
         bound.config_spec.cache_fingerprint_hash(),
         config.to_json(),
         settings,
-        facts,
+        facts if include_guard_facts else (),
     )
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
@@ -706,6 +795,9 @@ class GeneratedCodeState:
     # Disk entries this binding already wrote or loaded. Repeated set_config
     # calls skip the writers' lock and eviction scan.
     persisted_source_keys: set[str] = dataclasses.field(default_factory=set)
+    persisted_source_links: set[tuple[str, str]] = dataclasses.field(
+        default_factory=set
+    )
     persisted_binding: tuple[Config, str] | None = None
 
     @classmethod
@@ -723,6 +815,9 @@ class GeneratedCodeState:
             return None
         guard_sources: list[GuardSource] = []
         extractors = bound._specialize_extra(guard_sources)
+        assert len(guard_sources) == len(extractors), (
+            "generated-code guards must match specialization extractors"
+        )
         arguments = {
             name: index
             for index, name in enumerate(bound.kernel.signature.parameters.keys())
@@ -747,14 +842,95 @@ class GeneratedCodeState:
         """The specialization guards as the cache saves them."""
         return self.input_key[1]
 
-    def load(self, config: Config) -> str | None:
+    def load(self, bound: BoundKernel, config: Config) -> str | None:
         """Saved source for a normalized config that ``compile_and_save`` keyed."""
         if (source_key := self.source_keys.get(config)) is None:
             return None
         source = load_generated_code(source_key)
         if source is not None:
             self.persisted_source_keys.add(source_key)
+            return source
+        # Code generation can add size/stride facts after the frontend. The
+        # source key includes them, so discover the saved variant separately
+        # and restore those facts before the generated module can run.
+        lookup_key = _generated_code_cache_key(bound, config, include_guard_facts=False)
+        if lookup_key is None or (schema := load_binding_schema(lookup_key)) is None:
+            return None
+        guards = cast("list[list[object]]", schema["guards"])
+        if schema["compiler_seed_facts"] or any(guard[0] != "fact" for guard in guards):
+            return None
+        from .cached_kernel import _guard_fact
+        from .kernel import _PreparedMetadataSpecializationExtractor
+
+        try:
+            param_names = tuple(bound.kernel.signature.parameters)
+            facts = tuple(_guard_fact(guard, param_names) for guard in guards)
+            results = tuple(bound._guard_fact_value(fact) for fact in facts)
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
+            log.warning(
+                "Ignoring generated source guard schema %s: %s", lookup_key, error
+            )
+            return None
+        if None in results:
+            return None
+        artifact = _load_compiled_kernel_entry(
+            binding_variant_key(lookup_key, schema, results, ())
+        )
+        if artifact is None:
+            return None
+        selected, normalized, source_key, source = artifact
+        extractors = [_PreparedMetadataSpecializationExtractor(fact) for fact in facts]
+        expected_key = _generated_code_cache_key(
+            bound,
+            config,
+            include_guard_facts=True,
+            guard_facts=tuple(zip(map(repr, extractors), results, strict=True)),
+        )
+        if selected != config or normalized != config or source_key != expected_key:
+            log.warning("Ignoring inconsistent generated source entry %s", lookup_key)
+            return None
+        bound.kernel._publish_guard_facts(bound, extractors)
+        self.source_keys[config] = source_key
+        self.persisted_source_keys.add(source_key)
+        self.persisted_source_links.add((lookup_key, source_key))
         return source
+
+    def _save_source_link(
+        self, bound: BoundKernel, config: Config, source_key: str
+    ) -> None:
+        """Index source by its codegen facts, without choosing a tuning config."""
+        facts = bound._guard_fact_results()
+        if not facts:
+            return
+        guards = bound.kernel._published_guards.get(bound._base_spec_key)
+        if guards is None:
+            return
+        fact_guards = guards[len(self.guards) :]
+        if len(fact_guards) != len(facts) or any(
+            guard is None or guard[0] != "fact" for guard in fact_guards
+        ):
+            _warn_cache_unavailable(bound.kernel, "unserializable codegen guard facts")
+            return
+        lookup_key = _generated_code_cache_key(bound, config, include_guard_facts=False)
+        if (
+            lookup_key is None
+            or (lookup_key, source_key) in self.persisted_source_links
+        ):
+            return
+        schema: dict[str, list[object]] = {
+            "guards": list(fact_guards),
+            "compiler_seed_facts": [],
+        }
+        save_binding_schema(lookup_key, schema)
+        save_compiled_kernel(
+            binding_variant_key(
+                lookup_key, schema, tuple(value for _, value in facts), ()
+            ),
+            config,
+            config,
+            source_key,
+        )
+        self.persisted_source_links.add((lookup_key, source_key))
 
     def compile_and_save(self, bound: BoundKernel, config: Config) -> CompiledConfig:
         """Compile the config ``set_config`` selected and persist its source.
@@ -800,6 +976,8 @@ class GeneratedCodeState:
             else:
                 save_generated_code(source_key, source)
                 self.persisted_source_keys.add(source_key)
+        if source_key is not None and source_key in self.persisted_source_keys:
+            self._save_source_link(bound, normalized, source_key)
         if (
             self.artifact_key is not None
             and (source_key := self.source_keys.get(normalized)) is not None
@@ -879,10 +1057,12 @@ def _save_entry(path: Path, entry: dict[str, object]) -> None:
         # need no lock: an evicted artifact is an ordinary cache miss.
         with FileLock(root / ".lock", timeout=5):
             _reserve_space(root, path, len(data), limit)
-            with tempfile.NamedTemporaryFile(
-                mode="wb", dir=path.parent, delete=False
-            ) as output:
-                temporary = Path(output.name)
+            # Like the config cache, use ordinary file permissions filtered by
+            # the process umask, so image-build caches can be read by a service
+            # user. Exclusive creation prevents following a pre-existing link.
+            candidate = path.parent / f".{uuid.uuid4().hex}.json.tmp"
+            with candidate.open("xb") as output:
+                temporary = candidate
                 output.write(data)
             os.replace(temporary, path)
     except Timeout:
@@ -942,8 +1122,13 @@ def _evict_entries(root: Path, target: Path, incoming: int, limit: int) -> int:
     """Evict least recently used entries and return the resulting total."""
     entries: list[tuple[int, Path, int]] = []
     total = incoming
-    for path in root.rglob("*.json"):
-        if path == target:
+    for path in root.rglob("*.json*"):
+        if path.name.endswith(".json.tmp"):
+            # All writers hold the lock, so these can only be abandoned by an
+            # interrupted writer. Its reservation counted the bytes until now.
+            path.unlink(missing_ok=True)
+            continue
+        if path.suffix != ".json" or path == target:
             continue
         try:
             stat = path.stat()

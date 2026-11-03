@@ -992,7 +992,10 @@ def _bind_kernel_for_lowering(kernel: Kernel, args: tuple[object, ...]) -> Bound
         )
         return kernel._bind_isolated(args)
     try:
-        return kernel._bind(args)
+        # Frontend attributes must never trigger materialization after this
+        # nonblocking acquisition is released: an eager bind could acquire
+        # _bind_lock then wait for the compile lock Inductor owns.
+        return kernel._bind(args)._materialize(kernel.normalize_args(*args))
     finally:
         kernel._bind_lock.release()
 

@@ -28,10 +28,12 @@ generated source with `cache_level="code"` or `HELION_CACHE_LEVEL=code`.
 An explicit `cache_level` takes precedence over the environment variable.
 Setting `cache_level="code"` on a non-Triton kernel raises `ValueError`.
 The global `HELION_CACHE_LEVEL=code` setting instead logs a warning for
-non-Triton kernels and leaves them at `cache_level="config"`.
+non-Triton kernels, once per process and backend, and leaves them at
+`cache_level="config"`. `HELION_LOGS=helion.runtime.settings` reports the
+effective cache level and backend, including explicit overrides.
 
 With the default `@helion.kernel` and no `config=`, the default adaptive
-autotuner selects the config, and the cache only skips source generation:
+autotuner selects the config, and a source hit skips source generation:
 every process still runs frontend compilation (`KernelCompiler.compile`) so
 that `LocalAutotuneCache` stays authoritative when a tuning result is deleted
 or replaced. Skipping the frontend as well requires a single explicit config,
@@ -86,7 +88,14 @@ Bindings keep the ordinary frontend path, and no binding entry is saved, when:
   cannot skip the handoff, or the PyTorch build lacks Helion's `torch.compile`
   integration, so legacy graph capture reuses ordinary compiled launchers.
 
-Those paths can still reuse generated source after frontend compilation.
+Keeping the frontend path does not guarantee a source hit. Tensor-descriptor
+configs, runtime input specializations, unsupported dependencies and
+unrepresentable guard facts also bypass source caching. Other frontend paths
+can reuse generated source after frontend compilation, including dynamic-shape
+kernels with guards the cache can represent.
+Unsupported dependencies, tensor-descriptor indexing and other source-cache
+eligibility failures log the reason once per kernel and reason in each process.
+An ordinary cold cache miss does not warn.
 Custom config selectors still run. Autotuning candidates are not written to
 this cache; `set_config` persists only the chosen config, including a winner
 already compiled during autotuning.

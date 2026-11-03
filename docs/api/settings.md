@@ -82,9 +82,14 @@ enables the opt-in persistent source cache for selected Triton configs.
 Explicit settings take precedence over `HELION_CACHE_LEVEL`.
 An explicit `cache_level="code"` on a non-Triton kernel raises `ValueError`;
 the global environment setting instead logs a warning and uses
-`cache_level="config"` for that kernel. With the default
+`cache_level="config"` for that kernel, once per process and backend.
+`HELION_LOGS=helion.runtime.settings` reports the effective cache level and
+backend. With the default
 `@helion.kernel` and no `config=`, adaptive autotuning still runs frontend
-compilation in every process and the cache only skips source generation.
+compilation in every process; a source hit skips source generation. This also
+supports dynamic shapes when the frontend's dependencies and guards can be
+cached. Tensor-descriptor configs, runtime input specializations and unsupported
+dependencies or guard facts bypass source caching.
 With a single explicit config, a custom config selector or disabled autotuning,
 inputs that an earlier process's binding would accept also skip frontend
 compilation.

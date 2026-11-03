@@ -17,6 +17,7 @@ import helion.language as hl
 from helion.runtime import generated_code_cache as cache
 from helion.runtime.kernel import KernelCompiler
 from helion.runtime.kernel import PyCodeCache
+from helion.runtime.settings import _warn_unsupported_code_cache_backend
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
@@ -33,6 +34,8 @@ def _policy_kernel(x: torch.Tensor) -> torch.Tensor:
 class TestCacheLevelSettings(TestCase):
     def setUp(self) -> None:
         super().setUp()
+        _warn_unsupported_code_cache_backend.cache_clear()
+        self.addCleanup(_warn_unsupported_code_cache_backend.cache_clear)
         self._test_stack.enter_context(
             patch.dict("os.environ", {"HELION_CACHE_LEVEL": ""})
         )

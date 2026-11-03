@@ -60,6 +60,15 @@ _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 log = logging.getLogger(__name__)
 
 
+@functools.cache
+def _warn_unsupported_code_cache_backend(backend: str) -> None:
+    log.warning(
+        "HELION_CACHE_LEVEL=code is not supported for backend=%r; "
+        "using cache_level='config'",
+        backend,
+    )
+
+
 def _resolve_warning_name(name: str) -> type[exc.BaseWarning]:
     attr = name.strip()
     if not attr:
@@ -1194,12 +1203,10 @@ class Settings(_Settings):
                     "cache_level='code' requires backend='triton', "
                     f"got backend={self.backend!r}"
                 )
-            log.warning(
-                "HELION_CACHE_LEVEL=code is not supported for backend=%r; "
-                "using cache_level='config'",
-                self.backend,
-            )
+            _warn_unsupported_code_cache_backend(self.backend)
             self.cache_level = "config"
+
+        log.info("Using cache_level=%r for backend=%r", self.cache_level, self.backend)
 
         if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
             raise exc.MissingEnableTile

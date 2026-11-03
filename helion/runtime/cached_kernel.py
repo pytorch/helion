@@ -28,6 +28,7 @@ from .._compiler.compile_environment import _replay_tensor_input_source
 from .._compiler.compile_environment import (
     tensor_descriptor_layout_signature_from_strides,
 )
+from .._utils import counters
 from .config import Config
 from .cute_structural_config import CuteStructuralConfig
 from .generated_code_cache import binding_input_key
@@ -465,6 +466,8 @@ class _CachedBoundKernel(Generic[_R]):
         return tree_map(restore, self._binding_args), expired
 
     def _materialize(self, args: tuple[object, ...] | None = None) -> BoundKernel[_R]:
+        if self._delegate is not None:
+            return self._delegate
         # Every path which needs both locks uses this order, including bind().
         with self.kernel._bind_lock, self._materialize_lock:
             if self._delegate is not None:
@@ -495,6 +498,7 @@ class _CachedBoundKernel(Generic[_R]):
                 else self.kernel._bound_kernels.get(current_key)
             )
             if current is not None and not current._is_disk_runner:
+                self._transfer_launch_state(current)
                 self._evict()
                 self._delegate = current
                 self._run = None
@@ -572,6 +576,7 @@ class _CachedBoundKernel(Generic[_R]):
                 # the frontend matches it. Preserve it and its bindings, as
                 # ordinary bind() does.
                 self._evict()
+            self._transfer_launch_state(normal, reuse_launcher=same_schema)
             cache_key = self.kernel._create_bound_kernel_cache_key(
                 normal, args, signature, snapshot_runtime_results=True
             )
@@ -583,6 +588,21 @@ class _CachedBoundKernel(Generic[_R]):
             # stale dispatch state cannot keep using this facade.
             self._run = None
             return normal
+
+    def _transfer_launch_state(
+        self, bound: BoundKernel[_R], *, reuse_launcher: bool = False
+    ) -> None:
+        """Preserve a selected config and launcher when publishing its frontend."""
+        if self._config is None or bound._config is not None:
+            return
+        if not reuse_launcher or self._run is None:
+            bound.set_config(self._config)
+            return
+        normalized = bound._normalized_config_copy(self._config)
+        bound._config = self._config
+        bound._run = self._run
+        bound._compile_cache[normalized] = self._run
+        bound._cache_path_map[normalized] = self._compiled_path
 
     def _evict(self) -> None:
         """Remove this runner from dispatch before a delegate replaces it."""
@@ -600,7 +620,7 @@ class _CachedBoundKernel(Generic[_R]):
 
     def _requested_config(self, config: ConfigLike | None) -> Config:
         if config is None:
-            return self._config or self._artifact[0]
+            return self._config if self._config is not None else self._artifact[0]
         if isinstance(config, Config):
             return config
         if isinstance(config, CuteStructuralConfig):
@@ -648,6 +668,11 @@ class _CachedBoundKernel(Generic[_R]):
         requested = self._requested_config(config)
         if self._delegate is None and requested in self._artifact[:2]:
             run = self.compile_config(requested)
+            counters["best_config_decorator"][
+                BoundKernel.format_kernel_decorator(
+                    cast("BoundKernel[_R]", self), requested, self.settings
+                )
+            ] = 1
         else:
             self._materialize().set_config(requested)
             run = None

@@ -3174,7 +3174,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     None
                     if self._generated_code is None
                     or config in self._render_only_configs
-                    else self._generated_code.load(config)
+                    else self._generated_code.load(self, config)
                 )
                 if triton_code is None:
                     triton_code = self.to_triton_code(
