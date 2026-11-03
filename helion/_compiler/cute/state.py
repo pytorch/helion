@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     from .register_region import RegisterRegionPlan
     from .resident_reductions import ResidentReductionLayout
     from .resident_sequence import SequenceRegion
+    from .resident_while import ResidentWhileMemo
     from .selection.radix_selection import RadixSelectionPlan
     from .selection.topk import CuteTopKPlan
     from .simt_gemm import SimtGemmSite
@@ -127,6 +128,9 @@ class CuteEnvState:
     # (``cute/register_tile_admission.py``); the persistent reduction
     # strategy then keeps its rolled lane nesting.
     register_tile_disabled: bool = False
+    # ``resident_while_plan``'s memo for the traced graphs, which live as
+    # long as the environment (``cute/resident_while.py``).
+    resident_while_plans: ResidentWhileMemo = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -197,6 +201,9 @@ class CuteCodegenState:
     # (``append_device_remainder_fills``); their host statements are dropped
     # when the host wrapper is finalized.
     remainder_fills: list[RemainderFill] = dataclasses.field(default_factory=list)
+    # ``resident_while_plan``'s memo for this pass's graph copies, which die
+    # with the pass (``cute/resident_while.py``).
+    resident_while_plans: ResidentWhileMemo = dataclasses.field(default_factory=dict)
 
     def declare_matmul(self) -> None:
         """A matmul lowering declared itself: ``uses_matmul`` and one more

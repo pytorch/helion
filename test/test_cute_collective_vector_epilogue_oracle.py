@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from helion._compiler.compile_environment import CompileEnvironment
-from helion._compiler.cute.collective_vector_epilogue import _load_pointer_roots
+from helion._compiler.cute.collective_epilogue import _load_pointer_roots
 from helion._compiler.cute.collective_vector_epilogue import (
     vectorize_collective_store_epilogue,
 )

@@ -56,7 +56,7 @@ from ..variable_origin import GridOrigin
 if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
     from ..device_ir import GraphInfo
-    from .computed_fragment import Fragment
+    from .fragment_context import Fragment
 
 KEY = "cute_fragment_slab_loads"
 
