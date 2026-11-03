@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import gc
 import math
 import os
 import re
@@ -9,6 +10,7 @@ from typing import Any
 from typing import Callable
 from typing import cast
 import unittest
+import weakref
 
 from examples.geglu import _geglu_pallas as _geglu_pallas_example
 from examples.swiglu import _swiglu_fwd_pallas as _swiglu_fwd_pallas_example
@@ -3574,6 +3576,30 @@ class TestPallas(TestCase):
             f"(max_abs_diff="
             f"{(reference.float() - baseline_result.float()).abs().max().item()}).",
         )
+
+    def test_pallas_launcher_cache_does_not_leak_arguments(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scale_rows(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+            m, _ = x.shape
+            out = torch.empty_like(x)
+            for _g in hl.grid(1):
+                for outer in hl.tile(4, m, block_size=8):
+                    for inner in hl.tile(outer.begin, outer.end):
+                        out[inner, :] = x[inner, :] + bias[:, :]
+            return out
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(1, 128, device=DEVICE, dtype=torch.float32)
+        fn = scale_rows.bind((x, bias)).compile_config(
+            helion.Config(block_sizes=[8], pallas_loop_type="fori_loop")
+        )
+        x_ref = weakref.ref(x)
+        bias_ref = weakref.ref(bias)
+        torch.testing.assert_close(fn(x, bias)[4:], (x + bias)[4:])
+        del x, bias
+        gc.collect()
+        self.assertIsNone(x_ref())
+        self.assertIsNone(bias_ref())
 
     def test_pallas_autotuner_final_pick_picks_true_best_on_noisy_initial_rank(
         self,
