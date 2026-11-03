@@ -1,6 +1,7 @@
 """Operand facts of the fused flash matcher (CPU).
 
-The attention matcher (``backend._attention_softmax_pattern_head_dim``) reads
+The attention matcher (``attention_match._attention_softmax_pattern_head_dim``)
+reads
 two source forms: the 3-D ``bmm`` / ``baddbmm`` pair of ``examples/attention.py``
 and the 2-D ``hl.dot`` pair over a scalar batch-head index (the form
 ``examples/fp8_attention.py`` takes once its query-tile loop is a launch
@@ -29,8 +30,9 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 import helion
-from helion._compiler import backend as _compiler_backend
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.analysis import attention_match as _attention_match
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import EXAMPLES_DIR
@@ -361,9 +363,13 @@ def _as_sm100() -> Iterator[None]:
     """CPU codegen with the flash gate forced on (as the flex matcher tests)."""
     with (
         cpu_codegen(),
-        patch("helion._compiler.backend._attention_flash_supported", return_value=True),
         patch(
-            "helion._compiler.backend._attention_flash_gate_enabled", return_value=True
+            "helion._compiler.cute.analysis.attention_match._attention_flash_supported",
+            return_value=True,
+        ),
+        patch(
+            "helion._compiler.cute.analysis.attention_match._attention_flash_gate_enabled",
+            return_value=True,
         ),
     ):
         yield
@@ -394,7 +400,7 @@ def _kv_loop_graph(bound: BoundKernel) -> ForLoopGraphInfo:
         and len(graph_info.block_ids) == 1
         and not (set(graph_info.block_ids) & root)
         and any(
-            _compiler_backend._attention_matmul_form(node) is not None
+            _attention_match._attention_matmul_form(node) is not None
             for node in graph_info.graph.nodes
         )
     ]
@@ -402,18 +408,18 @@ def _kv_loop_graph(bound: BoundKernel) -> ForLoopGraphInfo:
     return graphs[0]
 
 
-def _pattern(bound: BoundKernel) -> _compiler_backend.AttentionSoftmaxPattern | None:
+def _pattern(bound: BoundKernel) -> _attention_match.AttentionSoftmaxPattern | None:
     graph_info = _kv_loop_graph(bound)
     with bound.env, bound.host_function:
-        return _compiler_backend._attention_softmax_pattern_head_dim(
+        return _attention_match._attention_softmax_pattern_head_dim(
             graph_info.graph, kv_block_id=graph_info.block_ids[0]
         )
 
 
-def _surface(bound: BoundKernel) -> _compiler_backend.FlashSearchSurface | None:
+def _surface(bound: BoundKernel) -> _attention_match.FlashSearchSurface | None:
     device_ir = bound.host_function.device_ir
     with _as_sm100(), bound.env, bound.host_function:
-        return _compiler_backend.detect_flash_search_surface(device_ir)
+        return _attention_match.detect_flash_search_surface(device_ir)
 
 
 def _standard_example() -> Kernel:
@@ -873,7 +879,7 @@ def test_kv_scalar_batch_block_must_be_the_root_batch_block() -> None:
     assert pattern.score_rank == 2
     assert pattern.batch_block_id is not None
     assert pattern.batch_block_id != root[0]
-    fits_root = _compiler_backend._attention_pattern_fits_root
+    fits_root = _attention_match._attention_pattern_fits_root
     # With every operand fact hosted, the off-root block alone declines.
     with patch.object(cute_flash, "flash_operand_facts_lowered", return_value=True):
         assert not fits_root(pattern, root)
@@ -931,7 +937,8 @@ def _flash_generation(
     spec = ConfigSpec(backend=CuteBackend())
     for block_id, target in ((1, 128), (3, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         num_kv=num_kv,
         num_bh=num_bh,
@@ -952,9 +959,9 @@ def test_fp8_surface_coverage_design_is_complete(
     head_dim: int, num_kv: int, num_bh: int, max_kv_stage: int
 ) -> None:
     generation = _flash_generation(head_dim, num_kv, num_bh, torch.float8_e4m3fn)
-    configs = generation.flash_deterministic_population_configs()
+    configs = generation.extension.deterministic_population_configs()
     assert configs
-    assert generation.flash_structural_coverage_uncovered_interactions() == []
+    assert generation.extension.flash_structural_coverage_uncovered_interactions() == []
     assert {config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] for config in configs} == {
         "fa4"
     }
@@ -974,7 +981,7 @@ def test_fp8_surface_coverage_design_is_complete(
     assert fp8_max_kv_stage == max_kv_stage
     bf16_configs = _flash_generation(
         head_dim, num_kv, num_bh, torch.bfloat16
-    ).flash_deterministic_population_configs()
+    ).extension.deterministic_population_configs()
     assert (
         max(config[cute_flash.FLASH_KV_STAGE_KEY] for config in bf16_configs)
         < fp8_max_kv_stage

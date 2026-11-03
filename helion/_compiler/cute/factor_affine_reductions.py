@@ -42,6 +42,14 @@ from ..ast_extension import clone_ast
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import call_path_str
+from ._ast_pass_utils import loop_extent
+from ._ast_pass_utils import names_read
+from ._ast_pass_utils import names_written
+from ._ast_pass_utils import rename_names
+from ._ast_pass_utils import resolve_alias
+from .fx_matcher import _is_full_slice
 from .licm_profitability import repeated_work_is_profitable
 from .scalar_recipe import PURE_HELPERS
 
@@ -72,15 +80,6 @@ def _binary_args(
     if not isinstance(lhs, torch.fx.Node) or not isinstance(rhs, torch.fx.Node):
         return None
     return lhs, rhs
-
-
-def _is_full_slice(value: object) -> bool:
-    return (
-        isinstance(value, slice)
-        and value.start is None
-        and value.stop is None
-        and value.step is None
-    )
 
 
 def _shape(node: torch.fx.Node) -> tuple[object, ...] | None:
@@ -491,44 +490,6 @@ def factor_affine_reductions(graph: torch.fx.Graph, *, fast_math: bool) -> int:
     return changed
 
 
-def _ast_call_path(node: ast.expr) -> str | None:
-    parts: list[str] = []
-    current = node
-    while isinstance(current, ast.Attribute):
-        parts.append(current.attr)
-        current = current.value
-    if not isinstance(current, ast.Name):
-        return None
-    parts.append(current.id)
-    return ".".join(reversed(parts))
-
-
-def _assigned_name(stmt: ast.stmt) -> str | None:
-    if (
-        isinstance(stmt, ast.Assign)
-        and len(stmt.targets) == 1
-        and isinstance(stmt.targets[0], ast.Name)
-    ):
-        return stmt.targets[0].id
-    return None
-
-
-def _names_read(node: ast.AST) -> set[str]:
-    return {
-        child.id
-        for child in ast.walk(node)
-        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
-    }
-
-
-def _names_written(node: ast.AST) -> set[str]:
-    return {
-        child.id
-        for child in ast.walk(node)
-        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
-    }
-
-
 def _mutation_roots(node: ast.AST) -> set[str]:
     result: set[str] = set()
     for child in ast.walk(node):
@@ -544,24 +505,24 @@ def _mutation_roots(node: ast.AST) -> set[str]:
 
 def _statement_effects(stmt: ast.stmt) -> tuple[set[str], set[str]]:
     if isinstance(stmt, ast.Assign):
-        reads = _names_read(stmt.value)
+        reads = names_read(stmt.value)
         writes = {target.id for target in stmt.targets if isinstance(target, ast.Name)}
         for target in stmt.targets:
             if not isinstance(target, ast.Name):
-                reads.update(_names_read(target))
+                reads.update(names_read(target))
         return reads, writes
     if isinstance(stmt, ast.For):
         bound = {stmt.target.id} if isinstance(stmt.target, ast.Name) else set()
         live, writes = _block_effects(stmt.body, bound)
-        return _names_read(stmt.iter) | live, bound | writes
+        return names_read(stmt.iter) | live, bound | writes
     if isinstance(stmt, ast.If):
         body_live, body_writes = _block_effects(stmt.body, set())
         else_live, else_writes = _block_effects(stmt.orelse, set())
         return (
-            _names_read(stmt.test) | body_live | else_live,
+            names_read(stmt.test) | body_live | else_live,
             body_writes | else_writes,
         )
-    return _names_read(stmt), _names_written(stmt)
+    return names_read(stmt), names_written(stmt)
 
 
 def _block_effects(
@@ -600,14 +561,14 @@ def _definitely_written_block(body: list[ast.stmt]) -> set[str]:
 
 def _reads_before_def_statement(statement: ast.stmt) -> set[str]:
     if isinstance(statement, ast.Assign):
-        reads = _names_read(statement.value)
+        reads = names_read(statement.value)
         for target in statement.targets:
             if not isinstance(target, ast.Name):
-                reads.update(_names_read(target))
+                reads.update(names_read(target))
         return reads
     if isinstance(statement, ast.If):
         return (
-            _names_read(statement.test)
+            names_read(statement.test)
             | _live_before_block(statement.body)
             | _live_before_block(statement.orelse)
         )
@@ -616,11 +577,11 @@ def _reads_before_def_statement(statement: ast.stmt) -> set[str]:
             {statement.target.id} if isinstance(statement.target, ast.Name) else set()
         )
         return (
-            _names_read(statement.iter)
+            names_read(statement.iter)
             | _live_before_block(statement.body, initially_defined=bound)
             | _live_before_block(statement.orelse)
         )
-    return _names_read(statement)
+    return names_read(statement)
 
 
 def _live_before_block(
@@ -667,7 +628,7 @@ def _names_read_suffixes(body: list[ast.stmt]) -> list[set[str]]:
     reads: set[str] = set()
     result = [reads]
     for statement in reversed(body):
-        reads = reads | _names_read(statement)
+        reads = reads | names_read(statement)
         result.append(reads)
     result.reverse()
     return result
@@ -686,18 +647,18 @@ def _nested_live_out(
         )
         result.update(_live_before_block(child, initially_defined=bound))
     elif field == "body" and isinstance(statement, ast.While):
-        result.update(_names_read(statement.test))
+        result.update(names_read(statement.test))
         result.update(_live_before_block(child))
     return result
 
 
 def _zero_fp32_assignment(stmt: ast.stmt) -> str | None:
-    name = _assigned_name(stmt)
+    name = assigned_name(stmt)
     if name is None or not isinstance(cast("ast.Assign", stmt).value, ast.Call):
         return None
     call = cast("ast.Call", cast("ast.Assign", stmt).value)
     if (
-        _ast_call_path(call.func) != "cutlass.Float32"
+        call_path_str(call.func) != "cutlass.Float32"
         or len(call.args) != 1
         or call.keywords
         or not isinstance(call.args[0], ast.Constant)
@@ -708,20 +669,11 @@ def _zero_fp32_assignment(stmt: ast.stmt) -> str | None:
 
 
 def _constexpr_loop(node: ast.stmt) -> tuple[ast.For, str, int] | None:
-    if (
-        not isinstance(node, ast.For)
-        or not isinstance(node.target, ast.Name)
-        or not isinstance(node.iter, ast.Call)
-        or _ast_call_path(node.iter.func) != "cutlass.range_constexpr"
-        or len(node.iter.args) != 1
-        or node.iter.keywords
-        or not isinstance(node.iter.args[0], ast.Constant)
-        or not isinstance(node.iter.args[0].value, int)
-        or node.iter.args[0].value <= 0
-        or node.orelse
-    ):
+    extent = loop_extent(node, kinds=("constexpr",), minimum=1)
+    if extent is None:
         return None
-    return node, node.target.id, node.iter.args[0].value
+    assert isinstance(node, ast.For) and isinstance(node.target, ast.Name)
+    return node, node.target.id, extent
 
 
 def _static_repeated_loop(node: ast.stmt) -> tuple[ast.For, str, int] | None:
@@ -733,7 +685,7 @@ def _static_repeated_loop(node: ast.stmt) -> tuple[ast.For, str, int] | None:
         not isinstance(node, ast.For)
         or not isinstance(node.target, ast.Name)
         or not isinstance(node.iter, ast.Call)
-        or _ast_call_path(node.iter.func) != "range"
+        or call_path_str(node.iter.func) != "range"
         or len(node.iter.args) != 1
         or node.iter.keywords
         or not isinstance(node.iter.args[0], ast.Constant)
@@ -746,48 +698,16 @@ def _static_repeated_loop(node: ast.stmt) -> tuple[ast.For, str, int] | None:
     return node, node.target.id, node.iter.args[0].value
 
 
-def _reduction_result(stmt: ast.stmt, accumulator: str) -> tuple[str, ast.Call] | None:
-    result = _assigned_name(stmt)
-    if result is None:
-        return None
-    value = cast("ast.Assign", stmt).value
-    if (
-        not isinstance(value, ast.Call)
-        or _ast_call_path(value.func) != "cutlass.Float32"
-        or len(value.args) != 1
-        or value.keywords
-        or not isinstance(value.args[0], ast.Call)
-    ):
-        return None
-    reduction = value.args[0]
-    if (
-        _ast_call_path(reduction.func) != "cute.arch.warp_reduction_sum"
-        or len(reduction.args) != 1
-        or any(
-            keyword.arg != "threads_in_group"
-            or not isinstance(keyword.value, ast.Constant)
-            or not isinstance(keyword.value.value, int)
-            or keyword.value.value <= 0
-            for keyword in reduction.keywords
-        )
-    ):
-        return None
-    argument = reduction.args[0]
-    if not isinstance(argument, ast.Name) or argument.id != accumulator:
-        return None
-    return result, reduction
-
-
 def _warp_reduction_assignment(
     stmt: ast.stmt,
 ) -> tuple[str, str, ast.Call] | None:
-    result = _assigned_name(stmt)
+    result = assigned_name(stmt)
     if result is None:
         return None
     value = cast("ast.Assign", stmt).value
     if (
         not isinstance(value, ast.Call)
-        or _ast_call_path(value.func) != "cutlass.Float32"
+        or call_path_str(value.func) != "cutlass.Float32"
         or len(value.args) != 1
         or value.keywords
         or not isinstance(value.args[0], ast.Call)
@@ -795,7 +715,7 @@ def _warp_reduction_assignment(
         return None
     reduction = value.args[0]
     if (
-        _ast_call_path(reduction.func) != "cute.arch.warp_reduction_sum"
+        call_path_str(reduction.func) != "cute.arch.warp_reduction_sum"
         or len(reduction.args) != 1
         or any(
             keyword.arg != "threads_in_group"
@@ -813,7 +733,7 @@ def _warp_reduction_assignment(
 
 
 def _accumulated_term(stmt: ast.stmt, accumulator: str) -> ast.expr | None:
-    if _assigned_name(stmt) != accumulator:
+    if assigned_name(stmt) != accumulator:
         return None
     value = cast("ast.Assign", stmt).value
     if not isinstance(value, ast.BinOp) or not isinstance(value.op, ast.Add):
@@ -902,9 +822,9 @@ def _safe_invariant_expression(
     outer_mutations: set[str],
     rmem_names: set[str],
 ) -> bool:
-    if outer_lane in _names_read(expression):
+    if outer_lane in names_read(expression):
         return False
-    free_names = _names_read(expression) - _AST_GLOBAL_NAMES
+    free_names = names_read(expression) - _AST_GLOBAL_NAMES
     if free_names & (outer_writes | outer_mutations):
         return False
     for child in ast.walk(expression):
@@ -924,7 +844,7 @@ def _safe_invariant_expression(
         ):
             return False
         if isinstance(child, ast.Call):
-            path = _ast_call_path(child.func)
+            path = call_path_str(child.func)
             if path == "cute.arch.load" or path not in _AST_PURE_CALLS:
                 return False
         if isinstance(child, ast.Subscript):
@@ -947,21 +867,10 @@ def _fresh_ast_name(occupied: set[str], prefix: str) -> str:
     return result
 
 
-class _RenameAstName(ast.NodeTransformer):
-    def __init__(self, old: str, new: str) -> None:
-        self.old = old
-        self.new = new
-
-    def visit_Name(self, node: ast.Name) -> ast.Name:
-        if node.id != self.old:
-            return node
-        return ast.copy_location(ast.Name(id=self.new, ctx=node.ctx), node)
-
-
 def _unwrap_fp32(expression: ast.expr) -> ast.expr:
     if (
         isinstance(expression, ast.Call)
-        and _ast_call_path(expression.func) == "cutlass.Float32"
+        and call_path_str(expression.func) == "cutlass.Float32"
         and len(expression.args) == 1
         and not expression.keywords
     ):
@@ -972,7 +881,7 @@ def _unwrap_fp32(expression: ast.expr) -> ast.expr:
 def _as_fp32(expression: ast.expr) -> ast.expr:
     if (
         isinstance(expression, ast.Call)
-        and _ast_call_path(expression.func) == "cutlass.Float32"
+        and call_path_str(expression.func) == "cutlass.Float32"
         and len(expression.args) == 1
         and not expression.keywords
     ):
@@ -1078,14 +987,14 @@ def _has_effectful_call(
                 continue
             if id(child) in ignored_calls:
                 continue
-            path = _ast_call_path(child.func)
+            path = call_path_str(child.func)
             if path is None:
                 if isinstance(child.func, ast.Attribute):
                     receiver = child.func.value
                     if (
                         child.func.attr == "bitcast"
                         and isinstance(receiver, ast.Call)
-                        and _ast_call_path(receiver.func) in _AST_PURE_CALLS
+                        and call_path_str(receiver.func) in _AST_PURE_CALLS
                     ):
                         continue
                     if child.func.attr == "load" and any(
@@ -1145,7 +1054,7 @@ def _deduplicate_fused_body(
 
         name = target.id
         rhs = statement.value
-        rhs_names = _names_read(rhs) - _AST_GLOBAL_NAMES
+        rhs_names = names_read(rhs) - _AST_GLOBAL_NAMES
         rhs_versions = {
             dependency: versions.get(dependency, 0) for dependency in rhs_names
         }
@@ -1242,7 +1151,7 @@ def _clone_pair_expression(
 def _definitions(body: list[ast.stmt]) -> dict[str, ast.expr] | None:
     result: dict[str, ast.expr] = {}
     for statement in body:
-        name = _assigned_name(statement)
+        name = assigned_name(statement)
         if name is None:
             continue
         if name in result:
@@ -1268,7 +1177,7 @@ def _dependency_closure(names: set[str], definitions: dict[str, ast.expr]) -> se
         expression = definitions.get(name)
         if expression is None:
             continue
-        for dependency in _names_read(expression):
+        for dependency in names_read(expression):
             if dependency not in result:
                 result.add(dependency)
                 worklist.append(dependency)
@@ -1283,7 +1192,7 @@ def _index_dependencies(
         for statement in body
         for node in ast.walk(statement)
         if isinstance(node, ast.Subscript)
-        for name in _names_read(node.slice)
+        for name in names_read(node.slice)
     }
     return _dependency_closure(names, definitions)
 
@@ -1291,7 +1200,7 @@ def _index_dependencies(
 def _strip_int_cast(expression: ast.expr) -> ast.expr:
     while (
         isinstance(expression, ast.Call)
-        and _ast_call_path(expression.func) in {"cutlass.Int32", "cutlass.Int64"}
+        and call_path_str(expression.func) in {"cutlass.Int32", "cutlass.Int64"}
         and len(expression.args) == 1
         and not expression.keywords
     ):
@@ -1314,7 +1223,7 @@ def _lane_affine_coefficient(expression: ast.expr, lane_name: str) -> int | None
             return None
         return -coefficient if isinstance(expression.op, ast.USub) else coefficient
     if not isinstance(expression, ast.BinOp):
-        return 0 if lane_name not in _names_read(expression) else None
+        return 0 if lane_name not in names_read(expression) else None
     if isinstance(expression.op, (ast.Add, ast.Sub)):
         left = _lane_affine_coefficient(expression.left, lane_name)
         right = _lane_affine_coefficient(expression.right, lane_name)
@@ -1330,7 +1239,7 @@ def _lane_affine_coefficient(expression: ast.expr, lane_name: str) -> int | None
         if isinstance(right, ast.Constant) and isinstance(right.value, int):
             coefficient = _lane_affine_coefficient(left, lane_name)
             return None if coefficient is None else right.value * coefficient
-        return None if lane_name in _names_read(expression) else 0
+        return None if lane_name in names_read(expression) else 0
     if (
         isinstance(expression.op, ast.FloorDiv)
         and isinstance(_strip_int_cast(expression.right), ast.Constant)
@@ -1343,14 +1252,14 @@ def _lane_affine_coefficient(expression: ast.expr, lane_name: str) -> int | None
             "int", cast("ast.Constant", _strip_int_cast(expression.right)).value
         )
         return coefficient // divisor
-    return None if lane_name in _names_read(expression) else 0
+    return None if lane_name in names_read(expression) else 0
 
 
 def _safe_lane_local_stores(
     loop: ast.For, lane_name: str, rmem_names: set[str]
 ) -> bool:
     mutated = _mutation_roots(loop)
-    loop_locals = _names_written(loop) - {lane_name}
+    loop_locals = names_written(loop) - {lane_name}
     store_mappings: dict[str, set[str]] = {}
     if not mutated <= rmem_names:
         return False
@@ -1370,7 +1279,7 @@ def _safe_lane_local_stores(
             return False
         if not isinstance(node.ctx, ast.Store):
             return False
-        if _names_read(node.slice) & loop_locals:
+        if names_read(node.slice) & loop_locals:
             return False
         coefficient = _lane_affine_coefficient(node.slice, lane_name)
         if coefficient in {None, 0}:
@@ -1411,14 +1320,14 @@ def _numeric_expression_kind(
 ) -> str | None:
     if (
         isinstance(expression, ast.Call)
-        and _ast_call_path(expression.func) == "cutlass.Float32"
+        and call_path_str(expression.func) == "cutlass.Float32"
         and len(expression.args) == 1
         and not expression.keywords
     ):
         return "fp32"
     if (
         isinstance(expression, ast.Call)
-        and _ast_call_path(expression.func) == "cutlass.Int32"
+        and call_path_str(expression.func) == "cutlass.Int32"
         and len(expression.args) == 1
         and not expression.keywords
     ):
@@ -1480,7 +1389,7 @@ def _numeric_expression_kind(
             return None
         return "fp32" if "fp32" in {body_kind, else_kind} else "int"
     if isinstance(expression, ast.Call):
-        path = _ast_call_path(expression.func)
+        path = call_path_str(expression.func)
         if path not in _FP32_MATH_CALLS or not expression.args:
             return None
         argument_kinds = [
@@ -1815,12 +1724,12 @@ def _pair_constexpr_loop(
     seen: set[str] = set()
     accumulator_set = set(accumulators)
     for statement in loop.body:
-        assigned = _assigned_name(statement)
-        reads = _names_read(statement)
+        assigned = assigned_name(statement)
+        reads = names_read(statement)
         if assigned in accumulator_set:
             assert assigned is not None
             term = _accumulated_term(statement, assigned)
-            if term is None or _names_read(term) & accumulator_set:
+            if term is None or names_read(term) & accumulator_set:
                 return None
             reads.discard(assigned)
         elif reads & accumulator_set:
@@ -1843,12 +1752,12 @@ def _pair_constexpr_loop(
         if len(matches) != 1:
             return None
         accumulator_terms[accumulator] = matches[0]
-        seeds.update(_names_read(matches[0]))
+        seeds.update(names_read(matches[0]))
     append_statements = [
         statement for statement in loop.body if _append_call(statement) is not None
     ]
     for statement in append_statements:
-        seeds.update(_names_read(statement))
+        seeds.update(names_read(statement))
     value_dependencies = _dependency_closure(seeds, definitions)
     index_dependencies = _index_dependencies(loop.body, definitions)
     blocked_inline = index_dependencies | accumulator_set
@@ -1924,7 +1833,7 @@ def _pair_constexpr_loop(
     packed_operations = 0
 
     for statement in loop.body:
-        assigned = _assigned_name(statement)
+        assigned = assigned_name(statement)
         if assigned in accumulators:
             assert assigned is not None
             term = accumulator_terms[assigned]
@@ -2056,7 +1965,7 @@ def _rmem_storage_names(body: list[ast.stmt]) -> tuple[set[str], set[str]]:
     module = ast.Module(body=body, type_ignores=[])
     assignments: dict[str, list[ast.Assign]] = {}
     for node in ast.walk(module):
-        name = _assigned_name(node) if isinstance(node, ast.stmt) else None
+        name = assigned_name(node) if isinstance(node, ast.stmt) else None
         if name is not None:
             assignments.setdefault(name, []).append(cast("ast.Assign", node))
     write_counts: dict[str, int] = {}
@@ -2072,13 +1981,13 @@ def _rmem_storage_names(body: list[ast.stmt]) -> tuple[set[str], set[str]]:
         value = definitions[0].value
         if (
             not isinstance(value, ast.Call)
-            or _ast_call_path(value.func) != "cute.make_rmem_tensor"
+            or call_path_str(value.func) != "cute.make_rmem_tensor"
             or len(value.args) != 2
             or value.keywords
         ):
             continue
         rmem_names.add(name)
-        if _ast_call_path(cast("ast.expr", value.args[1])) == "cutlass.Float32":
+        if call_path_str(cast("ast.expr", value.args[1])) == "cutlass.Float32":
             fp32_rmem.add(name)
 
     # A register fragment is considered non-aliasing only when every load of
@@ -2113,7 +2022,7 @@ def _collect_fp32_names(
     assignments: dict[str, list[ast.expr]] = {}
     write_counts: dict[str, int] = {}
     for node in ast.walk(module):
-        name = _assigned_name(node) if isinstance(node, ast.stmt) else None
+        name = assigned_name(node) if isinstance(node, ast.stmt) else None
         if name is not None:
             assignments.setdefault(name, []).append(cast("ast.Assign", node).value)
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
@@ -2135,7 +2044,7 @@ def _collect_fp32_names(
 
 
 def _empty_list_assignment(statement: ast.stmt) -> str | None:
-    name = _assigned_name(statement)
+    name = assigned_name(statement)
     if name is None:
         return None
     value = cast("ast.Assign", statement).value
@@ -2197,7 +2106,7 @@ def _loop_accumulator_initializers(
     accumulators = {
         name
         for statement in loop.body
-        if (name := _assigned_name(statement)) is not None
+        if (name := assigned_name(statement)) is not None
         and _accumulated_term(statement, name) is not None
     }
     if not accumulators:
@@ -2277,7 +2186,7 @@ def _pack_fp32_block(
         accumulators = tuple(
             name
             for candidate in statement.body
-            if (name := _assigned_name(candidate)) in initializer_indices
+            if (name := assigned_name(candidate)) in initializer_indices
         )
         if not accumulators and not any(
             _append_call(candidate) is not None for candidate in statement.body
@@ -2409,7 +2318,7 @@ _PACKED_LICM_UNSUPPORTED_CONTROL = (
 def _fp32_name(expression: ast.expr, name: str) -> bool:
     return (
         isinstance(expression, ast.Call)
-        and _ast_call_path(expression.func) == "cutlass.Float32"
+        and call_path_str(expression.func) == "cutlass.Float32"
         and len(expression.args) == 1
         and not expression.keywords
         and isinstance(expression.args[0], ast.Name)
@@ -2433,7 +2342,7 @@ def _packed_accumulator_update(
         or cast("ast.Name", target.elts[0]).id != lo_accumulator
         or cast("ast.Name", target.elts[1]).id != hi_accumulator
         or not isinstance(statement.value, ast.Call)
-        or _ast_call_path(statement.value.func) != "cute.arch.fma_packed_f32x2"
+        or call_path_str(statement.value.func) != "cute.arch.fma_packed_f32x2"
         or len(statement.value.args) != 3
         or statement.value.keywords
         or any(
@@ -2454,7 +2363,7 @@ def _packed_accumulator_update(
 def _packed_pair_sum(
     statement: ast.stmt, lo_accumulator: str, hi_accumulator: str
 ) -> str | None:
-    result = _assigned_name(statement)
+    result = assigned_name(statement)
     if result is None:
         return None
     value = cast("ast.Assign", statement).value
@@ -2469,7 +2378,7 @@ def _packed_pair_sum(
 
 
 def _packed_licm_call_is_pure(call: ast.Call) -> bool:
-    path = _ast_call_path(call.func)
+    path = call_path_str(call.func)
     if path == "cute.math.div":
         return (
             len(call.args) == 2
@@ -2489,7 +2398,7 @@ def _packed_licm_call_is_pure(call: ast.Call) -> bool:
         and isinstance(call.func.value, ast.Call)
     ):
         return False
-    return _ast_call_path(call.func.value.func) in _AST_PURE_CALLS
+    return call_path_str(call.func.value.func) in _AST_PURE_CALLS
 
 
 def _packed_licm_statement_is_pure(statement: ast.stmt, rmem_names: set[str]) -> bool:
@@ -2597,7 +2506,7 @@ def _dead_packed_assignment_is_discardable(statement: ast.stmt) -> bool:
             )
         if not isinstance(expression, ast.Call) or expression.keywords:
             return False
-        path = _ast_call_path(expression.func)
+        path = call_path_str(expression.func)
         return path in (_AST_PURE_CALLS - {"cute.arch.load"}) and all(
             safe_expression(argument) for argument in expression.args
         )
@@ -2613,10 +2522,10 @@ def _packed_block_effects(
     all_writes: set[str] = set()
     for statement in body:
         if isinstance(statement, ast.Assign):
-            reads = _names_read(statement.value)
+            reads = names_read(statement.value)
             for target in statement.targets:
                 if not isinstance(target, (ast.Name, ast.Tuple)):
-                    reads.update(_names_read(target))
+                    reads.update(names_read(target))
             writes = {
                 node.id
                 for target in statement.targets
@@ -2627,11 +2536,11 @@ def _packed_block_effects(
             nested_live, nested_writes = _packed_block_effects(
                 statement.body, {statement.target.id}
             )
-            reads = _names_read(statement.iter) | nested_live
+            reads = names_read(statement.iter) | nested_live
             writes = {statement.target.id} | nested_writes
         else:
-            reads = _names_read(statement)
-            writes = _names_written(statement)
+            reads = names_read(statement)
+            writes = names_written(statement)
         live.update(reads - written)
         written.update(writes)
         all_writes.update(writes)
@@ -2656,20 +2565,12 @@ def _load_name_counts(nodes: Iterable[ast.AST]) -> dict[str, int]:
     return result
 
 
-def _canonical_ast_name(name: str, rename_groups: dict[str, str]) -> str:
-    seen: set[str] = set()
-    while name in rename_groups and name not in seen:
-        seen.add(name)
-        name = rename_groups[name]
-    return name
-
-
 def _canonical_counts(
     counts: dict[str, int], rename_groups: dict[str, str]
 ) -> dict[str, int]:
     result: dict[str, int] = {}
     for name, count in counts.items():
-        canonical = _canonical_ast_name(name, rename_groups)
+        canonical = resolve_alias(name, rename_groups)
         result[canonical] = result.get(canonical, 0) + count
     return result
 
@@ -2687,7 +2588,7 @@ def _packed_inner_dependency_slice(
     definitions: dict[str, ast.expr] = {}
     definition_indices: dict[str, int] = {}
     for index, statement in enumerate(loop.body[:-1]):
-        name = _assigned_name(statement)
+        name = assigned_name(statement)
         if (
             name is None
             or name in definitions
@@ -2701,14 +2602,14 @@ def _packed_inner_dependency_slice(
     local_names = set(definitions)
     seen = {cast("ast.Name", loop.target).id}
     for statement in loop.body[:-1]:
-        name = _assigned_name(statement)
+        name = assigned_name(statement)
         assert name is not None
-        if _names_read(statement) & (local_names - seen):
+        if names_read(statement) & (local_names - seen):
             return None
         seen.add(name)
 
     needed = _dependency_closure(
-        _names_read(cast("ast.Assign", loop.body[-1]).value)
+        names_read(cast("ast.Assign", loop.body[-1]).value)
         - {lo_accumulator, hi_accumulator},
         definitions,
     )
@@ -2784,7 +2685,7 @@ def _try_hoist_one_packed_reduction(
         result_name = reduction[0]
         original_pattern = body[index : index + 5]
         call_paths = [
-            _ast_call_path(node.func)
+            call_path_str(node.func)
             for statement in original_pattern
             for node in ast.walk(statement)
             if isinstance(node, ast.Call)
@@ -2832,46 +2733,46 @@ def _try_hoist_one_packed_reduction(
             _load_name_counts(original_pattern), rename_groups
         )
         if any(
-            scope_loads.get(_canonical_ast_name(name, rename_groups), 0)
-            != original_loads.get(_canonical_ast_name(name, rename_groups), 0)
+            scope_loads.get(resolve_alias(name, rename_groups), 0)
+            != original_loads.get(resolve_alias(name, rename_groups), 0)
             for name in internal_names
         ):
             continue
         canonical_live_after = {
-            _canonical_ast_name(name, rename_groups) for name in live_after_scope
+            resolve_alias(name, rename_groups) for name in live_after_scope
         }
         if {
-            _canonical_ast_name(name, rename_groups) for name in internal_names
+            resolve_alias(name, rename_groups) for name in internal_names
         } & canonical_live_after:
             continue
 
         row_prefix = body[:index]
-        canonical_result = _canonical_ast_name(result_name, rename_groups)
+        canonical_result = resolve_alias(result_name, rename_groups)
         if canonical_result in {
-            _canonical_ast_name(name, rename_groups)
-            for name in _names_read(ast.Module(body=row_prefix, type_ignores=[]))
+            resolve_alias(name, rename_groups)
+            for name in names_read(ast.Module(body=row_prefix, type_ignores=[]))
         }:
             continue
         row_suffix = body[index + 5 :]
         if canonical_result not in {
-            _canonical_ast_name(name, rename_groups)
-            for name in _names_read(ast.Module(body=row_suffix, type_ignores=[]))
+            resolve_alias(name, rename_groups)
+            for name in names_read(ast.Module(body=row_suffix, type_ignores=[]))
         }:
             continue
 
         unselected = [*row_prefix, *row_suffix]
         unselected_writes = {
-            _canonical_ast_name(name, rename_groups)
-            for name in _names_written(ast.Module(body=unselected, type_ignores=[]))
+            resolve_alias(name, rename_groups)
+            for name in names_written(ast.Module(body=unselected, type_ignores=[]))
         }
         unselected_mutations = {
-            _canonical_ast_name(name, rename_groups)
+            resolve_alias(name, rename_groups)
             for name in _mutation_roots(ast.Module(body=unselected, type_ignores=[]))
         }
         canonical_external_reads = {
-            _canonical_ast_name(name, rename_groups) for name in external_reads
+            resolve_alias(name, rename_groups) for name in external_reads
         }
-        if _canonical_ast_name(lane_name, rename_groups) in canonical_external_reads:
+        if resolve_alias(lane_name, rename_groups) in canonical_external_reads:
             continue
         if canonical_external_reads & (
             set(canonical_original_stores) | unselected_writes | unselected_mutations
@@ -2900,12 +2801,10 @@ def _earliest_packed_hoist_index(
     insertion_index = 0
     for index, statement in enumerate(prefix):
         written_or_mutated = {
-            _canonical_ast_name(name, rename_groups)
-            for name in _names_written(statement) | _mutation_roots(statement)
+            resolve_alias(name, rename_groups)
+            for name in names_written(statement) | _mutation_roots(statement)
         }
-        read = {
-            _canonical_ast_name(name, rename_groups) for name in _names_read(statement)
-        }
+        read = {resolve_alias(name, rename_groups) for name in names_read(statement)}
         has_control_exit = any(
             isinstance(
                 node,
@@ -3062,10 +2961,11 @@ def _try_fuse_adjacent_reduction_loops(loop: ast.For, rmem_names: set[str]) -> b
         if second_acc is None or second_loop_match is None:
             continue
         second_loop, second_lane, second_extent = second_loop_match
-        second_reduction = _reduction_result(body[first_index + 4], second_acc)
+        second_reduction = _warp_reduction_assignment(body[first_index + 4])
         if (
             first_extent != second_extent
             or second_reduction is None
+            or second_reduction[1] != second_acc
             or not second_reduction[0].startswith("_helion_factored_base_sum")
             or first_acc in _statement_effects(second_loop)[0]
         ):
@@ -3076,9 +2976,9 @@ def _try_fuse_adjacent_reduction_loops(loop: ast.For, rmem_names: set[str]) -> b
         ):
             continue
         first_live = _live_before_block(first_loop.body, {first_lane, first_acc})
-        first_writes = _names_written(first_loop)
+        first_writes = names_written(first_loop)
         second_live = _live_before_block(second_loop.body, {second_lane, second_acc})
-        second_writes = _names_written(second_loop)
+        second_writes = names_written(second_loop)
         if (first_live & first_writes) - {first_acc} or (
             second_live & second_writes
         ) - {second_acc}:
@@ -3111,9 +3011,8 @@ def _try_fuse_adjacent_reduction_loops(loop: ast.For, rmem_names: set[str]) -> b
 
         second_loop_copy = cast("ast.For", clone_ast(second_loop))
         if second_lane != first_lane:
-            rename = _RenameAstName(second_lane, first_lane)
             for statement in second_loop_copy.body:
-                rename.visit(statement)
+                rename_names(statement, {second_lane: first_lane})
         stores = _subscript_accesses(first_loop.body, ast.Store)
         loads = _subscript_accesses(second_loop_copy.body, ast.Load)
         if any(
@@ -3148,7 +3047,7 @@ def _hoist_one_invariant_reduction(
         return None
     body = loop.body
     outer_lane = loop.target.id
-    outer_writes = _names_written(loop)
+    outer_writes = names_written(loop)
     outer_mutations = _mutation_roots(loop)
     for index in range(len(body) - 2):
         accumulator = _zero_fp32_assignment(body[index])
@@ -3156,10 +3055,10 @@ def _hoist_one_invariant_reduction(
         if accumulator is None or inner_match is None:
             continue
         inner_loop, inner_lane, extent = inner_match
-        reduced = _reduction_result(body[index + 2], accumulator)
-        if reduced is None or not inner_loop.body:
+        reduced = _warp_reduction_assignment(body[index + 2])
+        if reduced is None or reduced[1] != accumulator or not inner_loop.body:
             continue
-        result_name, _reduction_call = reduced
+        result_name, _accumulator, _reduction_call = reduced
         if not result_name.startswith("_helion_factored_dot_sum"):
             continue
         term = _accumulated_term(inner_loop.body[-1], accumulator)
@@ -3168,7 +3067,7 @@ def _hoist_one_invariant_reduction(
         definitions: dict[str, ast.expr] = {}
         valid = True
         for statement in inner_loop.body[:-1]:
-            name = _assigned_name(statement)
+            name = assigned_name(statement)
             if name is None:
                 valid = False
                 break
@@ -3181,15 +3080,15 @@ def _hoist_one_invariant_reduction(
             continue
         seen: set[str] = set()
         for statement in inner_loop.body[:-1]:
-            name = _assigned_name(statement)
+            name = assigned_name(statement)
             assert name is not None
-            if _names_read(statement) & (set(definitions) - seen):
+            if names_read(statement) & (set(definitions) - seen):
                 valid = False
                 break
             seen.add(name)
         if not valid:
             continue
-        term_dependencies = _dependency_closure(_names_read(term), definitions)
+        term_dependencies = _dependency_closure(names_read(term), definitions)
         if set(definitions) - term_dependencies:
             continue
         new_lane = _fresh_ast_name(occupied, "_factored_lane")
@@ -3203,9 +3102,9 @@ def _hoist_one_invariant_reduction(
         except ValueError:
             continue
         candidate_writes = (
-            _names_written(body[index])
-            | _names_written(body[index + 1])
-            | _names_written(body[index + 2])
+            names_written(body[index])
+            | names_written(body[index + 1])
+            | names_written(body[index + 2])
         )
         if not _safe_invariant_expression(
             normalized,
@@ -3215,11 +3114,11 @@ def _hoist_one_invariant_reduction(
             rmem_names=rmem_names,
         ):
             continue
-        deleted_names = _names_written(inner_loop) | {inner_lane, accumulator}
+        deleted_names = names_written(inner_loop) | {inner_lane, accumulator}
         outside_slice = [*body[:index], *body[index + 3 :]]
         if deleted_names & (
             live_after
-            | {name for statement in outside_slice for name in _names_read(statement)}
+            | {name for statement in outside_slice for name in names_read(statement)}
         ):
             continue
         new_accumulator = _fresh_ast_name(occupied, "_factored_acc")
@@ -3257,7 +3156,7 @@ def _hoist_one_invariant_reduction(
             child
             for child in ast.walk(result_assignment.value)
             if isinstance(child, ast.Call)
-            and _ast_call_path(child.func) == "cute.arch.warp_reduction_sum"
+            and call_path_str(child.func) == "cute.arch.warp_reduction_sum"
         )
         replacement_call.args[0] = create(ast.Name, id=new_accumulator, ctx=ast.Load())
         del body[index : index + 3]

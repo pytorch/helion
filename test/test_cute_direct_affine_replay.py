@@ -11,35 +11,47 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from helion._compiler.cute import direct_affine_replay as replay_impl
+from helion._compiler.ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from helion._compiler.cute import direct_affine_emission as emission_impl
+from helion._compiler.cute import direct_affine_templates as templates_impl
+from helion._compiler.cute.direct_affine_emission import (
+    compose_direct_affine_replacement,
+)
 from helion._compiler.cute.direct_affine_plan import DirectAffineCoefficientLayout
 from helion._compiler.cute.direct_affine_plan import DirectAffineMma
 from helion._compiler.cute.direct_affine_plan import DirectAffinePhaseOrder
 from helion._compiler.cute.direct_affine_plan import DirectAffineStateAccessProof
 from helion._compiler.cute.direct_affine_plan import DirectAffineStateIngress
 from helion._compiler.cute.direct_affine_plan import resolve_direct_affine_plan
-from helion._compiler.cute.direct_affine_replay import DirectAffineCoordinates
-from helion._compiler.cute.direct_affine_replay import DirectAffineEffectReplay
-from helion._compiler.cute.direct_affine_replay import DirectAffineNodeReplay
-from helion._compiler.cute.direct_affine_replay import DirectAffineOrdinaryAxis
-from helion._compiler.cute.direct_affine_replay import DirectAffineReplay
-from helion._compiler.cute.direct_affine_replay import DirectAffineReplayBindings
-from helion._compiler.cute.direct_affine_replay import DirectAffineReplayProof
-from helion._compiler.cute.direct_affine_replay import DirectAffineResolvedTemplates
-from helion._compiler.cute.direct_affine_replay import DirectAffineSharedBuffer
-from helion._compiler.cute.direct_affine_replay import DirectAffineStateStoreReplay
-from helion._compiler.cute.direct_affine_replay import DirectAffineStepReplay
-from helion._compiler.cute.direct_affine_replay import DirectAffineValueReplay
-from helion._compiler.cute.direct_affine_replay import compose_direct_affine_replacement
-from helion._compiler.cute.direct_affine_replay import instantiate_direct_affine_value
-from helion._compiler.cute.direct_affine_replay import replace_direct_affine_replay
-from helion._compiler.cute.direct_affine_replay import resolve_direct_affine_coordinates
-from helion._compiler.cute.direct_affine_replay import resolve_direct_affine_replay
-from helion._compiler.cute.direct_affine_replay import resolve_direct_affine_templates
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineCoordinates
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineEffectReplay
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineNodeReplay
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineOrdinaryAxis
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineReplay
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineReplayBindings
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineReplayProof
+from helion._compiler.cute.direct_affine_replay_core import (
+    DirectAffineResolvedTemplates,
+)
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineSharedBuffer
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineStateStoreReplay
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineStepReplay
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineValueReplay
+from helion._compiler.cute.direct_affine_replay_core import (
+    instantiate_direct_affine_value,
+)
+from helion._compiler.cute.direct_affine_replay_core import replace_direct_affine_replay
+from helion._compiler.cute.direct_affine_replay_core import (
+    resolve_direct_affine_coordinates,
+)
+from helion._compiler.cute.direct_affine_replay_core import resolve_direct_affine_replay
+from helion._compiler.cute.direct_affine_templates import (
+    resolve_direct_affine_templates,
+)
 
 pytestmark = pytest.mark.cpu_only
 
-validate_direct_affine_templates = replay_impl._validate_direct_affine_templates
+validate_direct_affine_templates = templates_impl._validate_direct_affine_templates
 
 
 def _expression(source: str) -> ast.expr:
@@ -490,7 +502,7 @@ def test_overlapping_coordinate_alias_uses_outer_substitution() -> None:
     ],
 )
 def test_pointer_contract_rejects_wrong_tensor_or_stride(pointer: str) -> None:
-    assert not replay_impl._pointer_has_tensor_layout(
+    assert not templates_impl._pointer_has_tensor_layout(
         _expression(pointer),
         argument_name="state",
         row=_expression("row"),
@@ -508,7 +520,7 @@ def test_pointer_contract_accepts_exact_ranked_layout() -> None:
         "cutlass.Int32(state.layout.stride[3])"
     )
 
-    assert replay_impl._pointer_has_tensor_layout(
+    assert templates_impl._pointer_has_tensor_layout(
         pointer,
         argument_name="state",
         row=_expression("row"),
@@ -524,13 +536,13 @@ def _feature_reduction_loop(*extra: str) -> ast.For:
         "    feature = lane * 4 + element\n"
         "    value = source.iterator.load() + feature\n"
         "    reduced = _helion_lane_reduce(value, 'sum', "
-        "cutlass.Float32(0), 32, 1, 0, '', 1, 1)\n"
+        "cutlass.Float32(0), threads_in_group=32)\n"
         + "".join(f"    {line}\n" for line in extra)
         + "    (scratch.iterator + feature).store(value + reduced)"
     )
     loop = statements[0]
     assert isinstance(loop, ast.For)
-    setattr(loop, replay_impl.HELION_LANE_LOOP_VAR_ATTR, "element")
+    setattr(loop, HELION_LANE_LOOP_VAR_ATTR, "element")
     return loop
 
 
@@ -540,28 +552,29 @@ def _feature_reduction_loop(*extra: str) -> ast.For:
         (
             "partial = source_feature * source_feature\n"
             "reduced = _helion_lane_reduce(partial, 'max', "
-            "cutlass.Float32(0), 32, 1, 0, '', 1, 1)"
+            "cutlass.Float32(0), threads_in_group=32)"
         ),
         (
             "partial = source_feature * source_feature\n"
             "reduced = _helion_lane_reduce(partial, 'sum', "
-            "cutlass.Float32(0), 16, 1, 0, '', 1, 1)"
+            "cutlass.Float32(0), threads_in_group=16)"
         ),
         (
             "partial = source_feature * source_feature\n"
             "reduced = _helion_lane_reduce(partial, 'sum', "
-            "cutlass.Float32(0), 32, 2, 16, 'lane', 1, 1)"
+            "cutlass.Float32(0), threads_in_group=32, group_pre=2, "
+            "group_span=16, group_lane_expr='lane')"
         ),
         (
             "partial = source_row * source_row\n"
             "reduced = _helion_lane_reduce(partial, 'sum', "
-            "cutlass.Float32(0), 32, 1, 0, '', 1, 1)"
+            "cutlass.Float32(0), threads_in_group=32)"
         ),
     ],
 )
 def test_feature_reduction_rejects_unsupported_marker(statements: str) -> None:
     plan = _plan(3, DirectAffineMma.M16N8)
-    assert not replay_impl._feature_reduction_markers_are_supported(
+    assert not templates_impl._feature_reduction_markers_are_supported(
         _statements(statements),
         _coordinates(plan),
     )
@@ -574,7 +587,7 @@ def test_dependency_replay_rejects_marker_owned_by_non_reduction_node() -> None:
     statements = _statements(
         "partial = source_feature * source_feature\n"
         "reduced = _helion_lane_reduce(partial, 'sum', "
-        "cutlass.Float32(0), 32, 1, 0, '', 1, 1)"
+        "cutlass.Float32(0), threads_in_group=32)"
     )
     replay = DirectAffineReplay(
         candidate=cast(
@@ -603,7 +616,7 @@ def test_dependency_replay_rejects_marker_owned_by_non_reduction_node() -> None:
     )
 
     assert (
-        replay_impl._dependency_value_replay(
+        templates_impl._dependency_value_replay(
             replay,
             node,
             _coordinates(_plan(3, DirectAffineMma.M16N8)),
@@ -613,7 +626,7 @@ def test_dependency_replay_rejects_marker_owned_by_non_reduction_node() -> None:
 
 
 def test_feature_reduction_split_is_two_pass_and_all_lane_owned() -> None:
-    split = replay_impl._split_feature_reduction_loop(
+    split = emission_impl._split_feature_reduction_loop(
         _feature_reduction_loop(),
         {
             "scratch": DirectAffineSharedBuffer(
@@ -646,7 +659,7 @@ def test_feature_reduction_split_rejects_raw_fallback_and_name_capture() -> None
     )
     carried = _feature_reduction_loop("carry += value")
     assert (
-        replay_impl._split_feature_reduction_loop(
+        emission_impl._split_feature_reduction_loop(
             carried,
             {"scratch": buffer},
             "lane",
@@ -656,7 +669,7 @@ def test_feature_reduction_split_rejects_raw_fallback_and_name_capture() -> None
     )
     colliding = _feature_reduction_loop()
     assert (
-        replay_impl._split_feature_reduction_loop(
+        emission_impl._split_feature_reduction_loop(
             colliding,
             {"scratch": buffer},
             "lane",
@@ -721,7 +734,7 @@ def test_reduction_marker_outside_feature_materialization_is_rejected() -> None:
         statements=_statements(
             "partial = source_feature * source_feature\n"
             "reduced = _helion_lane_reduce(partial, 'sum', "
-            "cutlass.Float32(0), 32, 1, 0, '', 1, 1)"
+            "cutlass.Float32(0), threads_in_group=32)"
         ),
         value=_expression("reduced"),
         bindings=DirectAffineReplayBindings(
@@ -734,7 +747,7 @@ def test_reduction_marker_outside_feature_materialization_is_rejected() -> None:
         steps=(step,),
     )
 
-    assert not replay_impl._template_reduction_placement_is_supported(
+    assert not templates_impl._template_reduction_placement_is_supported(
         templates,
         _coordinates(plan),
     )
@@ -883,11 +896,11 @@ def test_composer_rebinds_only_proved_feature_reduction_owners(
     plan = _plan(step_count, mma)
     replay = _detached_replay(step_count)
     coordinates = _coordinates(plan)
-    owner_argument = "" if owner is None else f", {owner!r}"
+    owner_argument = "" if owner is None else f", owner_lane={owner!r}"
     statements = _statements(
         "partial = source_feature * source_feature\n"
         "reduced = cutlass.Float32(_helion_lane_reduce(partial, 'sum', "
-        f"cutlass.Float32(0), 32, 1, 0, '', 1, 1{owner_argument}))\n"
+        f"cutlass.Float32(0), threads_in_group=32{owner_argument}))\n"
         "normalized = source_feature + reduced"
     )
     metadata = object()
@@ -1201,16 +1214,39 @@ def test_packed_state_replay_preserves_non_slot_guard_conjuncts() -> None:
     assert "source_feature < 128" in validated_guard
 
 
-def test_packed_state_replay_rejects_nonconjunctive_slot_guard() -> None:
+_REJECTED_PACKED_STATE_STATEMENTS = {
+    "replay_rejects_nonconjunctive_slot_guard": "if update_scale_value_0 < checkpoint_extent_0 or semantic_guard:\n"
+    "    state_address_0(update_scale_value_0, source_row, "
+    "source_feature).store(state_cast_0)",
+    "rejects_effectful_pointer_support": "leading = side_effect()\n"
+    "if update_scale_value_0 < checkpoint_extent_0:\n"
+    "    (state_tensor.iterator + "
+    "leading * state_tensor.layout.stride[0] + "
+    "source_row * state_tensor.layout.stride[2] + "
+    "source_feature * state_tensor.layout.stride[3]).store(state_cast_0)",
+    "rejects_control_flow_reaching_definition": "feature_guard = True\n"
+    "if semantic_guard:\n"
+    "    feature_guard = source_feature % 2 == 0\n"
+    "if update_scale_value_0 < checkpoint_extent_0 and feature_guard:\n"
+    "    state_address_0(update_scale_value_0, source_row, "
+    "source_feature).store(state_cast_0)",
+    "replay_requires_store_value_from_logical_state": "unused_state = state_value_0\n"
+    "if update_scale_value_0 < checkpoint_extent_0:\n"
+    "    state_address_0(update_scale_value_0, source_row, "
+    "source_feature).store(unrelated_value)",
+}
+
+
+@pytest.mark.parametrize("case", list(_REJECTED_PACKED_STATE_STATEMENTS))
+def test_packed_state_rejects_replayed_statement(case: str) -> None:
+    source = _REJECTED_PACKED_STATE_STATEMENTS[case]
     plan = _plan(3, DirectAffineMma.M16N8)
     replay = _automatic_template_replay(3)
     state_effect = replay.candidate.region.steps[0].state_effect
     replay = _replace_replayed_statement(
         replay,
         state_effect,
-        "if update_scale_value_0 < checkpoint_extent_0 or semantic_guard:\n"
-        "    state_address_0(update_scale_value_0, source_row, "
-        "source_feature).store(state_cast_0)",
+        source,
     )
 
     templates = resolve_direct_affine_templates(replay, _coordinates(plan))
@@ -1324,46 +1360,6 @@ def test_validated_state_rejects_effectful_slot_extent() -> None:
         )
         is None
     )
-
-
-def test_packed_state_rejects_effectful_pointer_support() -> None:
-    plan = _plan(3, DirectAffineMma.M16N8)
-    replay = _automatic_template_replay(3)
-    state_effect = replay.candidate.region.steps[0].state_effect
-    replay = _replace_replayed_statement(
-        replay,
-        state_effect,
-        "leading = side_effect()\n"
-        "if update_scale_value_0 < checkpoint_extent_0:\n"
-        "    (state_tensor.iterator + "
-        "leading * state_tensor.layout.stride[0] + "
-        "source_row * state_tensor.layout.stride[2] + "
-        "source_feature * state_tensor.layout.stride[3]).store(state_cast_0)",
-    )
-
-    templates = resolve_direct_affine_templates(replay, _coordinates(plan))
-
-    assert templates is None
-
-
-def test_packed_state_rejects_control_flow_reaching_definition() -> None:
-    plan = _plan(3, DirectAffineMma.M16N8)
-    replay = _automatic_template_replay(3)
-    state_effect = replay.candidate.region.steps[0].state_effect
-    replay = _replace_replayed_statement(
-        replay,
-        state_effect,
-        "feature_guard = True\n"
-        "if semantic_guard:\n"
-        "    feature_guard = source_feature % 2 == 0\n"
-        "if update_scale_value_0 < checkpoint_extent_0 and feature_guard:\n"
-        "    state_address_0(update_scale_value_0, source_row, "
-        "source_feature).store(state_cast_0)",
-    )
-
-    templates = resolve_direct_affine_templates(replay, _coordinates(plan))
-
-    assert templates is None
 
 
 def test_output_replay_rejects_effectful_residual_guard() -> None:
@@ -1492,24 +1488,6 @@ def test_packed_state_replay_rejects_control_or_sibling_effects(
     replay = _automatic_template_replay(3)
     state_effect = replay.candidate.region.steps[0].state_effect
     replay = _replace_replayed_statement(replay, state_effect, state_source)
-
-    templates = resolve_direct_affine_templates(replay, _coordinates(plan))
-
-    assert templates is None
-
-
-def test_packed_state_replay_requires_store_value_from_logical_state() -> None:
-    plan = _plan(3, DirectAffineMma.M16N8)
-    replay = _automatic_template_replay(3)
-    state_effect = replay.candidate.region.steps[0].state_effect
-    replay = _replace_replayed_statement(
-        replay,
-        state_effect,
-        "unused_state = state_value_0\n"
-        "if update_scale_value_0 < checkpoint_extent_0:\n"
-        "    state_address_0(update_scale_value_0, source_row, "
-        "source_feature).store(unrelated_value)",
-    )
 
     templates = resolve_direct_affine_templates(replay, _coordinates(plan))
 

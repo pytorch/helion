@@ -94,10 +94,12 @@ def zero_fill_launches_apply(
     capability = env.config_spec.target_device_capability
     if capability is None or capability < (9, 0):
         return False
+    from .passes.pdl import pdl_applies
+
     state = device_function.cute_state
     return (
-        state.cute_pdl_entry_wait
-        or device_function._cute_pdl_applies()
+        state.tcgen05.pdl_entry_wait
+        or pdl_applies(device_function)
         or any(
             plan.get("use_pdl")
             for plan in device_function.codegen.cute_wrapper_plans  # type: ignore[attr-defined]

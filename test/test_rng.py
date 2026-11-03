@@ -10,7 +10,7 @@ from torch._environment import is_fbcode
 from torch._inductor import inductor_prims
 
 import helion
-from helion._compiler.backend import PallasBackend
+from helion._compiler.pallas.backend import PallasBackend
 from helion._compiler.rng_utils import philox_rand_ref
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE

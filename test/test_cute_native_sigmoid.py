@@ -13,8 +13,7 @@ import torch
 
 import helion
 from helion._compiler.cute import cute_epilogue
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
-from helion._testing import skipUnlessBackends
+from helion._compiler.cute import target_facts
 from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
 
@@ -31,9 +30,7 @@ if TYPE_CHECKING:
 def cpu_b200() -> Iterator[None]:
     with (
         cpu_target(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=232448),
     ):
         yield
 
@@ -114,7 +111,6 @@ def _sigmoid_signatures(source: str) -> list[tuple[object, ...]]:
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 @pytest.mark.parametrize("pointwise_static_shapes", (False, True))
 @pytest.mark.parametrize("fast_math", (False, True))
-@skipUnlessBackends(["cute"])
 def test_native_and_pointwise_sigmoid_share_the_same_math(
     cpu_b200: None, dtype: torch.dtype, pointwise_static_shapes: bool, fast_math: bool
 ) -> None:
@@ -131,7 +127,7 @@ def test_native_and_pointwise_sigmoid_share_the_same_math(
         static_shapes=True,
         fast_math=fast_math,
     )._bind_isolated(args)
-    native.env.config_spec.cute_tcgen05_search_enabled = True
+    native.env.config_spec.tcgen05.search_enabled = True
     native_source = native.to_code(_native_config())
     pointwise_args = (torch.empty(129, dtype=dtype),)
     pointwise = helion.kernel(

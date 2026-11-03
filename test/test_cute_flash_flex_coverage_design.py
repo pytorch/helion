@@ -31,10 +31,14 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
-from helion._compiler.backend import CuteBackend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
+from helion._compiler.cute.autotune.flash_surface import _resolve_cute_flash_config
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_bwd_search
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.autotune.heuristics.cute import CuteFlashAttentionHeuristic
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.device_ir import DeviceIR
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -87,7 +91,8 @@ def flex_forward_spec(
     score_region = walk == "score"
     trivial_walk = walk == "trivial"
     dense = walk == "dense"
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         head_dim_v=None,
         num_kv=kv_seq // 128,
@@ -135,7 +140,8 @@ def attention_spec(
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 0))
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         num_kv=num_kv,
         num_bh=64,
@@ -159,7 +165,8 @@ def flex_backward_spec(head_dim: int) -> ConfigSpec:
     for block_id in (0, 1):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=128))
     two_cta = head_dim == 128
-    spec.enable_cute_flash_bwd_search(
+    enable_cute_flash_bwd_search(
+        spec,
         block_size_targets={0: 128, 1: 128},
         two_cta_allowed=two_cta,
         two_cta_table_steps=160 if two_cta else 0,
@@ -272,9 +279,12 @@ def test_flex_forward_coverage_design_is_complete(
     )
     with patch.dict(os.environ, {}, clear=True):
         generation = ConfigGeneration(spec)
-        generation.validate_flash_structural_coverage()
-        assert generation.flash_structural_coverage_uncovered_values() == []
-        assert generation.flash_structural_coverage_uncovered_interactions() == []
+        generation.extension.validate_flash_structural_coverage()
+        assert generation.extension.flash_structural_coverage_uncovered_values() == []
+        assert (
+            generation.extension.flash_structural_coverage_uncovered_interactions()
+            == []
+        )
 
 
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
@@ -300,7 +310,7 @@ def test_tail_split_offers_only_the_splits_a_correction_tile_realizes(
         head_dim, q_seq=4096, kv_seq=4096, num_bh=64, heads=16, kv_group=1
     )
     with patch.dict(os.environ, {}, clear=True):
-        fragments = spec._cute_flash_autotune_fragments()
+        fragments = _cute_flash_autotune_fragments(spec)
     fragment = fragments[cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY]
     assert isinstance(fragment, EnumFragment)
     assert tuple(fragment.search_choices or fragment.choices) == expected
@@ -310,14 +320,15 @@ def test_tail_split_offers_only_the_splits_a_correction_tile_realizes(
             continue
         size = next(s for s in corr_tiles if (head_dim // s) % splits == 0)
         with patch.dict(os.environ, {}, clear=True):
-            resolved = spec._resolve_cute_flash_config(
+            resolved = _resolve_cute_flash_config(
+                spec,
                 {
                     **spec.default_config().config,
                     cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: splits,
                     cute_flash.FLASH_CORR_TILE_SIZE_KEY: size,
                     cute_flash.FLASH_PERSISTENT_KEY: False,
                     cute_flash.FLASH_KV_SPLIT_KEY: 1,
-                }
+                },
             )
         assert (resolved.flex_tail_split, resolved.corr_tile_size) == (splits, size)
 
@@ -355,8 +366,8 @@ def test_dense_flex_surface_seeds_the_dense_families() -> None:
     with patch.dict(os.environ, {}, clear=True):
         seeds = recorded_compiler_seeds(spec)
         assert seeds
-        resolved = [spec._resolve_cute_flash_config(seed.config) for seed in seeds]
-        fragments = spec._cute_flash_autotune_fragments()
+        resolved = [_resolve_cute_flash_config(spec, seed.config) for seed in seeds]
+        fragments = _cute_flash_autotune_fragments(spec)
         messages: list[str] = []
         pairs = ConfigGeneration(spec).seed_flat_config_pairs(messages.append)
     assert not messages
@@ -397,7 +408,7 @@ def test_flex_forward_surface_seeds_the_measured_list_walk_bodies(
         seeds = recorded_compiler_seeds(spec)
         assert seeds
         assert all(seed.config["block_sizes"] == [128, 128] for seed in seeds)
-        resolved = [spec._resolve_cute_flash_config(seed.config) for seed in seeds]
+        resolved = [_resolve_cute_flash_config(spec, seed.config) for seed in seeds]
     mid = [
         cfg
         for cfg in resolved

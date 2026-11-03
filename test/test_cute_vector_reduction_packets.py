@@ -8,8 +8,8 @@ import pytest
 import torch
 
 from helion._compiler.ast_extension import statement_from_string
+from helion._compiler.cute.emitters.lane_packets import _cute_unroll_vec_load_expr
 from helion._compiler.cute.vector_reduction_packets import optimize_vector_reductions
-from helion.language.memory_ops import _cute_unroll_vec_load_expr
 
 pytestmark = pytest.mark.cpu_only
 
@@ -221,7 +221,38 @@ def test_four_byte_hints_use_the_four_byte_helpers() -> None:
     assert "evict" not in code
 
 
-def test_cache_helpers_build_matching_eight_and_sixteen_byte_ir() -> None:
+def test_thirty_two_byte_hints_are_opt_in() -> None:
+    # A 32-byte packet (eight fp32 or sixteen 16-bit lanes, SM100+) keeps the
+    # plain load unless the caller passes the ``cute_wide_packet_hints`` knob
+    # (``wide_packets``), which selects the ``_32b`` helper of the policy;
+    # narrower packets and the read-only ``nc_l2_first`` helper ignore it.
+    for dtype, width in ((torch.float32, 8), (torch.bfloat16, 16), (torch.float16, 16)):
+        for suffix, helper in (
+            ("__l2_last__", "_cute_load_l2_evict_last_32b"),
+            ("__l1_l2_first__", "_cute_load_l1_l2_evict_first_32b"),
+            ("__l1_l2_last__", "_cute_load_l1_l2_evict_last_32b"),
+        ):
+            plain = _cute_unroll_vec_load_expr("ptr", dtype, width, suffix)
+            assert plain.startswith("cute.arch.load(")
+            assert "evict" not in plain
+            hinted = _cute_unroll_vec_load_expr(
+                "ptr", dtype, width, suffix, wide_packets=True
+            )
+            assert hinted.startswith(f"{helper}(")
+            assert f"[{width}]" in hinted
+            assert hinted.replace(f"{helper}(", "cute.arch.load(") == plain
+    for dtype, width in ((torch.float32, 4), (torch.bfloat16, 8)):
+        assert _cute_unroll_vec_load_expr(
+            "ptr", dtype, width, "__l2_last__", wide_packets=True
+        ) == _cute_unroll_vec_load_expr("ptr", dtype, width, "__l2_last__")
+    nc = _cute_unroll_vec_load_expr("ptr", torch.float32, 8, "__nc_l2_first__")
+    assert nc.startswith("_cute_load_nc_l2_evict_first_32b(")
+    assert nc == _cute_unroll_vec_load_expr(
+        "ptr", torch.float32, 8, "__nc_l2_first__", wide_packets=True
+    )
+
+
+def test_cache_helpers_build_matching_ir_for_every_packet_width() -> None:
     cutlass = pytest.importorskip("cutlass")
     from cutlass._mlir import ir
     from cutlass._mlir.dialects import func
@@ -241,6 +272,9 @@ def test_cache_helpers_build_matching_eight_and_sixteen_byte_ir() -> None:
                 (8, "first"): l2_policy.load_v16b_l1_l2_evict_first,
                 (8, "last"): l2_policy.load_v16b_l1_l2_evict_last,
                 (8, "l2"): l2_policy.load_v16b_l2_evict_last,
+                (16, "first"): l2_policy.load_v32b_l1_l2_evict_first,
+                (16, "last"): l2_policy.load_v32b_l1_l2_evict_last,
+                (16, "l2"): l2_policy.load_v32b_l2_evict_last,
             }
             for (width, policy), helper in helpers.items():
                 vector_type = ir.VectorType.get([width], cutlass.Uint16.mlir_type)
@@ -266,12 +300,14 @@ def test_cache_helpers_build_matching_eight_and_sixteen_byte_ir() -> None:
                     func.ReturnOp([value])
         module.operation.verify()
         text = str(module)
-        for words in (2, 4):
+        for words in (2, 4, 8):
             for policy in ("first", "last"):
                 assert (
                     f"ld.global.L1::evict_{policy}.L2::cache_hint.v{words}.b32" in text
                 )
             assert f"ld.global.L2::cache_hint.v{words}.b32" in text
+        # The 32-byte forms load eight words through one ``.v8`` (SM100+).
+        assert "{$0,$1,$2,$3,$4,$5,$6,$7}, [$8], pol;" in text
         # The 4-byte forms are scalar ``.b32`` loads (PTX has no ``.v1``).
         for policy in ("first", "last"):
             assert (

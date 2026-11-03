@@ -10,12 +10,12 @@ from unittest.mock import patch
 
 import torch
 
-from .cute_codegen import cpu_target
-from .cute_codegen import cuda_fake
-from .cute_codegen import forbid_native_compile
+from . import cpu_render_target
+from . import default_cute_mma_support
+from . import patch_target_facts
 import helion
 from helion._compiler import compile_environment
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute import target_facts
 from helion._hardware import HardwareInfo
 import helion.language as hl
 
@@ -23,10 +23,10 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
 # ``cpu_codegen_target`` reports the full opt-in capacity as the AB budget.
-# ``gb300_target`` restores the production descriptors, including the 28 KiB
-# AB reserve, so selection is priced on the real budget.
-_REAL_CAPACITY = CuteTcgen05Config.__dict__["per_cta_smem_capacity_bytes"]
-_REAL_BUDGET = CuteTcgen05Config.__dict__["per_cta_smem_budget_bytes"]
+# ``gb300_target`` restores the production probes, including the 28 KiB AB
+# reserve, so selection is priced on the real budget.
+_REAL_CAPACITY = target_facts.per_cta_smem_capacity_bytes
+_REAL_BUDGET = target_facts.per_cta_smem_budget_bytes
 _GB300_PROPERTIES = SimpleNamespace(
     name="NVIDIA GB300",
     major=10,
@@ -41,13 +41,7 @@ _GB300_PROPERTIES = SimpleNamespace(
 def blackwell_capability(capability: tuple[int, int]) -> Generator[None, None, None]:
     """Report ``capability`` to helion, torch and inductor device queries."""
     with (
-        patch(
-            "helion.runtime.kernel.target_device_capability", return_value=capability
-        ),
-        patch(
-            "helion._compiler.compile_environment.target_device_capability",
-            return_value=capability,
-        ),
+        patch_target_facts(capability=capability),
         patch("torch.cuda.get_device_capability", return_value=capability),
         patch(
             "torch._inductor.runtime.hints.DeviceProperties.create",
@@ -83,28 +77,22 @@ def _cpu_hardware_info(device: torch.device | None = None) -> HardwareInfo:
 def cpu_codegen_target(
     capability: tuple[int, int] = (10, 0),
 ) -> Generator[None, None, None]:
-    """Generate CuTe source for a 152-SM Blackwell device without CUDA work."""
-    with (
-        cpu_target(),
-        forbid_native_compile(),
-        patch("helion._hardware.get_hardware_info", new=_cpu_hardware_info),
-        patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=152),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
-        patch("torch.cuda.current_device", return_value=0),
-        patch(
-            "helion.runtime.kernel._find_device", return_value=torch.device("cuda:0")
-        ),
-        patch(
-            "helion._compiler.cute.backend.CuteBackend.normalize_input_fake_tensor",
-            new=cuda_fake,
-        ),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-        blackwell_capability(capability),
+    """Generate CuTe source for a 152-SM Blackwell device without CUDA work.
+
+    ``cpu_render_target`` (CUDA hidden, the ``_lazy_init`` guard, native
+    compilation forbidden) with the default tcgen05-on MMA support record, the
+    full opt-in capacity as the AB and reduction budgets, the inputs traced as
+    ``cuda:0`` tensors of a 152-SM device and the product identity derived
+    from ``capability``.
+    """
+    with cpu_render_target(
+        mma_support=default_cute_mma_support(),
+        fake_device_sm_count=152,
+        capability=capability,
+        matmul_num_sm=152,
+        smem_budget_bytes=232448,
+        reduction_smem_budget_bytes=232448,
+        hardware=_cpu_hardware_info,
     ):
         yield
 
@@ -114,14 +102,14 @@ def gb300_target() -> Generator[None, None, None]:
     """CPU codegen against the production GB300 SMEM capacity and AB reserve."""
     with (
         cpu_codegen_target((10, 3)),
-        patch.object(CuteTcgen05Config, "per_cta_smem_capacity_bytes", _REAL_CAPACITY),
-        patch.object(CuteTcgen05Config, "per_cta_smem_budget_bytes", _REAL_BUDGET),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", _REAL_CAPACITY),
+        patch.object(target_facts, "per_cta_smem_budget_bytes", _REAL_BUDGET),
         patch("torch.cuda.is_available", return_value=True),
         patch("torch.cuda.get_device_properties", return_value=_GB300_PROPERTIES),
     ):
         device = torch.device("cuda:0")
-        assert CuteTcgen05Config.per_cta_smem_capacity_bytes(device) == 232448
-        assert CuteTcgen05Config.per_cta_smem_budget_bytes(device) == 203776
+        assert target_facts.per_cta_smem_capacity_bytes(device) == 232448
+        assert target_facts.per_cta_smem_budget_bytes(device) == 203776
         yield
 
 

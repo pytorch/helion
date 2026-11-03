@@ -12,33 +12,29 @@ the full runtime thread id like the non-synthetic cross-warp path.
 from __future__ import annotations
 
 import ast
-from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
-from unittest.mock import patch
 
 import pytest
 import torch
 
 import helion
 from helion._compiler.autotuner_heuristics import get_heuristics
-from helion._compiler.autotuner_heuristics.cute import CuteReductionTileHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteReductionTileHeuristic
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
-
-pytestmark = pytest.mark.cpu_only
 
 rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
 softmax = import_example("softmax").softmax
 
-if TYPE_CHECKING:
-    from collections.abc import Iterator
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(reduction_smem_budget_bytes=232448),
+]
 
 TWO_STAGE = "_cute_grouped_reduce_shared_two_stage"
 MAX_THREADS_PER_BLOCK = 1024
@@ -46,7 +42,7 @@ MAX_THREADS_PER_BLOCK = 1024
 # ALL launch-block threads, taken from the runtime block dims, with a group
 # for every warp-row the 1024-thread budget allows: a redundant thread axis
 # mapped later in codegen must not alias the slots.  Once the launch shape is
-# final, ``finalize_shared_reduce_groups`` sizes the groups for the threads
+# final, ``finalize_shared_reduce_groups_for_launch`` sizes the groups for the threads
 # that launch and reduces the lane of a one-dimensional block to
 # ``thread_idx()[0]``.
 X_LANE = "cutlass.Int32(cute.arch.thread_idx()[0])"
@@ -58,19 +54,6 @@ RUNTIME_LANE = (
     " * cutlass.Int32(cute.arch.block_dim()[0])"
     " * cutlass.Int32(cute.arch.block_dim()[1])"
 )
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
-        yield
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -278,7 +261,6 @@ def _assert_one_warp_vector_row(
     assert "in range(" not in _kernel_body(code)
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     "width,threads,vec",
     [
@@ -326,7 +308,6 @@ def test_whole_warp_thread_request_covers_the_full_row(
     assert block[0] * next(iter(lane_extents)) == width
 
 
-@skipUnlessBackends(["cute"])
 def test_rms_norm_1024_bf16_one_vector_per_thread_uses_four_warps() -> None:
     bound, _arguments = _bind_rms_norm(256, 1024, torch.bfloat16)
     config = _row_config(bound, reduction_threads=128, vec=8)
@@ -349,7 +330,6 @@ def test_rms_norm_1024_bf16_one_vector_per_thread_uses_four_warps() -> None:
     assert code.count(" % 128 < 1:") == 1
 
 
-@skipUnlessBackends(["cute"])
 def test_multiwarp_row_reduce_is_sized_for_the_launched_block() -> None:
     # The thread axes known when the reduce is emitted only cover the row's
     # own axis; a sibling branch can still map a redundant axis onto
@@ -381,14 +361,13 @@ def test_multiwarp_row_reduce_is_sized_for_the_launched_block() -> None:
 
 def _finalize(source: str, dims: tuple[int, int, int]) -> str:
     from helion._compiler.cute.finalize_reduce_groups import (
-        finalize_shared_reduce_groups,
+        finalize_shared_reduce_groups_for_launch,
     )
 
-    body = ast.parse(source).body
-    return "\n".join(
-        ast.unparse(stmt)
-        for stmt in finalize_shared_reduce_groups(body, thread_block_dims=dims)
+    body, _ = finalize_shared_reduce_groups_for_launch(
+        ast.parse(source).body, thread_block_dims=dims, claimed_axis_sizes={}
     )
+    return "\n".join(ast.unparse(stmt) for stmt in body)
 
 
 _EMITTED_REDUCE = (
@@ -433,7 +412,6 @@ def _row_sumsq_per_arange_row(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@skipUnlessBackends(["cute"])
 def test_free_arange_thread_axis_keeps_the_runtime_lane_form() -> None:
     # The free arange claims a synthetic thread axis the strategies' static
     # shape does not know about: the launch is block=(128, 4, 1), not the
@@ -520,7 +498,6 @@ def test_finalize_shared_reduce_groups_leaves_other_shapes_alone() -> None:
     assert "group_count=1)" in _finalize(exact, (256, 2, 2))
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     "dtype,threads,vec,suffix",
     [
@@ -557,7 +534,6 @@ def test_hinted_row_loads_use_the_cache_policy_helper_of_their_width(
     _assert_reduces_once_per_reduction(code, reductions=1, group_span=threads)
 
 
-@skipUnlessBackends(["cute"])
 def test_fp32_row_uses_eight_warps_with_v4() -> None:
     bound, _arguments = _bind_rms_norm(256, 1024, torch.float32)
     code = bound.to_code(_row_config(bound, reduction_threads=256, vec=4))
@@ -568,7 +544,6 @@ def test_fp32_row_uses_eight_warps_with_v4() -> None:
     assert "_cute_store_u32_vec(out.iterator" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_softmax_reduces_once_per_reduction() -> None:
     bound, _arguments = _bind(
         _example_kernel(softmax.fn),
@@ -586,7 +561,6 @@ def test_softmax_reduces_once_per_reduction() -> None:
     assert len(_top_level_store_lines(code, "_cute_store_u16_vec")) == 1
 
 
-@skipUnlessBackends(["cute"])
 def test_rows_sharing_a_cta_reduce_in_separate_groups() -> None:
     bound, _arguments = _bind(
         _row_rms_static,
@@ -610,7 +584,6 @@ def test_rows_sharing_a_cta_reduce_in_separate_groups() -> None:
     assert "% 128 < 1" not in code
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     "width,dtype,threads,vec,element,store",
     [
@@ -641,7 +614,6 @@ def test_capped_row_keeps_one_warp_vector_loads(
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_mismatched_vector_width_keeps_single_warp_lane_loop() -> None:
     # 64 threads would give each thread 16 elements, not one V=8 vector: the
     # established one-warp scalar lane loop is kept.
@@ -653,7 +625,6 @@ def test_mismatched_vector_width_keeps_single_warp_lane_loop() -> None:
     assert TWO_STAGE not in code
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     "dtype,threads,vec",
     [(torch.bfloat16, 128, 8), (torch.float16, 128, 8), (torch.float32, 256, 4)],
@@ -726,7 +697,6 @@ def test_reduction_tile_heuristic_seeds_multiwarp_vector_row(
     _assert_reduces_once_per_reduction(code, reductions=1, group_span=threads)
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("width", [1000, 128, 2048])
 def test_reduction_tile_heuristic_skips_rows_without_the_layout(width: int) -> None:
     # 1000: masked (non power-of-two) row; 128: 16 threads is below one warp;
@@ -763,7 +733,6 @@ def test_reduction_tile_heuristic_skips_rows_without_the_layout(width: int) -> N
     assert seeds == expected
 
 
-@skipUnlessBackends(["cute"])
 def test_reduction_tile_heuristic_requires_static_extent() -> None:
     # A dynamic row is masked and never vectorized, however power-of-two its
     # size hint happens to be: the seed keys on the static extent, not the hint.

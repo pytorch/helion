@@ -93,10 +93,19 @@ from ..device_ir import IfGraphInfo
 from ..device_ir import NodeArgsGraphInfo
 from ..device_ir import ReductionLoopGraphInfo
 from ..device_ir import RootGraphInfo
+from ..emitter_protocols import statements_and_reads_adapter
+from . import target_facts
+from .analysis.match_common import host_tensor_name
+from .analysis.match_common import is_full_slice
 from .cute_flash import FLASH_KV_STAGE_KEY
 from .cute_flash import _flash_graph_host_tensors
 from .cute_flash import _flash_ws_qk_ahead
 from .cute_flash import emit_flash_module_statements
+from .flash_template_runs import FLASH_QKV_TMA_PARTITIONS
+from .flash_template_runs import flash_ws_p_store_partitions
+from .flash_template_runs import flash_ws_pv_step
+from .flash_template_runs import flash_ws_qk_step
+from .flash_template_runs import flash_ws_s_load_partitions
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -300,15 +309,6 @@ def _gated_mma_dtype_str(dtype: torch.dtype) -> str:
     if dtype is torch.float32:
         return "cutlass.TFloat32"
     return _gated_io_dtype_str(dtype)
-
-
-def _is_full_slice(value: object) -> bool:
-    return (
-        isinstance(value, slice)
-        and value.start is None
-        and value.stop is None
-        and value.step is None
-    )
 
 
 def _node_val(node: torch.fx.Node) -> object:
@@ -717,7 +717,7 @@ class _ProgramChecker:
             if target is view_ops.subscript:
                 index = node.args[1] if len(node.args) > 1 else None
                 if not isinstance(index, (list, tuple)) or not all(
-                    item is None or _is_full_slice(item) for item in index
+                    item is None or is_full_slice(item) for item in index
                 ):
                     return None
             return self.check(node.args[0])
@@ -816,18 +816,6 @@ def _is_zero_constant(value: object, scope: _GraphScope) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _host_tensor_name(node: object) -> str | None:
-    if (
-        isinstance(node, torch.fx.Node)
-        and node.op == "call_function"
-        and node.target is _tracing_ops._host_tensor
-        and node.args
-        and isinstance(node.args[0], str)
-    ):
-        return node.args[0]
-    return None
-
-
 def _parse_row_access(
     env: CompileEnvironment,
     scope: _GraphScope,
@@ -843,7 +831,7 @@ def _parse_row_access(
         memory_ops.store,
     ):
         return None
-    name = _host_tensor_name(node.args[0])
+    name = host_tensor_name(node.args[0])
     if name is None:
         return None
     indices = node.args[1] if len(node.args) > 1 else None
@@ -867,9 +855,9 @@ def _parse_row_access(
             or mask_val.shape[1] != 1
         ):
             return None
-    if not _is_full_slice(indices[2]):
+    if not is_full_slice(indices[2]):
         return None
-    if _is_full_slice(indices[1]):
+    if is_full_slice(indices[1]):
         # ``x[tile, :, :]`` on the row block: the block-size symnode indexes
         # the whole tile (rows are absolute), every lane is loaded.
         first = scope.resolve(indices[0])
@@ -1040,7 +1028,7 @@ def _scalar_load_parts(node: object) -> tuple[str, object] | None:
         and node.op == "call_function"
         and node.target is memory_ops.load
     ):
-        name = _host_tensor_name(node.args[0])
+        name = host_tensor_name(node.args[0])
         indices = node.args[1] if len(node.args) > 1 else None
         if name is not None and isinstance(indices, (list, tuple)):
             if len(indices) == 1:
@@ -1136,6 +1124,216 @@ def _permute_source(node: object, order: list[int], scope: _GraphScope) -> objec
     return None
 
 
+class _GatedGraphs(NamedTuple):
+    """A kernel's graph set as both forms read it."""
+
+    graphs: tuple[GraphInfo, ...]
+    scope: _GraphScope
+    root: RootGraphInfo
+    # Device ``for`` loops (reductions are not loops here).
+    loops: list[ForLoopGraphInfo]
+
+
+def _gated_graphs(device_ir: DeviceIR) -> _GatedGraphs | None:
+    graphs = tuple(device_ir.graphs)
+    root_graphs = [info for info in graphs if isinstance(info, RootGraphInfo)]
+    if len(root_graphs) != 1:
+        return None
+    loop_graphs = [
+        info
+        for info in graphs
+        if isinstance(info, ForLoopGraphInfo)
+        and not isinstance(info, ReductionLoopGraphInfo)
+    ]
+    return _GatedGraphs(graphs, _GraphScope(graphs), root_graphs[0], loop_graphs)
+
+
+def _gated_io_fakes(
+    graphs: Sequence[GraphInfo], accesses: Sequence[GatedRowAccess]
+) -> tuple[list[torch.Tensor], int] | None:
+    """The host tensors behind the Q/K/V/O accesses and the head dim: all
+    rank-3 and contiguous in one ``GATED_IO_DTYPES`` dtype with a supported
+    head dim and 32-bit row counts (row coordinates are TMA coordinates;
+    element offsets are 64-bit)."""
+    host_tensors = _flash_graph_host_tensors(graphs)
+    fakes = [host_tensors.get(access.name) for access in accesses]
+    if any(fake is None for fake in fakes):
+        return None
+    fakes = cast("list[torch.Tensor]", fakes)
+    q_fake = fakes[0]
+    if q_fake.ndim != 3 or q_fake.dtype not in GATED_IO_DTYPES:
+        return None
+    head_dim = q_fake.shape[2]
+    if not isinstance(head_dim, int) or head_dim not in GATED_HEAD_DIMS:
+        return None
+    for access, fake in zip(accesses, fakes, strict=True):
+        if (
+            fake.ndim != 3
+            or fake.dtype != q_fake.dtype
+            or not fake.is_contiguous()
+            or fake.shape[2] != head_dim
+        ):
+            return None
+        rows = fake.shape[access.row_dim]
+        if isinstance(rows, int) and rows >= 2**31:
+            return None
+    return fakes, head_dim
+
+
+def _match_accumulator(
+    scope: _GraphScope,
+    loop_graph: ForLoopGraphInfo,
+    loop_node: torch.fx.Node,
+    pv_node: torch.fx.Node,
+    fused_target: object,
+) -> tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node] | None:
+    """The fp32 accumulator the KV loop carries: its single output (``pv``
+    itself when the contraction is the fused ``fused_target`` --
+    ``addmm`` / ``baddbmm`` -- else ``acc + pv``), the zero ``full`` seeding
+    it (a loop input) and the P operand of the PV contraction. Returns
+    ``(acc_out, acc_carry, p_node)``."""
+    outputs = next(node for node in loop_graph.graph.nodes if node.op == "output")
+    output_values = outputs.args[0]
+    if not isinstance(output_values, (list, tuple)) or len(output_values) != 1:
+        return None
+    acc_out = output_values[0]
+    if not isinstance(acc_out, torch.fx.Node):
+        return None
+    if pv_node.target is fused_target:
+        if acc_out is not pv_node:
+            return None
+        acc_carry = scope.resolve(pv_node.args[0])
+        p_node = pv_node.args[1]
+    else:
+        if (
+            acc_out.op != "call_function"
+            or acc_out.target is not torch.ops.aten.add.Tensor
+            or len(acc_out.args) != 2
+            or acc_out.kwargs.get("alpha", 1) != 1
+        ):
+            return None
+        if acc_out.args[0] is pv_node:
+            carry_arg = acc_out.args[1]
+        elif acc_out.args[1] is pv_node:
+            carry_arg = acc_out.args[0]
+        else:
+            return None
+        acc_carry = scope.resolve(carry_arg)
+        p_node = pv_node.args[0]
+    acc_val = _node_val(acc_out)
+    if not isinstance(acc_val, torch.Tensor) or acc_val.dtype != torch.float32:
+        return None
+    if not isinstance(p_node, torch.fx.Node):
+        return None
+    if (
+        not isinstance(acc_carry, torch.fx.Node)
+        or acc_carry.op != "call_function"
+        or acc_carry.target is not creation_ops.full
+        or not _is_zero_constant(acc_carry, scope)
+    ):
+        return None
+    # The zero accumulator must be the loop input feeding the carry.
+    loop_inputs = loop_node.args[3]
+    if not isinstance(loop_inputs, (list, tuple)) or acc_carry not in loop_inputs:
+        return None
+    return acc_out, acc_carry, p_node
+
+
+def _convert_source(value: object, io_dtype: torch.dtype) -> object:
+    """``value`` behind a ``convert`` to ``io_dtype`` (``value`` itself when
+    it is no convert); None for a convert to another dtype."""
+    if (
+        isinstance(value, torch.fx.Node)
+        and value.op == "call_function"
+        and value.target in _CONVERT_TARGETS
+    ):
+        target_dtype = (
+            value.args[1] if len(value.args) > 1 else value.kwargs.get("dtype")
+        )
+        if target_dtype != io_dtype:
+            return None
+        return value.args[0]
+    return value
+
+
+def _match_phi_carry(
+    scope: _GraphScope,
+    body_graph: torch.fx.Graph,
+    loop_node: torch.fx.Node,
+    value: object,
+    acc_carry: torch.fx.Node,
+) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+    """``value`` is the fp32 ``_phi(zeros, loop result)`` joining the zero
+    accumulator with the KV loop's single result in ``body_graph``. Returns
+    ``(value, loop_result)``."""
+    if (
+        not isinstance(value, torch.fx.Node)
+        or value.op != "call_function"
+        or value.target is not _tracing_ops._phi
+        or len(value.args) != 2
+    ):
+        return None
+    phi_sources = {scope.resolve(arg) for arg in value.args}
+    loop_results = [
+        node
+        for node in body_graph.nodes
+        if node.op == "call_function"
+        and node.target is operator.getitem
+        and node.args[0] is loop_node
+        and node.args[1] == 0
+    ]
+    if len(loop_results) != 1 or phi_sources != {acc_carry, loop_results[0]}:
+        return None
+    value_val = _node_val(value)
+    if not isinstance(value_val, torch.Tensor) or value_val.dtype != torch.float32:
+        return None
+    return value, loop_results[0]
+
+
+def _gate_program_checker(
+    env: CompileEnvironment,
+    scope: _GraphScope,
+    *,
+    score_node: torch.fx.Node,
+    p_node: torch.fx.Node,
+    q_block_id: int,
+    kv_block_id: int,
+    leading_block_ids: tuple[int, ...],
+) -> _ProgramChecker | None:
+    """The gate program between the score and P, checked: P must vary along
+    both the query rows and the KV columns and derive from the score."""
+    checker = _ProgramChecker(
+        env,
+        scope,
+        score_node=score_node,
+        q_block_id=q_block_id,
+        kv_block_id=kv_block_id,
+        leading_block_ids=leading_block_ids,
+    )
+    p_domain = checker.check(p_node)
+    if p_domain is None or _Q_ROW not in p_domain or _KV_COL not in p_domain:
+        return None
+    if score_node not in checker.domains:
+        return None
+    return checker
+
+
+def _calls_accounted(
+    call_nodes: Iterable[torch.fx.Node],
+    accounted: set[torch.fx.Node],
+    accesses: Iterable[GatedRowAccess],
+) -> bool:
+    """Whole-graph audit: every call in the root, ``if`` and loop graphs must
+    be a matched structural node, part of a checked program, an access index
+    or a pure leaf. Anything else (atomics, other stores or loops,
+    reductions) is rejected."""
+    for access in accesses:
+        accounted.update(access.index_nodes)
+    return all(
+        node in accounted or node.target in _PURE_LEAF_TARGETS for node in call_nodes
+    )
+
+
 def _match_sequence_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
     """``for s in hl.grid(B): start, end = off[s], off[s + 1]; for tile_q in
     hl.tile(start, end): ...; for tile_kv in hl.tile(start, end): bmm over the
@@ -1144,18 +1342,10 @@ def _match_sequence_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
     if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 1:
         return None
     seq_block_id = device_ir.grid_block_ids[0][0]
-    graphs = tuple(device_ir.graphs)
-    scope = _GraphScope(graphs)
-    root_graphs = [info for info in graphs if isinstance(info, RootGraphInfo)]
-    if len(root_graphs) != 1:
+    graph_set = _gated_graphs(device_ir)
+    if graph_set is None:
         return None
-    root_graph = root_graphs[0]
-    loop_graphs = [
-        info
-        for info in graphs
-        if isinstance(info, ForLoopGraphInfo)
-        and not isinstance(info, ReductionLoopGraphInfo)
-    ]
+    graphs, scope, root_graph, loop_graphs = graph_set
     if len(loop_graphs) != 2 or any(len(info.block_ids) != 1 for info in loop_graphs):
         return None
     call_nodes = _gated_call_nodes(graphs)
@@ -1277,34 +1467,16 @@ def _match_sequence_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         return None
     if len({access.name for access in accesses}) != 4:
         return None
-    host_tensors = _flash_graph_host_tensors(graphs)
-    fakes = [host_tensors.get(access.name) for access in accesses]
-    if any(fake is None for fake in fakes):
+    io_facts = _gated_io_fakes(graphs, accesses)
+    if io_facts is None:
         return None
-    q_fake = fakes[0]
-    assert q_fake is not None
-    if q_fake.ndim != 3 or q_fake.dtype not in GATED_IO_DTYPES:
-        return None
-    head_dim = q_fake.shape[2]
-    lane_extent = q_fake.shape[1]
-    if not isinstance(head_dim, int) or head_dim not in GATED_HEAD_DIMS:
-        return None
+    fakes, head_dim = io_facts
+    lane_extent = fakes[0].shape[1]
     if not isinstance(lane_extent, int) or lane_extent < 1:
         return None
-    for fake in fakes:
-        assert fake is not None
-        if (
-            fake.ndim != 3
-            or fake.dtype != q_fake.dtype
-            or not fake.is_contiguous()
-            or fake.shape[1] != lane_extent
-            or fake.shape[2] != head_dim
-        ):
-            return None
-        rows = fake.shape[0]
-        if isinstance(rows, int) and rows >= 2**31:
-            return None
-    io_dtype = q_fake.dtype
+    if any(fake.shape[1] != lane_extent for fake in fakes):
+        return None
+    io_dtype = fakes[0].dtype
     score_val = _node_val(score_node)
     pv_val = _node_val(pv_node)
     if not isinstance(score_val, torch.Tensor) or not isinstance(pv_val, torch.Tensor):
@@ -1322,98 +1494,33 @@ def _match_sequence_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
 
     # Accumulator carried by the KV loop, seeded with zeros, permuted back and
     # stored once.
-    outputs = next(node for node in kv_graph.graph.nodes if node.op == "output")
-    output_values = outputs.args[0]
-    if not isinstance(output_values, (list, tuple)) or len(output_values) != 1:
+    accumulator = _match_accumulator(
+        scope, kv_graph, kv_loop_node, pv_node, torch.ops.aten.baddbmm.default
+    )
+    if accumulator is None:
         return None
-    acc_out = output_values[0]
-    if not isinstance(acc_out, torch.fx.Node):
-        return None
-    if pv_node.target is torch.ops.aten.baddbmm.default:
-        if acc_out is not pv_node:
-            return None
-        acc_carry = scope.resolve(pv_node.args[0])
-        p_node = pv_node.args[1]
-    else:
-        if (
-            acc_out.op != "call_function"
-            or acc_out.target is not torch.ops.aten.add.Tensor
-            or len(acc_out.args) != 2
-            or acc_out.kwargs.get("alpha", 1) != 1
-        ):
-            return None
-        if acc_out.args[0] is pv_node:
-            carry_arg = acc_out.args[1]
-        elif acc_out.args[1] is pv_node:
-            carry_arg = acc_out.args[0]
-        else:
-            return None
-        acc_carry = scope.resolve(carry_arg)
-        p_node = pv_node.args[0]
-    acc_val = _node_val(acc_out)
-    if not isinstance(acc_val, torch.Tensor) or acc_val.dtype != torch.float32:
-        return None
-    if not isinstance(p_node, torch.fx.Node):
-        return None
-    if (
-        not isinstance(acc_carry, torch.fx.Node)
-        or acc_carry.op != "call_function"
-        or acc_carry.target is not creation_ops.full
-        or not _is_zero_constant(acc_carry, scope)
-    ):
-        return None
-    loop_inputs = kv_loop_node.args[3]
-    if not isinstance(loop_inputs, (list, tuple)) or acc_carry not in loop_inputs:
-        return None
+    acc_out, acc_carry, p_node = accumulator
     store_value = store_node.args[2]
-    value = store_value
-    if isinstance(value, torch.fx.Node) and value.op == "call_function":
-        if value.target in _CONVERT_TARGETS:
-            target_dtype = (
-                value.args[1] if len(value.args) > 1 else value.kwargs.get("dtype")
-            )
-            if target_dtype != io_dtype:
-                return None
-            value = value.args[0]
+    value = _convert_source(store_value, io_dtype)
     permuted = _permute_source(value, [1, 0, 2], scope)
     if not isinstance(permuted, torch.fx.Node):
         return None
     store_view = scope.resolve(value)
-    value = permuted
-    if (
-        not isinstance(value, torch.fx.Node)
-        or value.op != "call_function"
-        or value.target is not _tracing_ops._phi
-        or len(value.args) != 2
-    ):
+    carry = _match_phi_carry(scope, q_graph.graph, kv_loop_node, permuted, acc_carry)
+    if carry is None:
         return None
-    phi_sources = {scope.resolve(arg) for arg in value.args}
-    loop_results = [
-        node
-        for node in q_graph.graph.nodes
-        if node.op == "call_function"
-        and node.target is operator.getitem
-        and node.args[0] is kv_loop_node
-        and node.args[1] == 0
-    ]
-    if len(loop_results) != 1 or phi_sources != {acc_carry, loop_results[0]}:
-        return None
-    value_val = _node_val(value)
-    if not isinstance(value_val, torch.Tensor) or value_val.dtype != torch.float32:
-        return None
+    value, loop_result = carry
 
-    checker = _ProgramChecker(
+    checker = _gate_program_checker(
         env,
         scope,
         score_node=score_node,
+        p_node=p_node,
         q_block_id=q_block_id,
         kv_block_id=kv_block_id,
         leading_block_ids=(seq_block_id,),
     )
-    p_domain = checker.check(p_node)
-    if p_domain is None or _Q_ROW not in p_domain or _KV_COL not in p_domain:
-        return None
-    if score_node not in checker.domains:
+    if checker is None:
         return None
     for scalar in (q_begin, q_end):
         domain = checker.check(scalar)
@@ -1427,7 +1534,7 @@ def _match_sequence_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
             kv_loop_node,
             store_node,
             value,
-            loop_results[0],
+            loop_result,
             score_node,
             pv_node,
             q_src,
@@ -1442,11 +1549,7 @@ def _match_sequence_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         accounted.add(store_value)
     if isinstance(store_view, torch.fx.Node):
         accounted.add(store_view)
-    for access in accesses:
-        accounted.update(access.index_nodes)
-    for node in call_nodes:
-        if node in accounted or node.target in _PURE_LEAF_TARGETS:
-            continue
+    if not _calls_accounted(call_nodes, accounted, accesses):
         return None
     return GatedAttentionMatch(
         root_block_ids=(seq_block_id,),
@@ -1493,18 +1596,10 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         return None
     q_block_id = root_block_ids[-1]
     leading_block_ids = root_block_ids[:-1]
-    graphs = tuple(device_ir.graphs)
-    scope = _GraphScope(graphs)
-    root_graphs = [info for info in graphs if isinstance(info, RootGraphInfo)]
-    if len(root_graphs) != 1:
+    graph_set = _gated_graphs(device_ir)
+    if graph_set is None:
         return None
-    root_graph = root_graphs[0]
-    loop_graphs = [
-        info
-        for info in graphs
-        if isinstance(info, ForLoopGraphInfo)
-        and not isinstance(info, ReductionLoopGraphInfo)
-    ]
+    graphs, scope, root_graph, loop_graphs = graph_set
     if len(loop_graphs) != 1 or len(loop_graphs[0].block_ids) != 1:
         return None
     loop_graph = loop_graphs[0]
@@ -1658,31 +1753,11 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         return None
     if len({access.offset for access in accesses}) != 1:
         return None
-    host_tensors = _flash_graph_host_tensors(graphs)
-    fakes = [host_tensors.get(access.name) for access in accesses]
-    if any(fake is None for fake in fakes):
+    io_facts = _gated_io_fakes(graphs, accesses)
+    if io_facts is None:
         return None
-    q_fake = fakes[0]
-    assert q_fake is not None
-    if q_fake.ndim != 3 or q_fake.dtype not in GATED_IO_DTYPES:
-        return None
-    head_dim = q_fake.shape[2]
-    if not isinstance(head_dim, int) or head_dim not in GATED_HEAD_DIMS:
-        return None
-    for access, fake in zip(accesses, fakes, strict=True):
-        assert fake is not None
-        if (
-            fake.ndim != 3
-            or fake.dtype != q_fake.dtype
-            or not fake.is_contiguous()
-            or fake.shape[2] != head_dim
-        ):
-            return None
-        # Row coordinates are 32-bit (TMA); element offsets are 64-bit.
-        rows = fake.shape[access.row_dim]
-        if isinstance(rows, int) and rows >= 2**31:
-            return None
-    io_dtype = q_fake.dtype
+    fakes, head_dim = io_facts
+    io_dtype = fakes[0].dtype
     score_val = _node_val(score_node)
     pv_val = _node_val(pv_node)
     if not isinstance(score_val, torch.Tensor) or not isinstance(pv_val, torch.Tensor):
@@ -1702,99 +1777,32 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
 
     # Accumulator: ``acc = acc + pv`` (or ``addmm(acc, P, v)``) carried by the
     # loop, seeded with zeros, converted once and stored.
-    outputs = next(node for node in loop_graph.graph.nodes if node.op == "output")
-    output_values = outputs.args[0]
-    if not isinstance(output_values, (list, tuple)) or len(output_values) != 1:
+    accumulator = _match_accumulator(
+        scope, loop_graph, loop_node, pv_node, torch.ops.aten.addmm.default
+    )
+    if accumulator is None:
         return None
-    acc_out = output_values[0]
-    if not isinstance(acc_out, torch.fx.Node):
-        return None
-    if pv_node.target is torch.ops.aten.addmm.default:
-        if acc_out is not pv_node:
-            return None
-        acc_carry = scope.resolve(pv_node.args[0])
-        p_node = pv_node.args[1]
-    else:
-        if (
-            acc_out.op != "call_function"
-            or acc_out.target is not torch.ops.aten.add.Tensor
-            or len(acc_out.args) != 2
-            or acc_out.kwargs.get("alpha", 1) != 1
-        ):
-            return None
-        if acc_out.args[0] is pv_node:
-            carry_arg = acc_out.args[1]
-        elif acc_out.args[1] is pv_node:
-            carry_arg = acc_out.args[0]
-        else:
-            return None
-        acc_carry = scope.resolve(carry_arg)
-        p_node = pv_node.args[0]
-    acc_val = _node_val(acc_out)
-    if not isinstance(acc_val, torch.Tensor) or acc_val.dtype != torch.float32:
-        return None
-    if not isinstance(p_node, torch.fx.Node):
-        return None
-    if (
-        not isinstance(acc_carry, torch.fx.Node)
-        or acc_carry.op != "call_function"
-        or acc_carry.target is not creation_ops.full
-        or not _is_zero_constant(acc_carry, scope)
-    ):
-        return None
-    # The zero accumulator must be the loop input feeding the carry.
-    loop_inputs = loop_node.args[3]
-    if not isinstance(loop_inputs, (list, tuple)) or acc_carry not in loop_inputs:
-        return None
+    acc_out, acc_carry, p_node = accumulator
 
     # Store value: convert(_phi(zeros, loop result)) or the phi itself.
     store_value = store_node.args[2]
-    value = store_value
-    if isinstance(value, torch.fx.Node) and value.op == "call_function":
-        if value.target in _CONVERT_TARGETS:
-            target_dtype = (
-                value.args[1] if len(value.args) > 1 else value.kwargs.get("dtype")
-            )
-            if target_dtype != io_dtype:
-                return None
-            value = value.args[0]
-    if (
-        not isinstance(value, torch.fx.Node)
-        or value.op != "call_function"
-        or value.target is not _tracing_ops._phi
-        or len(value.args) != 2
-    ):
+    value = _convert_source(store_value, io_dtype)
+    carry = _match_phi_carry(scope, body_info.graph, loop_node, value, acc_carry)
+    if carry is None:
         return None
-    phi_sources = {scope.resolve(arg) for arg in value.args}
-    loop_results = [
-        node
-        for node in body_info.graph.nodes
-        if node.op == "call_function"
-        and node.target is operator.getitem
-        and node.args[0] is loop_node
-        and node.args[1] == 0
-    ]
-    if len(loop_results) != 1 or phi_sources != {acc_carry, loop_results[0]}:
-        return None
-    value_val = _node_val(value)
-    if not isinstance(value_val, torch.Tensor) or value_val.dtype != torch.float32:
-        return None
+    value, loop_result = carry
 
     # The gate program between the score and P plus every scalar program.
-    checker = _ProgramChecker(
+    checker = _gate_program_checker(
         env,
         scope,
         score_node=score_node,
+        p_node=p_node,
         q_block_id=q_block_id,
         kv_block_id=kv_block_id,
         leading_block_ids=leading_block_ids,
     )
-    p_domain = checker.check(p_node)
-    if p_domain is None:
-        return None
-    if _Q_ROW not in p_domain or _KV_COL not in p_domain:
-        return None
-    if score_node not in checker.domains:
+    if checker is None:
         return None
     # The KV bound and the guard may depend on the query tile (per work item);
     # the row offset must be a CTA-level scalar.
@@ -1885,16 +1893,13 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
             assert isinstance(bound, torch.fx.Node)
             v_row_bound = bound
 
-    # Whole-graph audit: every call in the root, ``if`` and loop graphs must be
-    # a matched structural node, part of a checked program, or a pure leaf.
-    # Anything else (atomics, other stores or loops, reductions) is rejected.
     accounted: set[torch.fx.Node] = set(checker.domains)
     accounted.update(
         (
             loop_node,
             store_node,
             value,
-            loop_results[0],
+            loop_result,
             score_node,
             pv_node,
             kt_node,
@@ -1909,11 +1914,7 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         accounted.add(store_value)
     if if_node is not None:
         accounted.add(if_node)
-    for access in accesses:
-        accounted.update(access.index_nodes)
-    for node in call_nodes:
-        if node in accounted or node.target in _PURE_LEAF_TARGETS:
-            continue
+    if not _calls_accounted(call_nodes, accounted, accesses):
         return None
     return GatedAttentionMatch(
         root_block_ids=root_block_ids,
@@ -1963,9 +1964,7 @@ def gated_smem_bytes(
 
 
 def _gated_smem_capacity(env: CompileEnvironment) -> int:
-    from .tcgen05_config import CuteTcgen05Config
-
-    capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device)
+    capacity = target_facts.per_cta_smem_capacity_bytes(env.device)
     return capacity if capacity > 0 else _GATED_DEFAULT_SMEM_CAPACITY
 
 
@@ -2025,9 +2024,9 @@ def _config_envelope_ok(config: Config) -> bool:
 
 def detect_flash_gated_search_surface(device_ir: DeviceIR) -> GatedSearchSurface | None:
     """Config-independent search-surface detector for the gated body."""
-    from ..backend import _attention_flash_gate_enabled
-    from ..backend import _attention_flash_supported
-    from ..backend import _flash_block_sizes_reachable
+    from .analysis.attention_match import _attention_flash_gate_enabled
+    from .analysis.attention_match import _attention_flash_supported
+    from .analysis.attention_match import _flash_block_sizes_reachable
 
     if not _attention_flash_gate_enabled() or not _attention_flash_supported():
         return None
@@ -2131,12 +2130,12 @@ def detect_gated_attention_loop(
     if not env.config_spec.cute_flash_gated_search_enabled:
         return None
     state = fn.cute_state
-    if not state.attention_flash_gated_probed:
-        state.attention_flash_gated_probe = match_gated_attention(
+    if not state.flash.gated_probed:
+        state.flash.gated_probe = match_gated_attention(
             HostFunction.current().device_ir
         )
-        state.attention_flash_gated_probed = True
-    match = state.attention_flash_gated_probe
+        state.flash.gated_probed = True
+    match = state.flash.gated_probe
     if match is None:
         return None
     trigger = match.q_block_id if match.form == "sequence" else match.kv_block_id
@@ -3182,7 +3181,7 @@ class _GatedEmitter:
 
     def _emit_scalar_load(self, node: torch.fx.Node) -> _Value:
         host_tensors = _flash_graph_host_tensors(self.scope.infos)
-        name = _host_tensor_name(node.args[0])
+        name = host_tensor_name(node.args[0])
         assert name is not None
         fake = host_tensors[name]
         arg = self.df.tensor_arg(fake, prefer_name=name)
@@ -3272,17 +3271,7 @@ def _gated_producer_body(
     pv_current = f"""
                 flash_p_full = flash_p_ready_cons.wait_and_advance()
                 flash_v_full = flash_v_cons.wait_and_advance(){v_mask}
-                flash_first_acc = flash_o_started
-                if (flash_p_idx % 2) == 0:
-                    for flash_kp in cutlass.range(flash_nk2, unroll_full=True):
-                        _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_first_acc | (flash_kp != 0))
-                        cute.gemm(_flash_pv_mma, tOtO, tOrP0[None, None, flash_kp, 0],
-                                  tOrV[None, None, flash_kp, flash_v_full.index], tOtO)
-                else:
-                    for flash_kp in cutlass.range(flash_nk2, unroll_full=True):
-                        _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_first_acc | (flash_kp != 0))
-                        cute.gemm(_flash_pv_mma, tOtO, tOrP1[None, None, flash_kp, 0],
-                                  tOrV[None, None, flash_kp, flash_v_full.index], tOtO)
+{flash_ws_pv_step("                ")}
                 flash_v_full.release()
                 flash_p_full.release()
                 flash_p_idx = (flash_p_idx + 1) % 2
@@ -3310,21 +3299,7 @@ if warp_idx == 0:
             flash_o_started = cutlass.Boolean(False)
             flash_q_full = flash_q_cons.wait_and_advance()
             if cutlass.Int32(0) < flash_num_kv_active:
-                flash_k_full = flash_k_cons.wait_and_advance()
-                flash_s_handle = flash_mma_s_prod.acquire_and_advance()
-                if (flash_qk_idx % 2) == 0:
-                    for flash_kp in cutlass.range(flash_nk, unroll_full=True):
-                        _flash_qk_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_kp != 0)
-                        cute.gemm(_flash_qk_mma, tStS0, tSrQ[None, None, flash_kp, flash_q_full.index],
-                                  tSrK[None, None, flash_kp, flash_k_full.index], tStS0)
-                else:
-                    for flash_kp in cutlass.range(flash_nk, unroll_full=True):
-                        _flash_qk_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_kp != 0)
-                        cute.gemm(_flash_qk_mma, tStS1, tSrQ[None, None, flash_kp, flash_q_full.index],
-                                  tSrK[None, None, flash_kp, flash_k_full.index], tStS1)
-                flash_s_handle.commit()
-                flash_k_full.release()
-                flash_qk_idx = (flash_qk_idx + 1) % 2{qk0_pf}
+{flash_ws_qk_step("                ")}{qk0_pf}
             flash_o_handle = flash_mma_o_prod.acquire_and_advance()
             for flash_active_kv in cutlass.range(flash_num_kv_active, unroll=1):
                 flash_kv = flash_active_kv{qk_next}{pv_current}
@@ -3658,6 +3633,15 @@ tStS = flash_qkt.make_fragment_C(flash_qk_acc_shape)
 flash_pv_acc_shape = flash_pvt.partition_shape_C(({q_tile}, {hd}))
 tOtO = flash_pvt.make_fragment_C(flash_pv_acc_shape)
 """
+    s_load_partitions = flash_ws_s_load_partitions(ld_atom)
+    p_store_partitions = flash_ws_p_store_partitions(
+        kv_cols=bn,
+        io_dtype=mma_dtype,
+        q_rows=q_tile,
+        p_base="flash_p_base",
+        p1_offset=p1_offset,
+        st_atom=st_atom,
+    )
     part_a2 = f"""
 flash_tmem.wait_for_alloc()
 _helion_flash_rt.tcgen05_fence_after_thread_sync()
@@ -3690,29 +3674,9 @@ tOrP1 = cute.make_tensor(
 
 cS = cute.make_identity_tensor(({q_tile}, {bn}))
 tScS = flash_qkt.partition_C(cS)
-flash_ld_atom = cute.make_copy_atom({ld_atom}, cutlass.Float32)
-flash_tiled_ld0 = cute_tcgen05_flash.make_tmem_copy(flash_ld_atom, tStS0)
-flash_tiled_ld1 = cute_tcgen05_flash.make_tmem_copy(flash_ld_atom, tStS1)
-flash_thr_ld0 = flash_tiled_ld0.get_slice(flash_local_tidx)
-flash_thr_ld1 = flash_tiled_ld1.get_slice(flash_local_tidx)
-tLDtS0 = flash_thr_ld0.partition_S(tStS0)
-tLDtS1 = flash_thr_ld1.partition_S(tStS1)
-tLDcS = flash_thr_ld0.partition_D(tScS)
+{s_load_partitions}
 
-flash_tilePlikeFP32 = {bn} // cutlass.Float32.width * {mma_dtype}.width
-flash_P_layout = cute.composition(flash_s_layout, cute.make_layout(({q_tile}, flash_tilePlikeFP32)))
-tStS_P0 = cute.make_tensor(flash_p_base, flash_P_layout)
-tStS_P1 = cute.make_tensor(flash_p_base + {p1_offset}, flash_P_layout)
-flash_tScS_P_layout = cute.composition(tScS.layout, cute.make_layout(({q_tile}, flash_tilePlikeFP32)))
-tScS_P = cute.make_tensor(tScS.iterator, flash_tScS_P_layout)
-flash_st_atom = cute.make_copy_atom({st_atom}, cutlass.Float32)
-flash_tiled_st0 = cute_tcgen05_flash.make_tmem_copy(flash_st_atom, tStS_P0)
-flash_tiled_st1 = cute_tcgen05_flash.make_tmem_copy(flash_st_atom, tStS_P1)
-flash_thr_st0 = flash_tiled_st0.get_slice(flash_local_tidx)
-flash_thr_st1 = flash_tiled_st1.get_slice(flash_local_tidx)
-tSTtS0 = flash_thr_st0.partition_D(tStS_P0)
-tSTtS1 = flash_thr_st1.partition_D(tStS_P1)
-tSTcS = flash_thr_st0.partition_S(tScS_P)
+{p_store_partitions}
 """
     slices = f"""
 # Jagged rows: shift the TMA coordinate tensors by the per-CTA row base so
@@ -3724,18 +3688,7 @@ flash_mV_rows = cute.domain_offset((0, flash_row_base, 0), _flash_mVt)
 gQ = cute.flat_divide(flash_mQ_rows, cute.select(({q_tile}, {bn}, {hd}), mode=[0, 2]))
 gK = cute.flat_divide(flash_mK_rows, cute.select(({q_tile}, {bn}, {hd}), mode=[1, 2]))
 gV = cute.flat_divide(flash_mV_rows, cute.select(({q_tile}, {hd}, {bn}), mode=[1, 2]))
-tSgQ = flash_qkt.partition_A(gQ)
-tSgK = flash_qkt.partition_B(gK)
-tOgV = flash_pvt.partition_B(gV)
-tQsQ, tQgQ_qdl = cute_cpasync_flash.tma_partition(
-    _flash_tma_q, 0, cute.make_layout(1),
-    cute.group_modes(sQ, 0, 3), cute.group_modes(tSgQ, 0, 3))
-tKsK, tKgK_kdl = cute_cpasync_flash.tma_partition(
-    _flash_tma_k, 0, cute.make_layout(1),
-    cute.group_modes(sK, 0, 3), cute.group_modes(tSgK, 0, 3))
-tVsV, tVgV_dkl = cute_cpasync_flash.tma_partition(
-    _flash_tma_v, 0, cute.make_layout(1),
-    cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3))
+{FLASH_QKV_TMA_PARTITIONS}
 tQgQ = tQgQ_qdl[None, None, 0, flash_lane]
 tKgK = tKgK_kdl[None, None, 0, flash_lane]
 tVgV = tVgV_dkl[None, 0, None, flash_lane]
@@ -3831,6 +3784,9 @@ def emit_gated_flash_device_body(
         )
     finally:
         _GEOMETRY.reset(token)
+
+
+emit_gated_flash_body = statements_and_reads_adapter(emit_gated_flash_device_body)
 
 
 def _emit_gated_flash_device_body(
@@ -4042,7 +3998,7 @@ def codegen_gated_attention_flash(cg: GenerateAST) -> bool:
     wrapper-only kernel params and emits the whole device body.
     """
     df = cg.device_function
-    plan = df.cute_state.attention_flash_gated_match
+    plan = df.cute_state.flash.gated_match
     if plan is None:
         return False
     if plan.row_warps:
@@ -4066,7 +4022,7 @@ def codegen_gated_attention_flash(cg: GenerateAST) -> bool:
         ):
             return False
         args[key] = arg
-    body, scalar_tensor_names = emit_gated_flash_device_body(df, plan)
+    emitted = emit_gated_flash_body(df, plan)
     emit_flash_module_statements(cg)
     wrapper_plan: dict[str, object] = {
         "kind": GATED_WRAPPER_KIND,
@@ -4088,13 +4044,13 @@ def codegen_gated_attention_flash(cg: GenerateAST) -> bool:
     cg.cute_wrapper_plans.append(wrapper_plan)
     df.wrapper_only_params.extend(GATED_KERNEL_PARAMS)
     df.placeholder_args.update(arg.name for arg in args.values())
-    df.placeholder_args.update(scalar_tensor_names)
+    df.placeholder_args.update(emitted.reads)
     cg.cute_uses_matmul = True
-    df.cute_state.attention_flash_threads = plan.threads
+    df.cute_state.flash.threads = plan.threads
     if match.form == "sequence":
         assert match.lane_extent is not None
-        df.cute_state.launch_grid_multiplier = match.lane_extent
-    df.body = body
+        df.cute_state.lanes.launch_grid_multiplier = match.lane_extent
+    df.body = emitted.statements
     df.preamble = []
     return True
 

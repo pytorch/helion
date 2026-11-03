@@ -20,12 +20,11 @@ from test.test_cute_resident_serial_row_seeds import _cpu_only  # noqa: F401
 
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
-from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
+from helion._compiler.cute.autotune.heuristics.cute_resident_reductions import (
     CuteResidentReductionHeuristic,
 )
 from helion._compiler.cute.resident_reductions import _packed_terminal_body
 from helion._compiler.cute.resident_reductions import _terminal_output_product
-from helion._testing import skipUnlessBackends
 from helion.autotuner.compiler_coverage import append_compiler_coverage
 from helion.autotuner.config_generation import ConfigGeneration
 
@@ -85,7 +84,6 @@ def test_deferred_requires_cross_warp_publication():
 
 
 @pytest.mark.parametrize("kind,columns", (("layer", 8192), ("rms", 4096)))
-@skipUnlessBackends(["cute"])
 def test_full_population_reaches_coupled_carrier_and_preserves_old_seed_prefix(
     kind, columns
 ):
@@ -129,7 +127,6 @@ def test_full_population_reaches_coupled_carrier_and_preserves_old_seed_prefix(
         assert "mul_packed_f32x2" in bound.to_code(appended[-1])
 
 
-@skipUnlessBackends(["cute"])
 def test_default_modes_are_omitted_and_do_not_change_generated_source():
     bound, _ = _bind(128, 4096, kind="layer")
     carrier = _carrier(bound)

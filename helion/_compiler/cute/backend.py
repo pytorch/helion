@@ -1,5 +1,24 @@
-"""CuteBackend backend class, moved out of the backend-neutral
-helion/_compiler/backend.py."""
+"""``CuteBackend``: the CuTe backend's implementation of the ``Backend`` hooks.
+
+Role: hook surface.  Core (``helion/_compiler/backend.py``) calls the
+hooks; this module answers them by forwarding into the package: the host
+rewrites (``customize_ast``), the device-IR passes (``rewrite_device_ir`` ->
+``ir_passes``), the search-surface registration (``search_surface``), the
+tile / reduction / program-id strategies (the core per-thread planner
+``per_thread_planning``, ``reduction_emitter``, ``tcgen05.scheduler_pids``), the
+per-thread strategies' layout and lane-nest hooks (``tile_packing``,
+``lane_cluster_split``, ``lane_loops.nest_check``), the
+planner cascade (``pre_codegen``), the emitter registries (``emitters``,
+``kernel_generators``), the device-body passes (``passes``), the lane
+pipeline (``lane_loops.root_passes``), the state factories (``state``), the
+autotune surface (``autotune``) and the runtime hooks (``runtime_hooks``).
+The module-level functions before the class are the MMA / attention loop
+detectors the ``per_thread_*`` hooks run for the shared per-thread tile
+planner (tests patch them here).  Most imports are
+function-local: ``backend_registry`` loads this module while
+``compile_environment`` is still initializing.  ``README.md`` in this
+directory is the map.
+"""
 
 from __future__ import annotations
 
@@ -23,33 +42,47 @@ from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
 from ... import exc
+from ..ast_extension import expr_from_string
+from ..ast_extension import statement_from_string
 from ..backend import Backend
 from ..backend import BackendState
-from ..backend import _active_loop_block_ids
-from ..backend import _attention_flash_gate_enabled
-from ..backend import _attention_flash_supported
-from ..backend import _attention_pattern_fits_root
-from ..backend import _attention_softmax_pattern_head_dim
-from ..backend import _grouped_rank3_specialized_mma_plan
-from ..backend import _kernel_specialized_mma_impl
-from ..backend import _kernel_specialized_mma_plan
+from ..backend import DeviceIRStage
 from ..backend import _largest_divisor_at_most
-from ..backend import _loop_contains_matmul
-from ..backend import _specialized_mma_root_mn_block_ids
 from ..backend import log
+from .analysis.attention_match import _attention_flash_gate_enabled
+from .analysis.attention_match import _attention_flash_supported
+from .analysis.attention_match import _attention_pattern_fits_root
+from .analysis.attention_match import _attention_pattern_geometry
+from .analysis.attention_match import _attention_softmax_pattern_head_dim
+from .analysis.specialized_mma import _grouped_rank3_specialized_mma_plan
+from .analysis.specialized_mma import _kernel_specialized_mma_impl
+from .analysis.specialized_mma import _kernel_specialized_mma_plan
+from .analysis.specialized_mma import _specialized_mma_root_mn_block_ids
 from .attention_plan import flash_head_dims_supported
+from .cache_policy_loads import PACKET_LOAD_HELPERS
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
+from .launch_shape import LaunchShapeFlags
+from .launch_shape import check_launch_shape
+from .launch_shape import live_grid_thread_extents
+from .launch_shape import plan_owned_launch
 from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
 from .pdl_release import ZERO_FILL_KERNEL_PREFIX
 from .pdl_release import generic_release_rendered
 from .pdl_release import spread_rendered
+from .state import cute_codegen_state
+from .state import cute_env_state
+from .state import new_codegen_state
+from .state import new_device_state
+from .state import new_env_state
+from .tcgen05.knobs import launch_epi_warp_groups_knob
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .thread_budget import MAX_THREADS_PER_BLOCK
 from .thread_budget import check_thread_block_dims
-from .thread_budget import check_thread_limit
+from .thread_budget import referenced_thread_axes
 from .thread_budget import thread_idx_axis
 
 if TYPE_CHECKING:
@@ -61,17 +94,47 @@ if TYPE_CHECKING:
 
     from ...autotuner.config_priors import ValuePrior
     from ...autotuner.config_spec import ConfigSpec
+    from ...autotuner.llm.profile import LlmPromptProfile
+    from ...autotuner.search_surface import BackendSearchSurface
     from ...runtime.config import Config
+    from ...runtime.cute.structural_policy import CuteStructuralPolicy
     from ...runtime.kernel import BoundKernel
+    from ...runtime.settings import Settings
     from ..aten_lowering import Lowering
+    from ..aten_lowering import LoweringContext
+    from ..autotuner_heuristics.registry import AutotunerHeuristicType
+    from ..autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
+    from ..backend import HandlerOpOverrides
+    from ..compile_environment import CompileEnvironment
     from ..device_function import Argument
+    from ..device_function import DeviceBodyContext
     from ..device_function import DeviceFunction
+    from ..device_ir import DeviceIR
+    from ..device_ir import ForLoopGraphInfo
     from ..device_ir import GraphInfo
+    from ..device_ir_analysis import DeviceIRAnalysis
+    from ..emitter_protocols import KernelGenerator
+    from ..emitter_protocols import RetryPolicy
+    from ..emitter_protocols import RootEmitter
     from ..generate_ast import GenerateAST
+    from ..helper_function import CodegenInterface
     from ..host_function import HostFunction
+    from ..inductor_lowering import CodegenState
+    from ..program_id import ProgramIDs
+    from ..reduction_strategy import ReductionEmitter
+    from ..reduction_strategy import ReductionStrategy
     from ..tile_dispatch import TileStrategyDispatch
+    from ..tile_strategy import DeviceGridState
+    from ..tile_strategy import DeviceLoopState
+    from ..tile_strategy import PerThreadNDTileStrategy
     from ..tile_strategy import TileStrategy
+    from ..tile_strategy import VecLaneWrapper
     from .attention_plan import AttentionScorePlan
+    from .device_state import CuteDeviceFunctionState
+    from .lane_loops.statements import LanePlacement
+    from .lane_loops.statements import LaneScope
+    from .state import CuteCodegenState
+    from .state import CuteEnvState
 
     InductorOpOverrides = OpsHandler[Any]
 
@@ -109,29 +172,6 @@ def validate_thread_axis_accesses(statements: Sequence[ast.AST]) -> None:
             and 0 <= axis.value < 3
         ):
             raise exc.BackendUnsupported("cute", f"thread axis {ast.unparse(axis)}")
-
-
-def _live_grid_thread_extents(
-    statements: Sequence[ast.AST], extents: dict[str, tuple[int, int]]
-) -> dict[int, int]:
-    """Recover grid launch requirements from surviving named assignments."""
-    live: dict[int, int] = {}
-    for statement in statements:
-        for node in ast.walk(statement):
-            if not isinstance(node, ast.Assign):
-                continue
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id in extents:
-                    axis, extent = extents[target.id]
-                    live[axis] = max(live.get(axis, 1), extent)
-    return live
-
-
-def _live_grid_thread_dims(
-    statements: Sequence[ast.AST], extents: dict[str, tuple[int, int]]
-) -> list[int]:
-    live = _live_grid_thread_extents(statements, extents)
-    return [live.get(axis, 1) for axis in range(3)]
 
 
 # The ``cute.arch`` calls a thread makes on its own: its coordinates and the
@@ -280,7 +320,7 @@ def launch_drops_root_threads(
     launches narrower than its extent, or ``None``.
 
     ``roots`` holds, per root loop, the thread extent of each launch axis
-    the root's own statements read (``GenerateAST.root_read_axis_sizes``).
+    the root's own statements read (``CuteCodegenState.root_read_axis_sizes``).
     An axis a root never reads (a tile whose index is unused) is absent and
     may launch one thread, whatever extent a sibling root records for it.
     """
@@ -439,7 +479,10 @@ def _multi_phase_block_dims(
             axis = base_axis + local_axis
             if size > 1 and axis < 3 and dims[axis] != size:
                 reject(axis, size, f"reduction over tile block {block_id}")
-    for subject, layout in device_function.cute_state.multi_phase_lane_reduce_layouts:
+    for (
+        subject,
+        layout,
+    ) in device_function.cute_state.lanes.multi_phase_lane_reduce_layouts:
         for axis, size in layout.items():
             if axis < 3 and dims[axis] != size:
                 reject(axis, size, subject)
@@ -667,7 +710,7 @@ def _detect_grouped_rank3_specialized_mma_loop(
     if any(block_id in root_grid_ids for block_id in block_ids):
         return False
     env = CompileEnvironment.current()
-    semantic_block_ids = env.config_spec._tcgen05_matmul_block_ids()
+    semantic_block_ids = env.config_spec.tcgen05.matmul_block_ids
     axes = None
     if semantic_block_ids is not None:
         m_block_id, n_block_id, k_block_id = semantic_block_ids
@@ -713,8 +756,6 @@ def _detect_grouped_rank3_specialized_mma_loop(
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
-    from .cute_mma import _tcgen05_epi_warp_groups
-
     if not _specialized_mma_root_threads_support_impl(
         "tcgen05",
         bm=bm,
@@ -723,7 +764,7 @@ def _detect_grouped_rank3_specialized_mma_loop(
         root_n_threads=root_n_threads,
         root_m_threads_explicit=root_m_threads_explicit,
         root_n_threads_explicit=root_n_threads_explicit,
-        epi_warp_groups=_tcgen05_epi_warp_groups(config),
+        epi_warp_groups=launch_epi_warp_groups_knob(config),
     ):
         return False
 
@@ -758,7 +799,6 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _loop_subrange_parent_block_id
     from .cute_mma import _mma_tiles_are_static_full
     from .cute_mma import _ragged_batched_tcgen05_config
-    from .cute_mma import _tcgen05_epi_warp_groups
     from .cute_mma import analyze_cute_mma_node
     from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
     from .mma_support import cute_fp32_dot_uses_tf32
@@ -784,11 +824,12 @@ def _detect_specialized_mma_loop(
     # (``create_loop_strategy``): axes that only bound an inner loop carry no
     # threads or lanes, so the output tile is the root minus those axes.
     from ..compile_environment import CompileEnvironment
+    from ..per_thread_planning import tile_loop_inactive_block_ids
     from .loop_nesting import boundary_only_grid_blocks
 
     env = CompileEnvironment.current()
     inactive_root_block_ids = frozenset(
-        _tile_loop_inactive_block_ids(
+        tile_loop_inactive_block_ids(
             fn,
             list(root_grid_ids),
             boundary_only_grid_blocks(env, device_ir, fn.codegen.codegen_graphs),
@@ -835,7 +876,7 @@ def _detect_specialized_mma_loop(
         return False
     # Ragged batched tiles take the flat one-CTA tcgen05 pipeline (TMA
     # zero-fill, predicated stores); the launch geometry must agree with
-    # ``_emit_mma_pipeline``'s admission or the MMA warp never exists.
+    # ``plan_tcgen05_pipeline``'s admission or the MMA warp never exists.
     candidates = [
         (node, candidate)
         for node, candidate in candidates
@@ -849,7 +890,7 @@ def _detect_specialized_mma_loop(
     # A K loop that subdivides an outer tile (``hl.tile(outer.begin,
     # outer.end)``) may only become a lane-free specialized loop through the
     # exact fp32 SIMT GEMM, which masks its steps against the loop's own end;
-    # every other lowering declines it in ``_emit_mma_pipeline``, and a
+    # every other lowering declines it in ``plan_tcgen05_pipeline``, and a
     # declined lane-free loop would leave the scalar fallback one K element
     # per step.
     k_subrange_parent = _loop_subrange_parent_block_id(env, block_ids[0])
@@ -909,7 +950,7 @@ def _detect_specialized_mma_loop(
             root_n_threads=root_n_threads,
             root_m_threads_explicit=root_m_threads_explicit,
             root_n_threads_explicit=root_n_threads_explicit,
-            epi_warp_groups=_tcgen05_epi_warp_groups(config),
+            epi_warp_groups=launch_epi_warp_groups_knob(config),
         ):
             if mma_impl == "tcgen05" and not ensure_tcgen05_fragment_epilogue_plan(
                 fn,
@@ -952,12 +993,13 @@ def _attention_loop_shape(
     from ..host_function import HostFunction
 
     device_ir = HostFunction.current().device_ir
-    # Attention binds to a 2-axis root grid (tile_b, tile_m) plus one inner
+    # Attention binds to a 2-axis root grid (tile_b, tile_m), or the
+    # flattened-rows form's one axis over ``B*H*M`` rows, plus one inner
     # tile_n device loop.
     if len(device_ir.grid_block_ids) != 1:
         return None
     root_grid_ids = device_ir.grid_block_ids[0]
-    if len(root_grid_ids) != 2:
+    if len(root_grid_ids) not in (1, 2):
         return None
     if len(block_ids) != 1 or any(bid in root_grid_ids for bid in block_ids):
         return None
@@ -987,25 +1029,23 @@ def _attention_loop_shape(
     env = CompileEnvironment.current()
 
     # The flash kernel walks full 128-row/128-col tiles, so BOTH the query
-    # (tile_m) and key/value (tile_n) sequence lengths must be exact multiples of
-    # 128. ``known_multiple`` is conservative under dynamic shapes (False unless
-    # PROVABLY divisible), so a runtime-variable seq keeps the scalar path. This
-    # mirrors the codegen's seq%128 gate at detection time, where the device
-    # function arguments are not yet populated -- so the detector never sets
-    # ``mma_mode`` / forces ``block=(128,1,1)`` on a config codegen would reject.
-    if not env.block_sizes[root_grid_ids[1]].known_multiple(128):
-        return None
-    if not env.block_sizes[block_ids[0]].known_multiple(128):
-        return None
-    # The flash codegen derives num_kv from the QUERY length, so it only handles
+    # (tile_m) and key/value (tile_n) sequence lengths must be exact multiples
+    # of 128, and it derives num_kv from the QUERY length, so it only handles
     # SQUARE self-attention (query seq == key/value seq). Cross-attention
     # (q seq != kv seq, e.g. the 1024-query/512-kv test_attention_block_pointer
     # shape) would iterate the wrong number of KV tiles -> keep the scalar path.
-    # Require statically-equal concrete sizes: a dynamic (SymInt) seq is rejected
-    # conservatively (size hints can collide for distinct unbacked symbols).
-    q_seq = env.block_sizes[root_grid_ids[1]].size
-    kv_seq = env.block_sizes[block_ids[0]].size
-    if not (isinstance(q_seq, int) and isinstance(kv_seq, int) and q_seq == kv_seq):
+    # Only statically-equal concrete sizes qualify: a dynamic (SymInt) seq is
+    # rejected conservatively (size hints can collide for distinct unbacked
+    # symbols). This mirrors the codegen's seq%128 gate at detection time,
+    # where the device function arguments are not yet populated -- so the
+    # detector never sets ``mma_mode`` / forces ``block=(128,1,1)`` on a config
+    # codegen would reject.
+    geometry = _attention_pattern_geometry(pattern, root_grid_ids, block_ids[0])
+    if (
+        geometry is None
+        or geometry.q_seq != geometry.kv_seq
+        or geometry.q_seq % 128 != 0
+    ):
         return None
     # The flash kernel emits its OWN (batch*head, query-tile) program mapping; it
     # is only valid for the default flat pid with no L2 reordering. Persistent /
@@ -1025,19 +1065,20 @@ def _attention_loop_shape(
     ):
         return None
 
-    # bm/bn from the config block sizes for tile_m (root grid axis 1) and tile_n
-    # (the device loop block), NOT from the grid sizes.
-    bm = env.block_sizes[root_grid_ids[1]].from_config(config)
+    # bm/bn from the config block sizes for tile_m (the root grid's last
+    # axis) and tile_n (the device loop block), NOT from the grid sizes.
+    bm = env.block_sizes[root_grid_ids[-1]].from_config(config)
     (bn,) = (env.block_sizes[bid].from_config(config) for bid in block_ids)
     if not isinstance(bm, int) or not isinstance(bn, int):
         return None
     # tile_b must be one (batch, head) per CTA -- the flash kernel maps the
     # b*h flatten one row per program. A tile_b block > 1 would pack multiple
     # (batch, head) rows per CTA and miscompute. Enforce what the docstrings
-    # claim (previously unchecked).
-    tile_b = env.block_sizes[root_grid_ids[0]].from_config(config)
-    if not isinstance(tile_b, int) or tile_b != 1:
-        return None
+    # claim (previously unchecked). The flattened-rows form has no batch axis.
+    if len(root_grid_ids) == 2:
+        tile_b = env.block_sizes[root_grid_ids[0]].from_config(config)
+        if not isinstance(tile_b, int) or tile_b != 1:
+            return None
     return bm, bn, pattern.score_plan
 
 
@@ -1077,7 +1118,7 @@ def _detect_attention_bwd_mma_loop(
     match = match_attention_bwd(device_ir)
     if match is None:
         return False
-    fn.cute_state.attention_flash_bwd_match = match
+    fn.cute_state.flash.bwd_match = match
     return True
 
 
@@ -1107,12 +1148,12 @@ def _detect_flex_attention_bwd_loop(
         return False
     env = CompileEnvironment.current()
     state = fn.cute_state
-    if not state.attention_flex_bwd_probed:
-        state.attention_flex_bwd_probed = True
-        state.attention_flex_bwd_match = match_flex_attention_bwd(
+    if not state.flash.flex_bwd_probed:
+        state.flash.flex_bwd_probed = True
+        state.flash.flex_bwd_match = match_flex_attention_bwd(
             fn.codegen.codegen_graphs, root_grid_ids, env=env
         )
-    match = state.attention_flex_bwd_match
+    match = state.flash.flex_bwd_match
     if match is None or block_ids[0] not in match.loop_block_ids:
         return False
     if (
@@ -1125,9 +1166,9 @@ def _detect_flex_attention_bwd_loop(
         for block_id in (match.b_block_id, match.hk_block_id)
     ):
         return False
-    state.attention_flash_bwd_match = match
-    if state.attention_flash_bwd_block_ids is None:
-        state.attention_flash_bwd_block_ids = list(match.loop_block_ids)
+    state.flash.bwd_match = match
+    if state.flash.bwd_block_ids is None:
+        state.flash.bwd_block_ids = list(match.loop_block_ids)
     return True
 
 
@@ -1183,12 +1224,12 @@ def _detect_flex_attention_loop(
         return False
     env = CompileEnvironment.current()
     state = fn.cute_state
-    if not state.attention_flex_probed:
-        state.attention_flex_probed = True
-        state.attention_flex_match = match_flex_envelope(
+    if not state.flash.flex_probed:
+        state.flash.flex_probed = True
+        state.flash.flex_match = match_flex_envelope(
             fn.codegen.codegen_graphs, root_grid_ids, env=env
         )
-    match = state.attention_flex_match
+    match = state.flash.flex_match
     if match is None or block_ids[0] not in match.loop_block_ids:
         return False
     if not _attention_config_envelope_ok(config):
@@ -1206,8 +1247,8 @@ def _detect_flex_attention_loop(
     # single-tile body's cooperative pair hosts the walk.)
     if not flash_head_dims_supported(match.head_dim, match.head_dim_v):
         return False
-    state.attention_flash_score_plan = match.plan
-    state.attention_flash_block_ids = list(match.loop_block_ids)
+    state.flash.score_plan = match.plan
+    state.flash.block_ids = list(match.loop_block_ids)
     return True
 
 
@@ -1241,7 +1282,7 @@ def _detect_attention_mma_loop(
         gated = detect_gated_attention_loop(fn, block_ids, config=config)
         if gated is None:
             return False
-        fn.cute_state.attention_flash_gated_match = gated
+        fn.cute_state.flash.gated_match = gated
         return True
     from ..host_function import HostFunction
 
@@ -1273,7 +1314,7 @@ def _detect_attention_mma_loop(
             return False
         if score_plan.requires_ws_overlap:
             return False
-    fn.cute_state.attention_flash_score_plan = score_plan
+    fn.cute_state.flash.score_plan = score_plan
     return True
 
 
@@ -1307,55 +1348,18 @@ def _loop_may_use_mma(
     fn: DeviceFunction,
     block_ids: list[int],
 ) -> bool:
-    from ...language._decorators import is_api_func
-    from ..device_ir import RootGraphInfo
-    from ..host_function import HostFunction
+    """Whether the device loop over ``block_ids`` (nested for-loops included)
+    has a matmul the MMA lowering admits."""
+    from ..device_ir import iter_loop_graph_nodes
     from .cute_mma import analyze_cute_mma_node
 
-    device_ir = HostFunction.current().device_ir
-    graph_by_id = {
-        graph_info.graph_id: graph_info
-        for graph_info in fn.codegen.codegen_graphs
-        if hasattr(graph_info, "graph")
-    }
-
-    def graph_contains_mma(graph: object) -> bool:
-        if not isinstance(graph, torch.fx.Graph):
-            return False
-        for node in graph.nodes:
-            candidate = analyze_cute_mma_node(node, graphs=fn.codegen.codegen_graphs)
-            if (
-                candidate is not None
-                and not candidate.requires_scalar_fallback
-                and (candidate.with_acc or candidate.is_dot)
-            ):
-                return True
-            if is_api_func(node.target) and getattr(node.target, "__name__", "") in {
-                "_for_loop",
-                "_for_loop_step",
-            }:
-                graph_id = node.args[0] if node.args else None
-                if isinstance(graph_id, int):
-                    nested = graph_by_id.get(graph_id)
-                    if nested is not None and graph_contains_mma(nested.graph):
-                        return True
-        return False
-
-    def graph_matches_loop(graph_info: object) -> bool:
-        if getattr(graph_info, "block_ids", None) == block_ids:
-            return True
-        if not isinstance(graph_info, RootGraphInfo):
-            return False
-        phase_index = graph_info.phase_index
-        return (
-            0 <= phase_index < len(device_ir.grid_block_ids)
-            and device_ir.grid_block_ids[phase_index] == block_ids
-        )
-
-    for graph_info in fn.codegen.codegen_graphs:
-        if not graph_matches_loop(graph_info):
-            continue
-        if graph_contains_mma(getattr(graph_info, "graph", None)):
+    for node in iter_loop_graph_nodes(fn, block_ids):
+        candidate = analyze_cute_mma_node(node, graphs=fn.codegen.codegen_graphs)
+        if (
+            candidate is not None
+            and not candidate.requires_scalar_fallback
+            and (candidate.with_acc or candidate.is_dot)
+        ):
             return True
     return False
 
@@ -1404,225 +1408,15 @@ def _loop_contains_atomic(
     fn: DeviceFunction,
     block_ids: list[int],
 ) -> bool:
-    from ...language._decorators import is_api_func
+    """Whether the device loop over ``block_ids`` (nested for-loops included)
+    calls an ``hl.atomic_*`` op."""
     from ...language.atomic_ops import ATOMIC_OPS as atomic_targets
-    from ..device_ir import RootGraphInfo
-    from ..host_function import HostFunction
+    from ..device_ir import iter_loop_graph_nodes
 
-    device_ir = HostFunction.current().device_ir
-    graph_by_id = {
-        graph_info.graph_id: graph_info
-        for graph_info in fn.codegen.codegen_graphs
-        if hasattr(graph_info, "graph")
-    }
-
-    def graph_contains_atomic(graph: object) -> bool:
-        if not isinstance(graph, torch.fx.Graph):
-            return False
-        for node in graph.nodes:
-            if node.op != "call_function":
-                continue
-            if node.target in atomic_targets:
-                return True
-            if is_api_func(node.target) and getattr(node.target, "__name__", "") in {
-                "_for_loop",
-                "_for_loop_step",
-            }:
-                graph_id = node.args[0] if node.args else None
-                if isinstance(graph_id, int):
-                    nested = graph_by_id.get(graph_id)
-                    if nested is not None and graph_contains_atomic(nested.graph):
-                        return True
-        return False
-
-    def graph_matches_loop(graph_info: object) -> bool:
-        if getattr(graph_info, "block_ids", None) == block_ids:
-            return True
-        if not isinstance(graph_info, RootGraphInfo):
-            return False
-        phase_index = graph_info.phase_index
-        return (
-            0 <= phase_index < len(device_ir.grid_block_ids)
-            and device_ir.grid_block_ids[phase_index] == block_ids
-        )
-
-    for graph_info in fn.codegen.codegen_graphs:
-        if not graph_matches_loop(graph_info):
-            continue
-        if graph_contains_atomic(getattr(graph_info, "graph", None)):
-            return True
-    return False
-
-
-def _tile_loop_inactive_block_ids(
-    fn: DeviceFunction,
-    block_ids: list[int],
-    inactive_grid_block_ids: set[int],
-) -> set[int]:
-    """Axes of a multi-dimensional tile loop that carry no threads or lanes.
-
-    The boundary-only grid axes, plus every axis of the loop whose element
-    coordinate no graph observes (sizes known equal to an observed axis stay
-    active, they alias its coordinate).  The root strategy and the
-    specialized-MMA detection use the same set so they agree on the output
-    tile a matmul owns.
-    """
-    from ..compile_environment import CompileEnvironment
-
-    env = CompileEnvironment.current()
-    inactive_block_ids = inactive_grid_block_ids.intersection(block_ids)
-    if len(block_ids) <= 1:
-        return inactive_block_ids
-    known_equal = getattr(env, "known_equal", None)
-    used_block_ids = _graph_used_block_ids(fn, block_ids)
-    if not used_block_ids:
-        used_block_ids = set(block_ids)
-    for block_id in tuple(used_block_ids):
-        block_size = env.block_sizes[block_id].size
-        if block_size is None or not isinstance(block_size, (int, torch.SymInt)):
-            continue
-        for other_block_id in block_ids:
-            if other_block_id == block_id:
-                continue
-            other_size = env.block_sizes[other_block_id].size
-            if other_size is None or not isinstance(other_size, (int, torch.SymInt)):
-                continue
-            equal = (
-                known_equal(block_size, other_size)
-                if known_equal is not None
-                else bool(block_size == other_size)
-            )
-            if equal:
-                used_block_ids.add(other_block_id)
-    inactive_block_ids.update(set(block_ids) - used_block_ids)
-    return inactive_block_ids
-
-
-def _graph_used_block_ids(
-    fn: DeviceFunction,
-    block_ids: list[int],
-) -> set[int]:
-    from ...language import memory_ops
-    from ..compile_environment import CompileEnvironment
-    from ..device_ir import RootGraphInfo
-    from ..device_ir import control_flow_child_graph_ids
-    from ..host_function import HostFunction
-    from ..variable_origin import BlockSizeOrigin
-
-    env = CompileEnvironment.current()
-    host_function = HostFunction.current()
-    device_ir = host_function.device_ir
-    candidate_block_ids = set(block_ids)
-    used: set[int] = set()
-
-    def visit_value(value: object) -> None:
-        if isinstance(value, torch.Tensor):
-            for dim in value.shape:
-                visit_value(dim)
-            return
-        if isinstance(value, torch.SymInt):
-            block_id = env.get_block_id(value)
-            if block_id is not None and block_id in candidate_block_ids:
-                used.add(block_id)
-            raw_expr = getattr(getattr(value, "node", None), "_expr", None)
-            if isinstance(raw_expr, sympy.Expr):
-                visit_value(raw_expr)
-            return
-        if isinstance(value, sympy.Expr):
-            for symbol in value.free_symbols:
-                block_id = env.get_block_id(symbol)
-                if block_id is not None and block_id in candidate_block_ids:
-                    used.add(block_id)
-            return
-        if isinstance(value, dict):
-            for key, item in value.items():
-                visit_value(key)
-                visit_value(item)
-            return
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                visit_value(item)
-
-    def is_tensor_like_value(value: object) -> bool:
-        if isinstance(value, torch.Tensor):
-            return True
-        if isinstance(value, dict):
-            return any(
-                is_tensor_like_value(key) or is_tensor_like_value(item)
-                for key, item in value.items()
-            )
-        if isinstance(value, (list, tuple)):
-            return any(is_tensor_like_value(item) for item in value)
-        return False
-
-    for block_id in candidate_block_ids:
-        block_info = env.block_sizes[block_id]
-        if block_info.reduction:
-            used.add(block_id)
-
-    def graph_matches_loop(graph_info: object) -> bool:
-        if getattr(graph_info, "block_ids", None) == block_ids:
-            return True
-        if not isinstance(graph_info, RootGraphInfo):
-            return False
-        try:
-            phase_index = device_ir.root_ids.index(graph_info.graph_id)
-        except ValueError:
-            return False
-        return (
-            0 <= phase_index < len(device_ir.grid_block_ids)
-            and device_ir.grid_block_ids[phase_index] == block_ids
-        )
-
-    graph_by_id = {
-        graph_info.graph_id: graph_info for graph_info in fn.codegen.codegen_graphs
-    }
-    pending = [
-        graph_info
-        for graph_info in fn.codegen.codegen_graphs
-        if graph_matches_loop(graph_info)
-    ]
-    visited: set[int] = set()
-    while pending:
-        graph_info = pending.pop()
-        if graph_info.graph_id in visited:
-            continue
-        visited.add(graph_info.graph_id)
-        graph = getattr(graph_info, "graph", None)
-        if graph is None:
-            continue
-        for node in graph.nodes:
-            # A root coordinate can first be read inside a captured device
-            # scope. Its thread distribution must remain live there as well.
-            pending.extend(
-                graph_by_id[graph_id] for graph_id in control_flow_child_graph_ids(node)
-            )
-            if node.target is memory_ops.store:
-                # A store has no value; its index names every tile axis it
-                # writes, including axes a broadcast value does not carry.
-                # Like ``SubscriptIndexing.compute_shape``, only a tile itself
-                # spans its block; ``tile.id`` / ``tile.begin`` drop the dim.
-                for index in node.args[1]:
-                    if not isinstance(index, torch.fx.Node):
-                        continue
-                    index_value = index.meta.get("val")
-                    if not isinstance(index_value, torch.SymInt):
-                        continue
-                    origin = host_function.expr_to_origin.get(index_value._sympy_())
-                    if origin is not None and isinstance(
-                        origin.origin, BlockSizeOrigin
-                    ):
-                        visit_value(index_value)
-            value = node.meta.get("val")
-            if is_tensor_like_value(value):
-                visit_value(value)
-                for arg in node.args:
-                    if is_tensor_like_value(arg):
-                        visit_value(arg)
-                for arg in node.kwargs.values():
-                    if is_tensor_like_value(arg):
-                        visit_value(arg)
-    return used
+    return any(
+        node.op == "call_function" and node.target in atomic_targets
+        for node in iter_loop_graph_nodes(fn, block_ids)
+    )
 
 
 # Leave broad headroom below the G1 sweep's 3600s subprocess timeout: budget
@@ -1631,193 +1425,14 @@ def _graph_used_block_ids(
 _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
 
 
-# Config keys the CuTe backend lowers beyond the backend-neutral surface.
-# ``supports_config_key`` runs for every key of every normalized config, so
-# membership is one frozenset lookup rather than a chain of comparisons.
-_CUTE_CONFIG_KEYS: frozenset[str] = frozenset(
-    {
-        "num_threads",
-        "cute_vector_widths",
-        "cute_lane_layouts",
-        "cute_reduction_reloads",
-        "cute_reduction_schedule",
-        "cute_reduction_group_rows",
-        "cute_reduction_pipeline_depth",
-        "cute_reduction_local_tree",
-        "cute_reduction_row_schedule",
-        "cute_reduction_pack_output",
-        "cute_reduction_sequence",
-        "cute_host_paired_sum",
-        "cute_materialized_schedule",
-        "cute_materialized_operand_schedule",
-        "cute_fragment_scan",
-        "cute_fragment_reduction",
-        "cute_fp32_dot",
-        "cute_fragment_threads",
-        "cute_fragment_register_loads",
-        "cute_fragment_producer_cache",
-        "cute_fragment_warp_scan",
-        "cute_fragment_topk_network",
-        "cute_fragment_cta_topk",
-        "cute_selection_algorithm",
-        "cute_radix_threads",
-        "cute_radix_candidate_key_cache",
-        "cute_radix_scalar_candidates",
-        "cute_radix_valid_domain",
-        "cute_radix_ticket_stores",
-        "cute_radix_cached_payload_inverse",
-        "cute_radix_resident_input",
-        "cute_radix_boundary_early_exit",
-        "cute_radix_defer_output",
-        "cute_radix_partial_scan",
-        "cute_radix_packet_bits",
-        "cute_radix_scan_unroll",
-        "cute_radix_cluster_ctas",
-        "cute_radix_candidate_capacity",
-        "cute_radix_histogram_mode",
-        "cute_fragment_atomic_aggregation",
-        "cute_fragment_integer_atomic_epochs",
-        "cute_fragment_local_atomic_registers",
-        "cute_fragment_register_snapshots",
-        "cute_fragment_register_producers",
-        "cute_fragment_scan_exports",
-        "cute_fragment_warp_producer_regions",
-        "cute_fragment_bounded_gather",
-        "cute_fragment_published_scalars",
-        "cute_fragment_skip_zero_atomics",
-        "cute_fragment_atomic_consumer_fusion",
-        "cute_fragment_pure_producer_regions",
-        "cute_integer_loop_reduction",
-        "cute_fragment_packet_loads",
-        "cute_fragment_padded_rows",
-        "cute_fragment_unrolled_loops",
-        "cute_fragment_vector_io",
-        "cute_fragment_batched_loads",
-        "cute_fragment_split_k",
-        "cute_fragment_mma_rows",
-        "cute_fragment_slab_loads",
-        "cute_fragment_warp_results",
-        "cute_fragment_private_scalar_loops",
-        "cute_pointwise_pid_type",
-        "cute_async_store_policy",
-        "cute_store_policy",
-        "cute_exact_div_form",
-        "cute_bf16x2_recurrence",
-        "cute_register_chain",
-        "cute_simt_mma",
-        "cute_simt_mma_layout",
-        "cute_signed_bitfield_bf16",
-        "cute_collective_mma",
-        "cute_collective_static_layouts",
-        "cute_collective_copy",
-        "cute_collective_recipe",
-        "cute_collective_operand_packets",
-        "cute_collective_epilogue",
-        "cute_collective_stages",
-        "cute_collective_compute",
-        "cute_collective_native_seeded",
-        "cute_collective_tmem_seed",
-        "cute_collective_tmem_a",
-        "cute_gathered_mma_n",
-        "cute_gathered_mma_stages",
-        "cute_proven_bounds",
-        "cute_rng_packet",
-        "cute_independent_reduction",
-        "cute_cluster_warp_online",
-        "cute_register_row",
-        "cute_register_row_tensor_copy",
-        "cute_scalar_epilogue",
-        "cute_scalar_epilogue_keep_inputs",
-        "cute_scalar_epilogue_owner_fold",
-        "cute_warp_fp32_redux",
-        "cute_register_tile_warp_fold",
-        "cute_register_tile_store_first",
-        "cute_replicated_reduction",
-        "cute_vector_packet_unroll",
-        "cute_packet_prefetch",
-        "cute_vloop_sink",
-        "cute_lane_unroll",
-        "cute_dot_fragment_mma",
-        "cute_dot_ring_mma",
-        "cute_dot_ring_stages",
-        "cute_dot_ring_split",
-        "cute_pdl",
-        "cute_pdl_release",
-        "cute_pdl_spread",
-        "cute_warp_aggregated_atomics",
-        "cross_loop_pipeline",
-        "cute_split_k_workspace",
-        "cute_split_k_stages",
-        "cute_split_k_partitions",
-        "cute_split_k_atomic_epilogue",
-        "cute_split_k_schedule",
-        "cute_split_k_finalizer_warps",
-        "cute_grouped_rna_warps",
-        "cute_grouped_rna_block_k",
-        "cute_grouped_ab_stages",
-        "cute_grouped_ctas_per_sm",
-        "cute_grouped_prefix_scan",
-        "cute_grouped_descriptor_policy",
-        "cute_mma_f32_conversion",
-        "cute_chunk_recurrence_dv_partitions",
-        "cute_chunk_recurrence_register_cap",
-        "cute_chunk_prepare_schedule",
-        "cute_gdn_recurrence_stages",
-        "cute_gdn_recurrence_epilogue_warps",
-        "cute_gdn_recurrence_token_groups",
-        "cute_gdn_recurrence_mma_m",
-        "cute_affine_scan_schedule",
-        "cute_cluster_n",
-        "cute_min_blocks_per_mp",
-        "cute_tiles_per_block",
-        "cute_matmul_family",
-        "cute_warp_mma_warps",
-        "cute_register_subblocks",
-        "cute_register_subblocks_warps",
-        "cute_register_subblocks_prefetch",
-        "cute_register_subblocks_mask",
-        "cute_register_subblocks_colside",
-        "cute_register_subblocks_roll",
-        "cute_topk_lanes_per_row",
-        "cute_topk_rows_per_block",
-        "cute_topk_vector_width",
-        "cute_topk_output_vector_width",
-        "cute_topk_value_mode",
-        "cute_topk_key_dtype",
-        "cute_topk_rank_mode",
-        "cute_topk_selection_layout",
-        "cute_topk_sort_network",
-        "cute_topk_key_encoder",
-        "cute_topk_defer_value_gathers",
-        "cute_topk_merge_schedule",
-        "cute_topk_coarse_keys",
-        "cute_topk_key_recovery",
-        "cute_mma_dag",
-        "cute_mma_dag_warps",
-        "cute_mma_dag_stages",
-        "cute_mma_dag_store",
-        "cute_mma_dag_exchange",
-        "cute_mma_dag_pass_warps",
-        "cute_mma_dag_loads",
-        "cute_mma_dag_aux",
-        "cute_mma_dag_persistent",
-        "cute_mma_dag_cluster",
-        "cute_mma_dag_split",
-        "cute_mma_dag_derived",
-        "cute_mma_dag_epilogue",
-        "cute_mma_dag_lookahead",
-    }
-)
-_CUTE_CONFIG_KEY_PREFIXES: tuple[str, ...] = (
-    "tcgen05_",
-    "cute_flash_",
-    "cute_async_load_",
-    "cute_scaled_",
-)
-
-
 class CuteBackend(Backend):
-    """CuTe DSL (CUTLASS Python DSL) code generation backend."""
+    """CuTe DSL (CUTLASS Python DSL) code generation backend.
+
+    One method per ``Backend`` hook this backend overrides; the bodies
+    forward to the modules named in the module docstring.  A decision that
+    depends on this backend belongs here or behind a hook with a no-op
+    default in ``Backend``, never behind a backend-name comparison in core.
+    """
 
     @classmethod
     def finalist_preference(cls, config: Config, source: Callable[[], str]) -> int:
@@ -1841,9 +1456,9 @@ class CuteBackend(Backend):
         Whether a config renders that release is read off its generated
         module (``generic_release_rendered``), not off its keys: the tcgen05,
         warp-MMA, collective and block-scaled families own their wait and
-        release (``DeviceFunction._cute_pdl_applies``; the tcgen05 kernels
+        release (``passes.pdl.pdl_applies``; the tcgen05 kernels
         take the ``entry`` placement after their own waits,
-        ``DeviceFunction._tcgen05_early_pdl_release``), and on them every
+        ``passes.pdl._tcgen05_early_pdl_release``), and on them every
         config ranks alike: their back-to-back timing sees the knob, and a
         ranking by the release there would break ties between unrelated
         knobs (matmul backward s2: a clc-persistent finalist 0.5% behind in
@@ -1871,10 +1486,11 @@ class CuteBackend(Backend):
         from ..compile_environment import CompileEnvironment
         from .grouped_row_union import physical_schedule
         from .grouped_row_union import schedule_supported
+        from .tcgen05_config import facts
 
         env = CompileEnvironment.current()
         spec = env.config_spec._cute_tcgen05_config
-        dense = spec._dense_aligned_n_plan(fn.config.config)
+        dense = facts._dense_aligned_n_plan(spec, fn.config.config)
         if (
             dense is not None
             and env.canonical_block_id(block_id) in dense.block_ids[:2]
@@ -1887,7 +1503,7 @@ class CuteBackend(Backend):
         axes = spec.matmul_block_ids
         return (
             profile is not None
-            and spec.row_union_profile_supported(profile.name)
+            and facts.row_union_profile_supported(spec, profile.name)
             and axes is not None
             and env.canonical_block_id(block_id)
             in tuple(env.canonical_block_id(axis) for axis in axes[:2])
@@ -1898,10 +1514,11 @@ class CuteBackend(Backend):
 
     def codegen_config(self, config: Config) -> Config:
         from ..compile_environment import CompileEnvironment
+        from .tcgen05_config import facts
 
         state = CompileEnvironment.current().config_spec._cute_tcgen05_config
-        return state.project_dense_aligned_n_codegen(
-            state.project_row_union_codegen(config)
+        return facts.project_dense_aligned_n_codegen(
+            state, facts.project_row_union_codegen(state, config)
         )
 
     # Bump when config_value_priors() changes its candidate distribution.
@@ -1914,6 +1531,115 @@ class CuteBackend(Backend):
     @property
     def state(self) -> BackendState:
         return BackendState.BETA
+
+    def reserved_device_names(self) -> frozenset[str]:
+        # CuTe treats `_` as a write-only discard binding. Python host
+        # locals can still supply values through a renamed device argument.
+        return frozenset({"_"})
+
+    @property
+    def lowers_integer_powers(self) -> bool:
+        return True
+
+    @property
+    def requires_proved_integer_powers(self) -> bool:
+        return True
+
+    def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:
+        # A CuTe SIMT branch condition can vary per thread, and the
+        # convergent ``sync_threads`` barrier deadlocks in a divergent
+        # branch.
+        return not in_divergent_control_flow
+
+    @property
+    def lowers_chunk_unbind(self) -> bool:
+        return True
+
+    def barrier_allows_pid_type(self, pid_type: str) -> bool:
+        # CuTe launches the phases in order with ``pid_type="flat"``;
+        # DeviceIR keeps ``flat`` only once it has proved those launches
+        # (``ordered_phases_supported``).
+        return pid_type == "flat"
+
+    def local_fetch_add_fake_shape(
+        self, target: torch.Tensor, index: list[object]
+    ) -> torch.Tensor | None:
+        from ..host_function import HostFunction
+
+        if (
+            target not in HostFunction.current().tensor_to_origin
+            and target.dtype == torch.int32
+            and target.ndim == 1
+            and len(index) == 1
+            and isinstance(index[0], torch.Tensor)
+        ):
+            # Local fetch-add returns one old value per logical index.
+            # Normalizing a concrete index extent to a padded reduction block
+            # here changes the meaning of downstream views (for example, flip
+            # reverses padding).
+            return torch.empty_like(index[0], dtype=target.dtype)
+        return None
+
+    def transform_launch_grid(self, fn: DeviceFunction, grid_expr: ast.AST) -> ast.AST:
+        if (
+            fn.cute_state.tcgen05.program_id_divisor > 1
+            and not fn.cute_state.tcgen05.split_k_applied
+        ):
+            raise exc.InvalidConfig(
+                f"{TCGEN05_SPLIT_K_CONFIG_KEY} > 1 requires the flat one-CTA "
+                "tcgen05 GEMM pipeline, which this kernel did not take"
+            )
+        grid_multiplier = fn.cute_state.lanes.launch_grid_multiplier
+        if grid_multiplier != 1:
+            # A fused body running one CTA per (grid index, lane).
+            assert isinstance(grid_expr, ast.Tuple) and len(grid_expr.elts) == 1
+            grid_expr = expr_from_string(
+                f"(({{grid}}[0]) * {grid_multiplier},)", grid=grid_expr
+            )
+        simt_cluster_n = max(
+            fn.cute_state.lanes.simt_cluster_n, fn.cute_state.lanes.grid_cluster_n
+        )
+        if simt_cluster_n > 1:
+            # The cluster splits each row across ``cluster_n`` CTAs on a new
+            # trailing grid dim.  Only a 1-D grid can host the cluster dim.
+            if not (isinstance(grid_expr, ast.Tuple) and len(grid_expr.elts) == 1):
+                raise self.unsupported("cute_cluster_n > 1 requires a 1-D launch grid")
+            grid_expr = expr_from_string(
+                f"(*{{grid}}, {simt_cluster_n})", grid=grid_expr
+            )
+        return grid_expr
+
+    @property
+    def supports_augmented_assign(self) -> bool:
+        return False
+
+    @property
+    def folds_static_program_counts(self) -> bool:
+        return True
+
+    @property
+    def reduction_loops_allow_non_power_of_two(self) -> bool:
+        return True
+
+    @property
+    def reduction_loops_allow_full_extent(self) -> bool:
+        return True
+
+    @property
+    def merges_reduction_dims(self) -> bool:
+        return True
+
+    @property
+    def requires_merged_reduction_dims(self) -> bool:
+        return True
+
+    @property
+    def warns_fast_math_unused(self) -> bool:
+        return True
+
+    @property
+    def supports_autotune_multi(self) -> bool:
+        return True
 
     @property
     def supports_eager_prepared_call(self) -> bool:
@@ -1939,6 +1665,9 @@ class CuteBackend(Backend):
         from .cutedsl_compat import check_cute_backend_requirements
 
         check_cute_backend_requirements()
+
+    def rng_streams(self) -> tuple[str, ...]:
+        return ("auto", "word0", "philox4")
 
     def config_value_priors(self, config_spec: ConfigSpec) -> dict[str, ValuePrior]:
         """Bias the random half of the initial population toward the config
@@ -2149,6 +1878,330 @@ class CuteBackend(Backend):
             return UniformComparisonLowering()
         return None
 
+    def argreduce_uses_aten_lowering(self, node: torch.fx.Node) -> bool:
+        from .argreduce import _should_use_cute_argreduce_lowering
+
+        return _should_use_cute_argreduce_lowering(node)
+
+    def emit_virtual_clone(
+        self, ctx: LoweringContext, node: torch.fx.Node
+    ) -> object | None:
+        from .cute_reshape import codegen_cute_virtual_clone
+
+        return codegen_cute_virtual_clone(ctx, node)
+
+    def emit_completed_matmul_sum(
+        self, ctx: LoweringContext, node: torch.fx.Node
+    ) -> ast.AST | None:
+        from .completed_matmul_sum import completed_matmul_sum_input
+
+        return completed_matmul_sum_input(ctx, node)
+
+    def reduction_active_block_id(
+        self, state: CodegenState, node: torch.fx.Node, size: object
+    ) -> int | None:
+        from .active_blocks import match_active_reduction_block_id
+
+        return match_active_reduction_block_id(state, node, size)
+
+    def handler_op_overrides(self) -> HandlerOpOverrides:
+        from .handler_ops import CuteHandlerOpOverrides
+
+        return CuteHandlerOpOverrides()
+
+    def deferred_node_codegen(
+        self,
+        cg: CodegenInterface,
+        node: torch.fx.Node,
+        operand_env: Mapping[torch.fx.Node, object],
+    ) -> object | None:
+        from .device_state import DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
+
+        cute_state = cg.device_function.cute_state
+        if cute_state.has_tcgen05_fragment_epilogue_plan:
+            if cute_state.is_deferred_tcgen05_fragment_epilogue_node(node):
+                return DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
+            if (
+                any(
+                    operand_env.get(input_node) is DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
+                    for input_node in node.all_input_nodes
+                )
+                and cute_state.tcgen05_fragment_epilogue_plan_for_store(node) is None
+            ):
+                raise exc.BackendUnsupported(
+                    self.name,
+                    "deferred tcgen05 fragment epilogue escaped its committed store",
+                )
+        return None
+
+    def exchanged_node_operands(
+        self,
+        cg: CodegenInterface,
+        node: torch.fx.Node,
+        operand_env: Mapping[torch.fx.Node, object],
+    ) -> dict[torch.fx.Node, ast.AST]:
+        # Local imports: at module level, cute.repeated_block_ids ->
+        # completed_matmul_sum -> device_ir -> ``from helion import Config``
+        # fails while helion/__init__ is still importing.
+        from ..inductor_lowering import PointwiseLowering
+        from .cute_reshape import REBOUND_CHECK_TARGETS
+        from .cute_reshape import check_pointwise_rebound_block_ids
+        from .repeated_block_ids import check_repeated_block_ids
+        from .view_subtile import check_view_coord_consumers
+
+        check_repeated_block_ids(cg, node)
+        check_view_coord_consumers(cg, node)
+        if (
+            isinstance(node.meta["lowering"], PointwiseLowering)
+            or node.target in REBOUND_CHECK_TARGETS
+        ):
+            return check_pointwise_rebound_block_ids(cg, node, operand_env=operand_env)
+        return {}
+
+    def prepare_graph_codegen(self, cg: GenerateAST, graph: torch.fx.Graph) -> None:
+        from .cute_mma import prepare_cute_collective_lane_loop_suppression
+        from .simt_gemm import prepare_cute_simt_gemm_loads
+
+        prepare_cute_collective_lane_loop_suppression(cg, graph)
+        prepare_cute_simt_gemm_loads(cg, graph)
+
+    def tile_loop_paths(
+        self, fn: DeviceFunction
+    ) -> tuple[tuple[tuple[int, ...], ...], ...]:
+        from ..host_function import HostFunction
+        from .loop_nesting import tile_loop_paths
+
+        return tile_loop_paths(
+            HostFunction.current().device_ir, fn.codegen.codegen_graphs
+        )
+
+    def constexpr_live_graph_ids(self, fn: DeviceFunction) -> frozenset[int] | None:
+        from ..host_function import HostFunction
+        from .loop_nesting import constexpr_live_graph_ids
+
+        return constexpr_live_graph_ids(
+            HostFunction.current().device_ir, fn.codegen.codegen_graphs, fn
+        )
+
+    def constexpr_live_block_ids(
+        self, fn: DeviceFunction, live_graph_ids: frozenset[int]
+    ) -> frozenset[int]:
+        from ..active_blocks import active_block_ids
+        from ..compile_environment import CompileEnvironment
+        from ..host_function import HostFunction
+
+        return active_block_ids(
+            [
+                graph
+                for graph in fn.codegen.codegen_graphs
+                if graph.graph_id in live_graph_ids
+            ],
+            (
+                block_id
+                for ids in HostFunction.current().device_ir.grid_block_ids
+                for block_id in ids
+            ),
+            CompileEnvironment.current(),
+        )
+
+    def shares_sibling_thread_axes(self) -> bool:
+        return True
+
+    def inactive_broadcast_alias_block_ids(
+        self, fn: DeviceFunction, strategies: Sequence[TileStrategy]
+    ) -> set[int]:
+        from .active_blocks import inactive_broadcast_alias_block_ids
+
+        return inactive_broadcast_alias_block_ids(fn, strategies)
+
+    def roots_may_reserve_distinct_thread_axes(self) -> bool:
+        return True
+
+    def pointwise_op_is_pure_scalar(self, node: torch.fx.Node) -> bool:
+        from ...language.inline_asm_ops import inline_asm_elementwise
+        from .pure_lane_packets import is_pure_scalar_assembly
+
+        if (
+            node.target is not inline_asm_elementwise
+            or len(node.args) != 6
+            or node.args[5] != 1
+        ):
+            return False
+        return is_pure_scalar_assembly(node.args[0], node.args[1], node.args[4])
+
+    def rolls_free_iota_reductions(self) -> bool:
+        return True
+
+    def boundary_only_grid_block_ids(self, fn: DeviceFunction) -> set[int]:
+        from ..compile_environment import CompileEnvironment
+        from ..host_function import HostFunction
+        from .loop_nesting import boundary_only_grid_blocks
+
+        return boundary_only_grid_blocks(
+            CompileEnvironment.current(),
+            HostFunction.current().device_ir,
+            fn.codegen.codegen_graphs,
+        )
+
+    def tile_loop_thread_count(
+        self, fn: DeviceFunction, config: Config, inactive_grid_block_ids: set[int]
+    ) -> int:
+        # Budget simultaneously active grid/device-loop axes. Sibling
+        # passes reuse axes; multiplying all their tile sizes would turn
+        # otherwise legal threaded reductions into serial lane loops.
+        from ..compile_environment import CompileEnvironment
+        from ..host_function import HostFunction
+        from .thread_budget import tile_loop_thread_count
+
+        return tile_loop_thread_count(
+            CompileEnvironment.current(),
+            HostFunction.current().device_ir,
+            fn.codegen.codegen_graphs,
+            config,
+            inactive_block_ids=inactive_grid_block_ids,
+        )
+
+    def packed_grid_block(self, config: Config) -> tuple[int, int] | None:
+        from ..compile_environment import CompileEnvironment
+        from .tile_packing import packed_grid_block
+
+        return packed_grid_block(CompileEnvironment.current(), config)
+
+    # Tensor-core policy of the shared per-thread planner
+    # (``per_thread_planning.plan_per_thread_loop_strategy``).  The detectors
+    # are this module's globals, read at call time (tests patch them here).
+
+    def per_thread_mma_candidate_loop(
+        self,
+        fn: DeviceFunction,
+        block_ids: list[int],
+        *,
+        block_sizes: Sequence[int | torch.SymInt],
+        num_threads_config: Sequence[int],
+        grid_ids: set[int],
+    ) -> bool:
+        return _is_mma_candidate_loop(
+            fn,
+            block_ids,
+            block_sizes=block_sizes,
+            num_threads_config=num_threads_config,
+            grid_ids=grid_ids,
+        )
+
+    def per_thread_matmul_loop_has_mma_path(
+        self, fn: DeviceFunction, block_ids: list[int], config: Config
+    ) -> bool:
+        forced_mma_impl = os.environ.get("HELION_CUTE_MMA_IMPL", "auto")
+        return _kernel_has_specialized_mma_path(fn, config=config) or (
+            _loop_may_use_mma(fn, block_ids)
+            and not _loop_contains_atomic(fn, block_ids)
+            and forced_mma_impl.strip().lower() != "auto"
+        )
+
+    def per_thread_mma_mode(
+        self,
+        fn: DeviceFunction,
+        block_ids: list[int],
+        config: Config,
+        *,
+        block_sizes: Sequence[int | torch.SymInt],
+    ) -> bool:
+        # Detect MMA-compatible K-loops: device loops containing addmm/mm
+        # with float16/bfloat16 operands.
+        from .cute_warp_mma_gemm import MATMUL_FAMILY_WARP_MMA
+        from .cute_warp_mma_gemm import WARP_MMA_FAMILY_KEY
+        from .cute_warp_mma_gemm import detect_warp_mma_gemm
+
+        if config.get(WARP_MMA_FAMILY_KEY) == MATMUL_FAMILY_WARP_MMA:
+            # The register-MMA GEMM family: the dedicated codegen
+            # emits the whole device body (``32 * warps`` threads);
+            # a kernel that is not the plain GEMM it lowers fails
+            # closed with the reason instead of running tcgen05.
+            return detect_warp_mma_gemm(fn, block_ids, config=config)
+        if _detect_attention_mma_loop(fn, block_ids, config=config):
+            # Fused tcgen05 flash-attention: suppress synthetic lane
+            # loops (mma_mode) and run a single 128-thread warpgroup
+            # like the spike. The dedicated flash codegen emits the
+            # whole device body; the FX-graph statement walk is bypassed.
+            # The flex envelope records every loop it owns up front
+            # (two nests); keep that list instead of the current loop.
+            if fn.cute_state.flash.block_ids is None:
+                fn.cute_state.flash.block_ids = list(block_ids)
+            return True
+        if _detect_attention_bwd_mma_loop(fn, block_ids, config=config):
+            # Fused tcgen05 attention BACKWARD: the dedicated bwd
+            # codegen emits the whole device body. The flex envelope
+            # records every loop it owns up front; keep that list.
+            if fn.cute_state.flash.bwd_block_ids is None:
+                fn.cute_state.flash.bwd_block_ids = list(block_ids)
+            return True
+        return _detect_specialized_mma_loop(
+            fn,
+            block_ids,
+            block_sizes=block_sizes,
+            config=config,
+        )
+
+    def per_thread_root_thread_counts(
+        self,
+        fn: DeviceFunction,
+        block_ids: list[int],
+        config: Config,
+        *,
+        block_sizes: Sequence[int | torch.SymInt],
+        num_threads_config: Sequence[int],
+        original_num_threads_config: Sequence[int],
+    ) -> list[int] | None:
+        specialized_mma_plan = _kernel_specialized_mma_plan(fn, config=config)
+        if specialized_mma_plan is None or specialized_mma_plan.impl != "tcgen05":
+            return None
+        from ..compile_environment import CompileEnvironment
+        from .cute_mma import _tcgen05_root_m_threads
+        from .cute_mma import _tcgen05_root_n_threads
+
+        env = CompileEnvironment.current()
+        m_axis = block_ids.index(specialized_mma_plan.m_block_id)
+        n_axis = block_ids.index(specialized_mma_plan.n_block_id)
+        m_block_size = block_sizes[m_axis]
+        n_block_size = block_sizes[n_axis]
+        # The generic SIMT budget above can resolve an automatic
+        # M axis before this specialized plan is known. Preserve
+        # the original auto setting: that temporary width is not
+        # an explicit request for multiple lanes per warp slot.
+        # TCgen05's role launch multiplies this width by its warp
+        # count, so retaining (for example) 64 would double it.
+        requested_m_threads = env.config_spec.num_threads.config_get(
+            config.num_threads, specialized_mma_plan.m_block_id, 0
+        )
+        root_m_threads = (
+            _tcgen05_root_m_threads(int(m_block_size), int(n_block_size))
+            if requested_m_threads == 0
+            and isinstance(m_block_size, int)
+            and isinstance(n_block_size, int)
+            else num_threads_config[m_axis]
+        )
+        root_n_threads = (
+            _tcgen05_root_n_threads(
+                int(n_block_size),
+                epi_warp_groups=launch_epi_warp_groups_knob(config),
+            )
+            if original_num_threads_config[n_axis] == 0
+            and isinstance(n_block_size, int)
+            else num_threads_config[n_axis]
+        )
+        result = list(num_threads_config)
+        result[m_axis] = root_m_threads
+        result[n_axis] = root_n_threads
+        return result
+
+    def free_iota_reductions(
+        self, graphs: list[GraphInfo]
+    ) -> Mapping[torch.fx.Node, tuple[torch.fx.Node, ...]]:
+        from ..compile_environment import CompileEnvironment
+        from .reduction_coordinates import free_iota_reductions
+
+        return free_iota_reductions(CompileEnvironment.current(), graphs)
+
     def customize_ast(self, hf: HostFunction) -> bool:
         """CuTe-specific AST rewrites that rewrite high-level patterns into
         equivalent forms that compile to materially faster code.
@@ -2194,6 +2247,43 @@ class CuteBackend(Backend):
         rewritten |= stage_unaligned_matmul_operands(hf)
         return rewritten
 
+    def decomp_table_overrides(
+        self, table: dict[torch._ops.OpOverload, Callable[..., object]]
+    ) -> None:
+        # CuTe lowers these native numeric extrema directly. Preserve their
+        # distinction from NaN-propagating minimum/maximum during tracing.
+        table.pop(torch.ops.aten.fmin.default, None)
+        table.pop(torch.ops.aten.fmax.default, None)
+
+    def rewrite_device_ir(
+        self,
+        stage: DeviceIRStage,
+        func: HostFunction | None,
+        device_ir: DeviceIR,
+        analysis: DeviceIRAnalysis | None = None,
+    ) -> None:
+        from .ir_passes import rewrite_device_ir
+
+        rewrite_device_ir(stage, func, device_ir, analysis)
+
+    def register_search_surface(
+        self, device_ir: DeviceIR, config_spec: ConfigSpec
+    ) -> None:
+        from .search_surface import register_search_surface
+
+        register_search_surface(device_ir, config_spec)
+
+    def register_reduction_loop_config_slots(
+        self,
+        env: CompileEnvironment,
+        block_id: int,
+        size_hint: int,
+    ) -> None:
+        from ..device_ir import DeviceIR
+        from .search_surface import admit_register_tile_reduction
+
+        admit_register_tile_reduction(env, DeviceIR.current(), block_id)
+
     def pre_codegen(
         self,
         graphs: list[GraphInfo],
@@ -2208,39 +2298,41 @@ class CuteBackend(Backend):
         from .chunk_recurrence import plan_chunk_recurrence
         from .cute_mma_dag import plan_mma_dag
         from .direct_affine_candidate import discover_direct_affine_candidates
+        from .execution_plans import plan_execution
         from .fixed_token_rank1_recurrence import plan_fixed_token_rank1_recurrence
         from .gdn_recurrence import plan_gdn_recurrence
-        from .layout_propagation import plan_layouts
         from .literal_dims import annotate_literal_dims
-        from .radix_selection import plan_radix_selection_root
         from .register_region import plan_register_region
+        from .selection.radix_selection import plan_radix_selection_root
+        from .selection.topk import plan_topk_root
         from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
         from .split_single_token_rank1_recurrence import (
             plan_split_single_token_rank1_recurrence,
         )
-        from .topk import plan_topk_root
         from .view_subtile import annotate_view_subtiles
 
         device_function = DeviceFunction.current()
-        device_function.cute_state.radix_selection_plan = plan_radix_selection_root(
+        device_function.cute_state.root_plans.radix_selection_plan = (
+            plan_radix_selection_root(graphs, tile_strategy)
+        )
+        if device_function.cute_state.root_plans.radix_selection_plan is not None:
+            return
+        device_function.cute_state.root_plans.topk_plan = plan_topk_root(
             graphs, tile_strategy
         )
-        if device_function.cute_state.radix_selection_plan is not None:
+        if device_function.cute_state.root_plans.topk_plan is not None:
             return
-        device_function.cute_state.topk_plan = plan_topk_root(graphs, tile_strategy)
-        if device_function.cute_state.topk_plan is not None:
-            return
-        device_function.cute_state.register_region_plan = plan_register_region(
-            graphs, tile_strategy
+        device_function.cute_state.root_plans.register_region_plan = (
+            plan_register_region(graphs, tile_strategy)
         )
-        if device_function.cute_state.register_region_plan is not None:
+        if device_function.cute_state.root_plans.register_region_plan is not None:
             return
         direct_affine_requested = (
             config.cute_affine_scan_schedule != DIRECT_AFFINE_ORDINARY_SCHEDULE
         )
         if direct_affine_requested:
             direct_affine_candidates = discover_direct_affine_candidates(graphs)
-            device_function.cute_state.direct_affine_candidates = (
+            device_function.cute_state.root_plans.direct_affine_candidates = (
                 direct_affine_candidates
             )
             if not CompileEnvironment.current().settings.fast_math:
@@ -2261,48 +2353,128 @@ class CuteBackend(Backend):
                 )
             annotate_view_subtiles(graphs, config)
             annotate_literal_dims(graphs, config)
-            plan_layouts(graphs, config, tile_strategy)
+            plan_execution(graphs, tile_strategy)
             return
 
-        device_function.cute_state.direct_affine_candidates = ()
+        device_function.cute_state.root_plans.direct_affine_candidates = ()
         from .cute_register_subblocks import plan_register_subblocks
 
-        device_function.cute_state.register_subblocks_plan = plan_register_subblocks(
-            graphs, config
+        device_function.cute_state.root_plans.register_subblocks_plan = (
+            plan_register_subblocks(graphs, config)
         )
-        if device_function.cute_state.register_subblocks_plan is not None:
+        if device_function.cute_state.root_plans.register_subblocks_plan is not None:
             return
         plan_block_scaled(graphs)
-        if DeviceFunction.current().cute_state.block_scaled_plan is not None:
+        if DeviceFunction.current().cute_state.root_plans.block_scaled_plan is not None:
             return
         plan_chunk_prepare(graphs, tile_strategy)
-        if DeviceFunction.current().cute_state.chunk_prepare_plan is not None:
+        if (
+            DeviceFunction.current().cute_state.root_plans.chunk_prepare_plan
+            is not None
+        ):
             return
         plan_chunk_recurrence(graphs, tile_strategy)
-        if DeviceFunction.current().cute_state.chunk_recurrence_plan is not None:
+        if (
+            DeviceFunction.current().cute_state.root_plans.chunk_recurrence_plan
+            is not None
+        ):
             return
         plan_gdn_recurrence(graphs, tile_strategy)
-        if DeviceFunction.current().cute_state.gdn_recurrence_plan is not None:
+        if (
+            DeviceFunction.current().cute_state.root_plans.gdn_recurrence_plan
+            is not None
+        ):
             return
-        device_function.cute_state.mma_dag_plan = plan_mma_dag(graphs, config)
-        if device_function.cute_state.mma_dag_plan is not None:
+        device_function.cute_state.root_plans.mma_dag_plan = plan_mma_dag(
+            graphs, config
+        )
+        if device_function.cute_state.root_plans.mma_dag_plan is not None:
             return
         plan_single_token_rank1_recurrence(graphs, tile_strategy)
-        if DeviceFunction.current().cute_state.single_token_rank1_plan is not None:
+        if (
+            DeviceFunction.current().cute_state.root_plans.single_token_rank1_plan
+            is not None
+        ):
             return
         split_t1_plan = plan_split_single_token_rank1_recurrence(graphs, tile_strategy)
-        DeviceFunction.current().cute_state.split_single_token_rank1_plan = (
+        DeviceFunction.current().cute_state.root_plans.split_single_token_rank1_plan = (
             split_t1_plan
         )
         if split_t1_plan is not None:
             return
 
         plan_fixed_token_rank1_recurrence(graphs, tile_strategy)
-        if device_function.cute_state.fixed_token_rank1_plan is not None:
+        if device_function.cute_state.root_plans.fixed_token_rank1_plan is not None:
             return
         annotate_view_subtiles(graphs, config)
         annotate_literal_dims(graphs, config)
-        plan_layouts(graphs, config, tile_strategy)
+        plan_execution(graphs, tile_strategy)
+
+    def finalize_device_body(
+        self, body: list[ast.stmt], ctx: DeviceBodyContext
+    ) -> tuple[list[ast.stmt], list[ast.arg]]:
+        # The pass tables live in ``passes.pipeline``, imported at call time:
+        # ``pipeline`` imports ``compile_environment`` and ``device_function``
+        # at module level, and this module is loaded through
+        # ``backend_registry`` (imported at the top of ``compile_environment``)
+        # while ``compile_environment`` is still initializing.
+        from .passes import pdl
+        from .passes.pipeline import run_device_body_passes
+
+        fn = ctx.device_function
+        body, late = pdl.prepare_device_body(fn, body, ctx.body_start)
+        body, extra_args = run_device_body_passes(body, ctx)
+        if late is not None:
+            body = pdl.place_late_wait(body, late)
+        return body, extra_args
+
+    def finalize_kernel_def(
+        self,
+        fn_def: ast.FunctionDef,
+        prefix: list[ast.stmt],
+        ctx: DeviceBodyContext,
+    ) -> list[ast.stmt]:
+        from .passes import launch_attributes
+        from .passes import pdl
+        from .passes.pipeline import run_kernel_def_passes
+
+        run_kernel_def_passes(fn_def, prefix, ctx)
+        fn = ctx.device_function
+        pdl.insert_spread_pad(fn, fn_def)
+        statements = launch_attributes.module_statements(fn)
+        launch_attributes.project_launch_block(fn)
+        return statements
+
+    def tensors_proven_disjoint(
+        self, env: CompileEnvironment, left: torch.Tensor, right: torch.Tensor
+    ) -> bool:
+        from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
+
+        return runtime_tensors_are_proven_disjoint(env, left, right)
+
+    def new_env_state(self) -> CuteEnvState:
+        return new_env_state()
+
+    def new_codegen_state(self) -> CuteCodegenState:
+        return new_codegen_state()
+
+    def new_device_state(self, config: Config) -> CuteDeviceFunctionState:
+        return new_device_state(config)
+
+    def root_emitters(self) -> tuple[RootEmitter, ...]:
+        from .emitters import ROOT_EMITTERS
+
+        return ROOT_EMITTERS
+
+    def kernel_generators(self) -> tuple[KernelGenerator, ...]:
+        from .kernel_generators import KERNEL_GENERATORS
+
+        return KERNEL_GENERATORS
+
+    def retry_policy(self) -> RetryPolicy:
+        from .kernel_generators import REGENERATION
+
+        return REGENERATION
 
     def reference_override(
         self, function: object, args: tuple[object, ...]
@@ -2323,9 +2495,118 @@ class CuteBackend(Backend):
                 "cute", "philox4 supports explicit uniform hl.rand only"
             )
 
+    def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
+        # Imported here: the heuristics pull the config spec and most of the
+        # backend, which import this module first.
+        from .autotune.heuristics import CUTE_HEURISTICS
+
+        return CUTE_HEURISTICS
+
+    def seed_fact_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
+        from .autotune.heuristics import CUTE_SEED_FACT_HEURISTICS
+
+        return CUTE_SEED_FACT_HEURISTICS
+
+    def register_seed_facts(
+        self, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from .autotune.heuristics import register_seed_facts
+
+        return register_seed_facts(env, device_ir)
+
+    def postprocess_seed_configs(
+        self, env: CompileEnvironment, device_ir: DeviceIR, configs: list[Config]
+    ) -> list[Config]:
+        from .autotune.heuristics import postprocess_seed_configs
+
+        return postprocess_seed_configs(env, device_ir, configs)
+
+    def register_coverage_groups(
+        self, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> None:
+        from .autotune.heuristics import register_coverage_groups
+
+        register_coverage_groups(env, device_ir)
+
+    # -- runtime hooks: see ``cute/runtime_hooks.py`` -------------------------
+
+    def on_bind(
+        self,
+        bound: BoundKernel[Any],
+        args: tuple[object, ...],
+        *,
+        rewrite_ast: bool,
+    ) -> None:
+        from . import runtime_hooks
+
+        runtime_hooks.plan_bound_kernel(bound, args, rewrite_ast=rewrite_ast)
+
+    def host_structural_facts(
+        self, host_function: HostFunction, config_spec: ConfigSpec
+    ) -> None:
+        from . import runtime_hooks
+
+        runtime_hooks.record_host_structural_facts(host_function, config_spec)
+
+    def before_codegen(self, bound: BoundKernel[Any], config: Config) -> None:
+        from . import runtime_hooks
+
+        runtime_hooks.begin_codegen(bound)
+
+    def after_codegen(self, bound: BoundKernel[Any], config: Config) -> None:
+        from . import runtime_hooks
+
+        runtime_hooks.finish_codegen(bound, config)
+
+    def after_compile(self, bound: BoundKernel[Any], config: Config) -> None:
+        from . import runtime_hooks
+
+        runtime_hooks.register_compiled(bound, config)
+
+    def decorator_settings(self, settings: Settings) -> list[str]:
+        from . import runtime_hooks
+
+        return runtime_hooks.decorator_settings(settings)
+
+    def structural_policy_type(self) -> type[CuteStructuralPolicy]:
+        from . import runtime_hooks
+
+        return runtime_hooks.structural_policy_type()
+
+    def llm_prompt_profile(self) -> LlmPromptProfile:
+        from .autotune.llm_profile import CuteLlmPromptProfile
+
+        return CuteLlmPromptProfile()
+
+    def final_rebenchmark_top_k(self) -> int | None:
+        # The flash-attention search surface has a wide config space where
+        # verifying more finalists materially improves the final pick; the
+        # other backends do not need the extra rebenchmark cost (it ~2.5x'd
+        # autotune wall-time on cheap kernels).
+        return 32
+
+    def final_rebenchmark_isolated(self) -> bool:
+        # The interleaved bench lets L2 cache-POLICY state leak between
+        # candidates that read the same input tensors (an ``l2_last``
+        # candidate pins its inputs in L2 and every rival free-rides on the
+        # hits, so the config CAUSING the speedup can never out-measure the
+        # others).  Isolated mode times each finalist in its own steady
+        # window -- the same regime the deployment-style do_bench measures --
+        # with suspicious-result confirmation guarding against thermal drift
+        # between windows.
+        return True
+
+    def config_spec_extension(self) -> BackendSearchSurface:
+        # Imported here: the surface pulls the config spec and most of the
+        # backend, which import this module first.
+        from .autotune.search_surface import CUTE_SEARCH_SURFACE
+
+        return CUTE_SEARCH_SURFACE
+
     def supports_config_key(self, key: str) -> bool:
-        if key in _CUTE_CONFIG_KEYS or key.startswith(_CUTE_CONFIG_KEY_PREFIXES):
-            return True
+        if key == "reduction_fusion":
+            # The CuTe reduction emitters fuse on their own terms.
+            return False
         return super().supports_config_key(key)
 
     def cross_loop_pipelines(self) -> tuple[str, ...]:
@@ -2634,10 +2915,6 @@ class CuteBackend(Backend):
             "_cute_nan_min": "from helion._compiler.cute.reduce_helpers import _cute_nan_min",
             "_helion_pdl_spread_keep": "from helion._compiler.cute._pdl_spread_runtime import keep_smem_live as _helion_pdl_spread_keep",
             "_cute_aux_copy_layout": "from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout as _cute_aux_copy_layout",
-            "_helion_tcgen05_pipeline": (
-                "from helion._compiler.cute import tcgen05_pipeline "
-                "as _helion_tcgen05_pipeline"
-            ),
             "_cute_gelu_erf_exact_f32x2": (
                 "from helion._compiler.cute.epilogue_helpers import "
                 "gelu_erf_exact_f32x2 as _cute_gelu_erf_exact_f32x2"
@@ -2675,7 +2952,6 @@ class CuteBackend(Backend):
             "_cute_grouped_reduce_block": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_block",
             "_cute_grouped_reduce_cluster_warp_online_pair": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster_warp_online_pair",
             "_cute_grouped_reduce_cluster_online_pair": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster_online_pair",
-            "_cute_pre_vec_fold": "from helion._compiler.cute.reduce_helpers import _cute_pre_vec_fold",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
             "_cute_python_mod": "from helion._compiler.cute.integer_helpers import python_mod as _cute_python_mod",
@@ -2719,23 +2995,7 @@ class CuteBackend(Backend):
             "_cute_rank1_load_u32x4_if_valid": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_u32x4_if_valid as _cute_rank1_load_u32x4_if_valid",
             "_cute_rank1_store_u32x4_if_valid": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u32x4_if_valid as _cute_rank1_store_u32x4_if_valid",
             "_cute_rank1_store_u16_or_zero": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u16_or_zero as _cute_rank1_store_u16_or_zero",
-            "_cute_load_l2_evict_last": "from helion._compiler.cute.l2_policy import load_v16b_l2_evict_last as _cute_load_l2_evict_last",
-            "_cute_load_v64b_if": "from helion._compiler.cute.masked_packet_load import load_v64b_if as _cute_load_v64b_if",
-            "_cute_load_v32b_if": "from helion._compiler.cute.masked_packet_load import load_v32b_if as _cute_load_v32b_if",
-            "_cute_load_v16b_if": "from helion._compiler.cute.masked_packet_load import load_v16b_if as _cute_load_v16b_if",
-            "_cute_load_v8b_if": "from helion._compiler.cute.masked_packet_load import load_v8b_if as _cute_load_v8b_if",
-            "_cute_load_v4b_if": "from helion._compiler.cute.masked_packet_load import load_v4b_if as _cute_load_v4b_if",
-            "_cute_load_nc_l2_evict_first_32b": "from helion._compiler.cute.readonly_packet_load_helpers import load_nc_l2_evict_first_32b as _cute_load_nc_l2_evict_first_32b",
-            "_cute_load_nc_l2_evict_first_16b": "from helion._compiler.cute.readonly_packet_load_helpers import load_nc_l2_evict_first_16b as _cute_load_nc_l2_evict_first_16b",
-            "_cute_scalar_policy_load": "from helion._compiler.cute.l2_policy import scalar_policy_load as _cute_scalar_policy_load",
-            "_cute_load_l1_l2_evict_first": "from helion._compiler.cute.l2_policy import load_v16b_l1_l2_evict_first as _cute_load_l1_l2_evict_first",
-            "_cute_load_l1_l2_evict_first_8b": "from helion._compiler.cute.l2_policy import load_v8b_l1_l2_evict_first as _cute_load_l1_l2_evict_first_8b",
-            "_cute_load_l1_l2_evict_last": "from helion._compiler.cute.l2_policy import load_v16b_l1_l2_evict_last as _cute_load_l1_l2_evict_last",
-            "_cute_load_l1_l2_evict_last_8b": "from helion._compiler.cute.l2_policy import load_v8b_l1_l2_evict_last as _cute_load_l1_l2_evict_last_8b",
-            "_cute_load_l2_evict_last_8b": "from helion._compiler.cute.l2_policy import load_v8b_l2_evict_last as _cute_load_l2_evict_last_8b",
-            "_cute_load_l2_evict_last_4b": "from helion._compiler.cute.l2_policy import load_v4b_l2_evict_last as _cute_load_l2_evict_last_4b",
-            "_cute_load_l1_l2_evict_first_4b": "from helion._compiler.cute.l2_policy import load_v4b_l1_l2_evict_first as _cute_load_l1_l2_evict_first_4b",
-            "_cute_load_l1_l2_evict_last_4b": "from helion._compiler.cute.l2_policy import load_v4b_l1_l2_evict_last as _cute_load_l1_l2_evict_last_4b",
+            **{helper.name: helper.import_line for helper in PACKET_LOAD_HELPERS},
             "_cute_store_u16x8_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u16x8_l2_evict_last as _cute_store_u16x8_l2_evict_last",
             "_cute_store_u32x4_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u32x4_l2_evict_last as _cute_store_u32x4_l2_evict_last",
             "_cute_store_u16x8_streaming": "from helion._compiler.cute.l2_policy import store_u16x8_streaming as _cute_store_u16x8_streaming",
@@ -2758,7 +3018,7 @@ class CuteBackend(Backend):
         if dim == 0:
             from ..device_function import DeviceFunction
 
-            divisor = DeviceFunction.current().cute_state.program_id_divisor
+            divisor = DeviceFunction.current().cute_state.tcgen05.program_id_divisor
             if divisor > 1:
                 # ``tcgen05_split_k``: ``divisor`` consecutive CTAs share one
                 # output tile (the split index is ``block_idx % divisor``).
@@ -2893,10 +3153,6 @@ class CuteBackend(Backend):
             @staticmethod
             def sqrt(x: CuteDSLArg) -> CuteDSLArg:
                 return HelionCuteDSLOpOverrides._unary_math(x, "sqrt")
-
-            @staticmethod
-            def rsqrt(x: CuteDSLArg) -> CuteDSLArg:
-                return HelionCuteDSLOpOverrides._unary_math(x, "rsqrt")
 
             @staticmethod
             def log(x: CuteDSLArg) -> CuteDSLArg:
@@ -3339,13 +3595,32 @@ class CuteBackend(Backend):
     def max_reduction_threads(self) -> int | None:
         return 1024
 
+    def reduction_emitter(self, strategy: ReductionStrategy) -> ReductionEmitter[Any]:
+        from .reduction_emitter import reduction_emitter_for
+
+        return reduction_emitter_for(strategy)
+
+    def create_reduction_strategy(
+        self, fn: DeviceFunction, block_id: int, reduction_loop: int | None
+    ) -> TileStrategy:
+        if reduction_loop is None:
+            from .reduction_emitter import CutePersistentReductionStrategy
+
+            return CutePersistentReductionStrategy(fn, block_id)
+        return super().create_reduction_strategy(fn, block_id, reduction_loop)
+
     def max_reduction_loop(self) -> int | None:
-        from ..reduction_strategy import cute_looped_reduction_block_size
+        from .reduction_emitter import cute_looped_reduction_block_size
 
         max_threads = self.max_reduction_threads()
         if max_threads is None:
             return None
         return cute_looped_reduction_block_size(2**31 - 1, max_threads)
+
+    def default_reduction_loop(self, size_hint: int, max_threads: int) -> int:
+        from .reduction_emitter import cute_looped_reduction_block_size
+
+        return cute_looped_reduction_block_size(size_hint, max_threads)
 
     def adjust_reduction_thread_count(
         self, requested: int, existing_strategies: list[TileStrategy]
@@ -3664,12 +3939,13 @@ class CuteBackend(Backend):
             return []
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
-        from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
-        from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
         from ..compile_environment import CompileEnvironment
         from ..device_function import ConstExprArg
         from ..device_function import DeviceFunction
         from ..host_function import HostFunction
+        from ..reduction_strategy import ReductionStrategy
+        from .autotune.config_keys import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
+        from .autotune.config_keys import _cute_chunk_recurrence_config_is_safe
 
         device_function = DeviceFunction.current()
         codegen = device_function.codegen
@@ -3690,7 +3966,7 @@ class CuteBackend(Backend):
             # A body whose shared cross-warp reductions were sized for a
             # launch shape (``finalize_shared_reduce_groups``) must launch
             # with exactly that shape: any other block would alias groups.
-            sized_for = device_function.cute_state.shared_reduce_launch_block
+            sized_for = device_function.cute_state.lanes.shared_reduce_launch_block
             if sized_for is not None:
                 literal = re.fullmatch(r"block=\((\d+), (\d+), (\d+)\)", block_arg)
                 launched = (
@@ -3708,7 +3984,7 @@ class CuteBackend(Backend):
             # codegen (``_implicit_pdl_release`` sizes the resident CTAs per
             # SM from it); an argument-sized axis leaves it unknown.
             static_block = re.fullmatch(r"block=\((\d+), (\d+), (\d+)\)", block_arg)
-            device_function.cute_state.launch_block = (
+            device_function.cute_state.lanes.launch_block = (
                 (
                     int(static_block.group(1)),
                     int(static_block.group(2)),
@@ -3724,7 +4000,9 @@ class CuteBackend(Backend):
             ptxas_options: list[str] = []
             recurrence_register_cap = config.get(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY)
             if recurrence_register_cap is not None:
-                recurrence_plan = device_function.cute_state.chunk_recurrence_plan
+                recurrence_plan = (
+                    device_function.cute_state.root_plans.chunk_recurrence_plan
+                )
                 if recurrence_plan is None or type(recurrence_register_cap) is not int:
                     raise exc.BackendUnsupported(
                         "cute", "invalid matched recurrence register cap"
@@ -3741,7 +4019,7 @@ class CuteBackend(Backend):
                     "--override-directive-values "
                     f"--maxrregcount={recurrence_register_cap}"
                 )
-            prepare_plan = device_function.cute_state.chunk_prepare_plan
+            prepare_plan = device_function.cute_state.root_plans.chunk_prepare_plan
             if prepare_plan is not None and prepare_plan.schedule.startswith(
                 "split_alias_cpc"
             ):
@@ -3781,92 +4059,13 @@ class CuteBackend(Backend):
                 )
             return launcher_args
 
-        direct_affine_plan = device_function.cute_state.direct_affine_plan
-        topk_plan = device_function.cute_state.topk_plan
-        if topk_plan is not None:
-            return launcher_args_with_compile_options(
-                f"block=({topk_plan.threads}, 1, 1)"
-            )
-        register_region_plan = device_function.cute_state.register_region_plan
-        if register_region_plan is not None:
-            return launcher_args_with_compile_options(
-                f"block=({register_region_plan.threads}, 1, 1)"
-            )
-        if direct_affine_plan is not None:
-            x, y, z = direct_affine_plan.cta_shape
-            check_thread_block_dims(
-                (x, y, z), context=str(direct_affine_plan.cta_shape)
-            )
+        # A whole-root plan that owns the body owns its launch (the
+        # structural ``LaunchShape``); the SIMT thread-axis recovery below
+        # does not apply to it.
+        owned_launch = plan_owned_launch(device_function.cute_state)
+        if owned_launch is not None:
+            x, y, z = owned_launch.dims
             return launcher_args_with_compile_options(f"block=({x}, {y}, {z})")
-
-        register_chain_block_dims = (
-            device_function.cute_state.collective_register_chain_block_dims
-            or device_function.cute_state.owned_root_block_dims
-        )
-        if register_chain_block_dims is not None:
-            return launcher_args_with_compile_options(
-                f"block={register_chain_block_dims}"
-            )
-
-        # The single-token rank-1 path owns the complete physical body.  The
-        # original B1 schedule uses 256 threads while its batched schedule uses
-        # one warp; the structural plan proves which topology was emitted.
-        single_rank1_plan = device_function.cute_state.single_token_rank1_plan
-        if single_rank1_plan is not None:
-            return launcher_args_with_compile_options(
-                f"block=({single_rank1_plan.threads}, 1, 1)"
-            )
-
-        # The split-input T=1 path owns one 32-thread warp per 16 output rows.
-        if device_function.cute_state.split_single_token_rank1_plan is not None:
-            return launcher_args_with_compile_options("block=(32, 1, 1)")
-
-        # The fixed-token grouped rank-1 path owns one physical CTA per
-        # sequence/head/value split and replaces the complete device body.
-        fixed_rank1_plan = device_function.cute_state.fixed_token_rank1_plan
-        if fixed_rank1_plan is not None:
-            fixed_rank1_threads = (
-                128 * fixed_rank1_plan.key_split // fixed_rank1_plan.value_split
-            )
-            return launcher_args_with_compile_options(
-                f"block=({fixed_rank1_threads}, 1, 1)"
-            )
-
-        # The exact chunk-prepare and chunk-recurrence lowerings own their physical
-        # launch topology rather than the carrier's logical tile axes.
-        if device_function.cute_state.chunk_prepare_plan is not None:
-            return launcher_args_with_compile_options("block=(128, 1, 1)")
-        if device_function.cute_state.block_scaled_plan is not None:
-            return launcher_args_with_compile_options("block=(192, 1, 1)")
-        recurrence_plan = device_function.cute_state.chunk_recurrence_plan
-        if recurrence_plan is not None:
-            return launcher_args_with_compile_options(
-                f"block=({recurrence_plan.threads}, 1, 1)"
-            )
-        gdn_plan = device_function.cute_state.gdn_recurrence_plan
-        if gdn_plan is not None:
-            return launcher_args_with_compile_options(
-                f"block=({gdn_plan.threads}, 1, 1)"
-            )
-
-        # The register-MMA GEMM family owns the whole device body and runs
-        # one CTA of ``32 * warps`` threads per output tile.
-        warp_mma_plan = device_function.cute_state.warp_mma_gemm_plan
-        if warp_mma_plan is not None:
-            return launcher_args_with_compile_options(
-                f"block=({warp_mma_plan.threads}, 1, 1)"
-            )
-
-        # Fused tcgen05 flash-attention: 128 threads (single-warpgroup Stage-3)
-        # or 256 threads (Stage-4 warp-spec producer/consumer split). The custom
-        # flash codegen owns the whole device body, so the SIMT thread-axis
-        # heuristics below do not apply.
-        if (
-            device_function.cute_state.attention_flash_block_ids is not None
-            or device_function.cute_state.attention_flash_bwd_block_ids is not None
-        ):
-            flash_threads = device_function.cute_state.attention_flash_threads
-            return launcher_args_with_compile_options(f"block=({flash_threads}, 1, 1)")
 
         block_size_values = {
             name: int(value)
@@ -3900,13 +4099,11 @@ class CuteBackend(Backend):
                 flags=re.MULTILINE,
             )
         )
-        grid_thread_extents = device_function.cute_state.grid_thread_extents
-        live_grid_thread_extents = _live_grid_thread_extents(
+        grid_thread_extents = device_function.cute_state.lanes.grid_thread_extents
+        live_extents = live_grid_thread_extents(
             [*device_function.preamble, *device_function.body], grid_thread_extents
         )
-        exact_grid_thread_dims = [
-            live_grid_thread_extents.get(axis, 1) for axis in range(3)
-        ]
+        exact_grid_thread_dims = [live_extents.get(axis, 1) for axis in range(3)]
         offset_thread_dims = list(exact_grid_thread_dims)
         # Grid producers record exact extents independently of index spelling.
         # Keep text recovery only for older/unregistered index producers.
@@ -3938,7 +4135,7 @@ class CuteBackend(Backend):
         # to keep the per-line ``(block_size, epT)`` pair intact.
         # ``indices_line_re`` anchors on the
         # ``cutlass.Int32(cute.arch.thread_idx()[<axis>])`` form the CuTe
-        # backend emits via ``lane_index_expr`` (see backend.py:2666).
+        # backend emits via ``CuteBackend.lane_index_expr``.
         # The trailing ``\)`` after ``\]`` is the close of the
         # ``cutlass.Int32(...)`` wrapper around ``thread_idx``; if a
         # future codegen path drops the wrapper, the regex will
@@ -4068,7 +4265,7 @@ class CuteBackend(Backend):
         # drops nothing.
         root_read_axes = [
             {axis: size for axis, size in root.items() if axis in final_thread_axes}
-            for root in codegen.root_read_axis_sizes
+            for root in cute_codegen_state(codegen).root_read_axis_sizes
         ]
         static_threads = functools.reduce(operator.mul, static_dims, 1)
         dynamic_threads = functools.reduce(operator.mul, dims, 1)
@@ -4091,7 +4288,44 @@ class CuteBackend(Backend):
                     root_grid_dims[axis] = max(root_grid_dims[axis], size)
         root_static_dims = tuple(root_grid_dims)
         root_static_threads = functools.reduce(operator.mul, root_static_dims, 1)
-        recorded_tcgen05_block_shape = device_function.cute_state.block_shape
+
+        def _emits_cute_gemm(stmt: ast.AST) -> bool:
+            for sub in ast.walk(stmt):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "gemm"
+                    and isinstance(sub.func.value, ast.Name)
+                    and sub.func.value.id == "cute"
+                ):
+                    return True
+            return False
+
+        kernel_has_mma = any(
+            _emits_cute_gemm(stmt)
+            for stmt in [*device_function.preamble, *device_function.body]
+        )
+
+        reduction_strategies = any(
+            isinstance(strategy, ReductionStrategy)
+            for strategy in tile_strategy.strategies
+        )
+
+        def launch_shape_flags(*, multi_phase: bool, tcgen05: bool) -> LaunchShapeFlags:
+            return LaunchShapeFlags(
+                multi_phase=multi_phase,
+                nested_device_loops=has_nested_device_loops,
+                mma=kernel_has_mma,
+                tcgen05=tcgen05,
+                reduction=reduction_strategies,
+                synthetic_axes=bool(codegen.cute_synthetic_arange_axis_sizes),
+                symbolic_axes=bool(symbolic_axes),
+                pointwise_fact=bool(
+                    CompileEnvironment.current().config_spec.pointwise_facts
+                ),
+            )
+
+        recorded_tcgen05_block_shape = device_function.cute_state.tcgen05.block_shape
         specialized_root_tcgen05 = recorded_tcgen05_block_shape is not None or (
             _kernel_specialized_mma_impl(device_function, config=device_function.config)
             == "tcgen05"
@@ -4111,6 +4345,11 @@ class CuteBackend(Backend):
             # shape expression, so ``symbolic_axes`` declined above.
             check_thread_block_dims(phase_dims, context=str(phase_dims))
             _reject_dropped_root_threads(phase_dims, root_read_axes)
+            check_launch_shape(
+                device_function,
+                phase_dims,
+                flags=launch_shape_flags(multi_phase=True, tcgen05=False),
+            )
             return launcher_args_with_compile_options(
                 f"block=({phase_dims[0]}, {phase_dims[1]}, {phase_dims[2]})"
             )
@@ -4226,7 +4465,7 @@ class CuteBackend(Backend):
             else:
                 dims = DeviceFunction.current().tile_strategy.thread_block_dims()
         pointwise_dims = _pointwise_grid_thread_dims(
-            live_grid_thread_extents,
+            live_extents,
             final_thread_axes,
             referenced_dims,
             has_pointwise_fact=bool(
@@ -4286,22 +4525,6 @@ class CuteBackend(Backend):
         # reduction axis (e.g. K) than the codegen "references" through the
         # strategy's per-block thread count.
 
-        def _emits_cute_gemm(stmt: ast.AST) -> bool:
-            for sub in ast.walk(stmt):
-                if (
-                    isinstance(sub, ast.Call)
-                    and isinstance(sub.func, ast.Attribute)
-                    and sub.func.attr == "gemm"
-                    and isinstance(sub.func.value, ast.Name)
-                    and sub.func.value.id == "cute"
-                ):
-                    return True
-            return False
-
-        kernel_has_mma = any(
-            _emits_cute_gemm(stmt)
-            for stmt in [*device_function.preamble, *device_function.body]
-        )
         if (
             tcgen05_compact_dims is None
             and not specialized_root_tcgen05
@@ -4372,6 +4595,14 @@ class CuteBackend(Backend):
                     [*device_function.preamble, *device_function.body],
                 )
             )
+        check_launch_shape(
+            device_function,
+            (dims[0], dims[1], dims[2]),
+            flags=launch_shape_flags(
+                multi_phase=False,
+                tcgen05=tcgen05_compact_dims is not None or specialized_root_tcgen05,
+            ),
+        )
         return launcher_args_with_compile_options(
             f"block=({dims[0]}, {dims[1]}, {dims[2]})"
         )
@@ -4446,482 +4677,382 @@ class CuteBackend(Backend):
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
 
+    def create_program_ids(
+        self, fn: DeviceFunction, pid_type: str, block_ids: list[int]
+    ) -> ProgramIDs | None:
+        """The tcgen05 persistent scheduler for persistent pid types on a
+        tcgen05 GEMM body; ``None`` (the generic strategies) otherwise."""
+        if not pid_type.startswith("persistent"):
+            return None
+        from .cute_warp_mma_gemm import MATMUL_FAMILY_WARP_MMA
+        from .cute_warp_mma_gemm import WARP_MMA_FAMILY_KEY
+
+        # The register-MMA family owns the whole body (one CTA per tile); the
+        # tcgen05 persistent scheduler would need a tcgen05 plan it never gets.
+        if fn.config.get(WARP_MMA_FAMILY_KEY) == MATMUL_FAMILY_WARP_MMA:
+            return None
+        if _kernel_specialized_mma_impl(fn, config=fn.config) != "tcgen05":
+            return None
+        from .tcgen05.scheduler_pids import Tcgen05PersistentProgramIDs
+
+        return Tcgen05PersistentProgramIDs(is_blocked=pid_type == "persistent_blocked")
+
+    def lower_owned_lane_loop(self, codegen: GenerateAST) -> None:
+        from .lane_loops.root_passes import run_root_lane_passes
+
+        run_root_lane_passes(codegen)
+
+    def tracks_statement_owners(self) -> bool:
+        return True
+
+    def tile_begin_expr(self, codegen: GenerateAST, block_idx: int) -> str | None:
+        from .tile_ops import cute_tile_begin_expr
+
+        return cute_tile_begin_expr(codegen, block_idx)
+
+    def rewrite_lowered_root(
+        self, codegen: GenerateAST, grid_state: DeviceGridState, body: list[ast.AST]
+    ) -> bool:
+        from .direct_affine_lowering import try_lower_direct_affine_root
+        from .thread_budget import record_root_read_axes
+
+        record_root_read_axes(codegen, grid_state, body)
+        return try_lower_direct_affine_root(codegen, grid_state, body)
+
+    def explain_root_failure(
+        self, codegen: GenerateAST, error: exc.BackendUnsupported
+    ) -> exc.BackendUnsupported | exc.InvalidConfig:
+        """Report a generic-lowering refusal after a fragment capacity decline.
+
+        The computed-fragment owner declines a root whose shared memory exceeds
+        the CTA capacity so the ordinary lowering can own it; when that lowering
+        refuses instead (lane restores, repeated block ids), the config, not the
+        kernel, failed: the overflow is the actionable message. Callers wrap the
+        statement visit and the device function finalization.
+
+        ``RegisterTileUnsupported`` is not a refusal but the register tile's
+        regeneration signal (``generate_ast`` retries with the rolled lane) and
+        passes through unchanged, decline or not.
+        """
+        from .register_tile_admission import RegisterTileUnsupported
+
+        if isinstance(error, RegisterTileUnsupported):
+            return error
+        declined = (
+            codegen.device_function.cute_state.root_plans.fragment_capacity_decline
+        )
+        if declined is None:
+            return error
+        needed, capacity = declined
+        return exc.InvalidConfig(
+            f"computed fragments need {needed} shared bytes, exceeding {capacity}, "
+            f"and no other lowering owns this root: {error}"
+        )
+
+    def validate_codegen_config(
+        self, env: CompileEnvironment, device_ir: DeviceIR, config: Config
+    ) -> None:
+        if config.get("cute_fragment_warp_scan", False):
+            from .autotune.heuristics.cute_fragment_warp_scan import (
+                validate_warp_scan_request,
+            )
+
+            validate_warp_scan_request(env, device_ir, config)
+        if config.get("cute_fragment_scan_exports", False):
+            from .autotune.heuristics.cute_fragment_scan_exports import (
+                validate_scan_exports,
+            )
+
+            validate_scan_exports(env, device_ir, config)
+        if config.get("cute_fragment_warp_producer_regions", False):
+            from .autotune.heuristics.cute_fragment_warp_producer_regions import (
+                validate_warp_producer_regions,
+            )
+
+            validate_warp_producer_regions(env, device_ir, config)
+
+    def after_device_codegen(
+        self, codegen: GenerateAST, host: HostFunction, config: Config
+    ) -> None:
+        from .cute_reshape import run_deferred_rebound_checks
+        from .host_remainder_fills import append_device_remainder_fills
+        from .lane_loops.root_passes import reject_lane_reads_without_lane_loops
+
+        codegen.device_function.cute_state.finalize_tcgen05_paired_fanout_stores()
+        # Re-binding checks deferred from tcgen05 epilogue chains that no
+        # store drained (chains ending in an atomic or a specialized
+        # store path).
+        run_deferred_rebound_checks(codegen)
+        if codegen.suppressed_lane_names:
+            reject_lane_reads_without_lane_loops(
+                codegen.device_function.body,
+                codegen.suppressed_lane_names,
+                codegen.device_function.dce_vars,
+                backend=self,
+            )
+        cute_codegen_state(codegen).remainder_fills = append_device_remainder_fills(
+            codegen, host, config
+        )
+
+    def finalize_host_statements(
+        self, codegen: GenerateAST, host: HostFunction, statements: list[ast.AST]
+    ) -> tuple[list[ast.AST], list[ast.AST]]:
+        from ..compile_environment import CompileEnvironment
+        from .host_metadata import can_bake_tensor_shapes
+        from .host_metadata import post_kernel_metadata_statements
+        from .host_remainder_fills import lower_host_remainder_fills
+        from .host_sums import PAIRED_SUM_KEY
+        from .host_sums import lower_host_sums
+        from .host_zero_fill_launches import lower_host_zero_fill_launches
+        from .host_zero_fill_launches import zero_fill_launches_apply
+        from .host_zero_fills import lower_host_zero_fills
+
+        env = CompileEnvironment.current()
+        fn = codegen.device_function
+        # The wrapper plans index the launcher's argument order, so they are
+        # resolved before the host passes below rewrite the wrapper.
+        metadata = post_kernel_metadata_statements(codegen, host)
+        if not can_bake_tensor_shapes(codegen):
+            statements = [
+                statement_from_string(
+                    f"{fn.name}._helion_cute_disable_bake_tensor_shapes = True"
+                ),
+                *statements,
+            ]
+        statements = lower_host_remainder_fills(
+            statements, cute_codegen_state(codegen).remainder_fills
+        )
+        statements = lower_host_sums(
+            host, statements, cast("str", fn.config.get(PAIRED_SUM_KEY, "off"))
+        )
+        statements = lower_host_zero_fills(host, statements, env, fn.config)
+        fill_kernels: list[ast.AST] = []
+        if zero_fill_launches_apply(fn, env, fn.config):
+            # The zero fills that survive the elision launch as
+            # dependent fill kernels ahead of this (``cute_pdl``)
+            # kernel instead of memset nodes.
+            statements, fill_kernels = lower_host_zero_fill_launches(
+                host, statements, env=env, kernel_name=fn.name
+            )
+        return statements, [*metadata, *fill_kernels]
+
+    def canonicalizes_reduction_loop_blocks(self) -> bool:
+        return True
+
+    def prepare_device_loop(
+        self,
+        graph_info: ForLoopGraphInfo,
+        state: CodegenState,
+        device_loop: DeviceLoopState,
+    ) -> None:
+        from .loop_carries import prepare_device_loop
+
+        prepare_device_loop(graph_info, state, device_loop)
+
+    def finish_device_loop_body(
+        self,
+        state: CodegenState,
+        device_loop: DeviceLoopState,
+        outputs: list[object],
+        initials: dict[int, str],
+    ) -> None:
+        from .loop_carries import finish_device_loop_body
+
+        finish_device_loop_body(state, device_loop, outputs, initials)
+
+    def synthetic_thread_axis_sizes(self, codegen: GenerateAST) -> Mapping[int, int]:
+        return cute_codegen_state(codegen).synthetic_arange_axis_sizes
+
+    def consume_root_lane_loop_suppression(self, fn: DeviceFunction) -> bool:
+        return fn.cute_state.consume_root_lane_loop_suppression()
+
+    def reorder_post_loop_statements(
+        self, fn: DeviceFunction, body: list[ast.AST]
+    ) -> list[ast.AST]:
+        return fn.cute_state.move_tcgen05_post_loop_stmts_to_end(body)
+
+    def roots_fissioned(self, env: CompileEnvironment) -> bool:
+        return cute_env_state(env).fission_plan is not None
+
+    def split_persistent_post_loop(
+        self, fn: DeviceFunction, body: list[ast.AST]
+    ) -> tuple[list[ast.AST], list[ast.stmt]]:
+        cute_state = fn.cute_state
+        if not cute_state.has_tcgen05_post_loop_marks:
+            return body, []
+        statements = cast("list[ast.stmt]", body)
+        post_loop = [s for s in statements if cute_state.is_tcgen05_post_loop(s)]
+        return [
+            s for s in statements if not cute_state.is_tcgen05_post_loop(s)
+        ], post_loop
+
+    def collective_sibling_blocks(
+        self, env: CompileEnvironment, config: Config
+    ) -> tuple[set[int], set[tuple[int, ...]]] | None:
+        from .matmul_utils import collective_sibling_blocks
+
+        return collective_sibling_blocks(env, config)
+
     def create_loop_strategy(
         self, fn: DeviceFunction, block_ids: list[int], config: Config
     ) -> TileStrategy:
+        from ..per_thread_planning import plan_per_thread_loop_strategy
+
+        return plan_per_thread_loop_strategy(self, fn, block_ids, config)
+
+    # -- thread layout and lane loops of the tile strategies -------------------
+
+    def loop_var_prefixes(self) -> tuple[str, str]:
+        # The CuTe DSL preprocessor reserves ``offset_<n>`` / ``step_<n>``
+        # (see ``TileStrategy.__init__``).
+        return ("tile_offset", "tile_step")
+
+    def plans_launch_thread_axes(self) -> bool:
+        return True
+
+    def single_thread_tile_claims_axis(self) -> bool:
+        return False
+
+    def flat_strided_tile_walks_elements(self) -> bool:
+        return True
+
+    def tracks_flat_grid_origins(self) -> bool:
+        return True
+
+    def reflattens_pointwise_tiles(self) -> bool:
+        return True
+
+    def tunes_lane_vector_widths(self) -> bool:
+        return True
+
+    def thread_axis_limit(self) -> int | None:
+        return 3
+
+    def record_launch_thread_extent(
+        self, fn: DeviceFunction, name: str, axis: int, extent: int
+    ) -> None:
+        fn.cute_state.lanes.launch_thread_extents[name] = (axis, extent)
+
+    def record_grid_thread_extent(
+        self, fn: DeviceFunction, name: str, axis: int, extent: int
+    ) -> None:
+        fn.cute_state.lanes.grid_thread_extents[name] = (axis, extent)
+
+    def referenced_thread_axes(self, statements: Sequence[ast.AST]) -> list[int]:
+        return referenced_thread_axes(statements)
+
+    def record_vloop_wrapper(
+        self,
+        fn: DeviceFunction,
+        wrapper: VecLaneWrapper,
+        *,
+        block_id: int,
+        lane_var: str,
+        index_var: str,
+        mask_var: str | None,
+        begin: object,
+        extent: object,
+        step: object,
+    ) -> None:
         from ..compile_environment import CompileEnvironment
-        from ..device_ir import ForLoopGraphInfo
-        from ..device_ir import ReductionLoopGraphInfo
-        from ..host_function import HostFunction
+        from .device_state import CuteVloopWrapperFact
+
+        vec_width = fn.lane_contexts[block_id].vec_width
+        # ``base = begin + pid * block + ... * V`` is V-aligned only from a
+        # zero origin walked in unit steps, and a V-wide chunk cannot straddle
+        # an extent that is a multiple of V.  The V-loop sink
+        # (``cute/sink_vector_loops.py``) finds the constexpr V-loop by this
+        # fact wherever it nests.
+        aligned = isinstance(begin, int) and begin == 0 and step in (None, 1)
+        fn.cute_state.lanes.vloop_sink_wrappers[wrapper.vec_lane_var] = (
+            CuteVloopWrapperFact(
+                block_id=block_id,
+                vec_width=vec_width,
+                lane_var=lane_var,
+                vec_lane_var=wrapper.vec_lane_var,
+                base_index_var=wrapper.base_index_var,
+                index_var=index_var,
+                mask_var=mask_var,
+                uniform_vector_mask=aligned
+                and CompileEnvironment.current().specialized_multiple(
+                    extent, vec_width
+                ),
+                chunk_base_aligned=aligned,
+            )
+        )
+
+    def apply_lane_cluster_split(
+        self, strategy: PerThreadNDTileStrategy, state: CodegenState
+    ) -> None:
+        from ..compile_environment import CompileEnvironment
+        from .lane_cluster_split import apply_cluster_split
+
+        apply_cluster_split(strategy, CompileEnvironment.current(), state)
+
+    def check_lane_loop_nest(self, state: DeviceLoopState) -> None:
+        from .lane_loops.nest_check import check_lane_loop_nest
+
+        check_lane_loop_nest(state)
+
+    def add_lane_nest_barriers(
+        self,
+        state: DeviceGridState,
+        placement: list[ast.AST | LanePlacement],
+        scopes: Sequence[LaneScope],
+        rename_groups: Mapping[str, str],
+    ) -> None:
+        from .lane_loops.nest_check import add_lane_nest_barriers
+
+        add_lane_nest_barriers(state, placement, scopes, rename_groups)
+
+    def demote_grid_tile_vec_stores(
+        self,
+        state: DeviceGridState,
+        body: list[ast.AST],
+        placement: list[ast.AST | LanePlacement] | None,
+    ) -> bool:
+        """Restore the collected stores a later statement of their loop observes.
+
+        ``placement`` distributes ``body`` around the lane loops, or is None
+        when the full nest is kept.  Only the statements that stay inside a
+        store's lane loop run before its flush: a lane-invariant statement
+        placed after the loop follows the flush and one placed before it
+        precedes the store's site, both ordered by ``distribute_lane_loops``.
+        True when a site was demoted; its flush left the loop and its scalar
+        store joined the body, so the caller places the body again.  Only the
+        per-thread lane strategies collect vector stores.
+        """
         from ..tile_strategy import PerThreadFlattenedTileStrategy
         from ..tile_strategy import PerThreadNDTileStrategy
-        from .matmul_utils import cute_kernel_has_half_precision_matmul
-        from .matmul_utils import cute_matmul_contraction_block_ids
+        from .lane_loops.placement import statements_inside_loop
+        from .memory_ops import demote_reordered_tile_vec_stores
 
-        if len(set(block_ids)) != len(block_ids):
-            # ``hl.tile([m, n], block_size=[bs, bs])`` with one registered
-            # block size hands both dimensions the same block: they would
-            # share one index and one mask, walking the diagonal.
-            raise exc.BackendUnsupported(
-                self.name,
-                "a tile whose dimensions share one block size symbol "
-                f"(block ids {block_ids}); register a block size per dimension",
-            )
-        env = CompileEnvironment.current()
-        device_ir = HostFunction.current().device_ir
-        block_size_infos = [env.block_sizes[i] for i in block_ids]
-        flattened = block_size_infos[0].is_flattened(config)
-        # A registered tile can also appear in a multidimensional loop.
-        # Its permutation applies only there; a one-dimensional loop has
-        # no order to configure.
-        loop_order = (
-            env.config_spec.loop_orders.config_get(config.loop_orders, block_ids[0])
-            if len(block_ids) > 1
-            else None
-        ) or [*range(len(block_ids))]
-        l2_grouping = env.config_spec.l2_groupings.config_get(
-            config.l2_groupings, block_ids[0], 1
-        )
-        has_device_loops = any(
-            isinstance(graph, ForLoopGraphInfo)
-            and not isinstance(graph, ReductionLoopGraphInfo)
-            for graph in fn.codegen.codegen_graphs
-        )
-        has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
-        grid_ids = {bid for ids in device_ir.grid_block_ids for bid in ids}
-        num_threads_config = [
-            int(env.config_spec.num_threads.config_get(config.num_threads, block_id, 0))
-            for block_id in block_ids
-        ]
-        # Budget simultaneously active grid/device-loop axes. Sibling
-        # passes reuse axes; multiplying all their tile sizes would turn
-        # otherwise legal threaded reductions into serial lane loops.
-        from .thread_budget import tile_loop_thread_count
-
-        inactive_grid_block_ids: set[int] = set()
-        if self.name == "cute":
-            from .loop_nesting import boundary_only_grid_blocks
-
-            inactive_grid_block_ids = boundary_only_grid_blocks(
-                env, device_ir, fn.codegen.codegen_graphs
-            )
-
-        def _shrink_auto_thread_counts(
-            nd_block_size: Sequence[object], thread_limit: int
-        ) -> int:
-            int_positions: list[int] = []
-            int_block_sizes: dict[int, int] = {}
-            for i, block_size in enumerate(nd_block_size):
-                if isinstance(block_size, int):
-                    int_positions.append(i)
-                    int_block_sizes[i] = block_size
-            resolved_threads = [
-                num_threads_config[i]
-                if num_threads_config[i] > 0
-                else int_block_sizes[i]
-                for i in int_positions
-            ]
-            auto_positions = {
-                pos
-                for pos, block_idx in enumerate(int_positions)
-                if num_threads_config[block_idx] == 0
-            }
-            static_threads = functools.reduce(operator.mul, resolved_threads, 1)
-            while static_threads > thread_limit and auto_positions:
-                shrink_idx = max(
-                    (pos for pos in auto_positions if resolved_threads[pos] > 1),
-                    key=lambda pos: resolved_threads[pos],
-                    default=None,
-                )
-                if shrink_idx is None:
-                    break
-                block_idx = int_positions[shrink_idx]
-                block_size = int_block_sizes[block_idx]
-                next_threads = _largest_divisor_at_most(
-                    block_size, resolved_threads[shrink_idx] - 1
-                )
-                if next_threads == resolved_threads[shrink_idx]:
-                    break
-                resolved_threads[shrink_idx] = next_threads
-                num_threads_config[block_idx] = next_threads
-                static_threads = functools.reduce(operator.mul, resolved_threads, 1)
-            return static_threads
-
-        if self.name == "cute":
-            total_threads = tile_loop_thread_count(
-                env,
-                device_ir,
-                fn.codegen.codegen_graphs,
-                config,
-                inactive_block_ids=inactive_grid_block_ids,
-            )
-        else:
-            # Metal shares this strategy constructor but retains its
-            # existing allocation policy.
-            total_threads = 1
-            for block_id in _active_loop_block_ids(fn):
-                info = env.block_sizes[block_id]
-                if info.reduction:
-                    continue
-                bs = info.from_config(config)
-                if isinstance(bs, int):
-                    nt = int(
-                        env.config_spec.num_threads.config_get(
-                            config.num_threads, block_id, 0
-                        )
-                    )
-                    total_threads *= nt if nt > 0 else bs
-        if total_threads > MAX_THREADS_PER_BLOCK:
-            for i, block_id in enumerate(block_ids):
-                if num_threads_config[i] == 0 and block_id not in grid_ids:
-                    num_threads_config[i] = 1
-        if (
-            has_device_loops
-            or has_dynamic_shape
-            or len(device_ir.grid_block_ids) != 1
-            or (len(block_ids) > 1 and not flattened)
-            or bool(inactive_grid_block_ids.intersection(block_ids))
+        strategy = state.strategy
+        if not isinstance(
+            strategy, (PerThreadNDTileStrategy, PerThreadFlattenedTileStrategy)
         ):
-            nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
-            original_num_threads_config = list(num_threads_config)
-            mma_candidate = _is_mma_candidate_loop(
-                fn,
-                block_ids,
-                block_sizes=nd_block_size,
-                num_threads_config=original_num_threads_config,
-                grid_ids=grid_ids,
-            )
-            inactive_block_ids = _tile_loop_inactive_block_ids(
-                fn, block_ids, inactive_grid_block_ids
-            )
-            for i, block_id in enumerate(block_ids):
-                if block_id in inactive_block_ids:
-                    num_threads_config[i] = 1
-            is_device_loop = any(bid not in grid_ids for bid in block_ids)
-            active_block_ids = device_ir.codegen_active_block_ids
-            reduction_axis_reserve = (
-                1
-                if any(
-                    info.reduction
-                    and (active_block_ids is None or info.block_id in active_block_ids)
-                    for info in env.block_sizes
-                )
-                and self.reduction_axis_first()
-                else 0
-            )
-
-            # ``cute_tiles_per_block``: the packed grid axis is a thread axis
-            # of extent ``pack`` even when the body never distributes over it
-            # (``PerThreadNDTileStrategy`` reactivates it); budget it here.
-            packed_block_id = None
-            if self.name == "cute":
-                from .tile_packing import packed_grid_block
-
-                packed = packed_grid_block(env, config)
-                packed_block_id = None if packed is None else packed[0]
-
-            def uses_thread_axis_for(
-                block_id: int, block_size: object, num_threads: int
-            ) -> bool:
-                if block_id == packed_block_id:
-                    return True
-                if (
-                    block_id in inactive_block_ids
-                    or block_id in inactive_grid_block_ids
-                ):
-                    return False
-                if num_threads > 0:
-                    return num_threads > 1
-                return not (isinstance(block_size, int) and block_size == 1)
-
-            consumed_grid_axes = 0
-            if is_device_loop:
-                for grid_block_id in grid_ids:
-                    grid_info = env.block_sizes[grid_block_id]
-                    grid_block_size = grid_info.from_config(config)
-                    grid_threads = int(
-                        env.config_spec.num_threads.config_get(
-                            config.num_threads,
-                            grid_block_id,
-                            0,
-                        )
-                    )
-                    if uses_thread_axis_for(
-                        grid_block_id,
-                        grid_block_size,
-                        grid_threads,
-                    ):
-                        consumed_grid_axes += 1
-            available_axes = max(0, 3 - reduction_axis_reserve - consumed_grid_axes)
-
-            def current_strategy_axes() -> int:
-                return sum(
-                    int(uses_thread_axis_for(block_id, block_size, threads))
-                    for block_id, block_size, threads in zip(
-                        block_ids,
-                        nd_block_size,
-                        num_threads_config,
-                        strict=True,
-                    )
-                )
-
-            while current_strategy_axes() > available_axes:
-                candidates = [
-                    i
-                    for i, (block_id, block_size, threads) in enumerate(
-                        zip(block_ids, nd_block_size, num_threads_config, strict=True)
-                    )
-                    if threads == 0
-                    and uses_thread_axis_for(block_id, block_size, threads)
-                    and (not is_device_loop or block_id not in grid_ids)
-                ]
-                if not candidates:
-                    break
-                num_threads_config[candidates[-1]] = 1
-            thread_limit = MAX_THREADS_PER_BLOCK
-            if len(block_ids) > 1 and _loop_contains_matmul(fn, block_ids):
-                forced_mma_impl = os.environ.get("HELION_CUTE_MMA_IMPL", "auto")
-                if (
-                    mma_candidate
-                    or _kernel_has_specialized_mma_path(fn, config=config)
-                    or (
-                        _loop_may_use_mma(fn, block_ids)
-                        and not _loop_contains_atomic(fn, block_ids)
-                        and forced_mma_impl.strip().lower() != "auto"
-                    )
-                ):
-                    thread_limit = MAX_THREADS_PER_BLOCK
-                else:
-                    # Matmul-heavy CuTe kernels with no viable MMA path, and
-                    # especially atomic-accumulating split-K loops, can be
-                    # register/smem limited well before the 1024-thread hard
-                    # cap. Keep those auto-threaded ND tiles within 256
-                    # threads and let lane loops cover the rest.
-                    thread_limit = min(thread_limit, 256)
-            if len(block_ids) > 1 and mma_candidate:
-                inactive_block_ids.clear()
-                num_threads_config = [
-                    env.config_spec.num_threads.config_get(
-                        config.num_threads, block_id, 0
-                    )
-                    for block_id in block_ids
-                ]
-            # OPTION B (matmul-contraction synthetic-lane fix): when a reduction
-            # block is the *contraction* (K) axis of a matmul lowered through the
-            # scalar fallback, it must keep enough real hardware threads to cover
-            # its full extent so the cross-warp shared-memory reduction sums the
-            # whole K.  Otherwise the budget below would hand the free tile axes
-            # the threads and leave K split into ``threads x synthetic-lane`` -
-            # the reduction then sums only the thread lanes, never the synthetic
-            # lanes, so each contracted dot product covers only a fraction of K.
-            # Reserve the K block's full thread extent up front by shrinking the
-            # thread limit available to the free tile axes; the contraction axis
-            # then claims that budget when its reduction strategy is created and
-            # the synthetic lane is pushed onto the free tile axes instead.
-            reserved_contraction_threads = self._cute_matmul_contraction_thread_reserve(
-                fn, block_ids
-            )
-            if reserved_contraction_threads > 1:
-                # Budget left for the free tile axes after the contraction axis
-                # has claimed its full thread extent.
-                free_budget = max(1, thread_limit // reserved_contraction_threads)
-                # The free axes are built across separate ``create_loop_strategy``
-                # calls but their thread counts multiply, so split the budget so
-                # the product over every free axis stays within ``free_budget``.
-                free_axes = self._cute_free_auto_thread_axis_count(fn, config)
-                per_axis_limit = free_budget
-                while per_axis_limit > 1 and per_axis_limit**free_axes > free_budget:
-                    per_axis_limit //= 2
-                thread_limit = max(1, per_axis_limit)
-            static_threads = _shrink_auto_thread_counts(nd_block_size, thread_limit)
-
-            # Detect MMA-compatible K-loops: device loops containing
-            # addmm/mm with float16/bfloat16 operands.  Metal borrows this
-            # planner but has its own matmul lowering (MPP), and everything
-            # ``mma_mode`` selects -- tcgen05, warpgroups, cute_state -- is
-            # CuTe's, so only run the detectors for CuTe.
-            mma_mode = False
-            detect_mma = self.name == "cute"
-            if is_device_loop and detect_mma:
-                from .cute_warp_mma_gemm import MATMUL_FAMILY_WARP_MMA
-                from .cute_warp_mma_gemm import WARP_MMA_FAMILY_KEY
-                from .cute_warp_mma_gemm import detect_warp_mma_gemm
-
-                if config.get(WARP_MMA_FAMILY_KEY) == MATMUL_FAMILY_WARP_MMA:
-                    # The register-MMA GEMM family: the dedicated codegen
-                    # emits the whole device body (``32 * warps`` threads);
-                    # a kernel that is not the plain GEMM it lowers fails
-                    # closed with the reason instead of running tcgen05.
-                    mma_mode = detect_warp_mma_gemm(fn, block_ids, config=config)
-                elif _detect_attention_mma_loop(
-                    fn,
-                    block_ids,
-                    config=config,
-                ):
-                    # Fused tcgen05 flash-attention: suppress synthetic lane
-                    # loops (mma_mode) and run a single 128-thread warpgroup
-                    # like the spike. The dedicated flash codegen emits the
-                    # whole device body; the FX-graph statement walk is bypassed.
-                    # The flex envelope records every loop it owns up front
-                    # (two nests); keep that list instead of the current loop.
-                    mma_mode = True
-                    if fn.cute_state.attention_flash_block_ids is None:
-                        fn.cute_state.attention_flash_block_ids = list(block_ids)
-                elif _detect_attention_bwd_mma_loop(
-                    fn,
-                    block_ids,
-                    config=config,
-                ):
-                    # Fused tcgen05 attention BACKWARD: the dedicated bwd
-                    # codegen emits the whole device body. The flex envelope
-                    # records every loop it owns up front; keep that list.
-                    mma_mode = True
-                    if fn.cute_state.attention_flash_bwd_block_ids is None:
-                        fn.cute_state.attention_flash_bwd_block_ids = list(block_ids)
-                else:
-                    mma_mode = _detect_specialized_mma_loop(
-                        fn,
-                        block_ids,
-                        block_sizes=nd_block_size,
-                        config=config,
-                    )
-            elif (
-                detect_mma
-                and len(device_ir.grid_block_ids) == 1
-                and block_ids == device_ir.grid_block_ids[0]
+            # Only the per-thread lane strategies collect vector stores; the
+            # other strategies have none.
+            return False
+        demoted = False
+        for context in strategy.lane_contexts_with_vec_stores():
+            inside = None
+            if placement is not None:
+                assert context.vloop is not None
+                lane_var = state.vec_wrapper_lane_var(context.vloop)
+                inside = statements_inside_loop(placement, lane_var)
+            if demote_reordered_tile_vec_stores(
+                context, strategy.fn, body, inside=inside
             ):
-                specialized_mma_plan = _kernel_specialized_mma_plan(fn, config=config)
-                if (
-                    specialized_mma_plan is not None
-                    and specialized_mma_plan.impl == "tcgen05"
-                ):
-                    from .cute_mma import _tcgen05_epi_warp_groups
-                    from .cute_mma import _tcgen05_root_m_threads
-                    from .cute_mma import _tcgen05_root_n_threads
+                demoted = True
+        return demoted
 
-                    m_axis = block_ids.index(specialized_mma_plan.m_block_id)
-                    n_axis = block_ids.index(specialized_mma_plan.n_block_id)
-                    m_block_size = nd_block_size[m_axis]
-                    n_block_size = nd_block_size[n_axis]
-                    # The generic SIMT budget above can resolve an automatic
-                    # M axis before this specialized plan is known. Preserve
-                    # the original auto setting: that temporary width is not
-                    # an explicit request for multiple lanes per warp slot.
-                    # TCgen05's role launch multiplies this width by its warp
-                    # count, so retaining (for example) 64 would double it.
-                    requested_m_threads = env.config_spec.num_threads.config_get(
-                        config.num_threads, specialized_mma_plan.m_block_id, 0
-                    )
-                    root_m_threads = (
-                        _tcgen05_root_m_threads(int(m_block_size), int(n_block_size))
-                        if requested_m_threads == 0
-                        and isinstance(m_block_size, int)
-                        and isinstance(n_block_size, int)
-                        else num_threads_config[m_axis]
-                    )
-                    root_n_threads = (
-                        _tcgen05_root_n_threads(
-                            int(n_block_size),
-                            epi_warp_groups=_tcgen05_epi_warp_groups(config),
-                        )
-                        if original_num_threads_config[n_axis] == 0
-                        and isinstance(n_block_size, int)
-                        else num_threads_config[n_axis]
-                    )
-                    num_threads_config[m_axis] = root_m_threads
-                    num_threads_config[n_axis] = root_n_threads
-                    static_threads = functools.reduce(
-                        operator.mul,
-                        (
-                            threads
-                            if threads > 0
-                            else int(block_size)
-                            if isinstance(block_size, int)
-                            else 0
-                            for block_size, threads in zip(
-                                nd_block_size,
-                                num_threads_config,
-                                strict=True,
-                            )
-                        ),
-                        1,
-                    )
+    def demote_loop_tile_vec_stores(
+        self, strategy: TileStrategy, block_ids: list[int]
+    ) -> None:
+        from .memory_ops import demote_reordered_tile_vec_stores
 
-            check_thread_limit(static_threads, context=str(tuple(nd_block_size)))
-            return PerThreadNDTileStrategy(
-                fn,
-                block_ids,
-                block_size=nd_block_size,
-                loop_order=loop_order,
-                l2_grouping=l2_grouping,
-                num_threads=num_threads_config,
-                mma_mode=mma_mode,
-                inactive_block_ids=inactive_block_ids,
-            )
-        nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
-        block_size = functools.reduce(operator.mul, nd_block_size)  # pyrefly: ignore[incompatible-overload-residual]
-        # Resolve per-axis thread counts then flatten to a single total
-        all_auto = all(nt <= 0 for nt in num_threads_config)
-        flat_num_threads = functools.reduce(
-            operator.mul,
-            (
-                nt if nt > 0 else (int(bs) if isinstance(bs, int) else 0)
-                for nt, bs in zip(num_threads_config, nd_block_size, strict=True)
-            ),
-            1,
-        )
-        if (
-            isinstance(block_size, int)
-            and flat_num_threads > MAX_THREADS_PER_BLOCK
-            and all_auto
-        ):
-            # Auto thread budget exceeds the 1024-per-CTA cap: fall back to a
-            # lane loop (each thread owns block_size // 1024 elements).
-            flat_num_threads = MAX_THREADS_PER_BLOCK
-        if (
-            isinstance(block_size, int)
-            and flat_num_threads > 1
-            and all_auto
-            # A tile that is itself a contraction axis (``x[tile, :].T @
-            # g[tile, :]``) keeps its threads: the fallback reduces it across
-            # threads only, not across a flattened tile's lane loop.
-            and not cute_matmul_contraction_block_ids().intersection(
-                env.canonical_block_id(block_id) for block_id in block_ids
-            )
-            # A 16-bit matmul may take the direct grouped-N warp-MMA plan,
-            # which needs one tile row per thread.
-            and not cute_kernel_has_half_precision_matmul()
-        ):
-            # A flattened tile reserves a matmul's contraction axis its full
-            # thread extent (see the N-D branch above), so ``x[tile, :] @
-            # w[:, :]`` keeps K on real threads and the tile takes the lane
-            # loop, rather than splitting K into synthetic lanes.  A
-            # contraction past the thread cap is folded serially whatever its
-            # threads (``PersistentReductionStrategy`` gives it one): the tile
-            # keeps its threads then.
-            contraction_extents = self._cute_matmul_contraction_extents(block_ids)
-            reserved_contraction_threads = (
-                self._cute_matmul_contraction_thread_reserve(fn, block_ids)
-                if max(contraction_extents, default=0) <= MAX_THREADS_PER_BLOCK
-                else 1
-            )
-            if reserved_contraction_threads > 1:
-                free_budget = max(
-                    1, MAX_THREADS_PER_BLOCK // reserved_contraction_threads
-                )
-                free_axes = self._cute_free_auto_thread_axis_count(fn, config)
-                per_axis_limit = free_budget
-                while per_axis_limit > 1 and per_axis_limit**free_axes > free_budget:
-                    per_axis_limit //= 2
-                flat_num_threads = _largest_divisor_at_most(
-                    block_size, min(flat_num_threads, per_axis_limit)
-                )
-        if isinstance(block_size, int) and flat_num_threads > 0:
-            check_thread_limit(flat_num_threads, context=str(block_size))
-        return PerThreadFlattenedTileStrategy(
-            fn,
-            block_ids,
-            block_size=block_size,
-            loop_order=loop_order,
-            num_threads=flat_num_threads,
-        )
+        for block_id in block_ids:
+            context = strategy.fn.lane_contexts[block_id]
+            assert context.vloop is not None
+            demote_reordered_tile_vec_stores(context, strategy.fn, context.vloop.body)

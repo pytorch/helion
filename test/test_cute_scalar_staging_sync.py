@@ -14,7 +14,6 @@ from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_consumer_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_if
 from helion._compiler.cute.cute_mma import _Tcgen05ScalarSmemSync
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
 
@@ -63,7 +62,6 @@ def _assert_copy_order(source: str, first_store: str) -> None:
 @pytest.mark.parametrize(
     "shape,bm", [((73, 41, 78), 64), ((73, 41, 162), 128), ((128, 128, 78), 64)]
 )
-@skipUnlessBackends(["cute"])
 def test_edge_scalar_staging_is_ordered(
     dtype: torch.dtype, aot: bool, shape: tuple[int, int, int], bm: int
 ) -> None:
@@ -114,7 +112,6 @@ def test_edge_scalar_staging_is_ordered(
     assert "tcgen05_scalar_smem_phase ^ cutlass.Int32(1)" in edge
 
 
-@skipUnlessBackends(["cute"])
 def test_all_tma_kernel_keeps_its_pipeline() -> None:
     kernel = helion.kernel(
         matmul_custom_key.fn,
@@ -171,14 +168,9 @@ def test_non_pipelined_consumer_binds_try_token_before_wait() -> None:
         "ab_consumer_try_token = ab_pipeline.consumer_try_wait(ab_consumer_state)",
         "ab_pipeline.consumer_wait(ab_consumer_state, ab_consumer_try_token)",
     ]
-    skipped = _build_kloop_non_pipeline_consumer_if(
-        replace(args, skip_consumer_wait=True)
-    )
-    assert "consumer_try_token" not in ast.unparse(skipped)
 
 
 @pytest.mark.parametrize("transpose_rhs", [False, True])
-@skipUnlessBackends(["cute"])
 def test_m_major_lhs_matmul_binds_try_token_before_every_wait(
     transpose_rhs: bool,
 ) -> None:

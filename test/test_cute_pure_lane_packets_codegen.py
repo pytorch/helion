@@ -13,30 +13,18 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
 from helion._compiler.cute import affine_vector_io
+from helion._compiler.cute.autotune.heuristics.cute import CutePointwiseVecHeuristic
 from helion._compiler.rng_utils import philox_rand_ref
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
 _examples_low_mem_dropout = import_example("low_mem_dropout")
 low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
 low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
-
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only():
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
+pytestmark = [pytest.mark.cpu_only, pytest.mark.cpu_render]
 
 
 def _config(width: int) -> helion.Config:

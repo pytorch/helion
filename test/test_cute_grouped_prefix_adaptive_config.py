@@ -9,14 +9,16 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
+
 from .cute_population_contracts import _target
 from .cute_population_contracts import checked_initial_population
 from .test_cute_grouped_fp32_output import _grouped_fp32_output
-from .test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from .test_cute_grouped_large_device_seeds import _kernel
 import helion
-from helion._compiler.autotuner_heuristics import cute as heuristics
 from helion._compiler.cute import cute_mma
+from helion._compiler.cute.autotune.heuristics import cute as heuristics
+from helion._compiler.cute.tcgen05_config import facts
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
@@ -135,7 +137,6 @@ def test_both_worker_policies_and_existing_reservations_survive_strict_transfer(
         {"cute_min_blocks_per_mp": 0},
         {"cute_min_blocks_per_mp": 2},
         {"tcgen05_cta_group": "one"},
-        {"tcgen05_cluster_m2_one_cta_role_local": True},
         {"tcgen05_cluster_m": 1},
         {"tcgen05_cluster_n": 2},
         {"tcgen05_grouped_worklist_source_m_tile": 256},
@@ -293,8 +294,8 @@ def test_unregistered_native_matmul_axes_do_not_claim_a_recipe() -> None:
         spec = cpu_bind(
             _kernel(), _args(groups=4, m=257, n=768, k=256, dtype=torch.float16)
         ).config_spec
-        assert not spec.cute_tcgen05_search_enabled
-        assert spec._cute_tcgen05_config._matmul_block_indices() is None
+        assert not spec.tcgen05.search_enabled
+        assert facts._matmul_block_indices(spec._cute_tcgen05_config) is None
         assert not spec._cute_tcgen05_config.grouped_prefix_adaptive_n_supported
         assert not _recipes(spec)
 

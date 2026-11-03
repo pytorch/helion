@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -15,10 +14,10 @@ from test.test_cute_collective_tf32 import _kernel
 from test.test_cute_collective_tf32 import _round_tf32
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
@@ -33,10 +32,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture
 def cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
+    with cpu_render_target():
         yield
 
 

@@ -1,7 +1,14 @@
 """Thread budget validation for CuTe layout planning.
 
-Centralizes the 1024-thread-per-block limit enforcement that was
-previously scattered across backend.py and tile_strategy.py.
+Re-exports the per-block thread limit of the shared per-thread planner
+(``per_thread_planning.MAX_THREADS_PER_BLOCK`` / ``check_thread_limit``) for
+the CuTe layout passes, and hosts the two register-tile admission inputs the
+reduction strategies look up at call time: ``shared_memory_budget_bytes`` (the device's per-block shared memory,
+opt-in when larger) and ``register_tile_shape`` (whether a scalar synthetic
+reduction lane unrolls as a per-thread register tile).  Both are
+``mock.patch`` seams -- the SMEM-probe tests and
+``helion._testing.patch_target_facts`` patch the budget, the register-tile
+tests patch the gate -- so patch them on this module, not on their callers.
 """
 
 from __future__ import annotations
@@ -10,8 +17,14 @@ import ast
 import math
 from typing import TYPE_CHECKING
 
+import torch
+
 from ... import exc
+from ..per_thread_planning import MAX_THREADS_PER_BLOCK
+from ..per_thread_planning import check_thread_limit
 from .simplify_proven_bounds import _axis_index
+from .state import cute_codegen_state
+from .state import cute_env_state
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -19,10 +32,27 @@ if TYPE_CHECKING:
 
     from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
+    from ..device_function import DeviceFunction
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
+    from ..generate_ast import GenerateAST
+    from ..tile_strategy import DeviceGridState
 
-MAX_THREADS_PER_BLOCK = 1024
+__all__ = [
+    "CUTE_REGISTER_TILE_MAX_ELEMENTS",
+    "CUTE_REGISTER_TILE_MAX_LIVE_VALUES",
+    "MAX_THREADS_PER_BLOCK",
+    "MAX_THREAD_BLOCK_DIMS",
+    "check_thread_block_dims",
+    "check_thread_limit",
+    "checked_thread_block_dims",
+    "record_root_read_axes",
+    "register_tile_shape",
+    "shared_memory_budget_bytes",
+    "thread_idx_axis",
+    "tile_loop_thread_count",
+]
+
 # CUDA's per-axis limits on a thread block: 1024 along x and y, 64 along z.
 MAX_THREAD_BLOCK_DIMS = (1024, 1024, 64)
 # Largest per-thread register tile (reduction lanes x vector elements) that a
@@ -170,25 +200,87 @@ def checked_thread_block_dims(dims: Sequence[int]) -> tuple[int, int, int]:
     return x, y, z
 
 
-def check_thread_limit(
-    num_threads: int,
-    *,
-    context: str = "",
+def record_root_read_axes(
+    codegen: GenerateAST, grid_state: DeviceGridState, body: list[ast.AST]
 ) -> None:
-    """Raise ``BackendUnsupported`` if *num_threads* exceeds 1024.
+    """Record the launch axes the root loop ``grid_state`` reads with their
+    thread extents (``CuteCodegenState.root_read_axis_sizes``): its index
+    setup in the
+    statement list that receives the body, the body, the lane setup and
+    the prefix and suffix around the lane loops."""
+    statements: list[ast.AST] = [
+        *(grid_state.hoist_parent_statements or ()),
+        *grid_state.outer_prefix,
+        *grid_state.lane_setup_statements,
+        *body,
+        *grid_state.outer_suffix,
+    ]
+    read_axes = set(referenced_thread_axes(statements))
+    cute_codegen_state(codegen).root_read_axis_sizes.append(
+        {
+            axis: size
+            for axis, size in grid_state.root_axis_sizes.items()
+            if axis in read_axes
+        }
+    )
 
-    This is the single source of truth for the CuTe thread-per-block limit.
-    Both the scattered checks in ``backend.py`` and the layout planner call
-    this function.
 
-    Args:
-        num_threads: Concrete thread count to validate.
-        context: Human-readable description for the error message
-                 (e.g. block sizes or node name).
+def shared_memory_budget_bytes() -> int:
+    """The current CUDA device's per-block shared memory budget (opt-in when
+    larger).  Read through this module at call time: tests patch it here."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    default_shared = int(props.shared_memory_per_block)
+    optin_shared = int(getattr(props, "shared_memory_per_block_optin", 0) or 0)
+    return max(default_shared, optin_shared)
+
+
+def register_tile_shape(fn: DeviceFunction, block_index: int, lane_extent: int) -> bool:
+    """Whether a scalar synthetic reduction lane of ``lane_extent`` over
+    reduction block ``block_index`` can nest outside the tile lane loops of
+    ``fn`` as a per-thread register tile.
+
+    Mirrors ``DeviceGridState.nest_reduction_lane_outside_vector_tiles`` from
+    the tile strategies' construction-time state: every tile block that has a
+    lane loop must be vectorized with one V-wide fragment per thread (elements
+    per thread == V), at least one such block must exist, no matmul lowering
+    may replace the lane bodies, the unrolled per-thread element count stays
+    within ``CUTE_REGISTER_TILE_MAX_ELEMENTS``, the device IR admits the
+    reduction block (``ConfigSpec.cute_register_tile_reduction_blocks``) and no
+    earlier pass over this kernel rejected the register tile
+    (``CuteEnvState.register_tile_disabled``).
     """
-    if num_threads > MAX_THREADS_PER_BLOCK:
-        from ..compile_environment import CompileEnvironment
+    from ..compile_environment import CompileEnvironment
+    from ..tile_strategy import PerThreadFlattenedTileStrategy
+    from ..tile_strategy import PerThreadNDTileStrategy
 
-        backend_name = CompileEnvironment.current().backend.name
-        msg = f"thread block too large for {backend_name} kernel: {context or num_threads}"
-        raise exc.BackendUnsupported(backend_name, msg)
+    env = CompileEnvironment.current()
+    if (
+        cute_env_state(env).register_tile_disabled
+        or env.config_spec.matmul_facts
+        or block_index not in env.config_spec.cute_register_tile_reduction_blocks
+    ):
+        return False
+    unrolled = lane_extent
+    found = False
+    for strategy in fn.tile_strategy.strategies:
+        if isinstance(strategy, PerThreadFlattenedTileStrategy):
+            if strategy._lane_var is None:
+                continue
+            vec_width = strategy.lane_context(strategy.block_ids[-1]).vec_width
+            if vec_width <= 1 or strategy._elements_per_thread != vec_width:
+                return False
+            unrolled *= vec_width
+            found = True
+            continue
+        if not isinstance(strategy, PerThreadNDTileStrategy):
+            continue
+        for block_id in strategy._lane_var_by_block:
+            vec_width = strategy.lane_context(block_id).vec_width
+            if (
+                vec_width <= 1
+                or strategy._elements_per_thread_for_block(block_id) != vec_width
+            ):
+                return False
+            unrolled *= vec_width
+            found = True
+    return found and unrolled <= CUTE_REGISTER_TILE_MAX_ELEMENTS

@@ -15,15 +15,14 @@ from test.test_cute_mxfp8_mma import _wrapper_plan
 from test.test_cute_mxfp8_registered_grid import _bound
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_mxfp8_epilogue_coverage import KEY
-from helion._compiler.autotuner_heuristics.cute_mxfp8_epilogue_coverage import (
+from helion._compiler.cute.autotune.heuristics.cute_mxfp8_epilogue_coverage import KEY
+from helion._compiler.cute.autotune.heuristics.cute_mxfp8_epilogue_coverage import (
     register_mxfp8_epilogue_coverage,
 )
 from helion._compiler.cute.block_scaled_config import MXFP8_EPILOGUE_MODES
 from helion._compiler.cute.block_scaled_config import mxfp8_shared_memory_bytes
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import forbid_cuda_work
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.metrics import AutotuneMetrics
 
 pytestmark = pytest.mark.cpu_only
@@ -32,11 +31,8 @@ pytestmark = pytest.mark.cpu_only
 @pytest.fixture(autouse=True)
 def _cpu_only():
     with (
+        cpu_render_target(smem_capacity_bytes=228 * 1024),
         forbid_cuda_work(),
-        mock_cuda_unavailable(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=228 * 1024
-        ),
     ):
         yield
 

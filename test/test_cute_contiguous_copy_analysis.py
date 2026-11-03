@@ -20,7 +20,6 @@ from helion._compiler.cute.collective_vector_recipe import emit_vector_recipe
 from helion._compiler.cute.contiguous_copy import CopyTensorFacts
 from helion._compiler.cute.contiguous_copy import _Analysis
 from helion._compiler.cute.contiguous_copy import plan_contiguous_copy
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
@@ -227,7 +226,6 @@ def _shift_config(recipe: str, compute: str) -> helion.Config:
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("recipe", ["vector", "vector_unrolled"])
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
-@skipUnlessBackends(["cute"])
 def test_float_shifted_matmul_keeps_only_aligned_operand_vectorized(
     dtype: torch.dtype, recipe: str, compute: str
 ) -> None:
@@ -249,7 +247,6 @@ def test_float_shifted_matmul_keeps_only_aligned_operand_vectorized(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("recipe", ["vector", "vector_unrolled"])
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
-@skipUnlessBackends(["cute"])
 def test_float_shifted_matmul_cuda_mutations(
     dtype: torch.dtype, recipe: str, compute: str, tmp_path: Path
 ) -> None:

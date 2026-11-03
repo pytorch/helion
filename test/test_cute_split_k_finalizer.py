@@ -11,20 +11,26 @@ import torch
 from test.cute_population_contracts import checked_initial_population
 from test.test_cute_split_k_cluster import _bind
 from test.test_cute_split_k_cluster import _carrier
-from test.test_cute_split_k_cluster import cpu_only as cpu_only
 from test.test_cute_split_k_workspace import _embedded_sources
 
 import helion
 from helion._compiler.cute.split_k_cluster_config import CLUSTER8_K4
 from helion._compiler.cute.split_k_cluster_config import LEGACY
 from helion._compiler.cute.split_k_cluster_config import SCHEDULE_KEY
-from helion._testing import skipUnlessBackends
+from helion._testing import default_cute_mma_support
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
+# ``tcgen05_cpu_target``: the B200 model with the default (tcgen05-on) MMA
+# support record and the full 227 KiB opt-in SMEM as the AB budget.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(
+        mma_support=default_cute_mma_support(), smem_budget_bytes=232448
+    ),
+]
 
 FINALIZER_KEY = "cute_split_k_finalizer_warps"
 FINALIZER_MECHANISM = "cute.split_k_finalizer"

@@ -12,6 +12,13 @@ from test.test_cute_block_reduce_cta import _tile_reduce
 
 import helion
 from helion._compiler import tile_strategy as lanes
+from helion._compiler.cute.lane_loops.markers import _find_lane_reduce_call
+from helion._compiler.cute.lane_loops.markers import _lane_reduce_marker_expr
+from helion._compiler.cute.lane_loops.markers import set_marker_owner
+from helion._compiler.cute.lane_loops.split import _flatten_vector_reduction_lane
+from helion._compiler.cute.lane_loops.split import (
+    interchange_lane_outside_serial_reductions,
+)
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
@@ -55,7 +62,7 @@ def test_vector_slots_belong_to_complete_reduction(operation, threads, width, la
 
 
 def _loop(prefix="base = outer * 8", suffix="", *, owned=True):
-    marker = lanes._lane_reduce_marker_expr(
+    marker = _lane_reduce_marker_expr(
         "value", "max", "cutlass.Float32(float('-inf'))", 2, owner_lane="outer"
     )
     loop = ast.parse(
@@ -89,12 +96,12 @@ def _loop(prefix="base = outer * 8", suffix="", *, owned=True):
 def test_vector_ownership_declines_unproved_preparation(prefix, suffix):
     loop, vector = _loop(prefix, suffix)
     with pytest.raises(helion.exc.BackendUnsupported, match="scalar ownership proof"):
-        lanes._flatten_vector_reduction_lane(loop, vector, "outer")
+        _flatten_vector_reduction_lane(loop, vector, "outer")
 
 
 def test_independent_serial_loop_is_not_flattened():
     loop, _ = _loop(owned=False)
-    output = lanes.interchange_lane_outside_serial_reductions([loop])
+    output = interchange_lane_outside_serial_reductions([loop])
     text = ast.unparse(ast.Module(output, []))
     assert "// 8" not in text
     assert "% 8" not in text
@@ -137,19 +144,19 @@ def test_vector_ownership_rejects_incomplete_domains(mutation):
             0, ast.parse("for item in range(2):\n    value = item").body[0]
         )
     elif mutation == "owner":
-        marker = lanes._find_lane_reduce_call(vector.body[2])
+        marker = _find_lane_reduce_call(vector.body[2])
         assert marker is not None
-        marker.args[9] = ast.Constant("different_owner")
+        set_marker_owner(marker, "different_owner")
     else:
         vector.body.insert(0, ast.parse("outer = 0").body[0])
     with pytest.raises(helion.exc.BackendUnsupported, match="scalar ownership proof"):
-        lanes._flatten_vector_reduction_lane(loop, vector, "outer")
+        _flatten_vector_reduction_lane(loop, vector, "outer")
 
 
 def test_single_outer_vector_retains_every_coordinate():
     loop, vector = _loop()
     loop.iter.args[0] = ast.Constant(1)
-    flat = lanes._flatten_vector_reduction_lane(loop, vector, "outer")
+    flat = _flatten_vector_reduction_lane(loop, vector, "outer")
     assert ast.literal_eval(flat.iter.args[0]) == 8
     assert "outer // 8" in ast.unparse(flat)
     assert "outer % 8" in ast.unparse(flat)
@@ -168,7 +175,7 @@ def _readonly_packet_loop():
 
 def test_vector_readonly_packet_preserves_scalar_coordinates():
     loop, vector = _readonly_packet_loop()
-    flat = lanes._flatten_vector_reduction_lane(loop, vector, "outer")
+    flat = _flatten_vector_reduction_lane(loop, vector, "outer")
     assert ast.literal_eval(flat.iter.args[0]) == 16
     # Evaluate the exact transformed coordinate assignments and extraction.
     values = list(range(16))
@@ -228,4 +235,4 @@ def test_vector_packet_replay_rejects_effects_and_unstable_addresses(mutation):
         else:
             load.args[0] = ast.parse("pointers[0]", mode="eval").body
     with pytest.raises(helion.exc.BackendUnsupported, match="scalar ownership proof"):
-        lanes._flatten_vector_reduction_lane(loop, vector, "outer")
+        _flatten_vector_reduction_lane(loop, vector, "outer")

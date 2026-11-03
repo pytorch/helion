@@ -22,7 +22,7 @@ against the SM count times the CTAs an SM holds (from the launch block, or
 take part in dependent launch (the fission producer that releases its
 dependents at entry, the tcgen05 consumer with its role-local wait) are
 covered in ``test_cute_materialized_pdl.py`` and ``test_cute_tcgen05_pdl.py``;
-GPU semantics live in ``test_cute_pdl_cuda.py``.
+the GPU semantics are checked at the end of this module.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch._inductor.codecache import PyCodeCache
 
 from test._cute_vloop_sink_kernels import col_reduce_max_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_dynamic
@@ -52,9 +53,14 @@ from helion import exc
 from helion._compiler.cute.host_zero_fill_launches import MAX_FILL_NUMEL
 from helion._compiler.cute.pdl_release import ZERO_FILL_KERNEL_PREFIX
 from helion._compiler.cute.pdl_release import resident_ctas_per_sm
+from helion._testing import DEVICE
+from helion._testing import TestCase
+from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing import onlyBackends
+from helion._testing import skipIfNotCUDA
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
@@ -62,21 +68,16 @@ pytestmark = pytest.mark.cpu_only
 rms_norm_batched = import_example("aot_example").rms_norm_batched
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
+    from types import ModuleType
 
 cutlass = pytest.importorskip("cutlass")
 
 
 @pytest.fixture
 def cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
         yield
 
 
@@ -203,7 +204,7 @@ def _release_block(kernel: ast.FunctionDef, start: int) -> int:
 def _late_wait_names(code: str) -> set[str]:
     """The host names of the zero fills launched as fill kernels: behind
     them a kernel's wait moves down to the first touch of a filled tensor
-    (``DeviceFunction._place_late_pdl_wait``)."""
+    (``passes.pdl.place_late_wait``)."""
     fills = {fill.name for fill in _fill_kernels(code)}
     names: set[str] = set()
     for node in ast.walk(ast.parse(code)):
@@ -600,7 +601,7 @@ def test_the_release_knob_rides_on_cute_pdl(cpu_only: None) -> None:
     assert spec._flat_fields()["cute_pdl_release"].search_choices == ("auto",)
     # The nested-row seeds turn the knob on, leave the placement to its
     # grid-aware default and spread the CTAs to one wave's density.
-    from helion._compiler.autotuner_heuristics.cute import _dependent_launch
+    from helion._compiler.cute.autotune.heuristics.cute import _dependent_launch
 
     assert _dependent_launch(spec) == {"cute_pdl": True, "cute_pdl_spread": True}
     # Pre-Hopper targets search neither the knob nor the placement.
@@ -1030,7 +1031,7 @@ def test_the_spread_pad_declines_storage_the_sum_cannot_see() -> None:
     # already at the per-block maximum), the dynamic shared memory base, or
     # a size that is not a literal gets no pad at all: a pad sized against
     # storage of unknown size would fail every launch past the maximum.
-    from helion._compiler.device_function import _literal_smem_bytes
+    from helion._compiler.cute.passes.pdl import _literal_smem_bytes
 
     def statements(source: str) -> list[ast.AST]:
         return list(ast.parse(source).body)
@@ -1116,7 +1117,7 @@ def test_the_spread_knob_pads_the_kernel_after_its_release(cpu_only: None) -> No
     # cannot hold the footprint leaves the body alone.
     with patch.object(spec, "num_sm", 1):
         assert bound.to_code(cfg) == on
-    with patch("helion._compiler.device_function._smem_per_sm", return_value=2000):
+    with patch("helion._compiler.cute.passes.pdl._smem_per_sm", return_value=2000):
         assert bound.to_code(cfg) == on
 
 
@@ -1186,3 +1187,315 @@ def test_the_spread_knob_rides_on_cute_pdl(cpu_only: None) -> None:
         assert bound.to_code(round_trip) == bound.to_code(config)
     with patch.object(spec, "target_device_capability", (8, 0)):
         assert spec._flat_fields()["cute_pdl_spread"].search_choices == (False,)
+
+
+# GPU semantics of ``cute_pdl`` (programmatic dependent launch).
+#
+# A programmatic dependent launch starts as soon as the kernel ahead of it in
+# the stream releases its dependents (``griddepcontrol.launch_dependents``), so
+# a producer that releases them at entry and writes late exposes every read a
+# dependent issues ahead of its ``griddepcontrol.wait``.  Such a producer (a
+# Triton kernel) runs ahead of the knob-on kernels here, which must match the
+# knob-off kernels bit for bit, in the stream and inside a CUDA graph, where
+# the launch attribute becomes a programmatic edge.  A control that launches
+# the knob-on module without its wait has to read stale data: that proves the
+# producer really overlaps the launch and the wait is load-bearing.  The
+# pure-launch chain at the end shows why a kernel that releases its dependents
+# at entry has to stay an ordinary launch (the materialized-fission producer,
+# which ``_stage_config`` keeps away from the knob).  The release placements
+# (``cute_pdl_release``) are told apart by a dependent that does not wait: it
+# reaches the kernel's input while the kernel still reads it only when the
+# kernel released at entry.
+
+
+_COLUMN = {
+    "block_sizes": [1024, 16],
+    "num_threads": [128, 4],
+    "cute_vector_widths": [1, 4],
+    "cute_lane_layouts": ["strided", "blocked"],
+    "cute_vloop_sink": True,
+    "cute_lane_unroll": 8,
+}
+
+
+_PRODUCER_GRID = 128
+_BLOCK = 1024
+# The positive control's producer spins this many rounds ahead of every store
+# (about a millisecond per run) so a dependent launched without the wait is
+# certain to read ``x`` before the producer rewrites it; at the default 64
+# rounds the producer can finish inside the consumer's host launch latency
+# and the control is a coin flip.
+_CONTROL_DELAY = 4096
+
+
+def _tk() -> ModuleType:
+    """The Triton reference kernels, imported on first use: this module is
+    imported by ``test_autotuner_final_preference`` on CPU rows without Triton."""
+    import test._cute_pdl_triton_kernels as kernels
+
+    return kernels
+
+
+def _produce(
+    src: torch.Tensor, dst: torch.Tensor, *, delay: int = 64, release: bool = True
+) -> None:
+    n = dst.numel()
+    programs = (n + _PRODUCER_GRID - 1) // _PRODUCER_GRID
+    per_program = (programs + _BLOCK - 1) // _BLOCK * _BLOCK
+    _tk()._late_writer[(_PRODUCER_GRID,)](
+        src.view(-1),
+        dst.view(-1),
+        n,
+        per_program,
+        delay,
+        RELEASE=release,
+        BLOCK=_BLOCK,
+    )
+
+
+def _build(
+    kernel: helion.Kernel, x: torch.Tensor, **config: object
+) -> tuple[helion.runtime.kernel.BoundKernel, Callable[..., torch.Tensor], str]:
+    bound = kernel.bind((x,))
+    normalized = bound.config_spec.normalized_config(helion.Config(**config))
+    return bound, bound.compile_config(normalized), bound.to_code(normalized)
+
+
+def _attribute_only_control(
+    bound: helion.runtime.kernel.BoundKernel, on: str
+) -> Callable[..., torch.Tensor]:
+    """The knob-on module minus its wait: a programmatic dependent launch
+    that reads its input right away."""
+    lines = on.splitlines()
+    kept = [line for line in lines if _WAIT not in line]
+    assert len(kept) == len(lines) - 1
+    source = "\n".join(kept) + "\n"
+    module = PyCodeCache.load(source)
+    bound.env.backend.annotate_compiled_module(module, source, bound.kernel.name)
+    return getattr(module, bound.kernel.name)
+
+
+def _stale_runs(
+    fn: Callable[..., torch.Tensor],
+    x: torch.Tensor,
+    sources: list[torch.Tensor],
+    references: list[torch.Tensor],
+    iterations: int,
+    *,
+    delay: int = 64,
+) -> int:
+    """Runs producer -> ``fn`` back to back and counts runs whose output
+    differs (bitwise) from the reference of the source just produced.
+
+    ``delay`` is the producer's spin count ahead of every store: the
+    zero-stale assertions hold at any delay, while the positive control (a
+    programmatic launch without the wait) needs a producer that outlives the
+    consumer's host launch latency, or the race it demonstrates may never
+    be lost."""
+    stale = torch.zeros((), dtype=torch.int64, device=DEVICE)
+    for i in range(iterations):
+        j = i & 1
+        _produce(sources[j], x, delay=delay)
+        stale += (fn(x) != references[j]).any()
+    torch.cuda.synchronize()
+    return int(stale)
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+class TestCutePdl(TestCase):
+    def test_knob_on_matches_knob_off_behind_a_producer_that_releases_at_entry(
+        self,
+    ) -> None:
+        iterations = 100
+        # The max kernel writes into ``torch.empty``: nothing sits between
+        # the producer and the reduction, so a missing wait reads stale
+        # data (the control proves it).  The sum zero-fills its output first;
+        # that fill node is what the knob's launch overlaps.
+        for kernel, shape, control in (
+            (col_reduce_max_dynamic, (2000, 1008), True),
+            (col_reduce_sum_static, (1024, 1024), False),
+        ):
+            x = torch.empty(*shape, dtype=torch.bfloat16, device=DEVICE)
+            sources = [
+                torch.randn(*shape, dtype=torch.bfloat16, device=DEVICE),
+                torch.randn(*shape, dtype=torch.bfloat16, device=DEVICE) * 7,
+            ]
+            bound, off, off_code = _build(kernel, x, **_COLUMN)
+            self.assertNotIn(_WAIT, off_code)
+            self.assertNotIn(_ATTRIBUTE, off_code)
+            references = []
+            for source in sources:
+                _produce(source, x)
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(x, source))
+                references.append(off(x).clone())
+            self.assertEqual(_stale_runs(off, x, sources, references, iterations), 0)
+            # The knob with each placement of its own release: ``entry``
+            # lets the next kernel (here the producer of the next source)
+            # launch while this one runs; every placement must still read
+            # the source just produced.
+            for release in (
+                {},
+                {"cute_pdl_release": "none"},
+                {"cute_pdl_release": "exit"},
+                {"cute_pdl_release": "entry"},
+                {"cute_pdl_release": "last_wave"},
+                {"cute_pdl_spread": True},
+            ):
+                _bound, on, on_code = _build(
+                    kernel, x, **_COLUMN, cute_pdl=True, **release
+                )
+                self.assertEqual(on_code.count(_WAIT), 1)
+                self.assertEqual(on_code.count(_ATTRIBUTE), 1)
+                self.assertEqual(
+                    on_code.count(_RELEASE),
+                    int(release.get("cute_pdl_release", "entry") != "none"),
+                )
+                # ``cute_pdl_spread`` pads the static grid's kernel to one
+                # wave's density (one CTA of 512 threads per SM at 64 CTAs);
+                # the pad is a live allocation the kernel never reads.
+                self.assertEqual(
+                    on_code.count("_helion_pdl_spread_keep(pdl_spread_pad.toint())"),
+                    int(bool(release.get("cute_pdl_spread")) and not control),
+                )
+                self.assertEqual(_stale_runs(on, x, sources, references, iterations), 0)
+                # One graph holding producer -> kernel -> producer -> kernel:
+                # the launch attribute becomes a programmatic edge inside the
+                # graph.
+                side = torch.cuda.Stream()
+                with torch.cuda.stream(side):
+                    _produce(sources[0], x)
+                    on(x)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    _produce(sources[0], x)
+                    out0 = on(x)
+                    _produce(sources[1], x)
+                    out1 = on(x)
+                for _ in range(iterations // 4):
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    self.assertTrue(torch.equal(out0, references[0]))
+                    self.assertTrue(torch.equal(out1, references[1]))
+            _bound, on, on_code = _build(kernel, x, **_COLUMN, cute_pdl=True)
+            if control:
+                attribute_only = _attribute_only_control(bound, on_code)
+                self.assertGreater(
+                    _stale_runs(
+                        attribute_only,
+                        x,
+                        sources,
+                        references,
+                        iterations,
+                        delay=_CONTROL_DELAY,
+                    ),
+                    0,
+                )
+
+    def test_only_the_entry_release_lets_a_dependent_run_during_the_kernel(
+        self,
+    ) -> None:
+        # One CTA sums 2^18 rows of zeros serially (hundreds of microseconds)
+        # on a machine with every other SM idle.  A dependent launched behind
+        # it with ``launch_pdl`` and no wait of its own writes ones over the
+        # last rows the moment it is released: at ``entry`` that is while the
+        # sum still has those rows ahead of it, so the sum reads them (the
+        # output is no longer zero); released after the body (``exit``) or
+        # at grid completion (``none``) the sum has finished reading first.
+        rows, cols, tail = 1 << 18, 16, 4096
+        x = torch.zeros(rows, cols, dtype=torch.bfloat16, device=DEVICE)
+        bound = col_reduce_sum_static.bind((x,))
+        iterations = 8
+
+        def dirty_runs(placement: str) -> int:
+            config = bound.config_spec.normalized_config(
+                helion.Config(**_COLUMN, cute_pdl=True, cute_pdl_release=placement)
+            )
+            code = bound.to_code(config)
+            self.assertEqual(code.count(_RELEASE), int(placement != "none"))
+            fn = bound.compile_config(config)
+
+            def run() -> torch.Tensor:
+                x.zero_()
+                out = fn(x)
+                _tk()._poison_tail_without_wait[(tail * cols // _BLOCK,)](
+                    x.view(-1),
+                    (rows - tail) * cols,
+                    rows * cols,
+                    BLOCK=_BLOCK,
+                    launch_pdl=True,
+                )
+                torch.cuda.synchronize()
+                return out
+
+            # The first call of either kernel compiles on the host, which can
+            # outlast the sum; count only warm launches.
+            run()
+            return sum(int(bool((run() != 0).any())) for _ in range(iterations))
+
+        self.assertEqual(dirty_runs("none"), 0)
+        self.assertEqual(dirty_runs("exit"), 0)
+        self.assertEqual(dirty_runs("entry"), iterations)
+        # One CTA is one wave: ``last_wave`` is the entry release.
+        self.assertEqual(dirty_runs("last_wave"), iterations)
+
+    def test_graph_replay_sees_the_fill_before_the_kernel(self) -> None:
+        x = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        bound = col_reduce_sum_static.bind((x,))
+        config = bound.config_spec.normalized_config(
+            helion.Config(**_COLUMN, cute_pdl=True)
+        )
+        fn = bound.compile_config(config)
+        # ``col_reduce_sum`` zero-fills its output in a kernel that precedes
+        # the reduction inside the captured graph; the reduction's launch
+        # overlaps that fill and its wait orders the two.
+        replay = _make_cudagraph_replay(lambda: fn(x))
+        expected = x.float().sum(0).to(torch.bfloat16)
+        for _ in range(3):
+            torch.testing.assert_close(replay(), expected, atol=2e-2, rtol=2e-2)
+
+    def test_a_kernel_that_releases_its_dependents_at_entry_must_be_an_ordinary_launch(
+        self,
+    ) -> None:
+        # Producer (releases at entry, writes x late) -> middle kernel ->
+        # copy of x launched as a dependent with no wait of its own, the
+        # shape of the tcgen05 consumer's ordinary-operand loads ahead of
+        # its wait.
+        n = 512 * 1024
+        x = torch.empty(n, dtype=torch.bfloat16, device=DEVICE)
+        out = torch.empty_like(x)
+        flag = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+        sources = [
+            torch.randn(n, dtype=torch.bfloat16, device=DEVICE),
+            torch.randn(n, dtype=torch.bfloat16, device=DEVICE),
+        ]
+        iterations = 50
+
+        def stale_runs(*, middle_is_dependent: bool, release_first: bool) -> int:
+            stale = torch.zeros((), dtype=torch.int64, device=DEVICE)
+            for i in range(iterations):
+                j = i & 1
+                _produce(sources[j], x, delay=256)
+                _tk()._middle[(_PRODUCER_GRID,)](
+                    flag, RELEASE_FIRST=release_first, launch_pdl=middle_is_dependent
+                )
+                _tk()._copy_without_wait[(n // _BLOCK,)](
+                    x, out, n, BLOCK=_BLOCK, launch_pdl=True
+                )
+                stale += (out != sources[j]).any()
+            torch.cuda.synchronize()
+            return int(stale)
+
+        # The fission producer's shape: an ordinary launch that releases at
+        # entry.  It starts after the producer completes, so its dependents
+        # cannot start earlier either.
+        self.assertEqual(stale_runs(middle_is_dependent=False, release_first=True), 0)
+        # The shape ``cute_pdl`` gave it before ``_stage_config`` kept the
+        # knob away: launched as a dependent it starts while the producer
+        # still runs, releases at once, and the copy reads x unwritten.
+        self.assertGreater(stale_runs(middle_is_dependent=True, release_first=True), 0)
+        # A dependent launch that waits before it releases is safe.
+        self.assertEqual(stale_runs(middle_is_dependent=True, release_first=False), 0)

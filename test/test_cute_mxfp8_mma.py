@@ -17,7 +17,6 @@ import helion
 from helion._compiler.cute.block_scaled_config import block_scaled_workspace_shape
 from helion._compiler.cute.mxfp8_mma import _match_mxfp8
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
 from helion.language import _tracing_ops
@@ -25,8 +24,6 @@ from helion.language.matmul_ops import dot_scaled
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -342,8 +339,14 @@ def test_cpu_native_mxfp8_stages_only_under_aligned_raw_operands() -> None:
     assert arguments[0].data_ptr() % 16 == 0
     assert arguments[1] is tensors[1]
     assert not copy_backs
-    kernel._helion_cute_wrapper_plans[0].pop("format")
-    assert _cute_stage_under_aligned_operands(kernel, (original, *tensors[1:])) is None
+    # The staged operands are a per-plan-list constant (the launch descriptor
+    # caches them on the kernel), so a plan without the format is a new kernel.
+    nvfp4 = SimpleNamespace(
+        _helion_cute_wrapper_plans=[
+            {"kind": "block_scaled_mma", "lhs_idx": 0, "rhs_idx": 1}
+        ]
+    )
+    assert _cute_stage_under_aligned_operands(nvfp4, (original, *tensors[1:])) is None
 
 
 @pytest.mark.parametrize(

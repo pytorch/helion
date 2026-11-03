@@ -976,7 +976,7 @@ def codegen_gated_row_mma(cg: GenerateAST, plan: GatedAttentionPlan) -> bool:
     df.placeholder_args.update(names.values())
     df.placeholder_args.update(scalar_tensor_names)
     cg.cute_uses_matmul = True
-    df.cute_state.attention_flash_threads = plan.threads
+    df.cute_state.flash.threads = plan.threads
     df.body = body
     df.preamble = []
     return True

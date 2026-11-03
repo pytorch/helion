@@ -36,12 +36,14 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import types
 from typing import TYPE_CHECKING
 from typing import cast
 
 import torch
 
 from ... import language as hl
+from ... import runtime
 from ..ast_extension import ExtendedAST
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
@@ -174,7 +176,7 @@ def _global_value(node: ast.AST, host: HostFunction, local_names: set[str]) -> o
         return host.fn.__globals__.get(node.id)
     if isinstance(node, ast.Attribute):
         parent = _global_value(node.value, host, local_names)
-        if parent is torch or parent is hl:
+        if isinstance(parent, types.ModuleType):
             return vars(parent).get(node.attr)
     return None
 
@@ -237,8 +239,13 @@ def _metadata_expression(
     if isinstance(node, ast.Subscript):
         return recurse(node.value) and recurse(node.slice)
     if isinstance(node, ast.Call):
-        if _global_value(node.func, host, local_names) is torch.promote_types:
+        function = _global_value(node.func, host, local_names)
+        if function is torch.promote_types:
             return not node.keywords and all(recurse(arg) for arg in node.args)
+        if function is runtime.get_num_sm:
+            # The SM count is a pure function of the device (looked up at call
+            # time: the CPU test targets patch the probe).
+            return not node.keywords and len(node.args) == 1 and recurse(node.args[0])
         return (
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
@@ -544,11 +551,13 @@ def _input_binding_is_stable(
                 ):
                     continue
                 return False
-            if isinstance(parent, ast.Call) and any(
-                _global_value(parent.func, host, local_names) is function
-                for function in (*_FACTORIES, *_MATMULS)
-            ):
-                continue
+            if isinstance(parent, ast.Call):
+                function = _global_value(parent.func, host, local_names)
+                if any(function is item for item in (*_FACTORIES, *_MATMULS)) or (
+                    # A device load reads the tensor it names first.
+                    function is hl.load and parent.args and parent.args[0] is node
+                ):
+                    continue
             return False
     return True
 

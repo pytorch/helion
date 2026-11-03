@@ -9,19 +9,21 @@ from typing import cast
 import torch
 
 from ..active_blocks import active_block_ids
+from . import target_facts
 from .materialized_fission_codegen import _region_graph_ids
 from .pipeline_smem import Tcgen05PipelineSmemFacts
+from .tcgen05_config import surface
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing import TypeAlias
 
-    from ...language.matmul_ops import CuteTcgen05SearchPlan
-    from ...language.matmul_ops import _CuteTcgen05SearchPlanningResult
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
     from .cute_mma import _CuteMmaNode
+    from .tcgen05.search_plan import CuteTcgen05SearchPlan
+    from .tcgen05.search_plan import _CuteTcgen05SearchPlanningResult
 
     _Placed: TypeAlias = dict[int, tuple[_CuteMmaNode, CuteTcgen05SearchPlan]]
 
@@ -224,9 +226,8 @@ def _register_region_mma_search(
     flat, and ``tcgen05_region_pid_types`` may run the GEMM launches as the
     static persistent two-CTA pipeline (``CuteTcgen05Config``).
     """
-    from ...language.matmul_ops import _cuda_num_sms_or_zero
     from .pipeline_smem import analyze_pipeline_smem_facts
-    from .tcgen05_config import CuteTcgen05Config
+    from .tcgen05.search_plan import _cuda_num_sms_or_zero
 
     spec = env.config_spec
     state = spec._cute_tcgen05_config
@@ -249,7 +250,7 @@ def _register_region_mma_search(
     pair_budget_facts = []
     for index in indices:
         candidate, _plan = placed[index]
-        capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(
+        capacity = target_facts.per_cta_smem_capacity_bytes(
             candidate.operands.lhs.source_fake.device
         )
         region_graphs = [
@@ -269,7 +270,7 @@ def _register_region_mma_search(
         )
     state.materialized_pipeline_facts = tuple(facts)
     state.materialized_pair_budget_facts = tuple(pair_budget_facts)
-    spec.cute_tcgen05_search_enabled = True
+    spec.tcgen05.search_enabled = True
     state.materialized_matmul_block_ids = tuple(
         (
             candidate.operands.m_block_id,
@@ -281,7 +282,8 @@ def _register_region_mma_search(
     state.materialized_matmul_region_indices = tuple(indices)
     # Existing one-CTA seeds remain unchanged. Optional paired fanout schedules
     # use the complete independent region budgets and strict full-tile guards.
-    spec.narrow_tcgen05_autotune_to_validated_configs(
+    surface.narrow_autotune_to_validated_configs(
+        spec.tcgen05,
         allow_persistent_pid_types=allow_persistent,
         reason=reason,
     )

@@ -8,12 +8,14 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_tcgen05_schedule import (
+from helion._compiler.cute.autotune.heuristics.cute_tcgen05_schedule import (
     CuteTcgen05ScheduleHeuristic,
 )
 from helion._compiler.cute.one_cta_pipeline import max_one_cta_pipeline_ab_stages
 from helion._compiler.cute.one_cta_pipeline import one_cta_pipeline_smem_bytes
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import smem
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_dense_tcgen05 import atomic_output_mm
@@ -85,7 +87,7 @@ def test_deep_pipeline_all_scales_and_widths(kernel: helion.Kernel, mode: int) -
     bound = kernel._bind_isolated(scaled_args(mode=mode))
     state = bound.config_spec._cute_tcgen05_config
     assert state.one_cta_pipeline_facts is not None
-    assert state._get_dtype_ab_stages_hard_cap(1) == 12
+    assert smem._get_dtype_ab_stages_hard_cap(1) == 12
     with bound.env:
         gen = ConfigGeneration(bound.config_spec)
         flat, config = gen.canonicalize_flat(gen.flatten(_config()))
@@ -95,12 +97,12 @@ def test_deep_pipeline_all_scales_and_widths(kernel: helion.Kernel, mode: int) -
         assert config.block_sizes == [64, 32, 128]
         assert config.config["tcgen05_ab_stages"] == 16
         assert config.config["tcgen05_c_stages"] == 2
-        seeds = state.one_cta_pipeline_seed_configs()
+        seed_configs = seeds.one_cta_pipeline_seed_configs(state)
         assert any(
             s.block_sizes == [64, 32, 128] and s.config["tcgen05_ab_stages"] == 16
-            for s in seeds
+            for s in seed_configs
         )
-        for seed in seeds:
+        for seed in seed_configs:
             _flat, normalized = gen.canonicalize_flat(gen.flatten(seed))
             assert normalized.block_sizes == seed.block_sizes
             assert (
@@ -122,7 +124,7 @@ def test_explicit_bk256_depth_and_store_ring_preserved(store_mode: str) -> None:
     config = _config(
         block_sizes=[64, 32, 256], tcgen05_ab_stages=9, tcgen05_c_store_mode=store_mode
     )
-    assert state._one_cta_pipeline_stage_limit(config.config) == 9
+    assert smem._one_cta_pipeline_stage_limit(state, config.config) == 9
     source = bound.to_code(config)
     assert "num_stages=9" in source and "CtaGroup.ONE" in source
     assert ("PipelineTmaStore.create" in source) == (store_mode == "normal")
@@ -157,8 +159,8 @@ def test_extra_protocols_cannot_borrow_complete_budget(
     bound = scaled_mm._bind_isolated(scaled_args())
     config = _config(**overrides)
     assert (
-        bound.config_spec._cute_tcgen05_config._one_cta_pipeline_parameters(
-            config.config
+        seeds._one_cta_pipeline_parameters(
+            bound.config_spec._cute_tcgen05_config, config.config
         )
         is None
     )
@@ -207,7 +209,7 @@ def test_m128_pipeline_uses_one_cta_output_layout(
     bound = kernel._bind_isolated(scaled_args(m=128))
     config = _config(block_sizes=[128, 32, 64], tcgen05_c_store_mode=store)
     state = bound.config_spec._cute_tcgen05_config
-    assert state._one_cta_pipeline_stage_limit(config.config) == 16
+    assert smem._one_cta_pipeline_stage_limit(state, config.config) == 16
     with bound.env:
         generation = ConfigGeneration(bound.config_spec)
         flat, normalized = generation.canonicalize_flat(generation.flatten(config))
@@ -224,7 +226,7 @@ def test_wide_bn_fp32_c4_boundary_source() -> None:
     bound = scaled_mm_fp32._bind_isolated(scaled_args(m=128))
     state = bound.config_spec._cute_tcgen05_config
     config = _config(block_sizes=[128, 256, 32], tcgen05_c_stages=4)
-    limit = state._one_cta_pipeline_stage_limit(config.config)
+    limit = smem._one_cta_pipeline_stage_limit(state, config.config)
     assert limit is not None and 0 < limit < 16
     config.config["tcgen05_ab_stages"] = limit
     source = bound.to_code(config)
@@ -243,8 +245,8 @@ def test_wide_bn_fp32_c4_boundary_source() -> None:
 def test_partial_tiles_keep_old_budget(shape: tuple[int, int, int]) -> None:
     bound = scaled_mm._bind_isolated(scaled_args(*shape))
     assert (
-        bound.config_spec._cute_tcgen05_config._one_cta_pipeline_parameters(
-            _config().config
+        seeds._one_cta_pipeline_parameters(
+            bound.config_spec._cute_tcgen05_config, _config().config
         )
         is None
     )
@@ -264,8 +266,8 @@ def test_pid_vetoes_and_registration_idempotence() -> None:
         bound.env, bound.host_function.device_ir
     )
     assert state.one_cta_pipeline_facts == facts
-    assert not state.one_cta_pipeline_seed_configs()
-    assert state._one_cta_pipeline_parameters(_config().config) is None
+    assert not seeds.one_cta_pipeline_seed_configs(state)
+    assert seeds._one_cta_pipeline_parameters(state, _config().config) is None
     assert bound.config_spec.disallowed_pid_type_causes == previous
 
 

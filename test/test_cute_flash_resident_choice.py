@@ -13,9 +13,16 @@ import torch
 from .test_cute_flash_exp2 import _emit_causal_resident_native_source
 from .test_cute_flash_exp2 import _emit_dense_resident_value_graph_source
 from .test_cute_flash_exp2 import _flash_runtime
-from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._compiler.cute.autotune.flash_surface import (
+    _cute_flash_block_size_target_list,
+)
+from helion._compiler.cute.autotune.flash_surface import (
+    _legalize_cute_flash_compiler_seeds,
+)
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.backend import CuteBackend
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
@@ -94,7 +101,7 @@ def test_resident_choice_is_general(
     config, source = _emit(head_dim, num_kv, dtype=dtype)
     assert config.softmax_lowering == "resident_value_graph"
     assert "resident_softmax_value_graph" in source
-    assert "fa4_sp_exp_convert_store_whole_rowsum" not in source
+    assert "whole_row_sum=True" not in source
     assert "cutlass.Float32(7.0) - flash_row_max_safe" not in source
     # D128 uses all 512 TMEM columns at N=128; a requested wider score tile
     # must still obey the existing allocation bound.
@@ -369,7 +376,8 @@ def _spec(
     )
     for block_id, size_hint in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=size_hint))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         num_kv=num_kv,
         dtype=dtype,
@@ -544,7 +552,8 @@ def test_two_tile_dense_hd128_seed_follows_the_surface(
     spec = ConfigSpec(backend=CuteBackend())
     for block_id, size_hint in enumerate(block_size_targets.values()):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=size_hint))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=128,
         num_kv=16,
         block_size_targets=block_size_targets,
@@ -555,11 +564,12 @@ def test_two_tile_dense_hd128_seed_follows_the_surface(
         dense_lse_output=dense_lse_output,
         fast_math=fast_math,
     )
-    seeds = spec._legalize_cute_flash_compiler_seeds(
+    seeds = _legalize_cute_flash_compiler_seeds(
+        spec,
         cute_flash.flash_attention_seed_configs(
             128,
             16,
-            block_size_targets=spec._cute_flash_block_size_target_list(),
+            block_size_targets=_cute_flash_block_size_target_list(spec),
             device_sm_count=148,
             target_device_capability=(10, 3),
             num_bh=32,
@@ -567,7 +577,7 @@ def test_two_tile_dense_hd128_seed_follows_the_surface(
             standard_dense_output=standard_dense_output,
             dense_lse_output=dense_lse_output,
             fast_math=fast_math,
-        )
+        ),
     )
     spec.compiler_seed_configs = list(seeds)
 

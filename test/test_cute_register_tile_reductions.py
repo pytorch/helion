@@ -20,12 +20,14 @@ tile axis on ``thread_idx[0]`` so a warp's packet loads cover whole rows.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import itertools
 import logging
 import pathlib
 import types
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Callable
 from unittest.mock import patch
 
 import pytest
@@ -49,28 +51,29 @@ from test._cute_register_tile_kernels import rms_norm_bwd_arguments
 
 import helion
 from helion._compiler import generate_ast as generate_ast_module
+from helion._compiler.backend import Backend
 from helion._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
-from helion._compiler.cute.masked_packet_load_names import (
-    MASKED_PACKET_LOAD_HELPER_NAMES,
-)
+from helion._compiler.cute.cache_policy_loads import MASKED_PACKET_LOAD_HELPER_NAMES
 from helion._compiler.cute.persistent_branch_vec import _generated_access_pointer
 from helion._compiler.cute.register_tile_admission import (
     _CUTE_REGISTER_TILE_CONTROL_FLOW,
 )
 from helion._compiler.cute.register_tile_admission import RegisterTileUnsupported
+from helion._compiler.emitter_protocols import RetryPolicy
+from helion._testing import DEVICE
 from helion._testing import skipIfRefEager
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.experimental.linear_attention import recurrent_step_fused
 import helion.language as hl
 from helion.language import _tracing_ops
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(reduction_smem_budget_bytes=232448),
+]
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from collections.abc import Iterator
 
 BH, D, DV = 8, 128, 128
 COLUMN_REDUCE = "_cute_grouped_reduce_shared_columns("
@@ -78,19 +81,6 @@ CONSTEXPR_OWNER = "for synthetic_lane_1 in cutlass.range_constexpr("
 ROLLED_OWNER = "for synthetic_lane_1 in range("
 FALLBACK_LOG = "regenerating with the rolled reduction lane"
 LOOPED_RETRY_LOG = "the retry loops the reduction"
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
-        yield
 
 
 def _kernel() -> helion.Kernel:
@@ -136,6 +126,7 @@ def _config(
     reduction_threads: int,
     vec: int = 4,
     reduction_loop: int | None = None,
+    **extra: Any,
 ) -> helion.Config:
     spec = bound.config_spec
     (reduction,) = [
@@ -155,6 +146,7 @@ def _config(
                 vec if block_id == dv else 1
                 for block_id in spec.cute_vector_widths.valid_block_ids()
             ],
+            **extra,
         )
     )
 
@@ -240,7 +232,6 @@ def _assert_defined_before_use(code: str) -> None:
     visit(kernel.body)
 
 
-@skipUnlessBackends(["cute"])
 def test_same_index_state_update_keeps_vector_loads_and_stores() -> None:
     bound, _arguments = _bind()
     code = bound.to_code(_config(bound, dv_block=32, dv_threads=8, reduction_threads=8))
@@ -281,7 +272,6 @@ def test_same_index_state_update_keeps_vector_loads_and_stores() -> None:
     assert "block=(8, 8, 1)" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_column_reduce_runs_once_per_tile() -> None:
     bound, _arguments = _bind()
     code = bound.to_code(_config(bound, dv_block=32, dv_threads=8, reduction_threads=8))
@@ -301,7 +291,6 @@ def test_column_reduce_runs_once_per_tile() -> None:
     assert code.count("_cute_store_u32_vec(out.iterator") == 1
 
 
-@skipUnlessBackends(["cute"])
 def test_multiwarp_group_keeps_its_thread_count() -> None:
     # 16 reduction threads above 8 vector threads span four warps; the
     # register tile keeps them (no one-warp collapse) and combines with the
@@ -316,7 +305,6 @@ def test_multiwarp_group_keeps_its_thread_count() -> None:
     assert "pre=8, group_span=128, group_count=1)" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_mismatched_vector_width_keeps_rolled_lanes() -> None:
     # Eight elements per thread with V=4 is two vectors per lane, not one: the
     # established rolled nesting is kept.
@@ -327,7 +315,6 @@ def test_mismatched_vector_width_keeps_rolled_lanes() -> None:
     assert "for synthetic_lane_2 in range(16):" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_aliasing_inputs_reject_the_split(caplog: pytest.LogCaptureFixture) -> None:
     # ``q`` viewing the state storage removes the disjointness proof.  The
     # deferred vector store of ``state`` may not flush past the later load of
@@ -345,7 +332,9 @@ def test_aliasing_inputs_reject_the_split(caplog: pytest.LogCaptureFixture) -> N
     bound = cpu_bind(recurrent_step_in_place, arguments)
     with (
         caplog.at_level(logging.DEBUG, logger="helion._compiler.cute.memory_ops"),
-        caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"),
+        caplog.at_level(
+            logging.DEBUG, logger="helion._compiler.cute.kernel_generators"
+        ),
         pytest.raises(helion.exc.BackendUnsupported, match="aliasing write"),
     ):
         bound.to_code(_config(bound, dv_block=32, dv_threads=8, reduction_threads=8))
@@ -357,7 +346,6 @@ def test_aliasing_inputs_reject_the_split(caplog: pytest.LogCaptureFixture) -> N
     assert "a store repeats inside an element loop" in caplog.text
 
 
-@skipUnlessBackends(["cute"])
 def test_explicit_reduction_threads_stay_persistent() -> None:
     bound, _arguments = _bind()
     explicit = _config(bound, dv_block=64, dv_threads=16, reduction_threads=8)
@@ -373,7 +361,6 @@ def test_explicit_reduction_threads_stay_persistent() -> None:
     assert "pre=16, group_span=128, group_count=1)" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_flattened_column_tile_forms_a_register_tile() -> None:
     # A single flattened tile axis (``PerThreadFlattenedTileStrategy``) with a
     # persistent row reduction gets the same lowering: the column axis on
@@ -398,7 +385,6 @@ def test_flattened_column_tile_forms_a_register_tile() -> None:
     assert "% 64 < 8:" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_reduction_derived_scale_is_emitted_in_the_consume_nest() -> None:
     # ``r = 1 / (sum(t * t) + 1)`` is lane-invariant but feeds the lane-varying
     # store of every row, so the consume nest must define it before the
@@ -418,7 +404,6 @@ def test_reduction_derived_scale_is_emitted_in_the_consume_nest() -> None:
     assert code.count(COLUMN_REDUCE) == 1
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     ("policy", "helper"),
     (
@@ -447,7 +432,6 @@ def test_eviction_policy_loads_form_a_register_tile(policy: str, helper: str) ->
     _assert_defined_before_use(code)
 
 
-@skipUnlessBackends(["cute"])
 def test_nested_device_loop_keeps_the_rolled_lane() -> None:
     # The device IR shows a rolled loop inside the tile body, so the lane
     # nesting the register tile needs is never chosen: the established rolled
@@ -465,7 +449,6 @@ def test_nested_device_loop_keeps_the_rolled_lane() -> None:
     assert "_lane_stash" not in code
 
 
-@skipUnlessBackends(["cute"])
 def test_two_reductions_share_one_register_tile() -> None:
     arguments = (torch.empty((128, 1024), dtype=torch.float32),)
     bound = cpu_bind(col_stats, arguments)
@@ -482,7 +465,6 @@ def test_two_reductions_share_one_register_tile() -> None:
     assert code.count("% 64 < 8:") == 2
 
 
-@skipUnlessBackends(["cute"])
 def test_single_vector_thread_uses_the_warp_column_path() -> None:
     # One vector thread under 64 consecutive reduction threads: the column
     # reduce folds each warp with a shuffle before the shared-memory exchange.
@@ -508,7 +490,7 @@ def _rolled_code(bound: Any, config: helion.Config) -> str:
     """``config``'s code with the register tile never predicted: the rolled
     lane nesting the persistent strategy used before register tiles existed."""
     with patch(
-        "helion._compiler.reduction_strategy._cute_register_tile_shape",
+        "helion._compiler.cute.thread_budget.register_tile_shape",
         return_value=False,
     ):
         return bound.to_code(config)
@@ -518,7 +500,6 @@ def _f32(*shape: int) -> torch.Tensor:
     return torch.empty(shape, dtype=torch.float32)
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     ("kernel", "make_arguments", "owner_loops", "stashes", "once"),
     (
@@ -558,7 +539,9 @@ def test_chained_reductions_run_one_accumulate_nest_per_level(
     arguments = make_arguments()
     bound = cpu_bind(kernel, arguments)
     config = column_config(bound, block=32, tile_threads=8, reduction_threads=8)
-    with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
+    with caplog.at_level(
+        logging.DEBUG, logger="helion._compiler.cute.kernel_generators"
+    ):
         code = bound.to_code(config)
     assert FALLBACK_LOG not in caplog.text
     assert ROLLED_OWNER not in code
@@ -593,7 +576,6 @@ def _kernel_statements(code: str) -> list[str]:
     return [ast.unparse(node) for node in kernel.body]
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     ("kernel", "make_arguments", "block", "reduction_threads", "vec", "capability"),
     (
@@ -652,7 +634,9 @@ def test_unschedulable_bodies_fall_back_to_the_rolled_lane(
         vec=vec,
     )
     assert config.reduction_loops == [None]
-    with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
+    with caplog.at_level(
+        logging.DEBUG, logger="helion._compiler.cute.kernel_generators"
+    ):
         code = bound.to_code(config)
     assert FALLBACK_LOG in caplog.text
     # 16 reduction threads cover 128 rows without the register tile too, so
@@ -665,7 +649,6 @@ def test_unschedulable_bodies_fall_back_to_the_rolled_lane(
     assert code == _rolled_code(bound, config)
 
 
-@skipUnlessBackends(["cute"])
 def test_bf16_register_tile_flushes_fp32_results_on_sm100(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -673,7 +656,9 @@ def test_bf16_register_tile_flushes_fp32_results_on_sm100(
     bound = cpu_bind(col_sum_f32_out, arguments)
     bound.config_spec.target_device_capability = (10, 0)
     config = column_config(bound, block=64, tile_threads=8, reduction_threads=16, vec=8)
-    with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
+    with caplog.at_level(
+        logging.DEBUG, logger="helion._compiler.cute.kernel_generators"
+    ):
         code = bound.to_code(config)
     assert FALLBACK_LOG not in caplog.text
     assert CONSTEXPR_OWNER in code
@@ -683,7 +668,6 @@ def test_bf16_register_tile_flushes_fp32_results_on_sm100(
     assert code.count("_cute_store_u32_vec(out.iterator") == 1
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     ("kernel", "make_arguments"),
     (
@@ -715,7 +699,9 @@ def test_rejected_register_tiles_retry_as_the_looped_reduction(
     bound = cpu_bind(kernel, arguments)
     config = column_config(bound, block=32, tile_threads=8, reduction_threads=64)
     assert config.reduction_loops == [None]
-    with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
+    with caplog.at_level(
+        logging.DEBUG, logger="helion._compiler.cute.kernel_generators"
+    ):
         code = bound.to_code(config)
     assert FALLBACK_LOG in caplog.text
     assert LOOPED_RETRY_LOG in caplog.text
@@ -754,7 +740,6 @@ def _passes(bound: Any, config: helion.Config) -> tuple[str, list[helion.Config]
     return code, passes
 
 
-@skipUnlessBackends(["cute"])
 def test_vector_loop_sinking_leaves_the_register_tile_alone() -> None:
     # ``cute_vloop_sink`` interchanges a grid V-loop into the serial reduction
     # nest it wraps (``cute/sink_vector_loops.py``).  A register tile has no
@@ -775,7 +760,6 @@ def test_vector_loop_sinking_leaves_the_register_tile_alone() -> None:
     assert code == bound.to_code(config)
 
 
-@skipUnlessBackends(["cute"])
 def test_the_looped_retry_keeps_the_sink_knob() -> None:
     # The retry after a rejected register tile re-normalizes the config with
     # register tiles withheld and nothing else: ``cute_vloop_sink`` survives
@@ -806,15 +790,30 @@ def test_the_retry_starts_the_memory_transforms_afresh() -> None:
     # Inductor's prologue transform remembers the fused inputs whose
     # placeholder it already emitted so a second load of the same input reuses
     # the result variable.  That memory belongs to one codegen pass: the pass
-    # the register-tile split rejects is thrown away, so the regenerated pass
-    # must emit every placeholder again.  The record lives on the pass's
-    # ``GenerateAST``, which the retry creates anew.
+    # a backend's retry policy (the register-tile split) rejects is thrown
+    # away, so the regenerated pass must emit every placeholder again.  The
+    # record lives on the pass's ``GenerateAST``, which the retry creates anew.
     arguments = (_f32(64, 64), _f32(64, 64))
     bound = cpu_bind(add_rows, arguments)
     host = bound.host_function
     assert host is not None
     passes: list[list[dict[str, str]]] = []
+    repairs: list[BaseException] = []
     generate = generate_ast_module._generate_ast
+
+    @dataclasses.dataclass(frozen=True)
+    class RetryOnce(RetryPolicy):
+        signals: tuple[type[BaseException], ...] = (RegisterTileUnsupported,)
+
+        def repair(
+            self, signal: BaseException, config: helion.Config, *, caller_graphs: bool
+        ) -> helion.Config | None:
+            # One repair only: a second signal propagates and fails the test
+            # instead of regenerating forever.
+            if repairs:
+                return None
+            repairs.append(signal)
+            return config
 
     def generate_failing_once(*args: Any, **kwargs: Any) -> ast.Module:
         passes.append([])
@@ -842,6 +841,7 @@ def test_the_retry_starts_the_memory_transforms_afresh() -> None:
     with (
         bound.env,
         patch.object(generate_ast_module, "_generate_ast", generate_failing_once),
+        patch.object(Backend, "retry_policy", return_value=RetryOnce()),
     ):
         generate_ast_module.generate_ast(
             host,
@@ -853,7 +853,6 @@ def test_the_retry_starts_the_memory_transforms_afresh() -> None:
     assert passes[0] == passes[1] == [{}, {"x": "emitted"}]
 
 
-@skipUnlessBackends(["cute"])
 def test_register_budget_keeps_wide_stashes_rolled(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -862,7 +861,9 @@ def test_register_budget_keeps_wide_stashes_rolled(
     # lanes per thread fit.
     arguments = (_f32(128, 1024), _f32(128, 1024), _f32(128, 1024))
     bound = cpu_bind(col_scale_three, arguments)
-    with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
+    with caplog.at_level(
+        logging.DEBUG, logger="helion._compiler.cute.kernel_generators"
+    ):
         code = bound.to_code(
             column_config(bound, block=32, tile_threads=8, reduction_threads=8)
         )
@@ -870,7 +871,9 @@ def test_register_budget_keeps_wide_stashes_rolled(
     assert ROLLED_OWNER in code
     assert "_lane_stash" not in code
     caplog.clear()
-    with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
+    with caplog.at_level(
+        logging.DEBUG, logger="helion._compiler.cute.kernel_generators"
+    ):
         code = bound.to_code(
             column_config(bound, block=32, tile_threads=8, reduction_threads=16)
         )
@@ -879,7 +882,6 @@ def test_register_budget_keeps_wide_stashes_rolled(
     _assert_defined_before_use(code)
 
 
-@skipUnlessBackends(["cute"])
 def test_eight_byte_policy_loads_are_stashed() -> None:
     # fp32 V=2 under ``l1_l2_first`` loads through the 8-byte policy helper.
     # It is a load like the 16-byte form: the loaded tile is stashed for the
@@ -903,7 +905,6 @@ def test_eight_byte_policy_loads_are_stashed() -> None:
     _assert_defined_before_use(code)
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     ("vec", "block", "policy"),
     ((2, 16, None), (4, 32, "l1_l2_first"), (2, 16, "l1_l2_first")),
@@ -923,7 +924,9 @@ def test_aliasing_views_reject_every_load_form(
         {} if policy is None else {"load_eviction_policies": [policy]}
     )
     with (
-        caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"),
+        caplog.at_level(
+            logging.DEBUG, logger="helion._compiler.cute.kernel_generators"
+        ),
         pytest.raises(helion.exc.BackendUnsupported, match="aliasing write"),
     ):
         bound.to_code(
@@ -939,14 +942,13 @@ def test_aliasing_views_reject_every_load_form(
     assert "a load of one lane may alias a store of another lane" in caplog.text
 
 
-@skipUnlessBackends(["cute"])
 def test_load_helper_names_match_the_backend_imports() -> None:
     # Every ``_cute_load_*`` helper the backend binds in generated code is in
     # one of the two lists the lane-loop passes read: the cache-hinted loads
     # (relocation, load collection and the aliasing proofs) or the predicated
-    # packet loads of the sunk V-loop (``masked_packet_load_names``, which the
-    # relocation proof reads; they appear only in bodies the sink already
-    # unrolled), so a new helper cannot slip past them.
+    # packet loads of the sunk V-loop (``MASKED_PACKET_LOAD_HELPER_NAMES``,
+    # which the relocation proof reads; they appear only in bodies the sink
+    # already unrolled), so a new helper cannot slip past them.
     bound, _arguments = _bind()
     bound_names = {
         name
@@ -991,7 +993,6 @@ def test_column_reduce_returns_behind_a_barrier() -> None:
     assert returns == 3
 
 
-@skipUnlessBackends(["cute"])
 def test_register_tile_blocks_follow_the_body_and_the_extent() -> None:
     # Config normalization, the seed and codegen share one admission: the
     # reduction block is listed only for a body the schedule may lower (no
@@ -1016,7 +1017,6 @@ def test_register_tile_blocks_follow_the_body_and_the_extent() -> None:
         assert (reduction in blocks) is admitted, kernel.name
 
 
-@skipUnlessBackends(["cute"])
 def test_tile_axis_reductions_keep_the_rolled_nesting(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1035,7 +1035,9 @@ def test_tile_axis_reductions_keep_the_rolled_nesting(
     default = spec.default_config()
     assert default.config["cute_vector_widths"] == [1, 1]
     assert "num_threads" not in default.config
-    with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
+    with caplog.at_level(
+        logging.DEBUG, logger="helion._compiler.cute.kernel_generators"
+    ):
         code = bound.to_code(default)
     assert FALLBACK_LOG not in caplog.text
     assert "block=(32, 32, 1)" in code
@@ -1045,7 +1047,6 @@ def test_tile_axis_reductions_keep_the_rolled_nesting(
     assert "_lane_stash" not in code
 
 
-@skipUnlessBackends(["cute"])
 def test_tile_axis_reduction_under_a_register_tile_falls_back(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1058,7 +1059,8 @@ def test_tile_axis_reduction_under_a_register_tile_falls_back(
     # row tile), instead of a kernel-level failure of the seed's default.
     arguments = rms_norm_bwd_arguments()
     with patch(
-        "helion._compiler.device_ir.register_tile_body_admitted", return_value=True
+        "helion._compiler.cute.register_tile_admission.register_tile_body_admitted",
+        return_value=True,
     ):
         bound = cpu_bind(rms_norm_bwd, arguments)
     spec = bound.config_spec
@@ -1071,7 +1073,9 @@ def test_tile_axis_reduction_under_a_register_tile_falls_back(
     assert seed.config["num_threads"] == [8, 4]
     assert seed.config["cute_vector_widths"] == [1, 4]
     with (
-        caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"),
+        caplog.at_level(
+            logging.DEBUG, logger="helion._compiler.cute.kernel_generators"
+        ),
         pytest.raises(
             helion.exc.BackendUnsupported, match="nested in a different lane owner"
         ),
@@ -1082,7 +1086,6 @@ def test_tile_axis_reduction_under_a_register_tile_falls_back(
     assert LOOPED_RETRY_LOG not in caplog.text
 
 
-@skipUnlessBackends(["cute"])
 def test_dynamic_extent_forces_the_looped_reduction() -> None:
     # With ``static_shapes=False`` a persistent lane loop would bake its lane
     # count from the size hint and a later, larger extent would drop rows; a
@@ -1136,7 +1139,6 @@ def test_access_pointer_widths() -> None:
     assert _access("cute.arch.atomic_add(p, v)") is None
 
 
-@skipUnlessBackends(["cute"])
 def test_register_tile_seed_is_the_default_config() -> None:
     # The autotune-off default is the stride-aware layout the seed describes:
     # the stride-1 dv axis on vectorized lanes (8 threads x 4 fp32), the
@@ -1165,7 +1167,6 @@ def test_register_tile_seed_is_the_default_config() -> None:
     assert "block=(8, 8, 1)" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_default_stays_the_base_config_without_the_register_tile_shape() -> None:
     # A dv extent the vector tile does not divide has no register-tile
     # geometry: nothing is promoted, the base default stands.
@@ -1181,3 +1182,461 @@ def test_default_stays_the_base_config_without_the_register_tile_shape() -> None
     spec = bound.config_spec
     assert "cute_register_tile" not in spec.autotuner_heuristics
     assert spec.compiler_default_config is None
+
+
+# GPU numerics for register-tile lane reductions (see
+# ``test_cute_register_tile_reductions.py`` for the codegen shape).
+
+
+BH_DEVICE = 256
+
+
+def _check_recurrent_step(
+    *,
+    dtype: torch.dtype,
+    dv_block: int,
+    dv_threads: int,
+    reduction_threads: int,
+    vec: int = 4,
+    **extra: Any,
+) -> str:
+    """Run the fused recurrent step with a register-tile config on two input
+    sets (a stale output or new state cannot pass twice) and return the
+    generated code."""
+    kernel = helion.kernel(
+        recurrent_step_fused.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    )
+    torch.manual_seed(0)
+    q = torch.randn(BH_DEVICE, D, device=DEVICE).to(dtype)
+    k = torch.randn(BH_DEVICE, D, device=DEVICE).to(dtype)
+    v = torch.randn(BH_DEVICE, DV, device=DEVICE).to(dtype)
+    alpha = torch.rand(BH_DEVICE, device=DEVICE).to(dtype)
+    initial = torch.randn(BH_DEVICE, D, DV, device=DEVICE).to(dtype)
+    state = initial.clone()
+    bound = kernel.bind((q, k, v, state, alpha))
+    config = _config(
+        bound,
+        dv_block=dv_block,
+        dv_threads=dv_threads,
+        reduction_threads=reduction_threads,
+        vec=vec,
+        **extra,
+    )
+    code = bound.to_code(config)
+    assert "_lane_stash" in code
+    compiled = bound.compile_config(config)
+    # The kernel computes in fp32 and rounds the state and the output once.
+    rtol, atol = (1e-3, 1e-3) if dtype is torch.float32 else (2e-2, 2e-1)
+    for _ in range(2):
+        out, new_state = compiled(q, k, v, state, alpha)
+        torch.cuda.synchronize()
+        expected_state = (
+            alpha.float()[:, None, None] * initial.float()
+            + k.float()[:, :, None] * v.float()[:, None, :]
+        )
+        expected_out = (q.float()[:, :, None] * expected_state).sum(1)
+        torch.testing.assert_close(
+            new_state.float(), expected_state, rtol=rtol, atol=atol
+        )
+        torch.testing.assert_close(out.float(), expected_out, rtol=rtol, atol=atol)
+        assert torch.equal(state, initial)
+        q.copy_(torch.rand_like(q, dtype=torch.float32).mul_(2).sub_(1).to(dtype))
+        v.copy_(torch.rand_like(v, dtype=torch.float32).mul_(2).sub_(1).to(dtype))
+    return code
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("dv_block", "dv_threads", "reduction_threads"),
+    (
+        pytest.param(32, 8, 8, id="one-warp-columns-64-elements"),
+        pytest.param(32, 8, 16, id="four-warp-columns"),
+        pytest.param(64, 16, 8, id="two-warp-wide-tile"),
+    ),
+)
+def test_register_tile_matches_reference(
+    dv_block: int, dv_threads: int, reduction_threads: int
+) -> None:
+    _check_recurrent_step(
+        dtype=torch.float32,
+        dv_block=dv_block,
+        dv_threads=dv_threads,
+        reduction_threads=reduction_threads,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.cuda
+@pytest.mark.parametrize("pid_type", ("persistent_blocked", "persistent_interleaved"))
+def test_persistent_pid_reuses_the_column_reduce_safely(pid_type: str) -> None:
+    # A persistent CTA runs the column reduce once per tile with no other
+    # barrier in between; the helper's trailing barrier keeps a fast warp's
+    # next-tile partials from overwriting slots a slower warp still reads.
+    # The race is timing dependent, so a pass here does not prove the barrier
+    # is present: ``test_column_reduce_returns_behind_a_barrier`` pins it in
+    # the helper's source; this test checks the persistent register tile runs
+    # and its numerics.
+    code = _check_recurrent_step(
+        dtype=torch.float32,
+        dv_block=32,
+        dv_threads=8,
+        reduction_threads=16,
+        pid_type=pid_type,
+    )
+    assert "for virtual_pid in range(" in code
+    assert code.count(COLUMN_REDUCE) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.cuda
+def test_bf16_register_tile_flushes_u16_packets() -> None:
+    # bf16 state with V=8: one 16-byte packet per lane and a u16 flush.
+    code = _check_recurrent_step(
+        dtype=torch.bfloat16,
+        dv_block=64,
+        dv_threads=8,
+        reduction_threads=16,
+        vec=8,
+    )
+    assert "ir.VectorType.get([8], cutlass.Uint16.mlir_type)" in code
+    assert code.count("_cute_store_u16_vec(new_state.iterator") == 1
+
+
+def _col_sum_reference(x: torch.Tensor) -> torch.Tensor:
+    return x.sum(0)
+
+
+def _col_scale_reference(x: torch.Tensor) -> torch.Tensor:
+    return x / ((x * x).sum(0) + 1.0)[None, :]
+
+
+def _col_stats_reference(x: torch.Tensor) -> torch.Tensor:
+    return torch.stack([x.sum(0), (x * x).sum(0)])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("kernel", "reference", "block", "tile_threads", "reduction_threads", "extra"),
+    (
+        pytest.param(col_sum, _col_sum_reference, 32, 8, 8, {}, id="col-sum"),
+        pytest.param(
+            col_sum,
+            _col_sum_reference,
+            4,
+            1,
+            64,
+            {},
+            id="col-sum-warp-columns",
+        ),
+        pytest.param(
+            col_sum,
+            _col_sum_reference,
+            4,
+            1,
+            64,
+            {"pid_type": "persistent_blocked"},
+            id="col-sum-warp-columns-persistent",
+        ),
+        pytest.param(
+            col_sum,
+            _col_sum_reference,
+            32,
+            8,
+            8,
+            {"load_eviction_policies": ["l2_last"]},
+            id="col-sum-l2-last",
+        ),
+        pytest.param(
+            col_sum,
+            _col_sum_reference,
+            32,
+            8,
+            8,
+            {"load_eviction_policies": ["l1_l2_first"]},
+            id="col-sum-l1-l2-first",
+        ),
+        pytest.param(col_scale, _col_scale_reference, 32, 8, 8, {}, id="col-scale"),
+        pytest.param(
+            col_scale,
+            _col_scale_reference,
+            32,
+            8,
+            8,
+            {"pid_type": "persistent_interleaved"},
+            id="col-scale-persistent",
+        ),
+        pytest.param(col_stats, _col_stats_reference, 32, 8, 8, {}, id="col-stats"),
+    ),
+)
+def test_column_register_tiles_match_reference(
+    kernel: helion.Kernel,
+    reference: Callable[[torch.Tensor], torch.Tensor],
+    block: int,
+    tile_threads: int,
+    reduction_threads: int,
+    extra: dict[str, Any],
+) -> None:
+    torch.manual_seed(0)
+    x = torch.randn(128, 16384, device=DEVICE)
+    bound = kernel.bind((x,))
+    config = column_config(
+        bound,
+        block=block,
+        tile_threads=tile_threads,
+        reduction_threads=reduction_threads,
+        **extra,
+    )
+    code = bound.to_code(config)
+    assert COLUMN_REDUCE in code
+    compiled = bound.compile_config(config)
+    for _ in range(2):
+        out = compiled(x)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, reference(x), rtol=1e-4, atol=1e-3)
+        x.uniform_(-1, 1)
+
+
+def _col_sum_f32_reference(x: torch.Tensor) -> torch.Tensor:
+    return x.float().sum(0)
+
+
+def _col_scale_three_reference(
+    x: torch.Tensor, u: torch.Tensor, w: torch.Tensor
+) -> torch.Tensor:
+    r = 1.0 / ((x * x).sum(0) + 1.0)[None, :]
+    return x * r + u * r + w
+
+
+def _randn_like_inputs(inputs: tuple[torch.Tensor, ...]) -> None:
+    for tensor in inputs:
+        tensor.copy_(
+            torch.rand_like(tensor, dtype=torch.float32)
+            .mul_(2)
+            .sub_(1)
+            .to(tensor.dtype)
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("kernel", "reference", "dtype", "inputs", "block", "reduction_threads", "vec"),
+    (
+        pytest.param(
+            col_sum_f32_out,
+            _col_sum_f32_reference,
+            torch.bfloat16,
+            1,
+            64,
+            16,
+            8,
+            id="col-sum-bf16-to-fp32",
+        ),
+        pytest.param(
+            col_scale_three,
+            _col_scale_three_reference,
+            torch.float32,
+            3,
+            32,
+            8,
+            4,
+            id="col-scale-three-tiles",
+        ),
+    ),
+)
+def test_supported_store_and_rolled_fallback_match_reference(
+    kernel: helion.Kernel,
+    reference: Callable[..., torch.Tensor],
+    dtype: torch.dtype,
+    inputs: int,
+    block: int,
+    reduction_threads: int,
+    vec: int,
+) -> None:
+    # SM100 can pack eight widened fp32 results into one 32-byte output packet.
+    # Older targets and live-value budget overruns retain rolled fallback.
+    torch.manual_seed(0)
+    tensors = tuple(
+        torch.randn(128, 16384, device=DEVICE).to(dtype) for _ in range(inputs)
+    )
+    bound = kernel.bind(tensors)
+    config = column_config(
+        bound, block=block, tile_threads=8, reduction_threads=reduction_threads, vec=vec
+    )
+    assert config.reduction_loops == [None]
+    code = bound.to_code(config)
+    wide_store = dtype is torch.bfloat16 and torch.cuda.get_device_capability() >= (
+        10,
+        0,
+    )
+    if wide_store:
+        assert "for synthetic_lane_1 in cutlass.range_constexpr(" in code
+        assert COLUMN_REDUCE in code
+        assert code.count("_cute_store_u32_vec(out.iterator") == 1
+    else:
+        assert "for synthetic_lane_1 in range(" in code
+    assert "_lane_stash" not in code
+    compiled = bound.compile_config(config)
+    for _ in range(2):
+        out = compiled(*tensors)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            out.float(), reference(*tensors).float(), rtol=1e-4, atol=1e-4
+        )
+        _randn_like_inputs(tensors)
+
+
+def _col_sum_guarded_reference(x: torch.Tensor, flag: int) -> torch.Tensor:
+    return x.sum(0) * (2.0 if flag > 0 else 1.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("kernel", "reference", "inputs", "extra"),
+    (
+        pytest.param(
+            col_sum_guarded,
+            _col_sum_guarded_reference,
+            1,
+            (1,),
+            id="guard-inside-the-element-loops",
+        ),
+        pytest.param(
+            col_scale_three,
+            _col_scale_three_reference,
+            3,
+            (),
+            id="three-stashed-tiles",
+        ),
+    ),
+)
+def test_looped_retry_matches_reference(
+    kernel: helion.Kernel,
+    reference: Callable[..., torch.Tensor],
+    inputs: int,
+    extra: tuple[int, ...],
+) -> None:
+    # Over 1024 rows with threads [8, 64] the register tile is the only reason
+    # the config keeps the reduction persistent.  When the split rejects the
+    # body, the retry compiles the looped reduction (reduction_loops=[128],
+    # 64 reduction threads) the geometry meant before register tiles existed.
+    torch.manual_seed(0)
+    tensors = tuple(torch.randn(1024, 4096, device=DEVICE) for _ in range(inputs))
+    bound = kernel.bind((*tensors, *extra))
+    config = column_config(bound, block=32, tile_threads=8, reduction_threads=64)
+    assert config.reduction_loops == [None]
+    code = bound.to_code(config)
+    assert "synthetic_lane_1" not in code
+    assert "_REDUCTION_BLOCK_1" in code
+    assert "block=(64, 8, 1)" in code
+    compiled = bound.compile_config(config)
+    for _ in range(2):
+        out = compiled(*tensors, *extra)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            out, reference(*tensors, *extra), rtol=1e-4, atol=1e-4
+        )
+        _randn_like_inputs(tensors)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.cuda
+@pytest.mark.parametrize("reduction_threads", (8, 16))
+def test_column_softmax_chains_two_register_tile_levels(
+    reduction_threads: int,
+) -> None:
+    # One reduction feeding another: the tile is loaded once, the max is
+    # combined, ``exp(t - max)`` is computed once more in a second accumulate
+    # nest and stashed for the store, then the sum is combined.
+    torch.manual_seed(0)
+    x = torch.randn(128, 16384, device=DEVICE)
+    bound = col_softmax.bind((x,))
+    config = column_config(
+        bound, block=32, tile_threads=8, reduction_threads=reduction_threads
+    )
+    assert config.reduction_loops == [None]
+    code = bound.to_code(config)
+    assert "for synthetic_lane_1 in range(" not in code
+    assert code.count("for synthetic_lane_1 in cutlass.range_constexpr(") == 3
+    assert code.count("cute.math.exp2(") == 1
+    assert code.count("cute.arch.load(x.iterator") == 1
+    compiled = bound.compile_config(config)
+    for _ in range(2):
+        out = compiled(x)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, torch.softmax(x, dim=0), rtol=1e-4, atol=1e-5)
+        x.uniform_(-1, 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.cuda
+def test_two_pass_variance_chains_two_register_tile_levels() -> None:
+    # The second reduction reads the first one's mean: level-1 accumulate
+    # nest from the stashed tile, both results flushed by the once-only tail.
+    torch.manual_seed(0)
+    x = torch.randn(128, 16384, device=DEVICE)
+    bound = col_var.bind((x,))
+    config = column_config(bound, block=32, tile_threads=8, reduction_threads=16)
+    code = bound.to_code(config)
+    assert code.count("for synthetic_lane_1 in cutlass.range_constexpr(") == 2
+    assert code.count(COLUMN_REDUCE) == 2
+    compiled = bound.compile_config(config)
+    for _ in range(2):
+        out = compiled(x)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, x.var(0, unbiased=False), rtol=1e-4, atol=1e-5)
+        x.uniform_(-1, 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.cuda
+def test_eight_byte_policy_register_tile_matches_reference() -> None:
+    # fp32 V=2 under ``l1_l2_first``: the 8-byte policy helper is a load the
+    # register tile stashes for its consume nest.
+    torch.manual_seed(0)
+    x = torch.randn(128, 16384, device=DEVICE)
+    y = torch.empty_like(x)
+    bound = col_scale_into.bind((x, y))
+    config = column_config(
+        bound,
+        block=16,
+        tile_threads=8,
+        reduction_threads=8,
+        vec=2,
+        load_eviction_policies=["l1_l2_first"],
+    )
+    code = bound.to_code(config)
+    assert code.count("_cute_load_l1_l2_evict_first_8b(") == 1
+    assert "_lane_stash" in code
+    compiled = bound.compile_config(config)
+    for _ in range(2):
+        compiled(x, y)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(y, _col_scale_reference(x), rtol=1e-4, atol=1e-3)
+        x.uniform_(-1, 1)
+        y.zero_()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.cuda
+def test_dynamic_extent_binding_covers_larger_extents() -> None:
+    # ``static_shapes=False``: the shrunk reduction thread count is forced
+    # looped, so a binding made at 1024 rows reads the extent at runtime and
+    # covers 2048 rows too instead of baking a 32-lane loop from the hint.
+    torch.manual_seed(0)
+    small = torch.randn(1024, 4096, device=DEVICE)
+    bound = col_sum_dynamic.bind((small,))
+    config = column_config(bound, block=32, tile_threads=8, reduction_threads=64)
+    assert config.reduction_loops == [128]
+    compiled = bound.compile_config(config)
+    for x in (small, torch.randn(2048, 4096, device=DEVICE)):
+        out = compiled(x)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, x.sum(0), rtol=1e-4, atol=1e-3)

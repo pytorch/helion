@@ -20,6 +20,8 @@ from test.test_cute_tcgen05_split_k_search import _samples
 from test.test_cute_tcgen05_split_k_search import _sm100_target
 
 import helion
+from helion._compiler.cute.tcgen05_config import repair
+from helion._compiler.cute.tcgen05_config import seeds
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
@@ -33,7 +35,7 @@ def test_ragged_edge_family_keeps_its_128_row_pairs(shape) -> None:
         bound = _bind(*shape)
         spec = bound.config_spec
         tcgen05 = spec._cute_tcgen05_config
-        assert tcgen05.plain_edge_pair128_admitted()
+        assert repair.plain_edge_pair128_admitted(tcgen05)
         gen = ConfigGeneration(spec)
         pair_seeds = [
             seed
@@ -79,8 +81,8 @@ def test_a_grid_of_256_row_pairs_keeps_the_pair_family_as_is() -> None:
     with _sm100_target():
         bound = _bind(4096, 4096, 4096)
         tcgen05 = bound.config_spec._cute_tcgen05_config
-        assert not tcgen05.plain_edge_pair128_admitted()
-        assert tcgen05._plain_edge_pair128_seed_configs(helion.Config()) == []
+        assert not repair.plain_edge_pair128_admitted(tcgen05)
+        assert seeds._plain_edge_pair128_seed_configs(tcgen05, helion.Config()) == []
 
 
 @helion.kernel(backend="cute", static_shapes=True)
@@ -104,7 +106,7 @@ def test_a_half_machine_of_256_row_pairs_keeps_the_edge_family_on_them() -> None
         bound = _bind(5000, 5000, 5000)
         tcgen05 = bound.config_spec._cute_tcgen05_config
         assert 2 in tcgen05.cluster_m_search_choices
-        assert not tcgen05.plain_edge_pair128_admitted()
+        assert not repair.plain_edge_pair128_admitted(tcgen05)
 
 
 def test_fp8_and_auxiliary_epilogues_keep_the_256_row_pair() -> None:
@@ -118,14 +120,14 @@ def test_fp8_and_auxiliary_epilogues_keep_the_256_row_pair() -> None:
         a = torch.empty(1000, 1000, dtype=torch.float8_e4m3fn)
         b = torch.empty(1000, 1000, dtype=torch.float8_e4m3fn).T
         fp8 = _gemm_fp8.bind((a, b)).config_spec._cute_tcgen05_config
-        assert not fp8.plain_edge_pair128_admitted()
+        assert not repair.plain_edge_pair128_admitted(fp8)
         assert fp8.cluster_m_search_choices == (1,)
         a = torch.empty(1000, 1000, dtype=torch.bfloat16)
         b = torch.empty(1000, 1000, dtype=torch.bfloat16)
         bias = torch.empty(1000, dtype=torch.bfloat16)
         aux = _bias_gemm.bind((a, b, bias)).config_spec
-        assert aux.cute_tcgen05_aux_kernel_detected
-        assert not aux._cute_tcgen05_config.plain_edge_pair128_admitted()
+        assert aux.tcgen05.aux_kernel_detected
+        assert not repair.plain_edge_pair128_admitted(aux._cute_tcgen05_config)
         assert 2 in aux._cute_tcgen05_config.cluster_m_search_choices
 
 

@@ -14,6 +14,7 @@ from torch.fx.node import Node
 from torch.fx.node import map_arg
 
 from .. import exc
+from ..language._decorators import BackendDispatchTable
 from ..language._decorators import is_api_func
 from ..language._tracing_ops import _get_symnode
 from ..language.matmul_ops import MATMUL_DIM_BLOCK_IDS_META
@@ -63,7 +64,9 @@ def _env_arg(ctx: LoweringContext, node: Node) -> Argument:
 class AtenLowering(Lowering):
     target: object | None = None
     masked_value_fn: MaskedValueFn | None = None
-    codegen_impls: dict[str, CodegenHandler] = dataclasses.field(default_factory=dict)
+    codegen_impls: BackendDispatchTable[CodegenHandler] = dataclasses.field(
+        default_factory=BackendDispatchTable
+    )
 
     def register_codegen(
         self, backend: str
@@ -78,18 +81,11 @@ class AtenLowering(Lowering):
 
     def codegen(self, ctx: LoweringContext, node: Node) -> object:
         env = CompileEnvironment.current()
-        from .backend_registry import repair_backend_codegen
-
-        repair_backend_codegen(env.codegen_name)
-        handler = self.codegen_impls.get(env.codegen_name)
-        if handler is None:
-            handler = self.codegen_impls.get("common")
-        if handler is None:  # pragma: no cover - defensive
-            target = self.target or "unknown"
-            raise exc.BackendImplementationMissing(
-                env.backend_name,
-                f"Aten lowering codegen not registered for {target!r}",
-            )
+        handler = self.codegen_impls.lookup(
+            env.codegen_name,
+            backend_name=env.backend_name,
+            what=f"Aten lowering codegen not registered for {self.target or 'unknown'!r}",
+        )
         return handler(ctx, node)
 
     def get_masked_value(self, node: Node) -> float | bool | None:
@@ -401,72 +397,6 @@ def _normalize_argreduce_dim(node: Node) -> tuple[torch.Tensor, int]:
             f"{node.target} without an explicit integer dim",
         )
     return input_val, dim
-
-
-def _should_use_cute_argreduce_lowering(argreduce_node: Node) -> bool:
-    from ..language import _tracing_ops
-    from ..language._decorators import is_api_func
-    from .device_ir import DeviceIR
-
-    if CompileEnvironment.current().backend_name != "cute":
-        return False
-    if not argreduce_node.args or not isinstance(argreduce_node.args[0], Node):
-        return False
-
-    matmul_targets = {
-        torch.matmul,
-        torch.ops.aten.mm.default,
-        torch.ops.aten.addmm.default,
-        torch.ops.aten.bmm.default,
-        torch.ops.aten.baddbmm.default,
-    }
-    try:
-        device_ir = DeviceIR.current()
-        graph_by_id = {
-            idx: graph_info
-            for idx, graph_info in enumerate(getattr(device_ir, "graphs", ()))
-            if hasattr(graph_info, "graph")
-        }
-    except (AttributeError, IndexError):
-        graph_by_id = {}
-    seen_graph_ids: set[int] = set()
-    seen_nodes: set[Node] = set()
-
-    def graph_contains_matmul(graph_id: int) -> bool:
-        if graph_id in seen_graph_ids:
-            return False
-        seen_graph_ids.add(graph_id)
-        graph_info = graph_by_id.get(graph_id)
-        graph = getattr(graph_info, "graph", None)
-        if not isinstance(graph, torch.fx.Graph):
-            return False
-        return any(node_contains_matmul(node) for node in graph.nodes)
-
-    def node_contains_matmul(node: Node) -> bool:
-        if node in seen_nodes:
-            return False
-        seen_nodes.add(node)
-        if node.op != "call_function":
-            return False
-        if node.target in matmul_targets:
-            return True
-        if is_api_func(node.target):
-            name = getattr(node.target, "__name__", "")
-            if name == "dot":
-                return True
-            if _tracing_ops.is_for_loop_target(node.target):
-                graph_id = node.args[0] if node.args else None
-                if isinstance(graph_id, int) and graph_contains_matmul(graph_id):
-                    return True
-        for arg in node.args:
-            if isinstance(arg, Node) and node_contains_matmul(arg):
-                return True
-        for arg in node.kwargs.values():
-            if isinstance(arg, Node) and node_contains_matmul(arg):
-                return True
-        return False
-
-    return node_contains_matmul(argreduce_node.args[0])
 
 
 def _triton_argreduce(ctx: LoweringContext, node: Node, reduction_type: str) -> ast.AST:

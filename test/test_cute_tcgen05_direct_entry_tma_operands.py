@@ -12,13 +12,16 @@ from test.test_cute_shared_rhs_grouped import _bind as _bind_shared_rhs_grouped
 from test.test_cute_shared_rhs_grouped import _inputs as _shared_rhs_grouped_inputs
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2FfiHeuristic
+from helion._compiler.cute import target_facts
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteTcgen05ClusterM2FfiHeuristic,
+)
 from helion._compiler.cute.cute_mma import _CuteMmaNode
 from helion._compiler.cute.cute_mma import _tcgen05_grouped_rhs_keeps_store_protocol
 from helion._compiler.cute.cute_mma import _tcgen05_mma_output_tma_store_provable
 from helion._compiler.cute.cute_mma import analyze_cute_mma_node
 from helion._compiler.cute.mma_support import get_cute_mma_support
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute.tcgen05_config import seeds
 from helion._hardware import HardwareInfo
 from helion._testing import DEVICE
 from helion._testing import import_example
@@ -183,8 +186,8 @@ class TestCuteTcgen05DirectEntryTmaOperands(unittest.TestCase):
         )
         bound = kernel.bind((a, b))
         spec = bound.config_spec
-        self.assertFalse(spec.cute_tcgen05_matmul_operands_tma_provable)
-        self.assertFalse(spec._tcgen05_full_tile_direct_entry_seed_eligible())
+        self.assertFalse(spec.tcgen05.matmul_operands_tma_provable)
+        self.assertFalse(seeds.full_tile_direct_entry_seed_eligible(spec.tcgen05))
         config = spec.default_config()
         self.assertIsNot(config.config.get("tcgen05_tvm_ffi_launch"), True)
         self.assertIsNot(config.config.get("tcgen05_flat_role_coordinates"), True)
@@ -201,8 +204,8 @@ class TestCuteTcgen05DirectEntryTmaOperands(unittest.TestCase):
         b = torch.randn([768, 1024], device=DEVICE, dtype=torch.bfloat16)
         bound = _ordinary_gemm.bind((a, b))
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_matmul_operands_tma_provable)
-        self.assertTrue(spec._tcgen05_full_tile_direct_entry_seed_eligible())
+        self.assertTrue(spec.tcgen05.matmul_operands_tma_provable)
+        self.assertTrue(seeds.full_tile_direct_entry_seed_eligible(spec.tcgen05))
         config = spec.default_config()
         code = bound.to_code(config)
         self.assertIn("a = torch.constant_pad_nd(", code)
@@ -224,15 +227,15 @@ class TestCuteTcgen05DirectEntryTmaOperands(unittest.TestCase):
         spec = bound.config_spec
         row_major_spec = _ordinary_gemm.bind((a.contiguous(), b)).config_spec
         self.assertEqual(
-            spec._tcgen05_full_tile_direct_entry_seed_eligible(),
-            row_major_spec._tcgen05_full_tile_direct_entry_seed_eligible(),
+            seeds.full_tile_direct_entry_seed_eligible(spec.tcgen05),
+            seeds.full_tile_direct_entry_seed_eligible(row_major_spec.tcgen05),
         )
         self.assertEqual(spec.default_config(), row_major_spec.default_config())
         a_major = re.compile(
             r"make_trivial_tiled_mma\([^,]+, [^,]+, cute\.nvgpu\.OperandMajorMode\.MN"
         )
         for config in (spec.default_config(), helion.Config(block_sizes=[128, 64, 64])):
-            self.assertRegex(bound.to_triton_code(config), a_major)
+            self.assertRegex(bound.to_code(config), a_major)
             bound.set_config(config)
             torch.testing.assert_close(
                 bound(a, b), torch.matmul(a, b), rtol=1e-2, atol=1e-1
@@ -249,9 +252,9 @@ class TestCuteTcgen05DirectEntryTmaOperands(unittest.TestCase):
         b = torch.randn([256, 256], device=DEVICE, dtype=torch.float16).T
         bound = _ordinary_gemm.bind((a, b))
         with self.assertRaisesRegex(helion.exc.BackendUnsupported, "block_n=8"):
-            bound.to_triton_code(helion.Config(block_sizes=[64, 8, 16]))
+            bound.to_code(helion.Config(block_sizes=[64, 8, 16]))
         config = helion.Config(block_sizes=[64, 8, 32])
-        self.assertIn("tcgen05", bound.to_triton_code(config))
+        self.assertIn("tcgen05", bound.to_code(config))
         bound.set_config(config)
         torch.testing.assert_close(
             bound(a, b), torch.matmul(a, b), rtol=1e-2, atol=1e-1
@@ -269,8 +272,8 @@ class TestCuteTcgen05DirectEntryTmaOperands(unittest.TestCase):
         w = torch.randn([768, 1024], device=DEVICE, dtype=torch.bfloat16)
         bound = broadcast_matmul.bind((x, w))
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_matmul_operands_tma_provable)
-        self.assertTrue(spec._tcgen05_full_tile_direct_entry_seed_eligible())
+        self.assertTrue(spec.tcgen05.matmul_operands_tma_provable)
+        self.assertTrue(seeds.full_tile_direct_entry_seed_eligible(spec.tcgen05))
         config = spec.default_config()
         self.assertIs(config.config.get("tcgen05_tvm_ffi_launch"), True)
         self.assertIs(config.config.get("tcgen05_flat_role_coordinates"), True)
@@ -285,11 +288,9 @@ class TestCuteTcgen05DirectEntryTmaOperands(unittest.TestCase):
         b = torch.randn([768, 1024], device=DEVICE, dtype=torch.bfloat16)
         bound = _make_ordinary_gemm_into().bind((a, b, out))
         spec = bound.config_spec
+        self.assertEqual(spec.tcgen05.matmul_operands_tma_provable, tma_store_legal)
         self.assertEqual(
-            spec.cute_tcgen05_matmul_operands_tma_provable, tma_store_legal
-        )
-        self.assertEqual(
-            spec._tcgen05_full_tile_direct_entry_seed_eligible(), tma_store_legal
+            seeds.full_tile_direct_entry_seed_eligible(spec.tcgen05), tma_store_legal
         )
         config = spec.default_config()
         self.assertEqual(
@@ -335,10 +336,11 @@ class TestCuteTcgen05DirectEntryTmaOperands(unittest.TestCase):
 def _blackwell_bind_patches() -> Iterator[None]:
     with (
         patch_cute_mma_support(),
-        patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+        patch(
+            "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+            return_value=132,
         ),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=232448),
     ):
         yield
 
@@ -357,10 +359,10 @@ class TestCuteTcgen05DirectEntryTmaOutputProof(unittest.TestCase):
                 bound = _make_ordinary_gemm_into().bind((a, b, out))
                 spec = bound.config_spec
                 self.assertEqual(
-                    spec.cute_tcgen05_matmul_operands_tma_provable, tma_store_legal
+                    spec.tcgen05.matmul_operands_tma_provable, tma_store_legal
                 )
                 self.assertEqual(
-                    spec._tcgen05_full_tile_direct_entry_seed_eligible(),
+                    seeds.full_tile_direct_entry_seed_eligible(spec.tcgen05),
                     tma_store_legal,
                 )
                 self.assertEqual(
@@ -435,14 +437,14 @@ class TestCuteTcgen05DirectEntryTmaOutputProof(unittest.TestCase):
             bound = _bind_shared_rhs_grouped(
                 grouped_gemm_jagged.fn, _shared_rhs_grouped_inputs()
             )
-        self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+        self.assertTrue(bound.config_spec.tcgen05.search_enabled)
         _node, candidate = self._single_mma_candidate(bound)
         rhs = candidate.operands.rhs
         self.assertTrue(rhs.rhs_is_grouped)
         self.assertFalse(rhs.rhs_rank3_grouped_nt)
         self.assertIsNotNone(rhs.rhs_packed_group)
         self.assertIsNone(rhs.rhs_segment_group)
-        self.assertTrue(bound.config_spec.cute_tcgen05_matmul_operands_tma_provable)
+        self.assertTrue(bound.config_spec.tcgen05.matmul_operands_tma_provable)
         self._assert_output_proof_consulted(bound, consulted=True)
 
     def test_rank3_nk_major_grouped_rhs_is_exempt_from_output_proof(self) -> None:
@@ -504,7 +506,7 @@ class TestCuteTcgen05DirectEntryTmaOutputProof(unittest.TestCase):
         with (
             patch_cute_mma_support(),
             patch(
-                "helion._compiler.autotuner_heuristics.cute."
+                "helion._compiler.cute.autotune.heuristics.cute."
                 "tcgen05_runtime_n_ptx_compatible",
                 return_value=True,
             ),

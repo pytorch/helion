@@ -35,7 +35,7 @@ from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from ..compile_environment import CompileEnvironment
 from .memory_ops import tensor_has_specialized_base_alignment
-from .persistent_branch_vec import _plain_scalar_load_pointer
+from .packet_access import match_packet_access
 from .scalar_recipe import PURE_HELPERS
 
 if TYPE_CHECKING:
@@ -288,17 +288,13 @@ def _pointer(node: ast.expr) -> _Pointer | None:
 
 def _load_call(node: ast.Call) -> tuple[ast.expr, str | None] | None:
     """``(pointer, element dtype)`` of a scalar load; dtype ``None`` for ``.load()``."""
-    name = ast.unparse(node.func)
-    if name == "cute.arch.load":
-        if len(node.args) != 2 or node.keywords:
-            return None
-        dtype = node.args[1]
-        if not isinstance(dtype, ast.Attribute):
-            return None
-        return node.args[0], ast.unparse(dtype)
-    pointer = _plain_scalar_load_pointer(node)
-    if pointer is not None:
-        return pointer, None
+    access = match_packet_access(node)
+    if access is None:
+        return None
+    if access.kind == "arch_load" and not access.keywords:
+        return access.pointer, access.carrier
+    if access.kind == "load":
+        return access.pointer, None
     return None
 
 

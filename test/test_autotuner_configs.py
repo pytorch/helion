@@ -597,7 +597,7 @@ class TestConfigValuePriors(TestCase):
         # Disable size repair/shrink so the forced value is observed verbatim.
         with (
             patch.object(gen, "shrink_config", lambda *a, **k: None),
-            patch.object(gen, "_repair_cute_num_threads", lambda *a, **k: None),
+            patch.object(gen.extension, "repair_flat_config", lambda *a, **k: None),
         ):
             for _ in range(25):
                 self.assertEqual(gen.biased_random_flat()[flat_idx], value)
@@ -641,7 +641,12 @@ class TestConfigValuePriors(TestCase):
             population = gen.random_population_flat(6)
         self.assertEqual(population, [default_flat] * 6)
 
+    @onlyBackends(["cute"])
     def test_flash_population_stores_normalized_flat_configs(self) -> None:
+        # The flash population path is the CuTe search surface's
+        # (``CuteConfigGenerationExtension.initial_population_flats``); the
+        # default backend's no-op extension takes the generic path, so
+        # ``cute_flash_search_enabled`` is inert there.
         gen, _ = self._add_config_gen()
         default_flat = gen.default_flat()
         normalized = gen.unflatten(default_flat)

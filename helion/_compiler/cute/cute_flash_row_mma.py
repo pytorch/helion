@@ -43,8 +43,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ..emitter_protocols import statements_adapter
 from .attention_plan import CAUSAL_MASK_KIND
 from .attention_plan import TENSOR_BIAS_KIND
+from .flash_knobs import ROW_MMA_FAMILY as ROW_MMA_FAMILY
 from .flash_row_epilogue import emit_row_epilogue
 
 if TYPE_CHECKING:
@@ -53,7 +55,6 @@ if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
     from .cute_flash import FlashRowEpilogueEmit
 
-ROW_MMA_FAMILY = "row_mma"
 # The score modifiers the row programs host: the square causal mask (a
 # per-element select on the S^T fragment before the row max, with the chunk
 # loop trimmed to the keys a warp can see) and one additive tensor bias (its
@@ -1129,3 +1130,6 @@ def emit_flash_row_mma_device_body(
             )
     source = "\n".join(lines) + "\n"
     return list(ast.parse(textwrap.dedent(source)).body)
+
+
+emit_flash_row_mma_body = statements_adapter(emit_flash_row_mma_device_body)

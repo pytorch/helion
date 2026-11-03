@@ -18,16 +18,15 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -80,14 +79,7 @@ def _config(
 
 @contextmanager
 def _cpu_codegen() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU test")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
         yield
 
 

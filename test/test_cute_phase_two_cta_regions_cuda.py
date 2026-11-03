@@ -23,16 +23,15 @@ from test._cute_se_bwd_chains import se_bwd_da_chain
 from test._cute_se_bwd_chains import se_bwd_dx_chain
 
 import helion
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import surface
 from helion._testing import DEVICE
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 squeeze_and_excitation_net_bwd_dc = import_example(
     "squeeze_and_excitation_net"
 ).squeeze_and_excitation_net_bwd_dc
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 def _requires_sm100() -> None:
@@ -145,7 +144,7 @@ def _check_bwd_dx(
         autotune_effort="none",
     )
     bound = kernel._bind_isolated(args)
-    assert bound.config_spec._cute_tcgen05_config.region_pid_type_choices()
+    assert surface.region_pid_type_choices(bound.config_spec._cute_tcgen05_config)
     # grad_c: 512x256x512 (relu-backward mask), grad_x: 512x512x256
     # (grad_out * d + acc); 128x128x64 CTA-pair tiles, 4-deep AB rings.
     tiles = [128, 128, 64, 128, 128, 64]
@@ -229,7 +228,7 @@ def test_bwd_dc_one_gemm_chain_region_launches(pdl: bool) -> None:
     state = bound.config_spec._cute_tcgen05_config
     # grad_cb: 512x512 pointwise phase; grad_c: 512x256x512 (relu mask).
     assert state.materialized_matmul_shapes == ((512, 256, 512),)
-    assert state.region_pid_type_choices()
+    assert surface.region_pid_type_choices(state)
     tiles = [128, 128, 64]
     flat = _chain_config(bound, None, tiles=tiles, region_ab_stages=[], pdl=pdl)
     assert flat.config["tcgen05_ab_stages"] == 2
@@ -375,11 +374,11 @@ def test_chain_seeds_compile_and_match() -> None:
     )
     bound = kernel._bind_isolated(args)
     spec = bound.config_spec
-    seeds = spec._cute_tcgen05_config.region_two_cta_seed_configs()
+    seed_configs = seeds.region_two_cta_seed_configs(spec._cute_tcgen05_config)
     # Two K tiles x (all persistent, grad_c flat, grad_x flat).
-    assert len(seeds) == 6
+    assert len(seed_configs) == 6
     expected = bound.compile_config(spec.default_config(), allow_print=False)(*args)
-    for seed in seeds:
+    for seed in seed_configs:
         config = helion.Config.from_dict(spec.default_config().config | seed.config)
         spec.normalize(config)
         assert (

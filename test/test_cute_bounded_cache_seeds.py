@@ -12,7 +12,7 @@ from .test_cute_bounded_cache_codegen import _cpu_target
 from .test_cute_bounded_cache_codegen import _functions
 import helion
 from helion._compiler.autotuner_heuristics import HEURISTICS_BY_BACKEND
-from helion._compiler.autotuner_heuristics.cute_bounded_loop_cache import (
+from helion._compiler.cute.autotune.heuristics.cute_bounded_loop_cache import (
     CuteBoundedLoopCacheHeuristic,
 )
 from helion._testing import skipUnlessBackends

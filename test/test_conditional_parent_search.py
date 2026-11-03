@@ -7,6 +7,9 @@ from unittest.mock import Mock
 import pytest
 
 import helion
+from helion._compiler.cute.autotune.config_generation_ext import (
+    CuteConfigGenerationExtension,
+)
 from helion._compiler.cute.cute_flash import flash_structural_leaf_from_config
 from helion.autotuner import LFBOPatternSearch
 from helion.autotuner.base_search import PopulationMember
@@ -29,7 +32,6 @@ class _ConditionalGeneration:
     """Small conditional surface with inherited, fixed parent schedule values."""
 
     coordinate_neighbor_projections = ConfigGeneration.coordinate_neighbor_projections
-    flash_owned_coordinate_indices = ConfigGeneration.flash_owned_coordinate_indices
     keys = ("cute_flash_e2e_schedule", "cute_flash_packed_reduce", "cute_flash_s_stage")
     block_size_indices = ()
     num_warps_index = -1
@@ -37,6 +39,7 @@ class _ConditionalGeneration:
     process_group_name = None
 
     def __init__(self, values=(True, False)):
+        self.extension = CuteConfigGenerationExtension(self)
         self.overridden_flat_indices = {2}
         self._override_values = {}
         self.flat_spec = [_Fragment(()), _Fragment(values), _Fragment((2,))]

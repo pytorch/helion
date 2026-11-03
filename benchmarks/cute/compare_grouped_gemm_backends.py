@@ -291,7 +291,7 @@ def _prepare_helion(
         },
     )
     bound = kernel.bind(kernel_args)
-    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    bound.env.config_spec.tcgen05.search_enabled = True
     bound.set_config(config)
 
     def launch() -> object:
@@ -358,7 +358,7 @@ def prepare_cutlass(
     import cutlass.utils as cutlass_utils
     import torch
 
-    from helion.runtime import _ensure_cute_dsl_arch_env
+    from helion.runtime.cute.launcher import _ensure_cute_dsl_arch_env
 
     _ensure_cute_dsl_arch_env(())
     initial = tuple(

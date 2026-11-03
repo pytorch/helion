@@ -15,27 +15,15 @@ from test.test_cute_host_paired_sum import _literal
 from test.test_cute_host_paired_sum_seeds import _population
 
 import helion
-from helion._compiler.cute.host_paired_sum import PAIRED_SUM_KEY
-from helion._testing import skipUnlessBackends
+from helion._compiler.cute.host_sum_site import PAIRED_SUM_KEY
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import InvalidConfig
 import helion.language as hl
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
+pytestmark = [pytest.mark.cpu_only, pytest.mark.cpu_render]
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from pathlib import Path
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

@@ -182,7 +182,7 @@ def test_supplied_converted_full_storage_keeps_raw_empty_and_lane_arrivals(
 @pytest.mark.parametrize(
     "edited",
     (
-        "tcgen05_grouped_prefix",
+        "tcgen05_flattened_prefix",
         "tcgen05_operand_pipeline",
         "tcgen05_operand_transform",
         "tcgen05_storage",
@@ -192,7 +192,7 @@ def test_native_helper_dependency_edit_changes_only_native_disk_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, edited: str
 ) -> None:
     paths = set(source_dependencies._COMMON_DEPENDENCIES)
-    for dependencies in source_dependencies._WRAPPER_DEPENDENCIES.values():
+    for dependencies in source_dependencies.wrapper_dependencies().values():
         paths.update(dependencies)
     for relative in paths:
         path = tmp_path / relative

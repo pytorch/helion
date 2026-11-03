@@ -72,8 +72,8 @@ from helion.autotuner.process_utils import start_isolated_process_group
 from helion.autotuner.random_search import RandomSearch
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
 import helion.language as hl
-from helion.runtime import _create_cute_wrapper
 from helion.runtime.config import Config
+from helion.runtime.cute.launcher import _create_cute_wrapper
 from helion.runtime.settings import Settings
 
 if TYPE_CHECKING:
@@ -1310,6 +1310,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             backend=SimpleNamespace(
                 name="cute",
                 get_do_bench=lambda: None,
+                prefers_wall_clock_bench=lambda: True,
                 probe_long_autotune_kernels=lambda _config_spec: False,
             ),
             cute_flash_search_enabled=False,
@@ -1661,6 +1662,9 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_timeout_kills_worker(self) -> None:
         worker = BenchmarkWorker()
         try:
+            # Warm the worker: its start precedes the job's deadline and
+            # takes seconds, which the promptness bound below is not about.
+            self.assertEqual(worker.run(_ReturnValue(0), timeout=60.0), 0)
             t0 = time.time()
             with self.assertRaises(BenchmarkTimeout):
                 worker.run(_Sleep(60), timeout=0.5)
@@ -1874,6 +1878,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
 
         worker = BenchmarkWorker()
         try:
+            self.assertEqual(worker.run(_ReturnValue(0), timeout=60.0), 0)
             t0 = time.time()
             with (
                 patch.object(Connection, "poll", poll_until_ready),

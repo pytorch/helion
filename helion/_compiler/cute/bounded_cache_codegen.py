@@ -40,9 +40,6 @@ if TYPE_CHECKING:
     from ..device_function import DeviceFunction
 
 
-BOUNDED_SEQUENCE_MODES = frozenset({"bounded", "bounded_layout"})
-
-
 def _launch_block(df: DeviceFunction) -> tuple[int, int, int] | None:
     """Read the emitted launcher; strategy x/y order is not authoritative."""
     calls = [
@@ -105,7 +102,7 @@ class BoundedCacheRequest:
         if (
             df.codegen.cute_wrapper_plans
             or df.codegen.cute_uses_matmul
-            or df.cute_state.simt_cluster_n != 1
+            or df.cute_state.lanes.simt_cluster_n != 1
             or df.has_rng_ops()
             or df._scratch_args
             or df.wrapper_only_params

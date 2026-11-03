@@ -767,33 +767,6 @@ def flash_bwd_flex_2cta_shared_storage(
     return SharedStorageFlex2cta
 
 
-@dsl_user_op
-def cpasync_reduce_bulk_add_f32(
-    smem_ptr: cute.Pointer,
-    gmem_ptr: cute.Pointer,
-    store_bytes: object,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    """Bulk-group async global reduce-add (f32) from a contiguous smem chunk.
-
-    Ported from flash-attention main's ``copy_utils.cpasync_reduce_bulk_add_f32``
-    (the dQaccum accumulation primitive). Pair with
-    ``cute.arch.cp_async_bulk_commit_group`` / ``cp_async_bulk_wait_group``.
-    """
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    llvm.inline_asm(
-        None,
-        [gmem_ptr.llvm_ptr, smem_ptr_i32, cutlass.Int32(store_bytes).ir_value()],
-        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
-        "l,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
 def fbwd_p_pairs_packed(
     frg: cute.Tensor,
     lse_frg: cute.Tensor,
@@ -1201,26 +1174,6 @@ def fbwd_ds_pairs_packed_off(
         dp_any[dp_off + 2 * v + 1] = b
 
 
-@dsl_user_op
-def red_global_add_f32(
-    gmem_ptr: cute.Pointer,
-    val: object,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    """Fire-and-forget scalar global reduce-add (no result, no scoreboard)."""
-    llvm.inline_asm(
-        None,
-        [gmem_ptr.llvm_ptr, Float32(val).ir_value(loc=loc, ip=ip)],
-        "red.global.add.f32 [$0], $1;",
-        "l,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
 def mbar_spin_wait(
     mbar_ptr: object, phase: object, wait_hint: int = 10_000_000
 ) -> None:
@@ -1489,13 +1442,13 @@ def _evaluate_polynomial_2(x: Float32, y: Float32, poly: tuple) -> tuple:
     return out
 
 
-def ex2_emulation_2(x: Float32, y: Float32) -> tuple:
-    """FA4 ex2_emulation_2: software exp2 for a pair (x, y) via FMA/ALU pipe.
+def _ex2_emulation_poly_2(x: Float32, y: Float32, poly: tuple) -> tuple:
+    """Software exp2 of the pair (x, y) on the FMA/ALU pipe with ``poly``.
 
     Fully on the FMA/ALU pipe (packed-f32x2 add/sub/mul + shl/IMAD), NO XU.
     Assumes x, y <= 127.0.  Splits each input into integer + fractional parts
-    using the round-to-int magic constant, evaluates the degree-3 poly on the
-    frac, and reconstructs 2^x = 2^int * 2^frac.
+    using the round-to-int magic constant, evaluates ``poly`` on the frac, and
+    reconstructs 2^x = 2^int * 2^frac.
     """
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     xy_rounded = cute.arch.add_packed_f32x2(
@@ -1505,14 +1458,14 @@ def ex2_emulation_2(x: Float32, y: Float32) -> tuple:
     )
     xy_rounded_back = _sub_packed_f32x2(xy_rounded, (_FP32_ROUND_INT, _FP32_ROUND_INT))
     xy_frac = _sub_packed_f32x2(xy_clamped, xy_rounded_back)
-    xy_frac_ex2 = _evaluate_polynomial_2(xy_frac[0], xy_frac[1], _POLY_EX2_DEG3)
+    xy_frac_ex2 = _evaluate_polynomial_2(xy_frac[0], xy_frac[1], poly)
     x_out = _combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0])
     y_out = _combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1])
     return x_out, y_out
 
 
-def ex2_emulation_batch(pairs: list[tuple]) -> list[tuple]:
-    """Level-schedule software exp2 for independent packed pairs."""
+def _ex2_emulation_poly_batch(pairs: list[tuple], poly: tuple) -> list[tuple]:
+    """Level-schedule software exp2 for independent packed pairs with ``poly``."""
     xy_clamped = [
         (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0)) for x, y in pairs
     ]
@@ -1531,11 +1484,11 @@ def ex2_emulation_batch(pairs: list[tuple]) -> list[tuple]:
     xy_frac = list(
         starmap(_sub_packed_f32x2, zip(xy_clamped, xy_rounded_back, strict=True))
     )
-    xy_frac_ex2 = [(_POLY_EX2_DEG3[-1], _POLY_EX2_DEG3[-1]) for _ in pairs]
-    for coefficient in reversed(_POLY_EX2_DEG3[:-1]):
+    xy_frac_ex2 = [(poly[-1], poly[-1]) for _ in pairs]
+    for coefficient in reversed(poly[:-1]):
         xy_frac_ex2 = [
-            _fma_packed_f32x2(poly, frac, (coefficient, coefficient))
-            for poly, frac in zip(xy_frac_ex2, xy_frac, strict=True)
+            _fma_packed_f32x2(poly_value, frac, (coefficient, coefficient))
+            for poly_value, frac in zip(xy_frac_ex2, xy_frac, strict=True)
         ]
     return [
         (
@@ -1544,57 +1497,26 @@ def ex2_emulation_batch(pairs: list[tuple]) -> list[tuple]:
         )
         for rounded, frac_ex2 in zip(xy_rounded, xy_frac_ex2, strict=True)
     ]
+
+
+def ex2_emulation_2(x: Float32, y: Float32) -> tuple:
+    """FA4 ex2_emulation_2: degree-3 software exp2 for a pair (x, y)."""
+    return _ex2_emulation_poly_2(x, y, _POLY_EX2_DEG3)
+
+
+def ex2_emulation_batch(pairs: list[tuple]) -> list[tuple]:
+    """Level-schedule degree-3 software exp2 for independent packed pairs."""
+    return _ex2_emulation_poly_batch(pairs, _POLY_EX2_DEG3)
 
 
 def ex2_emulation_deg2_2(x: Float32, y: Float32) -> tuple:
     """Packed degree-2 software exp2 with a [0, 1] minimax approximation."""
-    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
-    xy_rounded = cute.arch.add_packed_f32x2(
-        xy_clamped,
-        (_FP32_ROUND_INT, _FP32_ROUND_INT),
-        rnd="rm",
-    )
-    xy_rounded_back = _sub_packed_f32x2(xy_rounded, (_FP32_ROUND_INT, _FP32_ROUND_INT))
-    xy_frac = _sub_packed_f32x2(xy_clamped, xy_rounded_back)
-    xy_frac_ex2 = _evaluate_polynomial_2(xy_frac[0], xy_frac[1], _POLY_EX2_DEG2)
-    x_out = _combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0])
-    y_out = _combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1])
-    return x_out, y_out
+    return _ex2_emulation_poly_2(x, y, _POLY_EX2_DEG2)
 
 
 def ex2_emulation_deg2_batch(pairs: list[tuple]) -> list[tuple]:
     """Level-schedule independent packed degree-2 software exp2 pairs."""
-    xy_clamped = [
-        (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0)) for x, y in pairs
-    ]
-    xy_rounded = [
-        cute.arch.add_packed_f32x2(
-            pair,
-            (_FP32_ROUND_INT, _FP32_ROUND_INT),
-            rnd="rm",
-        )
-        for pair in xy_clamped
-    ]
-    xy_rounded_back = [
-        _sub_packed_f32x2(pair, (_FP32_ROUND_INT, _FP32_ROUND_INT))
-        for pair in xy_rounded
-    ]
-    xy_frac = list(
-        starmap(_sub_packed_f32x2, zip(xy_clamped, xy_rounded_back, strict=True))
-    )
-    xy_frac_ex2 = [(_POLY_EX2_DEG2[-1], _POLY_EX2_DEG2[-1]) for _ in pairs]
-    for coefficient in reversed(_POLY_EX2_DEG2[:-1]):
-        xy_frac_ex2 = [
-            _fma_packed_f32x2(poly, frac, (coefficient, coefficient))
-            for poly, frac in zip(xy_frac_ex2, xy_frac, strict=True)
-        ]
-    return [
-        (
-            _combine_int_frac_ex2(rounded[0], frac_ex2[0]),
-            _combine_int_frac_ex2(rounded[1], frac_ex2[1]),
-        )
-        for rounded, frac_ex2 in zip(xy_rounded, xy_frac_ex2, strict=True)
-    ]
+    return _ex2_emulation_poly_batch(pairs, _POLY_EX2_DEG2)
 
 
 def ex2_emulation_deg1_2(x: Float32, y: Float32) -> tuple:
@@ -2400,92 +2322,25 @@ def causal_mask_t2r_chunk(
     mask_r2p_sm100_rank1(tLDrS, col_limit)
 
 
-def fa4_exp2_convert_rowsum(
-    tLDrS: cute.Tensor,
-    tSTrS_e: cute.Tensor,
-    scale: Float32,
-    minus_max_scale: Float32,
-    e2e_freq: int,
-    e2e_res: int,
-    io_dtype: object = cutlass.Float16,
-) -> Float32:
-    """FUSED FA4 softmax: scale-subtract + exp2(pipe-split) + f32->f16 convert +
-    deferred packed row-sum, returning the row-sum.
-
-    Faithful port of the verified zero-spill structure:
-    ``_lean_exp_convert`` FA4_EXP=="sp"/"fa4ip" ->
-    ``_sp_exp2_convert`` + ``_row_sum_packed``. Replaces the prior 3-pass
-    [exp2_split_inplace (full-row scale-subtract THEN a full-row exp2 split) +
-    fadd_reduce_packed (a 3rd full-row sum pass) + separate frag-by-frag convert]
-    sequence whose simultaneous live set (full f32 row + the exp2-emulation temps +
-    the reduction accumulators + the fp16 buffer) overran the 200-reg grant and
-    spilled (~109 LDL/STL in the softmax region).
-
-    The fused convert pass holds only ONE 32-elem fragment's transients at a time:
-    per 32-element fragment, in order:
-      (1) packed-f32x2 scale-subtract (scale * x + minus_max_scale);
-      (2) exp2 with the FA4 per-pair pipe-split -- most pairs to the hardware XU
-          (cute.arch.exp2 = ex2.approx.ftz.f32), the e2e_res residue pairs per period
-          to the FMA-pipe poly (ex2_emulation_2); the last pair of the row is always
-          routed to the XU (FA4 e2e_frg_limit=1 guard);
-      (3) ONE 32-wide .store(.load().to(fp16)) of the fragment into tSTrS_e (frees
-          the fragment's f32 temps before the next fragment).
-    The row-sum is then a SEPARATE deferred pass (``_row_sum_packed``) over the now
-    in-place exp'd ``tLDrS`` -- exactly the spike ordering. Deferring it keeps the 4
-    packed accumulators OFF the peak during the exp2/convert burst (folding them in
-    inline re-introduced ~45 spills/softmax, the convert temps + 8 accum regs
-    coexisting); the spike measured this deferred form as STACK:0.
-
-    The pair gate matches ``exp2_split_inplace`` EXACTLY (global pair index across the
-    full row), so the numerics are byte-identical to the prior split path -- only the
-    op grouping / register lifetimes change. ``e2e_freq`` / ``e2e_res`` are codegen
-    constants so the per-pair branch is resolved statically during trace.
-    """
-    n = cute.size(tLDrS)
-    assert n % 8 == 0, "fa4_exp2_convert_rowsum requires a multiple-of-8 row"
-    frg_tile = 32
-    frg_cnt = n // frg_tile
-    last_pair_idx = n // 2 - 1
-    tLDrS_frg = cute.logical_divide(tLDrS, cute.make_layout(frg_tile))
-    tSTrS_e_frg = cute.logical_divide(tSTrS_e, cute.make_layout(frg_tile))
-    for j in range(frg_cnt):
-        base_pair = (j * frg_tile) // 2
-        for k in range(0, frg_tile, 2):
-            r0, r1 = cute.arch.fma_packed_f32x2(
-                (tLDrS_frg[k, j], tLDrS_frg[k + 1, j]),
-                (scale, scale),
-                (minus_max_scale, minus_max_scale),
-            )
-            pair_idx = base_pair + k // 2
-            is_last = pair_idx >= last_pair_idx
-            use_xu = (pair_idx % e2e_freq) < (e2e_freq - e2e_res) or is_last
-            if use_xu:
-                r0 = cute.arch.exp2(r0)
-                r1 = cute.arch.exp2(r1)
-            else:
-                r0, r1 = ex2_emulation_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
-            tLDrS_frg[k, j] = r0
-            tLDrS_frg[k + 1, j] = r1
-        # ONE 32-wide convert -> staged-P fp16 chunk; frees the fragment's temps.
-        tSTrS_e_frg[None, j].store(  # pyrefly: ignore[missing-attribute]
-            tLDrS_frg[None, j].load().to(io_dtype)  # pyrefly: ignore[missing-attribute]
+def _disc_chunk_mask(
+    causal: bool,
+    frg: cute.Tensor,
+    tLDcS: cute.Tensor,
+    ci: int,
+    m_block: object,
+    n_block: object,
+) -> None:
+    """Causal-mask the loaded score chunk ``ci`` in place when ``causal`` (the
+    one step the chunked PASS2 helpers' causal body adds; a no-op for the
+    dense body)."""
+    if cutlass.const_expr(causal):
+        causal_mask_t2r_chunk(
+            frg,
+            cast("cute.Tensor", tLDcS[None, ci, None, None]),
+            cast("cutlass.Int32", m_block),
+            cast("cutlass.Int32", n_block),
+            ci,
         )
-    # DEFERRED packed row-sum (spike _row_sum_packed): 4 packed-f32x2 accumulators
-    # over the now-exp'd row, AFTER the convert burst so they never coexist with
-    # the convert temps -> off the spill peak.
-    s0 = (tLDrS[0], tLDrS[1])
-    s1 = (tLDrS[2], tLDrS[3])
-    s2 = (tLDrS[4], tLDrS[5])
-    s3 = (tLDrS[6], tLDrS[7])
-    for i in range(8, n, 8):
-        s0 = _add_packed_f32x2(s0, (tLDrS[i + 0], tLDrS[i + 1]))
-        s1 = _add_packed_f32x2(s1, (tLDrS[i + 2], tLDrS[i + 3]))
-        s2 = _add_packed_f32x2(s2, (tLDrS[i + 4], tLDrS[i + 5]))
-        s3 = _add_packed_f32x2(s3, (tLDrS[i + 6], tLDrS[i + 7]))
-    s0 = _add_packed_f32x2(s0, s1)
-    s2 = _add_packed_f32x2(s2, s3)
-    s0 = _add_packed_f32x2(s0, s2)
-    return cutlass.Float32(s0[0]) + cutlass.Float32(s0[1])  # pyrefly: ignore[bad-argument-type]
 
 
 def _fmax_reduce_chunk_balanced(frg: cute.Tensor, init_val: Float32) -> Float32:
@@ -2665,6 +2520,9 @@ def fa4_disc_exp_convert_store(
     pforc_ptr_stage: object = None,
     degree2: bool = False,
     *,
+    causal: bool = False,
+    m_block: object = None,
+    n_block: object = None,
     loc: object = None,
     ip: object = None,
 ) -> Float32:
@@ -2693,6 +2551,11 @@ def fa4_disc_exp_convert_store(
     XU via the e2e_frg_limit=1 guard) -- the FA4 ``apply_exp2_convert`` gate. This
     differs from the whole-row helper's global-pair gate, so the XU/poly routing
     differs slightly, but both stay within the fp16 rounding floor (~2.4e-4).
+
+    ``causal``: every loaded chunk is causal-masked in place
+    (``causal_mask_t2r_chunk`` at the query tile ``m_block`` and the key tile
+    ``n_block``) before its exp, the one step the causal body adds; the
+    chunked helpers below take the same three keywords.
     """
     p_sum = cutlass.Float32(0.0)
     # L2: the per-chunk fragment SHAPE is loop-invariant -> read once, not per chunk.
@@ -2700,6 +2563,7 @@ def fa4_disc_exp_convert_store(
     for ci in range(p_store_chunks):
         frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
         cute.copy(tiled_ld, tLDtS[None, ci, None, None], frg)
+        _disc_chunk_mask(causal, frg, tLDcS, ci, m_block, n_block)
         last_frag = ci >= p_store_chunks - 1
         _disc_chunk_exp(
             frg,
@@ -2768,71 +2632,6 @@ def _disc_chunk_release(
             cute.arch.fence_view_async_tmem_store()
             tcgen05_fence_before_thread_sync()
             mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-
-
-def fa4_disc_exp_convert_store_causal(
-    tiled_ld: object,
-    tLDtS: cute.Tensor,
-    tLDcS: cute.Tensor,
-    tiled_st: object,
-    tSTtS: cute.Tensor,
-    tSTcS: cute.Tensor,
-    scale: Float32,
-    minus_max_scale: Float32,
-    e2e_freq: int,
-    e2e_res: int,
-    e2e_offset: int,
-    pfor_ptr_stage: object,
-    pfor2_ptr_stage: object,
-    p_store_split: int,
-    p_store_chunks: int,
-    m_block: cutlass.Int32,
-    n_block: cutlass.Int32,
-    io_dtype: object = cutlass.Float16,
-    pfor_peer_cta_rank: object = None,
-    pfor_self_cta_rank: object = None,
-    pair_batch: int = 1,
-    emu_batch: int = 1,
-) -> Float32:
-    """Causal variant of ``fa4_disc_exp_convert_store``."""
-    p_sum = cutlass.Float32(0.0)
-    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
-    for ci in range(p_store_chunks):
-        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
-        cute.copy(tiled_ld, tLDtS[None, ci, None, None], frg)
-        causal_mask_t2r_chunk(
-            frg,
-            cast("cute.Tensor", tLDcS[None, ci, None, None]),
-            m_block,
-            n_block,
-            ci,
-        )
-        last_frag = ci >= p_store_chunks - 1
-        _disc_chunk_exp(
-            frg,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            last_frag,
-            pair_batch,
-            emu_batch,
-        )
-        _disc_chunk_convert_store(frg, tiled_st, tSTtS, tSTcS, ci, io_dtype)
-        p_sum = p_sum + _disc_chunk_rowsum(frg)
-        if cutlass.const_expr(pfor2_ptr_stage is not None):
-            if ci == p_store_split - 1:
-                cute.arch.fence_view_async_tmem_store()
-                tcgen05_fence_before_thread_sync()
-                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    cute.arch.fence_view_async_tmem_store()
-    tcgen05_fence_before_thread_sync()
-    if cutlass.const_expr(pfor2_ptr_stage is None):
-        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    else:
-        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    return p_sum
 
 
 def _disc_resident_exp_store_rowsum(
@@ -3140,6 +2939,9 @@ def fa4_disc_exp_convert_store_rep32(
     pair_batch: int = 1,
     emu_batch: int = 1,
     *,
+    causal: bool = False,
+    m_block: object = None,
+    n_block: object = None,
     loc: object = None,
     ip: object = None,
 ) -> Float32:
@@ -3159,6 +2961,7 @@ def fa4_disc_exp_convert_store_rep32(
         half_f32 = cute.size(pchunk) // 2
         frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
         cute.copy(tiled_ld, tLDtS[None, ld_ci0, None, None], frg)
+        _disc_chunk_mask(causal, frg, tLDcS, ld_ci0, m_block, n_block)
         _disc_chunk_exp(
             frg,
             scale,
@@ -3177,6 +2980,7 @@ def fa4_disc_exp_convert_store_rep32(
         p_sum = p_sum + _disc_chunk_rowsum(frg)
         frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
         cute.copy(tiled_ld, tLDtS[None, ld_ci1, None, None], frg)
+        _disc_chunk_mask(causal, frg, tLDcS, ld_ci1, m_block, n_block)
         _disc_chunk_exp(
             frg,
             scale,
@@ -3231,6 +3035,10 @@ def fa4_disc_exp_convert_store_rep32_split(
     pfor_self_cta_rank: object = None,
     pair_batch: int = 1,
     emu_batch: int = 1,
+    *,
+    causal: bool = False,
+    m_block: object = None,
+    n_block: object = None,
 ) -> Float32:
     """Rep32 P store while preserving the 3/4 staged-P release.
 
@@ -3248,6 +3056,8 @@ def fa4_disc_exp_convert_store_rep32_split(
         frg1 = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
         cute.copy(tiled_ld, tLDtS[None, ld_ci0, None, None], frg0)
         cute.copy(tiled_ld, tLDtS[None, ld_ci1, None, None], frg1)
+        _disc_chunk_mask(causal, frg0, tLDcS, ld_ci0, m_block, n_block)
+        _disc_chunk_mask(causal, frg1, tLDcS, ld_ci1, m_block, n_block)
         _disc_chunk_exp(
             frg0,
             scale,
@@ -3278,6 +3088,7 @@ def fa4_disc_exp_convert_store_rep32_split(
     if cutlass.const_expr(split_ld_chunks % 2 != 0):
         frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
         cute.copy(tiled_ld, tLDtS[None, ld_ci, None, None], frg)
+        _disc_chunk_mask(causal, frg, tLDcS, ld_ci, m_block, n_block)
         _disc_chunk_exp(
             frg,
             scale,
@@ -3298,6 +3109,7 @@ def fa4_disc_exp_convert_store_rep32_split(
     for ci in range(ld_ci, ld_chunks):
         frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
         cute.copy(tiled_ld, tLDtS[None, ci, None, None], frg)
+        _disc_chunk_mask(causal, frg, tLDcS, ci, m_block, n_block)
         _disc_chunk_exp(
             frg,
             scale,
@@ -3339,13 +3151,23 @@ def fa4_disc_exp_convert_store_rep32_pipe(
     pfor_self_cta_rank: object = None,
     pair_batch: int = 1,
     emu_batch: int = 1,
+    *,
+    causal: bool = False,
+    m_block: object = None,
+    n_block: object = None,
 ) -> Float32:
-    """Software-pipelined Rep32 PASS2.
+    """Software-pipelined PASS2 over paired load chunks (Rep32, or Rep16 S-loads
+    paired into the Rep16 P-store).
 
     The LD stream is still 32-column chunks, while the R2T stream stores two
     converted chunks at a time. This keeps one score fragment live at the
     conversion point, unlike the serial Rep32 helper's original two-fragment
     pack, while letting ``disc_pipe_depth`` overlap upcoming TMEM reads.
+
+    The emitter selects this body for ``Ld32x32bOp(Repetition(16))`` S-loads
+    too: the eight 16-column load chunks pair into the four 32-column fp16
+    P-store chunks, so every score column is consumed without changing the
+    PV-side layout; the pairing lives entirely in the tiled-copy arguments.
     """
     p_sum = cutlass.Float32(0.0)
     ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
@@ -3371,6 +3193,7 @@ def fa4_disc_exp_convert_store_rep32_pipe(
                 _prefetch(nxt % n_buf, nxt)
                 _disc_pin_frag(frgs[nxt % n_buf])
             cute.arch.fence_view_async_tmem_load()
+            _disc_chunk_mask(causal, cur, tLDcS, ld_ci, m_block, n_block)
             _disc_chunk_exp(
                 cur,
                 scale,
@@ -3651,503 +3474,6 @@ def fa4_disc_resident_finish16(
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
         mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-
-
-def fa4_disc_exp_convert_store_sload16_pair_pipe(
-    tiled_ld: object,
-    tLDtS: cute.Tensor,
-    tLDcS: cute.Tensor,
-    tiled_st: object,
-    tSTtS: cute.Tensor,
-    tSTcS: cute.Tensor,
-    scale: Float32,
-    minus_max_scale: Float32,
-    e2e_freq: int,
-    e2e_res: int,
-    e2e_offset: int,
-    pfor_ptr_stage: object,
-    pfor2_ptr_stage: object,
-    p_store_split: int,
-    p_store_chunks: int,
-    pipe_depth: int,
-    io_dtype: object = cutlass.Float16,
-    pfor_peer_cta_rank: object = None,
-    pfor_self_cta_rank: object = None,
-    pair_batch: int = 1,
-    emu_batch: int = 1,
-) -> Float32:
-    """PASS2 for Rep16 S-loads paired into the regular Rep16 P-store.
-
-    ``Ld32x32bOp(Repetition(16))`` splits the 128 score columns into eight
-    16-column load chunks, while the fp16 P layout still uses four 32-column
-    store chunks. Pack two loaded score fragments into each P-store fragment so
-    all score columns are consumed without changing the PV-side layout.
-    """
-    p_sum = cutlass.Float32(0.0)
-    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
-    st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
-    ld_chunks = p_store_chunks * 2
-    n_buf = pipe_depth + 1
-    frgs = [cute.make_rmem_tensor(ld_shape, cutlass.Float32) for _ in range(n_buf)]
-
-    def _prefetch(slot: int, idx: int) -> None:
-        cute.copy(tiled_ld, tLDtS[None, idx, None, None], frgs[slot])
-
-    for j in range(min(pipe_depth, ld_chunks)):
-        _prefetch(j % n_buf, j)
-        _disc_pin_frag(frgs[j % n_buf])
-    for pair_ci in range(p_store_chunks):
-        pchunk = cute.make_rmem_tensor(st_shape, cutlass.Float32)
-        half_f32 = cute.size(pchunk) // 2
-        for half in range(2):
-            ld_ci = pair_ci * 2 + half
-            nxt = ld_ci + pipe_depth
-            cur = frgs[ld_ci % n_buf]
-            if nxt < ld_chunks:
-                _prefetch(nxt % n_buf, nxt)
-                _disc_pin_frag(frgs[nxt % n_buf])
-            cute.arch.fence_view_async_tmem_load()
-            _disc_chunk_exp(
-                cur,
-                scale,
-                minus_max_scale,
-                e2e_freq,
-                e2e_res,
-                e2e_offset,
-                ld_ci >= ld_chunks - 1,
-                pair_batch,
-                emu_batch,
-            )
-            pchunk_half = cute.make_tensor(
-                cute.recast_ptr(pchunk.iterator + half * half_f32, dtype=io_dtype),
-                cur.layout,
-            )
-            pchunk_half.store(cur.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
-            p_sum = p_sum + _disc_chunk_rowsum(cur)
-        cute.copy(tiled_st, pchunk, tSTtS[None, None, pair_ci])
-        if cutlass.const_expr(pfor2_ptr_stage is not None):
-            if pair_ci == p_store_split - 1:
-                cute.arch.fence_view_async_tmem_store()
-                tcgen05_fence_before_thread_sync()
-                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    cute.arch.fence_view_async_tmem_store()
-    tcgen05_fence_before_thread_sync()
-    if cutlass.const_expr(pfor2_ptr_stage is None):
-        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    else:
-        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    return p_sum
-
-
-def fa4_disc_exp_convert_store_rep32_causal(
-    tiled_ld: object,
-    tLDtS: cute.Tensor,
-    tLDcS: cute.Tensor,
-    tiled_st: object,
-    tSTtS: cute.Tensor,
-    tSTcS: cute.Tensor,
-    scale: Float32,
-    minus_max_scale: Float32,
-    e2e_freq: int,
-    e2e_res: int,
-    e2e_offset: int,
-    pfor_ptr_stage: object,
-    pfor2_ptr_stage: object,
-    p_store_split: int,
-    p_store_chunks: int,
-    m_block: cutlass.Int32,
-    n_block: cutlass.Int32,
-    io_dtype: object = cutlass.Float16,
-    pfor_peer_cta_rank: object = None,
-    pfor_self_cta_rank: object = None,
-    pair_batch: int = 1,
-    emu_batch: int = 1,
-) -> Float32:
-    """Causal Rep32 PASS2 variant."""
-    p_sum = cutlass.Float32(0.0)
-    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
-    st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
-    for ci in range(p_store_chunks):
-        ld_ci0 = ci * 2
-        ld_ci1 = ld_ci0 + 1
-        pchunk = cute.make_rmem_tensor(st_shape, cutlass.Float32)
-        half_f32 = cute.size(pchunk) // 2
-        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
-        cute.copy(tiled_ld, tLDtS[None, ld_ci0, None, None], frg)
-        causal_mask_t2r_chunk(
-            frg,
-            cast("cute.Tensor", tLDcS[None, ld_ci0, None, None]),
-            m_block,
-            n_block,
-            ld_ci0,
-        )
-        _disc_chunk_exp(
-            frg,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            False,
-            pair_batch,
-            emu_batch,
-        )
-        pchunk0 = cute.make_tensor(
-            cute.recast_ptr(pchunk.iterator, dtype=io_dtype), frg.layout
-        )
-        pchunk0.store(frg.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
-        p_sum = p_sum + _disc_chunk_rowsum(frg)
-        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
-        cute.copy(tiled_ld, tLDtS[None, ld_ci1, None, None], frg)
-        causal_mask_t2r_chunk(
-            frg,
-            cast("cute.Tensor", tLDcS[None, ld_ci1, None, None]),
-            m_block,
-            n_block,
-            ld_ci1,
-        )
-        _disc_chunk_exp(
-            frg,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            ci >= p_store_chunks - 1,
-            pair_batch,
-            emu_batch,
-        )
-        pchunk1 = cute.make_tensor(
-            cute.recast_ptr(pchunk.iterator + half_f32, dtype=io_dtype), frg.layout
-        )
-        pchunk1.store(frg.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
-        p_sum = p_sum + _disc_chunk_rowsum(frg)
-        cute.copy(tiled_st, pchunk, tSTtS[None, None, ci])
-        if cutlass.const_expr(pfor2_ptr_stage is not None):
-            if ci == p_store_split - 1:
-                cute.arch.fence_view_async_tmem_store()
-                tcgen05_fence_before_thread_sync()
-                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    cute.arch.fence_view_async_tmem_store()
-    tcgen05_fence_before_thread_sync()
-    if cutlass.const_expr(pfor2_ptr_stage is None):
-        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    else:
-        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    return p_sum
-
-
-def fa4_disc_exp_convert_store_rep32_pipe_causal(
-    tiled_ld: object,
-    tLDtS: cute.Tensor,
-    tLDcS: cute.Tensor,
-    tiled_st: object,
-    tSTtS: cute.Tensor,
-    tSTcS: cute.Tensor,
-    scale: Float32,
-    minus_max_scale: Float32,
-    e2e_freq: int,
-    e2e_res: int,
-    e2e_offset: int,
-    pfor_ptr_stage: object,
-    pfor2_ptr_stage: object,
-    p_store_split: int,
-    p_store_chunks: int,
-    pipe_depth: int,
-    m_block: cutlass.Int32,
-    n_block: cutlass.Int32,
-    io_dtype: object = cutlass.Float16,
-    pfor_peer_cta_rank: object = None,
-    pfor_self_cta_rank: object = None,
-    pair_batch: int = 1,
-    emu_batch: int = 1,
-) -> Float32:
-    """Causal variant of ``fa4_disc_exp_convert_store_rep32_pipe``."""
-    p_sum = cutlass.Float32(0.0)
-    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
-    st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
-    ld_chunks = p_store_chunks * 2
-    n_buf = pipe_depth + 1
-    frgs = [cute.make_rmem_tensor(ld_shape, cutlass.Float32) for _ in range(n_buf)]
-
-    def _prefetch(slot: int, idx: int) -> None:
-        cute.copy(tiled_ld, tLDtS[None, idx, None, None], frgs[slot])
-
-    for j in range(min(pipe_depth, ld_chunks)):
-        _prefetch(j % n_buf, j)
-        _disc_pin_frag(frgs[j % n_buf])
-    for pair_ci in range(p_store_chunks):
-        pchunk = cute.make_rmem_tensor(st_shape, cutlass.Float32)
-        half_f32 = cute.size(pchunk) // 2
-        for half in range(2):
-            ld_ci = pair_ci * 2 + half
-            nxt = ld_ci + pipe_depth
-            cur = frgs[ld_ci % n_buf]
-            if nxt < ld_chunks:
-                _prefetch(nxt % n_buf, nxt)
-                _disc_pin_frag(frgs[nxt % n_buf])
-            cute.arch.fence_view_async_tmem_load()
-            causal_mask_t2r_chunk(
-                cur,
-                cast("cute.Tensor", tLDcS[None, ld_ci, None, None]),
-                m_block,
-                n_block,
-                ld_ci,
-            )
-            _disc_chunk_exp(
-                cur,
-                scale,
-                minus_max_scale,
-                e2e_freq,
-                e2e_res,
-                e2e_offset,
-                ld_ci >= ld_chunks - 1,
-                pair_batch,
-                emu_batch,
-            )
-            pchunk_half = cute.make_tensor(
-                cute.recast_ptr(pchunk.iterator + half * half_f32, dtype=io_dtype),
-                cur.layout,
-            )
-            pchunk_half.store(cur.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
-            p_sum = p_sum + _disc_chunk_rowsum(cur)
-        cute.copy(tiled_st, pchunk, tSTtS[None, None, pair_ci])
-        if cutlass.const_expr(pfor2_ptr_stage is not None):
-            if pair_ci == p_store_split - 1:
-                cute.arch.fence_view_async_tmem_store()
-                tcgen05_fence_before_thread_sync()
-                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    cute.arch.fence_view_async_tmem_store()
-    tcgen05_fence_before_thread_sync()
-    if cutlass.const_expr(pfor2_ptr_stage is None):
-        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    else:
-        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    return p_sum
-
-
-def fa4_disc_exp_convert_store_sload16_pair_pipe_causal(
-    tiled_ld: object,
-    tLDtS: cute.Tensor,
-    tLDcS: cute.Tensor,
-    tiled_st: object,
-    tSTtS: cute.Tensor,
-    tSTcS: cute.Tensor,
-    scale: Float32,
-    minus_max_scale: Float32,
-    e2e_freq: int,
-    e2e_res: int,
-    e2e_offset: int,
-    pfor_ptr_stage: object,
-    pfor2_ptr_stage: object,
-    p_store_split: int,
-    p_store_chunks: int,
-    pipe_depth: int,
-    m_block: cutlass.Int32,
-    n_block: cutlass.Int32,
-    io_dtype: object = cutlass.Float16,
-    pfor_peer_cta_rank: object = None,
-    pfor_self_cta_rank: object = None,
-    pair_batch: int = 1,
-    emu_batch: int = 1,
-) -> Float32:
-    """Causal variant of ``fa4_disc_exp_convert_store_sload16_pair_pipe``."""
-    p_sum = cutlass.Float32(0.0)
-    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
-    st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
-    ld_chunks = p_store_chunks * 2
-    n_buf = pipe_depth + 1
-    frgs = [cute.make_rmem_tensor(ld_shape, cutlass.Float32) for _ in range(n_buf)]
-
-    def _prefetch(slot: int, idx: int) -> None:
-        cute.copy(tiled_ld, tLDtS[None, idx, None, None], frgs[slot])
-
-    for j in range(min(pipe_depth, ld_chunks)):
-        _prefetch(j % n_buf, j)
-        _disc_pin_frag(frgs[j % n_buf])
-    for pair_ci in range(p_store_chunks):
-        pchunk = cute.make_rmem_tensor(st_shape, cutlass.Float32)
-        half_f32 = cute.size(pchunk) // 2
-        for half in range(2):
-            ld_ci = pair_ci * 2 + half
-            nxt = ld_ci + pipe_depth
-            cur = frgs[ld_ci % n_buf]
-            if nxt < ld_chunks:
-                _prefetch(nxt % n_buf, nxt)
-                _disc_pin_frag(frgs[nxt % n_buf])
-            cute.arch.fence_view_async_tmem_load()
-            causal_mask_t2r_chunk(
-                cur,
-                cast("cute.Tensor", tLDcS[None, ld_ci, None, None]),
-                m_block,
-                n_block,
-                ld_ci,
-            )
-            _disc_chunk_exp(
-                cur,
-                scale,
-                minus_max_scale,
-                e2e_freq,
-                e2e_res,
-                e2e_offset,
-                ld_ci >= ld_chunks - 1,
-                pair_batch,
-                emu_batch,
-            )
-            pchunk_half = cute.make_tensor(
-                cute.recast_ptr(pchunk.iterator + half * half_f32, dtype=io_dtype),
-                cur.layout,
-            )
-            pchunk_half.store(cur.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
-            p_sum = p_sum + _disc_chunk_rowsum(cur)
-        cute.copy(tiled_st, pchunk, tSTtS[None, None, pair_ci])
-        if cutlass.const_expr(pfor2_ptr_stage is not None):
-            if pair_ci == p_store_split - 1:
-                cute.arch.fence_view_async_tmem_store()
-                tcgen05_fence_before_thread_sync()
-                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    cute.arch.fence_view_async_tmem_store()
-    tcgen05_fence_before_thread_sync()
-    if cutlass.const_expr(pfor2_ptr_stage is None):
-        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    else:
-        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    return p_sum
-
-
-def fa4_disc_exp_convert_store_rep32_split_causal(
-    tiled_ld: object,
-    tLDtS: cute.Tensor,
-    tLDcS: cute.Tensor,
-    tiled_st32: object,
-    tST32tS: cute.Tensor,
-    tST32cS: cute.Tensor,
-    tiled_st16: object,
-    tST16tS: cute.Tensor,
-    tST16cS: cute.Tensor,
-    scale: Float32,
-    minus_max_scale: Float32,
-    e2e_freq: int,
-    e2e_res: int,
-    e2e_offset: int,
-    pfor_ptr_stage: object,
-    pfor2_ptr_stage: object,
-    ld_chunks: int,
-    m_block: cutlass.Int32,
-    n_block: cutlass.Int32,
-    io_dtype: object = cutlass.Float16,
-    pfor_peer_cta_rank: object = None,
-    pfor_self_cta_rank: object = None,
-    pair_batch: int = 1,
-    emu_batch: int = 1,
-) -> Float32:
-    """Causal Rep32 staged-P variant."""
-    p_sum = cutlass.Float32(0.0)
-    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
-    split_ld_chunks = ld_chunks * 3 // 4
-    pair_chunks = split_ld_chunks // 2
-    for pair_ci in range(pair_chunks):
-        ld_ci0 = pair_ci * 2
-        ld_ci1 = ld_ci0 + 1
-        frg0 = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
-        frg1 = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
-        cute.copy(tiled_ld, tLDtS[None, ld_ci0, None, None], frg0)
-        cute.copy(tiled_ld, tLDtS[None, ld_ci1, None, None], frg1)
-        causal_mask_t2r_chunk(
-            frg0,
-            cast("cute.Tensor", tLDcS[None, ld_ci0, None, None]),
-            m_block,
-            n_block,
-            ld_ci0,
-        )
-        causal_mask_t2r_chunk(
-            frg1,
-            cast("cute.Tensor", tLDcS[None, ld_ci1, None, None]),
-            m_block,
-            n_block,
-            ld_ci1,
-        )
-        _disc_chunk_exp(
-            frg0,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            False,
-            pair_batch,
-            emu_batch,
-        )
-        _disc_chunk_exp(
-            frg1,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            ld_ci1 >= ld_chunks - 1,
-            pair_batch,
-            emu_batch,
-        )
-        _disc_chunk_pair_convert_store(
-            frg0, frg1, tiled_st32, tST32tS, tST32cS, pair_ci, io_dtype
-        )
-        p_sum = p_sum + _disc_chunk_rowsum(frg0) + _disc_chunk_rowsum(frg1)
-    ld_ci = pair_chunks * 2
-    if cutlass.const_expr(split_ld_chunks % 2 != 0):
-        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
-        cute.copy(tiled_ld, tLDtS[None, ld_ci, None, None], frg)
-        causal_mask_t2r_chunk(
-            frg,
-            cast("cute.Tensor", tLDcS[None, ld_ci, None, None]),
-            m_block,
-            n_block,
-            ld_ci,
-        )
-        _disc_chunk_exp(
-            frg,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            ld_ci >= ld_chunks - 1,
-            pair_batch,
-            emu_batch,
-        )
-        _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ld_ci, io_dtype)
-        p_sum = p_sum + _disc_chunk_rowsum(frg)
-        ld_ci += 1
-    cute.arch.fence_view_async_tmem_store()
-    tcgen05_fence_before_thread_sync()
-    mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    for ci in range(ld_ci, ld_chunks):
-        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
-        cute.copy(tiled_ld, tLDtS[None, ci, None, None], frg)
-        causal_mask_t2r_chunk(
-            frg,
-            cast("cute.Tensor", tLDcS[None, ci, None, None]),
-            m_block,
-            n_block,
-            ci,
-        )
-        _disc_chunk_exp(
-            frg,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            ci >= ld_chunks - 1,
-            pair_batch,
-            emu_batch,
-        )
-        _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ci, io_dtype)
-        p_sum = p_sum + _disc_chunk_rowsum(frg)
-    cute.arch.fence_view_async_tmem_store()
-    tcgen05_fence_before_thread_sync()
-    mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    return p_sum
 
 
 def fa4_disc_zero_store(
@@ -4607,40 +3933,26 @@ def fa4_correction_epilogue_to_smem_scoped(
     corr_tile_size: int,
     o_dtype: object,
     relu_output: bool = False,
+    use_2cta_instrs: bool = False,
     *,
     loc: object = None,
     ip: object = None,
 ) -> None:
-    """FA4 correction epilogue with copy-view lifetimes scoped to the copy body."""
-    o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
-    epi_subtile = (128, corr_tile_size)
-    tmem_atom = sm100_utils_flash.get_tmem_load_op(
-        (128, head_dim),
-        o_layout,
-        o_dtype,
-        cutlass.Float32,
-        epi_subtile,
-        use_2cta_instrs=False,
+    """FA4 correction epilogue with copy-view lifetimes scoped to the copy body
+    (``use_2cta_instrs``: the pair's 256-row accumulator, staged in CTA-local
+    shared memory)."""
+    tiled_t2r, tiled_r2s, tOtO_t2r, tOsO_r2s, tOcO_t2r = (
+        fa4_correction_epilogue_partitions(
+            flash_pvt,
+            tOtO,
+            sO,
+            tidx,
+            head_dim,
+            corr_tile_size,
+            o_dtype,
+            use_2cta_instrs=use_2cta_instrs,
+        )
     )
-    cO = cute.make_identity_tensor((128, head_dim))
-    flash_pvt_copy = cast("Any", flash_pvt)
-    tOcO = flash_pvt_copy.partition_C(cO)
-    tOtO_i = cute.logical_divide(tOtO, cute.make_layout((128, corr_tile_size)))
-    tOcO_i = cute.logical_divide(tOcO, cute.make_layout((128, corr_tile_size)))
-    # sO is per CTA, so both CTAs use the rank-zero SMEM mapping.
-    tOsO = flash_pvt_copy.get_slice(0).partition_C(sO)
-    tOsO_i = cute.logical_divide(tOsO, cute.make_layout((128, corr_tile_size)))
-
-    tiled_t2r = tcgen05.make_tmem_copy(tmem_atom, tOtO_i[(None, None), 0])
-    smem_atom = sm100_utils_flash.get_smem_store_op(
-        o_layout, o_dtype, cutlass.Float32, tiled_t2r
-    )
-    tiled_r2s = cute.make_tiled_copy_D(smem_atom, tiled_t2r)
-    thr_t2r = tiled_t2r.get_slice(tidx)
-    tOcO_t2r = thr_t2r.partition_D(tOcO_i[(None, None), None])
-    tOtO_t2r = thr_t2r.partition_S(tOtO_i[(None, None), None])
-    tOsO_r2s = partition_D_position_independent(thr_t2r, tOsO_i[(None, None), None])
-
     for i in range(head_dim // corr_tile_size):
         reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
         reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
@@ -5009,60 +4321,6 @@ def fa4_split_merge_rows(
             )
 
 
-@dsl_user_op
-def fa4_correction_epilogue_to_smem_scoped_2cta(
-    flash_pvt: object,
-    tOtO: cute.Tensor,
-    sO: cute.Tensor,
-    tidx: object,
-    inv_sum: object,
-    head_dim: int,
-    corr_tile_size: int,
-    o_dtype: object,
-    relu_output: bool = False,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    """Two-CTA correction epilogue with a CTA-local shared-memory destination."""
-    o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
-    epi_subtile = (128, corr_tile_size)
-    tmem_atom = sm100_utils_flash.get_tmem_load_op(
-        (256, head_dim),
-        o_layout,
-        o_dtype,
-        cutlass.Float32,
-        epi_subtile,
-        use_2cta_instrs=True,
-    )
-    cO = cute.make_identity_tensor((256, head_dim))
-    flash_pvt_copy = cast("Any", flash_pvt)
-    tOcO = flash_pvt_copy.partition_C(cO)
-    tOtO_i = cute.logical_divide(tOtO, cute.make_layout((128, corr_tile_size)))
-    tOcO_i = cute.logical_divide(tOcO, cute.make_layout((128, corr_tile_size)))
-    tOsO = flash_pvt_copy.get_slice(0).partition_C(sO)
-    tOsO_i = cute.logical_divide(tOsO, cute.make_layout((128, corr_tile_size)))
-
-    tiled_t2r = tcgen05.make_tmem_copy(tmem_atom, tOtO_i[(None, None), 0])
-    smem_atom = sm100_utils_flash.get_smem_store_op(
-        o_layout, o_dtype, cutlass.Float32, tiled_t2r
-    )
-    tiled_r2s = cute.make_tiled_copy_D(smem_atom, tiled_t2r)
-    thr_t2r = tiled_t2r.get_slice(tidx)
-    tOcO_t2r = thr_t2r.partition_D(tOcO_i[(None, None), None])
-    tOtO_t2r = thr_t2r.partition_S(tOtO_i[(None, None), None])
-    tOsO_r2s = partition_D_position_independent(thr_t2r, tOsO_i[(None, None), None])
-
-    for i in range(head_dim // corr_tile_size):
-        reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
-        reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
-        cute.copy(tiled_t2r, tOtO_t2r[None, 0, 0, i], reg)
-        reg.store(reg.load() * inv_sum)
-        if cutlass.const_expr(relu_output):
-            relu_fragment_inplace(reg)
-        cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
-
-
 def fa4_correction_epilogue_partitions(
     flash_pvt: object,
     tOtO: cute.Tensor,
@@ -5073,12 +4331,12 @@ def fa4_correction_epilogue_partitions(
     o_dtype: object,
     use_2cta_instrs: bool = False,
 ) -> tuple[object, object, cute.Tensor, cute.Tensor, cute.Tensor]:
-    """Copy views of the chunked FA4 correction epilogue for inline programs.
+    """Copy views of the chunked FA4 correction epilogue.
 
-    Mirrors ``fa4_correction_epilogue_to_smem_scoped[_2cta]`` but returns the
-    tiled copies and per-thread partitions instead of running the identity
-    epilogue, so a fused row epilogue can walk the chunks itself.  Returns
-    ``(tiled_t2r, tiled_r2s, tOtO_t2r, tOsO_r2s, tOcO_t2r)``.
+    The tiled copies and per-thread partitions
+    ``fa4_correction_epilogue_to_smem_scoped`` walks, for the identity
+    epilogue and for a fused row epilogue that walks the chunks itself.
+    Returns ``(tiled_t2r, tiled_r2s, tOtO_t2r, tOsO_r2s, tOcO_t2r)``.
     """
     o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
     epi_subtile = (128, corr_tile_size)
@@ -5145,6 +4403,7 @@ def fa4_correction_epilogue_handoff_to_smem_scoped(
     o_dtype: object,
     wait_hint: int = 10_000_000,
     relu_output: bool = False,
+    use_2cta_instrs: bool = False,
 ) -> None:
     """Wait for O/epilogue handoff, scope copy views, then publish staged O."""
     mbar_spin_wait(o_full_ptr_stage, o_full_phase, wait_hint)
@@ -5159,41 +4418,7 @@ def fa4_correction_epilogue_handoff_to_smem_scoped(
         corr_tile_size,
         o_dtype,
         relu_output=relu_output,
-    )
-    cute.arch.fence_view_async_shared()
-    cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
-
-
-def fa4_correction_epilogue_handoff_to_smem_scoped_2cta(
-    o_full_ptr_stage: object,
-    o_full_phase: object,
-    corr_epi_empty_ptr_stage: object,
-    corr_epi_empty_phase: object,
-    corr_epi_full_ptr_stage: object,
-    flash_pvt: object,
-    tOtO: cute.Tensor,
-    sO: cute.Tensor,
-    tidx: object,
-    inv_sum: object,
-    head_dim: int,
-    corr_tile_size: int,
-    o_dtype: object,
-    wait_hint: int = 10_000_000,
-    relu_output: bool = False,
-) -> None:
-    """Wait for handoff and stage a two-CTA output in CTA-local shared memory."""
-    mbar_spin_wait(o_full_ptr_stage, o_full_phase, wait_hint)
-    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase, wait_hint)
-    fa4_correction_epilogue_to_smem_scoped_2cta(
-        flash_pvt,
-        tOtO,
-        sO,
-        tidx,
-        inv_sum,
-        head_dim,
-        corr_tile_size,
-        o_dtype,
-        relu_output=relu_output,
+        use_2cta_instrs=use_2cta_instrs,
     )
     cute.arch.fence_view_async_shared()
     cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
@@ -5270,7 +4495,8 @@ def resident_softmax_value_graph(
     return fadd_reduce_packed(tLDrS, row_sum_init)
 
 
-def _fa4_sp_exp_convert_store_impl(
+@dsl_user_op
+def fa4_sp_exp_convert_store(
     tLDrS: cute.Tensor,
     tiled_st: object,
     tSTtS: cute.Tensor,
@@ -5287,17 +4513,20 @@ def _fa4_sp_exp_convert_store_impl(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
-    whole_row_sum: bool = False,
     early_split_publish: bool = False,
     pair_batch: int = 1,
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
     f16x2_xu: bool = False,
+    whole_row_sum: bool = False,
     *,
     loc: object = None,
     ip: object = None,
 ) -> Float32:
+    """Whole-row PASS2 with fused exp2, row-sum, convert, and P-store
+    (``whole_row_sum``: one packed row-sum over the full row instead of the
+    per-fragment folds)."""
     tSTrS = cute.make_rmem_tensor(tSTcS.shape, cutlass.Float32)
     tSTrS_e = cute.make_tensor(
         cute.recast_ptr(tSTrS.iterator, dtype=io_dtype), tLDrS.layout
@@ -5391,119 +4620,7 @@ def _fa4_sp_exp_convert_store_impl(
     return p_sum
 
 
-@dsl_user_op
-def fa4_sp_exp_convert_store(
-    tLDrS: cute.Tensor,
-    tiled_st: object,
-    tSTtS: cute.Tensor,
-    tSTcS: cute.Tensor,
-    scale: Float32,
-    minus_max_scale: Float32,
-    e2e_freq: int,
-    e2e_res: int,
-    e2e_offset: int,
-    pfor_ptr_stage: object,
-    pfor2_ptr_stage: object,
-    p_store_split: int,
-    p_store_chunks: int,
-    io_dtype: object = cutlass.Float16,
-    pfor_peer_cta_rank: object = None,
-    pfor_self_cta_rank: object = None,
-    early_split_publish: bool = False,
-    pair_batch: int = 1,
-    emu_batch: int = 1,
-    degree2: bool = False,
-    degree1: bool = False,
-    f16x2_xu: bool = False,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> Float32:
-    """Whole-row PASS2 with fused exp2, row-sum, convert, and P-store."""
-    return _fa4_sp_exp_convert_store_impl(
-        tLDrS,
-        tiled_st,
-        tSTtS,
-        tSTcS,
-        scale,
-        minus_max_scale,
-        e2e_freq,
-        e2e_res,
-        e2e_offset,
-        pfor_ptr_stage,
-        pfor2_ptr_stage,
-        p_store_split,
-        p_store_chunks,
-        io_dtype,
-        pfor_peer_cta_rank,
-        pfor_self_cta_rank,
-        False,
-        early_split_publish,
-        pair_batch,
-        emu_batch,
-        degree2,
-        degree1,
-        f16x2_xu,
-    )
-
-
-@dsl_user_op
-def fa4_sp_exp_convert_store_whole_rowsum(
-    tLDrS: cute.Tensor,
-    tiled_st: object,
-    tSTtS: cute.Tensor,
-    tSTcS: cute.Tensor,
-    scale: Float32,
-    minus_max_scale: Float32,
-    e2e_freq: int,
-    e2e_res: int,
-    e2e_offset: int,
-    pfor_ptr_stage: object,
-    pfor2_ptr_stage: object,
-    p_store_split: int,
-    p_store_chunks: int,
-    io_dtype: object = cutlass.Float16,
-    pfor_peer_cta_rank: object = None,
-    pfor_self_cta_rank: object = None,
-    early_split_publish: bool = False,
-    pair_batch: int = 1,
-    emu_batch: int = 1,
-    degree2: bool = False,
-    degree1: bool = False,
-    f16x2_xu: bool = False,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> Float32:
-    """Whole-row PASS2 with a single packed row-sum over the full row."""
-    return _fa4_sp_exp_convert_store_impl(
-        tLDrS,
-        tiled_st,
-        tSTtS,
-        tSTcS,
-        scale,
-        minus_max_scale,
-        e2e_freq,
-        e2e_res,
-        e2e_offset,
-        pfor_ptr_stage,
-        pfor2_ptr_stage,
-        p_store_split,
-        p_store_chunks,
-        io_dtype,
-        pfor_peer_cta_rank,
-        pfor_self_cta_rank,
-        True,
-        early_split_publish,
-        pair_batch,
-        emu_batch,
-        degree2,
-        degree1,
-        f16x2_xu,
-    )
-
-
-def _fa4_sp_exp_convert_store_rep32_split_impl(
+def fa4_sp_exp_convert_store_rep32_split(
     tLDrS: cute.Tensor,
     tiled_st32: object,
     tST32tS: cute.Tensor,
@@ -5521,13 +4638,15 @@ def _fa4_sp_exp_convert_store_rep32_split_impl(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
-    whole_row_sum: bool = False,
     pair_batch: int = 1,
     emu_batch: int = 1,
+    whole_row_sum: bool = False,
     *,
     loc: object = None,
     ip: object = None,
 ) -> Float32:
+    """Whole-row PASS2 with Rep32 stores before the staged-P split boundary
+    (``whole_row_sum`` as on ``fa4_sp_exp_convert_store``)."""
     src = cute.logical_divide(tLDrS, cute.make_layout(32))
     frag_count = cute.size(tLDrS) // 32
     for ci in range(frag_count):
@@ -5587,104 +4706,6 @@ def _fa4_sp_exp_convert_store_rep32_split_impl(
     for ci in range(frag_count):
         p_sum = p_sum + _disc_chunk_rowsum(cast("cute.Tensor", src[None, ci]))
     return p_sum
-
-
-def fa4_sp_exp_convert_store_rep32_split(
-    tLDrS: cute.Tensor,
-    tiled_st32: object,
-    tST32tS: cute.Tensor,
-    tST32cS: cute.Tensor,
-    tiled_st16: object,
-    tST16tS: cute.Tensor,
-    tST16cS: cute.Tensor,
-    scale: Float32,
-    minus_max_scale: Float32,
-    e2e_freq: int,
-    e2e_res: int,
-    e2e_offset: int,
-    pfor_ptr_stage: object,
-    pfor2_ptr_stage: object,
-    io_dtype: object = cutlass.Float16,
-    pfor_peer_cta_rank: object = None,
-    pfor_self_cta_rank: object = None,
-    pair_batch: int = 1,
-    emu_batch: int = 1,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> Float32:
-    """Whole-row PASS2 with Rep32 stores before the staged-P split boundary."""
-    return _fa4_sp_exp_convert_store_rep32_split_impl(
-        tLDrS,
-        tiled_st32,
-        tST32tS,
-        tST32cS,
-        tiled_st16,
-        tST16tS,
-        tST16cS,
-        scale,
-        minus_max_scale,
-        e2e_freq,
-        e2e_res,
-        e2e_offset,
-        pfor_ptr_stage,
-        pfor2_ptr_stage,
-        io_dtype,
-        pfor_peer_cta_rank,
-        pfor_self_cta_rank,
-        False,
-        pair_batch,
-        emu_batch,
-    )
-
-
-def fa4_sp_exp_convert_store_rep32_split_whole_rowsum(
-    tLDrS: cute.Tensor,
-    tiled_st32: object,
-    tST32tS: cute.Tensor,
-    tST32cS: cute.Tensor,
-    tiled_st16: object,
-    tST16tS: cute.Tensor,
-    tST16cS: cute.Tensor,
-    scale: Float32,
-    minus_max_scale: Float32,
-    e2e_freq: int,
-    e2e_res: int,
-    e2e_offset: int,
-    pfor_ptr_stage: object,
-    pfor2_ptr_stage: object,
-    io_dtype: object = cutlass.Float16,
-    pfor_peer_cta_rank: object = None,
-    pfor_self_cta_rank: object = None,
-    pair_batch: int = 1,
-    emu_batch: int = 1,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> Float32:
-    """Whole-row PASS2 with Rep32 stores and one packed full-row sum."""
-    return _fa4_sp_exp_convert_store_rep32_split_impl(
-        tLDrS,
-        tiled_st32,
-        tST32tS,
-        tST32cS,
-        tiled_st16,
-        tST16tS,
-        tST16cS,
-        scale,
-        minus_max_scale,
-        e2e_freq,
-        e2e_res,
-        e2e_offset,
-        pfor_ptr_stage,
-        pfor2_ptr_stage,
-        io_dtype,
-        pfor_peer_cta_rank,
-        pfor_self_cta_rank,
-        True,
-        pair_batch,
-        emu_batch,
-    )
 
 
 def _disc_chunk_rowsum(frg: cute.Tensor) -> Float32:
@@ -5752,6 +4773,10 @@ def fa4_disc_exp_convert_store_pipe(
     degree1: bool = False,
     f16x2_xu: bool = False,
     pforc_ptr_stage: object = None,
+    *,
+    causal: bool = False,
+    m_block: object = None,
+    n_block: object = None,
 ) -> Float32:
     """SOFTWARE-PIPELINED chunked-t2r PASS 2 (the L1 lever). Same numerics + staged-P
     handshake + zero-spill peak (ONE chunk + a bounded pipeline window) as the serial
@@ -5806,6 +4831,7 @@ def fa4_disc_exp_convert_store_pipe(
         # wait does NOT re-drain the just-issued prefetch onto the critical path
         # because the pin keeps it live above this fence in the IR.
         cute.arch.fence_view_async_tmem_load()
+        _disc_chunk_mask(causal, cur, tLDcS, ci, m_block, n_block)
         last_frag = ci >= p_store_chunks - 1
         _disc_chunk_exp(
             cur,
@@ -5833,91 +4859,6 @@ def fa4_disc_exp_convert_store_pipe(
             pfor_peer_cta_rank,
             pfor_self_cta_rank,
         )
-    cute.arch.fence_view_async_tmem_store()
-    tcgen05_fence_before_thread_sync()
-    if cutlass.const_expr(pfor2_ptr_stage is None):
-        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    else:
-        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    return p_sum
-
-
-def fa4_disc_exp_convert_store_pipe_causal(
-    tiled_ld: object,
-    tLDtS: cute.Tensor,
-    tLDcS: cute.Tensor,
-    tiled_st: object,
-    tSTtS: cute.Tensor,
-    tSTcS: cute.Tensor,
-    scale: Float32,
-    minus_max_scale: Float32,
-    e2e_freq: int,
-    e2e_res: int,
-    e2e_offset: int,
-    pfor_ptr_stage: object,
-    pfor2_ptr_stage: object,
-    p_store_split: int,
-    p_store_chunks: int,
-    pipe_depth: int,
-    m_block: cutlass.Int32,
-    n_block: cutlass.Int32,
-    io_dtype: object = cutlass.Float16,
-    pfor_peer_cta_rank: object = None,
-    pfor_self_cta_rank: object = None,
-    pair_batch: int = 1,
-    emu_batch: int = 1,
-    degree2: bool = False,
-    degree1: bool = False,
-    f16x2_xu: bool = False,
-) -> Float32:
-    """Causal variant of ``fa4_disc_exp_convert_store_pipe``."""
-    p_sum = cutlass.Float32(0.0)
-    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
-    n_buf = pipe_depth + 1
-    frgs = [cute.make_rmem_tensor(ld_shape, cutlass.Float32) for _ in range(n_buf)]
-
-    def _prefetch(slot: int, idx: int) -> None:
-        cute.copy(tiled_ld, tLDtS[None, idx, None, None], frgs[slot])
-
-    for j in range(min(pipe_depth, p_store_chunks)):
-        _prefetch(j % n_buf, j)
-        _disc_pin_frag(frgs[j % n_buf])
-    for ci in range(p_store_chunks):
-        nxt = ci + pipe_depth
-        cur = frgs[ci % n_buf]
-        if nxt < p_store_chunks:
-            _prefetch(nxt % n_buf, nxt)
-            _disc_pin_frag(frgs[nxt % n_buf])
-        cute.arch.fence_view_async_tmem_load()
-        causal_mask_t2r_chunk(
-            cur,
-            cast("cute.Tensor", tLDcS[None, ci, None, None]),
-            m_block,
-            n_block,
-            ci,
-        )
-        last_frag = ci >= p_store_chunks - 1
-        _disc_chunk_exp(
-            cur,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            last_frag,
-            pair_batch,
-            emu_batch,
-            degree2,
-            degree1,
-            f16x2_xu,
-        )
-        _disc_chunk_convert_store(cur, tiled_st, tSTtS, tSTcS, ci, io_dtype)
-        p_sum = p_sum + _disc_chunk_rowsum(cur)
-        if cutlass.const_expr(pfor2_ptr_stage is not None):
-            if ci == p_store_split - 1:
-                cute.arch.fence_view_async_tmem_store()
-                tcgen05_fence_before_thread_sync()
-                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
     tcgen05_fence_before_thread_sync()
     if cutlass.const_expr(pfor2_ptr_stage is None):

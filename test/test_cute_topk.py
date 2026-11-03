@@ -32,21 +32,21 @@ from test.cute_register_model import gather_registers
 import helion
 from helion import exc
 from helion._compiler.autotuner_heuristics import get_heuristics
-from helion._compiler.autotuner_heuristics.cute import CuteTopKHeuristic
-from helion._compiler.backend import CuteBackend
-from helion._compiler.backend import TritonBackend
-from helion._compiler.cute import selection_coarse
+from helion._compiler.cute.autotune.heuristics.cute import CuteTopKHeuristic
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.row_fragment import RowFragment
 from helion._compiler.cute.row_fragment import RowFragmentLayout
-from helion._compiler.cute.selection_coarse import trace_coarse_rank_selection
-from helion._compiler.cute.selection_network import selection_network
-from helion._compiler.cute.selection_network import trace_selection_network
-from helion._compiler.cute.topk import _match_direct_topk_root
-from helion._compiler.cute.topk import match_topk_root
-from helion._compiler.cute.topk import topk_tensors_are_proven_disjoint
+from helion._compiler.cute.selection import selection_coarse
+from helion._compiler.cute.selection.selection_coarse import trace_coarse_rank_selection
+from helion._compiler.cute.selection.selection_network import selection_network
+from helion._compiler.cute.selection.selection_network import trace_selection_network
+from helion._compiler.cute.selection.topk import _match_direct_topk_root
+from helion._compiler.cute.selection.topk import match_topk_root
+from helion._compiler.cute.selection.topk import topk_tensors_are_proven_disjoint
 from helion._compiler.runtime_tensor_guards import (
     _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
 )
+from helion._compiler.triton.backend import TritonBackend
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
@@ -66,8 +66,12 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
-from helion._compiler.cute.sorting_networks import COMPACT_SORT_LAYERS
+from helion._compiler.cute.autotune.search_surface import enable_cute_topk_search
+from helion._compiler.cute.selection.sorting_networks import COMPACT_SORT_LAYERS
 from helion.runtime import default_cute_launcher
+
+# Backend-independent (runs under every HELION_BACKEND, like a non-cute test);
+# the conftest gate over test_cute_* files leaves it alone.
 
 # Basic top-k tests.
 
@@ -1113,7 +1117,7 @@ def topk_spec(monkeypatch: pytest.MonkeyPatch) -> ConfigSpec:
     # Keep configuration validation independent of CUDA device discovery.
     monkeypatch.setattr("helion.autotuner.config_spec.get_num_xcd", lambda device: 1)
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 0), num_sm=1)
-    spec.enable_cute_topk_search()
+    enable_cute_topk_search(spec)
     return spec
 
 
@@ -1151,7 +1155,7 @@ def test_topk_compact_selection_networks(
     x, storage = _layout_input(5, width, dtype, 2, 1)
     original = storage.clone()
     with patch(
-        "helion._compiler.cute.selection_network.trace_selection_network",
+        "helion._compiler.cute.selection.selection_network.trace_selection_network",
         wraps=trace_selection_network,
     ) as trace:
         code, (values, indices) = code_and_output(
@@ -1504,7 +1508,7 @@ def _code(
             cute_topk_defer_value_gathers=defer_value_gathers,
             cute_topk_merge_schedule=merge_schedule,
         )
-        return bound.to_triton_code(config)
+        return bound.to_code(config)
 
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
@@ -2094,7 +2098,7 @@ def test_distributed_fragment_does_not_pad_every_lane_to_k(
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
 def test_topk_sort_network_reaches_codegen(network: str, layout: str) -> None:
     with patch(
-        "helion._compiler.cute.selection_network.trace_selection_network",
+        "helion._compiler.cute.selection.selection_network.trace_selection_network",
         wraps=trace_selection_network,
     ) as trace:
         code = _code(
@@ -2115,7 +2119,7 @@ def test_topk_sort_network_reaches_codegen(network: str, layout: str) -> None:
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 def test_topk_cache_hash_includes_compact_tables() -> None:
-    from helion._compiler.cute import selection_network
+    from helion._compiler.cute.selection import selection_network
 
     selection_network._compact_sort_layers.cache_clear()
     trace_selection_network.cache_clear()
@@ -2342,7 +2346,7 @@ def test_matcher_uses_runtime_span_alias_proof(
         patch("helion._compat._is_hip", return_value=False),
     ):
         bound = _out_topk._bind_isolated((x, values, indices))
-        code = bound.to_triton_code(bound.config_spec.default_config())
+        code = bound.to_code(bound.config_spec.default_config())
         assert _has_register_selection(code) == (alias_kind == "separate")
 
 
@@ -2501,7 +2505,8 @@ def selection_codegen_stub() -> Iterator[None]:
         )
 
     with patch(
-        "helion._compiler.cute.topk_codegen.emit_selection_network", side_effect=emit
+        "helion._compiler.cute.selection.topk_codegen.emit_selection_network",
+        side_effect=emit,
     ):
         yield
 
@@ -2592,7 +2597,7 @@ def test_selection_network_random_duplicates_and_padding(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 def test_compact_network_bounds_and_operation_count() -> None:
-    from helion._compiler.cute.selection_network import _compact_sort_layers
+    from helion._compiler.cute.selection.selection_network import _compact_sort_layers
 
     for size, layers in COMPACT_SORT_LAYERS.items():
         for layer in layers:
@@ -2801,7 +2806,7 @@ def test_packed_rare_config(
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 0), num_sm=1)
     with pytest.raises(exc.InvalidConfig, match="compatible top-k root"):
         spec.normalize({key: valid})
-    spec.enable_cute_topk_search()
+    enable_cute_topk_search(spec)
     assert spec.default_config()[key] == default
     config = helion.Config()
     config.config[key] = valid
@@ -3256,7 +3261,7 @@ def test_cached_topk_recompiles_after_construction_tensors_expire(
         values = torch.empty((5, 32), dtype=x.dtype)
         indices = torch.empty((5, 32), dtype=torch.int32)
         bound = kernel.bind((x, values, indices, 32, True))
-        assert "topk_output_max_rank" in bound.to_triton_code(_config("dsl"))
+        assert "topk_output_max_rank" in bound.to_code(_config("dsl"))
         return bound, x if retain_input else None
 
     bound, retained = first_binding()
@@ -3269,7 +3274,7 @@ def test_cached_topk_recompiles_after_construction_tensors_expire(
     values = torch.empty((5, 32), dtype=x.dtype)
     indices = torch.empty((5, 32), dtype=torch.int32)
     assert kernel.bind((x, values, indices, 32, True)) is bound
-    code = bound.to_triton_code(_config("asm"))
+    code = bound.to_code(_config("asm"))
     assert "topk_output_max_rank" in code
     assert "_cute_encode_ordered_topk" in code
     assert (retained is not None) == retain_input
@@ -3302,7 +3307,7 @@ def test_cached_topk_alias_binding_stays_rejected_after_release(
         assert (
             "cute_topk_lanes_per_row" in bound.config_spec.default_config()
         ) == expected
-        code = bound.to_triton_code(bound.config_spec.default_config())
+        code = bound.to_code(bound.config_spec.default_config())
         assert _has_register_selection(code) == expected
 
 
@@ -3334,7 +3339,7 @@ def test_singleton_topk_search_and_recompile_after_input_release(
         indices = torch.empty((5, 1), dtype=index_dtype)
         bound = kernel.bind((x, values, indices, 1, largest))
         assert bound.config_spec.cute_topk_search_enabled
-        _assert_register_selection(bound.to_triton_code(config))
+        _assert_register_selection(bound.to_code(config))
         return bound
 
     bound = first_binding()
@@ -3346,7 +3351,7 @@ def test_singleton_topk_search_and_recompile_after_input_release(
     indices = torch.empty((5, 1), dtype=index_dtype)
     assert kernel.bind((x, values, indices, 1, largest)) is bound
     config.config["cute_topk_vector_width"] = 4
-    _assert_register_selection(bound.to_triton_code(config))
+    _assert_register_selection(bound.to_code(config))
 
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
@@ -3571,7 +3576,7 @@ def test_balanced_config_roundtrip_and_default(monkeypatch: pytest.MonkeyPatch) 
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 0), num_sm=1)
     with pytest.raises(exc.InvalidConfig):
         spec.normalize(helion.Config(cute_topk_merge_schedule="balanced"))
-    spec.enable_cute_topk_search()
+    enable_cute_topk_search(spec)
     assert spec.default_config()["cute_topk_merge_schedule"] == "sequential"
     config = helion.Config(cute_topk_merge_schedule="balanced")
     spec.normalize(config)
@@ -3587,7 +3592,7 @@ def test_balanced_config_roundtrip_and_default(monkeypatch: pytest.MonkeyPatch) 
 @pytest.mark.parametrize("network", ["batcher", "compact", "compact_pruned"])
 def test_balanced_schedule_reaches_codegen(layout: str, network: str) -> None:
     with patch(
-        "helion._compiler.cute.selection_network.trace_selection_network",
+        "helion._compiler.cute.selection.selection_network.trace_selection_network",
         wraps=trace_selection_network,
     ) as trace:
         code = _code(
@@ -3733,7 +3738,7 @@ def test_balanced_endpoint_codegen_composition(encoder: str, largest: bool) -> N
     # chunked fallback and the balanced schedule is active. K/(L*V)=1 makes
     # every output group complete, activating the ordinal endpoint guard.
     with patch(
-        "helion._compiler.cute.selection_network.trace_selection_network",
+        "helion._compiler.cute.selection.selection_network.trace_selection_network",
         wraps=trace_selection_network,
     ) as trace:
         code = _code(
@@ -4694,7 +4699,7 @@ def test_topk_alias_fallback_retains_generic_search(
     assert spec.cute_topk_search_enabled == specialized
     config = spec.default_config()
     assert ("cute_topk_lanes_per_row" in config) == specialized
-    assert _has_register_selection(bound.to_triton_code(config)) == specialized
+    assert _has_register_selection(bound.to_code(config)) == specialized
     row = spec.block_sizes[0]
     if specialized:
         assert row.autotuner_min == row.max_size
@@ -6533,7 +6538,7 @@ def test_fp32_ordered_selection_runtime_lengths(next_n: int) -> None:
 
 def test_fp32_ordered_selection_config_legality(topk_spec: ConfigSpec) -> None:
     spec = topk_spec
-    spec.enable_cute_topk_search(torch.float32)
+    enable_cute_topk_search(spec, torch.float32)
     config = spec.default_config()
     assert config["cute_topk_key_dtype"] == "int64"
     assert spec.cute_topk_choices["cute_topk_key_encoder"] == ("dsl",)
@@ -6923,7 +6928,7 @@ def test_coarse_rank_topk_codegen_default_and_eligibility():
     assert old == bound.to_code(config)
     config.config["cute_topk_coarse_keys"] = True
     with patch(
-        "helion._compiler.cute.selection_coarse.trace_coarse_rank_selection",
+        "helion._compiler.cute.selection.selection_coarse.trace_coarse_rank_selection",
         wraps=trace_coarse_rank_selection,
     ) as trace:
         new = bound.to_code(config)
@@ -6961,7 +6966,7 @@ def test_coarse_rank_topk_old_population_prefix_and_rng(seed):
         _target(),
         forbid_native_compile(),
         patch(
-            "helion._compiler.autotuner_heuristics.register_topk_key_recovery_coverage"
+            "helion._compiler.cute.autotune.heuristics.register_topk_key_recovery_coverage"
         ),
     ):
         for enabled in (False, True):
@@ -6969,7 +6974,7 @@ def test_coarse_rank_topk_old_population_prefix_and_rng(seed):
                 _row_topk.fn, backend="cute", static_shapes=True, autotune_effort="full"
             )
             context = patch(
-                "helion._compiler.autotuner_heuristics.register_topk_coarse_keys_coverage"
+                "helion._compiler.cute.autotune.heuristics.register_topk_coarse_keys_coverage"
             )
             if not enabled:
                 with context:
@@ -7311,7 +7316,7 @@ def test_coarse_rank_topk_key_recovery_population(seed):
                 bound = cpu_bind(kernel, args)
             else:
                 with patch(
-                    "helion._compiler.autotuner_heuristics.register_topk_key_recovery_coverage"
+                    "helion._compiler.cute.autotune.heuristics.register_topk_key_recovery_coverage"
                 ):
                     bound = cpu_bind(kernel, args)
             spec = bound.config_spec
@@ -7365,7 +7370,7 @@ def test_coarse_rank_topk_key_recovery_config_and_codegen(mode):
     )
     assert repeated.config == normalized.config
     with patch(
-        "helion._compiler.cute.selection_coarse.trace_coarse_rank_selection",
+        "helion._compiler.cute.selection.selection_coarse.trace_coarse_rank_selection",
         wraps=trace_coarse_rank_selection,
     ) as trace:
         code = bound.to_code(cfg)
@@ -7749,7 +7754,7 @@ def test_coarse_rank_topk_payload_consumer_proof(recovery):
                 cute_topk_value_mode=mode,
             )
             with patch(
-                "helion._compiler.cute.selection_coarse.trace_coarse_rank_selection",
+                "helion._compiler.cute.selection.selection_coarse.trace_coarse_rank_selection",
                 wraps=trace_coarse_rank_selection,
             ) as trace:
                 code = bound.to_code(cfg)
@@ -7785,7 +7790,7 @@ def test_coarse_rank_topk_payload_sorted_native(recovery, k, lanes):
         cute_topk_key_dtype="int64",
     )
     with patch(
-        "helion._compiler.cute.selection_coarse.trace_coarse_rank_selection",
+        "helion._compiler.cute.selection.selection_coarse.trace_coarse_rank_selection",
         wraps=trace_coarse_rank_selection,
     ) as trace:
         code, (values, indices) = code_and_output(_row_topk, (x, k, True), **cfg)
@@ -8862,7 +8867,7 @@ def _network_prefix_without_later_coverage():
             "register_fragment_register_producers_coverage",
         ):
             stack.enter_context(
-                patch("helion._compiler.autotuner_heuristics." + registration)
+                patch("helion._compiler.cute.autotune.heuristics." + registration)
             )
         yield
 
@@ -8887,7 +8892,7 @@ def test_fragment_network_topk_population_prefix(seed):
             )
             if not enabled:
                 with patch(
-                    "helion._compiler.autotuner_heuristics.register_fragment_topk_network_coverage"
+                    "helion._compiler.cute.autotune.heuristics.register_fragment_topk_network_coverage"
                 ):
                     bound = cpu_bind(kernel, args)
             else:

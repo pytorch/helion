@@ -13,6 +13,9 @@ from __future__ import annotations
 import pytest
 import torch
 
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import surface
+
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
@@ -397,23 +400,23 @@ def test_search_surface_and_seeds() -> None:
         assert state.rowvec_aux_facts is not None
         assert state.rowvec_aux_facts.exact_aux_count == 2
         assert state.exact_aux_tma_provable
-        assert state.epi_tma_search_enabled()
-        fragment = state.aux_load_mode_autotune_fragments()[MODE]
+        assert surface.epi_tma_search_enabled(state)
+        fragment = surface.aux_load_mode_autotune_fragments(state)[MODE]
         assert EPI_TMA in fragment.choices  # type: ignore[attr-defined]
-        seeds = [
+        seed_configs = [
             seed
-            for seed in state._paired_pipeline_seed_configs()
+            for seed in seeds._paired_pipeline_seed_configs(state)
             if seed.config.get(MODE) == EPI_TMA
         ]
     # One twin per 256-row pair tile and placement, at the deepest fitting
     # ring beside the aux rings; the 128-row pair tile stays on SIMT reads.
-    assert all(seed.block_sizes[0] == 256 for seed in seeds)
+    assert all(seed.block_sizes[0] == 256 for seed in seed_configs)
     depths = {
         (
             tuple(seed.block_sizes),
             seed.config["tcgen05_aux_load_placement"],
         ): seed.config["tcgen05_ab_stages"]
-        for seed in seeds
+        for seed in seed_configs
     }
     assert depths[((256, 128, 64), "post_acc_wait")] == 7
     assert depths[((256, 128, 64), "pre_acc_wait")] == 7
@@ -437,9 +440,9 @@ def test_tma_illegal_aux_views_keep_the_staged_modes_off(view: str) -> None:
         state = bound.config_spec._cute_tcgen05_config
         assert state.exact_shape_aux_kernel_detected
         assert not state.exact_aux_tma_provable
-        assert not state.epi_tma_search_enabled()
-        assert not state._aux_tma_search_enabled()
-        assert state.aux_load_mode_autotune_fragments() == {}
+        assert not surface.epi_tma_search_enabled(state)
+        assert not surface._aux_tma_search_enabled(state)
+        assert surface.aux_load_mode_autotune_fragments(state) == {}
         assert all(
             seed.config.get(MODE, TCGEN05_AUX_LOAD_MODE_SIMT)
             == TCGEN05_AUX_LOAD_MODE_SIMT

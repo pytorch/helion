@@ -18,6 +18,7 @@ from test.test_cute_grouped_paired_clc_layout import _sdk
 
 import helion
 from helion._compiler.cute.cute_mma import _tcgen05_grouped_b_rank3_index_domain
+from helion._compiler.cute.tcgen05_config import smem
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES,
 )
@@ -328,7 +329,7 @@ def test_resource_config_fails_closed():
         assert model.grouped_d_shift_supported
         assert bound.config_spec.normalized_config(_profile())["tcgen05_ab_stages"] == 7
         with patch.object(model, "grouped_d_shift_supported", False):
-            assert not model._grouped_worklist_immutable_smem(_profile().config)
+            assert not smem._grouped_worklist_immutable_smem(model, _profile().config)
             with pytest.raises(InvalidConfig):
                 bound.config_spec.normalized_config(_profile())
         with pytest.raises(InvalidConfig):

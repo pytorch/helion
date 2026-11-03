@@ -11,16 +11,19 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
+from helion._compiler.cute.autotune.flash_surface import _resolve_cute_flash_config
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.flash_schedule import FlashScheduleError
 from helion._compiler.cute.flash_schedule import FlashScheduleSpec
 from helion._compiler.cute.flash_schedule import build_fa4_schedule
 from helion._compiler.cute.flash_schedule import max_fa4_kv_depth
 from helion._compiler.cute.flash_schedule import verify_flash_schedule
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing import cpu_render_target
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 
@@ -39,11 +42,8 @@ pytest.importorskip("cutlass.cute")
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
+        cpu_render_target(),
         patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}, clear=True),
-        mock_cuda_unavailable(),
-        patch.object(
-            torch.cuda, "_lazy_init", side_effect=AssertionError("CPU-only test")
-        ),
     ):
         yield
 
@@ -132,7 +132,8 @@ def _config_spec(
     )
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         num_kv=num_kv,
         num_bh=64,
@@ -157,8 +158,8 @@ def _normalized_compiler_seeds(spec: ConfigSpec) -> list[helion.Config]:
         flat, config = generation.canonicalize_flat(generation.flatten(seed))
         assert spec.normalized_config(config) == config
         assert generation.unflatten(flat) == config
-        assert spec._resolve_cute_flash_config(config.config) == (
-            spec._resolve_cute_flash_config(seed.config)
+        assert _resolve_cute_flash_config(spec, config.config) == (
+            _resolve_cute_flash_config(spec, seed.config)
         )
         normalized.append(config)
     messages: list[str] = []
@@ -293,7 +294,7 @@ def test_dense_single_search_and_normalization_retain_every_legal_depth(
     head_dim: int, dtype: torch.dtype, family: str, schedule: str
 ) -> None:
     spec = _config_spec(head_dim, dtype)
-    fragments = spec._cute_flash_autotune_fragments("fa4", family)
+    fragments = _cute_flash_autotune_fragments(spec, "fa4", family)
     transport = cast("EnumFragment", fragments[cute_flash.FLASH_STAT_TRANSPORT_KEY])
     assert {"ring2", "single"} <= set(transport.search_choices or transport.choices)
     schedule_spec = FlashScheduleSpec(
@@ -352,7 +353,7 @@ def test_dense_source_seeds_do_not_promote_ws_or_ordinary_causal(
 ) -> None:
     spec = _config_spec(head_dim, dtype, causal=causal, requires_ws_overlap=not causal)
     for seed in _normalized_compiler_seeds(spec):
-        resolved = spec._resolve_cute_flash_config(seed.config)
+        resolved = _resolve_cute_flash_config(spec, seed.config)
         assert resolved.stat_transport == "ring2"
 
 

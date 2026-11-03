@@ -35,9 +35,8 @@ import helion
 from helion import exc
 from helion._compiler import tile_strategy
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
+from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -45,8 +44,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from helion.runtime.kernel import BoundKernel
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 def _column_sums_added(x: torch.Tensor) -> torch.Tensor:
@@ -138,14 +135,7 @@ def _sibling_config(bound: BoundKernel, pid_type: str) -> helion.Config:
 
 @contextmanager
 def _cpu_codegen() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU test")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
         yield
 
 

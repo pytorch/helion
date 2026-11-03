@@ -21,7 +21,6 @@ import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.memory_ops import _cute_resolved_load_mask
 from helion._compiler.host_function import HostFunction
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 
@@ -82,7 +81,10 @@ def test_full_slice_preserves_resolved_axis_mask(
             codegen=codegen,
             device_function=SimpleNamespace(
                 cute_state=SimpleNamespace(
-                    matmul_operand_block_remap={}, matmul_operand_index_override={}
+                    tcgen05=SimpleNamespace(
+                        matmul_operand_block_remap={},
+                        matmul_operand_index_override={},
+                    )
                 )
             ),
         ),
@@ -153,7 +155,6 @@ def _assert_operand_coordinates_are_local(source: str) -> None:
 @pytest.mark.parametrize(
     "compute,copy", [("warp", "scalar"), ("tcgen05", "async_cached")]
 )
-@skipUnlessBackends(["cute"])
 def test_full_slice_equal_extents_do_not_capture_another_output_axis(
     dtype: torch.dtype,
     shape: tuple[int, int, int],
@@ -181,7 +182,6 @@ def test_full_slice_equal_extents_do_not_capture_another_output_axis(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("static_shapes", [False, True])
-@skipUnlessBackends(["cute"])
 def test_original_seeded_mamba_oversized_m_tile_has_no_escaped_row_mask(
     dtype: torch.dtype, static_shapes: bool
 ) -> None:
@@ -208,7 +208,6 @@ def test_original_seeded_mamba_oversized_m_tile_has_no_escaped_row_mask(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(64, 70, 64), (130, 21, 21)])
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
-@skipUnlessBackends(["cute"])
 def test_full_slice_equal_extent_tails_and_mutated_graphs(
     dtype: torch.dtype, shape: tuple[int, int, int], compute: str
 ) -> None:

@@ -184,7 +184,7 @@ def reach_tcgen05_matmul_anchors(
     """
     return reach_matmul_anchors(
         value_node,
-        target_fx_nodes=state.device_function.cute_state.matmul_fx_nodes,
+        target_fx_nodes=state.device_function.cute_state.tcgen05.matmul_fx_nodes,
         inner_outputs_by_graph_id=build_inner_outputs_index(state),
     )
 

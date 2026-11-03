@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import re
+import textwrap
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
+
+from .analysis.match_common import is_full_slice
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
 
+    from ..device_function import DeviceFunction
     from ..device_ir import DeviceIR
+    from ..generate_ast import GenerateAST
+
+
+_is_full_slice = is_full_slice
 
 
 @dataclasses.dataclass(frozen=True)
@@ -38,7 +48,57 @@ def _is_call(node: object, target: object) -> bool:
     )
 
 
-def _strip_value_casts(node: object) -> torch.fx.Node | None:
+def _binary_args(
+    node: object, targets: tuple[object, ...], *, exact_arity: bool = True
+) -> tuple[object, object] | None:
+    """The two operands of a binary ``call_function`` whose target is in ``targets``.
+
+    ``exact_arity=False`` admits calls carrying further positional arguments
+    (the chunk-prepare matcher's grammar); the default requires exactly two.
+    """
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.op != "call_function"
+        or node.target not in targets
+        or (len(node.args) != 2 if exact_arity else len(node.args) < 2)
+    ):
+        return None
+    return node.args[0], node.args[1]
+
+
+def _is_convert(node: object, source: object, dtype: torch.dtype) -> bool:
+    """``convert_element_type(source, dtype)`` with exactly those two arguments."""
+    return bool(
+        isinstance(node, torch.fx.Node)
+        and _is_call(node, torch.ops.prims.convert_element_type.default)
+        and node.args == (source, dtype)
+    )
+
+
+def _ancestors(node: object) -> set[torch.fx.Node]:
+    """Every node reachable through ``all_input_nodes`` from ``node`` (inclusive).
+
+    A list or tuple of nodes is walked element-wise; any other non-node
+    value has no ancestors.
+    """
+    pending = [node]
+    seen: set[torch.fx.Node] = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, (list, tuple)):
+            pending.extend(current)
+            continue
+        if not isinstance(current, torch.fx.Node):
+            continue
+        if current in seen:
+            continue
+        seen.add(current)
+        pending.extend(current.all_input_nodes)
+    return seen
+
+
+def _strip_value_casts(node: object, *, depth: int = 8) -> torch.fx.Node | None:
+    """The producer under at most ``depth`` clone / detach / dtype-cast nodes."""
     if not isinstance(node, torch.fx.Node):
         return None
     current = node
@@ -47,7 +107,7 @@ def _strip_value_casts(node: object) -> torch.fx.Node | None:
         torch.ops.aten.detach.default,
         torch.ops.prims.convert_element_type.default,
     }
-    for _ in range(8):
+    for _ in range(depth):
         if current.op != "call_function" or current.target not in cast_targets:
             return current
         if not current.args or not isinstance(current.args[0], torch.fx.Node):
@@ -122,6 +182,11 @@ def _memory_indices(node: torch.fx.Node) -> tuple[object, ...] | None:
     return tuple(node.args[1])
 
 
+def _tensor_arg(cg: GenerateAST, ref: _TensorRef) -> str:
+    """Kernel argument name of a matched host tensor (``ref.name`` preferred)."""
+    return cg.device_function.tensor_arg(ref.fake, prefer_name=ref.name).name
+
+
 def _linear_offsets_fit_i32(
     work_items: int,
     tensor_numels: Sequence[int],
@@ -169,12 +234,31 @@ class _GeneratedCodeTemplate:
         self._local_names: dict[str, str] = {}
         self._values: list[tuple[str, str]] = []
 
+    @classmethod
+    def for_device_function(
+        cls, cg: GenerateAST, prefix: str
+    ) -> _GeneratedCodeTemplate:
+        """Template whose occupied names are the kernel's current arguments
+        and ``cg._extra_params``."""
+
+        df = cg.device_function
+        return cls(
+            prefix,
+            (*(argument.name for argument in df.arguments), *cg._extra_params),
+            df.new_var,
+        )
+
     def protect(self, value: str) -> str:
         """Return an invalid-Python sentinel replaced after local renaming."""
 
         token = f"<HELION_EXACT_VALUE_{len(self._values)}>"
         self._values.append((token, value))
         return token
+
+    def protect_many(self, values: Sequence[str]) -> tuple[str, ...]:
+        """``protect`` every value, in order."""
+
+        return tuple(self.protect(value) for value in values)
 
     def render(self, source: str) -> str:
         def replacement(match: re.Match[str]) -> str:
@@ -190,6 +274,53 @@ class _GeneratedCodeTemplate:
         for token, value in self._values:
             source = source.replace(token, value)
         return source
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProtectedArguments:
+    """A plan's kernel arguments, registered and protected for one generated body."""
+
+    template: _GeneratedCodeTemplate
+    placeholder_args: set[str]
+    tensors: tuple[str, ...]
+    scalars: tuple[str, ...]
+
+    def install(self, df: DeviceFunction, preamble: str, body: str) -> None:
+        """Replace the device function's preamble and body with the rendered sources."""
+
+        df.preamble = cast(
+            "list[ast.AST]",
+            ast.parse(textwrap.dedent(self.template.render(preamble))).body,
+        )
+        df.body = cast(
+            "list[ast.AST]",
+            ast.parse(textwrap.dedent(self.template.render(body))).body,
+        )
+        df.placeholder_args.update(self.placeholder_args)
+
+
+def _protected_arguments(
+    cg: GenerateAST,
+    prefix: str,
+    tensors: Sequence[_TensorRef],
+    scalars: Sequence[object],
+) -> _ProtectedArguments:
+    """Register ``tensors`` (in order) and ``scalars`` as kernel arguments.
+
+    The template is built after registration so the new argument names count
+    as occupied when the generated ``prefix`` locals are renamed.
+    """
+
+    df = cg.device_function
+    tensor_names = [_tensor_arg(cg, ref) for ref in tensors]
+    scalar_names = [df.literal_expr(value) for value in scalars]
+    template = _GeneratedCodeTemplate.for_device_function(cg, prefix)
+    return _ProtectedArguments(
+        template,
+        set(tensor_names),
+        template.protect_many(tensor_names),
+        template.protect_many(scalar_names),
+    )
 
 
 def _canonical_root_axis_ids(

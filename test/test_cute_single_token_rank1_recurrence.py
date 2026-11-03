@@ -15,12 +15,10 @@ from torch._subclasses.fake_tensor import FakeTensor
 import helion
 from helion._compiler.cute.fx_matcher import _xyz_grid_fits
 from helion._testing import onlyBackends
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
-pytestmark = skipUnlessBackends(["cute"])
 _single_token_rank1_recurrence = importlib.import_module(
     "helion._compiler.cute.single_token_rank1_recurrence"
 )
@@ -255,7 +253,7 @@ def _shorten_root_task_extent(device_ir: DeviceIR) -> None:
     )
 
 
-# unittest runners ignore pytestmark.
+# unittest runners see neither pytest marks nor the conftest path gate.
 @onlyBackends(["cute"])
 class TestCuteSingleTokenRank1Recurrence(unittest.TestCase):
     def _code(
@@ -364,9 +362,7 @@ class TestCuteSingleTokenRank1Recurrence(unittest.TestCase):
             if mutate is not None:
                 assert bound.host_function is not None
                 mutate(bound.host_function.device_ir)
-            return bound.to_triton_code(
-                _config(block_v, num_warps, num_threads=num_threads)
-            )
+            return bound.to_code(_config(block_v, num_warps, num_threads=num_threads))
 
     def test_structural_match_emits_packed_rank1_kernel(self) -> None:
         code = self._code()
@@ -479,9 +475,9 @@ class TestCuteSingleTokenRank1Recurrence(unittest.TestCase):
             self.assertFalse(_xyz_grid_fits((1, 1, 8)))
 
     def test_generated_locals_do_not_shadow_tensor_arguments(self) -> None:
-        from helion._compiler.cute import single_token_rank1_recurrence
+        from helion._compiler.cute import fx_matcher
 
-        original = single_token_rank1_recurrence._host_tensor_ref
+        original = fx_matcher._host_tensor_ref
 
         for batch_size, num_warps, colliding, renamed in (
             (1, 8, "rank1_work", "rank1_work_1"),
@@ -491,12 +487,12 @@ class TestCuteSingleTokenRank1Recurrence(unittest.TestCase):
 
                 def colliding_name(node: object, collision: str = colliding) -> object:
                     ref = original(node)
-                    if ref is not None and ref.suggested_name == "packed":
-                        return dataclasses.replace(ref, suggested_name=collision)
+                    if ref is not None and ref.name == "packed":
+                        return dataclasses.replace(ref, name=collision)
                     return ref
 
                 with patch.object(
-                    single_token_rank1_recurrence,
+                    fx_matcher,
                     "_host_tensor_ref",
                     side_effect=colliding_name,
                 ):
@@ -592,7 +588,7 @@ class TestCuteSingleTokenRank1Recurrence(unittest.TestCase):
                 tile_rows = transferred.block_sizes[0]
                 transferred_packed_seeds[tile_rows] = (
                     transferred,
-                    bound.to_triton_code(transferred),
+                    bound.to_code(transferred),
                 )
 
         self.assertIn(

@@ -4,7 +4,13 @@
 # The CuTe DSL intentionally leaves its compile-time value types implicit.
 # ruff: noqa: ANN001, ANN202
 
-"""Low-level CuTe primitives shared by affine recurrence schedules."""
+"""Low-level CuTe primitives shared by affine recurrence schedules.
+
+The pointer-operand ``ldmatrix`` / ``stmatrix`` and MMA wrappers live here;
+the single-instruction helpers the schedules name through this module
+(``movmatrix_b16``, the TMA issue and fence, ``prefetch_global_l2``,
+``store_u32x4_if_valid``) are ``device/ptx.py`` rows re-exported.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +21,13 @@ import cutlass
 from cutlass._mlir.dialects import llvm
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import dsl_user_op
+
+from .device.ptx import movmatrix_b16
+from .device.ptx import prefetch_global_l2
+from .device.ptx import store_u32x4_if_valid
+from .device.ptx import tma_load_3d
+from .device.ptx import tma_store_3d
+from .device.ptx import tma_store_commit_group
 
 make_rmem_tensor = cute.make_rmem_tensor
 _LLVM_STRUCT_TYPE = cast("Any", llvm).StructType
@@ -58,6 +71,12 @@ def ldmatrix_x2_trans(smem_ptr, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def ldmatrix_x4(smem_ptr, *, loc=None, ip=None):
+    """Load four 8x8 b16 matrices into registers."""
+    return _ldmatrix(".x4", "", smem_ptr, 4, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def ldmatrix_x4_trans(smem_ptr, *, loc=None, ip=None):
     """Load and transpose four 8x8 b16 matrices into registers."""
     return _ldmatrix(".x4", ".trans", smem_ptr, 4, loc=loc, ip=ip)
@@ -94,23 +113,9 @@ def stmatrix_x2_trans(smem_ptr, r0, r1, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def movmatrix_b16(value, *, loc=None, ip=None):
-    """Transpose one 8x8 b16 register matrix."""
-    from cutlass._mlir.extras import types as _T
-
-    return cutlass.Int32(
-        llvm.inline_asm(
-            _T.IntegerType.get_signless(32),
-            [cutlass.Int32(value).ir_value(loc=loc, ip=ip)],
-            "movmatrix.sync.aligned.m8n8.trans.b16 $0, $1;",
-            "=r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
+def stmatrix_x4(smem_ptr, r0, r1, r2, r3, *, loc=None, ip=None):
+    """Store four 8x8 b16 register matrices to shared memory."""
+    _stmatrix(".x4", "", smem_ptr, (r0, r1, r2, r3), loc=loc, ip=ip)
 
 
 def _mma_m16n8k16(
@@ -179,125 +184,6 @@ def pack_bf16x2(lo: cutlass.Float32, hi: cutlass.Float32, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def prefetch_global_l2(ptr, *, loc=None, ip=None) -> None:
-    """``prefetch.global.L2`` of the line holding the global ``ptr``."""
-
-    llvm.inline_asm(
-        None,
-        [ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
-        "prefetch.global.L2 [$0];",
-        "l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def store_u32x4_if_valid(
-    ptr,
-    value0,
-    value1,
-    value2,
-    value3,
-    state_index,
-    state_size,
-    *,
-    loc=None,
-    ip=None,
-):
-    """Store four packed words only when their slot is in range."""
-
-    address = cast("Any", ptr).toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
-    values = [
-        cutlass.Uint32(value).ir_value(loc=loc, ip=ip)
-        for value in (value0, value1, value2, value3)
-    ]
-    index = cutlass.Int64(state_index).ir_value(loc=loc, ip=ip)
-    size = cutlass.Int64(state_size).ir_value(loc=loc, ip=ip)
-    llvm.inline_asm(
-        None,
-        [address, *values, index, size],
-        (
-            "{ .reg .pred valid; "
-            "setp.lt.u64 valid, $5, $6; "
-            "@valid st.global.L1::no_allocate.v4.u32 [$0], {$1, $2, $3, $4}; }"
-        ),
-        "l,r,r,r,r,l,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def tma_load_3d(smem_ptr, desc_addr, mbar_ptr, c0, c1, c2, *, loc=None, ip=None):
-    """Issue one global-to-shared 3D TMA load."""
-    llvm.inline_asm(
-        None,
-        [
-            smem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            cutlass.Int64(desc_addr).ir_value(loc=loc, ip=ip),
-            mbar_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c0).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c1).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c2).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
-        " [$0], [$1, {$3, $4, $5}], [$2];",
-        "r,l,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def tma_store_3d(desc_addr, smem_ptr, c0, c1, c2, *, loc=None, ip=None):
-    """Issue one shared-to-global 3D TMA store."""
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int64(desc_addr).ir_value(loc=loc, ip=ip),
-            smem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c0).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c1).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c2).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
-        " [$0, {$2, $3, $4}], [$1];",
-        "l,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def tma_store_commit_group(*, loc=None, ip=None):
-    """Close the current bulk-store group."""
-    llvm.inline_asm(
-        None,
-        [],
-        "cp.async.bulk.commit_group;",
-        "",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def tma_store_wait_read(keep: int, *, loc=None, ip=None):
     """Wait until at most ``keep`` stores still hold their source memory."""
     llvm.inline_asm(
@@ -355,6 +241,7 @@ __all__ = [
     "_mma_m16n8k16",
     "ldmatrix_x2",
     "ldmatrix_x2_trans",
+    "ldmatrix_x4",
     "ldmatrix_x4_trans",
     "mma_m16n8k16_bf16",
     "movmatrix_b16",
@@ -362,6 +249,7 @@ __all__ = [
     "prefetch_global_l2",
     "stmatrix_x2",
     "stmatrix_x2_trans",
+    "stmatrix_x4",
     "store_u32x4_if_valid",
     "store_vec8_bf16",
     "tma_load_3d",

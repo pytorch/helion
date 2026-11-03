@@ -31,10 +31,10 @@ from test.test_cute_tma_rn import rn_config
 from test.test_cute_tma_rn import schedule
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_grouped_rna import (
+from helion._compiler.cute import tcgen05_flattened_prefix as prefix_module
+from helion._compiler.cute.autotune.heuristics.cute_grouped_rna import (
     CuteGroupedRnaHeuristic,
 )
-from helion._compiler.cute import tcgen05_flattened_prefix as prefix_module
 from helion._compiler.cute.tcgen05_flat_grouped_codegen import (
     flat_grouped_kernel_module,
 )

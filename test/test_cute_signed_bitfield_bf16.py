@@ -12,11 +12,16 @@ import pytest
 import torch
 from torch.fx import Graph
 
-from helion._compiler.autotuner_heuristics.cute_signed_bitfield import (
+from helion._compiler.cute import signed_bitfield as sb
+from helion._compiler.cute.autotune.heuristics.cute_signed_bitfield import (
     add_signed_bitfield_seeds,
 )
-from helion._compiler.cute import signed_bitfield as sb
+from helion._compiler.cute.autotune.search_surface import (
+    _normalize_cute_signed_bitfield_bf16,
+)
 from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.cute.emitters import lane_packets
+from helion._compiler.lane_loop_context import LaneLoopContext
 from helion._compiler.tile_strategy import DeviceGridState
 from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
@@ -301,12 +306,8 @@ def _physical(monkeypatch):
     vloop = ast.parse("for vi in cutlass.range_constexpr(8):\n    pass").body[0]
     body = [definition, vloop]
     statements = []
-    strategy = SimpleNamespace(
-        _cute_lane_body_by_block={1: body},
-        _cute_lane_vloop_by_block={1: vloop},
-        _cute_lane_axis_pos_by_block={1: 1},
-        _cute_lane_base_index_var_by_block={1: "base"},
-        _cute_flat_multi=False,
+    context = LaneLoopContext(
+        1, lane_body=body, vloop=vloop, lane_axis_pos=1, base_index_var="base"
     )
     grid = object.__new__(DeviceGridState)
     codegen = SimpleNamespace(
@@ -347,8 +348,7 @@ def _physical(monkeypatch):
     )
     sb.record_signed_byte_packet(
         state,
-        strategy,
-        1,
+        context,
         case.source.meta["val"],
         8,
         ["row", "column"],
@@ -358,15 +358,14 @@ def _physical(monkeypatch):
     )
     assert len(cute_state.signed_byte_packets) == 1
     state.fx_node = case.store
-    return case, state, strategy
+    return case, state, context
 
 
 def test_actual_store_protocol_preserves_order_and_scalar_fanout(monkeypatch):
-    case, state, strategy = _physical(monkeypatch)
+    case, state, context = _physical(monkeypatch)
     value = sb.packed_store_value(
         state,
-        strategy,
-        1,
+        context,
         8,
         case.output.meta["val"],
         ["different_row", "column"],
@@ -380,10 +379,9 @@ def test_actual_store_protocol_preserves_order_and_scalar_fanout(monkeypatch):
     original_scalar = deepcopy(state.env[case.value])
     sites = []
     for row in ("row*2", "row*2+1"):
-        statement = memory_ops._cute_register_tile_unroll_vec_store(
+        statement = lane_packets._cute_register_tile_unroll_vec_store(
             state,
-            strategy,
-            1,
+            context,
             "destination",
             [row, "column"],
             "scalar",
@@ -398,9 +396,10 @@ def test_actual_store_protocol_preserves_order_and_scalar_fanout(monkeypatch):
         assert isinstance(target, ast.Name)
         assert ast.unparse(statement) == f"{target.id} = packet"
         sites.append(target.id)
-    body = strategy._cute_lane_body_by_block[1]
+    body = context.lane_body
+    assert body is not None
     assert ast.dump(state.env[case.value]) == ast.dump(original_scalar)
-    assert len(body) == 4 and body[1] is strategy._cute_lane_vloop_by_block[1]
+    assert len(body) == 4 and body[1] is context.vloop
     assert "row * 2" in ast.unparse(body[2]) and "row * 2 + 1" in ast.unparse(body[3])
     for site, flush in zip(sites, body[2:], strict=True):
         operand = f"_cute_signed_bitfield_to_bf16_packed({site}, 0, 4, 8)"
@@ -421,7 +420,7 @@ def test_actual_store_protocol_preserves_order_and_scalar_fanout(monkeypatch):
         "environment",
         "loop",
         "statements",
-        "strategy",
+        "context",
         "definition_after",
         "reassignment",
         "branch",
@@ -432,11 +431,10 @@ def test_actual_store_protocol_preserves_order_and_scalar_fanout(monkeypatch):
     ],
 )
 def test_physical_proof_declines_before_store_change(monkeypatch, fault):
-    case, state, strategy = _physical(monkeypatch)
+    case, state, context = _physical(monkeypatch)
     kwargs = {
         "state": state,
-        "strategy": strategy,
-        "block_id": 1,
+        "context": context,
         "width": 8,
         "tensor": case.output.meta["val"],
         "index_exprs": ["row", "column"],
@@ -458,12 +456,12 @@ def test_physical_proof_declines_before_store_change(monkeypatch, fault):
         state.codegen.active_device_loops[1] = [object.__new__(DeviceGridState)]
     elif fault == "statements":
         state.codegen.statements_stack = [[]]
-    elif fault == "strategy":
-        kwargs["strategy"] = deepcopy(strategy)
+    elif fault == "context":
+        kwargs["context"] = deepcopy(context)
     elif fault == "definition_after":
-        strategy._cute_lane_body_by_block[1].reverse()
+        context.lane_body.reverse()
     elif fault == "reassignment":
-        strategy._cute_lane_body_by_block[1].append(ast.parse("packet = 0").body[0])
+        context.lane_body.append(ast.parse("packet = 0").body[0])
     elif fault == "branch":
         state.codegen._cute_branch_path = [(7, 0)]
     elif fault == "alias":
@@ -478,9 +476,9 @@ def test_physical_proof_declines_before_store_change(monkeypatch, fault):
     elif fault == "stale_graph":
         replacement = _graph()
         state.fx_node = replacement.store
-    before = ast.dump(ast.Module(strategy._cute_lane_body_by_block[1], []))
+    before = ast.dump(ast.Module(context.lane_body, []))
     assert sb.packed_store_value(**kwargs) is None
-    assert before == ast.dump(ast.Module(strategy._cute_lane_body_by_block[1], []))
+    assert before == ast.dump(ast.Module(context.lane_body, []))
 
 
 @pytest.mark.parametrize(
@@ -509,7 +507,7 @@ def test_config_roundtrip_and_no_default_promotion():
     assert sb.KEY not in spec._flat_fields()
     config = {sb.KEY: True}
     with pytest.raises(InvalidConfig):
-        spec._normalize_cute_signed_bitfield_bf16(config, fix_invalid=False)
+        _normalize_cute_signed_bitfield_bf16(spec, config, fix_invalid=False)
     spec.cute_signed_bitfield_bf16_available = True
     before = spec._flat_fields()
     assert before[sb.KEY].search_values() == [False, True]
@@ -518,14 +516,14 @@ def test_config_roundtrip_and_no_default_promotion():
     assert spec.flatten_missing_field_default(sb.KEY, {}) == (True, False)
     for value in (False, True):
         config = {sb.KEY: value}
-        spec._normalize_cute_signed_bitfield_bf16(config, fix_invalid=False)
+        _normalize_cute_signed_bitfield_bf16(spec, config, fix_invalid=False)
         assert config == ({sb.KEY: True} if value else {})
         assert (
             Config.from_dict(Config(**{sb.KEY: value}).config).config[sb.KEY] is value
         )
     for bad in (0, 1, None, "true", [], {}):
         with pytest.raises(InvalidConfig):
-            spec._normalize_cute_signed_bitfield_bf16({sb.KEY: bad}, fix_invalid=False)
+            _normalize_cute_signed_bitfield_bf16(spec, {sb.KEY: bad}, fix_invalid=False)
     seeds = [
         Config(cute_vector_widths=[1]),
         Config(cute_vector_widths=[1, 8]),
@@ -567,13 +565,12 @@ def test_actual_rshift_operator_and_prims_cast(shift):
 
 
 def test_bad_definition_never_becomes_a_packet(monkeypatch):
-    case, state, strategy = _physical(monkeypatch)
+    case, state, context = _physical(monkeypatch)
     state.device_function.cute_state.signed_byte_packets.clear()
     state.fx_node = case.load
     sb.record_signed_byte_packet(
         state,
-        strategy,
-        1,
+        context,
         case.source.meta["val"],
         8,
         ["row", "column"],

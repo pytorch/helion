@@ -5,7 +5,7 @@ A_packed[rows] @ B``, ``static_shapes=False``) is one dense GEMM over the
 union of the group rows.  The grouped heuristic admits the register-MMA family
 on the first binding's extents; codegen re-proves the row union, specializes
 the extents under guards and renders one CTA per tile with membership-
-predicated stores.  Runtime numerics live in ``test_cute_warp_mma_gemm_gpu.py``.
+predicated stores.  The runtime numerics are in ``test_cute_warp_mma_gemm.py``.
 """
 
 from __future__ import annotations
@@ -13,21 +13,21 @@ from __future__ import annotations
 import ast
 import re
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
 
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_grouped_coverage_search import _bound
-from test.test_cute_shared_rhs_grouped import _target
 from test.test_cute_warp_mma_gemm import _repaired
 
 import helion
 from helion._compiler.cute import cute_warp_mma_gemm as family
 from helion._compiler.cute.grouped_row_union import CONFIG_KEY as ROW_UNION_KEY
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import InvalidConfig
 
 grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
@@ -48,13 +48,7 @@ RT = "_helion_warp_mma"
 def _cpu_only() -> Generator[None, None, None]:
     old_threads = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        _target(),
-        # The admission needs the device's SM count (the fake target has none).
-        patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support(), matmul_num_sm=148):
         yield
     torch.set_num_threads(old_threads)
 
@@ -91,11 +85,12 @@ def test_grouped_row_union_admits_and_seeds_the_family(s0: BoundKernel) -> None:
         assert config.grouped_row_union_supported
         assert config.warp_mma_admitted
         assert config.warp_mma_grouped_extents == (640, 128, 128)
-        seeds = config._warp_mma_seed_configs()
+        seed_configs = seeds._warp_mma_seed_configs(config)
         assert {
-            (tuple(seed.config["block_sizes"]), seed.config[WARPS]) for seed in seeds
+            (tuple(seed.config["block_sizes"]), seed.config[WARPS])
+            for seed in seed_configs
         } >= {((32, 32, 128), 4), ((64, 16, 128), 4), ((16, 32, 128), 2)}
-        for seed in seeds:
+        for seed in seed_configs:
             assert seed.config[FAMILY] == family.MATMUL_FAMILY_WARP_MMA
         # The floors reach the family's atoms while the default (non-autotuned)
         # block keeps the tcgen05 tile the kernel always ran.
@@ -204,7 +199,7 @@ def test_group_count_is_capped_at_one_warp_of_groups() -> None:
         # ``detect_warp_mma_grouped_gemm`` replaces that domain with the
         # family's, which keeps the cap.
         assert not state.grouped_row_union_supported
-        assert not state.warp_mma_admitted and state._warp_mma_seed_configs() == []
+        assert not state.warp_mma_admitted and seeds._warp_mma_seed_configs(state) == []
         with pytest.raises(InvalidConfig, match="not admitted"):
             over.config_spec.normalized_config(_config([32, 32, 64], 4))
     assert _repaired(over, _config([32, 32, 64], 4))[FAMILY] == "tcgen05"

@@ -28,6 +28,7 @@ from .fuse_two_pass_loads import _range_bounds
 from .fuse_two_pass_loads import _tensor_arg_roots
 from .persistent_branch_vec import _binding_write_roots
 from .persistent_branch_vec import _freeze_definition
+from .reduce_call import CTA_REDUCES
 from .resident_sequence import _clone
 from .scalar_recipe import _GLOBALS
 from .scalar_recipe import build_recipe
@@ -49,10 +50,7 @@ _DTYPE_BYTES = {
 # arguments are never rewritten; this list is used only by the effects proof.
 _REDUCTIONS = frozenset(
     {
-        "_cute_grouped_reduce_warp",
-        "_cute_grouped_reduce_shared_two_stage",
-        "_cute_grouped_reduce_shared_serial",
-        "_cute_grouped_reduce_shared_tree",
+        *CTA_REDUCES,
         "cute.arch.warp_reduction_sum",
         "cute.arch.warp_reduction_max",
         "cute.arch.warp_reduction_min",

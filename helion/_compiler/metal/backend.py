@@ -15,7 +15,6 @@ from ... import exc
 from ..backend import Backend
 from ..backend import BackendState
 from ..backend import _largest_divisor_at_most
-from ..cute.backend import CuteBackend
 from ._constants import MAX_THREAD_AXES
 from ._constants import MAX_THREADS_PER_THREADGROUP
 from ._constants import SIMD_WIDTH
@@ -29,6 +28,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ..aten_lowering import Lowering
+    from ..autotuner_heuristics.registry import AutotunerHeuristicType
     from ..compile_environment import CompileEnvironment
     from ..device_function import Argument
     from ..device_function import DeviceFunction
@@ -230,6 +230,11 @@ def _config_fixed_scalars() -> set[str]:
 
 class MetalBackend(Backend):
     """Metal Shading Language (MSL) code generation backend for macOS."""
+
+    def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
+        from .row_reduction_heuristic import MetalRowReductionHeuristic
+
+        return (MetalRowReductionHeuristic,)
 
     @staticmethod
     def _get_dtype_to_metal() -> dict[torch.dtype, str]:
@@ -557,7 +562,7 @@ class MetalBackend(Backend):
         # axis is what makes its threads a contiguous run of SIMD lanes.
         return True
 
-    def _cute_matmul_contraction_thread_reserve(
+    def matmul_contraction_thread_reserve(
         self, fn: DeviceFunction, tile_block_ids: list[int]
     ) -> int:
         """Not a contraction reserve on Metal: this hook carries the thread
@@ -999,8 +1004,9 @@ class MetalBackend(Backend):
         config = self._config_with_reduction_thread_budget(fn, block_ids, config)
         # Re-clamp any count the passes above left not dividing its block size.
         config = self._config_with_divisible_thread_counts(block_ids, config)
-        # pyrefly: ignore[bad-argument-type]
-        strategy = CuteBackend.create_loop_strategy(self, fn, block_ids, config)
+        from ..per_thread_planning import plan_per_thread_loop_strategy
+
+        strategy = plan_per_thread_loop_strategy(self, fn, block_ids, config)
         self._reject_dynamic_thread_extents(strategy)
         return strategy
 

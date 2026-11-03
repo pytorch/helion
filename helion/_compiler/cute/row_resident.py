@@ -22,6 +22,7 @@ from ...language import memory_ops
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import RootGraphInfo
 from ..indexing_strategy import exact_tile_block_ids
+from .analysis.match_common import node_tensor
 from .cute_epilogue import Tcgen05UnaryEpilogueChain
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
@@ -29,6 +30,7 @@ from .epilogue_fanout import _fresh_returned_tensors
 from .memory_ops import _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
 from .memory_ops import tensor_has_specialized_tma_alignment
 from .promote_output_axis import _access_tensor
+from .target_facts import static_smem_budget
 
 if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
@@ -89,14 +91,6 @@ def _call(node: object, target: object, count: int) -> bool:
     )
 
 
-def _value(node: object) -> torch.Tensor | None:
-    if isinstance(node, torch.fx.Node):
-        value = node.meta.get("val")
-        if isinstance(value, torch.Tensor):
-            return value
-    return None
-
-
 def _literal_int(value: object) -> int | None:
     if type(value) is int:
         return value
@@ -153,8 +147,8 @@ def _direct_load(
     ):
         return None
     assert isinstance(source, torch.fx.Node)
-    tensor = _value(source)
-    loaded = _value(node)
+    tensor = node_tensor(source)
+    loaded = node_tensor(node)
     name = source.args[0]
     if (
         tensor is None
@@ -261,7 +255,7 @@ def _stage(
     if _call(acc, _tracing_ops._new_var, 1):
         assert isinstance(acc, torch.fx.Node)
         acc = acc.args[0]
-    value = _value(mma)
+    value = node_tensor(mma)
     if acc is not placeholders[0] or value is None or value.dtype is not torch.float32:
         return None
     a = _direct_load(env, lhs, (axes[0], k_axis), dtype)
@@ -464,4 +458,4 @@ def prove_row_resident(
     plan = RowResidentPlan(
         (first, second), arguments, int(first.lhs.shape[0]), columns, reductions
     )
-    return plan if plan.shared_bytes <= 48 * 1024 else None
+    return plan if plan.shared_bytes <= static_smem_budget() else None

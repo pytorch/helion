@@ -1,20 +1,23 @@
 from __future__ import annotations
 
+import contextlib
 from copy import deepcopy
 import random
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_compiler_coverage import make_search
 
 import helion
 from helion import exc
+from helion._compiler.cute.autotune.search_surface import _normalize_fragment_option
+from helion._compiler.cute.emitters import PlannedRootEmitter
+from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 import helion.language as hl
@@ -74,12 +77,7 @@ def _tiled_scan(x: torch.Tensor):
 
 @pytest.fixture(autouse=True)
 def _cpu_only():
-    with (
-        mock_cuda_unavailable(),
-        _target(),
-        forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
 
 
@@ -110,8 +108,27 @@ def _without_later_fragment_coverage():
             "register_fragment_slab_loads_coverage",
         ):
             stack.enter_context(
-                patch("helion._compiler.autotuner_heuristics." + registration)
+                patch("helion._compiler.cute.autotune.heuristics." + registration)
             )
+        yield
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from helion._compiler.generate_ast import GenerateAST
+
+
+@contextlib.contextmanager
+def _forbid_root_emitter(name: str, message: str) -> Iterator[None]:
+    """Fail when the root-emitter registry consults the planned family ``name``."""
+    original = PlannedRootEmitter.plan
+
+    def plan(self: PlannedRootEmitter, codegen: GenerateAST) -> object | None:
+        assert self.name != name, message
+        return original(self, codegen)
+
+    with patch.object(PlannedRootEmitter, "plan", plan):
         yield
 
 
@@ -221,7 +238,7 @@ def test_cooperative_scan_oversized_shared_memory_rejected():
     bound = _bind()
     with (
         patch(
-            "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_capacity_bytes",
+            "helion._compiler.cute.target_facts.per_cta_smem_capacity_bytes",
             return_value=128,
         ),
         pytest.raises(exc.InvalidConfig, match="shared bytes"),
@@ -240,7 +257,9 @@ def test_cooperative_scan_oversized_shared_memory_rejected():
 @pytest.mark.usefixtures("_without_warp_scan_coverage")
 @pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_scan_coverage_preserves_original_population_and_rng(strategy):
-    with patch("helion._compiler.autotuner_heuristics.register_fragment_scan_coverage"):
+    with patch(
+        "helion._compiler.cute.autotune.heuristics.register_fragment_scan_coverage"
+    ):
         old_bound = _bind()
     bound = _bind()
     old = make_search(old_bound.config_spec, count=20, strategy=strategy)
@@ -297,13 +316,9 @@ def test_scan_helper_alpha_rejected_by_shared_proof_and_codegen():
 
 
 def test_cooperative_scan_cannot_be_intercepted_by_another_root_emitter():
-    from helion._compiler.generate_ast import GenerateAST
-
     bound = _bind()
-    with patch.object(
-        GenerateAST,
-        "_try_codegen_block_scaled_root",
-        side_effect=AssertionError("requested fragment owner must run first"),
+    with _forbid_root_emitter(
+        "block_scaled", "requested fragment owner must run first"
     ):
         assert "fragment_smem" in bound.to_code(_config(bound, "cooperative"))
 
@@ -430,7 +445,7 @@ def _reduction_config(bound, mode):
     ],
 )
 def test_fragment_reduction_algorithm_fact_matches_supported_combines(kind, dtype):
-    from helion._compiler.autotuner_heuristics.cute_fragment_reduction import MODES
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_reduction import MODES
 
     bound = _bind_reduction(kind, dtype)
     spec = bound.config_spec
@@ -460,8 +475,12 @@ def test_fragment_reduction_strict_normalization_and_owner_conflicts():
     for owner in ("cute_collective_mma", "cute_register_chain"):
         requested = {REDUCTION_KEY: "warp", owner: True}
         with pytest.raises(exc.InvalidConfig, match="computed scalar reduction"):
-            spec._normalize_cute_fragment_reduction(requested, fix_invalid=False)
-        spec._normalize_cute_fragment_reduction(requested, fix_invalid=True)
+            _normalize_fragment_option(
+                spec, requested, "cute_fragment_reduction", fix_invalid=False
+            )
+        _normalize_fragment_option(
+            spec, requested, "cute_fragment_reduction", fix_invalid=True
+        )
         assert REDUCTION_KEY not in requested
 
 
@@ -500,10 +519,10 @@ def test_fragment_reduction_explicit_phase_roots_share_capability():
 @pytest.mark.usefixtures("_without_thread_coverage")
 @pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_reduction_coverage_preserves_original_population_and_rng(strategy):
-    from helion._compiler.autotuner_heuristics.cute_fragment_reduction import MODES
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_reduction import MODES
 
     with patch(
-        "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
+        "helion._compiler.cute.autotune.heuristics.register_fragment_reduction_coverage"
     ):
         old_bound = _bind_reduction()
     bound = _bind_reduction()
@@ -540,7 +559,7 @@ def test_fragment_reduction_coverage_preserves_original_population_and_rng(strat
 @pytest.mark.usefixtures("_without_thread_coverage")
 @pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_reduction_neighbors_random_mutation_and_overrides():
-    from helion._compiler.autotuner_heuristics.cute_fragment_reduction import MODES
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_reduction import MODES
 
     bound = _bind_reduction()
     generation = bound.config_spec.create_config_generation()
@@ -601,10 +620,10 @@ def _scan_and_fragment_reduction(x: torch.Tensor):
 @pytest.mark.usefixtures("_without_warp_scan_coverage")
 @pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_reduction_coverage_composes_with_existing_scan_coverage():
-    from helion._compiler.autotuner_heuristics.cute_fragment_reduction import MODES
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_reduction import MODES
 
     with patch(
-        "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
+        "helion._compiler.cute.autotune.heuristics.register_fragment_reduction_coverage"
     ):
         old_bound = cpu_bind(_scan_and_fragment_reduction, (torch.ones(3, 128),))
     bound = cpu_bind(_scan_and_fragment_reduction, (torch.ones(3, 128),))
@@ -636,7 +655,7 @@ def test_fragment_reduction_coverage_composes_with_existing_scan_coverage():
 
 
 def test_fragment_reduction_mixed_supported_and_indexed_nodes_use_shared_predicate():
-    from helion._compiler.autotuner_heuristics.cute_fragment_reduction import (
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_reduction import (
         fragment_warp_reduction_supported,
     )
     from helion._compiler.inductor_lowering import ReductionLowering
@@ -699,7 +718,7 @@ def _resource_repeated_scan_dot(x: torch.Tensor):
 def _resource_bound_and_actual(bound, config):
     import math
 
-    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_resources import (
         FragmentResourceCatalog,
     )
     from helion._compiler.cute.computed_fragment import FragmentCompiler
@@ -721,7 +740,7 @@ def _resource_bound_and_actual(bound, config):
     with (
         patch.object(FragmentCompiler, "allocate", allocate),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
@@ -743,7 +762,7 @@ def _resource_bound_and_actual(bound, config):
 def test_fragment_resource_supplements_preserve_full_cold_prefix_and_rng(width):
     inputs = (torch.ones(3, width),)
     with patch(
-        "helion._compiler.autotuner_heuristics.fragment_resource_carrier",
+        "helion._compiler.cute.autotune.heuristics.fragment_resource_carrier",
         return_value=None,
     ):
         old_bound = cpu_bind(_resource_fullrow_scan, inputs)
@@ -795,10 +814,10 @@ def test_fragment_resource_bound_covers_scan_aliases_dot_and_tails(dtype, width)
 def test_fragment_resource_catalog_declines_nested_and_unproved_runtime_extents():
     from test.test_cute_computed_fragment import _fragment_captured_reduction
 
-    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_resources import (
         FragmentResourceCatalog,
     )
-    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_resources import (
         FragmentStorageTerm,
     )
 
@@ -824,7 +843,7 @@ def test_fragment_resource_catalog_declines_nested_and_unproved_runtime_extents(
 @pytest.mark.usefixtures("_without_warp_scan_coverage")
 @pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_resource_carrier_builds_catalog_only_once():
-    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_resources import (
         FragmentResourceCatalog,
     )
 
@@ -852,7 +871,7 @@ def test_fragment_resource_carrier_builds_catalog_only_once():
 def test_fragment_resource_hard_minima_preserve_prefix_and_rng(rows):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_resources import (
         FragmentResourceCatalog,
     )
 
@@ -861,7 +880,7 @@ def test_fragment_resource_hard_minima_preserve_prefix_and_rng(rows):
     # Without the supplemental tier, these large-grid floors exclude every
     # storage-feasible row tile. Ordinary seeds and coverage remain unchanged.
     with patch(
-        "helion._compiler.autotuner_heuristics.fragment_resource_carrier",
+        "helion._compiler.cute.autotune.heuristics.fragment_resource_carrier",
         return_value=None,
     ):
         old_bound = cpu_bind(_resource_fullrow_scan, inputs)
@@ -906,10 +925,10 @@ def test_fragment_resource_hard_minima_preserve_prefix_and_rng(rows):
 def test_fragment_resource_hard_minima_keep_legal_bounds_and_scheduling():
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_resources import (
         FragmentResourceCatalog,
     )
-    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_resources import (
         fragment_resource_carrier,
     )
 
@@ -945,10 +964,10 @@ def test_fragment_resource_hard_minima_keep_legal_bounds_and_scheduling():
 def test_fragment_resource_hard_minima_never_codegen_neighbors():
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_resources import (
         FragmentResourceCatalog,
     )
-    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_resources import (
         fragment_resource_carrier,
     )
     from helion.runtime.kernel import BoundKernel
@@ -978,7 +997,7 @@ def _without_thread_coverage():
     # Keep each earlier coordinate's population-size tests isolated. Combined
     # old/new coverage and the full prior prefix are tested below.
     with patch(
-        "helion._compiler.autotuner_heuristics.register_fragment_threads_coverage"
+        "helion._compiler.cute.autotune.heuristics.register_fragment_threads_coverage"
     ):
         yield
 
@@ -993,7 +1012,7 @@ def _thread_config(bound, count):
 
 
 def test_fragment_threads_strict_domain_and_roundtrip():
-    from helion._compiler.autotuner_heuristics.cute_fragment_threads import THREADS
+    from helion._compiler.cute.autotune.heuristics.cute_fragment_threads import THREADS
 
     bound = _bind()
     spec = bound.config_spec
@@ -1055,17 +1074,12 @@ def test_fragment_threads_scan_loop_and_launch_ownership(count, mode):
 
 
 def test_fragment_threads_codegen_rechecks_owner_and_preserves_default():
-    from helion._compiler.generate_ast import GenerateAST
 
     bound = _bind()
     assert bound.to_code(_thread_config(bound, 128)) == bound.to_code(
         bound.config_spec.default_config()
     )
-    with patch.object(
-        GenerateAST,
-        "_try_codegen_topk_root",
-        side_effect=AssertionError("explicit fragment owns root"),
-    ):
+    with _forbid_root_emitter("topk", "explicit fragment owns root"):
         assert "block=(512, 1, 1)" in bound.to_code(_thread_config(bound, 512))
     with (
         patch(
@@ -1091,7 +1105,7 @@ def test_fragment_threads_complete_prior_population_and_rng(strategy, resource):
     kernel = _resource_fullrow_scan if resource else _scan_and_fragment_reduction
     x = torch.ones(3, 8193) if resource else torch.ones(3, 128)
     with patch(
-        "helion._compiler.autotuner_heuristics.register_fragment_threads_coverage"
+        "helion._compiler.cute.autotune.heuristics.register_fragment_threads_coverage"
     ):
         old_bound = cpu_bind(kernel, (x,))
     bound = cpu_bind(kernel, (x,))
@@ -1255,7 +1269,7 @@ def test_register_loads_strict_bool_roundtrip_and_neighbors():
 @pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_register_loads_complete_existing_prefix_and_rng(strategy):
     with patch(
-        "helion._compiler.autotuner_heuristics.register_fragment_register_loads_coverage"
+        "helion._compiler.cute.autotune.heuristics.register_fragment_register_loads_coverage"
     ):
         old_bound = _register_load_bound()
     bound = _register_load_bound()
@@ -1380,7 +1394,7 @@ def _without_warp_scan_coverage():
     # The original groups retain their isolated historical assertions. The
     # complete prefix including every previous group is checked separately.
     with patch(
-        "helion._compiler.autotuner_heuristics.register_fragment_warp_scan_coverage"
+        "helion._compiler.cute.autotune.heuristics.register_fragment_warp_scan_coverage"
     ):
         yield
 
@@ -1433,7 +1447,7 @@ def test_warp_scan_boolean_strict_admission_and_legacy_emitters():
 @pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_warp_scan_complete_prior_prefix_rng_seeds_and_overrides(strategy):
     with patch(
-        "helion._compiler.autotuner_heuristics.register_fragment_warp_scan_coverage"
+        "helion._compiler.cute.autotune.heuristics.register_fragment_warp_scan_coverage"
     ):
         old_bound = _bind()
     bound = _bind()
@@ -1487,14 +1501,9 @@ def test_warp_scan_dtype_and_capacity_rejection(dtype, columns):
 
 
 def test_warp_scan_lost_proof_and_specialized_owner_do_not_fallback():
-    from helion._compiler.generate_ast import GenerateAST
 
     bound = _bind()
-    with patch.object(
-        GenerateAST,
-        "_try_codegen_block_scaled_root",
-        side_effect=AssertionError("wrong owner"),
-    ):
+    with _forbid_root_emitter("block_scaled", "wrong owner"):
         assert "shuffle_sync_up" in bound.to_code(_warp_scan_config(bound))
     with (
         patch(
@@ -1587,17 +1596,17 @@ def test_fragment_extensions_complete_legacy_prefix_rng_and_final_coverage(
             # This test inventories the four earlier additions only.
             stack.enter_context(
                 patch(
-                    "helion._compiler.autotuner_heuristics.register_fragment_skip_zero_atomics_coverage"
+                    "helion._compiler.cute.autotune.heuristics.register_fragment_skip_zero_atomics_coverage"
                 )
             )
             stack.enter_context(
                 patch(
-                    "helion._compiler.autotuner_heuristics.register_fragment_published_scalars_coverage"
+                    "helion._compiler.cute.autotune.heuristics.register_fragment_published_scalars_coverage"
                 )
             )
             for registration in registrations[enabled:]:
                 stack.enter_context(
-                    patch("helion._compiler.autotuner_heuristics." + registration)
+                    patch("helion._compiler.cute.autotune.heuristics." + registration)
                 )
             specs.append(
                 cpu_bind(
@@ -1698,14 +1707,14 @@ def test_atomic_aggregation_complete_prior_prefix_rng_seeds_and_overrides(strate
     # The epoch tests separately retain the whole old population as a prefix.
     with (
         patch(
-            "helion._compiler.autotuner_heuristics.register_fragment_skip_zero_atomics_coverage"
+            "helion._compiler.cute.autotune.heuristics.register_fragment_skip_zero_atomics_coverage"
         ),
         patch(
-            "helion._compiler.autotuner_heuristics.register_fragment_integer_atomic_epochs_coverage"
+            "helion._compiler.cute.autotune.heuristics.register_fragment_integer_atomic_epochs_coverage"
         ),
     ):
         with patch(
-            "helion._compiler.autotuner_heuristics.register_fragment_atomic_aggregation_coverage"
+            "helion._compiler.cute.autotune.heuristics.register_fragment_atomic_aggregation_coverage"
         ):
             old_bound = _atomic_aggregation_bind()
         bound = _atomic_aggregation_bind()

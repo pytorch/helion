@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from .._compiler.device_ir import DeviceIR
-    from ..runtime.cute_structural_policy import CuteStructuralPolicy
+    from ..runtime.structural_policy import StructuralPolicy
 
 
 _post_autotune_hooks: list[Callable[[AutotuneMetrics], None]] = []
@@ -143,7 +143,7 @@ class KernelMetadata:
     _device_ir: DeviceIR | None = dataclasses.field(
         default=None, repr=False, compare=False, hash=False
     )
-    cute_structural_policy: CuteStructuralPolicy | None = None
+    cute_structural_policy: StructuralPolicy | None = None
 
     @functools.cached_property
     def run_id(self) -> str:

@@ -10,9 +10,8 @@ import torch
 from .cute_population_contracts import _target
 from .test_cute_grouped_fp32_output import _grouped_fp32_output
 import helion
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute.tcgen05_config import repair
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
@@ -122,10 +121,9 @@ def test_grouped_multiplier_workspace_cache_matches_expanded_grid() -> None:
 def test_grouped_multiplier_keeps_cooperative_contracts(change: dict) -> None:
     config = dict(_config(2).config)
     config.update(change)
-    assert not CuteTcgen05Config._grouped_grid_multiplier_supported(config)
+    assert not repair._grouped_grid_multiplier_supported(config)
 
 
-@skipUnlessBackends(["cute"])
 def test_grouped_multiplier_live_offsets() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")

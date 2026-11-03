@@ -19,7 +19,10 @@ import torch
 
 import helion
 from helion._compiler import tile_strategy
+from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute import scan_ops
+from helion._compiler.cute.lane_loops.markers import _create_lane_loop
+from helion._compiler.cute.lane_loops.markers import _reverse_lane_loop_iter
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
 import helion.language as hl
@@ -713,12 +716,12 @@ def test_reverse_masked_cross_warp_scan_tracks_validity_through_smem() -> None:
 
 
 def _fake_state() -> Any:
-    cute_state = SimpleNamespace(scan_lane_directions={})
+    cute_state = SimpleNamespace(lanes=SimpleNamespace(scan_lane_directions={}))
     return SimpleNamespace(device_function=SimpleNamespace(cute_state=cute_state))
 
 
 def _directions(state: Any) -> dict[str, bool]:
-    return state.device_function.cute_state.scan_lane_directions
+    return state.device_function.cute_state.lanes.scan_lane_directions
 
 
 def _geometry(owner: Any, lane_var: str) -> Any:
@@ -750,7 +753,7 @@ def _grid(lane_var: str = "lane_0") -> tile_strategy.DeviceGridState:
 
 
 def _vector_partition(grid: tile_strategy.DeviceGridState, lane_var: str) -> None:
-    outer = tile_strategy._create_lane_loop(lane_var, 2, [_for("for i in x:\n pass")])
+    outer = _create_lane_loop(lane_var, 2, [_for("for i in x:\n pass")])
     vloop = _for("for vec_lane_0 in cutlass.range_constexpr(4):\n    pass")
     grid.vec_lane_wrappers[lane_var] = tile_strategy.VecLaneWrapper(
         outer_for=outer,
@@ -762,10 +765,8 @@ def _vector_partition(grid: tile_strategy.DeviceGridState, lane_var: str) -> Non
 
 def test_device_loop_reversal_flips_every_lane_loop_and_records_the_direction() -> None:
     inner = _for("for i in x:\n    pass")
-    lane_loop = tile_strategy._create_lane_loop("lane_1", 8, [inner])
-    tail_loop = tile_strategy._create_lane_loop(
-        "lane_1", 8, [_for("for j in y:\n pass")]
-    )
+    lane_loop = _create_lane_loop("lane_1", 8, [inner])
+    tail_loop = _create_lane_loop("lane_1", 8, [_for("for j in y:\n pass")])
     device_loop = _for("for tile_offset_1 in range(0, 256, 64):\n    pass")
     device_loop.body = [lane_loop, tail_loop]
     state = _fake_state()
@@ -791,11 +792,9 @@ def test_device_loop_reversal_flips_every_lane_loop_and_records_the_direction() 
 
 
 def test_failed_device_loop_reversal_mutates_nothing() -> None:
-    lane_loop = tile_strategy._create_lane_loop(
-        "lane_1", 8, [_for("for i in x:\n pass")]
-    )
-    stale = tile_strategy._create_lane_loop("lane_1", 8, [_for("for j in y:\n pass")])
-    assert tile_strategy._reverse_lane_loop_iter(stale)
+    lane_loop = _create_lane_loop("lane_1", 8, [_for("for i in x:\n pass")])
+    stale = _create_lane_loop("lane_1", 8, [_for("for j in y:\n pass")])
+    assert _reverse_lane_loop_iter(stale)
     device_loop = _for("for tile_offset_1 in range(0, 256, 64):\n    pass")
     device_loop.body = [lane_loop, stale]
     state = _fake_state()
@@ -825,7 +824,9 @@ def test_grid_reversal_is_recorded_and_applied_when_the_loop_is_built() -> None:
     assert grid.reversed_lane_vars == {"lane_0"}
     assert _directions(state) == {"lane_0": True}
     body = ast.parse("value = lane_0 + 1").body
-    (loop,) = grid.wrap_body(cast("list[ast.AST]", list(body)))
+    # ``wrap_body`` runs the compile environment's backend passes.
+    with CompileEnvironment(torch.device("cpu"), helion.Settings(backend="cute")):
+        (loop,) = grid.wrap_body(cast("list[ast.AST]", list(body)))
     assert isinstance(loop, ast.For)
     assert ast.unparse(loop.iter) == "range(7, -1, -1)"
     assert ast.unparse(loop.body[0]) == "value = lane_0 + 1"
@@ -850,5 +851,9 @@ def test_wrap_body_refuses_to_reverse_a_vector_partition() -> None:
     _vector_partition(grid, "lane_0")
     grid.reversed_lane_vars.add("lane_0")
     body = ast.parse("value = lane_base_0 + vec_lane_0").body
-    with pytest.raises(helion.exc.BackendUnsupported, match="vectorised lane loop"):
+    # The refusal names the backend of the compile environment.
+    with (
+        CompileEnvironment(torch.device("cpu"), helion.Settings(backend="cute")),
+        pytest.raises(helion.exc.BackendUnsupported, match="vectorised lane loop"),
+    ):
         grid.wrap_body(cast("list[ast.AST]", list(body)))

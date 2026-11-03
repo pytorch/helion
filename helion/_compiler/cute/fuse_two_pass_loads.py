@@ -52,7 +52,9 @@ from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import ReadWrites
+from ._ast_pass_utils import tensor_roots_may_alias
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from .packet_access import match_packet_access
 
 _PERSISTENT_BRANCH_VEC_LOAD = "_helion_persistent_branch_vec_load"
 _PERSISTENT_BRANCH_VEC_STORE = "_helion_persistent_branch_vec_store"
@@ -259,29 +261,15 @@ def _looks_like_unmasked_load(node: ast.AST) -> ast.Call | None:
 
 
 def _looks_like_vec_load(node: ast.AST) -> ast.Call | None:
-    """Return the Call if ``node`` is a ``cute.arch.load(ptr, vec_type)``
-    expression — the hoisted U16 vec load emitted by the LoopedReductionStrategy
-    ``unroll`` mode — or a cache-hinted vector load helper of the same call
-    shape (``_cute_load_l2_evict_last_8b(ptr, vec_type)``, see
-    ``cache_policy_loads``).
+    """Return the Call if ``node`` is a ``cute.arch.load(...)`` -- the hoisted
+    U16 vec load emitted by the LoopedReductionStrategy ``unroll`` mode, or a
+    cache-hinted scalar load -- or a cache-hinted vector load helper of the
+    same call shape (``_cute_load_l2_evict_last_8b(ptr, vec_type)``, see
+    ``cache_policy_loads``).  ``_vec_width`` tells the packets apart.
     """
-    if not isinstance(node, ast.Call):
-        return None
-    func = node.func
-    if isinstance(func, ast.Name) and func.id in _CUTE_CACHE_LOAD_HELPER_NAMES:
-        return node
-    if not isinstance(func, ast.Attribute):
-        return None
-    if func.attr != "load":
-        return None
-    val = func.value
-    # Match either ``cute.arch.load`` or ``cute.arch.<whatever>.load`` — we
-    # only care that ``arch`` is in the call chain because that's what the
-    # cute helper uses.
-    while isinstance(val, ast.Attribute):
-        if val.attr == "arch":
-            return node
-        val = val.value
+    access = match_packet_access(node)
+    if access is not None and access.kind in ("arch_load", "packet", "hinted_packet"):
+        return access.call
     return None
 
 
@@ -331,24 +319,14 @@ def _load_kind(
 
 
 def _vec_width(node: ast.AST) -> int | None:
-    """Extract the V from ``cute.arch.load(ptr, ir.VectorType.get([V], ...))``.
+    """Extract the V from ``cute.arch.load(ptr, ir.VectorType.get([V], ...))``
+    or its L2-hinted helper form.
 
     Returns None when the expression isn't a recognised vec load.
     """
-    if not isinstance(node, ast.Call) or len(node.args) < 2:
-        return None
-    vec_arg = node.args[1]
-    if (
-        isinstance(vec_arg, ast.Call)
-        and isinstance(vec_arg.func, ast.Attribute)
-        and vec_arg.func.attr == "get"
-        and len(vec_arg.args) >= 1
-    ):
-        shape_arg = vec_arg.args[0]
-        if isinstance(shape_arg, ast.List) and len(shape_arg.elts) == 1:
-            elt = shape_arg.elts[0]
-            if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
-                return elt.value
+    access = match_packet_access(node)
+    if access is not None and access.kind in ("packet", "hinted_packet"):
+        return access.width
     return None
 
 
@@ -687,21 +665,6 @@ def _store_tensor_roots(
     return _tensor_arg_roots(pointer, tensor_names) if pointer is not None else None
 
 
-def _tensor_roots_may_alias(
-    left: frozenset[str] | None,
-    right: frozenset[str] | None,
-    proven_disjoint_tensor_pairs: set[frozenset[str]],
-) -> bool:
-    if left is None or right is None:
-        return True
-    return any(
-        left_name == right_name
-        or frozenset((left_name, right_name)) not in proven_disjoint_tensor_pairs
-        for left_name in left
-        for right_name in right
-    )
-
-
 class _LexicalMemoryOrder(ast.NodeVisitor):
     """Track assignments and stores in generated source execution order."""
 
@@ -741,7 +704,7 @@ class _LexicalMemoryOrder(ast.NodeVisitor):
         store_roots: frozenset[str] | None,
         load_roots: frozenset[str] | None,
     ) -> bool:
-        return _tensor_roots_may_alias(
+        return tensor_roots_may_alias(
             store_roots,
             load_roots,
             self._proven_disjoint_tensor_pairs,
@@ -1027,7 +990,7 @@ class _CuteFuseTwoPassLoads:
                 if isinstance(child, ast.Call) and _is_store_call(child)
             ):
                 store_roots = _store_tensor_roots(store_call, tensor_names)
-                if not _tensor_roots_may_alias(
+                if not tensor_roots_may_alias(
                     store_roots,
                     load_roots,
                     self._proven_disjoint_tensor_pairs,

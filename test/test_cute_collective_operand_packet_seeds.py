@@ -3,7 +3,6 @@ from __future__ import annotations
 from copy import deepcopy
 import random
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -13,30 +12,17 @@ from test.test_cute_collective_tf32 import _jagged_inputs
 from test.test_cute_collective_tf32 import _kernel
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
-from helion._testing import skipUnlessBackends
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 import helion.language as hl
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
+pytestmark = [pytest.mark.cpu_only, pytest.mark.cpu_render]
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from helion.runtime.kernel import BoundKernel
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
 
 
 def _population(

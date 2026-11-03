@@ -1,71 +1,65 @@
+"""Target tuning policies for the CuTe flash-attention forward.
+
+A ``FlashTuningPolicy`` is one target's measured per-shape records.  A dense
+or causal record names the knob values its body was measured with (projected
+onto the autotune keys by ``knob_values``, in the seeds' key order) and the
+lowering selections that are not knobs (the resident softmax lowering, the
+packed exp2 mode, the probability shift, the causal seed template).  The
+name-valued knobs validate against the knob registry's choice tables
+(``flash_knobs``); the records mirror none of them.
+"""
+
 from __future__ import annotations
 
 import dataclasses
 import enum
 import math
+from typing import TYPE_CHECKING
 
-_FLASH_POLICY_EXP2_PACKETS = frozenset(
-    {
-        "1x1",
-        "4x1",
-        "4x2",
-        "8x1",
-        "8x2",
-        "deg2_16x6",
-        "hybrid_deg1_16x8",
-        "deg1_16x8",
-        "deg1_8x2_corr10",
-        "causal_hd128_resident3_013_prefetch2_deg2_early_acquire",
-        "causal_hd128_resident3_013_prefetch2_deg2_16x4_early_acquire",
-        "causal_hd128_resident3_013_prefetch2_deg2_16x2_early_acquire",
-        "causal_hd128_resident3_013_prefetch2_xu_early_acquire",
-    }
-)
-_FLASH_POLICY_E2E_SCHEDULES = frozenset({"xu", "8/2", "16/2", "16/4", "16/6", "16/8"})
-_FLASH_POLICY_STAT_TRANSPORTS = frozenset({"ring2", "single", "single_final"})
-_FLASH_POLICY_PIPELINE_FAMILIES = frozenset(
-    {
-        "ws_overlap",
-        # The single-tile body's cooperative pair (two 128-row query tiles of
-        # one batch head on a 2-CTA tcgen05 MMA): a measured policy may name
-        # it like any other codegen family.
-        "ws_2cta",
-        "fa4",
-        "row_mma",
-        "fa4_deep_1cta",
-        "fa4_2cta_causal",
-        "fa4_tma_4d",
-        "fa4_local_tma",
-        "fa4_local_tma_4d",
-        "fa4_cga2_local",
-        "fa4_cga2_local_tma_4d",
-        "fa4_2cta",
-        "fa4_2cta_tma_4d",
-        "fa4_clc",
-        "fa4_clc_tma_4d",
-        "fa4_clc_local_tma",
-        "fa4_clc_local_tma_4d",
-        "fa4_alt",
-    }
-)
-_FLASH_POLICY_FP16_HD64_PIPELINE_FAMILIES = frozenset(
-    {
-        "fa4_tma_4d",
-        "fa4_local_tma_4d",
-        "fa4_cga2_local_tma_4d",
-        "fa4_2cta_tma_4d",
-        "fa4_clc_tma_4d",
-        "fa4_clc_local_tma_4d",
-    }
-)
-_FLASH_POLICY_ROLE_MAPS = frozenset({"helion", "fa4"})
-_FLASH_POLICY_BASE_EXP2_PACKETS = frozenset({"1x1", "4x1", "4x2", "8x1", "8x2"})
-_FLASH_POLICY_DEGREE1_EXP2_PACKETS = frozenset({"deg1_16x8", "deg1_8x2_corr10"})
+from .flash_knobs import _FLASH_DEG1_EXP2_PACKETS
+from .flash_knobs import _FLASH_DEG2_EXP2_PACKET
+from .flash_knobs import FLASH_CAUSAL_KV_ORDER_KEY
+from .flash_knobs import FLASH_CAUSAL_LOOP_SPLIT_KEY
+from .flash_knobs import FLASH_CORR_REGS_KEY
+from .flash_knobs import FLASH_CORR_TILE_SIZE_KEY
+from .flash_knobs import FLASH_DISC_PIPE_KEY
+from .flash_knobs import FLASH_E2E_OFFSET0_KEY
+from .flash_knobs import FLASH_E2E_OFFSET_KEY
+from .flash_knobs import FLASH_E2E_SCHEDULE_CHOICES
+from .flash_knobs import FLASH_E2E_SCHEDULE_KEY
+from .flash_knobs import FLASH_EPI_TMA_KEY
+from .flash_knobs import FLASH_EXP2_PACKET_CHOICES
+from .flash_knobs import FLASH_EXP2_PACKET_KEY
+from .flash_knobs import FLASH_FIRST_LOAD_ORDER_KEY
+from .flash_knobs import FLASH_KV_ORDER_KEY
+from .flash_knobs import FLASH_KV_STAGE_KEY
+from .flash_knobs import FLASH_KV_TILE_N_KEY
+from .flash_knobs import FLASH_MASKED_E2E_SCHEDULE_KEY
+from .flash_knobs import FLASH_OTHER_REGS_KEY
+from .flash_knobs import FLASH_PERSISTENT_KEY
+from .flash_knobs import FLASH_PIPELINE_FAMILY_FLAGS
+from .flash_knobs import FLASH_PIPELINE_FAMILY_KEY
+from .flash_knobs import FLASH_PRECOMPUTE_QK_DESC_KEY
+from .flash_knobs import FLASH_RESCALE_CHUNK_COLS_KEY
+from .flash_knobs import FLASH_RESCALE_THRESHOLD_KEY
+from .flash_knobs import FLASH_ROLE_MAP_CHOICES
+from .flash_knobs import FLASH_ROLE_MAP_KEY
+from .flash_knobs import FLASH_SOFTMAX_DISC_KEY
+from .flash_knobs import FLASH_SOFTMAX_REGS_KEY
+from .flash_knobs import FLASH_SP_ROW_SUM_KEY
+from .flash_knobs import FLASH_SPLIT_P_ARRIVE_KEY
+from .flash_knobs import FLASH_STAT_TRANSPORT_CHOICES
+from .flash_knobs import FLASH_STAT_TRANSPORT_KEY
+from .flash_knobs import FLASH_WAIT_HINT_KEY
+from .flash_knobs import flash_exp2_packet_is_compound
+
+if TYPE_CHECKING:
+    from collections.abc import Container
+
 FLASH_FLOAT16_MAX_LOG2 = math.log2(65504.0)
-_FLASH_FLOAT16_MAX_LOG2 = FLASH_FLOAT16_MAX_LOG2
 
 
-def _validate_policy_choice(name: str, value: str, choices: frozenset[str]) -> None:
+def _validate_policy_choice(name: str, value: str, choices: Container[str]) -> None:
     if value not in choices:
         raise ValueError(f"unsupported flash {name}: {value!r}")
 
@@ -118,6 +112,37 @@ class FlashTuningWorkload:
             raise ValueError("flash tuning head dimension must be positive")
 
 
+# The dense record's knobs in seed order: the measured structure, then the
+# optional fields a record may leave unstated (``None``), then the register
+# pair.
+_DENSE_POLICY_KNOBS: tuple[tuple[str, str], ...] = (
+    (FLASH_KV_TILE_N_KEY, "kv_tile_n"),
+    (FLASH_PIPELINE_FAMILY_KEY, "pipeline_family"),
+    (FLASH_KV_STAGE_KEY, "kv_stage"),
+    (FLASH_PERSISTENT_KEY, "persistent"),
+    (FLASH_E2E_SCHEDULE_KEY, "e2e_schedule"),
+    (FLASH_E2E_OFFSET_KEY, "e2e_offset"),
+    (FLASH_E2E_OFFSET0_KEY, "e2e_offset0"),
+    (FLASH_EXP2_PACKET_KEY, "exp2_packet"),
+    (FLASH_STAT_TRANSPORT_KEY, "stat_transport"),
+    (FLASH_RESCALE_THRESHOLD_KEY, "rescale_threshold"),
+    (FLASH_EPI_TMA_KEY, "epi_tma"),
+    (FLASH_KV_ORDER_KEY, "kv_order"),
+    (FLASH_PRECOMPUTE_QK_DESC_KEY, "precompute_qk_desc"),
+    (FLASH_RESCALE_CHUNK_COLS_KEY, "rescale_chunk_cols"),
+    (FLASH_FIRST_LOAD_ORDER_KEY, "first_load_order"),
+    (FLASH_CORR_TILE_SIZE_KEY, "corr_tile_size"),
+    (FLASH_ROLE_MAP_KEY, "role_map"),
+    (FLASH_SOFTMAX_REGS_KEY, "softmax_regs"),
+    (FLASH_SPLIT_P_ARRIVE_KEY, "split_p_arrive"),
+    (FLASH_SOFTMAX_DISC_KEY, "softmax_disc"),
+    (FLASH_DISC_PIPE_KEY, "disc_pipe_depth"),
+    (FLASH_SP_ROW_SUM_KEY, "sp_row_sum"),
+    (FLASH_CORR_REGS_KEY, "corr_regs"),
+    (FLASH_OTHER_REGS_KEY, "other_regs"),
+)
+
+
 @dataclasses.dataclass(frozen=True)
 class FlashDenseTuningPolicy:
     """Exact dense seed and optional lowering choices for one KV size."""
@@ -157,24 +182,24 @@ class FlashDenseTuningPolicy:
         if self.kv_tile_n <= 0 or self.kv_tile_n % 32:
             raise ValueError("dense KV tile width must be a positive multiple of 32")
         _validate_policy_choice(
-            "dense exp2 packet", self.exp2_packet, _FLASH_POLICY_EXP2_PACKETS
+            "dense exp2 packet", self.exp2_packet, FLASH_EXP2_PACKET_CHOICES
         )
         _validate_policy_choice(
             "dense end-to-end schedule",
             self.e2e_schedule,
-            _FLASH_POLICY_E2E_SCHEDULES,
+            FLASH_E2E_SCHEDULE_CHOICES,
         )
         if self.e2e_offset < 0 or self.e2e_offset0 < 0:
             raise ValueError("dense end-to-end offsets must be nonnegative")
         _validate_policy_choice(
             "dense statistics transport",
             self.stat_transport,
-            _FLASH_POLICY_STAT_TRANSPORTS,
+            FLASH_STAT_TRANSPORT_CHOICES,
         )
         _validate_policy_choice(
             "dense pipeline family",
             self.pipeline_family,
-            _FLASH_POLICY_PIPELINE_FAMILIES,
+            FLASH_PIPELINE_FAMILY_FLAGS,
         )
         if self.kv_stage <= 0:
             raise ValueError("dense KV stage must be positive")
@@ -234,7 +259,7 @@ class FlashDenseTuningPolicy:
                 )
             if (
                 self.probability_log2_shift + self.rescale_threshold
-                >= _FLASH_FLOAT16_MAX_LOG2
+                >= FLASH_FLOAT16_MAX_LOG2
             ):
                 raise ValueError(
                     "dense probability shift and rescale threshold exceed fp16 range"
@@ -243,10 +268,7 @@ class FlashDenseTuningPolicy:
             raise ValueError(
                 "dense probability shift requires a resident or packed exp2 lowering"
             )
-        if (
-            uses_packed_exp2
-            and self.exp2_packet not in _FLASH_POLICY_DEGREE1_EXP2_PACKETS
-        ):
+        if uses_packed_exp2 and self.exp2_packet not in _FLASH_DEG1_EXP2_PACKETS:
             raise ValueError("packed exp2 lowering requires a degree-1 exp2 packet")
         if (self.corr_regs is None) != (self.other_regs is None):
             raise ValueError(
@@ -281,7 +303,7 @@ class FlashDenseTuningPolicy:
             raise ValueError("dense correction tile size must be 8, 16, or 32")
         if self.role_map is not None:
             _validate_policy_choice(
-                "dense role map", self.role_map, _FLASH_POLICY_ROLE_MAPS
+                "dense role map", self.role_map, FLASH_ROLE_MAP_CHOICES
             )
         if self.softmax_regs is not None and self.softmax_regs not in (
             176,
@@ -302,12 +324,21 @@ class FlashDenseTuningPolicy:
         if self.sp_row_sum not in (None, "fragment", "whole"):
             raise ValueError("dense SP row-sum mode must be fragment or whole")
 
+    def knob_values(self) -> dict[str, object]:
+        """The record's values on the autotune keys (an optional field only
+        when stated), in the order the dense seeds are written."""
+        return {
+            key: value
+            for key, field in _DENSE_POLICY_KNOBS
+            if (value := getattr(self, field)) is not None
+        }
+
     @property
     def requires_fp16_hd64(self) -> bool:
         """Whether this policy selects an implementation limited to FP16/hd64."""
         return (
-            self.pipeline_family in _FLASH_POLICY_FP16_HD64_PIPELINE_FAMILIES
-            or self.exp2_packet not in _FLASH_POLICY_BASE_EXP2_PACKETS
+            FLASH_PIPELINE_FAMILY_FLAGS[self.pipeline_family].tensor_4d_tma
+            or flash_exp2_packet_is_compound(self.exp2_packet)
             or self.softmax_lowering is not FlashSoftmaxLowering.STANDARD
             or self.packed_exp2_mode is not FlashPackedExp2Mode.DISABLED
         )
@@ -355,7 +386,7 @@ class FlashCausalTuningPolicy:
                 f"unsupported causal softmax lowering: {self.softmax_lowering!r}"
             )
         _validate_policy_choice(
-            "causal role map", self.role_map, _FLASH_POLICY_ROLE_MAPS
+            "causal role map", self.role_map, FLASH_ROLE_MAP_CHOICES
         )
         if self.softmax_regs is not None and (
             self.softmax_regs <= 0 or self.softmax_regs % 8
@@ -371,6 +402,34 @@ class FlashCausalTuningPolicy:
             not self.causal_loop_split or self.causal_kv_order != "descending"
         ):
             raise ValueError("causal resident softmax requires a descending split loop")
+
+    def knob_values(self) -> dict[str, object]:
+        """The record's values on the autotune keys: the causal degree-2 seed
+        template (``DEGREE2_V1``: the fa4 family at the 16/6 cadence on the
+        degree-2 packet, a three-deep PASS2 pipe and 16-column rescale chunks)
+        with the record's offsets, output path, role map, ring depth, loop
+        form and its stated registers and load order."""
+        values: dict[str, object] = {
+            FLASH_PIPELINE_FAMILY_KEY: "fa4",
+            FLASH_E2E_SCHEDULE_KEY: "16/6",
+            FLASH_MASKED_E2E_SCHEDULE_KEY: "16/6",
+            FLASH_E2E_OFFSET_KEY: self.e2e_offset,
+            FLASH_E2E_OFFSET0_KEY: self.e2e_offset0,
+            FLASH_EXP2_PACKET_KEY: _FLASH_DEG2_EXP2_PACKET,
+            FLASH_WAIT_HINT_KEY: 0,
+            FLASH_DISC_PIPE_KEY: 3,
+            FLASH_EPI_TMA_KEY: self.epi_tma,
+            FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+            FLASH_ROLE_MAP_KEY: self.role_map,
+            FLASH_KV_STAGE_KEY: self.kv_stage,
+            FLASH_CAUSAL_LOOP_SPLIT_KEY: self.causal_loop_split,
+            FLASH_CAUSAL_KV_ORDER_KEY: self.causal_kv_order,
+        }
+        if self.softmax_regs is not None:
+            values[FLASH_SOFTMAX_REGS_KEY] = self.softmax_regs
+        if self.first_load_order is not None:
+            values[FLASH_FIRST_LOAD_ORDER_KEY] = self.first_load_order
+        return values
 
     @property
     def requires_fp16_hd64(self) -> bool:

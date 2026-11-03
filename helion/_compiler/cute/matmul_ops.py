@@ -41,15 +41,10 @@ from .matmul_utils import cute_static_k_invariant_extent
 from .matmul_utils import cute_synthetic_lane_k_extent
 from .matmul_utils import emit_cute_serial_mm_from_load_views
 from .matmul_utils import emit_cute_synthetic_lane_fold_mm
-from .strategies import is_pure_matmul_role_lifecycle_config
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
-
-
-def _requested_pure_matmul_role_lifecycle(state: CodegenState) -> bool:
-    return is_pure_matmul_role_lifecycle_config(state.device_function.config)
 
 
 def _requested_tcgen05_flat_role_coordinates(state: CodegenState) -> bool:
@@ -186,12 +181,6 @@ def _(state: CodegenState) -> object:
                 "cute",
                 "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
             )
-    if _requested_pure_matmul_role_lifecycle(state):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05_strategy='pure_matmul_role_lifecycle' requires hl.dot "
-            "to lower through the tcgen05 K-loop path",
-        )
     if _requested_tcgen05_flat_role_coordinates(state):
         raise exc.BackendUnsupported(
             "cute",

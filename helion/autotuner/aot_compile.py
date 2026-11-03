@@ -41,7 +41,7 @@ from .._compiler.output_code_utils import dependency_free_runtime_source
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from ..runtime.cute_structural_policy import CuteStructuralPolicy
+    from ..runtime.structural_policy import StructuralPolicy
     from .aot_structural_export import RuntimeGuard
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -278,7 +278,7 @@ def generate_standalone_file(
     dispatch_keys: list[tuple[object, ...]] | None = None,
     tensor_descriptor_guards: bool = False,
     *,
-    structural_policy: CuteStructuralPolicy | None = None,
+    structural_policy: StructuralPolicy | None = None,
     user_key: Callable[..., object] | None = None,
     dynamic_groups: list[tuple[tuple[object, ...], list[int]]] | None = None,
     runtime_guards: tuple[RuntimeGuard, ...] = (),

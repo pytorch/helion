@@ -36,40 +36,6 @@ class NativeCollectiveLifetime:
     initialized: ast.expr
 
 
-def prune_pure_scalar_statements(
-    statements: Sequence[ast.stmt], live: set[str]
-) -> tuple[list[ast.stmt], set[str]]:
-    """Backward liveness inside an independently proven pure scalar region.
-
-    The caller proves all assignments and predicates pure and no values escape
-    the region except ``live``. This handles overwritten definitions, unlike
-    name-wide dead-assignment elimination. Do not use on arbitrary device ASTs.
-    """
-    result: list[ast.stmt] = []
-    live = set(live)
-    for statement in reversed(statements):
-        if isinstance(statement, ast.Pass):
-            continue
-        if isinstance(statement, ast.Assign):
-            assert len(statement.targets) == 1
-            target = statement.targets[0]
-            assert isinstance(target, ast.Name)
-            if target.id not in live:
-                continue
-            live.remove(target.id)
-            live.update(_read_names(statement.value))
-            result.append(statement)
-            continue
-        assert isinstance(statement, ast.If)
-        left, left_live = prune_pure_scalar_statements(statement.body, live)
-        right, right_live = prune_pure_scalar_statements(statement.orelse, live)
-        if not left and not right:
-            continue
-        live = left_live | right_live | _read_names(statement.test)
-        result.append(ast.If(statement.test, left or [ast.Pass()], right))
-    return list(reversed(result)), live
-
-
 def _same_cell(index: ast.expr, offset: str, coordinate: str) -> bool:
     if isinstance(index, ast.Name) and index.id == coordinate:
         return True

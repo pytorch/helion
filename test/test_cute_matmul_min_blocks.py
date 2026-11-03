@@ -10,17 +10,17 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_flash_exp2 import _dense_attention_output
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_launch_bounds import MIN_BLOCKS_KEY
-from helion._compiler.autotuner_heuristics.cute_launch_bounds import (
+from helion._compiler.cute.autotune.heuristics.cute_launch_bounds import MIN_BLOCKS_KEY
+from helion._compiler.cute.autotune.heuristics.cute_launch_bounds import (
     register_matmul_min_blocks_coverage,
 )
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner import LFBOTreeSearch
 from helion.autotuner.compiler_coverage import CoverageDependency
 from helion.autotuner.config_generation import ConfigGeneration
@@ -116,7 +116,7 @@ STRUCTURAL_SETTINGS = (
 
 
 REGISTRATION = (
-    "helion._compiler.autotuner_heuristics.register_matmul_min_blocks_coverage"
+    "helion._compiler.cute.autotune.heuristics.register_matmul_min_blocks_coverage"
 )
 
 
@@ -136,11 +136,7 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
         monkeypatch.delenv(name, raising=False)
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        _target(),
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
     torch.set_num_threads(previous)
 

@@ -10,7 +10,7 @@ from .test_cute_grouped_fp32_output import _grouped_fp32_output
 from .test_cute_grouped_grid_multiplier import _config
 import helion
 from helion import exc
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute.tcgen05_config import repair
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY as REGISTER_REALLOCATION,
 )
@@ -86,7 +86,7 @@ def test_grouped_static_registers_preserve_pipeline_lifecycle(multiplier: int) -
 def test_static_registers_keep_independent_worklist_contract(change: dict) -> None:
     config = dict(_config(2).config)
     config.update(change)
-    assert not CuteTcgen05Config._grouped_static_registers_supported(config)
+    assert not repair._grouped_static_registers_supported(config)
 
 
 def test_static_registers_reject_conflicting_consumer_ceiling() -> None:

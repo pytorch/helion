@@ -13,8 +13,8 @@ import torch
 from test.test_cute_bounded_cache_codegen import _cpu_target
 
 import helion
-from helion._compiler.backend import TritonBackend
 from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.triton.backend import TritonBackend
 from helion._testing.cute_codegen import forbid_native_compile
 from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
 from helion.autotuner.config_generation import ConfigGeneration

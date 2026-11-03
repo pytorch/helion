@@ -29,8 +29,10 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ...autotuner.config_fragment import ConfigSpecFragment
+    from ...autotuner.llm.profile import LlmPromptProfile
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
+    from ..autotuner_heuristics.registry import AutotunerHeuristicType
     from ..device_function import Argument
 
     InductorOpOverrides = OpsHandler[Any]
@@ -65,6 +67,40 @@ class TritonBackend(Backend):
     @property
     def name(self) -> str:
         return "triton"
+
+    def llm_prompt_profile(self) -> LlmPromptProfile:
+        from ...autotuner.llm.profile import LlmPromptProfile
+
+        return LlmPromptProfile("Triton")
+
+    @property
+    def lowers_integer_powers(self) -> bool:
+        return True
+
+    @property
+    def supports_inter_loop_barriers(self) -> bool:
+        return True
+
+    def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:
+        # Triton branches are uniform per program, so the barrier is always
+        # placeable.
+        return True
+
+    @property
+    def lowers_chunk_unbind(self) -> bool:
+        return True
+
+    @property
+    def merges_reduction_dims(self) -> bool:
+        return True
+
+    @property
+    def warns_fast_math_unused(self) -> bool:
+        return True
+
+    @property
+    def supports_autotune_multi(self) -> bool:
+        return True
 
     @property
     def state(self) -> BackendState:
@@ -139,6 +175,11 @@ class TritonBackend(Backend):
         if key in _compat.get_mtia_tunable_fragments():
             return _compat.supports_mtia_tunables()
         return super().supports_config_key(key)
+
+    def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
+        from ..autotuner_heuristics.triton import TRITON_HEURISTICS
+
+        return TRITON_HEURISTICS
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         from ..._compat import get_mtia_tunable_fragments
@@ -602,7 +643,9 @@ class TritonBackend(Backend):
 
         from ...autotuner.config_spec import _get_backend_tunable_keys
 
-        for key in _get_backend_tunable_keys():
+        # Sorted: the key set is a frozenset, whose iteration order follows the
+        # process hash seed, and the rendered text keys the autotune cache.
+        for key in sorted(_get_backend_tunable_keys()):
             if key in config:
                 args.append(f"{key}={config[key]!r}")
 
@@ -714,6 +757,27 @@ class TileIRBackend(TritonBackend):
     def name(self) -> str:
         return "tileir"
 
+    def llm_prompt_profile(self) -> LlmPromptProfile:
+        # The prompts name this backend by its registry name.
+        return Backend.llm_prompt_profile(self)
+
+    @property
+    def supports_inter_loop_barriers(self) -> bool:
+        # ``tl.debug_barrier()`` lowers to ``ttg.barrier``, which the TileIR
+        # pass pipeline does not legalize.
+        return False
+
+    def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:
+        return False
+
+    @property
+    def lowers_chunk_unbind(self) -> bool:
+        return False
+
+    @property
+    def warns_fast_math_unused(self) -> bool:
+        return False
+
     @property
     def codegen_name(self) -> str:
         return "triton"
@@ -731,6 +795,11 @@ class TileIRBackend(TritonBackend):
 
     def supports_block_ptr_indexing(self) -> bool:
         return False
+
+    def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
+        from ..autotuner_heuristics.tileir import TILEIR_HEURISTICS
+
+        return TILEIR_HEURISTICS
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         from ...autotuner.config_fragment import PowerOfTwoFragment

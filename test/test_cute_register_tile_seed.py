@@ -20,23 +20,25 @@ from test.test_cute_register_tile_reductions import COLUMN_REDUCE
 from test.test_cute_register_tile_reductions import CONSTEXPR_OWNER
 from test.test_cute_register_tile_reductions import ROLLED_OWNER
 from test.test_cute_register_tile_reductions import _bind
-from test.test_cute_register_tile_reductions import _cpu_only  # noqa: F401
 
 import helion
 from helion._compiler.autotuner_heuristics import get_heuristics
-from helion._compiler.autotuner_heuristics.cute import CuteColumnReductionHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteRegisterTileHeuristic
-from helion._testing import skipUnlessBackends
+from helion._compiler.cute.autotune.heuristics.cute import CuteColumnReductionHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteRegisterTileHeuristic
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
 
-pytestmark = pytest.mark.cpu_only
+# ``test_cute_register_tile_reductions``'s CPU model (its ``_cpu_only`` fixture
+# was imported here before it became this marker).
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(reduction_smem_budget_bytes=232448),
+]
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-@skipUnlessBackends(["cute"])
 def test_register_tile_heuristic_seeds_the_geometry() -> None:
     bound, _arguments = _bind()
     host = bound.host_function
@@ -74,7 +76,6 @@ def test_register_tile_heuristic_seeds_the_geometry() -> None:
     assert code.count(COLUMN_REDUCE) == 1
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     ("kernel", "make_arguments", "capability"),
     (
@@ -119,7 +120,6 @@ def test_seed_compiles_bodies_the_register_tile_cannot_schedule(
     assert "_lane_stash" not in code
 
 
-@skipUnlessBackends(["cute"])
 def test_seed_keeps_bf16_to_fp32_column_store_on_sm100() -> None:
     arguments = (torch.empty((128, 1024), dtype=torch.bfloat16),)
     bound = cpu_bind(col_sum_f32_out, arguments)
@@ -137,7 +137,6 @@ def test_seed_keeps_bf16_to_fp32_column_store_on_sm100() -> None:
     assert code.count("_cute_store_u32_vec(out.iterator") == 1
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     ("kernel", "make_arguments"),
     (
@@ -180,7 +179,6 @@ def test_seed_retries_wide_extents_as_the_looped_reduction(
     assert "block=(64, 8, 1)" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_seed_skips_bodies_outside_the_register_tile_shape() -> None:
     # A rolled device loop or a dynamic reduction extent: the block is not
     # admitted and no seed is offered.
@@ -200,7 +198,6 @@ def test_seed_skips_bodies_outside_the_register_tile_shape() -> None:
         assert not CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
 
 
-@skipUnlessBackends(["cute"])
 def test_chained_reductions_seed_half_the_lanes_per_level() -> None:
     # One reduction feeding another (two accumulate nests) stashes more of the
     # tile between the combines, so the seed halves the lanes per thread:
@@ -233,7 +230,6 @@ def test_chained_reductions_seed_half_the_lanes_per_level() -> None:
     assert "block=(8, 16, 1)" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_register_tile_and_column_reduction_seeds_are_disjoint() -> None:
     # Both heuristics seed column reductions, of different IR shapes:
     # ``CuteColumnReductionHeuristic`` a reduction over a serial device-loop
@@ -287,7 +283,6 @@ def _col_sum_scale_in_place(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@skipUnlessBackends(["cute"])
 def test_seed_skips_bodies_whose_lane_split_would_order_memory() -> None:
     # The lane split cannot order two threads' accesses to one tensor: no
     # barrier fits next to the lane-reduce placeholder, and the RAW barrier

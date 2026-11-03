@@ -1,6 +1,7 @@
-"""The DEFAULT-layout tcgen05 GEMM's static SMEM model (CPU only).
+"""The DEFAULT-layout tcgen05 GEMM's static SMEM model, and the sm_100 compile
+checks of the fp32-row geometries it admits (at the end of the module).
 
-``CuteTcgen05Config.default_layout_smem_bytes`` reproduces the arena ptxas
+``tcgen05_config.smem.default_layout_smem_bytes`` reproduces the arena ptxas
 lays out for the role-local kernel; the expectations below are the ``SHARED``
 bytes ``cuobjdump --dump-resource-usage`` reported for the compiled cubins on
 B200 minus the 1 KiB the system reserves per CTA. The fits verdicts follow the
@@ -10,11 +11,17 @@ ran, every one it rejects failed in NVVM (``too much shared``).
 
 from __future__ import annotations
 
-import pytest
+from typing import TYPE_CHECKING
+from typing import NamedTuple
 
-from helion._compiler.backend import CuteBackend
+import pytest
+import torch
+
+import helion
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
+from helion._compiler.cute.tcgen05_config import smem
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES,
 )
@@ -25,8 +32,15 @@ from helion._compiler.cute.tcgen05_constants import Tcgen05RowvecAuxFacts
 from helion._compiler.cute.tcgen05_constants import Tcgen05RowvecAuxRow
 from helion._compiler.cute.tcgen05_constants import tcgen05_fixed_smem_overhead_bytes
 from helion._compiler.cute.tcgen05_constants import tcgen05_round_up_smem_bytes
+from helion._testing import DEVICE
+from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotCUDA
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_spec import ConfigSpec
+import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
 
@@ -126,7 +140,8 @@ def test_arena_model_matches_the_compiled_cubin(
     shared: int,
 ) -> None:
     config = _config(dtype_bytes, _FACTS[facts_name])
-    arena = config.default_layout_smem_bytes(
+    arena = smem.default_layout_smem_bytes(
+        config,
         bm=bm,
         bn=bn,
         bk=bk,
@@ -138,7 +153,8 @@ def test_arena_model_matches_the_compiled_cubin(
     )
     assert arena == shared - RESERVED_PER_CTA_BYTES
     assert arena + TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES <= B200_OPTIN_BYTES
-    assert config.default_layout_smem_fits(
+    assert smem.default_layout_smem_fits(
+        config,
         bm=bm,
         bn=bn,
         bk=bk,
@@ -173,7 +189,8 @@ def test_arena_model_rejects_the_geometries_nvvm_rejected(
     dtype_bytes: int, bm: int, bn: int, bk: int, cluster_m: int, ab: int, c: int
 ) -> None:
     config = _config(dtype_bytes, F32_ROW)
-    arena = config.default_layout_smem_bytes(
+    arena = smem.default_layout_smem_bytes(
+        config,
         bm=bm,
         bn=bn,
         bk=bk,
@@ -184,7 +201,8 @@ def test_arena_model_rejects_the_geometries_nvvm_rejected(
     )
     assert arena is not None
     assert arena > B200_OPTIN_BYTES
-    assert not config.default_layout_smem_fits(
+    assert not smem.default_layout_smem_fits(
+        config,
         bm=bm,
         bn=bn,
         bk=bk,
@@ -231,17 +249,33 @@ def test_row_stages_occupy_whole_kib_ahead_of_the_c_ring() -> None:
     promoted = _config(2, PROMOTED_ROW)
     plain = _config(2, NO_ROWS)
     kwargs = {"bm": 128, "bn": 64, "bk": 64, "cluster_m": 1, "ab_stages": 8}
-    staged = promoted.default_layout_smem_bytes(c_stages=2, stage_rows=True, **kwargs)
-    bare = plain.default_layout_smem_bytes(c_stages=2, stage_rows=False, **kwargs)
+    staged = smem.default_layout_smem_bytes(
+        promoted, c_stages=2, stage_rows=True, **kwargs
+    )
+    bare = smem.default_layout_smem_bytes(plain, c_stages=2, stage_rows=False, **kwargs)
     assert staged is not None and bare is not None
     assert staged - bare == 1024
     # The fp32 warp-private stage of a 128-wide tile is 2 KiB already.
     f32 = _config(2, F32_ROW)
-    staged = f32.default_layout_smem_bytes(
-        bm=128, bn=128, bk=64, cluster_m=1, ab_stages=6, c_stages=2, stage_rows=True
+    staged = smem.default_layout_smem_bytes(
+        f32,
+        bm=128,
+        bn=128,
+        bk=64,
+        cluster_m=1,
+        ab_stages=6,
+        c_stages=2,
+        stage_rows=True,
     )
-    bare = plain.default_layout_smem_bytes(
-        bm=128, bn=128, bk=64, cluster_m=1, ab_stages=6, c_stages=2, stage_rows=False
+    bare = smem.default_layout_smem_bytes(
+        plain,
+        bm=128,
+        bn=128,
+        bk=64,
+        cluster_m=1,
+        ab_stages=6,
+        c_stages=2,
+        stage_rows=False,
     )
     assert staged is not None and bare is not None
     assert staged - bare == 2048
@@ -257,31 +291,49 @@ def test_unanalyzed_store_chain_is_judged_at_the_widest_output() -> None:
     # way); on a 16-wide tile it is the larger of the two.
     unknown = _config(2, None)
     assert (
-        unknown.default_layout_smem_bytes(
-            bm=128, bn=128, bk=64, cluster_m=1, ab_stages=6, c_stages=4, stage_rows=True
+        smem.default_layout_smem_bytes(
+            unknown,
+            bm=128,
+            bn=128,
+            bk=64,
+            cluster_m=1,
+            ab_stages=6,
+            c_stages=4,
+            stage_rows=True,
         )
         is None
     )
-    assert not unknown.default_layout_smem_fits(
-        bm=128, bn=128, bk=64, cluster_m=1, ab_stages=6, c_stages=4, stage_rows=True
+    assert not smem.default_layout_smem_fits(
+        unknown,
+        bm=128,
+        bn=128,
+        bk=64,
+        cluster_m=1,
+        ab_stages=6,
+        c_stages=4,
+        stage_rows=True,
     )
     known = _config(2, NO_ROWS)
     kwargs = {"bm": 128, "bn": 128, "bk": 64, "cluster_m": 1, "c_stages": 4}
-    unknown_bytes = unknown.default_layout_smem_bytes(
-        ab_stages=6, stage_rows=False, **kwargs
+    unknown_bytes = smem.default_layout_smem_bytes(
+        unknown, ab_stages=6, stage_rows=False, **kwargs
     )
-    known_bytes = known.default_layout_smem_bytes(
-        ab_stages=6, stage_rows=False, **kwargs
+    known_bytes = smem.default_layout_smem_bytes(
+        known, ab_stages=6, stage_rows=False, **kwargs
     )
     assert unknown_bytes is not None and unknown_bytes == known_bytes
-    assert unknown.default_layout_smem_fits(ab_stages=6, stage_rows=False, **kwargs)
-    assert not unknown.default_layout_smem_fits(ab_stages=7, stage_rows=False, **kwargs)
-    narrow = {"bm": 128, "bn": 16, "bk": 64, "cluster_m": 1, "c_stages": 4}
-    unknown_bytes = unknown.default_layout_smem_bytes(
-        ab_stages=8, stage_rows=False, **narrow
+    assert smem.default_layout_smem_fits(
+        unknown, ab_stages=6, stage_rows=False, **kwargs
     )
-    known_bytes = known.default_layout_smem_bytes(
-        ab_stages=8, stage_rows=False, **narrow
+    assert not smem.default_layout_smem_fits(
+        unknown, ab_stages=7, stage_rows=False, **kwargs
+    )
+    narrow = {"bm": 128, "bn": 16, "bk": 64, "cluster_m": 1, "c_stages": 4}
+    unknown_bytes = smem.default_layout_smem_bytes(
+        unknown, ab_stages=8, stage_rows=False, **narrow
+    )
+    known_bytes = smem.default_layout_smem_bytes(
+        known, ab_stages=8, stage_rows=False, **narrow
     )
     assert unknown_bytes is not None and known_bytes is not None
     # (128, 16) subtile at 4 B vs 2 B per element, four stages.
@@ -292,7 +344,8 @@ def test_model_needs_a_recorded_budget() -> None:
     config = CuteTcgen05Config(ConfigSpec(backend=CuteBackend()))
     config.rowvec_aux_facts = NO_ROWS
     assert (
-        config.default_layout_smem_bytes(
+        smem.default_layout_smem_bytes(
+            config,
             bm=128,
             bn=128,
             bk=64,
@@ -303,6 +356,191 @@ def test_model_needs_a_recorded_budget() -> None:
         )
         is None
     )
-    assert not config.default_layout_smem_fits(
-        bm=128, bn=128, bk=64, cluster_m=1, ab_stages=2, c_stages=2, stage_rows=False
+    assert not smem.default_layout_smem_fits(
+        config,
+        bm=128,
+        bn=128,
+        bk=64,
+        cluster_m=1,
+        ab_stages=2,
+        c_stages=2,
+        stage_rows=False,
     )
+
+
+# Compile checks for the fp32-row geometries the SMEM model admits (sm_100 GPU).
+#
+# Each case is a ``pre_acc_wait`` row-vector GEMM whose 192 KiB AB ring, 32 KiB
+# c=4 ring and 2 KiB fp32 row stage fill the per-CTA opt-in to within a KiB
+# (231 588-231 716 B of 232 448 modelled; the cubins report 232 612-232 740 B
+# ``SHARED`` with the 1 KiB reservation). The 3 KiB seed headroom demoted every
+# one of them to its ``post_acc_wait`` / c=2 twin; the arena model keeps them,
+# and they must compile, launch and agree with the reference.
+
+
+def _sm100_gpu(test: Callable[..., object]) -> Callable[..., object]:
+    """Skip ``test`` without a CUDA GPU of capability 10.0 or newer."""
+    return skipIfNotCUDA()(
+        skipIfCudaCapabilityLessThan((10, 0), reason="tcgen05 requires an sm_100 GPU")(
+            test
+        )
+    )
+
+
+LAUNCHES = 8
+
+
+def _f16_scale_gemm(
+    x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = (acc * scale[tile_n]).to(x.dtype)
+    return out
+
+
+def _fp8_scale_gemm(
+    x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = (acc * scale[tile_n]).to(torch.bfloat16)
+    return out
+
+
+class _Case(NamedTuple):
+    operands: str
+    bm: int
+    bn: int
+    bk: int
+    cluster_m: int
+    ab_stages: int
+    values: dict[str, object]
+    # Modelled arena bytes (``default_layout_smem_bytes``), exact for these
+    # kernels: the compiled cubins report these plus the 1 KiB reservation.
+    arena_bytes: int
+
+
+def _two_cta(operands: str, bk: int, ab_stages: int, cluster_n: int) -> _Case:
+    return _Case(
+        operands,
+        256,
+        128,
+        bk,
+        2,
+        ab_stages,
+        {
+            "block_sizes": [256, 128, bk],
+            "pid_type": "persistent_interleaved",
+            "l2_groupings": [4],
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": cluster_n,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_ab_stages": ab_stages,
+            "tcgen05_c_stages": 4,
+            "tcgen05_aux_load_placement": "pre_acc_wait",
+        },
+        231_596,
+    )
+
+
+def _one_cta(operands: str, bk: int, ab_stages: int) -> _Case:
+    return _Case(
+        operands,
+        128,
+        128,
+        bk,
+        1,
+        ab_stages,
+        {
+            "block_sizes": [128, 128, bk],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cta_group": "auto",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": ab_stages,
+            "tcgen05_c_stages": 4,
+            "tcgen05_acc_stages": 2,
+            "l2_groupings": [1],
+            "tcgen05_l2_swizzle_size": 1,
+            "tcgen05_persistence_model": "static_persistent",
+            "tcgen05_strategy": "role_local_monolithic",
+            "tcgen05_layout_strategy": "default",
+            "tcgen05_aux_load_placement": "pre_acc_wait",
+        },
+        # A ring deeper than eight stages takes a second 128 B mbarrier chunk.
+        231_716 if ab_stages > 8 else 231_588,
+    )
+
+
+_CASES = {
+    "f16_256x128x64_cm2cn1_ab8": _two_cta("f16", 64, 8, 1),
+    "f16_256x128x64_cm2cn2_ab8": _two_cta("f16", 64, 8, 2),
+    "f16_256x128x128_cm2cn1_ab4": _two_cta("f16", 128, 4, 1),
+    "f16_256x128x128_cm2cn2_ab4": _two_cta("f16", 128, 4, 2),
+    "f16_128x128x32_ab12": _one_cta("f16", 32, 12),
+    "f16_128x128x64_ab6": _one_cta("f16", 64, 6),
+    "f16_128x128x128_ab3": _one_cta("f16", 128, 3),
+    "fp8_256x128x128_cm2cn1_ab8": _two_cta("fp8", 128, 8, 1),
+    "fp8_256x128x128_cm2cn2_ab8": _two_cta("fp8", 128, 8, 2),
+    "fp8_128x128x64_ab12": _one_cta("fp8", 64, 12),
+    "fp8_128x128x128_ab6": _one_cta("fp8", 128, 6),
+}
+
+
+def _inputs(operands: str) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    torch.manual_seed(0)
+    if operands == "f16":
+        x = torch.randn(1024, 1024, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(1024, 1024, device=DEVICE, dtype=torch.float16)
+    else:
+        x = (torch.randn(1024, 1024, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(1024, 1024, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+    scale = torch.rand(1024, device=DEVICE, dtype=torch.float32) + 0.5
+    expected = (x.float() @ y.float()) * scale
+    return (x, y, scale), expected
+
+
+@_sm100_gpu
+@pytest.mark.parametrize("case", sorted(_CASES), ids=sorted(_CASES))
+def test_admitted_fp32_row_geometry_compiles_and_runs(case: str) -> None:
+    c = _CASES[case]
+    args, expected = _inputs(c.operands)
+    kernel_fn = _f16_scale_gemm if c.operands == "f16" else _fp8_scale_gemm
+    kernel = helion.kernel(kernel_fn, backend="cute", static_shapes=True)
+    bound = kernel.bind(args)
+    spec = bound.config_spec
+    # The search projection keeps the sampled knobs ...
+    projected = dict(c.values)
+    spec.normalize(projected, _fix_invalid=True)
+    assert projected["tcgen05_ab_stages"] == c.ab_stages
+    assert projected["tcgen05_c_stages"] == 4
+    assert projected["tcgen05_aux_load_placement"] == "pre_acc_wait"
+    # ... because the modelled arena (exact for these kernels) fits the opt-in.
+    modelled = smem.default_layout_smem_bytes(
+        spec._cute_tcgen05_config,
+        bm=c.bm,
+        bn=c.bn,
+        bk=c.bk,
+        cluster_m=c.cluster_m,
+        ab_stages=c.ab_stages,
+        c_stages=4,
+        stage_rows=True,
+    )
+    assert modelled == c.arena_bytes
+    assert modelled + TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES <= B200_OPTIN_BYTES
+    bound.set_config(helion.Config(**c.values))
+    outputs = [bound(*args) for _ in range(LAUNCHES)]
+    torch.cuda.synchronize()
+    for out in outputs:
+        torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=1e-1)

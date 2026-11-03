@@ -31,7 +31,7 @@ def test_dynamic_jagged_row_masks_keep_affine_vector_loads(
         mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
@@ -68,7 +68,7 @@ def test_vector_width_on_a_jagged_feature_axis_stays_scalar(
         mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):

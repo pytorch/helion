@@ -2,60 +2,37 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
 
 from test.cute_population_contracts import with_flat_min_blocks_default
 from test.test_cute_full_slice_matmul import _bind
-from test.test_cute_materialized_fission import _cpu_target
 from test.test_cute_materialized_fission import _se_args
 from test.test_cute_materialized_fission import _sources
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_materialized import (
+from helion._compiler.cute.autotune.heuristics.cute_materialized import (
     CuteMaterializedMmaHeuristic,
 )
 from helion._compiler.cute.mma_support import CuteMmaSupport
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
+
+pytestmark = pytest.mark.cpu_only
 
 squeeze_and_excitation_net_fwd = import_example(
     "squeeze_and_excitation_net"
 ).squeeze_and_excitation_net_fwd
-
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
-
 if TYPE_CHECKING:
     from collections.abc import Generator
 
 
 @pytest.fixture(autouse=True)
 def _native_cpu_target() -> Generator[None, None, None]:
-    support = CuteMmaSupport(
-        universal=True, warp_f16bf16=True, warpgroup_f16bf16=True, tcgen05_f16bf16=True
-    )
-    with (
-        _cpu_target(),
-        # The imported bind helper does not carry its module's autouse fixture.
-        # Keep hardware specialization on the mocked target even on GPU workers.
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        patch(
-            "helion._compiler.cute.mma_support.get_cute_mma_support",
-            return_value=support,
-        ),
-        patch(
-            "helion._compiler.cute.cute_mma.get_cute_mma_support", return_value=support
-        ),
-        patch(
-            "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_budget_bytes",
-            return_value=232448,
-        ),
-    ):
+    support = CuteMmaSupport(universal=True, warp_f16bf16=True, tcgen05_f16bf16=True)
+    with cpu_render_target(mma_support=support, smem_budget_bytes=232448):
         yield
 
 
@@ -70,8 +47,8 @@ def test_fission_native_seeds_emit_both_matrix_products(
     host = bound.host_function
     assert host is not None
     spec = bound.config_spec
-    assert spec.cute_tcgen05_search_enabled
-    assert spec._tcgen05_matmul_block_ids() is None
+    assert spec.tcgen05.search_enabled
+    assert spec.tcgen05.matmul_block_ids is None
     assert spec._cute_tcgen05_config.materialized_matmul_block_ids == (
         (0, 1, 2),
         (3, 4, 5),

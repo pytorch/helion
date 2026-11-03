@@ -45,8 +45,12 @@ import re
 from typing import cast
 
 from ..ast_extension import statement_from_string
-from ._ast_pass_utils import _assignment_lhs_name
-from ._ast_pass_utils import _names_read
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import constexpr_v_loop
+from ._ast_pass_utils import loop_extent
+from ._ast_pass_utils import names_read
+from .reduce_call import CLUSTER_REDUCES
+from .reduce_call import LANE_FOLD_REDUCES
 
 # Warp-reduction call attribute names recognised by this pass.  Each maps
 # to the identity element used for the per-thread V-fold accumulator.
@@ -67,20 +71,11 @@ _REDUCE_COMBINE: dict[str, str] = {
 }
 
 
-# Grouped-reduction helper names (multi-warp shared-memory reductions and
-# the interleaved grouped warp reduce).  These take the reduction op as a
-# string literal in args[1] and the identity element in args[2]; the pass
-# hoists them exactly like ``cute.arch.warp_reduction_*``.  Without this a
-# multi-warp config (group_span > 32) runs a full two-barrier block
+# The grouped-reduce helpers (``LANE_FOLD_REDUCES``) take the reduction op
+# as a string literal in args[1] and the identity element in args[2]; the
+# pass hoists them exactly like ``cute.arch.warp_reduction_*``.  Without
+# this a multi-warp config (group_span > 32) runs a full two-barrier block
 # reduction per V-lane per reduce.
-_GROUPED_REDUCE_FUNCS: frozenset[str] = frozenset(
-    {
-        "_cute_grouped_reduce_shared_two_stage",
-        "_cute_grouped_reduce_shared_tree",
-        "_cute_grouped_reduce_warp",
-        "_cute_grouped_reduce_cluster",
-    }
-)
 _GROUPED_OP_TO_KEY: dict[str, str] = {
     "sum": "warp_reduction_sum",
     "max": "warp_reduction_max",
@@ -97,7 +92,7 @@ def _looks_like_warp_reduce_call(node: ast.AST) -> tuple[str, ast.expr] | None:
     if not isinstance(node, ast.Call):
         return None
     func = node.func
-    if isinstance(func, ast.Name) and func.id in _GROUPED_REDUCE_FUNCS:
+    if isinstance(func, ast.Name) and func.id in LANE_FOLD_REDUCES:
         if len(node.args) < 3:
             return None
         op_arg = node.args[1]
@@ -136,29 +131,6 @@ def _find_warp_reduce_in_expr(
         if result is not None:
             return result
     return None
-
-
-def _is_constexpr_v_loop(node: ast.stmt) -> tuple[ast.For, int] | None:
-    """If ``node`` is ``for X in cutlass.range_constexpr(V): ...``, return
-    ``(node, V)``.  Otherwise None.
-    """
-    if not isinstance(node, ast.For):
-        return None
-    iter_node = node.iter
-    if not (
-        isinstance(iter_node, ast.Call)
-        and isinstance(iter_node.func, ast.Attribute)
-        and iter_node.func.attr == "range_constexpr"
-        and isinstance(iter_node.func.value, ast.Name)
-        and iter_node.func.value.id == "cutlass"
-    ):
-        return None
-    if not iter_node.args:
-        return None
-    arg = iter_node.args[0]
-    if not (isinstance(arg, ast.Constant) and isinstance(arg.value, int)):
-        return None
-    return node, arg.value
 
 
 def _names_written(node: ast.stmt) -> set[str]:
@@ -211,7 +183,7 @@ def _compute_dependency_closure(
         i = worklist.pop()
         stmt = body[i]
         defs_before = def_history[i]
-        for name in _names_read(stmt):
+        for name in names_read(stmt):
             j = defs_before.get(name)
             if j is not None and j not in closure:
                 closure.add(j)
@@ -260,7 +232,7 @@ def _name_explicit_fp32_reduce_inputs(
         name = statement.targets[0].id
         if (
             writes[name] == 1
-            and _names_read(statement) & writes.keys() <= definite.keys()
+            and names_read(statement) & writes.keys() <= definite.keys()
         ):
             definite[name] = index
     result: list[ast.stmt] = []
@@ -327,7 +299,7 @@ def _try_hoist_one_vloop(
     reduce_validate: list[tuple[int, str, str]] = []
     for idx, stmt in enumerate(body):
         rhs = _assignment_rhs(stmt)
-        lhs = _assignment_lhs_name(stmt)
+        lhs = assigned_name(stmt)
         if rhs is None or lhs is None:
             continue
         found = _find_warp_reduce_in_expr(rhs)
@@ -354,7 +326,7 @@ def _try_hoist_one_vloop(
     if vec_lane_var is not None:
         v_defined_names: set[str] = set()
         for i, stmt in enumerate(body):
-            reads = _names_read(stmt)
+            reads = names_read(stmt)
             if vec_lane_var in reads or (reads & v_defined_names):
                 v_dependent.add(i)
                 if i not in reduce_stmt_indices:
@@ -416,7 +388,7 @@ def _try_hoist_one_vloop(
     reduce_info_copy: list[tuple[int, str, str, str, ast.Call, ast.stmt]] = []
     for idx, stmt in enumerate(body_copy):
         rhs = _assignment_rhs(stmt)
-        lhs = _assignment_lhs_name(stmt)
+        lhs = assigned_name(stmt)
         if rhs is None or lhs is None:
             continue
         found = _find_warp_reduce_in_expr(rhs)
@@ -530,7 +502,7 @@ def _try_hoist_one_vloop(
         #      fold each lane in, then ONE warp reduce.  [the original path]
         input_def = body_copy[input_def_idx]
         input_is_running_sum = input_name in running_sums
-        if not input_is_running_sum and input_name in _names_read(input_def):
+        if not input_is_running_sum and input_name in names_read(input_def):
             return None  # case (c): loop-carried but not a known running sum
         input_is_loop_carried = input_is_running_sum
 
@@ -681,7 +653,7 @@ def _replace_reduce_input(
                 if (
                     acc_dtype is not None
                     and isinstance(node.func, ast.Name)
-                    and node.func.id in _GROUPED_REDUCE_FUNCS
+                    and node.func.id in LANE_FOLD_REDUCES
                     and len(new_args) >= 3
                 ):
                     new_args[2] = _rewrite_cast_wrapper(new_args[2], acc_dtype)
@@ -720,7 +692,7 @@ def _hoist_in_body(
         if isinstance(stmt, ast.For):
             stmt.body = walk(stmt.body)
             stmt.orelse = walk(stmt.orelse)
-            match = _is_constexpr_v_loop(stmt)
+            match = constexpr_v_loop(stmt)
             if match is not None and not (
                 isinstance(stmt.target, ast.Name)
                 and stmt.target.id in unfoldable_vec_lanes
@@ -792,21 +764,7 @@ def hoist_warp_reduce_from_vloop(
 def _is_static_range_loop(node: ast.stmt) -> int | None:
     """If ``node`` is ``for X in range(<int>): ...`` (a static lane loop as
     emitted by ``_create_lane_loop``), return the trip count."""
-    if not isinstance(node, ast.For) or node.orelse:
-        return None
-    it = node.iter
-    if not (
-        isinstance(it, ast.Call)
-        and isinstance(it.func, ast.Name)
-        and it.func.id == "range"
-        and len(it.args) == 1
-        and isinstance(it.args[0], ast.Constant)
-        and isinstance(it.args[0].value, int)
-    ):
-        return None
-    if not isinstance(node.target, ast.Name):
-        return None
-    return it.args[0].value
+    return loop_extent(node, kinds=("range",), minimum=None)
 
 
 _COLLAPSE_UPDATE_OPS: dict[str, str] = {
@@ -928,7 +886,7 @@ def _try_collapse_lane_reduce(
     reduce_entries: list[tuple[int, str, str, ast.Call, str]] = []
     for i, stmt in enumerate(body):
         rhs = _assignment_rhs(stmt)
-        lhs = _assignment_lhs_name(stmt)
+        lhs = assigned_name(stmt)
         if rhs is None or lhs is None:
             continue
         found = _find_warp_reduce_in_expr(rhs)
@@ -978,12 +936,12 @@ def _try_collapse_lane_reduce(
         vloop_idx = None
         for j in range(init_idx + 1, idx):
             stmt = body[j]
-            if isinstance(stmt, ast.For) and _is_constexpr_v_loop(stmt) is not None:
+            if isinstance(stmt, ast.For) and constexpr_v_loop(stmt) is not None:
                 if acc_name in _names_written_recursive(stmt):
                     if vloop_idx is not None:
                         return None
                     vloop_idx = j
-            elif acc_name in _names_written(stmt) or acc_name in _names_read(stmt):
+            elif acc_name in _names_written(stmt) or acc_name in names_read(stmt):
                 return None
         if vloop_idx is None:
             return None
@@ -1007,7 +965,7 @@ def _try_collapse_lane_reduce(
                 update_idx = j
                 carry_name, src_name = matched
                 break
-            lhs = _assignment_lhs_name(stmt)
+            lhs = assigned_name(stmt)
             rhs = _assignment_rhs(stmt)
             if (
                 lhs is not None
@@ -1083,7 +1041,7 @@ def _try_collapse_lane_reduce(
             # The whole closure moves out together, so reads of names other
             # closure members write are fine; only reads of names the loop
             # still writes (or of the lane var) make the move unsafe.
-            reads = _names_read(stmt)
+            reads = names_read(stmt)
             if lane_var in reads or reads & (loop_written - closure_written):
                 return None
             move_out.append(j)
@@ -1188,13 +1146,8 @@ def validate_cluster_reduce_placement(
     mbarrier would deadlock on the second execution)."""
     from ... import exc
 
-    cluster_reduces = (
-        "_cute_grouped_reduce_cluster",
-        "_cute_grouped_reduce_cluster_online_pair",
-        "_cute_grouped_reduce_cluster_warp_online_pair",
-    )
     if not any(
-        isinstance(node, ast.Name) and node.id in cluster_reduces
+        isinstance(node, ast.Name) and node.id in CLUSTER_REDUCES
         for stmt in body
         for node in ast.walk(stmt)
     ):
@@ -1212,7 +1165,7 @@ def validate_cluster_reduce_placement(
                     if (
                         isinstance(sub, ast.Call)
                         and isinstance(sub.func, ast.Name)
-                        and sub.func.id in cluster_reduces
+                        and sub.func.id in CLUSTER_REDUCES
                     ):
                         raise exc.BackendUnsupported(
                             "cute",

@@ -11,13 +11,13 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from helion._compiler import tile_strategy
 from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.cute import affine_vector_io
 from helion._compiler.cute import factor_affine_reductions
 from helion._compiler.cute import hoist_lane_invariant_reductions
 from helion._compiler.cute import pipeline_state_loads
+from helion._compiler.cute._ast_pass_utils import _is_proven_relocatable_call
 from helion._compiler.cute.scalar_recipe import PURE_HELPERS
 from helion._compiler.cute.scalar_recipe import build_recipe
 
@@ -529,7 +529,7 @@ def test_pure_helpers_are_pure_in_every_effect_proof(helper: str) -> None:
     call = _expr(f"{helper}(a, b)")
     assert isinstance(call, ast.Call)
     assert build_recipe(call, [], {"a", "b"}) is not None
-    assert tile_strategy._is_proven_relocatable_call(call, allow_load=False)
+    assert _is_proven_relocatable_call(call, allow_load=False)
     assert affine_vector_io._accesses(_body(f"c = {helper}(a, b)")) == []
     assert pipeline_state_loads._prefetch_overlap_call_is_safe(
         call,

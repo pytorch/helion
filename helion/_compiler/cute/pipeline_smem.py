@@ -1,7 +1,16 @@
-"""Shared-memory accounting for a single native GEMM epilogue."""
+"""Shared-memory accounting of one native tcgen05 GEMM launch.
+
+Two byte models price the per-CTA arena -- ``pipeline_smem_bytes`` for the
+static CtaGroup.TWO schedule and ``one_cta_pipeline_smem_bytes`` for the
+role-local CtaGroup.ONE schedule -- and ``SmemArena`` is the one object the
+stage searches reach them through (``max_pipeline_ab_stages`` and its
+one-CTA alias).  Every budget here is ``Tcgen05PipelineSmemFacts.capacity_bytes``,
+the device's opt-in capacity read once at bind.
+"""
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
@@ -13,6 +22,7 @@ from .tcgen05_constants import Tcgen05RowvecAuxRow
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_aux_ring_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
+from .tcgen05_constants import tcgen05_default_epilogue_tile_size
 from .tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
 
 if TYPE_CHECKING:
@@ -345,30 +355,165 @@ def pipeline_smem_bytes(
     )
 
 
-def max_pipeline_ab_stages(
+def paired_pipeline_tile_modeled(
+    *, bm: int, bn: int, bk: int, c_stages: int, acc_stages: int
+) -> bool:
+    """The tiles and ring counts ``pipeline_smem_bytes`` prices.
+
+    Non-power-of-two N widths are proved only for the M128 instruction.
+    """
+    return (
+        (bn in (64, 128, 256) or (bm == 128 and bn % 16 == 0 and 64 < bn < 256))
+        and bm in (128, 256)
+        and bk in (64, 128, 256)
+        and c_stages in (2, 4)
+        and acc_stages in (1, 2)
+    )
+
+
+def one_cta_pipeline_tile_modeled(
+    *, bm: int, bn: int, bk: int, c_stages: int, acc_stages: int
+) -> bool:
+    """The tiles and ring counts ``one_cta_pipeline_smem_bytes`` prices."""
+    return (
+        bm in (64, 128)
+        and bn in (16, 32, 64, 128, 256)
+        and bk in (32, 64, 128, 256)
+        and c_stages in (2, 4)
+        and acc_stages in (1, 2)
+    )
+
+
+def one_cta_pipeline_smem_bytes(
     facts: Tcgen05PipelineSmemFacts,
     *,
     bm: int,
     bn: int,
     bk: int,
+    ab_stages: int,
     c_stages: int,
     acc_stages: int,
-    aux_load_placement: str = "post_acc_wait",
-    store_mode: str = "normal",
-    epi_warps: int = 4,
     aux_load_mode: str = "simt",
     aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
     epi_warp_groups: int = 1,
     epi_subtile_n: int | None = None,
 ) -> int:
-    """Fill shared memory without changing the epilogue or accumulator ring."""
-    return deepest_fitting_ab_stages(
-        lambda stages: pipeline_smem_bytes(
-            facts,
+    """Conservative AB + actual-width DEFAULT D + bookkeeping bound.
+
+    Only post-wait SIMT auxiliary loads are admitted, so scales need no SMEM.
+    Direct stores retain the D-ring charge. The shared DEFAULT sizing helper
+    follows the same with-source convention as the device/descriptor resolver.
+    The model prices one- and two-byte operands (the FP8 persistent pipeline
+    and the flat 16-bit launches of an ordered barrier chain run the same
+    role-local CtaGroup.ONE schedule).  A staged aux load mode adds one
+    ``aux_stages``-deep ring of the DEFAULT epilogue subtile per exact-shape
+    auxiliary operand (``facts.exact_aux_count``), ``epi_warp_groups``
+    multiplies the C stages and ``epi_subtile_n`` pins the C subtile to
+    ``(min(bm, 128), epi_subtile_n)`` (``tcgen05_epi_subtile_n``), as the
+    paired model does.  This function does not change any legacy one- or
+    two-CTA allocation model.
+    """
+    assert one_cta_pipeline_tile_modeled(
+        bm=bm, bn=bn, bk=bk, c_stages=c_stages, acc_stages=acc_stages
+    )
+    assert facts.input_dtype_bytes in (1, 2) and facts.output_dtype_bytes in (2, 4)
+    assert ab_stages > 0 and epi_warp_groups >= 1
+    width = facts.output_dtype_bytes * 8
+    epi_m, epi_n = tcgen05_default_epilogue_tile_size(
+        bm, bn, elem_width_d=width, elem_width_c=width
+    )
+    c_tile_m, c_tile_n = epi_m, epi_n
+    if epi_subtile_n is not None:
+        c_tile_m, c_tile_n = min(bm, 128), epi_subtile_n
+    aux_ring_bytes = (
+        tcgen05_aux_ring_smem_bytes_per_cta(
+            epi_tile_m=epi_m,
+            epi_tile_n=epi_n,
+            dtype_bytes=facts.output_dtype_bytes,
+            aux_stages=aux_stages,
+            ring_count=facts.exact_aux_count,
+        )
+        if aux_load_mode in TCGEN05_AUX_LOAD_MODES_STAGED
+        else 0
+    )
+    return (
+        tcgen05_ab_smem_bytes_per_cta(
             bm=bm,
             bn=bn,
             bk=bk,
-            ab_stages=stages,
+            dtype_bytes=facts.input_dtype_bytes,
+            ab_stages=ab_stages,
+            cluster_m=1,
+        )
+        + tcgen05_c_smem_bytes_per_cta(
+            epi_tile_m=c_tile_m,
+            epi_tile_n=c_tile_n,
+            dtype_bytes=facts.output_dtype_bytes,
+            c_stages=c_stages * epi_warp_groups,
+        )
+        + aux_ring_bytes
+        + tcgen05_bookkeeping_smem_bytes(ab_stages=ab_stages, acc_stages=acc_stages)
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class SmemArena:
+    """The per-CTA shared-memory arena of one tcgen05 GEMM launch, one pricer.
+
+    ``cluster_m`` selects the byte model: ``2`` is the static CtaGroup.TWO
+    schedule (``pipeline_smem_bytes``: the 128-row MMA's 64-row per-CTA
+    epilogue, the 256-row family's FP32 row stages under ``pre_acc_wait``),
+    ``1`` the role-local CtaGroup.ONE schedule (``one_cta_pipeline_smem_bytes``:
+    the DEFAULT epilogue tile, no row stages, so ``aux_load_placement`` /
+    ``store_mode`` / ``epi_warps`` do not change its bytes).  Every ring must
+    fit ``facts.capacity_bytes``; ``deepest_ab_stages`` is the one search over
+    AB depth the seeds, the repair chain and the validators share.
+    """
+
+    facts: Tcgen05PipelineSmemFacts
+    cluster_m: int = 2
+
+    def __post_init__(self) -> None:
+        assert self.cluster_m in (1, 2), self.cluster_m
+
+    def bytes(
+        self,
+        *,
+        bm: int,
+        bn: int,
+        bk: int,
+        ab_stages: int,
+        c_stages: int,
+        acc_stages: int,
+        aux_load_placement: str = "post_acc_wait",
+        store_mode: str = "normal",
+        epi_warps: int = 4,
+        aux_load_mode: str = "simt",
+        aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+        epi_warp_groups: int = 1,
+        epi_subtile_n: int | None = None,
+    ) -> int:
+        """Bytes of the launch's rings under this arena's byte model."""
+        if self.cluster_m == 1:
+            return one_cta_pipeline_smem_bytes(
+                self.facts,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                ab_stages=ab_stages,
+                c_stages=c_stages,
+                acc_stages=acc_stages,
+                aux_load_mode=aux_load_mode,
+                aux_stages=aux_stages,
+                epi_warp_groups=epi_warp_groups,
+                epi_subtile_n=epi_subtile_n,
+            )
+        return pipeline_smem_bytes(
+            self.facts,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            ab_stages=ab_stages,
             c_stages=c_stages,
             acc_stages=acc_stages,
             aux_load_placement=aux_load_placement,
@@ -378,6 +523,121 @@ def max_pipeline_ab_stages(
             aux_stages=aux_stages,
             epi_warp_groups=epi_warp_groups,
             epi_subtile_n=epi_subtile_n,
-        ),
-        facts.capacity_bytes,
+        )
+
+    def deepest_ab_stages(
+        self,
+        *,
+        bm: int,
+        bn: int,
+        bk: int,
+        c_stages: int,
+        acc_stages: int,
+        max_stages: int = TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+        aux_load_placement: str = "post_acc_wait",
+        store_mode: str = "normal",
+        epi_warps: int = 4,
+        aux_load_mode: str = "simt",
+        aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+        epi_warp_groups: int = 1,
+        epi_subtile_n: int | None = None,
+    ) -> int:
+        """Deepest AB ring in ``1..max_stages`` that fits the capacity, else 0.
+
+        The epilogue and accumulator rings are the caller's; only the AB
+        depth is searched.
+        """
+        return deepest_fitting_ab_stages(
+            lambda stages: self.bytes(
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                ab_stages=stages,
+                c_stages=c_stages,
+                acc_stages=acc_stages,
+                aux_load_placement=aux_load_placement,
+                store_mode=store_mode,
+                epi_warps=epi_warps,
+                aux_load_mode=aux_load_mode,
+                aux_stages=aux_stages,
+                epi_warp_groups=epi_warp_groups,
+                epi_subtile_n=epi_subtile_n,
+            ),
+            self.facts.capacity_bytes,
+            max_stages=max_stages,
+        )
+
+
+def max_pipeline_ab_stages(
+    facts: Tcgen05PipelineSmemFacts,
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    c_stages: int,
+    acc_stages: int,
+    cluster_m: int = 2,
+    max_stages: int = TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+    aux_load_placement: str = "post_acc_wait",
+    store_mode: str = "normal",
+    epi_warps: int = 4,
+    aux_load_mode: str = "simt",
+    aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+    epi_warp_groups: int = 1,
+    epi_subtile_n: int | None = None,
+) -> int:
+    """Fill shared memory without changing the epilogue or accumulator ring.
+
+    ``SmemArena(facts, cluster_m).deepest_ab_stages`` by another name: the
+    paired byte model unless ``cluster_m=1`` selects the one-CTA model.
+    """
+    return SmemArena(facts, cluster_m).deepest_ab_stages(
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        c_stages=c_stages,
+        acc_stages=acc_stages,
+        max_stages=max_stages,
+        aux_load_placement=aux_load_placement,
+        store_mode=store_mode,
+        epi_warps=epi_warps,
+        aux_load_mode=aux_load_mode,
+        aux_stages=aux_stages,
+        epi_warp_groups=epi_warp_groups,
+        epi_subtile_n=epi_subtile_n,
+    )
+
+
+def max_one_cta_pipeline_ab_stages(
+    facts: Tcgen05PipelineSmemFacts,
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    c_stages: int,
+    acc_stages: int,
+    max_stages: int = TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+    aux_load_mode: str = "simt",
+    aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+    epi_warp_groups: int = 1,
+    epi_subtile_n: int | None = None,
+) -> int:
+    """Deepest AB ring in ``1..max_stages`` the one-CTA launch fits, else 0.
+
+    The one-CTA model's historical name for ``max_pipeline_ab_stages(...,
+    cluster_m=1)``.
+    """
+    return max_pipeline_ab_stages(
+        facts,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        c_stages=c_stages,
+        acc_stages=acc_stages,
+        cluster_m=1,
+        max_stages=max_stages,
+        aux_load_mode=aux_load_mode,
+        aux_stages=aux_stages,
+        epi_warp_groups=epi_warp_groups,
+        epi_subtile_n=epi_subtile_n,
     )

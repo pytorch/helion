@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from ...runtime.kernel import BoundKernel
     from ...runtime.settings import DotPrecision
     from ..aten_lowering import Lowering
+    from ..autotuner_heuristics.registry import AutotunerHeuristicType
     from ..device_function import Argument
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
@@ -274,6 +275,18 @@ class PallasBackend(Backend):
     @property
     def name(self) -> str:
         return "pallas"
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Filled by ``build_launcher_args``; the launcher returns these tensors.
+        self._output_only_names: list[str] = []
+
+    def output_only_names(self) -> list[str]:
+        return self._output_only_names
+
+    @property
+    def supports_autotune_multi(self) -> bool:
+        return True
 
     @property
     def state(self) -> BackendState:
@@ -923,6 +936,11 @@ class PallasBackend(Backend):
             outer_spec = block_specs_by_id.get(bounded_by)
             if outer_spec is not None:
                 outer_spec.update_min(spec.min_size)
+
+    def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
+        from ..autotuner_heuristics.pallas import PALLAS_HEURISTICS
+
+        return PALLAS_HEURISTICS
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}

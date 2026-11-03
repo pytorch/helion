@@ -21,9 +21,9 @@ import pytest
 import torch
 
 from test._cute_vloop_sink_kernels import col_reduce_sum_static
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_pdl import _COLUMN_SUM
 from test.test_cute_tcgen05_fixed_chain import _bind_gemm
-from test.test_cute_tcgen05_fixed_chain import _cpu_only  # noqa: F401
 from test.test_cute_tcgen05_fixed_chain import _source
 from test.test_cute_tcgen05_pdl import _persistent_config
 
@@ -37,7 +37,18 @@ from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.runtime.settings import Settings
 
-pytestmark = pytest.mark.cpu_only
+# The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced as
+# ``cuda:0`` tensors of a 148-SM device, and the reduction SMEM budget (the
+# ``test_cute_tcgen05_fixed_chain`` binders' target).
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(
+        mma_support=tcgen05_mma_support(),
+        forbid_native=False,
+        fake_device_sm_count=148,
+        reduction_smem_budget_bytes=232448,
+    ),
+]
 
 _ENV = "HELION_AUTOTUNE_FINAL_SELECTION_PREFERENCE_TOLERANCE"
 _WAIT = "    cute.arch.griddepcontrol_wait()\n"
@@ -251,7 +262,6 @@ def test_the_tolerance_is_an_environment_override(raw: str, expected: float) -> 
 
 
 @skipUnlessBackends(["cute"])
-@pytest.mark.usefixtures("_cpu_only")
 def test_rendered_kernels_rank_as_their_lowering() -> None:
     # Real renders: a column reduction on the generic path releases at entry
     # (one wave) and ranks ahead of the families, first with the spread pad;

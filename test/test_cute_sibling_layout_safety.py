@@ -22,11 +22,10 @@ from test.test_cute_sibling_loop_threads import _context
 from test.test_cute_sibling_loop_threads import _row_ir
 
 import helion
-from helion._compiler.cute.layout_propagation import _plan_warp_per_row_execution
+from helion._compiler.cute.execution_plans import _plan_warp_per_row_execution
 from helion._compiler.cute.memory_ops import _cute_vector_load_mask_is_lane_only
 from helion._compiler.tile_dispatch import TileStrategyDispatch
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 
@@ -144,7 +143,7 @@ def _code(rows: int, columns: int, kind: str, shared_budget: int = 232448) -> st
         mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=shared_budget,
         ),
     ):
@@ -365,7 +364,6 @@ def _memory_coverage(
         ("warp_per_row", 17, 80),
     ),
 )
-@skipUnlessBackends(["cute"])
 def test_emitted_sibling_addresses_and_output_coverage(
     kind: str, rows: int, columns: int
 ) -> None:
@@ -478,7 +476,6 @@ def _broadcast_counts(code: str, columns: int) -> list[list[int]]:
 
 
 @pytest.mark.parametrize("columns", (16, 17, 1024))
-@skipUnlessBackends(["cute"])
 def test_broadcast_count_uses_physical_row_stride(columns: int) -> None:
     actual = _broadcast_counts(_code(128, columns, "broadcast_count"), columns)
     expected = [min(2, columns - offset) for offset in range(0, columns, 2)]
@@ -486,7 +483,6 @@ def test_broadcast_count_uses_physical_row_stride(columns: int) -> None:
 
 
 @pytest.mark.parametrize("shared_budget", (0, 20000))
-@skipUnlessBackends(["cute"])
 def test_unavailable_strided_reduce_storage_does_not_fall_back_to_wrong_warp(
     shared_budget: int,
 ) -> None:

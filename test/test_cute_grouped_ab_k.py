@@ -14,7 +14,7 @@ from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
 
 import helion
-from helion._compiler.autotuner_heuristics import cute as heuristics
+from helion._compiler.cute.autotune.heuristics import cute as heuristics
 from helion._compiler.cute.grouped_ab_k import physical_grouped_ab_k
 from helion._compiler.cute.grouped_ab_k import prove_grouped_ab_k_loop
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY
@@ -441,7 +441,7 @@ def test_none_keeps_legacy_source_and_fused_seeds_keep_logical_cap() -> None:
         ),
     ):
         with patch(
-            "helion._compiler.autotuner_heuristics.cute._tcgen05_grouped_physical_k_seeds",
+            "helion._compiler.cute.autotune.heuristics.cute._tcgen05_grouped_physical_k_seeds",
             return_value=[],
         ):
             old = cpu_bind(_observed_logical_k, args)

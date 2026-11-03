@@ -180,7 +180,7 @@ def cuda_binding(
             ),
         ),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):

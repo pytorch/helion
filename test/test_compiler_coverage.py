@@ -738,10 +738,10 @@ def test_coverage_is_after_every_flash_best_available_return(
         )
         for value in (20, 21)
     ]
-    generation.flash_deterministic_population_configs = lambda: configs
-    generation.flash_structural_population_budget = lambda target: 1
-    generation.flash_structural_qualification_prefix_count = lambda: 1
-    generation.flash_exact_effective_search_space_configs = lambda target: (
+    generation.extension.deterministic_population_configs = lambda: configs
+    generation.extension.structural_population_budget = lambda target: 1
+    generation.extension.structural_qualification_prefix_count = lambda: 1
+    generation.extension.exact_effective_search_space_configs = lambda target: (
         configs if exact else None
     )
     with (

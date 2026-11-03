@@ -14,18 +14,15 @@ import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
 
+from test._cute_grouped_gemm_split_sizes import _selected_config
+from test.cute_population_contracts import _cpu_target
+from test.cute_population_contracts import _target
 from test.test_cute_full_slice_matmul import _CpuRefMode
-from test.test_cute_grouped_gemm_split_sizes import _selected_config
-from test.test_cute_materialized_fission import _cpu_target
 
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.cute_mma import analyze_tcgen05_grouped_worklist
-from helion._hardware import HardwareInfo
 from helion._testing import import_example
-from helion._testing import patch_cute_mma_support
-from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import BackendUnsupported
 import helion.language as hl
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
@@ -33,14 +30,15 @@ from helion.runtime.cute.launcher import _validate_tcgen05_grouped_dynamic_ab_te
 from helion.runtime.ref_mode import RefMode
 from helion.runtime.ref_mode import RefModeContext
 
-pytestmark = pytest.mark.cpu_only
+_examples_grouped_gemm = import_example("grouped_gemm")
+grouped_gemm_jagged = _examples_grouped_gemm.grouped_gemm_jagged
+grouped_gemm_jagged_persistent = _examples_grouped_gemm.grouped_gemm_jagged_persistent
 
-grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
-
+# The B200 model, CUDA hidden and native compilation forbidden.
+pytestmark = [pytest.mark.cpu_only, pytest.mark.cpu_render()]
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Generator
-    from contextlib import ExitStack
     from typing import Any
 
     from helion.runtime.kernel import BoundKernel
@@ -90,46 +88,15 @@ def _explicit_offset_mm(
     return out
 
 
-def _target() -> ExitStack:
-    stack = _cpu_target()
-    stack.enter_context(
-        patch_cute_mma_support(
-            SimpleNamespace(
-                universal=True,
-                warp_f16bf16=True,
-                warpgroup_f16bf16=True,
-                tcgen05_f16bf16=True,
-            )
-        )
-    )
-    for name, value in (
-        (
-            "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_capacity_bytes",
-            232448,
-        ),
-        (
-            "helion._hardware.get_hardware_info",
-            HardwareInfo(
-                device_kind="cuda",
-                hardware_name="NVIDIA B200",
-                runtime_version="13.0",
-                compute_capability="sm100",
-            ),
-        ),
-    ):
-        stack.enter_context(patch(name, return_value=value))
-    return stack
+# ``_target`` (the B200 model with tcgen05 MMA support) is the population
+# contracts' target; the files importing it from here keep working.
 
 
 @pytest.fixture(autouse=True)
-def _cpu_only() -> Generator[None, None, None]:
+def _single_thread() -> Generator[None, None, None]:
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
+    yield
     torch.set_num_threads(previous)
 
 
@@ -170,7 +137,6 @@ def _plans(source: str) -> list[dict[str, object]]:
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("column_major", [False, True])
-@skipUnlessBackends(["cute"])
 def test_original_example_emits_shared_rank2_worklist(
     dtype: torch.dtype, column_major: bool
 ) -> None:
@@ -180,7 +146,7 @@ def test_original_example_emits_shared_rank2_worklist(
     with _target():
         bound = _bind(grouped_gemm_jagged.fn, args)
         assert bound.host_function is not None
-        assert bound.config_spec.cute_tcgen05_search_enabled
+        assert bound.config_spec.tcgen05.search_enabled
         facts = bound.config_spec.matmul_facts
         assert len(facts) == 1
         analysis = analyze_tcgen05_grouped_worklist(
@@ -272,7 +238,6 @@ def _run_reference(
         [-200, -1, 20, 100, 105],
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_normalization_preserves_offsets_empty_groups_and_untouched_rows(
     dtype: torch.dtype, offsets: list[int]
 ) -> None:
@@ -306,7 +271,6 @@ def test_normalization_preserves_offsets_empty_groups_and_untouched_rows(
         ),
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_normalization_rejects_unproven_programs(before: str, after: str) -> None:
     source = inspect.getsource(_offset_mm)
     assert source.count(before) == 1
@@ -325,7 +289,6 @@ def test_normalization_rejects_unproven_programs(before: str, after: str) -> Non
     assert ast.dump(root) == ast.dump(original)
 
 
-@skipUnlessBackends(["cute"])
 def test_normalization_is_opt_in() -> None:
     bound = _bind(_offset_mm, _inputs(), enabled=False)
     assert bound.host_function is not None
@@ -337,7 +300,6 @@ def test_normalization_is_opt_in() -> None:
 @pytest.mark.parametrize(
     "effect", ["b[0, 0] = 0", "hl.atomic_add(b, [0, 0], 1.0)", "offsets[0] = 0"]
 )
-@skipUnlessBackends(["cute"])
 def test_shared_rhs_worklist_rejects_other_device_writes(effect: str) -> None:
     source = inspect.getsource(_explicit_offset_mm)
     anchor = "        group = group_tile.index.sum()"
@@ -363,7 +325,6 @@ def test_shared_rhs_worklist_rejects_other_device_writes(effect: str) -> None:
         )
 
 
-@skipUnlessBackends(["cute"])
 def test_shared_rhs_worklist_rejects_input_alias_output() -> None:
     source = inspect.getsource(_explicit_offset_mm).replace(
         "out = torch.zeros((m, n), dtype=a.dtype, device=a.device)", "out = a"
@@ -384,7 +345,6 @@ def test_shared_rhs_worklist_rejects_input_alias_output() -> None:
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_shared_rhs_worklist_rejects_unknown_device_call() -> None:
     args = _inputs()
     bound = _bind(_explicit_offset_mm, args)
@@ -402,7 +362,6 @@ def test_shared_rhs_worklist_rejects_unknown_device_call() -> None:
     assert analyze_tcgen05_grouped_worklist(bound.env, host.device_ir, fact) is None
 
 
-@skipUnlessBackends(["cute"])
 def test_shared_rhs_worklist_rejects_unaligned_input_pointer() -> None:
     a, b, offsets = _inputs()
     b = torch.empty(b.numel() + 1, dtype=b.dtype)[1:].view(b.shape)
@@ -601,7 +560,6 @@ def _serial_offset_initializer(tree: ast.Module) -> ast.Module:
 
 
 @pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
-@skipUnlessBackends(["cute"])
 def test_emitted_device_metadata_preserves_clipped_signed_ranges(
     offset_dtype: torch.dtype,
 ) -> None:
@@ -691,3 +649,107 @@ def test_shared_rhs_runtime_validation_checks_rank_stride_and_alignment(
             _validate_tcgen05_grouped_dynamic_ab_tensormaps(plan, (a, bad))
         with pytest.raises(BackendUnsupported, match="matching rank-2"):
             _validate_tcgen05_grouped_dynamic_ab_tensormaps(plan, (a, b.unsqueeze(0)))
+
+
+# GPU numerics of the shared-RHS grouped GEMM: device offsets and graph
+# replay (sm_100 family).
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("column_major", [False, True])
+def test_shared_rhs_device_offsets_and_graph_replay(
+    dtype: torch.dtype, offset_dtype: torch.dtype, column_major: bool
+) -> None:
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("SM100-family TCGEN05 required")
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(731)
+    a = torch.randn((313, 128), device=device, dtype=dtype, generator=generator)
+    b = torch.randn(
+        (352, 128) if column_major else (128, 352),
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
+    if column_major:
+        b = b.T
+    offsets = torch.tensor([0, 0, 1, 129, 313], device=device, dtype=offset_dtype)
+    args = (a, b, offsets)
+    kernel = helion.kernel(
+        _offset_mm,
+        backend="cute",
+        static_shapes=False,
+        autotune_effort="none",
+        cute_segmented_matmul_tiling=True,
+    )
+    bound = kernel.bind(args)
+    config = _selected_config(64)
+    config.config["tcgen05_ab_stages"] = 6
+    source = bound.to_code(config)
+    assert "'shared_rhs': True" in source
+    assert "cute.gemm(" in source
+    bound.set_config(config)
+
+    def expected(routing: list[int]) -> torch.Tensor:
+        result = torch.zeros((313, 352), device=device, dtype=dtype)
+        product = (a.float() @ b.float()).to(dtype)
+        for start, end in itertools.pairwise(routing):
+            first, last = max(0, start), min(313, end)
+            if last > first:
+                result[first:last] = product[first:last]
+        return result
+
+    torch.testing.assert_close(
+        bound(*args), expected([0, 0, 1, 129, 313]), rtol=3e-2, atol=3e-2
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = bound(*args)
+    for routing in (
+        [5, 171, 171, 9, 287],  # Empty, overlapping, and uncovered intervals.
+        [-50, 363, 380, 380, 400],  # Negative prefix and an extent larger than M.
+        [7, 7, 7, 7, 7],  # No work remains, including the final epilogue.
+    ):
+        a.normal_(generator=generator)
+        b.normal_(generator=generator)
+        offsets.copy_(offsets.new_tensor(routing))
+        graph.replay()
+        torch.testing.assert_close(captured, expected(routing), rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_persistent_example_takes_the_shared_rhs_worklist() -> None:
+    # The hand-rolled worklist of the persistent example normalizes to the
+    # same segment tile space as ``_offset_mm``; its grouped tcgen05 render
+    # computes the product over the covered rows (an empty group included).
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("SM100-family TCGEN05 required")
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(733)
+    a = torch.randn(
+        (313, 128), device=device, dtype=torch.bfloat16, generator=generator
+    )
+    b = torch.randn(
+        (128, 352), device=device, dtype=torch.bfloat16, generator=generator
+    )
+    offsets = torch.tensor([0, 0, 1, 129, 313], device=device, dtype=torch.int32)
+    args = (a, b, offsets)
+    kernel = helion.kernel(
+        grouped_gemm_jagged_persistent.fn,
+        backend="cute",
+        static_shapes=False,
+        autotune_effort="none",
+        cute_segmented_matmul_tiling=True,
+    )
+    bound = kernel.bind(args)
+    config = _selected_config(64)
+    source = bound.to_code(config)
+    assert "'shared_rhs': True" in source
+    assert "cute.gemm(" in source
+    bound.set_config(config)
+    expected = (a.float() @ b.float()).to(torch.bfloat16)
+    torch.testing.assert_close(bound(*args), expected, rtol=3e-2, atol=3e-2)

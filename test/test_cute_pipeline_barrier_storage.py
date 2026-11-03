@@ -7,8 +7,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from .test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
-from .test_cute_grouped_gemm_split_sizes import _selected_config
+from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
+from test._cute_grouped_gemm_split_sizes import _selected_config
+
 from .test_cute_scheduler_mailbox import _plain_matmul
 from helion import exc
 from helion._compiler.cute import tcgen05_constants
@@ -160,8 +161,9 @@ def test_clc_full_empty_allocations(wait_mode: str, sched_stages: int) -> None:
 def test_auxiliary_full_empty_allocations(stages: int) -> None:
     if stages == 3:
         # Productive AUX currently excludes this depth independently of the
-        # AB storage correction. Preserve that public admission restriction.
-        with pytest.raises(exc.BackendUnsupported, match="incompatible"):
+        # AB storage correction. Preserve that public admission restriction
+        # (the strict normalizer refuses it ahead of codegen).
+        with pytest.raises(exc.InvalidConfig, match="incompatible"):
             rank_two_code(
                 rank_two_inputs(),
                 _config(block_sizes=[128, 128, 64], tcgen05_ab_stages=stages),

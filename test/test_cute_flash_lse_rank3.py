@@ -20,7 +20,6 @@ from helion._compiler.cute import cute_flash
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import import_example
-from helion._testing import onlyBackends
 from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
@@ -141,9 +140,13 @@ def _bind_as_if_sm100(
 ) -> BoundKernel:
     """Bind with the tcgen05 support probe forced on (no GPU needed)."""
     with (
-        patch("helion._compiler.backend._attention_flash_supported", return_value=True),
         patch(
-            "helion._compiler.backend._attention_flash_gate_enabled", return_value=True
+            "helion._compiler.cute.analysis.attention_match._attention_flash_supported",
+            return_value=True,
+        ),
+        patch(
+            "helion._compiler.cute.analysis.attention_match._attention_flash_gate_enabled",
+            return_value=True,
         ),
     ):
         return kernel.bind(args)
@@ -184,7 +187,6 @@ def test_canonical_attention_example_reaches_the_flash_path() -> None:
     assert plan.lse_name == "lse"
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("family", ("ws_overlap", "fa4"))
 def test_rank3_lse_runtime_matches_reference(family: str) -> None:
     torch.manual_seed(0)

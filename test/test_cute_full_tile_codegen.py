@@ -9,43 +9,36 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_pure_lane_packets_codegen import _capture
 from test.test_cute_pure_lane_packets_codegen import _execute
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CutePointwiseVecHeuristic
 from helion._compiler.cute.full_tile_bounds import FullTilePlan
 from helion._compiler.cute.full_tile_bounds import specialize_full_tile_bounds
 from helion._compiler.cute.tensor_layout_relations import TensorLayoutRelation
 from helion._compiler.rng_utils import philox_rand_ref
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 import helion.language as hl
 
+pytestmark = pytest.mark.cpu_only
+
 _examples_low_mem_dropout = import_example("low_mem_dropout")
 low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
 low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
-
 
 @pytest.fixture(autouse=True)
 def _cpu_only():
-    with (
-        _target(),
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
+    with cpu_render_target(
+        mma_support=tcgen05_mma_support(), reduction_smem_budget_bytes=232448
     ):
         yield
 

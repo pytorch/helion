@@ -10,9 +10,14 @@ import torch
 
 import helion
 from helion import exc
-from helion._compiler.autotuner_heuristics.cute import CuteAsyncStateLoadHeuristic
-from helion._compiler.backend import CuteBackend
-from helion._compiler.backend import TritonBackend
+from helion._compiler.cute.autotune.heuristics.cute import CuteAsyncStateLoadHeuristic
+from helion._compiler.cute.autotune.search_surface import (
+    enable_cute_async_load_pipeline,
+)
+from helion._compiler.cute.autotune.search_surface import enable_cute_bf16x2_recurrence
+from helion._compiler.cute.autotune.search_surface import enable_cute_proven_bounds
+from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.triton.backend import TritonBackend
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import MemoryOpFact
 from helion.runtime.kernel import _input_tensor_metadata
@@ -110,9 +115,9 @@ def test_config_surface_is_fact_gated_and_normalized() -> None:
     spec.normalize(removed, _fix_invalid=True)
     assert "cute_proven_bounds" not in removed
 
-    spec.enable_cute_async_load_pipeline()
-    spec.enable_cute_bf16x2_recurrence()
-    spec.enable_cute_proven_bounds()
+    enable_cute_async_load_pipeline(spec)
+    enable_cute_bf16x2_recurrence(spec)
+    enable_cute_proven_bounds(spec)
     config: dict[str, object] = {
         "cute_async_load_stages": 5,
         "cute_async_load_lookahead": 4,
@@ -153,7 +158,7 @@ def test_omitted_async_lookahead_is_derived_from_stages(
     stages: int, lookahead: int
 ) -> None:
     spec = ConfigSpec(backend=CuteBackend())
-    spec.enable_cute_async_load_pipeline()
+    enable_cute_async_load_pipeline(spec)
     config: dict[str, object] = {"cute_async_load_stages": stages}
 
     spec.normalize(config)
@@ -176,7 +181,7 @@ def test_async_integer_knobs_require_exact_integers(
     key: str, value: object, repaired_value: int
 ) -> None:
     spec = ConfigSpec(backend=CuteBackend())
-    spec.enable_cute_async_load_pipeline()
+    enable_cute_async_load_pipeline(spec)
 
     with pytest.raises(exc.InvalidConfig, match=key):
         spec.normalize({key: value})
@@ -195,7 +200,7 @@ def test_l2_store_policy_is_canonicalized_and_not_searched_when_unsupported(
 ) -> None:
     with patch("helion.autotuner.config_spec.torch.version.cuda", cuda_version):
         spec = ConfigSpec(backend=CuteBackend(), target_device_capability=capability)
-        spec.enable_cute_async_load_pipeline()
+        enable_cute_async_load_pipeline(spec)
         config: dict[str, object] = {
             "cute_async_load_stages": 5,
             "cute_async_store_policy": "l2_evict_last",
@@ -213,7 +218,7 @@ def test_l2_store_policy_is_canonicalized_and_not_searched_when_unsupported(
 @patch("helion.autotuner.config_spec.torch.version.cuda", "13.0")
 def test_l2_store_policy_is_preserved_and_searched_on_validated_target() -> None:
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 3))
-    spec.enable_cute_async_load_pipeline()
+    enable_cute_async_load_pipeline(spec)
     config: dict[str, object] = {
         "cute_async_load_stages": 5,
         "cute_async_store_policy": "l2_evict_last",
@@ -249,9 +254,9 @@ def test_new_knobs_are_cute_only(config: dict[str, object]) -> None:
 )
 def test_new_knobs_reject_invalid_values(key: str, value: object, message: str) -> None:
     spec = ConfigSpec(backend=CuteBackend())
-    spec.enable_cute_async_load_pipeline()
-    spec.enable_cute_bf16x2_recurrence()
-    spec.enable_cute_proven_bounds()
+    enable_cute_async_load_pipeline(spec)
+    enable_cute_bf16x2_recurrence(spec)
+    enable_cute_proven_bounds(spec)
 
     with pytest.raises(exc.InvalidConfig, match=message):
         spec.normalize({key: value})
@@ -263,8 +268,8 @@ def test_new_knobs_reject_invalid_values(key: str, value: object, message: str) 
 
 def test_bf16x2_is_disabled_when_async_pipeline_is_disabled() -> None:
     spec = ConfigSpec(backend=CuteBackend())
-    spec.enable_cute_async_load_pipeline()
-    spec.enable_cute_bf16x2_recurrence()
+    enable_cute_async_load_pipeline(spec)
+    enable_cute_bf16x2_recurrence(spec)
     config: dict[str, object] = {
         "cute_async_load_stages": 0,
         "cute_bf16x2_recurrence": True,
@@ -366,7 +371,7 @@ def test_heuristic_requires_known_sm80_or_newer(
     assert not specialization_facts
     assert seed is None
 
-    spec.enable_cute_async_load_pipeline()
+    enable_cute_async_load_pipeline(spec)
     assert not CuteAsyncStateLoadHeuristic.is_eligible(env, _UNUSED_DEVICE_IR)
     assert CuteAsyncStateLoadHeuristic.get_seed_config(env, _UNUSED_DEVICE_IR) is None
 

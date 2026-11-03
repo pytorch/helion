@@ -17,9 +17,9 @@ from .published_scalars import immutable_publications
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from .computed_fragment import Fragment
-    from .computed_fragment import FragmentCompiler
-    from .computed_fragment import HostTensor
+    from .fragment_context import Fragment
+    from .fragment_context import FragmentContext
+    from .fragment_context import HostTensor
 
 KEY = "cute_fragment_packet_loads"
 # Element types of a four-scalar packet: 16 bytes of fp32, 8 bytes of 16-bit.
@@ -128,7 +128,7 @@ def _load_assignment(
 
 
 def _published_dependencies(
-    compiler: FragmentCompiler, dependencies: tuple[Fragment, ...]
+    compiler: FragmentContext, dependencies: tuple[Fragment, ...]
 ) -> frozenset[str]:
     """Known shared scalar epochs; every transitive allocation stays held.
 
@@ -177,7 +177,7 @@ class _CaptureAddress(ast.NodeTransformer):
 
 
 def materialize_packet_load(
-    compiler: FragmentCompiler,
+    compiler: FragmentContext,
     tensor: HostTensor,
     value: Fragment,
     load: Callable[[tuple[str, ...]], str],

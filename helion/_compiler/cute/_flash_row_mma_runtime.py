@@ -5,158 +5,34 @@
 # traced inline into the kernel body.  Every helper is one PTX instruction (or
 # a short warp-shuffle chain) with explicit register operands, so the emitted
 # body is a straight line of SSA values that ptxas cannot reorder around the
-# cp.async wait that guards the operand data.
+# cp.async wait that guards the operand data.  The single-instruction helpers
+# are ``device/ptx.py`` rows re-exported under the names the emitters render.
 import cutlass
 from cutlass._mlir.dialects import llvm
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import T
 from cutlass.cutlass_dsl import dsl_user_op
 
-_ASM_KW = {
-    "is_align_stack": False,
-    "asm_dialect": llvm.AsmDialect.AD_ATT,
-}
-
-
-def _words(
-    result: object, count: int, *, loc: object, ip: object
-) -> tuple[object, ...]:
-    return tuple(
-        cutlass.Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
-        for i in range(count)
-    )
-
-
-def _floats(
-    result: object, count: int, *, loc: object, ip: object
-) -> tuple[object, ...]:
-    return tuple(
-        cutlass.Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip))
-        for i in range(count)
-    )
-
-
-@dsl_user_op
-def cp_async_16(
-    smem_address: object, gmem_address: object, *, loc: object = None, ip: object = None
-) -> None:
-    """``cp.async.cg.shared.global`` of one 16-byte packet (L2 only)."""
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
-            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.cg.shared.global [$0], [$1], 16;",
-        "r,l,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-
-
-@dsl_user_op
-def cp_async_16_zfill(
-    smem_address: object,
-    gmem_address: object,
-    src_bytes: object,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    """``cp.async.cg.shared.global`` of one 16-byte packet reading
-    ``src_bytes`` (16 or 0) bytes from global memory and zero-filling the
-    rest: a masked row costs no global read."""
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
-            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(src_bytes).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.cg.shared.global [$0], [$1], 16, $2;",
-        "r,l,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-
-
-@dsl_user_op
-def ldmatrix_x4(
-    smem_address: object, *, loc: object = None, ip: object = None
-) -> tuple[object, ...]:
-    """``ldmatrix.sync.aligned.m8n8.x4.shared.b16``: four 8x8 b16 tiles whose
-    row addresses the lanes supply (lane l -> row l % 8 of tile l // 8); lane
-    (g, c) receives row g, columns 2c, 2c+1 of each tile."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32()] * 4),  # pyrefly: ignore[missing-attribute]
-        [cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip)],
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-    return _words(result, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def ldmatrix_x4_trans(
-    smem_address: object, *, loc: object = None, ip: object = None
-) -> tuple[object, ...]:
-    """``ldmatrix ... .trans``: lane (g, c) receives rows 2c, 2c+1 of column g."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32()] * 4),  # pyrefly: ignore[missing-attribute]
-        [cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip)],
-        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-    return _words(result, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def ldmatrix_x2_trans(
-    smem_address: object, *, loc: object = None, ip: object = None
-) -> tuple[object, ...]:
-    """``ldmatrix ... .x2.trans``: two 8x8 b16 tiles whose row addresses
-    lanes 0-15 supply (the other lanes' addresses are ignored); lane (g, c)
-    receives rows 2c, 2c+1 of column g of each tile."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32()] * 2),  # pyrefly: ignore[missing-attribute]
-        [cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip)],
-        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {$0, $1}, [$2];",
-        "=r,=r,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-    return _words(result, 2, loc=loc, ip=ip)
-
-
-def _unpack_x2(
-    kind: str, word: object, *, loc: object, ip: object
-) -> tuple[object, ...]:
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32()] * 2),  # pyrefly: ignore[missing-attribute]
-        [cutlass.Uint32(word).ir_value(loc=loc, ip=ip)],
-        "{.reg .b16 lo, hi; mov.b32 {lo, hi}, $2; "
-        f"cvt.f32.{kind} $0, lo; cvt.f32.{kind} $1, hi;}}",
-        "=f,=f,r",
-        has_side_effects=False,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-    return _floats(result, 2, loc=loc, ip=ip)
+from .device.ptx import ASM_KW
+from .device.ptx import bulk_reduce_add_f32  # noqa: F401
+from .device.ptx import cp_async_16  # noqa: F401
+from .device.ptx import cp_async_16_zfill  # noqa: F401
+from .device.ptx import finite_or_zero  # noqa: F401
+from .device.ptx import floats
+from .device.ptx import ldmatrix_x2_trans  # noqa: F401
+from .device.ptx import ldmatrix_x4  # noqa: F401
+from .device.ptx import ldmatrix_x4_trans  # noqa: F401
+from .device.ptx import lds_f32  # noqa: F401
+from .device.ptx import lds_v2_f32  # noqa: F401
+from .device.ptx import lds_v4_f32  # noqa: F401
+from .device.ptx import mask_key_after  # noqa: F401
+from .device.ptx import movmatrix_trans  # noqa: F401
+from .device.ptx import stg_b32  # noqa: F401
+from .device.ptx import stg_f32  # noqa: F401
+from .device.ptx import stg_v4_b32  # noqa: F401
+from .device.ptx import sts_f32  # noqa: F401
+from .device.ptx import sts_v2_f32  # noqa: F401
+from .device.ptx import unpack_f16x2  # noqa: F401
 
 
 @dsl_user_op
@@ -164,81 +40,18 @@ def unpack_bf16x2(
     word: object, *, loc: object = None, ip: object = None
 ) -> tuple[object, ...]:
     """The two bf16 halves of ``word`` (low half first) widened to fp32."""
-    return _unpack_x2("bf16", word, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def unpack_f16x2(
-    word: object, *, loc: object = None, ip: object = None
-) -> tuple[object, ...]:
-    """The two f16 halves of ``word`` (low half first) widened to fp32."""
-    return _unpack_x2("f16", word, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def mask_key_after(
-    value: object,
-    key: object,
-    query: object,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> cutlass.Float32:
-    """``-inf`` when ``key > query`` (the square causal mask), else ``value``."""
     result = llvm.inline_asm(
-        T.f32(),
-        [
-            cutlass.Float32(value).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(key).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(query).ir_value(loc=loc, ip=ip),
-        ],
-        "{.reg .pred p; setp.gt.s32 p, $2, $3; selp.f32 $0, 0fFF800000, $1, p;}",
-        "=f,f,r,r",
-        has_side_effects=False,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-    return cutlass.Float32(result)
-
-
-@dsl_user_op
-def finite_or_zero(
-    value: object, *, loc: object = None, ip: object = None
-) -> cutlass.Float32:
-    """``0`` when ``value`` is ``-inf`` (a row max that saw no key), else
-    ``value``: the finite stand-in the softmax subtracts from masked rows."""
-    result = llvm.inline_asm(
-        T.f32(),
-        [cutlass.Float32(value).ir_value(loc=loc, ip=ip)],
-        "{.reg .pred p; setp.eq.f32 p, $1, 0fFF800000; selp.f32 $0, 0f00000000, $1, p;}",
-        "=f,f",
-        has_side_effects=False,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-    return cutlass.Float32(result)
-
-
-@dsl_user_op
-def movmatrix_trans(
-    word: object, *, loc: object = None, ip: object = None
-) -> cutlass.Uint32:
-    """``movmatrix.sync.aligned.m8n8.trans.b16``: transpose one 8x8 16-bit
-    tile held in the mma C/A fragment layout (lane (g, c) holds row g,
-    columns 2c, 2c+1), yielding the mma B fragment of the transposed tile."""
-    result = llvm.inline_asm(
-        T.i32(),
+        llvm.StructType.get_literal([T.f32()] * 2),  # pyrefly: ignore[missing-attribute]
         [cutlass.Uint32(word).ir_value(loc=loc, ip=ip)],
-        "movmatrix.sync.aligned.m8n8.trans.b16 $0, $1;",
-        "=r,r",
+        "{.reg .b16 lo, hi; mov.b32 {lo, hi}, $2; "
+        "cvt.f32.bf16 $0, lo; cvt.f32.bf16 $1, hi;}",
+        "=f,=f,r",
         has_side_effects=False,
         loc=loc,
         ip=ip,
-        **_ASM_KW,
+        **ASM_KW,
     )
-    return cutlass.Uint32(result)
+    return floats(result, 2, loc=loc, ip=ip)
 
 
 def _mma_m16n8k16(
@@ -270,9 +83,9 @@ def _mma_m16n8k16(
         has_side_effects=False,
         loc=loc,
         ip=ip,
-        **_ASM_KW,
+        **ASM_KW,
     )
-    return _floats(result, 4, loc=loc, ip=ip)
+    return floats(result, 4, loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -329,7 +142,7 @@ def _pack_x2(
         has_side_effects=False,
         loc=loc,
         ip=ip,
-        **_ASM_KW,
+        **ASM_KW,
     )
     return cutlass.Uint32(result)
 
@@ -348,104 +161,6 @@ def pack_f16x2(
 ) -> cutlass.Uint32:
     """``cvt.rn.f16x2.f32``: ``low`` in the low half, ``high`` in the high half."""
     return _pack_x2("f16", low, high, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def sts_f32(
-    smem_address: object, value: object, *, loc: object = None, ip: object = None
-) -> None:
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(value).ir_value(loc=loc, ip=ip),
-        ],
-        "st.shared.f32 [$0], $1;",
-        "r,f,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-
-
-@dsl_user_op
-def lds_f32(
-    smem_address: object, *, loc: object = None, ip: object = None
-) -> cutlass.Float32:
-    result = llvm.inline_asm(
-        T.f32(),
-        [cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip)],
-        "ld.shared.f32 $0, [$1];",
-        "=f,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-    return cutlass.Float32(result)
-
-
-@dsl_user_op
-def lds_v4_f32(
-    smem_address: object, *, loc: object = None, ip: object = None
-) -> tuple[object, ...]:
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32()] * 4),  # pyrefly: ignore[missing-attribute]
-        [cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip)],
-        "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];",
-        "=f,=f,=f,=f,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-    return _floats(result, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def stg_v4_b32(
-    gmem_address: object,
-    w0: object,
-    w1: object,
-    w2: object,
-    w3: object,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
-            *[cutlass.Uint32(v).ir_value(loc=loc, ip=ip) for v in (w0, w1, w2, w3)],
-        ],
-        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-
-
-@dsl_user_op
-def stg_f32(
-    gmem_address: object, value: object, *, loc: object = None, ip: object = None
-) -> None:
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(value).ir_value(loc=loc, ip=ip),
-        ],
-        "st.global.f32 [$0], $1;",
-        "l,f,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
 
 
 def octet_max(value: object) -> object:
@@ -497,126 +212,3 @@ def lane_group_min(value: object, width: int) -> object:
         )
         offset *= 2
     return value
-
-
-# ---- primitives of the register-MMA backward row programs (``cute_flash_bwd_row_mma``)
-
-
-@dsl_user_op
-def lds_v2_f32(
-    smem_address: object, *, loc: object = None, ip: object = None
-) -> tuple[object, ...]:
-    """``ld.shared.v2.f32``: two consecutive fp32 words (8-byte aligned)."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32()] * 2),  # pyrefly: ignore[missing-attribute]
-        [cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip)],
-        "ld.shared.v2.f32 {$0, $1}, [$2];",
-        "=f,=f,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-    return _floats(result, 2, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def sts_v2_f32(
-    smem_address: object,
-    a: object,
-    b: object,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    """``st.shared.v2.f32`` of two consecutive fp32 words (8-byte aligned)."""
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(a).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(b).ir_value(loc=loc, ip=ip),
-        ],
-        "st.shared.v2.f32 [$0], {$1, $2};",
-        "r,f,f,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-
-
-@dsl_user_op
-def stg_b32(
-    gmem_address: object, word: object, *, loc: object = None, ip: object = None
-) -> None:
-    """``st.global.b32`` of one packed 16-bit pair."""
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
-            cutlass.Uint32(word).ir_value(loc=loc, ip=ip),
-        ],
-        "st.global.b32 [$0], $1;",
-        "l,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-
-
-@dsl_user_op
-def red_global_add_v2_f32(
-    gmem_address: object,
-    a: object,
-    b: object,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    """``red.global.add.v2.f32``: a fire-and-forget reduce-add of two
-    consecutive fp32 words (8-byte aligned; sm_90+)."""
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(a).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(b).ir_value(loc=loc, ip=ip),
-        ],
-        "red.global.add.v2.f32 [$0], {$1, $2};",
-        "l,f,f,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-
-
-@dsl_user_op
-def bulk_reduce_add_f32(
-    gmem_address: object,
-    smem_address: object,
-    size: int,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    """``cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32``: one
-    bulk-group reduce-add of ``size`` contiguous bytes (a multiple of 16) of
-    fp32 from shared into global memory, issued by one thread; completion
-    through ``cp.async.bulk.commit_group`` / ``wait_group``."""
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(size).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
-        "l,r,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )

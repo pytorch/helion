@@ -15,7 +15,6 @@ from test.test_cute_materialized_fission import _CpuRefMode
 
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
@@ -57,12 +56,7 @@ class _OperandCpuRefMode(_CpuRefMode):
 
 @pytest.fixture(autouse=True)
 def _cpu_b200() -> Iterator[None]:
-    with (
-        cpu_target(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
-    ):
+    with cpu_target():
         yield
 
 
@@ -470,7 +464,7 @@ def test_bare_integer_cast_of_loaded_tile_is_materialized() -> None:
     bound = _bind(_int16_bare_cast_rhs, args)
     plan = bound.env.cute_fission_plan
     assert plan is not None and plan.region_count == 2
-    assert bound.config_spec.cute_tcgen05_search_enabled
+    assert bound.config_spec.tcgen05.search_enabled
     derived = _bind(_int16_derived_cast_rhs, args)
     assert derived.env.cute_fission_plan is None
 
@@ -483,7 +477,10 @@ def test_static_cast_gemm_in_the_register_mma_regime_stays_fused() -> None:
     the family's regime (and for dynamic shapes, which the fused program
     would not specialize) the tcgen05 pipeline needs the materialized
     operand and the fission proceeds."""
-    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
         fused = _bind(
             _int16_bare_cast_rhs, _int16_args((128, 256, 128)), static_shapes=True
         )
@@ -512,7 +509,7 @@ def test_bare_integer_cast_on_the_lhs_is_materialized() -> None:
     plan = bound.env.cute_fission_plan
     assert plan is not None and plan.region_count == 2
     assert plan.operand_interleave_factor == 1
-    assert bound.config_spec.cute_tcgen05_search_enabled
+    assert bound.config_spec.tcgen05.search_enabled
     assert plan.replacement_body is not None
     producer = ast.unparse(plan.replacement_body[-3])
     assert "_helion_materialize_m, _helion_materialize_k" in producer
@@ -836,7 +833,10 @@ def test_producer_seed_geometry_is_one_packet_per_thread_in_a_warp_quartet() -> 
 
 
 def test_small_grid_seeds_add_one_cta_tiles_with_pdl() -> None:
-    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
         bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
     spec = bound.config_spec
     state = spec._cute_tcgen05_config
@@ -901,7 +901,10 @@ def test_small_grid_seeds_add_one_cta_tiles_with_pdl() -> None:
 
 
 def test_small_grid_seeds_absent_when_standard_tiles_fill_the_device() -> None:
-    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
         bound = _bind(_int16_bare_cast_rhs, _int16_args((2048, 1024, 2048)))
     spec = bound.config_spec
     with bound.env:
@@ -918,7 +921,10 @@ def test_small_grid_seeds_absent_when_standard_tiles_fill_the_device() -> None:
 
 
 def test_one_cta_pdl_requires_the_persistent_role_local_schedule() -> None:
-    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
         bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
     spec = bound.config_spec
     with bound.env:

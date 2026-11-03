@@ -18,11 +18,11 @@ import torch
 from torch._inductor.codecache import PyCodeCache
 
 from test.cute_population_contracts import checked_initial_population
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_full_slice_matmul import _matmul
 from test.test_cute_repro_settings import _case
 from test.test_cute_repro_settings import _host
 from test.test_cute_repro_settings import _replay
-from test.test_cute_shared_rhs_grouped import _target
 from test.test_cute_split_k_workspace import _args as _split_k_args
 from test.test_cute_split_k_workspace import _config as _split_k_config
 from test.test_cute_split_k_workspace import _embedded_sources
@@ -30,17 +30,17 @@ from test.test_cute_split_k_workspace import _fp32_bias
 
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target as _split_k_target
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.base_search import normalize_autotune_seed_configs
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
-from helion.runtime.cute_structural_config import CuteStructuralConfig
-from helion.runtime.cute_structural_config import StructuralPolicyError
-from helion.runtime.cute_structural_config import resolve_cute_structural_policy
-from helion.runtime.cute_structural_policy import CUTE_STRUCTURAL_SETTINGS
-from helion.runtime.cute_structural_policy import CuteStructuralPolicy
+from helion.runtime.cute.structural_config import CuteStructuralConfig
+from helion.runtime.cute.structural_config import StructuralPolicyError
+from helion.runtime.cute.structural_config import resolve_cute_structural_policy
+from helion.runtime.cute.structural_policy import CUTE_STRUCTURAL_SETTINGS
+from helion.runtime.cute.structural_policy import CuteStructuralPolicy
 from helion.runtime.settings import Settings
 
 pytestmark = pytest.mark.cpu_only
@@ -49,6 +49,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from helion.runtime.kernel import BoundKernel
+
+# Backend-independent (runs under every HELION_BACKEND, like a non-cute test);
+# the conftest gate over test_cute_* files leaves it alone.
 
 
 @pytest.fixture(autouse=True)
@@ -59,14 +62,8 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("HELION_AUTOTUNE_RANDOM_SEED", "0")
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        _target(),
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
+    with cpu_render_target(
+        mma_support=tcgen05_mma_support(), reduction_smem_budget_bytes=232448
     ):
         yield
     torch.set_num_threads(previous_threads)

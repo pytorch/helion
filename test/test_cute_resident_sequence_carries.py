@@ -14,6 +14,7 @@ from test.test_cute_resident_sequence import _reduce
 
 from helion import exc
 from helion._compiler.ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from helion._compiler.cute.resident_reductions import ResidentPassContext
 from helion._compiler.cute.resident_sequence import SequenceRegion
 from helion._compiler.cute.resident_sequence import materialize_resident_sequences
 
@@ -120,12 +121,14 @@ def _rewrite(
     rewritten = materialize_resident_sequences(
         list(body),
         regions=regions,
-        tensor_dtypes={"x": "cutlass.Float32", "out": "cutlass.Float32"},
-        rename_groups=renames,
-        disjoint_pairs={frozenset(("x", "out"))},
-        boundary_names={"x", "out", "width", "rows", "initial_max", "initial_sum"},
+        context=ResidentPassContext(
+            tensor_dtypes={"x": "cutlass.Float32", "out": "cutlass.Float32"},
+            rename_groups=renames,
+            disjoint_pairs={frozenset(("x", "out"))},
+            uniform_names={"x", "out", "width", "rows", "initial_max", "initial_sum"},
+            new_var=lambda hint: f"{hint}_{next(counter)}",
+        ),
         resident=True,
-        new_var=lambda hint: f"{hint}_{next(counter)}",
     )
 
     class Rename(ast.NodeTransformer):

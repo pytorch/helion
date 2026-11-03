@@ -14,18 +14,20 @@ import torch
 
 from .test_cute_flash_exp2 import _policy_template_seed
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
-from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute import flash_knobs
 from helion._compiler.cute.attention_plan import SOFTCAP_KIND
 from helion._compiler.cute.attention_plan import AttentionScoreModifier
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.autotune.heuristics.cute import CuteFlashAttentionHeuristic
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.mma_support import CuteMmaSupport
+from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import skipUnlessCuteAvailable
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
@@ -46,7 +48,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with mock_cuda_unavailable(), forbid_native_compile():
+    with cpu_render_target():
         yield
 
 
@@ -68,7 +70,8 @@ def _spec(
     )
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         num_kv=num_kv,
         num_bh=64,
@@ -231,7 +234,7 @@ def test_causal_hardware_maximum_only_updates_unmasked_rows(
 
 
 def test_partial_resident_causal_scores_retain_hardware_maxima() -> None:
-    packet = cute_flash._FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_DEG2_EARLY_ACQUIRE_EXP2_PACKET
+    packet = flash_knobs._FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_DEG2_EARLY_ACQUIRE_EXP2_PACKET
     # The degree-2 resident cadence is offered under fast_math only.
     config, source = _source(
         dtype=torch.bfloat16,
@@ -275,17 +278,17 @@ def test_dense_kv_tail_reduces_after_masking() -> None:
 def test_rowmax_is_covered_and_present_in_terminal_coordinates(causal: bool) -> None:
     spec = _spec(dtype=torch.bfloat16, causal=causal)
     generation = spec.create_config_generation()
-    configs = generation.flash_deterministic_population_configs()
+    configs = generation.extension.deterministic_population_configs()
     assert {config.config[cute_flash.FLASH_ROWMAX_KEY] for config in configs} == {
         "software",
         "tmem",
     }
-    assert generation.flash_structural_coverage_uncovered_values() == []
-    assert generation.flash_structural_coverage_underqualified_leaves() == []
-    assert generation.flash_structural_coverage_uncovered_interactions() == []
+    assert generation.extension.flash_structural_coverage_uncovered_values() == []
+    assert generation.extension.flash_structural_coverage_underqualified_leaves() == []
+    assert generation.extension.flash_structural_coverage_uncovered_interactions() == []
     leaves = cast(
         "list[dict[str, object]]",
-        generation.flash_terminal_coordinate_surface_catalog()["leaves"],
+        generation.extension.flash_terminal_coordinate_surface_catalog()["leaves"],
     )
     for leaf in leaves:
         assert any(
@@ -397,7 +400,6 @@ def test_frontend_bind_carries_rowmax_proof_without_widening_fused_scope(
     support = CuteMmaSupport(
         universal=True,
         warp_f16bf16=True,
-        warpgroup_f16bf16=True,
         tcgen05_f16bf16=True,
         tcgen05_f8=True,
         tcgen05_tf32=True,
@@ -446,7 +448,7 @@ def test_frontend_bind_carries_rowmax_proof_without_widening_fused_scope(
             # fa4 bodies' resident softmax, which no row of this surface
             # runs -- the fragment keeps it out of the search and a request
             # normalizes to the software rowmax.
-            rowmax = spec._cute_flash_autotune_fragments()[cute_flash.FLASH_ROWMAX_KEY]
+            rowmax = _cute_flash_autotune_fragments(spec)[cute_flash.FLASH_ROWMAX_KEY]
             assert tuple(rowmax.search_choices or ()) == ("software",)
             assert config.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "ws_2cta"
             assert config.config[cute_flash.FLASH_ROWMAX_KEY] == "software"

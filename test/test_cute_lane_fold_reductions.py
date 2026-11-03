@@ -20,7 +20,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 
 import helion
 from helion import exc
@@ -29,11 +29,10 @@ from helion._compiler.cute.fold_lane_reductions import fold_site_key
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 REDUCE = "_cute_grouped_reduce_shared_two_stage("
@@ -223,13 +222,10 @@ def _device_loop_body(code: str) -> str:
 
 @pytest.fixture
 def _cpu_only():
-    with (
-        _target(),
-        mock_cuda_unavailable(),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
+    with cpu_render_target(
+        mma_support=tcgen05_mma_support(),
+        reduction_smem_budget_bytes=232448,
+        forbid_cuda_init=None,
     ):
         yield
 
@@ -242,7 +238,6 @@ def _bind(fn, n: int = 16384, dtype: torch.dtype = torch.bfloat16):
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("unroll", [1, 2])
 def test_two_lanes_fold_into_one_reduction_per_trip(_cpu_only, unroll: int) -> None:
     """128 threads x V16 over a 4096-wide tile: two packets per thread.  Each
@@ -271,7 +266,6 @@ def test_two_lanes_fold_into_one_reduction_per_trip(_cpu_only, unroll: int) -> N
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("fast_math", [False, True])
 def test_online_softmax_lanes_fuse_into_one_pass(_cpu_only, fast_math: bool) -> None:
     """max then sum of exp(x - max): one lane loop over the packets (per-lane
@@ -309,7 +303,6 @@ def test_online_softmax_lanes_fuse_into_one_pass(_cpu_only, fast_math: bool) -> 
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     "fn", [softmax_shifted_by_max_of_other_rows, weighted_softmax_rows]
 )
@@ -331,7 +324,6 @@ def test_other_minuend_or_weighted_exponential_keeps_two_folds(_cpu_only, fn) ->
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 def test_single_lane_code_is_unchanged(_cpu_only) -> None:
     """One packet per thread per trip reduces the whole tile already: the
     recorded site needs no fold and the knob-off code is kept (no lists,
@@ -344,7 +336,6 @@ def test_single_lane_code_is_unchanged(_cpu_only) -> None:
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 def test_non_fold_consumer_reduces_the_whole_tile(_cpu_only) -> None:
     """``acc += sum(tile) ** 2`` with four packets per thread: one reduction
     per trip over the four per-lane partials, the square once."""
@@ -356,7 +347,6 @@ def test_non_fold_consumer_reduces_the_whole_tile(_cpu_only) -> None:
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 def test_fold_under_a_row_lane_loop(_cpu_only) -> None:
     """Two rows per CTA walked by a rolled row lane loop (one thread on the
     rows) around the vectorized reduction axis: the knob unrolls nests from
@@ -379,7 +369,6 @@ def test_fold_under_a_row_lane_loop(_cpu_only) -> None:
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("cluster", [1, 2])
 def test_lane_loop_already_reduced_after_it_keeps_its_form(
     _cpu_only, cluster: int
@@ -413,7 +402,6 @@ def test_lane_loop_already_reduced_after_it_keeps_its_form(
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 def test_scalar_lanes_keep_the_two_pass_marker_path(_cpu_only) -> None:
     """A scalar lane loop (V = 1) is the two-pass lane marker's shape; the
     fold records no site there."""
@@ -423,7 +411,6 @@ def test_scalar_lanes_keep_the_two_pass_marker_path(_cpu_only) -> None:
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 def test_two_loops_with_identical_reduce_calls_both_fold(_cpu_only) -> None:
     """Two device loops reducing with the same op on the grouped warp path
     (32 threads per row, two rows per CTA) emit identical reduce calls;
@@ -444,7 +431,6 @@ def test_two_loops_with_identical_reduce_calls_both_fold(_cpu_only) -> None:
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 def test_single_warp_direct_reduce_is_folded(_cpu_only) -> None:
     """A one-warp CTA takes the direct ``cute.arch.warp_reduction_*`` path;
     inside a vectorized lane loop it is recorded and folded like the
@@ -462,7 +448,6 @@ def test_single_warp_direct_reduce_is_folded(_cpu_only) -> None:
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 def test_register_cache_fill_runs_once_per_lane_after_the_folds(
     _cpu_only, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -515,7 +500,6 @@ def test_register_cache_fill_runs_once_per_lane_after_the_folds(
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 def test_online_pair_zeroes_the_rescaled_term_of_an_empty_lane(_cpu_only) -> None:
     """A lane whose max is -inf has an exact zero sum but a guarded frame
     F(0); its rescale factor exp(F(0) - F(m)) overflows for rows far below
@@ -538,7 +522,6 @@ def test_online_pair_zeroes_the_rescaled_term_of_an_empty_lane(_cpu_only) -> Non
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 def test_more_lanes_than_the_unroll_bound_are_rejected(_cpu_only) -> None:
     """128 packets per thread would be unrolled in place 128 ways; the
     forced unroll is bounded like the knob's."""
@@ -548,7 +531,6 @@ def test_more_lanes_than_the_unroll_bound_are_rejected(_cpu_only) -> None:
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 def test_integer_reduction_left_per_element_is_rejected(_cpu_only) -> None:
     """``hoist_warp_reduce`` does not V-fold integer inputs, so the reduce
     stays inside the ``range_constexpr(V)`` loop of every lane: not a form
@@ -565,7 +547,6 @@ def test_integer_reduction_left_per_element_is_rejected(_cpu_only) -> None:
 
 
 @skipIfRefEager("generates code")
-@skipUnlessBackends(["cute"])
 def test_folded_cluster_sites_keep_two_exchanges(_cpu_only) -> None:
     """A single-trip full-row online softmax split across a cluster whose
     per-lane consumers the collapse cannot move: the fold runs each cluster

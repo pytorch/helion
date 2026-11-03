@@ -8,11 +8,15 @@ from unittest.mock import patch
 
 import torch
 
+from test._cute_kernels import cute_fp8_matmul
+from test._cute_kernels import cute_matmul_mma
+from test._cute_kernels import fresh
 from test.cute_population_contracts import with_flat_min_blocks_default
 
 import helion
 from helion import _compat
-from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
+from helion._compiler.cute import target_facts
+from helion._compiler.cute.autotune.heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.cute.pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
@@ -23,6 +27,10 @@ from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.strategies import Tcgen05WarpSpec
 from helion._compiler.cute.strategies import validate_tcgen05_strategy_invariants
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute.tcgen05_config import facts
+from helion._compiler.cute.tcgen05_config import repair
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import surface
 from helion._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
@@ -190,7 +198,7 @@ def _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(
     """Bind the 4096^3 matmul with the per-CTA AB-SMEM budget mocked.
 
     The SMEM-budget gate is purely deterministic given a budget value
-    (see ``CuteTcgen05Config.per_cta_ab_smem_budget_bytes``). Mocking
+    (see ``target_facts.per_cta_ab_smem_budget_bytes``). Mocking
     that helper lets the demote/keep/seed unit tests exercise the gate
     on any device, not just hosts that report a B200-sized opt-in
     SMEM cap. ``budget_bytes`` is the per-CTA AB-SMEM budget in bytes
@@ -215,14 +223,14 @@ def _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(
     with (
         patch_cute_mma_support(),
         patch.object(
-            CuteTcgen05Config,
+            target_facts,
             "per_cta_smem_capacity_bytes",
             return_value=capacity_bytes,
         ),
         patch.object(
-            CuteTcgen05Config,
+            target_facts,
             "per_cta_ab_smem_budget_bytes",
-            staticmethod(lambda device: budget_bytes),
+            lambda device: budget_bytes,
         ),
     ):
         return _cute_4096_matmul_kernel.bind(args)
@@ -261,7 +269,7 @@ def _bind_cute_strategy_kernel():
     with (
         patch_cute_mma_support(),
         patch(
-            "helion.language.matmul_ops._cuda_num_sms_or_zero",
+            "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
             return_value=0,
         ),
     ):
@@ -305,24 +313,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_matmul_constrains_search_space(self) -> None:
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
         # Two 128x128 output tiles on this device: the search admits the
         # 64-row one-CTA tile for grids smaller than the SM count (the
@@ -346,30 +342,18 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # This small-N problem cannot form the validated 256x256 CtaGroup.TWO
         # tile, so the autotuner keeps cluster_m narrowed to 1.
         self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 1)
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1,))
         self.assertIn("persistent_blocked", spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_equal_dims_keep_default_within_max_bound(self) -> None:
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [128, 8, 16])
         # tile_k upper bound is now 128 (the static_k=8192 case; capped at 128
@@ -392,7 +376,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # though bk=16 is over the K-tile cap. The FFI full-tile default lands
         # on cluster_m=2, and the search exposes both arms.
         self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 2)
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1, 2))
         over_cap_config = {
             "block_sizes": [256, 256, 16],
             "pid_type": "flat",
@@ -419,24 +403,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_widened_default_stays_on_tcgen05_path(self) -> None:
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
             config = bound.config_spec.default_config()
             code = bound.to_triton_code(config)
         # 16-bit 8192^3 is FFI-eligible (fp16 == bf16 parity); the default is the
@@ -453,27 +425,15 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_two_cta_enters_validated_search_space(self) -> None:
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
             torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
-        search_fragments = spec._tcgen05_optional_fragments(for_search=True)
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1, 2))
+        search_fragments = surface.optional_fragments(spec.tcgen05, for_search=True)
         self.assertEqual(search_fragments["tcgen05_cluster_m"].choices, (1, 2))
 
         # The ordinary cluster_m=2 search arm remains distinct from the FFI
@@ -541,18 +501,6 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         live GPU's SM count.
         """
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         def bind_at(size: int):
             args = (
                 torch.empty([size, size], device=DEVICE, dtype=HALF_DTYPE),
@@ -561,11 +509,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             with (
                 patch_cute_mma_support(),
                 patch(
-                    "helion.language.matmul_ops._cuda_num_sms_or_zero",
+                    "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
                     return_value=148,
                 ),
             ):
-                return cute_matmul_mma.bind(args).config_spec
+                return fresh(cute_matmul_mma).bind(args).config_spec
 
         # Suppressed: 512^3 = 4 cluster slots of 256x256 and 16 of the
         # narrowest one-wave tile (256x64) < 148 // 4 = 37. cluster_m=2 search
@@ -573,8 +521,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # so the autotuner never spends budget on the cluster_m=2 seed for a
         # shape where it has no productive lever.
         suppressed_spec = bind_at(512)
-        self.assertEqual(suppressed_spec._tcgen05_cluster_m_search_choices, (1,))
-        self.assertIsNone(suppressed_spec._tcgen05_cluster_m2_search_constraints)
+        self.assertEqual(suppressed_spec.tcgen05.cluster_m_search_choices, (1,))
+        self.assertIsNone(suppressed_spec.tcgen05.cluster_m2_search_constraints)
         # Keep this assertion scoped to the cluster_m=2 seed heuristic:
         # future unrelated heuristics may still apply to these shapes.
         self.assertNotIn(
@@ -592,8 +540,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # there: 2-CTA 256x64x64 with a 9-deep ring, 6.2 us vs 7.8 for the
         # one-CTA tiles the unseeded search found; cuBLAS runs 128x64 2cta).
         one_wave_spec = bind_at(1024)
-        self.assertEqual(one_wave_spec._tcgen05_cluster_m_search_choices, (1, 2))
-        one_wave_constraints = one_wave_spec._tcgen05_cluster_m2_search_constraints
+        self.assertEqual(one_wave_spec.tcgen05.cluster_m_search_choices, (1, 2))
+        one_wave_constraints = one_wave_spec.tcgen05.cluster_m2_search_constraints
         self.assertIsNotNone(one_wave_constraints)
         self.assertTrue(one_wave_constraints.allow_one_wave_tiles)
 
@@ -601,8 +549,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # cluster slots >= 37. cluster_m=2 search stays exposed, its constraints
         # are recorded, and the cluster_m=2 seed heuristic is registered.
         admitted_spec = bind_at(2048)
-        self.assertEqual(admitted_spec._tcgen05_cluster_m_search_choices, (1, 2))
-        self.assertIsNotNone(admitted_spec._tcgen05_cluster_m2_search_constraints)
+        self.assertEqual(admitted_spec.tcgen05.cluster_m_search_choices, (1, 2))
+        self.assertIsNotNone(admitted_spec.tcgen05.cluster_m2_search_constraints)
         self.assertIn(
             CuteTcgen05ClusterM2Heuristic.name,
             admitted_spec.autotuner_heuristics,
@@ -621,18 +569,6 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         bm=256 candidate still projects to the full tile (no regression).
         """
 
-        @helion.kernel(backend="cute")
-        def cute_fp8_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-                out[tile_m, tile_n] = acc.to(torch.bfloat16)
-            return out
-
         args = (
             torch.empty([512, 4096], device=DEVICE, dtype=torch.float8_e4m3fn),
             torch.empty([4096, 2048], device=DEVICE, dtype=torch.float8_e4m3fn),
@@ -640,17 +576,17 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         with (
             patch_cute_mma_support(),
             patch(
-                "helion.language.matmul_ops._cuda_num_sms_or_zero",
+                "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
                 return_value=148,
             ),
         ):
-            bound = cute_fp8_matmul.bind(args)
+            bound = fresh(cute_fp8_matmul).bind(args)
         spec = bound.config_spec
 
         # The cluster_m=2 search arm is exposed with the fp8 small-grid flag set,
         # and the seed heuristic is registered.
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
-        constraints = spec._tcgen05_cluster_m2_search_constraints
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1, 2))
+        constraints = spec.tcgen05.cluster_m2_search_constraints
         self.assertIsNotNone(constraints)
         self.assertTrue(constraints.allow_fp8_small_grid)
         self.assertIn(
@@ -734,18 +670,6 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         bm=128 if it wins.
         """
 
-        @helion.kernel(backend="cute")
-        def cute_fp8_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-                out[tile_m, tile_n] = acc.to(torch.bfloat16)
-            return out
-
         # 2048x2048 -> (2048/128)^2 = 256 clusters, far above 148 // 2 = 74.
         args = (
             torch.empty([2048, 2048], device=DEVICE, dtype=torch.float8_e4m3fn),
@@ -754,17 +678,17 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         with (
             patch_cute_mma_support(),
             patch(
-                "helion.language.matmul_ops._cuda_num_sms_or_zero",
+                "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
                 return_value=148,
             ),
             patch("helion.runtime.get_num_sm", return_value=148),
         ):
-            bound = cute_fp8_matmul.bind(args)
+            bound = fresh(cute_fp8_matmul).bind(args)
             spec = bound.config_spec
 
             # Search admission is unchanged: the small-grid arm stays enabled so
             # bm=128 candidates remain reachable during autotuning.
-            constraints = spec._tcgen05_cluster_m2_search_constraints
+            constraints = spec.tcgen05.cluster_m2_search_constraints
             self.assertIsNotNone(constraints)
             self.assertTrue(constraints.allow_fp8_small_grid)
 
@@ -781,24 +705,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
     def test_cute_tcgen05_cluster_m1_persistent_search_caps_m_tile(self) -> None:
         """Search-only cluster_m=1 persistent configs stay on tcgen05 M tiles."""
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
             torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
 
         for pid_type in ("persistent_blocked", "persistent_interleaved"):
@@ -843,24 +755,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
     ) -> None:
         """Invalid cluster_m=2 search products fall back without pid churn."""
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
             torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
 
         for block_sizes in (
@@ -877,7 +777,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                     "pid_type": "flat",
                     "tcgen05_cluster_m": 2,
                 }
-                spec._fix_tcgen05_cluster_m2_search_config(config)
+                repair._fix_cluster_m2_search_config(spec.tcgen05, config)
                 self.assertEqual(config["tcgen05_cluster_m"], 1)
                 self.assertEqual(config["pid_type"], "flat")
                 self.assertEqual(config["block_sizes"], original_block_sizes)
@@ -896,7 +796,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 "pid_type": "flat",
                 "tcgen05_cluster_m": 2,
             }
-            spec._fix_tcgen05_cluster_m2_search_config(config)
+            repair._fix_cluster_m2_search_config(spec.tcgen05, config)
         finally:
             spec.allowed_pid_types = original_allowed_pid_types
         self.assertEqual(config["tcgen05_cluster_m"], 1)
@@ -918,7 +818,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         """
         # B200's optin reports 232 448 bytes = 227 KiB; subtract the
         # 28 KiB non-AB reservation to match what
-        # ``CuteTcgen05Config.per_cta_ab_smem_budget_bytes`` produces in production
+        # ``target_facts.per_cta_ab_smem_budget_bytes`` produces in production
         # (203 776 bytes). Tracking the production value exactly is
         # what makes the over-budget vs in-budget boundary in this
         # test mirror the running gate.
@@ -926,23 +826,27 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
         spec = bound.config_spec
 
-        constraints = spec._tcgen05_ab_stages_three_search_constraints
+        constraints = spec.tcgen05.ab_stages_three_search_constraints
         self.assertIsNotNone(constraints)
         # ``itemsize`` for BF16/FP16 is 2 bytes — matches the matmul
         # binding's ``lhs.dtype.itemsize`` argument.
         self.assertEqual(constraints.dtype_bytes, HALF_DTYPE.itemsize)
         self.assertEqual(constraints.per_cta_smem_budget_bytes, b200_budget_bytes)
 
-        search_fragments = spec._tcgen05_optional_fragments(for_search=True)
+        search_fragments = surface.optional_fragments(spec.tcgen05, for_search=True)
         # The fragment covers both the legacy AB reservation and the explicit
         # paired-CTA allocation proof. The latter admits up to 16 stages; the
         # unchanged legacy configs below must still obey their narrower budget.
-        self.assertTrue(spec._cute_tcgen05_config.paired_pipeline_search_enabled())
+        self.assertTrue(
+            surface.paired_pipeline_search_enabled(spec._cute_tcgen05_config)
+        )
         self.assertEqual(
             search_fragments["tcgen05_ab_stages"].high,
             TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
         )
-        validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
+        validation_fragments = surface.optional_fragments(
+            spec.tcgen05, for_search=False
+        )
         self.assertEqual(
             validation_fragments["tcgen05_ab_stages"].high,
             TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
@@ -1024,18 +928,22 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 )
                 spec = bound.config_spec
                 tcfg = spec._cute_tcgen05_config
-                self.assertIsNone(spec._tcgen05_ab_stages_three_search_constraints)
-                self.assertFalse(spec._tcgen05_full_tile_direct_entry_seed_eligible())
-                search = spec._tcgen05_optional_fragments(for_search=True)
-                validation = spec._tcgen05_optional_fragments(for_search=False)
-                seeds = spec.compiler_seed_configs
+                self.assertIsNone(spec.tcgen05.ab_stages_three_search_constraints)
+                self.assertFalse(
+                    seeds.full_tile_direct_entry_seed_eligible(spec.tcgen05)
+                )
+                search = surface.optional_fragments(spec.tcgen05, for_search=True)
+                validation = surface.optional_fragments(spec.tcgen05, for_search=False)
+                seed_configs = spec.compiler_seed_configs
                 legacy = [
                     seed
-                    for seed in seeds
+                    for seed in seed_configs
                     if seed.get("tcgen05_cta_group", "auto") == "auto"
                 ]
                 paired = [
-                    seed for seed in seeds if seed.get("tcgen05_cta_group") == "two"
+                    seed
+                    for seed in seed_configs
+                    if seed.get("tcgen05_cta_group") == "two"
                 ]
                 # Retain every original family and its baseline depth, while
                 # excluding the old deep-AB CLC seed when its budget is absent.
@@ -1049,7 +957,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                     self.assertEqual(search["tcgen05_ab_stages"].high, 2)
                     self.assertEqual(validation["tcgen05_ab_stages"].high, 3)
                     continue
-                self.assertTrue(tcfg.paired_pipeline_search_enabled())
+                self.assertTrue(surface.paired_pipeline_search_enabled(tcfg))
                 self.assertTrue(paired)
                 self.assertEqual(
                     search["tcgen05_ab_stages"].high,
@@ -1082,21 +990,24 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
         spec = bound.config_spec
 
-        self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
+        self.assertIsNotNone(spec.tcgen05.ab_stages_three_search_constraints)
         with patch.object(type(spec.block_sizes), "__len__", lambda self: 9):
             with patch.object(
-                CuteTcgen05Config,
+                target_facts,
                 "per_cta_ab_smem_budget_bytes",
-                staticmethod(lambda device: b200_budget_bytes),
+                lambda device: b200_budget_bytes,
             ):
-                spec.allow_tcgen05_ab_stages_three_search(
+                surface.allow_ab_stages_three_search(
+                    spec.tcgen05,
                     dtype_bytes=2,
                     device=torch.device("cuda:0"),
                 )
-            self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
-            search_fragments = spec._tcgen05_optional_fragments(for_search=True)
+            self.assertIsNotNone(spec.tcgen05.ab_stages_three_search_constraints)
+            search_fragments = surface.optional_fragments(spec.tcgen05, for_search=True)
             # Extra unrelated slots must not hide either allocation proof.
-            self.assertTrue(spec._cute_tcgen05_config.paired_pipeline_search_enabled())
+            self.assertTrue(
+                surface.paired_pipeline_search_enabled(spec._cute_tcgen05_config)
+            )
             self.assertEqual(
                 search_fragments["tcgen05_ab_stages"].high,
                 TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
@@ -1121,7 +1032,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         ``test_cute_tcgen05_ab_stages_three_smem_budget_gate``).
         """
         # B200 production value: 227 KiB optin minus 28 KiB non-AB
-        # reservation (see CuteTcgen05Config.per_cta_ab_smem_budget_bytes).
+        # reservation (see target_facts.per_cta_ab_smem_budget_bytes).
         b200_budget_bytes = 227 * 1024 - 28 * 1024
         bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
         spec = bound.config_spec
@@ -1522,8 +1433,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_validated_autotune_narrowing(self) -> None:
-        """``narrow_tcgen05_autotune_to_validated_configs`` consolidates the
-        tcgen05 limitations into a single config_spec call.
+        """``tcgen05_config.surface.narrow_autotune_to_validated_configs``
+        consolidates the tcgen05 limitations into a single config_spec call.
 
         Pin the resulting state so any future change to the helper has to
         update the test as well: persistent pid types stay in the autotune
@@ -1533,24 +1444,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         to ``(4,)``.
         """
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
         # Every candidate M/N/K block size divides this static problem, so
         # role-local persistent pid types are admitted back into autotune.
@@ -1558,25 +1457,27 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
         # This N=128 problem cannot form a validated 256x256 CtaGroup.TWO
         # tile, so the autotune search stays narrowed to cluster_m=1.
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1,))
         # num_epi_warps != 4 currently produces wrong output on B200
         # (only 4 epi warps lowers correctly today). The autotune search
         # is narrowed to num_epi_warps=4 so the autotuner does not
         # converge on a wrong-output config.
-        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+        self.assertEqual(spec.tcgen05.num_epi_warps_search_choices, (4,))
         # The validated narrowing leaves cluster_m=2 still accepted as a
         # legal value for an explicit user-supplied helion.Config
         # (CUDA-launch-failure is loud and won't silently miscompute).
-        validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
+        validation_fragments = surface.optional_fragments(
+            spec.tcgen05, for_search=False
+        )
         self.assertEqual(validation_fragments["tcgen05_cluster_m"].choices, (1, 2))
         # num_epi_warps is the exception: validation is also tightened
         # to (4,) because non-4 values silently produce wrong output, so
         # an explicit user-supplied helion.Config must be rejected
         # rather than allowed to miscompute.
-        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+        self.assertEqual(spec.tcgen05.num_epi_warps_validation_choices, (4,))
         self.assertEqual(validation_fragments["tcgen05_num_epi_warps"].choices, (4,))
         # The search view exposes the same narrowed EnumFragment.
-        search_fragments = spec._tcgen05_optional_fragments(for_search=True)
+        search_fragments = surface.optional_fragments(spec.tcgen05, for_search=True)
         self.assertEqual(search_fragments["tcgen05_num_epi_warps"].choices, (4,))
 
     @onlyBackends(["cute"])
@@ -1585,18 +1486,6 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
     ) -> None:
         """Compact paired tiles unlock persistence without widening auto CTA gates."""
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([64, 192], device=DEVICE, dtype=HALF_DTYPE),
@@ -1604,19 +1493,21 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         with (
             patch_cute_mma_support(),
             patch.object(
-                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+                target_facts, "per_cta_smem_capacity_bytes", return_value=232448
             ),
         ):
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
         self.assertEqual([x.max_size for x in spec.block_sizes], [256, 128, 64])
         self.assertIn("persistent_blocked", spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
         # The automatic 256x256 two-CTA tile is still unavailable. The explicit
         # family has exact 128x64 tiles for N=192 and its own allocation proof.
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
-        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
-        self.assertTrue(spec._cute_tcgen05_config.paired_pipeline_search_enabled())
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1,))
+        self.assertEqual(spec.tcgen05.num_epi_warps_search_choices, (4,))
+        self.assertTrue(
+            surface.paired_pipeline_search_enabled(spec._cute_tcgen05_config)
+        )
         seeds = [
             seed
             for seed in spec.compiler_seed_configs
@@ -1657,26 +1548,14 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
     def test_cute_tcgen05_double_edge_no_divisor_keeps_flat_search(self) -> None:
         """Double-edge flat tcgen05 search no longer needs divisor tiles."""
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.randn([67, 16], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([16, 67], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        self.assertTrue(spec.tcgen05.search_enabled)
         self.assertEqual([x.max_size for x in spec.block_sizes], [64, 64, 16])
         self.assertIn("tcgen05_cluster_m", spec.default_config().config)
 
@@ -1684,90 +1563,54 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
     def test_cute_tcgen05_double_edge_keeps_wide_n_search(self) -> None:
         """Double-edge search keeps N wide and caps M to flat tcgen05."""
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.randn([192, 64], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([64, 67], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        self.assertTrue(spec.tcgen05.search_enabled)
         self.assertEqual([x.max_size for x in spec.block_sizes], [128, 64, 64])
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_partial_single_edge_search_stays_enabled(self) -> None:
         """A double-edge default tile keeps wide-N tcgen05 candidates searchable."""
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.randn([5000, 64], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([64, 5000], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        self.assertTrue(spec.tcgen05.search_enabled)
         self.assertEqual([x.max_size for x in spec.block_sizes], [128, 256, 64])
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_edge_k_tail_family_admits_cluster_m2_search(self) -> None:
         """The large double-edge + K-tail family exposes CtaGroup.TWO search."""
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
             torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        self.assertTrue(spec.tcgen05.search_enabled)
         self.assertEqual([x.max_size for x in spec.block_sizes], [128, 256, 128])
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1, 2))
         self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
         flat_fields = spec._flat_fields()
         self.assertIn("pid_type", flat_fields)
         self.assertIn("persistent_interleaved", flat_fields["pid_type"].choices)
-        constraints = spec._tcgen05_cluster_m2_search_constraints
+        constraints = spec.tcgen05.cluster_m2_search_constraints
         assert constraints is not None
         self.assertTrue(constraints.allow_edge_k_tail_family)
         self.assertTrue(
-            spec._tcgen05_cluster_m2_bk_is_valid(
+            repair.cluster_m2_bk_is_valid(
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
                 constraints,
             )
@@ -1775,12 +1618,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # The deep-AB family admits bk=64 on the edge/K-tail family; other
         # K tiles stay out of the validated set.
         self.assertTrue(
-            spec._tcgen05_cluster_m2_bk_is_valid(
+            repair.cluster_m2_bk_is_valid(
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K,
                 constraints,
             )
         )
-        self.assertFalse(spec._tcgen05_cluster_m2_bk_is_valid(32, constraints))
+        self.assertFalse(repair.cluster_m2_bk_is_valid(32, constraints))
 
     def test_tcgen05_edge_tile_detection_skips_unknown_dims(self) -> None:
         config_spec = SimpleNamespace(
@@ -1805,7 +1648,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         tcgen05 = CuteTcgen05Config(config_spec)
 
         self.assertTrue(
-            tcgen05._matmul_fact_has_edge_tile(
+            facts._matmul_fact_has_edge_tile(
+                tcgen05,
                 {"block_sizes": [128, 64]},
                 fact_index=0,
             )
@@ -1826,9 +1670,9 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         with patch_cute_mma_support():
             bound = _cute_two_matmuls_kernel.bind(args)
         spec = bound.config_spec
-        self.assertFalse(spec.cute_tcgen05_search_enabled)
-        self.assertIsNone(spec._tcgen05_cluster_m_search_choices)
-        self.assertIsNone(spec._tcgen05_num_epi_warps_search_choices)
+        self.assertFalse(spec.tcgen05.search_enabled)
+        self.assertIsNone(spec.tcgen05.cluster_m_search_choices)
+        self.assertIsNone(spec.tcgen05.num_epi_warps_search_choices)
         self.assertIsNone(spec._cute_tcgen05_config.matmul_block_ids)
         self.assertIn("persistent_blocked", spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
@@ -1845,7 +1689,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
         with patch_cute_mma_support():
             spec = _cute_two_matmuls_kernel.bind(args).config_spec
-        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        self.assertTrue(spec.tcgen05.search_enabled)
         second_fact = spec.matmul_facts[1]
         self.assertEqual(
             spec._cute_tcgen05_config.matmul_block_ids,
@@ -1866,7 +1710,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
         with patch_cute_mma_support():
             bound = _cute_two_matmuls_force_persistent_kernel.bind(args)
-        self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
+        self.assertFalse(bound.config_spec.tcgen05.search_enabled)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_multi_root_distributed_disables_tcgen05_search(
@@ -1903,15 +1747,16 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
         ):
             bound = _cute_two_matmuls_distributed_kernel.bind(args)
-        self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
+        self.assertFalse(bound.config_spec.tcgen05.search_enabled)
 
+    @onlyBackends(["cute"])
     def test_narrow_tcgen05_autotune_to_validated_configs_helper(self) -> None:
         """Direct unit test for the narrowing helper that does not depend
         on the dot-requirements bind path. The helper only manipulates the
         autotune search state on the receiver and is safe to invoke on any
         ``ConfigSpec`` instance."""
 
-        @helion.kernel
+        @helion.kernel(backend="cute")
         def stub(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size(0)):
@@ -1921,7 +1766,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         args = (torch.randn([1024], device=DEVICE),)
         spec = stub.bind(args).config_spec
         before_pid = set(spec.allowed_pid_types)
-        spec.narrow_tcgen05_autotune_to_validated_configs()
+        surface.narrow_autotune_to_validated_configs(spec.tcgen05)
         # Both persistent types are dropped (idempotently if they were
         # already absent).
         self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
@@ -1931,20 +1776,20 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             self.assertIn(pid_type, spec.allowed_pid_types)
         # The cluster_m search is narrowed to (1,) unless the matmul caller
         # proves it can form validated CtaGroup.TWO search candidates.
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1,))
         # The num_epi_warps search is now narrowed to (4,) -- the only
         # currently-correct value on B200 (1 and 2 are directly verified
         # to produce wrong output, 3 is unsafe by extension).
-        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+        self.assertEqual(spec.tcgen05.num_epi_warps_search_choices, (4,))
         # Validation is also tightened for num_epi_warps because the
         # failure mode is silent wrong output.
-        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+        self.assertEqual(spec.tcgen05.num_epi_warps_validation_choices, (4,))
         # Calling it twice is idempotent.
-        spec.narrow_tcgen05_autotune_to_validated_configs()
+        surface.narrow_autotune_to_validated_configs(spec.tcgen05)
         self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
-        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
-        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1,))
+        self.assertEqual(spec.tcgen05.num_epi_warps_search_choices, (4,))
+        self.assertEqual(spec.tcgen05.num_epi_warps_validation_choices, (4,))
 
         spec = stub.bind(args).config_spec
         spec.allowed_pid_types = (
@@ -1953,14 +1798,14 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             "persistent_blocked",
             "persistent_interleaved",
         )
-        spec.narrow_tcgen05_autotune_to_validated_configs(
-            allow_persistent_pid_types=True
+        surface.narrow_autotune_to_validated_configs(
+            spec.tcgen05, allow_persistent_pid_types=True
         )
         self.assertIn("persistent_blocked", spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
-        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
-        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1,))
+        self.assertEqual(spec.tcgen05.num_epi_warps_search_choices, (4,))
+        self.assertEqual(spec.tcgen05.num_epi_warps_validation_choices, (4,))
 
         spec = stub.bind(args).config_spec
         spec.allowed_pid_types = (
@@ -1969,24 +1814,26 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             "persistent_blocked",
             "persistent_interleaved",
         )
-        spec.narrow_tcgen05_autotune_to_validated_configs(
+        surface.narrow_autotune_to_validated_configs(
+            spec.tcgen05,
             allow_persistent_pid_types=True,
-            allow_cluster_m2_search=True,
+            enable_cluster_m2_search=True,
             cluster_m2_static_k=4096,
         )
         self.assertIn("persistent_blocked", spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
-        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
-        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1, 2))
+        self.assertEqual(spec.tcgen05.num_epi_warps_search_choices, (4,))
+        self.assertEqual(spec.tcgen05.num_epi_warps_validation_choices, (4,))
 
         spec = stub.bind(args).config_spec
         with self.assertRaisesRegex(
             AssertionError,
             "cluster_m=2 search requires persistent pid types",
         ):
-            spec.narrow_tcgen05_autotune_to_validated_configs(
-                allow_cluster_m2_search=True,
+            surface.narrow_autotune_to_validated_configs(
+                spec.tcgen05,
+                enable_cluster_m2_search=True,
                 cluster_m2_static_k=5000,
             )
 
@@ -1995,7 +1842,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             AssertionError,
             "edge/K-tail admission requires cluster_m=2 search",
         ):
-            spec.narrow_tcgen05_autotune_to_validated_configs(
+            surface.narrow_autotune_to_validated_configs(
+                spec.tcgen05,
                 cluster_m2_static_k=5000,
                 allow_cluster_m2_edge_k_tail_family=True,
             )
@@ -2007,19 +1855,20 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             "persistent_blocked",
             "persistent_interleaved",
         )
-        spec.narrow_tcgen05_autotune_to_validated_configs(
-            allow_cluster_m2_search=True,
+        surface.narrow_autotune_to_validated_configs(
+            spec.tcgen05,
+            enable_cluster_m2_search=True,
             cluster_m2_static_k=5000,
             allow_cluster_m2_edge_k_tail_family=True,
         )
         self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
-        constraints = spec._tcgen05_cluster_m2_search_constraints
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1, 2))
+        constraints = spec.tcgen05.cluster_m2_search_constraints
         assert constraints is not None
         self.assertTrue(constraints.allow_edge_k_tail_family)
         self.assertTrue(
-            spec._tcgen05_cluster_m2_bk_is_valid(
+            repair.cluster_m2_bk_is_valid(
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
                 constraints,
             )
@@ -2027,26 +1876,28 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # The deep-AB family admits bk=64 on the edge/K-tail family; other
         # K tiles stay out of the validated set.
         self.assertTrue(
-            spec._tcgen05_cluster_m2_bk_is_valid(
+            repair.cluster_m2_bk_is_valid(
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K,
                 constraints,
             )
         )
-        self.assertFalse(spec._tcgen05_cluster_m2_bk_is_valid(32, constraints))
+        self.assertFalse(repair.cluster_m2_bk_is_valid(32, constraints))
 
+    @onlyBackends(["cute"])
     def test_restrict_tcgen05_num_epi_warps_search_helper(self) -> None:
-        """Direct unit test for ``restrict_tcgen05_num_epi_warps_search``.
+        """Direct unit test for
+        ``tcgen05_config.surface.restrict_num_epi_warps_search``.
 
         The helper sets the per-instance search-only override and never
         affects the validation view returned by
-        ``_tcgen05_optional_fragments(for_search=False)``. The test
+        ``tcgen05_config.surface.optional_fragments(state, for_search=False)``. The test
         exercises the override on its own (i.e. without going through
-        the full ``narrow_tcgen05_autotune_to_validated_configs``
+        the full ``tcgen05_config.surface.narrow_autotune_to_validated_configs``
         consolidation) so any future regression to the helper itself is
         caught here directly.
         """
 
-        @helion.kernel
+        @helion.kernel(backend="cute")
         def stub(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size(0)):
@@ -2055,35 +1906,39 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         args = (torch.randn([1024], device=DEVICE),)
         spec = stub.bind(args).config_spec
-        # Default state: no override is set, so the search uses the
-        # default IntegerFragment range and the validation view keeps
-        # the same range.
-        self.assertIsNone(spec._tcgen05_num_epi_warps_search_choices)
-        default_search = spec._tcgen05_optional_fragments(for_search=True)
-        self.assertEqual(default_search["tcgen05_num_epi_warps"].low, 1)
-        self.assertEqual(default_search["tcgen05_num_epi_warps"].high, 4)
+        # Default state: no override is set; the search view is pinned by
+        # declaration (``TCGEN05_NUM_EPI_WARPS_SEARCH_CHOICES``) while the
+        # validation view keeps the full IntegerFragment range.
+        self.assertIsNone(spec.tcgen05.num_epi_warps_search_choices)
+        default_search = surface.optional_fragments(spec.tcgen05, for_search=True)
+        self.assertEqual(default_search["tcgen05_num_epi_warps"].choices, (4,))
+        default_validation = surface.optional_fragments(spec.tcgen05, for_search=False)
+        self.assertEqual(default_validation["tcgen05_num_epi_warps"].low, 1)
+        self.assertEqual(default_validation["tcgen05_num_epi_warps"].high, 4)
 
-        spec.restrict_tcgen05_num_epi_warps_search((1, 2))
-        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (1, 2))
-        narrowed_search = spec._tcgen05_optional_fragments(for_search=True)
-        # Narrowing flips the search view to an EnumFragment so the
-        # autotuner samples only the listed values.
+        surface.restrict_num_epi_warps_search(spec.tcgen05, (1, 2))
+        self.assertEqual(spec.tcgen05.num_epi_warps_search_choices, (1, 2))
+        narrowed_search = surface.optional_fragments(spec.tcgen05, for_search=True)
+        # The seam lifts the pinned search view to the listed values.
         self.assertEqual(narrowed_search["tcgen05_num_epi_warps"].choices, (1, 2))
         # Validation view is unaffected by the search-only helper:
         # user-supplied helion.Config values in [1, 4] still round-trip
-        # through normalize() unless ``restrict_tcgen05_num_epi_warps_validation``
-        # is also called (see ``test_restrict_tcgen05_num_epi_warps_validation_helper``).
-        validation = spec._tcgen05_optional_fragments(for_search=False)
+        # through normalize() unless
+        # ``tcgen05_config.surface.restrict_num_epi_warps_validation`` is also
+        # called (see ``test_restrict_tcgen05_num_epi_warps_validation_helper``).
+        validation = surface.optional_fragments(spec.tcgen05, for_search=False)
         self.assertEqual(validation["tcgen05_num_epi_warps"].low, 1)
         self.assertEqual(validation["tcgen05_num_epi_warps"].high, 4)
 
         # Empty override raises (a misuse: every search must allow at
         # least one value).
         with self.assertRaises(AssertionError):
-            spec.restrict_tcgen05_num_epi_warps_search(())
+            surface.restrict_num_epi_warps_search(spec.tcgen05, ())
 
+    @onlyBackends(["cute"])
     def test_restrict_tcgen05_num_epi_warps_validation_helper(self) -> None:
-        """Direct unit test for ``restrict_tcgen05_num_epi_warps_validation``.
+        """Direct unit test for
+        ``tcgen05_config.surface.restrict_num_epi_warps_validation``.
 
         Unlike the search-only sibling, this helper tightens what
         ``normalize()`` accepts so user-supplied configs with bad
@@ -2092,7 +1947,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         epi-warp counts produce silent wrong output.
         """
 
-        @helion.kernel
+        @helion.kernel(backend="cute")
         def stub(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size(0)):
@@ -2102,24 +1957,24 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         args = (torch.randn([1024], device=DEVICE),)
         spec = stub.bind(args).config_spec
         # Default state: validation view is the full IntegerFragment.
-        self.assertIsNone(spec._tcgen05_num_epi_warps_validation_choices)
-        default_validation = spec._tcgen05_optional_fragments(for_search=False)
+        self.assertIsNone(spec.tcgen05.num_epi_warps_validation_choices)
+        default_validation = surface.optional_fragments(spec.tcgen05, for_search=False)
         self.assertEqual(default_validation["tcgen05_num_epi_warps"].low, 1)
         self.assertEqual(default_validation["tcgen05_num_epi_warps"].high, 4)
 
-        spec.restrict_tcgen05_num_epi_warps_validation((4,))
-        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
-        narrowed_validation = spec._tcgen05_optional_fragments(for_search=False)
+        surface.restrict_num_epi_warps_validation(spec.tcgen05, (4,))
+        self.assertEqual(spec.tcgen05.num_epi_warps_validation_choices, (4,))
+        narrowed_validation = surface.optional_fragments(spec.tcgen05, for_search=False)
         # Validation view flipped to EnumFragment with the restricted choices.
         self.assertEqual(narrowed_validation["tcgen05_num_epi_warps"].choices, (4,))
-        # Search view unaffected by the validation-only helper.
-        search = spec._tcgen05_optional_fragments(for_search=True)
-        self.assertEqual(search["tcgen05_num_epi_warps"].low, 1)
-        self.assertEqual(search["tcgen05_num_epi_warps"].high, 4)
+        # Search view unaffected by the validation-only helper (it stays
+        # pinned by declaration).
+        search = surface.optional_fragments(spec.tcgen05, for_search=True)
+        self.assertEqual(search["tcgen05_num_epi_warps"].choices, (4,))
 
         # Empty override raises.
         with self.assertRaises(AssertionError):
-            spec.restrict_tcgen05_num_epi_warps_validation(())
+            surface.restrict_num_epi_warps_validation(spec.tcgen05, ())
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_num_epi_warps_search_routes_through_flat_fields(
@@ -2132,18 +1987,6 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         sampling the full IntegerFragment range.
         """
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
@@ -2151,15 +1994,15 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         with (
             patch_cute_mma_support(),
             patch.object(
-                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+                target_facts, "per_cta_smem_capacity_bytes", return_value=232448
             ),
         ):
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
-        # cute_tcgen05_search_enabled gates the inclusion of the tcgen05
+        # tcgen05.search_enabled gates the inclusion of the tcgen05
         # optional fragments in _flat_fields(); structural DeviceIR analysis
         # sets it during bind, so the narrowed search view should appear.
-        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        self.assertTrue(spec.tcgen05.search_enabled)
         flat_fields = spec._flat_fields()
         self.assertIn("tcgen05_num_epi_warps", flat_fields)
         # The matmul-side narrowing collapses the search to (4,);
@@ -2168,7 +2011,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(flat_fields["tcgen05_num_epi_warps"].choices, (4,))
         # The automatic family still cannot form its 256x256 tile. Explicit
         # paired-CTA kernels can use the independently proved 128x64 geometry.
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1,))
         self.assertEqual(flat_fields["tcgen05_cluster_m"].choices, (1, 2))
         self.assertEqual(flat_fields["tcgen05_cta_group"].choices, ("auto", "two"))
         self.assertIn("persistent_blocked", flat_fields["pid_type"].choices)
@@ -2186,28 +2029,16 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         bypassing autotune. The legal value 4 must still round-trip.
         """
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
         # Both the search and validation accept-sets are narrowed to (4,).
-        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
-        self.assertEqual(spec._tcgen05_num_epi_warps_validation_choices, (4,))
+        self.assertEqual(spec.tcgen05.num_epi_warps_search_choices, (4,))
+        self.assertEqual(spec.tcgen05.num_epi_warps_validation_choices, (4,))
         # Non-4 values are rejected: silent wrong output on the
         # current SIMT-store epilogue.
         for n_epi in (1, 2, 3):
@@ -2242,24 +2073,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         validation default.
         """
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         spec = bound.config_spec
         # The narrowed search default is what default_config() exposes.
         default_cfg = spec.default_config()
@@ -2283,8 +2102,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # a legal user-supplied value (otherwise constructing the
         # ``helion.Config(tcgen05_num_epi_warps=2)`` below would be
         # rejected by ``normalize``'s validation pass).
-        spec._tcgen05_num_epi_warps_validation_choices = None
-        spec.restrict_tcgen05_num_epi_warps_search((2,))
+        spec.tcgen05.num_epi_warps_validation_choices = None
+        surface.restrict_num_epi_warps_search(spec.tcgen05, (2,))
         new_default = spec.default_config()
         self.assertEqual(new_default.config["tcgen05_num_epi_warps"], 2)
         winning_2 = helion.Config(**new_default.config)
@@ -2476,8 +2295,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
         self.assertEqual(with_scheduler_cfg.config["tcgen05_cluster_m"], 1)
 
-        # ``DYNAMIC_PERSISTENT`` is not in the persistence-model
-        # fragment surface today (no codegen supports it).
+        # A persistence model outside the enum is refused by the
+        # strategy validation fragment.
         with self.assertRaises(InvalidConfig):
             spec.normalize(
                 helion.Config(**base, tcgen05_persistence_model="dynamic_persistent")
@@ -2590,17 +2409,20 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
         self.assertTrue(any("scheduler_warps=1" in e for e in errors))
 
-        # DYNAMIC_PERSISTENT under a strategy that does not support it.
+        # CLC_PERSISTENT under a strategy that does not support it (the
+        # monolithic role-local lowering has no scheduler warp to issue CLC).
         errors = validate_tcgen05_strategy_invariants(
             strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
-            persistence_model=Tcgen05PersistenceModel.DYNAMIC_PERSISTENT,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
             layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
             warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
             layout_overrides=Tcgen05LayoutOverrides(),
             pid_type="persistent_blocked",
             cluster_m=1,
         )
-        self.assertTrue(any("dynamic_persistent" in e for e in errors))
+        self.assertTrue(
+            any("clc_persistent" in e and "not supported" in e for e in errors)
+        )
 
         # ``ROLE_LOCAL_WITH_SCHEDULER`` runs at cluster_m ∈ {1, 2}.
         # cluster_m=3+ falls outside the supported set; the
@@ -2859,7 +2681,6 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             "cluster_m": 1,
             "is_two_cta": False,
             "uses_role_local_persistent_body": True,
-            "uses_cluster_m2_one_cta_role_local_bridge": False,
             "cta_thread_count": 256,
             "physical_m_threads": 128,
             "acc_stage_count": 2,
@@ -3095,7 +2916,6 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             cluster_m=2,
             is_two_cta=True,
             uses_role_local_persistent_body=True,
-            uses_cluster_m2_one_cta_role_local_bridge=False,
             cta_thread_count=256,
             physical_m_threads=32,
             acc_stage_count=2,
@@ -3195,8 +3015,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         with self.assertRaisesRegex(
             InvalidConfig, "tcgen05 strategy invariants violated"
         ):
-            tcfg.validate_strategy_invariants(dict(config), fix_invalid=False)
-        tcfg.validate_strategy_invariants(config, fix_invalid=True)
+            repair.validate_strategy_invariants(tcfg, dict(config), fix_invalid=False)
+        repair.validate_strategy_invariants(tcfg, config, fix_invalid=True)
         self.assertEqual(config["tcgen05_strategy"], "role_local_monolithic")
         self.assertEqual(config["tcgen05_persistence_model"], "static_persistent")
         self.assertEqual(config["tcgen05_layout_strategy"], "default")
@@ -3206,7 +3026,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         config2 = _base_strategy_config()
         config2["tcgen05_layout_strategy"] = "default"
         config2["tcgen05_layout_overrides_epi_tile_n"] = 64
-        tcfg.validate_strategy_invariants(config2, fix_invalid=True)
+        repair.validate_strategy_invariants(tcfg, config2, fix_invalid=True)
         self.assertIsNone(config2["tcgen05_layout_overrides_epi_tile_n"])
         self.assertEqual(config2["tcgen05_layout_strategy"], "default")
 
@@ -3215,7 +3035,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         config3 = _base_strategy_config()
         config3["tcgen05_layout_strategy"] = "default"
         config3["tcgen05_layout_overrides_d_store_box_n"] = 32
-        tcfg.validate_strategy_invariants(config3, fix_invalid=True)
+        repair.validate_strategy_invariants(tcfg, config3, fix_invalid=True)
         self.assertIsNone(config3["tcgen05_layout_overrides_d_store_box_n"])
         self.assertEqual(config3["tcgen05_layout_strategy"], "default")
 
@@ -3232,9 +3052,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         ``contradicts pid_type`` invariant.
 
         The path: a search config with ``pid_type="flat"`` and
-        ``tcgen05_cluster_m=2`` lands in ``_fix_tcgen05_cluster_m2_search_config``,
-        which rewrites ``pid_type`` to ``persistent_interleaved``. The
-        derived persistence model must follow that rewrite.
+        ``tcgen05_cluster_m=2`` lands in
+        ``tcgen05_config.repair._fix_cluster_m2_search_config``, which rewrites
+        ``pid_type`` to ``persistent_interleaved``. The derived persistence
+        model must follow that rewrite.
         """
 
         spec = _bind_cute_strategy_kernel().config_spec

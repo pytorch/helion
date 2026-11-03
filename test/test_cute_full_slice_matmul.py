@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import ast
-from contextlib import ExitStack
+from contextlib import contextmanager
 import dataclasses
 import sys
 from types import FunctionType
 from types import ModuleType
 from typing import TYPE_CHECKING
 from typing import cast
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -16,23 +15,23 @@ import torch
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.device_ir import ForLoopGraphInfo
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing import patch_target_facts
 import helion.language as hl
 from helion.runtime.ref_mode import RefMode
 from helion.runtime.ref_mode import RefModeContext
 from helion.runtime.ref_mode import RefModeTorchFunctionMode
 
+pytestmark = pytest.mark.cpu_only
+
 squeeze_and_excitation_net_fwd = import_example(
     "squeeze_and_excitation_net"
 ).squeeze_and_excitation_net_fwd
-
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
-
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Generator
+    from collections.abc import Iterator
     from typing import Any
 
     from helion._compiler.host_function import HostFunction
@@ -283,20 +282,17 @@ def _direct_imports(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _cpu_target() -> ExitStack:
-    stack = ExitStack()
-    for name, value in (
-        ("helion.runtime.kernel.target_device_capability", (10, 0)),
-        ("helion._compiler.compile_environment.target_device_capability", (10, 0)),
-        ("helion.runtime.get_num_sm", 148),
-        ("helion._compat._is_hip", False),
-        (
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            128 * 1024,
-        ),
+@contextmanager
+def _cpu_target() -> Iterator[None]:
+    """The B200 capability, SM count and HIP flag with a 128 KiB reduction
+    SMEM budget (the tcgen05 SMEM capacity stays unmodelled)."""
+    with patch_target_facts(
+        capability=(10, 0),
+        num_sm=148,
+        is_hip=False,
+        reduction_smem_budget_bytes=128 * 1024,
     ):
-        stack.enter_context(patch(name, return_value=value))
-    return stack
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -305,10 +301,7 @@ def _cpu_only() -> Generator[None, None, None]:
     torch.set_num_threads(1)
     # Hardware specialization also runs for CPU arguments. Keep these target
     # mocks independent of whether this pytest worker can see a real GPU.
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
+    with cpu_render_target():
         yield
     torch.set_num_threads(previous)
 

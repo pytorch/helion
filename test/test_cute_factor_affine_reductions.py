@@ -11,9 +11,9 @@ import torch
 from helion._compiler.ast_extension import ExtendedAST
 from helion._compiler.ast_extension import convert
 from helion._compiler.ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from helion._compiler.cute._ast_pass_utils import names_read
 from helion._compiler.cute.factor_affine_reductions import _live_before_block
 from helion._compiler.cute.factor_affine_reductions import _live_before_suffixes
-from helion._compiler.cute.factor_affine_reductions import _names_read
 from helion._compiler.cute.factor_affine_reductions import _names_read_suffixes
 from helion._compiler.cute.factor_affine_reductions import factor_affine_reductions
 from helion._compiler.cute.factor_affine_reductions import hoist_factored_reductions
@@ -354,9 +354,8 @@ def _assert_factored_ast_unchanged(source: str) -> None:
     assert ast.unparse(ast.Module(body=rewritten, type_ignores=[])) == before
 
 
-def test_rejected_fusion_does_not_mutate_second_lane_name() -> None:
-    _assert_factored_ast_unchanged(
-        """
+_UNCHANGED_FACTORED_SOURCES = {
+    "rejected_fusion_does_not_mutate_second_lane_name": """
 cache = cute.make_rmem_tensor(8, cutlass.Float32)
 for row_lane in range(16):
     first_acc = cutlass.Float32(0)
@@ -372,13 +371,8 @@ for row_lane in range(16):
     _helion_factored_base_sum = cutlass.Float32(
         cute.arch.warp_reduction_sum(second_acc)
     )
-"""
-    )
-
-
-def test_does_not_fuse_when_second_initializer_crosses_a_read() -> None:
-    _assert_factored_ast_unchanged(
-        """
+""",
+    "does_not_fuse_when_second_initializer_crosses_a_read": """
 cache = cute.make_rmem_tensor(8, cutlass.Float32)
 second_acc = cutlass.Float32(7)
 for row_lane in range(16):
@@ -396,13 +390,8 @@ for row_lane in range(16):
     _helion_factored_base_sum = cutlass.Float32(
         cute.arch.warp_reduction_sum(second_acc)
     )
-"""
-    )
-
-
-def test_does_not_fuse_cross_loop_scalar_dataflow() -> None:
-    _assert_factored_ast_unchanged(
-        """
+""",
+    "does_not_fuse_cross_loop_scalar_dataflow": """
 cache = cute.make_rmem_tensor(8, cutlass.Float32)
 for row_lane in range(16):
     first_acc = cutlass.Float32(0)
@@ -418,13 +407,8 @@ for row_lane in range(16):
     _helion_factored_base_sum = cutlass.Float32(
         cute.arch.warp_reduction_sum(second_acc)
     )
-"""
-    )
-
-
-def test_does_not_fuse_second_loop_across_first_reduction_dependency() -> None:
-    _assert_factored_ast_unchanged(
-        """
+""",
+    "does_not_fuse_second_loop_across_first_reduction_dependency": """
 cache = cute.make_rmem_tensor(8, cutlass.Float32)
 for row_lane in range(16):
     first_acc = cutlass.Float32(0)
@@ -440,13 +424,8 @@ for row_lane in range(16):
     _helion_factored_base_sum = cutlass.Float32(
         cute.arch.warp_reduction_sum(second_acc)
     )
-"""
-    )
-
-
-def test_does_not_fuse_second_loop_overwriting_first_reduction() -> None:
-    _assert_factored_ast_unchanged(
-        """
+""",
+    "does_not_fuse_second_loop_overwriting_first_reduction": """
 cache = cute.make_rmem_tensor(8, cutlass.Float32)
 for row_lane in range(16):
     first_acc = cutlass.Float32(0)
@@ -463,8 +442,43 @@ for row_lane in range(16):
     _helion_factored_base_sum = cutlass.Float32(
         cute.arch.warp_reduction_sum(second_acc)
     )
-"""
+""",
+    "does_not_fuse_aliased_register_fragment": """
+cache = cute.make_rmem_tensor(8, cutlass.Float32)
+alias = cache
+for row_lane in range(16):
+    first_acc = cutlass.Float32(0)
+    for lane in cutlass.range_constexpr(8):
+        value = source[lane]
+        cache[lane] = value
+        first_acc = first_acc + cutlass.Float32(value)
+    first = cutlass.Float32(cute.arch.warp_reduction_sum(first_acc))
+    second_acc = cutlass.Float32(0)
+    for lane in cutlass.range_constexpr(8):
+        value = alias[lane]
+        second_acc = second_acc + cutlass.Float32(value)
+    _helion_factored_base_sum = cutlass.Float32(
+        cute.arch.warp_reduction_sum(second_acc)
     )
+""",
+    "does_not_hoist_untracked_arch_load": """
+for row_lane in range(16):
+    dot_acc = cutlass.Float32(0)
+    for k_lane in cutlass.range_constexpr(8):
+        value = cute.arch.load(pointer + k_lane, cutlass.Float32)
+        dot_acc = dot_acc + cutlass.Float32(value)
+    _helion_factored_dot_sum = cutlass.Float32(
+        cute.arch.warp_reduction_sum(dot_acc)
+    )
+    output = scalar[row_lane] * _helion_factored_dot_sum
+""",
+}
+
+
+@pytest.mark.parametrize("case", list(_UNCHANGED_FACTORED_SOURCES))
+def test_factored_ast_unchanged(case: str) -> None:
+    source = _UNCHANGED_FACTORED_SOURCES[case]
+    _assert_factored_ast_unchanged(source)
 
 
 def test_does_not_fuse_cache_read_after_write_or_noninjective_stores() -> None:
@@ -488,29 +502,6 @@ for row_lane in range(16):
     )
 """
         )
-
-
-def test_does_not_fuse_aliased_register_fragment() -> None:
-    _assert_factored_ast_unchanged(
-        """
-cache = cute.make_rmem_tensor(8, cutlass.Float32)
-alias = cache
-for row_lane in range(16):
-    first_acc = cutlass.Float32(0)
-    for lane in cutlass.range_constexpr(8):
-        value = source[lane]
-        cache[lane] = value
-        first_acc = first_acc + cutlass.Float32(value)
-    first = cutlass.Float32(cute.arch.warp_reduction_sum(first_acc))
-    second_acc = cutlass.Float32(0)
-    for lane in cutlass.range_constexpr(8):
-        value = alias[lane]
-        second_acc = second_acc + cutlass.Float32(value)
-    _helion_factored_base_sum = cutlass.Float32(
-        cute.arch.warp_reduction_sum(second_acc)
-    )
-"""
-    )
 
 
 def test_does_not_hoist_unused_effect_or_forward_dependency() -> None:
@@ -554,22 +545,6 @@ for row_lane in range(16):
 consume(dot_acc)
 """
         _assert_factored_ast_unchanged(source)
-
-
-def test_does_not_hoist_untracked_arch_load() -> None:
-    _assert_factored_ast_unchanged(
-        """
-for row_lane in range(16):
-    dot_acc = cutlass.Float32(0)
-    for k_lane in cutlass.range_constexpr(8):
-        value = cute.arch.load(pointer + k_lane, cutlass.Float32)
-        dot_acc = dot_acc + cutlass.Float32(value)
-    _helion_factored_dot_sum = cutlass.Float32(
-        cute.arch.warp_reduction_sum(dot_acc)
-    )
-    output = scalar[row_lane] * _helion_factored_dot_sum
-"""
-    )
 
 
 def _packed_code(
@@ -998,8 +973,8 @@ def test_does_not_pack_odd_width_fp32_loop() -> None:
     assert _packed_code(source) == ast.unparse(ast.parse(source))
 
 
-def test_does_not_pack_loop_with_unknown_effect() -> None:
-    source = """
+_UNPACKED_LOOPS = {
+    "loop_with_unknown_effect": """
 cache = cute.make_rmem_tensor(8, cutlass.BFloat16)
 acc = cutlass.Float32(0)
 for lane in cutlass.range_constexpr(8):
@@ -1007,13 +982,8 @@ for lane in cutlass.range_constexpr(8):
     observe(value)
     acc = acc + value
 result = cute.arch.warp_reduction_sum(acc)
-"""
-
-    assert _packed_code(source) == ast.unparse(ast.parse(source))
-
-
-def test_does_not_pack_store_through_aliased_fragment() -> None:
-    source = """
+""",
+    "store_through_aliased_fragment": """
 cache = cute.make_rmem_tensor(8, cutlass.BFloat16)
 alias = cache
 acc = cutlass.Float32(0)
@@ -1022,13 +992,8 @@ for lane in cutlass.range_constexpr(8):
     cache[lane] = value
     acc = acc + value
 result = cute.arch.warp_reduction_sum(acc)
-"""
-
-    assert _packed_code(source) == ast.unparse(ast.parse(source))
-
-
-def test_does_not_pack_store_with_noninjective_lane_index() -> None:
-    source = """
+""",
+    "store_with_noninjective_lane_index": """
 cache = cute.make_rmem_tensor(8, cutlass.Float32)
 acc = cutlass.Float32(0)
 for lane in cutlass.range_constexpr(8):
@@ -1036,13 +1001,8 @@ for lane in cutlass.range_constexpr(8):
     cache[lane % 2] = value
     acc = acc + value
 result = cute.arch.warp_reduction_sum(acc)
-"""
-
-    assert _packed_code(source) == ast.unparse(ast.parse(source))
-
-
-def test_does_not_pack_overlapping_affine_store_mappings() -> None:
-    source = """
+""",
+    "overlapping_affine_store_mappings": """
 cache = cute.make_rmem_tensor(9, cutlass.Float32)
 first_acc = cutlass.Float32(0)
 second_acc = cutlass.Float32(0)
@@ -1054,13 +1014,8 @@ for lane in cutlass.range_constexpr(8):
     first_acc = first_acc + first
     second_acc = second_acc + second
 consume(first_acc, second_acc, cache)
-"""
-
-    assert _packed_code(source) == ast.unparse(ast.parse(source))
-
-
-def test_does_not_assume_loop_local_index_component_is_invariant() -> None:
-    source = """
+""",
+    "does_not_assume_loop_local_index_component_is_invariant": """
 cache = cute.make_rmem_tensor(8, cutlass.Float32)
 acc = cutlass.Float32(0)
 for lane in cutlass.range_constexpr(8):
@@ -1069,13 +1024,8 @@ for lane in cutlass.range_constexpr(8):
     cache[lane + offset] = value
     acc = acc + value
 result = cute.arch.warp_reduction_sum(acc)
-"""
-
-    assert _packed_code(source) == ast.unparse(ast.parse(source))
-
-
-def test_does_not_pack_cross_lane_fragment_dependency() -> None:
-    source = """
+""",
+    "cross_lane_fragment_dependency": """
 cache = cute.make_rmem_tensor(8, cutlass.Float32)
 acc = cutlass.Float32(0)
 for lane in cutlass.range_constexpr(8):
@@ -1083,26 +1033,16 @@ for lane in cutlass.range_constexpr(8):
     value = cache[lane - 1]
     acc = acc + value
 result = cute.arch.warp_reduction_sum(acc)
-"""
-
-    assert _packed_code(source) == ast.unparse(ast.parse(source))
-
-
-def test_does_not_pack_loop_local_value_used_after_loop() -> None:
-    source = """
+""",
+    "loop_local_value_used_after_loop": """
 cache = cute.make_rmem_tensor(8, cutlass.Float32)
 acc = cutlass.Float32(0)
 for lane in cutlass.range_constexpr(8):
     value = cache[lane]
     acc = acc + value
 result = value + cute.arch.warp_reduction_sum(acc)
-"""
-
-    assert _packed_code(source) == ast.unparse(ast.parse(source))
-
-
-def test_does_not_pack_conditionally_overwritten_loop_local() -> None:
-    source = """
+""",
+    "conditionally_overwritten_loop_local": """
 cache = cute.make_rmem_tensor(8, cutlass.Float32)
 acc = cutlass.Float32(0)
 for lane in cutlass.range_constexpr(8):
@@ -1111,13 +1051,8 @@ for lane in cutlass.range_constexpr(8):
 if condition:
     value = cutlass.Float32(0)
 consume(value, acc)
-"""
-
-    assert _packed_code(source) == ast.unparse(ast.parse(source))
-
-
-def test_does_not_pack_loop_local_escaping_enclosing_branch() -> None:
-    source = """
+""",
+    "loop_local_escaping_enclosing_branch": """
 cache = cute.make_rmem_tensor(8, cutlass.Float32)
 if condition:
     acc = cutlass.Float32(0)
@@ -1127,13 +1062,8 @@ if condition:
 else:
     value = cutlass.Float32(0)
 consume(value)
-"""
-
-    assert _packed_code(source) == ast.unparse(ast.parse(source))
-
-
-def test_does_not_pack_loop_local_used_on_enclosing_loop_backedge() -> None:
-    source = """
+""",
+    "loop_local_used_on_enclosing_loop_backedge": """
 value = cutlass.Float32(7)
 for outer in range(4):
     consume(value)
@@ -1142,13 +1072,8 @@ for outer in range(4):
     for lane in cutlass.range_constexpr(8):
         value = cache[lane]
         acc = acc + value
-"""
-
-    assert _packed_code(source) == ast.unparse(ast.parse(source))
-
-
-def test_does_not_pack_mixed_fp32_float64_expression() -> None:
-    source = """
+""",
+    "mixed_fp32_float64_expression": """
 left = cute.make_rmem_tensor(8, cutlass.Float32)
 right = cute.make_rmem_tensor(8, cutlass.Float64)
 acc = cutlass.Float32(0)
@@ -1156,8 +1081,21 @@ for lane in cutlass.range_constexpr(8):
     product = left[lane] * right[lane]
     acc = acc + product
 consume(acc)
-"""
+""",
+    "append_with_nested_effect": """
+cache = cute.make_rmem_tensor(8, cutlass.Float32)
+values = []
+for lane in cutlass.range_constexpr(8):
+    value = cache[lane] * scale
+    values.append(convert_and_record(value))
+consume(values)
+""",
+}
 
+
+@pytest.mark.parametrize("case", list(_UNPACKED_LOOPS))
+def test_does_not_pack(case: str) -> None:
+    source = _UNPACKED_LOOPS[case]
     assert _packed_code(source) == ast.unparse(ast.parse(source))
 
 
@@ -1194,19 +1132,6 @@ consume(values)
     assert _packed_code(source, float_scalar_names={"scale"}) == ast.unparse(
         ast.parse(source)
     )
-
-
-def test_does_not_pack_append_with_nested_effect() -> None:
-    source = """
-cache = cute.make_rmem_tensor(8, cutlass.Float32)
-values = []
-for lane in cutlass.range_constexpr(8):
-    value = cache[lane] * scale
-    values.append(convert_and_record(value))
-consume(values)
-"""
-
-    assert _packed_code(source) == ast.unparse(ast.parse(source))
 
 
 def test_packed_fp32_loop_is_idempotent() -> None:
@@ -1250,6 +1175,5 @@ e = d + c + z
         _live_before_block(body[index:], live_out=live_out) for index in suffixes
     ]
     assert _names_read_suffixes(body) == [
-        _names_read(ast.Module(body=body[index:], type_ignores=[]))
-        for index in suffixes
+        names_read(ast.Module(body=body[index:], type_ignores=[])) for index in suffixes
     ]

@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 
 _STANDALONE_LAUNCHES: dict[str, tuple[Any, ...]] = {}
 _STANDALONE_COMPILED: dict[tuple[str, int], Any] = {}
+# A frozen copy of ``helion._compiler.cute.dtypes.CUTLASS_POINTER_DTYPE_NAME``
+# keyed by ``str(dtype)`` (this module stays Helion-free; a test keeps them equal).
 _STANDALONE_DTYPES = {
     "torch.float16": cutlass.Float16,
     "torch.bfloat16": cutlass.BFloat16,
@@ -36,6 +38,7 @@ _STANDALONE_DTYPES = {
     "torch.bool": cutlass.Uint8,
     "torch.float8_e4m3fn": cutlass.Float8E4M3FN,
     "torch.float8_e5m2": cutlass.Float8E5M2,
+    "torch.float8_e8m0fnu": cutlass.Float8E8M0FNU,
     "torch.float4_e2m1fn_x2": cutlass.Uint8,
 }
 

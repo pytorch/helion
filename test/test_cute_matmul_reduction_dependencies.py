@@ -15,8 +15,9 @@ from test.test_cute_staged_matmul_reductions import _marker
 from test.test_cute_staged_matmul_reductions import _source
 
 import helion
-from helion._compiler import tile_strategy as lanes
 from helion._compiler.cute import matmul_fallback
+from helion._compiler.cute.lane_loops.markers import _lane_reduce_marker_expr
+from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 from helion._compiler.generate_ast import GenerateAST
 
 pytestmark = pytest.mark.cpu_only
@@ -91,7 +92,7 @@ def test_unproved_definition_or_ownership_keeps_old_route(fault: str) -> None:
     elif fault == "unowned":
         prefix = prefix.replace(
             _marker("score", "max"),
-            lanes._lane_reduce_marker_expr(
+            _lane_reduce_marker_expr(
                 "score", "max", "cutlass.Float32(float('-inf'))", 1
             ),
         )
@@ -138,7 +139,7 @@ def test_bare_carry_uses_complete_FP32_products_once_per_tile(
         orelse=[],
     )
     ast.fix_missing_locations(outer)
-    lowered = lanes.split_lane_loop_reductions([outer], rename_groups=_RENAMES)
+    lowered = split_lane_loop_reductions([outer], rename_groups=_RENAMES)
     scores = np.resize(np.array([-2, -1, 0, 1, 2], np.float32), 3 * extent)
     scores[extent : 2 * extent] += 4
     scores[2 * extent :] += 8
@@ -191,7 +192,7 @@ def test_raw_running_sum_with_marker_dependency_still_rejects() -> None:
         )
     )
     with pytest.raises(helion.exc.BackendUnsupported, match="unproved body effect"):
-        lanes.split_lane_loop_reductions(
+        split_lane_loop_reductions(
             [_loop(source=body)], rename_groups=_RENAMES, running_sums={"dot_acc"}
         )
 

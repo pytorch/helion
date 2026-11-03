@@ -35,6 +35,7 @@ from ...language import _tracing_ops
 from ...language import tile_ops
 from ...language import view_ops
 from ..compile_environment import CompileEnvironment
+from .analysis.match_common import node_tensor
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -68,14 +69,6 @@ class FlatGatherLaneSplit:
     lane_dim: int
 
 
-def _value(node: object) -> torch.Tensor | None:
-    if isinstance(node, Node):
-        value = node.meta.get("val")
-        if isinstance(value, torch.Tensor):
-            return value
-    return None
-
-
 def _is_broadcast_view(node: Node) -> bool:
     if node.target is view_ops.subscript:
         subscripts = node.args[1]
@@ -104,7 +97,7 @@ def _tile_index_block(node: object, env: CompileEnvironment) -> int | None:
     current = node
     while isinstance(current, Node) and current.op == "call_function":
         if current.target is tile_ops.tile_index:
-            value = _value(current)
+            value = node_tensor(current)
             if value is None or value.ndim != 1:
                 return None
             return _block_id_of_size(env, value.shape[0])
@@ -174,15 +167,15 @@ def match_flat_gather_lane(
         return None
     if index.kwargs.get("alpha", 1) != 1 or set(index.kwargs) - {"alpha"}:
         return None
-    index_value = _value(index)
+    index_value = node_tensor(index)
     if index_value is None or index_value.dtype not in _INTEGER_DTYPES:
         return None
     for lane_term, row in (index.args, index.args[::-1]):
         block_id = _tile_index_block(lane_term, env)
         if block_id is None or not isinstance(row, Node):
             continue
-        lane_value = _value(lane_term)
-        row_value = _value(row)
+        lane_value = node_tensor(lane_term)
+        row_value = node_tensor(row)
         if lane_value is None or row_value is None:
             continue
         if row_value.dtype not in _INTEGER_DTYPES:
@@ -254,7 +247,7 @@ def row_is_multiple_of(
         if depth > 64:
             return False
         memo[value] = False
-        tensor = _value(value)
+        tensor = node_tensor(value)
         result = False
         if tensor is not None and tensor.dtype in _INTEGER_DTYPES:
             if _is_broadcast_view(value):
@@ -268,7 +261,7 @@ def row_is_multiple_of(
                 for scalar, other in ((left, right), (right, left)):
                     if _scalar(scalar) is None:
                         continue
-                    other_value = _value(other)
+                    other_value = node_tensor(other)
                     if not (
                         type(other) is int
                         or (
@@ -315,10 +308,10 @@ def flat_gather_sink_vec_width(
     dtype; ``row`` must be a multiple of V and every tensor's base aligned
     for it.  None when any access fails or none exists.
     """
-    from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
     from ...language.memory_ops import load
     from ...language.memory_ops import store
     from ..device_ir import ForLoopGraphInfo
+    from .emitters.lane_packets import _CUTE_VECTOR_MAX_BYTES
 
     # The alignment proof reads the bound inputs through the host function
     # and the compile environment; the autotuner heuristics may ask outside
@@ -335,14 +328,14 @@ def flat_gather_sink_vec_width(
         for node in graph_info.graph.nodes:
             if node.op != "call_function" or node.target not in (load, store):
                 continue
-            tensor = _value(node.args[0])
+            tensor = node_tensor(node.args[0])
             subscript = node.args[1]
             if tensor is None or not isinstance(subscript, (list, tuple)):
                 continue
             positions = [
                 pos
                 for pos, item in enumerate(subscript)
-                if isinstance(item, Node) and _value(item) is not None
+                if isinstance(item, Node) and node_tensor(item) is not None
             ]
             if not positions:
                 continue
@@ -407,7 +400,7 @@ def flat_gather_rows_hint(
         for node in graph_info.graph.nodes:
             if node.op != "call_function" or node.target not in (load, store):
                 continue
-            tensor = _value(node.args[0])
+            tensor = node_tensor(node.args[0])
             subscript = node.args[1]
             if tensor is None or not isinstance(subscript, (list, tuple)):
                 continue

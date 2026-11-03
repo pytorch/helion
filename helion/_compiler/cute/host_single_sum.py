@@ -1,4 +1,11 @@
-"""Typed proof for one terminal host FP32 sum followed by a final cast."""
+"""Typed proof for one terminal host FP32 sum followed by a final cast.
+
+The second of the three host-sum tails (:mod:`host_sums`): a ``return`` whose
+value (or whose tuple's last element) is ``<2-D FP32>.sum(0).to(<dtype>)``
+becomes one ``_cute_try_single_sum_cast`` call
+(:mod:`helion.runtime.cute.single_sum`) with the original return as the
+fallback.
+"""
 
 from __future__ import annotations
 
@@ -9,12 +16,15 @@ from typing import TYPE_CHECKING
 import torch
 
 from ..ast_extension import ExtendedAST
-from ..ast_extension import statement_from_string
-from .host_paired_sum import PAIRED_SUM_CHOICES
-from .host_paired_sum import SumCastValue
-from .host_paired_sum import _constant_condition
-from .host_paired_sum import _folded_body
-from .host_paired_sum import _sum_cast_value
+from .host_sum_site import PAIRED_SUM_CHOICES
+from .host_sum_site import HostSumSite
+from .host_sum_site import SumCastValue
+from .host_sum_site import assigned_names
+from .host_sum_site import bound_names
+from .host_sum_site import fold_constexpr_branches
+from .host_sum_site import fresh_temporary
+from .host_sum_site import prove_host_body
+from .host_sum_site import sum_cast_value
 
 if TYPE_CHECKING:
     from ..host_function import HostFunction
@@ -46,37 +56,11 @@ def prove_host_single_sum(host: HostFunction) -> HostSingleSumProof:
     every unsupported runtime binding, including autograd and custom dispatch.
     Only typed constexpr branches are folded; dynamic bodies are not searched.
     """
-    nodes = list(ast.walk(ast.Module(body=host.body, type_ignores=[])))
-    # Any lexical binding can shadow the injected module import, including a
-    # local store after the return. Apply this proof before exposing seeds.
-    if host.name == _SINGLE_SUM_HELPER or any(
-        (isinstance(node, ast.Name) and node.id == _SINGLE_SUM_HELPER)
-        or (isinstance(node, ast.arg) and node.arg == _SINGLE_SUM_HELPER)
-        or (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-            and node.name == _SINGLE_SUM_HELPER
-        )
-        or (
-            isinstance(node, ast.alias)
-            and (node.asname or node.name.split(".", 1)[0]) == _SINGLE_SUM_HELPER
-        )
-        for node in (*nodes, *ast.walk(host.args))
-    ):
+    facts = prove_host_body(host, (_SINGLE_SUM_HELPER,))
+    if facts is None:
         return HostSingleSumProof(None, {})
-    if any(
-        isinstance(node, (ast.Delete, ast.Try, ast.Global, ast.Nonlocal))
-        for node in nodes
-    ):
-        return HostSingleSumProof(None, {})
-    conditions = {
-        node._location: (ast.dump(node.test), condition)
-        for node in nodes
-        if isinstance(node, ast.If)
-        and isinstance(node, ExtendedAST)
-        and (condition := _constant_condition(node.test, host)) is not None
-    }
-    defined = {argument.arg for argument in host.args.args}
-    for statement in _folded_body(host.body, conditions):
+    defined = facts.defined
+    for statement in facts.folded:
         if isinstance(statement, ast.Return):
             if not isinstance(statement, ExtendedAST) or statement.value is None:
                 break
@@ -93,7 +77,7 @@ def prove_host_single_sum(host: HostFunction) -> HostSingleSumProof:
                 if len(prefix) != len(expression.elts) - 1:
                     break
                 expression = expression.elts[-1]
-            value = _sum_cast_value(
+            value = sum_cast_value(
                 expression, (torch.float16, torch.bfloat16, torch.float32)
             )
             if value is None:
@@ -106,18 +90,13 @@ def prove_host_single_sum(host: HostFunction) -> HostSingleSumProof:
                     ReturnedSum(
                         statement._location, ast.dump(statement), value, prefix
                     ),
-                    conditions,
+                    facts.conditions,
                 )
             break
         if isinstance(statement, ast.Raise):
             break
-        if isinstance(statement, ast.Assign):
-            defined.update(
-                target.id
-                for target in statement.targets
-                if isinstance(target, ast.Name)
-            )
-    return HostSingleSumProof(None, conditions)
+        defined.update(assigned_names(statement))
+    return HostSingleSumProof(None, facts.conditions)
 
 
 def lower_host_single_sum(
@@ -130,17 +109,8 @@ def lower_host_single_sum(
     proof = prove_host_single_sum(host)
     if (site := proof.site) is None:
         return body
-    folded = _folded_body(body, proof.conditions)
-    names = {
-        node.id
-        for statement in folded
-        for node in ast.walk(statement)
-        if isinstance(node, ast.Name)
-    }
-    names.update(argument.arg for argument in host.args.args)
-    temporary = "_helion_single_sum"
-    while temporary in names:
-        temporary += "_"
+    folded = fold_constexpr_branches(body, proof.conditions)
+    temporary = fresh_temporary("_helion_single_sum", bound_names(host, folded))
     for index, statement in enumerate(folded):
         if not (
             isinstance(statement, ast.Return)
@@ -158,19 +128,15 @@ def lower_host_single_sum(
             )
         return [
             *folded[:index],
-            statement_from_string(
-                f"{temporary} = {_SINGLE_SUM_HELPER}("
+            *HostSumSite(
+                temporary,
+                f"{_SINGLE_SUM_HELPER}("
                 f"{value.source}, {value.dtype_argument}, "
                 f"dtype_is_tensor={value.dtype_is_tensor!r}, layout={layout!r}, "
-                "_launcher=_launcher)"
-            ),
-            ast.If(
-                test=ast.Compare(
-                    ast.Name(temporary, ast.Load()), [ast.Is()], [ast.Constant(None)]
-                ),
-                body=[statement],
-                orelse=[ast.Return(result)],
-            ),
+                "_launcher=_launcher)",
+                (statement,),
+                orelse=(ast.Return(result),),
+            ).emit(),
             *folded[index + 1 :],
         ]
     return body

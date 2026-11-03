@@ -4,13 +4,13 @@ import ast
 
 import pytest
 
+from helion._compiler.cute.lane_loops.markers import _LaneReduceMarker
+from helion._compiler.cute.lane_loops.split import _lane_split_reorders_aliasing_memory
 from helion._compiler.cute.persistent_branch_vec import _BranchLocalPersistentVectorizer
 from helion._compiler.cute.persistent_branch_vec import _definition_snapshots
 from helion._compiler.cute.persistent_branch_vec import (
     _memory_address_definition_snapshots,
 )
-from helion._compiler.tile_strategy import _lane_split_reorders_aliasing_memory
-from helion._compiler.tile_strategy import _LaneReduceMarker
 
 pytestmark = pytest.mark.cpu_only
 

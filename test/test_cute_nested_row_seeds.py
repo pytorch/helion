@@ -7,13 +7,12 @@ import torch
 
 import helion
 from helion._compiler.autotuner_heuristics import get_heuristics
-from helion._compiler.autotuner_heuristics.cute import CuteNestedRowHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteSiblingRowHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteNestedRowHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteSiblingRowHeuristic
 from helion._compiler.cute.loop_nesting import tile_loop_paths
 from helion._compiler.cute.thread_budget import tile_loop_thread_count
 from helion._testing import DEVICE
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
@@ -23,8 +22,6 @@ jagged_layer_norm_kernel = _examples_jagged_layer_norm.jagged_layer_norm_kernel
 reference_jagged_layer_norm_pytorch = (
     _examples_jagged_layer_norm.reference_jagged_layer_norm_pytorch
 )
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @pytest.mark.parametrize("columns", [32, 69, 128, 512])
@@ -95,7 +92,7 @@ def test_nested_jagged_passes_receive_reachable_coherent_seeds(
             continue
         rendered.add(family)
         with patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ):
             source = bound.to_code(seed)
@@ -141,7 +138,7 @@ def test_nested_jagged_default_is_the_primary_seed(
     # calls), and it waits ahead of its first global access.
     assert default.config["cute_pdl"] is True
     with patch(
-        "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+        "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
         return_value=232448,
     ):
         source = bound.to_code(default)
@@ -268,7 +265,7 @@ def test_flat_jagged_search_reaches_wide_coherent_vector_sweeps(
             fragment = item._fragment(spec)
             assert fragment.low <= size <= fragment.high
         with patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ):
             assert "def _helion_jagged_layer_norm_kernel" in bound.to_code(seed)

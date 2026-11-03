@@ -23,7 +23,6 @@ from test.test_cute_structural_cache import _search
 from test.test_cute_structural_compatibility import _pointwise
 
 import helion
-from helion._testing import skipUnlessBackends
 from helion.autotuner.aot_cache import AOTAutotuneCache
 from helion.autotuner.aot_cache import ShapeKey
 from helion.autotuner.aot_cache import find_heuristic_file
@@ -46,10 +45,10 @@ from helion.autotuner.heuristic_generator import evaluate_heuristic
 from helion.autotuner.heuristic_generator import generate_heuristic
 from helion.autotuner.heuristic_generator import get_backend
 from helion.autotuner.heuristic_generator import load_measurements
-from helion.runtime.cute_structural_config import CuteStructuralConfig
-from helion.runtime.cute_structural_config import StructuralPolicyError
-from helion.runtime.cute_structural_policy import CUTE_STRUCTURAL_SETTINGS
-from helion.runtime.cute_structural_policy import CuteStructuralPolicy
+from helion.runtime.cute.structural_config import CuteStructuralConfig
+from helion.runtime.cute.structural_config import StructuralPolicyError
+from helion.runtime.cute.structural_policy import CUTE_STRUCTURAL_SETTINGS
+from helion.runtime.cute.structural_policy import CuteStructuralPolicy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -119,7 +118,6 @@ def _target_options(backend: str) -> PerformanceTarget:
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_real_measurement_partitions_preserve_legacy_and_equal_knob_identity() -> None:
     policies = (
         None,
@@ -158,7 +156,6 @@ def test_real_measurement_partitions_preserve_legacy_and_equal_knob_identity() -
 
 
 @pytest.mark.parametrize("change", ["version", "id", "config", "mixed", "filename"])
-@skipUnlessBackends(["cute"])
 def test_measurement_validation_precedes_config_interpretation(
     change: str, tmp_path: Path
 ) -> None:
@@ -195,7 +192,6 @@ def test_measurement_validation_precedes_config_interpretation(
 
 @pytest.mark.parametrize("backend", ["decision_tree", "nearest_neighbor"])
 @pytest.mark.parametrize("combined", [False, True])
-@skipUnlessBackends(["cute"])
 def test_installed_training_backends_preserve_numeric_keys_and_config_order(
     backend: str,
     combined: bool,
@@ -269,7 +265,6 @@ def test_installed_training_backends_preserve_numeric_keys_and_config_order(
 
 
 @pytest.mark.parametrize("failure", [False, True])
-@skipUnlessBackends(["cute"])
 def test_measure_all_configs_uses_selected_partition_and_restores_provider(
     failure: bool,
 ) -> None:
@@ -309,7 +304,6 @@ def test_measure_all_configs_uses_selected_partition_and_restores_provider(
     assert search.settings.autotune_precompile == original_precompile
 
 
-@skipUnlessBackends(["cute"])
 def test_real_measure_fn_rebinds_and_times_complete_allocating_callable(
     tmp_path: Path,
 ) -> None:
@@ -469,7 +463,6 @@ def test_policy_lookup_never_falls_back_to_unversioned_model(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("backend", ["decision_tree", "nearest_neighbor"])
-@skipUnlessBackends(["cute"])
 def test_actual_runner_partitions_train_and_evaluate_separately(
     backend: str, tmp_path: Path
 ) -> None:
@@ -544,7 +537,6 @@ def test_actual_runner_partitions_train_and_evaluate_separately(
             assert evaluation["_pointwise"]["max_slowdown"] == 1.0
 
 
-@skipUnlessBackends(["cute"])
 def test_content_scoped_model_cache_ignores_stale_same_size_bytecode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -587,7 +579,6 @@ def test_content_scoped_model_cache_ignores_stale_same_size_bytecode(
 
 @pytest.mark.parametrize("backend", ["decision_tree", "nearest_neighbor"])
 @pytest.mark.parametrize("user_key", [False, True])
-@skipUnlessBackends(["cute"])
 def test_feature_evaluation_reuses_real_dtype_and_user_key_features(
     backend: str, user_key: bool, tmp_path: Path
 ) -> None:

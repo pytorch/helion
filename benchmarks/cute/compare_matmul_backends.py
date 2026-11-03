@@ -85,10 +85,6 @@ import torch
 import helion
 from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
 from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_STORE_WARPS_KEY
-from helion._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
-from helion._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
-from helion._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
-from helion._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODES
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
@@ -259,7 +255,6 @@ _TCGEN05_CONFIG_KEYS = (
     "tcgen05_ab_stages",
     "tcgen05_acc_stages",
     "tcgen05_c_stages",
-    TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
     TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
     TCGEN05_C_STORE_MODE_CONFIG_KEY,
@@ -307,7 +302,6 @@ _TWO_CTA_DIAGNOSTIC_BASE = {
     "helion_range_warp_specializes": [None, None],
     "helion_range_num_stages": [0, 0],
     "helion_range_unroll_factors": [0, 0],
-    "helion_acc_producer_mode": TCGEN05_ACC_PRODUCER_MODE_NORMAL,
     "helion_acc_wait_placement": TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
     "helion_c_acquire_placement": TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP,
     "helion_c_store_mode": TCGEN05_C_STORE_MODE_NORMAL,
@@ -673,7 +667,6 @@ _HELION_TWO_CTA_NCU_TARGET_CONFIGS = (
     "two_cta_module_helper_acc_t2r",
     "two_cta_module_helper_store_tail",
     "two_cta_skip_epilogue_store",
-    "two_cta_skip_umma",
     "cluster_m1_flat",
 )
 _QUACK_TWO_CTA_NCU_TARGET_CONFIGS = ("quack_same_tile", "quack_best")
@@ -1331,9 +1324,6 @@ def _make_helion_config_from_args(args: argparse.Namespace) -> helion.Config:
         config[TCGEN05_CONSUMER_REGS_CONFIG_KEY] = args.helion_consumer_regs
     if args.helion_persistence_model is not None:
         config["tcgen05_persistence_model"] = args.helion_persistence_model
-    if args.helion_acc_producer_mode != TCGEN05_ACC_PRODUCER_MODE_NORMAL:
-        config[TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY] = args.helion_acc_producer_mode
-        config[TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY] = True
     if args.helion_acc_wait_placement != TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP:
         config[TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY] = args.helion_acc_wait_placement
     if args.helion_c_acquire_placement != TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP:
@@ -1358,7 +1348,6 @@ def _make_helion_config_from_args(args: argparse.Namespace) -> helion.Config:
 
 _HELION_DIAGNOSTIC_ARG_DEFAULTS: dict[str, object] = {
     "helion_acc_wait_placement": TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
-    "helion_acc_producer_mode": TCGEN05_ACC_PRODUCER_MODE_NORMAL,
     "helion_c_acquire_placement": TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP,
     "helion_c_store_mode": TCGEN05_C_STORE_MODE_NORMAL,
     "helion_aux_load_mode": TCGEN05_AUX_LOAD_MODE_SIMT,
@@ -1388,8 +1377,6 @@ def _helion_diagnostic_flag_args(args: argparse.Namespace) -> list[str]:
                 args.helion_acc_wait_placement,
             ]
         )
-    if args.helion_acc_producer_mode != TCGEN05_ACC_PRODUCER_MODE_NORMAL:
-        result.extend(["--helion-acc-producer-mode", args.helion_acc_producer_mode])
     if args.helion_c_acquire_placement != TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP:
         result.extend(
             [
@@ -1667,7 +1654,7 @@ def _prepare_helion(args: argparse.Namespace) -> _PreparedHelion:
     bound = matmul.bind(kernel_args)
     config = _make_helion_config_from_args(args) if args.helion_force_config else None
     if config is not None and any(key in config.config for key in _TCGEN05_CONFIG_KEYS):
-        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.env.config_spec.tcgen05.search_enabled = True
 
     if config is None:
         active_config = bound.autotune(kernel_args, force=True)
@@ -1990,7 +1977,6 @@ def _two_cta_edge_k_tail_monolithic_args(
             ),
             "helion_range_num_stages": list(_HELION_DEFAULT_RANGE_NUM_STAGES),
             "helion_range_unroll_factors": list(_HELION_DEFAULT_RANGE_UNROLL_FACTORS),
-            "helion_acc_producer_mode": TCGEN05_ACC_PRODUCER_MODE_NORMAL,
             "helion_acc_wait_placement": TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
             "helion_c_acquire_placement": TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
             "helion_c_store_mode": TCGEN05_C_STORE_MODE_NORMAL,
@@ -2083,12 +2069,6 @@ def _two_cta_skip_epilogue_store_args(args: argparse.Namespace) -> argparse.Name
     return argparse.Namespace(**values)
 
 
-def _two_cta_skip_umma_args(args: argparse.Namespace) -> argparse.Namespace:
-    values = vars(_two_cta_seed_args(args)).copy()
-    values["helion_acc_producer_mode"] = TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
-    return argparse.Namespace(**values)
-
-
 def _cluster_m1_flat_args(args: argparse.Namespace) -> argparse.Namespace:
     values = vars(args).copy()
     # Preserve any user-supplied ``--helion-strategy``; the diagnostic
@@ -2116,7 +2096,6 @@ def _cluster_m1_flat_args(args: argparse.Namespace) -> argparse.Namespace:
             "helion_c_stages": 4,
             "helion_num_epi_warps": 4,
             "helion_strategy": user_strategy,
-            "helion_acc_producer_mode": TCGEN05_ACC_PRODUCER_MODE_NORMAL,
             "helion_acc_wait_placement": TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
             "helion_c_acquire_placement": TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP,
             "helion_c_store_mode": TCGEN05_C_STORE_MODE_NORMAL,
@@ -2160,7 +2139,6 @@ def _cluster_m2_cta_group_one_args(args: argparse.Namespace) -> argparse.Namespa
             "helion_c_stages": 4,
             "helion_num_epi_warps": 4,
             "helion_strategy": user_strategy,
-            "helion_acc_producer_mode": TCGEN05_ACC_PRODUCER_MODE_NORMAL,
             "helion_acc_wait_placement": TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
             "helion_c_acquire_placement": TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP,
             "helion_c_store_mode": TCGEN05_C_STORE_MODE_NORMAL,
@@ -2201,8 +2179,6 @@ def _ncu_target_helion_args(args: argparse.Namespace) -> argparse.Namespace:
         return _two_cta_module_helper_store_tail_args(args)
     if args.ncu_target_config == "two_cta_skip_epilogue_store":
         return _two_cta_skip_epilogue_store_args(args)
-    if args.ncu_target_config == "two_cta_skip_umma":
-        return _two_cta_skip_umma_args(args)
     if args.ncu_target_config == "cluster_m1_flat":
         return _cluster_m1_flat_args(args)
     raise RuntimeError(f"unknown NCU target config {args.ncu_target_config!r}")
@@ -6256,15 +6232,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--helion-acc-producer-mode",
-        choices=TCGEN05_ACC_PRODUCER_MODES,
-        default=TCGEN05_ACC_PRODUCER_MODE_NORMAL,
-        help=(
-            "Diagnostic-only invalid-output tcgen05 accumulator producer mode. "
-            "Non-normal values require --skip-correctness 1."
-        ),
-    )
-    parser.add_argument(
         "--helion-c-acquire-placement",
         choices=TCGEN05_C_ACQUIRE_PLACEMENTS,
         default=TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP,
@@ -6490,15 +6457,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def _uses_invalid_output_diagnostic_mode(args: argparse.Namespace) -> bool:
-    if (
-        args.helion_c_store_mode != TCGEN05_C_STORE_MODE_NORMAL
-        or args.helion_acc_producer_mode != TCGEN05_ACC_PRODUCER_MODE_NORMAL
-    ):
+    if args.helion_c_store_mode != TCGEN05_C_STORE_MODE_NORMAL:
         return True
-    return args.ncu_target_config in {
-        "two_cta_skip_epilogue_store",
-        "two_cta_skip_umma",
-    } and (
+    return args.ncu_target_config == "two_cta_skip_epilogue_store" and (
         args.helion_two_cta_ncu_report
         or args.helion_two_cta_ncu_target
         or args.helion_two_cta_cubin_sass_report

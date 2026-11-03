@@ -16,7 +16,7 @@ import torch
 from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
 
-from ..runtime.cute_structural_config import StructuralPolicyError
+from ..runtime.structural_policy import StructuralPolicyError
 from .aot_structural_policy import MODEL_MANIFEST
 from .aot_structural_policy import model_configs
 from .aot_structural_policy import policy_path
@@ -25,8 +25,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from typing import Any
 
-    from ..runtime.cute_structural_policy import CuteStructuralPolicy
     from ..runtime.kernel import BoundKernel
+    from ..runtime.structural_policy import StructuralPolicy
 
 RuntimeGuard = tuple[
     str,
@@ -249,9 +249,7 @@ def _export_call_key(
     return key(args)
 
 
-def _model_manifest(
-    code: str, name: str, policy: CuteStructuralPolicy
-) -> dict[str, Any]:
+def _model_manifest(code: str, name: str, policy: StructuralPolicy) -> dict[str, Any]:
     tree = ast.parse(code)
     values = [
         node.value
@@ -340,7 +338,7 @@ def generate_policy_standalone(
     output_dir: Path,
     kernel_source_file: str | None,
     dispatch_keys: list[tuple[object, ...]] | None,
-    policy: CuteStructuralPolicy,
+    policy: StructuralPolicy,
     user_key: Callable[..., object] | None,
     dynamic_groups: list[tuple[tuple[object, ...], list[int]]] | None,
     runtime_guards: tuple[RuntimeGuard, ...],

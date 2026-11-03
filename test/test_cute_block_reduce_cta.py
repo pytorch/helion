@@ -287,9 +287,10 @@ def test_complete_tile_reduction_native(threads):
 
 @pytest.mark.parametrize("threads", [64, 128, 512])
 def test_multiwarp_finalize_without_group_proof_rejects(threads):
-    from helion._compiler import tile_strategy
+    from helion._compiler.cute.lane_loops.markers import _finalize_lane_reduce_marker
+    from helion._compiler.cute.lane_loops.markers import _LaneReduceMarker
 
-    marker = tile_strategy._LaneReduceMarker(
+    marker = _LaneReduceMarker(
         input_name="value",
         wrap_template="__HELION_FINALIZED__",
         reduction_type="max",
@@ -300,4 +301,4 @@ def test_multiwarp_finalize_without_group_proof_rejects(threads):
     with pytest.raises(
         helion.exc.BackendUnsupported, match="cross-warp grouped finalize"
     ):
-        tile_strategy._finalize_lane_reduce_marker(marker, "acc")
+        _finalize_lane_reduce_marker(marker, "acc")

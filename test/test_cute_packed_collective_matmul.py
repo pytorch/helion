@@ -10,13 +10,12 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_matmul import _tensor_roots
 from helion._compiler.cute.packed_matmul import packed_axis_for_fact
 from helion._compiler.cute.packed_matmul import packed_matmul_axis
 from helion._compiler.tile_strategy import PerThreadNDTileStrategy
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import BackendUnsupported
@@ -101,7 +100,6 @@ def _original_bound(
 @pytest.mark.parametrize(
     "shape", [(128, 256, 128), (512, 1024, 512), (1024, 2048, 1024)]
 )
-@skipUnlessBackends(["cute"])
 def test_original_int4_has_searchable_packed_collective_seeds(
     shape: tuple[int, int, int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -157,7 +155,6 @@ def test_original_int4_has_searchable_packed_collective_seeds(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("factor", [2, 4])
 @pytest.mark.parametrize("use_addmm", [False, True])
-@skipUnlessBackends(["cute"])
 def test_packed_collective_is_not_specific_to_int4(
     dtype: torch.dtype, factor: int, use_addmm: bool
 ) -> None:
@@ -177,7 +174,6 @@ def test_packed_collective_is_not_specific_to_int4(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("n_first", [False, True])
-@skipUnlessBackends(["cute"])
 def test_packed_collective_preserves_input_alias_rejection(
     dtype: torch.dtype, n_first: bool
 ) -> None:
@@ -198,7 +194,6 @@ def test_tensor_subscript_reads_participate_in_alias_proof() -> None:
 @pytest.mark.parametrize(
     "mutation", ["interleave", "extent", "term_dtype", "affine_start"]
 )
-@skipUnlessBackends(["cute"])
 def test_packed_axis_rejects_unproved_interleaving(mutation: str) -> None:
     bound = _original_bound()
     assert bound.host_function is not None
@@ -231,7 +226,6 @@ def test_packed_axis_rejects_unproved_interleaving(mutation: str) -> None:
     assert packed_matmul_axis(bound.env, lhs, rhs) is None
 
 
-@skipUnlessBackends(["cute"])
 def test_nonintegral_mma_expansion_has_no_collective_seed() -> None:
     inputs = (
         torch.empty((73, 117), dtype=torch.bfloat16),
@@ -281,7 +275,6 @@ class _ScalarTensor:
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
-@skipUnlessBackends(["cute"])
 def test_actual_staging_replays_all_nibbles_and_mnk_tail_masks(
     dtype: torch.dtype, compute: str
 ) -> None:

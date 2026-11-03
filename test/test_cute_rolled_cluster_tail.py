@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 from typing import Any
 from unittest.mock import patch
 
@@ -14,33 +13,16 @@ import torch
 
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.reduction_emitter import CuteLoopedReductionEmitter
 from helion._compiler.host_function import HostFunction
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
-pytestmark = pytest.mark.cpu_only
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-        forbid_native_compile() as compiles,
-    ):
-        yield
-        for compile_mock in compiles:
-            compile_mock.assert_not_called()
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(reduction_smem_budget_bytes=232448),
+]
 
 
 def _normalize_rows(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -223,7 +205,9 @@ def test_partial_cluster_keeps_legality_guards(reason: str) -> None:
     )
     fn = SimpleNamespace(
         config=helion.Config(cute_cluster_n=8),
-        cute_state=SimpleNamespace(simt_cluster_n=2 if reason == "claimed" else 1),
+        cute_state=SimpleNamespace(
+            lanes=SimpleNamespace(simt_cluster_n=2 if reason == "claimed" else 1)
+        ),
         new_var=lambda name, **kwargs: name,
     )
     strategy: Any = object.__new__(LoopedReductionStrategy)
@@ -250,6 +234,6 @@ def test_partial_cluster_keeps_legality_guards(reason: str) -> None:
         patch.object(CompileEnvironment, "current", return_value=env),
         patch.object(HostFunction, "current", return_value=host),
     ):
-        strategy._maybe_apply_cute_rolled_cluster(state)
+        CuteLoopedReductionEmitter(strategy)._maybe_apply_cute_rolled_cluster(state)
     assert strategy._cute_rolled_cluster_n == 1
     assert strategy._mask_var == "mask_0"

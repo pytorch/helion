@@ -24,14 +24,13 @@ from torch.nn.attention.flex_attention import _create_empty_block_mask
 from torch.nn.attention.flex_attention import flex_attention as torch_flex
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.autotune.flash_surface import _resolve_cute_flash_config
+from helion._compiler.cute.autotune.heuristics.cute import CuteFlashAttentionHeuristic
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import import_example
-from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipUnlessBackends
 from helion.autotuner.config_fragment import EnumFragment
 
 if TYPE_CHECKING:
@@ -39,8 +38,6 @@ if TYPE_CHECKING:
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 def _meta_args(shape: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
@@ -61,9 +58,13 @@ def _bind_as_if_sm100(
     kernel: helion.Kernel, args: tuple[torch.Tensor, ...]
 ) -> BoundKernel:
     with (
-        patch("helion._compiler.backend._attention_flash_supported", return_value=True),
         patch(
-            "helion._compiler.backend._attention_flash_gate_enabled", return_value=True
+            "helion._compiler.cute.analysis.attention_match._attention_flash_supported",
+            return_value=True,
+        ),
+        patch(
+            "helion._compiler.cute.analysis.attention_match._attention_flash_gate_enabled",
+            return_value=True,
         ),
     ):
         return kernel.bind(args)
@@ -128,7 +129,7 @@ def test_lse_surface_offers_and_seeds_the_resident_lowering() -> None:
             )
             assert values[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4"
             assert values[cute_flash.FLASH_Q_TILE_COUNT_KEY] == 2
-            resolved = spec._resolve_cute_flash_config(values)
+            resolved = _resolve_cute_flash_config(spec, values)
             assert resolved.softmax_lowering == "resident_value_graph"
 
 
@@ -160,7 +161,6 @@ def _reference(
     return out, lse
 
 
-@onlyBackends(["cute"])
 @skipIfNotCUDA()
 @pytest.mark.parametrize(
     ("family", "scale"), (("fa4", 1.0), ("fa4", 4.0), ("fa4_2cta", 1.0))
@@ -245,7 +245,6 @@ def _flex_args(
     )
 
 
-@onlyBackends(["cute"])
 @skipIfNotCUDA()
 @pytest.mark.parametrize(
     ("family", "kv_heads"), (("fa4", 4), ("fa4_2cta", 4), ("fa4", 2))

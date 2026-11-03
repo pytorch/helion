@@ -1,0 +1,696 @@
+"""Migration pins for the derived config-key tables.
+
+``VALID_KEYS``, ``BACKEND_SPECIFIC_KEYS``, the CuTe surface's implicit-default
+set and every backend's ``supports_config_key`` acceptance used to be literal
+tables spelled out four times (``config_spec.py`` and the 185-line
+``CuteBackend.supports_config_key`` chain).  They are now derived from the
+knob-family tables in ``helion/_compiler/cute/autotune/config_keys.py``; the
+whitespace-separated tables below are the literal sets as recorded on the tree
+before the derivation (commit 34a6915ef) and must not drift.  Keep this file
+until the knob tables themselves become the declaration of record for every
+family.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from helion._compat import get_mtia_tunable_fragments
+from helion._compiler.cute.autotune.config_keys import CUTE_CONFIG_KEYS
+from helion._compiler.cute.autotune.config_keys import CUTE_DEBUG_KEYS
+from helion._compiler.cute.autotune.config_keys import CUTE_FLASH_GATE_KEYS
+from helion._compiler.cute.autotune.config_keys import CUTE_IMPLICIT_DEFAULT_KEYS
+from helion._compiler.cute.autotune.search_surface import CUTE_SEARCH_SURFACE
+from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.cute.cute_flash_gated import FLASH_GATE_WARPGROUPS_KEY
+from helion._compiler.pallas.backend import PallasBackend
+from helion._compiler.triton.backend import TileIRBackend
+from helion._compiler.triton.backend import TritonBackend
+from helion.autotuner.config_spec import BACKEND_SPECIFIC_KEYS
+from helion.autotuner.config_spec import DEBUG_KEYS
+from helion.autotuner.config_spec import VALID_KEYS
+from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.search_surface import EMPTY_SEARCH_SURFACE
+from helion.autotuner.search_surface import BackendSearchSurface
+
+# ``VALID_KEYS`` on 34a6915ef (418 keys).
+_BASE_VALID_KEYS = """
+    advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
+    cute_affine_scan_schedule cute_async_load_cache cute_async_load_group_rows
+    cute_async_load_lookahead cute_async_load_stages cute_async_store_policy
+    cute_bf16x2_recurrence cute_chunk_prepare_schedule
+    cute_chunk_recurrence_dv_partitions cute_chunk_recurrence_register_cap
+    cute_cluster_n cute_cluster_warp_online cute_collective_compute
+    cute_collective_copy cute_collective_epilogue cute_collective_mma
+    cute_collective_native_seeded cute_collective_operand_packets
+    cute_collective_recipe cute_collective_stages cute_collective_static_layouts
+    cute_collective_tmem_a cute_collective_tmem_seed cute_exact_div_form
+    cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
+    cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
+    cute_flash_bwd_exp2_f32 cute_flash_bwd_family cute_flash_bwd_hook_cols
+    cute_flash_bwd_hook_pin cute_flash_bwd_kv_stage cute_flash_bwd_mask_form
+    cute_flash_bwd_persistent cute_flash_bwd_regs cute_flash_bwd_row_kv
+    cute_flash_bwd_row_q_chunk cute_flash_bwd_row_q_split cute_flash_bwd_s_first
+    cute_flash_bwd_stats_mma cute_flash_bwd_table_steps cute_flash_bwd_tile_group
+    cute_flash_bwd_two_cta cute_flash_causal_head_pair cute_flash_causal_kv_order
+    cute_flash_causal_loop_split cute_flash_causal_lpt_l2_shift
+    cute_flash_causal_lpt_swizzle cute_flash_causal_mask_storeback
+    cute_flash_causal_skip_dead_tile cute_flash_causal_stagger cute_flash_cga2_local
+    cute_flash_clc cute_flash_clc_heads_per_batch cute_flash_clc_pdl
+    cute_flash_clc_stages cute_flash_corr_regs cute_flash_corr_tile_size
+    cute_flash_disc_pipe cute_flash_e2e_freq cute_flash_e2e_offset
+    cute_flash_e2e_offset0 cute_flash_e2e_res cute_flash_e2e_schedule
+    cute_flash_early_prologue_loads cute_flash_epi_stg cute_flash_epi_stg_gmem
+    cute_flash_epi_stg_store cute_flash_epi_tma cute_flash_epi_tma_setup
+    cute_flash_exp2_impl cute_flash_exp2_packet cute_flash_first_load_order
+    cute_flash_flex_aux_smem cute_flash_flex_coalesce
+    cute_flash_flex_dead_stage_split cute_flash_flex_early_qk
+    cute_flash_flex_hook_fast_full cute_flash_flex_item_words
+    cute_flash_flex_mask_form cute_flash_flex_prefetch cute_flash_flex_rolled_chunks
+    cute_flash_flex_skip_absent cute_flash_flex_tail_split
+    cute_flash_gate_warpgroups cute_flash_kv_order cute_flash_kv_split
+    cute_flash_kv_stage cute_flash_kv_tile_n cute_flash_local_tma_partition
+    cute_flash_masked_e2e_schedule cute_flash_mma_interleave cute_flash_o_over_q
+    cute_flash_o_stage cute_flash_other_regs cute_flash_p_chunk_arrive
+    cute_flash_p_store_rep cute_flash_packed_reduce cute_flash_pair_cluster
+    cute_flash_persistent cute_flash_persistent_ctas_per_sm
+    cute_flash_persistent_loop cute_flash_pipeline_family
+    cute_flash_precompute_qk_desc cute_flash_q_tile_count cute_flash_q_tile_m
+    cute_flash_recompute_tile_coords cute_flash_rescale_chunk_cols
+    cute_flash_rescale_threshold cute_flash_role_chain cute_flash_role_map
+    cute_flash_row_bound_tiling cute_flash_row_epilogue_warps
+    cute_flash_row_sum_schedule cute_flash_row_tile_m cute_flash_row_warps
+    cute_flash_rowmax cute_flash_s_load_rep cute_flash_s_resident cute_flash_s_stage
+    cute_flash_skip_rescale_stats cute_flash_small_biased cute_flash_softmax_disc
+    cute_flash_softmax_lowering cute_flash_softmax_region cute_flash_softmax_regs
+    cute_flash_softmax_setup cute_flash_sp_row_sum cute_flash_split_p_arrive
+    cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_topology
+    cute_flash_uneven_kv_ring cute_flash_use_2cta cute_flash_wait_hint
+    cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
+    cute_flash_ws_one_pass cute_fp32_dot cute_fragment_atomic_aggregation
+    cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
+    cute_fragment_bounded_gather cute_fragment_cta_topk
+    cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
+    cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
+    cute_fragment_private_scalar_loops cute_fragment_producer_cache
+    cute_fragment_published_scalars cute_fragment_pure_producer_regions
+    cute_fragment_reduction cute_fragment_register_loads
+    cute_fragment_register_producers cute_fragment_register_snapshots
+    cute_fragment_scan cute_fragment_scan_exports cute_fragment_skip_zero_atomics
+    cute_fragment_slab_loads cute_fragment_split_k cute_fragment_threads
+    cute_fragment_topk_network cute_fragment_unrolled_loops cute_fragment_vector_io
+    cute_fragment_warp_producer_regions cute_fragment_warp_results
+    cute_fragment_warp_scan cute_gathered_mma_n cute_gathered_mma_stages
+    cute_gdn_recurrence_epilogue_warps cute_gdn_recurrence_mma_m
+    cute_gdn_recurrence_stages cute_gdn_recurrence_token_groups
+    cute_grouped_ab_stages cute_grouped_ctas_per_sm cute_grouped_descriptor_policy
+    cute_grouped_prefix_scan cute_grouped_rna_block_k cute_grouped_rna_warps
+    cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
+    cute_lane_layouts cute_lane_unroll cute_materialized_operand_schedule
+    cute_materialized_schedule cute_matmul_family cute_min_blocks_per_mp
+    cute_mma_dag cute_mma_dag_aux cute_mma_dag_cluster cute_mma_dag_derived
+    cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
+    cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
+    cute_mma_dag_split cute_mma_dag_stages cute_mma_dag_store cute_mma_dag_warps
+    cute_mma_f32_conversion cute_packet_prefetch cute_pdl cute_pdl_release
+    cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
+    cute_radix_cached_payload_inverse cute_radix_candidate_capacity
+    cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
+    cute_radix_histogram_mode cute_radix_packet_bits cute_radix_partial_scan
+    cute_radix_resident_input cute_radix_scalar_candidates cute_radix_scan_unroll
+    cute_radix_threads cute_radix_ticket_stores cute_radix_valid_domain
+    cute_reduction_group_rows cute_reduction_local_tree cute_reduction_pack_output
+    cute_reduction_pipeline_depth cute_reduction_reloads cute_reduction_row_schedule
+    cute_reduction_schedule cute_reduction_sequence cute_register_chain
+    cute_register_row cute_register_row_tensor_copy cute_register_subblocks
+    cute_register_subblocks_colside cute_register_subblocks_mask
+    cute_register_subblocks_prefetch cute_register_subblocks_roll
+    cute_register_subblocks_warps cute_register_tile_store_first
+    cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
+    cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
+    cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
+    cute_scaled_epilogue_mode cute_scaled_epilogue_n cute_scaled_fused_scales
+    cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
+    cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
+    cute_scaled_stages cute_scaled_swap_ab cute_scaled_tile_k cute_scaled_tile_m
+    cute_scaled_tile_n cute_selection_algorithm cute_signed_bitfield_bf16
+    cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
+    cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
+    cute_split_k_workspace cute_store_policy cute_tiles_per_block
+    cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
+    cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
+    cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
+    cute_topk_rows_per_block cute_topk_selection_layout cute_topk_sort_network
+    cute_topk_value_mode cute_topk_vector_width cute_vector_packet_unroll
+    cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
+    cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops
+    host_tensor_descriptors indexing l2_groupings load_cache_modifiers
+    load_eviction_policies loop_orders matrix_instr_nonkdim maxnreg num_ctas
+    num_sm_multiplier num_stages num_threads num_warps occupancy
+    pallas_emit_pipeline_group_size pallas_fold_dot_lhs_cast
+    pallas_indirect_access_mode pallas_internal_scratch pallas_load_buffer_count
+    pallas_loop_type pallas_pre_broadcast pallas_use_low_level_scheduler
+    pallas_worklist_grouping pid_type range_flattens range_multi_buffers
+    range_num_stages range_unroll_factors range_warp_specializes reduction_fusion
+    reduction_loops static_ranges store_cache_modifiers tcgen05_ab_stages
+    tcgen05_ab_startup_prefill tcgen05_acc_stages tcgen05_acc_wait_placement
+    tcgen05_aux_fragment_hoist tcgen05_aux_load_mode tcgen05_aux_load_placement
+    tcgen05_aux_prefetch_subtiles tcgen05_aux_stages tcgen05_batch_raster
+    tcgen05_c_acquire_placement tcgen05_c_stages tcgen05_c_store_mode
+    tcgen05_clc_query_pacing tcgen05_cluster_m tcgen05_cluster_n
+    tcgen05_consumer_regs tcgen05_cta_group tcgen05_cubin_lineinfo
+    tcgen05_diagnostic_invalid_output tcgen05_epi_subtile_n tcgen05_epi_warp_groups
+    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_flat_role_coordinates
+    tcgen05_grouped_ab_tile_k tcgen05_grouped_balanced_workers
+    tcgen05_grouped_ctas_per_sm tcgen05_grouped_d_shift
+    tcgen05_grouped_dense_row_union tcgen05_grouped_external_direct_pointers
+    tcgen05_grouped_external_direct_strides tcgen05_grouped_full_allocation_a
+    tcgen05_grouped_full_coverage tcgen05_grouped_l2_swizzle_alternate
+    tcgen05_grouped_l2_swizzle_mn_ratio tcgen05_grouped_mode
+    tcgen05_grouped_prefix_adaptive_n tcgen05_grouped_row_union_ab_stages
+    tcgen05_grouped_row_union_schedule tcgen05_grouped_runtime_direct
+    tcgen05_grouped_static_problem_signature tcgen05_grouped_static_reserved_sms
+    tcgen05_grouped_worklist_mma_m tcgen05_grouped_worklist_mma_n
+    tcgen05_grouped_worklist_orientation tcgen05_grouped_worklist_source_m_tile
+    tcgen05_l2_swizzle_size tcgen05_large_bn_proof
+    tcgen05_layout_overrides_d_store_box_n tcgen05_layout_overrides_epi_tile_m
+    tcgen05_layout_overrides_epi_tile_n tcgen05_layout_overrides_smem_swizzle_a
+    tcgen05_layout_overrides_smem_swizzle_b tcgen05_layout_strategy
+    tcgen05_materialized_pdl tcgen05_num_epi_warps tcgen05_persistence_model
+    tcgen05_persistent_grid_cap tcgen05_region_ab_stages tcgen05_region_c_stages
+    tcgen05_region_pid_types tcgen05_sched_consumer_wait_mode
+    tcgen05_sched_stage_count tcgen05_split_k tcgen05_strategy tcgen05_tile_n
+    tcgen05_tvm_ffi_launch tcgen05_warp_register_reallocation
+    tcgen05_warp_spec_ab_load_warps tcgen05_warp_spec_c_input_warps
+    tcgen05_warp_spec_epi_load_warps tcgen05_warp_spec_mma_warps
+    tcgen05_warp_spec_register_decrease tcgen05_warp_spec_register_increase
+    tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
+    xcd_remap
+    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles
+"""
+
+# ``BACKEND_SPECIFIC_KEYS`` on 34a6915ef (395 keys).
+_BASE_BACKEND_SPECIFIC_KEYS = """
+    cross_loop_pipeline cute_affine_scan_schedule cute_async_load_cache
+    cute_async_load_group_rows cute_async_load_lookahead cute_async_load_stages
+    cute_async_store_policy cute_bf16x2_recurrence cute_chunk_prepare_schedule
+    cute_chunk_recurrence_dv_partitions cute_chunk_recurrence_register_cap
+    cute_cluster_n cute_cluster_warp_online cute_collective_compute
+    cute_collective_copy cute_collective_epilogue cute_collective_mma
+    cute_collective_native_seeded cute_collective_operand_packets
+    cute_collective_recipe cute_collective_stages cute_collective_static_layouts
+    cute_collective_tmem_a cute_collective_tmem_seed cute_exact_div_form
+    cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
+    cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
+    cute_flash_bwd_exp2_f32 cute_flash_bwd_family cute_flash_bwd_hook_cols
+    cute_flash_bwd_hook_pin cute_flash_bwd_kv_stage cute_flash_bwd_mask_form
+    cute_flash_bwd_persistent cute_flash_bwd_regs cute_flash_bwd_row_kv
+    cute_flash_bwd_row_q_chunk cute_flash_bwd_row_q_split cute_flash_bwd_s_first
+    cute_flash_bwd_stats_mma cute_flash_bwd_table_steps cute_flash_bwd_tile_group
+    cute_flash_bwd_two_cta cute_flash_causal_head_pair cute_flash_causal_kv_order
+    cute_flash_causal_loop_split cute_flash_causal_lpt_l2_shift
+    cute_flash_causal_lpt_swizzle cute_flash_causal_mask_storeback
+    cute_flash_causal_skip_dead_tile cute_flash_causal_stagger cute_flash_cga2_local
+    cute_flash_clc cute_flash_clc_heads_per_batch cute_flash_clc_pdl
+    cute_flash_clc_stages cute_flash_corr_regs cute_flash_corr_tile_size
+    cute_flash_disc_pipe cute_flash_e2e_freq cute_flash_e2e_offset
+    cute_flash_e2e_offset0 cute_flash_e2e_res cute_flash_e2e_schedule
+    cute_flash_early_prologue_loads cute_flash_epi_stg cute_flash_epi_stg_gmem
+    cute_flash_epi_stg_store cute_flash_epi_tma cute_flash_epi_tma_setup
+    cute_flash_exp2_impl cute_flash_exp2_packet cute_flash_first_load_order
+    cute_flash_flex_aux_smem cute_flash_flex_coalesce
+    cute_flash_flex_dead_stage_split cute_flash_flex_early_qk
+    cute_flash_flex_hook_fast_full cute_flash_flex_item_words
+    cute_flash_flex_mask_form cute_flash_flex_prefetch cute_flash_flex_rolled_chunks
+    cute_flash_flex_skip_absent cute_flash_flex_tail_split
+    cute_flash_gate_warpgroups cute_flash_kv_order cute_flash_kv_split
+    cute_flash_kv_stage cute_flash_kv_tile_n cute_flash_local_tma_partition
+    cute_flash_masked_e2e_schedule cute_flash_mma_interleave cute_flash_o_over_q
+    cute_flash_o_stage cute_flash_other_regs cute_flash_p_chunk_arrive
+    cute_flash_p_store_rep cute_flash_packed_reduce cute_flash_pair_cluster
+    cute_flash_persistent cute_flash_persistent_ctas_per_sm
+    cute_flash_persistent_loop cute_flash_pipeline_family
+    cute_flash_precompute_qk_desc cute_flash_q_tile_count cute_flash_q_tile_m
+    cute_flash_recompute_tile_coords cute_flash_rescale_chunk_cols
+    cute_flash_rescale_threshold cute_flash_role_chain cute_flash_role_map
+    cute_flash_row_bound_tiling cute_flash_row_epilogue_warps
+    cute_flash_row_sum_schedule cute_flash_row_tile_m cute_flash_row_warps
+    cute_flash_rowmax cute_flash_s_load_rep cute_flash_s_resident cute_flash_s_stage
+    cute_flash_skip_rescale_stats cute_flash_small_biased cute_flash_softmax_disc
+    cute_flash_softmax_lowering cute_flash_softmax_region cute_flash_softmax_regs
+    cute_flash_softmax_setup cute_flash_sp_row_sum cute_flash_split_p_arrive
+    cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_topology
+    cute_flash_uneven_kv_ring cute_flash_use_2cta cute_flash_wait_hint
+    cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
+    cute_flash_ws_one_pass cute_fp32_dot cute_fragment_atomic_aggregation
+    cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
+    cute_fragment_bounded_gather cute_fragment_cta_topk
+    cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
+    cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
+    cute_fragment_private_scalar_loops cute_fragment_producer_cache
+    cute_fragment_published_scalars cute_fragment_pure_producer_regions
+    cute_fragment_reduction cute_fragment_register_loads
+    cute_fragment_register_producers cute_fragment_register_snapshots
+    cute_fragment_scan cute_fragment_scan_exports cute_fragment_skip_zero_atomics
+    cute_fragment_slab_loads cute_fragment_split_k cute_fragment_threads
+    cute_fragment_topk_network cute_fragment_unrolled_loops cute_fragment_vector_io
+    cute_fragment_warp_producer_regions cute_fragment_warp_results
+    cute_fragment_warp_scan cute_gathered_mma_n cute_gathered_mma_stages
+    cute_gdn_recurrence_epilogue_warps cute_gdn_recurrence_mma_m
+    cute_gdn_recurrence_stages cute_gdn_recurrence_token_groups
+    cute_grouped_ab_stages cute_grouped_ctas_per_sm cute_grouped_descriptor_policy
+    cute_grouped_prefix_scan cute_grouped_rna_block_k cute_grouped_rna_warps
+    cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
+    cute_lane_layouts cute_lane_unroll cute_materialized_operand_schedule
+    cute_materialized_schedule cute_matmul_family cute_min_blocks_per_mp
+    cute_mma_dag cute_mma_dag_aux cute_mma_dag_cluster cute_mma_dag_derived
+    cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
+    cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
+    cute_mma_dag_split cute_mma_dag_stages cute_mma_dag_store cute_mma_dag_warps
+    cute_mma_f32_conversion cute_packet_prefetch cute_pdl cute_pdl_release
+    cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
+    cute_radix_cached_payload_inverse cute_radix_candidate_capacity
+    cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
+    cute_radix_histogram_mode cute_radix_packet_bits cute_radix_partial_scan
+    cute_radix_resident_input cute_radix_scalar_candidates cute_radix_scan_unroll
+    cute_radix_threads cute_radix_ticket_stores cute_radix_valid_domain
+    cute_reduction_group_rows cute_reduction_local_tree cute_reduction_pack_output
+    cute_reduction_pipeline_depth cute_reduction_reloads cute_reduction_row_schedule
+    cute_reduction_schedule cute_reduction_sequence cute_register_chain
+    cute_register_row cute_register_row_tensor_copy cute_register_subblocks
+    cute_register_subblocks_colside cute_register_subblocks_mask
+    cute_register_subblocks_prefetch cute_register_subblocks_roll
+    cute_register_subblocks_warps cute_register_tile_store_first
+    cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
+    cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
+    cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
+    cute_scaled_epilogue_mode cute_scaled_epilogue_n cute_scaled_fused_scales
+    cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
+    cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
+    cute_scaled_stages cute_scaled_swap_ab cute_scaled_tile_k cute_scaled_tile_m
+    cute_scaled_tile_n cute_selection_algorithm cute_signed_bitfield_bf16
+    cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
+    cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
+    cute_split_k_workspace cute_store_policy cute_tiles_per_block
+    cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
+    cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
+    cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
+    cute_topk_rows_per_block cute_topk_selection_layout cute_topk_sort_network
+    cute_topk_value_mode cute_topk_vector_width cute_vector_packet_unroll
+    cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
+    cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps host_tensor_descriptors
+    load_cache_modifiers matrix_instr_nonkdim num_ctas num_threads occupancy
+    pallas_emit_pipeline_group_size pallas_fold_dot_lhs_cast
+    pallas_indirect_access_mode pallas_load_buffer_count pallas_loop_type
+    pallas_pre_broadcast pallas_use_low_level_scheduler pallas_worklist_grouping
+    store_cache_modifiers tcgen05_ab_stages tcgen05_ab_startup_prefill
+    tcgen05_acc_stages tcgen05_acc_wait_placement tcgen05_aux_fragment_hoist
+    tcgen05_aux_load_mode tcgen05_aux_load_placement tcgen05_aux_prefetch_subtiles
+    tcgen05_aux_stages tcgen05_batch_raster tcgen05_c_acquire_placement
+    tcgen05_c_stages tcgen05_c_store_mode tcgen05_clc_query_pacing tcgen05_cluster_m
+    tcgen05_cluster_n tcgen05_consumer_regs tcgen05_cta_group tcgen05_cubin_lineinfo
+    tcgen05_diagnostic_invalid_output tcgen05_epi_subtile_n tcgen05_epi_warp_groups
+    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_flat_role_coordinates
+    tcgen05_grouped_ab_tile_k tcgen05_grouped_balanced_workers
+    tcgen05_grouped_ctas_per_sm tcgen05_grouped_d_shift
+    tcgen05_grouped_dense_row_union tcgen05_grouped_external_direct_pointers
+    tcgen05_grouped_external_direct_strides tcgen05_grouped_full_allocation_a
+    tcgen05_grouped_full_coverage tcgen05_grouped_l2_swizzle_alternate
+    tcgen05_grouped_l2_swizzle_mn_ratio tcgen05_grouped_mode
+    tcgen05_grouped_prefix_adaptive_n tcgen05_grouped_row_union_ab_stages
+    tcgen05_grouped_row_union_schedule tcgen05_grouped_runtime_direct
+    tcgen05_grouped_static_problem_signature tcgen05_grouped_static_reserved_sms
+    tcgen05_grouped_worklist_mma_m tcgen05_grouped_worklist_mma_n
+    tcgen05_grouped_worklist_orientation tcgen05_grouped_worklist_source_m_tile
+    tcgen05_l2_swizzle_size tcgen05_large_bn_proof
+    tcgen05_layout_overrides_d_store_box_n tcgen05_layout_overrides_epi_tile_m
+    tcgen05_layout_overrides_epi_tile_n tcgen05_layout_overrides_smem_swizzle_a
+    tcgen05_layout_overrides_smem_swizzle_b tcgen05_layout_strategy
+    tcgen05_materialized_pdl tcgen05_num_epi_warps tcgen05_persistence_model
+    tcgen05_persistent_grid_cap tcgen05_region_ab_stages tcgen05_region_c_stages
+    tcgen05_region_pid_types tcgen05_sched_consumer_wait_mode
+    tcgen05_sched_stage_count tcgen05_split_k tcgen05_strategy tcgen05_tile_n
+    tcgen05_tvm_ffi_launch tcgen05_warp_register_reallocation
+    tcgen05_warp_spec_ab_load_warps tcgen05_warp_spec_c_input_warps
+    tcgen05_warp_spec_epi_load_warps tcgen05_warp_spec_mma_warps
+    tcgen05_warp_spec_register_decrease tcgen05_warp_spec_register_increase
+    tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
+    xcd_remap
+    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles
+"""
+
+# ``_CUTE_IMPLICIT_DEFAULT_KEYS`` on 34a6915ef (144 keys).
+_BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
+    atomic_indexing cute_async_load_cache cute_async_load_group_rows
+    cute_async_load_lookahead cute_async_load_stages cute_async_store_policy
+    cute_bf16x2_recurrence cute_cluster_warp_online cute_collective_compute
+    cute_collective_copy cute_collective_epilogue cute_collective_mma
+    cute_collective_native_seeded cute_collective_operand_packets
+    cute_collective_recipe cute_collective_stages cute_collective_static_layouts
+    cute_collective_tmem_a cute_collective_tmem_seed cute_exact_div_form
+    cute_fp32_dot cute_fragment_atomic_aggregation
+    cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
+    cute_fragment_bounded_gather cute_fragment_cta_topk
+    cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
+    cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
+    cute_fragment_private_scalar_loops cute_fragment_producer_cache
+    cute_fragment_published_scalars cute_fragment_pure_producer_regions
+    cute_fragment_reduction cute_fragment_register_loads
+    cute_fragment_register_producers cute_fragment_register_snapshots
+    cute_fragment_scan cute_fragment_scan_exports cute_fragment_skip_zero_atomics
+    cute_fragment_slab_loads cute_fragment_split_k cute_fragment_threads
+    cute_fragment_topk_network cute_fragment_unrolled_loops cute_fragment_vector_io
+    cute_fragment_warp_producer_regions cute_fragment_warp_results
+    cute_fragment_warp_scan cute_gathered_mma_n cute_gathered_mma_stages
+    cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
+    cute_lane_unroll cute_materialized_operand_schedule cute_materialized_schedule
+    cute_packet_prefetch cute_pdl cute_pdl_release cute_pointwise_pid_type
+    cute_proven_bounds cute_radix_boundary_early_exit
+    cute_radix_cached_payload_inverse cute_radix_candidate_capacity
+    cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
+    cute_radix_histogram_mode cute_radix_packet_bits cute_radix_partial_scan
+    cute_radix_resident_input cute_radix_scalar_candidates cute_radix_scan_unroll
+    cute_radix_threads cute_radix_ticket_stores cute_radix_valid_domain
+    cute_reduction_group_rows cute_reduction_local_tree cute_reduction_pack_output
+    cute_reduction_pipeline_depth cute_reduction_row_schedule
+    cute_reduction_schedule cute_reduction_sequence cute_register_chain
+    cute_register_row cute_register_row_tensor_copy cute_register_tile_store_first
+    cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
+    cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
+    cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
+    cute_scaled_epilogue_mode cute_scaled_epilogue_n cute_scaled_fused_scales
+    cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
+    cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
+    cute_scaled_stages cute_scaled_swap_ab cute_scaled_tile_k cute_scaled_tile_m
+    cute_scaled_tile_n cute_selection_algorithm cute_signed_bitfield_bf16
+    cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
+    cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
+    cute_split_k_workspace cute_store_policy cute_topk_coarse_keys
+    cute_topk_key_recovery cute_vector_packet_unroll cute_vloop_sink
+    cute_warp_aggregated_atomics cute_warp_fp32_redux cute_wide_packet_hints flatten_loops indexing
+    l2_groupings load_eviction_policies loop_orders maxnreg num_sm_multiplier
+    num_stages num_warps pid_type range_flattens range_multi_buffers
+    range_num_stages range_unroll_factors range_warp_specializes static_ranges
+    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_pdl_spread cute_split_k_atomic_epilogue
+"""
+
+# ``{k in VALID_KEYS: CuteBackend().supports_config_key(k)}`` on 34a6915ef (402 keys).
+_BASE_CUTE_ACCEPTED = """
+    advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
+    cute_affine_scan_schedule cute_async_load_cache cute_async_load_group_rows
+    cute_async_load_lookahead cute_async_load_stages cute_async_store_policy
+    cute_bf16x2_recurrence cute_chunk_prepare_schedule
+    cute_chunk_recurrence_dv_partitions cute_chunk_recurrence_register_cap
+    cute_cluster_n cute_cluster_warp_online cute_collective_compute
+    cute_collective_copy cute_collective_epilogue cute_collective_mma
+    cute_collective_native_seeded cute_collective_operand_packets
+    cute_collective_recipe cute_collective_stages cute_collective_static_layouts
+    cute_collective_tmem_a cute_collective_tmem_seed cute_exact_div_form
+    cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
+    cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
+    cute_flash_bwd_exp2_f32 cute_flash_bwd_family cute_flash_bwd_hook_cols
+    cute_flash_bwd_hook_pin cute_flash_bwd_kv_stage cute_flash_bwd_mask_form
+    cute_flash_bwd_persistent cute_flash_bwd_regs cute_flash_bwd_row_kv
+    cute_flash_bwd_row_q_chunk cute_flash_bwd_row_q_split cute_flash_bwd_s_first
+    cute_flash_bwd_stats_mma cute_flash_bwd_table_steps cute_flash_bwd_tile_group
+    cute_flash_bwd_two_cta cute_flash_causal_head_pair cute_flash_causal_kv_order
+    cute_flash_causal_loop_split cute_flash_causal_lpt_l2_shift
+    cute_flash_causal_lpt_swizzle cute_flash_causal_mask_storeback
+    cute_flash_causal_skip_dead_tile cute_flash_causal_stagger cute_flash_cga2_local
+    cute_flash_clc cute_flash_clc_heads_per_batch cute_flash_clc_pdl
+    cute_flash_clc_stages cute_flash_corr_regs cute_flash_corr_tile_size
+    cute_flash_disc_pipe cute_flash_e2e_freq cute_flash_e2e_offset
+    cute_flash_e2e_offset0 cute_flash_e2e_res cute_flash_e2e_schedule
+    cute_flash_early_prologue_loads cute_flash_epi_stg cute_flash_epi_stg_gmem
+    cute_flash_epi_stg_store cute_flash_epi_tma cute_flash_epi_tma_setup
+    cute_flash_exp2_impl cute_flash_exp2_packet cute_flash_first_load_order
+    cute_flash_flex_aux_smem cute_flash_flex_coalesce
+    cute_flash_flex_dead_stage_split cute_flash_flex_early_qk
+    cute_flash_flex_hook_fast_full cute_flash_flex_item_words
+    cute_flash_flex_mask_form cute_flash_flex_prefetch cute_flash_flex_rolled_chunks
+    cute_flash_flex_skip_absent cute_flash_flex_tail_split
+    cute_flash_gate_warpgroups cute_flash_kv_order cute_flash_kv_split
+    cute_flash_kv_stage cute_flash_kv_tile_n cute_flash_local_tma_partition
+    cute_flash_masked_e2e_schedule cute_flash_mma_interleave cute_flash_o_over_q
+    cute_flash_o_stage cute_flash_other_regs cute_flash_p_chunk_arrive
+    cute_flash_p_store_rep cute_flash_packed_reduce cute_flash_pair_cluster
+    cute_flash_persistent cute_flash_persistent_ctas_per_sm
+    cute_flash_persistent_loop cute_flash_pipeline_family
+    cute_flash_precompute_qk_desc cute_flash_q_tile_count cute_flash_q_tile_m
+    cute_flash_recompute_tile_coords cute_flash_rescale_chunk_cols
+    cute_flash_rescale_threshold cute_flash_role_chain cute_flash_role_map
+    cute_flash_row_bound_tiling cute_flash_row_epilogue_warps
+    cute_flash_row_sum_schedule cute_flash_row_tile_m cute_flash_row_warps
+    cute_flash_rowmax cute_flash_s_load_rep cute_flash_s_resident cute_flash_s_stage
+    cute_flash_skip_rescale_stats cute_flash_small_biased cute_flash_softmax_disc
+    cute_flash_softmax_lowering cute_flash_softmax_region cute_flash_softmax_regs
+    cute_flash_softmax_setup cute_flash_sp_row_sum cute_flash_split_p_arrive
+    cute_flash_stat_transport cute_flash_tensor_4d_tma cute_flash_topology
+    cute_flash_uneven_kv_ring cute_flash_use_2cta cute_flash_wait_hint
+    cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
+    cute_flash_ws_one_pass cute_fp32_dot cute_fragment_atomic_aggregation
+    cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
+    cute_fragment_bounded_gather cute_fragment_cta_topk
+    cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
+    cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
+    cute_fragment_private_scalar_loops cute_fragment_producer_cache
+    cute_fragment_published_scalars cute_fragment_pure_producer_regions
+    cute_fragment_reduction cute_fragment_register_loads
+    cute_fragment_register_producers cute_fragment_register_snapshots
+    cute_fragment_scan cute_fragment_scan_exports cute_fragment_skip_zero_atomics
+    cute_fragment_slab_loads cute_fragment_split_k cute_fragment_threads
+    cute_fragment_topk_network cute_fragment_unrolled_loops cute_fragment_vector_io
+    cute_fragment_warp_producer_regions cute_fragment_warp_results
+    cute_fragment_warp_scan cute_gathered_mma_n cute_gathered_mma_stages
+    cute_gdn_recurrence_epilogue_warps cute_gdn_recurrence_mma_m
+    cute_gdn_recurrence_stages cute_gdn_recurrence_token_groups
+    cute_grouped_ab_stages cute_grouped_ctas_per_sm cute_grouped_descriptor_policy
+    cute_grouped_prefix_scan cute_grouped_rna_block_k cute_grouped_rna_warps
+    cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
+    cute_lane_layouts cute_lane_unroll cute_materialized_operand_schedule
+    cute_materialized_schedule cute_matmul_family cute_min_blocks_per_mp
+    cute_mma_dag cute_mma_dag_aux cute_mma_dag_cluster cute_mma_dag_derived
+    cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
+    cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
+    cute_mma_dag_split cute_mma_dag_stages cute_mma_dag_store cute_mma_dag_warps
+    cute_mma_f32_conversion cute_packet_prefetch cute_pdl cute_pdl_release
+    cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
+    cute_radix_cached_payload_inverse cute_radix_candidate_capacity
+    cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
+    cute_radix_histogram_mode cute_radix_packet_bits cute_radix_partial_scan
+    cute_radix_resident_input cute_radix_scalar_candidates cute_radix_scan_unroll
+    cute_radix_threads cute_radix_ticket_stores cute_radix_valid_domain
+    cute_reduction_group_rows cute_reduction_local_tree cute_reduction_pack_output
+    cute_reduction_pipeline_depth cute_reduction_reloads cute_reduction_row_schedule
+    cute_reduction_schedule cute_reduction_sequence cute_register_chain
+    cute_register_row cute_register_row_tensor_copy cute_register_subblocks
+    cute_register_subblocks_colside cute_register_subblocks_mask
+    cute_register_subblocks_prefetch cute_register_subblocks_roll
+    cute_register_subblocks_warps cute_register_tile_store_first
+    cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
+    cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
+    cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
+    cute_scaled_epilogue_mode cute_scaled_epilogue_n cute_scaled_fused_scales
+    cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
+    cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
+    cute_scaled_stages cute_scaled_swap_ab cute_scaled_tile_k cute_scaled_tile_m
+    cute_scaled_tile_n cute_selection_algorithm cute_signed_bitfield_bf16
+    cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
+    cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
+    cute_split_k_workspace cute_store_policy cute_tiles_per_block
+    cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
+    cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
+    cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
+    cute_topk_rows_per_block cute_topk_selection_layout cute_topk_sort_network
+    cute_topk_value_mode cute_topk_vector_width cute_vector_packet_unroll
+    cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
+    cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops indexing
+    l2_groupings load_eviction_policies loop_orders maxnreg num_sm_multiplier
+    num_stages num_threads num_warps pallas_internal_scratch pid_type range_flattens
+    range_multi_buffers range_num_stages range_unroll_factors range_warp_specializes
+    reduction_fusion reduction_loops static_ranges tcgen05_ab_stages
+    tcgen05_ab_startup_prefill tcgen05_acc_stages tcgen05_acc_wait_placement
+    tcgen05_aux_fragment_hoist tcgen05_aux_load_mode tcgen05_aux_load_placement
+    tcgen05_aux_prefetch_subtiles tcgen05_aux_stages tcgen05_batch_raster
+    tcgen05_c_acquire_placement tcgen05_c_stages tcgen05_c_store_mode
+    tcgen05_clc_query_pacing tcgen05_cluster_m tcgen05_cluster_n
+    tcgen05_consumer_regs tcgen05_cta_group tcgen05_cubin_lineinfo
+    tcgen05_diagnostic_invalid_output tcgen05_epi_subtile_n tcgen05_epi_warp_groups
+    tcgen05_epilogue_fanout tcgen05_epilogue_layout tcgen05_flat_role_coordinates
+    tcgen05_grouped_ab_tile_k tcgen05_grouped_balanced_workers
+    tcgen05_grouped_ctas_per_sm tcgen05_grouped_d_shift
+    tcgen05_grouped_dense_row_union tcgen05_grouped_external_direct_pointers
+    tcgen05_grouped_external_direct_strides tcgen05_grouped_full_allocation_a
+    tcgen05_grouped_full_coverage tcgen05_grouped_l2_swizzle_alternate
+    tcgen05_grouped_l2_swizzle_mn_ratio tcgen05_grouped_mode
+    tcgen05_grouped_prefix_adaptive_n tcgen05_grouped_row_union_ab_stages
+    tcgen05_grouped_row_union_schedule tcgen05_grouped_runtime_direct
+    tcgen05_grouped_static_problem_signature tcgen05_grouped_static_reserved_sms
+    tcgen05_grouped_worklist_mma_m tcgen05_grouped_worklist_mma_n
+    tcgen05_grouped_worklist_orientation tcgen05_grouped_worklist_source_m_tile
+    tcgen05_l2_swizzle_size tcgen05_large_bn_proof
+    tcgen05_layout_overrides_d_store_box_n tcgen05_layout_overrides_epi_tile_m
+    tcgen05_layout_overrides_epi_tile_n tcgen05_layout_overrides_smem_swizzle_a
+    tcgen05_layout_overrides_smem_swizzle_b tcgen05_layout_strategy
+    tcgen05_materialized_pdl tcgen05_num_epi_warps tcgen05_persistence_model
+    tcgen05_persistent_grid_cap tcgen05_region_ab_stages tcgen05_region_c_stages
+    tcgen05_region_pid_types tcgen05_sched_consumer_wait_mode
+    tcgen05_sched_stage_count tcgen05_split_k tcgen05_strategy tcgen05_tile_n
+    tcgen05_tvm_ffi_launch tcgen05_warp_register_reallocation
+    tcgen05_warp_spec_ab_load_warps tcgen05_warp_spec_c_input_warps
+    tcgen05_warp_spec_epi_load_warps tcgen05_warp_spec_mma_warps
+    tcgen05_warp_spec_register_decrease tcgen05_warp_spec_register_increase
+    tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps
+    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles
+"""
+
+# The same census for ``TritonBackend`` (27 keys).
+_BASE_TRITON_ACCEPTED = """
+    advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
+    epilogue_subtile flatten_loops host_tensor_descriptors indexing l2_groupings
+    load_cache_modifiers load_eviction_policies loop_orders maxnreg
+    num_sm_multiplier num_stages num_warps pallas_internal_scratch pid_type
+    range_flattens range_multi_buffers range_num_stages range_unroll_factors
+    range_warp_specializes reduction_fusion reduction_loops static_ranges
+    store_cache_modifiers
+"""
+
+# The same census for ``TileIRBackend`` (27 keys).
+_BASE_TILEIR_ACCEPTED = """
+    advanced_controls_file atomic_indexing block_sizes epilogue_subtile
+    flatten_loops indexing l2_groupings load_cache_modifiers load_eviction_policies
+    loop_orders maxnreg num_ctas num_sm_multiplier num_stages num_warps occupancy
+    pallas_internal_scratch pid_type range_flattens range_multi_buffers
+    range_num_stages range_unroll_factors range_warp_specializes reduction_fusion
+    reduction_loops static_ranges store_cache_modifiers
+"""
+
+# The same census for ``PallasBackend`` (12 keys).
+_BASE_PALLAS_ACCEPTED = """
+    block_sizes flatten_loops loop_orders pallas_emit_pipeline_group_size
+    pallas_fold_dot_lhs_cast pallas_indirect_access_mode pallas_internal_scratch
+    pallas_load_buffer_count pallas_loop_type pallas_pre_broadcast
+    pallas_use_low_level_scheduler pallas_worklist_grouping
+"""
+
+
+# The keys ``TritonBackend.supports_config_key`` decides by the device the
+# row runs on: ``host_tensor_descriptors`` needs a CUDA device of capability
+# >= 9.0, ``cross_loop_pipeline`` is off on ROCm, ``waves_per_eu`` /
+# ``matrix_instr_nonkdim`` / ``xcd_remap`` are AMD tunables accepted only
+# there, and the MTIA tunables only on MTIA.
+_DEVICE_DECIDED_KEYS = frozenset(
+    {
+        "host_tensor_descriptors",
+        "cross_loop_pipeline",
+        "matrix_instr_nonkdim",
+        "waves_per_eu",
+        "xcd_remap",
+        *get_mtia_tunable_fragments(),
+    }
+)
+
+
+def _keys(table: str) -> frozenset[str]:
+    return frozenset(table.split())
+
+
+def _accepted(backend: object) -> frozenset[str]:
+    return frozenset(
+        key
+        for key in VALID_KEYS
+        if backend.supports_config_key(key)  # pyrefly: ignore[missing-attribute]
+    )
+
+
+def test_valid_keys_match_the_literal_table() -> None:
+    assert _keys(_BASE_VALID_KEYS) == VALID_KEYS
+
+
+def test_backend_specific_keys_match_the_literal_table() -> None:
+    assert _keys(_BASE_BACKEND_SPECIFIC_KEYS) == BACKEND_SPECIFIC_KEYS
+    assert BACKEND_SPECIFIC_KEYS <= VALID_KEYS
+
+
+def test_cute_implicit_default_keys_match_the_literal_table() -> None:
+    assert _keys(_BASE_CUTE_IMPLICIT_DEFAULT_KEYS) == CUTE_IMPLICIT_DEFAULT_KEYS
+    assert CUTE_SEARCH_SURFACE.implicit_default_keys == CUTE_IMPLICIT_DEFAULT_KEYS
+
+
+def test_cute_backend_acceptance_matches_the_literal_chain() -> None:
+    # ``reduction_fusion`` is the one deliberate move: ``ConfigSpec`` used to
+    # reject it for CuTe by naming the backend; ``CuteBackend`` now rejects it
+    # itself, so the spec-level answer (below) is unchanged.
+    assert _accepted(CuteBackend()) == _keys(_BASE_CUTE_ACCEPTED) - {"reduction_fusion"}
+    assert not ConfigSpec(backend=CuteBackend()).supports_config_key("reduction_fusion")
+    assert ConfigSpec(backend=TritonBackend()).supports_config_key("reduction_fusion")
+    # Every CuTe family key is accepted; the surface declares each exactly once.
+    assert _keys(_BASE_CUTE_ACCEPTED) >= CUTE_CONFIG_KEYS | CUTE_DEBUG_KEYS
+    assert not (CUTE_CONFIG_KEYS & CUTE_DEBUG_KEYS)
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [
+        (TritonBackend(), _BASE_TRITON_ACCEPTED),
+        (TileIRBackend(), _BASE_TILEIR_ACCEPTED),
+        (PallasBackend(), _BASE_PALLAS_ACCEPTED),
+    ],
+    ids=["triton", "tileir", "pallas"],
+)
+def test_other_backends_reject_the_cute_surface(backend: object, expected: str) -> None:
+    # The surface split is what this test pins (the expected tables carry no
+    # CuTe-only key); the keys the row's device decides are compared on
+    # neither side (``_DEVICE_DECIDED_KEYS``).
+    assert _accepted(backend) - _DEVICE_DECIDED_KEYS == (
+        _keys(expected) - _DEVICE_DECIDED_KEYS
+    )
+
+
+def test_unknown_keys_follow_the_two_set_rule() -> None:
+    # Keys no backend declares are accepted everywhere (the generic default);
+    # CuTe-prefixed keys outside the surface are not special any more than
+    # any other unknown key.
+    for key in ("my_tunable", "tcgen05_not_a_knob", "cute_not_a_knob"):
+        assert key not in VALID_KEYS
+        assert CuteBackend().supports_config_key(key)
+        assert TritonBackend().supports_config_key(key)
+
+
+def test_debug_keys_are_accepted_but_not_searched() -> None:
+    assert DEBUG_KEYS == CUTE_DEBUG_KEYS
+    assert sorted(DEBUG_KEYS) == [
+        "tcgen05_cubin_lineinfo",
+        "tcgen05_diagnostic_invalid_output",
+    ]
+    assert DEBUG_KEYS <= BACKEND_SPECIFIC_KEYS
+    assert not (DEBUG_KEYS & CUTE_CONFIG_KEYS)
+    assert not (DEBUG_KEYS & CUTE_IMPLICIT_DEFAULT_KEYS)
+    for key in DEBUG_KEYS:
+        assert CuteBackend().supports_config_key(key)
+        assert not TritonBackend().supports_config_key(key)
+
+
+def test_empty_surface_declares_nothing() -> None:
+    surface = BackendSearchSurface()
+    assert not surface.config_keys
+    assert not surface.debug_keys
+    assert not surface.implicit_default_keys
+    assert not surface.supports_key("num_threads")
+
+
+def test_backends_hand_out_one_surface_object() -> None:
+    # The surfaces are stateless; ``supports_config_key`` runs per key, so the
+    # hook returns a shared object rather than building one per call.
+    assert TritonBackend().config_spec_extension() is EMPTY_SEARCH_SURFACE
+    assert PallasBackend().config_spec_extension() is EMPTY_SEARCH_SURFACE
+    assert CuteBackend().config_spec_extension() is CUTE_SEARCH_SURFACE
+    assert type(EMPTY_SEARCH_SURFACE) is BackendSearchSurface
+
+
+def test_flash_gate_key_matches_the_gated_emitter() -> None:
+    # ``config_keys`` cannot import the gated emitter (it pulls ``device_ir``
+    # into ``config_spec``'s import), so the key is spelled there; pin it.
+    from helion._compiler.cute.cute_flash_gated_row_mma import GATED_ROW_WARPS_KEY
+
+    assert CUTE_FLASH_GATE_KEYS == (FLASH_GATE_WARPGROUPS_KEY, GATED_ROW_WARPS_KEY)

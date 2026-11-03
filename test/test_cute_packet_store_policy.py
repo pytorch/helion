@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CutePointwiseVecHeuristic
 from helion._compiler.cute.packet_store_policy import lower_packet_store_policy
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind

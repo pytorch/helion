@@ -26,14 +26,10 @@ from helion._compiler.cute import cute_flash_gated
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
-from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
-from helion._testing import skipUnlessBackends
 from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.runtime.kernel import Kernel
-
-pytestmark = skipUnlessBackends(["cute"])
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -862,7 +858,7 @@ def test_hstu_selects_gated_body_at_fused_tiles(head_dim: int) -> None:
         assert spec.cute_flash_gated_search_enabled
         assert not spec.cute_flash_search_enabled
         # The fused body owns the root: no tcgen05 matmul fields hide the knob.
-        assert not spec.cute_tcgen05_search_enabled
+        assert not spec.tcgen05.search_enabled
         assert list(spec._flat_fields()) == [
             "block_sizes",
             "cute_flash_kv_stage",
@@ -1981,7 +1977,6 @@ def _assert_matches(out: torch.Tensor, expected: torch.Tensor, tol: float) -> No
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("head_dim", "kv_stage", "kv_tile", "q_tile", "warpgroups"),
@@ -2036,7 +2031,6 @@ def test_gated_hstu_matches_reference_at_jagged_lengths(
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "name", ["tile_end", "no_if", "band", "row_only", "pair_table", "row_scaled"]
@@ -2095,7 +2089,6 @@ def test_gated_variants_match_reference_on_gpu(name: str) -> None:
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("q_tile", [128, 64])
 def test_gated_long_sequence_bitwise_across_warpgroups(q_tile: int) -> None:
@@ -2125,7 +2118,6 @@ def test_gated_long_sequence_bitwise_across_warpgroups(q_tile: int) -> None:
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("q_tile", [128, 64])
 def test_gated_oversubscribed_grid_is_deterministic(q_tile: int) -> None:
@@ -2157,7 +2149,6 @@ def test_gated_oversubscribed_grid_is_deterministic(q_tile: int) -> None:
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_gated_exact_math_matches_reference_on_gpu() -> None:
     """The shipped example runs the fast_math gate in every other GPU test;
@@ -2185,7 +2176,6 @@ def test_gated_exact_math_matches_reference_on_gpu() -> None:
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("head_dim", "kv_tile", "warpgroups", "q_tile"),

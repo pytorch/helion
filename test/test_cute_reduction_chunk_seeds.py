@@ -8,10 +8,14 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from helion import Config
-from helion._compiler.autotuner_heuristics.cute import CuteReductionWideChunkHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteRolledClusterLadderHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteRolledRowLadderHeuristic
-from helion._compiler.backend import CuteBackend
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteReductionWideChunkHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteRolledClusterLadderHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute import CuteRolledRowLadderHeuristic
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.flydsl.backend import FlyDSLBackend
 from helion._testing import DEVICE
 from helion.autotuner.config_spec import BlockSizeSpec

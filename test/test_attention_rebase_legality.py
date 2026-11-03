@@ -8,13 +8,16 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
-from helion._compiler.backend import CuteBackend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute import cute_flash as flash
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_config_topology
+from helion._compiler.cute.autotune.flash_surface import _resolve_cute_flash_config
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.autotune.heuristics.cute import CuteFlashAttentionHeuristic
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.device_ir import DeviceIR
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing import cpu_render_target
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
@@ -29,7 +32,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with mock_cuda_unavailable(), forbid_native_compile():
+    with cpu_render_target():
         yield
 
 
@@ -48,7 +51,8 @@ def _spec(
     )
     for index, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=index, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=128,
         num_kv=num_kv,
         num_bh=4,
@@ -75,14 +79,15 @@ def test_row_topology_precedes_fa4_paired_query_rule(
 ) -> None:
     spec = _spec(num_kv=num_kv)
     parent = {selector: "row_mma"}
-    assert spec._resolve_cute_flash_config(parent).topology == "row_mma"
+    assert _resolve_cute_flash_config(spec, parent).topology == "row_mma"
     assert (
-        spec._cute_flash_config_topology(
+        _cute_flash_config_topology(
+            spec,
             {
                 **parent,
                 flash.FLASH_SOFTMAX_LOWERING_KEY: "resident_stateful",
                 flash.FLASH_ROW_SUM_SCHEDULE_KEY: "pre_acquire",
-            }
+            },
         )
         == "row_mma"
     )
@@ -93,8 +98,8 @@ def test_row_topology_respects_workload_admission(num_kv: int) -> None:
     spec = _spec(num_kv=num_kv, score_modifiers=True)
     parent = {flash.FLASH_PIPELINE_FAMILY_KEY: "row_mma"}
     expected = "ws_overlap" if num_kv % 2 else "fa4"
-    assert spec._resolve_cute_flash_config(parent).topology == expected
-    assert spec._cute_flash_config_topology(parent) == expected
+    assert _resolve_cute_flash_config(spec, parent).topology == expected
+    assert _cute_flash_config_topology(spec, parent) == expected
 
 
 @pytest.mark.parametrize("num_kv", (3, 4))
@@ -106,17 +111,17 @@ def test_environment_row_topology_retains_odd_kv_and_explicit_precedence(
 ) -> None:
     monkeypatch.setenv(env_key, "row_mma")
     spec = _spec(num_kv=num_kv)
-    assert spec._resolve_cute_flash_config({}).topology == "row_mma"
+    assert _resolve_cute_flash_config(spec, {}).topology == "row_mma"
     assert (
-        spec._cute_flash_config_topology(
-            {flash.FLASH_SOFTMAX_LOWERING_KEY: "resident_stateful"}
+        _cute_flash_config_topology(
+            spec, {flash.FLASH_SOFTMAX_LOWERING_KEY: "resident_stateful"}
         )
         == "row_mma"
     )
     explicit = {flash.FLASH_TOPOLOGY_KEY: "fa4"}
     expected = "ws_overlap" if num_kv % 2 else "fa4"
-    assert spec._resolve_cute_flash_config(explicit).topology == expected
-    assert spec._cute_flash_config_topology(explicit) == expected
+    assert _resolve_cute_flash_config(spec, explicit).topology == expected
+    assert _cute_flash_config_topology(spec, explicit) == expected
 
 
 @pytest.mark.parametrize("family", ("row_mma", "fa4_alt"))
@@ -131,7 +136,7 @@ def test_separate_emitters_reject_explicit_resident_lowerings(
         flash.FLASH_SOFTMAX_LOWERING_KEY: lowering,
     }
     with pytest.raises(InvalidConfig):
-        spec._resolve_cute_flash_config(config)
+        _resolve_cute_flash_config(spec, config)
     with pytest.raises(InvalidConfig):
         spec.normalized_config(config)
 
@@ -221,8 +226,8 @@ def test_resident_p_chunk_ownership_preserves_ordinary_choice() -> None:
     config = spec.normalized_config({"block_sizes": [1, 128, 128], **resident})
     assert config.config[flash.FLASH_P_CHUNK_ARRIVE_KEY] is False
     identities = generation._flat_coordinate_identities()
-    owned = generation.flash_owned_coordinate_indices(config)
-    ordinary_owned = generation.flash_owned_coordinate_indices(ordinary)
+    owned = generation.extension.flash_owned_coordinate_indices(config)
+    ordinary_owned = generation.extension.flash_owned_coordinate_indices(ordinary)
     assert flash.FLASH_P_CHUNK_ARRIVE_KEY in {identities[i][0] for i in owned}
     assert flash.FLASH_P_CHUNK_ARRIVE_KEY not in {
         identities[i][0] for i in ordinary_owned
@@ -238,13 +243,13 @@ def test_row_epilogue_keeps_chunked_safety_and_excludes_resident_seeds(
 ) -> None:
     spec = _spec(causal=causal, row_epilogue=True)
     parent = {flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"}
-    assert spec._resolve_cute_flash_config(parent).softmax_disc is True
+    assert _resolve_cute_flash_config(spec, parent).softmax_disc is True
     request = {**parent, flash.FLASH_SOFTMAX_LOWERING_KEY: lowering}
     with pytest.raises(InvalidConfig):
-        spec._resolve_cute_flash_config(request)
+        _resolve_cute_flash_config(spec, request)
     with pytest.raises(InvalidConfig):
         spec.normalized_config({"block_sizes": [1, 128, 128], **request})
-    fragments = spec._cute_flash_autotune_fragments("fa4", "fa4")
+    fragments = _cute_flash_autotune_fragments(spec, "fa4", "fa4")
     fragment = fragments[flash.FLASH_SOFTMAX_LOWERING_KEY]
     assert isinstance(fragment, EnumFragment)
     assert lowering not in fragment._active_choices()

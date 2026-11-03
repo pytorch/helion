@@ -4,12 +4,10 @@ import ast
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import cast
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
 from test.test_cute_full_slice_matmul import _bind
 from test.test_cute_materialized_fission import _se_args
 from test.test_cute_materialized_fission import _sources
@@ -18,9 +16,8 @@ from helion._compiler.ast_read_writes import dead_assignment_elimination
 from helion._compiler.cute.memory_ops import _pure_epilogue_ancestors
 from helion._compiler.cute.mma_support import CuteMmaSupport
 from helion._compiler.generate_ast import GenerateAST
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.language import memory_ops
 
@@ -38,25 +35,8 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _native_cpu_target() -> Generator[None, None, None]:
-    support = CuteMmaSupport(
-        universal=True, warp_f16bf16=True, warpgroup_f16bf16=True, tcgen05_f16bf16=True
-    )
-    with (
-        _target(),
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        patch(
-            "helion._compiler.cute.mma_support.get_cute_mma_support",
-            return_value=support,
-        ),
-        patch(
-            "helion._compiler.cute.cute_mma.get_cute_mma_support", return_value=support
-        ),
-        patch(
-            "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_budget_bytes",
-            return_value=232448,
-        ),
-    ):
+    support = CuteMmaSupport(universal=True, warp_f16bf16=True, tcgen05_f16bf16=True)
+    with cpu_render_target(mma_support=support, smem_budget_bytes=232448):
         yield
 
 
@@ -85,7 +65,6 @@ def _inputs(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(128, 256, 64), (73, 88, 56)])
-@skipUnlessBackends(["cute"])
 def test_full_slice_rounded_relu_only_emits_the_fused_expression(
     dtype: torch.dtype, shape: tuple[int, int, int]
 ) -> None:
@@ -115,7 +94,6 @@ def test_full_slice_rounded_relu_only_emits_the_fused_expression(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_unfused_scalar_relu_remains_live(
     dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -172,7 +150,6 @@ def test_epilogue_dce_stops_at_memory_mutation_and_random_operations() -> None:
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(128, 256, 64), (73, 88, 56)])
-@skipUnlessBackends(["cute"])
 def test_materialized_rounded_relu_only_emits_the_fused_expression(
     dtype: torch.dtype, shape: tuple[int, int, int]
 ) -> None:
@@ -204,7 +181,6 @@ def test_materialized_rounded_relu_only_emits_the_fused_expression(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_materialized_unfused_scalar_relu_remains_live(
     dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch
 ) -> None:

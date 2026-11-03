@@ -12,7 +12,8 @@ from .cute_population_contracts import checked_initial_population
 from .test_cute_grouped_large_device_seeds import _kernel
 from .test_cute_grouped_prefix_adaptive_config import _args
 from .test_cute_grouped_prefix_adaptive_config import _recipes
-from helion._compiler.autotuner_heuristics import cute as heuristics
+from helion._compiler.cute.autotune.heuristics import cute as heuristics
+from helion._compiler.cute.tcgen05_config import facts
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
@@ -53,8 +54,8 @@ def test_m256_pair_survives_strict_transfer(dtype, offset_dtype, balanced):
         assert effective.get(RESERVED, 0) == 0
         assert effective["tcgen05_grouped_l2_swizzle_alternate"] == 4
         assert effective["tcgen05_grouped_l2_swizzle_mn_ratio"] == 1
-        profile = spec._cute_tcgen05_config.get_grouped_prefix_adaptive_n_profile(
-            effective
+        profile = facts.get_grouped_prefix_adaptive_n_profile(
+            spec._cute_tcgen05_config, effective
         )
         assert profile is not None
         assert (
@@ -93,7 +94,6 @@ def test_m256_pair_survives_strict_transfer(dtype, offset_dtype, balanced):
         {"cute_min_blocks_per_mp": 2},
         {"tcgen05_cluster_n": 2},
         {"tcgen05_cta_group": "one"},
-        {"tcgen05_cluster_m2_one_cta_role_local": True},
         {"tcgen05_grouped_l2_swizzle_alternate": None},
         {"tcgen05_grouped_l2_swizzle_alternate": 2},
         {"tcgen05_grouped_l2_swizzle_mn_ratio": 2},
@@ -127,8 +127,8 @@ def test_m256_domain_uses_real_metadata_and_supports_complete_box_tails(
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
         spec = cpu_bind(_kernel(), _args(groups=groups, m=m, n=n, k=k)).config_spec
         assert (
-            spec._cute_tcgen05_config.get_grouped_prefix_adaptive_n_profile(
-                {SOURCE: 256}
+            facts.get_grouped_prefix_adaptive_n_profile(
+                spec._cute_tcgen05_config, {SOURCE: 256}
             )
             is not None
         )
@@ -142,8 +142,8 @@ def test_m256_outside_domain_has_no_profile(groups, n, k):
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
         spec = cpu_bind(_kernel(), _args(groups=groups, m=8192, n=n, k=k)).config_spec
         assert (
-            spec._cute_tcgen05_config.get_grouped_prefix_adaptive_n_profile(
-                {SOURCE: 256}
+            facts.get_grouped_prefix_adaptive_n_profile(
+                spec._cute_tcgen05_config, {SOURCE: 256}
             )
             is None
         )

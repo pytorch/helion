@@ -8,12 +8,11 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_matmul import _is_direct_zero_seed
 from helion._compiler.cute.collective_matmul import has_collective_native_seed_candidate
 from helion._compiler.cute.matmul_utils import cute_matmul_root_placements
 from helion._testing import TestCase
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_spec import KernelGridFact
 from helion.autotuner.config_spec import MatmulFact
@@ -56,7 +55,6 @@ def _admitted_inputs() -> tuple[torch.Tensor, ...]:
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_independent_contractions_receive_complete_collective_seeds() -> None:
     bound = cpu_bind(_independent_matmuls, _admitted_inputs())
     assert bound.host_function is not None
@@ -213,7 +211,6 @@ def _assert_geometry_without_seeds(bound: BoundKernel) -> None:
     assert "cute.gemm(" not in bound.to_code(explicit)
 
 
-@skipUnlessBackends(["cute"])
 def test_serial_loop_carried_accumulator_receives_no_collective_seeds() -> None:
     # The full-slice K contraction accumulates the chunk loop's carry, so only
     # the first chunk starts from the captured zero. The lowering refuses such
@@ -240,7 +237,6 @@ def test_serial_loop_carried_accumulator_receives_no_collective_seeds() -> None:
     _assert_geometry_without_seeds(bound)
 
 
-@skipUnlessBackends(["cute"])
 def test_serial_loop_indexed_operands_receive_no_collective_seeds() -> None:
     # A zero created in every chunk passes the seed proof, but the operands
     # index the chunk loop's coordinate, which no scalar recipe can replay.
@@ -280,7 +276,6 @@ def _block_size_scaled_operand(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor
     return out
 
 
-@skipUnlessBackends(["cute"])
 def test_branch_between_grid_rows_and_reduction_receives_no_collective_seeds() -> None:
     # The predicate is scalar, but the row lane of a grid M wraps the whole
     # root body, so the branch sits inside the row/reduction region the
@@ -299,7 +294,6 @@ def test_branch_between_grid_rows_and_reduction_receives_no_collective_seeds() -
     _assert_geometry_without_seeds(bound)
 
 
-@skipUnlessBackends(["cute"])
 def test_enclosing_loop_block_size_keeps_collective_seeds() -> None:
     # The enclosing loop's block size is replayed as a constant; only its
     # position (grid index, tile begin, or the tile as a load coordinate)
@@ -316,7 +310,6 @@ def test_enclosing_loop_block_size_keeps_collective_seeds() -> None:
 
 
 class TestCollectiveSeedCodegen(TestCase):
-    @skipUnlessBackends(["cute"])
     def test_admitted_contractions_keep_their_seeds_and_code(self) -> None:
         # The structural seed filter must leave an admitted kernel untouched:
         # pin the seed count and the first seed's generated code.

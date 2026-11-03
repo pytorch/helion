@@ -6,12 +6,12 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion.runtime.cute.launch_descriptor import wrapper_plan_bakes_tensor_shapes
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
-from helion.runtime.cute.launcher import _cute_wrapper_plan_bakes_tensor_shapes
 
 moe_matmul_ogs = import_example("moe_matmul_ogs").moe_matmul_ogs
 
@@ -49,7 +49,6 @@ def _bound(
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("static", [False, True])
-@skipUnlessBackends(["cute"])
 def test_original_gathered_contraction_emits_pipeline(shape, dtype, static) -> None:
     bound = _bound(shape, dtype, static)
     source = bound.to_code(
@@ -74,7 +73,6 @@ def test_original_gathered_contraction_emits_pipeline(shape, dtype, static) -> N
     ast.parse(source)
 
 
-@skipUnlessBackends(["cute"])
 def test_gathered_seeds_keep_wide_columns_and_pipeline_depth() -> None:
     bound = _bound((1024, 512, 512, 8), torch.float16, False)
     assert bound.host_function is not None
@@ -122,7 +120,7 @@ def test_gathered_wrapper_uses_runtime_m_extent_and_exact_tensor_shapes() -> Non
     assert "cutlass.Int32(arg3)" in text
     assert "_helion_make_gathered_tma(arg0, arg1, 512, 2)" in text
     assert arguments == plan["kernel_args"]
-    assert _cute_wrapper_plan_bakes_tensor_shapes(plan)
+    assert wrapper_plan_bakes_tensor_shapes(plan)
 
 
 def test_oversized_gathered_pipeline_is_rejected_by_wrapper() -> None:
@@ -136,7 +134,6 @@ def test_oversized_gathered_pipeline_is_rejected_by_wrapper() -> None:
         _append_cute_wrapper_plan([], [], plan)
 
 
-@skipUnlessBackends(["cute"])
 def test_gathered_mode_requires_collective_admission() -> None:
     bound = _bound((256, 128, 128, 4), torch.float16, False)
     with pytest.raises(helion.exc.BackendUnsupported, match="admitted collective"):
@@ -151,7 +148,6 @@ def test_gathered_mode_requires_collective_admission() -> None:
         )
 
 
-@skipUnlessBackends(["cute"])
 def test_gathered_mode_rejects_unaligned_input_after_binding() -> None:
     bound = _bound((256, 128, 128, 4), torch.float16, False, lhs_offset=1)
     with pytest.raises(helion.exc.BackendUnsupported, match="unproved gathered"):
@@ -166,7 +162,6 @@ def test_gathered_mode_rejects_unaligned_input_after_binding() -> None:
         )
 
 
-@skipUnlessBackends(["cute"])
 def test_group_metadata_loads_are_bound_once_ahead_of_the_pipeline() -> None:
     # The row recipe reads the group's offset and the row predicate its
     # token count; both are coordinate-free, so the pipeline binds each once

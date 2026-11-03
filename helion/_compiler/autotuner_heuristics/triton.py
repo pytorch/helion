@@ -5411,3 +5411,21 @@ class TritonMatmulReductionEpilogueHeuristic(AutotunerHeuristic):
             "num_stages": num_stages,
         }
         return Config(**seed)
+
+
+# Ranked registry (``TritonBackend.autotuner_heuristics``).
+TRITON_HEURISTICS: tuple[type[AutotunerHeuristic], ...] = (
+    # The two sm90 front ends are disjoint and share the B200 decision flow,
+    # with WGMMA/register-resident resource policy.
+    TritonH100FormulaMatmulHeuristic,
+    TritonH100MultiMatmulHeuristic,
+    TritonSkinnyGemmHeuristic,
+    # The two sm100 front ends are disjoint and both provide fast
+    # autotune-off defaults as well as autotuner seeds.
+    TritonB200FormulaMatmulHeuristic,
+    TritonB200MultiMatmulHeuristic,
+    TritonMatmulReductionEpilogueHeuristic,
+    TritonReductionHeuristic,
+    TritonNarrowReductionHeuristic,
+    TritonPointwiseSeedHeuristic,
+)

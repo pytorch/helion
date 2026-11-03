@@ -14,16 +14,15 @@ from test.test_cute_collective_native_seeded import _mamba_sizes
 from test.test_cute_collective_vector_epilogue_codegen import _mamba_config
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.collective_epilogue import prune_pure_scalar_statements
 from helion._compiler.cute.collective_tcgen05 import CollectiveTcgen05Plan
 from helion._compiler.cute.collective_tcgen05 import CollectiveTmemResource
 from helion._compiler.cute.collective_tmem_seed import NativeCollectiveLifetime
 from helion._compiler.cute.collective_tmem_seed import _same_cell
 from helion._compiler.cute.collective_tmem_seed import _seed_recipe
 from helion._compiler.cute.collective_tmem_seed import bridge_collective_tmem_seeds
-from helion._compiler.cute.collective_tmem_seed import prune_pure_scalar_statements
 from helion._testing import pairwise
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_flash import compiled_source
 from helion.autotuner.benchmarking import _make_cudagraph_replay
@@ -242,7 +241,6 @@ else:
 @pytest.mark.parametrize(
     ("block_m", "block_n", "static_shapes"), _MAMBA_SEED_TILE_CASES
 )
-@skipUnlessBackends(["cute"])
 def test_generated_mamba_has_direct_seed_and_live_final_drain(
     block_m: int, block_n: int, static_shapes: bool
 ) -> None:
@@ -267,7 +265,6 @@ def test_generated_mamba_has_direct_seed_and_live_final_drain(
     assert "mul.rn.f32" in source
 
 
-@skipUnlessBackends(["cute"])
 def test_tmem_seed_search_and_config_roundtrip() -> None:
     args = tuple(torch.empty(size, dtype=torch.bfloat16) for size in _mamba_sizes(2))
     bound = cpu_bind(_mamba_kernel(static_shapes=False), args)
@@ -288,7 +285,6 @@ def test_tmem_seed_search_and_config_roundtrip() -> None:
 
 
 @pytest.mark.parametrize("value", [None, 0, 1, "yes"])
-@skipUnlessBackends(["cute"])
 def test_invalid_tmem_seed_flag_is_rejected(value: object) -> None:
     args = tuple(torch.empty(size, dtype=torch.bfloat16) for size in _mamba_sizes(0))
     bound = cpu_bind(_mamba_kernel(static_shapes=False), args)
@@ -344,7 +340,6 @@ def _dependent_inputs(dtype: torch.dtype, device: str) -> tuple[torch.Tensor, ..
 
 
 @pytest.mark.parametrize("block_m,block_n", [(64, 32), (128, 64)])
-@skipUnlessBackends(["cute"])
 def test_dynamic_empty_reduction_codegen(block_m: int, block_n: int) -> None:
     bound = cpu_bind(_dependent_contractions, _dependent_inputs(torch.float16, "cpu"))
     source = bound.to_code(_dependent_config(block_m, block_n, True))
@@ -358,7 +353,6 @@ def test_dynamic_empty_reduction_codegen(block_m: int, block_n: int) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("block_m,block_n", [(64, 32), (128, 64)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_dependent_contractions_cuda_tail_empty_k_and_graph_reset(
     block_m: int, block_n: int, dtype: torch.dtype
 ) -> None:
@@ -400,7 +394,6 @@ def test_dependent_contractions_cuda_tail_empty_k_and_graph_reset(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(("block_m", "block_n", "dtype"), _MAMBA_SEED_CUDA_CASES)
-@skipUnlessBackends(["cute"])
 def test_mamba_cuda_tmem_seed_matches_existing_exactly(
     block_m: int, block_n: int, dtype: torch.dtype
 ) -> None:

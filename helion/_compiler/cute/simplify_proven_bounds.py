@@ -10,22 +10,17 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+import functools
 from typing import cast
+
+from ._ast_pass_utils import call_path as _call_path
+from ._ast_pass_utils import comparison_is_always_true
+from ._ast_pass_utils import names_read
+from ._ast_pass_utils import names_stored_or_deleted as _assigned_names
 
 _INT32_MAX = (1 << 31) - 1
 _ABI_VERSION = 1
 _MARKER_PREFIX = "_cute_proven_bounds_"
-
-
-def _call_path(node: ast.AST) -> tuple[str, ...] | None:
-    path: list[str] = []
-    while isinstance(node, ast.Attribute):
-        path.append(node.attr)
-        node = node.value
-    if not isinstance(node, ast.Name):
-        return None
-    path.append(node.id)
-    return tuple(reversed(path))
 
 
 def _axis_index(node: ast.AST, function: str) -> int | None:
@@ -41,22 +36,6 @@ def _axis_index(node: ast.AST, function: str) -> int | None:
     ):
         return None
     return node.slice.value
-
-
-def _assigned_names(node: ast.AST) -> set[str]:
-    return {
-        child.id
-        for child in ast.walk(node)
-        if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del))
-    }
-
-
-def _loaded_names(node: ast.AST) -> set[str]:
-    return {
-        child.id
-        for child in ast.walk(node)
-        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
-    }
 
 
 def _boolean_value(node: ast.expr) -> bool:
@@ -195,45 +174,6 @@ def _integer_interval(
     return _checked_interval(low, high)
 
 
-def _comparison_is_true(
-    node: ast.Compare,
-    *,
-    bounds: dict[str, tuple[int, int]],
-    thread_block_dims: tuple[int, int, int],
-    block_grid_dims: tuple[int, int, int],
-) -> bool:
-    if len(node.ops) != 1 or len(node.comparators) != 1:
-        return False
-    left = _integer_interval(
-        node.left,
-        bounds=bounds,
-        thread_block_dims=thread_block_dims,
-        block_grid_dims=block_grid_dims,
-    )
-    right = _integer_interval(
-        node.comparators[0],
-        bounds=bounds,
-        thread_block_dims=thread_block_dims,
-        block_grid_dims=block_grid_dims,
-    )
-    if left is None or right is None:
-        return False
-    operation = node.ops[0]
-    if isinstance(operation, ast.Lt):
-        return left[1] < right[0]
-    if isinstance(operation, ast.LtE):
-        return left[1] <= right[0]
-    if isinstance(operation, ast.Gt):
-        return left[0] > right[1]
-    if isinstance(operation, ast.GtE):
-        return left[0] >= right[1]
-    if isinstance(operation, ast.Eq):
-        return left[0] == left[1] == right[0] == right[1]
-    if isinstance(operation, ast.NotEq):
-        return left[1] < right[0] or right[1] < left[0]
-    return False
-
-
 def _range_interval(
     node: ast.expr,
     *,
@@ -314,6 +254,12 @@ class _Simplifier:
         self, node: ast.expr, bounds: dict[str, tuple[int, int]]
     ) -> ast.expr:
         parent = self
+        interval = functools.partial(
+            _integer_interval,
+            bounds=bounds,
+            thread_block_dims=self.thread_block_dims,
+            block_grid_dims=self.block_grid_dims,
+        )
 
         class Transformer(ast.NodeTransformer):
             def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
@@ -328,12 +274,7 @@ class _Simplifier:
             def visit_Compare(self, node: ast.Compare) -> ast.AST:
                 visited = self.generic_visit(node)
                 assert isinstance(visited, ast.Compare)
-                if _comparison_is_true(
-                    visited,
-                    bounds=bounds,
-                    thread_block_dims=parent.thread_block_dims,
-                    block_grid_dims=parent.block_grid_dims,
-                ):
+                if comparison_is_always_true(visited, interval):
                     parent.changed += 1
                     return ast.copy_location(ast.Constant(value=True), visited)
                 return visited
@@ -382,7 +323,7 @@ class _Simplifier:
                     statement.targets[0], ast.Name
                 ):
                     target = statement.targets[0].id
-                    if target in _loaded_names(statement.value):
+                    if target in names_read(statement.value):
                         bounds.pop(target, None)
                     else:
                         interval = _integer_interval(
@@ -452,13 +393,17 @@ def simplify_proven_bounds(
     *,
     enabled: bool,
     xyz_grid: bool,
-    thread_block_dims: tuple[int, int, int],
+    thread_block_dims: tuple[int, int, int] | None,
     block_grid_dims: tuple[int | None, int | None, int | None],
     constexpr_values: dict[str, int],
     proven_tensor_size_values: dict[tuple[str, int], tuple[str, int]],
 ) -> list[ast.stmt]:
-    """Simplify only bounds proven by exact launch and input metadata."""
-    if not enabled or not xyz_grid:
+    """Simplify only bounds proven by exact launch and input metadata.
+
+    ``thread_block_dims`` is the proven static launch shape; ``None`` (an
+    argument-sized or otherwise unproven axis) proves nothing.
+    """
+    if not enabled or not xyz_grid or thread_block_dims is None:
         return body
     if len(thread_block_dims) != 3 or len(block_grid_dims) != 3:
         return body

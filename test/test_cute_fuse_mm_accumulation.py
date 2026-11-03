@@ -16,7 +16,6 @@ from helion._compiler.cute.cute_mma import analyze_cute_mma_node
 from helion._compiler.cute.fuse_mm_accumulation import fuse_mm_accumulation
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
 from helion.language import _tracing_ops
@@ -216,7 +215,6 @@ def test_refuses_noncanonical_accumulation(change: str) -> None:
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(128, 128, 64), (73, 41, 78)])
-@skipUnlessBackends(["cute"])
 def test_aot_source_uses_half_mma_with_fp32_accumulator(
     dtype: torch.dtype, shape: tuple[int, int, int]
 ) -> None:
@@ -232,7 +230,7 @@ def test_aot_source_uses_half_mma_with_fp32_accumulator(
         bound = kernel._bind_isolated(
             (torch.empty((m, k), dtype=dtype), torch.empty((k, n), dtype=dtype))
         )
-        assert bound.env.config_spec.cute_tcgen05_search_enabled
+        assert bound.env.config_spec.tcgen05.search_enabled
         assert bound.host_function is not None
         with bound.env, bound.host_function:
             candidates = [
@@ -254,7 +252,6 @@ def test_aot_source_uses_half_mma_with_fp32_accumulator(
     assert "cutlass.TFloat32" not in code
 
 
-@skipUnlessBackends(["cute"])
 def test_true_fp32_inputs_keep_ieee_precision() -> None:
     kernel = helion.kernel(
         matmul_custom_key.fn,
@@ -265,7 +262,7 @@ def test_true_fp32_inputs_keep_ieee_precision() -> None:
     )
     with cpu_target():
         bound = kernel._bind_isolated((torch.empty((64, 64)), torch.empty((64, 32))))
-        assert not bound.env.config_spec.cute_tcgen05_search_enabled
+        assert not bound.env.config_spec.tcgen05.search_enabled
         assert bound.host_function is not None
         with bound.env, bound.host_function:
             for info in bound.host_function.device_ir.graphs:
@@ -284,7 +281,6 @@ def test_true_fp32_inputs_keep_ieee_precision() -> None:
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("mismatch_first", [False, True])
-@skipUnlessBackends(["cute"])
 def test_dynamic_inputs_key_both_k_sizes_and_output_extents(
     dtype: torch.dtype, mismatch_first: bool
 ) -> None:
@@ -312,16 +308,13 @@ def test_dynamic_inputs_key_both_k_sizes_and_output_extents(
             assert kernel.bind(tuple(torch.empty_like(arg) for arg in args)) is bound
             bounds.append(bound)
             assert bound.env.specialized_vars
-            assert bound.env.config_spec.cute_tcgen05_search_enabled == (
-                left_k == right_k
-            )
+            assert bound.env.config_spec.tcgen05.search_enabled == (left_k == right_k)
             code = bound.to_code(helion.Config(block_sizes=[64, 32, 32]))
             assert ("cute.gemm(" in code) == (left_k == right_k)
             ast.parse(code)
 
 
 @pytest.mark.parametrize("change", ["cast_chain", "masked_load", "computed_operand"])
-@skipUnlessBackends(["cute"])
 def test_mma_proof_keeps_cast_and_mask_semantics(change: str) -> None:
     kernel = helion.kernel(
         matmul_custom_key.fn,
@@ -368,7 +361,6 @@ def test_mma_proof_keeps_cast_and_mask_semantics(change: str) -> None:
             assert analyze_cute_mma_node(node) is None
 
 
-@skipUnlessBackends(["cute"])
 def test_computed_fp32_inputs_are_not_specialized_or_narrowed() -> None:
     @helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
     def computed(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -391,14 +383,13 @@ def test_computed_fp32_inputs_are_not_specialized_or_narrowed() -> None:
             )
         )
         assert not bound.env.specialized_vars
-        assert not bound.env.config_spec.cute_tcgen05_search_enabled
+        assert not bound.env.config_spec.tcgen05.search_enabled
         code = bound.to_code(helion.Config(block_sizes=[64, 32, 32]))
     assert "cute.gemm(" not in code
     assert "1.25" in code
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_zero_k_keeps_zero_accumulator(dtype: torch.dtype) -> None:
     kernel = helion.kernel(
         matmul_custom_key.fn,
@@ -410,46 +401,8 @@ def test_zero_k_keeps_zero_accumulator(dtype: torch.dtype) -> None:
         bound = kernel._bind_isolated(
             (torch.empty((64, 0), dtype=dtype), torch.empty((0, 32), dtype=dtype))
         )
-        assert not bound.env.config_spec.cute_tcgen05_search_enabled
+        assert not bound.env.config_spec.tcgen05.search_enabled
         code = bound.to_code(helion.Config(block_sizes=[64, 32, 32]))
     ast.parse(code)
     assert "cute.gemm(" not in code
     assert "cutlass.Float32(0.0)" in code
-
-
-@skipUnlessBackends(["cute"])
-def test_role_lifecycle_owns_absorbed_cast_scaffolding() -> None:
-    kernel = helion.kernel(
-        matmul_custom_key.fn,
-        backend="cute",
-        static_shapes=False,
-        autotune_effort="none",
-        dot_precision="ieee",
-    )
-    config = helion.Config(
-        block_sizes=[128, 256, 128],
-        indexing=["tensor_descriptor"] * 3,
-        l2_groupings=[1],
-        loop_orders=[[0, 1]],
-        num_stages=2,
-        num_warps=4,
-        pid_type="flat",
-        tcgen05_ab_stages=2,
-        tcgen05_acc_stages=1,
-        tcgen05_c_stages=2,
-        tcgen05_cluster_m=1,
-        tcgen05_cluster_n=1,
-        tcgen05_num_epi_warps=4,
-        tcgen05_strategy="pure_matmul_role_lifecycle",
-    )
-    with cpu_target():
-        bound = kernel._bind_isolated(
-            (
-                torch.empty((128, 384), dtype=torch.bfloat16),
-                torch.empty((384, 256), dtype=torch.bfloat16),
-            )
-        )
-        code = bound.to_code(config)
-    ast.parse(code)
-    assert "cute.gemm(" in code
-    assert "cutlass.Float32(load" not in code
