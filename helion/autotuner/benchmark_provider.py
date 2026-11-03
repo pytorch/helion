@@ -2916,7 +2916,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return None
 
         if self._benchmark_worker is None:
-            self._benchmark_worker = BenchmarkWorker(device=None)
+            self._benchmark_worker = BenchmarkWorker(
+                device=None, log_warning=self.log.warning
+            )
 
         if (
             len(self.mutated_arg_indices) > 0
@@ -2966,7 +2968,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return None
 
         if self._benchmark_worker is None:
-            self._benchmark_worker = BenchmarkWorker(device=None)
+            self._benchmark_worker = BenchmarkWorker(
+                device=None, log_warning=self.log.warning
+            )
 
         job = BenchmarkJob(
             fn_spec=fn_spec,

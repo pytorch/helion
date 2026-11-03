@@ -4,6 +4,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 import tempfile
+from typing import Callable
 import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
@@ -54,8 +55,10 @@ class TestFreshFinalistProcess(unittest.TestCase):
             provider._benchmark_worker = None
             workers: list[BenchmarkWorker] = []
 
-            def new_worker(*, device: int | None) -> BenchmarkWorker:
-                worker = BenchmarkWorker(device=device)
+            def new_worker(
+                *, device: int | None, log_warning: Callable[[str], object]
+            ) -> BenchmarkWorker:
+                worker = BenchmarkWorker(device=device, log_warning=log_warning)
                 workers.append(worker)
                 return worker
 
