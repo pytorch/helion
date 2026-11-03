@@ -945,8 +945,8 @@ def uniform_output_stores_are_writeonly(
     distinct output. Repeated stores through one exact tensor retain order.
     """
     from ...language import memory_ops
-    from .memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
-    from .memory_ops import runtime_tensors_are_proven_disjoint
+    from ..runtime_tensor_guards import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+    from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
     from .register_loads import host_load_is_readonly
 
     if not tree.output_stores:

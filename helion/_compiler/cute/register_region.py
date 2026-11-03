@@ -39,9 +39,9 @@ from ..device_ir import RootGraphInfo
 from ..host_function import HostFunction
 from ..inductor_lowering import ReductionLowering
 from ..program_id import XYZProgramIDs
+from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 from ..tile_strategy import DeviceGridState
 from .bounded_gather import integer_bounds
-from .memory_ops import runtime_tensors_are_proven_disjoint
 from .register_program import emit_register_program
 from .register_program import register_program_supported
 from .row_fragment import RowFragment

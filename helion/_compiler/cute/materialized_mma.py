@@ -8,7 +8,7 @@ from typing import cast
 
 import torch
 
-from .active_blocks import active_block_ids
+from ..active_blocks import active_block_ids
 from .materialized_fission_codegen import _region_graph_ids
 from .pipeline_smem import Tcgen05PipelineSmemFacts
 

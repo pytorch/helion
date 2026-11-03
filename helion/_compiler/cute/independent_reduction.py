@@ -57,7 +57,7 @@ def independent_reduction_coordinates(
         if not isinstance(index, Node) or index.target is not _tracing_ops._get_symnode:
             return None
         axis = env.resolve_block_id(index.meta.get("val"))
-        if axis is None or env.block_sizes[axis].reduction:
+        if axis is None or not env.block_sizes[axis].is_tile:
             return None
         return axis
 

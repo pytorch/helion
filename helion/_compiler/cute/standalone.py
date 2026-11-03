@@ -28,8 +28,8 @@ from ...runtime.cute.launcher import _normalize_cute_scalar
 from ..compile_environment import _replay_tensor_input_source
 from ..output_code_utils import _check_kernel_name_not_shadowed
 from ..output_code_utils import _GlobalToNonlocal
+from ..runtime_tensor_guards import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
 from .memory_ops import _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
-from .memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

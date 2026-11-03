@@ -143,7 +143,7 @@ def _uniform_load(load: torch.fx.Node) -> bool:
     whenever it loads it.  A distributed kernel is refused: a peer may write
     the tensor during the kernel.
     """
-    from .memory_ops import runtime_tensors_are_proven_disjoint
+    from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
     from .view_ops import _host_tensor_root_name
 
     tensor, index, extra_mask, *_ = load.args

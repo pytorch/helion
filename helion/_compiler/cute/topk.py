@@ -21,7 +21,7 @@ from ..device_ir import GraphInfo
 from ..device_ir import ReductionLoopGraphInfo
 from ..device_ir import RootGraphInfo
 from ..host_function import HostFunction
-from .memory_ops import runtime_tensors_are_proven_disjoint
+from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 from .ordered_selection import is_ordered_selection
 from .ordered_selection import selection_args
 

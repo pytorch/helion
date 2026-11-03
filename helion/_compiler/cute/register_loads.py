@@ -115,9 +115,9 @@ def host_load_is_readonly(
     alias a host storage; their normal initialization/update barriers remain.
     """
     from ...language import creation_ops
+    from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
     from .local_atomic import _reachable_graphs
     from .local_atomic import atomic_target_origins
-    from .memory_ops import runtime_tensors_are_proven_disjoint
 
     source_node = node.args[0]
     if not isinstance(source_node, Node):

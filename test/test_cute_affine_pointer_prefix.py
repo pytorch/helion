@@ -14,7 +14,9 @@ from test.test_cute_affine_vector_io import _execute
 from test.test_cute_affine_vector_io import _rewrite
 
 import helion
-from helion._compiler.cute.memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+from helion._compiler.runtime_tensor_guards import (
+    _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
+)
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 

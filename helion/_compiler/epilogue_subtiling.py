@@ -697,7 +697,7 @@ def _find_split_candidate(
         block_id = env.get_block_id(size)
         if (
             block_id is not None
-            and not env.block_sizes[block_id].reduction
+            and env.block_sizes[block_id].is_tile
             and not env.is_jagged_tile(block_id)
             and size % split_factor == 0
         ):

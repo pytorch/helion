@@ -340,7 +340,7 @@ def _physical(monkeypatch):
     monkeypatch.setattr(sb.HostFunction, "current", lambda: None)
     monkeypatch.setattr(sb, "_fresh_tensors", lambda host: {case.output.meta["val"]})
     monkeypatch.setattr(
-        "helion._compiler.cute.memory_ops.runtime_tensors_are_proven_disjoint",
+        "helion._compiler.runtime_tensor_guards.runtime_tensors_are_proven_disjoint",
         lambda *args: False,
     )
     sb.record_signed_byte_packet(
