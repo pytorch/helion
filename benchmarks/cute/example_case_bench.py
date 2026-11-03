@@ -240,7 +240,12 @@ def main() -> None:
         )
     if args.kernel_profile:
         result.update(baseline.kernel_profile(call, max(args.reps, 20)))
-    if args.graph_calls > 1 and not args.no_graph:
+    # A call the CUDA graph capture rejected (``graph_capturable`` False, a
+    # host synchronization) is not captured again for the batched and cold
+    # readings: a second capture fails the same way, and the comparison
+    # worker keeps such a baseline eager-only. Its ``event_ms`` stands.
+    graph = not args.no_graph and result["graph_capturable"]
+    if args.graph_calls > 1 and graph:
         result.update(
             baseline.measure_batched(
                 call,
@@ -251,7 +256,7 @@ def main() -> None:
                 output_dtype=output_dtype,
             )
         )
-    if not args.no_graph and not args.no_bench:
+    if graph and not args.no_bench:
         # Secondary: the autotuner's cold-L2 regime (bench_ms).
         result.update(baseline.measure_cold(call, args.reps))
     if args.provider in {"cute", "triton"}:
@@ -267,6 +272,7 @@ def main() -> None:
             "bench_ms",
             "bench_error",
             "event_ms",
+            "graph_capturable",
             "graph_ms",
             "graph_error",
             "graph_calls_ms",
