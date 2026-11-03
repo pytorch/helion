@@ -1154,6 +1154,75 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=2e-2,
         )
 
+    # Only the CuTe path lowers the fused flash body and the mul.f32x2 idiom
+    # this test exercises.
+    @onlyBackends(["cute"])
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="the fused flash body and mul.f32x2 require Blackwell"
+    )
+    @skipIfRefEager("inline asm codegen is not available in ref eager mode")
+    def test_blackwell_attention(self):
+        # The forward is the flattened-rows attention form (one root axis
+        # over B*H*M rows, a runtime softmax scale, a packed ``mul.f32x2``
+        # rescale): on cute it takes the fused flash body, as the backward
+        # takes the fused flash backward.  The forward has no pinned config
+        # on cute, so pin its default config (the flash default, restored on
+        # teardown) instead of autotuning.
+        mod = self._check_blackwell_attention()
+        # The fused body takes the row max of the raw scores and scales it,
+        # so the generated host function asserts the runtime scale positive
+        # before the launch (the SIMT twin computes the kernel as written).
+        q, k, v = (
+            torch.randn((1, 4, 256, 64), dtype=torch.bfloat16, device=DEVICE)
+            for _ in range(3)
+        )
+        with self.assertRaisesRegex(AssertionError, "softmax scale must be positive"):
+            mod.blackwell_attention_kernel(q, k, v, -0.125)
+
+    @onlyBackends(["cute"])
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="the example's raw mul.f32x2 requires Blackwell"
+    )
+    @skipIfRefEager("inline asm codegen is not available in ref eager mode")
+    def test_blackwell_attention_simt(self):
+        # The same forward with the fused flash body gated off: the split /
+        # join round trip over the accumulator is elided and the packed pure
+        # asm relocates through the staged lane schedule.
+        with patch.dict("os.environ", {"HELION_CUTE_FLASH": "0"}):
+            self._check_blackwell_attention()
+
+    def _check_blackwell_attention(self):
+        mod = import_path(EXAMPLES_DIR / "blackwell_attention.py")
+        kernel = mod.blackwell_attention_kernel
+        kernel.reset()
+        self.addCleanup(kernel.reset)
+        self.addCleanup(setattr, kernel, "configs", kernel.configs)
+        shape = (1, 4, 256, 64)
+        q, k, v = (
+            torch.randn(shape, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
+            for _ in range(3)
+        )
+        qk_scale = math.sqrt(1.0 / shape[-1])
+        kernel.configs = [kernel.bind((q, k, v, qk_scale)).config_spec.default_config()]
+        q_ref, k_ref, v_ref = (
+            t.detach().clone().requires_grad_(True) for t in (q, k, v)
+        )
+        expected = F.scaled_dot_product_attention(q_ref, k_ref, v_ref)
+        grad_out = torch.randn_like(expected)
+        expected.backward(grad_out)
+        result = mod.blackwell_attention_fwd_bwd(q, k, v)
+        result.backward(grad_out)
+        torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)
+        for got, ref in (
+            (q.grad, q_ref.grad),
+            (k.grad, k_ref.grad),
+            (v.grad, v_ref.grad),
+        ):
+            torch.testing.assert_close(got, ref, atol=1e-1, rtol=1e-1)
+        return mod
+
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")

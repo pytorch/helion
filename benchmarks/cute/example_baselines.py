@@ -91,6 +91,55 @@ class PreparedCandidate:
     details: dict
 
 
+def baseline_unavailable(error: BaseException) -> bool:
+    """Whether a baseline failed because it cannot run here, not because it
+    computed or measured wrongly: its optional package is not installed, the
+    selected library has no kernel for these inputs (``sdpa_kernel`` forcing
+    one SDPA backend), or ``torch.compile(fullgraph=True)`` cannot trace a
+    reference whose control flow depends on tensor values (jagged offsets)."""
+    import torch._dynamo.exc
+
+    return isinstance(
+        error,
+        (ImportError, torch._dynamo.exc.Unsupported, torch._dynamo.exc.UserError),
+    ) or (
+        isinstance(error, RuntimeError) and str(error).startswith("No available kernel")
+    )
+
+
+# CUDA's messages for a capture the captured call itself invalidated.
+CAPTURE_INVALIDATED = (
+    "operation failed due to a previous error during capture",
+    "Cannot copy between CPU and CUDA tensors during CUDA graph capture",
+    "operation not permitted when stream is capturing",
+)
+
+
+def capture_cause(error: BaseException) -> BaseException:
+    """The error a failed CUDA graph capture reports.  CUDA's "operation
+    failed due to a previous error during capture" names an earlier failure
+    of the same capture; when that failure is chained to it (``__cause__`` or
+    the implicit ``__context__``) it is the one to report and classify."""
+    while CAPTURE_INVALIDATED[0] in str(error):
+        chained = error.__cause__ or error.__context__
+        if chained is None:
+            return error
+        error = chained
+    return error
+
+
+def capture_invalidated(error: BaseException) -> bool:
+    """Whether a failed CUDA graph capture was invalidated by the captured call
+    itself: a host synchronization (offsets read back for data-dependent
+    shapes, ``.item()`` loops, a device-to-host copy) that cannot be part of a
+    graph. CUDA names the capture in exactly the ``CAPTURE_INVALIDATED``
+    messages; a failure that would fail eagerly too (out of memory, a call
+    raising on its own) does not, nor does CUDA's "previous error during
+    capture" report of such a failure when the failure is chained to it."""
+    cause = str(capture_cause(error))
+    return any(message in cause for message in CAPTURE_INVALIDATED)
+
+
 def live_example_kernels() -> dict[str, Any]:
     """Every live Helion kernel whose function is defined in an example module.
 
@@ -675,34 +724,33 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
         result["quack.gather_gemm"] = lambda: moe_provider(True)
         result["aten.grouped_mm"] = lambda: moe_provider(False)
     if module == "jagged_dense_bmm":
+        # quack's varlen-M gemm (TF32 for these FP32 inputs) is correct at the
+        # catalogue's D=64 and D=128 workloads and read back 95.7% mismatched
+        # at D=32 (2026-11).  It is offered at every D: the D=32 failure stays
+        # in the result as a baseline failure, where a quack fix would show.
+        def quack_grouped() -> Callable:
+            gemm = importlib.import_module("quack.gemm_interface").gemm
 
-        def grouped_jagged(use_quack: bool) -> Callable:
-            if use_quack:
-                gemm = importlib.import_module("quack.gemm_interface").gemm
+            return lambda offsets, x, weights, bias: gemm(
+                x, weights, bias=bias, cu_seqlens_m=offsets.int()
+            )
 
-                return lambda offsets, x, weights, bias: gemm(
-                    x, weights, bias=bias, cu_seqlens_m=offsets.int()
-                )
+        result["quack.grouped_mm"] = quack_grouped
 
-            def call(
-                offsets: torch.Tensor,
-                x: torch.Tensor,
-                weights: torch.Tensor,
-                bias: torch.Tensor,
-            ) -> torch.Tensor:
-                rows = torch.repeat_interleave(
-                    torch.arange(weights.shape[0], device=x.device),
-                    offsets[1:] - offsets[:-1],
-                    output_size=x.shape[0],
-                )
-                return (
-                    torch._grouped_mm(x, weights, offs=offsets[1:].int()) + bias[rows]
-                )
+        def grouped_mm(
+            offsets: torch.Tensor,
+            x: torch.Tensor,
+            weights: torch.Tensor,
+            bias: torch.Tensor,
+        ) -> torch.Tensor:
+            rows = torch.repeat_interleave(
+                torch.arange(weights.shape[0], device=x.device),
+                offsets[1:] - offsets[:-1],
+                output_size=x.shape[0],
+            )
+            return torch._grouped_mm(x, weights, offs=offsets[1:].int()) + bias[rows]
 
-            return call
-
-        result["quack.grouped_mm"] = lambda: grouped_jagged(True)
-        result["aten.grouped_mm"] = lambda: grouped_jagged(False)
+        result["aten.grouped_mm"] = lambda: grouped_mm
         # FP32 _grouped_mm copies offsets to the host, which CUDA graphs reject.
         # A padded batched GEMM is a capture-safe ATen formulation.
         offsets = case.args[0]
@@ -1338,14 +1386,31 @@ def measure(
         "event_runs_ms": runs,
         "graph_state_warmup": warmup,
     }
+    # The forward graph of backward-only workloads is intentionally built
+    # before capture. PyTorch can redirect its saved streams into capture.
+    torch.autograd.graph.set_override_stale_capture_stream(True)
     try:
-        # The forward graph of backward-only workloads is intentionally built
-        # before capture. PyTorch can redirect its saved streams into capture.
-        torch.autograd.graph.set_override_stale_capture_stream(True)
-        try:
-            replay = _make_cudagraph_replay(fn)
-        finally:
-            torch.autograd.graph.set_override_stale_capture_stream(False)
+        replay = _make_cudagraph_replay(fn)
+    except Exception as error:
+        cause = capture_cause(error)
+        result["graph_error"] = f"{type(cause).__name__}: {cause}"
+        # A failed capture leaves the capture stream current; later
+        # measurements must not run on it.
+        torch.cuda.set_stream(torch.cuda.default_stream())
+        # Only a call that synchronizes with the host (offsets read back for
+        # data-dependent shapes, ``.item()`` loops) is uncapturable: the
+        # record keeps its eager timing only. Any other failure of the
+        # capture (out of memory, a call raising on its own) is a graph
+        # error the caller fails on, as before the field existed.
+        if capture_invalidated(cause):
+            result.update(graph_capturable=False, graph_ms=None)
+        else:
+            result["graph_capturable"] = True
+        return result
+    finally:
+        torch.autograd.graph.set_override_stale_capture_stream(False)
+    result["graph_capturable"] = True
+    try:
         actual = replay()
         result["graph_output"] = metadata(actual)
         if graph_nodes:
