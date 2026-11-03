@@ -14,11 +14,15 @@ from torch.fx.node import Node
 from torch.fx.node import map_arg
 
 from .. import exc
+from ..language._decorators import is_api_func
+from ..language._tracing_ops import _get_symnode
 from ..language.matmul_ops import MATMUL_DIM_BLOCK_IDS_META
 from ..language.matmul_ops import MATMUL_FACT_ID_META
 from ..language.matmul_ops import enforce_dot_requirements
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
+from .compile_environment import _to_sympy
+from .host_function import HostFunction
 from .node_masking import apply_masking
 from .node_masking import broadcasts_onto_masked_lanes
 from .node_masking import cached_masked_value
@@ -117,6 +121,93 @@ def register_lowering(
     lowering = AtenLowering(target=fn, masked_value_fn=masked_value_fn)
     aten_lowering_dispatch[fn] = lambda node: make_lowering(lowering, node)
     return lowering
+
+
+def _keep_shape_size_reads(node: Node) -> None:
+    """Keep physical tile extents in shape parameters."""
+    physical: Node | None = None
+
+    def physical_size(arg: Node) -> Node:
+        nonlocal physical
+        if arg is not node:
+            return arg
+        if physical is None:
+            with node.graph.inserting_before(node):
+                physical = node.graph.call_function(
+                    _get_symnode,
+                    (
+                        CompileEnvironment.current().sympy_debug(
+                            _to_sympy(node.meta["val"])
+                        ),
+                    ),
+                )
+            physical.meta.update(node.meta)
+            physical.meta["helion_host_scalar"] = False
+        return physical
+
+    for user in list(node.users):
+        if isinstance(user.target, torch._ops.OpOverload):
+            parameters = [argument.name for argument in user.target._schema.arguments]
+        elif is_api_func(user.target):
+            parameters = list(user.target._signature.parameters)
+        else:
+            continue
+        args, kwargs = list(user.args), dict(user.kwargs)
+        for position, name in enumerate(parameters):
+            if name not in {"size", "shape", "length", "output_size"} and not (
+                user.target
+                in (
+                    torch.ops.aten.arange.default,
+                    torch.ops.aten.arange.start,
+                    torch.ops.aten.arange.start_step,
+                )
+                and name == "end"
+            ):
+                continue
+            if position < len(args):
+                args[position] = map_arg(args[position], physical_size)
+            elif name in kwargs:
+                kwargs[name] = map_arg(kwargs[name], physical_size)
+        if tuple(args) != user.args or kwargs != user.kwargs:
+            user.args, user.kwargs = tuple(args), kwargs
+
+
+def resolve_reduction_sizes(graph: torch.fx.Graph) -> None:
+    """Read a full slice's logical extent, independent of padding or chunk size."""
+    env = CompileEnvironment.current()
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target not in (
+            torch.ops.aten.sym_size.int,
+            _get_symnode,
+        ):
+            continue
+        block_id = env.get_block_id(node.meta["val"])
+        if block_id is None or not env.block_sizes[block_id].reduction:
+            continue
+        _keep_shape_size_reads(node)
+        size = env.block_sizes[block_id].size
+        assert isinstance(size, (int, torch.SymInt))
+        # Keep the scalar node's identity: nested graph captures can refer to
+        # it outside FX's users map. Inline literal values on ordinary FX edges
+        # as before, while keeping their source addressable for those captures.
+        node.target = _get_symnode
+        size_expr = _to_sympy(size)
+        node.args = (
+            str(size) if isinstance(size, int) else env.sympy_debug(size_expr),
+        )
+        node.kwargs = {}
+        node.meta["val"] = size
+        node.meta["helion_host_scalar"] = isinstance(size, int) or (
+            HostFunction.current().is_host_scalar_expr(size_expr)
+        )
+        if isinstance(size, int):
+            for user in list(node.users):
+                user.args, user.kwargs = map_arg(
+                    (user.args, user.kwargs),
+                    lambda arg, extent=size, source=node: (
+                        extent if arg is source else arg
+                    ),
+                )
 
 
 sym_size_lowering = register_lowering(torch.ops.aten.sym_size.int)

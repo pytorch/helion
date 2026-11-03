@@ -345,7 +345,7 @@ def record_signed_byte_packet(
 
 def _no_alias_effects(state: CodegenState, graph: torch.fx.Graph) -> bool:
     from ..compile_environment import CompileEnvironment
-    from .memory_ops import runtime_tensors_are_proven_disjoint
+    from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 
     if not all(
         _ordinary_operation(node)

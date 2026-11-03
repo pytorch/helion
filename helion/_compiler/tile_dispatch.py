@@ -8,16 +8,19 @@ import torch
 
 from .. import exc
 from .._compat import shape_env_size_hint
+from .._utils import next_power_of_2
 from .compile_environment import CompileEnvironment
 from .compile_environment import _symint_sympy_expr
 from .cute.layout import CuTeGridExecutionPlan
 from .cute.matmul_utils import cute_matmul_root_placements
 from .cute.packed_matmul import contraction_axis_for_fact
 from .device_function import DeviceFunction
+from .device_function import find_block_size_symbols
 from .device_ir import ForLoopGraphInfo
 from .device_ir import ReductionLoopGraphInfo
 from .device_ir import RootGraphInfo
 from .host_function import HostFunction
+from .reduction_strategy import LoopedReductionStrategy
 from .reduction_strategy import ReductionStrategy
 from .reduction_strategy import cute_looped_reduction_block_size
 from .tile_strategy import CompactedShape
@@ -310,7 +313,7 @@ class TileStrategyDispatch:
         inactive_aliases = self._inactive_cute_broadcast_aliases(fn)
 
         if self._constexpr_live_graph_ids is not None:
-            from .cute.active_blocks import active_block_ids as live_block_ids
+            from .active_blocks import active_block_ids as live_block_ids
 
             # A reduction dim used only on the untaken side of a constant
             # branch is never emitted; its strategy would only claim an axis.
@@ -435,7 +438,7 @@ class TileStrategyDispatch:
             and block.block_id not in executable
             and (canonical := env.canonical_block_id(block.block_id)) != block.block_id
             and canonical in tile_blocks
-            and not env.block_sizes[canonical].reduction
+            and env.block_sizes[canonical].is_tile
             and block.symbol() == env.block_sizes[canonical].symbol()
             and block.numel == env.block_sizes[canonical].symbol()
         }
@@ -488,6 +491,30 @@ class TileStrategyDispatch:
             expr = shape
         else:
             return self.strategies[0].fn.literal_expr(shape)
+
+        env = CompileEnvironment.current()
+        if env.codegen_name == "triton" and not isinstance(expr, sympy.Symbol):
+            block_symbols, _ = find_block_size_symbols(expr)
+            for block_id in block_symbols.values():
+                info = env.block_sizes[block_id]
+                if not info.reduction:
+                    continue
+                numel = env.specialize_expr(info.numel)
+                # A derived shape scales the physical extent, and nothing masks
+                # the lanes it adds past a padded or rolled axis's logical size.
+                if (
+                    isinstance(
+                        self.block_id_to_strategy.get_any(block_id),
+                        LoopedReductionStrategy,
+                    )
+                    or not isinstance(numel, (int, sympy.Integer))
+                    or int(numel) != next_power_of_2(int(numel))
+                ):
+                    raise exc.BackendUnsupported(
+                        "triton",
+                        "derived tensor shapes involving a padded or rolled "
+                        "reduction axis",
+                    )
 
         # Try to map block symbols to their variable names
         mapped_expr = DeviceFunction.current().try_map_block_symbols_to_vars(expr)

@@ -9397,7 +9397,7 @@ class TestFragmentRegisterAtomicConsumersCPU(unittest.TestCase):
         x = torch.ones((4, 65), dtype=torch.float32)
         out = torch.empty_like(x, dtype=torch.int32)[:, :35]
         kernel = _fragment_register_atomic_branches
-        key = "cute_tensor_storage_disjoint_matrix_v1"
+        key = "tensor_storage_disjoint_matrix_v1"
         with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
             bound = kernel.bind((x, out, 17))
             self.assertTrue(
@@ -14389,7 +14389,7 @@ class TestUniformRegionWorkerDiscoveryCPU(unittest.TestCase):
         with bound.env, bound.host_function:
             self.assertTrue(computed_fragment_supported(bound.env, ir.graphs))
             self.assertIn(
-                "cute_tensor_storage_disjoint_matrix_v1",
+                "tensor_storage_disjoint_matrix_v1",
                 bound.env.bound_runtime_input_specialization_results,
             )
             tree = uniform_local_regions(ir.graphs)
@@ -14598,7 +14598,7 @@ class TestUniformLocalDiscoveryCPU(unittest.TestCase):
         )
         from helion._compiler.cute.computed_fragment import computed_fragment_supported
 
-        key = "cute_tensor_storage_disjoint_matrix_v1"
+        key = "tensor_storage_disjoint_matrix_v1"
         x = torch.ones((3, 35), dtype=torch.int32)
         limits = torch.tensor([0, 1, 3], dtype=torch.int32)
         backing = torch.empty(105, dtype=torch.int32)
@@ -15167,7 +15167,7 @@ class TestUniformOutputStoresCPU(unittest.TestCase):
         unused = torch.empty((3, 19), dtype=torch.int32)
         out, second = torch.empty_like(unused), torch.empty_like(unused)
         kernel = _fragment_output_without_host_reads
-        key = "cute_tensor_storage_disjoint_matrix_v1"
+        key = "tensor_storage_disjoint_matrix_v1"
         with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
             bound = kernel.bind((unused, out, second))
             graphs = bound.host_function.device_ir.graphs

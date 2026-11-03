@@ -66,14 +66,14 @@ def configured_fragment_expr(
                 )
             block = env.block_sizes[info.origin.block_id]
             replacement = (
-                block.numel if block.reduction else resolve_block_size(block.block_id)
+                block.numel if not block.is_tile else resolve_block_size(block.block_id)
             )
             if replacement is None:
                 continue
             if isinstance(replacement, torch.SymInt):
                 replacement = replacement._sympy_()
             resolved = resolve(sympy.sympify(replacement), visiting | {symbol})
-            if block.reduction:
+            if not block.is_tile:
                 logical = env.specialize_expr(sympy.sympify(resolved))
                 if logical.free_symbols and metadata_guarded(env, logical):
                     # Storage has a static capacity; masks and scans still

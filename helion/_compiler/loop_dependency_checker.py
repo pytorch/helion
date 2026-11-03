@@ -4,6 +4,11 @@ import ast
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from torch.fx import Node
+    from torch.fx.node import Argument
+
     from .device_ir import GraphInfo
 
 
@@ -172,7 +177,7 @@ def _is_fresh_allocation(call: ast.Call) -> bool:
     return func.attr in _FRESH_TENSOR_METHODS
 
 
-def _storage_ids(graphs: list[GraphInfo], graph_id: int, obj: object) -> set[int]:
+def _storage_ids(graphs: Sequence[GraphInfo], graph_id: int, obj: object) -> set[int]:
     import torch
 
     from .device_ir import NodeArgsGraphInfo
@@ -200,6 +205,16 @@ def _storage_ids(graphs: list[GraphInfo], graph_id: int, obj: object) -> set[int
     for arg in obj.args:
         result.update(_storage_ids(graphs, graph_id, arg))
     return result
+
+
+def memory_write_target(node: Node) -> Argument | None:
+    """The target of an ordinary Helion store or atomic operation."""
+    from ..language import _MEMORY_OPS
+    from ..language.memory_ops import load
+
+    if node.target in _MEMORY_OPS and node.target is not load:
+        return node.args[0]
+    return None
 
 
 def graph_memory_access_storage_ids(
@@ -231,13 +246,11 @@ def graph_memory_access_storage_ids(
         if node.target is memory_ops.load:
             reads.update(_storage_ids(graphs, graph_id, node.args[0]))
             continue
-        if node.target is memory_ops.store:
-            writes.update(_storage_ids(graphs, graph_id, node.args[0]))
-            continue
-        if node.target in ATOMIC_OPS:
-            storage_ids = _storage_ids(graphs, graph_id, node.args[0])
-            reads.update(storage_ids)
+        if (target := memory_write_target(node)) is not None:
+            storage_ids = _storage_ids(graphs, graph_id, target)
             writes.update(storage_ids)
+            if node.target in ATOMIC_OPS:
+                reads.update(storage_ids)
             continue
         # Handle subgraphs for control flow constructs
         if node.target in (_for_loop, _for_loop_step):

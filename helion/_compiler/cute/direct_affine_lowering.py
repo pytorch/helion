@@ -761,8 +761,8 @@ def _resolve_memory_proof(
     ):
         return None
 
+    from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
     from .memory_ops import runtime_tensor_has_specialized_alignment
-    from .memory_ops import runtime_tensors_are_proven_disjoint
 
     if not runtime_tensor_has_specialized_alignment(
         env, state.fake, STATE_VECTOR_BYTES

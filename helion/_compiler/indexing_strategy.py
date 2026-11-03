@@ -48,6 +48,21 @@ log = logging.getLogger(__name__)
 _warned_block_ptr_fallback = False
 
 
+def _block_size_origin(index: object) -> BlockSizeOrigin | None:
+    symbol = _symint_expr(index) if isinstance(index, torch.SymInt) else index
+    if not isinstance(symbol, sympy.Symbol):
+        return None
+    origin = HostFunction.current().expr_to_origin.get(symbol)
+    if origin is not None and isinstance(origin.origin, BlockSizeOrigin):
+        return origin.origin
+    return None
+
+
+def is_block_size_index(index: object) -> bool:
+    """Whether an index denotes a tile extent rather than a scalar coordinate."""
+    return isinstance(index, torch.SymInt) and _block_size_origin(index) is not None
+
+
 class TileWithOffsetInfo(NamedTuple):
     block_id: int
     offset: int | torch.SymInt
@@ -506,12 +521,12 @@ def _resolve_configured_extent(
         return None
     substitutions: dict[sympy.Symbol, sympy.Integer] = {}
     for symbol in expression.free_symbols:
-        origin = HostFunction.current().expr_to_origin.get(symbol)
-        if origin is None or not isinstance(origin.origin, BlockSizeOrigin):
+        origin = _block_size_origin(symbol)
+        if origin is None:
             return None
         value = (
             CompileEnvironment.current()
-            .block_sizes[origin.origin.block_id]
+            .block_sizes[origin.block_id]
             .from_config(config)
         )
         if not isinstance(value, int):
@@ -1420,14 +1435,8 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 assert isinstance(block_size, int)
                 descriptor_block_shape.append(block_size)
             elif isinstance(k, torch.SymInt):
-                symbol = _symint_expr(k)
-                origin = None
-                if isinstance(symbol, sympy.Symbol):
-                    origin = HostFunction.current().expr_to_origin.get(symbol)
-                if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    block_size = env.block_sizes[origin.origin.block_id].from_config(
-                        config
-                    )
+                if (origin := _block_size_origin(k)) is not None:
+                    block_size = env.block_sizes[origin.block_id].from_config(config)
                     if not valid_block_size(block_size, stride, i, size):
                         return False
                     assert isinstance(block_size, int)
@@ -1892,13 +1901,10 @@ class SubscriptIndexing(NamedTuple):
                 output_size.append(tile_info.resolved_block_size_var(env))
             elif isinstance(k, torch.SymInt):
                 input_size.popleft()
-                symbol = _symint_expr(k)
-                if isinstance(symbol, sympy.Symbol):
-                    origin = HostFunction.current().expr_to_origin.get(symbol)
-                    if origin and isinstance(origin.origin, BlockSizeOrigin):
-                        # Always use block size for consistency with type propagation.
-                        # This ensures shapes match what _device_indexing_size computes.
-                        output_size.append(k)
+                if is_block_size_index(k):
+                    # Always use block size for consistency with type propagation.
+                    # This ensures shapes match what _device_indexing_size computes.
+                    output_size.append(k)
                 # Note: if not BlockSizeOrigin, this is a scalar index that eliminates the dim
             elif isinstance(k, slice):
                 size = input_size.popleft()
@@ -2191,12 +2197,8 @@ class SubscriptIndexing(NamedTuple):
                     size1_broadcast_dims.append((output_idx, output_size[output_idx]))
                 output_idx += 1
             elif isinstance(k, torch.SymInt):
-                symbol = _symint_expr(k)
-                origin = None
-                if isinstance(symbol, sympy.Symbol):
-                    origin = HostFunction.current().expr_to_origin.get(symbol)
-                if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    block_id = _resolve_codegen_block_id(state, origin.origin.block_id)
+                if (origin := _block_size_origin(k)) is not None:
+                    block_id = _resolve_codegen_block_id(state, origin.block_id)
                     index_var = state.codegen.index_var(block_id)
                     expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
@@ -2565,14 +2567,8 @@ class BlockedSubscriptIndexing:
                 if tile_ends_short(block_index, input_size):
                     return False
             elif isinstance(k, torch.SymInt):
-                symbol = _symint_expr(k)
-                origin = None
-                if isinstance(symbol, sympy.Symbol):
-                    origin = HostFunction.current().expr_to_origin.get(symbol)
-                if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    block_index = _resolve_codegen_block_id(
-                        state, origin.origin.block_id
-                    )
+                if (origin := _block_size_origin(k)) is not None:
+                    block_index = _resolve_codegen_block_id(state, origin.block_id)
                     try:
                         state.codegen.offset_var(block_index)
                     except NotImplementedError:
@@ -2683,11 +2679,8 @@ class BlockedSubscriptIndexing:
                         tile_info.resolved_block_size_var(env), block_id
                     )
             elif isinstance(k, torch.SymInt):
-                symbol = _symint_expr(k)
-                # pyrefly: ignore[no-matching-overload, bad-argument-type]
-                origin = HostFunction.current().expr_to_origin.get(symbol)
-                if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    block_id = _resolve_codegen_block_id(state, origin.origin.block_id)
+                if (origin := _block_size_origin(k)) is not None:
+                    block_id = _resolve_codegen_block_id(state, origin.block_id)
                     if not is_size_one(fake_value.size(len(res.offsets)), block_id):
                         res.offsets.append(state.codegen.offset_var(block_id))
                         res.block_shape.append(k)

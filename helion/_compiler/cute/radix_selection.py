@@ -19,9 +19,9 @@ from ..compile_environment import CompileEnvironment
 from ..compile_environment import RuntimeInputSpecialization
 from ..device_ir import RootGraphInfo
 from ..host_function import HostFunction
+from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 from ..variable_origin import GridOrigin
 from .fragment_storage import aligned_shared_bytes
-from .memory_ops import runtime_tensors_are_proven_disjoint
 from .ordered_selection import unordered_topk_args
 from .radix_selection_config import ALGORITHM_KEY
 from .radix_selection_config import HISTOGRAM_KEY
@@ -208,11 +208,7 @@ def _row_block(node: object, rows: int) -> int | None:
     bid = origin.origin.block_id
     env = CompileEnvironment.current()
     block = env.block_sizes[bid]
-    return (
-        bid
-        if not block.reduction and env.specialize_expr(block.numel) == rows
-        else None
-    )
+    return bid if block.is_tile and env.specialize_expr(block.numel) == rows else None
 
 
 def _closure(node: Node) -> frozenset[Node]:
