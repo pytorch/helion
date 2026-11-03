@@ -1080,6 +1080,25 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="pointer",
         )
 
+    @skipIfRefEager("checks the example's reference, not a kernel")
+    @skipIfFn(
+        lambda: DEVICE.type == "tpu",
+        "the reference does not run on TPU (_baseline_unless_tpu)",
+    )
+    def test_attention_baseline_keeps_no_autograd_graph(self):
+        # The autotuner keeps the baseline output for the whole search, and
+        # benchmark harnesses (tritonbench) pass inputs that require grad: a
+        # graph behind the output pinned every score block of the reference's
+        # LSE loop, ~50 GiB at (4, 48, 8192, 128).
+        mod = import_path(EXAMPLES_DIR / "attention.py")
+        args = [
+            torch.randn(1, 2, 128, 64, device=DEVICE, requires_grad=True)
+            for _ in range(3)
+        ]
+        for baseline in (mod._attention_baseline, mod._causal_attention_baseline):
+            for output in baseline(*args):
+                self.assertFalse(output.requires_grad)
+
     def test_attention_output(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
