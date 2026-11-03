@@ -41,6 +41,8 @@ def _add_one(x: torch.Tensor) -> torch.Tensor:
 
 
 def _run_backward_lowering_race() -> None:
+    from torch._dynamo.convert_frame import compile_lock
+
     from helion._compiler._inductor import template_buffer
 
     def make_kernel():
@@ -69,6 +71,7 @@ def _run_backward_lowering_race() -> None:
             torch.testing.assert_close(kernel(y), y + 1)
         except BaseException as error:
             errors.append(error)
+            eager_in_frontend.set()
 
     original_propagate = KernelCompiler.propagate_types
     original_bind = template_buffer._bind_kernel_for_lowering
@@ -78,10 +81,13 @@ def _run_backward_lowering_race() -> None:
         if threading.current_thread().name == "eager-new-binding":
             # The eager thread owns _bind_lock and is about to wait for
             # Dynamo's compile_lock, held by the lazy backward compiler.
+            assert kernel._bind_lock._is_owned(), "eager bind did not own its lock"
             eager_in_frontend.set()
         return original_propagate(compiler, host_function)
 
     def bind_for_lowering(target, args):
+        if target is kernel:
+            assert compile_lock._is_owned(), "lowering did not own the compile lock"
         bound = original_bind(target, args)
         if target is kernel and not lowered:
             lowered.append(bound)
