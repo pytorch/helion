@@ -1016,6 +1016,7 @@ class Kernel(Generic[_R]):
         self.name: str = fn.__name__
         # pyrefly: ignore [read-only]
         self.fn: types.FunctionType = fn
+        self._kernel_source: str | None = None
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings, selected_configs, self._cute_structural_policy = (
             select_structural_policy(
@@ -1105,7 +1106,6 @@ class Kernel(Generic[_R]):
 
             self._capture_op = register_decoration_op(self)
 
-    @functools.cache  # noqa: B019
     def kernel_source(self) -> str:
         """
         Return the kernel's source text.
@@ -1113,7 +1113,9 @@ class Kernel(Generic[_R]):
         This is the stable identifier across processes/runs, suitable for
         grouping telemetry rows by kernel during analysis.
         """
-        return inspect.getsource(self.fn)
+        if self._kernel_source is None:
+            self._kernel_source = inspect.getsource(self.fn)
+        return self._kernel_source
 
     def _validate_structural_policy(self) -> None:
         # Legacy kernels retain their existing mutable Settings behavior. An
