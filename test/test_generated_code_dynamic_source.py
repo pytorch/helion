@@ -3,11 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
+import unittest
 from unittest.mock import patch
 
 import torch
 
+from test.test_generated_code_cache import _GeneratedCodeCacheTestCase
+
 import helion
+from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._utils import counters
@@ -24,6 +28,15 @@ def _dynamic_source_increment(x: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size(0)):
         out[tile] = x[tile] + 1
     return out
+
+
+def _dynamic_source_kernel():
+    return helion.kernel(
+        backend="triton",
+        cache_level="code",
+        static_shapes=False,
+        autotune_effort="quick",
+    )(_dynamic_source_increment.fn)
 
 
 class TestDynamicGeneratedSource(RefEagerTestDisabled, TestCase):
@@ -55,12 +68,7 @@ class TestDynamicGeneratedSource(RefEagerTestDisabled, TestCase):
     def _kernel(self):
         # The default adaptive autotuner keeps the frontend authoritative;
         # source discovery must not turn its saved config into a winner.
-        return helion.kernel(
-            backend="triton",
-            cache_level="code",
-            static_shapes=False,
-            autotune_effort="quick",
-        )(_dynamic_source_increment.fn)
+        return _dynamic_source_kernel()
 
     def test_adaptive_dynamic_source_hit_restores_codegen_guards(self) -> None:
         config = helion.Config(block_sizes=[32])
@@ -181,3 +189,40 @@ class TestDynamicGeneratedSource(RefEagerTestDisabled, TestCase):
             self.assertRaisesRegex(AssertionError, "guards must match"),
         ):
             cache.GeneratedCodeState.create(bound, args, None, "input-key")
+
+
+class TestDynamicGeneratedSourceCUDA(_GeneratedCodeCacheTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), reason="requires CUDA and Triton")
+    def test_source_discovery_runs_real_triton_and_separates_singletons(self) -> None:
+        config = helion.Config(block_sizes=[32])
+        cold = _dynamic_source_kernel()
+        x = torch.randn(16, device=DEVICE)
+        bound = cold.bind((x,))
+        bound.set_config(config)
+        torch.testing.assert_close(bound(x), x + 1)
+        self.assertTrue(bound._guard_fact_results())
+
+        warm = _dynamic_source_kernel()
+        unseen = torch.randn(48, device=DEVICE)
+        loaded = warm.bind((unseen,))
+        self.assertIsInstance(loaded, BoundKernel)
+        self.assertIsNotNone(loaded._generated_code)
+        self.assertIsNone(loaded._generated_code.artifact_key)
+        with patch.object(
+            loaded, "to_triton_code", side_effect=AssertionError("source cache miss")
+        ):
+            loaded.set_config(config)
+            torch.testing.assert_close(loaded(unseen), unseen + 1)
+
+        singleton = torch.randn(1, device=DEVICE)
+        other = warm._dispatch_bind((singleton,))
+        self.assertIsNot(other, loaded)
+        with patch.object(
+            other, "to_triton_code", wraps=other.to_triton_code
+        ) as render:
+            other.set_config(config)
+        render.assert_called_once()
+        torch.testing.assert_close(other(singleton), singleton + 1)
+        # The singleton's new guard schema also keeps the loaded large-input
+        # binding valid when eager dispatch returns to that bucket.
+        torch.testing.assert_close(warm(unseen), unseen + 1)

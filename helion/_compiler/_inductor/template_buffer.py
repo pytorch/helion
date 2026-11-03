@@ -992,10 +992,13 @@ def _bind_kernel_for_lowering(kernel: Kernel, args: tuple[object, ...]) -> Bound
         )
         return kernel._bind_isolated(args)
     try:
-        # Frontend attributes must never trigger materialization after this
-        # nonblocking acquisition is released: an eager bind could acquire
-        # _bind_lock then wait for the compile lock Inductor owns.
-        return kernel._bind(args)._materialize(kernel.normalize_args(*args))
+        bound = kernel._bind(args)
+        if bound._is_disk_runner:
+            # Keep lowering's frontend private. Materializing the runner would
+            # publish shared state whose later code generation can need
+            # _bind_lock while Inductor still owns Dynamo's compile lock.
+            return kernel._bind_isolated(args)
+        return bound
     finally:
         kernel._bind_lock.release()
 

@@ -55,7 +55,8 @@ def _run_backward_lowering_race() -> None:
     x = torch.ones(1024, device=DEVICE)
     make_kernel()(x)
     kernel = make_kernel()
-    assert isinstance(_runner(kernel, (x,)), _CachedBoundKernel)
+    runner = _runner(kernel, (x,))
+    assert isinstance(runner, _CachedBoundKernel)
     torch.testing.assert_close(kernel(x), x + 1)
     eager_started = threading.Event()
     eager_in_frontend = threading.Event()
@@ -111,17 +112,20 @@ def _run_backward_lowering_race() -> None:
     assert not errors, errors
     assert lowered, "lazy backward did not lower the Helion kernel"
     assert all(isinstance(bound, BoundKernel) for bound in lowered)
+    assert all(not bound._cache_managed for bound in lowered)
+    assert runner in kernel._bound_kernels.values()
     torch.testing.assert_close(value.grad, torch.full_like(value, 2))
 
 
 class TestGeneratedCodeLifecycle(_GeneratedCodeBindingTestCase):
-    def _warm(self):
+    def _warm(self, *, launch: bool = True):
         x = torch.ones(16)
         config = helion.Config(block_sizes=[32])
         _bound(x).set_config(config)
         warm = _bound(x)
         self.assertIsInstance(warm, _CachedBoundKernel)
-        warm.set_config(config)
+        if launch:
+            warm.set_config(config)
         return x, config, warm
 
     def test_public_bind_preserves_selected_config_and_launcher(self) -> None:
@@ -186,34 +190,49 @@ class TestGeneratedCodeLifecycle(_GeneratedCodeBindingTestCase):
         supports_torch_compile_template_lowering(),
         "requires Helion's Inductor template lowering",
     )
-    def test_lowering_materializes_before_releasing_nonblocking_bind_lock(
-        self,
-    ) -> None:
+    def test_lowering_uses_isolated_frontend_for_warm_runner(self) -> None:
         from helion._compiler._inductor.template_buffer import _bind_kernel_for_lowering
 
-        x, config, warm = self._warm()
-        materialize = warm._materialize
-        acquired: list[bool] = []
+        for launched in (False, True):
+            with self.subTest(launched=launched):
+                x, _, warm = self._warm(launch=launched)
+                isolated = warm.kernel._bind_isolated
+                acquired: list[bool] = []
 
-        def try_eager_lock() -> bool:
-            lock = warm.kernel._bind_lock
-            result = lock.acquire(blocking=False)
-            if result:
-                lock.release()
-            return result
+                def try_eager_lock(lock=warm.kernel._bind_lock) -> bool:
+                    result = lock.acquire(blocking=False)
+                    if result:
+                        lock.release()
+                    return result
 
-        with ThreadPoolExecutor(max_workers=1) as pool:
+                with ThreadPoolExecutor(max_workers=1) as pool:
 
-            def checked_materialize(args):
-                acquired.append(pool.submit(try_eager_lock).result(timeout=2))
-                return materialize(args)
+                    def checked_isolated(
+                        args,
+                        _acquired=acquired,
+                        _isolated=isolated,
+                        _pool=pool,
+                        _try_lock=try_eager_lock,
+                    ):
+                        _acquired.append(_pool.submit(_try_lock).result(timeout=2))
+                        return _isolated(args)
 
-            with patch.object(warm, "_materialize", side_effect=checked_materialize):
-                bound = _bind_kernel_for_lowering(warm.kernel, (x, 2))
-        self.assertEqual(acquired, [False])
-        self.assertIsInstance(bound, BoundKernel)
-        self.assertEqual(bound._config, config)
-        self.assertIsNotNone(bound._run)
+                    with (
+                        patch.object(
+                            warm,
+                            "_materialize",
+                            side_effect=AssertionError("lowering materialized runner"),
+                        ),
+                        patch.object(
+                            warm.kernel, "_bind_isolated", side_effect=checked_isolated
+                        ),
+                    ):
+                        bound = _bind_kernel_for_lowering(warm.kernel, (x, 2))
+                self.assertEqual(acquired, [False])
+                self.assertIsInstance(bound, BoundKernel)
+                self.assertFalse(bound._cache_managed)
+                self.assertIn(warm, warm.kernel._bound_kernels.values())
+                self.assertIsNone(warm._delegate)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA and Triton")
