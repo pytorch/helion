@@ -23,6 +23,7 @@ import pytest
 import torch
 
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute import flash_knobs
 from helion._compiler.cute.attention_plan import CAUSAL_MASK_KIND
 from helion._compiler.cute.attention_plan import FLEX_SCORE_KIND
 from helion._compiler.cute.attention_plan import AttentionScorePlan
@@ -231,10 +232,10 @@ def test_resolver_defaults_the_knob_off_and_takes_it_on_list_walks_only() -> Non
 def test_knob_is_an_appended_schema_axis_with_its_fa4_witness() -> None:
     # Appended behind the axes it was introduced after (an inserted axis
     # would reshuffle every later axis's coverage rows).
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     assert keys.count(KEY) == 1
     assert keys.index(KEY) > keys.index(cute_flash.FLASH_EARLY_PROLOGUE_LOADS_KEY)
-    witness = cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(KEY, True)]
+    witness = flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(KEY, True)]
     assert witness == {cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"}
     # The witness context is sufficient on the list walk: it resolves to the
     # knob's value, and the projection round-trips both values.

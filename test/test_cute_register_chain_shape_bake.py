@@ -10,6 +10,8 @@ import unittest
 import pytest
 
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
+from helion._compiler.cute.host_metadata import can_bake_tensor_shapes
+from helion._compiler.cute.state import CuteCodegenState
 from helion._compiler.generate_ast import GenerateAST
 from helion.runtime.config import Config
 
@@ -25,9 +27,7 @@ class TestCuteRegisterChainShapeBake(unittest.TestCase):
         super().setUp()
         self.state = CuteDeviceFunctionState()
         self.codegen = object.__new__(GenerateAST)
-        self.codegen._cute_uses_matmul = False
-        self.codegen._cute_matmul_declaration_count = 0
-        self.codegen.cute_wrapper_plans = []
+        self.codegen.backend_state = CuteCodegenState()
         self.codegen.device_function = cast(
             "DeviceFunction",
             SimpleNamespace(cute_state=self.state, config=Config()),
@@ -37,31 +37,31 @@ class TestCuteRegisterChainShapeBake(unittest.TestCase):
         self.codegen.device_function.config = Config(cute_register_chain=True)
         for identity in range(2):
             self.codegen.cute_uses_matmul = True
-            self.state.collective_mma_sites.append(
+            self.state.lanes.collective_mma_sites.append(
                 cast("CollectiveMmaSite", SimpleNamespace(identity=identity))
             )
-        self.state.collective_register_chain_lowered = lowered
+        self.state.lanes.collective_register_chain_lowered = lowered
 
     def test_complete_lowered_chain_can_bake(self) -> None:
         self.chain(lowered=True)
         self.assertTrue(self.codegen.cute_uses_matmul)
-        self.assertTrue(self.codegen._cute_can_bake_tensor_shapes())
+        self.assertTrue(can_bake_tensor_shapes(self.codegen))
 
     def test_requested_but_unlowered_chain_cannot_bake(self) -> None:
         self.chain(lowered=False)
-        self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+        self.assertFalse(can_bake_tensor_shapes(self.codegen))
 
     def test_extra_matmul_declaration_after_chain_cannot_bake(self) -> None:
         self.chain(lowered=True)
         self.codegen.cute_uses_matmul = True
-        self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+        self.assertFalse(can_bake_tensor_shapes(self.codegen))
 
     def test_extra_matmul_declaration_before_chain_cannot_bake(self) -> None:
         self.codegen.cute_uses_matmul = True
         self.chain(lowered=False)
-        self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
-        self.state.collective_register_chain_lowered = True
-        self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+        self.assertFalse(can_bake_tensor_shapes(self.codegen))
+        self.state.lanes.collective_register_chain_lowered = True
+        self.assertFalse(can_bake_tensor_shapes(self.codegen))
 
     def test_declarations_do_not_count_only_boolean_transitions(self) -> None:
         self.chain(lowered=True)
@@ -69,26 +69,26 @@ class TestCuteRegisterChainShapeBake(unittest.TestCase):
         self.assertFalse(self.codegen.cute_uses_matmul)
         self.codegen.cute_uses_matmul = True
         self.assertTrue(self.codegen.cute_uses_matmul)
-        self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+        self.assertFalse(can_bake_tensor_shapes(self.codegen))
 
     def test_incomplete_ownership_cannot_bake(self) -> None:
         self.chain(lowered=True)
-        original = list(self.state.collective_mma_sites)
+        original = list(self.state.lanes.collective_mma_sites)
         for sites in ([], original[:1], [*original, original[0]]):
             with self.subTest(sites=len(sites)):
-                self.state.collective_mma_sites = sites
-                self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+                self.state.lanes.collective_mma_sites = sites
+                self.assertFalse(can_bake_tensor_shapes(self.codegen))
 
     def test_incompatible_wrapper_cannot_inherit_chain_exemption(self) -> None:
         self.chain(lowered=True)
         self.codegen.cute_wrapper_plans = [{"kind": "tcgen05_grouped_static"}]
-        self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+        self.assertFalse(can_bake_tensor_shapes(self.codegen))
 
     def test_default_and_ordinary_matmul_policy_is_unchanged(self) -> None:
-        self.assertFalse(self.state.collective_register_chain_lowered)
-        self.assertTrue(self.codegen._cute_can_bake_tensor_shapes())
+        self.assertFalse(self.state.lanes.collective_register_chain_lowered)
+        self.assertTrue(can_bake_tensor_shapes(self.codegen))
         self.codegen.cute_uses_matmul = True
-        self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+        self.assertFalse(can_bake_tensor_shapes(self.codegen))
 
     def test_plain_tcgen05_plans_bake(self) -> None:
         """The plain tcgen05 GEMM plans (A/B TMA loads, D TMA store over the
@@ -101,9 +101,9 @@ class TestCuteRegisterChainShapeBake(unittest.TestCase):
         }
         d = {"kind": "tcgen05_d_tma", "rank3_mnl_tensor": True}
         self.codegen.cute_wrapper_plans = [ab, d]
-        self.assertTrue(self.codegen._cute_can_bake_tensor_shapes())
+        self.assertTrue(can_bake_tensor_shapes(self.codegen))
         self.codegen.cute_wrapper_plans = [dict(ab, orientation="mn")]
-        self.assertTrue(self.codegen._cute_can_bake_tensor_shapes())
+        self.assertTrue(can_bake_tensor_shapes(self.codegen))
         for key in (
             "shared_rhs",
             "fixed_ab_tensormaps",
@@ -116,15 +116,15 @@ class TestCuteRegisterChainShapeBake(unittest.TestCase):
         ):
             with self.subTest(key=key):
                 self.codegen.cute_wrapper_plans = [{**ab, key: True}, d]
-                self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+                self.assertFalse(can_bake_tensor_shapes(self.codegen))
         for key in ("fixed_tensormap", "bounded_output_shift", "dynamic_d_tensormap"):
             with self.subTest(key=key):
                 self.codegen.cute_wrapper_plans = [ab, {**d, key: True}]
-                self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+                self.assertFalse(can_bake_tensor_shapes(self.codegen))
         for extra in ("tcgen05_grouped_static_persistent", "tcgen05_aux_tma"):
             with self.subTest(extra=extra):
                 self.codegen.cute_wrapper_plans = [ab, d, {"kind": extra}]
-                self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+                self.assertFalse(can_bake_tensor_shapes(self.codegen))
 
     def test_existing_safe_wrapper_policy_is_unchanged(self) -> None:
         self.codegen.cute_uses_matmul = True
@@ -138,9 +138,9 @@ class TestCuteRegisterChainShapeBake(unittest.TestCase):
         ):
             with self.subTest(kind=kind):
                 self.codegen.cute_wrapper_plans = [{"kind": kind}]
-                self.assertTrue(self.codegen._cute_can_bake_tensor_shapes())
+                self.assertTrue(can_bake_tensor_shapes(self.codegen))
                 self.codegen.cute_wrapper_plans.append({"kind": "unknown"})
-                self.assertFalse(self.codegen._cute_can_bake_tensor_shapes())
+                self.assertFalse(can_bake_tensor_shapes(self.codegen))
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import math
 from typing import TYPE_CHECKING
 from typing import Literal
 
+from ._ast_pass_utils import call_path_str
 from .scalar_recipe import _clone
 from .scalar_recipe import _read_names
 from .scalar_recipe import build_recipe
@@ -40,16 +41,6 @@ class CopyTensorFacts:
     dtype: str
     strides: tuple[int, ...]
     alignment_bytes: int
-
-
-def _path(value: ast.expr) -> str | None:
-    if isinstance(value, ast.Name):
-        return value.id
-    if isinstance(value, ast.Attribute):
-        base = _path(value.value)
-        if base is not None:
-            return f"{base}.{value.attr}"
-    return None
 
 
 def _replace(value: ast.AST, replacements: Mapping[str, ast.expr]) -> ast.AST:
@@ -153,7 +144,7 @@ class _Analysis:
                 return result
         if isinstance(value, ast.Subscript) and isinstance(value.slice, ast.Constant):
             dim = value.slice.value
-            path = _path(value.value)
+            path = call_path_str(value.value)
             if path is not None and type(dim) is int:
                 source, _, attr = path.partition(".")
                 facts = self.tensors.get(source)
@@ -166,7 +157,8 @@ class _Analysis:
     def integer_cast(value: ast.expr) -> bool:
         return (
             isinstance(value, ast.Call)
-            and _path(value.func) in {f"cutlass.{name}" for name in _INTEGER_CASTS}
+            and call_path_str(value.func)
+            in {f"cutlass.{name}" for name in _INTEGER_CASTS}
             and len(value.args) == 1
             and not value.keywords
         )
@@ -192,7 +184,7 @@ class _Analysis:
             if value.id == self.coordinate or value.id in self.aligned_names:
                 return "integer"
         if isinstance(value, ast.Attribute) and value.attr == "iterator":
-            source = _path(value.value)
+            source = call_path_str(value.value)
             if source in self.tensors:
                 return "pointer"
         if isinstance(value, ast.UnaryOp) and isinstance(
@@ -240,7 +232,7 @@ class _Analysis:
         if isinstance(value, ast.Name):
             return math.gcd(self.width, self.aligned_names.get(value.id, 1))
         if isinstance(value, ast.Attribute) and value.attr == "iterator":
-            source = _path(value.value)
+            source = call_path_str(value.value)
             facts = self.tensors.get(source) if source is not None else None
             if facts is not None and facts.dtype in _DTYPE_BYTES:
                 return math.gcd(
@@ -282,7 +274,7 @@ class _Analysis:
             return type(value.value) is int
         if isinstance(value, ast.Subscript):
             return self.constant(value) is not None
-        if _path(value) == f"{source_tensor}.iterator":
+        if call_path_str(value) == f"{source_tensor}.iterator":
             return True
         if self.integer_cast(value):
             assert isinstance(value, ast.Call)
@@ -359,7 +351,7 @@ class _Analysis:
             pairs = itertools.pairwise(arguments)
         elif (
             isinstance(value, ast.Call)
-            and _path(value.func)
+            and call_path_str(value.func)
             in {"operator.lt", "operator.le", "operator.gt", "operator.ge"}
             and len(value.args) == 2
             and not value.keywords
@@ -452,7 +444,7 @@ class _Analysis:
         elif (
             isinstance(value, ast.Call) and len(value.args) == 2 and not value.keywords
         ):
-            path = _path(value.func)
+            path = call_path_str(value.func)
             if path is None:
                 return False
             operator_type = {
@@ -495,7 +487,7 @@ class _Analysis:
                 pairs = list(itertools.pairwise([value.left, *value.comparators]))
                 operators = [type(op) for op in value.ops]
             elif isinstance(value, ast.Call) and len(value.args) == 2:
-                path = _path(value.func)
+                path = call_path_str(value.func)
                 if path is None:
                     return None
                 operator_type = {
@@ -606,19 +598,15 @@ class ContiguousCopy:
     width: int = 8
     _uniform_positive_zero: bool = False
 
-    def emit_from_registers(
-        self, registers: str, fresh_name: Callable[[str], str]
-    ) -> list[ast.stmt]:
-        """Store a typed register vector using this address/mask proof.
-
-        The caller builds the proof from a synthetic load at its original
-        store address, with the original store predicate. No synthetic load
-        executes: only its invariant address/mask definitions are replayed.
-        All vector predicates must hold; partial vectors keep scalar stores.
-        """
+    def _replay_proof(
+        self, fresh_name: Callable[[str], str], suffix: str
+    ) -> tuple[list[ast.stmt], ast.expr, ast.AST, dict[str, ast.expr]]:
+        """Replay the invariant address/mask definitions under fresh
+        ``<name>_<suffix>`` names: ``(definitions, every-lane predicate,
+        packet pointer, renames)``."""
         names = {
             statement.targets[0].id: _expr(
-                fresh_name(f"{statement.targets[0].id}_store")
+                fresh_name(f"{statement.targets[0].id}_{suffix}")
             )
             for statement in self._statements
             if isinstance(statement.targets[0], ast.Name)
@@ -643,6 +631,19 @@ class ContiguousCopy:
             if ast.dump(low) == ast.dump(high)
             else ast.BoolOp(op=ast.And(), values=[low, high])
         )
+        return common, condition, pointer, names
+
+    def emit_from_registers(
+        self, registers: str, fresh_name: Callable[[str], str]
+    ) -> list[ast.stmt]:
+        """Store a typed register vector using this address/mask proof.
+
+        The caller builds the proof from a synthetic load at its original
+        store address, with the original store predicate. No synthetic load
+        executes: only its invariant address/mask definitions are replayed.
+        All vector predicates must hold; partial vectors keep scalar stores.
+        """
+        common, condition, pointer, names = self._replay_proof(fresh_name, "store")
         target = fresh_name("epilogue_destination")
         vector = ast.parse(
             f"{target} = cute.make_tensor(cute.make_ptr("
@@ -673,31 +674,7 @@ class ContiguousCopy:
         reduction (``helper``: ``_cute_red_add_{f32,f16,bf16}_vec``) of the
         register vector at the proven address when every lane's predicate
         holds, else one scalar ``cute.arch.atomic_add`` per active lane."""
-        names = {
-            statement.targets[0].id: _expr(fresh_name(f"{statement.targets[0].id}_red"))
-            for statement in self._statements
-            if isinstance(statement.targets[0], ast.Name)
-        }
-        common: list[ast.stmt] = []
-        for statement in self._statements:
-            target = statement.targets[0]
-            assert isinstance(target, ast.Name)
-            if target.id in self._invariants:
-                copied = _replace(statement, names)
-                assert isinstance(copied, ast.stmt)
-                common.append(copied)
-        low = _replace(self._predicate, names)
-        high = _replace(
-            self._predicate,
-            {**names, self.coordinate: _expr(f"{self.coordinate} + {self.width - 1}")},
-        )
-        pointer = _replace(self._pointer, names)
-        assert isinstance(low, ast.expr) and isinstance(high, ast.expr)
-        condition = (
-            low
-            if ast.dump(low) == ast.dump(high)
-            else ast.BoolOp(op=ast.And(), values=[low, high])
-        )
+        common, condition, pointer, names = self._replay_proof(fresh_name, "red")
         lanes = ", ".join(f"{registers}[{lane}]" for lane in range(self.width))
         vector = ast.parse(
             f"{helper}(({ast.unparse(pointer)}).llvm_ptr, [{lanes}])"
@@ -1020,11 +997,11 @@ def plan_contiguous_copy(
             zero = analysis.resolve(terminal.orelse)
             if (
                 isinstance(zero, ast.Call)
-                and _path(zero.func) in _DTYPES
+                and call_path_str(zero.func) in _DTYPES
                 and len(zero.args) == 1
                 and not zero.keywords
             ):
-                casts.append(str(_path(zero.func)))
+                casts.append(str(call_path_str(zero.func)))
                 zero = analysis.resolve(zero.args[0])
             if (
                 not isinstance(zero, ast.Constant)
@@ -1037,11 +1014,11 @@ def plan_contiguous_copy(
             terminal = terminal.body
         elif (
             isinstance(terminal, ast.Call)
-            and _path(terminal.func) in _DTYPES
+            and call_path_str(terminal.func) in _DTYPES
             and len(terminal.args) == 1
             and not terminal.keywords
         ):
-            casts.append(str(_path(terminal.func)))
+            casts.append(str(call_path_str(terminal.func)))
             terminal = terminal.args[0]
         else:
             break

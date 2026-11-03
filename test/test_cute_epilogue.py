@@ -353,8 +353,8 @@ class TestCuteEpilogue(unittest.TestCase):
         )
         with patch_cute_mma_support():
             bound = scaled_fp8.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            code = bound.to_triton_code(cfg)
+            bound.env.config_spec.tcgen05.search_enabled = True
+            code = bound.to_code(cfg)
 
         loop_pos = code.index("for _tcgen05_subtile in cutlass.range")
         product_pos = code.index(
@@ -398,8 +398,8 @@ class TestCuteEpilogue(unittest.TestCase):
         )
         with patch_cute_mma_support():
             bound = scaled_fp8.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            code = bound.to_triton_code(cfg)
+            bound.env.config_spec.tcgen05.search_enabled = True
+            code = bound.to_code(cfg)
 
         loop_pos = code.index("for _tcgen05_subtile in cutlass.range")
         chain_lines = [
@@ -447,8 +447,8 @@ class TestCuteEpilogue(unittest.TestCase):
         )
         with patch_cute_mma_support():
             bound = scaled_fp8.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            code = bound.to_triton_code(cfg)
+            bound.env.config_spec.tcgen05.search_enabled = True
+            code = bound.to_code(cfg)
 
         loop_pos = code.index("for _tcgen05_subtile in cutlass.range")
         product_pos = code.index(
@@ -479,9 +479,9 @@ class TestCuteEpilogue(unittest.TestCase):
         )
         with patch_cute_mma_support():
             int_bound = scaled_fp8.bind(int_args)
-            int_bound.env.config_spec.cute_tcgen05_search_enabled = True
+            int_bound.env.config_spec.tcgen05.search_enabled = True
             with self.assertRaises(exc.BackendUnsupported):
-                int_bound.to_triton_code(cfg)
+                int_bound.to_code(cfg)
 
         @helion.kernel(backend="cute", static_shapes=True)
         def integer_scaled(
@@ -509,9 +509,9 @@ class TestCuteEpilogue(unittest.TestCase):
         )
         with patch_cute_mma_support():
             int_scalar_bound = integer_scaled.bind((args[0], args[1], int_args[2]))
-            int_scalar_bound.env.config_spec.cute_tcgen05_search_enabled = True
+            int_scalar_bound.env.config_spec.tcgen05.search_enabled = True
             with self.assertRaises(exc.BackendUnsupported):
-                int_scalar_bound.to_triton_code(int_scalar_cfg)
+                int_scalar_bound.to_code(int_scalar_cfg)
 
     @onlyBackends(["cute"])
     def test_tcgen05_bm256_broadcast_scales_reuse_auxiliary_loads(self) -> None:
@@ -552,8 +552,8 @@ class TestCuteEpilogue(unittest.TestCase):
         )
         with patch_cute_mma_support():
             bound = scaled_fp8.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            code = bound.to_triton_code(cfg)
+            bound.env.config_spec.tcgen05.search_enabled = True
+            code = bound.to_code(cfg)
 
         self.assertIn(
             "tcgen05_aux_rowvec_smem_layout_1 = "

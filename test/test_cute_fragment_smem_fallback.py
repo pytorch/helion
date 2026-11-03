@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
 
 import helion
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 
 layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
 
@@ -21,19 +19,11 @@ if TYPE_CHECKING:
 
     from helion.runtime.kernel import BoundKernel
 
-pytestmark = skipUnlessBackends("cute")
-
 
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_only() -> Iterator[None]:
     # The CPU model has no device to query: pin the B200 CTA capacity.
-    with (
-        mock_cuda_unavailable(),
-        patch(
-            "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_capacity_bytes",
-            return_value=232448,
-        ),
-    ):
+    with cpu_render_target(forbid_cuda_init=None):
         yield
 
 

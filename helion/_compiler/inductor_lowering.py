@@ -49,15 +49,11 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .aten_lowering import Lowering
 from .aten_lowering import LoweringContext
-from .aten_lowering import _should_use_cute_argreduce_lowering
 from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _symint_expr
 from .compile_environment import _symint_sympy_expr
-from .cute.cute_reshape import REBOUND_CHECK_TARGETS
-from .cute.cute_reshape import check_pointwise_rebound_block_ids
-from .cute.view_subtile import check_view_coord_consumers
 from .device_function import DeviceFunction
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
@@ -71,10 +67,8 @@ if TYPE_CHECKING:
     from torch.utils._ordered_set import OrderedSet
 
     from .. import Config
+    from .backend import HandlerOpOverrides
     from .backend import InductorOpOverrides
-    from .cute.layout import MatmulAxisModel
-    from .cute.layout import MatmulExecutionPlan
-    from .cute.layout import ThreadLayout
     from .device_ir import GraphInfo
     from .generate_ast import GenerateAST
     from .helper_function import CodegenInterface
@@ -237,7 +231,9 @@ def prepare_node_lowering(
         if node.target in {
             torch.ops.aten.argmax.default,
             torch.ops.aten.argmin.default,
-        } and not _should_use_cute_argreduce_lowering(node):
+        } and not CompileEnvironment.current().backend.argreduce_uses_aten_lowering(
+            node
+        ):
             pass
         else:
             node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
@@ -626,13 +622,9 @@ class FakeGraphLowering(GraphLowering):
 
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
-        if (
-            node.target is torch.ops.aten.clone.default
-            and CompileEnvironment.current().backend_name == "cute"
-        ):
-            from .cute.cute_reshape import codegen_cute_virtual_clone
-
-            if (result := codegen_cute_virtual_clone(ctx, node)) is not None:
+        if node.target is torch.ops.aten.clone.default:
+            result = CompileEnvironment.current().backend.emit_virtual_clone(ctx, node)
+            if result is not None:
                 return result
         return self.codegen_from_input_asts(ctx, node, self.input_asts(ctx, node))
 
@@ -1053,12 +1045,11 @@ class ReductionLowering(InductorLowering):
         mask_node_inputs(node, default)
 
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
-        if CompileEnvironment.current().backend.name == "cute":
-            from .cute.completed_matmul_sum import completed_matmul_sum_input
-
-            completed = completed_matmul_sum_input(ctx, node)
-            if completed is not None:
-                return completed
+        completed = CompileEnvironment.current().backend.emit_completed_matmul_sum(
+            ctx, node
+        )
+        if completed is not None:
+            return completed
         reduction = self.buffer.data
         assert isinstance(reduction, Reduction)
         indices = [sympy.Symbol(f"i{n}") for n in range(len(reduction.ranges))]
@@ -1099,76 +1090,15 @@ class ReductionLowering(InductorLowering):
 
         env = CompileEnvironment.current()
 
-        def match_active_block_id(size: object) -> int | None:
-            candidates: set[int] = set()
-            block_id = env.resolve_block_id(size)
-            if block_id is not None:
-                block_id = env.resolve_codegen_block_id(
-                    block_id,
-                    state.codegen,
-                    node.graph,
-                )
-                if state.codegen.active_device_loops.get(block_id) or (
-                    state.codegen.device_function.tile_strategy.thread_axis_for_block_id(
-                        block_id
-                    )
-                    is not None
-                ):
-                    candidates.add(block_id)
-            for strategy in state.codegen.device_function.tile_strategy.strategies:
-                for candidate_block_id in strategy.block_ids:
-                    if (
-                        state.codegen.device_function.tile_strategy.thread_axis_for_block_id(
-                            candidate_block_id
-                        )
-                        is None
-                    ):
-                        continue
-                    candidate_size = env.block_sizes[candidate_block_id].size
-                    candidate_source = getattr(
-                        env.block_sizes[candidate_block_id].block_size_source,
-                        "value",
-                        None,
-                    )
-                    if (
-                        isinstance(size, torch.SymInt)
-                        and isinstance(candidate_source, torch.SymInt)
-                        and candidate_source._sympy_() == size._sympy_()
-                    ):
-                        candidates.add(candidate_block_id)
-                        continue
-                    if isinstance(size, (int, torch.SymInt)) and isinstance(
-                        candidate_size, (int, torch.SymInt)
-                    ):
-                        if env.known_equal(candidate_size, size):
-                            candidates.add(candidate_block_id)
-
-            seen: set[int] = set()
-            for loops in state.codegen.active_device_loops.values():
-                for loop_state in loops:
-                    key = id(loop_state)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    for candidate_block_id, info in loop_state.block_id_to_info.items():
-                        if isinstance(
-                            size, (int, torch.SymInt)
-                        ) and info.is_end_matching(size):
-                            candidates.add(candidate_block_id)
-            if len(candidates) == 1:
-                return next(iter(candidates))
-            return None
-
         active_block_id = (
-            match_active_block_id(repr_input.size(dims[0]))
-            if env.backend.name == "cute"
-            and not env.block_sizes[self.block_index].reduction
+            env.backend.reduction_active_block_id(state, node, repr_input.size(dims[0]))
+            if not env.block_sizes[self.block_index].reduction
             else None
         )
         if active_block_id is not None:
-            from .reduction_strategy import BlockReductionStrategy
-
-            strategy = BlockReductionStrategy(state, active_block_id)
+            strategy = env.backend.create_block_reduction_strategy(
+                state, active_block_id
+            )
         elif env.block_sizes[self.block_index].reduction:
             strategy = ctx.cg.device_function.tile_strategy.get_reduction_strategy(
                 self.block_index
@@ -1179,9 +1109,8 @@ class ReductionLowering(InductorLowering):
             )
 
         env.backend.validate_reduction_input(strategy.block_index, repr_input)
-        from .reduction_strategy import cute_mark_cross_block_vec_lanes
-
-        cute_mark_cross_block_vec_lanes(state, strategy.block_index)
+        if (emitter := strategy.emitter) is not None:
+            emitter.mark_cross_block_vec_lanes(state)
         result_ast = strategy.codegen_reduction(
             state,
             output_name,
@@ -1265,13 +1194,11 @@ class APIFuncLowering(Lowering):
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         env = CompileEnvironment.current()
-        try:
-            codegen_fn = self.api_func._codegen[env.codegen_name]
-        except KeyError:
-            raise exc.BackendImplementationMissing(
-                env.backend_name,
-                f"codegen for API function {self.api_func.__qualname__}",
-            ) from None
+        codegen_fn = self.api_func._codegen.lookup(
+            env.codegen_name,
+            backend_name=env.backend_name,
+            what=f"codegen for API function {self.api_func.__qualname__}",
+        )
         from .generate_ast import GenerateAST
 
         if not isinstance(ctx.cg, GenerateAST):
@@ -1359,9 +1286,9 @@ class GenerateASTFromInductor(DefaultHandler):
         load_check: Callable[[str, sympy.Expr], None] | None = None,
     ) -> None:
         super().__init__()
-        self.parent_handler: InductorOpOverrides = (
-            CompileEnvironment.current().backend.inductor_op_overrides()
-        )
+        backend = CompileEnvironment.current().backend
+        self.parent_handler: InductorOpOverrides = backend.inductor_op_overrides()
+        self.handler_overrides: HandlerOpOverrides = backend.handler_op_overrides()
         self.cg = cg
         self.input_name_lookup = input_name_lookup
         self.load_check = load_check
@@ -1447,33 +1374,9 @@ class GenerateASTFromInductor(DefaultHandler):
         device context during compute-type selection, and to guarantee a visible
         cast in generated code that matches PyTorch's dtype semantics.
         """
-        if (
-            CompileEnvironment.current().backend.name == "cute"
-            and src_dtype is torch.float8_e4m3fn
-            and dtype is torch.float32
-        ):
-            cast_expr = expr_from_string(
-                "_cute_fp8e4m3fn_to_float32({x})",
-                x=self._to_ast(x),
-            )
-            return self._lift(cast_expr)
-        if (
-            dtype is torch.float32
-            and CompileEnvironment.current().backend.name == "cute"
-        ):
-            # A 16-bit value the mma_dag emitters hold exactly in fp32 (an
-            # unpacked tile element, a widening side load) widens to that
-            # value, not through a cast pair.  The record lives on the
-            # device function's cute state; a lowering driven by a stand-in
-            # device function (the flex score-mod lowering's tests) has none.
-            device_function = self.cg.device_function
-            x_ast = self._to_ast(x)
-            if isinstance(device_function, DeviceFunction) and isinstance(
-                x_ast, ast.Name
-            ):
-                exact = device_function.cute_state.mma_dag_exact_f32.get(x_ast.id)
-                if exact is not None:
-                    return self._lift(expr_from_string(exact))
+        override = self.handler_overrides.to_dtype(self, x, dtype, src_dtype)
+        if override is not None:
+            return override
         cast_expr = self._create_cast_expr(x, dtype)
         return self._lift(cast_expr)
 
@@ -1549,16 +1452,10 @@ class GenerateASTFromInductor(DefaultHandler):
         )
 
     def rsqrt(self, x: object) -> str:  # type: ignore[override]
+        override = self.handler_overrides.rsqrt(self, x)
+        if override is not None:
+            return override
         backend_name = CompileEnvironment.current().backend_name
-        if backend_name == "cute":
-            suffix = (
-                ", fastmath=True"
-                if CompileEnvironment.current().settings.fast_math
-                else ""
-            )
-            return self._lift(
-                expr_from_string(f"cute.math.rsqrt({{x}}{suffix})", x=self._to_ast(x))
-            )
         if backend_name == "pallas":
             return self._lift(expr_from_string("lax.rsqrt({x})", x=self._to_ast(x)))
         try:
@@ -1569,24 +1466,10 @@ class GenerateASTFromInductor(DefaultHandler):
             return self.reciprocal(self.sqrt(x))
 
     def _integer_shift(self, name: str, x: object, y: object) -> str:
-        dtype = self._expected_tensor_dtype()
-        if (
-            dtype is None
-            or CompileEnvironment.current().backend_name != "cute"
-            or dtype
-            not in (
-                torch.int8,
-                torch.uint8,
-                torch.int16,
-                torch.uint16,
-            )
-        ):
-            return self._default(name, (x, y), {})
-        # CuTe promotes a narrow integer combined with a Python shift count
-        # to Int32. Torch truncates each tensor operation to its result dtype,
-        # before any subsequent shift or conversion.
-        result = _unpack_opsvalue(getattr(self.parent_handler, name)(x, y))
-        return self._lift(self._create_cast_expr(expr_from_string(result), dtype))
+        override = self.handler_overrides.integer_shift(self, name, x, y)
+        if override is not None:
+            return override
+        return self._default(name, (x, y), {})
 
     def bitwise_left_shift(self, x0: object, x1: object) -> str:
         return self._integer_shift("bitwise_left_shift", x0, x1)
@@ -1595,48 +1478,28 @@ class GenerateASTFromInductor(DefaultHandler):
         return self._integer_shift("bitwise_right_shift", x0, x1)
 
     def neg(self, x: object) -> str:  # type: ignore[override]
-        if CompileEnvironment.current().backend_name != "cute":
-            return self._default("neg", (x,), {})
-        return self._lift(expr_from_string("-({x})", x=self._to_ast(x)))
+        override = self.handler_overrides.neg(self, x)
+        if override is not None:
+            return override
+        return self._default("neg", (x,), {})
 
     def abs(self, x: object) -> str:  # type: ignore[override]
-        if CompileEnvironment.current().backend_name != "cute":
-            return self._default("abs", (x,), {})
-        dtype = self._expected_tensor_dtype()
-        if dtype is not None and not dtype.is_signed:
-            # The DSL's abs reads an unsigned value as signed.
-            return _unpack_opsvalue(x)
-        return self._lift(expr_from_string("abs({x})", x=self._to_ast(x)))
+        override = self.handler_overrides.abs(self, x)
+        if override is not None:
+            return override
+        return self._default("abs", (x,), {})
 
     def maximum(self, a: object, b: object) -> str:  # type: ignore[override]
-        if CompileEnvironment.current().backend_name != "cute":
-            return self._default("maximum", (a, b), {})
-        dtype = self._expected_tensor_dtype()
-        if dtype is not None:
-            a = self._create_cast_expr(a, dtype)
-            b = self._create_cast_expr(b, dtype)
-        return self._lift(
-            expr_from_string(
-                "cute.math.max({a}, {b}, propagate_nan=True)",
-                a=self._to_ast(a),
-                b=self._to_ast(b),
-            )
-        )
+        override = self.handler_overrides.maximum(self, a, b)
+        if override is not None:
+            return override
+        return self._default("maximum", (a, b), {})
 
     def minimum(self, a: object, b: object) -> str:  # type: ignore[override]
-        if CompileEnvironment.current().backend_name != "cute":
-            return self._default("minimum", (a, b), {})
-        dtype = self._expected_tensor_dtype()
-        if dtype is not None:
-            a = self._create_cast_expr(a, dtype)
-            b = self._create_cast_expr(b, dtype)
-        return self._lift(
-            expr_from_string(
-                "cute.math.min({a}, {b}, propagate_nan=True)",
-                a=self._to_ast(a),
-                b=self._to_ast(b),
-            )
-        )
+        override = self.handler_overrides.minimum(self, a, b)
+        if override is not None:
+            return override
+        return self._default("minimum", (a, b), {})
 
     def mul(self, a: object, b: object) -> str:  # type: ignore[override]
         # Triton promotes scalar*tensor results to float32, deviating from
@@ -1714,39 +1577,6 @@ class GraphInterpreter(LoweringContext, Interpreter):
         if isinstance(value, ast.AST):
             return value
         raise TypeError(f"Unsupported value type for AST conversion: {type(value)}")
-
-    @property
-    def cute_layout(self) -> ThreadLayout | None:
-        if V.current_node is None:
-            return None
-        from .cute.layout_propagation import META_KEY
-
-        constraint = V.current_node.meta.get(META_KEY)
-        if constraint is None:
-            return None
-        return constraint.primary_layout()
-
-    @property
-    def cute_matmul_axes(self) -> MatmulAxisModel | None:
-        if V.current_node is None:
-            return None
-        from .cute.layout_propagation import META_KEY
-
-        constraint = V.current_node.meta.get(META_KEY)
-        if constraint is None:
-            return None
-        return constraint.matmul_axes
-
-    @property
-    def cute_matmul_plan(self) -> MatmulExecutionPlan | None:
-        if V.current_node is None:
-            return None
-        from .cute.layout_propagation import META_KEY
-
-        constraint = V.current_node.meta.get(META_KEY)
-        if constraint is None:
-            return None
-        return constraint.matmul_plan
 
     def _create_named_result(self, node: Node, result: ast.expr) -> str:
         """Create a named variable for a node result, handling block-size-only expressions as constexpr."""
@@ -1877,49 +1707,19 @@ class GraphInterpreter(LoweringContext, Interpreter):
                 V.set_current_node(n),
             ):
                 try:
-                    cute_state = self.cg.device_function.cute_state
-                    if cute_state.has_tcgen05_fragment_epilogue_plan:
-                        if cute_state.is_deferred_tcgen05_fragment_epilogue_node(n):
-                            n.meta["codegen"] = _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
-                            return _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
-                        if (
-                            any(
-                                self.env.get(input_node)
-                                is _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
-                                for input_node in n.all_input_nodes
-                            )
-                            and cute_state.tcgen05_fragment_epilogue_plan_for_store(n)
-                            is None
-                        ):
-                            raise exc.BackendUnsupported(
-                                "cute",
-                                "deferred tcgen05 fragment epilogue escaped its "
-                                "committed store",
-                            )
                     # Operands exchanged between threads for this node only.
                     exchanged: dict[torch.fx.Node, ast.AST] = {}
                     # ``has_current``: test_cute_fx_replay replays ``run_node``
                     # with no CompileEnvironment.
-                    if (
-                        CompileEnvironment.has_current()
-                        and CompileEnvironment.current().backend.name == "cute"
-                    ):
-                        # Local import: at module level, cute.repeated_block_ids
-                        # -> completed_matmul_sum -> device_ir -> ``from helion
-                        # import Config`` fails while helion/__init__ is still
-                        # importing (via language -> ... -> runtime.kernel ->
-                        # generate_ast -> this module).
-                        from .cute.repeated_block_ids import check_repeated_block_ids
-
-                        check_repeated_block_ids(self.cg, n)
-                        check_view_coord_consumers(self.cg, n)
-                        if (
-                            isinstance(n.meta["lowering"], PointwiseLowering)
-                            or n.target in REBOUND_CHECK_TARGETS
-                        ):
-                            exchanged = check_pointwise_rebound_block_ids(
-                                self.cg, n, operand_env=self.env
-                            )
+                    if CompileEnvironment.has_current():
+                        backend = CompileEnvironment.current().backend
+                        deferred = backend.deferred_node_codegen(self.cg, n, self.env)
+                        if deferred is not None:
+                            n.meta["codegen"] = deferred
+                            return deferred
+                        exchanged = backend.exchanged_node_operands(
+                            self.cg, n, self.env
+                        )
                     lowering: Lowering = n.meta["lowering"]
                     own_values = {operand: self.env[operand] for operand in exchanged}
                     # pyrefly: ignore [no-matching-overload]
@@ -1988,13 +1788,6 @@ class GraphInterpreter(LoweringContext, Interpreter):
         return super().run_node(n)
 
 
-_DEFERRED_TCGEN05_FRAGMENT_EPILOGUE = object()
-
-
-def is_deferred_tcgen05_fragment_epilogue(value: object) -> bool:
-    return value is _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
-
-
 def codegen_call_with_graph(
     cg: GenerateAST,
     graph: torch.fx.Graph,
@@ -2003,11 +1796,7 @@ def codegen_call_with_graph(
     copy_named_args: bool = True,
 ) -> list[object]:
     with compile_lock:
-        from .cute.cute_mma import prepare_cute_collective_lane_loop_suppression
-        from .cute.simt_gemm import prepare_cute_simt_gemm_loads
-
-        prepare_cute_collective_lane_loop_suppression(cg, graph)
-        prepare_cute_simt_gemm_loads(cg, graph)
+        CompileEnvironment.current().backend.prepare_graph_codegen(cg, graph)
         new_args = []
         placeholders = graph.find_nodes(op="placeholder")
         for arg, placeholder in zip(args, placeholders, strict=True):
@@ -2075,39 +1864,3 @@ class CodegenState(NamedTuple):
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         return self.codegen.device_function.sympy_expr(expr)
-
-    @property
-    def cute_layout(self) -> ThreadLayout | None:
-        """Return the resolved CuTe ThreadLayout for the current FX node, if any."""
-        if self.fx_node is None:
-            return None
-        from .cute.layout_propagation import META_KEY
-
-        constraint = self.fx_node.meta.get(META_KEY)
-        if constraint is None:
-            return None
-        return constraint.primary_layout()  # type: ignore[return-value]
-
-    @property
-    def cute_matmul_axes(self) -> MatmulAxisModel | None:
-        """Return the planner-owned CuTe matmul axis model for the current FX node."""
-        if self.fx_node is None:
-            return None
-        from .cute.layout_propagation import META_KEY
-
-        constraint = self.fx_node.meta.get(META_KEY)
-        if constraint is None:
-            return None
-        return constraint.matmul_axes
-
-    @property
-    def cute_matmul_plan(self) -> MatmulExecutionPlan | None:
-        """Return the planner-owned CuTe matmul execution plan for the node."""
-        if self.fx_node is None:
-            return None
-        from .cute.layout_propagation import META_KEY
-
-        constraint = self.fx_node.meta.get(META_KEY)
-        if constraint is None:
-            return None
-        return constraint.matmul_plan

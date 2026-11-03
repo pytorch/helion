@@ -12,7 +12,7 @@ from test.test_cute_full_chunk_row_seeds import bind
 from test.test_cute_rolled_cluster_packet_seeds import _fused_rows
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_rolled_cluster_packet import (
+from helion._compiler.cute.autotune.heuristics.cute_rolled_cluster_packet import (
     CuteRolledClusterPacketHeuristic,
 )
 from helion._testing.cute_codegen import forbid_native_compile

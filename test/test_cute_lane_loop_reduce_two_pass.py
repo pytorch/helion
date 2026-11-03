@@ -179,7 +179,6 @@ class TestCuteLaneLoopReduceTwoPass(TestCase):
         self.assertNotIn("_cute_grouped_reduce", _lane_loop_body(code))
 
 
-@onlyBackends(["cute"])
 def test_owned_marker_restore_when_two_pass_split_is_unsafe() -> None:
     """jagged_layer_norm at 256 threads x 2 lanes: the lane loop carries extra
     cross-lane sums, so the two-pass split is refused and the owned marker is
@@ -239,7 +238,7 @@ def test_two_lane_nested_row_seeds_match_their_static_twin_under_dynamic_shapes(
         _examples_jagged_layer_norm.reference_jagged_layer_norm_pytorch
     )
 
-    from helion._compiler.autotuner_heuristics.cute import CuteNestedRowHeuristic
+    from helion._compiler.cute.autotune.heuristics.cute import CuteNestedRowHeuristic
 
     torch.manual_seed(0)
     lengths = torch.randint(0, 40, (17,))

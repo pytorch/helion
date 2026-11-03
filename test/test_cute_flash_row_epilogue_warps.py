@@ -26,10 +26,9 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.backend import CuteBackend
+from helion._compiler.cute.backend import CuteBackend
 from helion._testing import DEVICE
 from helion._testing import code_and_output
-from helion._testing import onlyBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -38,6 +37,7 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
 from helion._testing import import_example
 
 _FA4_2CTA = {
@@ -237,7 +237,8 @@ def _fused_row_spec(
     spec = ConfigSpec(backend=CuteBackend())
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         num_kv=num_kv,
         num_bh=64,
@@ -277,8 +278,8 @@ def test_fused_row_epilogue_surfaces_have_complete_structural_coverage(
     # has unreachable values and the autotuner refuses to start.
     spec = _fused_row_spec(head_dim, num_kv, dtype)
     generation = spec.create_config_generation()
-    generation.validate_flash_structural_coverage()
-    configs = generation.flash_deterministic_population_configs()
+    generation.extension.validate_flash_structural_coverage()
+    configs = generation.extension.deterministic_population_configs()
     assert configs
     assert all(
         generation.canonicalize_flat(generation.flatten(config))[1] == config
@@ -331,7 +332,8 @@ def test_target_seed_round_trips_under_the_fused_row_body() -> None:
     )
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=64,
         num_kv=256,
         num_bh=8,
@@ -389,7 +391,6 @@ def test_target_seed_round_trips_under_the_fused_row_body() -> None:
     }
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("shape", ((1, 4, 256, 64), (2, 16, 2048, 128)))
 def test_xsa_search_surface_has_complete_structural_coverage(
     shape: tuple[int, int, int, int],
@@ -401,12 +402,11 @@ def test_xsa_search_surface_has_complete_structural_coverage(
     spec = _xsa_kernel().bind((q, k, v)).config_spec
     assert spec._cute_flash_has_row_epilogue and not spec._cute_flash_plain_row_body
     generation = spec.create_config_generation()
-    generation.validate_flash_structural_coverage()
+    generation.extension.validate_flash_structural_coverage()
     # The autotuner's first act is to build this population.
-    assert generation.flash_deterministic_population_configs()
+    assert generation.extension.deterministic_population_configs()
 
 
-@onlyBackends(["cute"])
 def test_xsa_normalizes_the_whole_row_body_away() -> None:
     q, k, v = _qkv(2, 16, 2048, 128, torch.bfloat16)
     bound = _xsa_kernel().bind((q, k, v))
@@ -421,7 +421,6 @@ def test_xsa_normalizes_the_whole_row_body_away() -> None:
     assert normalized.config[cute_flash.FLASH_SOFTMAX_DISC_KEY] is False
 
 
-@onlyBackends(["cute"])
 def test_row_sum_publish_waits_for_the_last_alpha_slot() -> None:
     # The two-slot statistics ring lets the row-sum publish follow the last
     # alpha before the correction warp consumed it; two bar.arrive from one
@@ -507,7 +506,6 @@ def test_row_epilogue_warps_is_searched_only_with_a_row_program() -> None:
 # --------------------------------------------------------------------------
 
 
-@onlyBackends(["cute"])
 def test_softmax_route_stages_aux_through_smem_on_the_2cta_persistent_body() -> None:
     q, k, v = _qkv(1, 2, 512, 128, torch.bfloat16)
     code = _code(_xsa_kernel(fast_math=True), (q, k, v), **_FA4_2CTA)
@@ -595,7 +593,6 @@ def test_softmax_route_stages_aux_through_smem_on_the_2cta_persistent_body() -> 
     assert "flash_m_tile0 = " in softmax0
 
 
-@onlyBackends(["cute"])
 def test_correction_route_keeps_the_program_in_the_correction_warps() -> None:
     q, k, v = _qkv(1, 2, 512, 128, torch.bfloat16)
     code = _code(_xsa_kernel(fast_math=True), (q, k, v), **_FA4_2CTA, **_CORRECTION)
@@ -612,7 +609,6 @@ def test_correction_route_keeps_the_program_in_the_correction_warps() -> None:
     assert "_helion_inv_div_0 = 1.0 / _ep0_v7" in correction
 
 
-@onlyBackends(["cute"])
 def test_softmax_route_direct_store_reads_aux_from_gmem() -> None:
     q, k, v = _qkv(1, 2, 512, 128, torch.bfloat16)
     code = _code(_xsa_kernel(), (q, k, v), **_FA4_DIRECT)
@@ -629,7 +625,6 @@ def test_softmax_route_direct_store_reads_aux_from_gmem() -> None:
     )
 
 
-@onlyBackends(["cute"])
 def test_staged_stg_route_and_flat_grid_also_stage_aux() -> None:
     q, k, v = _qkv(1, 2, 512, 128, torch.bfloat16)
     stg = _code(_xsa_kernel(), (q, k, v), **_FA4_STG)
@@ -642,7 +637,6 @@ def test_staged_stg_route_and_flat_grid_also_stage_aux() -> None:
     assert epilogue_warp.count("cute.copy(_flash_tma_aux0") == 2
 
 
-@onlyBackends(["cute"])
 def test_plain_attention_codegen_ignores_the_knob() -> None:
     q, k, v = _qkv(1, 2, 512, 128, torch.bfloat16)
     default = _code(_attention_kernel(), (q, k, v), **_FA4_2CTA)
@@ -651,7 +645,6 @@ def test_plain_attention_codegen_ignores_the_knob() -> None:
     assert "flash_sm_o_full_phase" not in default and "_flash_tma_aux0" not in default
 
 
-@onlyBackends(["cute"])
 def test_ws_staged_route_stages_aux_and_ignores_the_knob() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     code = _code(_xsa_kernel(), (q, k, v), **_WS)
@@ -691,7 +684,6 @@ def test_ws_staged_route_stages_aux_and_ignores_the_knob() -> None:
 # --------------------------------------------------------------------------
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("seq", (256, 1024, 2048))
 @pytest.mark.parametrize(
     "config",
@@ -716,7 +708,6 @@ def test_xsa_matches_reference_on_every_family(
     torch.testing.assert_close(out, ref_xsa(q, k, v), atol=2e-2, rtol=2e-2)
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     "config",
     (
@@ -734,7 +725,6 @@ def test_xsa_routes_match_reference(config: dict[str, object]) -> None:
     torch.testing.assert_close(out, ref_xsa(q, k, v), atol=2e-2, rtol=2e-2)
 
 
-@onlyBackends(["cute"])
 def test_xsa_head_dim_64_and_fp16_stage_aux() -> None:
     ref_xsa = import_example("xsa").ref_xsa
 
@@ -745,7 +735,6 @@ def test_xsa_head_dim_64_and_fp16_stage_aux() -> None:
         torch.testing.assert_close(out, ref_xsa(q, k, v), atol=2e-2, rtol=2e-2)
 
 
-@onlyBackends(["cute"])
 def test_xsa_two_inputs_do_not_alias_the_staged_aux() -> None:
     """The aux tile is TMA-loaded per work item; the same compiled kernel run
     on a second input set must not see the first one's rows."""
@@ -762,7 +751,6 @@ def test_xsa_two_inputs_do_not_alias_the_staged_aux() -> None:
     )
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     "config, shape",
     (
@@ -806,7 +794,6 @@ def test_persistent_ctas_run_several_xsa_work_items(
         torch.testing.assert_close(fn(q, k, v), ref_xsa(q, k, v), atol=2e-2, rtol=2e-2)
 
 
-@onlyBackends(["cute"])
 def test_packed_and_scalar_row_programs_agree() -> None:
     ref_xsa = import_example("xsa").ref_xsa
 

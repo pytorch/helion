@@ -15,13 +15,14 @@ from typing import TYPE_CHECKING
 import torch
 
 from ...language import memory_ops
+from .analysis.match_common import node_tensor
 from .memory_ops import _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
 from .memory_ops import tensor_has_specialized_base_alignment
 from .row_resident import RowResidentPlan
 from .row_resident import RowStore
 from .row_resident import _call
 from .row_resident import _direct_load
-from .row_resident import _value
+from .target_facts import static_smem_budget
 
 if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
@@ -189,14 +190,14 @@ def prove_row_matrix_transport(
         value = values[product.name]
         if materialized.chain.auxiliary_tensor_loads:
             continue
-        base_tensor = _value(base)
+        base_tensor = node_tensor(base)
         if base_tensor is None or base_tensor.dtype is not torch.float16:
             continue
         if _call(value, torch.ops.prims.convert_element_type.default, 2):
             if value.args[1] is not torch.float16:
                 continue
             value = value.args[0]
-        value_tensor = _value(value)
+        value_tensor = node_tensor(value)
         if (
             not _call(value, torch.ops.aten.mul.Tensor, 2)
             or value_tensor is None
@@ -243,7 +244,7 @@ def prove_row_matrix_transport(
         plan = RowMatrixPlan(
             row, (first, second), materialized, product, name, base_left, base, value
         )
-        if plan.shared_bytes > 48 * 1024 or plan.weight_bytes % 1024:
+        if plan.shared_bytes > static_smem_budget() or plan.weight_bytes % 1024:
             continue
         return plan
     return None

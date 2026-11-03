@@ -61,6 +61,7 @@ import dataclasses
 import math
 import operator
 from typing import TYPE_CHECKING
+from typing import TypeVar
 
 import sympy
 import torch
@@ -942,38 +943,33 @@ def _is_auxiliary_tensor_expr_node(node: torch.fx.Node, depth: int = 0) -> bool:
     return False
 
 
+_LeafExpr = TypeVar("_LeafExpr", _AuxiliaryTensorLoadExpr, _RuntimeScalarExpr)
+
+
+def _tensor_expr_leaves(
+    expr: _TensorExpr, kind: type[_LeafExpr]
+) -> tuple[_LeafExpr, ...]:
+    """The ``kind`` leaves of a tensor expression, left to right."""
+    if isinstance(expr, kind):
+        return (expr,)
+    if isinstance(
+        expr, (_CurrentTensorExpr, _AuxiliaryTensorLoadExpr, _RuntimeScalarExpr)
+    ):
+        return ()
+    if isinstance(expr, _UnaryTensorExpr):
+        return _tensor_expr_leaves(expr.operand, kind)
+    if isinstance(expr, _BinaryTensorExpr):
+        return (
+            *_tensor_expr_leaves(expr.lhs, kind),
+            *_tensor_expr_leaves(expr.rhs, kind),
+        )
+    raise AssertionError(f"unexpected tensor expression: {type(expr).__name__}")
+
+
 def _auxiliary_tensor_expr_operands(
     expr: _TensorExpr,
 ) -> tuple[_AuxiliaryTensorLoadExpr, ...]:
-    if isinstance(expr, (_CurrentTensorExpr, _RuntimeScalarExpr)):
-        return ()
-    if isinstance(expr, _AuxiliaryTensorLoadExpr):
-        return (expr,)
-    if isinstance(expr, _UnaryTensorExpr):
-        return _auxiliary_tensor_expr_operands(expr.operand)
-    if isinstance(expr, _BinaryTensorExpr):
-        return (
-            *_auxiliary_tensor_expr_operands(expr.lhs),
-            *_auxiliary_tensor_expr_operands(expr.rhs),
-        )
-    raise AssertionError(f"unexpected tensor expression: {type(expr).__name__}")
-
-
-def _runtime_scalar_operands(
-    expr: _TensorExpr,
-) -> tuple[_RuntimeScalarExpr, ...]:
-    if isinstance(expr, (_CurrentTensorExpr, _AuxiliaryTensorLoadExpr)):
-        return ()
-    if isinstance(expr, _RuntimeScalarExpr):
-        return (expr,)
-    if isinstance(expr, _UnaryTensorExpr):
-        return _runtime_scalar_operands(expr.operand)
-    if isinstance(expr, _BinaryTensorExpr):
-        return (
-            *_runtime_scalar_operands(expr.lhs),
-            *_runtime_scalar_operands(expr.rhs),
-        )
-    raise AssertionError(f"unexpected tensor expression: {type(expr).__name__}")
+    return _tensor_expr_leaves(expr, _AuxiliaryTensorLoadExpr)
 
 
 def _tensor_expr_contains_current(expr: _TensorExpr) -> bool:
@@ -996,7 +992,7 @@ def _render_runtime_scalar(expr: _RuntimeScalarExpr) -> str:
 
     df = DeviceFunction.current()
     if isinstance(expr.source, torch.fx.Node):
-        from ...language.memory_ops import _cute_scalar_load_expr
+        from .emitters.memory_access import _cute_scalar_load_expr
 
         tensor_node = expr.source.args[0]
         assert isinstance(tensor_node, torch.fx.Node)
@@ -1143,7 +1139,9 @@ class Tcgen05UnaryEpilogueChain:
         :attr:`auxiliary_tensor_loads`, which never includes these leaves.
         """
         return tuple(
-            leaf for step in self.steps for leaf in _runtime_scalar_operands(step.expr)
+            leaf
+            for step in self.steps
+            for leaf in _tensor_expr_leaves(step.expr, _RuntimeScalarExpr)
         )
 
     def render_runtime_scalar_bindings(
@@ -1946,7 +1944,7 @@ def analyze_tcgen05_unary_epilogue_chain(
         if state is None:
             return None
         df = state.device_function
-        target_fx_nodes = df.cute_state.matmul_fx_nodes
+        target_fx_nodes = df.cute_state.tcgen05.matmul_fx_nodes
     if not target_fx_nodes:
         return None
 

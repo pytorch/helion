@@ -35,12 +35,12 @@ from torch.utils._pytree import tree_flatten
 from .. import exc
 from .._compat import extract_device
 from .._compat import get_device_name
-from ..runtime.cute_structural_config import CuteStructuralConfig
-from ..runtime.cute_structural_config import StructuralPolicyError
-from ..runtime.cute_structural_config import bound_structural_policy
-from ..runtime.cute_structural_config import require_same_structural_policy
 from ..runtime.settings import _env_get_int
 from ..runtime.settings import _env_get_optional_int
+from ..runtime.structural_policy import StructuralConfig
+from ..runtime.structural_policy import StructuralPolicyError
+from ..runtime.structural_policy import bound_structural_policy
+from ..runtime.structural_policy import require_same_structural_policy
 from .benchmark_provider import _COMPILER_SEED_TIMEOUT_RETRY_LIMIT
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
@@ -82,9 +82,10 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing_extensions import Self
 
+    from .._compiler.backend import Backend
     from ..runtime.config import Config
-    from ..runtime.cute_structural_policy import CuteStructuralPolicy
     from ..runtime.settings import Settings
+    from ..runtime.structural_policy import StructuralPolicy
     from . import ConfigSpec
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
@@ -117,12 +118,8 @@ _SUSPICIOUS_REBENCHMARK_REP = 100
 # confirming costs a fresh worker process per finalist.
 _SUSPICIOUS_REBENCHMARK_MIN_DELTA_MS = 0.001
 _FINAL_REBENCHMARK_TOP_K_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K"
+# A backend may verify more finalists (``Backend.final_rebenchmark_top_k``).
 _FINAL_REBENCHMARK_TOP_K_DEFAULT = 8
-# The cute/flash-attention search surface has a wide config space where verifying
-# more finalists materially improves the final pick. Other backends do not need
-# the extra rebenchmark cost (it ~2.5x'd autotune wall-time on cheap kernels), so
-# the larger finalist set is scoped to cute only.
-_FINAL_REBENCHMARK_TOP_K_CUTE = 32
 _FINAL_REBENCHMARK_TARGET_MS_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS"
 _FINAL_REBENCHMARK_TARGET_MS_DEFAULT = 5000.0
 _FINAL_REBENCHMARK_TARGET_MS_MAX = 60000.0
@@ -272,25 +269,27 @@ _CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>")
 def normalize_autotune_seed_configs(
     settings: Settings,
     *,
-    structural_policy: CuteStructuralPolicy
-    | Callable[[], CuteStructuralPolicy | None]
+    structural_policy: StructuralPolicy
+    | Callable[[], StructuralPolicy | None]
     | None = None,
 ) -> tuple[Config, ...]:
     """Return user-provided autotune seed configs from settings as concrete Configs."""
+    from .._compiler.backend_registry import get_backend
     from ..runtime.config import Config
 
     seed_configs = settings.autotune_seed_configs
     if seed_configs is None:
         return ()
-    if isinstance(seed_configs, CuteStructuralConfig):
+    if isinstance(seed_configs, StructuralConfig):
         seed_configs = (seed_configs,)
     if isinstance(seed_configs, Config):
         return (seed_configs,)
     if isinstance(seed_configs, dict):
         return (Config.from_dict(seed_configs),)
     result = []
+    policy_type = get_backend(settings.backend).structural_policy_type()
     for seed_config in seed_configs:
-        if isinstance(seed_config, CuteStructuralConfig):
+        if isinstance(seed_config, StructuralConfig):
             # Legacy search-policy inspection can run before binding. Only a
             # new envelope needs the captured bound's policy, so resolve lazily.
             policy = (
@@ -300,8 +299,8 @@ def normalize_autotune_seed_configs(
             )
             require_same_structural_policy(
                 seed_config.policy,
-                policy or settings.get_cute_structural_policy()
-                if settings.backend == "cute"
+                (policy or policy_type.from_settings(settings))
+                if policy_type is not None
                 else None,
                 context="Late autotune seed envelope",
             )
@@ -458,7 +457,7 @@ class BaseSearch(BaseAutotuner):
         super().__init__()
         self.kernel = kernel
         self.settings: Settings = kernel.settings
-        if isinstance(self.settings.autotune_config_overrides, CuteStructuralConfig):
+        if isinstance(self.settings.autotune_config_overrides, StructuralConfig):
             raise StructuralPolicyError(
                 "Policy-bearing autotune overrides must be supplied before "
                 "creating a new Kernel; late overrides must be an ordinary "
@@ -1153,6 +1152,14 @@ class BaseSearch(BaseAutotuner):
                             raise exc.NoConfigFound
                         if not self.args.defer_selected_log:
                             self.benchmark_provider.log_selected(best)
+                except exc.NoConfigFound as error:
+                    # Every candidate dropped by the worker's compile deadline
+                    # is a deadline (or host) problem, not a kernel without a
+                    # working config: say so where the search's caller looks.
+                    cascade = self.benchmark_provider.compile_deadline_cascade()
+                    if cascade is None:
+                        raise
+                    raise exc.NoConfigFound(f": {cascade}") from error
                 finally:
                     self._finalize_autotune_metrics(best)
         except BenchmarkWorkerUnkillable as error:
@@ -2535,7 +2542,9 @@ class PopulationBasedSearch(BaseSearch):
         """
         if total <= 0 or not self.config_spec.cute_flash_search_enabled:
             return 0
-        return min(total, self.config_gen.flash_structural_qualification_prefix_count())
+        return min(
+            total, self.config_gen.extension.structural_qualification_prefix_count()
+        )
 
     @contextlib.contextmanager
     def _initial_population_budget(
@@ -2970,11 +2979,20 @@ class PopulationBasedSearch(BaseSearch):
         for config in configs:
             self.pin_finalist_config(config)
 
-    def _final_rebenchmark_top_k_default(self) -> int:
+    def _final_rebenchmark_backend(self) -> Backend | None:
+        """The backend whose finalist policy applies, or ``None`` for a search
+        built without a config spec (the unit tests' bare searches)."""
+        from .._compiler.backend_registry import get_backend
+
         backend_name = getattr(getattr(self, "config_spec", None), "backend_name", None)
-        if backend_name == "cute":
-            return _FINAL_REBENCHMARK_TOP_K_CUTE
-        return _FINAL_REBENCHMARK_TOP_K_DEFAULT
+        if backend_name is None:
+            return None
+        return get_backend(backend_name)
+
+    def _final_rebenchmark_top_k_default(self) -> int:
+        backend = self._final_rebenchmark_backend()
+        top_k = None if backend is None else backend.final_rebenchmark_top_k()
+        return _FINAL_REBENCHMARK_TOP_K_DEFAULT if top_k is None else top_k
 
     def _final_rebenchmark_top_k(self) -> int:
         default = self._final_rebenchmark_top_k_default()
@@ -3016,16 +3034,11 @@ class PopulationBasedSearch(BaseSearch):
     def _final_rebenchmark_use_isolated(self) -> bool:
         from ..runtime.settings import _env_get_bool
 
-        # Default to ISOLATED finalist timing on cute: the interleaved bench
-        # lets L2 cache-POLICY state leak between candidates that read the
-        # same input tensors (an ``l2_last`` candidate pins its inputs in L2
-        # and every rival free-rides on the hits, so the config CAUSING the
-        # speedup can never out-measure the others).  Isolated mode times
-        # each finalist in its own steady window — the same regime the
-        # deployment-style do_bench measures — with suspicious-result
-        # confirmation guarding against thermal drift between windows.
-        backend_name = getattr(getattr(self, "config_spec", None), "backend_name", None)
-        default = backend_name == "cute"
+        # The backend decides whether finalists are timed ISOLATED (each in
+        # its own steady window) or interleaved by default
+        # (``Backend.final_rebenchmark_isolated``).
+        backend = self._final_rebenchmark_backend()
+        default = backend is not None and backend.final_rebenchmark_isolated()
         try:
             return _env_get_bool(_FINAL_REBENCHMARK_ISOLATED_ENV, default)
         except ValueError:

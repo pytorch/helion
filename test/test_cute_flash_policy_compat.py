@@ -7,8 +7,10 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.backend import CuteBackend
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
@@ -33,7 +35,8 @@ def _config_spec(
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 3))
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         num_kv=num_kv,
         num_bh=64,
@@ -219,7 +222,7 @@ def test_fixed_config_compatibility_does_not_expand_ws_fragment_choices(
     num_kv: int, key: str, value: object
 ) -> None:
     spec = _config_spec(num_kv)
-    fragments = spec._cute_flash_autotune_fragments("ws_overlap", "ws_overlap")
+    fragments = _cute_flash_autotune_fragments(spec, "ws_overlap", "ws_overlap")
     assert value not in cast("EnumFragment", fragments[key]).choices
     config = _fixed_config(
         {cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap", key: value}

@@ -11,8 +11,9 @@ from unittest.mock import patch
 
 import torch
 
-from helion._hardware import HardwareInfo
+from helion._compiler.cute.target_facts import B200
 from helion._testing import patch_cute_mma_support
+from helion._testing import patch_target_facts
 from helion.autotuner.compiler_coverage import same_value
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -131,44 +132,37 @@ def _pointwise(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# The MMA support record ``_target`` installs: every implementation on, no
+# ``supported_impls`` tuple (the production ``get_cute_mma_support`` shape).
+# Patch a copy (``tcgen05_mma_support()``), never this template: a test that
+# mutates the installed record must not leak into later ``_target()`` users.
+TCGEN05_MMA_SUPPORT = SimpleNamespace(
+    universal=True,
+    warp_f16bf16=True,
+    tcgen05_f16bf16=True,
+)
+
+
+def tcgen05_mma_support() -> SimpleNamespace:
+    """A fresh copy of :data:`TCGEN05_MMA_SUPPORT` for one patch."""
+    return SimpleNamespace(**vars(TCGEN05_MMA_SUPPORT))
+
+
 def _cpu_target() -> ExitStack:
+    """The B200 capability, SM count and HIP flag without CUDA work."""
     stack = ExitStack()
-    for name, value in (
-        ("helion.runtime.kernel.target_device_capability", (10, 0)),
-        ("helion._compiler.compile_environment.target_device_capability", (10, 0)),
-        ("helion.runtime.get_num_sm", 148),
-        ("helion._compat._is_hip", False),
-    ):
-        stack.enter_context(patch(name, return_value=value))
+    stack.enter_context(
+        patch_target_facts(capability=(10, 0), num_sm=148, is_hip=False)
+    )
     return stack
 
 
 def _target() -> ExitStack:
+    """``_cpu_target`` plus tcgen05 MMA support, the B200 opt-in SMEM capacity
+    (the budget derives from it) and the B200 hardware identity."""
     stack = _cpu_target()
+    stack.enter_context(patch_cute_mma_support(tcgen05_mma_support()))
     stack.enter_context(
-        patch_cute_mma_support(
-            SimpleNamespace(
-                universal=True,
-                warp_f16bf16=True,
-                warpgroup_f16bf16=True,
-                tcgen05_f16bf16=True,
-            )
-        )
+        patch_target_facts(smem_capacity_bytes=232448, hardware=B200.hardware_info())
     )
-    for name, value in (
-        (
-            "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_capacity_bytes",
-            232448,
-        ),
-        (
-            "helion._hardware.get_hardware_info",
-            HardwareInfo(
-                device_kind="cuda",
-                hardware_name="NVIDIA B200",
-                runtime_version="13.0",
-                compute_capability="sm100",
-            ),
-        ),
-    ):
-        stack.enter_context(patch(name, return_value=value))
     return stack

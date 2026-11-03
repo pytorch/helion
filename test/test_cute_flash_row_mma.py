@@ -27,7 +27,6 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
-from helion._testing import onlyBackends
 from helion._testing import skipIfLowVRAM
 import helion.language as hl
 
@@ -36,6 +35,7 @@ pytest.importorskip("cutlass.cute")
 
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute import cute_flash_row_mma
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
 from helion._testing import import_example
 from helion.autotuner.config_fragment import EnumFragment
 
@@ -854,7 +854,6 @@ def _code(
     return bound.to_code(bound._normalized_config_copy(helion.Config(**config)))
 
 
-@onlyBackends(["cute"])
 def test_row_mma_renders_the_single_chunk_row_program() -> None:
     code = _code(_attention_kernel(), _qkv(1, 4, 256, 64, torch.bfloat16), **_ROW)
     assert "'kind': 'helion_flash_row_mma'" in code
@@ -899,7 +898,6 @@ def test_row_mma_renders_the_single_chunk_row_program() -> None:
     )
 
 
-@onlyBackends(["cute"])
 def test_row_mma_renders_two_octets_and_eight_warps() -> None:
     code = _code(
         _attention_kernel(),
@@ -915,7 +913,6 @@ def test_row_mma_renders_two_octets_and_eight_warps() -> None:
     assert code.count("_helion_flash_rowmma.pack_f16x2(") == 8 + 4
 
 
-@onlyBackends(["cute"])
 def test_row_mma_renders_the_chunk_loop_for_long_key_ranges() -> None:
     code = _code(_attention_kernel(), _qkv(1, 1, 1024, 64, torch.bfloat16), **_ROW)
     # 256 keys per warp stream as four 64-key chunks through two stages.
@@ -925,7 +922,6 @@ def test_row_mma_renders_the_chunk_loop_for_long_key_ranges() -> None:
     assert "cute.arch.exp2((rm_mo_0_a - rm_m_0_a) * rm_scale)" in code
 
 
-@onlyBackends(["cute"])
 def test_row_mma_renders_the_single_stage_chunk_loop() -> None:
     # 96 keys per warp of the 128-wide head with eight warps of 16 rows: six
     # 16-key chunks through one stage, refilled after each chunk's reads.
@@ -941,7 +937,6 @@ def test_row_mma_renders_the_single_stage_chunk_loop() -> None:
     assert "cute.arch.alloc_smem(cutlass.BFloat16, 32768, alignment=128)" in code
 
 
-@onlyBackends(["cute"])
 def test_row_mma_renders_the_relu_epilogue() -> None:
     code = _code(_relu_kernel(), _qkv(1, 4, 256, 64, torch.bfloat16), **_ROW)
     assert "'kind': 'helion_flash_row_mma'" in code
@@ -953,7 +948,6 @@ def test_row_mma_renders_the_relu_epilogue() -> None:
 # --------------------------------------------------------------------------
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     ("shape", "dtype", "warps", "tile_m"),
     (
@@ -979,7 +973,6 @@ def test_row_mma_matches_reference(
     torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
-@onlyBackends(["cute"])
 def test_row_mma_relu_output_matches_reference() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     expected_out, _ = _reference(q, k, v)
@@ -988,7 +981,6 @@ def test_row_mma_relu_output_matches_reference() -> None:
     torch.testing.assert_close(out, torch.relu(expected_out), atol=1e-2, rtol=1e-2)
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("under_aligned", ("q", "k", "v"))
 def test_row_mma_falls_back_to_tcgen05_for_an_under_aligned_base(
     under_aligned: str,
@@ -1022,7 +1014,6 @@ def test_row_mma_falls_back_to_tcgen05_for_an_under_aligned_base(
 _TWO_GIB_SHAPE = (1, 131073, 128, 64)
 
 
-@onlyBackends(["cute"])
 # q, k, v, and the output in bf16, the fp32 lse, and 1 GiB of slack.
 @skipIfLowVRAM(
     "Test requires ~9 GiB of free VRAM",
@@ -1045,7 +1036,6 @@ def test_row_mma_byte_offsets_pass_two_gib() -> None:
         torch.testing.assert_close(lse[:, rows], expected_lse, atol=2e-2, rtol=2e-2)
 
 
-@onlyBackends(["cute"])
 def test_row_mma_is_deterministic_and_does_not_alias_the_output() -> None:
     kernel = _attention_kernel()
     outs = []
@@ -1066,7 +1056,6 @@ def test_row_mma_is_deterministic_and_does_not_alias_the_output() -> None:
     assert not torch.equal(outs[0], outs[1])
 
 
-@onlyBackends(["cute"])
 def test_row_mma_seed_survives_normalization_and_seed_deduplication() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     bound = _attention_kernel().bind((q, k, v))
@@ -1097,7 +1086,6 @@ def test_row_mma_seed_survives_normalization_and_seed_deduplication() -> None:
 # --------------------------------------------------------------------------
 
 
-@onlyBackends(["cute"])
 def test_row_mma_renders_the_fused_row_epilogue() -> None:
     code = _code(_xsa_kernel(), _qkv(1, 4, 256, 64, torch.bfloat16), **_ROW)
     runtime = "_helion_flash_rowmma"
@@ -1149,7 +1137,6 @@ def test_row_mma_renders_the_fused_row_epilogue() -> None:
     assert f"{runtime}.stg_f32(" not in code
 
 
-@onlyBackends(["cute"])
 def test_row_mma_fused_row_epilogue_renders_sixteen_lane_groups_and_passes() -> None:
     # hd128: sixteen 16-byte packets per row, so the reductions complete over
     # sixteen lanes; two warps leave 64 threads for 128 (row, packet) pairs,
@@ -1173,7 +1160,6 @@ def test_row_mma_fused_row_epilogue_renders_sixteen_lane_groups_and_passes() -> 
     assert code.count(f"{runtime}.stg_v4_b32(") == 2
 
 
-@onlyBackends(["cute"])
 def test_row_mma_fused_row_epilogue_renders_fp32_aux_rows_and_max_reductions() -> None:
     # An fp32 aux row needs two packets per thread (32 bytes of eight columns).
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
@@ -1215,7 +1201,6 @@ def _ws_overlap_output(kernel: helion.Kernel, args: tuple[object, ...]) -> torch
     return out
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     ("shape", "dtype", "warps", "tile_m"),
     (
@@ -1248,7 +1233,6 @@ def test_row_mma_fused_row_epilogue_matches_the_tcgen05_body_and_reference(
     assert torch.equal(out, again)
 
 
-@onlyBackends(["cute"])
 def test_row_mma_fused_row_epilogue_keeps_a_zero_value_row_finite() -> None:
     # ``F.normalize`` semantics: a zero V row divides by eps, not by zero.
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
@@ -1262,7 +1246,6 @@ def test_row_mma_fused_row_epilogue_keeps_a_zero_value_row_finite() -> None:
     )
 
 
-@onlyBackends(["cute"])
 def test_row_mma_fused_row_epilogue_fp32_aux_rows_match_reference() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     torch.manual_seed(3)
@@ -1279,7 +1262,6 @@ def test_row_mma_fused_row_epilogue_fp32_aux_rows_match_reference() -> None:
         torch.testing.assert_close(out.float(), expected.float(), atol=2e-2, rtol=1e-2)
 
 
-@onlyBackends(["cute"])
 def test_row_mma_fused_row_epilogue_max_reduction_matches_reference() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     code, out = code_and_output(_amax_normalized_rows, (q, k, v, 1e-6), **_ROW)
@@ -1293,7 +1275,6 @@ def test_row_mma_fused_row_epilogue_max_reduction_matches_reference() -> None:
     assert torch.equal(out, again)
 
 
-@onlyBackends(["cute"])
 def test_row_mma_joins_the_fused_row_surface_inside_the_search_bound() -> None:
     # XSA at (1, 4, 256, 64): 128 row programs, so the family is searched with
     # its two knobs and seeded; the seed survives normalization and dedup.
@@ -1304,7 +1285,7 @@ def test_row_mma_joins_the_fused_row_surface_inside_the_search_bound() -> None:
     assert spec._cute_flash_has_row_epilogue
     assert not spec._cute_flash_plain_row_body
     assert not spec._cute_flash_has_score_modifiers
-    fragments = spec._cute_flash_autotune_fragments()
+    fragments = _cute_flash_autotune_fragments(spec)
     assert "row_mma" in _active(fragments[FAMILY])
     assert _active(fragments[WARPS]) == (4, 2, 8)
     assert _active(fragments[TILE_M]) == (8, 16)
@@ -1316,7 +1297,7 @@ def test_row_mma_joins_the_fused_row_surface_inside_the_search_bound() -> None:
     assert len(row) == 1
     (seed,) = row
     config_gen = spec.create_config_generation()
-    config_gen.validate_flash_structural_coverage()
+    config_gen.extension.validate_flash_structural_coverage()
     _flat, normalized = config_gen.canonicalize_flat(config_gen.flatten(seed))
     assert normalized.config[FAMILY] == "row_mma"
     assert (normalized.config[WARPS], normalized.config[TILE_M]) == (4, 8)
@@ -1334,7 +1315,7 @@ def test_row_mma_joins_the_fused_row_surface_inside_the_search_bound() -> None:
         q, k, v = _qkv(*shape, torch.bfloat16)
         large = _xsa_kernel().bind((q, k, v, 1e-6)).config_spec
         assert large._cute_flash_has_row_epilogue
-        fragments = large._cute_flash_autotune_fragments()
+        fragments = _cute_flash_autotune_fragments(large)
         assert "row_mma" not in _active(fragments[FAMILY])
         assert _active(fragments[WARPS]) == (4,)
         assert _active(fragments[TILE_M]) == (8,)
@@ -1345,7 +1326,6 @@ def test_row_mma_joins_the_fused_row_surface_inside_the_search_bound() -> None:
         ]
 
 
-@onlyBackends(["cute"])
 def test_row_mma_joins_a_fused_row_epilogue_over_biased_scores() -> None:
     # A tensor bias next to the row epilogue: the flash surface records the
     # modifier kind, the bias tile is staged in the main loop and the program
@@ -1359,7 +1339,7 @@ def test_row_mma_joins_a_fused_row_epilogue_over_biased_scores() -> None:
     assert spec._cute_flash_has_row_epilogue
     assert spec._cute_flash_has_score_modifiers
     assert spec._cute_flash_score_modifier_kinds == ("tensor_bias",)
-    fragments = spec._cute_flash_autotune_fragments()
+    fragments = _cute_flash_autotune_fragments(spec)
     assert "row_mma" in _active(fragments[FAMILY])
     assert _active(fragments[WARPS]) == (4, 2, 8)
     assert [
@@ -1490,7 +1470,6 @@ def test_row_mma_bias_staging_joins_the_shared_memory_plan() -> None:
     assert resolved.pipeline_family == "row_mma"
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("name", ("causal_attention", "biased_attention"))
 def test_row_mma_joins_the_modifier_surfaces_inside_the_search_bound(
     name: str,
@@ -1509,7 +1488,7 @@ def test_row_mma_joins_the_modifier_surfaces_inside_the_search_bound(
     assert not spec._cute_flash_plain_row_body
     expected_kinds = ("tensor_bias",) if "biased" in name else ("causal_mask",)
     assert spec._cute_flash_score_modifier_kinds == expected_kinds
-    fragments = spec._cute_flash_autotune_fragments()
+    fragments = _cute_flash_autotune_fragments(spec)
     assert "row_mma" in _active(fragments[FAMILY])
     assert _active(fragments[WARPS]) == (4, 2, 8)
     assert _active(fragments[TILE_M]) == (8, 16)
@@ -1521,7 +1500,7 @@ def test_row_mma_joins_the_modifier_surfaces_inside_the_search_bound(
     assert len(row) == 1
     (seed,) = row
     config_gen = spec.create_config_generation()
-    config_gen.validate_flash_structural_coverage()
+    config_gen.extension.validate_flash_structural_coverage()
     _flat, normalized = config_gen.canonicalize_flat(config_gen.flatten(seed))
     assert normalized.config[FAMILY] == "row_mma"
     assert (normalized.config[WARPS], normalized.config[TILE_M]) == (4, 8)
@@ -1539,7 +1518,7 @@ def test_row_mma_joins_the_modifier_surfaces_inside_the_search_bound(
             else (q, k, v)
         )
         large = _example_kernel(name).bind(args).config_spec
-        fragments = large._cute_flash_autotune_fragments()
+        fragments = _cute_flash_autotune_fragments(large)
         assert "row_mma" not in _active(fragments[FAMILY])
         assert _active(fragments[WARPS]) == (4,)
         assert _active(fragments[TILE_M]) == (8,)
@@ -1550,7 +1529,6 @@ def test_row_mma_joins_the_modifier_surfaces_inside_the_search_bound(
         ]
 
 
-@onlyBackends(["cute"])
 def test_row_mma_renders_the_causal_mask() -> None:
     code = _code(
         _example_kernel("causal_attention"), _qkv(1, 4, 256, 64, torch.bfloat16), **_ROW
@@ -1579,7 +1557,6 @@ def test_row_mma_renders_the_causal_mask() -> None:
     assert "rm_bscale" not in code
 
 
-@onlyBackends(["cute"])
 def test_row_mma_renders_the_causal_chunk_loop_trimmed_to_visible_keys() -> None:
     code = _code(
         _example_kernel("causal_attention"),
@@ -1604,7 +1581,6 @@ def test_row_mma_renders_the_causal_chunk_loop_trimmed_to_visible_keys() -> None
     assert code[commit - 5 : commit] == "\n    "
 
 
-@onlyBackends(["cute"])
 def test_row_mma_renders_the_staged_tensor_bias() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     code = _code(
@@ -1656,7 +1632,6 @@ def test_row_mma_renders_the_staged_tensor_bias() -> None:
     assert code.count(f"{runtime}.unpack_f16x2(") == 8
 
 
-@onlyBackends(["cute"])
 def test_row_mma_renders_lane_guarded_bias_packets_and_x2_tiles() -> None:
     # 96 keys per warp of the 128-wide head: 16-key chunks, so a chunk's bias
     # tile is 16 packets (lanes 0-15 issue it) and one ldmatrix.trans x2.
@@ -1679,7 +1654,6 @@ def test_row_mma_renders_lane_guarded_bias_packets_and_x2_tiles() -> None:
     assert "for rm_chunk in cutlass.range(1, 6):" in code
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     ("shape", "dtype", "warps", "tile_m"),
     (
@@ -1712,7 +1686,6 @@ def test_row_mma_causal_matches_reference(
     torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     ("shape", "dtype", "warps", "tile_m"),
     (
@@ -1743,7 +1716,6 @@ def test_row_mma_biased_matches_reference(
     torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
-@onlyBackends(["cute"])
 def test_row_mma_biased_rows_tolerate_a_fully_masked_warp() -> None:
     # An additive -inf bias over one warp's whole key range (keys 64-127 of
     # four 64-key warps): its partial has a -inf max and an empty sum, and
@@ -1760,7 +1732,6 @@ def test_row_mma_biased_rows_tolerate_a_fully_masked_warp() -> None:
     torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     "name",
     (

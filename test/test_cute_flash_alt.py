@@ -27,9 +27,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test._cute_kernels import _attention_with_lse
+
 import helion
-from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.cute_flash_alt import FA4_ALT_V_STAGE
 from helion._compiler.cute.cute_flash_alt import emit_flash_fa4_alt_device_body
 from helion._compiler.cute.cute_flash_alt import fa4_alt_supported
@@ -40,7 +43,6 @@ from helion._compiler.cute.flash_schedule import build_fa4_alt_schedule
 from helion._compiler.cute.flash_schedule import verify_flash_schedule
 from helion._testing import DEVICE
 from helion._testing import import_example
-from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -103,49 +105,6 @@ _ALT_DEFAULT: dict[str, object] = {
     "cute_flash_rescale_threshold": 8.0,
     "cute_flash_corr_tile_size": 16,
 }
-
-
-@helion.kernel(backend="cute", static_shapes=True)
-def _attention_with_lse(
-    q_in: torch.Tensor,
-    k_in: torch.Tensor,
-    v_in: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    m_dim = q_in.size(-2)
-    n_dim = k_in.size(-2)
-    head_dim = hl.specialize(q_in.size(-1))
-    q_view = q_in.reshape([-1, m_dim, head_dim])
-    v_view = v_in.reshape([-1, n_dim, head_dim])
-    k_view = k_in.reshape([-1, n_dim, head_dim])
-    out = torch.empty_like(q_view)
-    lse = torch.empty(
-        [q_view.size(0), m_dim, 1], device=q_in.device, dtype=torch.float32
-    )
-    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
-    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
-        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
-        l_i = torch.full_like(m_i, 1.0)
-        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
-        q = q_view[tile_b, tile_m, :]
-        for tile_n in hl.tile(v_view.size(1)):
-            q_scaled = q * qk_scale
-            k = k_view[tile_b, tile_n, :]
-            qk = torch.bmm(q_scaled, k.transpose(1, 2), torch.float32)
-            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
-            qk = qk - m_ij[:, :, None]
-            p = torch.exp2(qk)
-            l_ij = torch.sum(p, -1)
-            alpha = torch.exp2(m_i - m_ij)
-            l_i = l_i * alpha + l_ij
-            acc = acc * alpha[:, :, None]
-            v = v_view[tile_b, tile_n, :]
-            p = p.to(v.dtype)
-            acc = torch.baddbmm(acc, p, v)
-            m_i = m_ij
-        acc = acc / l_i[:, :, None]
-        lse[tile_b, tile_m, :] = (m_i + torch.log2(l_i))[:, :, None]
-        out[tile_b, tile_m, :] = acc.to(out.dtype)
-    return out.view(q_in.size()), lse.reshape(q_in.size()[:-1])
 
 
 @helion.kernel(backend="cute", static_shapes=True)
@@ -471,7 +430,7 @@ def _search_spec(**overrides: object) -> ConfigSpec:
         "standard_causal_output": False,
     }
     values.update(overrides)
-    spec.enable_cute_flash_search(**values)  # pyrefly: ignore[bad-argument-type]
+    enable_cute_flash_search(spec, **values)  # pyrefly: ignore[bad-argument-type]
     return spec
 
 
@@ -698,7 +657,8 @@ def test_coverage_design_keeps_the_64_row_tile_witness() -> None:
     spec = ConfigSpec(backend=CuteBackend())
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=128,
         num_kv=48,
         num_bh=64,
@@ -712,11 +672,11 @@ def test_coverage_design_keeps_the_64_row_tile_witness() -> None:
         overrides={cute_flash.FLASH_EPI_TMA_KEY: False}
     )
     with patch.dict(os.environ, {}, clear=True):
-        coverage = generation.flash_deterministic_population_configs()
+        coverage = generation.extension.deterministic_population_configs()
     # the family's only output path is the TMA store: under the direct-epilogue
     # override it is unreachable, which the design reports but does not reject
     # (as it does the shared staged output tile, a child of that epilogue)
-    assert set(generation.flash_structural_coverage_uncovered_values()) == {
+    assert set(generation.extension.flash_structural_coverage_uncovered_values()) == {
         (FAMILY_KEY, "fa4_alt"),
         (cute_flash.FLASH_O_STAGE_KEY, 1),
     }
@@ -939,7 +899,6 @@ def _reference(
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     ("config", "shape", "dtype"),
     (
@@ -980,7 +939,6 @@ def test_family_matches_the_fa4_body_and_sdpa(
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     ("config", "shape"),
     ((_ALT, (2, 16, 2048, 128)), (_ALT_DEFAULT, (2, 16, 768, 128))),
@@ -1015,7 +973,6 @@ def test_output_only_body_matches_the_fa4_body_and_sdpa(
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_output_relu_epilogue_matches_the_fa4_body_and_sdpa() -> None:
     """The output ReLU of ``attention_relu_output`` is applied by the
     correction warps (it used to be dropped: the plain attention output)."""
@@ -1044,7 +1001,6 @@ def test_output_relu_epilogue_matches_the_fa4_body_and_sdpa() -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_only_alternating_modules_import_the_family_runtime() -> None:
     """The family's runtime import is not part of the shared flash preamble
     (which is also the CuTe disk-cache key of every flash render): fa4 and
@@ -1073,7 +1029,6 @@ def test_only_alternating_modules_import_the_family_runtime() -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_shared_output_tile_request_runs_the_two_tile_body() -> None:
     """The (2, 16, 2048, 128) bf16 campaign winner carried
     ``cute_flash_o_stage`` = 1 on this family: 512 items over 148 CTAs, and
@@ -1106,7 +1061,6 @@ def test_shared_output_tile_request_runs_the_two_tile_body() -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_family_launches_are_deterministic_under_repetition() -> None:
     """Repeated launches cover the barrier parities carried across KV steps and
     work items (three or four items per CTA on this shape); the handoff
@@ -1153,7 +1107,6 @@ def _spilled_base_waits(texts: list[str], window: int = 6) -> list[str]:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_spin_waits_address_their_barriers_uniformly_in_the_sass(
     tmp_path: Path,
 ) -> None:
@@ -1167,11 +1120,17 @@ def test_spin_waits_address_their_barriers_uniformly_in_the_sass(
     pattern (10 of 110 waits and 68 LDL on the winner; 9 of 94 and 56 here).
     A register-allocation change can bring the spill back silently, so the
     SASS is checked: a fresh compile with the cubin kept, then the count."""
+    # The child runs this file as a script, so ``sys.path[0]`` is test/, not
+    # the repository root the ``test.*`` imports need: hand it the root.
+    root = Path(cast("str", helion.__file__)).resolve().parents[1]
     result = subprocess.run(
         [sys.executable, os.path.abspath(__file__), "sass"],
-        cwd=Path(cast("str", helion.__file__)).resolve().parents[1],
+        cwd=root,
         env={
             **os.environ,
+            "PYTHONPATH": os.pathsep.join(
+                [str(root), *filter(None, [os.environ.get("PYTHONPATH")])]
+            ),
             "HELION_BACKEND": "cute",
             "CUTE_DSL_KEEP": "sass",
             "CUTE_DSL_DUMP_DIR": str(tmp_path),

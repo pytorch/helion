@@ -12,16 +12,17 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.flash_schedule import FlashScheduleError
 from helion._compiler.cute.flash_schedule import FlashScheduleSpec
 from helion._compiler.cute.flash_schedule import build_fa4_schedule
 from helion._compiler.cute.flash_schedule import max_fa4_kv_depth
 from helion._compiler.cute.flash_schedule import verify_flash_schedule
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing import cpu_render_target
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 
@@ -43,13 +44,10 @@ flash_fa4_shared_storage = importlib.import_module(
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        mock_cuda_unavailable(),
+        cpu_render_target(capability=(10, 3)),
         patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}, clear=True),
-        patch.object(
-            torch.cuda, "_lazy_init", side_effect=AssertionError("CPU-only test")
-        ),
         patch(
-            "helion.autotuner.config_spec.get_target_device_capability",
+            "helion._compiler.cute.autotune.search_surface.get_target_device_capability",
             return_value=(10, 3),
         ),
     ):
@@ -60,7 +58,8 @@ def _config_spec(head_dim: int, dtype: torch.dtype, num_kv: int = 48) -> ConfigS
     spec = ConfigSpec(backend=CuteBackend())
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         num_kv=num_kv,
         num_bh=64,
@@ -284,8 +283,8 @@ def test_codegen_storage_group_preserves_cluster_transaction_bytes(
 def test_structural_pipeline_catalog_retains_new_depth_witnesses() -> None:
     spec = _config_spec(128, torch.float16)
     generation = spec.create_config_generation()
-    catalog = generation.flash_pipeline_lane_catalog()
-    witnesses = generation.flash_pipeline_lane_witnesses()
+    catalog = generation.extension.flash_pipeline_lane_catalog()
+    witnesses = generation.extension.flash_pipeline_lane_witnesses()
     chunked = cute_flash.FlashStructuralLeaf("fa4_2cta", None, True)
     whole_row = cute_flash.FlashStructuralLeaf("fa4_2cta", None, False)
     for stage in (3, 4, 5, 6, 7, 8, 9, 10):
@@ -326,7 +325,7 @@ def test_structural_pipeline_catalog_retains_new_depth_witnesses() -> None:
         spec.normalize(ring_config)
         assert ring_config.config[cute_flash.FLASH_STAT_TRANSPORT_KEY] == "ring2"
         assert ring_config.config[cute_flash.FLASH_KV_STAGE_KEY] == 2
-    assert generation.flash_structural_coverage_uncovered_values() == []
+    assert generation.extension.flash_structural_coverage_uncovered_values() == []
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from test.test_cute_grouped_prefix_adaptive_n_codegen import _plans
 
 from helion._compiler.cute.grouped_prefix_adaptive_n_codegen import _is_role
 from helion._compiler.cute.grouped_prefix_adaptive_n_codegen import _role_payload
+from helion._compiler.cute.tcgen05_config import facts
 from helion._testing import DEVICE
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
@@ -58,8 +59,8 @@ def _recipe(spec: ConfigSpec, *, balanced: bool = False) -> helion.Config:
         return deepcopy(
             next(value for value in recipes if value.get(BALANCED, False) is balanced)
         )
-    profile = spec._cute_tcgen05_config.get_grouped_prefix_adaptive_n_profile(
-        {SOURCE: 256}
+    profile = facts.get_grouped_prefix_adaptive_n_profile(
+        spec._cute_tcgen05_config, {SOURCE: 256}
     )
     assert profile is not None
     config = _ordinary_config("mn")
@@ -88,8 +89,8 @@ def sources() -> dict[str, str]:
         for balanced in (False, True):
             config = spec.normalized_config(_recipe(spec, balanced=balanced))
             result[str(balanced)] = bound.to_code(config)
-        profile = spec._cute_tcgen05_config.get_grouped_prefix_adaptive_n_profile(
-            config.config
+        profile = facts.get_grouped_prefix_adaptive_n_profile(
+            spec._cute_tcgen05_config, config.config
         )
         assert profile is not None
         for branch in (profile.primary, profile.alternate):

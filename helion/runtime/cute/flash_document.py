@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch.utils.weak import WeakIdKeyDictionary
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # The KV-range prelude and the per-tile predicates index the table by 128-token
 # tile regardless of the configured KV tile width.
@@ -63,16 +68,33 @@ def document_tile_bounds(document_ids: torch.Tensor, num_tiles: int) -> torch.Te
     call (see ``_DOCUMENT_TILE_BOUNDS_CACHE``), so graph replays recompute it
     from the current ids; raw-pointer writes to the ids are not tracked.
     """
-    if document_ids.is_inference() or (
-        document_ids.is_cuda and torch.cuda.is_current_stream_capturing()
+    return _versioned_table(
+        document_ids,
+        num_tiles,
+        _DOCUMENT_TILE_BOUNDS_CACHE,
+        _build_document_tile_bounds,
+    )
+
+
+def _versioned_table(
+    source: torch.Tensor,
+    extent: int,
+    cache: WeakIdKeyDictionary,
+    build: Callable[[torch.Tensor, int], torch.Tensor],
+) -> torch.Tensor:
+    """``build(source, extent)`` cached per ``source`` tensor behind its
+    storage pointer and version counter; rebuilt on every call for inference
+    tensors and inside a CUDA-graph capture (so replays recompute it)."""
+    if source.is_inference() or (
+        source.is_cuda and torch.cuda.is_current_stream_capturing()
     ):
-        return _build_document_tile_bounds(document_ids, num_tiles)
-    key = (num_tiles, document_ids.data_ptr(), document_ids._version)
-    cached = _DOCUMENT_TILE_BOUNDS_CACHE.get(document_ids)
+        return build(source, extent)
+    key = (extent, source.data_ptr(), source._version)
+    cached = cache.get(source)
     if cached is not None and cached[0] == key:
         return cached[1]
-    table = _build_document_tile_bounds(document_ids, num_tiles)
-    _DOCUMENT_TILE_BOUNDS_CACHE[document_ids] = (key, table)
+    table = build(source, extent)
+    cache[source] = (key, table)
     return table
 
 
@@ -182,14 +204,6 @@ def row_bound_work_table(lower_bound: torch.Tensor, seq: int) -> torch.Tensor:
     inside a CUDA-graph capture on every call, exactly like
     ``document_tile_bounds`` (see ``_DOCUMENT_TILE_BOUNDS_CACHE``).
     """
-    if lower_bound.is_inference() or (
-        lower_bound.is_cuda and torch.cuda.is_current_stream_capturing()
-    ):
-        return _build_row_bound_work_table(lower_bound, seq)
-    key = (seq, lower_bound.data_ptr(), lower_bound._version)
-    cached = _ROW_BOUND_WORK_CACHE.get(lower_bound)
-    if cached is not None and cached[0] == key:
-        return cached[1]
-    table = _build_row_bound_work_table(lower_bound, seq)
-    _ROW_BOUND_WORK_CACHE[lower_bound] = (key, table)
-    return table
+    return _versioned_table(
+        lower_bound, seq, _ROW_BOUND_WORK_CACHE, _build_row_bound_work_table
+    )

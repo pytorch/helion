@@ -110,6 +110,7 @@ from ..compile_environment import shape_env_size_hint
 from ..compile_environment import shape_env_var_hints
 from ..variable_origin import BlockSizeOrigin
 from ..variable_origin import GridOrigin
+from .fx_matcher import _is_call
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -686,14 +687,6 @@ def _static_range(d: tuple[object, ...]) -> tuple[int, int] | None:
 
 # --------------------------------------------------------------------------
 # Matching / flattening
-
-
-def _is_call(node: object, target: object) -> bool:
-    return (
-        isinstance(node, torch.fx.Node)
-        and node.op == "call_function"
-        and node.target is target
-    )
 
 
 class _Matcher:
@@ -4127,7 +4120,7 @@ def emit_register_subblocks_module_statements(cg: GenerateAST) -> None:
 def codegen_register_subblocks(cg: GenerateAST) -> bool:
     """Replace the device body by the register sub-block program of the plan."""
     df = cg.device_function
-    plan = df.cute_state.register_subblocks_plan
+    plan = df.cute_state.root_plans.register_subblocks_plan
     if plan is None:
         return False
     root = cg.current_root_graph_info
@@ -4156,5 +4149,5 @@ def codegen_register_subblocks(cg: GenerateAST) -> bool:
     )
     df.body = list(ast.parse(textwrap.dedent(source)).body)
     df.preamble = []
-    df.cute_state.owned_root_block_dims = (plan.threads, 1, 1)
+    df.cute_state.lanes.owned_root_block_dims = (plan.threads, 1, 1)
     return True

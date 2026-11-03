@@ -13,12 +13,15 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_tcgen05_schedule import (
+from helion._compiler.cute.autotune.heuristics.cute_tcgen05_schedule import (
     CuteTcgen05ScheduleHeuristic,
 )
 from helion._compiler.cute.dense_gemm import prove_dense_gemm_facts
 from helion._compiler.cute.one_cta_pipeline import prove_one_cta_pipeline_facts
 from helion._compiler.cute.tcgen05_config import _TWO_CTA_PERSISTENT_PID_VETO
+from helion._compiler.cute.tcgen05_config import facts
+from helion._compiler.cute.tcgen05_config import repair
+from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_schedule_facts import Tcgen05FullTileScheduleFacts
 from helion._compiler.cute.tcgen05_schedule_facts import analyze_native_gemm
 from helion._compiler.cute.tcgen05_schedule_facts import full_tile_schedule_supported
@@ -91,11 +94,11 @@ def test_exact_tile_is_reachable_and_emits_native_pipeline(
             assert canonical.block_sizes == list(tile)
             assert canonical.config["pid_type"] == "persistent_interleaved"
             assert canonical.config["tcgen05_cluster_m"] == cluster_m
-            seeds = state.full_tile_schedule_seed_configs()
-            assert seeds
+            seed_configs = seeds.full_tile_schedule_seed_configs(state)
+            assert seed_configs
             assert all(
-                state._full_tile_schedule_config_supported(seed.config)
-                for seed in seeds
+                repair._full_tile_schedule_config_supported(state, seed.config)
+                for seed in seed_configs
             )
         source = bound.to_code(config)
         # The search-normalized schedule emits the same kernel.
@@ -134,8 +137,8 @@ def test_other_capability_cannot_reuse_native_proofs(
         return (
             prove_full_tile_schedule_facts(gemm),
             prove_one_cta_pipeline_facts(bound.env, gemm),
-            prove_dense_gemm_facts(bound.env, gemm),
-            state._paired_pipeline_parameters(paired),
+            prove_dense_gemm_facts(gemm),
+            seeds._paired_pipeline_parameters(state, paired),
         )
 
     # Positive control: the native target proves every family.
@@ -253,18 +256,18 @@ def _unregistered_full_tile(
 
 def _assert_owned_veto_is_lifted() -> None:
     """Positive control: registration lifts the CuTe-owned veto alone."""
-    bound, facts = _unregistered_full_tile(_TWO_CTA_PERSISTENT_PID_VETO)
+    bound, schedule_facts = _unregistered_full_tile(_TWO_CTA_PERSISTENT_PID_VETO)
     state = bound.config_spec._cute_tcgen05_config
-    state.register_full_tile_schedule_facts(facts)
-    assert state.full_tile_schedule_facts == facts
+    facts.register_full_tile_schedule_facts(state, schedule_facts)
+    assert state.full_tile_schedule_facts == schedule_facts
     assert "persistent_interleaved" in bound.config_spec.allowed_pid_types
 
 
 def test_unrelated_pid_restriction_is_not_resurrected() -> None:
     _assert_owned_veto_is_lifted()
-    bound, facts = _unregistered_full_tile("another loop forbids persistence")
+    bound, schedule_facts = _unregistered_full_tile("another loop forbids persistence")
     state = bound.config_spec._cute_tcgen05_config
-    state.register_full_tile_schedule_facts(facts)
+    facts.register_full_tile_schedule_facts(state, schedule_facts)
     assert state.full_tile_schedule_facts is None
     assert "persistent_interleaved" not in bound.config_spec.allowed_pid_types
 
@@ -274,7 +277,9 @@ def test_later_independent_pid_veto_is_not_hidden_by_first_reason(
     second_reason: str | None,
 ) -> None:
     _assert_owned_veto_is_lifted()
-    bound, facts = _unregistered_full_tile(_TWO_CTA_PERSISTENT_PID_VETO, second_reason)
+    bound, schedule_facts = _unregistered_full_tile(
+        _TWO_CTA_PERSISTENT_PID_VETO, second_reason
+    )
     for pid in ("persistent_interleaved", "persistent_blocked"):
         assert (
             bound.config_spec.disallowed_pid_type_reasons[pid]
@@ -285,7 +290,7 @@ def test_later_independent_pid_veto_is_not_hidden_by_first_reason(
             second_reason,
         }
     state = bound.config_spec._cute_tcgen05_config
-    state.register_full_tile_schedule_facts(facts)
+    facts.register_full_tile_schedule_facts(state, schedule_facts)
     assert state.full_tile_schedule_facts is None
     assert "persistent_interleaved" not in bound.config_spec.allowed_pid_types
     assert "persistent_blocked" not in bound.config_spec.allowed_pid_types
@@ -315,11 +320,11 @@ def test_paired_k_tail_survives_search_and_emits_tma(
         assert canonical.block_sizes == config.block_sizes
         assert canonical.config["pid_type"] == "persistent_interleaved"
         assert canonical.config["tcgen05_cluster_m"] == 2
-        seeds = state.full_tile_schedule_seed_configs()
+        seed_configs = seeds.full_tile_schedule_seed_configs(state)
         assert any(
             seed.block_sizes == config.block_sizes
             and seed.config["tcgen05_cluster_m"] == 2
-            for seed in seeds
+            for seed in seed_configs
         )
     source = bound.to_code(canonical)
     # The split-barrier-init prologue builds the pipeline through the runtime

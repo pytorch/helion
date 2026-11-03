@@ -2,24 +2,36 @@
 
 These are selectable source transformations, after vector reduction hoisting.
 They preserve the per-element expression and its casts, but reassociate sums.
+``_PacketReductions`` owns the one lane-splitting emitter (per-lane partials,
+expanded traversal, butterfly join); its three matchers admit a packet loop
+(``split``), a carried-cache packet nest (``split_carried``) or, late in the
+pipeline, a cached rolled traversal (``split_rolled``, driven top-level-only by
+:func:`split_rolled_vector_sums` under the ``_cute_rolled_*`` name prefix).
 """
 
 from __future__ import annotations
 
 import ast
 from collections import Counter
+from functools import cached_property
 from typing import TYPE_CHECKING
 from typing import TypeVar
 from typing import cast
 
 from ..ast_extension import ExtendedAST
 from ..ast_extension import statement_from_string
-from ._ast_pass_utils import _assignment_lhs_name
-from ._ast_pass_utils import _names_read
+from ..ast_read_writes import ReadWrites
+from ._ast_pass_utils import _is_proven_relocatable_assignment
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import names_read
+from ._ast_pass_utils import substitute_names
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from .packet_access import match_packet_access
 from .prefetch_reduction_packets import _index_expression
+from .reduce_call import ReduceScope
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Mapping
 
 
@@ -191,7 +203,7 @@ def _private_raw_caches(
     }
     result: set[str] = set()
     for stmt in body:
-        name = _assignment_lhs_name(stmt)
+        name = assigned_name(stmt)
         if name is None or not isinstance(stmt, ast.Assign):
             continue
         value = stmt.value
@@ -222,27 +234,16 @@ def _private_raw_caches(
 
 
 def _packet_load(node: ast.expr, width: int, tensors: set[str]) -> bool:
-    if not (
-        isinstance(node, ast.Call)
-        and ast.unparse(node.func) in _VECTOR_LOADS
-        and len(node.args) == 2
-        and not node.keywords
-        and _index_expression(node.args[0], tensors)
-    ):
-        return False
-    typ = node.args[1]
+    """An unhinted-keyword plain or L2-helper packet of ``width`` ``Uint16`` /
+    ``Uint32`` lanes whose pointer is an index expression over ``tensors``."""
+    access = match_packet_access(node)
     return (
-        isinstance(typ, ast.Call)
-        and ast.unparse(typ.func) == "ir.VectorType.get"
-        and not typ.keywords
-        and len(typ.args) == 2
-        and isinstance(typ.args[0], ast.List)
-        and len(typ.args[0].elts) == 1
-        and isinstance(typ.args[0].elts[0], ast.Constant)
-        and type(typ.args[0].elts[0].value) is int
-        and typ.args[0].elts[0].value == width
-        and ast.unparse(typ.args[1])
-        in {"cutlass.Uint16.mlir_type", "cutlass.Uint32.mlir_type"}
+        access is not None
+        and access.kind in ("packet", "hinted_packet")
+        and not access.keywords
+        and _index_expression(access.pointer, tensors)
+        and access.width == width
+        and access.carrier in ("cutlass.Uint16", "cutlass.Uint32")
     )
 
 
@@ -310,17 +311,8 @@ def _packet_scalar(
     )
 
 
-class _Substitute(ast.NodeTransformer):
-    def __init__(self, replacements: Mapping[str, ast.expr]) -> None:
-        self.replacements = replacements
-
-    def visit_Name(self, node: ast.Name) -> ast.expr:
-        if node.id not in self.replacements:
-            return node
-        replacement = _clone(self.replacements[node.id])
-        if isinstance(replacement, ast.Name):
-            replacement.ctx = _clone(node.ctx)
-        return ast.copy_location(replacement, node)
+def _parsed_statement(source: str) -> ast.stmt:
+    return ast.parse(source).body[0]
 
 
 class _PacketReductions:
@@ -329,10 +321,15 @@ class _PacketReductions:
         body: list[ast.stmt],
         constants: Mapping[str, object],
         thread_block_dims: tuple[int, int, int] | None,
+        *,
+        prefix: str = "_helion_packet",
+        statement: Callable[[str], ast.stmt] = statement_from_string,
     ) -> None:
         self.body = body
         self.constants = constants
         self.thread_block_dims = thread_block_dims
+        self.prefix = prefix
+        self.statement = statement
         self.names = {
             node.id
             for stmt in body
@@ -347,16 +344,71 @@ class _PacketReductions:
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
         )
 
+    @cached_property
+    def rolled_reads(self) -> Mapping[str, int]:
+        """``ReadWrites`` read counts of the body as the rolled matcher saw it."""
+        return ReadWrites.from_ast(ast.Module(body=self.body, type_ignores=[])).reads
+
     def fresh(self, suffix: str) -> str:
         while True:
-            value = f"_helion_packet_{suffix}_{self.counter}"
+            value = f"{self.prefix}_{suffix}_{self.counter}"
             self.counter += 1
             if value not in self.names:
                 self.names.add(value)
                 return value
 
+    def lanes(
+        self,
+        leaf: list[ast.stmt],
+        lane: str,
+        accumulator: str,
+        partials: list[str],
+    ) -> list[ast.stmt]:
+        """One clone of the leaf body per lane: the lane index becomes that
+        constant and the accumulator the lane's own partial."""
+        result: list[ast.stmt] = []
+        for index, name in enumerate(partials):
+            replacements: dict[str, ast.expr] = {
+                lane: ast.Constant(index),
+                accumulator: ast.Name(id=name, ctx=ast.Load()),
+            }
+            result.extend(
+                substitute_names(
+                    _clone(stmt),
+                    replacements,
+                    clone=_clone,
+                    loads_only=False,
+                    keep_ctx=True,
+                )
+                for stmt in leaf
+            )
+        return result
+
+    def combine(
+        self, accumulator: str, partials: list[str], traversal: ast.stmt
+    ) -> list[ast.stmt]:
+        """Zeroed partials, the expanded traversal, a butterfly join of the
+        partials and the final assignment back to the accumulator."""
+        result = [self.statement(f"{name} = cutlass.Float32(0)") for name in partials]
+        result.append(traversal)
+        # Butterfly halves give (0+2)+(1+3) for a four-lane vector.
+        while len(partials) > 1:
+            half = len(partials) // 2
+            combined = []
+            for index in range(half):
+                name = self.fresh("join")
+                result.append(
+                    self.statement(
+                        f"{name} = {partials[index]} + {partials[index + half]}"
+                    )
+                )
+                combined.append(name)
+            partials = combined
+        result.append(self.statement(f"{accumulator} = {partials[0]}"))
+        return result
+
     def split(self, init: ast.stmt, outer: ast.For) -> list[ast.stmt] | None:
-        accumulator = _assignment_lhs_name(init)
+        accumulator = assigned_name(init)
         if not (
             accumulator is not None
             and isinstance(init, ast.Assign)
@@ -391,13 +443,13 @@ class _PacketReductions:
             and isinstance(outer.iter, ast.Call)
             and len(outer.iter.args) == 1
             and isinstance(outer.iter.args[0], ast.Constant)
-            and all(_assignment_lhs_name(stmt) is not None for stmt in outer.body[:-1])
+            and all(assigned_name(stmt) is not None for stmt in outer.body[:-1])
         ):
             return None
         prefix = ast.Module(body=outer.body[:-1], type_ignores=[])
         vectors: set[str] = set()
         for stmt in outer.body[:-1]:
-            name = _assignment_lhs_name(stmt)
+            name = assigned_name(stmt)
             assert name is not None and isinstance(stmt, ast.Assign)
             vectors.discard(name)
             if (
@@ -407,7 +459,7 @@ class _PacketReductions:
                 vectors.add(name)
         scalars = {accumulator, inner.target.id, outer.target.id}
         for stmt in inner.body:
-            name = _assignment_lhs_name(stmt)
+            name = assigned_name(stmt)
             if (
                 name is None
                 or not isinstance(stmt, ast.Assign)
@@ -421,9 +473,7 @@ class _PacketReductions:
             for node in ast.walk(prefix)
         ):
             return None
-        writes = [
-            stmt for stmt in inner.body if _assignment_lhs_name(stmt) == accumulator
-        ]
+        writes = [stmt for stmt in inner.body if assigned_name(stmt) == accumulator]
         if len(writes) != 1 or writes[0] is not inner.body[-1]:
             return None
         update = writes[0]
@@ -434,17 +484,15 @@ class _PacketReductions:
             and isinstance(rhs.op, ast.Add)
             and isinstance(rhs.left, ast.Name)
             and rhs.left.id == accumulator
-            and accumulator not in _names_read(rhs.right)
-            and all(accumulator not in _names_read(stmt) for stmt in inner.body[:-1])
+            and accumulator not in names_read(rhs.right)
+            and all(accumulator not in names_read(stmt) for stmt in inner.body[:-1])
         ):
             return None
         # No other loop-carried value may depend on the inner traversal order.
-        local_names = {_assignment_lhs_name(stmt) for stmt in inner.body[:-1]}
-        if _names_read(prefix) & (local_names | {inner.target.id}):
+        local_names = {assigned_name(stmt) for stmt in inner.body[:-1]}
+        if names_read(prefix) & (local_names | {inner.target.id}):
             return None
-        if any(
-            _assignment_lhs_name(stmt) == inner.target.id for stmt in outer.body[:-1]
-        ):
+        if any(assigned_name(stmt) == inner.target.id for stmt in outer.body[:-1]):
             return None
         if inner.target.id in local_names or (
             isinstance(outer.target, ast.Name) and outer.target.id in local_names
@@ -452,48 +500,23 @@ class _PacketReductions:
             return None
         assigned: set[str] = set()
         for stmt in inner.body[:-1]:
-            name = _assignment_lhs_name(stmt)
+            name = assigned_name(stmt)
             assert name is not None
-            if (_names_read(stmt) & local_names) - assigned:
+            if (names_read(stmt) & local_names) - assigned:
                 return None
             assigned.add(name)
-        if (_names_read(rhs.right) & local_names) - assigned:
+        if (names_read(rhs.right) & local_names) - assigned:
             return None
         partials = [self.fresh("sum") for _ in range(width)]
-        result = [
-            statement_from_string(f"{name} = cutlass.Float32(0)") for name in partials
-        ]
         transformed = _clone(outer)
         transformed.iter = _clone(outer.iter)
         assert isinstance(transformed.iter, ast.Call)
         transformed.iter.func = ast.parse("cutlass.range_constexpr", mode="eval").body
-        transformed.body = [_clone(stmt) for stmt in outer.body[:-1]]
-        for lane, name in enumerate(partials):
-            substitute = _Substitute(
-                {
-                    inner.target.id: ast.Constant(lane),
-                    accumulator: ast.Name(id=name, ctx=ast.Load()),
-                }
-            )
-            transformed.body.extend(
-                substitute.visit(_clone(stmt)) for stmt in inner.body
-            )
-        result.append(transformed)
-        # Butterfly halves give (0+2)+(1+3) for a four-lane vector.
-        while len(partials) > 1:
-            half = len(partials) // 2
-            combined = []
-            for index in range(half):
-                name = self.fresh("join")
-                result.append(
-                    statement_from_string(
-                        f"{name} = {partials[index]} + {partials[index + half]}"
-                    )
-                )
-                combined.append(name)
-            partials = combined
-        result.append(statement_from_string(f"{accumulator} = {partials[0]}"))
-        return result
+        transformed.body = [
+            *(_clone(stmt) for stmt in outer.body[:-1]),
+            *self.lanes(inner.body, inner.target.id, accumulator, partials),
+        ]
+        return self.combine(accumulator, partials, transformed)
 
     def split_carried(self, init: ast.stmt, outer: ast.For) -> list[ast.stmt] | None:
         """Split only the scalar packet traversal; preserve carried-cache order.
@@ -502,7 +525,7 @@ class _PacketReductions:
         in place. Only the opted-in FP32 summation tree changes. At most eight
         new FP32 register slots are used, independently of the retained cache.
         """
-        accumulator = _assignment_lhs_name(init)
+        accumulator = assigned_name(init)
         if not (
             accumulator and isinstance(init, ast.Assign) and _float_zero(init.value)
         ):
@@ -556,7 +579,7 @@ class _PacketReductions:
         if reads[lane] != self.read_counts[lane]:
             return None
         prefixes = [stmt for wrapper in wrappers for stmt in wrapper.body[:-1]]
-        if any(accumulator in _names_read(stmt) for stmt in prefixes):
+        if any(accumulator in names_read(stmt) for stmt in prefixes):
             return None
         cache_roots = _private_raw_caches(self.body, constants)
         tensors = {
@@ -567,16 +590,12 @@ class _PacketReductions:
             and isinstance(n.value, ast.Name)
         }
         prefix_names = {
-            name
-            for stmt in prefixes
-            if (name := _assignment_lhs_name(stmt)) is not None
+            name for stmt in prefixes if (name := assigned_name(stmt)) is not None
         }
         if accumulator in prefix_names:
             return None
         leaf_names = {
-            name
-            for stmt in inner.body
-            if (name := _assignment_lhs_name(stmt)) is not None
+            name for stmt in inner.body if (name := assigned_name(stmt)) is not None
         }
         locals_ = leaf_names - {accumulator}
         if locals_ & (prefix_names | set(coordinates)) or prefix_names & set(
@@ -592,9 +611,9 @@ class _PacketReductions:
         for stmt in prefixes:
             if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
                 return None
-            if (_names_read(stmt.value) & (prefix_names | locals_)) - assigned:
+            if (names_read(stmt.value) & (prefix_names | locals_)) - assigned:
                 return None
-            name = _assignment_lhs_name(stmt)
+            name = assigned_name(stmt)
             if name is None:
                 target = stmt.targets[0]
                 if not (
@@ -602,8 +621,7 @@ class _PacketReductions:
                     and isinstance(target.value, ast.Name)
                     and target.value.id in cache_roots
                     and not (
-                        (_names_read(target.slice) & (prefix_names | locals_))
-                        - assigned
+                        (names_read(target.slice) & (prefix_names | locals_)) - assigned
                     )
                     and _index_expression(target.slice, set())
                     and _pure_scalar(stmt.value, scalars, vectors)
@@ -623,13 +641,11 @@ class _PacketReductions:
                 return None
             assigned.add(name)
         if not inner.body or any(
-            not isinstance(stmt, ast.Assign) or _assignment_lhs_name(stmt) is None
+            not isinstance(stmt, ast.Assign) or assigned_name(stmt) is None
             for stmt in inner.body
         ):
             return None
-        updates = [
-            stmt for stmt in inner.body if _assignment_lhs_name(stmt) == accumulator
-        ]
+        updates = [stmt for stmt in inner.body if assigned_name(stmt) == accumulator]
         if len(updates) != 1 or updates[0] is not inner.body[-1]:
             return None
         update = cast("ast.Assign", updates[0])
@@ -648,66 +664,164 @@ class _PacketReductions:
         assigned.clear()
         for stmt in inner.body[:-1]:
             assert isinstance(stmt, ast.Assign)
-            name = _assignment_lhs_name(stmt)
+            name = assigned_name(stmt)
             assert name is not None
             if (
-                accumulator in _names_read(stmt)
-                or ((_names_read(stmt.value) & locals_) - assigned)
+                accumulator in names_read(stmt)
+                or ((names_read(stmt.value) & locals_) - assigned)
                 or not _packet_scalar(stmt.value, scalars, vectors, booleans)
             ):
                 return None
             scalars.add(name)
             assigned.add(name)
         if (
-            accumulator in _names_read(rhs.right)
-            or ((_names_read(rhs.right) & locals_) - assigned)
+            accumulator in names_read(rhs.right)
+            or ((names_read(rhs.right) & locals_) - assigned)
             or not _packet_scalar(rhs.right, scalars, vectors, booleans)
         ):
             return None
         partials = [self.fresh("sum") for _ in range(width)]
-        result = [
-            statement_from_string(f"{name} = cutlass.Float32(0)") for name in partials
-        ]
         transformed = _clone(outer)
         packet = transformed
         for _ in wrappers[1:]:
             packet = cast("ast.For", packet.body[-1])
         packet.body.pop()
-        for index, name in enumerate(partials):
-            substitute = _Substitute(
-                {
-                    lane: ast.Constant(index),
-                    accumulator: ast.Name(id=name, ctx=ast.Load()),
-                }
+        packet.body.extend(self.lanes(inner.body, lane, accumulator, partials))
+        return self.combine(accumulator, partials, transformed)
+
+    def split_rolled(self, init: ast.stmt, outer: ast.For) -> list[ast.stmt] | None:
+        """Split the innermost ``range_constexpr`` traversal of a rolled nest.
+
+        Unlike ``split`` this admits any wrapper depth and only proven
+        relocatable assignments (loads included) around the one accumulator
+        fold; the outer loops keep their iterators and the rolled statements
+        their nodes (the innermost traversal is replaced in place).
+        """
+        if not (
+            isinstance(init, ast.Assign)
+            and len(init.targets) == 1
+            and isinstance(init.targets[0], ast.Name)
+            and _float_zero(init.value)
+            and not outer.orelse
+        ):
+            return None
+        accumulator = init.targets[0].id
+        updates: list[ast.Assign] = []
+        leaves: list[ast.For] = []
+
+        def visit(statements: list[ast.stmt], owner: ast.For) -> bool:
+            for statement in statements:
+                if isinstance(statement, ast.For):
+                    if statement.orelse or not visit(statement.body, statement):
+                        return False
+                elif (
+                    isinstance(statement, ast.Assign)
+                    and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Name)
+                    and _is_proven_relocatable_assignment(statement, allow_load=True)
+                ):
+                    if statement.targets[0].id == accumulator:
+                        value = statement.value
+                        if not (
+                            isinstance(value, ast.BinOp)
+                            and isinstance(value.op, ast.Add)
+                            and isinstance(value.left, ast.Name)
+                            and value.left.id == accumulator
+                            and accumulator
+                            not in ReadWrites.from_ast(value.right).reads
+                            and statement is owner.body[-1]
+                        ):
+                            return False
+                        updates.append(statement)
+                        leaves.append(owner)
+                    elif (
+                        statement.targets[0].id
+                        in ReadWrites.from_ast(statement.value).reads
+                    ):
+                        return False
+                elif not isinstance(statement, ast.Pass):
+                    return False
+            return True
+
+        if not visit(outer.body, outer) or len(updates) != 1:
+            return None
+        inner = leaves[0]
+        iterator = inner.iter
+        if not (
+            inner is not outer
+            and isinstance(inner.target, ast.Name)
+            and isinstance(iterator, ast.Call)
+            and ast.unparse(iterator.func) == "cutlass.range_constexpr"
+            and len(iterator.args) == 1
+            and isinstance(iterator.args[0], ast.Constant)
+            and iterator.args[0].value in (2, 4, 8)
+        ):
+            return None
+        width = iterator.args[0].value
+        inner_reads = ReadWrites.from_ast(inner).reads[inner.target.id]
+        if self.rolled_reads[inner.target.id] != inner_reads:
+            return None
+        if ReadWrites.from_ast(outer).reads[accumulator] != 1:
+            return None
+        locals_ = {
+            statement.targets[0].id
+            for statement in inner.body
+            if isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and statement.targets[0].id != accumulator
+        }
+        assigned: set[str] = set()
+        for statement in inner.body:
+            if not isinstance(statement, ast.Assign):
+                return None
+            if (set(ReadWrites.from_ast(statement.value).reads) & locals_) - assigned:
+                return None
+            assigned.update(
+                target.id
+                for target in statement.targets
+                if isinstance(target, ast.Name)
             )
-            packet.body.extend(substitute.visit(_clone(stmt)) for stmt in inner.body)
-        result.append(transformed)
-        while len(partials) > 1:
-            half = len(partials) // 2
-            combined = []
-            for index in range(half):
-                name = self.fresh("join")
-                result.append(
-                    statement_from_string(
-                        f"{name} = {partials[index]} + {partials[index + half]}"
-                    )
-                )
-                combined.append(name)
-            partials = combined
-        result.append(statement_from_string(f"{accumulator} = {partials[0]}"))
-        return result
+        outside = [
+            node
+            for node in ast.walk(outer)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in locals_
+        ]
+        internal = {
+            id(node)
+            for node in ast.walk(inner)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        }
+        if any(id(node) not in internal for node in outside):
+            return None
+        partials = [self.fresh("sum") for _ in range(width)]
+        replacement = self.lanes(inner.body, inner.target.id, accumulator, partials)
+
+        class Replace(ast.NodeTransformer):
+            def visit_For(self, node: ast.For) -> ast.AST | list[ast.stmt]:
+                if node is inner:
+                    return replacement
+                return self.generic_visit(node)
+
+        # Replacements are built from clones; the source loop owns the same
+        # nodes until this successful proof replaces the innermost traversal.
+        changed = Replace().visit(outer)
+        assert isinstance(changed, ast.For)
+        return self.combine(accumulator, partials, changed)
 
     def replicate(
         self, stmt: ast.stmt, prefix: list[ast.stmt]
     ) -> list[ast.stmt] | None:
-        target = _assignment_lhs_name(stmt)
+        target = assigned_name(stmt)
         if target is None or not isinstance(stmt, ast.Assign):
             return None
         call = stmt.value
         if not (
             isinstance(call, ast.Call)
             and isinstance(call.func, ast.Name)
-            and call.func.id == "_cute_grouped_reduce_shared_two_stage"
+            and call.func.id == ReduceScope.SHARED_TWO_STAGE.value
             and len(call.args) == 6
             and isinstance(call.args[1], ast.Constant)
             and call.args[1].value == "sum"
@@ -843,6 +957,28 @@ class _PacketReductions:
                     continue
             result.append(stmt)
         return result
+
+
+def split_rolled_vector_sums(body: list[ast.stmt]) -> list[ast.stmt]:
+    """Independent FP32 sums across a cached rolled vector traversal.
+
+    Top-level only: each zero-initialized accumulator followed by a rolled
+    loop nest is offered to ``_PacketReductions.split_rolled``.  Fresh names
+    use the ``_cute_rolled_*`` prefix and plain parsed statements.
+    """
+    reductions = _PacketReductions(
+        body, {}, None, prefix="_cute_rolled", statement=_parsed_statement
+    )
+    result: list[ast.stmt] = []
+    for statement in body:
+        if isinstance(statement, ast.For) and result:
+            replacement = reductions.split_rolled(result[-1], statement)
+            if replacement is not None:
+                result.pop()
+                result.extend(replacement)
+                continue
+        result.append(statement)
+    return result
 
 
 def optimize_vector_reductions(

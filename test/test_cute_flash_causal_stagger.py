@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute import flash_knobs
 from helion._compiler.cute.attention_plan import ALIBI_BIAS_KIND
 from helion._compiler.cute.attention_plan import CAUSAL_MASK_KIND
 from helion._compiler.cute.attention_plan import causal_score_plan
@@ -283,10 +284,10 @@ def test_resolver_pins_the_knob_off_outside_the_dead_tile_skips_body() -> None:
 def test_knob_is_an_appended_schema_axis_with_its_deep_ring_dependency() -> None:
     # Appended once behind the axes it was introduced after; knobs added later
     # append behind it in turn, so the tail itself is not pinned.
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     assert keys.count(KEY) == 1
     assert keys.index(KEY) > keys.index(SKIP_KEY)
-    witness = cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(KEY, True)]
+    witness = flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(KEY, True)]
     assert witness == {
         cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
         cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: "descending",
@@ -386,7 +387,7 @@ def test_fragment_default_is_the_deep_ring_fa4_resolver_default(
             False,
         ),
     )
-    witness = cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(KEY, True)]
+    witness = flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(KEY, True)]
     with patch.dict(os.environ, environ, clear=True):
         for head_dim, dtype, options, searched in surfaces:
             fragment = cute_flash.flash_autotune_fragments(

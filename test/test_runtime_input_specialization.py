@@ -34,9 +34,12 @@ from helion._compiler.cute.memory_ops import (
 from helion._compiler.cute.memory_ops import _persistent_vec_alignment_matrix_signature
 from helion._compiler.cute.memory_ops import _persistent_vec_alignment_prepared_guard
 from helion._compiler.cute.memory_ops import runtime_tensor_has_specialized_alignment
+from helion._compiler.cute.search_surface import _finalize_cute_tcgen05_search_planning
+from helion._compiler.cute.tcgen05.search_plan import (
+    _plan_cute_tcgen05_search_candidate,
+)
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_function import StaticShape
-from helion._compiler.device_ir import _finalize_cute_tcgen05_search_planning
 from helion._compiler.runtime_tensor_guards import (
     _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
 )
@@ -58,14 +61,13 @@ from helion._testing import skipIfRefEager
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
 import helion.language as hl
 from helion.language.constexpr import ConstExpr
-from helion.language.matmul_ops import _plan_cute_tcgen05_search_candidate
 from helion.runtime.cute.launcher import _Tcgen05GroupedWorklistCompatibilityClassifier
 from helion.runtime.kernel import BoundKernel
 from helion.runtime.kernel import Kernel
+from helion.runtime.kernel import PreparedMetadataSpecializationExtractor
 from helion.runtime.kernel import _input_tensor_aliases
 from helion.runtime.kernel import _partition_prepared_extra_guards
 from helion.runtime.kernel import _PreparedCall
-from helion.runtime.kernel import _PreparedMetadataSpecializationExtractor
 from helion.runtime.kernel import _RuntimeInputSpecializationExtractor
 
 if TYPE_CHECKING:
@@ -1014,7 +1016,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         def content_extractor(args: Sequence[object]) -> int:
             return content_classifier((args[0],))
 
-        metadata_extractor = _PreparedMetadataSpecializationExtractor(
+        metadata_extractor = PreparedMetadataSpecializationExtractor(
             lambda args: cast("torch.Tensor", args[0]).size(0)
         )
         unknown_property_extractor = _RuntimeInputSpecializationExtractor(

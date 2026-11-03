@@ -124,10 +124,12 @@ for m_offset in range(0, m, 64):
         codegen=SimpleNamespace(max_thread_block_dims=(32, 4, 1)),
         new_var=lambda hint: f"{hint}_{next(counter)}",
         cute_state=SimpleNamespace(
-            collective_mma_sites=[site],
-            collective_mma_emitted_stmt_ids=set(),
-            collective_mma_shared_results=set(),
-            collective_mma_pure_stmt_ids=set(),
+            lanes=SimpleNamespace(
+                collective_mma_sites=[site],
+                collective_mma_emitted_stmt_ids=set(),
+                collective_mma_shared_results=set(),
+                collective_mma_pure_stmt_ids=set(),
+            )
         ),
     )
     tensors = ("a", "b", "out", "limits", "flags", "rows")

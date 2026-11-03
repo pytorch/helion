@@ -20,13 +20,17 @@ from typing import cast
 import sympy
 import torch
 
-from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from ...language.matmul_ops import dot
 from ..compile_environment import CompileEnvironment
+from .autotune.config_keys import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from .chunk_prepare import _packed_workspace_is_proven
 from .chunk_prepare import _register_packed_workspace_specialization
+from .fx_matcher import _ancestors
+from .fx_matcher import _binary_args
 from .fx_matcher import _canonical_root_axis_ids
 from .fx_matcher import _is_call
+from .fx_matcher import _is_convert
+from .fx_matcher import _is_full_slice
 from .fx_matcher import _is_matrix_transpose_of
 from .fx_matcher import _linear_offsets_fit_i32
 from .fx_matcher import _load_ref
@@ -34,6 +38,7 @@ from .fx_matcher import _memory_indices
 from .fx_matcher import _same_ref
 from .fx_matcher import _store_ref
 from .fx_matcher import _strip_value_casts
+from .fx_matcher import _tensor_arg
 from .fx_matcher import _TensorRef
 from .fx_matcher import _xyz_grid_fits
 
@@ -198,20 +203,6 @@ def _single_ref_load(node: object) -> tuple[torch.fx.Node, _TensorRef] | None:
     return (current, ref) if ref is not None else None
 
 
-def _ancestors(node: object) -> set[torch.fx.Node]:
-    if not isinstance(node, torch.fx.Node):
-        return set()
-    pending = [node]
-    seen: set[torch.fx.Node] = set()
-    while pending:
-        current = pending.pop()
-        if current in seen:
-            continue
-        seen.add(current)
-        pending.extend(current.all_input_nodes)
-    return seen
-
-
 def _contains_target(node: object, targets: set[object]) -> bool:
     return any(
         current.op == "call_function" and current.target in targets
@@ -277,32 +268,6 @@ def _is_bf16_roundtrip(node: object) -> bool:
         and len(inner.args) >= 2
         and inner.args[1] is torch.bfloat16
     )
-
-
-def _binary_args(
-    node: object, targets: tuple[object, ...]
-) -> tuple[object, object] | None:
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.op != "call_function"
-        or node.target not in targets
-        or len(node.args) != 2
-    ):
-        return None
-    return node.args[0], node.args[1]
-
-
-def _is_convert(node: object, source: object, dtype: torch.dtype) -> bool:
-    return bool(
-        isinstance(node, torch.fx.Node)
-        and _is_call(node, torch.ops.prims.convert_element_type.default)
-        and len(node.args) == 2
-        and node.args == (source, dtype)
-    )
-
-
-def _is_full_slice(value: object) -> bool:
-    return isinstance(value, slice) and value == slice(None)
 
 
 def _subscript_source(
@@ -1430,13 +1395,9 @@ def plan_chunk_recurrence(
 ) -> None:
     from ..device_function import DeviceFunction
 
-    DeviceFunction.current().cute_state.chunk_recurrence_plan = _plan_chunk_recurrence(
-        graphs, tile_strategy
+    DeviceFunction.current().cute_state.root_plans.chunk_recurrence_plan = (
+        _plan_chunk_recurrence(graphs, tile_strategy)
     )
-
-
-def _tensor_arg(cg: GenerateAST, ref: _TensorRef) -> str:
-    return cg.device_function.tensor_arg(ref.fake, prefer_name=ref.name).name
 
 
 def _emit_module_imports(cg: GenerateAST, schedule: str) -> None:
@@ -1464,7 +1425,7 @@ def codegen_chunk_recurrence(cg: GenerateAST) -> bool:
     """Replace the matched root with the vendored exact device body."""
 
     df = cg.device_function
-    plan = df.cute_state.chunk_recurrence_plan
+    plan = df.cute_state.root_plans.chunk_recurrence_plan
     root = cg.current_root_graph_info
     if plan is None or root is None or root.graph_id != plan.root_graph_id:
         return False

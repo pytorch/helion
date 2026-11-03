@@ -19,7 +19,6 @@ import torch
 import helion
 from helion import exc
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
@@ -148,7 +147,6 @@ _SIDE: dict[str, tuple[object, Callable[..., torch.Tensor]]] = {
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
 @pytest.mark.parametrize("kernel_name", sorted(_SIDE))
-@skipUnlessBackends(["cute"])
 def test_uniform_loads_beside_collective_matmul(compute: str, kernel_name: str) -> None:
     if compute == "tcgen05" and torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family")
@@ -178,7 +176,6 @@ def test_uniform_loads_beside_collective_matmul(compute: str, kernel_name: str) 
 
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
 @pytest.mark.parametrize("kernel", [_tensor_copy, _tensor_loaded_before, _row_store])
-@skipUnlessBackends(["cute"])
 def test_per_element_statements_beside_collective_matmul_are_refused(
     compute: str, kernel: object
 ) -> None:

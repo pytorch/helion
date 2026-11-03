@@ -8,8 +8,8 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
-from helion._compiler.autotuner_heuristics.cute import _seq_config_list
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import _seq_config_list
 from helion._compiler.cute.local_atomic import _allocation_origin_resolver
 from helion._compiler.cute.local_atomic import _reachable_graphs
 from helion._compiler.device_ir import GraphInfo
@@ -20,7 +20,6 @@ from helion._compiler.device_ir import control_flow_parent_ids
 from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
@@ -39,9 +38,6 @@ def _pointwise_block_id(bound: BoundKernel) -> int:
         fact.k_block_id,
     }
     return block_id
-
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

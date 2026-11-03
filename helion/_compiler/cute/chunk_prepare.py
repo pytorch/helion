@@ -14,17 +14,29 @@ from __future__ import annotations
 import ast
 from collections import Counter
 import dataclasses
+import functools
 import operator
 from typing import TYPE_CHECKING
 from typing import cast
 
 import torch
 
-from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from ...language.matmul_ops import dot
 from ..compile_environment import CompileEnvironment
+from .analysis.match_common import binary_pair
+from .autotune.config_keys import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
+from .fx_matcher import _ancestors
+from .fx_matcher import _binary_args as _exact_binary_args
 from .fx_matcher import _canonical_root_axis_ids
+from .fx_matcher import _is_call
+from .fx_matcher import _is_convert
 from .fx_matcher import _linear_offsets_fit_i32
+from .fx_matcher import _load_ref
+from .fx_matcher import _memory_indices
+from .fx_matcher import _store_ref
+from .fx_matcher import _strip_value_casts as _shallow_strip_value_casts
+from .fx_matcher import _tensor_arg
+from .fx_matcher import _TensorRef
 from .fx_matcher import _xyz_grid_fits
 
 if TYPE_CHECKING:
@@ -59,12 +71,6 @@ _SCALED_DEVICE_ABI = 3
 _UNSCALED_DEVICE_ABI = 4
 _LOG2_E = 1.4426950408889634
 _PACKED_WORKSPACE_SPECIALIZATION_KEY = "cute_kda_packed_workspace_v1"
-
-
-@dataclasses.dataclass(frozen=True)
-class _TensorRef:
-    fake: torch.Tensor
-    name: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -242,47 +248,11 @@ def _static_float(value: object) -> float | None:
         return None
 
 
-def _is_call(node: object, target: object) -> bool:
-    return (
-        isinstance(node, torch.fx.Node)
-        and node.op == "call_function"
-        and node.target is target
-    )
-
-
-def _host_tensor_ref(node: object) -> _TensorRef | None:
-    from ...language._tracing_ops import _host_tensor
-
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.op != "call_function"
-        or node.target is not _host_tensor
-        or not node.args
-        or not isinstance(node.args[0], str)
-    ):
-        return None
-    value = node.meta.get("val")
-    if not isinstance(value, torch.Tensor):
-        return None
-    return _TensorRef(value, node.args[0])
-
-
-def _load_ref(node: object) -> _TensorRef | None:
-    from ...language import memory_ops
-
-    if not _is_call(node, memory_ops.load):
-        return None
-    assert isinstance(node, torch.fx.Node)
-    return _host_tensor_ref(node.args[0] if node.args else None)
-
-
-def _store_ref(node: object) -> _TensorRef | None:
-    from ...language import memory_ops
-
-    if not _is_call(node, memory_ops.store):
-        return None
-    assert isinstance(node, torch.fx.Node)
-    return _host_tensor_ref(node.args[0] if node.args else None)
+# The prepare grammar admits binary calls with trailing positional arguments and
+# strips up to sixteen value casts; the shared predicates default to the strict
+# forms.
+_binary_args = functools.partial(_exact_binary_args, exact_arity=False)
+_strip_value_casts = functools.partial(_shallow_strip_value_casts, depth=16)
 
 
 def _ref_key(ref: _TensorRef) -> tuple[int, str]:
@@ -310,47 +280,12 @@ def _tensor_meta(node: object) -> torch.Tensor | None:
     return value if isinstance(value, torch.Tensor) else None
 
 
-def _ancestors(node: object) -> set[torch.fx.Node]:
-    pending = [node]
-    seen: set[torch.fx.Node] = set()
-    while pending:
-        current = pending.pop()
-        if isinstance(current, (list, tuple)):
-            pending.extend(current)
-            continue
-        if not isinstance(current, torch.fx.Node):
-            continue
-        if current in seen:
-            continue
-        seen.add(current)
-        pending.extend(current.all_input_nodes)
-    return seen
-
-
 def _ancestor_ref_keys(node: object) -> set[tuple[int, str]]:
     return {
         _ref_key(ref)
         for ancestor in _ancestors(node)
         if (ref := _load_ref(ancestor)) is not None
     }
-
-
-def _strip_value_casts(node: object) -> torch.fx.Node | None:
-    if not isinstance(node, torch.fx.Node):
-        return None
-    current = node
-    passthroughs = {
-        torch.ops.aten.clone.default,
-        torch.ops.aten.detach.default,
-        torch.ops.prims.convert_element_type.default,
-    }
-    for _ in range(16):
-        if current.op != "call_function" or current.target not in passthroughs:
-            return current
-        if not current.args or not isinstance(current.args[0], torch.fx.Node):
-            return None
-        current = current.args[0]
-    return None
 
 
 def _strip_index_broadcast(node: object) -> torch.fx.Node | None:
@@ -396,26 +331,6 @@ def _is_column_broadcast_of(node: object, source: torch.fx.Node) -> bool:
         and isinstance(node.args[1], (list, tuple))
         and tuple(node.args[1]) == (None, slice(None))
     )
-
-
-def _memory_indices(node: torch.fx.Node) -> tuple[object, ...] | None:
-    if len(node.args) < 2 or not isinstance(node.args[1], (list, tuple)):
-        return None
-    return tuple(node.args[1])
-
-
-def _binary_args(
-    node: object,
-    targets: tuple[object, ...],
-) -> tuple[object, object] | None:
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.op != "call_function"
-        or node.target not in targets
-        or len(node.args) < 2
-    ):
-        return None
-    return node.args[0], node.args[1]
 
 
 def _scaled_term(node: object, source: torch.fx.Node, scale: int) -> bool:
@@ -465,14 +380,6 @@ def _store_value(store: torch.fx.Node) -> torch.fx.Node | None:
         return None
     value = store.args[2]
     return value if isinstance(value, torch.fx.Node) else None
-
-
-def _is_convert(node: object, source: object, dtype: torch.dtype) -> bool:
-    return bool(
-        isinstance(node, torch.fx.Node)
-        and _is_call(node, torch.ops.prims.convert_element_type.default)
-        and node.args == (source, dtype)
-    )
 
 
 def _roundtrip_source(node: object, storage_dtype: torch.dtype) -> torch.fx.Node | None:
@@ -686,29 +593,15 @@ def _match_chunk_group_coordinate(
     from ..variable_origin import GridOrigin
     from ..variable_origin import TileIdOrigin
 
-    def exact_binary(
-        node: object,
-        targets: tuple[object, ...],
-    ) -> tuple[object, object] | None:
-        if (
-            not isinstance(node, torch.fx.Node)
-            or node.op != "call_function"
-            or node.target not in targets
-            or len(node.args) != 2
-            or node.kwargs
-        ):
-            return None
-        return node.args[0], node.args[1]
-
     if len(loop.block_ids) != 1:
         return None
-    predicate_args = exact_binary(
+    predicate_args = binary_pair(
         loop_predicate,
         (operator.lt, torch.ops.aten.lt.Tensor),
     )
     if predicate_args is None or _static_extent(predicate_args[1]) != total_chunks:
         return None
-    chunk_args = exact_binary(
+    chunk_args = binary_pair(
         predicate_args[0],
         (operator.add, torch.ops.aten.add.Tensor),
     )
@@ -737,7 +630,7 @@ def _match_chunk_group_coordinate(
             or local_origin.block_id != loop.block_ids[0]
         ):
             continue
-        product_args = exact_binary(
+        product_args = binary_pair(
             product,
             (operator.mul, torch.ops.aten.mul.Tensor),
         )
@@ -2556,14 +2449,17 @@ def _plan_chunk_prepare(
     if target is None or target < (9, 0):
         return None
 
-    schedule = device_function.config.get(
-        CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
-        preferred_chunk_prepare_schedule(
+    config = device_function.config
+    if CUTE_CHUNK_PREPARE_SCHEDULE_KEY in config:
+        schedule = config[CUTE_CHUNK_PREPARE_SCHEDULE_KEY]
+    else:
+        # Only an unpinned config pays for the geometry probe (it re-matches
+        # the graphs and re-proves the packed workspace).
+        schedule = preferred_chunk_prepare_schedule(
             graphs,
             env=env,
             num_sm=env.config_spec.num_sm,
-        ),
-    )
+        )
     if type(schedule) is not str or schedule not in _VALID_PREPARE_SCHEDULES:
         return None
     chunks_per_cta = int(schedule.removeprefix("split_alias_cpc"))
@@ -2636,13 +2532,9 @@ def plan_chunk_prepare(
 
     from ..device_function import DeviceFunction
 
-    DeviceFunction.current().cute_state.chunk_prepare_plan = _plan_chunk_prepare(
-        graphs, tile_strategy
+    DeviceFunction.current().cute_state.root_plans.chunk_prepare_plan = (
+        _plan_chunk_prepare(graphs, tile_strategy)
     )
-
-
-def _tensor_arg(cg: GenerateAST, ref: _TensorRef) -> str:
-    return cg.device_function.tensor_arg(ref.fake, prefer_name=ref.name).name
 
 
 def _flat_tensor(name: str, elements: int) -> str:
@@ -2668,7 +2560,7 @@ def codegen_chunk_prepare(cg: GenerateAST) -> bool:
     """Replace the matched root with the exact imported device schedule."""
 
     df = cg.device_function
-    plan = df.cute_state.chunk_prepare_plan
+    plan = df.cute_state.root_plans.chunk_prepare_plan
     root = cg.current_root_graph_info
     if (
         plan is None

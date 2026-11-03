@@ -119,7 +119,7 @@ import torch
 from ..ast_extension import ExtendedAST
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
-from ._ast_pass_utils import _names_read
+from ._ast_pass_utils import names_read
 from .scalar_recipe_rounding import _kind
 from .scaled_sub_fusion import SCALED_SUBTRACTION_ATTR
 
@@ -329,7 +329,7 @@ def _is_loop_invariant(
         # First, conservatively forbid Subscript / Call / BinOp that we
         # can't fully analyze.  Actually, allow them — the deciding
         # factor is whether the rhs reads any non-invariant name.
-        rhs_reads = _names_read(rhs)
+        rhs_reads = names_read(rhs)
         for r in rhs_reads:
             if not _is_loop_invariant(
                 r,
@@ -1213,33 +1213,33 @@ def _collect_all_name_reads(body: list[ast.stmt]) -> set[str]:
             # Skip the LHS targets of Assign but include the RHS.  Use
             # ast.walk on stmt.value to collect Loads.
             if isinstance(stmt, ast.Assign):
-                reads.update(_names_read(stmt.value))
+                reads.update(names_read(stmt.value))
                 # Also collect from any non-Name LHS components
                 # (Subscripts, Attributes — those count as reads of
                 # base names).
                 for target in stmt.targets:
                     if not isinstance(target, ast.Name):
-                        reads.update(_names_read(target))
+                        reads.update(names_read(target))
                 continue
             if isinstance(stmt, ast.AugAssign):
-                reads.update(_names_read(stmt.value))
-                reads.update(_names_read(stmt.target))
+                reads.update(names_read(stmt.value))
+                reads.update(names_read(stmt.target))
                 continue
             if isinstance(stmt, ast.Expr):
-                reads.update(_names_read(stmt.value))
+                reads.update(names_read(stmt.value))
                 continue
             if isinstance(stmt, ast.If):
-                reads.update(_names_read(stmt.test))
+                reads.update(names_read(stmt.test))
                 _walk(stmt.body)
                 _walk(stmt.orelse)
                 continue
             if isinstance(stmt, ast.For):
-                reads.update(_names_read(stmt.iter))
+                reads.update(names_read(stmt.iter))
                 _walk(stmt.body)
                 _walk(stmt.orelse)
                 continue
             if isinstance(stmt, ast.While):
-                reads.update(_names_read(stmt.test))
+                reads.update(names_read(stmt.test))
                 _walk(stmt.body)
                 _walk(stmt.orelse)
                 continue
@@ -1248,10 +1248,10 @@ def _collect_all_name_reads(body: list[ast.stmt]) -> set[str]:
                 continue
             if isinstance(stmt, ast.Return):
                 if stmt.value is not None:
-                    reads.update(_names_read(stmt.value))
+                    reads.update(names_read(stmt.value))
                 continue
             # Fallback: walk the whole stmt.
-            reads.update(_names_read(stmt))
+            reads.update(names_read(stmt))
 
     _walk(body)
     return reads
@@ -1633,7 +1633,7 @@ def _select_derived_names(body: list[ast.stmt]) -> set[str]:
         for target in targets:
             for sub in ast.walk(target):
                 if isinstance(sub, ast.Subscript):
-                    bound.update(_canonical(n) for n in _names_read(sub.value))
+                    bound.update(_canonical(n) for n in names_read(sub.value))
         reads = {_canonical(n) for n in _value_reads(stmt.value)}
         facts.append((_contains_select(stmt.value), reads, bound))
     tainted: set[str] = set()
@@ -2173,9 +2173,9 @@ def _tainted_names(loop: ast.For, seeds: set[str]) -> set[str]:
         changed = False
         for node in ast.walk(loop):
             if isinstance(node, (ast.Assign, ast.AugAssign)):
-                reads = {_canonical(n) for n in _names_read(node.value)}
+                reads = {_canonical(n) for n in names_read(node.value)}
                 if isinstance(node, ast.AugAssign):
-                    reads |= {_canonical(n) for n in _names_read(node.target)}
+                    reads |= {_canonical(n) for n in names_read(node.target)}
                 if reads & tainted:
                     for name in _names_bound_by(node):
                         canon = _canonical(name)
@@ -2237,7 +2237,7 @@ def _redo_eligible(
         if isinstance(node, ast.For):
             guarded.append(node.iter)
     for expression in guarded:
-        if {_canonical(n) for n in _names_read(expression)} & tainted:
+        if {_canonical(n) for n in names_read(expression)} & tainted:
             return None
     # Roll back what the loop reads and updates (accumulators); its own
     # loop variables and the temporaries it defines before reading are
@@ -2248,9 +2248,9 @@ def _redo_eligible(
         if isinstance(node, ast.For)
         for name in _names_bound_by(node.target)  # pyrefly: ignore[bad-argument-type]
     }
-    read_in_loop = {_canonical(name) for name in _names_read(loop)}
+    read_in_loop = {_canonical(name) for name in names_read(loop)}
     # An augmented assignment reads its target (a Store context, which
-    # ``_names_read`` does not count).
+    # ``names_read`` does not count).
     read_in_loop |= {
         _canonical(name)
         for node in ast.walk(loop)

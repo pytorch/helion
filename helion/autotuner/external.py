@@ -48,6 +48,7 @@ class UserConfigSpec(ConfigSpec):
         fn: Callable[[ConfigSpecFragment], object],
         *,
         advanced_controls_files: list[str] | None = None,
+        flash_pipeline_family: str | None = None,
     ) -> helion.Config:
         return Config.from_dict(
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
@@ -66,7 +67,7 @@ class UserConfigSpec(ConfigSpec):
 def create_user_config_spec(
     tunables: dict[str, ConfigSpecFragment],
 ) -> UserConfigSpec:
-    from helion._compiler.backend import TritonBackend
+    from helion._compiler.triton.backend import TritonBackend
 
     return UserConfigSpec(
         backend=TritonBackend(),

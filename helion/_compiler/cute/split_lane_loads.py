@@ -39,6 +39,8 @@ import ast
 
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import loop_extent
 
 _LOAD_PREFIX = "_tile_unroll_vec_"
 
@@ -51,31 +53,13 @@ def _names_read(node: ast.AST) -> set[str]:
     return out
 
 
-def _assigned_name(stmt: ast.stmt) -> str | None:
-    if (
-        isinstance(stmt, ast.Assign)
-        and len(stmt.targets) == 1
-        and isinstance(stmt.targets[0], ast.Name)
-    ):
-        return stmt.targets[0].id
-    return None
-
-
 def _is_const_range_loop(loop: ast.For) -> tuple[str, int] | None:
     """Match ``for <lane> in range(<int >= 2>)`` (trace-time unrolled)."""
-    if not (isinstance(loop.target, ast.Name) and isinstance(loop.iter, ast.Call)):
+    extent = loop_extent(loop, kinds=("range",), minimum=2)
+    if extent is None:
         return None
-    func = loop.iter.func
-    if not (isinstance(func, ast.Name) and func.id == "range"):
-        return None
-    if len(loop.iter.args) != 1 or loop.iter.keywords:
-        return None
-    arg = loop.iter.args[0]
-    if not (isinstance(arg, ast.Constant) and isinstance(arg.value, int)):
-        return None
-    if arg.value < 2:
-        return None
-    return loop.target.id, arg.value
+    assert isinstance(loop.target, ast.Name)
+    return loop.target.id, extent
 
 
 def _try_split(loop: ast.For, counter: int) -> list[ast.stmt] | None:
@@ -85,14 +69,14 @@ def _try_split(loop: ast.For, counter: int) -> list[ast.stmt] | None:
     body = loop.body
     if len(body) < 3:
         return None
-    base_name = _assigned_name(body[0])
+    base_name = assigned_name(body[0])
     if base_name is None:
         return None
     # Collect the leading run of vec-load hoists right after the base stmt.
     load_stmts: list[ast.Assign] = []
     idx = 1
     while idx < len(body):
-        name = _assigned_name(body[idx])
+        name = assigned_name(body[idx])
         if name is None or not name.startswith(_LOAD_PREFIX):
             break
         load_stmts.append(body[idx])  # type: ignore[arg-type]
@@ -134,7 +118,7 @@ def _try_split(loop: ast.For, counter: int) -> list[ast.stmt] | None:
     compute_loop.iter = expr_from_string(f"cutlass.range_constexpr({reps})")
     compute_body: list[ast.stmt] = [body[0]]
     for list_name, load_stmt in zip(list_names, load_stmts, strict=True):
-        load_name = _assigned_name(load_stmt)
+        load_name = assigned_name(load_stmt)
         compute_body.append(
             statement_from_string(f"{load_name} = {list_name}[{lane_var}]")
         )

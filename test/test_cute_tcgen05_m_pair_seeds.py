@@ -13,7 +13,10 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute import target_facts
+from helion._compiler.cute.tcgen05_config import repair
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import smem
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from helion._testing import TestCase
@@ -85,10 +88,11 @@ def _bind(kernel: helion.Kernel, args: tuple[torch.Tensor, ...]) -> object:
     """Bind on a 148-SM B200 with its 227 KiB opt-in SMEM, on any host."""
     with (
         patch_cute_mma_support(),
-        patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+        patch(
+            "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+            return_value=148,
         ),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=232448),
     ):
         return cpu_bind(kernel, args)
 
@@ -107,7 +111,7 @@ class TestCuteTcgen05MPairSeeds(TestCase):
     def _assert_deep_m_pair_seeds(self, args: tuple[torch.Tensor, ...]) -> None:
         spec = _bind(_make_plain_gemm(), args).config_spec
         tcgen05 = spec._cute_tcgen05_config
-        self.assertTrue(tcgen05._m_pair_block_m_is_valid())
+        self.assertTrue(repair._m_pair_block_m_is_valid(tcgen05))
         m_pair = _m_pair_seeds(spec)
         deep = [seed for seed in m_pair if seed["block_sizes"][2] == 64]
         shallow = [seed for seed in m_pair if seed["block_sizes"][2] == 128]
@@ -162,7 +166,8 @@ class TestCuteTcgen05MPairSeeds(TestCase):
                 projected["tcgen05_persistence_model"], "static_persistent"
             )
         self.assertTrue(
-            tcgen05.c_stages_fits(
+            smem.c_stages_fits(
+                tcgen05,
                 bm=PAIR_BM,
                 bn=TCGEN05_TWO_CTA_BLOCK_N,
                 bk=64,
@@ -173,7 +178,8 @@ class TestCuteTcgen05MPairSeeds(TestCase):
             )
         )
         self.assertFalse(
-            tcgen05.c_stages_fits(
+            smem.c_stages_fits(
+                tcgen05,
                 bm=PAIR_BM,
                 bn=TCGEN05_TWO_CTA_BLOCK_N,
                 bk=64,
@@ -247,7 +253,7 @@ class TestCuteTcgen05MPairSeeds(TestCase):
         for kernel, args in cases:
             spec = _bind(kernel, args).config_spec
             tcgen05 = spec._cute_tcgen05_config
-            self.assertEqual(tcgen05._m_pair_deep_seed_configs(), [])
+            self.assertEqual(seeds._m_pair_deep_seed_configs(tcgen05), [])
             self.assertFalse(
                 any(seed["block_sizes"][2] == 64 for seed in _m_pair_seeds(spec)),
                 [tuple(t.shape) for t in args],
@@ -259,9 +265,9 @@ class TestCuteTcgen05MPairSeeds(TestCase):
         y = torch.empty([2048, 4096], dtype=torch.float16)
         spec = _bind(_make_plain_gemm(), (x, y)).config_spec
         tcgen05 = spec._cute_tcgen05_config
-        self.assertEqual(len(tcgen05._m_pair_deep_seed_configs()), 2)
+        self.assertEqual(len(seeds._m_pair_deep_seed_configs(tcgen05)), 2)
         with patch.object(tcgen05, "ab_stages_three_search_constraints", None):
-            self.assertEqual(tcgen05._m_pair_deep_seed_configs(), [])
+            self.assertEqual(seeds._m_pair_deep_seed_configs(tcgen05), [])
 
 
 if __name__ == "__main__":

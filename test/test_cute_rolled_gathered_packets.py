@@ -11,6 +11,7 @@ import pytest
 
 from helion._compiler.cute.memory_ops import _cute_looped_unroll_uniform_definitions
 from helion._compiler.cute.memory_ops import _cute_relocate_above_vloop
+from helion._compiler.lane_loop_context import LaneLoopContext
 
 pytestmark = pytest.mark.cpu_only
 
@@ -27,8 +28,7 @@ def _scope(source: str):
     lane_body = [loop]
     state = SimpleNamespace(codegen=SimpleNamespace(statements_stack=[body]))
     strategy = SimpleNamespace(
-        _cute_lane_vloop=loop,
-        _cute_lane_body=lane_body,
+        lane_context=LaneLoopContext(1, vloop=loop, lane_body=lane_body),
         _mask_var="mask",
         block_index=1,
         index_var=lambda block_index: "rindex",

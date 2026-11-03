@@ -13,12 +13,13 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
-from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash as flash
 from helion._compiler.cute.attention_plan import causal_score_plan
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.autotune.heuristics.cute import CuteFlashAttentionHeuristic
+from helion._compiler.cute.backend import CuteBackend
+from helion._testing import cpu_render_target
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with mock_cuda_unavailable(), forbid_native_compile():
+    with cpu_render_target():
         yield
 
 
@@ -49,7 +50,8 @@ def _spec(heads: int, *, proof: bool = True) -> ConfigSpec:
     )
     for index, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=index, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=64,
         num_kv=32,
         num_bh=heads,
@@ -136,7 +138,7 @@ def test_unqualified_stateful_does_not_gain_a_mapping() -> None:
 @pytest.mark.parametrize("heads", (1, 3, 64, 129))
 def test_active_widths_are_effective_and_compiler_seeded(heads: int) -> None:
     spec = _spec(heads)
-    fragment = spec._cute_flash_autotune_fragments()[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY]
+    fragment = _cute_flash_autotune_fragments(spec)[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY]
     assert 64 in fragment.choices
     # The stateful widths are searched next to the strategy values of the
     # other lowerings (0 the L2-sized group, 1 serial, the whole grid).
@@ -243,7 +245,7 @@ def test_both_schedules_reach_every_active_width(schedule: str) -> None:
         )
         assert config.config[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == width
         assert config.config[flash.FLASH_ROW_SUM_SCHEDULE_KEY] == schedule
-        owned = generation.flash_owned_coordinate_indices(config)
+        owned = generation.extension.flash_owned_coordinate_indices(config)
         identities = generation._flat_coordinate_identities()
         assert all(
             identities[i][0]
@@ -307,12 +309,12 @@ def test_fixed_parent_keeps_the_launch_group_searchable(
     generation = spec.create_config_generation(overrides=overrides)
     fragment = generation._flat_fields()[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY]
     assert isinstance(fragment, EnumFragment)
-    full = spec._cute_flash_autotune_fragments()[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY]
+    full = _cute_flash_autotune_fragments(spec)[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY]
     assert isinstance(full, EnumFragment)
     assert fragment._active_choices() == full._active_choices()
     assert {
         value
-        for key, value in generation.flash_structural_coverage_active_values()
+        for key, value in generation.extension.flash_structural_coverage_active_values()
         if key == flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY
     } >= {0, 1, 64}
 
@@ -326,7 +328,7 @@ def test_fixed_wide_mapping_keeps_every_lowering() -> None:
     )
     mode = generation._flat_fields()[flash.FLASH_SOFTMAX_LOWERING_KEY]
     assert isinstance(mode, EnumFragment)
-    full_mode = spec._cute_flash_autotune_fragments()[flash.FLASH_SOFTMAX_LOWERING_KEY]
+    full_mode = _cute_flash_autotune_fragments(spec)[flash.FLASH_SOFTMAX_LOWERING_KEY]
     assert isinstance(full_mode, EnumFragment)
     assert mode._active_choices() == full_mode._active_choices()
     assert {"auto", "standard", "resident_stateful"} <= set(mode._active_choices())
@@ -428,7 +430,7 @@ def test_normal100_retains_all_seeds_and_both_schedules() -> None:
         random.setstate(state)
     configs = [generation.canonicalize_flat(flat)[1] for flat in population]
     seeds = {config for _, config in generation.seed_flat_config_pairs()}
-    coverage = set(generation.flash_deterministic_population_configs())
+    coverage = set(generation.extension.deterministic_population_configs())
     # The complete design fits the nominal budget, so retain every coverage
     # row as well as every seed. Their union may exceed the nominal 100 rows.
     assert len(coverage) <= 100

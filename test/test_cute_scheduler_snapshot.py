@@ -10,16 +10,19 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from .test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
-from .test_cute_grouped_gemm_split_sizes import _selected_config
+from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
+from test._cute_grouped_gemm_split_sizes import _selected_config
+
 from .test_cute_scheduler_mailbox import _plain_matmul
 from helion import exc
-from helion._compiler import program_id
+from helion._compiler.cute.tcgen05 import scheduler_pids
+from helion._compiler.cute.tcgen05.scheduler_pids import (
+    _build_sched_pipeline_consumer_wait_block,
+)
+from helion._compiler.cute.tcgen05.scheduler_pids import _literal_mailbox_access_fields
+from helion._compiler.cute.tcgen05.scheduler_pids import _sched_mailbox_load_expr
+from helion._compiler.cute.tcgen05.scheduler_pids import _SchedMailboxSnapshot
 from helion._compiler.device_function import DeviceFunction
-from helion._compiler.program_id import _build_sched_pipeline_consumer_wait_block
-from helion._compiler.program_id import _literal_mailbox_access_fields
-from helion._compiler.program_id import _sched_mailbox_load_expr
-from helion._compiler.program_id import _SchedMailboxSnapshot
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_aux import aux_config as _config
@@ -280,7 +283,7 @@ def test_selected_grouped_snapshots_preserve_publication_proof() -> None:
         with (
             patch.object(_SchedMailboxSnapshot, "create", side_effect=create_snapshot),
             patch.object(
-                program_id,
+                scheduler_pids,
                 "_build_sched_pipeline_consumer_wait_block",
                 side_effect=wait_snapshot,
             ),

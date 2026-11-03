@@ -87,6 +87,8 @@ import cutlass.experimental.primitives as prims
 
 from .affine_recurrence_primitives import pack_bf16x2
 from .affine_recurrence_primitives import prefetch_global_l2
+from .device.sync import mbar_wait as mbarrier_wait
+from .device.sync import ring_advance as advance_ring
 from .gdn_recurrence_geometry import GDN_HALF_LANE_COLS
 from .gdn_recurrence_geometry import GDN_MAX_UNROLLED_K_STEPS
 from .gdn_recurrence_geometry import GDN_MMA_K
@@ -193,14 +195,6 @@ def tma_swizzle_for_row_bytes(row_bytes: int) -> cuda.TensorMapSwizzle:
 
 
 @cute.jit
-def mbarrier_wait(mbar, parity) -> None:
-    """Spin until the mbarrier phase with ``parity`` has completed."""
-
-    while not prims.mbarrier_wait_parity(mbar, parity, prims.MBarrierWait.TRY):
-        pass
-
-
-@cute.jit
 def tmem_row_ptr(tmem_base, quadrant, column, dtype: cutlass.Constexpr):
     """TMEM pointer at lane ``32 * quadrant`` and absolute column ``column``."""
 
@@ -259,16 +253,6 @@ def epilogue_sync(warps: cutlass.Constexpr) -> None:
     """Named barrier across the epilogue warps."""
 
     prims.barrier_cta_sync(EPILOGUE_BARRIER_ID, thread_count=THREADS_PER_WARP * warps)
-
-
-@cute.jit
-def advance_ring(stage, phase, STAGES: cutlass.Constexpr):
-    """Next ring slot and its parity without a division."""
-
-    wrapped = stage == STAGES - 1
-    next_stage = cutlass.Int32(0) if wrapped else stage + 1
-    next_phase = phase ^ 1 if wrapped else phase
-    return next_stage, next_phase
 
 
 @cute.jit

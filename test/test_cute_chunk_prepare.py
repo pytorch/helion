@@ -22,18 +22,18 @@ import helion
 from helion import _compat
 from helion import exc
 from helion._compiler.autotuner_heuristics import compiler_seed_specialization_facts
-from helion._compiler.autotuner_heuristics.cute import CuteChunkPrepareHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteChunkPrepareHeuristic
 from helion._compiler.cute.chunk_prepare import _packed_workspace_is_exact
 from helion._compiler.cute.chunk_prepare import _preferred_split_alias_chunks_per_cta
-from helion._compiler.cute.chunk_prepare import _TensorRef
+from helion._compiler.cute.fx_matcher import _TensorRef
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
-from helion.runtime.cute.launcher import _chunk_prepare_expected_tensor_map_specs
-from helion.runtime.cute.launcher import _chunk_prepare_tensor_map_specs
+from helion.runtime.cute.host_wrappers.recurrences import (
+    chunk_prepare_expected_tensor_map_specs,
+)
+from helion.runtime.cute.host_wrappers.recurrences import chunk_prepare_tensor_map_specs
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
-pytestmark = skipUnlessBackends(["cute"])
 _split_alias_device = importlib.import_module(
     "helion._compiler.cute.chunk_prepare_split_alias_device"
 )
@@ -141,6 +141,7 @@ def _code(
     config: helion.Config = _CONFIG,
     capability: tuple[int, int] = (10, 0),
     packed_workspace: bool = True,
+    render_patches: tuple[contextlib.AbstractContextManager[object], ...] = (),
 ) -> str:
     with (
         patch(
@@ -176,7 +177,10 @@ def _code(
         if mutate is not None:
             mutate(bound.host_function.device_ir)
         bound.config_spec.target_device_capability = capability
-        return bound.to_triton_code(config)
+        with contextlib.ExitStack() as stack:
+            for render_patch in render_patches:
+                stack.enter_context(render_patch)
+            return bound.to_code(config)
 
 
 def test_five_factor_prepare_codegen() -> None:
@@ -208,13 +212,15 @@ def test_prepare_device_exposes_only_the_matched_gate_contract() -> None:
 
 
 def test_prepare_uses_shared_device_primitives() -> None:
+    from helion._compiler.cute import affine_recurrence_primitives as primitives
     from helion._compiler.cute import chunk_prepare_split_alias_device as device
-    from helion._compiler.cute import kda_device_primitives as primitives
 
     for name in (
+        "ldmatrix_x4",
         "mma_m16n8k16_bf16",
         "movmatrix_b16",
         "pack_bf16x2",
+        "stmatrix_x4",
         "store_vec8_bf16",
         "tma_store_3d",
         "tma_store_commit_group",
@@ -264,9 +270,9 @@ def test_prepare_generated_names_do_not_shadow_tensor_arguments(
     collision: str,
     expected: tuple[str, ...],
 ) -> None:
-    from helion._compiler.cute import chunk_prepare
+    from helion._compiler.cute import fx_matcher
 
-    original = chunk_prepare._host_tensor_ref
+    original = fx_matcher._host_tensor_ref
 
     def colliding_name(node: object) -> object:
         ref = original(node)
@@ -274,7 +280,7 @@ def test_prepare_generated_names_do_not_shadow_tensor_arguments(
             return dataclasses.replace(ref, name=collision)
         return ref
 
-    with patch.object(chunk_prepare, "_host_tensor_ref", side_effect=colliding_name):
+    with patch.object(fx_matcher, "_host_tensor_ref", side_effect=colliding_name):
         code = _code()
     assert all(snippet in code for snippet in expected)
 
@@ -318,6 +324,30 @@ def test_five_factor_prepare_cpc4_split_alias_remains_available() -> None:
     assert "'chunks_per_cta': 4" in code
     assert "'schedule': 'split_alias_cpc4'" in code
     assert "'smem_bytes': 21968" in code
+
+
+def test_pinned_prepare_schedule_skips_the_geometry_probe() -> None:
+    # A config that pins the schedule must not pay for the seed's geometry
+    # probe on every render: the planner used to evaluate it eagerly as the
+    # ``dict.get`` default (re-matching the graphs and re-proving the packed
+    # workspace), then discard it.
+    config = helion.Config.from_dict(
+        {**_CONFIG.config, "cute_chunk_prepare_schedule": "split_alias_cpc4"}
+    )
+    code = _code(
+        tokens=8192,
+        heads=12,
+        chunks=515,
+        config=config,
+        render_patches=(
+            patch(
+                "helion._compiler.cute.chunk_prepare.preferred_chunk_prepare_schedule",
+                side_effect=AssertionError("pinned schedule ran the geometry probe"),
+            ),
+        ),
+    )
+    assert "'chunks_per_cta': 4" in code
+    assert "'schedule': 'split_alias_cpc4'" in code
 
 
 def test_prepare_autotuner_searches_all_split_alias_schedules() -> None:
@@ -894,7 +924,7 @@ def test_prepare_descriptor_geometry(
     gate_dtype: torch.dtype,
     gate_box: tuple[int, ...],
 ) -> None:
-    specs = _chunk_prepare_expected_tensor_map_specs(
+    specs = chunk_prepare_expected_tensor_map_specs(
         total_tokens=8192,
         total_chunks=515,
         heads=12,
@@ -999,7 +1029,7 @@ def test_prepare_runtime_validates_packed_workspace_and_specs() -> None:
         patch.object(torch.storage.UntypedStorage, "data_ptr", storage_data_ptr),
         patch.object(FakeTensor, "data_ptr", tensor_data_ptr),
     ):
-        specs = _chunk_prepare_tensor_map_specs(_runtime_plan(), args)
+        specs = chunk_prepare_tensor_map_specs(_runtime_plan(), args)
     assert tuple(spec.base_ptr for spec in specs) == expected_bases
 
     cpc1_plan = _runtime_plan()
@@ -1009,7 +1039,7 @@ def test_prepare_runtime_validates_packed_workspace_and_specs() -> None:
         patch.object(torch.storage.UntypedStorage, "data_ptr", storage_data_ptr),
         patch.object(FakeTensor, "data_ptr", tensor_data_ptr),
     ):
-        cpc1_specs = _chunk_prepare_tensor_map_specs(cpc1_plan, args)
+        cpc1_specs = chunk_prepare_tensor_map_specs(cpc1_plan, args)
     assert cpc1_specs == specs
 
     cpc5_plan = _runtime_plan()
@@ -1019,7 +1049,7 @@ def test_prepare_runtime_validates_packed_workspace_and_specs() -> None:
         patch.object(torch.storage.UntypedStorage, "data_ptr", storage_data_ptr),
         patch.object(FakeTensor, "data_ptr", tensor_data_ptr),
     ):
-        cpc5_specs = _chunk_prepare_tensor_map_specs(cpc5_plan, args)
+        cpc5_specs = chunk_prepare_tensor_map_specs(cpc5_plan, args)
     assert cpc5_specs == specs
 
 
@@ -1049,7 +1079,7 @@ def test_prepare_runtime_rejects_split_factor_allocations() -> None:
         patch.object(FakeTensor, "data_ptr", tensor_data_ptr),
         pytest.raises(exc.BackendUnsupported, match="packed workspace ABI"),
     ):
-        _chunk_prepare_tensor_map_specs(_runtime_plan(), tuple(args))
+        chunk_prepare_tensor_map_specs(_runtime_plan(), tuple(args))
 
 
 @pytest.mark.parametrize(
@@ -1134,7 +1164,7 @@ def test_prepare_descriptor_args_enter_cached_launch_schema() -> None:
         patch.object(launcher, "_get_cute_launcher_imports", side_effect=fake_imports),
         patch.object(
             launcher,
-            "_build_chunk_prepare_tensor_maps",
+            "build_chunk_prepare_tensor_maps",
             return_value=(descriptor_storage, (0x1000, 0x1080, 0x1100, 0x1180)),
         ),
     ):

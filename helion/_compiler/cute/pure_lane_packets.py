@@ -78,12 +78,34 @@ _OPERATORS = frozenset(f"operator.{operation}" for operation in _OPERATOR_CALLS)
 
 
 def _pure_packet_call(call: ast.Call) -> bool:
-    name = ast.unparse(call.func)
-    if name in _OPERATORS:
+    """A call the packet pass may stage: an operator or an unpacked
+    ``_cute_inline_asm_elementwise`` over pure scalar arithmetic.  Packed
+    calls (``pack`` keyword) stay out: the per-lane lowering replays their asm
+    once per element, which the packet staging does not model."""
+    if ast.unparse(call.func) in _OPERATORS:
         return True
-    if name != "_cute_inline_asm_elementwise" or len(call.args) != 1:
+    return not any(
+        keyword.arg == "pack" for keyword in call.keywords
+    ) and is_pure_inline_asm_call(call)
+
+
+def is_pure_inline_asm_call(call: ast.Call) -> bool:
+    """Whether ``call`` is ``_cute_inline_asm_elementwise`` over pure scalar
+    arithmetic (:func:`is_pure_scalar_assembly`), packed or not.
+
+    The lane passes relocate and duplicate such a call like any other
+    arithmetic: with ``is_pure`` the lowering (``inline_asm_helpers``) runs
+    the same effect-free asm once per element whatever the pack, so the pack
+    width changes the register ABI, not the purity.
+    """
+    if ast.unparse(call.func) != "_cute_inline_asm_elementwise" or len(call.args) != 1:
         return False
     keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+    pack = keywords.pop("pack", None)
+    if pack is not None and not (
+        isinstance(pack, ast.Constant) and type(pack.value) is int
+    ):
+        return False
     if set(keywords) != {"asm", "constraints", "dtype", "is_pure"}:
         return False
     pure, asm, constraints = (
@@ -127,12 +149,17 @@ def is_pure_scalar_assembly(asm: object, constraints: object, is_pure: object) -
     # A declared-pure asm can still describe a memory read. Accept only scalar
     # arithmetic instructions; no pointers, special registers, branches,
     # barriers, memory clobbers, or opaque instructions enter this envelope.
+    # Braces only group: a nested ``{ ... }`` scope around register
+    # declarations, or the vector operand ``{ $2, $3 }`` that packs two
+    # registers into one (``mov.b64 ra, { $2, $3 }`` around ``mul.f32x2``);
+    # neither adds an effect, and the opcode allowlist still gates every
+    # instruction inside.
     text = asm.strip().removeprefix("{").removesuffix("}").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_$.,+;\s-]*", text):
+    if not re.fullmatch(r"[A-Za-z0-9_$.,+;{}\s-]*", text):
         return False
     for instruction in text.split(";"):
-        instruction = instruction.strip()
-        if not instruction:
+        instruction = instruction.strip().lstrip("{").strip()
+        if not instruction or instruction == "}":
             continue
         if instruction.startswith(".reg "):
             if re.fullmatch(

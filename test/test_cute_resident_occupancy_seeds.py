@@ -9,20 +9,20 @@ import pytest
 from test.test_cute_resident_serial_row_seeds import _bind
 from test.test_cute_resident_serial_row_seeds import _cpu_only  # noqa: F401
 
-from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
+from helion._compiler.cute.autotune.heuristics.cute_resident_reductions import (
     CuteResidentReductionHeuristic,
 )
-from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
+from helion._compiler.cute.autotune.heuristics.cute_resident_reductions import (
     _occupancy_coarse,
 )
-from helion._compiler.autotuner_heuristics.cute_resident_reductions import _seed_vector
+from helion._compiler.cute.autotune.heuristics.cute_resident_reductions import (
+    _seed_vector,
+)
 from helion._testing import skipUnlessBackends
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
-_UNITS = (
-    "helion._compiler.autotuner_heuristics.cute_resident_reductions.num_compute_units"
-)
+_UNITS = "helion._compiler.cute.autotune.heuristics.cute_resident_reductions.num_compute_units"
 
 
 def _geometry(config: object) -> tuple[int, int, str, int]:

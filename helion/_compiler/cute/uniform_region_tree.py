@@ -29,7 +29,7 @@ from ..device_ir import RootGraphInfo
 from ..device_ir import WhileConditionGraphInfo
 from ..device_ir import WhileLoopGraphInfo
 from ..device_ir import control_flow_parent_entries
-from .scan_helper import additive_scan_helper
+from .scan_analysis import additive_scan_helper
 from .uniform_control import _carry_map
 from .uniform_control import _outputs
 from .uniform_control import _signature
@@ -1014,7 +1014,7 @@ def uniform_region_domains(
     from ...language import memory_ops
     from ...language import scan_ops
     from ..inductor_lowering import ReductionLowering
-    from .computed_fragment import _fragment_logical_shape
+    from .fragment_context import _fragment_logical_shape
     from .gather_domains import GatherDomainFacts
     from .register_loads import host_load_is_readonly
 

@@ -11,24 +11,23 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
+from test.cute_population_contracts import tcgen05_mma_support
 
 import helion
 from helion import exc
-from helion._compiler.autotuner_heuristics.cute_radix_selection import (
+from helion._compiler.cute.autotune.heuristics.cute_radix_selection import (
     CuteRadixSelectionHeuristic,
 )
-from helion._compiler.cute.ordered_selection import unordered_topk_args
-from helion._compiler.cute.radix_selection import match_radix_selection_root
-from helion._compiler.cute.radix_selection import radix_schedule
-from helion._compiler.cute.radix_selection_config import BOOLEAN_KEYS
-from helion._compiler.cute.radix_selection_config import CONFIG_KEYS
-from helion._compiler.cute.radix_selection_config import PIPELINE_CHOICES
+from helion._compiler.cute.selection.ordered_selection import unordered_topk_args
+from helion._compiler.cute.selection.radix_selection import match_radix_selection_root
+from helion._compiler.cute.selection.radix_selection import radix_schedule
+from helion._compiler.cute.selection.radix_selection_config import BOOLEAN_KEYS
+from helion._compiler.cute.selection.radix_selection_config import CONFIG_KEYS
+from helion._compiler.cute.selection.radix_selection_config import PIPELINE_CHOICES
+from helion._testing import cpu_render_target
 from helion._testing import pairwise
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
 from helion.runtime.ref_mode import RefMode
@@ -41,12 +40,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        _target(),
-        forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
 
 
@@ -404,7 +398,7 @@ def test_literal_resource_budget_and_mode_validation() -> None:
     )
     with (
         patch(
-            "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_capacity_bytes",
+            "helion._compiler.cute.target_facts.per_cta_smem_capacity_bytes",
             return_value=1024,
         ),
         pytest.raises(exc.InvalidConfig),

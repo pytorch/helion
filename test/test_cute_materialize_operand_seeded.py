@@ -14,15 +14,22 @@ from test._se_block_derived_operand_kernels import se_block_bwd_dw
 from test._se_block_derived_operand_kernels import se_block_bwd_dx
 from test.test_cute_materialize_operand import _bind
 from test.test_cute_materialize_operand import _computed_rhs
-from test.test_cute_materialize_operand import _cpu_b200 as _cpu_b200
 from test.test_cute_materialize_operand import _reference
 
 import helion
 from helion._compiler.cute.materialize_operand import _additive_seed
-from helion._testing import skipUnlessBackends
+from helion._testing import DEVICE
+from helion._testing import default_cute_mma_support
 import helion.language as hl
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
+# ``tcgen05_cpu_target``: the B200 model with the default (tcgen05-on) MMA
+# support record and the full 227 KiB opt-in SMEM as the AB budget.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(
+        mma_support=default_cute_mma_support(), smem_budget_bytes=232448
+    ),
+]
 
 if TYPE_CHECKING:
     from typing import Any
@@ -138,7 +145,7 @@ def test_augassign_seed_is_materialized_with_the_seed_in_the_epilogue() -> None:
     assert plan.pointwise_region_indices == (0,)
     assert bound.host_function is not None
     assert len(bound.host_function.device_ir.root_ids) == 2
-    assert bound.config_spec.cute_tcgen05_search_enabled
+    assert bound.config_spec.tcgen05.search_enabled
     producer, consumer = _roots(bound)
     assert producer.startswith(
         "for _helion_materialize_m, _helion_materialize_k in hl.tile([m, n]):"
@@ -180,7 +187,7 @@ def test_transposed_direct_operand_is_materialized_on_the_rhs() -> None:
     bound = _bind_se(se_block_bwd_dw, _dw_args(_se_args(1024, 512)))
     plan = bound.env.cute_fission_plan
     assert plan is not None and plan.region_count == 2
-    assert bound.config_spec.cute_tcgen05_search_enabled
+    assert bound.config_spec.tcgen05.search_enabled
     producer, consumer = _roots(bound)
     assert producer.startswith(
         "for _helion_materialize_k, _helion_materialize_n in hl.tile([m, n]):"
@@ -364,3 +371,80 @@ def test_population_cut_holds_a_flat_epi_tma_seed_of_every_tcgen05_tile() -> Non
     assert tiles <= {tile(config) for config in in_cut}
     assert epi_tma_tiles <= {tile(config) for config in in_cut if epi_tma(config)}
     assert len(in_cut) >= len(population) // 2
+
+
+# CUDA numerics of the materialized se_block backward GEMMs against the Triton
+# backend and the fused CuTe form.
+
+
+_SHAPES = ((256, 128), (1024, 512), (4096, 1024))
+
+
+def _inputs(m: int, n: int) -> dict[str, torch.Tensor]:
+    generator = torch.Generator(device=DEVICE).manual_seed(1234 + m)
+    x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, generator=generator)
+    w = torch.randn([n, n], device=DEVICE, dtype=torch.float16, generator=generator)
+    grad = torch.randn([m, n], device=DEVICE, dtype=torch.float16, generator=generator)
+    return {"grad_out": grad, "x": x, "w": w, "s": torch.sigmoid(x @ w)}
+
+
+def _args(kernel: Kernel[Any], values: dict[str, torch.Tensor]) -> tuple[Any, ...]:
+    if kernel is se_block_bwd_dx:
+        return (values["grad_out"], values["x"], values["w"], values["s"])
+    return (values["grad_out"], values["x"], values["s"])
+
+
+def _fp32_reference(
+    kernel: Kernel[Any], values: dict[str, torch.Tensor]
+) -> torch.Tensor:
+    """fp32 math over the once-rounded fp16 derived operand (the example's
+    contract)."""
+    grad, x, s = values["grad_out"].float(), values["x"].float(), values["s"].float()
+    derived = (2.0 * grad * x * s * (1.0 - s)).to(torch.float16).float()
+    if kernel is se_block_bwd_dx:
+        return (2.0 * grad * s + derived @ values["w"].float().T).to(torch.float16)
+    return (x.T @ derived).to(torch.float16)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("shape", _SHAPES, ids=["x".join(map(str, s)) for s in _SHAPES])
+@pytest.mark.parametrize("kernel", [se_block_bwd_dx, se_block_bwd_dw], ids=["dx", "dw"])
+def test_materialized_backward_matches_triton_and_the_fused_form(
+    kernel: Kernel[Any], shape: tuple[int, int]
+) -> None:
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family")
+    m, n = shape
+    values = _inputs(m, n)
+    args = _args(kernel, values)
+    materialized = helion.kernel(
+        kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_materialize_transformed_operands=True,
+    )._bind_isolated(args)
+    # dx reuses its [M, K] recipe across N (256-column tiles), dw its [K, N]
+    # recipe across N1 (128-row tiles): the gate wants two tiles' worth.
+    reused_tile = 256 if kernel is se_block_bwd_dx else 128
+    assert (materialized.env.cute_fission_plan is not None) is (n >= 2 * reused_tile)
+    fused = helion.kernel(
+        kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_materialize_transformed_operands=False,
+    )._bind_isolated(args)
+    assert fused.env.cute_fission_plan is None
+    triton = helion.kernel(
+        kernel.fn, backend="triton", static_shapes=True, autotune_effort="none"
+    )._bind_isolated(args)
+    reference = _fp32_reference(kernel, values)
+    # The example's tolerances; the materialized dx adds its seed after the
+    # contraction (one fp32 reassociation), the fused and Triton forms before.
+    tolerance = {"rtol": 1e-2, "atol": 1e-1}
+    actual = materialized(*args)
+    torch.testing.assert_close(actual, reference, **tolerance)
+    torch.testing.assert_close(actual, triton(*args), **tolerance)
+    torch.testing.assert_close(actual, fused(*args), **tolerance)

@@ -11,9 +11,15 @@ from ..ast_read_writes import ReadWrites
 from ..compile_environment import CompileEnvironment
 from ..device_function import TensorArg
 from . import cluster_online_pair as pair
+from ._ast_pass_utils import is_name_assign
+from .analysis.online_pair import _assigned_name
+from .analysis.online_pair import _int_kw
 from .fuse_two_pass_loads import _is_store_call
 from .fuse_two_pass_loads import _store_tensor_roots
 from .fuse_two_pass_loads import _tensor_arg_roots
+from .reduce_call import COLLECTIVE_REDUCES
+from .reduce_call import ONLINE_PAIR_REDUCES
+from .reduce_call import ReduceScope
 
 if TYPE_CHECKING:
     from ..device_function import DeviceFunction
@@ -32,14 +38,6 @@ _MODULE_NAMES = {
     "int",
     "bool",
     "range",
-}
-_COLLECTIVES = {
-    "_cute_grouped_reduce_cluster",
-    "_cute_grouped_reduce_cluster_online_pair",
-    "_cute_grouped_reduce_cluster_warp_online_pair",
-    "_cute_grouped_reduce_shared_two_stage",
-    "_cute_grouped_reduce_shared_tree",
-    "_cute_grouped_reduce_warp",
 }
 
 
@@ -64,10 +62,10 @@ def _whole_collective(statement: ast.stmt, threads: int) -> ast.Call | None:
     if not (
         isinstance(value, ast.Call)
         and isinstance(value.func, ast.Name)
-        and value.func.id in _COLLECTIVES
-        and pair._int_kw(value, "group_span") == threads
-        and pair._int_kw(value, "pre") in (None, 1)
-        and pair._int_kw(value, "group_count") in (None, 1)
+        and value.func.id in COLLECTIVE_REDUCES
+        and _int_kw(value, "group_span") == threads
+        and _int_kw(value, "pre") in (None, 1)
+        and _int_kw(value, "group_count") in (None, 1)
     ):
         return None
     return value
@@ -106,12 +104,12 @@ def _uniform(expr: ast.AST, names: set[str], cluster: int) -> bool:
 def _scalar_suffix(
     statements: list[ast.stmt], uniform: set[str], cluster: int
 ) -> list[ast.Call] | None:
-    from ..tile_strategy import _is_proven_relocatable_assignment
-    from ..tile_strategy import _validated_idempotent_store
+    from ._ast_pass_utils import _is_proven_relocatable_assignment
+    from .lane_loops.owner_guards import _validated_idempotent_store
 
     stores: list[ast.Call] = []
     for statement in statements:
-        if pair._is_name_assign(statement) and _is_proven_relocatable_assignment(
+        if is_name_assign(statement) and _is_proven_relocatable_assignment(
             statement, allow_load=True
         ):
             assert isinstance(statement, ast.Assign)
@@ -132,12 +130,17 @@ def lower_scalar_epilogue(
     body: list[ast.stmt],
     fn: DeviceFunction,
     constexpr_values: dict[str, int] | None,
-    thread_block_dims: tuple[int, int, int],
+    thread_block_dims: tuple[int, int, int] | None,
     disjoint_pairs: set[frozenset[str]],
 ) -> list[ast.stmt]:
+    """Fold the scalar epilogue of a canonical row reduction into its
+    collective's owner thread; ``thread_block_dims`` is the proven launch
+    shape, and an unproven shape (``None``) leaves the body alone."""
     from ..autotuner_heuristics.common import is_canonical_row_reduction
-    from ..tile_strategy import _is_proven_relocatable_assignment
+    from ._ast_pass_utils import _is_proven_relocatable_assignment
 
+    if thread_block_dims is None:
+        return body
     env = CompileEnvironment.current()
     if not is_canonical_row_reduction(env) or fn.config.block_sizes != [1]:
         return body
@@ -152,12 +155,12 @@ def lower_scalar_epilogue(
     last, call = collectives[-1]
     if last + 1 == len(body):
         return body
-    cluster = fn.cute_state.simt_cluster_n
+    cluster = fn.cute_state.lanes.simt_cluster_n
     uniform = {argument.name for argument in fn.arguments} | set(constexpr_values or {})
     for statement in body[: last + 1]:
         if _whole_collective(statement, threads) is not None:
             uniform.update(_targets(statement))
-        elif pair._is_name_assign(statement) and _is_proven_relocatable_assignment(
+        elif is_name_assign(statement) and _is_proven_relocatable_assignment(
             statement, allow_load=True
         ):
             assert isinstance(statement, ast.Assign)
@@ -206,13 +209,13 @@ def lower_scalar_epilogue(
     for index in scan:
         statement = body[index]
         if not (
-            pair._is_name_assign(statement)
+            is_name_assign(statement)
             and _targets(statement) & needed
             and _is_proven_relocatable_assignment(statement, allow_load=True)
         ):
             continue
         assert isinstance(statement, ast.Assign)
-        target = pair._assigned_name(statement)
+        target = _assigned_name(statement)
         other_reads = {
             name
             for later in body[index + 1 : last + 1]
@@ -251,16 +254,10 @@ def lower_scalar_epilogue(
         needed.update(ReadWrites.from_ast(statement.value).reads)
         moved.insert(0, statement)
         moved_ids.add(id(statement))
+    # The online pairs take ``(sum, max, lane, ...)``; the scalar family
+    # ``(input, op, identity, lane, ...)``.
     call_name = cast("ast.Name", call.func).id
-    if call_name == "_cute_grouped_reduce_cluster":
-        lane = call.args[3]
-    elif call_name in {
-        "_cute_grouped_reduce_cluster_online_pair",
-        "_cute_grouped_reduce_cluster_warp_online_pair",
-    }:
-        lane = call.args[2]
-    else:
-        lane = call.args[3]
+    lane = call.args[2 if call_name in ONLINE_PAIR_REDUCES else 3]
     condition = f"{ast.unparse(lane)} == 0"
     if cluster > 1:
         condition += " and cute.arch.block_idx_in_cluster() == 0"
@@ -272,7 +269,7 @@ def lower_scalar_epilogue(
     # while folding its local receive mirror only in that owner's warp.
     if (
         fn.config.get("cute_scalar_epilogue_owner_fold", False)
-        and ast.unparse(call.func) == "_cute_grouped_reduce_cluster_warp_online_pair"
+        and call_name == ReduceScope.CLUSTER_WARP_ONLINE_PAIR.value
     ):
         call.keywords.append(ast.keyword(arg="owner_only", value=ast.Constant(True)))
     return [statement for statement in prefix if id(statement) not in moved_ids] + [

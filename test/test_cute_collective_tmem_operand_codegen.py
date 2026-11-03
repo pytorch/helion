@@ -24,11 +24,11 @@ from test.test_cute_packed_collective_matmul import _config as _packed_config
 from test.test_cute_packed_collective_matmul import _original_bound
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute import target_facts
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_matmul import (
     has_collective_tmem_operand_candidate,
 )
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import pairwise
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
@@ -272,9 +272,7 @@ def test_materialized_packed_operand_keeps_native_shared_a(
 ) -> None:
     with (
         cpu_target(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=232448),
     ):
         bound = _original_bound(
             (128, 256, 128),

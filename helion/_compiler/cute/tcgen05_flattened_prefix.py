@@ -1,17 +1,31 @@
-"""Typed element-base proof for a flattened grouped operand/output pair.
+"""Typed element-base proof and tile prefix of a flattened grouped operand/output pair.
 
-This proposal is dormant: it does not install compiler admission. Unsupported
-static affine/layout domains must retain existing codegen. The dynamic span
-result distinguishes unsupported values from an empty group; it never clips a
-nonempty group into a smaller interval.
+``tcgen05_flat_grouped_codegen`` renders ``build_flat_tile_prefix_warp`` and
+``resolve_flat_nm_work`` into the flat grouped kernel; the plan records live in
+``tcgen05_flattened_prefix_plan``. This module installs no compiler admission
+of its own: unsupported static affine/layout domains retain the existing
+codegen. The dynamic span result distinguishes unsupported values from an
+empty group; it never clips a nonempty group into a smaller interval.
 """
 
 from __future__ import annotations
 
+from typing import cast
+
 import cutlass
 import cutlass.cute as cute
 
-from .tcgen05_grouped_prefix import load_layout_value
+
+@cute.jit
+def load_layout_value(
+    layout: cute.Tensor, group: cutlass.Int32
+) -> cutlass.Int32 | cutlass.Int64:
+    # The public wrapper builds an unswizzled rank-one layout for offsets.
+    offset_layout = cast("cute.Layout", layout.layout)
+    offset_stride = cast("tuple[cutlass.Int64, ...]", offset_layout.stride)[0]
+    return (
+        layout.iterator + cutlass.Int64(group) * cutlass.Int64(offset_stride)
+    ).load()
 
 
 @cute.jit

@@ -19,43 +19,38 @@ lowering hooks have been ordered explicitly.
 
 from __future__ import annotations
 
-import ast
 import dataclasses
-import textwrap
 from typing import TYPE_CHECKING
 from typing import cast
 
 import torch
 
 from ..compile_environment import CompileEnvironment
-from .fixed_token_rank1_recurrence import _is_direct_float_load
+from .analysis.rank1_recurrence import _ADD_TARGETS
+from .analysis.rank1_recurrence import _MUL_TARGETS
+from .analysis.rank1_recurrence import Rank1DecayMatch
+from .analysis.rank1_recurrence import Rank1UpdateMatch
+from .analysis.rank1_recurrence import _binary_pair
+from .analysis.rank1_recurrence import _cast_from
+from .analysis.rank1_recurrence import _has_unmatched_side_effect
+from .analysis.rank1_recurrence import _indices
+from .analysis.rank1_recurrence import _is_direct_float_load
+from .analysis.rank1_recurrence import _match_factored_output
+from .analysis.rank1_recurrence import _match_normalized_vector
+from .analysis.rank1_recurrence import _strip_casts
+from .analysis.rank1_recurrence import _strip_state_index_casts
+from .analysis.rank1_recurrence import match_rank1_step
 from .fixed_token_rank1_recurrence import _match_accepted_index
-from .fixed_token_rank1_recurrence import _match_normalized_vector
-from .fixed_token_rank1_recurrence import _matches_bias_index
-from .fixed_token_rank1_recurrence import _same_scalar
 from .fixed_token_rank1_recurrence import _tensor_shapes_match
 from .fx_matcher import _canonical_root_axis_ids
-from .fx_matcher import _GeneratedCodeTemplate
+from .fx_matcher import _is_call
 from .fx_matcher import _linear_offsets_fit_i32
-from .single_token_rank1_recurrence import _ADD_TARGETS
-from .single_token_rank1_recurrence import _MUL_TARGETS
+from .fx_matcher import _load_ref
+from .fx_matcher import _protected_arguments
+from .fx_matcher import _same_ref
+from .fx_matcher import _store_ref
+from .fx_matcher import _TensorRef
 from .single_token_rank1_recurrence import _RANK1_HELPER_ABI_VERSION
-from .single_token_rank1_recurrence import _binary_other
-from .single_token_rank1_recurrence import _binary_pair
-from .single_token_rank1_recurrence import _broadcast_source
-from .single_token_rank1_recurrence import _cast_from
-from .single_token_rank1_recurrence import _has_unmatched_side_effect
-from .single_token_rank1_recurrence import _indices
-from .single_token_rank1_recurrence import _is_call
-from .single_token_rank1_recurrence import _is_standard_key_iota
-from .single_token_rank1_recurrence import _load_ref
-from .single_token_rank1_recurrence import _match_factored_output
-from .single_token_rank1_recurrence import _same_ref
-from .single_token_rank1_recurrence import _store_ref
-from .single_token_rank1_recurrence import _strip_casts
-from .single_token_rank1_recurrence import _strip_state_index_casts
-from .single_token_rank1_recurrence import _sum_input
-from .single_token_rank1_recurrence import _TensorRef
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -104,42 +99,6 @@ class CuteSplitSingleTokenRank1Plan:
     state_stride0: int
     tile_rows: int = _VALUE_TILE
     threads: int = _THREADS
-
-
-@dataclasses.dataclass(frozen=True)
-class _MatchedT1Step:
-    state_update: torch.fx.Node
-    output_store: torch.fx.Node
-    state_store: torch.fx.Node
-    q_load: torch.fx.Node
-    k_load: torch.fx.Node
-    v_load: torch.fx.Node
-    gate_load: torch.fx.Node
-    beta_load: torch.fx.Node
-    a_log_load: torch.fx.Node
-    bias_load: torch.fx.Node
-    checkpoint_load: torch.fx.Node
-    token_coord: torch.fx.Node
-    head_coord: torch.fx.Node
-    value_coord: torch.fx.Node
-    key_coord: torch.fx.Node
-    scale: object
-    log2_e: object
-    epsilon: object
-    softplus_threshold: object
-
-    @property
-    def loads(self) -> set[torch.fx.Node]:
-        return {
-            self.q_load,
-            self.k_load,
-            self.v_load,
-            self.gate_load,
-            self.beta_load,
-            self.a_log_load,
-            self.bias_load,
-            self.checkpoint_load,
-        }
 
 
 def _scalar_value(value: object) -> object:
@@ -241,9 +200,7 @@ def _match_exp2_scaled(
     return None
 
 
-def _match_unbounded_decay(
-    node: torch.fx.Node,
-) -> tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node, object, object] | None:
+def _match_unbounded_decay(node: torch.fx.Node) -> Rank1DecayMatch | None:
     """Match the exact overflow-safe unbounded-softplus decay graph."""
 
     outer = _match_exp2_scaled(node)
@@ -325,12 +282,12 @@ def _match_unbounded_decay(
     if gate_pair is None:
         return None
     gate, bias = gate_pair
-    return (
+    return Rank1DecayMatch(
         gate,
         bias,
         a_log,
         _scalar_value(log2_e_node),
-        threshold,
+        softplus_threshold=threshold,
     )
 
 
@@ -350,9 +307,7 @@ def _match_beta_logit(node: object) -> torch.fx.Node | None:
 
 def _match_scaled_factored_projection(
     output_store: torch.fx.Node,
-    decayed: torch.fx.Node,
-    residual: torch.fx.Node,
-    key_broadcast: torch.fx.Node,
+    update: Rank1UpdateMatch,
 ) -> tuple[torch.fx.Node, object, object] | None:
     """Match the factored output graph and return Q load/scale/epsilon."""
 
@@ -368,9 +323,9 @@ def _match_scaled_factored_projection(
             continue
         normalized_query = _match_factored_output(
             factored,
-            decayed,
-            residual,
-            key_broadcast,
+            update.decayed,
+            update.residual,
+            update.key_broadcast,
         )
         if normalized_query is None:
             continue
@@ -383,233 +338,6 @@ def _match_scaled_factored_projection(
         if query_load is not None:
             return query_load, scale, epsilon
     return None
-
-
-def _match_t1_step(
-    state_store: torch.fx.Node,
-    output_store: torch.fx.Node,
-    incoming_state: torch.fx.Node,
-) -> _MatchedT1Step | None:
-    """Match the complete T1 update, projection, and both stores."""
-
-    stored_state = state_store.args[2] if len(state_store.args) > 2 else None
-    state_update = _strip_casts(stored_state)
-    update_pair = _binary_pair(state_update, _ADD_TARGETS)
-    if (
-        state_update is None
-        or update_pair is None
-        or not _cast_from(stored_state, state_update, torch.bfloat16)
-    ):
-        return None
-
-    decayed: torch.fx.Node | None = None
-    decay: torch.fx.Node | None = None
-    residual: torch.fx.Node | None = None
-    normalized_key: torch.fx.Node | None = None
-    key_broadcast: torch.fx.Node | None = None
-    for maybe_decayed, maybe_outer in (update_pair, reversed(update_pair)):
-        decay_broadcast = _binary_other(maybe_decayed, incoming_state, _MUL_TARGETS)
-        outer_pair = _binary_pair(maybe_outer, _MUL_TARGETS)
-        if decay_broadcast is None or outer_pair is None:
-            continue
-        maybe_decay = _broadcast_source(decay_broadcast, (None, slice(None)))
-        if maybe_decay is None:
-            continue
-        for residual_broadcast, maybe_key_broadcast in (
-            outer_pair,
-            reversed(outer_pair),
-        ):
-            maybe_residual = _broadcast_source(residual_broadcast, (slice(None), None))
-            maybe_key = _broadcast_source(maybe_key_broadcast, (None, slice(None)))
-            if maybe_residual is None or maybe_key is None:
-                continue
-            decayed = maybe_decayed
-            decay = maybe_decay
-            residual = maybe_residual
-            normalized_key = maybe_key
-            key_broadcast = maybe_key_broadcast
-            break
-        if decayed is not None:
-            break
-    if any(
-        value is None
-        for value in (decayed, decay, residual, normalized_key, key_broadcast)
-    ):
-        return None
-    assert decayed is not None
-    assert decay is not None
-    assert residual is not None
-    assert normalized_key is not None
-    assert key_broadcast is not None
-
-    residual_pair = _binary_pair(residual, _MUL_TARGETS)
-    if residual_pair is None:
-        return None
-    difference: torch.fx.Node | None = None
-    beta_load: torch.fx.Node | None = None
-    for maybe_difference, maybe_beta in (residual_pair, reversed(residual_pair)):
-        if (
-            maybe_difference.op == "call_function"
-            and maybe_difference.target is torch.ops.aten.sub.Tensor
-            and len(maybe_difference.args) == 2
-            and not maybe_difference.kwargs
-        ):
-            matched_beta = _match_beta_logit(maybe_beta)
-            if matched_beta is not None:
-                difference = maybe_difference
-                beta_load = matched_beta
-                break
-    if difference is None or beta_load is None:
-        return None
-    value_fp32, prediction = difference.args
-    if not isinstance(value_fp32, torch.fx.Node) or not isinstance(
-        prediction, torch.fx.Node
-    ):
-        return None
-    value_load = _is_direct_float_load(value_fp32)
-    prediction_product = _sum_input(prediction, (-1,))
-    prediction_pair = _binary_pair(prediction_product, _MUL_TARGETS)
-    if value_load is None or prediction_pair is None:
-        return None
-    if not any(
-        maybe_decayed is decayed
-        and _broadcast_source(maybe_key, (None, slice(None))) is normalized_key
-        for maybe_decayed, maybe_key in (prediction_pair, reversed(prediction_pair))
-    ):
-        return None
-
-    key_match = _match_normalized_vector(normalized_key)
-    if key_match is None:
-        return None
-    _, key_fp32, key_epsilon = key_match
-    key_load = _is_direct_float_load(key_fp32)
-    if key_load is None:
-        return None
-
-    decay_match = _match_unbounded_decay(decay)
-    if decay_match is None:
-        return None
-    gate_fp32, bias_value, a_log_value, log2_e, threshold = decay_match
-    gate_load = _is_direct_float_load(gate_fp32)
-    bias_load = _strip_casts(bias_value)
-    a_log_load = _strip_casts(a_log_value)
-    if (
-        gate_load is None
-        or not isinstance(bias_load, torch.fx.Node)
-        or not isinstance(a_log_load, torch.fx.Node)
-        or _load_ref(bias_load) is None
-        or _load_ref(a_log_load) is None
-        or bias_value is not bias_load
-        or a_log_value is not a_log_load
-    ):
-        return None
-
-    projection_match = _match_scaled_factored_projection(
-        output_store,
-        decayed,
-        residual,
-        key_broadcast,
-    )
-    if projection_match is None:
-        return None
-    query_load, scale, query_epsilon = projection_match
-    if not _same_scalar(query_epsilon, key_epsilon):
-        return None
-
-    state_indices = _indices(state_store)
-    output_indices = _indices(output_store)
-    query_indices = _indices(query_load)
-    key_indices = _indices(key_load)
-    value_indices = _indices(value_load)
-    gate_indices = _indices(gate_load)
-    beta_indices = _indices(beta_load)
-    a_log_indices = _indices(a_log_load)
-    bias_indices = _indices(bias_load)
-    all_indices = (
-        state_indices,
-        output_indices,
-        query_indices,
-        key_indices,
-        value_indices,
-        gate_indices,
-        beta_indices,
-        a_log_indices,
-        bias_indices,
-    )
-    if any(indices is None for indices in all_indices):
-        return None
-    assert state_indices is not None
-    assert output_indices is not None
-    assert query_indices is not None
-    assert key_indices is not None
-    assert value_indices is not None
-    assert gate_indices is not None
-    assert beta_indices is not None
-    assert a_log_indices is not None
-    assert bias_indices is not None
-    if (
-        len(state_indices) != 4
-        or len(output_indices) != 3
-        or len(query_indices) != 3
-        or len(key_indices) != 3
-        or len(value_indices) != 3
-        or len(gate_indices) != 3
-        or len(beta_indices) != 2
-        or len(a_log_indices) != 1
-        or len(bias_indices) != 1
-    ):
-        return None
-    token_coord, head_coord, value_coord = output_indices
-    if not all(
-        isinstance(coord, torch.fx.Node)
-        for coord in (token_coord, head_coord, value_coord)
-    ):
-        return None
-    assert isinstance(token_coord, torch.fx.Node)
-    assert isinstance(head_coord, torch.fx.Node)
-    assert isinstance(value_coord, torch.fx.Node)
-    key_coord = query_indices[2]
-    if not isinstance(key_coord, torch.fx.Node) or not _is_standard_key_iota(key_coord):
-        return None
-    if (
-        query_indices != (token_coord, head_coord, key_coord)
-        or key_indices != (token_coord, head_coord, key_coord)
-        or value_indices != (token_coord, head_coord, value_coord)
-        or gate_indices != (token_coord, head_coord, key_coord)
-        or beta_indices != (token_coord, head_coord)
-        or a_log_indices != (head_coord,)
-        or state_indices[1:] != (head_coord, value_coord, key_coord)
-        or not _matches_bias_index(bias_indices[0], head_coord, key_coord)
-    ):
-        return None
-    checkpoint_load = _strip_state_index_casts(state_indices[0])
-    if (
-        not isinstance(checkpoint_load, torch.fx.Node)
-        or _load_ref(checkpoint_load) is None
-    ):
-        return None
-
-    return _MatchedT1Step(
-        state_update=state_update,
-        output_store=output_store,
-        state_store=state_store,
-        q_load=query_load,
-        k_load=key_load,
-        v_load=value_load,
-        gate_load=gate_load,
-        beta_load=beta_load,
-        a_log_load=a_log_load,
-        bias_load=bias_load,
-        checkpoint_load=checkpoint_load,
-        token_coord=token_coord,
-        head_coord=head_coord,
-        value_coord=value_coord,
-        key_coord=key_coord,
-        scale=scale,
-        log2_e=log2_e,
-        epsilon=query_epsilon,
-        softplus_threshold=threshold,
-    )
 
 
 def _plan_split_single_token_rank1_recurrence(
@@ -706,7 +434,14 @@ def _plan_split_single_token_rank1_recurrence(
     if state_fp32 is None:
         return None
 
-    matched = _match_t1_step(state_stores[0], output_stores[0], state_fp32)
+    matched = match_rank1_step(
+        state_stores[0],
+        output_stores[0],
+        state_fp32,
+        beta=_match_beta_logit,
+        decay=_match_unbounded_decay,
+        projection=_match_scaled_factored_projection,
+    )
     if matched is None:
         return None
     if (
@@ -845,10 +580,6 @@ def plan_split_single_token_rank1_recurrence(
     return plan
 
 
-def _tensor_arg(cg: GenerateAST, ref: _TensorRef) -> str:
-    return cg.device_function.tensor_arg(ref.fake, prefer_name=ref.suggested_name).name
-
-
 def codegen_split_single_token_rank1_recurrence(
     cg: GenerateAST,
     plan: CuteSplitSingleTokenRank1Plan,
@@ -859,55 +590,31 @@ def codegen_split_single_token_rank1_recurrence(
     if root is None or root.graph_id != plan.root_graph_id:
         return False
     df = cg.device_function
-    q = _tensor_arg(cg, plan.q)
-    k = _tensor_arg(cg, plan.k)
-    v = _tensor_arg(cg, plan.v)
-    gate = _tensor_arg(cg, plan.gate)
-    beta = _tensor_arg(cg, plan.beta)
-    a_log = _tensor_arg(cg, plan.a_log)
-    bias = _tensor_arg(cg, plan.bias)
-    state_indices = _tensor_arg(cg, plan.state_indices)
-    accepted = _tensor_arg(cg, plan.num_accepted_tokens)
-    state = _tensor_arg(cg, plan.state)
-    output = _tensor_arg(cg, plan.output)
-    scale = df.literal_expr(plan.scale)
-    log2_e = df.literal_expr(plan.log2_e)
-    epsilon = df.literal_expr(plan.epsilon)
+    arguments = _protected_arguments(
+        cg,
+        "split_t1",
+        (
+            plan.q,
+            plan.k,
+            plan.v,
+            plan.gate,
+            plan.beta,
+            plan.a_log,
+            plan.bias,
+            plan.state_indices,
+            plan.num_accepted_tokens,
+            plan.state,
+            plan.output,
+        ),
+        (plan.scale, plan.log2_e, plan.epsilon),
+    )
+    q, k, v, gate, beta, a_log, bias, state_indices, accepted, state, output = (
+        arguments.tensors
+    )
+    scale, log2_e, epsilon = arguments.scalars
     threshold = _static_float(plan.softplus_threshold)
     if threshold is None:
         return False
-    placeholder_args = {
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        a_log,
-        bias,
-        state_indices,
-        accepted,
-        state,
-        output,
-    }
-    template = _GeneratedCodeTemplate(
-        "split_t1",
-        (*tuple(argument.name for argument in df.arguments), *cg._extra_params),
-        df.new_var,
-    )
-    q = template.protect(q)
-    k = template.protect(k)
-    v = template.protect(v)
-    gate = template.protect(gate)
-    beta = template.protect(beta)
-    a_log = template.protect(a_log)
-    bias = template.protect(bias)
-    state_indices = template.protect(state_indices)
-    accepted = template.protect(accepted)
-    state = template.protect(state)
-    output = template.protect(output)
-    scale = template.protect(scale)
-    log2_e = template.protect(log2_e)
-    epsilon = template.protect(epsilon)
 
     preamble = f"""
 split_t1_codegen_abi_version = {_SPLIT_T1_CODEGEN_ABI_VERSION}
@@ -1308,13 +1015,5 @@ for split_t1_row in cutlass.range_constexpr(8):
         cutlass.Int64({plan.state_size}),
     )
 """
-    df.preamble = cast(
-        "list[ast.AST]",
-        ast.parse(textwrap.dedent(template.render(preamble))).body,
-    )
-    df.body = cast(
-        "list[ast.AST]",
-        ast.parse(textwrap.dedent(template.render(body))).body,
-    )
-    df.placeholder_args.update(placeholder_args)
+    arguments.install(df, preamble, body)
     return True

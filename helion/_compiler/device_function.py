@@ -20,8 +20,6 @@ from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.graph import _Namespace
-from torch.utils._sympy.symbol import SymT
-from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
@@ -39,21 +37,12 @@ from .ast_read_writes import ast_rename
 from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import dead_lane_loop_elimination
+from .attribute_alias import AttributeAlias
 from .backend_registry import all_reserved_launch_param_names
 from .compile_environment import CompileEnvironment
-from .cute.device_state import CuteDeviceFunctionState
-from .cute.pdl_release import CUTE_PDL_RELEASE_DEFAULT
-from .cute.pdl_release import CUTE_PDL_SPREAD_KEY
-from .cute.pdl_release import DEFAULT_MAX_SMEM_PER_BLOCK
-from .cute.pdl_release import DEFAULT_RESIDENT_THREADS_PER_SM
-from .cute.pdl_release import DEFAULT_SMEM_PER_SM
-from .cute.pdl_release import SPREAD_KEEP_HELPER
-from .cute.pdl_release import SPREAD_PAD_NAME
-from .cute.pdl_release import resident_ctas_per_sm
-from .cute.pdl_release import spread_pad_bytes
-from .cute.tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
+from .lane_loop_context import LaneLoopContext
 from .output_header import reserved_names
 from .source_location import SyntheticLocation
 from .variable_origin import BlockSizeOrigin
@@ -64,11 +53,10 @@ from .variable_origin import TileBeginOrigin
 from .variable_origin import TileExtentOrigin
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from ..runtime.config import Config
     from .cross_loop_codegen import PeerState
     from .cute.bounded_cache_codegen import BoundedCacheRequest
+    from .cute.device_state import CuteDeviceFunctionState
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
@@ -113,8 +101,38 @@ def _exact_thread_block_dims(
             return None
         result = int(thread_dims[0]), int(thread_dims[1]), int(thread_dims[2])
         return result if all(dim > 0 for dim in result) else None
-    except Exception:
+    except (TypeError, ValueError):
+        # A sympy extent that is not an integer (``int()`` of a symbolic
+        # thread count); every other failure of the strategies surfaces.
         return None
+
+
+@dataclasses.dataclass
+class DeviceBodyContext:
+    """What ``Backend.finalize_device_body`` / ``finalize_kernel_def`` see.
+
+    The expressions ``DeviceFunction.codegen_function_def`` computed before
+    handing the rendered kernel body to the backend, passed through as they
+    are; the backend derives its frozen facts from them once per render
+    (the CuTe ``PassContext``).  ``args`` is the kernel signature at the
+    pre-rename hook; the hook returns the parameters it appends.
+    ``constexpr_values`` carries the pre-rename stage's result (the static
+    integer value of every constexpr name) to the post-rename stage, and
+    ``pass_context`` the backend's frozen facts (opaque to core).
+    ``body_start`` is the index of the first statement of the traced device
+    body; the statements before it are the argument preambles.
+    """
+
+    device_function: DeviceFunction
+    args: tuple[ast.arg, ...]
+    param_args: list[Argument]
+    sorted_arguments: list[Argument]
+    constexpr_to_inline: list[ConstExprArg]
+    wrapper_only_params: list[str]
+    bounded_cache_request: BoundedCacheRequest | None
+    constexpr_values: dict[str, int] = dataclasses.field(default_factory=dict)
+    pass_context: object | None = None
+    body_start: int = 0
 
 
 class VarInfo(NamedTuple):
@@ -278,117 +296,6 @@ class ScratchArg:
     shape_sources: tuple[tuple[torch.Tensor, int] | None, ...] | None = None
 
 
-def _resident_threads_per_sm(device: torch.device) -> int:
-    """The resident thread slots per SM of ``device`` (the hardware limit
-    ``_implicit_pdl_release`` sizes CTAs per SM against), queried from the
-    device when it is a live CUDA device and the sm_90+ default otherwise."""
-    if device.type == "cuda" and torch.cuda.is_available():
-        threads = getattr(
-            torch.cuda.get_device_properties(device),
-            "max_threads_per_multi_processor",
-            0,
-        )
-        if isinstance(threads, int) and threads > 0:
-            return threads
-    return DEFAULT_RESIDENT_THREADS_PER_SM
-
-
-def _smem_per_sm(device: torch.device) -> int:
-    """The shared memory of one SM of ``device`` (what ``cute_pdl_spread``
-    sizes its pad against), queried from the device when it is a live CUDA
-    device and the sm_90+ default otherwise."""
-    if device.type == "cuda" and torch.cuda.is_available():
-        capacity = getattr(
-            torch.cuda.get_device_properties(device),
-            "shared_memory_per_multiprocessor",
-            0,
-        )
-        if isinstance(capacity, int) and capacity > 0:
-            return capacity
-    return DEFAULT_SMEM_PER_SM
-
-
-def _max_smem_per_block(device: torch.device) -> int:
-    """The opt-in shared memory one block of ``device`` may allocate."""
-    if device.type == "cuda" and torch.cuda.is_available():
-        properties = torch.cuda.get_device_properties(device)
-        capacity = max(
-            int(getattr(properties, "shared_memory_per_block_optin", 0) or 0),
-            int(properties.shared_memory_per_block),
-        )
-        if capacity > 0:
-            return capacity
-    return DEFAULT_MAX_SMEM_PER_BLOCK
-
-
-# Element widths of the ``cutlass`` numeric types a generated body allocates
-# shared memory in (``cute.arch.alloc_smem(cutlass.<type>, count, ...)``).
-_CUTLASS_TYPE_BYTES: dict[str, int] = {
-    "cutlass.Int8": 1,
-    "cutlass.Uint8": 1,
-    "cutlass.Int16": 2,
-    "cutlass.Uint16": 2,
-    "cutlass.Float16": 2,
-    "cutlass.BFloat16": 2,
-    "cutlass.Int32": 4,
-    "cutlass.Uint32": 4,
-    "cutlass.Float32": 4,
-    "cutlass.TFloat32": 4,
-    "cutlass.Int64": 8,
-    "cutlass.Uint64": 8,
-    "cutlass.Float64": 8,
-}
-
-
-# Calls through which a body reserves shared memory the literal sum cannot
-# see: the DSL's ``SmemAllocator`` (its ``allocate`` / ``allocate_tensor`` /
-# ``allocate_array`` carve a struct or a layout's bytes out of the kernel's
-# allocation at trace time; the fa4 flash families and the tcgen05 GEMMs
-# hold their rings this way, at the per-block maximum already) and the
-# dynamic shared memory base.
-_OPAQUE_SMEM_CALLS = frozenset(
-    {
-        "SmemAllocator",
-        "allocate",
-        "allocate_tensor",
-        "allocate_array",
-        "get_dyn_smem",
-    }
-)
-
-
-def _literal_smem_bytes(statements: Sequence[ast.AST]) -> int | None:
-    """A lower bound of the shared memory ``statements`` allocate themselves:
-    the sum over their ``cute.arch.alloc_smem(<cutlass type>, <literal>, ...)``
-    calls (without alignment padding); ``None`` when a call's size or type is
-    not a literal the sum can account for, or when the body reserves shared
-    memory through a call the sum cannot see (``_OPAQUE_SMEM_CALLS``), so no
-    pad is sized against storage of unknown size."""
-    total = 0
-    for statement in statements:
-        for node in ast.walk(statement):
-            if not (
-                isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-            ):
-                continue
-            if node.func.attr in _OPAQUE_SMEM_CALLS:
-                return None
-            if ast.unparse(node.func) != "cute.arch.alloc_smem":
-                continue
-            if len(node.args) < 2:
-                return None
-            width = _CUTLASS_TYPE_BYTES.get(ast.unparse(node.args[0]))
-            count = node.args[1]
-            if (
-                width is None
-                or not isinstance(count, ast.Constant)
-                or type(count.value) is not int
-            ):
-                return None
-            total += width * count.value
-    return total
-
-
 def _is_literal_constexpr(arg: ConstExprArg) -> bool:
     """Check if a constexpr arg has a known literal value that can be inlined at module level."""
     host_str = arg.host_str()
@@ -432,6 +339,12 @@ def _selects_tma_access(config: Config) -> bool:
 
 
 class DeviceFunction:
+    # Lives on the CuTe device state (``CuteLaneState.matmul_running_sums``);
+    # the flat name is an alias for the readers that still use it.
+    cute_matmul_running_sums: AttributeAlias[set[str]] = AttributeAlias(
+        "cute_state.lanes.matmul_running_sums"
+    )
+
     def __init__(
         self,
         name: str,
@@ -469,10 +382,9 @@ class DeviceFunction:
         self.pid: ProgramIDs | None = None
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
-        if CompileEnvironment.current().backend.name == "cute":
-            # CuTe treats `_` as a write-only discard binding. Python host
-            # locals can still supply values through a renamed device argument.
-            self.namespace._used_names.add("_")
+        self.namespace._used_names.update(
+            CompileEnvironment.current().backend.reserved_device_names()
+        )
 
         self.namespace._used_names.update(all_reserved_launch_param_names())
         self.namespace._used_names.update(
@@ -482,12 +394,6 @@ class DeviceFunction:
         )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
-        # Names of matmul-fallback running-sum accumulators emitted as
-        # ``acc = acc + product`` inside a constexpr V-loop.  The
-        # ``hoist_warp_reduce`` pass reads this to reduce the FINAL value once
-        # (instead of building a per-lane V-fold, which would double-count the
-        # already-accumulated running sum).  See ``_emit_cute_matmul``.
-        self.cute_matmul_running_sums: set[str] = set()
         # Arg names referenced only by fusion placeholder strings
         # (<STORE_OUTPUT_*>, <LOAD_INPUT_*>), not by the AST body.
         # DCE would incorrectly strip them without this exemption.
@@ -499,19 +405,16 @@ class DeviceFunction:
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
-        self._cute_state = CuteDeviceFunctionState()
-        split_k = config.get(TCGEN05_SPLIT_K_CONFIG_KEY, 1)
-        if (
-            CompileEnvironment.current().backend_name == "cute"
-            and isinstance(split_k, int)
-            and split_k > 1
-        ):
-            # ``tcgen05_split_k``: the flat grid holds ``split_k`` CTAs per
-            # output tile (``block_idx // split_k`` is the tile's program id);
-            # the tcgen05 pipeline marks the config applied or the launch
-            # codegen rejects it (``codegen_function_call``).
-            self._cute_state.program_id_divisor = split_k
-            self._cute_state.launch_grid_multiplier = split_k
+        # The backend's per-device-function state (``Backend.new_device_state``);
+        # ``cute_state`` is the CuTe backend's typed view of it.
+        self.backend_state: object | None = (
+            CompileEnvironment.current().backend.new_device_state(config)
+        )
+        # The lane loop of each block a per-thread tile strategy or a
+        # vectorizable reduction strategy owns, keyed by block id
+        # (``lane_loop_context.py``); the strategy that opens the loop
+        # registers it (``register_lane``) and fills it in.
+        self.lane_contexts: dict[int, LaneLoopContext] = {}
 
         from .helper_function import HelperFunctionManager
 
@@ -873,7 +776,15 @@ class DeviceFunction:
 
     @property
     def cute_state(self) -> CuteDeviceFunctionState:
-        return self._cute_state
+        return cast("CuteDeviceFunctionState", self.backend_state)
+
+    def register_lane(
+        self, block_id: int, *, flat_multi: bool = False
+    ) -> LaneLoopContext:
+        """Open the lane-loop context of ``block_id`` for the strategy owning it."""
+        context = LaneLoopContext(block_id, flat_multi=flat_multi)
+        self.lane_contexts[block_id] = context
+        return context
 
     def set_pid(self, pid: ProgramIDs) -> None:
         if self.pid is not None:
@@ -896,7 +807,7 @@ class DeviceFunction:
         expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
-        if env.codegen_name in ("triton", "cute"):
+        if env.backend.lowers_integer_powers:
             from .integer_power import prepare_integer_powers
 
             # Expressions already evaluated on the host or in a device local
@@ -1441,75 +1352,6 @@ class DeviceFunction:
         )
         if function_decorator:
             decorators.append(expr_from_string(function_decorator))
-        cluster_sync: list[ast.stmt] = []
-        if getattr(self.cute_state, "simt_cluster_reduce_sites", 0) > 0:
-            # One fence + cluster barrier covering every cluster-reduce
-            # site's mbarrier init (emitted into the preamble above).
-            cluster_sync = [
-                statement_from_string("cute.arch.mbarrier_init_fence()"),
-                statement_from_string("cute.arch.cluster_arrive_relaxed()"),
-                statement_from_string("cute.arch.cluster_wait()"),
-            ]
-        dependent_launch: list[ast.stmt] = []
-        dependent_release: list[ast.stmt] = []
-        late_wait_names: set[str] = set()
-        late_wait_release: list[ast.stmt] = []
-        wait: ast.stmt | None = None
-        if self._cute_pdl_applies():
-            # Programmatic dependent launch (``cute_pdl``): the launch and
-            # this prologue overlap the previous kernel in the stream; wait
-            # for it before the first global memory access.  ``cute_pdl_release``
-            # places the release of this kernel's own dependents: ``entry``
-            # releases right after the wait so the dependents' CTAs become
-            # resident while this kernel runs (they hold SM slots while they
-            # wait: a one-wave kernel's gain, a multi-wave kernel's possible
-            # cost), ``exit`` releases after the body's last statement,
-            # ``none`` leaves it to the implicit trigger at grid completion,
-            # after which a dependent starts later than a plain stream edge
-            # would have launched it, ``last_wave`` releases at entry in the
-            # CTAs of the launch's last wave only (``_last_wave_release``),
-            # and ``auto`` (the default) picks ``entry`` while the grid fits
-            # in one wave and ``last_wave`` past it (``_implicit_pdl_release``).
-            # The dependents still wait for this grid's completion and memory
-            # flush at their own wait, so the placement never changes what
-            # they read.  A tcgen05 kernel on the entry-wait path
-            # (``cute_pdl_entry_wait``) gets only the wait here: its early
-            # release follows every wait of the body, this one included
-            # (``_tcgen05_early_pdl_release``, below).
-            with SyntheticLocation():
-                wait = statement_from_string("cute.arch.griddepcontrol_wait()")
-                dependent_launch = [wait]
-                # Behind the fill kernels of this kernel's own zero fills the
-                # wait may move down to the first statement that touches a
-                # filled tensor (``_place_late_pdl_wait``, on the lowered
-                # body): the fill kernel releases its dependents only after
-                # its own wait, so every earlier kernel of the stream has
-                # completed when this grid starts, and the fill's writes are
-                # confined to the filled tensors.  The operand loads and the
-                # K loop of a split-K kernel then overlap the fill instead of
-                # waiting for it.
-                late_wait_names = self._late_pdl_wait_names()
-                if late_wait_names:
-                    dependent_launch = []
-                placement = (
-                    "none"
-                    if self.cute_state.cute_pdl_entry_wait
-                    else self.config.config.get(
-                        "cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT
-                    )
-                )
-                if placement == "auto":
-                    placement = self._implicit_pdl_release("entry")
-                release = statement_from_string(
-                    "cute.arch.griddepcontrol_launch_dependents()"
-                )
-                if placement == "entry":
-                    dependent_launch.append(release)
-                elif placement == "exit":
-                    dependent_release = [release]
-                elif placement == "last_wave":
-                    dependent_launch.extend(self._last_wave_release(release))
-                late_wait_release = list(dependent_launch) if late_wait_names else []
         env = CompileEnvironment.current()
         if (
             self.triton_persistent_state_specs
@@ -1524,888 +1366,27 @@ class DeviceFunction:
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
-                *dependent_launch,
                 *[statement_from_string(pdl[op]) for op in env.pdl_entry],
                 *scalar_preamble,
                 *self.preamble,
-                *cluster_sync,
                 *self.body,
-                *dependent_release,
                 *[statement_from_string(pdl[op]) for op in env.pdl_exit],
             ],
         )
-        if self.cute_state.cute_pdl_entry_wait:
-            kernel_body = self._tcgen05_early_pdl_release(kernel_body)
-        constexpr_values: dict[str, int] = {}
-        if backend.name == "cute":
-            from .cute.fuse_two_pass_loads import fuse_two_pass_loads
-            from .cute.uniform_comparison import lower_uniform_comparisons
-
-            float_scalar_names = {
-                argument.name
-                for expression, argument in self._expr_args.items()
-                if isinstance(expression, sympy.Symbol)
-                and (
-                    symbol_is_type(expression, SymT.FLOAT)
-                    or symbol_is_type(expression, SymT.UNBACKED_FLOAT)
-                )
-            } | {
-                argument.name
-                for argument in self.arguments
-                if isinstance(argument, NumericArgument)
-                and isinstance(
-                    HostFunction.current().params.arguments.get(argument.host_str()),
-                    (float, torch.SymFloat),
-                )
-            }
-            kernel_body = lower_uniform_comparisons(
-                kernel_body, self, float_scalar_names=float_scalar_names
-            )
-
-            # Collect static integer values for constexpr names so the
-            # fusion pass can resolve range(..., step=cutlass.Int32(NAME))
-            # trip counts. Three sources: literal constexpr inlined args,
-            # host-side literal assignments to constexpr-named variables,
-            # and the inlined module-level constexpr decls.
-            constexpr_values = {}
-            for arg in constexpr_to_inline:
-                try:
-                    value = int(arg.host_str())
-                except (TypeError, ValueError):
-                    continue
-                constexpr_values[arg.name] = value
-            for stmt in self.codegen.host_statements:
-                if (
-                    isinstance(stmt, ast.Assign)
-                    and len(stmt.targets) == 1
-                    and isinstance(stmt.targets[0], ast.Name)
-                    and isinstance(stmt.value, ast.Constant)
-                    and isinstance(stmt.value.value, int)
-                ):
-                    constexpr_values[stmt.targets[0].id] = stmt.value.value
-            # Pass the per-axis thread dims so the fuser can size
-            # SMEM-backed caches correctly and build a per-thread
-            # linear slot index when ``cache_size`` exceeds the
-            # register-fragment threshold (opt-in via
-            # ``HELION_FUSER_MODE=smem``).
-            exact_thread_block_dims = _exact_thread_block_dims(self.tile_strategy)
-            thread_block_dims_are_exact = exact_thread_block_dims is not None
-            thread_block_dims = exact_thread_block_dims or (1, 1, 1)
-            # Best-effort map for the fuser's cache-dtype resolution;
-            # ``dtype_str`` raises for dtypes the cute backend has no
-            # canonical spelling for (e.g. uint32 barrier flags, which
-            # SIMT loads treat as raw bytes) — such tensors simply don't
-            # participate in load fusion.
-            tensor_dtypes = {}
-            for arg in self.arguments:
-                if isinstance(arg, TensorArg):
-                    try:
-                        tensor_dtypes[arg.name] = backend.dtype_str(
-                            arg.fake_value.dtype
-                        )
-                    except ValueError:
-                        continue
-            proven_disjoint_tensor_pairs = self.proven_disjoint_tensor_pairs()
-            from .cute.collective_matmul import lower_collective_matmul
-
-            kernel_body = lower_collective_matmul(
-                kernel_body,
-                self,
-                boundary_names={arg.name for arg in sorted_arguments},
-                disjoint_pairs=proven_disjoint_tensor_pairs,
-                rename_groups={k: v[0] for k, v in self._variable_renames.items()},
-            )
-            from .cute.simt_gemm import lower_simt_gemm
-
-            kernel_body = lower_simt_gemm(
-                kernel_body,
-                self,
-                rename_groups={k: v[0] for k, v in self._variable_renames.items()},
-            )
-            if any(
-                plan.get("kind") == "gathered_mma_tma"
-                for plan in self.codegen.cute_wrapper_plans
-            ):
-                # A proved late region may introduce TMA objects supplied by
-                # the wrapper and an explicit producer/consumer launch shape.
-                args.extend(
-                    create_arg(name)
-                    for name in self.wrapper_only_params
-                    if name not in wrapper_only_params
-                )
-                exact_thread_block_dims = thread_block_dims = (288, 1, 1)
-                thread_block_dims_are_exact = True
-            owned_block_dims = (
-                self.cute_state.collective_register_chain_block_dims
-                or self.cute_state.owned_root_block_dims
-            )
-            if owned_block_dims is not None:
-                exact_thread_block_dims = thread_block_dims = owned_block_dims
-                thread_block_dims_are_exact = True
-            # Autotuner-selected reload mode per rolled or persistent
-            # reduction dim ("auto" / "register" / "gmem").
-            env = CompileEnvironment.current()
-            reload_cfg = cast(
-                "list[str]",
-                self.config.config.get("cute_reduction_reloads", []) or [],
-            )
-            reload_modes = {
-                block_id: env.config_spec.cute_reduction_reloads.config_get(
-                    reload_cfg, block_id, "auto"
-                )
-                for block_id in env.config_spec.cute_reduction_reloads.valid_block_ids()
-            }
-            if bounded_cache_request is not None:
-                kernel_body = bounded_cache_request.prepare(
-                    kernel_body,
-                    self,
-                    param_args,
-                    constexpr_values,
-                    tensor_dtypes,
-                    proven_disjoint_tensor_pairs,
-                )
-                if bounded_cache_request.plan is not None:
-                    exact_thread_block_dims = bounded_cache_request.plan.launch_block
-                    thread_block_dims = exact_thread_block_dims
-                    thread_block_dims_are_exact = True
-            if exact_thread_block_dims is not None:
-                # The strategies' launch shape is final here: size the
-                # cross-warp shared reductions for the threads that launch
-                # instead of the 1024-thread budget they were emitted against.
-                # Declined when the body claimed a wider axis (a free
-                # ``hl.arange`` thread axis the launcher adds to ``block=``);
-                # the launcher checks the recorded shape against its launch.
-                from .cute.finalize_reduce_groups import (
-                    finalize_shared_reduce_groups_for_launch,
-                )
-
-                kernel_body, sized_for = finalize_shared_reduce_groups_for_launch(
-                    kernel_body,
-                    thread_block_dims=exact_thread_block_dims,
-                    claimed_axis_sizes=self.codegen.launch_thread_axis_sizes(),
-                )
-                if sized_for is not None:
-                    self.cute_state.shared_reduce_launch_block = sized_for
-                kernel_body = fuse_two_pass_loads(
-                    kernel_body,
-                    constexpr_values,
-                    thread_block_dims=exact_thread_block_dims,
-                    tensor_dtypes=tensor_dtypes,
-                    reload_modes=reload_modes,
-                    proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
-                    proven_tensor_stride_values=self.proven_tensor_stride_values(),
-                    dynamic_trip_counts=self.cute_state.dynamic_reduction_trips,
-                )
-            # Some exact persistent fragments have addresses defined only
-            # inside a runtime branch (for example a loaded state-slot index),
-            # so the normal root-wrapper hoist cannot legally reference them.
-            # Their lowering markers survive the reduction split and load
-            # fuser; place one vector transaction beside the earliest surviving
-            # constexpr sweep and erase every unhandled marker here.
-            from .cute.persistent_branch_vec import (
-                vectorize_branch_local_persistent_fragments,
-            )
-
-            kernel_body = vectorize_branch_local_persistent_fragments(
-                kernel_body,
-                proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
-                proven_tensor_stride_values=self.proven_tensor_stride_values(),
-            )
-            # Hoist warp reductions out of constexpr V-loops to collapse
-            # 4 per-V-lane warp reductions into 1 V-fold + 1 warp reduce.
-            # For online softmax style kernels this drops per-row reductions
-            # from ~396 to ~99 (4x fewer SHFL trees).
-            from .cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
-
-            # The collapse stage needs the post-rename canonical map to see
-            # through loop-carried alias vars (``v_1`` renaming to ``mi``).
-            rename_groups = {k: v[0] for k, v in self._variable_renames.items()}
-            kernel_body = hoist_warp_reduce_from_vloop(
-                kernel_body,
-                running_sum_accumulators=self.cute_matmul_running_sums,
-                rename_groups=rename_groups,
-                unfoldable_vec_lanes=self.cute_state.unfoldable_vec_lanes,
-            )
-            if self.cute_state.simt_cluster_n > 1:
-                from .cute.duplicate_reduction_carries import (
-                    eliminate_duplicate_cluster_maxima,
-                )
-
-                kernel_body = eliminate_duplicate_cluster_maxima(
-                    kernel_body, constexpr_values, rename_groups
-                )
-            from .cute.affine_vector_io import vectorize_affine_tile_lanes
-
-            if bounded_cache_request is not None:
-                kernel_body, private_fragments = bounded_cache_request.cache(
-                    kernel_body, constexpr_values, rename_groups
-                )
-                kernel_body = vectorize_affine_tile_lanes(
-                    kernel_body,
-                    self,
-                    constexpr_values,
-                    private_fragments=private_fragments,
-                )
-            else:
-                kernel_body = vectorize_affine_tile_lanes(
-                    kernel_body, self, constexpr_values
-                )
-            from .cute.literal_offset_loads import merge_literal_offset_loads
-
-            kernel_body = merge_literal_offset_loads(kernel_body, self)
-            # Replace a byte-by-byte fp4 x fp4 decode-multiply-add chain over
-            # two merged 8-byte vectors with the exact f16x2 group dot
-            # (``quantized_helpers.float4_e2m1fn_x16_dot_float32``).
-            from .cute.fuse_fp4_pair_dot import fuse_fp4_pair_dot
-
-            kernel_body = fuse_fp4_pair_dot(kernel_body)
-            # Merge adjacent constexpr V-loops that share an identical
-            # statement prefix.  Caches the last common per-V-lane value
-            # into a register fragment so V-loop 2's bitcast/cast chain
-            # disappears and the SASS scheduler can issue V-loop 2's
-            # arithmetic without waiting for V-loop 1's results.
-            from .cute.merge_sibling_v_loops import merge_sibling_v_loops
-
-            kernel_body = merge_sibling_v_loops(kernel_body)
-            from .cute.vector_reduction_packets import optimize_vector_reductions
-
-            kernel_body = optimize_vector_reductions(
-                kernel_body,
-                constexpr_values,
-                thread_block_dims=exact_thread_block_dims,
-                independent_accumulators=self.config.get(
-                    "cute_independent_reduction", False
-                )
-                is True,
-                replicated_single_use=self.config.get(
-                    "cute_replicated_reduction", False
-                )
-                is True,
-                unroll_packets=self.config.get("cute_vector_packet_unroll", False)
-                is True,
-            )
-            # A persistent row tile may repeat a row-invariant Q/K norm (and
-            # its warp reduction) once for every compile-time row lane.  Wide
-            # row tiles are useful only if that setup is shared.  Unswitch a
-            # proven-uniform terminal guard and move complete, pure invariant
-            # reduction slices before the row loop.  Runtime storage facts are
-            # required before a load may cross any loop write.
-            from .cute.hoist_lane_invariant_reductions import (
-                hoist_lane_invariant_reductions,
-            )
-
-            kernel_body = hoist_lane_invariant_reductions(
-                kernel_body,
-                tensor_names=set(tensor_dtypes),
-                tensor_dtypes=tensor_dtypes,
-                proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
-                rename_groups=rename_groups,
-                uniform_names={arg.arg for arg in args},
-                float_scalar_names=float_scalar_names,
-                thread_block_dims=exact_thread_block_dims,
-            )
-            if CompileEnvironment.current().settings.fast_math:
-                from .cute.factor_affine_reductions import hoist_factored_reductions
-
-                kernel_body = hoist_factored_reductions(
-                    kernel_body,
-                    fast_math=True,
-                )
-            # Fuse adjacent per-lane fp8 decodes in the SIMT matmul V-loop
-            # into one ``cvt.rn.f16x2.e4m3x2`` (decode 2 e4m3 bytes per
-            # instruction) — halves the decode instruction count on the
-            # skinny-M fp8 GEMV path.
-            from .cute.fuse_fp8_pair_decode import fuse_fp8_pair_decode
-
-            kernel_body = fuse_fp8_pair_decode(kernel_body)
-            # Under fast_math, hoist loop-invariant floating-point
-            # divisions out of inner tile loops, replacing each
-            # ``x / scalar`` with a hoisted ``inv = 1.0 / scalar`` +
-            # ``x * inv`` in the loop body.  B200 div is ~22 cycles vs ~2
-            # for multiply, so the softmax consume sweep (~12672 divides
-            # per row) sees a measured +20% bench gain on (4096, 12672)
-            # fp16.  The rewrite rounds differently and fires only in the
-            # loops a config creates, so it needs the setting.
-            from .cute.hoist_loop_invariant_recip import hoist_loop_invariant_recips
-
-            # Pass the post-renames map so the invariance analysis can
-            # treat ``v_1_0`` (which will be renamed to ``mi`` by
-            # ast_rename below) as an assignment to ``mi`` for the
-            # purpose of LICM.  Without this the FMA hoist would
-            # mistakenly classify ``mi`` as loop-invariant in the reduce
-            # loop and capture its stale initial value.
-            rename_groups = {k: v[0] for k, v in self._variable_renames.items()}
-            kernel_body = hoist_loop_invariant_recips(
-                kernel_body,
-                rename_groups=rename_groups,
-                fast_math=CompileEnvironment.current().settings.fast_math,
-            )
-            # Contract single-use fp32 ``t = a*b; w = t + c`` chains into
-            # ``cute.math.fma`` (the DSL's arith ops carry no contract
-            # flag, so NVVM won't fuse them itself).  Triton contracts by
-            # default, so this brings cute numerics closer to the triton
-            # backend.
-            from .cute.fuse_fma import fuse_fma
-
-            # Skipped for matmul kernels: tcgen05 scheduling passes pin
-            # exact statement sequences, and the MMA path gains nothing
-            # from contracting stray scalar epilogue math.
-            if not env.config_spec.matmul_facts:
-                kernel_body = fuse_fma(kernel_body, rename_groups=rename_groups)
-            # Issue all of a grid lane loop's vec loads before its first
-            # store (ptxas cannot prove the store doesn't alias the next
-            # iteration's load, so unsplit loops keep only ONE load in
-            # flight per thread; the triton backend and handwritten CuTe
-            # kernels both load the whole tile fragment first).
-            # ``cute_lane_unroll`` without vector-loop sinking, or with a sunk
-            # nest whose lane loops the sinking pass left rolled (their loads
-            # were persistent markers, now packets): unroll the lane loops (of
-            # the grid or of a device loop) at trace time with every unrolled
-            # lane's loads (packets and scalars alike) issued before the first
-            # lane's compute.  The knob-off code is regenerated when no loop
-            # takes the unroll.
-            # ``cute_dot_fragment_mma``: a GEMV's scalar dot fallback (16-bit
-            # packets, fp32 per-element FMAs, a grouped shuffle sum over the
-            # K threads) on an (8, 4, 1) thread block runs on ``mma.sync``
-            # fragments instead (``cute/fragment_mma_dot.py``); the lane
-            # unroll below then hoists the fragment packets like any other
-            # packet loads.  The knob-off code is regenerated when no dot
-            # takes the rewrite.
-            from .cute.fragment_mma_dot import FRAGMENT_MMA_KEY
-
-            # ``cute_dot_ring_mma``: the same GEMV dot on a ``(T, 1, 1)`` block
-            # streams the row tile through a cp.async ring in shared memory
-            # and multiplies on ``mma.sync`` fragments (``cute/ring_mma_dot.py``).
-            from .cute.ring_mma_dot import RING_MMA_KEY
-            from .cute.split_lane_loads import split_lane_loads
-            from .cute.unroll_lane_loads import LaneUnrollNotApplied
-            from .cute.unroll_lane_loads import unroll_lane_loads
-
-            if self.config.config.get(RING_MMA_KEY) is True:
-                from .cute.memory_ops import cute_tensor_base_is_aligned
-                from .cute.ring_mma_dot import RING_DEFAULT_SPLIT
-                from .cute.ring_mma_dot import RING_DEFAULT_STAGES
-                from .cute.ring_mma_dot import RING_SPLIT_KEY
-                from .cute.ring_mma_dot import RING_STAGES_KEY
-                from .cute.ring_mma_dot import RingMmaNotApplied
-                from .cute.ring_mma_dot import ring_mma_dot
-                from .cute.ring_mma_dot import ring_mma_smem_budget
-
-                ring_fact = env.config_spec._cute_fragment_mma_fact()
-                ring_rows: object = None
-                ring_chunk: object = None
-                ring_k_var: str | None = None
-                if (
-                    ring_fact is not None
-                    and ring_fact.m_block_id is not None
-                    and ring_fact.k_block_id is not None
-                ):
-                    ring_rows = env.block_sizes[ring_fact.m_block_id].from_config(
-                        self.config
-                    )
-                    ring_chunk = env.block_sizes[ring_fact.k_block_id].from_config(
-                        self.config
-                    )
-                    # A cache read only: ``block_size_var`` would lift a new
-                    # constexpr argument after the host call was emitted.
-                    ring_k_var = self.block_size_var_cache.get((ring_fact.k_block_id,))
-                kernel_body, ring_fired = ring_mma_dot(
-                    kernel_body,
-                    thread_block_dims=exact_thread_block_dims,
-                    rows=ring_rows if isinstance(ring_rows, int) else None,
-                    chunk=ring_chunk if isinstance(ring_chunk, int) else None,
-                    stages=cast(
-                        "int",
-                        self.config.config.get(RING_STAGES_KEY, RING_DEFAULT_STAGES),
-                    ),
-                    split=cast(
-                        "str",
-                        self.config.config.get(RING_SPLIT_KEY, RING_DEFAULT_SPLIT),
-                    ),
-                    k_block_var=ring_k_var,
-                    tensors={
-                        arg.name: arg.fake_value
-                        for arg in self.arguments
-                        if isinstance(arg, TensorArg)
-                    },
-                    aligned={
-                        arg.name
-                        for arg in self.arguments
-                        if isinstance(arg, TensorArg)
-                        and cute_tensor_base_is_aligned(env, arg.fake_value, 16)
-                    },
-                    new_var=lambda name: self.new_var(name, dce=False),
-                    rename_groups={k: v[0] for k, v in self._variable_renames.items()},
-                    smem_budget=ring_mma_smem_budget(env.device),
-                )
-                if not ring_fired:
-                    raise RingMmaNotApplied
-            if self.config.config.get(FRAGMENT_MMA_KEY) is True:
-                from .cute.fragment_mma_dot import FragmentMmaNotApplied
-                from .cute.fragment_mma_dot import fragment_mma_dot
-
-                kernel_body, fragment_fired = fragment_mma_dot(
-                    kernel_body,
-                    thread_block_dims=exact_thread_block_dims,
-                    new_var=lambda name: self.new_var(name, dce=False),
-                )
-                if not fragment_fired:
-                    raise FragmentMmaNotApplied
-            lane_unroll = cast("int", self.config.config.get("cute_lane_unroll", 1))
-            sinking = bool(self.config.config.get("cute_vloop_sink"))
-            knob_unroll = (
-                lane_unroll
-                if lane_unroll > 1
-                and not (sinking and self.cute_state.vloop_sink_unrolled)
-                else 1
-            )
-            # The vectorized lane loops of a reduced block whose per-lane
-            # cross-thread reductions are still inside them unroll completely
-            # whatever the knob says, and those reductions are folded across
-            # the trace-time lanes below.  A lane loop an earlier pass already
-            # reduces once after (the combine moved out of it) keeps its code.
-            from .cute.fold_lane_reductions import fold_lane_reductions
-            from .cute.fold_lane_reductions import lanes_with_sites
-
-            fold_sites = self.cute_state.lane_fold_reduce_sites
-            folded_lanes = lanes_with_sites(kernel_body, fold_sites)
-            if knob_unroll > 1 or folded_lanes:
-                kernel_body, unrolled = unroll_lane_loads(
-                    kernel_body,
-                    knob_unroll,
-                    lambda name: self.new_var(name, dce=False),
-                    forced_full=folded_lanes,
-                )
-                # With sinking the knob belongs to the sunk nest's lane loops
-                # (``_normalize_cute_vloop_sink``); a nest that offers none
-                # keeps its code rather than regenerating knob-off.
-                if knob_unroll > 1 and not unrolled and not sinking:
-                    raise LaneUnrollNotApplied
-            if folded_lanes:
-                kernel_body = fold_lane_reductions(
-                    kernel_body,
-                    {
-                        lane: keys
-                        for lane, keys in fold_sites.items()
-                        if lane in folded_lanes
-                    },
-                    lambda name: self.new_var(name, dce=False),
-                )
-            kernel_body = split_lane_loads(kernel_body)
-            # Preserve the global FMA decisions above. This optional pass
-            # moves only raw packet loads/cache writes across a proven
-            # single-trip reduction; arithmetic and PDL waits stay in place.
-            if exact_thread_block_dims is not None:
-                from .cute.prefetch_reduction_packets import prefetch_reduction_packets
-
-                kernel_body = prefetch_reduction_packets(
-                    kernel_body,
-                    constexpr_values=constexpr_values,
-                    thread_block_dims=exact_thread_block_dims,
-                    tensor_dtypes=tensor_dtypes,
-                    reload_modes=reload_modes,
-                    argument_names={arg.name for arg in self.arguments},
-                    proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
-                )
-            # P18: software-pipeline the per-iteration vec load by one
-            # stage.  Pre-issue iter 0's load above the loop and, inside
-            # the body, issue iter N+1's load BEFORE iter N's compute
-            # runs.  The B200 SASS scheduler can then keep multiple
-            # ld.global instructions in flight, hiding HBM round-trip
-            # latency on softmax/online-reduction inner loops where the
-            # ``load -> compute(mi, di) -> next iter`` sequential
-            # dependency chain dominates the per-iter stall budget.
-            from .cute.pipeline_inner_loads import pipeline_inner_loads
-
-            # Pass the post-rename canonical map so the loop-carried-write
-            # gate can correctly identify writes whose pre-rename target
-            # is an alias (e.g. ``v_1_0 = v_1`` will be renamed to
-            # ``mi = v_1``).  Without this, the gate would mis-classify
-            # the softmax reduce sweep as having no loop-carried write
-            # and incorrectly skip pipelining.
-            kernel_body = pipeline_inner_loads(
-                kernel_body,
-                constexpr_values,
-                rename_groups=rename_groups,
-                dynamic_trip_counts=self.cute_state.dynamic_reduction_trips,
-            )
-            # For an exact in-place vector state-update pattern, optionally
-            # stage future rows through a private-per-thread cp.async ring.
-            # The AST matcher proves the row/column coverage, exact load/store
-            # address equality, and consumes cache-keyed runtime alias/stride
-            # facts before it changes any code.
-            from .program_id import XYZProgramIDs
-
-            xyz_pid = (
-                self.pid
-                if isinstance(self.pid, XYZProgramIDs)
-                and self.cute_state.simt_cluster_n == 1
-                and len(self.pid.pid_info) <= 3
-                else None
-            )
-            xyz_grid = xyz_pid is not None
-            proven_tensor_size_values = self.proven_tensor_size_values()
-            exact_grid_extent_values: dict[sympy.Expr, int] = {}
-            ambiguous_grid_extent_expressions: set[sympy.Expr] = set()
-            if (
-                xyz_grid
-                and "input_tensor_metadata" in env.compiler_fact_specialization_facts
-            ):
-                for argument in self.arguments:
-                    if not isinstance(argument, TensorArg) or isinstance(
-                        argument, TensorDescriptorArg
-                    ):
-                        continue
-                    fake_tensor = argument.fake_value
-                    if env.tensor_input_source(fake_tensor) is None:
-                        continue
-                    runtime_tensor = env.runtime_value_for_tensor(fake_tensor)
-                    if not isinstance(runtime_tensor, torch.Tensor) or isinstance(
-                        runtime_tensor, FakeTensor
-                    ):
-                        continue
-                    for dimension, size in enumerate(fake_tensor.shape):
-                        if isinstance(size, int):
-                            continue
-                        try:
-                            expression = env.shape_env.replace(size._sympy_())
-                            value = int(runtime_tensor.size(dimension))
-                            if value != int(env.size_hint(size)):
-                                continue
-                        except (RuntimeError, TypeError, ValueError):
-                            continue
-                        previous = exact_grid_extent_values.get(expression)
-                        if previous is not None and previous != value:
-                            ambiguous_grid_extent_expressions.add(expression)
-                            exact_grid_extent_values.pop(expression, None)
-                        elif expression not in ambiguous_grid_extent_expressions:
-                            exact_grid_extent_values[expression] = value
-            block_grid_dims: list[int | None] = [None, None, None]
-            if xyz_pid is not None:
-                for axis, pid_info in enumerate(xyz_pid.pid_info):
-                    numel = pid_info.numel
-                    if isinstance(numel, (int, sympy.Integer)):
-                        extent = int(numel)
-                    elif isinstance(numel, sympy.Expr):
-                        try:
-                            normalized_numel = env.shape_env.replace(numel)
-                        except (RuntimeError, TypeError, ValueError):
-                            continue
-                        if normalized_numel not in exact_grid_extent_values:
-                            continue
-                        extent = exact_grid_extent_values[normalized_numel]
-                    else:
-                        continue
-                    try:
-                        block_size = int(pid_info.block_size_var)
-                    except (TypeError, ValueError):
-                        block_size = constexpr_values.get(pid_info.block_size_var, 0)
-                    if block_size > 0 and extent >= 0:
-                        block_grid_dims[axis] = (extent + block_size - 1) // block_size
-                for axis in range(len(xyz_pid.pid_info), 3):
-                    block_grid_dims[axis] = 1
-            async_load_stages = cast(
-                "int", self.config.config.get("cute_async_load_stages", 0)
-            )
-            if async_load_stages and exact_thread_block_dims is not None:
-                from .cute.memory_ops import runtime_tensor_has_specialized_alignment
-                from .cute.pipeline_state_loads import TensorMetadata
-                from .cute.pipeline_state_loads import pipeline_state_loads
-
-                tensor_metadata: dict[str, TensorMetadata] = {}
-                tensor_names = frozenset(
-                    arg.name for arg in self.arguments if isinstance(arg, TensorArg)
-                )
-                for arg in self.arguments:
-                    if not isinstance(arg, TensorArg):
-                        continue
-                    try:
-                        shape = tuple(
-                            env.size_hint(dim) for dim in arg.fake_value.shape
-                        )
-                    except (RuntimeError, TypeError, ValueError):
-                        continue
-                    tensor_metadata[arg.name] = TensorMetadata(
-                        tensor_dtypes.get(arg.name, ""), shape
-                    )
-                kernel_body = pipeline_state_loads(
-                    kernel_body,
-                    stages=async_load_stages,
-                    lookahead=cast(
-                        "int", self.config.config.get("cute_async_load_lookahead", 4)
-                    ),
-                    group_rows=cast(
-                        "int", self.config.config.get("cute_async_load_group_rows", 2)
-                    ),
-                    cache_policy=cast(
-                        "str", self.config.config.get("cute_async_load_cache", "cg")
-                    ),
-                    store_policy=cast(
-                        "str",
-                        self.config.config.get("cute_async_store_policy", "default"),
-                    ),
-                    thread_block_dims=exact_thread_block_dims,
-                    tensor_metadata=tensor_metadata,
-                    tensor_names=tensor_names,
-                    proven_tensor_base_alignments=frozenset(
-                        arg.name
-                        for arg in self.arguments
-                        if isinstance(arg, TensorArg)
-                        and runtime_tensor_has_specialized_alignment(
-                            env, arg.fake_value, 4
-                        )
-                    ),
-                    proven_tensor_size_values=proven_tensor_size_values,
-                    proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
-                    proven_tensor_stride_values=self.proven_tensor_stride_values(),
-                    block_grid_dims=cast(
-                        "tuple[int | None, int | None, int | None]",
-                        tuple(block_grid_dims),
-                    ),
-                    constexpr_values=constexpr_values,
-                    uniform_names=frozenset(
-                        arg.name
-                        for arg in param_args
-                        if isinstance(arg, (NumericArgument, TensorPropertyArg))
-                    )
-                    | frozenset(constexpr_values),
-                    target_device_capability=(env.config_spec.target_device_capability),
-                )
-            # Pair eligible fp32 constexpr-loop lanes only after state-load
-            # pipelining has recognized and staged the original scalar update
-            # loop.  Packing first obscures that matcher and forfeits cp.async.
-            from .cute.factor_affine_reductions import hoist_packed_factored_reductions
-            from .cute.factor_affine_reductions import pack_fp32_constexpr_loops
-
-            kernel_body = pack_fp32_constexpr_loops(
-                kernel_body,
-                fast_math=CompileEnvironment.current().settings.fast_math,
-                target_device_capability=(
-                    CompileEnvironment.current().config_spec.target_device_capability
-                ),
-                float_scalar_names=float_scalar_names,
-            )
-            kernel_body = hoist_packed_factored_reductions(
-                kernel_body,
-                fast_math=CompileEnvironment.current().settings.fast_math,
-                rename_groups=rename_groups,
-            )
-            # Once the async state pass has proved a private aligned BF16
-            # recurrence, an opt-in late transform can retain the state and
-            # both reductions as native BF16x2 words.  Running after the
-            # generic fp32 pair/LICM passes gives the matcher the complete
-            # recurrence graph while keeping all earlier passes reusable.
-            from .cute.pack_bf16_recurrence import pack_bf16_recurrences
-
-            kernel_body = pack_bf16_recurrences(
-                kernel_body,
-                enabled=cast(
-                    "bool",
-                    self.config.config.get("cute_bf16x2_recurrence", False),
-                ),
-                fast_math=CompileEnvironment.current().settings.fast_math,
-                target_device_capability=(
-                    CompileEnvironment.current().config_spec.target_device_capability
-                ),
-                uniform_names=frozenset(arg.arg for arg in args)
-                | frozenset(constexpr_values),
-                thread_block_dims=exact_thread_block_dims,
-            )
-            from .cute.proven_loop_bounds import exact_static_grid
-            from .cute.proven_loop_bounds import simplify_proven_loop_bounds
-            from .cute.simplify_proven_bounds import simplify_proven_bounds
-            from .program_id import CuteProgramIDs
-            from .program_id import FlatProgramIDs
-
-            # Ordinary collective launches use the PID strategy's grid
-            # unchanged. Other launch schedulers retain architectural bounds.
-            collective_grid = None
-            if (
-                self.pid is not None
-                and type(self.pid) in (FlatProgramIDs, CuteProgramIDs, XYZProgramIDs)
-                and self.cute_state.simt_cluster_n == 1
-                and self.cute_state.collective_mma_sites
-                and not self.codegen.cute_wrapper_plans
-            ):
-                collective_grid = exact_static_grid(
-                    self.pid.codegen_grid(), constexpr_values
-                )
-            kernel_body = simplify_proven_loop_bounds(
-                kernel_body,
-                enabled=bool(self.config.config.get("cute_proven_bounds", False)),
-                thread_block_dims=exact_thread_block_dims,
-                constexpr_values=constexpr_values,
-                block_grid_dims=collective_grid,
-            )
-
-            kernel_body = simplify_proven_bounds(
-                kernel_body,
-                enabled=cast(
-                    "bool",
-                    self.config.config.get("cute_proven_bounds", False),
-                )
-                and thread_block_dims_are_exact,
-                xyz_grid=xyz_grid,
-                thread_block_dims=thread_block_dims,
-                block_grid_dims=cast(
-                    "tuple[int | None, int | None, int | None]",
-                    tuple(block_grid_dims),
-                ),
-                constexpr_values=constexpr_values,
-                proven_tensor_size_values=proven_tensor_size_values,
-            )
-            # Fuse an online-softmax (max, sum) pair of cluster reduces into
-            # ONE packed DSM exchange: the max reduce relocalizes to a
-            # CTA-local block reduce, and the sum site exchanges the
-            # ``(local_max, local_sum)`` pair once and folds with the
-            # online-softmax rescale.  Under fast_math the write sweep also
-            # reuses the sum sweep's cached exp values; otherwise it keeps
-            # computing them exactly.  Saves a full cluster round-trip per
-            # row (+5..9% at cluster_n 2..16 on B200 softmax).
-            from .cute.cluster_online_pair import fuse_cluster_online_pair
-
-            kernel_body = fuse_cluster_online_pair(
-                kernel_body,
-                constexpr_values,
-                rename_groups=rename_groups,
-                fast_math=CompileEnvironment.current().settings.fast_math,
-            )
-            if self.config.get("cute_register_row", False):
-                from .cute.register_row_reduction import lower_register_row_reduction
-
-                if self.config.get("cute_register_row_tensor_copy", False):
-                    from .cute.register_row_tensor_copy import (
-                        context_from_device_function,
-                    )
-
-                    kernel_body = lower_register_row_reduction(
-                        kernel_body,
-                        constexpr_values,
-                        tensor_copy_context=context_from_device_function(
-                            self,
-                            exact_thread_block_dims or (0, 0, 0),
-                            tensor_dtypes,
-                        ),
-                    )
-                else:
-                    kernel_body = lower_register_row_reduction(
-                        kernel_body, constexpr_values
-                    )
-            # The rolled (``reduction_loops``) form's online pair: tried after
-            # the register-row lowering, which consumes the cluster sites when
-            # it fires, so the knob is honoured whatever ``cute_register_row``
-            # says.  Under fast_math the CTA-level pair caches sweep B's
-            # exponentials for the write sweep; otherwise the exact warp pair.
-            if self.config.get("cute_cluster_warp_online", False):
-                from .cute.rolled_cluster_online_pair import (
-                    fuse_rolled_cluster_online_pair,
-                )
-
-                kernel_body = fuse_rolled_cluster_online_pair(
-                    kernel_body,
-                    constexpr_values,
-                    rename_groups=rename_groups,
-                    fast_math=CompileEnvironment.current().settings.fast_math,
-                )
-            if self.config.get("cute_independent_reduction", False):
-                from .cute.rolled_vector_reduction import split_rolled_vector_sums
-
-                kernel_body = split_rolled_vector_sums(kernel_body)
-            # ``ex2.approx.ftz`` is a numerics change (denormal exp outputs
-            # flush to zero), so it is gated on the fast_math SETTING —
-            # tuned configs must never change numerics.
-            if CompileEnvironment.current().settings.fast_math:
-                from .cute.exp2_fastmath import apply_exp2_fastmath
-
-                kernel_body = apply_exp2_fastmath(kernel_body)
-            # The DSM cluster reduce uses a single-phase mbarrier, so each
-            # call site must execute exactly ONCE per kernel.  The
-            # lane-reduce collapse normally hoists it out of the (staged,
-            # multi-trip) lane loop; when the collapse bails for a config,
-            # the call would run once per lane iteration and DEADLOCK in
-            # ``mbarrier_wait`` (an unkillable kernel that wedges the
-            # autotuner's benchmark worker).  Reject such configs loudly so
-            # the autotuner skips them.
-            from .cute.hoist_warp_reduce import validate_cluster_reduce_placement
-
-            validate_cluster_reduce_placement(kernel_body, constexpr_values)
-            if bounded_cache_request is not None:
-                kernel_body = bounded_cache_request.finalize(kernel_body)
-            from .cute.full_tile_bounds import lower_full_tile_bounds
-
-            kernel_body = lower_full_tile_bounds(
-                kernel_body, self, param_args, constexpr_values, rename_groups
-            )
-            if self.config.get("cute_warp_fp32_redux", False):
-                from .cute.native_warp_reduction import enable_fp32_warp_redux
-
-                kernel_body = enable_fp32_warp_redux(kernel_body)
-            if self.config.get("cute_scalar_epilogue", False):
-                from .cute.scalar_epilogue import lower_scalar_epilogue
-
-                kernel_body = lower_scalar_epilogue(
-                    kernel_body,
-                    self,
-                    constexpr_values,
-                    thread_block_dims,
-                    proven_disjoint_tensor_pairs,
-                )
-            if self.config.get("cute_rng_packet", False):
-                from .cute.philox_packets import lower_philox_packets
-
-                kernel_body = lower_philox_packets(
-                    kernel_body,
-                    seed_exprs=self.cute_state.explicit_rng_seed_exprs,
-                    integer_names=set(constexpr_values),
-                    new_name=self.unique_name,
-                    vectorize_packet=lambda loop, read, known: (
-                        vectorize_affine_tile_lanes(
-                            [loop],
-                            self,
-                            constexpr_values,
-                            register_accesses=frozenset(
-                                {ast.dump(read, include_attributes=False)}
-                            ),
-                            integer_names=known,
-                        )
-                    ),
-                )
-            # Without fast_math, hoist the divisor-only work of an fp32
-            # ``x / d`` with a loop-invariant divisor as the Markstein
-            # sequence, speculated over the loop and redone with div.rn
-            # when a dividend left the admitted window: the IEEE quotient
-            # bit for bit (exact_division.py), at three FMA-pipe
-            # instructions and two FMNMX per element.  Last among the
-            # structural passes: the sweep matchers above (independent
-            # partial accumulators, pipelined and packed loads, the cluster
-            # pairs, the scalar epilogue) recognize the plain ``v = x / d``
-            # sweeps, so the redo render keeps the plain render's structure
-            # and summation order.  ``cute_exact_div_form="plain"`` keeps
-            # the plain division.  Not for matmul kernels, whose tcgen05
-            # scheduling passes pin exact statement sequences (as fuse_fma).
-            if (
-                CompileEnvironment.current().settings.cute_exact_division
-                and not CompileEnvironment.current().settings.fast_math
-                and self.config.cute_exact_div_form == "redo"
-                and not env.config_spec.matmul_facts
-            ):
-                from .cute.hoist_loop_invariant_recip import (
-                    hoist_exact_invariant_divisions,
-                )
-
-                kernel_body = hoist_exact_invariant_divisions(
-                    kernel_body,
-                    rename_groups,
-                    float_scalar_names=float_scalar_names,
-                    tensor_dtypes=tensor_dtypes,
-                    argument_names={arg.arg for arg in args},
-                    proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
-                )
-        if late_wait_names:
-            assert wait is not None
-            kernel_body = self._place_late_pdl_wait(
-                kernel_body, wait, late_wait_release, late_wait_names
-            )
+        body_context = DeviceBodyContext(
+            device_function=self,
+            args=tuple(args),
+            param_args=param_args,
+            sorted_arguments=sorted_arguments,
+            constexpr_to_inline=constexpr_to_inline,
+            wrapper_only_params=wrapper_only_params,
+            bounded_cache_request=bounded_cache_request,
+            body_start=len(env.pdl_entry) + len(scalar_preamble) + len(self.preamble),
+        )
+        kernel_body, extra_args = backend.finalize_device_body(
+            kernel_body, body_context
+        )
+        args.extend(extra_args)
         definition = ast_rename(
             create(
                 ast.FunctionDef,
@@ -2417,129 +1398,8 @@ class DeviceFunction:
             ),
             {k: v[0] for k, v in self._variable_renames.items()},
         )
-        if CompileEnvironment.current().backend.name == "cute":
-            from .cute.backend import validate_thread_axis_accesses
-            from .cute.boolean_guards import reassociate_boolean_guards
-
-            if self.config.get("cute_register_row", False):
-                from .cute.online_chunk_reduction import lower_online_chunk_reduction
-
-                definition.body = lower_online_chunk_reduction(
-                    definition.body, constexpr_values
-                )
-
-            # Type facts must see the final binding names, including every
-            # loop-carried alias, before changing the SDK's Boolean tree shape.
-            definition.body = reassociate_boolean_guards(definition.body)
-            if self.config.get("cute_fragment_published_scalars", False):
-                for request in self.cute_state.published_scalar_requests:
-                    request.lower(
-                        definition.body,
-                        {k: v[0] for k, v in self._variable_renames.items()},
-                        self.new_var,
-                    )
-            if self.config.get("cute_fragment_register_producers", False):
-                for request in self.cute_state.register_producer_requests:
-                    request.lower(
-                        definition.body,
-                        {k: v[0] for k, v in self._variable_renames.items()},
-                        self.new_var,
-                    )
-            validate_thread_axis_accesses([*prefix, definition])
-            from .cute.scalar_policy_loads import lower_scalar_policy_loads
-
-            # Keep ordinary load/effect recognition intact through all memory
-            # scheduling, including the late published/register-producer cuts.
-            definition.body = lower_scalar_policy_loads(definition.body)
-            from .cute.packet_store_policy import lower_packet_store_policy
-
-            variable_renames = {
-                name: aliases[0] for name, aliases in self._variable_renames.items()
-            }
-            definition.body = lower_packet_store_policy(
-                definition.body,
-                policy=self.config.cute_store_policy,
-                # Shared and register pointers are not global store targets.
-                global_tensor_names=frozenset(
-                    variable_renames.get(argument.name, argument.name)
-                    for argument in param_args
-                    if isinstance(argument, TensorArg)
-                    and not isinstance(argument, TensorDescriptorArg)
-                ),
-                target_device_capability=(
-                    CompileEnvironment.current().config_spec.target_device_capability
-                ),
-                cuda_version=torch.version.cuda,
-            )
-        result = [*prefix, definition]
-        if self._cute_pdl_applies() and self.config.config.get(CUTE_PDL_SPREAD_KEY):
-            # ``cute_pdl_spread``: pad the body's shared memory so that an
-            # early launch of this kernel cannot pack its CTAs denser than
-            # one wave on an idle device (``_pdl_spread_statements``).  The
-            # pad goes in after every body pass, sized against the body
-            # they left (a fused two-pass cache allocates late).
-            index = self._pdl_spread_index(definition.body)
-            definition.body[index:index] = self._pdl_spread_statements(definition.body)
-        if (
-            CompileEnvironment.current().backend.name == "cute"
-            and self.cute_state.resident_reduction_layouts
-        ):
-            # These imported device helpers are absent from generated source.
-            # Persist their dependency with this kernel through source reload.
-            result.append(
-                statement_from_string(
-                    f"{self.name}._helion_cute_helper_kinds = ('resident_reduction',)"
-                )
-            )
-        simt_cluster_n = max(
-            getattr(self.cute_state, "simt_cluster_n", 1),
-            getattr(self.cute_state, "grid_cluster_n", 1),
-        )
-        if simt_cluster_n > 1:
-            # The CuTe launcher reads this attribute to launch the kernel
-            # with a (1, cluster_n, 1) thread-block cluster.
-            result.append(
-                statement_from_string(
-                    f"{self.name}._helion_cute_cluster_shape = (1, {simt_cluster_n}, 1)"
-                )
-            )
-        if self._cute_pdl_applies():
-            # The CuTe launcher reads this attribute to launch the kernel
-            # with programmatic dependent launch (``use_pdl``).
-            with SyntheticLocation():
-                result.append(
-                    statement_from_string(f"{self.name}._helion_cute_use_pdl = True")
-                )
-        sass_checks = self.cute_state.sass_checks
-        if sass_checks:
-            # The CuTe launcher verifies the compiled kernel's SASS against
-            # these checks before its first launch
-            # (``helion.runtime.cute.sass_check``).
-            with SyntheticLocation():
-                result.append(
-                    statement_from_string(
-                        f"{self.name}._helion_cute_sass_checks = {tuple(sass_checks)!r}"
-                    )
-                )
-        min_blocks = self.config.config.get("cute_min_blocks_per_mp", 0)
-        if self.cute_state.tcgen05_min_blocks_per_mp is not None:
-            # The tcgen05 role launch's own requirement wins over the
-            # tunable: the epilogue-group block is one CTA per SM by SMEM
-            # anyway, and a higher count would only cap its registers.
-            min_blocks = self.cute_state.tcgen05_min_blocks_per_mp
-        if (
-            CompileEnvironment.current().backend.name == "cute"
-            and isinstance(min_blocks, int)
-            and min_blocks > 0
-        ):
-            # ptxas ``minnctapersm``: caps registers so ``min_blocks`` CTAs
-            # stay resident per SM (occupancy over spills).
-            result.append(
-                statement_from_string(
-                    f"{self.name}._helion_cute_min_blocks_per_mp = {min_blocks}"
-                )
-            )
-        return result
+        trailing = backend.finalize_kernel_def(definition, prefix, body_context)
+        return [*prefix, definition, *trailing]
 
     def proven_disjoint_tensor_pairs(self) -> set[frozenset[str]]:
         """Return tensor argument pairs with a cache-safe non-aliasing proof.
@@ -2555,8 +1415,6 @@ class DeviceFunction:
         storage they share.  Origin type alone is insufficient: host-local
         ``torch.empty``-family outputs commonly carry ``NameOrigin`` too.
         """
-        from .runtime_tensor_guards import runtime_tensors_are_proven_disjoint
-
         env = CompileEnvironment.current()
         host_function = HostFunction.current()
         input_storages = {
@@ -2587,11 +1445,7 @@ class DeviceFunction:
             and (
                 left_input is None
                 or right_input is None
-                or runtime_tensors_are_proven_disjoint(
-                    env,
-                    left_input,
-                    right_input,
-                )
+                or env.backend.tensors_proven_disjoint(env, left_input, right_input)
             )
         }
 
@@ -2701,476 +1555,6 @@ class DeviceFunction:
                 )
         return result
 
-    def _tcgen05_early_pdl_release(self, body: list[ast.stmt]) -> list[ast.stmt]:
-        """``cute_pdl_release`` on a tcgen05 kernel launched as a programmatic
-        dependent (``cute_pdl_entry_wait``).
-
-        The lowering waits where it knows each warp's first global read (the
-        TMA-load role, the epilogue role, the flat kernel's all-warp wait, or
-        the entry wait ``_cute_pdl_applies`` adds when those do not cover the
-        body) and releases the dependents after the MMA warp's last MMA.  That
-        late release leaves the next kernel's launch to the epilogue tail: in
-        a back-to-back sequence of short GEMMs the dependent's launch is
-        processed in the ~0.3 us the primary still runs, and its cold launch
-        state (the catalogue replays after an L2 flush) is exposed on every
-        node.  ``entry`` (``auto`` on a one-wave launch) puts a release right
-        after every one of the lowering's waits, so the dependents launch as
-        soon as this kernel's predecessor is done and overlap this whole
-        kernel: fp8 256^3 GEMM nodes (64 CTAs, 16-call graphs replayed
-        after an L2 flush) drop from 1.42-1.72 us (bimodal across processes)
-        to a steady 1.44 us, cuBLAS 1.49 us.  A release ahead of the waits
-        (the kernel's first statement) launches the dependents' dependents
-        too, a cascade of parked CTAs that measured 1.54-1.68 us on the same
-        nodes, so the release follows the wait as on the generic path.  ``last_wave`` guards that release to the last
-        wave's CTAs, ``exit`` and ``none`` leave the family's late release as
-        the only trigger (a second trigger from a CTA is a no-op, so the late
-        one stays on every placement).
-        """
-        placement = self.config.config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
-        if placement == "auto":
-            placement = self._implicit_pdl_release("entry")
-        if placement not in ("entry", "last_wave"):
-            return body
-        release_call = "cute.arch.griddepcontrol_launch_dependents()"
-        prefix: list[ast.stmt] = []
-        guard: str | None = None
-        if placement == "last_wave":
-            with SyntheticLocation():
-                statements = self._last_wave_release(
-                    statement_from_string(release_call)
-                )
-            if len(statements) == 2:
-                prefix = statements[:1]
-                guard = ast.unparse(cast("ast.If", statements[1]).test)
-
-        def release() -> ast.stmt:
-            with SyntheticLocation():
-                if guard is None:
-                    return statement_from_string(release_call)
-                return create(
-                    ast.If,
-                    test=expr_from_string(guard),
-                    body=[statement_from_string(release_call)],
-                    orelse=[create(ast.Pass)],
-                )
-
-        def is_wait(statement: ast.stmt) -> bool:
-            return (
-                isinstance(statement, ast.Expr)
-                and isinstance(statement.value, ast.Call)
-                and ast.unparse(statement.value) == "cute.arch.griddepcontrol_wait()"
-            )
-
-        def visit(statements: list[ast.stmt]) -> list[ast.stmt]:
-            result: list[ast.stmt] = []
-            for statement in statements:
-                result.append(statement)
-                if is_wait(statement):
-                    result.append(release())
-                    continue
-                for field in ("body", "orelse", "finalbody"):
-                    nested = getattr(statement, field, None)
-                    if isinstance(nested, list) and nested:
-                        setattr(statement, field, visit(nested))
-                for handler in getattr(statement, "handlers", None) or ():
-                    handler.body = visit(handler.body)
-            return result
-
-        if body and is_wait(body[0]):
-            # The entry wait stays the body's first statement; the guard's
-            # CTA index follows it, ahead of the guarded release.
-            return [body[0], *prefix, release(), *visit(body[1:])]
-        return [*prefix, *visit(body)]
-
-    def _late_pdl_wait_names(self) -> set[str]:
-        """The kernel-argument names through which this ``cute_pdl`` kernel
-        (generic path) can reach a host zero fill that launches as a
-        dependent fill kernel: the filled tensors' own arguments and every
-        argument whose fake tensor shares their storage (a host view or
-        alias, a tensor descriptor built on them).  The first mention of any
-        of these bounds the late wait.  Empty when the wait stays at the top:
-        no fill kernel (none admitted or every fill elided as dead, so the
-        kernel's primary is an unknown predecessor), the tcgen05 entry-wait
-        path, no filled tensor the kernel touches, or a kernel with access
-        paths the names cannot account for (wrapper-only or extra
-        parameters: a lowering's own tensor maps and pointers, the flash
-        backward's ``_fbwd_tma_dq``, which reduce into a tensor without
-        naming it)."""
-        from .compile_environment import CompileEnvironment
-        from .cute.host_zero_fill_launches import zero_fill_launch_tensors
-        from .cute.host_zero_fill_launches import zero_fill_launches_apply
-
-        env = CompileEnvironment.current()
-        if self.cute_state.cute_pdl_entry_wait or not zero_fill_launches_apply(
-            self, env, self.config
-        ):
-            return set()
-        if (
-            self.wrapper_only_params
-            or self.codegen._extra_params
-            or self.sourceless_prologue_params
-        ):
-            return set()
-        host = HostFunction.current()
-        storages = {
-            fake.untyped_storage()
-            for fake in zero_fill_launch_tensors(host, env, self.config)
-        }
-        if not storages:
-            return set()
-        arguments = [
-            *self._tensor_args.values(),
-            *self._tensor_descriptor_args.values(),
-        ]
-        return {
-            argument.name
-            for argument in arguments
-            if argument.fake_value.untyped_storage() in storages
-        }
-
-    @staticmethod
-    def _place_late_pdl_wait(
-        body: list[ast.stmt],
-        wait: ast.stmt,
-        release: list[ast.stmt],
-        names: set[str],
-    ) -> list[ast.stmt]:
-        """Put the ``cute_pdl`` wait of a kernel whose zero fills launch as
-        fill kernels before the first top-level statement of the lowered body
-        that mentions a filled tensor, when a statement touching memory (a
-        subscript, a load / store / copy / barrier call: a split-K kernel's
-        operand pipeline) precedes it; otherwise the kernel keeps the plain
-        form, the wait first and the entry release right after it."""
-
-        def mentions(statement: ast.AST) -> bool:
-            return any(
-                isinstance(node, ast.Name) and node.id in names
-                for node in ast.walk(statement)
-            )
-
-        def touches_memory(statement: ast.AST) -> bool:
-            for node in ast.walk(statement):
-                if isinstance(node, ast.Subscript):
-                    return True
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and any(
-                        token in node.func.attr
-                        for token in (
-                            "load",
-                            "store",
-                            "copy",
-                            "atomic",
-                            "cp_async",
-                            "tma",
-                            "sync",
-                            "barrier",
-                            "red",
-                        )
-                    )
-                ):
-                    return True
-            return False
-
-        release_ids = {id(statement) for statement in release}
-        rest = [statement for statement in body if id(statement) not in release_ids]
-        first = next(
-            (i for i, statement in enumerate(rest) if mentions(statement)), None
-        )
-        if first is not None and any(
-            isinstance(s, (ast.For, ast.While)) and touches_memory(s)
-            for s in rest[:first]
-        ):
-            return [*release, *rest[:first], wait, *rest[first:]]
-        return [wait, *release, *rest]
-
-    def _implicit_pdl_release(self, default: str) -> str:
-        """The release placement ``cute_pdl_release: auto`` resolves to:
-        ``entry`` (``default``) while the kernel's launch is known to fit in
-        one wave of CTAs, ``last_wave`` past it and for a grid the host
-        sizes at runtime (``_last_wave_release`` then compares against the
-        launched grid).  A persistent launch sized to the resident capacity
-        (``_NUM_SM * num_sm_multiplier``, or the tcgen05 schedulers'
-        ``min(work, capacity)`` clusters) is one wave by construction.
-
-        A release right after the wait lets the dependents' CTAs become
-        resident while this kernel runs.  PTX launches the dependent grid
-        only once every CTA of this grid has issued the trigger or exited.
-        When the whole grid was resident from the start the dependents only
-        fill idle slots and the next kernel starts 0.3-0.5 us earlier
-        (24-27% on the catalogue's one-wave reductions and pointwise
-        kernels); when the grid runs in several waves a release from every
-        CTA stretches it instead (rope fwd on [2, 16, 512, 128]: 1024 CTAs
-        on 148 SMs at ``cute_min_blocks_per_mp`` 4, 2.47 us unreleased,
-        2.75 released at entry) while a release from the last wave's CTAs
-        alone keeps the earlier waves undisturbed and still overlaps the
-        dependents' launch with the tail (2.42 us; embedding of 64 x 512
-        tokens from a 65536 x 1024 table, 32768 CTAs of 128 threads: 42.7
-        us unreleased, 45.9 at entry, 43.0 from the last wave).
-
-        The CTA count is the one the launcher receives: the program-id
-        strategy's static grid (``ProgramIDs.static_grid_size``: the sum
-        over the roots of a multi-root kernel, the parent of an L2-grouped
-        one, ``num_sm * num_sm_multiplier`` for a persistent one) times the
-        fused-body or split-K grid multiplier and the cluster size.  The resident
-        capacity is the SM count times the CTAs an SM holds, estimated from
-        the launch block (``resident_ctas_per_sm``: the thread limit, or
-        ``cute_min_blocks_per_mp`` when the config asked for an occupancy).
-        A launch shape or SM count codegen cannot know takes ``default``.
-        """
-        capacity = self._pdl_resident_capacity()
-        if capacity is None:
-            return default
-        ctas = self._pdl_launch_ctas()
-        if ctas is not None and ctas <= capacity:
-            return default
-        if ctas is None and self._pdl_launch_is_persistent():
-            return default
-        return "last_wave"
-
-    def _pdl_launch_is_persistent(self) -> bool:
-        """Whether the program-id strategy launches a persistent grid (one
-        sized to the device: ``_NUM_SM * num_sm_multiplier`` CTAs, or the
-        tcgen05 schedulers' ``min(work, capacity)`` clusters, whose count
-        ``static_grid_size`` cannot give)."""
-        from .program_id import ForEachProgramID
-
-        pid = self.pid
-        if pid is None:
-            return False
-        if isinstance(pid, ForEachProgramID):
-            return bool(pid.cases) and pid.cases[0]._is_persistent()
-        return pid._is_persistent()
-
-    def _pdl_launch_ctas(self) -> int | None:
-        """The CTA count of this kernel's launch when it is static: the
-        program-id strategy's grid (``ProgramIDs.static_grid_size``) times the
-        fused-body or split-K grid multiplier and the cluster size, or the
-        count a wrapper plan launches (``cute_state.launch_ctas``) where the
-        launcher sizes the grid from the plan; ``None`` for a grid the host
-        sizes at runtime."""
-        if self.cute_state.launch_ctas is not None:
-            return self.cute_state.launch_ctas
-        if self.pid is None:
-            return None
-        grid = self.pid.static_grid_size()
-        if grid is None:
-            return None
-        return (
-            grid
-            * self.cute_state.launch_grid_multiplier
-            * max(self.cute_state.simt_cluster_n, self.cute_state.grid_cluster_n)
-        )
-
-    def _pdl_resident_capacity(self) -> int | None:
-        """How many CTAs of this launch the device holds at once, as far as
-        codegen can tell: the SM count times ``resident_ctas_per_sm`` of the
-        launch block (the thread limit, or ``cute_min_blocks_per_mp`` when the
-        config asked for an occupancy); ``None`` when the SM count is unknown
-        (CPU targets)."""
-        env = CompileEnvironment.current()
-        num_sm = env.config_spec.num_sm
-        if num_sm <= 1:
-            return None
-        min_blocks = self.config.config.get("cute_min_blocks_per_mp", 0)
-        if not isinstance(min_blocks, int):
-            min_blocks = 0
-        if self.cute_state.cute_pdl_entry_wait:
-            # A tcgen05 GEMM kernel fills the SM's shared memory with its
-            # operand ring: one CTA per SM unless the config asked ptxas for
-            # an occupancy (the thread limit would call a 1024-CTA flat grid
-            # of 192-thread CTAs one wave).
-            return num_sm * max(1, min_blocks)
-        launch_block = self.cute_state.launch_block
-        per_sm = resident_ctas_per_sm(
-            math.prod(launch_block) if launch_block is not None else None,
-            min_blocks,
-            max_threads_per_sm=_resident_threads_per_sm(env.device),
-        )
-        return num_sm * per_sm
-
-    def _last_wave_release(self, release: ast.stmt) -> list[ast.stmt]:
-        """The statements of ``cute_pdl_release: last_wave``: ``release`` at
-        entry, guarded so that only the CTAs of the launch's last wave issue
-        it.
-
-        ``griddepcontrol.launch_dependents`` is per CTA and the dependent grid
-        launches once every CTA of this grid has issued it or exited.  A CTA
-        that never issues it counts at its exit, so guarding the entry
-        release to the CTAs whose dispatch-order index (``block_idx`` linear
-        in the launch grid, x fastest, the order the hardware dispatches
-        them) lies within the resident capacity (``_pdl_resident_capacity``)
-        of the grid's end launches the dependents as the last wave starts:
-        their CTAs fill the slots the tail frees and the earlier waves kept
-        every slot.  A grid known to fit in one wave gets the plain entry
-        release, as does a launch whose capacity codegen cannot size; a grid
-        the host sizes at runtime compares against ``grid_dim``'s product.
-        The guard carries an explicit empty else branch: the FMA fusion pass
-        pads every empty statement list with a located ``pass`` (origin
-        comments included), and the branch is rendered either way.
-        """
-        capacity = self._pdl_resident_capacity()
-        if capacity is None:
-            return [release]
-        ctas = self._pdl_launch_ctas()
-        if ctas is not None and ctas <= capacity:
-            return [release]
-        if ctas is None and self._pdl_launch_is_persistent():
-            return [release]
-        cta = self.new_var("pdl_cta")
-        grid_dim = "cutlass.Int32(cute.arch.grid_dim()[{}])"
-        block_idx = "cutlass.Int32(cute.arch.block_idx()[{}])"
-        statements = [
-            statement_from_string(
-                f"{cta} = {block_idx.format(0)} + {grid_dim.format(0)} * "
-                f"({block_idx.format(1)} + {grid_dim.format(1)} * {block_idx.format(2)})"
-            )
-        ]
-        if ctas is not None:
-            first = f"{ctas - capacity}"
-        else:
-            first = (
-                f"{grid_dim.format(0)} * {grid_dim.format(1)} * {grid_dim.format(2)}"
-                f" - {capacity}"
-            )
-        statements.append(
-            create(
-                ast.If,
-                test=expr_from_string(f"{cta} >= {first}"),
-                body=[release],
-                orelse=[create(ast.Pass)],
-            )
-        )
-        return statements
-
-    def _pdl_spread_statements(self, body: Sequence[ast.AST]) -> list[ast.stmt]:
-        """The statements of ``cute_pdl_spread``: one shared allocation that
-        raises the kernel's footprint to the smallest one at which more
-        CTAs than ``ceil(CTAs / SMs)`` no longer fit on an SM
-        (``spread_pad_bytes``), kept live by ``_helion_pdl_spread_keep``;
-        nothing for a grid the host sizes at runtime, a body whose own
-        allocations already enforce that density or reserve shared memory
-        the sum cannot account for (a non-literal size, or the storage a
-        family allocates through the DSL's ``SmemAllocator``: the fa4 flash
-        backward holds the per-block maximum that way, and a pad on top of
-        it would fail every launch), a density the pad cannot hold with the
-        slack it keeps per CTA, or an SM count codegen cannot know.
-
-        A programmatic dependent launches while its primary runs and the
-        hardware dispatches its CTAs onto whatever SMs have room: when the
-        primary's CTAs leave none beside them, every CTA of a small
-        dependent lands on the few SMs the primary left idle and runs
-        packed there once the primary completes (vanilla linear attention
-        forward: the 128 one-warp CTAs of the chunk state kernel on the
-        20 SMs the 128-CTA, 164 KB output kernel leaves idle, 7.45 us per
-        call against 4.1 spread).  At one wave's density the CTAs beyond
-        the idle SMs wait for the primary's to retire and take their SMs
-        one each, which costs nothing on an idle device (the dispatcher
-        spreads a fresh grid the same way) and lets the search's isolated
-        timing read the knob as a tie.
-        """
-        env = CompileEnvironment.current()
-        num_sm = env.config_spec.num_sm
-        ctas = self._pdl_launch_ctas()
-        own = _literal_smem_bytes(body)
-        if num_sm <= 1 or ctas is None or own is None:
-            return []
-        pad = spread_pad_bytes(
-            ctas,
-            num_sm,
-            own,
-            smem_per_sm=_smem_per_sm(env.device),
-            max_smem_per_block=_max_smem_per_block(env.device),
-        )
-        if pad is None:
-            return []
-        with SyntheticLocation():
-            return [
-                statement_from_string(
-                    f"{SPREAD_PAD_NAME} = cute.arch.alloc_smem("
-                    f"cutlass.Uint8, {pad}, alignment=128)"
-                ),
-                statement_from_string(
-                    f"{SPREAD_KEEP_HELPER}({SPREAD_PAD_NAME}.toint())"
-                ),
-            ]
-
-    @staticmethod
-    def _pdl_spread_index(body: Sequence[ast.AST]) -> int:
-        """Where the pad of ``cute_pdl_spread`` goes: right after the
-        kernel's own wait and release (the plain release, or the
-        ``last_wave`` CTA index and guard), which the final selection reads
-        as the two statements after the wait (``generic_release_rendered``);
-        after the wait alone when the kernel does not release early."""
-        statements = [ast.unparse(statement) for statement in body]
-        index = statements.index("cute.arch.griddepcontrol_wait()") + 1
-        if index < len(statements) and statements[index] == (
-            "cute.arch.griddepcontrol_launch_dependents()"
-        ):
-            return index + 1
-        if index + 1 < len(body):
-            guard_index = body[index]
-            if (
-                isinstance(guard_index, ast.Assign)
-                and ast.unparse(guard_index.targets[0]).startswith("pdl_cta")
-                and isinstance(body[index + 1], ast.If)
-            ):
-                return index + 2
-        return index
-
-    def _cute_pdl_applies(self) -> bool:
-        """Whether ``cute_pdl`` shapes this kernel.
-
-        The knob launches the kernel as a programmatic dependent of the
-        previous kernel in the stream and splices ``griddepcontrol_wait()``
-        in ahead of the scalar preamble, the preamble, the cluster sync and
-        the body, so every global read, write, atomic and bulk copy, on
-        every path, follows the wait; the passes that run afterwards may
-        hoist register or shared allocations above it, never a memory
-        access.  The generic path also places the kernel's own release
-        (``cute_pdl_release``); the tcgen05 entry-wait path below gets the
-        wait alone here, its early release follows every wait of the body
-        (``_tcgen05_early_pdl_release``).  It stays out of kernels
-        that already take part in dependent launch, which generate exactly
-        the knob-off code: native plans launched with ``use_pdl``, and
-        bodies that wait on or release their dependents themselves.  A release ahead of the knob's wait
-        would let the dependents start before this kernel's predecessors
-        finish; the materialized-fission producer gets its release inserted
-        after this function runs, so ``_stage_config`` keeps the knob away
-        from it.  ``griddepcontrol`` needs sm_90, so older targets are left
-        alone as well.
-        """
-        env = CompileEnvironment.current()
-        if env.backend.name != "cute" or self.config.config.get("cute_pdl") is not True:
-            return False
-        capability = env.config_spec.target_device_capability
-        if capability is None or capability < (9, 0):
-            return False
-        if self.cute_state.cute_pdl_entry_wait:
-            # A tcgen05 kernel launched with ``use_pdl`` through its wrapper
-            # plan places late waits where its lowering knows the first
-            # global read of each warp (the flat kernel's prefetch, the
-            # persistent TMA-load and epilogue roles); when the generated
-            # body reads global memory ahead of those on some path (the
-            # grouped layout reads of the prologue, a scheduler-warp or
-            # grouped persistent builder without role waits, a root-body
-            # load ahead of the K loop) it gets this wait at the top of the
-            # body instead. Its releases all follow either wait.
-            from .cute.pdl_coverage import waits_cover_global_reads
-
-            return not waits_cover_global_reads([*self.preamble, *self.body])
-        if any(plan.get("use_pdl") for plan in self.codegen.cute_wrapper_plans):
-            return False
-        return not any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr
-            in ("griddepcontrol_wait", "griddepcontrol_launch_dependents")
-            for stmt in [*self.preamble, *self.body]
-            for node in ast.walk(stmt)
-        )
-
     def codegen_function_call(self) -> ast.AST:
         env = CompileEnvironment.current()
         backend = env.backend
@@ -3195,41 +1579,7 @@ class DeviceFunction:
         pid = self.pid
         assert pid is not None
 
-        call_grid_expr = pid.codegen_grid()
-        if (
-            self.cute_state.program_id_divisor > 1
-            and not self.cute_state.tcgen05_split_k_applied
-        ):
-            raise exc.InvalidConfig(
-                f"{TCGEN05_SPLIT_K_CONFIG_KEY} > 1 requires the flat one-CTA "
-                "tcgen05 GEMM pipeline, which this kernel did not take"
-            )
-        grid_multiplier = self.cute_state.launch_grid_multiplier
-        if grid_multiplier != 1:
-            # A fused body running one CTA per (grid index, lane).
-            assert (
-                isinstance(call_grid_expr, ast.Tuple) and len(call_grid_expr.elts) == 1
-            )
-            call_grid_expr = expr_from_string(
-                f"(({{grid}}[0]) * {grid_multiplier},)", grid=call_grid_expr
-            )
-        simt_cluster_n = max(
-            getattr(self.cute_state, "simt_cluster_n", 1),
-            getattr(self.cute_state, "grid_cluster_n", 1),
-        )
-        if simt_cluster_n > 1:
-            # The cluster splits each row across ``cluster_n`` CTAs on a new
-            # trailing grid dim.  Only a 1-D grid can host the cluster dim.
-            if not (
-                isinstance(call_grid_expr, ast.Tuple) and len(call_grid_expr.elts) == 1
-            ):
-                raise exc.BackendUnsupported(
-                    "cute",
-                    "cute_cluster_n > 1 requires a 1-D launch grid",
-                )
-            call_grid_expr = expr_from_string(
-                f"(*{{grid}}, {simt_cluster_n})", grid=call_grid_expr
-            )
+        call_grid_expr = backend.transform_launch_grid(self, pid.codegen_grid())
         # Extra params are positional and must come before any keyword args that
         # build_launcher_args appends (e.g. num_warps=, num_stages=).
         args.extend(self.codegen._extra_params)
@@ -3241,8 +1591,8 @@ class DeviceFunction:
             has_barrier=self.has_barrier,
             sorted_args=arg_objects,
         )
-        # Check if the backend wants to capture return values for output-only tensors.
-        output_only_names = getattr(backend, "_output_only_names", [])
+        # The launcher's return values for output-only tensors, if any.
+        output_only_names = backend.output_only_names()
         launcher_call = (
             f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(call_args)})"
         )

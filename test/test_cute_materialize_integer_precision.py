@@ -13,9 +13,8 @@ from torch.fx import Node
 from test.test_cute_signed_bitfield_bf16 import _graph
 
 import helion
+from helion._compiler.cute import target_facts
 from helion._compiler.cute.materialize_operand import _exact_integer_cast
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
 
@@ -195,7 +194,6 @@ def _derived_cast_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     ),
 )
 @pytest.mark.parametrize("derived", (False, True))
-@skipUnlessBackends(["cute"])
 def test_actual_recipe_admission_uses_integer_precision(
     source: torch.dtype, destination: torch.dtype, derived_expected: bool, derived: bool
 ) -> None:
@@ -205,9 +203,7 @@ def test_actual_recipe_admission_uses_integer_precision(
     expected = derived_expected if derived else True
     with (
         cpu_target(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=232448),
     ):
         kernel = helion.kernel(
             (_derived_cast_rhs if derived else _direct_cast_rhs).fn,

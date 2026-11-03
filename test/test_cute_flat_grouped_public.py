@@ -18,10 +18,10 @@ from test.test_cute_flat_grouped_ir import _host
 from test.test_cute_flat_grouped_ir import cuda_binding
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_grouped_rna import (
+from helion._compiler.cute.autotune.heuristics.cute_grouped_rna import (
     CuteGroupedRnaHeuristic,
 )
-from helion._compiler.autotuner_heuristics.cute_grouped_rna import (
+from helion._compiler.cute.autotune.heuristics.cute_grouped_rna import (
     interleave_grouped_rna_seeds,
 )
 from helion._compiler.cute.backend import CuteBackend

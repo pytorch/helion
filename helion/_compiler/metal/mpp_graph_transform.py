@@ -28,10 +28,10 @@ from torch.fx.node import map_arg
 
 from ... import exc
 from ..compile_environment import CompileEnvironment
-from ..cute.cute_mma import _trace_to_load_tensor
 from ..device_ir import DeviceIR
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import RootGraphInfo
+from ..fx_load_trace import trace_to_load_tensor
 from ..inductor_lowering import APIFuncLowering
 from .factored_dims import factored_size
 from .mpp_graph_codegen import MPPGraphInfo
@@ -411,7 +411,7 @@ def _mpp_operand_views(
 
 def _trace_to_load_view(node: Node) -> _MPPLoadView | None:
     """Trace a value back to the 2D tensor load that produced it."""
-    load_info = _trace_to_load_tensor(node)
+    load_info = trace_to_load_tensor(node)
     if load_info is None:
         return None
     load_node, _, tensor = load_info

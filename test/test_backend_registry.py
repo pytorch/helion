@@ -18,10 +18,13 @@ from helion._compiler.backend_registry import all_reserved_launch_param_names
 from helion._compiler.backend_registry import get_backend_class
 from helion._compiler.backend_registry import list_backends
 from helion._compiler.backend_registry import register_compiler_backend
+from helion._compiler.backend_registry import registry_generation
 from helion._compiler.backend_registry import repair_backend_codegen
+from helion._compiler.backend_registry import unregister_compiler_backend
 from helion._compiler.compile_environment import CompileEnvironment
 import helion.language as hl
 from helion.language._decorators import APIFunc
+from helion.language._decorators import BackendDispatchTable
 from helion.language._decorators import api
 from helion.language._decorators import codegen
 
@@ -97,7 +100,85 @@ class TestBackendRegistry(unittest.TestCase):
             # custom backends default to experimental
             self.assertIs(_TestBackend().state, BackendState.EXPERIMENTAL)
         finally:
-            _REGISTRY.pop("_test_custom", None)
+            unregister_compiler_backend("_test_custom")
+
+    def test_late_registration_refreshes_keys_and_heuristics(self) -> None:
+        """A backend registered after import contributes its config keys and
+        heuristics: the derived tables key their caches on the registry."""
+        from helion._compiler.autotuner_heuristics import get_heuristics
+        from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
+        from helion.autotuner import config_spec
+        from helion.autotuner.search_surface import BackendSearchSurface
+
+        class _LateSurface(BackendSearchSurface):
+            config_keys = frozenset({"_test_late_key"})
+            debug_keys = frozenset({"_test_late_debug_key"})
+
+        class _LateHeuristic(AutotunerHeuristic):
+            name = "_test_late_heuristic"
+            backend = "_test_late"
+
+        class _LateBackend(Backend):
+            @property
+            def name(self) -> str:
+                return "_test_late"
+
+            def dtype_str(self, dtype: object) -> str:
+                return ""
+
+            def acc_type(self, dtype: object) -> str:
+                return ""
+
+            @property
+            def default_launcher_name(self) -> str:
+                return ""
+
+            @property
+            def constexpr_type(self) -> str:
+                return ""
+
+            @property
+            def function_decorator(self) -> str:
+                return ""
+
+            @property
+            def library_imports(self) -> dict[str, str]:
+                return {}
+
+            def config_spec_extension(self) -> BackendSearchSurface:
+                return _LateSurface()
+
+            def autotuner_heuristics(self) -> tuple[type[AutotunerHeuristic], ...]:
+                return (_LateHeuristic,)
+
+        from helion.language.tunable_ops import _tunable_name_conflicts
+
+        # The tables are populated before the registration.
+        self.assertNotIn("_test_late_key", config_spec.valid_keys())
+        self.assertEqual(get_heuristics("_test_late"), ())
+        self.assertFalse(_tunable_name_conflicts("_test_late_key"))
+        generation = registry_generation()
+        register_compiler_backend(_LateBackend)
+        try:
+            self.assertGreater(registry_generation(), generation)
+            self.assertIn("_test_late_key", config_spec.valid_keys())
+            self.assertIn("_test_late_key", config_spec.backend_specific_keys())
+            self.assertIn("_test_late_debug_key", config_spec.debug_keys())
+            self.assertIn("_test_late_key", config_spec.VALID_KEYS)
+            # ``hl.register_tunable`` refuses the late backend's key through
+            # the same live table.
+            self.assertTrue(_tunable_name_conflicts("_test_late_key"))
+            self.assertEqual(get_heuristics("_test_late"), (_LateHeuristic,))
+            self.assertTrue(_LateBackend().supports_config_key("_test_late_key"))
+            self.assertFalse(
+                get_backend_class("triton")().supports_config_key("_test_late_key")
+            )
+        finally:
+            unregister_compiler_backend("_test_late")
+        self.assertNotIn("_test_late_key", config_spec.valid_keys())
+        self.assertNotIn("_test_late_debug_key", config_spec.debug_keys())
+        self.assertEqual(get_heuristics("_test_late"), ())
+        self.assertFalse(_tunable_name_conflicts("_test_late_key"))
 
     def test_all_reserved_launch_param_names_is_union(self) -> None:
         result = all_reserved_launch_param_names()
@@ -224,7 +305,7 @@ class TestAtenCodegenRepair(unittest.TestCase):
         def triton(ctx: object, node: object) -> str:
             return "triton"
 
-        lowering = AtenLowering(codegen_impls={"triton": triton})
+        lowering = AtenLowering(codegen_impls=BackendDispatchTable({"triton": triton}))
         env = SimpleNamespace(codegen_name="triton", backend_name="triton")
 
         with (
@@ -245,7 +326,7 @@ class TestAtenCodegenRepair(unittest.TestCase):
         def triton(ctx: object, node: object) -> str:
             return "triton"
 
-        lowering = AtenLowering(codegen_impls={"common": common})
+        lowering = AtenLowering(codegen_impls=BackendDispatchTable({"common": common}))
         env = SimpleNamespace(codegen_name="triton", backend_name="triton")
 
         def repair(codegen_name: str) -> None:

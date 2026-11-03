@@ -10,9 +10,16 @@ elementwise mul on B200.  This emits the same PTX via inline asm.
 
 Called during ``@cute.kernel`` tracing (plain Python building MLIR),
 like ``vec_utils``.
+
+The ``load_v{4,8,16,32}b_*`` packet loads are ``_policy_load`` rows, declared
+as plain ``name = _policy_load(...)`` assignments so the standalone exporter
+copies each by name; ``cache_policy_loads.PACKET_LOAD_HELPERS`` lists the
+rows generated code binds.
 """
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import cutlass
 from cutlass._mlir import ir
@@ -24,6 +31,9 @@ import torch
 from . import cutedsl_compat
 from .cutedsl_compat import L2_EVICT_LAST_STORE_ABI_VERSION
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 __all__ = [
     "L2_EVICT_LAST_STORE_ABI_VERSION",
     "fixed_l2_evict_last_store_policy_supported",
@@ -34,7 +44,8 @@ __all__ = [
 
 def _vector_operand(words: int) -> str:
     """The PTX destination operand of a ``words``-word load: a brace list
-    for the ``.v2``/``.v4`` forms, a bare register for the scalar form."""
+    for the ``.v2``/``.v4``/``.v8`` forms, a bare register for the scalar
+    form."""
     registers = ",".join(f"${index}" for index in range(words))
     return f"{{{registers}}}" if words > 1 else registers
 
@@ -43,20 +54,20 @@ def _vector_suffix(words: int) -> str:
     return f".v{words}.b32" if words > 1 else ".b32"
 
 
-def _l2_only_assembly(words: int = 4) -> str:
-    """``createpolicy.fractional.L2::evict_last`` + a cache-hinted load of
-    ``words`` 32-bit words (16, 8 or 4 bytes)."""
+def _policy_assembly(words: int, policy: str, *, l1: bool) -> str:
+    """``createpolicy.fractional.L2::<policy>`` + a cache-hinted load of
+    ``words`` 32-bit words (32, 16, 8 or 4 bytes; the 32-byte ``.v8`` form
+    is SM100+ PTX), with the matching L1 eviction priority under ``l1``."""
+    level1 = f".L1::{policy}" if l1 else ""
     return (
         "{\n"
         ".reg .b64 pol;\n"
-        "createpolicy.fractional.L2::evict_last.b64 pol, 1.0;\n"
-        f"ld.global.L2::cache_hint{_vector_suffix(words)} "
+        f"createpolicy.fractional.L2::{policy}.b64 pol, 1.0;\n"
+        f"ld.global{level1}.L2::cache_hint{_vector_suffix(words)} "
         f"{_vector_operand(words)}, [${words}], pol;\n"
         "}"
     )
 
-
-_ASM_V4_B32_L2_EVICT_LAST = _l2_only_assembly(4)
 
 _ASM_STORE_V4_B32_L2_EVICT_LAST = (
     "st.global.L2::cache_hint.v4.u32 [$0], {$1,$2,$3,$4}, $5;"
@@ -172,59 +183,65 @@ def _load_vector_with_policy(
     return _vector_dialect.bitcast(vec_type, v4, loc=loc, ip=ip)
 
 
-@dsl_user_op
-def load_v16b_l2_evict_last(
-    ptr: object,
-    vec_type: ir.VectorType,
-    *,
-    loc: ir.Location | None = None,
-    ip: ir.InsertionPoint | None = None,
-) -> ir.Value:
-    """16-byte vector load with an L2 retention hint."""
-    return _load_vector_with_policy(
-        ptr, vec_type, _ASM_V4_B32_L2_EVICT_LAST, loc=loc, ip=ip
+def _policy_load(
+    name: str, words: int, policy: str, *, l1: bool = False
+) -> Callable[..., ir.Value]:
+    """The ``@dsl_user_op`` loading one ``words``-word packet (``4 * words``
+    bytes) under the L2 ``policy`` (``evict_last`` / ``evict_first``) and,
+    under ``l1``, the matching L1 eviction priority, bitcast to the requested
+    vector type."""
+    assembly = _policy_assembly(words, policy, l1=l1)
+
+    def load(
+        ptr: object,
+        vec_type: ir.VectorType,
+        *,
+        loc: ir.Location | None = None,
+        ip: ir.InsertionPoint | None = None,
+    ) -> ir.Value:
+        return _load_vector_with_policy(
+            ptr, vec_type, assembly, words=words, loc=loc, ip=ip
+        )
+
+    load.__name__ = load.__qualname__ = name
+    load.__doc__ = f"{4 * words}-byte vector load with an L2 ``{policy}`` hint" + (
+        " and the matching L1 eviction priority." if l1 else "."
     )
+    return dsl_user_op(load)
 
 
-def _two_level_assembly(priority: str, words: int = 4) -> str:
-    """Matching L1 eviction priority and L2 policy on a load of ``words``
-    32-bit words (16, 8 or 4 bytes)."""
-    return (
-        "{\n"
-        ".reg .b64 pol;\n"
-        f"createpolicy.fractional.L2::{priority}.b64 pol, 1.0;\n"
-        f"ld.global.L1::{priority}.L2::cache_hint{_vector_suffix(words)} "
-        f"{_vector_operand(words)}, [${words}], pol;\n"
-        "}"
-    )
-
-
-@dsl_user_op
-def load_v16b_l1_l2_evict_first(
-    ptr: object,
-    vec_type: ir.VectorType,
-    *,
-    loc: ir.Location | None = None,
-    ip: ir.InsertionPoint | None = None,
-) -> ir.Value:
-    """16-byte vector load with matching L1 and L2 eviction hints."""
-    return _load_vector_with_policy(
-        ptr, vec_type, _two_level_assembly("evict_first"), loc=loc, ip=ip
-    )
-
-
-@dsl_user_op
-def load_v16b_l1_l2_evict_last(
-    ptr: object,
-    vec_type: ir.VectorType,
-    *,
-    loc: ir.Location | None = None,
-    ip: ir.InsertionPoint | None = None,
-) -> ir.Value:
-    """16-byte vector load with matching L1 and L2 retention hints."""
-    return _load_vector_with_policy(
-        ptr, vec_type, _two_level_assembly("evict_last"), loc=loc, ip=ip
-    )
+load_v4b_l2_evict_last = _policy_load("load_v4b_l2_evict_last", 1, "evict_last")
+load_v4b_l1_l2_evict_first = _policy_load(
+    "load_v4b_l1_l2_evict_first", 1, "evict_first", l1=True
+)
+load_v4b_l1_l2_evict_last = _policy_load(
+    "load_v4b_l1_l2_evict_last", 1, "evict_last", l1=True
+)
+load_v8b_l2_evict_last = _policy_load("load_v8b_l2_evict_last", 2, "evict_last")
+load_v8b_l1_l2_evict_first = _policy_load(
+    "load_v8b_l1_l2_evict_first", 2, "evict_first", l1=True
+)
+load_v8b_l1_l2_evict_last = _policy_load(
+    "load_v8b_l1_l2_evict_last", 2, "evict_last", l1=True
+)
+load_v16b_l2_evict_last = _policy_load("load_v16b_l2_evict_last", 4, "evict_last")
+load_v16b_l1_l2_evict_first = _policy_load(
+    "load_v16b_l1_l2_evict_first", 4, "evict_first", l1=True
+)
+load_v16b_l1_l2_evict_last = _policy_load(
+    "load_v16b_l1_l2_evict_last", 4, "evict_last", l1=True
+)
+# 32-byte packets (``cute_vector_widths`` 8 fp32 / 16 bf16-fp16 on SM100+):
+# one ``ld.global...v8.b32`` carrying the same policies as the 16-byte forms.
+# Rendered only under the ``cute_wide_packet_hints`` config knob
+# (``cache_policy_loads.hint_wide_packets``).
+load_v32b_l2_evict_last = _policy_load("load_v32b_l2_evict_last", 8, "evict_last")
+load_v32b_l1_l2_evict_first = _policy_load(
+    "load_v32b_l1_l2_evict_first", 8, "evict_first", l1=True
+)
+load_v32b_l1_l2_evict_last = _policy_load(
+    "load_v32b_l1_l2_evict_last", 8, "evict_last", l1=True
+)
 
 
 def _store_u32x4_l2_evict_last(ptr: object, values: list[object]) -> None:
@@ -295,87 +312,3 @@ def store_u32x4_streaming(ptr: object, values: list[object]) -> None:
     """Store one 16-byte Uint32 fragment as a streaming (evict-first) store."""
 
     _store_u32x4_streaming(ptr, values)
-
-
-@dsl_user_op
-def load_v8b_l1_l2_evict_first(
-    ptr: object,
-    vec_type: ir.VectorType,
-    *,
-    loc: ir.Location | None = None,
-    ip: ir.InsertionPoint | None = None,
-) -> ir.Value:
-    """8-byte vector load with matching L1 and L2 eviction hints."""
-    return _load_vector_with_policy(
-        ptr, vec_type, _two_level_assembly("evict_first", 2), words=2, loc=loc, ip=ip
-    )
-
-
-@dsl_user_op
-def load_v8b_l1_l2_evict_last(
-    ptr: object,
-    vec_type: ir.VectorType,
-    *,
-    loc: ir.Location | None = None,
-    ip: ir.InsertionPoint | None = None,
-) -> ir.Value:
-    """8-byte vector load with matching L1 and L2 eviction hints."""
-    return _load_vector_with_policy(
-        ptr, vec_type, _two_level_assembly("evict_last", 2), words=2, loc=loc, ip=ip
-    )
-
-
-@dsl_user_op
-def load_v8b_l2_evict_last(
-    ptr: object,
-    vec_type: ir.VectorType,
-    *,
-    loc: ir.Location | None = None,
-    ip: ir.InsertionPoint | None = None,
-) -> ir.Value:
-    """8-byte vector load with an L2 retention hint."""
-    return _load_vector_with_policy(
-        ptr, vec_type, _l2_only_assembly(2), words=2, loc=loc, ip=ip
-    )
-
-
-@dsl_user_op
-def load_v4b_l2_evict_last(
-    ptr: object,
-    vec_type: ir.VectorType,
-    *,
-    loc: ir.Location | None = None,
-    ip: ir.InsertionPoint | None = None,
-) -> ir.Value:
-    """4-byte vector load with an L2 retention hint."""
-    return _load_vector_with_policy(
-        ptr, vec_type, _l2_only_assembly(1), words=1, loc=loc, ip=ip
-    )
-
-
-@dsl_user_op
-def load_v4b_l1_l2_evict_first(
-    ptr: object,
-    vec_type: ir.VectorType,
-    *,
-    loc: ir.Location | None = None,
-    ip: ir.InsertionPoint | None = None,
-) -> ir.Value:
-    """4-byte vector load with matching L1 and L2 eviction hints."""
-    return _load_vector_with_policy(
-        ptr, vec_type, _two_level_assembly("evict_first", 1), words=1, loc=loc, ip=ip
-    )
-
-
-@dsl_user_op
-def load_v4b_l1_l2_evict_last(
-    ptr: object,
-    vec_type: ir.VectorType,
-    *,
-    loc: ir.Location | None = None,
-    ip: ir.InsertionPoint | None = None,
-) -> ir.Value:
-    """4-byte vector load with matching L1 and L2 retention hints."""
-    return _load_vector_with_policy(
-        ptr, vec_type, _two_level_assembly("evict_last", 1), words=1, loc=loc, ip=ip
-    )

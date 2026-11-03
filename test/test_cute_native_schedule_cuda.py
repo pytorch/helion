@@ -13,11 +13,11 @@ from test.test_cute_shared_rhs_grouped import _plans
 from test.test_cute_tcgen05_fixed_chain import _batched_gemm
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import grouped_row_union_carrier
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.cute.autotune.heuristics.cute import grouped_row_union_carrier
+from helion._compiler.cute.autotune.heuristics.cute import (
     grouped_row_union_cluster4_carrier,
 )
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.cute.autotune.heuristics.cute import (
     grouped_row_union_paired_clc_carrier,
 )
 from helion._compiler.cute.epilogue_fanout import FANOUT_CONFIG_KEY
@@ -345,7 +345,7 @@ def test_native_row_union_dependent_launch_cuda(
     offsets rewritten between them; a read ahead of the wait would see the
     other layout's rows."""
     _require_sm100()
-    from test.test_cute_pdl_cuda import _produce
+    from test.test_cute_pdl import _produce
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(93217)

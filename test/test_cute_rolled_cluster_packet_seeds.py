@@ -15,7 +15,7 @@ from test.test_cute_full_chunk_row_seeds import normalize_rows
 
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_specialization_facts
-from helion._compiler.autotuner_heuristics.cute_rolled_cluster_packet import (
+from helion._compiler.cute.autotune.heuristics.cute_rolled_cluster_packet import (
     CuteRolledClusterPacketHeuristic,
 )
 from helion._compiler.cute.prefetch_reduction_packets import _containers

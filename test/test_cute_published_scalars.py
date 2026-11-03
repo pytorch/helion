@@ -205,7 +205,7 @@ def test_published_scalar_coverage_preserves_entire_previous_population(strategy
     x = torch.ones((3, 65), dtype=torch.int32)
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         with patch(
-            "helion._compiler.autotuner_heuristics.register_fragment_published_scalars_coverage"
+            "helion._compiler.cute.autotune.heuristics.register_fragment_published_scalars_coverage"
         ):
             previous = cpu_bind(
                 helion.kernel(_published_recipe.fn, backend="cute", static_shapes=True),

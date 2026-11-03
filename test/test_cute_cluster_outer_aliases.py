@@ -7,6 +7,10 @@ import pytest
 
 from helion._compiler.cute import cluster_online_pair as pair
 from helion._compiler.cute import rolled_cluster_online_pair as rolled
+from helion._compiler.cute._ast_pass_utils import is_name_assign
+from helion._compiler.cute.analysis.online_pair import _assigned_name
+from helion._compiler.cute.analysis.online_pair import _find_sites
+from helion._compiler.cute.analysis.online_pair import _prove
 
 pytestmark = pytest.mark.cpu_only
 
@@ -52,7 +56,7 @@ denominator = cutlass.Float32(reduced_sum)
 
 def _sites(body: list[ast.stmt]) -> tuple[list[ast.stmt], pair._Site, pair._Site]:
     working, owners = rolled._wrap_sites(body)
-    sites = pair._find_sites(working)
+    sites = _find_sites(working)
     assert sites is not None and len(sites) == 2
     assert all(id(site.for_node) in owners for site in sites)
     return working, sites[0], sites[1]
@@ -61,7 +65,7 @@ def _sites(body: list[ast.stmt]) -> tuple[list[ast.stmt], pair._Site, pair._Site
 class TestCuTeClusterOuterAliases(unittest.TestCase):
     def test_equivalent_scalar_row_addresses(self) -> None:
         body, first, second = _sites(_program())
-        self.assertIsNotNone(rolled._prove(body, first, second))
+        self.assertIsNotNone(_prove(body, first, second))
 
     def test_reassigned_alias_and_dependencies_decline(self) -> None:
         for statement in (
@@ -73,44 +77,43 @@ class TestCuTeClusterOuterAliases(unittest.TestCase):
             with self.subTest(statement=statement):
                 body, first, second = _sites(_program())
                 body.insert(second.top_idx, ast.parse(statement).body[0])
-                sites = pair._find_sites(body)
+                sites = _find_sites(body)
                 assert sites is not None and len(sites) == 2
-                self.assertIsNone(rolled._prove(body, *sites))
+                self.assertIsNone(_prove(body, *sites))
 
     def test_memory_load_alias_declines(self) -> None:
         program = _program()
         aliases = [
             statement
             for statement in program
-            if pair._is_name_assign(statement)
-            and pair._assigned_name(statement) == "raw_row"
+            if is_name_assign(statement) and _assigned_name(statement) == "raw_row"
         ]
         self.assertEqual(len(aliases), 1)
         aliases[0].value = ast.parse(
             "(row_indices.iterator + row).load()", mode="eval"
         ).body
         body, first, second = _sites(program)
-        self.assertIsNone(rolled._prove(body, first, second))
+        self.assertIsNone(_prove(body, first, second))
 
     def test_different_load_mask_declines(self) -> None:
         body, first, second = _sites(_program())
         for node in ast.walk(second.for_node):
             if isinstance(node, ast.Constant) and node.value == 4100:
                 node.value = 4099
-        self.assertIsNone(rolled._prove(body, first, second))
+        self.assertIsNone(_prove(body, first, second))
 
     def test_different_conversion_declines(self) -> None:
         body, first, second = _sites(_program())
         assignments = [
             node
             for node in ast.walk(second.for_node)
-            if pair._is_name_assign(node) and pair._assigned_name(node) == "other_value"
+            if is_name_assign(node) and _assigned_name(node) == "other_value"
         ]
         self.assertEqual(len(assignments), 1)
         cast = assignments[0].value
         assert isinstance(cast, ast.Call) and isinstance(cast.func, ast.Attribute)
         cast.func.attr = "Float16"
-        self.assertIsNone(rolled._prove(body, first, second))
+        self.assertIsNone(_prove(body, first, second))
 
 
 if __name__ == "__main__":

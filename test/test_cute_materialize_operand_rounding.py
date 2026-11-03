@@ -14,7 +14,7 @@ from test.test_cute_materialize_operand import _computed_rhs
 from test.test_cute_materialize_operand import _reference
 
 import helion
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute import target_facts
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
@@ -31,9 +31,7 @@ if TYPE_CHECKING:
 def cpu_b200() -> Iterator[None]:
     with (
         cpu_target(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=232448),
     ):
         yield
 

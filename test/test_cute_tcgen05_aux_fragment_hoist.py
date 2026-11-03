@@ -23,14 +23,19 @@ from torch._subclasses.fake_tensor import FakeTensor
 from test.cute_population_contracts import _target
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_epilogue_fanout import (
+from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.autotune.heuristics.cute_epilogue_fanout import (
     _synthesized_pair_fanout_carriers,
 )
-from helion._compiler.autotuner_heuristics.cute_l2_row_swizzle import row_swizzle_size
-from helion._compiler.autotuner_heuristics.cute_launch_bounds import MIN_BLOCKS_KEY
-from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.autotune.heuristics.cute_l2_row_swizzle import (
+    row_swizzle_size,
+)
+from helion._compiler.cute.autotune.heuristics.cute_launch_bounds import MIN_BLOCKS_KEY
 from helion._compiler.cute.epilogue_fanout import FANOUT_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
+from helion._compiler.cute.tcgen05_config import facts
+from helion._compiler.cute.tcgen05_config import repair
+from helion._compiler.cute.tcgen05_config import smem
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY,
 )
@@ -124,8 +129,15 @@ def plain_single(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.fixture(autouse=True)
-def cuda_trace() -> Generator[None, None, None]:
-    """Real static converter, with only the traced device replaced by CUDA."""
+def cuda_trace(request: pytest.FixtureRequest) -> Generator[None, None, None]:
+    """Real static converter, with only the traced device replaced by CUDA.
+
+    A ``cuda``-marked item opts out: the GPU tests folded into
+    ``test_cute_epi_warp_groups.py`` see the real device.
+    """
+    if request.node.get_closest_marker("cuda") is not None:
+        yield
+        return
     old_init = CompileEnvironment.__init__
     old_convert = CompileEnvironment._to_fake_tensor
     old_threads = torch.get_num_threads()
@@ -238,7 +250,7 @@ def test_facts_distinguish_aux_on_every_store() -> None:
     assert gated.rowvec_aux_facts == Tcgen05RowvecAuxFacts(
         output_itemsize=2, rows=(), output_count=2, exact_aux_count=1
     )
-    assert gated.pre_acc_wait_admissible_via_fanout()
+    assert repair.pre_acc_wait_admissible_via_fanout(gated)
 
     single = state_of(bind(residual_single))
     assert single.aux_kernel_detected and single.aux_loads_on_every_store
@@ -249,7 +261,7 @@ def test_facts_distinguish_aux_on_every_store() -> None:
     assert not plain.aux_kernel_detected and not plain.aux_loads_on_every_store
     assert plain.rowvec_aux_facts is not None
     assert plain.rowvec_aux_facts.output_count == 2
-    assert not plain.pre_acc_wait_admissible_via_fanout()
+    assert not repair.pre_acc_wait_admissible_via_fanout(plain)
 
 
 def test_pre_acc_wait_is_refused_at_an_aux_free_store_and_repaired_in_search() -> None:
@@ -359,9 +371,9 @@ def test_hoist_admission_is_strict_and_budgeted() -> None:
         tcgen05_cluster_m=2,
         tcgen05_c_stages=2,
     )
-    assert state.aux_fragment_hoist_admissible(pair)
+    assert repair.aux_fragment_hoist_admissible(state, pair)
     pair["tcgen05_cluster_m"] = 1
-    assert not state.aux_fragment_hoist_admissible(pair)
+    assert not repair.aux_fragment_hoist_admissible(state, pair)
     # Typed: a non-boolean is refused.
     with pytest.raises(InvalidConfig, match="must be a boolean"):
         normalized(bound, base_config(PRE, SHARED, **{HOIST: 1}))
@@ -376,7 +388,7 @@ def test_hoist_mirrors_the_static_full_cta_pair_tma_store_epilogue() -> None:
     # 16-bit bm=128 with cluster_m=2 is the clustered single-CTA family: no
     # role-local TMA-store epilogue, hence no hoist.
     clustered = base_config(PRE, ON, tcgen05_cluster_m=2, tcgen05_c_stages=2)
-    assert not state.aux_fragment_hoist_admissible(clustered)
+    assert not repair.aux_fragment_hoist_admissible(state, clustered)
     with pytest.raises(InvalidConfig, match="aux_fragment_hoist=True requires"):
         normalized(bound, clustered)
     assert normalized(bound, clustered, fix_invalid=True)[HOIST] is False
@@ -384,23 +396,23 @@ def test_hoist_mirrors_the_static_full_cta_pair_tma_store_epilogue() -> None:
     pair = base_config(
         PRE, ON, block_sizes=[256, 128, 64], tcgen05_cluster_m=2, tcgen05_c_stages=2
     )
-    assert state.aux_fragment_hoist_admissible(pair)
+    assert repair.aux_fragment_hoist_admissible(state, pair)
     assert normalized(bound, pair)[HOIST] is True
-    assert state._config_is_two_cta_mma(
-        {"tcgen05_cta_group": "two"}, bm=128, cluster_m=2
+    assert facts._config_is_two_cta_mma(
+        state, {"tcgen05_cta_group": "two"}, bm=128, cluster_m=2
     )
-    assert not state._config_is_two_cta_mma({}, bm=128, cluster_m=2)
-    assert not state._config_is_two_cta_mma({}, bm=256, cluster_m=1)
+    assert not facts._config_is_two_cta_mma(state, {}, bm=128, cluster_m=2)
+    assert not facts._config_is_two_cta_mma(state, {}, bm=256, cluster_m=1)
     # Whole tiles on every axis: a tile that does not divide the static
     # extents takes an edge-tile store the hoist does not render on.
-    assert state._static_full_tiles(bm=128, bn=128, bk=64)
-    assert not state._static_full_tiles(bm=128, bn=96, bk=64)
+    assert facts._static_full_tiles(state, bm=128, bn=128, bk=64)
+    assert not facts._static_full_tiles(state, bm=128, bn=96, bk=64)
     odd = bind(residual_single, rows=1024 + 64, columns=512)
-    assert not state_of(odd).aux_fragment_hoist_admissible(base_config(PRE, ON))
+    assert not repair.aux_fragment_hoist_admissible(state_of(odd), base_config(PRE, ON))
     with pytest.raises(InvalidConfig, match="aux_fragment_hoist=True requires"):
         normalized(odd, base_config(PRE, ON))
-    assert state_of(odd).aux_fragment_hoist_admissible(
-        base_config(PRE, ON, block_sizes=[64, 128, 64])
+    assert repair.aux_fragment_hoist_admissible(
+        state_of(odd), base_config(PRE, ON, block_sizes=[64, 128, 64])
     )
 
 
@@ -494,11 +506,11 @@ def test_smem_model_charges_one_c_ring_per_output() -> None:
         "c_stages": 4,
         "stage_rows": False,
     }
-    two_rings = state.default_layout_smem_bytes(**kwargs)
+    two_rings = smem.default_layout_smem_bytes(state, **kwargs)
     state.rowvec_aux_facts = Tcgen05RowvecAuxFacts(
         output_itemsize=2, rows=(), output_count=1
     )
-    one_ring = state.default_layout_smem_bytes(**kwargs)
+    one_ring = smem.default_layout_smem_bytes(state, **kwargs)
     state.rowvec_aux_facts = facts
     assert two_rings is not None and one_ring is not None
     # The (128, 32) fp16 subtile: 8 KiB per stage, 32 KiB per 4-stage ring.
@@ -506,15 +518,15 @@ def test_smem_model_charges_one_c_ring_per_output() -> None:
     # ab=6 + c=4 fits one ring (224 KiB) but not two (256 KiB): the sampled
     # rings are shallowed to the deepest AB depth the two rings leave.
     sample = base_config(tcgen05_ab_stages=6, tcgen05_c_stages=4)
-    state._fix_multi_output_ring_search_config(sample)
+    repair._fix_multi_output_ring_search_config(state, sample)
     assert (sample["tcgen05_ab_stages"], sample["tcgen05_c_stages"]) == (5, 4)
     sample = base_config(tcgen05_ab_stages=6, tcgen05_c_stages=2)
-    state._fix_multi_output_ring_search_config(sample)
+    repair._fix_multi_output_ring_search_config(state, sample)
     assert (sample["tcgen05_ab_stages"], sample["tcgen05_c_stages"]) == (6, 2)
     # A single-output kernel is untouched by this gate.
     single = state_of(bind(residual_single))
     sample = base_config(tcgen05_ab_stages=6, tcgen05_c_stages=4)
-    single._fix_multi_output_ring_search_config(sample)
+    repair._fix_multi_output_ring_search_config(single, sample)
     assert (sample["tcgen05_ab_stages"], sample["tcgen05_c_stages"]) == (6, 4)
     # An explicit config is refused where its two rings provably overflow
     # (128x128x128: ab=3 is 192 KiB, two 4-stage C rings 64 KiB more -- the
@@ -759,7 +771,7 @@ def test_pair_fanout_is_admitted_by_budget_at_every_pair_geometry() -> None:
         (64, 64, 9),
     ):
         sample = _pair(bn, bk, ab)
-        assert state.epilogue_fanout_refusal(sample) is None
+        assert repair.epilogue_fanout_refusal(state, sample) is None
         strict = normalized(bound, sample)
         repaired = normalized(bound, sample, fix_invalid=True)
         for config in (strict, repaired):
@@ -807,11 +819,11 @@ def test_pair_fanout_is_admitted_by_budget_at_every_pair_geometry() -> None:
     )
     for family in ({}, {"tcgen05_cta_group": "two"}):
         clustered = _pair(128, 64, 4) | {"block_sizes": [128, 128, 64]} | family
-        reason = state.epilogue_fanout_refusal(clustered)
+        reason = repair.epilogue_fanout_refusal(state, clustered)
         assert reason is not None and half in reason
     with pytest.raises(InvalidConfig, match=half):
         normalized(bound, _pair(128, 64, 4) | {"block_sizes": [128, 128, 64]})
-    assert state.epilogue_fanout_refusal(_pair(32, 64, 4)) == (
+    assert repair.epilogue_fanout_refusal(state, _pair(32, 64, 4)) == (
         f"the CTA pair runs its MMA at N tiles "
         f"{sorted(TCGEN05_TWO_CTA_PAIR_BLOCK_NS)}, not 32"
     )
@@ -871,15 +883,15 @@ def test_smem_model_keeps_the_with_source_subtile_for_two_outputs() -> None:
         "c_stages": 2,
         "stage_rows": False,
     }
-    two_outputs = state.default_layout_smem_bytes(**kwargs)
+    two_outputs = smem.default_layout_smem_bytes(state, **kwargs)
     facts = state.rowvec_aux_facts
     assert facts is not None and facts.output_count == 2
     state.rowvec_aux_facts = Tcgen05RowvecAuxFacts(
         output_itemsize=2, rows=(), output_count=1
     )
-    one_output_with_aux = state.default_layout_smem_bytes(**kwargs)
+    one_output_with_aux = smem.default_layout_smem_bytes(state, **kwargs)
     state.aux_kernel_detected = False
-    plain = state.default_layout_smem_bytes(**kwargs)
+    plain = smem.default_layout_smem_bytes(state, **kwargs)
     state.aux_kernel_detected = True
     state.rowvec_aux_facts = facts
     assert two_outputs is not None and one_output_with_aux is not None
@@ -890,7 +902,7 @@ def test_smem_model_keeps_the_with_source_subtile_for_two_outputs() -> None:
     fits = [
         ab
         for ab in range(1, 9)
-        if state.default_layout_smem_fits(**(kwargs | {"ab_stages": ab}))
+        if smem.default_layout_smem_fits(state, **(kwargs | {"ab_stages": ab}))
     ]
     assert fits == [1, 2, 3, 4, 5]
 
@@ -924,10 +936,10 @@ def test_codegen_and_the_arena_model_agree_on_the_pair_subtile() -> None:
         fits = [
             ab
             for ab in range(1, 9)
-            if state.default_layout_smem_fits(**kwargs, ab_stages=ab)
+            if smem.default_layout_smem_fits(state, **kwargs, ab_stages=ab)
         ]
         assert fits == list(range(1, deepest + 1)), fn.__name__
-        size = state.default_layout_smem_bytes(**kwargs, ab_stages=1)
+        size = smem.default_layout_smem_bytes(state, **kwargs, ab_stages=1)
         assert size is not None
         priced[fn.__name__] = size
         config = _pair(256, 64, deepest)
@@ -1019,7 +1031,7 @@ def test_row_swizzle_is_the_deepest_legal_size_within_one_row_of_n_tiles() -> No
         bound = bind(gated_pair, rows=rows, columns=columns)
         swizzle = _group(bound, SWIZZLE)
         assert swizzle is not None
-        n_index = state_of(bound)._matmul_block_indices()[1]
+        n_index = facts._matmul_block_indices(state_of(bound))[1]
         values = [w.value for w in swizzle.witnesses]
         assert values[::2] == [1] * (len(values) // 2)
         for witness in swizzle.witnesses:

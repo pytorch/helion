@@ -1039,7 +1039,7 @@ def _mark_collective(
     grid_row_lane = None
     owned_synthetic_lanes = {
         site.synthetic_k_lane
-        for site in df.cute_state.collective_mma_sites
+        for site in df.cute_state.lanes.collective_mma_sites
         if site.synthetic_k_lane is not None
     }
     if synthetic_k_lane is not None:
@@ -1107,7 +1107,7 @@ def _mark_collective(
     graph = next(graph for graph in cg.codegen_graphs if graph.graph is node.graph)
     if not _enclosing_control_is_scalar(cg.codegen_graphs, graph):
         return None
-    sites = df.cute_state.collective_mma_sites
+    sites = df.cute_state.lanes.collective_mma_sites
     site = CollectiveMmaSite(
         len(sites),
         cg.index_var(m_block_id),
@@ -1656,7 +1656,7 @@ def _remove_dead_staged_operands(
     can never become eligible for deletion.
     """
     owned = (
-        df.cute_state.collective_mma_pure_stmt_ids
+        df.cute_state.lanes.collective_mma_pure_stmt_ids
         if pure_statement_ids is None
         else pure_statement_ids
     )
@@ -1689,7 +1689,7 @@ def _remove_dead_staged_operands(
     dead_lane_loop_elimination(cast("list[ast.AST]", body))
     synthetic_lanes = {
         site.synthetic_k_lane
-        for site in df.cute_state.collective_mma_sites
+        for site in df.cute_state.lanes.collective_mma_sites
         if site.synthetic_k_lane is not None
     }
     if any(
@@ -1934,8 +1934,8 @@ def _lower_site(
         live_after = set(ReadWrites.from_list(list(k_parent[k_index + 1 :])).reads)
         if (k_writes & live_after) - {result_name}:
             reject("additional reduction-loop live-outs")
-    emitted_statement_ids = df.cute_state.collective_mma_emitted_stmt_ids
-    shared_results = df.cute_state.collective_mma_shared_results
+    emitted_statement_ids = df.cute_state.lanes.collective_mma_emitted_stmt_ids
+    shared_results = df.cute_state.lanes.collective_mma_shared_results
     dominating = [
         statement
         for part, index in path
@@ -2073,7 +2073,7 @@ def _lower_site(
         "load",
         tensor_names=tensor_names,
     )
-    marker_ids = {item.identity for item in df.cute_state.collective_mma_sites}
+    marker_ids = {item.identity for item in df.cute_state.lanes.collective_mma_sites}
     write_roots = _region_write_roots(
         region_body, marker_ids, emitted_statement_ids=emitted_statement_ids
     )
@@ -2126,7 +2126,7 @@ def _lower_site(
         )
         return m_loop, tid, ""
 
-    df.cute_state.collective_mma_pure_stmt_ids.update(pure_statement_ids)
+    df.cute_state.lanes.collective_mma_pure_stmt_ids.update(pure_statement_ids)
     flat = f"{prefix}_flat"
     m_parent, m_index = path[m_depth]
     insertion_body = (
@@ -2933,7 +2933,7 @@ def lower_collective_matmul(
             disjoint_pairs=disjoint_pairs,
             rename_groups=rename_groups,
         )
-    if not df.cute_state.collective_mma_sites:
+    if not df.cute_state.lanes.collective_mma_sites:
         if df.config.get("cute_collective_compute", "warp") == "tma_gather":
             raise exc.BackendUnsupported(
                 "cute", "gathered MMA requires an admitted collective contraction"
@@ -2956,13 +2956,13 @@ def lower_collective_matmul(
     occupied = _bound_names(module) | boundary_names
     native_sites = [
         site
-        for site in df.cute_state.collective_mma_sites
+        for site in df.cute_state.lanes.collective_mma_sites
         if _native_site_enabled(site, df.config)
     ]
     if native_sites:
         if (
-            df.cute_state.matmul_plan is not None
-            or df.cute_state.matmul_fx_nodes
+            df.cute_state.tcgen05.matmul_plan is not None
+            or df.cute_state.tcgen05.matmul_fx_nodes
             or df.cute_state.has_tcgen05_fragment_epilogue_plan
         ):
             raise exc.BackendUnsupported(
@@ -2976,12 +2976,12 @@ def lower_collective_matmul(
         CollectiveOperandSmem(
             _fresh_prefix("collective_operands", occupied, df.new_var)
         )
-        if len(df.cute_state.collective_mma_sites) > 1
+        if len(df.cute_state.lanes.collective_mma_sites) > 1
         else None
     )
     lowered_sites = []
     native_lifetimes: list[NativeCollectiveLifetime] = []
-    for site in df.cute_state.collective_mma_sites:
+    for site in df.cute_state.lanes.collective_mma_sites:
         loop, tid, shared_result = _lower_site(
             body,
             site,
@@ -3025,11 +3025,11 @@ def lower_collective_matmul(
         raise exc.BackendUnsupported("cute", "unlowered collective MMA marker")
     # Record completion only after every admitted marker has been replaced.
     # Universal MMA and native wrapper plans retain their layout guards.
-    df.cute_state.collective_mma_static_layouts = (
+    df.cute_state.lanes.collective_mma_static_layouts = (
         df.config.get("cute_collective_compute", "warp") == "warp"
         and not native_sites
-        and df.cute_state.matmul_plan is None
-        and not df.cute_state.matmul_fx_nodes
+        and df.cute_state.tcgen05.matmul_plan is None
+        and not df.cute_state.tcgen05.matmul_fx_nodes
         and not df.cute_state.has_tcgen05_fragment_epilogue_plan
     )
     df.namespace._used_names.update(_bound_names(ast.Module(body, [])))

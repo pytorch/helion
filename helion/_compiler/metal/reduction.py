@@ -198,7 +198,7 @@ def plan_reduced_tile_axes(
     ``hl.tile([m, n])`` stays strided and takes the ``strided`` collective
     (``masked`` when the stride is not a power of two).
     """
-    from ..cute.layout import CuTeGridExecutionPlan
+    from ..cute.execution_plans import CuTeGridExecutionPlan
     from ..cute.loop_nesting import tile_loop_paths
     from ..device_ir import RootGraphInfo
     from ..host_function import HostFunction
@@ -502,10 +502,11 @@ def argreduce_loop_update_statements(
 
     Lowest index wins a tie, matching Inductor's MPS semantics (``mps.py``) and
     torch.  The tie is explicit rather than implied by a strict comparison: the
-    accumulator index starts at ``reduction_index_init_expr`` (INT_MAX), so a
-    row that never strictly beats the identity -- an all-``-inf`` row under
-    argmax, say -- would otherwise never write ``acc_index`` and return the
-    sentinel as if it were a position.
+    accumulator index starts at INT_MAX (``backend.full_expr`` over
+    ``torch.iinfo(index_dtype).max`` in ``reduction_strategy``), so a row that
+    never strictly beats the identity -- an all-``-inf`` row under argmax, say
+    -- would otherwise never write ``acc_index`` and return the sentinel as if
+    it were a position.
 
     NaN counts as a new extremum for floats, but only over a non-NaN
     accumulator.  Letting it win against a NaN too would keep moving the index

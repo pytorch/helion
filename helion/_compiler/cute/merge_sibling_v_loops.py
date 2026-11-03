@@ -50,33 +50,17 @@ import os
 import re
 
 from ..ast_extension import statement_from_string
-from ._ast_pass_utils import _assignment_lhs_name
-from ._ast_pass_utils import _names_read
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import constexpr_v_loop
+from ._ast_pass_utils import names_read
 
 
 def _is_constexpr_v_loop(node: ast.stmt) -> tuple[ast.For, str, int] | None:
-    """If ``node`` is ``for X in cutlass.range_constexpr(V): ...`` with a
-    constant V and a plain Name target, return ``(loop, X, V)``.
-    """
-    if not isinstance(node, ast.For):
+    """``constexpr_v_loop`` restricted to a plain ``Name`` target: ``(loop, X, V)``."""
+    match = constexpr_v_loop(node)
+    if match is None or not isinstance(match[0].target, ast.Name):
         return None
-    if not isinstance(node.target, ast.Name):
-        return None
-    iter_node = node.iter
-    if not (
-        isinstance(iter_node, ast.Call)
-        and isinstance(iter_node.func, ast.Attribute)
-        and iter_node.func.attr == "range_constexpr"
-        and isinstance(iter_node.func.value, ast.Name)
-        and iter_node.func.value.id == "cutlass"
-    ):
-        return None
-    if not iter_node.args:
-        return None
-    arg = iter_node.args[0]
-    if not (isinstance(arg, ast.Constant) and isinstance(arg.value, int)):
-        return None
-    return node, node.target.id, arg.value
+    return match[0], match[0].target.id, match[1]
 
 
 def _names_written(stmt: ast.stmt) -> set[str]:
@@ -206,7 +190,7 @@ def _try_merge_pair(
     # variables — caching anything else gains nothing (it'd be dead).
     suffix_reads_v2: set[str] = set()
     for i in range(common_prefix_len, len(body2)):
-        suffix_reads_v2 |= _names_read(body2[i])
+        suffix_reads_v2 |= names_read(body2[i])
     prefix_writes_v2: set[str] = set()
     for i in range(common_prefix_len):
         prefix_writes_v2 |= _names_written(body2[i])
@@ -220,7 +204,7 @@ def _try_merge_pair(
     cache_dtype: str | None = None
     for i in range(common_prefix_len - 1, -1, -1):
         stmt = body1[i]
-        lhs = _assignment_lhs_name(stmt)
+        lhs = assigned_name(stmt)
         if lhs is None:
             continue
         if lhs not in candidate_names:
@@ -246,7 +230,7 @@ def _try_merge_pair(
     # body1's cache_stmt_idx (the common-prefix-text check already
     # implies this, but be explicit).
     body2_cache_stmt = body2[cache_stmt_idx]
-    if _assignment_lhs_name(body2_cache_stmt) != cache_var:
+    if assigned_name(body2_cache_stmt) != cache_var:
         return False
 
     # Don't try to cache a constexpr-only expression (no V-dep): no perf
@@ -257,7 +241,7 @@ def _try_merge_pair(
     v_defined_names: set[str] = {first_var}
     for i in range(cache_stmt_idx + 1):
         s = body1[i]
-        reads = _names_read(s)
+        reads = names_read(s)
         if reads & v_defined_names:
             v_defined_names.update(_names_written(s))
     if cache_var not in v_defined_names:
@@ -269,7 +253,7 @@ def _try_merge_pair(
     # value before the inter-loop update.
     prefix_reads: set[str] = set()
     for i in range(common_prefix_len):
-        prefix_reads |= _names_read(body1[i])
+        prefix_reads |= names_read(body1[i])
     if prefix_reads & inter_loop_writes:
         return False
 

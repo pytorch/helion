@@ -17,47 +17,42 @@ _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 # Ordinary generated kernels import these helpers without a wrapper plan.
 # Include their implementations and transitive cluster support in every key;
 # a generated import statement alone cannot identify the compiled device code.
+# The host wrapper emitters are keyed whole as well: they write the ``@cute.jit``
+# wrapper text (and ``flash_flex`` the tile counts baked into it), which the
+# key does not otherwise see; so are the two tables whose results the
+# compiled wrapper carries without naming their modules: ``occupancy`` (the
+# persistent flash grid clamp is baked into the wrapper text as a literal)
+# and ``dtypes`` (the ``make_ptr`` element type of every tensor argument).
 _COMMON_DEPENDENCIES = (
     "runtime/cute/launcher.py",
+    "runtime/cute/host_wrappers/__init__.py",
+    "runtime/cute/host_wrappers/block_scaled.py",
+    "runtime/cute/host_wrappers/context.py",
+    "runtime/cute/host_wrappers/flash.py",
+    "runtime/cute/host_wrappers/gathered.py",
+    "runtime/cute/host_wrappers/grouped_static.py",
+    "runtime/cute/host_wrappers/mma_dag.py",
+    "runtime/cute/host_wrappers/recurrences.py",
+    "runtime/cute/host_wrappers/tcgen05.py",
+    "runtime/cute/flash_flex.py",
+    "runtime/cute/occupancy.py",
+    "runtime/cute/plan_facts.py",
     "runtime/cute/register_tensor.py",
     "_compiler/cute/reduce_helpers.py",
     "_compiler/cute/cluster_helpers.py",
+    "_compiler/cute/device/sync.py",
     "_compiler/cute/vec_utils.py",
     "_compiler/cute/l2_policy.py",
     "_compiler/cute/cutedsl_compat.py",
+    "_compiler/cute/dtypes.py",
 )
 
-# The flash families (dense, gated, backward) share one generated preamble that
-# imports these runtime modules; the alternating-warpgroup body adds its own.
-_FLASH_DEPENDENCIES = (
-    "_compiler/cute/_flash_runtime.py",
-    "_compiler/cute/_flash_alt_runtime.py",
-    "_compiler/cute/_flash_gemm_ptx.py",
-    "_compiler/cute/_mlir_compat.py",
-    "_compiler/cute/epilogue_helpers.py",
-)
-
-# Keep transitive Helion device helpers with each wrapper or ordinary kernel
-# that compiles them.
-# CUTLASS itself is covered by the version in the launcher's cache key. These
-# are source paths relative to the package, making the digest checkout-neutral.
-_WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+# Helper kinds that are not wrapper plans: the external device kernels keyed
+# through ``set_helper_source_hash`` and the ordinary kernels'
+# ``_helion_cute_helper_kinds``.  The wrapper-plan kinds declare their helper
+# sources on their ``HostWrapperEmitter`` (``helion.runtime.cute.host_wrappers``).
+_HELPER_KIND_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "split_k_cluster": ("_compiler/cute/cluster_helpers.py",),
-    "tcgen05_grouped_rna": (
-        "_compiler/cute/_flash_runtime.py",
-        "_compiler/cute/_mlir_compat.py",
-        "_compiler/cute/tcgen05_flattened_prefix.py",
-        "_compiler/cute/tcgen05_grouped_prefix.py",
-        "_compiler/cute/tcgen05_operand_pipeline.py",
-        "_compiler/cute/tcgen05_operand_transform.py",
-        "_compiler/cute/tcgen05_storage.py",
-    ),
-    "tcgen05_grouped_tma_rn": (
-        "_compiler/cute/tcgen05_flattened_prefix.py",
-        "_compiler/cute/tcgen05_grouped_prefix.py",
-        "_compiler/cute/_flash_runtime.py",
-        "_compiler/cute/_mlir_compat.py",
-    ),
     "resident_reduction": ("_compiler/cute/resident_reduction_runtime.py",),
     "single_host_sum": (
         "runtime/cute/single_sum.py",
@@ -76,52 +71,25 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/full_sum_runtime.py",
         "_compiler/cute/resident_reduction_runtime.py",
     ),
-    "block_scaled_mma": (
-        "_compiler/cute/block_scaled_config.py",
-        "_compiler/cute/block_scaled_prepare.py",
-        "_compiler/cute/block_scaled_runtime.py",
-        "_compiler/cute/mxfp8_mma.py",
-        "_compiler/cute/mxfp8_prepare.py",
-    ),
-    "gathered_mma_tma": (
-        "_compiler/cute/_mlir_compat.py",
-        "_compiler/cute/gathered_mma_runtime.py",
-    ),
-    "helion_flash": _FLASH_DEPENDENCIES,
-    "helion_flash_gated": _FLASH_DEPENDENCIES,
-    "helion_flash_bwd": _FLASH_DEPENDENCIES,
-    "helion_flash_row_mma": ("_compiler/cute/_flash_row_mma_runtime.py",),
-    "helion_flash_gated_row_mma": (
-        *_FLASH_DEPENDENCIES,
-        "_compiler/cute/_flash_row_mma_runtime.py",
-    ),
-    "helion_flash_bwd_row_mma": ("_compiler/cute/_flash_row_mma_runtime.py",),
-    "helion_warp_mma_gemm": (
-        "_compiler/cute/_warp_mma_runtime.py",
-        "_compiler/cute/_flash_row_mma_runtime.py",
-    ),
-    "helion_register_subblocks": (
-        "_compiler/cute/_warp_mma_runtime.py",
-        "_compiler/cute/_mma_dag_runtime.py",
-        "_compiler/cute/_flash_row_mma_runtime.py",
-    ),
-    "chunk_recurrence_sm100": ("_compiler/cute/chunk_recurrence_sm100.py",),
-    "chunk_recurrence_warp_dv4": (
-        "_compiler/cute/chunk_recurrence_dv4_sm100.py",
-        "_compiler/cute/kda_device_primitives.py",
-    ),
-    "gdn_recurrence_sm100": (
-        "_compiler/cute/gdn_recurrence_sm100.py",
-        "_compiler/cute/gdn_recurrence_geometry.py",
-        "_compiler/cute/affine_recurrence_primitives.py",
-    ),
-    "helion_mma_dag_tma": (
-        "_compiler/cute/_mma_dag_runtime.py",
-        "_compiler/cute/_mma_dag_tcgen05_runtime.py",
-        "_compiler/cute/_flash_row_mma_runtime.py",
-        "_compiler/cute/_warp_mma_runtime.py",
-    ),
 }
+
+
+def wrapper_dependencies() -> dict[str, tuple[str, ...]]:
+    """Package-relative helper sources per wrapper-plan or helper kind.
+
+    The wrapper-plan kinds come from the host wrapper emitter registry; the
+    registry is imported lazily because the emitters import the compiler's
+    plan modules and this module is imported by device runtime modules.
+    """
+    from .host_wrappers import HOST_WRAPPER_EMITTERS
+
+    table = {
+        kind: emitter.source_dependencies
+        for kind, emitter in HOST_WRAPPER_EMITTERS.items()
+        if emitter.source_dependencies
+    }
+    table.update(_HELPER_KIND_DEPENDENCIES)
+    return table
 
 
 def wrapper_source_dependencies(
@@ -136,8 +104,9 @@ def wrapper_source_dependencies(
     The in-memory launcher cache avoids reading files on repeated launches.
     """
     paths = set(_COMMON_DEPENDENCIES)
+    table = wrapper_dependencies()
     for kind in kinds:
-        paths.update(_WRAPPER_DEPENDENCIES.get(kind, ()))
+        paths.update(table.get(kind, ()))
     return _fingerprints(sorted(paths))
 
 
@@ -226,7 +195,7 @@ def set_helper_source_hash(kernel: object, kind: str) -> None:
     Called once when its module is loaded, not on repeated launches. A missing
     dependency leaves the hash None and therefore disables on-disk reuse.
     """
-    assert kind in _WRAPPER_DEPENDENCIES
+    assert kind in _HELPER_KIND_DEPENDENCIES
     dependencies = wrapper_source_dependencies((kind,))
     digest = (
         hashlib.sha256(repr(dependencies).encode()).hexdigest()

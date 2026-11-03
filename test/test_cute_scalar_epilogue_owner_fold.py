@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -19,6 +22,9 @@ from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
 
 pytestmark = pytest.mark.cpu_only
+
+if TYPE_CHECKING:
+    from helion._compiler.device_function import DeviceFunction
 
 
 def _config(owner: bool | None = True, *, rows: int = 1) -> helion.Config:
@@ -52,6 +58,15 @@ def test_proved_final_result_gets_owner_keyword() -> None:
     )
     assert code.count("_cute_complete_row_tensor_copy(") == 1
     assert "group_span=256, cluster_n=8" in code
+
+
+def test_unproven_launch_shape_leaves_the_body_alone() -> None:
+    # ``thread_block_dims=None`` (an unproven launch shape) is not a
+    # ``(1, 1, 1)`` launch: the pass hands the body back before it reads the
+    # environment or the device function.
+    body = ast.parse("x = cute.arch.thread_idx()[0]\ny = x + 1").body
+    fn = cast("DeviceFunction", SimpleNamespace())
+    assert scalar_epilogue.lower_scalar_epilogue(body, fn, None, None, set()) is body
 
 
 def test_default_and_false_preserve_original_kernel_code() -> None:

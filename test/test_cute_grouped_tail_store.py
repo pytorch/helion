@@ -21,9 +21,8 @@ from helion._compiler.cute.cute_mma import _trace_to_mma_operand
 from helion._compiler.cute.cute_mma import (
     tcgen05_grouped_static_seed_has_common_k_proof,
 )
-from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+from helion._compiler.cute.tcgen05.scheduler_pids import Tcgen05PersistentProgramIDs
 from helion._testing import skipIfRefEager
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 from helion.language import memory_ops
 
@@ -39,15 +38,7 @@ if TYPE_CHECKING:
 def _target(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("HELION_CUTE_MMA_IMPL", "tcgen05")
     monkeypatch.setattr(grouped, "DEVICE", torch.device("cpu"))
-    with (
-        cpu_target(),
-        _grouped_worklist_bind_patches(),
-        patch(
-            "helion._compiler.cute.tcgen05_config."
-            "CuteTcgen05Config.per_cta_smem_capacity_bytes",
-            return_value=232448,
-        ),
-    ):
+    with cpu_target(), _grouped_worklist_bind_patches():
         yield
 
 
@@ -55,7 +46,6 @@ def _target(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 @pytest.mark.parametrize(
     "k,block_k,ab_stages", [(16, 16, 2), (96, 32, 3), (192, 64, 3)]
 )
-@skipUnlessBackends(["cute"])
 def test_folded_grouped_tail_store_keeps_native_seed_and_codegen(
     dtype: torch.dtype, k: int, block_k: int, ab_stages: int
 ) -> None:
@@ -75,7 +65,6 @@ def test_folded_grouped_tail_store_keeps_native_seed_and_codegen(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_folded_grouped_tail_store_keeps_dynamic_k_proof(dtype: torch.dtype) -> None:
     args = grouped._make_documented_mixed_k_args(dtype=dtype)
     kernel = grouped._rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes

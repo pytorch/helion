@@ -29,8 +29,10 @@ from unittest.mock import patch
 
 import torch
 
-from .._compiler.backend import CuteBackend
 from .._compiler.cute import cute_flash
+from .._compiler.cute.autotune.config_generation_ext import cute_generation_extension
+from .._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from .._compiler.cute.backend import CuteBackend
 from ..autotuner.config_fragment import EnumFragment
 from ..autotuner.config_generation import ConfigGeneration
 from ..autotuner.config_spec import BlockSizeSpec
@@ -79,34 +81,36 @@ def _flash_environment() -> tuple[tuple[str, str], ...]:
 
 @contextlib.contextmanager
 def memoized_flash_fragments() -> Iterator[None]:
-    """Memoize ``flash_autotune_fragments`` while a coverage design is built.
+    """Memoize ``flash_fragments_from_facts`` while a coverage design is built.
 
     The structural-coverage design calls it tens of thousands of times with
-    only a handful of distinct argument tuples, dominating its cost. The cache
-    lives for the process (keyed by the arguments and the ``HELION_``
+    only a handful of distinct inputs (the facts and one override pair per
+    pipeline family), dominating its cost. The cache lives for the process
+    (keyed by the facts, the keyword overrides and the ``HELION_``
     environment, so a monkeypatched environment never sees another test's
-    fragments); the first repeat of each key is re-verified against the real
-    function so nondeterminism would still fail, and every hit returns a fresh
-    dict. The key does not see patched module state: do not use it under a
-    patched flash target policy or a patched module constant the fragments
-    read (build such a generation unmemoized instead).
+    fragments; the facts carry the knob channel as well); the first repeat of
+    each key is re-verified against the real function so nondeterminism would
+    still fail, and every hit returns a fresh dict. The key does not see
+    patched module state: do not use it under a patched flash target policy
+    or a patched module constant the fragments read (build such a generation
+    unmemoized instead).
     """
-    real = cast("Callable[..., dict[str, Any]]", cute_flash.flash_autotune_fragments)
+    real = cast("Callable[..., dict[str, Any]]", cute_flash.flash_fragments_from_facts)
     environment = _flash_environment()
 
-    def wrapper(*args: object, **kwargs: object) -> dict[str, Any]:
-        key = (environment, args, tuple(sorted(kwargs.items())))
+    def wrapper(facts: object, **kwargs: object) -> dict[str, Any]:
+        key = (environment, facts, tuple(sorted(kwargs.items())))
         hit = _FRAGMENT_CACHE.get(key)
         if hit is None:
-            hit = _FRAGMENT_CACHE[key] = real(*args, **kwargs)
+            hit = _FRAGMENT_CACHE[key] = real(facts, **kwargs)
         elif key not in _FRAGMENT_VERIFIED:
             _FRAGMENT_VERIFIED.add(key)
-            assert real(*args, **kwargs) == hit
+            assert real(facts, **kwargs) == hit
         return dict(hit)
 
     # Nested blocks stay sound: an inner block sees the outer wrapper as
     # ``real`` and its hits short-circuit before reaching it.
-    with patch.object(cute_flash, "flash_autotune_fragments", wrapper):
+    with patch.object(cute_flash, "flash_fragments_from_facts", wrapper):
         yield
 
 
@@ -134,7 +138,8 @@ def flash_config_spec(
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=None)
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         num_kv=num_kv,
         num_bh=num_bh,
@@ -213,7 +218,9 @@ def _shared_flash_generation(
         # Build the design without validating it: a deliberately incomplete
         # domain (an override that pins a child's parent away) is still a
         # valid instance to query for its uncovered telemetry.
-        generation.flash_structural_coverage_uncovered_values()
+        cute_generation_extension(
+            generation
+        ).flash_structural_coverage_uncovered_values()
     return generation
 
 

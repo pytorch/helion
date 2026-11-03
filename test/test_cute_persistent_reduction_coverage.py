@@ -50,7 +50,7 @@ def test_graph_reduction_covers_extent_beyond_hardware_thread_cap(
     # claim the entire 1024-thread block, but wider rows still require lanes.
     config = helion.Config(block_sizes=[32, 1])
     with patch(
-        "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+        "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
         return_value=128 * 1024,
     ):
         source = ast.parse(bound.to_code(config))

@@ -23,6 +23,7 @@ from test.test_cute_grouped_prefix_adaptive_config import _recipes
 import helion
 from helion._compiler.cute.grouped_prefix_adaptive_n_codegen import _is_role
 from helion._compiler.cute.grouped_prefix_adaptive_n_codegen import _role_payload
+from helion._compiler.cute.tcgen05_config import facts
 from helion._testing import DEVICE
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
@@ -261,7 +262,7 @@ def test_unregistered_native_axes_reject_an_explicit_recipe(
             _args(groups=4, m=257, n=768, k=256, dtype=torch.float16),
         )
         assert (
-            unregistered.config_spec._cute_tcgen05_config._matmul_block_indices()
+            facts._matmul_block_indices(unregistered.config_spec._cute_tcgen05_config)
             is None
         )
         with pytest.raises(InvalidConfig):

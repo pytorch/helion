@@ -96,8 +96,9 @@ import os
 
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
-from ._ast_pass_utils import _assignment_lhs_name
-from ._ast_pass_utils import _names_read
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import names_read
+from .packet_access import match_packet_access
 
 _PIPE_COUNTER: list[int] = [0]
 
@@ -196,28 +197,10 @@ def _const_int_value(
 
 
 def _is_vec_load_call(node: ast.expr) -> bool:
-    """True if ``node`` is ``cute.arch.load(<ptr>, ir.VectorType.get([V], ...))``.
-
-    Matches both the raw call and the wrapped masked form used in some
-    backends.  We also accept any 2-arg ``cute.arch.load(...)`` to keep
-    the pattern flexible.
-    """
-    if not isinstance(node, ast.Call):
-        return False
-    func = node.func
-    if not isinstance(func, ast.Attribute) or func.attr != "load":
-        return False
-    val = func.value
-    if not (isinstance(val, ast.Attribute) and val.attr == "arch"):
-        return False
-    base = val.value
-    if not (isinstance(base, ast.Name) and base.id == "cute"):
-        return False
-    if len(node.args) != 2:
-        return False
-    # Second arg must be a VectorType / VectorType.get expression.  Be
-    # lax: just require it's a Call so we don't match scalar loads.
-    return isinstance(node.args[1], ast.Call)
+    """True if ``node`` is ``cute.arch.load(<ptr>, ir.VectorType.get([V], ...))``
+    (the plain packet form; not a scalar ``cute.arch.load``)."""
+    access = match_packet_access(node)
+    return access is not None and access.kind == "packet"
 
 
 def _has_memory_access(node: ast.AST) -> bool:
@@ -358,8 +341,8 @@ def _vec_load_is_self_guarded(load_rhs: ast.expr, lane_base_name: str) -> bool:
     pointer = load_rhs.args[0]
     return (
         isinstance(pointer, ast.IfExp)
-        and lane_base_name in _names_read(pointer.test)
-        and lane_base_name not in _names_read(pointer.orelse)
+        and lane_base_name in names_read(pointer.test)
+        and lane_base_name not in names_read(pointer.orelse)
     )
 
 
@@ -427,12 +410,12 @@ def _try_pipeline_one_outer_loop(
 
     # First inner statement: ``LANE_BASE = tile_var + ...``.
     lane_base_stmt = inner_body[0]
-    lane_base_name = _assignment_lhs_name(lane_base_stmt)
+    lane_base_name = assigned_name(lane_base_stmt)
     if lane_base_name is None:
         return None
     assert isinstance(lane_base_stmt, ast.Assign)
     lane_base_rhs = lane_base_stmt.value
-    if tile_var not in _names_read(lane_base_rhs):
+    if tile_var not in names_read(lane_base_rhs):
         return None
 
     # Next: ``LOAD_VAR = cute.arch.load(<addr using LANE_BASE>, VEC_TY)``.  A
@@ -447,7 +430,7 @@ def _try_pipeline_one_outer_loop(
         if candidate_rhs is not None and _is_vec_load_call(candidate_rhs):
             break
         if (
-            _assignment_lhs_name(candidate) is None
+            assigned_name(candidate) is None
             or candidate_rhs is None
             or _has_memory_access(candidate_rhs)
             or lane_base_name in _names_assigned(candidate)
@@ -457,18 +440,18 @@ def _try_pipeline_one_outer_loop(
     if load_idx >= len(inner_body):
         return None
     load_stmt = inner_body[load_idx]
-    load_var_name = _assignment_lhs_name(load_stmt)
+    load_var_name = assigned_name(load_stmt)
     if load_var_name is None:
         return None
     assert isinstance(load_stmt, ast.Assign)
     load_rhs = load_stmt.value
-    if lane_base_name not in _names_read(load_rhs):
+    if lane_base_name not in names_read(load_rhs):
         return None
     predicate_stmts = inner_body[1:load_idx]
     predicate_writes: set[str] = set()
     for stmt in predicate_stmts:
         predicate_writes |= _names_assigned(stmt)
-    if predicate_writes & (_names_read(load_rhs) | _names_read(lane_base_rhs)):
+    if predicate_writes & (names_read(load_rhs) | names_read(lane_base_rhs)):
         # The prefetch is issued before the predicates are re-evaluated for
         # the snapshotted lane base, so neither it nor the lane base may read
         # what they define.

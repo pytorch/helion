@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import functools
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -40,11 +41,18 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import iter_statements
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from ._ast_pass_utils import call_path_str
+from ._ast_pass_utils import comparison_is_always_true
+from ._ast_pass_utils import loop_extent
+from ._ast_pass_utils import names_read
+from ._ast_pass_utils import rename_names
+from ._ast_pass_utils import resolve_alias
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .fuse_two_pass_loads import _is_store_call
 from .fuse_two_pass_loads import _store_tensor_roots
 from .fuse_two_pass_loads import _tensor_arg_roots
 from .licm_profitability import repeated_work_is_profitable
+from .packet_access import match_packet_access
 from .scalar_recipe import PURE_HELPERS
 
 if TYPE_CHECKING:
@@ -163,21 +171,6 @@ def _clone_ast(value: object) -> object:
     return ast.copy_location(type(value)(**fields), value)
 
 
-class _LoadedNames(ast.NodeVisitor):
-    def __init__(self) -> None:
-        self.names: set[str] = set()
-
-    def visit_Name(self, node: ast.Name) -> None:
-        if isinstance(node.ctx, ast.Load):
-            self.names.add(node.id)
-
-
-def _names_read(node: ast.AST) -> set[str]:
-    visitor = _LoadedNames()
-    visitor.visit(node)
-    return visitor.names
-
-
 def _bound_names(node: ast.AST) -> set[str]:
     if isinstance(node, ast.Name):
         return {node.id}
@@ -195,7 +188,7 @@ def _assignment_target_reads(node: ast.AST) -> set[str]:
     """Names evaluated while assigning to a non-name target."""
     if isinstance(node, ast.Name):
         return set()
-    return _names_read(node)
+    return names_read(node)
 
 
 def _assignment_target_writes(node: ast.AST) -> set[str]:
@@ -242,7 +235,7 @@ def _statement_effects(stmt: ast.stmt) -> _Effects:
     accumulator reads.
     """
     if isinstance(stmt, ast.Assign):
-        reads = _names_read(stmt.value)
+        reads = names_read(stmt.value)
         writes: set[str] = set()
         for target in stmt.targets:
             reads.update(_assignment_target_reads(target))
@@ -251,10 +244,10 @@ def _statement_effects(stmt: ast.stmt) -> _Effects:
     if isinstance(stmt, ast.AnnAssign):
         reads = _assignment_target_reads(stmt.target)
         if stmt.value is not None:
-            reads.update(_names_read(stmt.value))
+            reads.update(names_read(stmt.value))
         return _Effects(frozenset(reads), frozenset(_bound_names(stmt.target)))
     if isinstance(stmt, ast.AugAssign):
-        reads = _names_read(stmt.value) | _names_read(stmt.target)
+        reads = names_read(stmt.value) | names_read(stmt.target)
         if isinstance(stmt.target, ast.Name):
             reads.add(stmt.target.id)
         return _Effects(frozenset(reads), frozenset(_bound_names(stmt.target)))
@@ -262,7 +255,7 @@ def _statement_effects(stmt: ast.stmt) -> _Effects:
         bound = _bound_names(stmt.target)
         effects = _block_effects(stmt.body, bound)
         return _Effects(
-            frozenset(_names_read(stmt.iter) | set(effects.live_in)),
+            frozenset(names_read(stmt.iter) | set(effects.live_in)),
             frozenset(bound | set(effects.writes)),
         )
     if isinstance(stmt, ast.If):
@@ -270,7 +263,7 @@ def _statement_effects(stmt: ast.stmt) -> _Effects:
         else_effects = _block_effects(stmt.orelse, set())
         return _Effects(
             frozenset(
-                _names_read(stmt.test)
+                names_read(stmt.test)
                 | set(body_effects.live_in)
                 | set(else_effects.live_in)
             ),
@@ -279,7 +272,7 @@ def _statement_effects(stmt: ast.stmt) -> _Effects:
 
     # Unsupported compound statements are never selected for hoisting.  Their
     # conservative flattened effects still keep the surrounding dataflow safe.
-    reads = _names_read(stmt)
+    reads = names_read(stmt)
     writes = {
         child.id
         for child in ast.walk(stmt)
@@ -288,20 +281,8 @@ def _statement_effects(stmt: ast.stmt) -> _Effects:
     return _Effects(frozenset(reads), frozenset(writes))
 
 
-def _call_path(node: ast.expr) -> str | None:
-    parts: list[str] = []
-    current: ast.expr = node
-    while isinstance(current, ast.Attribute):
-        parts.append(current.attr)
-        current = current.value
-    if not isinstance(current, ast.Name):
-        return None
-    parts.append(current.id)
-    return ".".join(reversed(parts))
-
-
 def _is_atomic_call(call: ast.Call) -> bool:
-    path = _call_path(call.func)
+    path = call_path_str(call.func)
     return path is not None and (
         path.split(".")[-1].startswith("atomic_") or path.startswith("_cute_atomic_")
     )
@@ -318,8 +299,8 @@ def _is_proven_scalar_bitcast(call: ast.Call) -> bool:
     ):
         return False
     receiver = call.func.value
-    receiver_type = _call_path(receiver.func)
-    target_type = _call_path(cast("ast.expr", call.args[0]))
+    receiver_type = call_path_str(receiver.func)
+    target_type = call_path_str(cast("ast.expr", call.args[0]))
     return (
         receiver_type in _CUTLASS_SCALAR_TYPES
         and len(receiver.args) == 1
@@ -331,31 +312,31 @@ def _is_proven_scalar_bitcast(call: ast.Call) -> bool:
 
 
 def _load_pointer(call: ast.Call) -> ast.AST | None:
-    path = _call_path(call.func)
-    if path == "cute.arch.load":
-        return call.args[0] if call.args else None
-    if path in _PURE_LOAD_HELPERS:
-        return call.args[0] if call.args else None
-    if isinstance(call.func, ast.Attribute) and call.func.attr == "load":
-        return call.func.value
+    """The pointer of a generated scalar or packet load (the predicated packet
+    loads of the V-loop sink are not pure calls here and stay unrecognized)."""
+    access = match_packet_access(call)
+    if access is not None and access.kind in (
+        "load",
+        "arch_load",
+        "packet",
+        "hinted_packet",
+    ):
+        return access.pointer
     return None
 
 
 def _is_generated_arch_load(call: ast.Call) -> bool:
+    """A ``cute.arch.load`` whose keywords are string-valued cache hints."""
+    access = match_packet_access(call)
     return (
-        _call_path(call.func) == "cute.arch.load"
-        and len(call.args) == 2
-        and all(
-            keyword.arg in {"cop", "level1_eviction_priority"}
-            and isinstance(keyword.value, ast.Constant)
-            and isinstance(keyword.value.value, str)
-            for keyword in call.keywords
-        )
+        access is not None
+        and access.kind in ("arch_load", "packet")
+        and access.cache_policy() is not None
     )
 
 
 def _is_allowed_pure_call(call: ast.Call) -> bool:
-    path = _call_path(call.func)
+    path = call_path_str(call.func)
     if path is None:
         if _is_proven_scalar_bitcast(call):
             return True
@@ -411,22 +392,7 @@ def _has_only_known_effects(node: ast.AST) -> bool:
 
 
 def _is_positive_constexpr_loop(stmt: ast.For) -> bool:
-    if stmt.orelse or not isinstance(stmt.target, ast.Name):
-        return False
-    call = stmt.iter
-    if (
-        not isinstance(call, ast.Call)
-        or _call_path(call.func) != "cutlass.range_constexpr"
-    ):
-        return False
-    if len(call.args) != 1:
-        return False
-    extent = call.args[0]
-    return (
-        isinstance(extent, ast.Constant)
-        and isinstance(extent.value, int)
-        and extent.value > 0
-    )
+    return loop_extent(stmt, kinds=("constexpr",), minimum=1) is not None
 
 
 def _is_hoistable_statement(stmt: ast.stmt, tensor_names: set[str]) -> bool:
@@ -462,18 +428,7 @@ def _is_hoistable_statement(stmt: ast.stmt, tensor_names: set[str]) -> bool:
 
 
 def _static_lane_extent(loop: ast.For) -> int | None:
-    call = loop.iter
-    if not isinstance(call, ast.Call) or _call_path(call.func) not in {
-        "range",
-        "cutlass.range_constexpr",
-    }:
-        return None
-    if len(call.args) != 1:
-        return None
-    extent = call.args[0]
-    if not isinstance(extent, ast.Constant) or not isinstance(extent.value, int):
-        return None
-    return extent.value
+    return loop_extent(loop, minimum=None)
 
 
 def _bounded_integer_interval(
@@ -514,7 +469,7 @@ def _bounded_integer_interval(
         isinstance(node, ast.Call)
         and len(node.args) == 1
         and not node.keywords
-        and _call_path(node.func) in {"cutlass.Int32", "cutlass.Int64"}
+        and call_path_str(node.func) in {"cutlass.Int32", "cutlass.Int64"}
     ):
         interval = _bounded_integer_interval(
             node.args[0],
@@ -528,7 +483,7 @@ def _bounded_integer_interval(
     if (
         isinstance(node, ast.Subscript)
         and isinstance(node.value, ast.Call)
-        and _call_path(node.value.func) == "cute.arch.thread_idx"
+        and call_path_str(node.value.func) == "cute.arch.thread_idx"
         and not node.value.args
         and not node.value.keywords
         and isinstance(node.slice, ast.Constant)
@@ -567,45 +522,6 @@ def _bounded_integer_interval(
     return None
 
 
-def _comparison_is_always_true(
-    node: ast.Compare,
-    *,
-    lane_var: str,
-    lane_extent: int,
-    thread_block_dims: tuple[int, int, int],
-) -> bool:
-    if len(node.ops) != 1 or len(node.comparators) != 1:
-        return False
-    left = _bounded_integer_interval(
-        node.left,
-        lane_var=lane_var,
-        lane_extent=lane_extent,
-        thread_block_dims=thread_block_dims,
-    )
-    right = _bounded_integer_interval(
-        node.comparators[0],
-        lane_var=lane_var,
-        lane_extent=lane_extent,
-        thread_block_dims=thread_block_dims,
-    )
-    if left is None or right is None:
-        return False
-    op = node.ops[0]
-    if isinstance(op, ast.Lt):
-        return left[1] < right[0]
-    if isinstance(op, ast.LtE):
-        return left[1] <= right[0]
-    if isinstance(op, ast.Gt):
-        return left[0] > right[1]
-    if isinstance(op, ast.GtE):
-        return left[0] >= right[1]
-    if isinstance(op, ast.Eq):
-        return left[0] == left[1] == right[0] == right[1]
-    if isinstance(op, ast.NotEq):
-        return left[1] < right[0] or right[1] < left[0]
-    return False
-
-
 def _simplify_full_lane_bounds(
     loop: ast.For,
     lane_var: str,
@@ -615,17 +531,18 @@ def _simplify_full_lane_bounds(
     """Erase generated bounds conjuncts proven true for the full lane tile."""
     if thread_block_dims is None:
         return loop
+    interval = functools.partial(
+        _bounded_integer_interval,
+        lane_var=lane_var,
+        lane_extent=lane_extent,
+        thread_block_dims=thread_block_dims,
+    )
 
     class _Simplifier(ast.NodeTransformer):
         def visit_Compare(self, node: ast.Compare) -> ast.AST:
             visited = self.generic_visit(node)
             assert isinstance(visited, ast.Compare)
-            if _comparison_is_always_true(
-                visited,
-                lane_var=lane_var,
-                lane_extent=lane_extent,
-                thread_block_dims=thread_block_dims,
-            ):
+            if comparison_is_always_true(visited, interval):
                 return ast.copy_location(ast.Constant(value=True), visited)
             return visited
 
@@ -660,7 +577,7 @@ def _is_warp_reduction_assignment(stmt: ast.stmt) -> bool:
         return False
     return any(
         isinstance(child, ast.Call)
-        and ((_call_path(child.func) or "").startswith("cute.arch.warp_reduction_"))
+        and ((call_path_str(child.func) or "").startswith("cute.arch.warp_reduction_"))
         for child in ast.walk(stmt.value)
     )
 
@@ -735,18 +652,10 @@ def _slice_preserves_reaching_definitions(
     return True
 
 
-def _canonical_name(name: str, rename_groups: dict[str, str]) -> str:
-    seen: set[str] = set()
-    while name in rename_groups and name not in seen:
-        seen.add(name)
-        name = rename_groups[name]
-    return name
-
-
 def _is_uniform_name(
     name: str, uniform_names: set[str], rename_groups: dict[str, str]
 ) -> bool:
-    canonical = _canonical_name(name, rename_groups)
+    canonical = resolve_alias(name, rename_groups)
     return canonical in uniform_names or canonical.startswith(
         ("_BLOCK_SIZE_", "_RDIM_SIZE_")
     )
@@ -765,7 +674,7 @@ def _update_uniform_names(
 ) -> None:
     if effects is None:
         effects = _statement_effects(stmt)
-    writes = {_canonical_name(name, rename_groups) for name in effects.writes}
+    writes = {resolve_alias(name, rename_groups) for name in effects.writes}
     if not writes:
         return
     # Only a plain assignment can establish uniformity; the source scan is
@@ -810,22 +719,22 @@ def _has_rename_alias_conflict(
             other_writes.update(_mutation_roots(stmt))
     selected_by_canonical: dict[str, set[str]] = {}
     for name in selected_names:
-        selected_by_canonical.setdefault(
-            _canonical_name(name, rename_groups), set()
-        ).add(name)
+        selected_by_canonical.setdefault(resolve_alias(name, rename_groups), set()).add(
+            name
+        )
     if any(len(names) > 1 for names in selected_by_canonical.values()):
         return True
     selected_touched_by_other_write = any(
         selected_name != other_name
-        and _canonical_name(selected_name, rename_groups)
-        == _canonical_name(other_name, rename_groups)
+        and resolve_alias(selected_name, rename_groups)
+        == resolve_alias(other_name, rename_groups)
         for selected_name in selected_names
         for other_name in other_writes
     )
     selected_write_observed_by_other_read = any(
         selected_name != other_name
-        and _canonical_name(selected_name, rename_groups)
-        == _canonical_name(other_name, rename_groups)
+        and resolve_alias(selected_name, rename_groups)
+        == resolve_alias(other_name, rename_groups)
         for selected_name in selected_writes
         for other_name in other_reads
     )
@@ -946,7 +855,7 @@ def _rmem_declaration(stmt: ast.stmt) -> tuple[str, _RmemInfo] | None:
         and len(stmt.targets) == 1
         and isinstance(stmt.targets[0], ast.Name)
         and isinstance(stmt.value, ast.Call)
-        and _call_path(stmt.value.func) == "cute.make_rmem_tensor"
+        and call_path_str(stmt.value.func) == "cute.make_rmem_tensor"
         and len(stmt.value.args) == 2
         and not stmt.value.keywords
         and isinstance(stmt.value.args[0], ast.Constant)
@@ -954,7 +863,7 @@ def _rmem_declaration(stmt: ast.stmt) -> tuple[str, _RmemInfo] | None:
         and stmt.value.args[0].value > 0
     ):
         return None
-    dtype = _call_path(cast("ast.expr", stmt.value.args[1]))
+    dtype = call_path_str(cast("ast.expr", stmt.value.args[1]))
     if dtype not in _CUTLASS_SCALAR_TYPES:
         return None
     return stmt.targets[0].id, _RmemInfo(stmt.value.args[0].value, dtype)
@@ -1190,12 +1099,12 @@ class _VectorExpressionResolver:
         context: _ExprContext,
         resolving: set[tuple[str, int]],
     ) -> ast.AST:
-        canonical = _canonical_name(name, self.rename_groups)
-        if canonical == _canonical_name(self.outer_lane, self.rename_groups):
+        canonical = resolve_alias(name, self.rename_groups)
+        if canonical == resolve_alias(self.outer_lane, self.rename_groups):
             raise _VectorCacheReject
         if context.info is not None and name == context.info.lane_var:
             return ast.Name(id="__constexpr_lane", ctx=ast.Load())
-        if context.info is not None and canonical == _canonical_name(
+        if context.info is not None and canonical == resolve_alias(
             context.info.lane_var, self.rename_groups
         ):
             raise _VectorCacheReject
@@ -1208,14 +1117,13 @@ class _VectorExpressionResolver:
             if any(
                 canonical
                 in {
-                    _canonical_name(item, self.rename_groups)
+                    resolve_alias(item, self.rename_groups)
                     for item in set(_statement_effects(prior).writes)
                     | _mutation_roots(prior)
                 }
                 for prior in context.info.loop.body[body_index + 1 : context.body_index]
             ) or canonical in {
-                _canonical_name(item, self.rename_groups)
-                for item in self.outer_mutations
+                resolve_alias(item, self.rename_groups) for item in self.outer_mutations
             }:
                 raise _VectorCacheReject
             key = ("inner", id(stmt))
@@ -1238,14 +1146,13 @@ class _VectorExpressionResolver:
             if any(
                 canonical
                 in {
-                    _canonical_name(item, self.rename_groups)
+                    resolve_alias(item, self.rename_groups)
                     for item in set(_statement_effects(prior).writes)
                     | _mutation_roots(prior)
                 }
                 for prior in self.outer_loop.body[outer_index + 1 : context.outer_index]
             ) or canonical in {
-                _canonical_name(item, self.rename_groups)
-                for item in self.outer_mutations
+                resolve_alias(item, self.rename_groups) for item in self.outer_mutations
             }:
                 raise _VectorCacheReject
             key = ("outer", id(stmt))
@@ -1260,7 +1167,7 @@ class _VectorExpressionResolver:
 
         outer_mutations = self.outer_writes | self.outer_mutations
         if name in outer_mutations or canonical in {
-            _canonical_name(item, self.rename_groups) for item in outer_mutations
+            resolve_alias(item, self.rename_groups) for item in outer_mutations
         }:
             raise _VectorCacheReject
         return ast.Name(id=canonical, ctx=ast.Load())
@@ -1372,11 +1279,11 @@ def _infer_scalar_dtype(
         return body_dtype if body_dtype == else_dtype else None
     if not isinstance(node, ast.Call):
         return None
-    path = _call_path(node.func)
+    path = call_path_str(node.func)
     if path in _CUTLASS_SCALAR_TYPES:
         return path
     if _is_proven_scalar_bitcast(node):
-        return _call_path(cast("ast.expr", node.args[0]))
+        return call_path_str(cast("ast.expr", node.args[0]))
     pointer = _load_pointer(node)
     if pointer is not None:
         if not (
@@ -1387,7 +1294,7 @@ def _infer_scalar_dtype(
         ):
             if not _is_generated_arch_load(node):
                 return None
-            explicit_dtype = _call_path(cast("ast.expr", node.args[1]))
+            explicit_dtype = call_path_str(cast("ast.expr", node.args[1]))
             return explicit_dtype if explicit_dtype in _CUTLASS_SCALAR_TYPES else None
         roots = _tensor_arg_roots(pointer, tensor_names)
         if roots is None or len(roots) != 1:
@@ -1466,7 +1373,7 @@ def _nested_rename_alias_conflict(
 
 
 def _candidate_used_later(info: _ConstexprLoopInfo, body_index: int, name: str) -> bool:
-    return any(name in _names_read(stmt) for stmt in info.loop.body[body_index + 1 :])
+    return any(name in names_read(stmt) for stmt in info.loop.body[body_index + 1 :])
 
 
 def _build_vector_candidates(
@@ -1531,7 +1438,7 @@ def _build_vector_candidates(
                 continue
             math_calls = sum(
                 isinstance(node, ast.Call)
-                and _call_path(node.func) in _PURE_CUTE_MATH_CALLS
+                and call_path_str(node.func) in _PURE_CUTE_MATH_CALLS
                 for node in ast.walk(normalized)
             )
             if math_calls == 0:
@@ -1565,17 +1472,6 @@ def _fresh_names(occupied: set[str], count: int) -> list[str]:
             occupied.add(candidate)
             result.append(candidate)
     return result
-
-
-class _RenameNames(ast.NodeTransformer):
-    def __init__(self, renames: dict[str, str]) -> None:
-        self.renames = renames
-
-    def visit_Name(self, node: ast.Name) -> ast.Name:
-        replacement = self.renames.get(node.id)
-        if replacement is None:
-            return node
-        return ast.copy_location(ast.Name(id=replacement, ctx=node.ctx), node)
 
 
 def _rewrite_selected_loop_body(
@@ -1677,7 +1573,7 @@ def _selected_cache_dependencies_are_private(
         cache_dependent_names.update(
             cast("ast.Name", stmt.targets[0]).id
             for stmt in assignments
-            if _names_read(stmt.value) & cache_dependent_names
+            if names_read(stmt.value) & cache_dependent_names
         )
         changed = len(cache_dependent_names) != previous_size
     if cache_dependent_names & terminal_names:
@@ -1869,12 +1765,12 @@ def _hoist_lane_invariant_constexpr_chain(
     ordered_assigned = list(dict.fromkeys(assigned_names))
     renames = dict(zip(ordered_assigned, fresh[1:], strict=True))
     renames[source.info.lane_var] = fresh_lane
-    rename = _RenameNames(renames)
     hoisted_top = [
-        rename.visit(cast("ast.stmt", _clone_ast(stmt))) for stmt in source_top
+        rename_names(cast("ast.stmt", _clone_ast(stmt)), renames) for stmt in source_top
     ]
     hoisted_inner = [
-        rename.visit(cast("ast.stmt", _clone_ast(stmt))) for stmt in source_inner
+        rename_names(cast("ast.stmt", _clone_ast(stmt)), renames)
+        for stmt in source_inner
     ]
     terminal_name = renames[source.target_name]
     hoisted_inner.append(
@@ -2004,7 +1900,7 @@ def _hoist_constexpr_scalar_invariants(
         *(set(effects[index].writes) for index in selected),
         set(),
     )
-    remainder_reads = _names_read(ast.Module(body=remainder, type_ignores=[]))
+    remainder_reads = names_read(ast.Module(body=remainder, type_ignores=[]))
     if not repeated_work_is_profitable(
         invariant,
         repeat_extent=loop_extent,
@@ -2177,7 +2073,7 @@ def _hoist_repeated_scalar_invariants(
     ]
     if not remainder:
         return [loop]
-    remainder_reads = _names_read(ast.Module(body=remainder, type_ignores=[]))
+    remainder_reads = names_read(ast.Module(body=remainder, type_ignores=[]))
     if not repeated_work_is_profitable(
         hoisted,
         repeat_extent=lane_extent,
@@ -2243,7 +2139,7 @@ def _hoist_reductions_from_loop(
             *(set(_statement_effects(body[i]).writes) for i in marginal),
             set(),
         )
-        remaining_reads = _names_read(
+        remaining_reads = names_read(
             ast.Module(
                 body=[
                     other
@@ -2314,7 +2210,7 @@ def _try_unswitch_and_hoist(
     if not isinstance(branch.test, ast.Name):
         return None
     prefix = body[:-1]
-    condition_names = _names_read(branch.test)
+    condition_names = names_read(branch.test)
     selected: set[int] = set()
     needed = set(condition_names)
     for index in range(len(prefix) - 1, -1, -1):
@@ -2346,12 +2242,12 @@ def _try_unswitch_and_hoist(
         *branch.orelse,
     ]
     protected_condition_canonical = {
-        _canonical_name(name, rename_groups) for name in protected_condition_names
+        resolve_alias(name, rename_groups) for name in protected_condition_names
     }
     if any(
         protected_condition_canonical
         & {
-            _canonical_name(name, rename_groups)
+            resolve_alias(name, rename_groups)
             for name in (set(_statement_effects(stmt).writes) | _mutation_roots(stmt))
         }
         for stmt in remaining_statements
@@ -2462,7 +2358,7 @@ def _try_unswitch_and_hoist(
             *(set(_statement_effects(statement).writes) for statement in moved),
             set(),
         )
-        remaining_reads = _names_read(rewritten[-1]) | _names_read(branch.test)
+        remaining_reads = names_read(rewritten[-1]) | names_read(branch.test)
         return repeated_work_is_profitable(
             moved,
             repeat_extent=lane_extent,
@@ -2685,11 +2581,11 @@ def hoist_lane_invariant_reductions(
         return [ast.fix_missing_locations(stmt) for stmt in body]
     renames = rename_groups or {}
     initial_uniform = {
-        _canonical_name(name, renames)
+        resolve_alias(name, renames)
         for name in {*_UNIFORM_GLOBAL_NAMES, *tensor_names, *(uniform_names or set())}
     }
     float_scalars = {
-        _canonical_name(name, renames) for name in (float_scalar_names or set())
+        resolve_alias(name, renames) for name in (float_scalar_names or set())
     }
     all_cache_access_counts = {
         name: len(accesses)
@@ -2704,7 +2600,7 @@ def hoist_lane_invariant_reductions(
     }
     occupied_names.update(renames)
     occupied_names.update(renames.values())
-    occupied_names.update(_canonical_name(name, renames) for name in renames)
+    occupied_names.update(resolve_alias(name, renames) for name in renames)
     obsolete_rmem: set[str] = set()
     result = _rewrite_block(
         body,

@@ -11,7 +11,7 @@ from test.test_cute_collective_native_seeded import _seed_written_in_place
 from test.test_cute_collective_native_seeded import _seeded_contraction
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.accuracy import _chunked_assert_close

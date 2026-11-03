@@ -206,12 +206,15 @@ def test_scalar_integer_power_codegen(cpu_codegen, base, begin, end, step):
     ],
 )
 def test_unproved_integer_powers_keep_existing_expression(base, bounds, backend):
+    from helion._compiler.backend_registry import get_backend_class
     from helion._compiler.integer_power import lower_integer_powers
 
     exponent = sympy.Symbol("exponent", integer=True)
     expression = PowByNatural(base, exponent)
     assert (
-        lower_integer_powers(expression, {exponent: bounds}, backend=backend)
+        lower_integer_powers(
+            expression, {exponent: bounds}, backend=get_backend_class(backend)()
+        )
         is expression
     )
 

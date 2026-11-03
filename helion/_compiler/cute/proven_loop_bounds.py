@@ -12,6 +12,7 @@ import ast
 from dataclasses import dataclass
 from dataclasses import field
 import math
+from typing import TYPE_CHECKING
 from typing import cast
 
 from .simplify_proven_bounds import _assigned_names
@@ -19,6 +20,9 @@ from .simplify_proven_bounds import _axis_index
 from .simplify_proven_bounds import _call_path
 from .simplify_proven_bounds import _checked_interval
 from .simplify_proven_bounds import _remove_true_and_operands
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 _LIMIT = (1 << 31) - 1
 _MAX_TERMS = 32
@@ -357,7 +361,11 @@ class _Proof:
         return output
 
 
-def _supported(statements: list[ast.stmt]) -> bool:
+def supported_statements(statements: Sequence[ast.stmt], *, with_blocks: bool) -> bool:
+    """The statement grammar the bounds walkers understand: single-target
+    assignments to a name, subscript or tuple of names, ``if`` / ``for``
+    (plain name target) blocks of the same, expression statements and
+    ``pass``; ``with`` blocks only when ``with_blocks``."""
     for statement in statements:
         if isinstance(statement, ast.Assign):
             if len(statement.targets) != 1:
@@ -376,10 +384,12 @@ def _supported(statements: list[ast.stmt]) -> bool:
                 statement.target, ast.Name
             ):
                 return False
-            if not _supported(statement.body) or not _supported(statement.orelse):
+            if not supported_statements(
+                statement.body, with_blocks=with_blocks
+            ) or not supported_statements(statement.orelse, with_blocks=with_blocks):
                 return False
-        elif isinstance(statement, ast.With):
-            if not _supported(statement.body):
+        elif with_blocks and isinstance(statement, ast.With):
+            if not supported_statements(statement.body, with_blocks=with_blocks):
                 return False
         elif not isinstance(statement, (ast.Expr, ast.Pass)):
             return False
@@ -417,7 +427,7 @@ def simplify_proven_loop_bounds(
     module = ast.Module(body=body, type_ignores=[])
     if _assigned_names(module) & (set(constexpr_values) | {"cutlass", "cute", "range"}):
         return body
-    if not _supported(body) or any(
+    if not supported_statements(body, with_blocks=True) or any(
         isinstance(
             node,
             (

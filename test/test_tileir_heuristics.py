@@ -13,11 +13,11 @@ from helion._compiler.autotuner_heuristics.tileir import TileIRChunkReductionHeu
 from helion._compiler.autotuner_heuristics.tileir import TileIRMatmulSeedHeuristic
 from helion._compiler.autotuner_heuristics.tileir import TileIRRowReductionHeuristic
 from helion._compiler.autotuner_heuristics.tileir import TileIRSmallReductionHeuristic
-from helion._compiler.backend import TileIRBackend
+from helion._compiler.triton.backend import TileIRBackend
+from helion._testing import cpu_render_target
 from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import MatmulFact
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("ENABLE_TILE", "1")
-    with mock_cuda_unavailable(), forbid_cuda_work():
+    with cpu_render_target(), forbid_cuda_work():
         yield
 
 
@@ -52,6 +52,7 @@ def _spec() -> ConfigSpec:
 
 def _env(spec: ConfigSpec) -> SimpleNamespace:
     return SimpleNamespace(
+        backend=TileIRBackend(),
         backend_name="tileir",
         config_spec=spec,
         settings=Settings(backend="tileir"),

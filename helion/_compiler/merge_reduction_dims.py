@@ -6,8 +6,9 @@ single-dim reductions while tracing and tags the chain's result. Flattening
 requires static_shapes so a later input cannot change the view's strides.
 ``merge_reduction_dims`` then rewrites the producers of each tagged chain's
 input to read ``x.flatten(1, 2)`` instead of ``x`` and replaces the chain
-with a single reduction. Chains it cannot rewrite remain on Triton. CuTe
-requires tagged chains to merge and otherwise raises ``BackendUnsupported``.
+with a single reduction. Chains it cannot rewrite stay chains of single-dim
+reductions, except on a backend whose ``requires_merged_reduction_dims`` is
+set (CuTe), which refuses them with ``BackendUnsupported``.
 """
 
 from __future__ import annotations
@@ -187,14 +188,13 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
     """Merge the dims of each tagged reduction chain in ``graphs`` that allows
     it; returns the block ids of the rdims the merged dims had."""
     env = CompileEnvironment.current()
-    # Other backends' tensor argument handling is untested with views, and
-    # without static_shapes kernels aren't specialized on strides, so a later
+    # Without static_shapes kernels aren't specialized on strides, so a later
     # input's flatten() might copy.
-    enabled = env.codegen_name in ("triton", "cute") and env.settings.static_shapes
+    enabled = env.backend.merges_reduction_dims and env.settings.static_shapes
 
     def require_chain_support(detail: str) -> None:
-        if env.backend.name == "cute":
-            raise exc.BackendUnsupported("cute", detail)
+        if env.backend.requires_merged_reduction_dims:
+            raise env.backend.unsupported(detail)
 
     replaced: set[int] = set()
     excluded: dict[int, torch.Tensor | None] | None = None

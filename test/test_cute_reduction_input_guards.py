@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import ast
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -13,29 +11,15 @@ from test.test_cute_persistent_reduction import _persistent_shifted_direct_updat
 from test.test_cute_persistent_reduction import _persistent_state_update
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.cute.autotune.heuristics.cute import (
     CutePersistentSubwarpRowsHeuristic,
 )
 from helion._compiler.cute.hoist_warp_reduce import _try_hoist_one_vloop
-from helion._testing.cute_codegen import mock_cuda_unavailable
 
-pytestmark = pytest.mark.cpu_only
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
-        yield
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(reduction_smem_budget_bytes=232448),
+]
 
 
 def _i32(value: int) -> int:

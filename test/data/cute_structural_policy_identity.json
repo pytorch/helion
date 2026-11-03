@@ -1,0 +1,127 @@
+{
+ "_comment": "Generated from abce7886a (before the structural-policy protocol refactor); every value is a persisted identity string and must never change.",
+ "config": {
+  "block_sizes": [
+   64,
+   32
+  ],
+  "num_stages": 3,
+  "num_warps": 4
+ },
+ "envelope": {
+  "dict": {
+   "config": {
+    "block_sizes": [
+     64,
+     32
+    ],
+    "num_stages": 3,
+    "num_warps": 4
+   },
+   "policy": {
+    "schema": "helion.cute.structural_policy",
+    "settings": {
+     "cute_flatten_nested_reductions": true,
+     "cute_full_slice_matmul_tiling": false,
+     "cute_materialize_transformed_operands": false,
+     "cute_region_fission": true,
+     "cute_segmented_matmul_tiling": false
+    },
+    "version": 1
+   },
+   "schema": "helion.cute.structural_config",
+   "version": 1
+  },
+  "identity": "258db9eb3bf3db4e31956a1f6d9484e39c0a13ede765bcaa57345593a1d52be9",
+  "json": "{\"config\":{\"block_sizes\":[64,32],\"num_stages\":3,\"num_warps\":4},\"policy\":{\"schema\":\"helion.cute.structural_policy\",\"settings\":{\"cute_flatten_nested_reductions\":true,\"cute_full_slice_matmul_tiling\":false,\"cute_materialize_transformed_operands\":false,\"cute_region_fission\":true,\"cute_segmented_matmul_tiling\":false},\"version\":1},\"schema\":\"helion.cute.structural_config\",\"version\":1}",
+  "repr": "helion.CuteStructuralConfig(config=helion.Config.from_dict({'block_sizes': [64, 32], 'num_stages': 3, 'num_warps': 4}), policy=helion.CuteStructuralPolicy.from_dict({'schema': 'helion.cute.structural_policy', 'version': 1, 'settings': {'cute_region_fission': True, 'cute_full_slice_matmul_tiling': False, 'cute_segmented_matmul_tiling': False, 'cute_flatten_nested_reductions': True, 'cute_materialize_transformed_operands': False}}))"
+ },
+ "kernel_metadata_dict": {
+  "cute_structural_policy": {
+   "schema": "helion.cute.structural_policy",
+   "settings": {
+    "cute_flatten_nested_reductions": true,
+    "cute_full_slice_matmul_tiling": false,
+    "cute_materialize_transformed_operands": false,
+    "cute_region_fission": true,
+    "cute_segmented_matmul_tiling": false
+   },
+   "version": 1
+  },
+  "dtypes": "['torch.float32']",
+  "hardware": "cpu",
+  "input_shapes": "[(4,)]",
+  "ir_graph": null,
+  "kernel_name": "k",
+  "kernel_source": "def k(x): return x",
+  "run_id": "1b2a61cfca9885e350e865e0ece58037827344d13fe9e26e60a84007aea7a449",
+  "settings": {
+   "backend": "cute"
+  }
+ },
+ "kernel_metadata_run_id": "1b2a61cfca9885e350e865e0ece58037827344d13fe9e26e60a84007aea7a449",
+ "measurement_config_hash": "258db9eb3bf3db4e",
+ "measurement_config_hash_no_policy": "2d8cb3305d1b5281",
+ "measurement_metadata": {
+  "aot_policy_version": "1",
+  "cute_structural_policy": "{\"schema\":\"helion.cute.structural_policy\",\"settings\":{\"cute_flatten_nested_reductions\":true,\"cute_full_slice_matmul_tiling\":false,\"cute_materialize_transformed_operands\":false,\"cute_region_fission\":true,\"cute_segmented_matmul_tiling\":false},\"version\":1}",
+  "cute_structural_policy_id": "4c2faa395185ec9a34673e1b9fc05be5a8ad84a1df2aafee7d078ab7bfda194b"
+ },
+ "model": "def key_k(*args):\n    return int(args[0].shape[0] > 128)\ndef autotune_k(*args):\n    return _helion_aot_structural_config.from_dict(\n        _HELION_AOT_STRUCTURAL_MANIFEST['configs']['k'][key_k(*args)]\n    )\n\nfrom helion.runtime.cute.structural_config import CuteStructuralConfig as _helion_aot_structural_config\n\n_HELION_AOT_STRUCTURAL_MANIFEST = {'schema': 'helion.aot.structural_model', 'version': 1, 'policy': {'schema': 'helion.cute.structural_policy', 'version': 1, 'settings': {'cute_region_fission': True, 'cute_full_slice_matmul_tiling': False, 'cute_segmented_matmul_tiling': False, 'cute_flatten_nested_reductions': True, 'cute_materialize_transformed_operands': False}}, 'policy_id': '4c2faa395185ec9a34673e1b9fc05be5a8ad84a1df2aafee7d078ab7bfda194b', 'configs': {'k': [{'schema': 'helion.cute.structural_config', 'version': 1, 'policy': {'schema': 'helion.cute.structural_policy', 'version': 1, 'settings': {'cute_region_fission': True, 'cute_full_slice_matmul_tiling': False, 'cute_segmented_matmul_tiling': False, 'cute_flatten_nested_reductions': True, 'cute_materialize_transformed_operands': False}}, 'config': {'block_sizes': [64, 32], 'num_stages': 3, 'num_warps': 4}}]}}\n",
+ "model_raw": "def key_k(*args):\n    return int(args[0].shape[0] > 128)\ndef autotune_k(*args):\n    return {}\n",
+ "policies": {
+  "default": {
+   "dict": {
+    "schema": "helion.cute.structural_policy",
+    "settings": {
+     "cute_flatten_nested_reductions": false,
+     "cute_full_slice_matmul_tiling": false,
+     "cute_materialize_transformed_operands": false,
+     "cute_region_fission": false,
+     "cute_segmented_matmul_tiling": false
+    },
+    "version": 1
+   },
+   "identity": "8ec923944ec375782992bd69fe6ddb904da2e6d54215a16dbc290ce2de530773",
+   "json": "{\"schema\":\"helion.cute.structural_policy\",\"settings\":{\"cute_flatten_nested_reductions\":false,\"cute_full_slice_matmul_tiling\":false,\"cute_materialize_transformed_operands\":false,\"cute_region_fission\":false,\"cute_segmented_matmul_tiling\":false},\"version\":1}"
+  },
+  "full": {
+   "dict": {
+    "schema": "helion.cute.structural_policy",
+    "settings": {
+     "cute_flatten_nested_reductions": true,
+     "cute_full_slice_matmul_tiling": true,
+     "cute_materialize_transformed_operands": true,
+     "cute_region_fission": true,
+     "cute_segmented_matmul_tiling": true
+    },
+    "version": 1
+   },
+   "identity": "7a1b8d1b32387d9d6564813aef75f57b099f77e8f59f6da7e78a03dae877c635",
+   "json": "{\"schema\":\"helion.cute.structural_policy\",\"settings\":{\"cute_flatten_nested_reductions\":true,\"cute_full_slice_matmul_tiling\":true,\"cute_materialize_transformed_operands\":true,\"cute_region_fission\":true,\"cute_segmented_matmul_tiling\":true},\"version\":1}"
+  },
+  "mixed": {
+   "dict": {
+    "schema": "helion.cute.structural_policy",
+    "settings": {
+     "cute_flatten_nested_reductions": true,
+     "cute_full_slice_matmul_tiling": false,
+     "cute_materialize_transformed_operands": false,
+     "cute_region_fission": true,
+     "cute_segmented_matmul_tiling": false
+    },
+    "version": 1
+   },
+   "identity": "4c2faa395185ec9a34673e1b9fc05be5a8ad84a1df2aafee7d078ab7bfda194b",
+   "json": "{\"schema\":\"helion.cute.structural_policy\",\"settings\":{\"cute_flatten_nested_reductions\":true,\"cute_full_slice_matmul_tiling\":false,\"cute_materialize_transformed_operands\":false,\"cute_region_fission\":true,\"cute_segmented_matmul_tiling\":false},\"version\":1}"
+  }
+ },
+ "policy_suffix": "__policy_4c2faa395185ec9a34673e1b9fc05be5a8ad84a1df2aafee7d078ab7bfda194b",
+ "settings": [
+  "cute_region_fission",
+  "cute_full_slice_matmul_tiling",
+  "cute_segmented_matmul_tiling",
+  "cute_flatten_nested_reductions",
+  "cute_materialize_transformed_operands"
+ ]
+}

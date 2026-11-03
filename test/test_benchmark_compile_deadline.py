@@ -1,11 +1,14 @@
 """The benchmark worker's compile deadline: a candidate whose compile (and
 first call) never finishes is killed, recorded as failed to compile and
 named; the timing window starts once the candidate is compiled; a timed-out
-default config gets the compiler seeds' fixed-repetition retry."""
+default config gets the compiler seeds' fixed-repetition retry; a fresh
+worker's start is held to its own timeout and never charged to the
+candidate, whose first-job deadline hit is retried once."""
 
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import math
 from multiprocessing.connection import Connection
@@ -22,6 +25,7 @@ import pytest
 import torch
 
 import helion
+from helion import exc
 from helion._testing import TestCase
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
@@ -33,6 +37,7 @@ from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
 from helion.autotuner.benchmark_worker import PhasedJob
+from helion.autotuner.benchmark_worker import _worker_loop
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.runtime.config import Config
@@ -91,6 +96,18 @@ class _CountCalls:
         return torch.empty(())
 
 
+def _delayed_worker_loop(
+    delay: float, connection: Connection, device: int | None
+) -> None:
+    """``_worker_loop`` after ``delay`` seconds: a slow interpreter start."""
+    time.sleep(delay)
+    _worker_loop(connection, device)
+
+
+def _exit_before_ready(connection: Connection, device: int | None) -> None:
+    """A worker whose interpreter dies before it reports ready."""
+
+
 class TestWorkerCompileDeadline(unittest.TestCase):
     """Real spawn workers: the slow tier, except the watchdog test, which kills
     its worker at the half-second compile deadline and is the smoke test."""
@@ -102,16 +119,28 @@ class TestWorkerCompileDeadline(unittest.TestCase):
             t0 = time.time()
             with self.assertRaises(BenchmarkCompileTimeout) as caught:
                 worker.run(_SleepInPhases(60, 0), timeout=30.0, compile_timeout=0.5)
-            self.assertLess(time.time() - t0, 15.0)
+            elapsed = time.time() - t0
             self.assertIn("compile and first call exceeded 0.5s", str(caught.exception))
             self.assertFalse(worker.alive())
             # Not a benchmark timeout: the candidate was never timed.
             self.assertNotIsInstance(caught.exception, BenchmarkTimeout)
+            # The job was the fresh worker's first: the error says how long
+            # the start it was not charged for took, and the kill was prompt
+            # once the deadline passed.
+            cold_start_seconds = caught.exception.cold_start_seconds
+            assert cold_start_seconds is not None
+            self.assertGreater(cold_start_seconds, 0.0)
+            self.assertEqual(worker.last_start_seconds, cold_start_seconds)
+            self.assertLess(elapsed - cold_start_seconds, 15.0)
             # The next job respawns the worker.
             self.assertEqual(
                 worker.run(_SleepInPhases(0, 0), timeout=30.0, compile_timeout=30.0),
                 0,
             )
+            # A deadline hit in the warm worker carries no start.
+            with self.assertRaises(BenchmarkCompileTimeout) as caught:
+                worker.run(_SleepInPhases(60, 0), timeout=30.0, compile_timeout=0.5)
+            self.assertIsNone(caught.exception.cold_start_seconds)
         finally:
             worker.shutdown()
 
@@ -119,10 +148,9 @@ class TestWorkerCompileDeadline(unittest.TestCase):
     def test_benchmark_timeout_counts_from_the_compiled_report(self) -> None:
         worker = BenchmarkWorker()
         try:
-            # The compile deadline is armed before a fresh worker's spawned
-            # process has imported torch and unpickled the job (seconds on an
-            # idle machine, far more under xdist contention on CI): warm the
-            # worker so the deadline below measures the job alone.
+            # A fresh worker's first job still unpickles the job (and imports
+            # this module) under the compile deadline: warm the worker so the
+            # deadline below measures the job alone under xdist contention.
             self.assertEqual(
                 worker.run(_ReturnValue(0), timeout=60.0, compile_timeout=60.0), 0
             )
@@ -145,6 +173,9 @@ class TestWorkerCompileDeadline(unittest.TestCase):
     def test_a_job_without_phases_keeps_the_whole_job_timeout(self) -> None:
         worker = BenchmarkWorker()
         try:
+            # Warm the worker: its start precedes the job's deadline and
+            # takes seconds, which the promptness bound below is not about.
+            self.assertEqual(worker.run(_ReturnValue(0), timeout=60.0), 0)
             t0 = time.time()
             with self.assertRaises(BenchmarkTimeout):
                 worker.run(_Sleep(60), timeout=0.5, compile_timeout=60.0)
@@ -179,6 +210,7 @@ class TestWorkerCompileDeadline(unittest.TestCase):
 
         worker = BenchmarkWorker()
         try:
+            self.assertEqual(worker.run(_ReturnValue(0), timeout=60.0), 0)
             t0 = time.time()
             with (
                 patch.object(Connection, "poll", poll_until_ready),
@@ -186,6 +218,73 @@ class TestWorkerCompileDeadline(unittest.TestCase):
             ):
                 worker.run(_SleepInPhases(60, 0), timeout=30.0, compile_timeout=0.5)
             self.assertLess(time.time() - t0, 15.0)
+            self.assertFalse(worker.alive())
+        finally:
+            worker.shutdown()
+
+
+class TestWorkerStart(unittest.TestCase):
+    def test_a_slow_start_is_not_charged_to_the_compile_deadline(self) -> None:
+        lines: list[str] = []
+        worker = BenchmarkWorker(log=lines.append)
+        try:
+            # The start takes longer than the whole compile deadline.
+            with patch(
+                "helion.autotuner.benchmark_worker._worker_loop",
+                functools.partial(_delayed_worker_loop, 4.0),
+            ):
+                self.assertEqual(
+                    worker.run(_SleepInPhases(0, 0), timeout=30.0, compile_timeout=2.0),
+                    0,
+                )
+            assert worker.last_start_seconds is not None
+            self.assertGreaterEqual(worker.last_start_seconds, 4.0)
+            self.assertEqual(len(lines), 1)
+            self.assertIn("Benchmark worker ready in", lines[0])
+            # The warm worker starts nothing.
+            self.assertEqual(
+                worker.run(_SleepInPhases(0, 0), timeout=30.0, compile_timeout=2.0), 0
+            )
+            self.assertEqual(len(lines), 1)
+        finally:
+            worker.shutdown()
+
+    def test_start_timeout_kills_the_worker_and_raises_died(self) -> None:
+        worker = BenchmarkWorker(start_timeout=0.5)
+        try:
+            t0 = time.time()
+            with (
+                patch(
+                    "helion.autotuner.benchmark_worker._worker_loop",
+                    functools.partial(_delayed_worker_loop, 60.0),
+                ),
+                self.assertRaises(BenchmarkWorkerDied) as caught,
+            ):
+                worker.run(_ReturnValue(7), timeout=30.0, compile_timeout=30.0)
+            self.assertLess(time.time() - t0, 15.0)
+            self.assertIn("did not start within 0.5s", str(caught.exception))
+            self.assertIn("HELION_AUTOTUNE_WORKER_START_TIMEOUT", str(caught.exception))
+            self.assertFalse(worker.alive())
+            self.assertIsNone(worker.last_start_seconds)
+            # The next job respawns the worker.
+            worker.start_timeout = 120.0
+            self.assertEqual(worker.run(_ReturnValue(7), timeout=30.0), 7)
+        finally:
+            worker.shutdown()
+
+    def test_a_worker_exiting_before_ready_raises_died(self) -> None:
+        worker = BenchmarkWorker()
+        try:
+            with (
+                patch(
+                    "helion.autotuner.benchmark_worker._worker_loop",
+                    _exit_before_ready,
+                ),
+                self.assertRaisesRegex(
+                    BenchmarkWorkerDied, "exited before it was ready"
+                ),
+            ):
+                worker.run(_ReturnValue(7), timeout=30.0)
             self.assertFalse(worker.alive())
         finally:
             worker.shutdown()
@@ -324,6 +423,122 @@ class TestProviderCompileDeadline(TestCase):
         self.assertIn(repr(config), message)
         self.assertIn("compile and first call exceeded 60.0s", message)
         self.assertIn("HELION_AUTOTUNE_COMPILE_TIMEOUT", message)
+
+    def test_a_cold_compile_timeout_is_retried_once(self) -> None:
+        provider = _provider()
+        fn = cast("CompiledConfig", object())
+        config = Config(block_sizes=[32])
+        cold = BenchmarkCompileTimeout(
+            "compile and first call exceeded 60.0s in the benchmark worker"
+        )
+        cold.cold_start_seconds = 7.5
+        with patch.object(
+            provider, "_run_subprocess_benchmark_job", side_effect=(cold, 1.5)
+        ) as run_job:
+            self.assertEqual(provider._benchmark_function_subprocess(config, fn), 1.5)
+        self.assertEqual(run_job.call_count, 2)
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 0)
+        self.assertEqual(provider._compile_deadline_failures, 0)
+        (message,) = provider.log.call_args.args  # pyrefly: ignore[missing-attribute]
+        self.assertIn(f"Retrying {config!r} once", message)
+        self.assertIn("first job of a fresh worker that took 7.5s to start", message)
+
+        # The retry's own deadline hit is the compile failure, and the search
+        # remembers the start it saw.
+        with patch.object(
+            provider, "_run_subprocess_benchmark_job", side_effect=(cold, cold)
+        ) as run_job:
+            self.assertEqual(
+                provider._benchmark_function_subprocess(config, fn), math.inf
+            )
+        self.assertEqual(run_job.call_count, 2)
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 1)
+        self.assertEqual(provider._compile_deadline_failures, 1)
+        self.assertEqual(provider._longest_cold_start_seconds, 7.5)
+        self.assertEqual(provider._last_benchmark_failure_status, "timeout")
+
+    def test_the_cold_retry_respects_the_budget(self) -> None:
+        provider = _provider()
+        provider.budget_exceeded_fn = Mock(return_value=True)
+        cold = BenchmarkCompileTimeout(
+            "compile and first call exceeded 60.0s in the benchmark worker"
+        )
+        cold.cold_start_seconds = 7.5
+        with patch.object(
+            provider, "_run_subprocess_benchmark_job", side_effect=cold
+        ) as run_job:
+            result = provider._benchmark_function_subprocess(
+                Config(block_sizes=[32]), cast("CompiledConfig", object())
+            )
+        self.assertEqual(result, math.inf)
+        run_job.assert_called_once()
+        provider.budget_exceeded_fn.assert_called_once_with()
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 1)
+
+    def test_the_worker_deadline_follows_the_compile_timeout_setting(self) -> None:
+        provider = _provider(autotune_compile_timeout=60, autotune_benchmark_timeout=17)
+        self.assertEqual(provider._worker_compile_timeout(), 60.0)
+        # ``set_adaptive_compile_timeout`` lowers the setting to a quantile of
+        # the precompile times; the worker's deadline is read live and follows,
+        # never below the benchmark timeout.
+        provider.settings.autotune_compile_timeout = 30
+        self.assertEqual(provider._worker_compile_timeout(), 30.0)
+        self.assertEqual(provider._worker_start_timeout(), 120.0)
+        provider.settings.autotune_compile_timeout = 10
+        self.assertEqual(provider._worker_compile_timeout(), 17.0)
+
+    def test_the_worker_start_timeout_follows_the_compile_deadline(self) -> None:
+        for settings, expected in (
+            ({"autotune_compile_timeout": 45}, 120.0),
+            ({"autotune_compile_timeout": 100}, 200.0),
+            (
+                {"autotune_compile_timeout": 100, "autotune_worker_start_timeout": 7},
+                7.0,
+            ),
+        ):
+            self.assertEqual(_provider(**settings)._worker_start_timeout(), expected)
+        provider = _provider(autotune_compile_timeout=100)
+        provider._benchmark_worker = None
+        with patch("helion.autotuner.benchmark_provider.BenchmarkWorker") as worker_cls:
+            self.assertIs(provider._get_benchmark_worker(), worker_cls.return_value)
+            self.assertIs(provider._get_benchmark_worker(), worker_cls.return_value)
+        worker_cls.assert_called_once_with(
+            device=None,
+            start_timeout=200.0,
+            log=provider.log,
+            log_warning=provider.log.warning,
+        )
+
+    def test_no_config_found_names_a_compile_deadline_cascade(self) -> None:
+        provider = _provider(autotune_compile_timeout=60)
+        fn = cast("CompiledConfig", object())
+        self.assertIsNone(provider.compile_deadline_cascade())
+        error = BenchmarkCompileTimeout(
+            "compile and first call exceeded 60.0s in the benchmark worker"
+        )
+        error.cold_start_seconds = 55.0
+        for _ in range(3):
+            provider._autotune_metrics.num_configs_tested += 1
+            with patch.object(
+                provider, "_run_subprocess_benchmark_job", side_effect=error
+            ):
+                provider._benchmark_function_subprocess(Config(block_sizes=[32]), fn)
+        cascade = provider.compile_deadline_cascade()
+        assert cascade is not None
+        self.assertIn("all 3 tested configs exceeded", cascade)
+        self.assertIn("compile deadline of 60s", cascade)
+        self.assertIn("HELION_AUTOTUNE_COMPILE_TIMEOUT", cascade)
+        self.assertIn("took up to 55.0s to start", cascade)
+        self.assertEqual(
+            str(exc.NoConfigFound(f": {cascade}")),
+            f"No working config found from autotuning: {cascade}",
+        )
+        self.assertEqual(
+            str(exc.NoConfigFound()), "No working config found from autotuning"
+        )
+        # A measured config means the deadline is not the whole story.
+        provider._autotune_metrics.num_configs_tested += 1
+        self.assertIsNone(provider.compile_deadline_cascade())
 
     def test_compile_timeout_of_a_seed_names_its_role(self) -> None:
         provider = _provider()

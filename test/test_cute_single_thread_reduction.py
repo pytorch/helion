@@ -45,7 +45,6 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
@@ -312,7 +311,7 @@ def _cpu_render(
         mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU test")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
@@ -322,7 +321,6 @@ def _cpu_render(
         return bound.to_code(helion.Config.from_dict(settings))
 
 
-@skipUnlessBackends(["cute"])
 def test_single_thread_reductions_claim_no_thread_axis() -> None:
     """The q/k head dim (192, 256 threads) and the value head dim (128, 4
     threads once the first reduction took the budget) own axes 0 and 1; the
@@ -337,7 +335,6 @@ def test_single_thread_reductions_claim_no_thread_axis() -> None:
     assert "permute_smem" not in code
 
 
-@skipUnlessBackends(["cute"])
 def test_second_matmul_contraction_folds_per_thread_in_the_key_lane_loop() -> None:
     """A RoPE side matmul adds a fifth reduction dim (64); with the single
     thread dims out of the way the four axes are not exhausted any more and

@@ -939,7 +939,7 @@ def _update_tiling_decision(
             from ..compile_environment import CompileEnvironment
 
             backend = CompileEnvironment.current().backend
-            from helion._compiler.backend import PallasBackend
+            from helion._compiler.pallas.backend import PallasBackend
 
             assert isinstance(backend, PallasBackend)
 

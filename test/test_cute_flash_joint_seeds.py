@@ -10,8 +10,8 @@ from .test_cute_flash_stateful_choice import _resolve
 from .test_cute_flash_stateful_choice import _spec
 import helion
 from helion._compiler.cute import cute_flash as flash
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
+from helion._testing import cpu_render_target
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with mock_cuda_unavailable(), forbid_native_compile():
+    with cpu_render_target():
         yield
 
 
@@ -90,7 +90,7 @@ def test_active_domains_and_parent_storage_cap(
 ) -> None:
     spec = _spec(head_dim, 32, torch.float16)
     old = _old_seeds(spec)
-    fragments = spec._cute_flash_autotune_fragments()
+    fragments = _cute_flash_autotune_fragments(spec)
     fragments[flash.FLASH_KV_STAGE_KEY] = EnumFragment(depths, depths)
     fragments[flash.FLASH_SOFTMAX_REGS_KEY] = EnumFragment(registers, registers)
     added = flash._flash_stateful_joint_seed_configs(
@@ -113,7 +113,7 @@ def test_weighted_budget_rejection_and_canonical_duplicate_parents() -> None:
         if c.config.get(flash.FLASH_SOFTMAX_LOWERING_KEY) == "resident_stateful"
         and c.config.get(flash.FLASH_ROWMAX_KEY) == "tmem"
     )
-    fragments = spec._cute_flash_autotune_fragments()
+    fragments = _cute_flash_autotune_fragments(spec)
 
     def supplement(parents):
         return flash._flash_stateful_joint_seed_configs(

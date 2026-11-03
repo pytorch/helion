@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.cute.autotune.heuristics.cute import (
     CutePersistentSubwarpRowsHeuristic,
 )
 from helion._compiler.cute.proven_loop_bounds import simplify_proven_loop_bounds

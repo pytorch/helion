@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import operator
 from typing import TYPE_CHECKING
 from typing import cast
+import weakref
 
 import sympy
 import torch
@@ -23,6 +24,7 @@ from ...language import creation_ops
 from ...language import inline_asm_ops
 from ...language import memory_ops
 from ...language import scan_ops
+from ..compile_environment import CompileEnvironment
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import GraphInfo
 from ..device_ir import RootGraphInfo
@@ -38,7 +40,6 @@ from .uniform_control import _signature
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ..compile_environment import CompileEnvironment
     from .gather_domains import GatherDomainFacts
     from .uniform_region_tree import UniformRegionFrame
 
@@ -402,7 +403,47 @@ def _legacy_resident_while_plan(
     )
 
 
+# Per compile environment: (id(call), ids of graphs) -> (call, graphs, plan or
+# refusal).  The entry keeps the call and the graphs alive so their ids cannot
+# be reused by later nodes within the environment's lifetime.
+_PLAN_CACHE: weakref.WeakKeyDictionary[
+    CompileEnvironment,
+    dict[
+        tuple[int, tuple[int, ...]],
+        tuple[Node, tuple[GraphInfo, ...], ResidentWhilePlan | exc.InvalidConfig],
+    ],
+] = weakref.WeakKeyDictionary()
+
+
 def resident_while_plan(call: Node, graphs: Sequence[GraphInfo]) -> ResidentWhilePlan:
+    """The plan of one while call, memoized per compile environment.
+
+    The fragment compiler, the bounded-gather admission, the local-atomic and
+    register-snapshot proofs and the register-snapshot heuristic all plan the
+    same call over the same graphs; the plan depends on nothing but the two,
+    so one compile environment computes it (or its ``InvalidConfig``) once.
+    Outside a compile environment nothing is cached: the structural tests
+    mutate a graph in place and re-plan the same call.
+    """
+    if not CompileEnvironment.has_current():
+        return _resident_while_plan(call, graphs)
+    cache = _PLAN_CACHE.setdefault(CompileEnvironment.current(), {})
+    key = (id(call), tuple(id(info) for info in graphs))
+    entry = cache.get(key)
+    if entry is None:
+        result: ResidentWhilePlan | exc.InvalidConfig
+        try:
+            result = _resident_while_plan(call, graphs)
+        except exc.InvalidConfig as error:
+            result = error
+        entry = cache[key] = (call, tuple(graphs), result)
+    if isinstance(entry[2], exc.InvalidConfig):
+        raise entry[2]
+    return entry[2]
+
+
+def _resident_while_plan(call: Node, graphs: Sequence[GraphInfo]) -> ResidentWhilePlan:
+    """Run the legacy planner, then the region-tree planner on ``InvalidConfig``."""
     try:
         return _legacy_resident_while_plan(call, graphs)
     except exc.InvalidConfig as legacy_error:
@@ -467,7 +508,7 @@ def resident_while_domain_facts(
     captures with a closed index recipe may retain their entry interval.
     """
     from .bounded_gather import integer_bounds
-    from .computed_fragment import _fragment_logical_shape
+    from .fragment_context import _fragment_logical_shape
     from .gather_domains import GatherDomainFacts
     from .gather_domains import _readonly_index_recipe
     from .register_loads import host_load_is_readonly

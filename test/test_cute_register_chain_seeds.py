@@ -14,10 +14,11 @@ import pytest
 import sympy
 import torch
 
-from helion._compiler.autotuner_heuristics.register_chain import (
+from helion._compiler.cute.autotune.heuristics.cute_register_chain import (
     CuteRegisterChainHeuristic,
 )
-from helion._compiler.backend import CuteBackend
+from helion._compiler.cute.autotune.search_surface import enable_cute_proven_bounds
+from helion._compiler.cute.backend import CuteBackend
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
@@ -265,7 +266,7 @@ class TestCuteRegisterChainSeeds(unittest.TestCase):
         axes = CuteRegisterChainHeuristic._axes(env, device_ir)
         first = env.config_spec.matmul_facts[0]
         with patch(
-            "helion._compiler.autotuner_heuristics.register_chain.cute_matmul_root_placements",
+            "helion._compiler.cute.autotune.heuristics.cute_register_chain.cute_matmul_root_placements",
             return_value=((first, (0, 1)),),
         ):
             self.assertEqual(
@@ -340,7 +341,7 @@ class TestCuteRegisterChainSeeds(unittest.TestCase):
         for item in spec.block_sizes:
             if item.block_id in (0, 1):
                 item.update_max(16)
-        spec.enable_cute_proven_bounds()
+        enable_cute_proven_bounds(spec)
         seeds = _chain_seeds(env, device_ir)
         self.assertEqual(len(seeds), 4)
         self.assertTrue(all("cute_proven_bounds" not in seed.config for seed in seeds))

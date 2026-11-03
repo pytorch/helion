@@ -61,6 +61,31 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
+class TestWorkerStartTimeoutSetting(TestCase):
+    def test_rejects_non_positive_timeout(self) -> None:
+        for value in (0, -1):
+            with self.assertRaisesRegex(
+                ValueError, "autotune_worker_start_timeout must be a positive"
+            ):
+                Settings(autotune_worker_start_timeout=value)
+        with (
+            patch.dict(os.environ, {"HELION_AUTOTUNE_WORKER_START_TIMEOUT": "0"}),
+            self.assertRaisesRegex(
+                ValueError, "autotune_worker_start_timeout must be a positive"
+            ),
+        ):
+            Settings()
+
+    def test_accepts_positive_timeout_and_default(self) -> None:
+        self.assertEqual(
+            Settings(autotune_worker_start_timeout=7).autotune_worker_start_timeout, 7
+        )
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_WORKER_START_TIMEOUT": "15"}):
+            self.assertEqual(Settings().autotune_worker_start_timeout, 15)
+        with without_env_var("HELION_AUTOTUNE_WORKER_START_TIMEOUT"):
+            self.assertIsNone(Settings().autotune_worker_start_timeout)
+
+
 @onlyBackends(["triton", "cute"])
 class TestAutotuneBudget(TestCase):
     def _make_search(self, settings: Settings) -> BaseSearch:
@@ -97,8 +122,8 @@ class TestAutotuneBudget(TestCase):
 
     def test_cute_backend_uses_default_autotune_budget_without_mutating(self) -> None:
         from helion._compiler.backend import Backend
-        from helion._compiler.backend import CuteBackend
         from helion._compiler.cute.backend import _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS
+        from helion._compiler.cute.backend import CuteBackend
 
         settings = Settings(
             autotune_budget_seconds=None,
@@ -122,7 +147,7 @@ class TestAutotuneBudget(TestCase):
 
     def test_cute_backend_leaves_full_autotune_unbudgeted_by_default(self) -> None:
         from helion._compiler.backend import Backend
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         settings = Settings(
             autotune_budget_seconds=None,
@@ -146,7 +171,7 @@ class TestAutotuneBudget(TestCase):
 
     def test_cute_backend_restores_default_autotune_budget_on_error(self) -> None:
         from helion._compiler.backend import Backend
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         settings = Settings(
             autotune_budget_seconds=None,
@@ -170,7 +195,7 @@ class TestAutotuneBudget(TestCase):
 
     def test_cute_backend_preserves_explicit_autotune_budget(self) -> None:
         from helion._compiler.backend import Backend
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         settings = Settings(
             autotune_budget_seconds=42,
@@ -1497,7 +1522,7 @@ class TestAutotuneBudget(TestCase):
             self.assertFalse(provider._effective_source_dedup_enabled())
 
     def test_cute_backend_reports_attached_generated_source_hash(self) -> None:
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         backend = CuteBackend()
         compiled = SimpleNamespace(
@@ -1637,7 +1662,7 @@ class TestAutotuneBudget(TestCase):
         # run on the Torch current stream, so CUDA-event timing is accurate
         # and subprocess benchmark jobs must NOT switch to the wall-clock
         # path that charges per-launch host overhead to the kernel.
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         backend = CuteBackend()
         self.assertIsNone(backend.get_do_bench())
@@ -1661,6 +1686,9 @@ class TestAutotuneBudget(TestCase):
             def get_do_bench(self):
                 return do_bench_generic
 
+            def prefers_wall_clock_bench(self) -> bool:
+                return False
+
         provider = self._make_stub_provider()
         provider.kernel.supports_subprocess_benchmark = lambda: True
         provider.config_spec = SimpleNamespace(backend=OtherBackend())
@@ -1671,7 +1699,7 @@ class TestAutotuneBudget(TestCase):
     def test_mtia_device_disables_subprocess_benchmark(self) -> None:
         # The MTIA runtime reserves the whole device for its first client,
         # so a spawned worker cannot open it while this process holds it.
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         backend = CuteBackend()
         self.assertIsNone(backend.get_do_bench())
@@ -1689,7 +1717,7 @@ class TestAutotuneBudget(TestCase):
         # A kernel writing into an ``out`` argument (most examples) must still
         # compile and run in the killable worker: a stalled or crashing JIT of
         # one config otherwise takes down the whole autotune.
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         provider = self._make_stub_provider()
         provider.kernel.supports_subprocess_benchmark = lambda: True
@@ -1702,7 +1730,7 @@ class TestAutotuneBudget(TestCase):
     def test_missing_device_env_does_not_break_subprocess_check(self) -> None:
         # Stub kernels mock env without a device; the MTIA carve-out must
         # tolerate that instead of raising AttributeError.
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         provider = self._make_stub_provider()
         provider.kernel.supports_subprocess_benchmark = lambda: True
@@ -2693,7 +2721,9 @@ class TestBudgetedInitialPopulation(TestCase):
         flash = SimpleNamespace(
             config_spec=SimpleNamespace(cute_flash_search_enabled=True),
             config_gen=SimpleNamespace(
-                flash_structural_qualification_prefix_count=lambda: 9
+                extension=SimpleNamespace(
+                    structural_qualification_prefix_count=lambda: 9,
+                ),
             ),
         )
         floor = PopulationBasedSearch._initial_population_floor

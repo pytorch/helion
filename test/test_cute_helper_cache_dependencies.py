@@ -12,15 +12,15 @@ from torch._inductor.codecache import PyCodeCache
 
 from test.test_cute_resident_reductions_codegen import _kernel_and_arguments
 
-from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
+from helion._compiler.cute.autotune.heuristics.cute_resident_reductions import (
     CuteResidentReductionHeuristic,
 )
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.precompile_future import _load_compiled_fn
 from helion.autotuner.precompile_future import _serialize_compiled_fn
 from helion.autotuner.precompile_future import _unload_compiled_fn
+from helion.runtime.cute import compile_cache
 from helion.runtime.cute import launcher
 from helion.runtime.cute import source_dependencies
 
@@ -30,7 +30,7 @@ pytestmark = pytest.mark.cpu_only
 @pytest.fixture
 def source_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     files = set(source_dependencies._COMMON_DEPENDENCIES)
-    for paths in source_dependencies._WRAPPER_DEPENDENCIES.values():
+    for paths in source_dependencies.wrapper_dependencies().values():
         files.update(paths)
     for relative in files:
         filename = tmp_path / relative
@@ -74,7 +74,7 @@ def _key(kernel: SimpleNamespace) -> str | None:
         ),
         (
             "chunk_recurrence_warp_dv4",
-            "_compiler/cute/kda_device_primitives.py",
+            "_compiler/cute/affine_recurrence_primitives.py",
             "chunk_recurrence_sm100",
         ),
         (
@@ -112,6 +112,26 @@ def _key(kernel: SimpleNamespace) -> str | None:
             "_compiler/cute/_warp_mma_runtime.py",
             "helion_flash_row_mma",
         ),
+        (
+            "helion_register_subblocks",
+            "_compiler/cute/device/ptx.py",
+            "helion_flash",
+        ),
+        (
+            "helion_mma_dag_tma",
+            "_compiler/cute/device/ptx.py",
+            "chunk_recurrence_sm100",
+        ),
+        (
+            "chunk_recurrence_warp_dv4",
+            "_compiler/cute/device/ptx.py",
+            "chunk_recurrence_sm100",
+        ),
+        (
+            "gdn_recurrence_sm100",
+            "_compiler/cute/device/ptx.py",
+            "helion_flash",
+        ),
     ],
 )
 def test_transitive_helper_changes_only_its_family(
@@ -144,16 +164,33 @@ def test_grouped_mailbox_helpers_invalidate_both_conversion_families(
     assert _key(unrelated) == before[2]
 
 
-def test_wrapper_generator_edit_invalidates_all_kinds(source_tree: Path) -> None:
-    kernels = [_kernel(None), *map(_kernel, source_dependencies._WRAPPER_DEPENDENCIES)]
+@pytest.mark.parametrize(
+    "edited",
+    [
+        relative
+        for relative in source_dependencies._COMMON_DEPENDENCIES
+        if relative == "runtime/cute/launcher.py"
+        or relative.startswith("runtime/cute/host_wrappers/")
+    ],
+)
+def test_wrapper_generator_edit_invalidates_all_kinds(
+    source_tree: Path, edited: str
+) -> None:
+    # The launcher and every host wrapper emitter module write the wrapper
+    # text the key does not otherwise see.
+    kernels = [_kernel(None), *map(_kernel, source_dependencies.wrapper_dependencies())]
     before = list(map(_key, kernels))
-    (source_tree / "runtime/cute/launcher.py").write_text("# new wrapper generation\n")
+    (source_tree / edited).write_text("# new wrapper generation\n")
     assert all(old != _key(kernel) for old, kernel in zip(before, kernels, strict=True))
 
 
 @pytest.mark.parametrize(
     "edited",
-    ("_compiler/cute/reduce_helpers.py", "_compiler/cute/cluster_helpers.py"),
+    (
+        "_compiler/cute/reduce_helpers.py",
+        "_compiler/cute/cluster_helpers.py",
+        "_compiler/cute/device/sync.py",
+    ),
 )
 def test_reduction_helper_edits_invalidate_ordinary_and_wrapper_keys(
     source_tree: Path, edited: str
@@ -163,7 +200,7 @@ def test_reduction_helper_edits_invalidate_ordinary_and_wrapper_keys(
     path = source_tree / edited
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("def helper():\n    return 1\n")
-    kernels = [_kernel(None), *map(_kernel, source_dependencies._WRAPPER_DEPENDENCIES)]
+    kernels = [_kernel(None), *map(_kernel, source_dependencies.wrapper_dependencies())]
     before = list(map(_key, kernels))
     assert all(key is not None for key in before)
     path.write_text("def helper():\n    return 2\n")
@@ -174,7 +211,6 @@ def test_reduction_helper_edits_invalidate_ordinary_and_wrapper_keys(
 
 
 @pytest.mark.parametrize("schedule", ["scalar", "resident", "pipelined"])
-@skipUnlessBackends(["cute"])
 def test_ordinary_resident_codegen_tracks_helper_edits_and_missing_source(
     source_tree: Path,
     tmp_path: Path,
@@ -188,7 +224,7 @@ def test_ordinary_resident_codegen_tracks_helper_edits_and_missing_source(
         mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
@@ -261,7 +297,7 @@ def test_direct_helper_cached_launcher_does_not_rehash_on_relaunch(
     with (
         patch.object(launcher, "_create_cute_wrapper", return_value=object()),
         patch.object(
-            launcher, "wrapper_source_dependencies", wraps=original
+            compile_cache, "wrapper_source_dependencies", wraps=original
         ) as fingerprint,
     ):
         first = launcher._get_compiled_cute_launcher(kernel, (), (256, 1, 1))
@@ -272,7 +308,7 @@ def test_direct_helper_cached_launcher_does_not_rehash_on_relaunch(
 
 
 @pytest.mark.parametrize(
-    "edited", source_dependencies._WRAPPER_DEPENDENCIES["paired_host_sum"]
+    "edited", source_dependencies._HELPER_KIND_DEPENDENCIES["paired_host_sum"]
 )
 def test_external_paired_sum_kernel_covers_all_compiled_helper_sources(
     source_tree: Path, edited: str
@@ -296,7 +332,7 @@ def test_missing_paired_helper_source_disables_disk_reuse(source_tree: Path) -> 
 
 
 @pytest.mark.parametrize(
-    "edited", source_dependencies._WRAPPER_DEPENDENCIES["single_host_sum"]
+    "edited", source_dependencies._HELPER_KIND_DEPENDENCIES["single_host_sum"]
 )
 def test_external_single_sum_kernel_covers_all_compiled_helper_sources(
     source_tree: Path, edited: str
@@ -312,7 +348,7 @@ def test_external_single_sum_kernel_covers_all_compiled_helper_sources(
     source_dependencies.set_helper_source_hash(changed_paired, "paired_host_sum")
     assert _key(changed_single) != before[0]
     assert (_key(changed_paired) != before[1]) == (
-        edited in source_dependencies._WRAPPER_DEPENDENCIES["paired_host_sum"]
+        edited in source_dependencies._HELPER_KIND_DEPENDENCIES["paired_host_sum"]
     )
     assert _key(single) == before[0]  # Already loaded objects retain their source.
 
@@ -382,7 +418,7 @@ def test_cached_launcher_does_not_rehash_helpers_on_relaunch(source_tree: Path) 
     with (
         patch.object(launcher, "_create_cute_wrapper", return_value=object()),
         patch.object(
-            launcher, "wrapper_source_dependencies", wraps=original
+            compile_cache, "wrapper_source_dependencies", wraps=original
         ) as fingerprint,
     ):
         first = launcher._get_compiled_cute_launcher(kernel, (), (192, 1, 1))
@@ -398,10 +434,53 @@ def test_source_checkout_path_does_not_enter_key(
     other = tmp_path / "second-checkout"
     for relative in (
         *source_dependencies._COMMON_DEPENDENCIES,
-        *source_dependencies._WRAPPER_DEPENDENCIES["block_scaled_mma"],
+        *source_dependencies.wrapper_dependencies()["block_scaled_mma"],
     ):
         filename = other / relative
         filename.parent.mkdir(parents=True, exist_ok=True)
         filename.write_bytes((source_tree / relative).read_bytes())
     monkeypatch.setattr(source_dependencies, "_PACKAGE_ROOT", other)
     assert _key(_kernel("block_scaled_mma")) == before
+
+
+# ``_mlir_compat`` is a typing shim (``ir: Any = cutlass._mlir.ir``): modules
+# import the ``ir`` object, not the shim, so the walk never reaches the file.
+_TYPING_SHIMS = frozenset({"_compiler/cute/_mlir_compat.py"})
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "chunk_recurrence_sm100",
+        "chunk_recurrence_warp_dv4",
+        "gdn_recurrence_sm100",
+        "gathered_mma_tma",
+    ],
+)
+def test_namespace_walk_reaches_the_declared_helper_sources(kind: str) -> None:
+    """The host entry a whole-root emitter binds into the wrapper namespace
+    reaches (``referenced_helper_sources``) every helper source the emitter
+    declares, so the declaration is a superset check of the walk the disk
+    key performs over the wrapper's globals.  ``block_scaled_mma`` keeps an
+    explicit declaration: its entry is rendered and exec'd (``__module__``
+    None) and its imports are function-local, so the walk cannot see them.
+    """
+    pytest.importorskip("cutlass")
+    from helion.runtime.cute.host_wrappers import HOST_WRAPPER_EMITTERS
+
+    emitter = HOST_WRAPPER_EMITTERS[kind]
+    assert emitter.namespace is not None
+    sources = source_dependencies.referenced_helper_sources(emitter.namespace({}))
+    assert sources is not None
+    reached = {relative for relative, _digest in sources}
+    assert set(emitter.source_dependencies) - _TYPING_SHIMS <= reached
+
+
+def test_helper_kinds_and_plan_kinds_are_disjoint() -> None:
+    from helion.runtime.cute.host_wrappers import HOST_WRAPPER_EMITTERS
+
+    assert not set(source_dependencies._HELPER_KIND_DEPENDENCIES) & set(
+        HOST_WRAPPER_EMITTERS
+    )
+    table = source_dependencies.wrapper_dependencies()
+    assert set(source_dependencies._HELPER_KIND_DEPENDENCIES) <= set(table)

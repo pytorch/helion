@@ -40,6 +40,7 @@ import ast
 import re
 
 from ..ast_extension import statement_from_string
+from ._ast_pass_utils import loop_extent
 
 _DECODE_FN = "_cute_fp8e4m3fn_to_float32"
 _DECODE2_FN = "_cute_fp8e4m3fn_x2_to_float32"
@@ -52,22 +53,11 @@ _SHIFT_RE = re.compile(
 
 
 def _is_constexpr_v_loop(node: ast.stmt) -> tuple[ast.For, str, int] | None:
-    if not isinstance(node, ast.For):
+    extent = loop_extent(node, kinds=("constexpr",), minimum=None)
+    if extent is None:
         return None
-    it = node.iter
-    if not (
-        isinstance(it, ast.Call)
-        and isinstance(it.func, ast.Attribute)
-        and it.func.attr == "range_constexpr"
-        and isinstance(it.func.value, ast.Name)
-        and it.func.value.id == "cutlass"
-        and len(it.args) == 1
-        and isinstance(it.args[0], ast.Constant)
-        and isinstance(it.args[0].value, int)
-        and isinstance(node.target, ast.Name)
-    ):
-        return None
-    return node, node.target.id, it.args[0].value
+    assert isinstance(node, ast.For) and isinstance(node.target, ast.Name)
+    return node, node.target.id, extent
 
 
 def _byte_extract_packed(rhs: ast.expr, lane_var: str) -> str | None:

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from helion._compiler.cute.rolled_vector_reduction import split_rolled_vector_sums
+from helion._compiler.cute.vector_reduction_packets import split_rolled_vector_sums
 
 pytestmark = pytest.mark.cpu_only
 

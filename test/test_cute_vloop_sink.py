@@ -9,7 +9,7 @@ with the loops: one V-wide vector load per row, V register accumulators, one
 fragment grouped combine per row tile, strength-reduced row addressing and an
 optional load-first unroll of the row lane loop (``cute_lane_unroll``).
 
-CPU code generation only; ``test_cute_vloop_sink_cuda.py`` runs the kernels.
+CPU code generation first; the GPU tests at the end run the kernels.
 """
 
 from __future__ import annotations
@@ -29,27 +29,36 @@ import torch
 from test._cute_vloop_sink_kernels import FRAGMENT_REDUCE
 from test._cute_vloop_sink_kernels import TWO_STAGE_REDUCE
 from test._cute_vloop_sink_kernels import _sink_config
+from test._cute_vloop_sink_kernels import col_reduce_max_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_atomic_then_load_static
 from test._cute_vloop_sink_kernels import col_reduce_sum_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_from8_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_from8_static
 from test._cute_vloop_sink_kernels import col_reduce_sum_gather_then_atomic_static
 from test._cute_vloop_sink_kernels import col_reduce_sum_lower_triangle_static
+from test._cute_vloop_sink_kernels import col_reduce_sum_pair_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_pair_static
 from test._cute_vloop_sink_kernels import col_reduce_sum_rescaled_const_static
+from test._cute_vloop_sink_kernels import col_reduce_sum_rescaled_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_rescaled_static
 from test._cute_vloop_sink_kernels import col_reduce_sum_static
+from test._cute_vloop_sink_kernels import col_weighted_mean_dynamic
 from test._cute_vloop_sink_kernels import col_weighted_mean_static
 
 import helion
-from helion._compiler import generate_ast
 from helion._compiler.ast_read_writes import ReadWrites
-from helion._compiler.autotuner_heuristics.cute import CuteColumnReductionHeuristic
 from helion._compiler.cute import sink_vector_loops
+from helion._compiler.cute.autotune.heuristics.cute import CuteColumnReductionHeuristic
+from helion._compiler.cute.lane_loops import root_passes
+from helion._compiler.cute.sink_vector_loops import VloopSinkNotApplied
+from helion._testing import DEVICE
+from helion._testing import TestCase
+from helion._testing import code_and_output
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
+from helion._testing import onlyBackends
+from helion._testing import skipIfNotCUDA
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
@@ -60,19 +69,14 @@ softmax = import_example("softmax").softmax
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from helion._compiler.generate_ast import GenerateAST
+
 cutlass = pytest.importorskip("cutlass")
 
 
 @pytest.fixture
 def cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
         yield
 
 
@@ -189,7 +193,6 @@ def _both(
     return on
 
 
-@skipUnlessBackends(["cute"])
 def test_column_sum_sinks_the_vector_loop_into_the_row_loops(cpu_only: None) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
     code = _cpu_code(
@@ -241,7 +244,6 @@ def test_column_sum_sinks_the_vector_loop_into_the_row_loops(cpu_only: None) -> 
     assert "_cute_store_u16_vec(out.iterator" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_lane_unroll_one_keeps_the_rolled_lane_loop(cpu_only: None) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
     code = _cpu_code(
@@ -261,7 +263,6 @@ def test_lane_unroll_one_keeps_the_rolled_lane_loop(cpu_only: None) -> None:
     assert "block=(2, 256, 1)" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_sunk_loads_keep_the_cache_policy(cpu_only: None) -> None:
     """A load's eviction policy applies to the vector form the sinking pass
     emits (the L2 policy helpers exist for 16-byte packets)."""
@@ -279,7 +280,6 @@ def test_sunk_loads_keep_the_cache_policy(cpu_only: None) -> None:
     assert "cute.arch.load(" not in code
 
 
-@skipUnlessBackends(["cute"])
 def test_rows_above_columns_uses_the_interleaved_fragment_reduce(
     cpu_only: None,
 ) -> None:
@@ -303,7 +303,6 @@ def test_rows_above_columns_uses_the_interleaved_fragment_reduce(
     assert len(_vector_loads(_loop(code, "lane_0").body)) == 4
 
 
-@skipUnlessBackends(["cute"])
 def test_dynamic_shapes_guard_whole_vectors_with_a_uniform_mask(
     cpu_only: None,
 ) -> None:
@@ -344,7 +343,6 @@ def test_dynamic_shapes_guard_whole_vectors_with_a_uniform_mask(
     assert code.count(FRAGMENT_REDUCE) == 1
 
 
-@skipUnlessBackends(["cute"])
 def test_extent_not_a_multiple_of_the_vector_width_stays_scalar(
     cpu_only: None,
 ) -> None:
@@ -365,7 +363,6 @@ def test_extent_not_a_multiple_of_the_vector_width_stays_scalar(
     assert "block=(128, 4, 1)" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_nonzero_grid_origin_keeps_per_element_masks_and_scalar_loads(
     cpu_only: None,
 ) -> None:
@@ -399,7 +396,6 @@ def _strided_view(view: str) -> torch.Tensor:
     return torch.empty(4096, 4100, dtype=torch.bfloat16)[:, :4096]
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("view", ["offset_2", "row_stride_4098"])
 def test_misaligned_input_views_stay_scalar_with_the_knob_on(
     cpu_only: None, view: str
@@ -422,7 +418,6 @@ def test_misaligned_input_views_stay_scalar_with_the_knob_on(
     assert code.count(TWO_STAGE_REDUCE) == 1
 
 
-@skipUnlessBackends(["cute"])
 def test_an_aligned_row_stride_still_sinks(cpu_only: None) -> None:
     code = _cpu_code(
         col_reduce_sum_static,
@@ -435,7 +430,6 @@ def test_an_aligned_row_stride_still_sinks(cpu_only: None) -> None:
     assert ".load()" not in code
 
 
-@skipUnlessBackends(["cute"])
 def test_per_element_load_conditions_are_unsupported(cpu_only: None) -> None:
     """A load under a condition that differs per V lane (an ``extra_mask``
     over both axes) has no whole-chunk transaction: the pass raises
@@ -466,7 +460,6 @@ def test_per_element_load_conditions_are_unsupported(cpu_only: None) -> None:
     assert "operator.ge(indices_0, indices_1)" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_row_only_loads_and_accumulators_become_per_lane(cpu_only: None) -> None:
     """``acc += sum(x * w[:, None]); wsum += sum(w)``: the row weight is
     loaded once per row before the V-loop (with its convert), and the
@@ -499,7 +492,6 @@ def test_row_only_loads_and_accumulators_become_per_lane(cpu_only: None) -> None
     assert "v_5 = acc_frag[vec_lane_1] / wsum_frag[vec_lane_1]" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_sibling_row_loops_sink_independently(cpu_only: None) -> None:
     """Two row loops over the same rows block define the same row index and
     mask names; each loop hoists its own definitions ahead of its vector
@@ -538,7 +530,6 @@ def test_sibling_row_loops_sink_independently(cpu_only: None) -> None:
     assert ".load()" not in code
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     ("kernel", "extra_args", "definition"),
     [
@@ -600,7 +591,6 @@ def test_a_lane_invariant_scalar_redefined_inside_the_segment_stays_per_lane(
     assert "v_3 = 0" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_a_load_after_a_bound_atomic_rejects_the_config(cpu_only: None) -> None:
     """``old = hl.atomic_add(count, [tile_n], 1); first = count[tile.id * B]``:
     threads 1-3 read the element thread 0's atomic bumps, a race no barrier
@@ -618,7 +608,6 @@ def test_a_load_after_a_bound_atomic_rejects_the_config(cpu_only: None) -> None:
         )
 
 
-@skipUnlessBackends(["cute"])
 def test_a_gathered_value_is_not_recomputed_after_the_atomic(cpu_only: None) -> None:
     """``before = gather(count[tile_n], tile_n.index)`` then
     ``hl.atomic_add(count, [tile_n], 1)``: the gather lowers to
@@ -695,7 +684,6 @@ def test_a_gathered_value_is_not_recomputed_after_the_atomic(cpu_only: None) -> 
     assert ast.unparse(off_gather).startswith("before = count[")
 
 
-@skipUnlessBackends(["cute"])
 def test_fission_stages_regenerate_the_knob_off_code_when_nothing_sinks(
     cpu_only: None,
 ) -> None:
@@ -751,19 +739,16 @@ def test_fission_stages_regenerate_the_knob_off_code_when_nothing_sinks(
         # with the knob off.
         restarts: list[bool] = []
 
-        def not_applied(self: generate_ast.GenerateAST) -> None:
+        def not_applied(codegen: GenerateAST) -> None:
             restarts.append(True)
-            raise generate_ast.VloopSinkNotApplied
+            raise VloopSinkNotApplied
 
-        with patch.object(
-            generate_ast.GenerateAST, "_sink_grid_vector_loops", not_applied
-        ):
+        with patch.object(root_passes, "sink_root_vector_loops", not_applied):
             retried = code(True)
         assert restarts == [True, True]
         assert retried == off
 
 
-@skipUnlessBackends(["cute"])
 def test_knob_off_keeps_the_original_nest(cpu_only: None) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
     code = _cpu_code(
@@ -779,7 +764,6 @@ def test_knob_off_keeps_the_original_nest(cpu_only: None) -> None:
     assert FRAGMENT_REDUCE not in code
 
 
-@skipUnlessBackends(["cute"])
 def test_kernels_without_the_pattern_generate_identical_code(cpu_only: None) -> None:
     def example(fn: Callable[..., Any]) -> helion.Kernel:
         return helion.kernel(
@@ -847,7 +831,6 @@ def test_kernels_without_the_pattern_generate_identical_code(cpu_only: None) -> 
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_lane_unroll_requires_sinking_or_a_grid_lane_loop(cpu_only: None) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
     bound = cpu_bind(col_reduce_sum_static, (x,))
@@ -884,7 +867,6 @@ def test_lane_unroll_requires_sinking_or_a_grid_lane_loop(cpu_only: None) -> Non
         )
 
 
-@skipUnlessBackends(["cute"])
 def test_column_reduction_heuristic_seeds_the_coalesced_layout(
     cpu_only: None,
 ) -> None:
@@ -980,3 +962,253 @@ def test_column_reduction_heuristic_seeds_the_coalesced_layout(
         ),
     )
     assert "cute_column_reduction" not in rows_bound.config_spec.autotuner_heuristics
+
+
+# GPU numerics for grid vector-loop sinking (``cute_vloop_sink``).
+#
+# Partial tiles on both axes, the interleaved (rows above columns) thread
+# layout, static shapes with several unroll depths, a max reduction and an
+# fp32 input; see ``test_cute_vloop_sink.py`` for the code-shape assertions.
+
+
+def _col_sum(t: torch.Tensor) -> torch.Tensor:
+    return t.float().sum(0).to(t.dtype)
+
+
+def _col_max(t: torch.Tensor) -> torch.Tensor:
+    return t.float().amax(0).to(t.dtype)
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+class TestCuteVloopSink(TestCase):
+    def _check(
+        self,
+        kernel: helion.Kernel,
+        ref: Callable[[torch.Tensor], torch.Tensor],
+        x: torch.Tensor,
+        **config: object,
+    ) -> str:
+        code, out = code_and_output(kernel, (x,), **config)  # pyrefly: ignore
+        torch.testing.assert_close(out, ref(x), atol=2e-2, rtol=2e-2)
+        # A second, different input must produce a different (correct) output.
+        y = torch.randn_like(x) * 3
+        _, out_y = code_and_output(kernel, (y,), **config)  # pyrefly: ignore
+        torch.testing.assert_close(out_y, ref(y), atol=5e-2, rtol=2e-2)
+        self.assertFalse(torch.allclose(out.float(), out_y.float()))
+        self.assertIn("_vsink_vec", code)
+        self.assertIn(FRAGMENT_REDUCE, code)
+        return code
+
+    def test_partial_tiles_on_both_axes(self) -> None:
+        """1000 rows against a 4096-row block and 1000 columns against
+        16-column blocks: row and column masks, V=4 and V=8."""
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        self._check(
+            col_reduce_sum_dynamic,
+            _col_sum,
+            x,
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+            ),
+        )
+        self._check(
+            col_reduce_sum_dynamic,
+            _col_sum,
+            x,
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[256, 2], vec=[1, 8], unroll=4
+            ),
+        )
+
+    def test_rows_above_columns_partial_tiles(self) -> None:
+        x = torch.randn(1000, 56, device=DEVICE, dtype=torch.bfloat16)
+        code = self._check(
+            col_reduce_sum_dynamic,
+            _col_sum,
+            x,
+            **_sink_config(
+                block_sizes=[2048, 16],
+                num_threads=[16, 8],
+                vec=[1, 2],
+                layouts=["blocked", "blocked"],
+                unroll=4,
+            ),
+        )
+        self.assertIn("pre=8, group_span=128", code)
+
+    def test_static_shapes_and_unroll_depths(self) -> None:
+        x = torch.randn(2048, 512, device=DEVICE, dtype=torch.bfloat16)
+        for unroll in (1, 2, 16):
+            self._check(
+                col_reduce_sum_static,
+                _col_sum,
+                x,
+                **_sink_config(
+                    block_sizes=[2048, 16],
+                    num_threads=[128, 2],
+                    vec=[1, 8],
+                    unroll=unroll,
+                ),
+            )
+
+    def test_max_reduction(self) -> None:
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        code = self._check(
+            col_reduce_max_dynamic,
+            _col_max,
+            x,
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+            ),
+        )
+        self.assertIn("'max', cutlass.Float32(float('-inf'))", code)
+        # The sunk per-lane combine keeps torch.amax's NaN propagation.
+        x[17, 5] = float("nan")
+        x[900, 640] = float("nan")
+        _, out = code_and_output(
+            col_reduce_max_dynamic,
+            (x,),
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+            ),
+        )
+        torch.testing.assert_close(out, _col_max(x), equal_nan=True)
+
+    def test_float32_input(self) -> None:
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.float32)
+        code = self._check(
+            col_reduce_sum_dynamic,
+            _col_sum,
+            x,
+            **_sink_config(
+                block_sizes=[4096, 8], num_threads=[128, 2], vec=[1, 4], unroll=4
+            ),
+        )
+        self.assertIn("ir.VectorType.get([4], cutlass.Uint32.mlir_type)", code)
+
+    def test_nonzero_grid_origin_declines_and_stays_correct(self) -> None:
+        """``hl.tile(8, n)`` keeps per-element column masks: the pass declines
+        (no out-of-bounds vector transaction) and the knob-off code runs."""
+        x = torch.randn(1000, 1008, device=DEVICE, dtype=torch.bfloat16)
+        code, out = code_and_output(
+            col_reduce_sum_from8_dynamic,
+            (x,),
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+            ),
+        )
+        expected = torch.zeros_like(out)
+        expected[8:] = _col_sum(x[:, 8:])
+        torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+        self.assertNotIn("_vsink", code)
+        self.assertNotIn(FRAGMENT_REDUCE, code)
+
+    def test_a_misaligned_input_view_declines_and_stays_correct(self) -> None:
+        """A view whose base is four bytes into its allocation cannot take the
+        8-byte sunk packet: the pass declines (it shares the tile hoist's base
+        proof) and the knob-off code runs instead of faulting on a misaligned
+        address."""
+        x = torch.randn(4096, 4112, device=DEVICE, dtype=torch.bfloat16)[:, 2:4098]
+        self.assertEqual(x.data_ptr() % 8, 4)
+        config = _sink_config(
+            block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+        )
+        code, out = code_and_output(col_reduce_sum_static, (x,), **config)
+        code_off, out_off = code_and_output(
+            col_reduce_sum_static, (x,), **{**config, "cute_vloop_sink": False}
+        )
+        torch.testing.assert_close(out, _col_sum(x), atol=2e-2, rtol=2e-2)
+        self.assertEqual(code, code_off)
+        self.assertTrue(torch.equal(out, out_off))
+        self.assertNotIn("_vsink", code)
+
+    def test_row_weighted_mean(self) -> None:
+        """A row-only weight load and a row-only sum next to the column sum:
+        both become per-lane state; partial tiles on both axes."""
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.rand(1000, device=DEVICE, dtype=torch.bfloat16) + 0.5
+        code, out = code_and_output(
+            col_weighted_mean_dynamic,
+            (x, w),
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+            ),
+        )
+        expected = (x.float() * w.float()[:, None]).sum(0) / w.float().sum()
+        torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("_vsink_vec", code)
+        self.assertEqual(code.count(FRAGMENT_REDUCE), 2)
+        self.assertIn("wsum_frag", code)
+
+    def test_lane_invariant_scalar_redefined_by_an_if(self) -> None:
+        """``s = scale[0]`` feeds one store, an ``if flag[0]`` doubles ``s``
+        and a second store uses it: with the flag set, every column of both
+        outputs must see one ``scale`` (not a value compounded over the V
+        lanes), and with it clear the second output equals the first."""
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        scale = torch.full((1,), 1.5, device=DEVICE, dtype=torch.float32)
+        column_sum = x.float().sum(0)
+        for flag_value, factor in ((1, 2.0), (0, 1.0)):
+            flag = torch.full((1,), flag_value, device=DEVICE, dtype=torch.int32)
+            code, (out1, out2) = code_and_output(
+                col_reduce_sum_rescaled_dynamic,
+                (x, scale, flag),
+                **_sink_config(
+                    block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+                ),
+            )
+            torch.testing.assert_close(out1, column_sum * 1.5, atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(
+                out2, column_sum * (1.5 * factor), atol=2e-2, rtol=2e-2
+            )
+            self.assertIn("_vsink_vec", code)
+            self.assertIn(FRAGMENT_REDUCE, code)
+
+    def test_a_gathered_value_is_read_before_the_atomic(self) -> None:
+        """Each lane gathers its own element of ``count`` and then bumps it,
+        unguarded (static shapes, one thread along the rows), so one thread
+        alone touches that element: the gathered value is the initial 2.0,
+        never the 3.0 the atomic leaves behind, with the knob on as with it
+        off.  Recomputing the gather after the row loop read 3.0."""
+        x = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        outputs: dict[bool, torch.Tensor] = {}
+        for sink in (False, True):
+            count = torch.full((1024,), 2.0, device=DEVICE, dtype=torch.float32)
+            code, out = code_and_output(
+                col_reduce_sum_gather_then_atomic_static,
+                (x, count),
+                **_sink_config(
+                    block_sizes=[1024, 16],
+                    num_threads=[1, 4],
+                    vec=[1, 4],
+                    unroll=8,
+                    sink=sink,
+                ),
+            )
+            self.assertEqual("_vsink_vec" in code, sink)
+            torch.testing.assert_close(count, torch.full_like(count, 3.0))
+            before = out - x.float().sum(0)
+            torch.testing.assert_close(
+                before, torch.full_like(before, 2.0), atol=5e-2, rtol=0
+            )
+            outputs[sink] = out
+        torch.testing.assert_close(outputs[True], outputs[False])
+
+    def test_sibling_row_loops(self) -> None:
+        x = torch.randn(1000, 1024, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(1000, 1024, device=DEVICE, dtype=torch.bfloat16) * 2
+        code, out = code_and_output(
+            col_reduce_sum_pair_dynamic,
+            (x, y),
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+            ),
+        )
+        expected = (x.float().sum(0) + y.float().sum(0)).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, atol=5e-2, rtol=2e-2)
+        # Each row loop strength-reduces and vectorizes its own tensor.
+        self.assertIn("_vsink_ptr = x.iterator", code)
+        self.assertIn("_vsink_ptr_1 = y.iterator", code)
+        self.assertEqual(code.count(FRAGMENT_REDUCE), 2)

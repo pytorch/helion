@@ -7,6 +7,7 @@ import ctypes
 import ctypes.util
 import dataclasses
 import functools
+import logging
 import multiprocessing as mp
 import os
 import signal
@@ -27,6 +28,13 @@ if TYPE_CHECKING:
     from multiprocessing.connection import Connection
 
 _T = TypeVar("_T")
+
+_log = logging.getLogger(__name__)
+
+# How long a fresh worker may take to report ready (``PHASE_READY``: its
+# interpreter started, the imports done and the device initialized) when the
+# provider does not set ``autotune_worker_start_timeout``.
+_DEFAULT_START_TIMEOUT_SECONDS = 120.0
 
 # How long a SIGKILLed worker may take to exit before it counts as unreapable.
 # A worker killed mid-kernel exits only once the driver has torn down its
@@ -52,6 +60,14 @@ def _worker_loop(connection: Connection, device: int | None) -> None:
     _set_pdeathsig()
     if device is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
+    # The first job's graphs would otherwise be captured in the fast dispatch
+    # state of a fresh process and ranked against later candidates captured
+    # in the steady one. The warm-up initializes the device (seconds, more on
+    # a loaded host), which like the spawned interpreter's start and imports
+    # is the worker's cost, not the first job's: the parent arms no job
+    # deadline before the ready report that follows.
+    steady_graph_dispatch()
+    connection.send(_PhaseReport(PHASE_READY))
 
     while True:
         try:
@@ -61,9 +77,7 @@ def _worker_loop(connection: Connection, device: int | None) -> None:
         if job is None:
             return
         try:
-            # The first job's graphs would otherwise be captured in the fast
-            # dispatch state of a fresh process and ranked against later
-            # candidates captured in the steady one.
+            # A no-op once the warm-up ran; a warm-up that failed is retried.
             steady_graph_dispatch()
             if isinstance(job, PhasedJob):
                 result: object = job(functools.partial(_report_phase, connection))
@@ -93,6 +107,9 @@ def _worker_loop(connection: Connection, device: int | None) -> None:
 # The phase a ``PhasedJob`` reports once its candidate is compiled and has
 # run once: from here on the parent holds it to the benchmark timeout.
 PHASE_COMPILED = "compiled"
+# The report a fresh worker sends before its first job: the parent holds the
+# start to ``start_timeout`` and arms the job's deadline only afterwards.
+PHASE_READY = "ready"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -132,7 +149,15 @@ class BenchmarkTimeout(BenchmarkSubprocessError):
 class BenchmarkCompileTimeout(BenchmarkSubprocessError):
     """A phased job did not finish compiling (and running once) within the
     compile deadline. Not a :class:`BenchmarkTimeout`: the candidate was never
-    timed, so it counts as a compile failure rather than a slow kernel."""
+    timed, so it counts as a compile failure rather than a slow kernel.
+
+    ``cold_start_seconds`` is how long the worker took to start when the job
+    was its first (set by ``BenchmarkWorker.run``), None for a job in a warm
+    worker. A first job also loads the arguments and the backend's runtime,
+    so the search tries a candidate dropped that way once more.
+    """
+
+    cold_start_seconds: float | None = None
 
 
 class BenchmarkWorkerDied(BenchmarkSubprocessError):
@@ -153,15 +178,27 @@ class BenchmarkWorkerUnkillable(BenchmarkSubprocessError):
 class BenchmarkWorker:
     """Single spawn subprocess. Lazily started on first ``run()``;
     respawned after timeout, sticky CUDA error, device out-of-memory error,
-    or unexpected exit."""
+    or unexpected exit.
+
+    A start (the spawned interpreter, its imports and the device
+    initialization: seconds on an idle host, far longer on a loaded one) is
+    held to ``start_timeout`` and is never charged to the job that caused it;
+    ``log`` receives one line per start with the measured time.
+    """
 
     def __init__(
         self,
         device: int | None = None,
         *,
+        start_timeout: float = _DEFAULT_START_TIMEOUT_SECONDS,
+        log: Callable[[str], None] = _log.debug,
         log_warning: Callable[[str], object] | None = None,
     ) -> None:
         self.device = device
+        self.start_timeout = start_timeout
+        self.log = log
+        # Seconds the most recent start took until the worker reported ready.
+        self.last_start_seconds: float | None = None
         self._process: mp.process.BaseProcess | None = None
         self._parent_connection: Connection | None = None
         self._lock = threading.Lock()
@@ -209,11 +246,15 @@ class BenchmarkWorker:
         it reports :data:`PHASE_COMPILED`; past it the worker is killed and
         ``BenchmarkCompileTimeout`` is raised) and then ``timeout`` seconds,
         counted from that report, for the timing. Any other job keeps the
-        single whole-job ``timeout``.
+        single whole-job ``timeout``. Both deadlines are armed once the
+        worker is ready: a job that starts the worker does not pay for the
+        start, and a ``BenchmarkCompileTimeout`` it raises carries the
+        start's measured seconds as ``cold_start_seconds``.
         """
         self._raise_if_unusable()
+        cold_start_seconds: float | None = None
         if not self.alive():
-            self._start()
+            cold_start_seconds = self._start()
         connection = self._parent_connection
         process = self._process
         assert connection is not None
@@ -232,10 +273,12 @@ class BenchmarkWorker:
         def timeout_error() -> BenchmarkSubprocessError:
             if compiling:
                 assert compile_timeout is not None
-                return BenchmarkCompileTimeout(
+                error = BenchmarkCompileTimeout(
                     f"compile and first call exceeded {compile_timeout:.1f}s "
                     "in the benchmark worker"
                 )
+                error.cold_start_seconds = cold_start_seconds
+                return error
             return BenchmarkTimeout(f"benchmark timeout after {timeout:.1f}s")
 
         def on_timeout(expected: threading.Timer) -> None:
@@ -354,7 +397,13 @@ class BenchmarkWorker:
         self._kill()
         self._raise_if_unusable()
 
-    def _start(self) -> None:
+    def _start(self) -> float:
+        """Spawn the worker and wait for its ready report; returns the
+        seconds that took.
+
+        A worker that is not ready within ``start_timeout`` (or exits
+        first) is killed and raises ``BenchmarkWorkerDied``.
+        """
         self._raise_if_unusable()
         context = mp.get_context("spawn")
         parent_connection, child_connection = context.Pipe(duplex=True)
@@ -363,11 +412,32 @@ class BenchmarkWorker:
             args=(child_connection, self.device),
             daemon=True,
         )
+        started = time.monotonic()
         process.start()
         child_connection.close()
         self._process = process
         self._parent_connection = parent_connection
         self._jobs_succeeded = 0
+        if not parent_connection.poll(self.start_timeout):
+            self._kill()
+            self._raise_if_unusable()
+            raise BenchmarkWorkerDied(
+                f"benchmark worker did not start within {self.start_timeout:g}s "
+                "(HELION_AUTOTUNE_WORKER_START_TIMEOUT)"
+            )
+        try:
+            report = parent_connection.recv()
+        except (EOFError, OSError) as e:
+            self._kill()
+            self._raise_if_unusable()
+            raise BenchmarkWorkerDied(
+                "benchmark worker exited before it was ready"
+            ) from e
+        assert report == _PhaseReport(PHASE_READY), report
+        seconds = time.monotonic() - started
+        self.last_start_seconds = seconds
+        self.log(f"Benchmark worker ready in {seconds:.1f}s")
+        return seconds
 
     def _kill_if_current(
         self,

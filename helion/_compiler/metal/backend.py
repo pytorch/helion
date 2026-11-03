@@ -15,7 +15,6 @@ from ... import exc
 from ..backend import Backend
 from ..backend import BackendState
 from ..backend import _largest_divisor_at_most
-from ..cute.backend import CuteBackend
 from ._constants import MAX_THREAD_AXES
 from ._constants import MAX_THREADS_PER_THREADGROUP
 from ._constants import SIMD_WIDTH
@@ -29,6 +28,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ..aten_lowering import Lowering
+    from ..autotuner_heuristics.registry import AutotunerHeuristicType
     from ..compile_environment import CompileEnvironment
     from ..device_function import Argument
     from ..device_function import DeviceFunction
@@ -231,6 +231,11 @@ def _config_fixed_scalars() -> set[str]:
 
 class MetalBackend(Backend):
     """Metal Shading Language (MSL) code generation backend for macOS."""
+
+    def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
+        from .row_reduction_heuristic import MetalRowReductionHeuristic
+
+        return (MetalRowReductionHeuristic,)
 
     @staticmethod
     def _get_dtype_to_metal() -> dict[torch.dtype, str]:
@@ -1007,8 +1012,9 @@ class MetalBackend(Backend):
         config = self._config_with_reduction_thread_budget(fn, block_ids, config)
         # Re-clamp any count the passes above left not dividing its block size.
         config = self._config_with_divisible_thread_counts(block_ids, config)
-        # pyrefly: ignore[bad-argument-type]
-        strategy = CuteBackend.create_loop_strategy(self, fn, block_ids, config)
+        from ..per_thread_planning import plan_per_thread_loop_strategy
+
+        strategy = plan_per_thread_loop_strategy(self, fn, block_ids, config)
         self._reject_dynamic_thread_extents(strategy)
         return strategy
 
@@ -1405,7 +1411,6 @@ class MetalBackend(Backend):
             return config
 
         from ..compile_environment import CompileEnvironment
-        from ..cute.thread_budget import MAX_THREADS_PER_BLOCK
 
         env = CompileEnvironment.current()
         num_threads = self._mutable_num_threads(config)
@@ -1444,11 +1449,11 @@ class MetalBackend(Backend):
             )
             if configured > 0:
                 used_threads *= configured
-                if used_threads > MAX_THREADS_PER_BLOCK:
+                if used_threads > MAX_THREADS_PER_THREADGROUP:
                     raise exc.BackendUnsupported(
                         self.name,
                         f"threadgroup of {used_threads} threads "
-                        f"(max {MAX_THREADS_PER_BLOCK}); MPP claims "
+                        f"(max {MAX_THREADS_PER_THREADGROUP}); MPP claims "
                         f"{mpp_threads} on tid[0] and the explicit num_threads "
                         "on the remaining axes do not fit alongside it",
                     )
@@ -1458,7 +1463,7 @@ class MetalBackend(Backend):
             if not isinstance(axis_size, int):
                 continue
 
-            budget = max(1, MAX_THREADS_PER_BLOCK // max(1, used_threads))
+            budget = max(1, MAX_THREADS_PER_THREADGROUP // max(1, used_threads))
             chosen = _largest_divisor_at_most(axis_size, budget)
             if self._record_thread_count(env, num_threads, block_id, chosen):
                 changed = True

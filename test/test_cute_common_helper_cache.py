@@ -75,8 +75,9 @@ def test_called_helper_edit_changes_kernel_key(common_sources: Path) -> None:
 
     relative = "_compiler/cute/reduce_helpers.py"
     (common_sources / relative).write_text("def helper():\n    return 1\n")
-    # reduce_helpers' own helper imports are part of its closure.
-    (common_sources / "_compiler/cute/cluster_helpers.py").write_text("# cluster\n")
+    # reduce_helpers' own helper imports (the DSM stores of ``device/sync.py``)
+    # are part of its closure; the fixture wrote that file with the other
+    # common dependencies.
     namespace = {"_cute_grouped_reduce_warp": reduce_helpers._cute_grouped_reduce_warp}
     before = _called_helper_key(namespace)
     assert before is not None
@@ -88,10 +89,11 @@ def test_called_helper_edit_changes_kernel_key(common_sources: Path) -> None:
     assert _called_helper_key(namespace) is None
 
 
-def test_cluster_reductions_key_on_cluster_helpers() -> None:
-    # The cluster reductions store to peer CTAs through cluster_helpers; the
-    # helper closure follows module globals, so it sees that module only
-    # through reduce_helpers' module-level imports.
+def test_cluster_reductions_key_on_device_sync() -> None:
+    # The cluster reductions store to peer CTAs through the DSM helpers of
+    # ``device/sync.py``; the helper closure follows module globals, so it
+    # sees the defining module only through reduce_helpers' module-level
+    # imports.
     pytest.importorskip("cutlass")
     from helion._compiler.cute import reduce_helpers
 
@@ -101,4 +103,4 @@ def test_cluster_reductions_key_on_cluster_helpers() -> None:
     ):
         sources = source_dependencies.referenced_helper_sources({"helper": helper})
         assert sources is not None
-        assert "_compiler/cute/cluster_helpers.py" in dict(sources)
+        assert "_compiler/cute/device/sync.py" in dict(sources)

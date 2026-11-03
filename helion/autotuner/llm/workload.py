@@ -12,6 +12,7 @@ from ..._compat import get_device_name
 from ..._compat import num_compute_units
 from ..._compiler.autotuner_heuristics.common import REDUCTION_TARGET_NAMES
 from ..._compiler.autotuner_heuristics.common import op_name_parts
+from .profile import prompt_profile
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -183,9 +184,8 @@ def _attention_reduction_hints(
     backend: str,
 ) -> list[str]:
     """Suggest conservative but diverse starting families for attention-like kernels."""
-    aggressive_settings = "num_warps/num_stages or advanced toggles"
-    if backend == "cute":
-        aggressive_settings = "settings"
+    profile = prompt_profile(backend)
+    aggressive_settings = profile.attention_aggressive_settings
 
     hints = [
         (
@@ -202,22 +202,12 @@ def _attention_reduction_hints(
             "much larger tile."
         ),
     ]
-    if backend != "cute":
-        hints.append(
-            "Keep most balanced configs on moderate warps and stages; "
-            "for attention-style streaming kernels, 4 warps is often the "
-            "balanced choice, while 8+ warps or 4+ stages are "
-            "exploratory unless tiles are clearly large and compile "
-            "cleanly."
-        )
+    hints.extend(profile.attention_balanced_lines())
     hints.append(
         "Include at least one persistent scheduling family when "
         "available for long streaming dimensions."
     )
-    if backend == "cute" and (
-        "block_sizes" not in flat_fields
-        or any(key.startswith("cute_flash_") for key in flat_fields)
-    ):
+    if not profile.attention_shape_hints_apply(flat_fields):
         return hints
     shapes = [list(tensor.shape) for tensor in tensors]
     if len(tensors) < 3 or not all(len(shape) >= 2 for shape in shapes[:3]):
@@ -235,19 +225,10 @@ def _attention_reduction_hints(
         f"family near [1, {mid_tile}, {inner_tile}] if that matches the "
         "config space."
     )
-    if backend != "cute":
-        hints.append(
-            "Within that starting family, include a couple of "
-            "balanced variants that keep block_sizes fixed and "
-            "vary num_stages through 2-3 before moving to much "
-            "larger tiles or higher warps."
-        )
+    hints.extend(profile.attention_stage_variant_lines())
     if inner_tile >= 32:
-        bounds = (
-            "Within the displayed block_sizes bounds, a" if backend == "cute" else "A"
-        )
         hints.append(
-            f"{bounds} nearby family like "
+            f"{profile.attention_bounds_prefix} nearby family like "
             f"[1, {mid_tile}, {max(16, inner_tile // 2)}] is already "
             "distinct for this shape; prefer that kind of inner-tile "
             "change before doubling the streaming tile, and keep tiles "
@@ -265,70 +246,15 @@ def _reduction_hints(
 ) -> list[str]:
     """Backend-specific guidance for reduction operations.
 
-    Triton's memory-bound row reductions recover their remaining headroom from
+    Memory-bound row reductions recover their remaining headroom from
     ``load_eviction_policies`` (which the LLM tends to leave at default), not
-    larger tiles. Family-general: no specific kernel or shape.
+    larger tiles. Family-general: no specific kernel or shape
+    (``LlmPromptProfile.reduction_hints``; ``STREAMING_REDUCTION_HINT`` opens
+    every profile's first line).
     """
     if workload_traits & {"matmul", "attention_reduction"}:
         return []
-    streaming_hint = (
-        "This kernel is a memory-bound reduction/normalization that streams "
-        "each input row once. "
-    )
-    if backend == "cute":
-        settings = []
-        if "block_sizes" in flat_fields:
-            settings.append("one row per program (small leading block_size, e.g. 1)")
-        if "reduction_loops" in flat_fields:
-            settings.append(
-                "no reduction looping (reduction_loops null) when the reduction dim fits"
-            )
-        if "num_stages" in flat_fields:
-            settings.append("num_stages 1-2")
-        conservative = "The best configs are usually conservative"
-        if settings:
-            conservative += ": " + ", ".join(settings)
-        hints = [
-            streaming_hint + conservative + " — not large tiles or deep pipelining."
-        ]
-        if "load_eviction_policies" in flat_fields:
-            hints.append(
-                "The main remaining speedup for such streaming reductions is "
-                "cache-eviction hints, which the search often overlooks: set "
-                "load_eviction_policies to 'last' (or 'first') on the streamed input "
-                "loads instead of leaving them empty, so a value read once is not "
-                "kept in cache. Include several configs that try 'last' on every "
-                "load_eviction_policies entry."
-            )
-        if "num_warps" in flat_fields:
-            hints.append(
-                "num_warps 4 is usually the balanced choice here; reserve 8+ warps "
-                "and any aggressive tiling for a small minority of exploratory "
-                "configs."
-            )
-        return hints
-    return [
-        (
-            streaming_hint + "The best configs are usually conservative: one "
-            "row per program (small leading block_size, e.g. 1), no reduction "
-            "looping (reduction_loops null) when the reduction dim fits, and "
-            "num_stages 1-2 — not large tiles or deep pipelining."
-        ),
-        (
-            "The main remaining speedup for such streaming reductions is "
-            "cache-eviction hints, which the search often overlooks: set "
-            "load_eviction_policies to 'last' (or 'first') on the streamed input "
-            "loads instead of leaving them empty, so a value read once is not "
-            "kept in cache. Include several configs that try 'last' on every "
-            "load_eviction_policies entry; leaving them all empty typically "
-            "leaves ~15-20% on the table for these kernels."
-        ),
-        (
-            "num_warps 4 is usually the balanced choice here; reserve 8+ warps "
-            "and any aggressive tiling for a small minority of exploratory "
-            "configs."
-        ),
-    ]
+    return prompt_profile(backend).reduction_hints(flat_fields)
 
 
 def _matmul_hints(
@@ -354,6 +280,7 @@ def _matmul_hints(
             )
         ]
 
+    profile = prompt_profile(backend)
     m, k = shapes[0]
     k2, n = shapes[1]
     total_tiles_64 = (m // 64) * (n // 64)
@@ -365,7 +292,7 @@ def _matmul_hints(
     # to a pure matmul so a reduction/attention-fused kernel keeps its own hints.
     is_pure_matmul = not (workload_traits & {"reduction", "attention_reduction"})
     if (
-        backend != "cute"
+        profile.large_gemm_guidance
         and is_pure_matmul
         and _is_large_balanced_gemm(m, n, k, total_tiles_64)
     ):
@@ -373,40 +300,13 @@ def _matmul_hints(
         return hints
 
     if total_tiles_64 > num_compute_units() * 4:
-        if backend != "cute":
-            hints.append(
-                "Problem large enough for persistent kernels - "
-                "try pid_type='persistent_blocked' with l2_groupings=8-64"
-            )
-        elif "pid_type" in flat_fields:
-            grouping = " with l2_groupings" if "l2_groupings" in flat_fields else ""
-            hints.append(
-                "Problem large enough for persistent kernels - "
-                f"try persistent pid_type choices{grouping} when available in the config space"
-            )
-    if backend != "cute" or "block_sizes" in flat_fields:
-        condition = " if that matches the config space" if backend == "cute" else ""
-        hints.append(
-            f"Try block_sizes near [{min(m, 128)}, {min(n, 128)}, "
-            f"{min(k, 64)}] as starting point{condition}"
-        )
-    if backend == "cute":
-        if "block_sizes" in flat_fields:
-            hints.append(
-                "High-perf matmul tips: try asymmetric tiles like [64,128,64] "
-                "if that matches the config space"
-            )
-        if "load_eviction_policies" in flat_fields:
-            hints.append(
-                "High-perf matmul tips: try load_eviction_policies with 'first' or 'last'"
-            )
-        return hints
-    hints.append(
-        "High-perf matmul tips: try asymmetric tiles like [64,128,64], "
-        "num_stages=3-4, maxnreg=128 or 256, "
-        "range_multi_buffers=[true,true] for double-buffering, "
-        "load_eviction_policies with 'first' or 'last'"
-    )
+        persistent = profile.matmul_persistent_hint(flat_fields)
+        if persistent is not None:
+            hints.append(persistent)
+    starting_tile = profile.matmul_starting_tile_hint(flat_fields, m, n, k)
+    if starting_tile is not None:
+        hints.append(starting_tile)
+    hints.extend(profile.matmul_tips(flat_fields))
     return hints
 
 

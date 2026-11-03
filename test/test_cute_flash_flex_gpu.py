@@ -40,6 +40,7 @@ from torch.nn.attention.flex_attention import noop_mask
 
 import helion
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.autotune.flash_surface import _resolve_cute_flash_config
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
@@ -157,7 +158,7 @@ def _bind_flex(
     assert spec._cute_flash_score_modifier_kinds == ("flex",)
     requested = {**spec.default_config().config, **(overrides or {})}
     normalized = bound._normalized_config_copy(helion.Config(**requested))
-    resolved = spec._resolve_cute_flash_config(normalized.config)
+    resolved = _resolve_cute_flash_config(spec, normalized.config)
     assert resolved.pipeline_family == "fa4"
     # (The list walk is persistent by default; an override pins either way.)
     assert resolved.persistent == bool(requested[cute_flash.FLASH_PERSISTENT_KEY])
@@ -279,7 +280,6 @@ def _band(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("order", ["descending", "ascending"])
 def test_dense_blockmask_is_bitwise_the_dense_fa4_kernel(order: str) -> None:
     batch, heads, seq = 2, 4, 2048
@@ -314,7 +314,6 @@ def test_dense_blockmask_is_bitwise_the_dense_fa4_kernel(order: str) -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_causal_blockmask_is_bitwise_the_causal_plan() -> None:
     batch, heads, seq = 2, 4, 2048
     q, k, v = _qkv(batch, heads, seq, seq)
@@ -339,7 +338,7 @@ def test_causal_blockmask_is_bitwise_the_causal_plan() -> None:
             }
         )
     )
-    resolved = causal_bound.config_spec._resolve_cute_flash_config(causal_cfg.config)
+    resolved = _resolve_cute_flash_config(causal_bound.config_spec, causal_cfg.config)
     assert resolved.causal_mask_storeback and resolved.causal_loop_split
     out_causal, _ = causal_bound.compile_config(causal_cfg)(q, k, v)
     torch.cuda.synchronize()
@@ -384,7 +383,6 @@ _REFERENCE_GRID = [
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     ("body", "case"), _REFERENCE_GRID, ids=["-".join(row) for row in _REFERENCE_GRID]
 )
@@ -404,7 +402,6 @@ def test_flex_matches_torch_flex_attention(body: str, case: str) -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_score_mod_with_a_table_gather() -> None:
     batch, heads, seq = 2, 4, 2048
     q, k, v = _qkv(batch, heads, seq, seq)
@@ -429,7 +426,6 @@ def test_score_mod_with_a_table_gather() -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     "overrides", [PAIR_DESC, STAGED_ASC], ids=["pair_desc", "staged_asc"]
 )
@@ -477,7 +473,6 @@ def test_aux_smem_staging_is_bitwise_the_global_gather(
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     "overrides", [PAIR_DESC, STAGED_ASC], ids=["pair_desc", "staged_asc"]
 )
@@ -644,7 +639,6 @@ def test_next_chunk_table_prefetch_is_bitwise_the_in_chunk_loads(
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
 @pytest.mark.parametrize(
     "overrides", [PAIR_DESC, STAGED_ASC], ids=["pair_desc", "staged_asc"]
@@ -732,7 +726,6 @@ def test_cooperative_table_loads_are_bitwise_the_per_lane_vectors(
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
 @pytest.mark.parametrize(
     ("overrides", "width"),
@@ -763,7 +756,6 @@ def test_cooperative_loads_of_the_spatial_vector_table_are_bitwise(
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
 @pytest.mark.parametrize(
     ("overrides", "width"),
@@ -904,7 +896,6 @@ def _plain_table_args(args: tuple[Any, ...]) -> tuple[Any, ...]:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
 @pytest.mark.parametrize(
     ("q_seq", "block_rows", "persistent"),
@@ -1113,7 +1104,6 @@ RESIDENT_REP32_SPLIT: dict[str, object] = {
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
 @pytest.mark.parametrize(
     ("persistent", "store"),
@@ -1182,7 +1172,6 @@ def test_resident_pass2_is_bitwise_the_reload_pass2(
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
 @pytest.mark.parametrize("resident", [False, True], ids=["reload", "resident"])
 def test_tmem_rowmax_is_bitwise_the_software_rowmax_on_the_list_walk(
@@ -1441,7 +1430,6 @@ def test_dead_stage_split_merges_both_softmax_warpgroups(
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
 # kv_seq: the one-word register walk (16 KV tiles) and the cursor walk over
 # the words table (34, 64 tiles); kv_order: the slice comes off either end
@@ -1756,7 +1744,6 @@ def test_tail_split_gqa_grid_replays_under_a_cuda_graph() -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
 @pytest.mark.parametrize(
     ("q_seq", "kv_seq", "body", "dead_split"),
@@ -2164,7 +2151,6 @@ def test_keep_word_mask_form_is_bitwise_the_element_form(
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
 @pytest.mark.parametrize(
     ("persistent", "seq"),
@@ -2287,7 +2273,6 @@ _SHARED_COVERAGE: dict[str, dict[str, object]] = {
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
 @pytest.mark.parametrize("case", sorted(_SHARED_COVERAGE), ids=sorted(_SHARED_COVERAGE))
 def test_shared_softmax_region_coverage_is_bitwise_the_per_stage_regions(
@@ -2509,7 +2494,6 @@ def test_flex_hook_fast_full_is_bitwise_the_plain_hook(case: str) -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
 @pytest.mark.parametrize(
     "case",

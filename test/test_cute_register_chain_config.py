@@ -9,7 +9,7 @@ import torch
 
 import helion
 from helion import exc
-from helion._compiler.backend import CuteBackend
+from helion._compiler.cute.backend import CuteBackend
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration

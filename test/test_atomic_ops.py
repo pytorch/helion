@@ -6155,9 +6155,9 @@ class TestFragmentPrivateScalarLoopCPU(unittest.TestCase):
         import ast
         from unittest.mock import patch
 
-        from helion._compiler.cute import computed_fragment
+        from helion._compiler.cute import fragment_control_flow
 
-        original = computed_fragment.privatize_scalar_loop
+        original = fragment_control_flow.privatize_scalar_loop
         for mutation in (
             "owner",
             "collective",
@@ -6199,7 +6199,7 @@ class TestFragmentPrivateScalarLoopCPU(unittest.TestCase):
 
             with (
                 self.subTest(mutation=mutation),
-                patch.object(computed_fragment, "privatize_scalar_loop", corrupt),
+                patch.object(fragment_control_flow, "privatize_scalar_loop", corrupt),
                 self.assertRaisesRegex(helion.exc.InvalidConfig, "thread-zero"),
             ):
                 _private_loop_codegen(
@@ -7616,13 +7616,13 @@ class TestFragmentLocalRegistersCPU(unittest.TestCase):
             _target(),
             forbid_native_compile(),
             patch(
-                "helion._compiler.autotuner_heuristics.register_fragment_published_scalars_coverage"
+                "helion._compiler.cute.autotune.heuristics.register_fragment_published_scalars_coverage"
             ),
             patch(
-                "helion._compiler.autotuner_heuristics.register_fragment_skip_zero_atomics_coverage"
+                "helion._compiler.cute.autotune.heuristics.register_fragment_skip_zero_atomics_coverage"
             ),
             patch(
-                "helion._compiler.autotuner_heuristics.register_fragment_register_snapshots_coverage"
+                "helion._compiler.cute.autotune.heuristics.register_fragment_register_snapshots_coverage"
             ),
         ):
             bound = cpu_bind(kernel, args)
@@ -7660,7 +7660,7 @@ class TestFragmentLocalRegistersCPU(unittest.TestCase):
             random.seed(20261003)
             new, state = population()
             with patch(
-                "helion._compiler.autotuner_heuristics.register_fragment_local_atomic_registers_coverage"
+                "helion._compiler.cute.autotune.heuristics.register_fragment_local_atomic_registers_coverage"
             ):
                 bound = cpu_bind(kernel, args)
             random.seed(20261003)
@@ -7771,7 +7771,7 @@ class TestFragmentLocalRegistersCPU(unittest.TestCase):
             config.config["cute_fragment_threads"] = 1024
             with (
                 patch(
-                    "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_capacity_bytes",
+                    "helion._compiler.cute.target_facts.per_cta_smem_capacity_bytes",
                     return_value=16,
                 ),
                 self.assertRaisesRegex(helion.exc.InvalidConfig, "shared bytes"),
@@ -9070,10 +9070,10 @@ class TestFragmentAtomicConsumerFusionCPU(unittest.TestCase):
             _target(),
             forbid_native_compile(),
             patch(
-                "helion._compiler.autotuner_heuristics.register_fragment_packet_loads_coverage"
+                "helion._compiler.cute.autotune.heuristics.register_fragment_packet_loads_coverage"
             ),
             patch(
-                "helion._compiler.autotuner_heuristics.register_fragment_register_producers_coverage"
+                "helion._compiler.cute.autotune.heuristics.register_fragment_register_producers_coverage"
             ),
         ):
             bound = cpu_bind(kernel, args)
@@ -9111,7 +9111,7 @@ class TestFragmentAtomicConsumerFusionCPU(unittest.TestCase):
                     random.seed(seed)
                     current, state = population(bound)
                     with patch(
-                        "helion._compiler.autotuner_heuristics.register_fragment_atomic_consumer_fusion_coverage"
+                        "helion._compiler.cute.autotune.heuristics.register_fragment_atomic_consumer_fusion_coverage"
                     ):
                         old_bound = cpu_bind(kernel, args)
                     random.seed(seed)
@@ -9380,7 +9380,7 @@ class TestFragmentRegisterAtomicConsumersCPU(unittest.TestCase):
     def test_discovery_keeps_final_bound_and_cached_alias_guards(self):
         from test.cute_population_contracts import _target
 
-        from helion._compiler.autotuner_heuristics.cute_fragment_common import (
+        from helion._compiler.cute.autotune.heuristics.cute_fragment_common import (
             computed_fragment_discovery_supported,
         )
         from helion._compiler.cute.computed_fragment import computed_fragment_supported
@@ -9568,11 +9568,7 @@ class TestFragmentThreadCoverageCompatibilityCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
         from test.cute_population_contracts import checked_initial_population
 
-        from helion._compiler.autotuner_heuristics import (
-            cute_fragment_local_atomic_registers,
-        )
-        from helion._compiler.autotuner_heuristics import cute_fragment_threads
-        from helion._compiler.autotuner_heuristics import cute_fragment_warp_results
+        from helion._compiler.cute.autotune.heuristics import cute_fragment_threads
         from helion.autotuner.pattern_search import InitialPopulationStrategy
         from helion.autotuner.pattern_search import PatternSearch
 
@@ -9598,18 +9594,15 @@ class TestFragmentThreadCoverageCompatibilityCPU(unittest.TestCase):
         def capture(kernel, args, key, legacy):
             with ExitStack() as stack:
                 if legacy:
-                    for module in (
-                        cute_fragment_threads,
-                        cute_fragment_warp_results,
-                        cute_fragment_local_atomic_registers,
-                    ):
-                        stack.enter_context(
-                            patch.object(
-                                module,
-                                "THREADS",
-                                cute_fragment_threads.LEGACY_COVERAGE_THREADS,
-                            )
+                    # The knob table reads the worker domain through the
+                    # threads module at call time.
+                    stack.enter_context(
+                        patch.object(
+                            cute_fragment_threads,
+                            "THREADS",
+                            cute_fragment_threads.LEGACY_COVERAGE_THREADS,
                         )
+                    )
                 bound = cpu_bind(
                     helion.kernel(
                         kernel.fn,
@@ -10040,7 +10033,7 @@ for index in range(thread, 32, 32):
         args = (torch.ones(1, 65, dtype=torch.int32), 3, 17, 32)
         with mock_cuda_unavailable(), _target(), forbid_native_compile():
             with patch(
-                "helion._compiler.autotuner_heuristics.register_fragment_integer_atomic_epochs_coverage"
+                "helion._compiler.cute.autotune.heuristics.register_fragment_integer_atomic_epochs_coverage"
             ):
                 old = cpu_bind(
                     helion.kernel(
@@ -10737,7 +10730,7 @@ class TestFragmentSkipZeroAtomicsCPU(unittest.TestCase):
             _target(),
             forbid_native_compile(),
             patch(
-                "helion._compiler.autotuner_heuristics.register_fragment_integer_atomic_epochs_coverage"
+                "helion._compiler.cute.autotune.heuristics.register_fragment_integer_atomic_epochs_coverage"
             ),
         ):
             bound = cpu_bind(_fragment_aggregated_histogram, args)
@@ -11342,7 +11335,7 @@ for b in cutlass.range_constexpr(2):
         from test.cute_population_contracts import _target
         from test.cute_population_contracts import checked_initial_population
 
-        from helion._compiler import autotuner_heuristics
+        from helion._compiler.cute.autotune import heuristics as cute_heuristics
         from helion.autotuner.pattern_search import InitialPopulationStrategy
         from helion.autotuner.pattern_search import PatternSearch
 
@@ -11351,8 +11344,8 @@ for b in cutlass.range_constexpr(2):
 
         def capture(enabled):
             with patch(
-                "helion._compiler.autotuner_heuristics.register_fragment_register_producers_coverage",
-                wraps=autotuner_heuristics.register_fragment_register_producers_coverage
+                "helion._compiler.cute.autotune.heuristics.register_fragment_register_producers_coverage",
+                wraps=cute_heuristics.register_fragment_register_producers_coverage
                 if enabled
                 else None,
             ) as hook:
@@ -14277,7 +14270,9 @@ class TestFragmentScanLogicalTailsNative(TestCase):
 @onlyBackends(["cute"])
 class TestUniformRegionWorkerDiscoveryCPU(unittest.TestCase):
     def test_composed_histogram_existing_worker_domain(self):
-        from helion._compiler.autotuner_heuristics.cute_fragment_threads import THREADS
+        from helion._compiler.cute.autotune.heuristics.cute_fragment_threads import (
+            THREADS,
+        )
 
         x = (torch.arange(3 * 33).reshape(3, 33) % 7 - 3).to(torch.int32)
         flags = torch.tensor([0, 1, 1], dtype=torch.int32)
@@ -14318,7 +14313,9 @@ class TestUniformRegionWorkerDiscoveryCPU(unittest.TestCase):
                     torch.testing.assert_close(x, original, rtol=0, atol=0)
 
     def test_float_completed_capture_existing_worker_domain(self):
-        from helion._compiler.autotuner_heuristics.cute_fragment_threads import THREADS
+        from helion._compiler.cute.autotune.heuristics.cute_fragment_threads import (
+            THREADS,
+        )
 
         x = (torch.arange(3 * 19).reshape(3, 19) % 7 - 3).float()
         limits = torch.tensor([0, 1, 3], dtype=torch.int32)
@@ -14348,8 +14345,10 @@ class TestUniformRegionWorkerDiscoveryCPU(unittest.TestCase):
                     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
     def test_discovery_keeps_complete_proof_and_coverage_budget(self):
-        from helion._compiler.autotuner_heuristics.cute_fragment_threads import THREADS
-        from helion._compiler.autotuner_heuristics.cute_fragment_threads import (
+        from helion._compiler.cute.autotune.heuristics.cute_fragment_threads import (
+            THREADS,
+        )
+        from helion._compiler.cute.autotune.heuristics.cute_fragment_threads import (
             CuteFragmentThreadsHeuristic,
         )
         from helion._compiler.cute.computed_fragment import computed_fragment_supported
@@ -14566,7 +14565,7 @@ class TestUniformLocalDiscoveryCPU(unittest.TestCase):
     def test_alias_cache_and_final_bound_proof(self):
         from test.cute_population_contracts import _target
 
-        from helion._compiler.autotuner_heuristics.cute_fragment_common import (
+        from helion._compiler.cute.autotune.heuristics.cute_fragment_common import (
             computed_fragment_discovery_supported,
         )
         from helion._compiler.cute.computed_fragment import computed_fragment_supported
@@ -14633,7 +14632,7 @@ class TestUniformLocalDiscoveryCPU(unittest.TestCase):
     def test_malformed_frame_and_unsupported_helper_decline(self):
         from test.cute_population_contracts import _target
 
-        from helion._compiler.autotuner_heuristics.cute_fragment_common import (
+        from helion._compiler.cute.autotune.heuristics.cute_fragment_common import (
             computed_fragment_discovery_supported,
         )
         from helion.language import _tracing_ops
@@ -15127,7 +15126,7 @@ class TestUniformOutputStoresCPU(unittest.TestCase):
     def test_if_only_no_host_reads_requires_actual_cache_disjointness(self):
         from test.cute_population_contracts import _target
 
-        from helion._compiler.autotuner_heuristics.cute_fragment_common import (
+        from helion._compiler.cute.autotune.heuristics.cute_fragment_common import (
             computed_fragment_discovery_supported,
         )
         from helion._compiler.cute.computed_fragment import computed_fragment_supported

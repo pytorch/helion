@@ -23,11 +23,10 @@ import helion
 from helion import exc
 from helion._compiler.cute.chunk_recurrence import _select_sm100_dv_partitions
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
-from helion.runtime.cute.launcher import _chunk_recurrence_tensor_map_specs
-
-pytestmark = skipUnlessBackends(["cute"])
+from helion.runtime.cute.host_wrappers.recurrences import (
+    chunk_recurrence_tensor_map_specs,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -154,7 +153,7 @@ def _code(
         if register_cap is not None:
             config_overrides["cute_chunk_recurrence_register_cap"] = register_cap
         config = helion.Config.from_dict({**_CONFIG.config, **config_overrides})
-        return bound.to_triton_code(config)
+        return bound.to_code(config)
 
 
 def _captured_plan(
@@ -952,7 +951,7 @@ def test_chunk_recurrence_runtime_validates_packed_workspace() -> None:
     args = _runtime_view_args()
     storage_patch, tensor_patch = _fake_pointer_patches(args)
     with storage_patch, tensor_patch:
-        specs = _chunk_recurrence_tensor_map_specs(_runtime_plan(), args)
+        specs = chunk_recurrence_tensor_map_specs(_runtime_plan(), args)
     assert specs["factor"].global_dim == (128, 128, 36)
     assert specs["aq"].global_dim == (256, 8, 12)
     assert specs["gt"].global_dim == (128, 8, 12)
@@ -976,7 +975,7 @@ def test_chunk_recurrence_runtime_rejects_legacy_abi1() -> None:
     with pytest.raises(
         exc.BackendUnsupported, match="unsupported chunk-recurrence ABI"
     ):
-        _chunk_recurrence_tensor_map_specs(plan, args, validate_only=True)
+        chunk_recurrence_tensor_map_specs(plan, args, validate_only=True)
 
 
 def test_chunk_recurrence_runtime_builds_dv4_tensor_map_geometry() -> None:
@@ -992,7 +991,7 @@ def test_chunk_recurrence_runtime_builds_dv4_tensor_map_geometry() -> None:
     )
     storage_patch, tensor_patch = _fake_pointer_patches(args)
     with storage_patch, tensor_patch:
-        specs = _chunk_recurrence_tensor_map_specs(plan, args)
+        specs = chunk_recurrence_tensor_map_specs(plan, args)
     assert specs["v"].box_dim == (32, 16, 1)
     assert specs["out"].box_dim == (32, 16, 1)
     assert specs["state_in"].box_dim == (64, 64, 1)
@@ -1005,12 +1004,12 @@ def test_chunk_recurrence_runtime_validates_sm100_dv2_without_raw_descriptors() 
     plan.update({"kind": "chunk_recurrence_sm100", "dv_partitions": 2})
     storage_patch, tensor_patch = _fake_pointer_patches(args)
     with storage_patch, tensor_patch:
-        assert _chunk_recurrence_tensor_map_specs(plan, args, validate_only=True) == {}
+        assert chunk_recurrence_tensor_map_specs(plan, args, validate_only=True) == {}
         with pytest.raises(
             exc.BackendUnsupported,
             match="raw chunk-recurrence TensorMaps require the warp-DV4 schedule",
         ):
-            _chunk_recurrence_tensor_map_specs(plan, args)
+            chunk_recurrence_tensor_map_specs(plan, args)
 
 
 def test_chunk_recurrence_runtime_allows_exact_value_output_alias() -> None:
@@ -1019,7 +1018,7 @@ def test_chunk_recurrence_runtime_allows_exact_value_output_alias() -> None:
     runtime_args = tuple(args)
     storage_patch, tensor_patch = _fake_pointer_patches(runtime_args)
     with storage_patch, tensor_patch:
-        specs = _chunk_recurrence_tensor_map_specs(_runtime_plan(), runtime_args)
+        specs = chunk_recurrence_tensor_map_specs(_runtime_plan(), runtime_args)
     assert specs["v"].base_ptr == specs["out"].base_ptr
 
 
@@ -1058,7 +1057,7 @@ def test_chunk_recurrence_runtime_rejects_output_metadata_alias(
             match=rf"chunk-recurrence output aliases {metadata_name}",
         ),
     ):
-        _chunk_recurrence_tensor_map_specs(_runtime_plan(), runtime_args)
+        chunk_recurrence_tensor_map_specs(_runtime_plan(), runtime_args)
 
 
 def test_chunk_recurrence_sm100_dv2_enters_launch_schema() -> None:
@@ -1156,7 +1155,7 @@ def test_chunk_recurrence_runtime_rejects_split_factor_storage() -> None:
         tensor_patch,
         pytest.raises(exc.BackendUnsupported, match="packed workspace ABI"),
     ):
-        _chunk_recurrence_tensor_map_specs(_runtime_plan(), runtime_args)
+        chunk_recurrence_tensor_map_specs(_runtime_plan(), runtime_args)
 
 
 def _require_dv4_runtime() -> torch.device:

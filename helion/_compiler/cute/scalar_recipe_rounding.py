@@ -24,13 +24,13 @@ from typing import cast
 import torch
 
 from ..ast_extension import expr_from_string
+from ._ast_pass_utils import call_path
 from .indexing import is_cute_shape_chain_target
 from .scalar_recipe import _MATH_CALLS
 from .scalar_recipe import ROUNDED_FP32_MULTIPLY_ASM
 from .scalar_recipe import ROUNDED_FP32_MULTIPLY_CONSTRAINTS
 from .scalar_recipe import ROUNDED_MULTIPLY_FORMS
 from .scalar_recipe import _clone
-from .scalar_recipe import _path
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -442,7 +442,7 @@ def _kind(node: ast.expr, names: Mapping[str, _Kind]) -> _Kind:
         return left if left == right else None
     if not isinstance(node, ast.Call):
         return None
-    path = _path(node.func)
+    path = call_path(node.func)
     if path == ("cutlass", "Float32"):
         return "fp32"
     if (
@@ -450,11 +450,11 @@ def _kind(node: ast.expr, names: Mapping[str, _Kind]) -> _Kind:
         and node.func.attr in {"to", "bitcast"}
         and len(node.args) == 1
         and not node.keywords
-        and _path(node.args[0]) == ("cutlass", "Float32")
+        and call_path(node.args[0]) == ("cutlass", "Float32")
     ):
         return "fp32"
     if path == ("_cute_inline_asm_elementwise",) and any(
-        keyword.arg == "dtype" and _path(keyword.value) == ("cutlass", "Float32")
+        keyword.arg == "dtype" and call_path(keyword.value) == ("cutlass", "Float32")
         for keyword in node.keywords
     ):
         return "fp32"
@@ -501,7 +501,7 @@ class _PreserveRounding(ast.NodeTransformer):
 
     def visit_Call(self, node: ast.Call) -> ast.expr:
         rounded = (
-            _path(node.func) == ("operator", "mul")
+            call_path(node.func) == ("operator", "mul")
             and len(node.args) == 2
             and not node.keywords
             and _kind(node, self.names) == "fp32"

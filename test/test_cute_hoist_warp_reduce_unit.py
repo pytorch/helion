@@ -32,6 +32,7 @@ import pytest
 from helion._compiler.cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
 from helion._testing import TestCase
 
+# Pure-AST tests: they run on every backend row.
 pytestmark = pytest.mark.cpu_only
 
 

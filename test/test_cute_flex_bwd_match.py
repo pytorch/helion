@@ -29,6 +29,7 @@ pytest.importorskip("cutlass.cute")
 import helion
 from helion._compiler.cute import flex_bwd_match as flex_bwd_match_module
 from helion._compiler.cute import flex_match
+from helion._compiler.cute.autotune.flash_surface import cute_flash_bwd_seed_configs
 from helion._compiler.cute.backend import _attention_config_envelope_ok
 from helion._compiler.cute.cute_flash_bwd_flex import _fit_smem_budget
 from helion._compiler.cute.cute_flash_bwd_flex import additive_bias_region
@@ -41,7 +42,6 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
 from helion.runtime.kernel import Kernel
@@ -55,7 +55,6 @@ if TYPE_CHECKING:
     from helion._compiler.host_function import HostFunction
     from helion.runtime.kernel import BoundKernel
 
-pytestmark = skipUnlessBackends(["cute"])
 _aten = torch.ops.aten
 _CPU = torch.device("cpu")
 
@@ -135,9 +134,13 @@ def _args(
 def _as_sm100() -> Iterator[None]:
     with (
         cpu_codegen(),
-        patch("helion._compiler.backend._attention_flash_supported", return_value=True),
         patch(
-            "helion._compiler.backend._attention_flash_gate_enabled", return_value=True
+            "helion._compiler.cute.analysis.attention_match._attention_flash_supported",
+            return_value=True,
+        ),
+        patch(
+            "helion._compiler.cute.analysis.attention_match._attention_flash_gate_enabled",
+            return_value=True,
         ),
         patch.object(flex_match, "FLEX_PLAN_ENABLED", True),
     ):
@@ -1437,7 +1440,7 @@ def _assert_kv_ring(code: str, *, slots: int) -> None:
         assert "'kv_stage': 1" in code
 
 
-# unittest runners ignore pytestmark.
+# unittest runners see neither pytest marks nor the conftest path gate.
 @onlyBackends(["cute"])
 class TestContiguousRenderPin(TestCase):
     """The exact text of one contiguous backward render (the
@@ -1744,7 +1747,7 @@ def test_two_cta_search_surface_and_seed() -> None:
         assert other.config_spec._flat_fields()["cute_flash_bwd_two_cta"].choices == (
             0,
         )
-        assert not other.config_spec.cute_flash_bwd_seed_configs()
+        assert not cute_flash_bwd_seed_configs(other.config_spec)
         # Pinned anyway, the knob renders the 1-CTA kernel, whose knobs all
         # apply: it reads 0 and strips nothing.
         config = other.config_spec.default_config()
@@ -1761,7 +1764,7 @@ def test_two_cta_search_surface_and_seed() -> None:
         assert config.config["cute_flash_bwd_stats_mma"] == 1
 
 
-# unittest runners ignore pytestmark.
+# unittest runners see neither pytest marks nor the conftest path gate.
 @onlyBackends(["cute"])
 class TestTwoCtaRenderPin(TestCase):
     """The exact text of one 2-CTA backward render (dense walk, GQA, head

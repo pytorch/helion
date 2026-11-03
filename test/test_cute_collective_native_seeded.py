@@ -10,11 +10,10 @@ from test.test_cute_collective_seeds import _independent_matmuls
 from test.test_cute_collective_tcgen05 import _scalar_epilogues
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_tcgen05 import CollectiveTcgen05Plan
 from helion._compiler.cute.collective_tcgen05 import CollectiveTmemResource
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.benchmarking import _make_cudagraph_replay
@@ -83,7 +82,6 @@ def _inputs(dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tenso
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tile", [(64, 32, 16), (64, 64, 32), (128, 64, 128)])
-@skipUnlessBackends(["cute"])
 def test_native_uploads_float32_carry_before_accumulating(
     dtype: torch.dtype, tile: tuple[int, int, int]
 ) -> None:
@@ -100,7 +98,6 @@ def test_native_uploads_float32_carry_before_accumulating(
     assert source.index("fence_view_async_tmem_store") < source.index("cute.gemm(")
 
 
-@skipUnlessBackends(["cute"])
 def test_seeded_native_is_optional_and_survives_config_roundtrip() -> None:
     bound = cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
     assert "tcgen05.CtaGroup.ONE" not in bound.to_code(_config(enabled=False))
@@ -113,7 +110,6 @@ def test_seeded_native_is_optional_and_survives_config_roundtrip() -> None:
 
 
 @pytest.mark.parametrize("seeded", [False, True])
-@skipUnlessBackends(["cute"])
 def test_seed_search_distinguishes_nonzero_carries(seeded: bool) -> None:
     if seeded:
         bound = cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
@@ -160,7 +156,6 @@ def test_seed_search_distinguishes_nonzero_carries(seeded: bool) -> None:
 
 
 @pytest.mark.parametrize("reason", ["invariant", "written_seed", "narrow_seed"])
-@skipUnlessBackends(["cute"])
 def test_seeded_native_does_not_relax_carry_dtype_or_alias_proofs(reason: str) -> None:
     a, b, seed, _limit = _inputs(torch.float16)
     if reason == "invariant":
@@ -204,7 +199,6 @@ def test_seed_store_wait_precedes_cta_handoff(bm: int, bn: int) -> None:
 
 
 @pytest.mark.parametrize("value", [0, 1, "true", None])
-@skipUnlessBackends(["cute"])
 def test_seeded_native_requires_boolean_config(value: object) -> None:
     bound = cpu_bind(_seeded_contraction, _inputs(torch.float16))
     config = helion.Config.from_dict(
@@ -215,7 +209,6 @@ def test_seeded_native_requires_boolean_config(value: object) -> None:
 
 
 @pytest.mark.parametrize("capability", [(8, 0), (9, 0), (12, 0), None])
-@skipUnlessBackends(["cute"])
 def test_seeded_native_is_available_only_on_sm100(
     capability: tuple[int, int] | None,
 ) -> None:
@@ -258,7 +251,6 @@ def _mamba_kernel(*, static_shapes: bool) -> helion.Kernel:
 
 @pytest.mark.parametrize("shape", [1, 2])
 @pytest.mark.parametrize("static_shapes", [False, True])
-@skipUnlessBackends(["cute"])
 def test_native_seed_search_covers_both_original_contractions(
     shape: int, static_shapes: bool
 ) -> None:
@@ -294,7 +286,6 @@ def test_native_seed_search_covers_both_original_contractions(
 @pytest.mark.parametrize(
     "tile,stride", [((64, 32, 16), 80), ((64, 64, 32), 78), ((128, 64, 128), 80)]
 )
-@skipUnlessBackends(["cute"])
 def test_seeded_native_tails_empty_k_and_mutating_graphs(
     dtype: torch.dtype, tile: tuple[int, int, int], stride: int
 ) -> None:
@@ -346,7 +337,6 @@ def test_seeded_native_tails_empty_k_and_mutating_graphs(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_native_accumulates_into_seed_before_each_k_instruction(
     dtype: torch.dtype,
 ) -> None:
@@ -367,7 +357,6 @@ def test_native_accumulates_into_seed_before_each_k_instruction(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [1, 2])
 @pytest.mark.parametrize("tile", [(64, 32, 64), (64, 64, 64), (128, 64, 128)])
-@skipUnlessBackends(["cute"])
 def test_seeded_native_original_mamba_strict_accuracy_and_mutated_graphs(
     shape: int, dtype: torch.dtype, tile: tuple[int, int, int]
 ) -> None:

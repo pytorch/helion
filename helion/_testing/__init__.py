@@ -70,6 +70,8 @@ from ..runtime.settings import RefMode
 if TYPE_CHECKING:
     import types
 
+    from .._compiler.cute.target_facts import TargetFacts
+    from .._hardware import HardwareInfo
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import Kernel
 
@@ -259,6 +261,10 @@ if EXAMPLES_PACKAGE not in sys.modules:
     _examples_spec.submodule_search_locations = [str(EXAMPLES_DIR)]
     sys.modules[EXAMPLES_PACKAGE] = importlib.util.module_from_spec(_examples_spec)
 PRETUNED_KERNELS_DIR: Path = PROJECT_ROOT / "pretuned_kernels"
+# The skip reason of ``skipUnlessBackends`` / ``onlyBackends``, followed by the
+# backend name; ``test/conftest.py`` recognizes an item's own backend decision
+# by this prefix and uses it for the ``test_cute_*`` suite gate.
+BACKEND_SKIP_REASON = "disabled for HELION_BACKEND="
 DEVICE = None
 
 
@@ -539,7 +545,7 @@ def skipUnlessBackends(backends: Sequence[str]) -> pytest.MarkDecorator:
     backend = _get_backend()
     return pytest.mark.skipif(
         not matchesBackends(backends),
-        reason=f"disabled for HELION_BACKEND={backend}",
+        reason=f"{BACKEND_SKIP_REASON}{backend}",
     )
 
 
@@ -568,19 +574,255 @@ def patch_cute_mma_support(
     Import consumers before patching so first use cannot leave a mock bound
     in a newly imported module after this context exits.
     """
+    from .._compiler.cute import mma_support
+
     if support is None:
         support = default_cute_mma_support()
-    with (
-        patch(
-            "helion._compiler.cute.cute_mma.get_cute_mma_support",
-            return_value=support,
+    mma_support.clear_cute_mma_support_cache()
+    try:
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            yield support
+    finally:
+        mma_support.clear_cute_mma_support_cache()
+
+
+class _Unset:
+    """Default of a ``patch_target_facts`` keyword that leaves its seam alone."""
+
+
+_UNSET = _Unset()
+_TARGET_FACTS = "helion._compiler.cute.target_facts"
+
+
+def _constant_probe(value: object) -> Callable[..., object]:
+    """A plain function returning ``value`` for one device-probe seam.
+
+    A ``MagicMock`` answers every attribute, so a kernel body that calls
+    ``helion.runtime.get_num_sm(x.device)`` on the host (the persistent
+    examples) would type-propagate the patched probe as a device-only API
+    function and fail to bind; a function has no such attributes.
+    """
+
+    def probe(*args: object, **kwargs: object) -> object:
+        return value
+
+    return probe
+
+
+@contextlib.contextmanager
+def patch_target_facts(
+    facts: TargetFacts | None = None,
+    *,
+    capability: tuple[int, int] | _Unset | None = _UNSET,
+    num_sm: int | _Unset = _UNSET,
+    matmul_num_sm: int | _Unset = _UNSET,
+    smem_capacity_bytes: int | _Unset = _UNSET,
+    smem_budget_bytes: int | _Unset = _UNSET,
+    reduction_smem_budget_bytes: int | _Unset = _UNSET,
+    hardware: HardwareInfo | Callable[..., HardwareInfo] | _Unset = _UNSET,
+    is_hip: bool | _Unset = _UNSET,
+) -> Generator[None, None, None]:
+    """Install one device model at every probe seam the CuTe compiler reads.
+
+    ``facts`` supplies the modelled fields (its ``None`` fields are left
+    unpatched); the keyword arguments override or add to it, ``capability``
+    included (``None`` there models an unknown target, what
+    ``target_device_capability`` reports without CUDA).  Each seam is the
+    dotted path fixtures patched by hand before this helper existed, so the
+    values a fixture pins are unchanged:
+
+    * ``capability`` -> ``helion._compat.target_device_capability`` and its
+      by-name bindings ``helion.runtime.kernel.target_device_capability`` and
+      ``helion._compiler.compile_environment.target_device_capability``
+    * ``num_sm`` -> ``helion.runtime.get_num_sm``
+    * ``matmul_num_sm`` -> ``helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero``
+    * ``smem_capacity_bytes`` / ``smem_budget_bytes`` ->
+      ``helion._compiler.cute.target_facts.per_cta_smem_capacity_bytes`` /
+      ``per_cta_smem_budget_bytes`` (``per_cta_ab_smem_budget_bytes`` derives
+      from the patched capacity)
+    * ``reduction_smem_budget_bytes`` ->
+      ``helion._compiler.cute.thread_budget.shared_memory_budget_bytes``
+    * ``hardware`` -> ``helion._hardware.get_hardware_info`` (a ``HardwareInfo``
+      is returned as is, a callable replaces the probe); ``facts`` with a
+      ``hardware_name`` contributes ``facts.hardware_info()``
+    * ``is_hip`` -> ``helion._compat._is_hip``
+    """
+    from .._hardware import HardwareInfo
+
+    def pick(value: object, modelled: object) -> object:
+        if not isinstance(value, _Unset):
+            return value
+        return _UNSET if modelled is None else modelled
+
+    modelled_hardware = (
+        facts.hardware_info()
+        if facts is not None
+        and facts.hardware_name is not None
+        and facts.capability is not None
+        else None
+    )
+    values = {
+        "capability": pick(capability, None if facts is None else facts.capability),
+        "num_sm": pick(num_sm, None if facts is None else facts.num_sm),
+        "matmul_num_sm": pick(
+            matmul_num_sm, None if facts is None else facts.matmul_num_sm
         ),
-        patch(
-            "helion._compiler.cute.mma_support.get_cute_mma_support",
-            return_value=support,
+        "smem_capacity_bytes": pick(
+            smem_capacity_bytes, None if facts is None else facts.smem_capacity_bytes
         ),
-    ):
-        yield support
+        "smem_budget_bytes": pick(
+            smem_budget_bytes, None if facts is None else facts.smem_budget_bytes
+        ),
+        "reduction_smem_budget_bytes": pick(
+            reduction_smem_budget_bytes,
+            None if facts is None else facts.reduction_smem_budget_bytes,
+        ),
+        "hardware": pick(hardware, modelled_hardware),
+        "is_hip": pick(is_hip, None if facts is None else facts.is_hip),
+    }
+    seams: dict[str, tuple[str, ...]] = {
+        "capability": (
+            "helion._compat.target_device_capability",
+            "helion.runtime.kernel.target_device_capability",
+            "helion._compiler.compile_environment.target_device_capability",
+        ),
+        "num_sm": ("helion.runtime.get_num_sm",),
+        "matmul_num_sm": (
+            "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        ),
+        "smem_capacity_bytes": (f"{_TARGET_FACTS}.per_cta_smem_capacity_bytes",),
+        "smem_budget_bytes": (f"{_TARGET_FACTS}.per_cta_smem_budget_bytes",),
+        "reduction_smem_budget_bytes": (
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
+        ),
+        "is_hip": ("helion._compat._is_hip",),
+    }
+    with contextlib.ExitStack() as stack:
+        for name, targets in seams.items():
+            value = values[name]
+            if isinstance(value, _Unset):
+                continue
+            for target in targets:
+                stack.enter_context(patch(target, new=_constant_probe(value)))
+        probe = values["hardware"]
+        if isinstance(probe, HardwareInfo):
+            stack.enter_context(
+                patch("helion._hardware.get_hardware_info", new=_constant_probe(probe))
+            )
+        elif not isinstance(probe, _Unset):
+            stack.enter_context(patch("helion._hardware.get_hardware_info", new=probe))
+        yield
+
+
+@contextlib.contextmanager
+def cpu_render_target(
+    facts: TargetFacts | None = None,
+    *,
+    mma_support: SimpleNamespace | None = None,
+    forbid_native: bool = True,
+    forbid_cuda_init: str | None = "GPU forbidden",
+    mock_cuda: bool = True,
+    fake_device_sm_count: int | None = None,
+    capability: tuple[int, int] | _Unset | None = _UNSET,
+    num_sm: int | _Unset = _UNSET,
+    matmul_num_sm: int | _Unset = _UNSET,
+    smem_capacity_bytes: int | _Unset = _UNSET,
+    smem_budget_bytes: int | _Unset = _UNSET,
+    reduction_smem_budget_bytes: int | _Unset = _UNSET,
+    hardware: HardwareInfo | Callable[..., HardwareInfo] | _Unset = _UNSET,
+    is_hip: bool | _Unset = _UNSET,
+) -> Generator[None, None, None]:
+    """CPU CuTe source generation against a modelled device (a B200 by default).
+
+    The suite's fixture stacks composed in one place: ``mock_cuda_unavailable``
+    (``mock_cuda``), ``patch_target_facts`` over ``facts`` (defaulting to the
+    :data:`~helion._compiler.cute.target_facts.B200` model) and the per-fact
+    keywords it accepts, which override the model,
+    ``patch_cute_mma_support(mma_support)`` when a support record is given,
+    ``forbid_native_compile`` (``forbid_native``) and a ``torch.cuda._lazy_init``
+    guard raising ``AssertionError(forbid_cuda_init)`` (``None`` leaves CUDA
+    initialization alone).  ``fake_device_sm_count`` additionally traces the
+    CPU inputs as ``cuda:0`` tensors (``cute_codegen.cuda_fake``; ``torch.cuda``'s
+    current device 0 with the modelled capability, the kernel's argument
+    device ``cuda:0``, inductor's ``DeviceProperties`` with that SM count),
+    which the tcgen05 planners need to see a CUDA target.
+    """
+    from .._compiler.cute.target_facts import B200
+    from .cute_codegen import cuda_fake
+    from .cute_codegen import forbid_native_compile
+    from .cute_codegen import mock_cuda_unavailable
+
+    model = B200 if facts is None else facts
+    with contextlib.ExitStack() as stack:
+        if mma_support is not None:
+            stack.enter_context(patch_cute_mma_support(mma_support))
+        if mock_cuda:
+            stack.enter_context(mock_cuda_unavailable())
+        if forbid_cuda_init is not None:
+            stack.enter_context(
+                patch(
+                    "torch.cuda._lazy_init",
+                    side_effect=AssertionError(forbid_cuda_init),
+                )
+            )
+        stack.enter_context(
+            patch_target_facts(
+                model,
+                capability=capability,
+                num_sm=num_sm,
+                matmul_num_sm=matmul_num_sm,
+                smem_capacity_bytes=smem_capacity_bytes,
+                smem_budget_bytes=smem_budget_bytes,
+                reduction_smem_budget_bytes=reduction_smem_budget_bytes,
+                hardware=hardware,
+                is_hip=is_hip,
+            )
+        )
+        if forbid_native:
+            stack.enter_context(forbid_native_compile())
+        if fake_device_sm_count is not None:
+            traced = model.capability if isinstance(capability, _Unset) else capability
+            assert traced is not None, "a fake CUDA device needs a capability"
+            major, minor = traced
+            stack.enter_context(patch("torch.cuda.current_device", return_value=0))
+            stack.enter_context(
+                patch("torch.cuda.get_device_capability", return_value=traced)
+            )
+            stack.enter_context(
+                patch(
+                    "helion.runtime.kernel._find_device",
+                    return_value=torch.device("cuda:0"),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "helion._compiler.cute.backend.CuteBackend"
+                    ".normalize_input_fake_tensor",
+                    new=cuda_fake,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "torch._inductor.runtime.hints.DeviceProperties.create",
+                    return_value=SimpleNamespace(
+                        type="cuda",
+                        index=0,
+                        cc=major * 10 + minor,
+                        warp_size=32,
+                        multi_processor_count=fake_device_sm_count,
+                    ),
+                )
+            )
+        yield
 
 
 @contextlib.contextmanager
@@ -633,7 +875,7 @@ def onlyBackends(
         backend = _get_backend()
         if matchesBackends(backends):
             return cls
-        return unittest.skip(f"disabled for HELION_BACKEND={backend}")(cls)
+        return unittest.skip(f"{BACKEND_SKIP_REASON}{backend}")(cls)
 
     return wrapper
 

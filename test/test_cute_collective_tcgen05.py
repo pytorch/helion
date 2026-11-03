@@ -12,11 +12,10 @@ from test.test_cute_collective_matmul import _padded_inputs
 from test.test_cute_collective_seeds import _independent_matmuls
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_tcgen05 import CollectiveTcgen05Plan
 from helion._compiler.cute.collective_tcgen05 import CollectiveTmemResource
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion.exc import InvalidConfig
 
@@ -86,7 +85,6 @@ def test_scalar_epilogue_projection_preserves_mask_names_and_order() -> None:
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tile", [(64, 32, 16), (64, 64, 32), (128, 64, 128)])
-@skipUnlessBackends(["cute"])
 def test_native_compute_preserves_computed_operand_and_epilogue(
     dtype: torch.dtype, tile: tuple[int, int, int]
 ) -> None:
@@ -110,7 +108,6 @@ def test_native_compute_preserves_computed_operand_and_epilogue(
     assert "rows.iterator" in native
 
 
-@skipUnlessBackends(["cute"])
 def test_native_scatter_retains_serial_row_loop_and_masks() -> None:
     kernel = helion.kernel(
         moe_matmul_ogs.fn, backend="cute", static_shapes=False, autotune_effort="none"
@@ -152,7 +149,6 @@ def test_native_scatter_retains_serial_row_loop_and_masks() -> None:
 
 
 @pytest.mark.parametrize("capability", [(8, 0), (9, 0), (12, 0), None])
-@skipUnlessBackends(["cute"])
 def test_native_config_requires_supported_architecture(
     capability: tuple[int, int] | None,
 ) -> None:
@@ -169,7 +165,6 @@ def test_native_config_requires_supported_architecture(
         bound.to_code(_native_config())
 
 
-@skipUnlessBackends(["cute"])
 def test_alias_rejection_still_applies_with_native_compute() -> None:
     bound = cpu_bind(
         _aliased_matmul,
@@ -183,7 +178,6 @@ def test_alias_rejection_still_applies_with_native_compute() -> None:
     assert "TmemAllocator" not in source
 
 
-@skipUnlessBackends(["cute"])
 def test_two_sequential_native_sites_share_one_allocation() -> None:
     bound = cpu_bind(
         _independent_matmuls,
@@ -296,7 +290,6 @@ def test_native_plan_rejects_unsupported_geometry(
     [(64, 32, 64), (128, 32, 64), (64, 64, 16), (64, 32, 32), (128, 64, 128)],
 )
 @pytest.mark.parametrize("copy", ["async", "async_cached"])
-@skipUnlessBackends(["cute"])
 def test_native_scatter_repeated_rows_multiple_tiles_and_empty_k(
     dtype: torch.dtype, empty_k: bool, tile: tuple[int, int, int], copy: str
 ) -> None:

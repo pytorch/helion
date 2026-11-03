@@ -46,42 +46,43 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import typing
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
 import torch
 
-from .attention_plan import FlexAuxBuffer
-from .attention_plan import FlexRegion
-from .flex_match import _COORD_PLACEHOLDER_NAMES
-from .flex_match import _COORD_PLACEHOLDER_SHAPES
+from .analysis.match_common import host_tensor_name as _host_tensor_name
+from .analysis.match_common import is_call as _is_call
+from .analysis.match_common import is_full_slice as _is_full_slice
+from .analysis.match_common import strip_new_var as _strip_new_var
+from .analysis.match_common import unit_fixed_block as _unit_fixed_block
 from .flex_match import FLEX_KV_BLOCK
 from .flex_match import FLEX_Q_BLOCKS
+from .flex_match import FlexOuterSpec
 from .flex_match import _const_true
 from .flex_match import _Ctx
 from .flex_match import _Dep
-from .flex_match import _host_tensor_name
 from .flex_match import _host_tensor_value
+from .flex_match import _InnerLoop
 from .flex_match import _int_literal
-from .flex_match import _is_call
-from .flex_match import _is_full_slice
 from .flex_match import _is_neg_inf
 from .flex_match import _Leaf
 from .flex_match import _load_parts
 from .flex_match import _loop_targets
+from .flex_match import _match_envelope_root
+from .flex_match import _match_envelope_with_log
+from .flex_match import _match_outer_graph
+from .flex_match import _OuterLoop
 from .flex_match import _region_key
 from .flex_match import _RegionBuilder
 from .flex_match import _scalar_value
 from .flex_match import _strip_identity
-from .flex_match import _strip_new_var
 from .flex_match import _table_lead_index_ok
-from .flex_match import _unit_fixed_block
-from .flex_match import _UnmappedRegionValue
 from .flex_match import contiguous_strides
 from .flex_match import flex_operand_strides
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Sequence
 
@@ -90,6 +91,8 @@ if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
+    from .attention_plan import FlexAuxBuffer
+    from .attention_plan import FlexRegion
 
 _aten = torch.ops.aten
 _prims = torch.ops.prims
@@ -375,24 +378,7 @@ class FlexBwdMatch:
         return tuple(buffer.name for buffer in self.plan.aux_buffers)
 
 
-class _Outer(NamedTuple):
-    loop: torch.fx.Node
-    graph_id: int
-    block_id: int
-    cnt_name: str
-    cnt_value: torch.Tensor
-    cnt_index: list[object]
-
-
-class _Inner(NamedTuple):
-    loop: torch.fx.Node
-    graph_id: int
-    block_id: int
-    idx_name: str
-    idx_value: torch.Tensor
-    idx_index: list[object]
-    q_block: int
-    q_len: int
+_BWD_OUTER = FlexOuterSpec("Q", "QB", "M")
 
 
 class _Regions(NamedTuple):
@@ -434,6 +420,8 @@ class _BwdCtx(_Ctx):
     ``h_id`` the unit q-head loop inside the item (the grid's own head axis
     is the KV head, ``hk_id``)."""
 
+    prefix = "flex_bwd"
+
     def __init__(
         self,
         graphs: Sequence[GraphInfo],
@@ -454,8 +442,7 @@ class _BwdRegionBuilder(_RegionBuilder):
     the region evaluates to the Jacobian."""
 
     def __init__(self, ctx: _Ctx, graph_id: int, score_root: torch.fx.Node) -> None:
-        inner = typing.cast("object", _GraphRef(graph_id))
-        super().__init__(ctx, inner, score_root)  # pyrefly: ignore[bad-argument-type]
+        super().__init__(ctx, graph_id, score_root)
         self.grad_root: torch.fx.Node | None = None
 
     def _classify_leaf(self, node: torch.fx.Node) -> _Leaf | None:
@@ -471,142 +458,37 @@ class _BwdRegionBuilder(_RegionBuilder):
             return _Dep(frozenset({"score"}), None)
         return super()._dep(node)
 
-    def build(  # type: ignore[override]
-        self,
-        nodes: list[torch.fx.Node],
-        output: torch.fx.Node,
-        aux_order: list[str],
-        host_scalars: list[str],
-        coord_meta: dict[str, object],
-    ) -> tuple[torch.fx.Graph, torch.fx.Node]:
-        if self.grad_root is None:
-            return super().build(nodes, output, aux_order, host_scalars, coord_meta)
-        # Temporarily make the gradient leaf render as the literal 1.0: the
-        # parent's ``transform`` maps unknown leaf kinds to host scalars, so
-        # route it through a fresh ``full([], 1.0)`` node instead.
-        graph, result = _build_with_grad_literal(
-            self, nodes, output, aux_order, host_scalars, coord_meta
-        )
-        return graph, result
+    def _is_grad(self, arg: object) -> bool:
+        if not isinstance(arg, torch.fx.Node):
+            return False
+        leaf = self.leaf_of(arg)
+        return leaf is not None and leaf.kind == "grad"
 
-
-class _GraphRef(NamedTuple):
-    graph_id: int
-
-
-def _build_with_grad_literal(
-    builder: _BwdRegionBuilder,
-    nodes: list[torch.fx.Node],
-    output: torch.fx.Node,
-    aux_order: list[str],
-    host_scalars: list[str],
-    coord_meta: dict[str, object],
-) -> tuple[torch.fx.Graph, torch.fx.Node]:
-    """``_RegionBuilder.build`` with the gradient leaf mapped to ``full([],
-    1.0)`` (a typed literal the renderer folds)."""
-    from ...language import creation_ops
-    from ...language import memory_ops
-    from .flex_match import _FULL_TARGETS
-    from .flex_match import _is_identity_view
-
-    graph = torch.fx.Graph()
-    placeholders: dict[str, torch.fx.Node] = {}
-    for key in ("score", "b", "h", "q", "kv"):
-        placeholder = graph.placeholder(_COORD_PLACEHOLDER_NAMES[key])
-        placeholder.meta["val"] = coord_meta[key]
-        placeholders[key] = placeholder
-    for index, name in enumerate(aux_order):
-        placeholder = graph.placeholder(f"aux_{index}")
-        placeholder.meta["val"] = builder.aux_nodes[name].meta.get("val")
-        placeholder.meta["flex_source_name"] = name
-        placeholders[f"aux:{name}"] = placeholder
-    for index, name in enumerate(host_scalars):
-        placeholder = graph.placeholder(f"host_scalar_{index}")
-        placeholder.meta["val"] = builder.host_scalar_nodes[name].meta.get("val")
-        placeholder.meta["flex_source_name"] = name
-        placeholders[f"hs:{name}"] = placeholder
-    mapping: dict[torch.fx.Node, Argument] = {}
-
-    def transform(node: torch.fx.Node) -> Argument:
-        if node in mapping:
-            return mapping[node]
-        leaf = builder.leaf_of(node)
-        if leaf is None:
-            raise _UnmappedRegionValue(node.name)
-        result: Argument
-        if leaf.kind == "score":
-            result = placeholders["score"]
-        elif leaf.kind == "grad":
+    def _leaf_value(
+        self, leaf: _Leaf, placeholders: dict[str, torch.fx.Node]
+    ) -> Argument:
+        if leaf.kind == "grad":
             # The gradient argument as the Python literal 1.0: the region then
             # evaluates to the Jacobian (a VJP is linear in its gradient), and
             # the pointwise lowerings take a number in any operand position.
-            result = 1.0
-        elif leaf.kind == "coord":
-            result = placeholders[leaf.key]
-        else:
-            result = placeholders[f"hs:{leaf.key}"]
-        mapping[node] = result
-        return result
+            return 1.0
+        return super()._leaf_value(leaf, placeholders)
 
-    def is_grad(arg: object) -> bool:
-        if not isinstance(arg, torch.fx.Node):
-            return False
-        leaf = builder.leaf_of(arg)
-        return leaf is not None and leaf.kind == "grad"
-
-    for node in nodes:
-        if _strip_new_var(node) is not node or _is_identity_view(node):
-            source = node.args[0]
-            assert isinstance(source, torch.fx.Node)
-            mapping[node] = transform(source)
-            continue
-        if node.target is _aten.sym_size.int:
-            continue
+    def _copy_node(
+        self,
+        graph: torch.fx.Graph,
+        node: torch.fx.Node,
+        transform: Callable[[torch.fx.Node], Argument],
+    ) -> Argument:
         if node.target in (_aten.mul.Tensor, _aten.mul.Scalar) and len(node.args) == 2:
             # ``grad * J`` / ``J * grad``: the factor itself (a VJP is linear in
             # its gradient, so the product with the unit gradient is ``J``).
             lhs, rhs = node.args
-            if is_grad(lhs) and not is_grad(rhs):
-                mapping[node] = (
-                    transform(rhs) if isinstance(rhs, torch.fx.Node) else rhs
-                )
-                continue
-            if is_grad(rhs) and not is_grad(lhs):
-                mapping[node] = (
-                    transform(lhs) if isinstance(lhs, torch.fx.Node) else lhs
-                )
-                continue
-        if node.target in _FULL_TARGETS or node.target is creation_ops.full:
-            target = node.target
-            assert callable(target)
-            rest = torch.fx.node.map_arg(tuple(node.args[1:]), transform)
-            kwargs = torch.fx.node.map_arg(dict(node.kwargs), transform)
-            copied = graph.call_function(target, ([], *rest), kwargs)
-            copied.meta = dict(node.meta)
-            mapping[node] = copied
-            continue
-        if node.target is memory_ops.load:
-            parts = _load_parts(node)
-            assert parts is not None
-            tensor, indices = parts
-            name = _host_tensor_name(tensor)
-            assert name is not None
-            new_indices: list[object] = []
-            for index in indices:
-                if isinstance(index, torch.fx.Node):
-                    new_indices.append(transform(index))
-                else:
-                    new_indices.append(index)
-            copied = graph.call_function(
-                memory_ops.load,
-                (placeholders[f"aux:{name}"], new_indices, None, None),  # pyrefly: ignore[bad-argument-type]
-            )
-            copied.meta = dict(node.meta)
-            copied.meta["flex_source_name"] = name
-            copied.meta["flex_index_class"] = builder.classify_load(node)
-            mapping[node] = copied
-            continue
-        reads_grad = any(is_grad(arg) for arg in node.args)
+            if self._is_grad(lhs) and not self._is_grad(rhs):
+                return transform(rhs) if isinstance(rhs, torch.fx.Node) else rhs
+            if self._is_grad(rhs) and not self._is_grad(lhs):
+                return transform(lhs) if isinstance(lhs, torch.fx.Node) else lhs
+        reads_grad = any(self._is_grad(arg) for arg in node.args)
         copied = graph.node_copy(node, transform)
         if reads_grad:
             if (
@@ -626,12 +508,7 @@ def _build_with_grad_literal(
             # repeated operand as None next to its prepared lowering, which
             # a fresh preparation could not rebuild).
             copied.meta.pop("lowering", None)
-        mapping[node] = copied
-    result = mapping[output] if output in mapping else transform(output)
-    assert isinstance(result, torch.fx.Node)
-    graph.output(result)
-    graph.lint()
-    return graph, result
+        return copied
 
 
 # -- entry ---------------------------------------------------------------------
@@ -662,15 +539,16 @@ def match_flex_attention_bwd(
     it the first decline is logged at DEBUG level
     (``HELION_LOGS=+helion._compiler.cute.flex_bwd_match``).
     """
-    logged = reasons is None and log.isEnabledFor(logging.DEBUG)
-    if logged:
-        reasons = []
-    match = _match_flex_attention_bwd(
-        graphs, root_grid_ids, env=env, host_function=host_function, reasons=reasons
+    return _match_envelope_with_log(
+        _match_flex_attention_bwd,
+        "flex backward envelope",
+        log,
+        graphs,
+        root_grid_ids,
+        env=env,
+        host_function=host_function,
+        reasons=reasons,
     )
-    if match is None and logged and reasons:
-        log.debug("flex backward envelope declined: %s", reasons[0])
-    return match
 
 
 def _match_flex_attention_bwd(
@@ -681,8 +559,6 @@ def _match_flex_attention_bwd(
     host_function: HostFunction | None,
     reasons: list[str] | None,
 ) -> FlexBwdMatch | None:
-    from ..device_ir import ForLoopGraphInfo
-    from ..device_ir import RootGraphInfo
     from ..host_function import HostFunction
 
     if host_function is None:
@@ -693,23 +569,9 @@ def _match_flex_attention_bwd(
             reasons.append("flex_bwd: the root grid must have three axes (b, hk, n)")
         return None
     ctx = _BwdCtx(graphs, root_grid_ids, env, host_function, reasons)
-    roots = [info for info in graphs if isinstance(info, RootGraphInfo)]
-    if len(roots) != 1:
-        ctx.decline("flex_bwd: exactly one root graph")
+    root = _match_envelope_root(ctx, graphs, (ctx.b_id, ctx.hk_id))
+    if root is None:
         return None
-    root = roots[0]
-    for block_id in (ctx.b_id, ctx.hk_id):
-        if not _unit_fixed_block(env, block_id):
-            ctx.decline(f"flex_bwd: root axis {block_id} is not pinned to block size 1")
-            return None
-    for info in graphs:
-        if isinstance(info, ForLoopGraphInfo) and len(info.block_ids) != 1:
-            ctx.decline("flex_bwd: multi-dimensional device loop")
-            return None
-        if not isinstance(info, (ForLoopGraphInfo, RootGraphInfo)):
-            ctx.decline(f"flex_bwd: unsupported graph {type(info).__name__}")
-            return None
-
     root_facts = _match_root(ctx, root)
     if root_facts is None:
         return None
@@ -717,9 +579,9 @@ def _match_flex_attention_bwd(
     outers = _match_group_graph(ctx, group_loop)
     if outers is None:
         return None
-    nests: list[tuple[_Outer, _Inner, _Body]] = []
+    nests: list[tuple[_OuterLoop, _InnerLoop, _Body]] = []
     for outer in outers:
-        inner = _match_outer_graph(ctx, outer)
+        inner = _match_outer_graph(ctx, outer, _BWD_OUTER)
         if inner is None:
             return None
         body = _match_inner_body(ctx, inner, k_root, v_root)
@@ -925,7 +787,7 @@ def _group_of_bounds(ctx: _BwdCtx, begin: object, end: object) -> int | None:
 # -- group loop graph ----------------------------------------------------------
 
 
-def _match_group_graph(ctx: _BwdCtx, loop: torch.fx.Node) -> list[_Outer] | None:
+def _match_group_graph(ctx: _BwdCtx, loop: torch.fx.Node) -> list[_OuterLoop] | None:
     """The q-head body: ``bcast_h``, two counted list walks (count =
     load(cnt[b', h', n_begin // KB]), nothing else."""
     import operator
@@ -983,7 +845,7 @@ def _match_group_graph(ctx: _BwdCtx, loop: torch.fx.Node) -> list[_Outer] | None
             "flex_bwd: the q-head body must hold two list walks and their counts"
         )
         return None
-    outers: list[_Outer] = []
+    outers: list[_OuterLoop] = []
     for node in loops:
         inner_graph_id, begins, ends = node.args[0], node.args[1], node.args[2]
         if not isinstance(inner_graph_id, int) or begins != [0]:
@@ -1012,11 +874,20 @@ def _match_group_graph(ctx: _BwdCtx, loop: torch.fx.Node) -> list[_Outer] | None
         if not isinstance(info, ForLoopGraphInfo):
             ctx.decline("flex_bwd: outer loop graph missing")
             return None
-        if _col_index_block(ctx, indices[2]) is None:
+        kv_block = _col_index_block(ctx, indices[2])
+        if kv_block is None:
             ctx.decline("flex_bwd: table column index is not n_begin // KB")
             return None
         outers.append(
-            _Outer(node, inner_graph_id, info.block_ids[0], name, value, indices)
+            _OuterLoop(
+                node,
+                inner_graph_id,
+                info.block_ids[0],
+                name,
+                value,
+                indices,
+                None if kv_block == 0 else kv_block,
+            )
         )
     return outers
 
@@ -1038,144 +909,11 @@ def _col_index_block(ctx: _BwdCtx, node: object) -> int | None:
     return sym.div
 
 
-# -- outer list graph ----------------------------------------------------------
-
-
-def _match_outer_graph(ctx: _BwdCtx, outer: _Outer) -> _Inner | None:
-    """``start_m = load(idx[b', h', col, tile_id]) * QB``; ``end_m =
-    minimum(start_m + QB, full([], M))``; one inner ``_for_loop([start], [end])``."""
-    import operator
-
-    from ...language import creation_ops
-    from ...language import memory_ops
-    from ...language import tile_ops
-    from ...language._tracing_ops import _for_loop
-    from ...language._tracing_ops import _get_symnode
-    from ...language._tracing_ops import _host_tensor
-    from ...language._tracing_ops import _new_var
-    from ...language._tracing_ops import _phi
-    from ..device_ir import ForLoopGraphInfo
-
-    allowed = (
-        _new_var,
-        _get_symnode,
-        _host_tensor,
-        tile_ops.tile_id,
-        tile_ops.tile_begin,
-        memory_ops.load,
-        _aten.mul.Tensor,
-        _aten.add.Tensor,
-        _aten.full.default,
-        creation_ops.full,
-        _aten.minimum.default,
-        _for_loop,
-        operator.getitem,
-        _phi,
-    )
-    graph = ctx.graphs[outer.graph_id].graph
-    inner_loops: list[torch.fx.Node] = []
-    loads: list[torch.fx.Node] = []
-    for node in graph.nodes:
-        if node.op != "call_function":
-            continue
-        if node.target not in allowed:
-            ctx.decline(f"flex_bwd: list body has {node.target}")
-            return None
-        if node.target is _for_loop:
-            inner_loops.append(node)
-        elif node.target is memory_ops.load:
-            loads.append(node)
-    if len(inner_loops) != 1 or len(loads) != 1:
-        ctx.decline("flex_bwd: the list body must hold one Q loop and one index load")
-        return None
-    loop = inner_loops[0]
-    graph_id, begins, ends = loop.args[0], loop.args[1], loop.args[2]
-    if (
-        not isinstance(graph_id, int)
-        or not isinstance(begins, (list, tuple))
-        or not isinstance(ends, (list, tuple))
-        or len(begins) != 1
-        or len(ends) != 1
-    ):
-        ctx.decline("flex_bwd: the Q loop must have one begin and one end")
-        return None
-    start, end = begins[0], ends[0]
-    if not (isinstance(start, torch.fx.Node) and _is_call(start, _aten.mul.Tensor)):
-        ctx.decline("flex_bwd: Q loop begin is not idx * QB")
-        return None
-    if len(start.args) != 2:
-        ctx.decline("flex_bwd: Q loop begin is not idx * QB")
-        return None
-    load_arg, qb_arg = start.args
-    if _is_call(qb_arg, memory_ops.load):
-        load_arg, qb_arg = qb_arg, load_arg
-    if load_arg is not loads[0] or not isinstance(qb_arg, int) or qb_arg <= 0:
-        ctx.decline("flex_bwd: QB must be a specialized positive int")
-        return None
-    q_block = qb_arg
-    parts = _load_parts(load_arg)
-    assert parts is not None
-    tensor, indices = parts
-    value = _host_tensor_value(tensor)
-    name = _host_tensor_name(tensor)
-    if (
-        value is None
-        or name is None
-        or value.ndim != 4
-        or value.dtype != torch.int32
-        or len(indices) != 4
-    ):
-        ctx.decline("flex_bwd: the index table must be a 4-D int32 tensor")
-        return None
-    if not ctx.unit_axis_index(indices[3], outer.block_id):
-        ctx.decline("flex_bwd: the index table's last index is not the list position")
-        return None
-    if not (isinstance(end, torch.fx.Node) and _is_call(end, _aten.minimum.default)):
-        ctx.decline("flex_bwd: Q loop end is not minimum(start + QB, M)")
-        return None
-    if len(end.args) != 2:
-        ctx.decline("flex_bwd: Q loop end is not minimum(start + QB, M)")
-        return None
-    sum_node, m_node = end.args
-    if _scalar_value(sum_node) is not None:
-        sum_node, m_node = m_node, sum_node
-    q_len_value = _scalar_value(m_node)
-    if (
-        not _is_call(sum_node, _aten.add.Tensor)
-        or q_len_value is None
-        or q_len_value != int(q_len_value)
-    ):
-        ctx.decline("flex_bwd: Q loop end is not minimum(start + QB, M)")
-        return None
-    assert isinstance(sum_node, torch.fx.Node)
-    add_args = list(sum_node.args)
-    if start not in add_args:
-        ctx.decline("flex_bwd: Q loop end does not add QB to the begin")
-        return None
-    add_args.remove(start)
-    if add_args != [q_block]:
-        ctx.decline("flex_bwd: Q loop end adds a different block size")
-        return None
-    info = ctx.graphs.get(graph_id)
-    if not isinstance(info, ForLoopGraphInfo):
-        ctx.decline("flex_bwd: Q loop graph missing")
-        return None
-    block_id = info.block_ids[0]
-    if ctx.kv_id is None:
-        ctx.kv_id = block_id
-    elif ctx.kv_id != block_id:
-        ctx.decline("flex_bwd: the two Q loops use different block sizes")
-        return None
-    return _Inner(
-        loop, graph_id, block_id, name, value, indices, q_block, int(q_len_value)
-    )
-
-
 # -- inner body ----------------------------------------------------------------
 
 
 def _match_inner_body(
-    ctx: _BwdCtx, inner: _Inner, k_root: torch.fx.Node, v_root: torch.fx.Node
+    ctx: _BwdCtx, inner: _InnerLoop, k_root: torch.fx.Node, v_root: torch.fx.Node
 ) -> _Body | None:
     from ...language import matmul_ops
     from ...language import memory_ops
@@ -1621,94 +1359,34 @@ def _capture_bwd_regions(
     grad_src: object,
 ) -> _Regions | None:
     builder = _BwdRegionBuilder(ctx, graph_id, score_root)
-    score_nodes = mask_nodes = grad_nodes = None
     if score_src is not score_root:
-        score_nodes = builder.collect(score_src)
-        if score_nodes is None:
-            ctx.decline(builder.failed or "flex_bwd: score region rejected")
+        if not builder.collect_region("score", score_src):
             return None
-        if not any(leaf.kind == "score" for leaf in builder.leaves.values()):
+        if not builder.reads("score"):
             ctx.decline("flex_bwd: the score region does not read the score")
             return None
-    if mask_pred is not None:
-        mask_nodes = builder.collect(mask_pred)
-        if mask_nodes is None:
-            ctx.decline(builder.failed or "flex_bwd: mask region rejected")
-            return None
+    if mask_pred is not None and not builder.collect_region("mask", mask_pred):
+        return None
     if grad_src is not None:
         builder.grad_root = ds_node
-        grad_nodes = builder.collect(grad_src)
-        if grad_nodes is None:
-            ctx.decline(builder.failed or "flex_bwd: score_mod_bwd region rejected")
+        if not builder.collect_region("score_mod_bwd", grad_src):
             return None
-        if not any(leaf.kind == "grad" for leaf in builder.leaves.values()):
+        if not builder.reads("grad"):
             ctx.decline("flex_bwd: score_mod_bwd does not read its gradient argument")
             return None
-    coord_meta: dict[str, object] = {"score": s_dot.meta.get("val")}
-    for node, leaf in builder.leaves.items():
-        if leaf.kind == "coord" and leaf.key not in coord_meta:
-            coord_meta[leaf.key] = node.meta.get("val")
-    for key, shape in _COORD_PLACEHOLDER_SHAPES.items():
-        if key not in coord_meta:
-            coord_meta[key] = torch.empty(
-                shape, dtype=torch.int32, device=ctx.env.device
-            )
-    aux_order = list(builder.aux_order)
-    host_scalars = list(builder.host_scalars)
-    score_graph = mask_graph = grad_graph = None
-    try:
-        if score_nodes is not None:
-            assert isinstance(score_src, torch.fx.Node)
-            score_graph = builder.build(
-                score_nodes, score_src, aux_order, host_scalars, coord_meta
-            )
-        if mask_nodes is not None:
-            assert isinstance(mask_pred, torch.fx.Node)
-            mask_graph = builder.build(
-                mask_nodes, mask_pred, aux_order, host_scalars, coord_meta
-            )
-        if grad_nodes is not None:
-            assert isinstance(grad_src, torch.fx.Node)
-            grad_graph = builder.build(
-                grad_nodes, grad_src, aux_order, host_scalars, coord_meta
-            )
-    except _UnmappedRegionValue as error:
-        ctx.decline(
-            f"flex_bwd: region value {error} is not a score, coordinate or scalar"
-        )
+    regions = builder.build_regions(s_dot)
+    if regions is None:
         return None
-    aux_buffers: list[FlexAuxBuffer] = []
-    for name in aux_order:
-        value = _host_tensor_value(builder.aux_nodes[name])
-        assert value is not None
-        classes = {builder.classify_load(load) for load in builder.aux_loads[name]}
-        index_class = classes.pop() if len(classes) == 1 else "general"
-        aux_buffers.append(
-            FlexAuxBuffer(
-                name=name,
-                dtype=value.dtype,
-                shape=tuple(int(size) for size in value.shape),
-                strides=tuple(int(stride) for stride in value.stride()),
-                index_class=index_class,
-            )
-        )
-
-    def region(
-        graph_output: tuple[torch.fx.Graph, torch.fx.Node] | None,
-    ) -> FlexRegion | None:
-        if graph_output is None:
-            return None
-        return FlexRegion(graph_output[0], graph_output[1])
-
+    score, grad = regions.get("score"), regions.get("score_mod_bwd")
     return _Regions(
-        region(score_graph),
-        region(mask_graph),
-        region(grad_graph),
-        tuple(aux_buffers),
-        tuple(host_scalars),
-        None if score_graph is None else _region_key(score_graph[0]),
-        None if grad_graph is None else _region_key(grad_graph[0]),
-        frozenset(load for loads in builder.aux_loads.values() for load in loads),
+        score,
+        regions.get("mask"),
+        grad,
+        builder.aux_buffers(),
+        tuple(builder.host_scalars),
+        None if score is None else _region_key(score.graph),
+        None if grad is None else _region_key(grad.graph),
+        builder.load_nodes(),
     )
 
 
@@ -1724,7 +1402,7 @@ def _assemble(
     dv_full: torch.fx.Node,
     dk_full: torch.fx.Node,
     dk_factor: object,
-    nests: list[tuple[_Outer, _Inner, _Body]],
+    nests: list[tuple[_OuterLoop, _InnerLoop, _Body]],
 ) -> FlexBwdMatch | None:
     (full_outer, full_inner, full_body), (part_outer, part_inner, part_body) = nests
     if full_body.regions.mask is not None:
@@ -1771,7 +1449,10 @@ def _assemble(
     ):
         ctx.decline("flex_bwd: the two bodies disagree on captured tables or scalars")
         return None
-    if full_inner.q_block != part_inner.q_block or full_inner.q_len != part_inner.q_len:
+    if (
+        full_inner.block_size != part_inner.block_size
+        or full_inner.axis_len != part_inner.axis_len
+    ):
         ctx.decline("flex_bwd: the two walks disagree on QB or M")
         return None
     k_parts = _load_parts(full_body.k_root)
@@ -1833,17 +1514,15 @@ def _assemble(
     if not flex_bwd_head_dims_supported(head_dim, head_dim_v):
         ctx.decline(f"flex_bwd: unsupported head dims ({head_dim}, {head_dim_v})")
         return None
-    if full_inner.q_len != q_seq:
+    if full_inner.axis_len != q_seq:
         ctx.decline("flex_bwd: the Q loop clamps to a length other than M")
         return None
-    q_block = full_inner.q_block
+    q_block = full_inner.block_size
     if q_block not in FLEX_Q_BLOCKS:
         ctx.decline(f"flex_bwd: QB must be in {FLEX_Q_BLOCKS} (got {q_block})")
         return None
-    kv_block = _col_index_block(ctx, part_outer.cnt_index[2])
+    kv_block = part_outer.table_block
     if kv_block is None:
-        return None
-    if kv_block == 0:
         kv_block = FLEX_KV_BLOCK
     if kv_block != FLEX_KV_BLOCK:
         ctx.decline(f"flex_bwd: KB must be {FLEX_KV_BLOCK} (got {kv_block})")
@@ -2054,7 +1733,7 @@ def _accumulators_threaded(
     group_loop: torch.fx.Node,
     dv_full: torch.fx.Node,
     dk_full: torch.fx.Node,
-    nests: list[tuple[_Outer, _Inner, _Body]],
+    nests: list[tuple[_OuterLoop, _InnerLoop, _Body]],
 ) -> bool:
     """The dV / dK accumulators flow root -> q-head loop -> full walk -> Q
     body -> partial walk -> Q body: the full body's accumulator placeholders

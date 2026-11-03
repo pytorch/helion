@@ -19,12 +19,13 @@ loop runs the combine, and everything downstream of it, once per lane::
 
 The tile program reduces the whole tile once per trip.  The two-pass lane
 marker that gives scalar lane loops that structure declines vectorized ones
-(``_device_lane_loop_marker_expr``), so the per-lane form above is what the
-strided reduce emits.  It computes the program only when the consumers form
-an online fold (softmax's rescaled running sum); ``acc += sum(tile) ** 2``
-squares per-lane partials.  It is also slow: a 16384-wide row at 128 threads
-x V16 x R2 runs 8 cross-thread rounds (two block reductions each: shuffles,
-shared-memory round trips, barriers) where 4 suffice.
+(``CuteBlockReductionEmitter.emit_device_lane_loop_marker``), so the per-lane
+form above is what the strided reduce emits.  It computes the program only
+when the consumers form an online fold (softmax's rescaled running sum);
+``acc += sum(tile) ** 2`` squares per-lane partials.  It is also slow: a
+16384-wide row at 128 threads x V16 x R2 runs 8 cross-thread rounds (two
+block reductions each: shuffles, shared-memory round trips, barriers) where 4
+suffice.
 
 This pass rewrites each such loop (recorded at emission in
 ``cute_state.lane_fold_reduce_sites``, keyed by ``fold_site_key``) into one
@@ -72,7 +73,7 @@ other than ``sum`` / ``max`` / ``min`` rejects the config
 
 Sites are recorded on every path that emits a cross-thread reduce inside a
 vectorized lane loop: the grouped strided helpers and the direct single-warp
-``cute.arch.warp_reduction_*`` (``ReductionStrategy._record_lane_fold_site``).
+``cute.arch.warp_reduction_*`` (``CuteReductionEmitter.record_lane_fold_site``).
 
 Online pair.  When the body holds exactly a ``max`` reduction followed by a
 ``sum`` reduction whose summands are ``exp(f(x) - m)`` with ``f(x)`` the very
@@ -105,23 +106,18 @@ from ... import exc
 from ..ast_extension import iter_statements
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import ReadWrites
-from ._ast_pass_utils import _names_read
+from ._ast_pass_utils import loop_extent
+from ._ast_pass_utils import names_read
+from ._ast_pass_utils import reparse_expr
+from .reduce_call import LANE_FOLD_REDUCES
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Collection
     from collections.abc import Mapping
 
-# The grouped strided reduces: the op is a string literal in ``args[1]``,
-# the identity in ``args[2]``.
-_REDUCE_HELPERS = frozenset(
-    {
-        "_cute_grouped_reduce_shared_two_stage",
-        "_cute_grouped_reduce_shared_tree",
-        "_cute_grouped_reduce_warp",
-        "_cute_grouped_reduce_cluster",
-    }
-)
+# The grouped strided reduces (``LANE_FOLD_REDUCES``): the op is a string
+# literal in ``args[1]``, the identity in ``args[2]``.
 # The direct single-warp reduces (``CuteBackend.reduction_expr``, emitted
 # when the CTA is one warp on the reduced axis): the op is in the name, or
 # for the generic ``cute.arch.warp_reduction(x, op_fn, ...)`` in ``args[1]``.
@@ -149,7 +145,7 @@ def _reduce_helper(call: ast.Call) -> str | None:
     """The reduce helper or direct warp reduce ``call`` invokes, or None."""
     func = call.func
     if isinstance(func, ast.Name):
-        return func.id if func.id in _REDUCE_HELPERS else None
+        return func.id if func.id in LANE_FOLD_REDUCES else None
     name = ast.unparse(func)
     if name in _DIRECT_REDUCES or name == _DIRECT_GENERIC:
         return name
@@ -187,7 +183,7 @@ def fold_site_key(call: ast.Call | str) -> str:
     if not isinstance(expression, ast.Call) or not expression.args:
         raise _reject(f"{ast.unparse(expression)} is not a reduce call")
     expression.args[0] = ast.Name(id="_", ctx=ast.Load())
-    if _reduce_helper(expression) in _REDUCE_HELPERS and len(expression.args) >= 3:
+    if _reduce_helper(expression) in LANE_FOLD_REDUCES and len(expression.args) >= 3:
         expression.args[2] = _canonical_identity(expression.args[2])
     return ast.unparse(ast.fix_missing_locations(expression))
 
@@ -206,7 +202,7 @@ def _site_operation(call: ast.Call) -> tuple[str, ast.expr | None]:
     identity expression (None for the direct warp reduces)."""
     helper = _reduce_helper(call)
     assert helper is not None
-    if helper in _REDUCE_HELPERS:
+    if helper in LANE_FOLD_REDUCES:
         if len(call.args) < 3:
             raise _reject("reduce call without an identity")
         op_node = call.args[1]
@@ -249,31 +245,12 @@ def _identity_init(stmt: ast.stmt, accumulator: str) -> tuple[str, str] | None:
 
 
 def _constexpr_extent(loop: ast.For) -> int | None:
-    iterator = loop.iter
-    if (
-        isinstance(iterator, ast.Call)
-        and ast.unparse(iterator.func) == "cutlass.range_constexpr"
-        and len(iterator.args) == 1
-        and isinstance(iterator.args[0], ast.Constant)
-        and isinstance(iterator.args[0].value, int)
-    ):
-        return iterator.args[0].value
-    return None
+    return loop_extent(loop, kinds=("constexpr",), minimum=None)
 
 
 def _rolled_extent(loop: ast.For) -> int | None:
     """``for x in range(N)`` -> N; None for any other iterator."""
-    iterator = loop.iter
-    if (
-        isinstance(iterator, ast.Call)
-        and isinstance(iterator.func, ast.Name)
-        and iterator.func.id == "range"
-        and len(iterator.args) == 1
-        and isinstance(iterator.args[0], ast.Constant)
-        and isinstance(iterator.args[0].value, int)
-    ):
-        return iterator.args[0].value
-    return None
+    return loop_extent(loop, kinds=("range",), minimum=None)
 
 
 def _unwrap_casts(node: ast.expr) -> ast.expr:
@@ -369,7 +346,7 @@ def _pure_target(target: ast.expr, caches: frozenset[str]) -> bool:
 def _is_pure(stmt: ast.AST, caches: frozenset[str] = frozenset()) -> bool:
     """Register arithmetic, casts, packet reads and loads only, stored to
     names or to the register caches in ``caches``."""
-    from ..tile_strategy import _is_proven_relocatable_call
+    from ._ast_pass_utils import _is_proven_relocatable_call
 
     if not isinstance(stmt, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.For)):
         return False
@@ -481,7 +458,7 @@ class _Fingerprint(ast.NodeTransformer):
         nested = _Fingerprint(
             self.loop_var, self.locals, self.caches, self.active | {name}
         )
-        return nested.visit(_expression_copy(expression))
+        return nested.visit(reparse_expr(expression))
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         if node.id in self.locals and node.id not in self.active:
@@ -489,7 +466,7 @@ class _Fingerprint(ast.NodeTransformer):
         return node
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
-        if self.loop_var in _names_read(node.slice):
+        if self.loop_var in names_read(node.slice):
             value = node.value
             if isinstance(value, ast.Name) and value.id in self.caches:
                 return ast.Name(id=self.caches[value.id], ctx=ast.Load())
@@ -501,12 +478,6 @@ class _Fingerprint(ast.NodeTransformer):
         return self.generic_visit(node)
 
 
-def _expression_copy(node: ast.expr) -> ast.expr:
-    copy = ast.parse(ast.unparse(node), mode="eval").body
-    assert isinstance(copy, ast.expr)
-    return copy
-
-
 def _fingerprint(
     expression: ast.expr,
     loop_var: str,
@@ -515,7 +486,7 @@ def _fingerprint(
 ) -> str:
     """Outer fp32 casts do not count: the V-fold wraps its input in one
     (``_rewrite_cast_wrapper``) that the exponential's minuend lacks."""
-    tree = _Fingerprint(loop_var, locals_, caches).visit(_expression_copy(expression))
+    tree = _Fingerprint(loop_var, locals_, caches).visit(reparse_expr(expression))
     assert isinstance(tree, ast.expr)
     return ast.unparse(ast.fix_missing_locations(_strip_float_casts(tree)))
 
@@ -1292,7 +1263,7 @@ def _is_monotone_in(node: ast.expr, names: frozenset[str]) -> bool:
     min, sums, differences with an independent subtrahend, products and
     fused multiply-adds by positive constants of such expressions.  An
     expression that reads none of ``names`` qualifies."""
-    if not _names_read(node) & names:
+    if not names_read(node) & names:
         return True
     if isinstance(node, ast.Name):
         return True
@@ -1316,7 +1287,7 @@ def _is_monotone_in(node: ast.expr, names: frozenset[str]) -> bool:
             )
         if isinstance(node.op, ast.Sub):
             return _is_monotone_in(node.left, names) and not (
-                _names_read(node.right) & names
+                names_read(node.right) & names
             )
         if isinstance(node.op, ast.Mult):
             if _positive_constant(node.right):

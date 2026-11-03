@@ -13,15 +13,13 @@ from .test_cute_scheduler_mailbox import _plain_matmul
 import helion
 from helion import exc
 from helion._compiler.cute.mma_support import get_cute_mma_support
+from helion._compiler.cute.tcgen05.scheduler_pids import Tcgen05PersistentProgramIDs
+from helion._compiler.cute.tcgen05_config import surface
 from helion._compiler.program_id import PIDInfo
-from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -274,7 +272,7 @@ def test_batched_plain_cold_search_does_not_expose_clc() -> None:
         bound = _batched_product._bind_isolated(args)
         config = bound.config_spec._cute_tcgen05_config
         assert config.matmul_has_leading_passthrough
-        assert not config._clc_persistence_search_enabled()
+        assert not surface._clc_persistence_search_enabled(config)
 
 
 @pytest.mark.parametrize("swizzle", [2, 4])

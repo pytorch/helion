@@ -65,6 +65,10 @@ from ... import exc
 from ...runtime.config import Config
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ..ast_read_writes import ReadWrites
+from . import target_facts
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import flatten_addition
+from ._ast_pass_utils import resolve_alias
 from .cute_warp_mma_gemm import _swizzled_chunk
 from .fragment_mma_dot import _CROSS_LANE_MARKERS
 from .fragment_mma_dot import _MMA_HELPERS
@@ -131,11 +135,9 @@ def ring_mma_smem_budget(device: torch.device | None) -> int:
     """Shared memory one CTA may stage on ``device``: the opt-in per-block
     capacity (the B200's 227 KB), the B200 figure when the device cannot be
     queried (CPU code generation)."""
-    from .tcgen05_config import CuteTcgen05Config
-
     if device is None:
         return RING_SMEM_BUDGET
-    return CuteTcgen05Config.per_cta_smem_capacity_bytes(device) or RING_SMEM_BUDGET
+    return target_facts.per_cta_smem_capacity_bytes(device) or RING_SMEM_BUDGET
 
 
 def ring_mma_smem_bytes(
@@ -214,16 +216,6 @@ def ring_mma_geometry_reason(
 
 # ---------------------------------------------------------------------------
 # matching
-
-
-def _assigned_name(stmt: ast.AST) -> str | None:
-    if (
-        isinstance(stmt, ast.Assign)
-        and len(stmt.targets) == 1
-        and isinstance(stmt.targets[0], ast.Name)
-    ):
-        return stmt.targets[0].id
-    return None
 
 
 def _reads(node: ast.AST) -> set[str]:
@@ -355,7 +347,7 @@ class _Packet:
 
 def _packet_load(stmt: ast.AST) -> _Packet | None:
     """``NAME = <load>(ADDR [if PRED else ADDR0], ir.VectorType.get([V], cutlass.Uint16.mlir_type))``."""
-    name = _assigned_name(stmt)
+    name = assigned_name(stmt)
     if name is None:
         return None
     assert isinstance(stmt, ast.Assign)
@@ -396,16 +388,7 @@ class _Address:
 
 def _parse_address(expr: ast.expr) -> _Address | None:
     """``T.iterator + cutlass.Int32(E0) * cutlass.Int32(T.layout.stride[0]) + ...``."""
-    parts: list[ast.expr] = []
-
-    def flatten(node: ast.expr) -> None:
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            flatten(node.left)
-            flatten(node.right)
-        else:
-            parts.append(node)
-
-    flatten(expr)
+    parts = flatten_addition(expr)
     if not parts:
         return None
     base = parts[0]
@@ -448,16 +431,7 @@ def _lane_base_axis(
 ) -> int | None:
     """The thread axis of the plain K lane base ``KOFF + thread_idx()[a] * V +
     lane * V`` (the packet's own K position), or None for any other form."""
-    parts: list[ast.expr] = []
-
-    def flatten(node: ast.expr) -> None:
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            flatten(node.left)
-            flatten(node.right)
-        else:
-            parts.append(node)
-
-    flatten(value)
+    parts = flatten_addition(value)
     if len(parts) != 3:
         return None
     seen_k = seen_lane = False
@@ -573,7 +547,7 @@ def _match_row_loop(
     # The row prologue: single-name assignments (gathers allowed), nothing
     # cross-lane, nothing per thread, no stores.
     for pre_stmt in pre:
-        if _assigned_name(pre_stmt) is None:
+        if assigned_name(pre_stmt) is None:
             return _no("a row prologue statement is not a single-name assignment")
         if _has_cross_lane(pre_stmt) or _mentions_thread(pre_stmt):
             return _no("a row prologue statement is per thread or cross-lane")
@@ -597,7 +571,7 @@ def _match_row_loop(
     trailing = list(body[lane_position + 1 :])
     if len(inits) > 1:
         return _no("more than one statement before the K lane loop")
-    init_name = _assigned_name(inits[0]) if inits else None
+    init_name = assigned_name(inits[0]) if inits else None
     if inits and (init_name is None or not _is_zero_float(inits[0].value)):  # type: ignore[union-attr]
         return _no("the statement before the K lane loop is not a zero init")
     # ---- the lane body: packets, the element loop, the row index statements
@@ -618,7 +592,7 @@ def _match_row_loop(
         if isinstance(lane_stmt, ast.For) and _constexpr_extent(lane_stmt) is not None:
             vec_loop = lane_stmt
             continue
-        name = _assigned_name(lane_stmt)
+        name = assigned_name(lane_stmt)
         if name is None or not _is_pure_assignment(lane_stmt):
             return _no("an impure lane body statement before the element loop")
         assert isinstance(lane_stmt, ast.Assign)
@@ -659,7 +633,7 @@ def _match_row_loop(
     if init_name is not None and init_name != vfold:
         return _no("the zero init before the lane loop is not the fold's")
     if init_name is None and not any(
-        _assigned_name(s) == vfold and _is_zero_float(s.value)  # type: ignore[union-attr]
+        assigned_name(s) == vfold and _is_zero_float(s.value)  # type: ignore[union-attr]
         for s in pre
     ):
         return _no("the fold accumulator is not zeroed before the K loop")
@@ -678,7 +652,7 @@ def _match_row_loop(
         return _no("the extracted elements do not come from the two packets")
     # ---- K-dependent names: the lane variable, the chunk offset, anything
     # read from the thread index, and what depends on them.
-    row_names = {row_var} | {name for s in pre if (name := _assigned_name(s))}
+    row_names = {row_var} | {name for s in pre if (name := assigned_name(s))}
     k_dependent = {lane_var, k_loop.var}
     changed = True
     while changed:
@@ -809,21 +783,21 @@ def _match_row_loop(
     needed = _closure(seeds, lane_defs, set())
     if needed & k_dependent:
         return _no("the row index depends on K")
-    row_index_slice = [s for s in lane_stmts if _assigned_name(s) in needed]
+    row_index_slice = [s for s in lane_stmts if assigned_name(s) in needed]
     # ---- the reduce of the fold and ``ACC = ACC + DOT``: the statements
     # after the element loop (in the lane body and after the lane loop).
     tail = [*lane_tail, *trailing]
     aliases: dict[str, str] = {}
     for pre_stmt in pre:
         if isinstance(pre_stmt, ast.Assign) and isinstance(pre_stmt.value, ast.Name):
-            name = _assigned_name(pre_stmt)
+            name = assigned_name(pre_stmt)
             if name is not None:
                 aliases[name] = pre_stmt.value.id
     reduce_target: str | None = None
     if not tail:
         return _no("no statements after the element loop")
     for t_stmt in tail[:-1]:
-        name = _assigned_name(t_stmt)
+        name = assigned_name(t_stmt)
         if name is None:
             return _no("a statement after the element loop is not an assignment")
         assert isinstance(t_stmt, ast.Assign)
@@ -839,7 +813,7 @@ def _match_row_loop(
         if not _is_pure_assignment(t_stmt):
             return _no("an impure statement after the element loop")
     acc_stmt = tail[-1]
-    acc = _assigned_name(acc_stmt)
+    acc = assigned_name(acc_stmt)
     if (
         acc is None
         or reduce_target is None
@@ -849,22 +823,18 @@ def _match_row_loop(
     ):
         return _no("the chunk does not end with ACC = ACC + DOT")
 
-    def resolve(name: str) -> str:
-        seen: set[str] = set()
-        while name in aliases and name not in seen:
-            seen.add(name)
-            name = aliases[name]
-        return name
-
     value = acc_stmt.value
     if not (isinstance(value.left, ast.Name) and isinstance(value.right, ast.Name)):
         return _no("the accumulate operands are not names")
-    operands = {resolve(value.left.id), resolve(value.right.id)}
+    operands = {
+        resolve_alias(value.left.id, aliases),
+        resolve_alias(value.right.id, aliases),
+    }
     if operands != {acc, reduce_target}:
         return _no("the accumulate is not ACC + the reduced fold")
     # The accumulator starts in the row prologue (any pure value: it is added
     # to the ring's dot at the end) and is stored after the K loop.
-    if not any(_assigned_name(s) == acc for s in pre):
+    if not any(assigned_name(s) == acc for s in pre):
         return _no("the accumulator is not initialized in the row prologue")
     if not post or not any(acc in _reads(s) for s in post):
         return _no("the accumulator is not read after the K loop")
@@ -1331,16 +1301,14 @@ def _emit_ring(
     # values they read (the row index, a bias): that backward slice of the
     # prologue, not the row gather the packets needed.
     pre_defs = {
-        name: stmt for stmt in match.pre if (name := _assigned_name(stmt)) is not None
+        name: stmt for stmt in match.pre if (name := assigned_name(stmt)) is not None
     }
     needed_by_post = _closure(
         {match.acc} | {name for stmt in match.post for name in _reads(stmt)},
         {name: stmt.value for name, stmt in pre_defs.items()},  # type: ignore[attr-defined]
         set(),
     )
-    epilogue_pre = [
-        stmt for stmt in match.pre if _assigned_name(stmt) in needed_by_post
-    ]
+    epilogue_pre = [stmt for stmt in match.pre if assigned_name(stmt) in needed_by_post]
     post_names = _assigned_names([*epilogue_pre, *match.post])
 
     def epilogue(row_text: str, acc_text: str, tag: str, indent: str) -> None:

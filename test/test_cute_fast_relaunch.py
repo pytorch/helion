@@ -16,6 +16,8 @@ from helion._testing import TestCase
 from helion._testing import onlyBackends
 import helion.language as hl
 from helion.runtime.cute import launcher as cute_launcher
+from helion.runtime.cute.compile_cache import is_tvm_ffi_compiled_function
+from helion.runtime.cute.fast_relaunch import FASTPATH_MISS
 
 
 def _make_add_pair() -> helion.Kernel:
@@ -54,9 +56,7 @@ class TestCuteFastRelaunch(RefEagerTestDisabled, TestCase):
             launchers = list(cute_kernel._helion_cute_compiled_launchers.values())  # type: ignore[attr-defined]
             self.assertEqual(len(launchers), 1)
             compiled = launchers[0]
-            self.assertTrue(
-                cute_launcher._is_tvm_ffi_compiled_function(compiled._compiled)
-            )
+            self.assertTrue(is_tvm_ffi_compiled_function(compiled._compiled))
             fastpath = cute_kernel._helion_cute_fastpath  # type: ignore[attr-defined]
             self.assertIsInstance(fastpath, cute_launcher._CuteFastRelaunch)
             self.assertIsNotNone(fastpath.packed_args)
@@ -91,7 +91,7 @@ class TestCuteFastRelaunch(RefEagerTestDisabled, TestCase):
                     fastpath.block,
                     fastpath.compile_options,
                 ),
-                cute_launcher._CUTE_FASTPATH_MISS,
+                FASTPATH_MISS,
             )
 
     def test_fast_relaunch_under_cuda_graph_capture(self) -> None:
@@ -142,7 +142,7 @@ class TestCuteFastRelaunch(RefEagerTestDisabled, TestCase):
             torch.testing.assert_close(add_pair(x, y), x + y)
         cute_kernel = _cute_kernel(add_pair.bind((x, y)))
         (compiled,) = cute_kernel._helion_cute_compiled_launchers.values()  # type: ignore[attr-defined]
-        self.assertTrue(cute_launcher._is_tvm_ffi_compiled_function(compiled._compiled))
+        self.assertTrue(is_tvm_ffi_compiled_function(compiled._compiled))
         self.assertIsInstance(
             cute_kernel._helion_cute_fastpath,  # type: ignore[attr-defined]
             cute_launcher._CuteFastRelaunch,

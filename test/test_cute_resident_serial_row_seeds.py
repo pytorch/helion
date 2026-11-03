@@ -13,13 +13,13 @@ import torch
 
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
-from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
+from helion._compiler.cute.autotune.heuristics.cute_resident_reductions import (
     CuteResidentReductionHeuristic,
 )
+from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner import LFBOTreeSearch
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.local_cache import LocalAutotuneCache
@@ -88,14 +88,7 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "HELION_CUTE_MATERIALIZE_TRANSFORMED_OPERANDS",
     ):
         monkeypatch.delenv(name, raising=False)
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
         yield
 
 
@@ -198,7 +191,7 @@ def _initial_population_with_legacy_prefix(
     with ExitStack() as stack:
         for registration in _FRAGMENT_COVERAGE_REGISTRATIONS:
             stack.enter_context(
-                patch("helion._compiler.autotuner_heuristics." + registration)
+                patch("helion._compiler.cute.autotune.heuristics." + registration)
             )
         old_bound = cpu_bind(bound.kernel, args)
     _old_search, old, old_rng = _capture_initial_population(old_bound, args, seed)

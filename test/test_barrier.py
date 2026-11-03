@@ -280,7 +280,10 @@ class TestBarrier(RefEagerTestBase, TestCase):
         original_graph_count = len(device_ir.graphs)
 
         fake_backend = SimpleNamespace(
-            register_reduction_loop_config_slots=lambda *_: None
+            register_reduction_loop_config_slots=lambda *_: None,
+            rewrite_device_ir=lambda *_: None,
+            reduction_loops_allow_non_power_of_two=False,
+            reduction_loops_allow_full_extent=False,
         )
         fake_env = SimpleNamespace(
             block_sizes=[_FakeRDim()],

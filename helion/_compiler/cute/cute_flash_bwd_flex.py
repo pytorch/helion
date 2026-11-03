@@ -30,14 +30,63 @@ reduce-add) with three generalizations:
 from __future__ import annotations
 
 import dataclasses
-import re
+import functools
 import textwrap
 from typing import TYPE_CHECKING
+from typing import Literal
 
 import torch
 
+from ..emitter_protocols import source_adapter
+from . import target_facts
 from .attention_plan import AttentionScorePlan
 from .attention_plan import FlexRegion
+from .cute_flash_bwd_common import FBWD_2CTA_DS_OFFSETS
+from .cute_flash_bwd_common import FBWD_CLC_CONSUME
+from .cute_flash_bwd_common import FBWD_COMPUTE_LOAD_VIEWS
+from .cute_flash_bwd_common import FBWD_MBAR_INITS
+from .cute_flash_bwd_common import FBWD_REG_SPLITS
+from .cute_flash_bwd_common import FBWD_SMEM_VIEWS
+from .cute_flash_bwd_common import FLASH_BWD_AUX_SMEM_KEY
+from .cute_flash_bwd_common import FLASH_BWD_BIAS_FOLD_KEY
+from .cute_flash_bwd_common import FLASH_BWD_DS_TMEM_KEY
+from .cute_flash_bwd_common import FLASH_BWD_EXP2_EMU_KEY
+from .cute_flash_bwd_common import FLASH_BWD_EXP2_F32_KEY
+from .cute_flash_bwd_common import FLASH_BWD_HOOK_COLS_KEY
+from .cute_flash_bwd_common import FLASH_BWD_HOOK_PIN_KEY
+from .cute_flash_bwd_common import FLASH_BWD_KV_STAGE_KEY
+from .cute_flash_bwd_common import FLASH_BWD_MASK_FORM_KEY
+from .cute_flash_bwd_common import FLASH_BWD_PERSISTENT_KEY
+from .cute_flash_bwd_common import FLASH_BWD_REGS_KEY
+from .cute_flash_bwd_common import FLASH_BWD_S_FIRST_KEY
+from .cute_flash_bwd_common import FLASH_BWD_STATS_MMA_KEY
+from .cute_flash_bwd_common import FLASH_BWD_TABLE_STEPS_KEY
+from .cute_flash_bwd_common import FLASH_BWD_TILE_GROUP_KEY
+from .cute_flash_bwd_common import FLASH_BWD_TWO_CTA_KEY
+from .cute_flash_bwd_common import FbwdPSpec
+from .cute_flash_bwd_common import chunked_region_renderer
+from .cute_flash_bwd_common import fbwd_clc_consume_only
+from .cute_flash_bwd_common import fbwd_clc_setup
+from .cute_flash_bwd_common import fbwd_compute_step_state
+from .cute_flash_bwd_common import fbwd_compute_tmem_views
+from .cute_flash_bwd_common import fbwd_dq_reduce_partitions
+from .cute_flash_bwd_common import fbwd_dq_reduce_views
+from .cute_flash_bwd_common import fbwd_epilogue_block
+from .cute_flash_bwd_common import fbwd_mma_descriptor_setup
+from .cute_flash_bwd_common import fbwd_mma_fragments
+from .cute_flash_bwd_common import fbwd_mma_step_loop_head
+from .cute_flash_bwd_common import fbwd_mma_tile_entry
+from .cute_flash_bwd_common import fbwd_p_pass
+from .cute_flash_bwd_common import fbwd_p_passes
+from .cute_flash_bwd_common import fbwd_p_store_views
+from .cute_flash_bwd_common import fbwd_tile_loop
+from .cute_flash_bwd_common import fbwd_tmem_warp
+from .cute_flash_bwd_common import hook_chunk_prefix
+from .cute_flash_bwd_common import hook_jacobian_lines
+from .cute_flash_bwd_common import indent_lines
+from .cute_flash_bwd_common import merge_blocks
+from .cute_flash_bwd_common import reg_split_counts
+from .cute_flash_bwd_common import setmaxreg
 from .flash_score_mod import FlexAuxSmem
 from .flash_score_mod import FlexHookCode
 from .flash_score_mod import flex_aux_smem_candidates
@@ -48,6 +97,7 @@ from .flex_bwd_match import flex_bwd_tmem_plan
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from ..compile_environment import CompileEnvironment
     from ..device_function import DeviceFunction
     from ..device_function import TensorArg
     from ..generate_ast import GenerateAST
@@ -57,6 +107,7 @@ if TYPE_CHECKING:
 _aten = torch.ops.aten
 
 __all__ = [
+    "FBWD_REG_SPLITS",
     "codegen_attention_flash_bwd_flex",
     "emit_flash_bwd_flex_device_body",
     "flex_bwd_hook_plan",
@@ -156,25 +207,6 @@ def additive_bias_region(plan: FlexBwdPlan) -> FlexRegion | None:
     graph.eliminate_dead_code()
     graph.lint()
     return FlexRegion(graph, mapping[g])
-
-
-def _lines(text: str, indent: int) -> str:
-    """Re-indent a hook block (complete lines) to ``indent`` spaces."""
-    if not text.strip():
-        return ""
-    body = textwrap.indent(textwrap.dedent(text).rstrip("\n"), " " * indent)
-    return body + "\n"
-
-
-def _merge_blocks(*texts: str) -> str:
-    """The union of the hooks' prelude lines in first-seen order (the renderer
-    emits identical lines for shared values, so exact-text dedup is exact)."""
-    seen: list[str] = []
-    for text in texts:
-        for line in textwrap.dedent(text).splitlines():
-            if line not in seen:
-                seen.append(line)
-    return "\n".join(seen) + ("\n" if seen else "")
 
 
 def _render_hooks(
@@ -320,12 +352,14 @@ def _compute_block(
     dp_off: int = 128,
     p_col: int | None = None,
     dv_off: int = 256,
+    dk_off: int,
     s_read: bool = False,
     dv_via_do: bool = False,
     kv_stage: int = 1,
     kv_slot: str = "0",
 ) -> str:
-    """One compute warpgroup's body (h = column half 0/1, warps 4-7 / 8-11).
+    """One compute warpgroup's body (h = column half 0/1, warps 4-7 / 8-11);
+    dV / dK accumulate at TMEM columns ``dv_off`` / ``dk_off``.
 
     ``chunked_region`` (a chunked step table: the emitter's wrapper around
     :func:`_chunk_loop`): the step loop runs once per chunk over
@@ -343,7 +377,6 @@ def _compute_block(
     of the smem dS staging (one 32 KB smem read per step less; the staging
     stays for the dQ MMA, whose M axis is Q).
     """
-    from .cute_flash_bwd import _fbwd_epilogue_block
 
     # The columns this warpgroup's epilogue writes: dV (h=0) is Dv wide, dK
     # (h=1) D wide; the TMEM partition is the padded width (the MMA's N).
@@ -376,95 +409,41 @@ def _compute_block(
     # scale folded in.
     p_scale = "fbwd_log2c" if pre_scaled else "fbwd_scale2"
     hooks = [hook for hook in (plain, masked, jac) if hook is not None]
-    item_block = _merge_blocks(*(hook.item_prelude for hook in hooks))
-    tile_block = _merge_blocks(*(hook.tile_prologue for hook in hooks))
+    item_block = merge_blocks(*(hook.item_prelude for hook in hooks))
+    tile_block = merge_blocks(*(hook.tile_prologue for hook in hooks))
     per_step_item = plan.group > 1
 
-    # The P pass of one 32-column chunk runs in ``hook_cols``-lane groups: the
-    # hook transforms a group's scores and the exp2 recompute consumes them
-    # before the next group's hook runs, so ptxas has no long run of
-    # precomputable hook values to hoist above the S wait (where they spill).
-    subs = 32 // hook_cols
-
     def chunk_prefix(ind: str) -> str:
-        lines = [
-            f"{ind}fbwd_ch2 = fbwd_ch * {subs} + fbwd_sub + {2 * subs * h}",
-            f"{ind}fbwd_off = fbwd_ch * 32 + fbwd_sub * {hook_cols}",
-            f"{ind}fbwd_s_chunk = cute.make_tensor(tLDrS[None, None, fbwd_ch].iterator + fbwd_sub * {hook_cols}, cute.make_layout({hook_cols}))",
-            f"{ind}fbwd_cchunk = cute.logical_divide(tLDcS[None, None, fbwd_ch], {hook_cols})[None, fbwd_sub]",
-        ]
-        if pre_scaled:
-            lines.append(
-                f"{ind}_helion_flash_rt._scale_fragment_packed_f32x2(fbwd_s_chunk, fbwd_scale)"
-            )
-        if has_grad:
-            lines.extend(
-                (
-                    f"{ind}fbwd_spre_chunk = cute.make_tensor(fbwd_spre[None, None, fbwd_ch].iterator + fbwd_sub * {hook_cols}, cute.make_layout({hook_cols}))",
-                    f"{ind}cute.autovec_copy(fbwd_s_chunk, fbwd_spre_chunk)",
-                )
-            )
-        return "\n".join(lines) + "\n"
-
-    def bias_lines(ind: str) -> str:
-        """The folded bias: ``g`` rendered into ``fbwd_gfrag``, then
-        ``lse' = lse - c g`` on the sub-chunk's LSE values."""
-        if not bias_fold or plain is None:
-            return ""
-        return (
-            f"{ind}fbwd_gfrag = cute.make_rmem_tensor(cute.make_layout({hook_cols}), cutlass.Float32)\n"
-            + _lines(plain.chunk_body, len(ind))
-            + f"{ind}_helion_flash_rt.fbwd_lse_fold(fbwd_lse_sub, fbwd_gfrag, fbwd_neg_log2c)\n"
+        return hook_chunk_prefix(
+            ind, h=h, hook_cols=hook_cols, pre_scaled=pre_scaled, has_grad=has_grad
         )
+
+    p_spec = FbwdPSpec(
+        hook_cols=hook_cols,
+        p_scale=p_scale,
+        exp2_f32=exp2_f32,
+        exp2_emu=exp2_emu,
+        chunk_prefix=chunk_prefix,
+        fold_body=plain.chunk_body if bias_fold and plain is not None else None,
+    )
 
     def p_pass(hook: FlexHookCode | None, ind: str) -> str:
         # Under the fold ``hook`` is the mask hook (masked steps) or None.
-        return (
-            f"{ind}for fbwd_ch in cutlass.range_constexpr(2):\n"
-            f"{ind}    fbwd_lse_frg = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)\n"
-            + (
-                f"{ind}    fbwd_lse_frg.fill(cutlass.Float32(0.0))\n"
-                if lse_in_mma
-                else f"{ind}    fbwd_lse_v = cute.make_tensor(fbwd_sLSE.iterator + fbwd_par + {64 * h} + fbwd_ch * 32, cute.make_layout(32))\n"
-                f"{ind}    cute.autovec_copy(fbwd_lse_v, fbwd_lse_frg)\n"
-            )
-            # A natural-log LSE (the in-body form) goes to the exp2 base with the
-            # no-visible-key rows (lse == -inf) mapped to 0; the preprocess
-            # kernel's ``lse2`` arrives converted.
-            + (
-                ""
-                if plan.lse_prescaled or lse_in_mma
-                else f"{ind}    _helion_flash_rt.fbwd_lse_to_log2(fbwd_lse_frg, fbwd_log2c)\n"
-            )
-            + f"{ind}    for fbwd_sub in cutlass.range_constexpr({subs}):\n"
-            + chunk_prefix(ind + "        ")
-            + f"{ind}        fbwd_lse_sub = cute.make_tensor(fbwd_lse_frg.iterator + fbwd_sub * {hook_cols}, cute.make_layout({hook_cols}))\n"
-            + bias_lines(ind + "        ")
-            + (_lines(hook.chunk_body, len(ind) + 8) if hook is not None else "")
-            + f"{ind}        _helion_flash_rt.fbwd_p_pairs_packed(tLDrS, fbwd_lse_sub, fbwd_off, {hook_cols}, {p_scale}, None, fbwd_off, exp2_f32={exp2_f32}, emu_res={exp2_emu})\n"
+        return fbwd_p_pass(
+            hook,
+            ind,
+            p_spec,
+            h=h,
+            lse_prescaled=plan.lse_prescaled,
+            lse_in_mma=lse_in_mma,
         )
 
-    unmasked_hook = None if bias_fold else plain
-    if masked is not None:
-        p_passes = (
-            "            if fbwd_masked != 0:\n"
-            + p_pass(masked, " " * 16)
-            + "            else:\n"
-            + p_pass(unmasked_hook, " " * 16)
-        )
-    else:
-        p_passes = p_pass(unmasked_hook, " " * 12)
-    jac_lines = ""
-    if jac is not None:
-        jac_lines = (
-            f"                for fbwd_sub in cutlass.range_constexpr({subs}):\n"
-            f"                    fbwd_ch2 = fbwd_ch * {subs} + fbwd_sub + {2 * subs * h}\n"
-            f"                    fbwd_spre_chunk = cute.make_tensor(fbwd_spre[None, None, fbwd_ch].iterator + fbwd_sub * {hook_cols}, cute.make_layout({hook_cols}))\n"
-            f"                    fbwd_cchunk = cute.logical_divide(tLDcS[None, None, fbwd_ch], {hook_cols})[None, fbwd_sub]\n"
-            + _lines(jac.chunk_body, 20)
-            + f"                    fbwd_ds_sub = cute.make_tensor(tLDrdP.iterator + fbwd_sub * {hook_cols}, cute.make_layout({hook_cols}))\n"
-            f"                    _helion_flash_rt.fbwd_mul_pairs_packed(fbwd_ds_sub, fbwd_spre, fbwd_ch * 32 + fbwd_sub * {hook_cols}, {hook_cols})\n"
-        )
+    p_passes = fbwd_p_passes(
+        p_pass, masked=masked, unmasked=None if bias_fold else plain
+    )
+    jac_lines = hook_jacobian_lines(
+        h=h, hook_cols=hook_cols, jac_body=None if jac is None else jac.chunk_body
+    )
     spre_alloc = (
         "            fbwd_spre = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)\n"
         if has_grad
@@ -481,7 +460,7 @@ def _compute_block(
         "                _helion_flash_rt.fbwd_ds_pairs_packed(tLDrdP, tLDrS, fbwd_ch * 32, fbwd_dlt_frg, 32)\n"
     )
     d_pad, dv_pad = _fbwd_padded(plan.head_dim), _fbwd_padded(plan.head_dim_v)
-    epilogue = _fbwd_epilogue_block(
+    epilogue = fbwd_epilogue_block(
         h=h,
         rows=128,
         d=_fbwd_padded(d),
@@ -491,7 +470,7 @@ def _compute_block(
         # the 32 KB dS staging (two slots).
         thr_mma="fbwd_dskt" if h == 1 and d_pad != dv_pad else "fbwd_tst",
         slots=dv_pad // 64 if h == 0 else 2,
-        epi_off=str(dv_off) if h == 0 else "FBWD_DK_OFF",
+        epi_off=str(dv_off if h == 0 else dk_off),
         epi_scale=(
             "_helion_flash_rt._scale_fragment_packed_f32x2(fbwd_reg, cutlass.Float32("
             + out_scale_expr
@@ -515,18 +494,16 @@ def _compute_block(
         ),
         gm_expr=("_fbwd_mdVt" if h == 0 else "_fbwd_mdKt") + f"[None, None, {k_index}]",
         stage_buf="sdO" if dv_via_do and h == 0 else None,
-    ).replace("FBWD_KV_SLOT", kv_slot)
-    if persistent and h == 1:
+        kv_slot=kv_slot,
         # The dK staging (sdS) is free for the next tile's first dS once the
         # store has read it.
-        tail_old = "        if warp_idx == 8:\n            cute.arch.cp_async_bulk_wait_group(0, read=True)\n"
-        assert epilogue.count(tail_old) == 1, epilogue[-400:]
-        epilogue = epilogue.replace(
-            tail_old,
-            tail_old
-            + "            with cute.arch.elect_one():\n"
-            + "                _helion_flash_rt.mbarrier_arrive(fbwd_sdsfree_ptr)\n",
-        )
+        tail_extra=(
+            "            with cute.arch.elect_one():\n"
+            "                _helion_flash_rt.mbarrier_arrive(fbwd_sdsfree_ptr)\n"
+            if persistent and h == 1
+            else ""
+        ),
+    )
     zero_target = "_fbwd_mdV" if h == 0 else "_fbwd_mdK"
     zero_store = f"""        fbwd_zrow = fbwd_kv_base + fbwd_local_tidx
         if fbwd_zrow < {plan.kv_seq}:
@@ -570,8 +547,8 @@ def _compute_block(
                 _helion_flash_rt.mbar_spin_wait(fbwd_dk_done_ptr, fbwd_dqf_phase, 10000000)
                 fbwd_dqf_phase ^= 1
 """
-    item_lines = _lines(item_block, 12 if per_step_item else 8)
-    tile_lines = _lines(tile_block, 12)
+    item_lines = indent_lines(item_block, 12 if per_step_item else 8)
+    tile_lines = indent_lines(tile_block, 12)
     item_once = "" if per_step_item else item_lines
     item_each = item_lines if per_step_item else ""
     stage_lse, stage_delta = not lse_in_mma, not delta_in_mma
@@ -647,49 +624,16 @@ def _compute_block(
     )
     setup = f"""
     if (warp_idx >= {warp_lo}) & (warp_idx < {warp_hi}):
-        {_setmaxreg(regs_compute)}
-        fbwd_s_shape = fbwd_sst.partition_shape_C((128, 128))
-        tStS_frag = fbwd_sst.make_fragment_C(fbwd_s_shape)
-        _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
-        fbwd_tmem_ptr = fbwd_tmem.retrieve_ptr(cutlass.Float32)
-        fbwd_half_layout = cute.composition(tStS_frag.layout, cute.make_layout((128, 64)))
-        tS_h = cute.make_tensor(fbwd_tmem_ptr + {64 * h}, fbwd_half_layout)
-        tdP_h = cute.make_tensor(fbwd_tmem_ptr + {dp_off + 64 * h}, fbwd_half_layout)
-        # Coordinates of this half's columns within the 128-wide tile (the
+        {setmaxreg(regs_compute)}
+{fbwd_compute_tmem_views(rows=128, s_col=64 * h, dp_col=dp_off + 64 * h)}        # Coordinates of this half's columns within the 128-wide tile (the
         # hooks read the Q position off them).
         cS = cute.domain_offset((0, {64 * h}), cute.make_identity_tensor((128, 128)))
-        tScS = fbwd_sst.partition_C(cS)
-        fbwd_cs_half_layout = cute.composition(tScS.layout, cute.make_layout((128, 64)))
-        tScS_h = cute.make_tensor(tScS.iterator, fbwd_cs_half_layout)
-        fbwd_ld_atom = cute.make_copy_atom(cute_tcgen05_flash.Ld32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
-        fbwd_tiled_ld = cute_tcgen05_flash.make_tmem_copy(fbwd_ld_atom, tS_h)
-        fbwd_thr_ld = fbwd_tiled_ld.get_slice(fbwd_local_tidx)
-        tLDtS = fbwd_thr_ld.partition_S(tS_h)
-        tLDtdP = fbwd_thr_ld.partition_S(tdP_h)
-        tLDcS = fbwd_thr_ld.partition_D(tScS_h)
-        fbwd_p_half_layout = cute.composition(tStS_frag.layout, cute.make_layout((128, 32)))
-        tP_h = cute.make_tensor(fbwd_tmem_ptr + {p_col}, fbwd_p_half_layout)
-        fbwd_cp_half_layout = cute.composition(tScS.layout, cute.make_layout((128, 32)))
-        tPcS_h = cute.make_tensor(tScS.iterator, fbwd_cp_half_layout)
-        fbwd_st_atom = cute.make_copy_atom(cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(16)), cutlass.Float32)
-        fbwd_tiled_st = cute_tcgen05_flash.make_tmem_copy(fbwd_st_atom, tP_h)
-        fbwd_thr_st = fbwd_tiled_st.get_slice(fbwd_local_tidx)
-        tSTtP = fbwd_thr_st.partition_D(tP_h)
-        tSTcP = fbwd_thr_st.partition_S(tPcS_h)
-{ds_tmem_setup}        fbwd_sdS_mnc = cute.make_tensor(fbwd_sdS_mn.iterator, cute.composition(fbwd_sdS_mn.layout, cute.make_layout((32, 2, 2, 128))))
+{FBWD_COMPUTE_LOAD_VIEWS}{fbwd_p_store_views(p_col=p_col)}{ds_tmem_setup}        fbwd_sdS_mnc = cute.make_tensor(fbwd_sdS_mn.iterator, cute.composition(fbwd_sdS_mn.layout, cute.make_layout((32, 2, 2, 128))))
         fbwd_crow = cutlass.Int32(tLDcS[0][0])
         fbwd_sdS_c0 = fbwd_sdS_mnc[None, 0, {h}, fbwd_crow]
         fbwd_sdS_c1 = fbwd_sdS_mnc[None, 1, {h}, fbwd_crow]
         fbwd_thr_row = cutlass.Int32(tLDcS[0][0])
-        fbwd_phase = cutlass.Int32(0)
-        fbwd_dqf_phase = cutlass.Int32(0)
-        fbwd_gstep = cutlass.Int32(0)
-        fbwd_scale = cutlass.Float32({scale_expr})
-        fbwd_log2c = cutlass.Float32({plan.log2_factor!r})
-        fbwd_neg_log2c = cutlass.Float32({-plan.log2_factor!r})
-        fbwd_scale2 = cutlass.Float32(({scale_expr}) * {plan.log2_factor!r})
-        fbwd_stat_j = fbwd_local_tidx % 64
-"""
+{fbwd_compute_step_state(scale_expr=scale_expr, log2_factor=plan.log2_factor)}"""
     steps_region = f"""{stage_first}        for fbwd_i in cutlass.range(fbwd_steps, unroll=1):
             fbwd_e = cutlass.Int32(fbwd_sSteps[fbwd_tbase + fbwd_i])
             fbwd_m_tile = fbwd_e & 65535
@@ -733,54 +677,12 @@ def _compute_block(
         else:
 {textwrap.indent(zero_store, "    ")}"""
     if persistent:
-        tile_region = p_head + textwrap.indent(tile_region, "    ") + p_tail
+        tile_region = fbwd_tile_loop(tile_region, head=p_head, tail=p_tail)
     return (
         setup
         + tile_region
         + "        _helion_flash_rt.named_barrier_arrive_unaligned(2, 13 * 32)\n"
     )
-
-
-# Register budgets per warp role (dQ-reduce warps / compute warpgroups / MMA +
-# load warps), ``cute_flash_bwd_regs``: 128 R + 256 C + 128 L registers must
-# fit the SM's 65536, i.e. R + 2 C + L <= 512. FA4's 1-CTA split is the
-# default; the others trade dQ-reduce or load/MMA registers for the compute
-# warps, whose score_mod / mask_mod hooks are the first to spill.
-FBWD_REG_SPLITS: tuple[str, ...] = (
-    # First = the default config's: the hooks' per-lane work lives in the
-    # compute warps, and 152 registers there measured best on the probed
-    # variants (alibi 421 -> 376 us, causal 194 -> 177, noop 280 -> 270 at 2K).
-    "120/152/88",
-    "152/136/88",
-    "136/144/88",
-    "104/160/88",
-    "88/168/88",
-    # The 2-CTA kernel's splits: its compute warps spill below 152 registers
-    # (the merged walk's per-step state next to the exchange staging) and
-    # its MMA / load warps hold six rings and the cluster descriptors
-    # (FA4's 2-CTA budget of 104); its reduce warps drain half a dQ tile.
-    "104/152/104",
-    "136/136/104",
-)
-
-
-def _reg_split(value: object) -> tuple[int, int, int]:
-    text = str(value) if value else FBWD_REG_SPLITS[0]
-    if text not in FBWD_REG_SPLITS:
-        text = FBWD_REG_SPLITS[0]
-    reduce_regs, compute_regs, other_regs = (int(part) for part in text.split("/"))
-    assert reduce_regs + 2 * compute_regs + other_regs <= 512
-    return reduce_regs, compute_regs, other_regs
-
-
-def _setmaxreg(count: int) -> str:
-    """The ``setmaxnreg`` call moving a warp from the 128-register launch
-    budget to ``count`` (an increase or a decrease, never both)."""
-    if count > 128:
-        return f"cute.arch.setmaxregister_increase({count})"
-    if count < 128:
-        return f"cute.arch.setmaxregister_decrease({count})"
-    return "pass"
 
 
 _SM100_SMEM_CAPACITY = 232448
@@ -990,11 +892,8 @@ def _fit_smem_budget(
 
     from ._flash_runtime import flash_bwd_flex_pair_shared_storage
     from ._flash_runtime import flash_bwd_shared_storage
-    from .tcgen05_config import CuteTcgen05Config
 
-    capacity = (
-        CuteTcgen05Config.per_cta_smem_capacity_bytes(device) or _SM100_SMEM_CAPACITY
-    )
+    capacity = target_facts.per_cta_smem_capacity_bytes(device) or _SM100_SMEM_CAPACITY
     dtype = cutlass.BFloat16 if plan.io_dtype == torch.bfloat16 else cutlass.Float16
     tmem = flex_bwd_tmem_plan(plan.head_dim, plan.head_dim_v)
     if tmem is not None and tmem.mode == "pair":
@@ -1350,7 +1249,6 @@ def emit_flash_bwd_flex_device_body(
     staging is handed back to the dS pass through ``sds_free``, and K / Q of
     the next tile load while the current epilogue drains.
     """
-    from .cute_flash_bwd import _FBWD_2CTA_DS_OFFSETS
 
     d, dv = plan.head_dim, plan.head_dim_v
     # Shared-memory tiles are padded to whole 64-column swizzle atoms (the
@@ -1444,7 +1342,7 @@ def emit_flash_bwd_flex_device_body(
         bias=bias,
         aux_smem_budget=smem.aux_bytes,
     )
-    regs_reduce, regs_compute, regs_other = _reg_split(reg_split)
+    regs_reduce, regs_compute, regs_other = reg_split_counts(reg_split)
     binding_lines = "".join(f"    {line}\n" for line in bindings)
     storage_dv = f", head_dim_v={dv_pad}" if dv_pad != d_pad else ""
     if dq_chunked:
@@ -1492,14 +1390,9 @@ def emit_flash_bwd_flex_device_body(
         else "fbwd_steps"
     )
 
-    def chunked_region(text: str, indent: int) -> str:
-        """Wrap a role's step region (over ``fbwd_steps``) in the chunk loop
-        when the table is chunked; unchanged otherwise."""
-        if not chunked:
-            return text
-        return _chunk_loop(plan, table_steps, indent) + textwrap.indent(
-            re.sub(r"\bfbwd_steps\b", "fbwd_csteps", text), "    "
-        )
+    chunked_region = chunked_region_renderer(
+        functools.partial(_chunk_loop, plan, table_steps) if chunked else None
+    )
 
     def decode_lines(ind: str) -> str:
         text = _tile_decode(plan, tile_group) + (
@@ -1560,7 +1453,6 @@ def emit_flash_bwd_flex_device_body(
     def p_tail(kind: str, indent: int) -> str:
         if not persistent:
             return ""
-        from .cute_flash_bwd import _FBWD_CLC_CONSUME
 
         ind = " " * indent
         inner = ind + "    "
@@ -1574,7 +1466,7 @@ def emit_flash_bwd_flex_device_body(
                 f"{inner}    _helion_flash_rt.mbarrier_arrive(fbwd_tempty_ptr + fbwd_tbuf)\n",
             ]
         lines += [
-            _FBWD_CLC_CONSUME.format(ind=inner),
+            FBWD_CLC_CONSUME.format(ind=inner),
             f"{inner}fbwd_tile_it = fbwd_tile_it + 1\n",
             f"{inner}if fbwd_steps > 0:\n",
             f"{inner}    fbwd_nz_it = fbwd_nz_it + 1\n",
@@ -1615,11 +1507,12 @@ def emit_flash_bwd_flex_device_body(
             dp_off=tmem.dp_off,
             p_col=tmem.p_cols[h],
             dv_off=tmem.dv_off,
+            dk_off=dk_off,
             s_read=tmem.mode == "alias_s",
             dv_via_do=v_early,
             kv_stage=kv_stage,
             kv_slot=kv_slot,
-        ).replace("FBWD_DK_OFF", str(dk_off))
+        )
         for h in (0, 1)
     )
     # "A dQ MMA was issued before this one": in a previous chunk of the tile
@@ -1865,11 +1758,7 @@ def emit_flash_bwd_flex_device_body(
         else ""
     )
     if persistent:
-        from .cute_flash_bwd import _FBWD_CLC_CONSUME
-        from .cute_flash_bwd import _fbwd_clc_consume_only
-        from .cute_flash_bwd import _fbwd_clc_setup
-
-        clc_setup = _fbwd_clc_setup(total_tiles, 1, "cute.make_layout((1, 1, 1, 1))")
+        clc_setup = fbwd_clc_setup(total_tiles, 1, "cute.make_layout((1, 1, 1, 1))")
         prologue_k_fill_aug = (
             f"{aug_const_fill}    cute.arch.sync_threads()\n" if aug else ""
         )
@@ -1878,7 +1767,7 @@ def emit_flash_bwd_flex_device_body(
         # hides behind the last steps and the epilogue.
         clc_warps = (
             "    if warp_idx == 14:\n"
-            + _fbwd_clc_consume_only(" " * 8)
+            + fbwd_clc_consume_only(" " * 8)
             + "    if warp_idx == 15:\n"
             "        fbwd_clc_pstate = cutlass_pipeline_flash.make_pipeline_state(cutlass_pipeline_flash.PipelineUserType.Producer, 2)\n"
             "        fbwd_clc_tile_it = cutlass.Int32(0)\n"
@@ -1892,7 +1781,7 @@ def emit_flash_bwd_flex_device_body(
             "            with cute.arch.elect_one():\n"
             "                cute.arch.issue_clc_query(fbwd_clc_mbar, fbwd_clc_rptr)\n"
             "            fbwd_clc_pstate.advance()\n"
-            + _FBWD_CLC_CONSUME.format(ind=" " * 12)
+            + FBWD_CLC_CONSUME.format(ind=" " * 12)
             + "        fbwd_clc_pipe.producer_tail(fbwd_clc_pstate)\n"
         )
         flex_mbar_init = (
@@ -2027,7 +1916,7 @@ def emit_flash_bwd_flex_device_body(
         "_helion_flash_ptx.gemm_ptx_precomputed_pv_ts(fbwd_dk_addr, fbwd_dp_addr, "
         "_helion_flash_ptx.make_smem_desc_start_addr(sQt[None, None, None, fbwd_qe.index].iterator), "
         "fbwd_qt_base, tTSrDS[None, None, None, 0].layout, tTSrQt[None, None, None, 0].layout, "
-        f'"{dkts_idesc}", zero_init=fbwd_dk_zero, a_offsets={_FBWD_2CTA_DS_OFFSETS})'
+        f'"{dkts_idesc}", zero_init=fbwd_dk_zero, a_offsets={FBWD_2CTA_DS_OFFSETS})'
     )
     dk_gemm = dk_gemm_ts if ds_tmem else dk_gemm_ss
     ds_tmem_mma_setup = (
@@ -2060,53 +1949,13 @@ def emit_flash_bwd_flex_device_body(
         )
         dk_zero_after_tail = "            fbwd_dk_zero = cutlass.Boolean(False)\n"
     mma_head = f"""        if fbwd_steps > 0:
-            tS_t = cute.make_tensor(fbwd_tmem_ptr, tStS_frag.layout)
-            tdP_t = cute.make_tensor(fbwd_tmem_ptr + {tmem.dp_off}, tStS_frag.layout)
-            tDV_t = cute.make_tensor(fbwd_tmem_ptr + {tmem.dv_off}, tDKV_frag.layout)
-            tDK_t = cute.make_tensor(fbwd_tmem_ptr + {dk_off}, tDK_frag.layout)
-            tDQ_t = cute.make_tensor(fbwd_tmem_ptr + {dq_off}, tDQ_frag.layout)
-            tP = cute.make_tensor(tS_t.iterator, _fbwd_ptl.outer)
-            tSrK = fbwd_sst.make_fragment_A(sK)
-            tSrQ = fbwd_sst.make_fragment_B(sQ)
-            tSrV = fbwd_sst.make_fragment_A(sV)
-            tSrDO = fbwd_sst.make_fragment_B(sdO)
-            tTSrP = fbwd_tst.make_fragment_A(tP)
-            tTSrDOt = fbwd_tst.make_fragment_B(sdOt)
-            tKSrDS = fbwd_dskt.make_fragment_A(fbwd_sdS_nk)
-            tKSrQt = fbwd_dskt.make_fragment_B(sQt)
-            tDQrDS = fbwd_dqt.make_fragment_A(fbwd_sdS_mn)
-            tDQrKt = fbwd_dqt.make_fragment_B(sKt)
-{ds_tmem_mma_setup}            fbwd_s_addr = tS_t.iterator.toint()
-            fbwd_dp_addr = tdP_t.iterator.toint()
-            fbwd_dv_addr = tDV_t.iterator.toint()
-            fbwd_dk_addr = tDK_t.iterator.toint()
-            fbwd_dqa_addr = tDQ_t.iterator.toint()
-            fbwd_k_base = _helion_flash_ptx.smem_desc_base_from_tensor(sK, _helion_flash_ptx.Major.K)
-            fbwd_v_base = _helion_flash_ptx.smem_desc_base_from_tensor(sV, _helion_flash_ptx.Major.K)
-            _helion_flash_ptx.declare_ptx_idesc(_fbwd_ss_mma.op, "helion_fbwd_ss_idesc")
-            fbwd_q_base = _helion_flash_ptx.smem_desc_base_from_tensor(sQ, _helion_flash_ptx.Major.K)
-            fbwd_do_base = _helion_flash_ptx.smem_desc_base_from_tensor(sdO, _helion_flash_ptx.Major.K)
-            fbwd_dot_base = _helion_flash_ptx.smem_desc_base_from_tensor(sdOt, _helion_flash_ptx.Major.MN)
-            _helion_flash_ptx.declare_ptx_idesc({ts_op}.op, "helion_fbwd_ts_idesc")
-            fbwd_dsnk_base = _helion_flash_ptx.smem_desc_base_from_tensor(fbwd_sdS_nk, _helion_flash_ptx.Major.K)
-            fbwd_qt_base = _helion_flash_ptx.smem_desc_base_from_tensor(sQt, _helion_flash_ptx.Major.MN)
-            _helion_flash_ptx.declare_ptx_idesc({dsk_op}.op, "helion_fbwd_dsk_idesc")
-{dkts_idesc_line}            fbwd_dsmn_base = _helion_flash_ptx.smem_desc_base_from_tensor(fbwd_sdS_mn, _helion_flash_ptx.Major.MN)
+{fbwd_mma_fragments("            ", dp_off=tmem.dp_off, dv_off=tmem.dv_off, dk_off=dk_off, dq_off=dq_off)}{ds_tmem_mma_setup}{fbwd_mma_descriptor_setup("            ", ts_op=ts_op, dsk_op=dsk_op)}{dkts_idesc_line}            fbwd_dsmn_base = _helion_flash_ptx.smem_desc_base_from_tensor(fbwd_sdS_mn, _helion_flash_ptx.Major.MN)
             fbwd_kt_base = _helion_flash_ptx.smem_desc_base_from_tensor(sKt, _helion_flash_ptx.Major.MN)
             _helion_flash_ptx.declare_ptx_idesc({dq_op}.op, "helion_fbwd_dq_idesc")
 {aug_mma_setup}            fbwd_mb = storage.mma_base.get_tensor(cute.make_layout(8))
             fbwd_mb[2] = _helion_flash_ptx.make_smem_desc_start_addr(fbwd_sdS_nk[None, None, None, 0].iterator)
             fbwd_mb[3] = _helion_flash_ptx.make_smem_desc_start_addr(fbwd_sdS_mn[None, None, None, 0].iterator)
-            fbwd_ke = fbwd_k_cons.wait_and_advance()
-            fbwd_mb[0] = _helion_flash_ptx.make_smem_desc_start_addr(sK[None, None, None, fbwd_ke.index].iterator)
-            fbwd_mb[4] = _helion_flash_ptx.make_smem_desc_start_addr(sKt[None, None, None, fbwd_ke.index].iterator)
-            fbwd_st_k = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 0)
-            fbwd_st_dsnk = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 2)
-            fbwd_st_dsmn = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 3)
-            fbwd_st_kt = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 4)
-            fbwd_dv_zero = cutlass.Boolean(True)
-            fbwd_dk_zero = cutlass.Boolean(True)
-{mma_v_wait if chunked else ""}"""
+{fbwd_mma_tile_entry("            ")}{mma_v_wait if chunked else ""}"""
 
     # The step's MMAs, shared by the plain and the alias_s schedules.
     def s_gemm_for(qe: str) -> str:
@@ -2165,16 +2014,7 @@ def emit_flash_bwd_flex_device_body(
             _helion_flash_rt.mbar_spin_wait(fbwd_p_full_ptr, fbwd_pf_phase, 10000000)
             fbwd_pf_phase ^= 1
             {dv_gemm_for("fbwd_dv_zero")}
-            fbwd_dv_zero = cutlass.Boolean(False)
-            fbwd_doe.release()
-            for fbwd_i in cutlass.range(fbwd_steps - 1, unroll=1):
-                fbwd_st_k = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 0)
-                fbwd_st_v = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 1)
-                fbwd_st_dsnk = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 2)
-                fbwd_st_dsmn = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 3)
-                fbwd_st_kt = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 4)
-                fbwd_qe2 = fbwd_q_cons.wait_and_advance()
-                {s_gemm_for("fbwd_qe2")}
+{fbwd_mma_step_loop_head("            ")}                {s_gemm_for("fbwd_qe2")}
 {aug_s_mma("fbwd_qe2", 16)}                with cute.arch.elect_one():
                     cute_tcgen05_flash.commit(fbwd_s_full_ptr)
                 _helion_flash_rt.mbar_spin_wait(fbwd_ds_full_ptr, fbwd_dsf_phase, 10000000)
@@ -2371,18 +2211,14 @@ def emit_flash_bwd_flex_device_body(
         8,
     )
     if persistent:
-        tma_region = (
-            p_head("tma", 8)
-            + textwrap.indent(tma_region + tma_issued, "    ")
-            + p_tail("tma", 8)
+        tma_region = fbwd_tile_loop(
+            tma_region + tma_issued, head=p_head("tma", 8), tail=p_tail("tma", 8)
         )
-        mma_region = (
-            p_head("mma", 8) + textwrap.indent(mma_region, "    ") + p_tail("mma", 8)
+        mma_region = fbwd_tile_loop(
+            mma_region, head=p_head("mma", 8), tail=p_tail("mma", 8)
         )
-        reduce_region = (
-            p_head("cons", 8)
-            + textwrap.indent(reduce_region, "    ")
-            + p_tail("cons", 8)
+        reduce_region = fbwd_tile_loop(
+            reduce_region, head=p_head("cons", 8), tail=p_tail("cons", 8)
         )
     tma_block = (
         "    if warp_idx == 13:\n        fbwd_lane = tidx % 32\n"
@@ -2423,16 +2259,7 @@ def emit_flash_bwd_flex_device_body(
     smem = cutlass_utils_flash.SmemAllocator()
     storage = smem.allocate(_fbwd_storage_cls)
     fbwd_sSteps = storage.sSteps.get_tensor(cute.make_layout({table_entries}))
-{tab_alias}{prologue_table}    sQ = storage.sQ.get_tensor(_fbwd_qsl.outer, swizzle=_fbwd_qsl.inner)
-    sdO = storage.sdO.get_tensor(_fbwd_dosl.outer, swizzle=_fbwd_dosl.inner)
-    sK = storage.sK.get_tensor(_fbwd_ksl.outer, swizzle=_fbwd_ksl.inner)
-    sV = storage.sV.get_tensor(_fbwd_vsl.outer, swizzle=_fbwd_vsl.inner)
-    sQt = cute.make_tensor(cute.recast_ptr(sQ.iterator, _fbwd_qtl.inner), _fbwd_qtl.outer)
-    sdOt = cute.make_tensor(cute.recast_ptr(sdO.iterator, _fbwd_dotl.inner), _fbwd_dotl.outer)
-    sKt = cute.make_tensor(cute.recast_ptr(sK.iterator, _fbwd_ktl.inner), _fbwd_ktl.outer)
-    fbwd_sdS_mn = storage.sdS.get_tensor(_fbwd_dssl.outer, swizzle=_fbwd_dssl.inner)
-    fbwd_sdS_nk = cute.make_tensor(cute.recast_ptr(fbwd_sdS_mn.iterator, _fbwd_dsnk.inner), _fbwd_dsnk.outer)
-{stat_views}    fbwd_sdq = storage.sdQaccum.get_tensor(_fbwd_dqsl.outer, swizzle=_fbwd_dqsl.inner)
+{tab_alias}{prologue_table}{FBWD_SMEM_VIEWS}{stat_views}    fbwd_sdq = storage.sdQaccum.get_tensor(_fbwd_dqsl.outer, swizzle=_fbwd_dqsl.inner)
 {aug_views}    fbwd_s_full_ptr = storage.s_full_mbar.data_ptr()
     fbwd_dp_full_ptr = storage.dp_full_mbar.data_ptr()
     fbwd_p_full_ptr = storage.p_full_mbar.data_ptr()
@@ -2447,16 +2274,7 @@ def emit_flash_bwd_flex_device_body(
     fbwd_sdsfree_ptr = storage.flex_mbar.data_ptr() + 4
     fbwd_tissued_ptr = storage.flex_mbar.data_ptr() + 5
 {sread_ptr_line}    fbwd_tmem_dealloc_ptr = storage.tmem_dealloc_mbar.data_ptr()
-    if tidx == 0:
-        cute.arch.mbarrier_init(fbwd_s_full_ptr, 1)
-        cute.arch.mbarrier_init(fbwd_dp_full_ptr, 1)
-        cute.arch.mbarrier_init(fbwd_p_full_ptr, 256)
-        cute.arch.mbarrier_init(fbwd_ds_full_ptr, 256)
-        cute.arch.mbarrier_init(fbwd_dq_full_ptr, 1)
-        cute.arch.mbarrier_init(fbwd_dq_empty_ptr, 128)
-        cute.arch.mbarrier_init(fbwd_dkv_done_ptr, 1)
-        cute.arch.mbarrier_init(fbwd_dv_done_ptr, 1)
-        cute.arch.mbarrier_init(fbwd_dk_done_ptr, 1)
+{FBWD_MBAR_INITS}        cute.arch.mbarrier_init(fbwd_dk_done_ptr, 1)
 {sread_init_line}{flex_mbar_init}{aug_mbar_init}    fbwd_tmem_user_bar = cutlass_pipeline_flash.NamedBarrier(barrier_id=2, num_threads=13 * 32)
     fbwd_tmem = cutlass_utils_flash.TmemAllocator(storage.tmem_holding_buf.ptr, barrier_for_retrieve=fbwd_tmem_user_bar, allocator_warp_id=12, is_two_cta=False, two_cta_tmem_dealloc_mbar_ptr=fbwd_tmem_dealloc_ptr)
     fbwd_q_bytes = cute.size_in_bytes({io_dtype}, cute.select(_fbwd_qsl, mode=[0, 1, 2]))
@@ -2486,37 +2304,10 @@ def emit_flash_bwd_flex_device_body(
     tVsV, tVgV_kdl = cute_cpasync_flash.tma_partition(_fbwd_tma_v, 0, cute.make_layout(1), cute.group_modes(sV, 0, 3), cute.group_modes(tSgV, 0, 3))
     tDOsDO, tDOgDO_qdl = cute_cpasync_flash.tma_partition(_fbwd_tma_do, 0, cute.make_layout(1), cute.group_modes(sdO, 0, 3), cute.group_modes(tSgdO, 0, 3))
     if (warp_idx >= 12) & (warp_idx < 16):
-        {_setmaxreg(regs_other)}
-{tma_block}    if warp_idx == 12:
-        fbwd_tmem.allocate(512)
-        fbwd_s_shape = fbwd_sst.partition_shape_C((128, 128))
-        tStS_frag = fbwd_sst.make_fragment_C(fbwd_s_shape)
-        fbwd_dkv_shape = fbwd_tst.partition_shape_C((128, {dv_pad}))
-        tDKV_frag = fbwd_tst.make_fragment_C(fbwd_dkv_shape)
-        fbwd_dk_shape = fbwd_dskt.partition_shape_C((128, {d_pad}))
-        tDK_frag = fbwd_dskt.make_fragment_C(fbwd_dk_shape)
-        fbwd_dq_shape = fbwd_dqt.partition_shape_C((128, {dq_w}))
-        tDQ_frag = fbwd_dqt.make_fragment_C(fbwd_dq_shape)
-        _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
-        fbwd_tmem_ptr = fbwd_tmem.retrieve_ptr(cutlass.Float32)
-{mma_block}        fbwd_tmem.relinquish_alloc_permit()
-        _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
-        fbwd_tmem.free(fbwd_tmem_ptr)
-    if warp_idx < 4:
-        {_setmaxreg(regs_reduce)}
-        fbwd_dq_shape = fbwd_dqt.partition_shape_C((128, {dq_w}))
-        tDQ_frag = fbwd_dqt.make_fragment_C(fbwd_dq_shape)
-        _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
-        fbwd_tmem_ptr = fbwd_tmem.retrieve_ptr(cutlass.Float32)
-        tDQ_t = cute.make_tensor(fbwd_tmem_ptr + {dq_chunk_cols[0] if dq_chunked else dq_off}, tDQ_frag.layout)
-{dq_slot_b_view}        cDQ = cute.make_identity_tensor((128, {dq_w}))
-        tDQcDQ = fbwd_dqt.partition_C(cDQ)
-        fbwd_dq_ld_atom = cute.make_copy_atom(cute_tcgen05_flash.Ld32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
-        fbwd_tiled_dq_ld = cute_tcgen05_flash.make_tmem_copy(fbwd_dq_ld_atom, tDQ_t)
-        fbwd_thr_dq_ld = fbwd_tiled_dq_ld.get_slice(fbwd_local_tidx)
-        tRDtDQ = fbwd_thr_dq_ld.partition_S(tDQ_t)
-{dq_slot_b_part}        tRDcDQ = fbwd_thr_dq_ld.partition_D(tDQcDQ)
-        fbwd_out_scale = cutlass.Float32({scale_expr})
+        {setmaxreg(regs_other)}
+{tma_block}{fbwd_tmem_warp(mma_block, dims=(dv_pad, d_pad, dq_w))}    if warp_idx < 4:
+        {setmaxreg(regs_reduce)}
+{fbwd_dq_reduce_views(d=dq_w, dq_off=dq_chunk_cols[0] if dq_chunked else dq_off)}{dq_slot_b_view}{fbwd_dq_reduce_partitions("        ", d=dq_w, slot_b=dq_slot_b_part)}        fbwd_out_scale = cutlass.Float32({scale_expr})
         fbwd_phase = cutlass.Int32(0)
 {dq_phase_b_init}{dq_slot_init if dq_boxes == 8 else ""}{reduce_block}        cute.arch.cp_async_bulk_wait_group(0, read=True)
         _helion_flash_rt.named_barrier_arrive_unaligned(2, 13 * 32)
@@ -2524,10 +2315,94 @@ def emit_flash_bwd_flex_device_body(
     return body  # noqa: RET504
 
 
+emit_flash_bwd_flex_body = source_adapter(emit_flash_bwd_flex_device_body)
+
+
+def flex_bwd_exp2_emu(df: DeviceFunction, env: CompileEnvironment) -> int:
+    """The polynomial exp2 emulation degree (``cute_flash_bwd_exp2_emu``):
+    an approximation, so fast_math kernels only."""
+    cfg = df.config.config.get(FLASH_BWD_EXP2_EMU_KEY, 0)
+    return cfg if isinstance(cfg, int) and env.settings.fast_math else 0
+
+
+def flex_bwd_bindings(
+    plan: FlexBwdPlan,
+    args: dict[str, TensorArg],
+    scalar_exprs: list[str],
+    extra: list[str] | None = None,
+) -> list[str]:
+    """A flex backward kernel's CTA-wide module bindings: the head count, the
+    walk tables, ``extra`` (a kernel's own), the aux buffers and the host
+    scalars."""
+    walk = plan.walk
+    bindings = [
+        f"_flash_heads = {plan.heads}",
+        f"_fbwd_part_cnt = {args[walk.part_cnt_name].name}",
+        f"_fbwd_part_idx = {args[walk.part_idx_name].name}",
+        f"_fbwd_full_cnt = {args[walk.full_cnt_name].name}",
+        f"_fbwd_full_idx = {args[walk.full_idx_name].name}",
+        *(extra or ()),
+    ]
+    for index, buffer in enumerate(plan.aux_buffers):
+        bindings.append(f"_flash_aux{index} = {args[buffer.name].name}")
+    for index, expr in enumerate(scalar_exprs):
+        bindings.append(f"_flash_hs{index} = {expr}")
+    return bindings
+
+
+def flex_bwd_wrapper_plan(
+    match: FlexBwdMatch,
+    args: dict[str, TensorArg],
+    io_dtype_str: str,
+    *,
+    total_tiles: int,
+    q_stage: int = 1,
+    do_stage: int = 1,
+    kv_stage: int = 1,
+    persistent: bool = False,
+    family: Literal["flex_two_cta", "flex_pair"] | None = None,
+) -> dict[str, object]:
+    """The host wrapper's launch plan shared by the flex backward kernels
+    (``family`` is the 2-CTA / pair kernel's flag, set right after the kind;
+    the 1-CTA kernel appends its own entries). The plan is ``repr``'d into
+    the generated module, so the key order is part of the render."""
+    plan = match.plan
+    batch, kv_heads = plan.batch, plan.kv_heads
+    family_flag: dict[str, object] = {} if family is None else {family: True}
+    return {
+        "kind": "helion_flash_bwd",
+        **family_flag,
+        "q_name": args[match.q_name].name,
+        "k_name": args[match.k_name].name,
+        "v_name": args[match.v_name].name,
+        "do_name": args[match.do_name].name,
+        "lse_name": args[match.lse_name].name,
+        "delta_name": args[match.delta_name].name,
+        "dq_name": args[match.dq_name].name,
+        "dk_name": args[match.dk_name].name,
+        "dv_name": args[match.dv_name].name,
+        "head_dim": plan.head_dim,
+        "dtype": io_dtype_str,
+        "total_q_rows": plan.num_bh * plan.q_seq,
+        "total_kv_rows": batch * kv_heads * plan.kv_seq,
+        "q_stage": q_stage,
+        "do_stage": do_stage,
+        "kv_stage": kv_stage,
+        "two_cta": False,
+        "persistent": persistent,
+        "total_tiles": total_tiles,
+        "topology": "fa4",
+        # Per-(batch, head) geometry: the launcher builds (seq, D, B*H) maps.
+        "flex_seq_q": plan.q_seq,
+        "flex_bh_q": plan.num_bh,
+        "flex_seq_k": plan.kv_seq,
+        "flex_bh_k": batch * kv_heads,
+    }
+
+
 def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bool:
     """Replace the device body with the fused flex backward kernel (True when
     emitted; False to fall back to the generic lowering)."""
-    import ast as ast_module
 
     from ..compile_environment import CompileEnvironment
     from ..host_function import HostFunction
@@ -2635,20 +2510,20 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
 
     env = CompileEnvironment.current()
     io_dtype_str = env.backend.dtype_str(plan.io_dtype)
-    exp2_f32 = bool(df.config.config.get("cute_flash_bwd_exp2_f32", 0))
-    mask_form = str(df.config.config.get("cute_flash_bwd_mask_form", "bitmask"))
-    reg_split = df.config.config.get("cute_flash_bwd_regs")
-    hook_cols_cfg = df.config.config.get("cute_flash_bwd_hook_cols", 32)
+    exp2_f32 = bool(df.config.config.get(FLASH_BWD_EXP2_F32_KEY, 0))
+    mask_form = str(df.config.config.get(FLASH_BWD_MASK_FORM_KEY, "bitmask"))
+    reg_split = df.config.config.get(FLASH_BWD_REGS_KEY)
+    hook_cols_cfg = df.config.config.get(FLASH_BWD_HOOK_COLS_KEY, 32)
     hook_cols = hook_cols_cfg if hook_cols_cfg in (8, 16, 32) else 32
-    hook_pin = bool(df.config.config.get("cute_flash_bwd_hook_pin", 1))
-    bias_fold = bool(df.config.config.get("cute_flash_bwd_bias_fold", 1))
-    tile_group_cfg = df.config.config.get("cute_flash_bwd_tile_group", 0)
+    hook_pin = bool(df.config.config.get(FLASH_BWD_HOOK_PIN_KEY, 1))
+    bias_fold = bool(df.config.config.get(FLASH_BWD_BIAS_FOLD_KEY, 1))
+    tile_group_cfg = df.config.config.get(FLASH_BWD_TILE_GROUP_KEY, 0)
     tile_group = tile_group_cfg if isinstance(tile_group_cfg, int) else 0
-    stats_mma = bool(df.config.config.get("cute_flash_bwd_stats_mma", 0))
-    persistent = bool(df.config.config.get("cute_flash_bwd_persistent", 0))
+    stats_mma = bool(df.config.config.get(FLASH_BWD_STATS_MMA_KEY, 0))
+    persistent = bool(df.config.config.get(FLASH_BWD_PERSISTENT_KEY, 0))
     # "auto" follows the form: on for the persistent walk (measured), off for
     # a one-tile CTA (every load is in flight from its prologue).
-    s_first_cfg = df.config.config.get("cute_flash_bwd_s_first", "auto")
+    s_first_cfg = df.config.config.get(FLASH_BWD_S_FIRST_KEY, "auto")
     s_first = persistent if s_first_cfg == "auto" else bool(s_first_cfg)
     # dS^T through TMEM for the dK MMA: only while dQ keeps its own TMEM
     # columns (aliased onto dP, dQ would occupy the packed dS^T's columns).
@@ -2672,7 +2547,7 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
             bias_fold=bias_fold,
             tile_group=tile_group,
         )
-    if bool(df.config.config.get("cute_flash_bwd_two_cta", 0)):
+    if bool(df.config.config.get(FLASH_BWD_TWO_CTA_KEY, 0)):
         # The cluster-of-2 family (head dim 128): one 256-row KV tile per
         # pair, the dQ partial reduce-added once per 256 KV rows.
         from .cute_flash_bwd_flex_2cta import codegen_flex_bwd_2cta
@@ -2695,14 +2570,10 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
                 tile_group=tile_group,
             )
     ds_tmem = (
-        bool(df.config.config.get("cute_flash_bwd_ds_tmem", 0)) and tmem.mode == "plain"
+        bool(df.config.config.get(FLASH_BWD_DS_TMEM_KEY, 0)) and tmem.mode == "plain"
     )
     total_tiles = batch * kv_heads * plan.num_kv_tiles
-    exp2_emu_cfg = df.config.config.get("cute_flash_bwd_exp2_emu", 0)
-    # The polynomial exp2 is an approximation: fast_math kernels only.
-    exp2_emu = (
-        exp2_emu_cfg if isinstance(exp2_emu_cfg, int) and env.settings.fast_math else 0
-    )
+    exp2_emu = flex_bwd_exp2_emu(df, env)
     # Hooks that read the natural-unit score (a non-additive score_mod or a
     # Jacobian) need S before the LSE term is folded in.
     bias_region = additive_bias_region(plan) if bias_fold else None
@@ -2711,7 +2582,7 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
     ) or plan.grad_region is not None
     from .cute_flash import flash_flex_aux_smem_canonical
 
-    aux_smem_cfg = df.config.config.get("cute_flash_bwd_aux_smem", 0)
+    aux_smem_cfg = df.config.config.get(FLASH_BWD_AUX_SMEM_KEY, 0)
     aux_smem = flash_flex_aux_smem_canonical(
         aux_smem_cfg if isinstance(aux_smem_cfg, int) else 0,
         fbwd_aux_smem_candidates(plan),
@@ -2719,13 +2590,13 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
     # Steps per step-table buffer (0 = automatic: the whole walk when it fits,
     # else the largest table that does); a smaller table walks the tile in
     # chunks of that many steps.
-    table_cap_cfg = df.config.config.get("cute_flash_bwd_table_steps", 0)
+    table_cap_cfg = df.config.config.get(FLASH_BWD_TABLE_STEPS_KEY, 0)
     table_cap = table_cap_cfg if isinstance(table_cap_cfg, int) else 0
     # The K / V rings' depth: two slots only on the persistent walk (a
     # one-tile CTA loads once) and only where the storage fits them; a
     # requested depth that does not fit renders the one-slot kernel (the
     # surface offers the knob only where the deepest searched storage fits).
-    kv_stage_cfg = df.config.config.get("cute_flash_bwd_kv_stage", 1)
+    kv_stage_cfg = df.config.config.get(FLASH_BWD_KV_STAGE_KEY, 1)
     kv_stage = 2 if kv_stage_cfg == 2 and persistent else 1
     smem = _fit_smem_budget(
         plan,
@@ -2758,47 +2629,19 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
     q_stage, do_stage, dq_boxes = smem.q_stage, smem.do_stage, smem.dq_boxes
 
     emit_flash_module_statements(cg)
-    bindings = [
-        f"_flash_heads = {heads}",
-        f"_fbwd_part_cnt = {args[walk.part_cnt_name].name}",
-        f"_fbwd_part_idx = {args[walk.part_idx_name].name}",
-        f"_fbwd_full_cnt = {args[walk.full_cnt_name].name}",
-        f"_fbwd_full_idx = {args[walk.full_idx_name].name}",
-    ]
-    for index, buffer in enumerate(plan.aux_buffers):
-        bindings.append(f"_flash_aux{index} = {args[buffer.name].name}")
-    for index, expr in enumerate(scalar_exprs):
-        bindings.append(f"_flash_hs{index} = {expr}")
-    wrapper_plan: dict[str, object] = {
-        "kind": "helion_flash_bwd",
-        "q_name": args[match.q_name].name,
-        "k_name": args[match.k_name].name,
-        "v_name": args[match.v_name].name,
-        "do_name": args[match.do_name].name,
-        "lse_name": args[match.lse_name].name,
-        "delta_name": args[match.delta_name].name,
-        "dq_name": args[match.dq_name].name,
-        "dk_name": args[match.dk_name].name,
-        "dv_name": args[match.dv_name].name,
-        "head_dim": d,
-        "dtype": io_dtype_str,
-        "total_q_rows": plan.num_bh * plan.q_seq,
-        "total_kv_rows": batch * kv_heads * plan.kv_seq,
-        "q_stage": q_stage,
-        "do_stage": do_stage,
-        "kv_stage": smem.kv_stage,
-        "two_cta": False,
-        "persistent": persistent,
-        "total_tiles": total_tiles,
-        "topology": "fa4",
-        # Per-(batch, head) geometry: the launcher builds (seq, D, B*H) maps.
-        "flex_seq_q": plan.q_seq,
-        "flex_bh_q": plan.num_bh,
-        "flex_seq_k": plan.kv_seq,
-        "flex_bh_k": batch * kv_heads,
-        "flex_dq_boxes": dq_boxes,
-        "flex_aug_stages": smem.aug_stages,
-    }
+    bindings = flex_bwd_bindings(plan, args, scalar_exprs)
+    wrapper_plan = flex_bwd_wrapper_plan(
+        match,
+        args,
+        io_dtype_str,
+        total_tiles=total_tiles,
+        q_stage=q_stage,
+        do_stage=do_stage,
+        kv_stage=smem.kv_stage,
+        persistent=persistent,
+    )
+    wrapper_plan["flex_dq_boxes"] = dq_boxes
+    wrapper_plan["flex_aug_stages"] = smem.aug_stages
     if plan.head_dim_v != d:
         wrapper_plan["head_dim_v"] = plan.head_dim_v
     if _fbwd_dq_chunked(tmem.mode, d):
@@ -2829,10 +2672,10 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
         df.wrapper_only_params.extend(_FLASH_BWD_FLEX_AUG_PARAMS)
     df.placeholder_args.update(a.name for a in args.values())
     cg.cute_uses_matmul = True  # type: ignore[attr-defined]
-    df.cute_state.attention_flash_threads = 512
+    df.cute_state.flash.threads = 512
     # The table / aux bindings are CTA-wide names: emit them before the warp
     # roles (the compute blocks re-bind nothing).
-    body_src = emit_flash_bwd_flex_device_body(
+    emitted = emit_flash_bwd_flex_body(
         plan=plan,
         io_dtype=io_dtype_str,
         scale_expr=scale_expr,
@@ -2854,8 +2697,6 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
         ds_tmem=ds_tmem,
         s_first=s_first,
     )
-    wrapped = ast_module.parse("if True:\n" + body_src)
-    assert isinstance(wrapped.body[0], ast_module.If)
-    df.body = list(wrapped.body[0].body)
+    df.body = emitted.statements
     df.preamble = []
     return True

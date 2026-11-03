@@ -33,6 +33,7 @@ from ..device_ir import RootGraphInfo
 from ..host_function import HostFunction
 from ..output_header import get_needed_import_lines
 from .host_zero_fills import lower_host_zero_fills
+from .tcgen05_config import facts
 from .tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES_STAGED
@@ -222,8 +223,11 @@ def _stage_config(
         # depths, its share of the shared fanout, and the exact-shape
         # auxiliary mechanisms only where it has such an operand.
         assert state is not None
-        result.config = state.region_launch_config(
-            result.config, positions.index(stage_index), owns_fanout_pair=owns_pair
+        result.config = facts.region_launch_config(
+            state,
+            result.config,
+            positions.index(stage_index),
+            owns_fanout_pair=owns_pair,
         )
     else:
         result.config.pop(TCGEN05_REGION_PID_TYPES_CONFIG_KEY, None)
@@ -362,10 +366,10 @@ def generate_materialized_fission(
     load_transform: Callable[..., ast.AST] | None = None,
     extra_params: list[str] | None = None,
 ) -> ast.Module:
-    from ..generate_ast import VloopSinkNotApplied
     from ..generate_ast import emit_main_def
     from ..generate_ast import generate_ast
-    from ..generate_ast import vloop_sink_off_config
+    from .sink_vector_loops import VloopSinkNotApplied
+    from .sink_vector_loops import vloop_sink_off_config
 
     env = CompileEnvironment.current()
     roots = func.body[plan.root_index : plan.root_index + plan.region_count]
@@ -639,14 +643,20 @@ def generate_materialized_fission(
         ],
         type_ignores=[],
     )
+    prepend_missing_imports(result)
+    return result
+
+
+def prepend_missing_imports(module: ast.Module) -> None:
+    """Prepend the library imports ``module`` reads but does not already
+    import (the generated wrapper modules of the multi-kernel generators)."""
     existing = {
-        ast.unparse(stmt)
-        for stmt in result.body
-        if isinstance(stmt, (ast.Import, ast.ImportFrom))
+        ast.unparse(statement)
+        for statement in module.body
+        if isinstance(statement, (ast.Import, ast.ImportFrom))
     }
-    result.body[:0] = [
+    module.body[:0] = [
         statement_from_string(line)
-        for line in get_needed_import_lines(result)
+        for line in get_needed_import_lines(module)
         if line not in existing
     ]
-    return result

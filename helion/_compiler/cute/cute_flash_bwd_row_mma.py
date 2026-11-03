@@ -50,8 +50,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ..emitter_protocols import source_adapter
 from .cute_flash_row_mma import ROW_MMA_SMEM_BUDGET
 from .cute_flash_row_mma import emit_flash_row_mma_module_statements
+from .flash_knobs import FLASH_BWD_FAMILY_KEY
+from .flash_knobs import FLASH_BWD_ROW_KV_KEY
+from .flash_knobs import FLASH_BWD_ROW_Q_CHUNK_KEY
+from .flash_knobs import FLASH_BWD_ROW_Q_SPLIT_KEY
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping
@@ -59,10 +64,6 @@ if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
     from .cute_flash_bwd import AttentionBwdPlan
 
-FLASH_BWD_FAMILY_KEY = "cute_flash_bwd_family"
-FLASH_BWD_ROW_KV_KEY = "cute_flash_bwd_row_kv"
-FLASH_BWD_ROW_Q_SPLIT_KEY = "cute_flash_bwd_row_q_split"
-FLASH_BWD_ROW_Q_CHUNK_KEY = "cute_flash_bwd_row_q_chunk"
 FLASH_BWD_ROW_KEYS: tuple[str, ...] = (
     FLASH_BWD_ROW_KV_KEY,
     FLASH_BWD_ROW_Q_SPLIT_KEY,
@@ -775,3 +776,6 @@ def emit_flash_bwd_row_mma_device_body(
         ("if rb_lane == 0:", "    cute.arch.cp_async_bulk_wait_group(0, read=True)")
     )
     return "".join(f"    {line}\n" for line in lines)
+
+
+emit_flash_bwd_row_mma_body = source_adapter(emit_flash_bwd_row_mma_device_body)

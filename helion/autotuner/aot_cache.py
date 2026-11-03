@@ -45,12 +45,13 @@ from .. import exc
 from .._hardware import get_hardware_info
 from .._utils import indexing_uses_tensor_descriptor
 from ..runtime.config import Config
-from ..runtime.cute_structural_config import CuteStructuralConfig
-from ..runtime.cute_structural_config import StructuralPolicyError
-from ..runtime.cute_structural_config import bound_structural_policy
-from ..runtime.cute_structural_config import config_artifact_json
-from ..runtime.cute_structural_config import decode_structural_policy
-from ..runtime.cute_structural_config import require_same_structural_policy
+from ..runtime.cute.structural_config import CuteStructuralConfig
+from ..runtime.cute.structural_config import config_artifact_json
+from ..runtime.cute.structural_config import decode_structural_policy
+from ..runtime.structural_policy import StructuralConfig
+from ..runtime.structural_policy import StructuralPolicyError
+from ..runtime.structural_policy import bound_structural_policy
+from ..runtime.structural_policy import require_same_structural_policy
 from .aot_kernel import _flatten_key_value
 from .aot_kernel import extract_key_features
 from .aot_kernel import extract_shape_features
@@ -69,7 +70,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing import Callable
 
-    from ..runtime.cute_structural_policy import CuteStructuralPolicy
+    from ..runtime.structural_policy import StructuralPolicy
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -127,7 +128,7 @@ def find_heuristic_file(
     kernel_name: str | None = None,
     data_dir: Path | None = None,
     *,
-    policy: CuteStructuralPolicy | None = None,
+    policy: StructuralPolicy | None = None,
 ) -> Path | None:
     """
     Find the heuristic file for a kernel.
@@ -211,7 +212,7 @@ def load_kernel_source_files(
     data_dir: Path,
     hardware_id: str,
     *,
-    policy: CuteStructuralPolicy | None = None,
+    policy: StructuralPolicy | None = None,
 ) -> dict[str, str]:
     """
     Load kernel source file mappings from tuned configs JSON.
@@ -319,7 +320,7 @@ class TunedConfig:
     # [1] = input tensor hashes after kernel runs (to detect in-place modifications)
     # [2] = output tensor hashes
     tensor_hashes: list[list[str]] | None = None
-    cute_structural_policy: CuteStructuralPolicy | None = None
+    cute_structural_policy: StructuralPolicy | None = None
 
 
 class AOTAutotuneCache(AutotuneCacheBase):
@@ -611,9 +612,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
         search_policy_hash = _cute_flash_search_policy_hash(
             self.autotuner,
-            cute_flash_search_enabled=bool(
-                getattr(self.kernel.config_spec, "cute_flash_search_enabled", False)
-            ),
+            cute_flash_search_enabled=self.kernel.config_spec.cute_flash_search_enabled,
         )
         return ShapeKey(
             kernel_name=self.kernel.kernel.name,
@@ -884,7 +883,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 f"Using cached heuristic result for {kernel_name} shape={shape_hash}"
             )
             result = AOTAutotuneCache._heuristic_results[cache_key]
-            if isinstance(result, CuteStructuralConfig):
+            if isinstance(result, StructuralConfig):
                 require_same_structural_policy(
                     result.policy, policy, context="Cached AOT heuristic"
                 )
@@ -913,7 +912,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 else:
                     # No user key: pass raw args to heuristic
                     config_dict = autotune_fn(*args)
-                if isinstance(config_dict, CuteStructuralConfig):
+                if isinstance(config_dict, StructuralConfig):
                     require_same_structural_policy(
                         config_dict.policy, policy, context="AOT heuristic"
                     )
@@ -945,7 +944,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     @classmethod
     def _load_heuristic_module(
-        cls, path: Path, policy: CuteStructuralPolicy | None
+        cls, path: Path, policy: StructuralPolicy | None
     ) -> types.ModuleType | None:
         key: Path | tuple[Path, str] = path
         if policy is not None:
@@ -1113,7 +1112,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         self,
         heuristic_file: Path,
         codes: list[str],
-        policy: CuteStructuralPolicy,
+        policy: StructuralPolicy,
     ) -> None:
         from ..language.constexpr import ConstExpr
         from .aot_compile import generate_standalone_file

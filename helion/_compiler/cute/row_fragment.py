@@ -30,14 +30,13 @@ from ...language.tile_ops import tile_index
 from ...language.view_ops import subscript
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
-from ..aten_lowering import LoweringContext
 from ..compile_environment import CompileEnvironment
 from ..inductor_lowering import PointwiseLowering
+from .scalar_lowering import scalar_lowering_context
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from torch.fx.node import Argument
     from torch.fx.node import Node
 
     from ..generate_ast import GenerateAST
@@ -461,10 +460,8 @@ class RowFragmentEmitter:
             inputs = row_fragment_tensor_inputs(node)
             if len(inputs) != len(input_values):
                 raise self._unsupported(node, "unexpected scalar operand")
-            context = LoweringContext.__new__(LoweringContext)
-            context.cg = self.cg
             input_by_node = dict(zip(inputs, input_values, strict=True))
-            context.env = cast("dict[Node, Argument]", input_by_node)
+            context = scalar_lowering_context(self.cg, input_by_node)
             lowering = node.meta.get("lowering")
             if lowering is None:
                 from ..inductor_lowering import FakeGraphLowering

@@ -322,7 +322,7 @@ class MPPGraphInfo(NodeArgsGraphInfo):
 
         assert self.out_tensor is not None
         assert self.out_dtype is not None
-        from ..backend import MetalBackend
+        from .backend import MetalBackend
 
         # 4. Store the cooperative tensor to HBM.  The cooperative store
         # requires matching dtypes, so any other output dtype takes a masked
@@ -412,7 +412,7 @@ class MPPGraphInfo(NodeArgsGraphInfo):
         df = codegen.device_function
         env = CompileEnvironment.current()
 
-        from ..backend import MetalBackend
+        from .backend import MetalBackend
 
         dtype_map = MetalBackend._get_dtype_to_metal()
         if self.lhs_tensor.dtype not in dtype_map:

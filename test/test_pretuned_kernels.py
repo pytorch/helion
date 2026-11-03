@@ -1244,7 +1244,7 @@ class TestPretunedCuteCodegen(TestCase):
         expected = module._reference(*args)
         with patch.dict(os.environ, HELION_CUTE_MMA_IMPL="tcgen05"):
             bound = module.grouped_gemm_deepgemm.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.env.config_spec.tcgen05.search_enabled = True
             actual = bound(*args)
             torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
             with helion.runtime.cute_cuda_graph() as graph:
@@ -1387,7 +1387,7 @@ class TestPretunedCuteCodegen(TestCase):
 
         with patch_cute_mma_support():
             bound = module.scale_mm_cute.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.env.config_spec.tcgen05.search_enabled = True
             code = bound.to_triton_code(config)
             bound.set_config(config)
             out = bound(*args)
@@ -1478,7 +1478,7 @@ class TestPretunedCuteCodegen(TestCase):
 
         with patch_cute_mma_support():
             bound = module.scale_mm_cute.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.env.config_spec.tcgen05.search_enabled = True
             bound.env.config_spec.num_sm = 80
             one_shot_code = bound.to_triton_code(config)
             bound.env.config_spec.num_sm = 79
@@ -1528,18 +1528,16 @@ class TestPretunedCuteCodegen(TestCase):
 
         with patch_cute_mma_support():
             bound = module.scale_mm_cute_swap_ab.bind(args)
-            original_search_enabled = bound.env.config_spec.cute_tcgen05_search_enabled
+            original_search_enabled = bound.env.config_spec.tcgen05.search_enabled
             original_num_sm = bound.env.config_spec.num_sm
             try:
-                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.env.config_spec.tcgen05.search_enabled = True
                 bound.env.config_spec.num_sm = 4
                 one_shot_code = bound.to_triton_code(helion.Config(**config_values))
                 bound.env.config_spec.num_sm = 3
                 persistent_code = bound.to_triton_code(helion.Config(**config_values))
             finally:
-                bound.env.config_spec.cute_tcgen05_search_enabled = (
-                    original_search_enabled
-                )
+                bound.env.config_spec.tcgen05.search_enabled = original_search_enabled
                 bound.env.config_spec.num_sm = original_num_sm
 
         role_loop = "while tcgen05_role_local_0_work_tile.is_valid_tile"

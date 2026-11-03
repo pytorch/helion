@@ -13,15 +13,21 @@ import torch
 from torch._subclasses import FakeTensor
 
 from ... import exc
-from .. import tile_strategy
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import ReadWrites
 from ..ast_read_writes import ast_rename
+from ..compile_environment import CompileEnvironment
+from ..device_function import TensorArg
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import call_path_str
 from .affine_vector_io import _i32_offset
 from .interchanged_store_dce import _known_statements
 from .interchanged_store_dce import _known_subscript
 from .interchanged_store_dce import _live_in
 from .interchanged_store_dce import _single_store
+from .lane_loops.markers import _is_lane_reduce_marker_assign
+from .lane_loops.markers import _LaneReduceMarker
+from .lane_loops.markers import _static_lane_loop_extent
 from .persistent_branch_vec import _binding_write_roots
 from .persistent_branch_vec import _freeze_definition
 from .persistent_branch_vec import _memory_load_calls
@@ -33,8 +39,10 @@ from .scalar_recipe import build_recipe
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterable
     from collections.abc import Mapping
 
+    from ...runtime.config import Config
     from ..device_function import DeviceFunction
 
 
@@ -50,7 +58,6 @@ class ResidentReductionLayout:
 
 def supports_resident_threads(fn: DeviceFunction, block_id: int) -> bool:
     """Admit whole-CTA sums only for an unbranched serial row-loop tree."""
-    from ..compile_environment import CompileEnvironment
     from ..device_ir import ForLoopGraphInfo
     from ..device_ir import RootGraphInfo
     from ..reduction_strategy import ReductionStrategy
@@ -78,9 +85,6 @@ def supports_resident_threads(fn: DeviceFunction, block_id: int) -> bool:
 
 def proven_resident_tensor_strides(fn: DeviceFunction) -> dict[tuple[str, int], int]:
     """Combine guarded input strides with static fresh-allocation strides."""
-    from ..compile_environment import CompileEnvironment
-    from ..device_function import TensorArg
-
     env = CompileEnvironment.current()
     result = fn.proven_tensor_stride_values()
     constants = _guarded_metadata_constants(fn)
@@ -99,9 +103,6 @@ def proven_resident_tensor_strides(fn: DeviceFunction) -> dict[tuple[str, int], 
 
 
 def _guarded_metadata_constants(fn: DeviceFunction) -> dict[sympy.Expr, sympy.Integer]:
-    from ..compile_environment import CompileEnvironment
-    from ..device_function import TensorArg
-
     env = CompileEnvironment.current()
     if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
         return {}
@@ -135,8 +136,6 @@ def _guarded_metadata_constants(fn: DeviceFunction) -> dict[sympy.Expr, sympy.In
 def _resolved_integer(
     value: int | torch.SymInt, constants: Mapping[sympy.Expr, sympy.Integer]
 ) -> int | None:
-    from ..compile_environment import CompileEnvironment
-
     if isinstance(value, int):
         return value
     env = CompileEnvironment.current()
@@ -147,8 +146,6 @@ def _resolved_integer(
 
 
 def proven_resident_tensor_alignments(fn: DeviceFunction) -> dict[str, int]:
-    from ..compile_environment import CompileEnvironment
-    from ..device_function import TensorArg
     from .memory_ops import tensor_has_specialized_base_alignment
 
     env = CompileEnvironment.current()
@@ -169,6 +166,99 @@ def proven_resident_tensor_alignments(fn: DeviceFunction) -> dict[str, int]:
                 result[argument.name] = alignment
                 break
     return result
+
+
+@dataclasses.dataclass(frozen=True)
+class ResidentPassContext:
+    """Facts about one device function that both resident passes read.
+
+    Built once per device function by ``for_device_function``; the reduction
+    pass adds the stride / alignment proofs and the constexpr block sizes
+    through ``with_reduction_facts`` so the sequence-only path never computes
+    them.
+    """
+
+    tensor_dtypes: Mapping[str, str]
+    rename_groups: dict[str, str]
+    disjoint_pairs: set[frozenset[str]]
+    uniform_names: set[str]
+    new_var: Callable[[str], str]
+    tensor_strides: Mapping[tuple[str, int], int] = dataclasses.field(
+        default_factory=dict
+    )
+    tensor_alignments: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    constexpr_values: Mapping[str, int] = dataclasses.field(default_factory=dict)
+
+    @classmethod
+    def for_device_function(
+        cls,
+        fn: DeviceFunction,
+        *,
+        extra_params: Iterable[str],
+        disjoint_pairs: set[frozenset[str]],
+    ) -> ResidentPassContext:
+        """The kernel arguments and ``extra_params`` are uniform across the CTA;
+        ``disjoint_pairs`` is ``fn.proven_disjoint_tensor_pairs()``, computed
+        once by the caller and shared with the lane passes."""
+        env = CompileEnvironment.current()
+        return cls(
+            tensor_dtypes={
+                argument.name: env.backend.dtype_str(argument.fake_value.dtype)
+                for argument in fn.arguments
+                if isinstance(argument, TensorArg)
+            },
+            rename_groups={
+                name: aliases[0] for name, aliases in fn._variable_renames.items()
+            },
+            disjoint_pairs=disjoint_pairs,
+            uniform_names={argument.name for argument in fn.arguments}
+            | set(extra_params),
+            new_var=fn.new_var,
+        )
+
+    def with_reduction_facts(self, fn: DeviceFunction) -> ResidentPassContext:
+        return dataclasses.replace(
+            self,
+            tensor_strides=proven_resident_tensor_strides(fn),
+            tensor_alignments=proven_resident_tensor_alignments(fn),
+            constexpr_values={
+                name: size
+                for block_ids, name in fn.block_size_var_cache.items()
+                if len(block_ids) == 1
+                and isinstance(size := fn.resolved_block_size(block_ids[0]), int)
+            },
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class ResidentReductionOptions:
+    """The ``cute_reduction_*`` knobs of one config, read once.
+
+    ``shared_memory_budget`` is supplied by the caller (only a pipelined
+    schedule prices shared memory, and the budget is a patched test seam).
+    """
+
+    group_rows: int = 1
+    pipelined: bool = False
+    pipeline_depth: int = 2
+    row_schedule: str = "batched"
+    pack_output: bool = False
+    local_tree: bool = False
+    shared_memory_budget: int = 0
+
+    @classmethod
+    def from_config(cls, config: Config) -> ResidentReductionOptions:
+        knobs = config.config
+        return cls(
+            group_rows=cast("int", knobs.get("cute_reduction_group_rows", 1)),
+            pipelined=knobs.get("cute_reduction_schedule") == "pipelined",
+            pipeline_depth=config.cute_reduction_pipeline_depth,
+            row_schedule=cast(
+                "str", knobs.get("cute_reduction_row_schedule", "batched")
+            ),
+            pack_output=cast("bool", knobs.get("cute_reduction_pack_output", False)),
+            local_tree=cast("bool", knobs.get("cute_reduction_local_tree", False)),
+        )
 
 
 def feature_index_expression(layout: ResidentReductionLayout, lane: str) -> str:
@@ -192,7 +282,7 @@ def _reads(node: ast.AST) -> set[str]:
 
 
 def _assignment(statement: ast.AST) -> str | None:
-    return tile_strategy._plain_assignment_name(statement)
+    return assigned_name(statement)
 
 
 def _dtype(
@@ -235,7 +325,7 @@ def _dtype(
             return right
         return None
     if isinstance(expression, ast.Call):
-        name = tile_strategy._qualified_name(expression.func)
+        name = call_path_str(expression.func)
         if (
             name
             in {
@@ -327,7 +417,7 @@ def _tainted(statements: list[ast.stmt], initial: set[str]) -> set[str]:
     for statement in statements:
         name = _assignment(statement)
         if name is not None:
-            if tile_strategy._is_lane_reduce_marker_assign(statement) is not None:
+            if _is_lane_reduce_marker_assign(statement) is not None:
                 continue
             if _reads(statement) & result:
                 result.add(name)
@@ -347,7 +437,7 @@ def _known_region(statements: list[ast.stmt]) -> bool:
                 and node.slice.value >= 0
             ):
                 return False
-        if tile_strategy._is_lane_reduce_marker_assign(statement) is not None:
+        if _is_lane_reduce_marker_assign(statement) is not None:
             continue
         store = _single_store(statement)
         values: list[ast.expr] = []
@@ -373,7 +463,7 @@ def _row_count_bound(
 ) -> tuple[int, bool] | None:
     if not (
         isinstance(iterator, ast.Call)
-        and tile_strategy._qualified_name(iterator.func) == "range"
+        and call_path_str(iterator.func) == "range"
         and not iterator.keywords
         and 1 <= len(iterator.args) <= 3
     ):
@@ -390,7 +480,7 @@ def _row_count_bound(
     if any(
         not (
             isinstance(value, ast.Call)
-            and tile_strategy._qualified_name(value.func) == "cutlass.Int32"
+            and call_path_str(value.func) == "cutlass.Int32"
             and len(value.args) == 1
             and not value.keywords
             or isinstance(value, ast.Constant)
@@ -408,7 +498,7 @@ def _row_count_bound(
             or _reads(value) - (uniform_names | {"cutlass", "cute"})
             or any(
                 isinstance(node, ast.Call)
-                and tile_strategy._qualified_name(node.func)
+                and call_path_str(node.func)
                 in {"cute.arch.thread_idx", "cute.arch.warp_idx"}
                 or isinstance(node, ast.Subscript)
                 and not _known_subscript(node)
@@ -420,7 +510,7 @@ def _row_count_bound(
     unwrapped = end
     while (
         isinstance(unwrapped, ast.Call)
-        and tile_strategy._qualified_name(unwrapped.func) == "cutlass.Int32"
+        and call_path_str(unwrapped.func) == "cutlass.Int32"
         and len(unwrapped.args) == 1
         and (
             _i32_offset(unwrapped.args[0])
@@ -515,7 +605,7 @@ def _vector_accesses(
             continue
         if any(
             isinstance(node, ast.Call)
-            and tile_strategy._qualified_name(node.func)
+            and call_path_str(node.func)
             in {"cute.arch.thread_idx", "cute.arch.lane_idx", "cute.arch.warp_idx"}
             for node in ast.walk(offset)
         ):
@@ -552,7 +642,7 @@ class _Plan:
     stash_names: list[str]
     row_stash_names: list[str]
     replay_prefix: list[ast.stmt]
-    markers: list[tile_strategy._LaneReduceMarker]
+    markers: list[_LaneReduceMarker]
     vector_accesses: dict[str, _VectorAccess]
     group_rows: int
     replay_row: list[ast.stmt]
@@ -565,36 +655,31 @@ class _Plan:
 def _plan(
     loop: ast.For,
     layout: ResidentReductionLayout,
-    tensor_dtypes: Mapping[str, str],
-    tensor_strides: Mapping[tuple[str, int], int],
-    disjoint_pairs: set[frozenset[str]],
+    context: ResidentPassContext,
     enclosing_definitions: Mapping[str, ast.expr],
-    uniform_names: set[str],
-    alignments: Mapping[str, int],
-    group_rows: int,
-    pipelined: bool,
-    pipeline_depth: int,
-    shared_memory_budget: int,
-    row_schedule: str,
-    pack_output: bool,
+    options: ResidentReductionOptions,
 ) -> _Plan | None:
     if (
         not isinstance(loop.target, ast.Name)
         or loop.orelse
-        or tile_strategy._static_lane_loop_extent(loop) != layout.lane_extent
+        or _static_lane_loop_extent(loop) != layout.lane_extent
         or layout.feature_extent != layout.threads * layout.lane_extent
         or layout.feature_extent <= 0
         or layout.feature_extent & (layout.feature_extent - 1)
         or layout.vector_width not in (1, 2, 4, 8)
         or layout.lane_extent % layout.vector_width
-        or group_rows not in (1, 2, 3, 4)
-        or type(pipeline_depth) is not int
-        or pipeline_depth not in (2, 4)
-        or (pipeline_depth != 2 and not pipelined)
-        or row_schedule not in ("batched", "serial", "serial_deferred")
+        or options.group_rows not in (1, 2, 3, 4)
+        or type(options.pipeline_depth) is not int
+        or options.pipeline_depth not in (2, 4)
+        or (options.pipeline_depth != 2 and not options.pipelined)
+        or options.row_schedule not in ("batched", "serial", "serial_deferred")
         or (
-            row_schedule == "serial_deferred"
-            and (not pipelined or pipeline_depth != 2 or layout.threads <= 32)
+            options.row_schedule == "serial_deferred"
+            and (
+                not options.pipelined
+                or options.pipeline_depth != 2
+                or layout.threads <= 32
+            )
         )
     ):
         return None
@@ -638,7 +723,7 @@ def _plan(
     if suffix_names & (prefix_names | row_names):
         return None
     mutable_names = _binding_write_roots(loop)
-    if mutable_names & set(tensor_dtypes):
+    if mutable_names & set(context.tensor_dtypes):
         return None
     if (
         layout.index_name in row_names
@@ -666,8 +751,7 @@ def _plan(
     markers = [
         marker
         for statement in row_body
-        if (marker := tile_strategy._is_lane_reduce_marker_assign(statement))
-        is not None
+        if (marker := _is_lane_reduce_marker_assign(statement)) is not None
     ]
     if not markers or any(
         marker.reduction_type != "sum"
@@ -687,7 +771,7 @@ def _plan(
     if dependent & carries or any(marker.input_name in dependent for marker in markers):
         return None
     if any(
-        tile_strategy._is_lane_reduce_marker_assign(statement) is not None
+        _is_lane_reduce_marker_assign(statement) is not None
         for statement in [*prefix, *suffix]
     ):
         return None
@@ -700,7 +784,7 @@ def _plan(
         if name is None:
             continue
         assert isinstance(statement, ast.Assign)
-        dtype = _dtype(statement.value, types, tensor_dtypes)
+        dtype = _dtype(statement.value, types, context.tensor_dtypes)
         if dtype is not None:
             types[name] = dtype
         else:
@@ -762,7 +846,10 @@ def _plan(
     if definitions is None:
         return None
     row_domain = _row_count_bound(
-        row_loop.iter, definitions, mutable_names, uniform_names | set(tensor_dtypes)
+        row_loop.iter,
+        definitions,
+        mutable_names,
+        context.uniform_names | set(context.tensor_dtypes),
     )
     if row_domain is None:
         return None
@@ -776,7 +863,7 @@ def _plan(
                 return None
             expanded = _freeze_definition(pointer, definitions)
             parts = _pointer_parts(expanded) if expanded is not None else None
-            if parts is None or parts[0] not in tensor_dtypes:
+            if parts is None or parts[0] not in context.tensor_dtypes:
                 return None
             read_roots.add(parts[0])
     for store in writes:
@@ -791,26 +878,26 @@ def _plan(
         if _reads(parts[1]) & (state | marker_names | {lane_name}):
             return None
         if _reads(parts[1]) - (
-            uniform_names
-            | set(tensor_dtypes)
+            context.uniform_names
+            | set(context.tensor_dtypes)
             | {"cutlass", "cute", layout.index_name, row_name}
         ):
             return None
         if any(
             isinstance(node, ast.Call)
-            and tile_strategy._qualified_name(node.func)
+            and call_path_str(node.func)
             in {"cute.arch.thread_idx", "cute.arch.lane_idx", "cute.arch.warp_idx"}
             for node in ast.walk(parts[1])
         ):
             return None
         feature_form = _pointer_integer_affine_form(
-            parts[1], layout.index_name, tensor_strides, set(), ""
+            parts[1], layout.index_name, context.tensor_strides, set(), ""
         )
         if feature_form is None or feature_form[0] != 1:
             return None
         if store is row_stores[0]:
             row_form = _pointer_integer_affine_form(
-                parts[1], row_name, tensor_strides, set(), ""
+                parts[1], row_name, context.tensor_strides, set(), ""
             )
             if (
                 row_form is None
@@ -827,7 +914,7 @@ def _plan(
             return None
         write_roots.append(parts[0])
     if len(write_roots) != len(set(write_roots)) or any(
-        left == right or frozenset((left, right)) not in disjoint_pairs
+        left == right or frozenset((left, right)) not in context.disjoint_pairs
         for index, left in enumerate(write_roots)
         for right in [*read_roots, *write_roots[index + 1 :]]
     ):
@@ -881,7 +968,7 @@ def _plan(
         [stmt for stmt in invariant_producer if _assignment(stmt) not in row_stash],
         _live_in([*invariant_consumer, *consumer]),
     )
-    if group_rows > 1 and any(
+    if options.group_rows > 1 and any(
         _memory_load_calls(stmt)
         or (
             types.get(_assignment(stmt) or "")
@@ -895,44 +982,44 @@ def _plan(
     ):
         return None
     terminal_product = (
-        _terminal_output_product(consumer, types, tensor_dtypes)
-        if pack_output
+        _terminal_output_product(consumer, types, context.tensor_dtypes)
+        if options.pack_output
         else None
     )
-    if pack_output and (
+    if options.pack_output and (
         layout.vector_width not in (2, 4, 8) or terminal_product is None
     ):
         return None
     staged_loads = {}
-    if pipelined:
+    if options.pipelined:
         candidates = _vector_accesses(
             row_body,
             definitions,
             layout,
             row_name,
-            tensor_dtypes,
-            tensor_strides,
-            alignments,
-            uniform_names,
+            context.tensor_dtypes,
+            context.tensor_strides,
+            context.tensor_alignments,
+            context.uniform_names,
             include_broadcast=True,
         )
         for key, access in candidates.items():
             row_form = _pointer_integer_affine_form(
-                access.offset, row_name, tensor_strides, set(), ""
+                access.offset, row_name, context.tensor_strides, set(), ""
             )
             if (
                 not access.write
                 and row_form is not None
                 and row_form[0] != 0
-                and alignments.get(access.tensor, 1)
+                and context.tensor_alignments.get(access.tensor, 1)
                 >= (16 if access.feature_stride else 4)
             ):
                 staged_loads[key] = access
         if not any(access.feature_stride for access in staged_loads.values()):
             return None
         shared_bytes = sum(
-            pipeline_depth
-            * group_rows
+            options.pipeline_depth
+            * options.group_rows
             * (layout.feature_extent if access.feature_stride else 1)
             * (4 if access.dtype == "cutlass.Float32" else 2)
             for access in staged_loads.values()
@@ -940,9 +1027,9 @@ def _plan(
         # Each allocation is aligned to 16 bytes; fused reduction scratch
         # needs one FP32 scalar per participating warp and per row/sum.
         shared_bytes += 16 * len(staged_loads) + (
-            group_rows * len(markers) * max(1, layout.threads // 32) * 4
+            options.group_rows * len(markers) * max(1, layout.threads // 32) * 4
         )
-        if shared_bytes > shared_memory_budget:
+        if shared_bytes > options.shared_memory_budget:
             return None
     return _Plan(
         layout,
@@ -966,16 +1053,16 @@ def _plan(
             definitions,
             layout,
             row_name,
-            tensor_dtypes,
-            tensor_strides,
-            alignments,
-            uniform_names,
+            context.tensor_dtypes,
+            context.tensor_strides,
+            context.tensor_alignments,
+            context.uniform_names,
         ),
-        group_rows,
+        options.group_rows,
         replay_row,
         staged_loads,
-        not exact_row_count or row_count % group_rows != 0,
-        pipeline_depth,
+        not exact_row_count or row_count % options.group_rows != 0,
+        options.pipeline_depth,
         terminal_product,
     )
 
@@ -1011,7 +1098,7 @@ def _terminal_output_product(
     def strip_casts(node: ast.expr) -> ast.expr:
         while (
             isinstance(node, ast.Call)
-            and tile_strategy._qualified_name(node.func) in allowed_casts
+            and call_path_str(node.func) in allowed_casts
             and len(node.args) == 1
             and not node.keywords
         ):
@@ -1341,16 +1428,13 @@ def _local_tree_update(
 def _emit(
     plan: _Plan,
     new_var: Callable[[str], str],
-    *,
-    local_tree: bool = False,
-    row_schedule: str = "batched",
-    pack_output: bool = False,
+    options: ResidentReductionOptions,
 ) -> list[ast.stmt]:
     lane = plan.lane_name
     extent = plan.layout.lane_extent
     rows = plan.group_rows
-    serial = row_schedule != "batched"
-    deferred = row_schedule == "serial_deferred"
+    serial = options.row_schedule != "batched"
+    deferred = options.row_schedule == "serial_deferred"
     stored_rows = 1 if serial else rows
     depth = plan.pipeline_depth
     marker_count = len(plan.markers)
@@ -1413,7 +1497,7 @@ def _emit(
     }
     tree_fragments = (
         {marker.result_var: new_var("resident_tree") for marker in plan.markers}
-        if local_tree and extent > 1
+        if options.local_tree and extent > 1
         else {}
     )
     declarations.extend(
@@ -1442,7 +1526,7 @@ def _emit(
     )
     for marker in plan.markers:
         accumulator = accumulators[marker.result_var]
-        if local_tree:
+        if options.local_tree:
             value = new_var("resident_tree_value")
             producer.append(statement_from_string(f"{value} = {marker.input_name}"))
             producer.extend(
@@ -1491,7 +1575,9 @@ def _emit(
         for name, fragment in stash.items()
     )
     consumer.extend(map(_clone, plan.consumer))
-    consumer_row.append(_feature_loop(plan, consumer, new_var, pack_output=pack_output))
+    consumer_row.append(
+        _feature_loop(plan, consumer, new_var, pack_output=options.pack_output)
+    )
     row_loop = _clone(plan.row_loop)
     assert isinstance(row_loop, ast.For) and isinstance(row_loop.iter, ast.Call)
     row_loop.target = ast.Name(id=group, ctx=ast.Store())
@@ -1633,23 +1719,11 @@ def materialize_resident_reductions(
     body: list[ast.AST],
     *,
     layouts: Mapping[str, ResidentReductionLayout],
-    tensor_dtypes: Mapping[str, str],
-    tensor_strides: Mapping[tuple[str, int], int],
-    disjoint_pairs: set[frozenset[str]],
-    rename_groups: dict[str, str],
-    new_var: Callable[[str], str],
-    constexpr_values: Mapping[str, int],
-    uniform_names: set[str],
-    tensor_alignments: Mapping[str, int] | None = None,
-    group_rows: int = 1,
-    pipelined: bool = False,
-    pipeline_depth: int = 2,
-    local_tree: bool = False,
-    row_schedule: str = "batched",
-    pack_output: bool = False,
-    shared_memory_budget: int = 0,
+    context: ResidentPassContext,
+    options: ResidentReductionOptions,
     require_proof: bool = False,
 ) -> list[ast.AST]:
+    rename_groups = context.rename_groups
     result: list[ast.AST] = []
     materialized: set[str] = set()
     for index, statement in enumerate(body):
@@ -1671,7 +1745,7 @@ def materialize_resident_reductions(
         if (
             not _known_region(prelude)
             or len(names) != len(set(names))
-            or set(names) & set(tensor_dtypes)
+            or set(names) & set(context.tensor_dtypes)
         ):
             result.append(statement)
             continue
@@ -1680,28 +1754,13 @@ def materialize_resident_reductions(
             set(),
             {
                 name: ast.Constant(value=value)
-                for name, value in constexpr_values.items()
+                for name, value in context.constexpr_values.items()
             },
         )
         if definitions is None:
             result.append(statement)
             continue
-        plan = _plan(
-            cloned,
-            layout,
-            tensor_dtypes,
-            tensor_strides,
-            disjoint_pairs,
-            definitions,
-            uniform_names,
-            tensor_alignments or {},
-            group_rows,
-            pipelined,
-            pipeline_depth,
-            shared_memory_budget,
-            row_schedule,
-            pack_output,
-        )
+        plan = _plan(cloned, layout, context, definitions, options)
         escapes = {
             rename_groups.get(name, name)
             for later in body[index + 1 :]
@@ -1710,15 +1769,7 @@ def materialize_resident_reductions(
         if plan is None or escapes:
             result.append(statement)
         else:
-            result.extend(
-                _emit(
-                    plan,
-                    new_var,
-                    local_tree=local_tree,
-                    row_schedule=row_schedule,
-                    pack_output=pack_output,
-                )
-            )
+            result.extend(_emit(plan, context.new_var, options))
             materialized.add(plan.lane_name)
     if require_proof and materialized != layouts.keys():
         raise exc.BackendUnsupported(

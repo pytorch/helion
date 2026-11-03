@@ -30,28 +30,32 @@ from test._cute_se_bwd_chains import se_bwd_da_chain
 from test._cute_se_bwd_chains import se_bwd_dx_chain
 from test.cute_population_contracts import with_flat_min_blocks_default
 from test.test_cute_full_slice_matmul import _bind
-from test.test_cute_full_slice_matmul import _cpu_target
 from test.test_cute_materialized_fission import _se_args
 from test.test_cute_materialized_fission import _sources
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
-from helion._compiler.autotuner_heuristics.cute_materialized import (
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute_materialized import (
     CuteMaterializedMmaHeuristic,
 )
-from helion._compiler.autotuner_heuristics.cute_materialized_operand import (
+from helion._compiler.cute.autotune.heuristics.cute_materialized_operand import (
     CuteMaterializedOperandHeuristic,
 )
 from helion._compiler.cute.aux_tensor import analyze_tcgen05_matmul_store_chains
 from helion._compiler.cute.mma_support import CuteMmaSupport
+from helion._compiler.cute.target_facts import TargetFacts
+from helion._compiler.cute.tcgen05_config import repair
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import surface
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 _examples_squeeze_and_excitation_net = import_example("squeeze_and_excitation_net")
 squeeze_and_excitation_net_bwd_dc = (
@@ -60,9 +64,6 @@ squeeze_and_excitation_net_bwd_dc = (
 squeeze_and_excitation_net_fwd = (
     _examples_squeeze_and_excitation_net.squeeze_and_excitation_net_fwd
 )
-
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
-
 if TYPE_CHECKING:
     from collections.abc import Generator
     from typing import Any
@@ -72,29 +73,19 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _native_cpu_target() -> Generator[None, None, None]:
-    support = CuteMmaSupport(
-        universal=True, warp_f16bf16=True, warpgroup_f16bf16=True, tcgen05_f16bf16=True
+    support = CuteMmaSupport(universal=True, warp_f16bf16=True, tcgen05_f16bf16=True)
+    # ``test_cute_full_slice_matmul._cpu_target``'s facts (a 148-SM B200 with
+    # a 128 KiB reduction SMEM budget and no hardware identity) plus the full
+    # opt-in capacity as both tcgen05 budgets.
+    facts = TargetFacts(
+        capability=(10, 0),
+        num_sm=148,
+        is_hip=False,
+        smem_capacity_bytes=232448,
+        smem_budget_bytes=232448,
+        reduction_smem_budget_bytes=128 * 1024,
     )
-    with (
-        _cpu_target(),
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        patch(
-            "helion._compiler.cute.mma_support.get_cute_mma_support",
-            return_value=support,
-        ),
-        patch(
-            "helion._compiler.cute.cute_mma.get_cute_mma_support", return_value=support
-        ),
-        patch(
-            "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_budget_bytes",
-            return_value=232448,
-        ),
-        patch(
-            "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_capacity_bytes",
-            return_value=232448,
-        ),
-    ):
+    with cpu_render_target(facts, mma_support=support, forbid_native=False):
         yield
 
 
@@ -137,9 +128,9 @@ def test_barrier_phases_plan_one_tcgen05_triple_per_gemm(bind: object) -> None:
     bound = bind()  # type: ignore[operator]
     spec = bound.config_spec
     state = spec._cute_tcgen05_config
-    assert spec.cute_tcgen05_search_enabled
+    assert spec.tcgen05.search_enabled
     # No single-matrix projection: each GEMM phase has its own triple.
-    assert spec._tcgen05_matmul_block_ids() is None
+    assert spec.tcgen05.matmul_block_ids is None
     assert state.materialized_matmul_block_ids == ((2, 3, 4), (5, 6, 7))
     assert state.materialized_matmul_region_indices == (1, 2)
     assert len(state.materialized_matmul_shapes) == 2
@@ -164,13 +155,16 @@ def test_barrier_phases_plan_one_tcgen05_triple_per_gemm(bind: object) -> None:
     # persistent two-CTA pipeline while the chain itself stays flat.  The
     # two-CTA coordinates and the per-region ring depths come with it; the
     # fission plan's materialized-operand PDL edge does not.
-    assert all(facts is not None for facts in state.materialized_pipeline_facts)
-    assert state.region_pid_type_choices() == (
+    assert all(
+        pipeline_facts is not None
+        for pipeline_facts in state.materialized_pipeline_facts
+    )
+    assert surface.region_pid_type_choices(state) == (
         "inherit",
         "persistent_blocked",
         "persistent_interleaved",
     )
-    fragments = state.optional_fragments(for_search=True)
+    fragments = surface.optional_fragments(state, for_search=True)
     assert fragments["tcgen05_cluster_m"].choices == (1, 2)  # type: ignore[attr-defined]
     assert fragments["tcgen05_cta_group"].choices == ("auto", "two")  # type: ignore[attr-defined]
     assert {
@@ -180,7 +174,7 @@ def test_barrier_phases_plan_one_tcgen05_triple_per_gemm(bind: object) -> None:
     } <= keys
     assert "tcgen05_materialized_pdl" not in keys
     # Explicit configs still validate the full coordinate set.
-    assert state.optional_fragments()["tcgen05_cluster_m"].choices == (1, 2)  # type: ignore[attr-defined]
+    assert surface.optional_fragments(state)["tcgen05_cluster_m"].choices == (1, 2)  # type: ignore[attr-defined]
 
 
 def test_phase_seeds_round_trip_and_render_three_launches() -> None:
@@ -267,15 +261,15 @@ def test_single_gemm_barrier_chain_plans_per_phase() -> None:
     bound = _bind(scale_then_mm.fn, (x, w))
     spec = bound.config_spec
     state = spec._cute_tcgen05_config
-    assert spec.cute_tcgen05_search_enabled
+    assert spec.tcgen05.search_enabled
     # One GEMM phase beside a plain phase is an ordered chain like any
     # other: the GEMM launch owns the one region triple (not the standalone
     # single-matrix projection) and may run persistent / two-CTA.
-    assert spec._tcgen05_matmul_block_ids() is None
+    assert spec.tcgen05.matmul_block_ids is None
     assert state.materialized_matmul_block_ids == ((2, 3, 4),)
     assert state.materialized_matmul_region_indices == (1,)
     assert state.materialized_matmul_shapes == ((256, 192, 128),)
-    assert state.region_pid_type_choices() == (
+    assert surface.region_pid_type_choices(state) == (
         "inherit",
         "persistent_blocked",
         "persistent_interleaved",
@@ -438,7 +432,7 @@ def test_one_gemm_chain_two_cta_launch_and_deep_flat_ring_at_campaign_shape() ->
     state = spec._cute_tcgen05_config
     assert state.materialized_matmul_shapes == ((4096, 512, 1024),)
     assert spec.allowed_pid_types == ("flat",)
-    fragments = state.optional_fragments(for_search=True)
+    fragments = surface.optional_fragments(state, for_search=True)
     cta_group = fragments["tcgen05_cta_group"]
     assert isinstance(cta_group, EnumFragment)
     assert cta_group.choices == ("auto", "two")
@@ -667,11 +661,11 @@ def test_same_shape_gemm_phases_plan_per_phase() -> None:
     bound = _bind(mm_twice.fn, (x, w, v))
     spec = bound.config_spec
     state = spec._cute_tcgen05_config
-    assert spec._tcgen05_matmul_block_ids() is None
+    assert spec.tcgen05.matmul_block_ids is None
     assert state.materialized_matmul_block_ids == ((0, 1, 2), (3, 4, 5))
     assert state.materialized_matmul_shapes == ((256, 256, 256),) * 2
     assert spec.allowed_pid_types == ("flat",)
-    assert state.region_pid_type_choices() is not None
+    assert surface.region_pid_type_choices(state) is not None
     assert spec.cute_pointwise_region_block_ids == frozenset()
 
 
@@ -704,7 +698,7 @@ def test_unsupported_gemm_epilogue_declines_the_phase_surface() -> None:
     w2 = torch.randn(256, 64, dtype=torch.float16)
     bound = _bind(two_gemms_with_a_reduction_epilogue.fn, (x, w1, w2))
     spec = bound.config_spec
-    assert not spec.cute_tcgen05_search_enabled
+    assert not spec.tcgen05.search_enabled
     assert spec._cute_tcgen05_config.materialized_matmul_block_ids == ()
     # The SIMT lowering stays, with the barrier kernel's ordinary pid types.
     assert "persistent_blocked" in spec.allowed_pid_types
@@ -743,7 +737,7 @@ def test_gemm_phase_with_an_independent_store_declines() -> None:
     c = torch.randn(256, 256, dtype=torch.float16)
     bound = _bind(gemm_phase_with_side_store.fn, (x, w1, w2, c))
     spec = bound.config_spec
-    assert not spec.cute_tcgen05_search_enabled
+    assert not spec.tcgen05.search_enabled
     assert spec._cute_tcgen05_config.materialized_matmul_block_ids == ()
     assert "persistent_blocked" in spec.allowed_pid_types
     # The SIMT lowering stays live: the default config renders.
@@ -781,7 +775,7 @@ def test_gemm_phase_with_an_atomic_declines() -> None:
     c = torch.randn(256, 256, dtype=torch.float16)
     bound = _bind(gemm_phase_with_atomic.fn, (x, w1, w2, c))
     spec = bound.config_spec
-    assert not spec.cute_tcgen05_search_enabled
+    assert not spec.tcgen05.search_enabled
     assert spec._cute_tcgen05_config.materialized_matmul_block_ids == ()
 
 
@@ -793,7 +787,7 @@ def test_materialized_fission_region_indices_are_the_launch_order() -> None:
     assert state.materialized_matmul_block_ids == ((0, 1, 2), (3, 4, 5))
     assert state.materialized_matmul_region_indices == (0, 1)
     # The fission surface is unchanged: ``cute_pdl`` is the tcgen05 search
-    # surface's own fragment (``CuteTcgen05Config.optional_fragments``, the
+    # surface's own fragment (``tcgen05_config.surface.optional_fragments``, the
     # renderer places the wait), offered here exactly as before; with its
     # persistent walks the paired two-CTA schedule and its region knobs stay.
     keys = set(ConfigGeneration(bound.config_spec)._key_to_flat_indices)
@@ -804,7 +798,7 @@ def test_materialized_fission_region_indices_are_the_launch_order() -> None:
         "tcgen05_region_c_stages",
         "tcgen05_materialized_pdl",
     } <= keys
-    fragments = state.optional_fragments(for_search=True)
+    fragments = surface.optional_fragments(state, for_search=True)
     assert fragments["tcgen05_cluster_m"].choices == (1, 2)  # type: ignore[attr-defined]
     assert fragments["tcgen05_cta_group"].choices == ("auto", "two")  # type: ignore[attr-defined]
 
@@ -815,7 +809,6 @@ def test_collective_seeds_ignore_axes_of_contraction_free_phases() -> None:
     support = CuteMmaSupport(
         universal=True,
         warp_f16bf16=True,
-        warpgroup_f16bf16=True,
         tcgen05_f16bf16=False,
     )
     with (
@@ -829,7 +822,7 @@ def test_collective_seeds_ignore_axes_of_contraction_free_phases() -> None:
     ):
         bound = _bind_bwd_dx()
     spec = bound.config_spec
-    assert not spec.cute_tcgen05_search_enabled
+    assert not spec.tcgen05.search_enabled
     host = bound.host_function
     assert host is not None
     with bound.env, host:
@@ -1071,7 +1064,7 @@ def test_clustered_launch_loop_orders_bind_by_block_ids() -> None:
     )
     spec = bound.config_spec
     state = spec._cute_tcgen05_config
-    assert state.region_pid_type_choices() is not None
+    assert surface.region_pid_type_choices(state) is not None
     assert state.materialized_matmul_region_indices == (2, 3)
     assert state.materialized_matmul_block_ids == ((3, 4, 5), (6, 7, 8))
     assert [tuple(item.block_ids) for item in spec.loop_orders] == [
@@ -1120,15 +1113,15 @@ def test_clustered_launch_loop_orders_bind_by_block_ids() -> None:
     assert _strict(bound, mixed).config["loop_orders"] == [[1, 0], [0, 1], [1, 0]]
     # The entries are the specs over each clustered launch's (m, n) block ids.
     free = chain(both, [[1, 0], [0, 1], [0, 1]])
-    assert state._clustered_launch_loop_order_entries(free.config) == [1, 2]
-    assert state._clustered_launch_loop_order_entries(mixed.config) == [1]
+    assert repair._clustered_launch_loop_order_entries(state, free.config) == [1, 2]
+    assert repair._clustered_launch_loop_order_entries(state, mixed.config) == [1]
     # Fail closed: a clustered launch without a unique entry over its (m, n)
     # block ids (here grad_c's spec is missing) yields no binding, and the
     # whole config then keeps the default raster.
     with patch.object(spec, "loop_orders", [spec.loop_orders[0], spec.loop_orders[2]]):
-        assert state._clustered_launch_loop_order_entries(free.config) is None
+        assert repair._clustered_launch_loop_order_entries(state, free.config) is None
     with patch.object(
-        type(state), "_clustered_launch_loop_order_entries", return_value=None
+        repair, "_clustered_launch_loop_order_entries", return_value=None
     ):
         with pytest.raises(helion.exc.InvalidConfig, match="loop_orders"):
             _strict(bound, free)
@@ -1183,18 +1176,18 @@ def test_region_two_cta_seeds_round_trip() -> None:
     assert host is not None
     spec = bound.config_spec
     state = spec._cute_tcgen05_config
-    seeds = state.region_two_cta_seed_configs()
+    seed_configs = seeds.region_two_cta_seed_configs(state)
     # Per K tile (64 and 128, both dividing every GEMM's K): the
     # all-persistent seed and one seed per GEMM launch left flat.
-    assert [seed.block_sizes[2:8] for seed in seeds] == [
+    assert [seed.block_sizes[2:8] for seed in seed_configs] == [
         [128, 64, 64, 128, 64, 64]
     ] * 3 + [[128, 64, 128, 128, 64, 128]] * 3
-    assert [seed.config["tcgen05_region_pid_types"] for seed in seeds] == [
+    assert [seed.config["tcgen05_region_pid_types"] for seed in seed_configs] == [
         ["persistent_blocked", "persistent_blocked"],
         ["inherit", "persistent_blocked"],
         ["persistent_blocked", "inherit"],
     ] * 2
-    for seed in seeds:
+    for seed in seed_configs:
         assert seed.config["tcgen05_cta_group"] == "two"
         assert seed.config["tcgen05_aux_load_placement"] == "pre_acc_wait"
         stages = seed.config["tcgen05_region_ab_stages"]
@@ -1212,7 +1205,7 @@ def test_region_two_cta_seeds_round_trip() -> None:
     assert ranked[0].pid_type == "flat"
     assert "tcgen05_region_pid_types" not in ranked[0].config
     two_cta = [seed for seed in ranked if "tcgen05_region_pid_types" in seed.config]
-    assert len(two_cta) == len(seeds)
+    assert len(two_cta) == len(seed_configs)
     generation = ConfigGeneration(spec)
     for seed in two_cta:
         # Strict normalization keeps the recipe, and the flat search schema
@@ -1231,11 +1224,10 @@ def test_region_two_cta_seeds_round_trip() -> None:
 
 
 def test_region_two_cta_tile_rule() -> None:
-    from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
     from helion.autotuner.config_fragment import BlockSizeFragment
 
     fragments = (BlockSizeFragment(64, 256, 128), BlockSizeFragment(16, 256, 128))
-    tile = CuteTcgen05Config._region_two_cta_tile
+    tile = seeds._region_two_cta_tile
     # Wide outputs: the widest machine-filling tile (B200: 74 CTA pairs).
     assert tile(4096, 512, fragments, pairs_per_wave=74) == (128, 256)
     assert tile(4096, 1024, fragments, pairs_per_wave=74) == (256, 256)
@@ -1253,7 +1245,7 @@ def test_fission_plan_keeps_its_whole_kernel_pid_types() -> None:
     )
     spec = bound.config_spec
     state = spec._cute_tcgen05_config
-    assert state.region_pid_type_choices() is None
+    assert surface.region_pid_type_choices(state) is None
     assert "tcgen05_region_pid_types" not in set(
         ConfigGeneration(spec)._key_to_flat_indices
     )

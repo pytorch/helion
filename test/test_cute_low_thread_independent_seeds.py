@@ -15,13 +15,12 @@ from test.test_cute_full_chunk_row_seeds import normalize_many
 from test.test_cute_full_chunk_row_seeds import seeds_for
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_full_chunk_row import (
+from helion._compiler.cute.autotune.heuristics.cute_full_chunk_row import (
     CuteFullChunkRowHeuristic,
 )
-from helion._compiler.autotuner_heuristics.cute_rolled_cluster_packet import (
+from helion._compiler.cute.autotune.heuristics.cute_rolled_cluster_packet import (
     CuteRolledClusterPacketHeuristic,
 )
-from helion._testing.cute_codegen import forbid_native_compile
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 
@@ -38,13 +37,11 @@ def cpu_only() -> Iterator[None]:
     initialized = torch.cuda.is_initialized()
     with (
         _cpu_target(),
-        forbid_native_compile() as native,
         patch.object(
             CuteRolledClusterPacketHeuristic, "get_seed_configs", return_value=[]
         ),
     ):
         yield
-        assert all(mock.call_count == 0 for mock in native)
     assert torch.cuda.is_initialized() == initialized
 
 

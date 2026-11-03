@@ -1582,8 +1582,8 @@ def test_ordinary_grid_scan_requires_logical_owner(monkeypatch, missing):
     from test.cute_population_contracts import _target
 
     from helion._compiler.cute.cute_reshape import _resolve_dim_block_id
+    from helion._compiler.cute.emitters.memory_access import _cute_remap_block_id
     import helion._compiler.cute.scan_ops as scan_ops
-    from helion.language.memory_ops import _cute_remap_block_id
 
     original = scan_ops._cute_codegen_serial_scan
 

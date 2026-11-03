@@ -1,0 +1,746 @@
+"""Knob/heuristic registry of the CuTe backend's autotuner surface.
+
+The ordered heuristic tuple, the seed post-processing that runs after every
+heuristic and the compiler coverage registrars. ``CuteBackend`` exposes these
+through the ``Backend`` autotuner hooks; the core package
+``helion._compiler.autotuner_heuristics`` runs them by backend name.
+
+Order is part of a seed list's identity (prefix contracts, promoted defaults
+and the autotune cache fingerprint depend on it): every registered heuristic
+carries the ``priority`` the sort below honours, and the registrars run in the
+fixed sequence of :func:`register_coverage_groups`.
+
+Role: heuristic (section 6 of ``../../README.md``).
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+import operator
+from typing import TYPE_CHECKING
+
+from .....autotuner.compiler_coverage import CompilerCoverageGroup
+from .....autotuner.compiler_coverage import CoverageDependency
+from .....autotuner.compiler_coverage import CoverageWitness
+from .....runtime.config import Config
+from ....autotuner_heuristics.common import dedupe_configs
+from ...grouped_row_union import AB_STAGES_KEY as GROUPED_ROW_UNION_AB_STAGES_KEY
+from ...grouped_row_union import CONFIG_KEY as GROUPED_ROW_UNION_KEY
+from ...grouped_row_union import LEGACY_SCHEDULE
+from ...grouped_row_union import PAIRED_CLC_SCHEDULE
+from ...grouped_row_union import RESIDENT_CTAS_KEY as GROUPED_RESIDENT_CTAS_KEY
+from ...grouped_row_union import (
+    ROUND_SUBTILES_KEY as GROUPED_ROW_UNION_ROUND_SUBTILES_KEY,
+)
+from ...grouped_row_union import SCHEDULE_KEY as GROUPED_ROW_UNION_SCHEDULE_KEY
+from ...grouped_row_union import STARTUP_PREFILL_KEY
+from ...grouped_row_union import TRANSPOSED_SCHEDULE
+from ...split_k_cluster_config import FINALIZER_KEY
+from ...tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
+from ..fragment_knobs import CuteFragmentAtomicAggregationHeuristic
+from ..fragment_knobs import CuteFragmentAtomicConsumerFusionHeuristic
+from ..fragment_knobs import CuteFragmentBatchedLoadsHeuristic
+from ..fragment_knobs import CuteFragmentBoundedGatherHeuristic
+from ..fragment_knobs import CuteFragmentIntegerAtomicEpochsHeuristic
+from ..fragment_knobs import CuteFragmentLocalAtomicRegistersHeuristic
+from ..fragment_knobs import CuteFragmentMmaRowsHeuristic
+from ..fragment_knobs import CuteFragmentPacketLoadsHeuristic
+from ..fragment_knobs import CuteFragmentPaddedRowsHeuristic
+from ..fragment_knobs import CuteFragmentPrivateScalarLoopsHeuristic
+from ..fragment_knobs import CuteFragmentProducerCacheHeuristic
+from ..fragment_knobs import CuteFragmentPublishedScalarsHeuristic
+from ..fragment_knobs import CuteFragmentPureProducerRegionsHeuristic
+from ..fragment_knobs import CuteFragmentReductionHeuristic
+from ..fragment_knobs import CuteFragmentRegisterLoadsHeuristic
+from ..fragment_knobs import CuteFragmentRegisterProducersHeuristic
+from ..fragment_knobs import CuteFragmentRegisterSnapshotsHeuristic
+from ..fragment_knobs import CuteFragmentScanExportsHeuristic
+from ..fragment_knobs import CuteFragmentScanHeuristic
+from ..fragment_knobs import CuteFragmentSkipZeroAtomicsHeuristic
+from ..fragment_knobs import CuteFragmentSlabLoadsHeuristic
+from ..fragment_knobs import CuteFragmentSplitKHeuristic
+from ..fragment_knobs import CuteFragmentTopKNetworkHeuristic
+from ..fragment_knobs import CuteFragmentUnrolledLoopsHeuristic
+from ..fragment_knobs import CuteFragmentVectorIoHeuristic
+from ..fragment_knobs import CuteFragmentWarpProducerRegionsHeuristic
+from ..fragment_knobs import CuteFragmentWarpResultsHeuristic
+from ..fragment_knobs import CuteFragmentWarpScanHeuristic
+from ..fragment_knobs import register_fragment_atomic_aggregation_coverage
+from ..fragment_knobs import register_fragment_atomic_consumer_fusion_coverage
+from ..fragment_knobs import register_fragment_batched_loads_coverage
+from ..fragment_knobs import register_fragment_bounded_gather_coverage
+from ..fragment_knobs import register_fragment_cta_topk_coverage
+from ..fragment_knobs import register_fragment_integer_atomic_epochs_coverage
+from ..fragment_knobs import register_fragment_local_atomic_registers_coverage
+from ..fragment_knobs import register_fragment_mma_rows_coverage
+from ..fragment_knobs import register_fragment_packet_loads_coverage
+from ..fragment_knobs import register_fragment_padded_rows_coverage
+from ..fragment_knobs import register_fragment_private_scalar_loops_coverage
+from ..fragment_knobs import register_fragment_producer_cache_coverage
+from ..fragment_knobs import register_fragment_published_scalars_coverage
+from ..fragment_knobs import register_fragment_pure_producer_regions_coverage
+from ..fragment_knobs import register_fragment_reduction_coverage
+from ..fragment_knobs import register_fragment_register_loads_coverage
+from ..fragment_knobs import register_fragment_register_producers_coverage
+from ..fragment_knobs import register_fragment_register_snapshots_coverage
+from ..fragment_knobs import register_fragment_scan_coverage
+from ..fragment_knobs import register_fragment_scan_exports_coverage
+from ..fragment_knobs import register_fragment_skip_zero_atomics_coverage
+from ..fragment_knobs import register_fragment_slab_loads_coverage
+from ..fragment_knobs import register_fragment_split_k_coverage
+from ..fragment_knobs import register_fragment_topk_network_coverage
+from ..fragment_knobs import register_fragment_unrolled_loops_coverage
+from ..fragment_knobs import register_fragment_vector_io_coverage
+from ..fragment_knobs import register_fragment_warp_producer_regions_coverage
+from ..fragment_knobs import register_fragment_warp_results_coverage
+from ..fragment_knobs import register_fragment_warp_scan_coverage
+from .cute import CuteAffineScanHeuristic
+from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
+from .cute import CuteAsyncStateLoadHeuristic
+from .cute import CuteChunkPrepareHeuristic
+from .cute import CuteChunkRecurrenceHeuristic
+from .cute import CuteCollectiveMatmulHeuristic
+from .cute import CuteColumnReductionHeuristic
+from .cute import CuteFixedTokenRank1Heuristic
+from .cute import CuteFlashAttentionHeuristic
+from .cute import CuteFlashGatedAttentionHeuristic
+from .cute import CuteFp8GemmSkinnyMHeuristic
+from .cute import CuteGdnRecurrenceHeuristic
+from .cute import CuteMaskedRolledClusterHeuristic
+from .cute import CuteNestedRowHeuristic
+from .cute import CutePackedSingleTokenRank1Heuristic
+from .cute import CutePersistentSubwarpRowsHeuristic
+from .cute import CutePointwiseVecHeuristic
+from .cute import CuteReductionTileHeuristic
+from .cute import CuteReductionWideChunkHeuristic
+from .cute import CuteRegisterTileHeuristic
+from .cute import CuteResidentMultiRowHeuristic
+from .cute import CuteResidentRowHeuristic
+from .cute import CuteResidentRowWideClusterHeuristic
+from .cute import CuteRolledClusterLadderHeuristic
+from .cute import CuteRolledRowLadderHeuristic
+from .cute import CuteScanTileHeuristic
+from .cute import CuteSiblingRowHeuristic
+from .cute import CuteTcgen05ClusterM2FfiHeuristic
+from .cute import CuteTcgen05ClusterM2Heuristic
+from .cute import CuteTcgen05GroupedDynamicBk64Heuristic
+from .cute import CuteTcgen05GroupedSource64Heuristic
+from .cute import CuteTcgen05GroupedStaticCommonKHeuristic
+from .cute import CuteTcgen05GroupedWorklistHeuristic
+from .cute import CuteTcgen05ThreadLocalEpilogueHeuristic
+from .cute import CuteTileVecHeuristic
+from .cute import CuteTileVecWarpPerRowHeuristic
+from .cute import CuteTileVecWarpReduceHeuristic
+from .cute import CuteTopKHeuristic
+from .cute import grouped_full_coverage_configs
+from .cute import grouped_row_union_carrier
+from .cute import grouped_row_union_cluster4_carrier
+from .cute import grouped_row_union_paired_clc_carrier
+from .cute_block_scaled import CuteBlockScaledMmaHeuristic
+from .cute_bounded_loop_cache import CuteBoundedLoopCacheHeuristic
+from .cute_dot_row_reduction import CuteDotRowReductionHeuristic
+from .cute_epilogue_fanout import register_aux_fragment_hoist_coverage
+from .cute_epilogue_fanout import register_epi_warp_groups_coverage
+from .cute_epilogue_fanout import register_epilogue_fanout_coverage
+from .cute_fp32_dot import CuteFp32DotHeuristic
+from .cute_fp32_dot import register_fp32_dot_coverage
+from .cute_fragment_resources import fragment_resource_carrier
+from .cute_fragment_threads import CuteFragmentThreadsHeuristic
+from .cute_fragment_threads import register_fragment_threads_coverage
+from .cute_fragment_warp_scan import register_gather_warp_scan_coverage
+from .cute_full_chunk_row import CuteFullChunkRowHeuristic
+from .cute_gemv_fragment_mma import CuteGemvFragmentMmaHeuristic
+from .cute_gemv_ring_mma import CuteGemvRingMmaHeuristic
+from .cute_grouped_rna import CuteGroupedRnaHeuristic
+from .cute_grouped_rna import interleave_grouped_rna_seeds
+from .cute_host_paired_sum import CuteHostPairedSumHeuristic
+from .cute_host_paired_sum import add_host_sum_seeds
+from .cute_integer_loop_reduction import CuteIntegerLoopReductionHeuristic
+from .cute_integer_loop_reduction import register_integer_loop_reduction_coverage
+from .cute_l2_row_swizzle import register_l2_row_swizzle_coverage
+from .cute_launch_bounds import register_matmul_min_blocks_coverage
+from .cute_materialized import CuteMaterializedMmaHeuristic
+from .cute_materialized_operand import CuteMaterializedOperandHeuristic
+from .cute_materialized_pdl import register_materialized_pdl_coverage
+from .cute_mma_dag import CuteMmaDagHeuristic
+from .cute_mxfp8_epilogue_coverage import register_mxfp8_epilogue_coverage
+from .cute_packed_operand import register_packed_operand_coverage
+from .cute_radix_selection import CuteRadixSelectionHeuristic
+from .cute_radix_selection import register_radix_selection_coverage
+from .cute_register_chain import CuteRegisterChainHeuristic
+from .cute_register_subblocks import CuteRegisterSubblocksHeuristic
+from .cute_resident_reductions import CuteResidentReductionHeuristic
+from .cute_resident_sequence import CuteResidentSequenceHeuristic
+from .cute_rolled_cluster_packet import CuteRolledClusterPacketHeuristic
+from .cute_row_resident import register_row_resident_coverage
+from .cute_signed_bitfield import add_signed_bitfield_seeds
+from .cute_simt_mma import CuteSimtMmaHeuristic
+from .cute_split_k_cluster import CuteSplitKClusterHeuristic
+from .cute_split_k_cluster import cluster_carrier
+from .cute_split_k_cluster import register_cluster_coverage
+from .cute_split_k_workspace import CuteSplitKWorkspaceHeuristic
+from .cute_tcgen05_schedule import CuteTcgen05ScheduleHeuristic
+from .cute_tile_packing import CuteTilePackWarpPerRowHeuristic
+from .cute_topk_coarse_keys import register_topk_coarse_keys_coverage
+from .cute_topk_coarse_keys import register_topk_key_recovery_coverage
+from .cute_warp_atomic import CuteWarpAtomicHeuristic
+
+if TYPE_CHECKING:
+    from ....autotuner_heuristics.registry import AutotunerHeuristicType
+    from ....autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
+    from ....compile_environment import CompileEnvironment
+    from ....device_ir import DeviceIR
+
+# The inventory; the order is the ``priority`` sort below.
+_CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
+    # Lowest priority: its promoted default yields to any later promoted
+    # family (flash, collective GEMM) that claims the same kernel.
+    CuteDotRowReductionHeuristic,
+    CuteAsyncStateLoadHeuristic,
+    CuteFp8GemmSkinnyMHeuristic,
+    CuteChunkRecurrenceHeuristic,
+    CuteGdnRecurrenceHeuristic,
+    CuteMmaDagHeuristic,
+    CuteRegisterSubblocksHeuristic,
+    CuteChunkPrepareHeuristic,
+    CuteAffineScanHeuristic,
+    CuteTopKHeuristic,
+    CuteFlashAttentionHeuristic,
+    CuteFlashGatedAttentionHeuristic,
+    CutePackedSingleTokenRank1Heuristic,
+    CuteFixedTokenRank1Heuristic,
+    CuteSplitKWorkspaceHeuristic,
+    CuteCollectiveMatmulHeuristic,
+    CuteSimtMmaHeuristic,
+    CuteGroupedRnaHeuristic,
+    CuteBlockScaledMmaHeuristic,
+    CuteMaterializedMmaHeuristic,
+    CuteMaterializedOperandHeuristic,
+    CuteTcgen05ClusterM2FfiHeuristic,
+    CuteTcgen05ScheduleHeuristic,
+    CuteTcgen05ClusterM2Heuristic,
+    CuteTcgen05GroupedWorklistHeuristic,
+    CuteTcgen05GroupedStaticCommonKHeuristic,
+    CuteTcgen05GroupedDynamicBk64Heuristic,
+    CuteTcgen05ThreadLocalEpilogueHeuristic,
+    CuteReductionTileHeuristic,
+    CuteRegisterTileHeuristic,
+    CuteReductionWideChunkHeuristic,
+    CuteResidentReductionHeuristic,
+    CuteResidentSequenceHeuristic,
+    CutePersistentSubwarpRowsHeuristic,
+    CuteAsyncPersistentSubwarpRowsHeuristic,
+    CuteRolledRowLadderHeuristic,
+    CuteRolledClusterLadderHeuristic,
+    CuteMaskedRolledClusterHeuristic,
+    CuteScanTileHeuristic,
+    CuteTileVecHeuristic,
+    CuteTileVecWarpReduceHeuristic,
+    CuteTileVecWarpPerRowHeuristic,
+    CuteTilePackWarpPerRowHeuristic,
+    CuteGemvFragmentMmaHeuristic,
+    CuteGemvRingMmaHeuristic,
+    CuteColumnReductionHeuristic,
+    CuteSiblingRowHeuristic,
+    CuteNestedRowHeuristic,
+    CuteResidentRowHeuristic,
+    CuteResidentRowWideClusterHeuristic,
+    CuteResidentMultiRowHeuristic,
+    CutePointwiseVecHeuristic,
+    CuteWarpAtomicHeuristic,
+    CuteRegisterChainHeuristic,
+    CuteBoundedLoopCacheHeuristic,
+    CuteHostPairedSumHeuristic,
+    CuteTcgen05GroupedSource64Heuristic,
+    CuteSplitKClusterHeuristic,
+    CuteFragmentScanHeuristic,
+    CuteFragmentReductionHeuristic,
+    CuteFp32DotHeuristic,
+    CuteFragmentThreadsHeuristic,
+    CuteFragmentPrivateScalarLoopsHeuristic,
+    CuteFragmentRegisterLoadsHeuristic,
+    CuteFragmentWarpResultsHeuristic,
+    CuteFragmentProducerCacheHeuristic,
+    CuteFragmentWarpScanHeuristic,
+    CuteFragmentTopKNetworkHeuristic,
+    CuteFragmentAtomicAggregationHeuristic,
+    CuteFragmentLocalAtomicRegistersHeuristic,
+    CuteFragmentRegisterSnapshotsHeuristic,
+    CuteFragmentPublishedScalarsHeuristic,
+    CuteFragmentSkipZeroAtomicsHeuristic,
+    CuteFragmentAtomicConsumerFusionHeuristic,
+    CuteIntegerLoopReductionHeuristic,
+    CuteFragmentIntegerAtomicEpochsHeuristic,
+    CuteFragmentPacketLoadsHeuristic,
+    CuteFragmentPaddedRowsHeuristic,
+    CuteFragmentUnrolledLoopsHeuristic,
+    CuteFragmentVectorIoHeuristic,
+    CuteFragmentBatchedLoadsHeuristic,
+    CuteFragmentSplitKHeuristic,
+    CuteFragmentMmaRowsHeuristic,
+    CuteFragmentSlabLoadsHeuristic,
+    CuteFragmentRegisterProducersHeuristic,
+    CuteFragmentScanExportsHeuristic,
+    CuteFragmentWarpProducerRegionsHeuristic,
+    CuteFragmentBoundedGatherHeuristic,
+    CuteFragmentPureProducerRegionsHeuristic,
+    CuteRadixSelectionHeuristic,
+)
+
+
+def _ranked(
+    classes: tuple[AutotunerHeuristicType, ...],
+) -> tuple[AutotunerHeuristicType, ...]:
+    """``classes`` sorted by ``priority``, the one source of the order.
+
+    Every class declares its own ``priority`` (the base class's 0 would sort
+    an undeclared one first without a word) and no two share one, so the sort
+    is total.
+    """
+    undeclared = [cls.__name__ for cls in classes if "priority" not in vars(cls)]
+    if undeclared:
+        raise TypeError(f"CuTe heuristics without a priority: {undeclared}")
+    by_priority: dict[int, str] = {}
+    for cls in classes:
+        if cls.priority in by_priority:
+            raise TypeError(
+                f"CuTe heuristics {by_priority[cls.priority]} and {cls.__name__} "
+                f"share priority {cls.priority}"
+            )
+        by_priority[cls.priority] = cls.__name__
+    return tuple(sorted(classes, key=operator.attrgetter("priority")))
+
+
+# The ranked registry.
+CUTE_HEURISTICS: tuple[AutotunerHeuristicType, ...] = _ranked(_CUTE_HEURISTIC_CLASSES)
+
+# Heuristics deliberately outside the ranked tuple whose seeds
+# :func:`postprocess_seed_configs` appends last; a fired one still owns its
+# cache specialization facts.
+CUTE_SEED_FACT_HEURISTICS: tuple[AutotunerHeuristicType, ...] = (
+    CuteRolledClusterPacketHeuristic,
+)
+
+
+def register_seed_facts(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> frozenset[CompilerHeuristicSpecializationFact]:
+    """Backend-wide correctness facts registered before any seed is built."""
+    # Imported here: computed_fragment reaches device_ir, which needs the
+    # ``helion`` package this registry is imported while initializing.
+    from ...computed_fragment import computed_fragment_specialization_facts
+
+    return computed_fragment_specialization_facts(env, device_ir)
+
+
+def postprocess_seed_configs(
+    env: CompileEnvironment, device_ir: DeviceIR, configs: list[Config]
+) -> list[Config]:
+    """Append the carriers and derived seeds after every heuristic ran.
+
+    The sequence is the historical one: each step sees the complete prefix the
+    steps before it produced and appends after it.
+    """
+    configs = add_host_sum_seeds(env, configs)
+    configs = add_signed_bitfield_seeds(env, configs)
+    configs = interleave_grouped_rna_seeds(dedupe_configs(configs))
+    serial_rows = CuteResidentReductionHeuristic.serial_row_seed_configs(env, device_ir)
+    if serial_rows:
+        configs.extend(serial_rows)
+        if (
+            CuteResidentReductionHeuristic.name
+            not in env.config_spec.autotuner_heuristics
+        ):
+            env.config_spec.autotuner_heuristics.append(
+                CuteResidentReductionHeuristic.name
+            )
+    configs.extend(
+        CuteResidentReductionHeuristic.pipeline_depth_seed_configs(env, device_ir)
+    )
+    if env.config_spec.cute_resident_reduction_blocks:
+        # Keep every existing witness in order and expose both summation trees
+        # on the same general resident schedules.
+        for seed in tuple(configs):
+            if seed.config.get("cute_reduction_schedule") in ("resident", "pipelined"):
+                values = deepcopy(seed.config)
+                values["cute_reduction_local_tree"] = True
+                configs.append(Config.from_dict(values))
+    # Preserve the complete old prefix. A declared coverage witness below
+    # admits the static-layout policy without displacing coupled schedules
+    # from a bounded initial population.
+    for seed in tuple(configs):
+        if (
+            seed.config.get("cute_collective_mma", False)
+            and seed.config.get("cute_collective_compute", "warp") == "warp"
+        ):
+            values = deepcopy(seed.config)
+            values["cute_collective_static_layouts"] = True
+            configs.append(Config.from_dict(values))
+    carrier = grouped_row_union_cluster4_carrier(env, device_ir)
+    if carrier is not None:
+        configs.append(carrier)
+        # The measured best of the transposed profile on a one-wave
+        # grouped GEMM (2560x512x512 bf16, 8 groups): a 6-stage AB ring
+        # with the epilogue stored in rounds of two subtiles
+        # (``tcgen05_epilogue_rounds``), 3.25 -> 3.03 us per call against
+        # cuBLAS's 2.97 in the catalogue's back-to-back graph.
+        configs.append(
+            Config.from_dict(
+                carrier.config
+                | {
+                    GROUPED_ROW_UNION_AB_STAGES_KEY: 6,
+                    GROUPED_ROW_UNION_ROUND_SUBTILES_KEY: 2,
+                }
+            )
+        )
+        # The same twin without the ``setmaxnreg`` pair: at one CTA per SM
+        # the six warps hold their registers from launch and the pair
+        # only lengthens the TMA-load warp's prologue (the critical path
+        # of the CTAs dispatched after the dependent-launch release;
+        # ``_tcgen05_prologue_runtime``).  Drops the consumer-register
+        # pin the knob forbids.
+        no_reallocation = {
+            key: value
+            for key, value in carrier.config.items()
+            if key != TCGEN05_CONSUMER_REGS_CONFIG_KEY
+        }
+        configs.append(
+            Config.from_dict(
+                no_reallocation
+                | {
+                    GROUPED_ROW_UNION_AB_STAGES_KEY: 6,
+                    GROUPED_ROW_UNION_ROUND_SUBTILES_KEY: 2,
+                    TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY: False,
+                }
+            )
+        )
+    cluster = cluster_carrier(env, device_ir)
+    if cluster is not None:
+        configs.append(cluster)
+        # Append the dependent finalizer after the complete legacy prefix.
+        configs.append(Config.from_dict(cluster.config | {FINALIZER_KEY: 4}))
+    serial_output = CuteResidentReductionHeuristic.serial_output_carrier(env, device_ir)
+    if serial_output is not None:
+        for row_schedule, packed in (
+            ("serial", False),
+            ("serial_deferred", False),
+            ("serial_deferred", True),
+        ):
+            values = deepcopy(serial_output.config) | {
+                "cute_reduction_row_schedule": row_schedule
+            }
+            if packed:
+                values["cute_reduction_pack_output"] = True
+            configs.append(Config.from_dict(values))
+    paired = grouped_row_union_paired_clc_carrier(env, device_ir)
+    if paired is not None:
+        configs.append(paired)
+        configs.append(Config.from_dict(paired.config | {STARTUP_PREFILL_KEY: True}))
+    # Add these last, after every legacy postprocessor and carrier. Existing
+    # seed prefixes and promoted defaults must remain unchanged.
+    full_chunks = CuteFullChunkRowHeuristic.get_seed_configs(env, device_ir)
+    if full_chunks:
+        configs.extend(full_chunks)
+        env.config_spec.autotuner_heuristics.append(CuteFullChunkRowHeuristic.name)
+    cluster_packets = CuteRolledClusterPacketHeuristic.get_seed_configs(env, device_ir)
+    if cluster_packets:
+        configs.extend(cluster_packets)
+        env.config_spec.autotuner_heuristics.append(
+            CuteRolledClusterPacketHeuristic.name
+        )
+    return configs
+
+
+def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> None:
+    """Declare independent coverage after every ordinary field is finalized.
+
+    Sampling and explicit-override policy belong to the generic autotuner.
+    Keep declarations present when automatic heuristics are disabled.
+    """
+    register_cluster_coverage(env, device_ir)
+    register_epilogue_fanout_coverage(env, device_ir)
+    register_aux_fragment_hoist_coverage(env, device_ir)
+    register_epi_warp_groups_coverage(env, device_ir)
+    register_l2_row_swizzle_coverage(env, device_ir)
+    register_materialized_pdl_coverage(env, device_ir)
+    configs = grouped_full_coverage_configs(env, device_ir)
+    deep_configs = grouped_full_coverage_configs(env, device_ir, block_k=128)
+    if not configs:
+        configs, deep_configs = deep_configs, []
+    if configs:
+        witnesses = [
+            CoverageWitness(configs[0], "off"),
+            CoverageWitness(configs[0], "fixed_tma_dense"),
+        ]
+        if deep_configs:
+            # Append one independently validated dense pipeline. Its ordinary
+            # carrier is checked by strict admission without adding a duplicate
+            # control seed or changing any existing initial-population row.
+            witnesses.append(CoverageWitness(deep_configs[0], "fixed_tma_dense"))
+        witnesses.append(
+            CoverageWitness(
+                deep_configs[0] if deep_configs else configs[0],
+                "fixed_tma_dense_local",
+            )
+        )
+        env.config_spec.register_compiler_coverage_group(
+            CompilerCoverageGroup(
+                mechanism="cute.grouped_full_coverage",
+                version=2,
+                key="tcgen05_grouped_full_coverage",
+                domain=("off", "fixed_tma_dense", "fixed_tma_dense_local"),
+                legacy="off",
+                witnesses=tuple(witnesses),
+            )
+        )
+    row_union = grouped_row_union_carrier(env, device_ir)
+    row_union_cluster4 = grouped_row_union_cluster4_carrier(env, device_ir)
+    row_union_paired = grouped_row_union_paired_clc_carrier(env, device_ir)
+    if row_union is not None:
+        env.config_spec.register_compiler_coverage_group(
+            CompilerCoverageGroup(
+                mechanism="cute.grouped_dense_row_union",
+                version=1,
+                key=GROUPED_ROW_UNION_KEY,
+                domain=(False, True),
+                legacy=False,
+                witnesses=(CoverageWitness(row_union, True),),
+            )
+        )
+        if env.config_spec._cute_tcgen05_config.grouped_row_union_multi_resident_supported:
+            carrier = Config.from_dict(
+                deepcopy(row_union.config) | {GROUPED_ROW_UNION_KEY: True}
+            )
+            env.config_spec.register_compiler_coverage_group(
+                CompilerCoverageGroup(
+                    mechanism="cute.grouped_resident_ctas",
+                    version=1,
+                    key=GROUPED_RESIDENT_CTAS_KEY,
+                    domain=(1, 2),
+                    legacy=1,
+                    witnesses=(CoverageWitness(carrier, 2),),
+                    dependencies=(
+                        CoverageDependency(
+                            "cute.grouped_dense_row_union", GROUPED_ROW_UNION_KEY, True
+                        ),
+                    ),
+                )
+            )
+    physical_carriers = [
+        (name, carrier)
+        for name, carrier in (
+            (TRANSPOSED_SCHEDULE, row_union_cluster4),
+            (PAIRED_CLC_SCHEDULE, row_union_paired),
+        )
+        if carrier is not None
+    ]
+    if physical_carriers:
+        witnesses = []
+        for name, carrier in physical_carriers:
+            schedule_carrier = Config.from_dict(dict(carrier.config))
+            schedule_carrier.config.pop(GROUPED_ROW_UNION_SCHEDULE_KEY)
+            witnesses.append(CoverageWitness(schedule_carrier, name))
+        env.config_spec.register_compiler_coverage_group(
+            CompilerCoverageGroup(
+                mechanism="cute.grouped_row_union_schedule",
+                version=1,
+                key=GROUPED_ROW_UNION_SCHEDULE_KEY,
+                domain=(LEGACY_SCHEDULE, *(name for name, _ in physical_carriers)),
+                legacy=LEGACY_SCHEDULE,
+                witnesses=tuple(witnesses),
+                dependencies=(
+                    CoverageDependency(
+                        "cute.grouped_dense_row_union", GROUPED_ROW_UNION_KEY, True
+                    ),
+                ),
+            )
+        )
+    if row_union_paired is not None:
+        env.config_spec.register_compiler_coverage_group(
+            CompilerCoverageGroup(
+                mechanism="cute.ab_startup_prefill",
+                version=1,
+                key=STARTUP_PREFILL_KEY,
+                domain=(False, True),
+                legacy=False,
+                witnesses=(CoverageWitness(row_union_paired, True),),
+                dependencies=(
+                    CoverageDependency(
+                        "cute.grouped_dense_row_union", GROUPED_ROW_UNION_KEY, True
+                    ),
+                    CoverageDependency(
+                        "cute.grouped_row_union_schedule",
+                        GROUPED_ROW_UNION_SCHEDULE_KEY,
+                        PAIRED_CLC_SCHEDULE,
+                    ),
+                ),
+            )
+        )
+    register_matmul_min_blocks_coverage(env, device_ir)
+    serial_output = CuteResidentReductionHeuristic.serial_output_carrier(env, device_ir)
+    if serial_output is not None:
+        env.config_spec.register_compiler_coverage_group(
+            CompilerCoverageGroup(
+                mechanism="cute.resident_row_consumption",
+                version=1,
+                key="cute_reduction_row_schedule",
+                domain=("batched", "serial", "serial_deferred"),
+                legacy="batched",
+                witnesses=tuple(
+                    CoverageWitness(serial_output, mode)
+                    for mode in ("serial", "serial_deferred")
+                ),
+            )
+        )
+        deferred = Config.from_dict(
+            deepcopy(serial_output.config)
+            | {"cute_reduction_row_schedule": "serial_deferred"}
+        )
+        env.config_spec.register_compiler_coverage_group(
+            CompilerCoverageGroup(
+                mechanism="cute.resident_terminal_product",
+                version=1,
+                key="cute_reduction_pack_output",
+                domain=(False, True),
+                legacy=False,
+                witnesses=(CoverageWitness(deferred, True),),
+                dependencies=(
+                    CoverageDependency(
+                        "cute.resident_row_consumption",
+                        "cute_reduction_row_schedule",
+                        "serial_deferred",
+                    ),
+                ),
+            )
+        )
+    register_row_resident_coverage(env, device_ir)
+    register_packed_operand_coverage(env, device_ir)
+    carriers = env.config_spec.compiler_seed_configs
+    if not carriers:
+        # Declarations remain available when automatic seed use is disabled.
+        # Reuse the same typed layout proof without promoting a default/seed.
+        carriers = CuteCollectiveMatmulHeuristic.get_seed_configs(env, device_ir)
+    for seed in carriers:
+        if (
+            seed.config.get("cute_collective_mma", False)
+            and seed.config.get("cute_collective_compute", "warp") == "warp"
+            and not seed.config.get("cute_collective_static_layouts", False)
+        ):
+            env.config_spec.register_compiler_coverage_group(
+                CompilerCoverageGroup(
+                    mechanism="cute.collective_static_layouts",
+                    version=1,
+                    key="cute_collective_static_layouts",
+                    domain=(False, True),
+                    legacy=False,
+                    witnesses=(CoverageWitness(seed, True),),
+                )
+            )
+            break
+    resource_carrier = fragment_resource_carrier(env, device_ir)
+    register_fragment_scan_coverage(env, device_ir, resource_carrier=resource_carrier)
+    register_fragment_reduction_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fp32_dot_coverage(env, device_ir, supplemental_carrier=resource_carrier)
+    # The tile-staging knobs lead the deferred tier: their witnesses precede
+    # every other fragment group's rows, so the populations the older groups'
+    # prefix contracts compare keep their relative order.
+    register_fragment_padded_rows_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_unrolled_loops_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_vector_io_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_batched_loads_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_split_k_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_mma_rows_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_slab_loads_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_threads_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_register_loads_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_warp_results_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_private_scalar_loops_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_producer_cache_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_warp_scan_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_atomic_aggregation_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_topk_coarse_keys_coverage(env)
+    register_topk_key_recovery_coverage(env)
+    register_fragment_topk_network_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_cta_topk_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_local_atomic_registers_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    if not env.config_spec.cute_fragment_register_snapshot_while_root_ids:
+        register_fragment_register_snapshots_coverage(
+            env, device_ir, resource_carrier=resource_carrier
+        )
+    register_fragment_published_scalars_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_skip_zero_atomics_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_atomic_consumer_fusion_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_integer_loop_reduction_coverage(env, device_ir)
+    register_fragment_integer_atomic_epochs_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_packet_loads_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_register_producers_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_bounded_gather_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    if env.config_spec.cute_fragment_register_snapshot_while_root_ids:
+        # This new capture case depends on the existing uniform-while owner.
+        # Preserve the registration order of all pre-existing snapshot roots.
+        register_fragment_register_snapshots_coverage(
+            env, device_ir, resource_carrier=resource_carrier
+        )
+    register_gather_warp_scan_coverage(env, device_ir)
+    register_fragment_atomic_consumer_fusion_coverage(
+        env, device_ir, resource_carrier=resource_carrier, extended_only=True
+    )
+    register_fragment_pure_producer_regions_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_scan_exports_coverage(env, device_ir)
+    register_fragment_warp_producer_regions_coverage(env, device_ir)
+    register_radix_selection_coverage(env, device_ir)
+
+    register_mxfp8_epilogue_coverage(env)

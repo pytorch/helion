@@ -15,6 +15,10 @@ from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from helion._compiler.cute.pipeline_smem import analyze_pipeline_smem_facts
 from helion._compiler.cute.pipeline_smem import max_pipeline_ab_stages
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
+from helion._compiler.cute.tcgen05_config import facts
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import smem
+from helion._compiler.cute.tcgen05_config import surface
 from helion._compiler.cute.tcgen05_constants import Tcgen05RowvecAuxRow
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
@@ -120,10 +124,10 @@ def test_fp8_ab13_is_native_and_survives_search(placement: str) -> None:
         assert canonical.block_sizes == [128, 128, 128]
         assert canonical.config["tcgen05_cta_group"] == "two"
         assert canonical.config["tcgen05_ab_stages"] == 13
-        seeds = state._paired_pipeline_seed_configs()
+        seed_configs = seeds._paired_pipeline_seed_configs(state)
         matches = [
             seed
-            for seed in seeds
+            for seed in seed_configs
             if seed.block_sizes == [128, 128, 128]
             and seed.config["tcgen05_ab_stages"] == 13
         ]
@@ -202,15 +206,14 @@ def test_unproved_inputs_cannot_bypass_old_budget(kind: str) -> None:
         args = args[:2]
     bound = kernel._bind_isolated(tuple(args))
     state = bound.config_spec._cute_tcgen05_config
-    assert not state.paired_pipeline_search_enabled()
+    assert not surface.paired_pipeline_search_enabled(state)
     with pytest.raises(helion.exc.InvalidConfig):
         bound.to_code(_config())
 
 
 def test_stage_repair_keeps_c_ring_and_generic_fp8_limit() -> None:
     bound = vector_scaled_mm._bind_isolated(_args())
-    state = bound.config_spec._cute_tcgen05_config
-    assert state._get_dtype_ab_stages_hard_cap(1) == 12
+    assert smem._get_dtype_ab_stages_hard_cap(1) == 12
     with bound.env:
         generation = ConfigGeneration(bound.config_spec)
         _flat, canonical = generation.canonicalize_flat(
@@ -224,12 +227,12 @@ def test_stage_repair_keeps_c_ring_and_generic_fp8_limit() -> None:
 def test_memory_facts_do_not_restore_unrelated_pid_restriction() -> None:
     bound = vector_scaled_mm._bind_isolated(_args())
     state = bound.config_spec._cute_tcgen05_config
-    facts = state.pipeline_smem_facts
-    assert facts is not None
+    pipeline_facts = state.pipeline_smem_facts
+    assert pipeline_facts is not None
     bound.config_spec.disallow_pid_type("persistent_blocked", reason="unrelated proof")
-    state.register_pipeline_smem_facts(facts)
+    facts.register_pipeline_smem_facts(state, pipeline_facts)
     assert "persistent_blocked" not in state.allowed_pid_types
-    assert not state.paired_pipeline_search_enabled()
+    assert not surface.paired_pipeline_search_enabled(state)
 
 
 @pytest.mark.parametrize(
@@ -240,8 +243,8 @@ def test_new_budget_rejects_output_edges_and_partial_first_k_tile(
 ) -> None:
     bound = vector_scaled_mm._bind_isolated(scaled_args(*shape))
     assert (
-        bound.config_spec._cute_tcgen05_config._paired_pipeline_parameters(
-            _config().config
+        seeds._paired_pipeline_parameters(
+            bound.config_spec._cute_tcgen05_config, _config().config
         )
         is None
     )
@@ -265,7 +268,7 @@ def test_fp8_paired_k_tail_budget_and_search(rhs_k_major: bool) -> None:
     )
     state = bound.config_spec._cute_tcgen05_config
     if not rhs_k_major:
-        assert state._paired_pipeline_parameters(_config().config) is None
+        assert seeds._paired_pipeline_parameters(state, _config().config) is None
         with pytest.raises(helion.exc.InvalidConfig):
             bound.to_code(_config())
         return
@@ -278,7 +281,7 @@ def test_fp8_paired_k_tail_budget_and_search(rhs_k_major: bool) -> None:
         assert any(
             seed.block_sizes == [128, 128, 128]
             and seed.config["tcgen05_ab_stages"] == 13
-            for seed in state._paired_pipeline_seed_configs()
+            for seed in seeds._paired_pipeline_seed_configs(state)
         )
     source = bound.to_code(canonical)
     assert "make_tma_umma_pipeline(" in source

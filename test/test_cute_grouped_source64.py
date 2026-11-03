@@ -10,21 +10,22 @@ import pytest
 import torch
 
 from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_grouped_coverage_search import _search
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.cute import target_facts
+from helion._compiler.cute.autotune.heuristics.cute import (
     CuteTcgen05GroupedSource64Heuristic,
 )
-from helion._compiler.autotuner_heuristics.cute import grouped_full_coverage_configs
+from helion._compiler.cute.autotune.heuristics.cute import grouped_full_coverage_configs
 from helion._compiler.cute.grouped_full_coverage import full_coverage_pipeline_supported
 from helion._compiler.cute.grouped_full_coverage import full_coverage_smem_upper_bound
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_constants import (
     resolve_tcgen05_grouped_worklist_mma_shape,
 )
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.exc import BackendUnsupported
@@ -57,11 +58,7 @@ FLAGS = {
 def _cpu_only() -> Generator[None, None, None]:
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        _target(),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
     torch.set_num_threads(previous)
 
@@ -179,10 +176,8 @@ def test_only_complete_typed_source64_pipeline_and_fixed_c_ring() -> None:
         {"tcgen05_l2_swizzle_size": 2},
         {"tcgen05_grouped_runtime_direct": True},
         {"tcgen05_grouped_external_direct_pointers": True},
-        {"tcgen05_ab_producer_advance_mode": "skip"},
     ),
 )
-@skipUnlessBackends(["cute"])
 def test_incomplete_or_other_source64_schedule_rejected(
     family: tuple[BoundKernel, tuple[torch.Tensor, ...]], updates: dict[str, object]
 ) -> None:
@@ -193,7 +188,6 @@ def test_incomplete_or_other_source64_schedule_rejected(
         bound.to_code(config)
 
 
-@skipUnlessBackends(["cute"])
 def test_shared_memory_limit_is_used_at_seed_and_final_codegen(
     family: tuple[BoundKernel, tuple[torch.Tensor, ...]],
 ) -> None:
@@ -202,7 +196,7 @@ def test_shared_memory_limit_is_used_at_seed_and_final_codegen(
     upper = full_coverage_smem_upper_bound(4, 128, 4, source_m_tile=64)
     assert bound.host_function is not None
     with patch.object(
-        CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=upper - 1
+        target_facts, "per_cta_smem_capacity_bytes", return_value=upper - 1
     ):
         assert (
             CuteTcgen05GroupedSource64Heuristic.get_seed_config(
@@ -212,9 +206,7 @@ def test_shared_memory_limit_is_used_at_seed_and_final_codegen(
         )
         with pytest.raises(BackendUnsupported):
             bound.to_code(config)
-    with patch.object(
-        CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=upper
-    ):
+    with patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=upper):
         assert _wide(bound) == config
         assert "tcgen05_grouped_full_coverage" in bound.to_code(config)
 
@@ -227,7 +219,6 @@ def test_shared_memory_limit_is_used_at_seed_and_final_codegen(
         (torch.bfloat16, torch.int32, 192),
     ),
 )
-@skipUnlessBackends(["cute"])
 def test_unsupported_semantics_do_not_create_source64_seed(
     dtype: torch.dtype, index_dtype: torch.dtype, k: int
 ) -> None:
@@ -245,7 +236,6 @@ def test_unsupported_semantics_do_not_create_source64_seed(
 
 
 @pytest.mark.parametrize("strategy", (None, "from_best_available"))
-@skipUnlessBackends(["cute"])
 def test_source64_reaches_original_full_search_first_benchmark(
     strategy: str | None,
 ) -> None:
@@ -307,7 +297,6 @@ def test_source64_reaches_original_full_search_first_benchmark(
 
 
 @pytest.mark.parametrize("disabled", (False, True))
-@skipUnlessBackends(["cute"])
 def test_off_or_disabled_search_does_not_deliver_source64(disabled: bool) -> None:
     settings = (
         {"disable_autotuner_heuristics": True}
@@ -335,7 +324,6 @@ def test_off_or_disabled_search_does_not_deliver_source64(disabled: bool) -> Non
     assert "tcgen05_grouped_full_coverage" in bound.to_code(config)
 
 
-@skipUnlessBackends(["cute"])
 def test_source64_keeps_stricter_dense_m_divisibility() -> None:
     bound, args = _bound(m=672, k=384)
     assert bound.host_function is not None

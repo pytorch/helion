@@ -338,7 +338,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
     ),
     "quick": AutotuneEffortProfile(
         # CuTe flash surfaces raise this population to one parent row per
-        # structural leaf (``ConfigGeneration.flash_population_floor``), so a
+        # structural leaf (``ConfigGenerationExtension.population_floor``), so a
         # surface wider than this budget still measures every pipeline
         # family without charging other kernels for it.
         pattern_search=PatternSearchConfig(

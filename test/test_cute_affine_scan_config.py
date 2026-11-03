@@ -6,11 +6,12 @@ import pytest
 
 import helion
 from helion import exc
-from helion._compiler.backend import CuteBackend
-from helion._compiler.backend import TritonBackend
+from helion._compiler.cute.autotune.config_keys import CUTE_AFFINE_SCAN_SCHEDULE_KEY
+from helion._compiler.cute.autotune.search_surface import enable_cute_affine_scan_search
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.direct_affine_plan import DIRECT_AFFINE_SCHEDULES
+from helion._compiler.triton.backend import TritonBackend
 from helion.autotuner.config_generation import ConfigGeneration
-from helion.autotuner.config_spec import CUTE_AFFINE_SCAN_SCHEDULE_KEY
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.search_space_logger import canonical_config_id
 
@@ -19,7 +20,7 @@ pytestmark = pytest.mark.cpu_only
 
 def _enabled_spec(*, step_count: int | None = 4) -> ConfigSpec:
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 0))
-    spec.enable_cute_affine_scan_search(step_count=step_count)
+    enable_cute_affine_scan_search(spec, step_count=step_count)
     return spec
 
 

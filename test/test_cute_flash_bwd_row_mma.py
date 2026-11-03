@@ -25,7 +25,6 @@ import helion
 from helion._compiler.cute.pdl_release import ZERO_FILL_KERNEL_PREFIX
 from helion._testing import DEVICE
 from helion._testing import code_and_output
-from helion._testing import onlyBackends
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 
@@ -222,7 +221,6 @@ def test_row_search_grid_bound() -> None:
 # --------------------------------------------------------------------------
 
 
-@onlyBackends(["cute"])
 def test_row_surface_is_searched_and_seeded_on_small_grids() -> None:
     bound = _kernel().bind(_args((1, 2, 256, 64)))
     spec = bound.config_spec
@@ -266,7 +264,6 @@ def test_row_surface_is_searched_and_seeded_on_small_grids() -> None:
     assert (off.config[KV], off.config[SPLIT], off.config[CHUNK]) == (16, 4, 64)
 
 
-@onlyBackends(["cute"])
 def test_row_surface_stays_explicit_on_large_grids() -> None:
     # 128 KV tiles of the tcgen05 family: the knobs exist for explicit configs
     # but the search and the seeds stay on the tcgen05 family.
@@ -290,7 +287,6 @@ def test_row_surface_stays_explicit_on_large_grids() -> None:
 # --------------------------------------------------------------------------
 
 
-@onlyBackends(["cute"])
 def test_row_renders_the_default_program() -> None:
     bound = _kernel().bind(_args((1, 4, 256, 64)))
     code = _code(bound, **_ROW)
@@ -338,7 +334,6 @@ def test_row_renders_the_default_program() -> None:
     assert "tma" not in body.lower()
 
 
-@onlyBackends(["cute"])
 def test_row_renders_the_double_buffered_chunk_loop() -> None:
     bound = _kernel().bind(_args((1, 2, 512, 64)))
     code = _code(bound, **_knobs(16, 2, 32))
@@ -356,7 +351,6 @@ def test_row_renders_the_double_buffered_chunk_loop() -> None:
     assert "rb_slot = rb_dq_w + (rb_ci * 2 + 1) % 2 * 4096" in code
 
 
-@onlyBackends(["cute"])
 def test_row_renders_the_single_stage_loop_and_direct_stores() -> None:
     # The 128-wide head with four Q ranges: two 32-row chunks through one
     # stage (two do not fit the budget), refilled after each chunk's reads.
@@ -378,7 +372,6 @@ def test_row_renders_the_single_stage_loop_and_direct_stores() -> None:
     )
 
 
-@onlyBackends(["cute"])
 def test_tcgen05_render_ignores_the_row_knobs() -> None:
     bound = _kernel().bind(_args((1, 2, 256, 64)))
     plain = _code(bound, block_sizes=[128, 128])
@@ -395,7 +388,6 @@ def test_tcgen05_render_ignores_the_row_knobs() -> None:
 # --------------------------------------------------------------------------
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     ("shape", "dtype", "q_seq", "knobs"),
     (
@@ -426,7 +418,6 @@ def test_row_matches_reference(
         )
 
 
-@onlyBackends(["cute"])
 def test_row_dk_dv_are_deterministic() -> None:
     args, expected = _inputs((1, 4, 256, 64))
     kernel = _kernel()
@@ -457,7 +448,7 @@ def cpu_only() -> Iterator[None]:
         _target(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
@@ -627,7 +618,6 @@ def test_the_row_launch_counts_its_own_ctas(cpu_only: None) -> None:
     _assert_fill_launch(on, off)
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("config", [config for config, _ in _FAMILY_CONFIGS])
 def test_dependent_launch_matches_reference(config: dict[str, object]) -> None:
     args, expected = _inputs((1, 4, 256, 64))

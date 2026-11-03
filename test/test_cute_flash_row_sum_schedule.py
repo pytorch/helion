@@ -17,8 +17,8 @@ from .test_cute_flash_stateful_choice import _resolve
 from .test_cute_flash_stateful_choice import _spec
 import helion
 from helion._compiler.cute import cute_flash as flash
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
+from helion._testing import cpu_render_target
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with mock_cuda_unavailable(), forbid_native_compile():
+    with cpu_render_target():
         yield
 
 
@@ -215,7 +215,7 @@ def test_both_schedules_normalize_idempotently_and_are_searchable(
         generation.flatten(helion.Config(cute_flash_pipeline_family="fa4"))
     )
     assert parent.config[flash.FLASH_ROW_SUM_SCHEDULE_KEY] == "post_acquire"
-    owned = generation.flash_owned_coordinate_indices(parent)
+    owned = generation.extension.flash_owned_coordinate_indices(parent)
     projections = generation.coordinate_neighbor_projections(base, frozen_indices=owned)
     choices = [p for p in projections if p.key == flash.FLASH_ROW_SUM_SCHEDULE_KEY]
     assert len(choices) == 1 and choices[0].outcome == "candidate"
@@ -270,7 +270,7 @@ def test_general_stateful_seed_pairs_preserve_post_alternative(
 
 def test_pre_acquire_seed_and_search_choice_require_actual_detector_proof() -> None:
     spec = _spec(64, 32, torch.float16, proof=False)
-    fragment = spec._cute_flash_autotune_fragments()[flash.FLASH_ROW_SUM_SCHEDULE_KEY]
+    fragment = _cute_flash_autotune_fragments(spec)[flash.FLASH_ROW_SUM_SCHEDULE_KEY]
     assert isinstance(fragment, EnumFragment)
     assert fragment._active_choices() == ("post_acquire",)
     assert all(
@@ -297,7 +297,7 @@ def test_fixed_parent_domains_do_not_advertise_inactive_pre_acquire(
     assert isinstance(fragment, EnumFragment)
     assert fragment._active_choices() == ("post_acquire",)
     assert (flash.FLASH_ROW_SUM_SCHEDULE_KEY, "pre_acquire") not in (
-        generation.flash_structural_coverage_active_values()
+        generation.extension.flash_structural_coverage_active_values()
     )
 
 
@@ -341,7 +341,7 @@ def test_pre_acquire_parent_can_switch_to_ordinary_lowerings() -> None:
         )
     )
     projections = generation.coordinate_neighbor_projections(
-        base, frozen_indices=generation.flash_owned_coordinate_indices(parent)
+        base, frozen_indices=generation.extension.flash_owned_coordinate_indices(parent)
     )
     switches = [
         p.config for p in projections if p.key == flash.FLASH_SOFTMAX_LOWERING_KEY

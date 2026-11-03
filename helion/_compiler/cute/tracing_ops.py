@@ -28,6 +28,7 @@ from ..dtype_utils import cast_ast
 from ..host_function import HostFunction
 from ..variable_origin import BlockSizeOrigin
 from .block_uniform import block_uniform
+from .synthetic_axes import branch_scope
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
@@ -119,7 +120,7 @@ def _(state: CodegenState) -> list[object]:
     if_body_stmts: list[ast.AST] = []
     with (
         state.codegen.set_statements(if_body_stmts),
-        state.codegen.cute_branch_scope(if_node_id, 0, divergent=not uniform),
+        branch_scope(state.codegen, if_node_id, 0, divergent=not uniform),
     ):
         if_outputs = codegen_call_with_graph(
             state.codegen, graph_info.graph, [*if_args]
@@ -129,7 +130,7 @@ def _(state: CodegenState) -> list[object]:
     else_body_stmts: list[ast.AST] = []
     with (
         state.codegen.set_statements(else_body_stmts),
-        state.codegen.cute_branch_scope(if_node_id, 1, divergent=not uniform),
+        branch_scope(state.codegen, if_node_id, 1, divergent=not uniform),
     ):
         else_outputs = codegen_call_with_graph(
             state.codegen, else_graph.graph, [*else_args]

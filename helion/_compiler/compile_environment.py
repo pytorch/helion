@@ -39,8 +39,9 @@ from .._compat import shape_env_size_hint
 from .._compat import target_device_capability
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
+from .attribute_alias import AttributeAlias
 from .backend import BackendState
-from .backend_registry import get_backend_class
+from .backend_registry import get_backend
 from .fake_tensor import create_fake_tensor_mode
 from .source_location import SourceLocation
 from .source_location import current_location
@@ -433,6 +434,35 @@ class CompileEnvironment:
     No config or codegen specific state should be stored here.
     """
 
+    # The CuTe backend's per-compile facts live on ``backend_state``
+    # (``cute/state.py``: ``CuteEnvState``); these names stay for one release
+    # for the readers outside the backend (``runtime_hooks`` sets the fission
+    # plan, tests assert on it).
+    cute_resolved_wrapper_plans: AttributeAlias[list[dict[str, object]]] = (
+        AttributeAlias("backend_state.resolved_wrapper_plans")
+    )
+    cute_hint_sized_reduction_extents: AttributeAlias[set[sympy.Expr]] = AttributeAlias(
+        "backend_state.hint_sized_reduction_extents"
+    )
+    cute_fission_plan: AttributeAlias[MaterializedFissionPlan | None] = AttributeAlias(
+        "backend_state.fission_plan"
+    )
+    cute_half_atomic_output_promotions: AttributeAlias[dict[str, torch.dtype]] = (
+        AttributeAlias("backend_state.half_atomic_output_promotions")
+    )
+    cute_scaled_contraction_count: AttributeAlias[int] = AttributeAlias(
+        "backend_state.scaled_contraction_count"
+    )
+    cute_dot_scaled_scales_exposed: AttributeAlias[bool] = AttributeAlias(
+        "backend_state.dot_scaled_scales_exposed"
+    )
+    cute_proven_tma_inputs: AttributeAlias[set[torch.Tensor]] = AttributeAlias(
+        "backend_state.proven_tma_inputs"
+    )
+    cute_register_tile_disabled: AttributeAlias[bool] = AttributeAlias(
+        "backend_state.register_tile_disabled"
+    )
+
     def __init__(
         self,
         device: torch.device,
@@ -447,19 +477,23 @@ class CompileEnvironment:
         # pyrefly: ignore [read-only]
         self.device = device
         self.settings = settings
-        if settings.cute_rng_stream not in ("auto", "word0", "philox4"):
-            raise ValueError("cute_rng_stream must be auto, word0 or philox4")
-        if settings.cute_rng_stream != "word0" and settings.backend != "cute":
-            raise ValueError(
-                f"cute_rng_stream={settings.cute_rng_stream} requires the CuTe backend"
-            )
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
         self._is_distributed = is_distributed
         self.process_group_name = None
-        self._backend = get_backend_class(settings.backend)()
+        self._backend = get_backend(settings.backend)
         self._backend.validate_environment()
+        rng_streams = self._backend.rng_streams()
+        if settings.cute_rng_stream not in rng_streams:
+            raise ValueError(
+                f"cute_rng_stream={settings.cute_rng_stream!r} is not supported by "
+                f"the {settings.backend} backend; expected one of "
+                f"{', '.join(rng_streams)}"
+            )
+        # The backend's per-compile state (``Backend.new_env_state``); read
+        # through the backend's typed accessor, never by name from core.
+        self.backend_state: object | None = self._backend.new_env_state()
         if (
             settings.debug_dtype_asserts
             and not self._backend.supports_debug_dtype_asserts
@@ -503,22 +537,6 @@ class CompileEnvironment:
             f"helion_runtime_arg_values_{id(self)}",
             default=None,
         )
-        self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
-        # Dynamic reduction extents whose CuTe persistent thread layout was
-        # sized from the size hint; the bound kernel keys their power-of-2
-        # bucket once code generation has used one.
-        self.cute_hint_sized_reduction_extents: set[sympy.Expr] = set()
-        self.cute_fission_plan: MaterializedFissionPlan | None = None
-        self.cute_half_atomic_output_promotions: dict[str, torch.dtype] = {}
-        # Internal stage compilers may inherit a proved TensorMap-aligned view
-        # of an owning kernel input. Only the stage builder populates this set;
-        # ordinary input tensors still require their runtime cache-key proof.
-        self.cute_proven_tma_inputs: set[torch.Tensor] = set()
-        # Set by ``generate_ast`` while it regenerates a kernel whose
-        # register-tile lane nesting the split-time lowering rejected
-        # (``cute/register_tile_admission.py``); the persistent reduction
-        # strategy then keeps its rolled lane nesting.
-        self.cute_register_tile_disabled: bool = False
         # Host integer helpers such as cdiv/next_power_of_2 deliberately return
         # unbacked SymInts during tracing. Preserve the config expression beside
         # that symbol so a fixed block size derived from a user tunable can still
@@ -2346,7 +2364,7 @@ class CompileEnvironment:
             source = info.block_size_source
             if isinstance(source, FixedBlockSizeSource):
                 value = source.value
-            elif self.backend_name == "cute" and isinstance(
+            elif self.backend.canonicalizes_reduction_loop_blocks() and isinstance(
                 source, ReductionLoopBlockSizeSource
             ):
                 value = info.size

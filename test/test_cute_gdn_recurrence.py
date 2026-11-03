@@ -26,6 +26,14 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 import helion
 from helion import exc
+from helion._compiler.cute.autotune.config_keys import (
+    CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
+)
+from helion._compiler.cute.autotune.config_keys import CUTE_GDN_RECURRENCE_MMA_M_KEY
+from helion._compiler.cute.autotune.config_keys import CUTE_GDN_RECURRENCE_STAGES_KEY
+from helion._compiler.cute.autotune.config_keys import (
+    CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
+)
 from helion._compiler.cute.gdn_recurrence_geometry import GDN_ADMITTED_BLOCK_V
 from helion._compiler.cute.gdn_recurrence_geometry import GDN_MMA_M
 from helion._compiler.cute.gdn_recurrence_geometry import gdn_acc_load_cols
@@ -51,14 +59,7 @@ from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import code_and_output
 from helion._testing import import_path
-from helion._testing import skipUnlessBackends
-from helion.autotuner.config_spec import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
-from helion.autotuner.config_spec import CUTE_GDN_RECURRENCE_MMA_M_KEY
-from helion.autotuner.config_spec import CUTE_GDN_RECURRENCE_STAGES_KEY
-from helion.autotuner.config_spec import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 import helion.language as hl
-
-pytestmark = skipUnlessBackends(["cute"])
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -274,7 +275,7 @@ def _code(
             kernel=kernel,
             inputs=inputs,
         )
-        return bound.to_triton_code(  # type: ignore[attr-defined]
+        return bound.to_code(  # type: ignore[attr-defined]
             _config(bound, block_v, **(overrides or {}))
         )
 
@@ -982,7 +983,7 @@ def test_gdn_recurrence_small_dstate_seeds_its_own_tile() -> None:
     # The preference is a seed-order heuristic only: a config that omits the
     # knob still gets the search domain's default.
     with _sm100_environment():
-        code = bound.to_triton_code(helion.Config(block_sizes=[32]))  # type: ignore[attr-defined]
+        code = bound.to_code(helion.Config(block_sizes=[32]))  # type: ignore[attr-defined]
     assert "'epilogue_warps': 8" in code
     assert "'token_groups': 2" in code
     assert "'mma_m': 128" in code
@@ -1067,7 +1068,7 @@ def test_gdn_recurrence_every_searched_tile_compiles(
                 groups = 4 if 4 in legal_groups else legal_groups[0]
                 assert repaired.config[CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY] == groups
                 with _sm100_environment():
-                    code = bound.to_triton_code(repaired)  # type: ignore[attr-defined]
+                    code = bound.to_code(repaired)  # type: ignore[attr-defined]
                 assert _PLAN_KIND in code
                 assert f"'token_groups': {groups}" in code
                 assert f"'mma_m': {mma_m}" in code
@@ -1090,7 +1091,7 @@ def test_gdn_recurrence_every_searched_tile_compiles(
         == expected_stage_choices[(128, 128)][0]
     )
     with _sm100_environment():
-        assert _PLAN_KIND in bound.to_triton_code(partial)  # type: ignore[attr-defined]
+        assert _PLAN_KIND in bound.to_code(partial)  # type: ignore[attr-defined]
 
 
 def test_gdn_recurrence_declines_tiles_outside_the_schedule() -> None:
@@ -1122,7 +1123,7 @@ def test_gdn_recurrence_declines_tiles_outside_the_schedule() -> None:
             _sm100_environment(),
             patch.dict(os.environ, HELION_CUTE_MMA_IMPL="universal"),
         ):
-            code = bound.to_triton_code(config)  # type: ignore[attr-defined]
+            code = bound.to_code(config)  # type: ignore[attr-defined]
         assert _PLAN_KIND not in code
         assert _SIMT_FALLBACK in code
     with patch.dict(os.environ, HELION_CUTE_MMA_IMPL="universal"):
@@ -1432,7 +1433,7 @@ def test_gdn_recurrence_schedule_sources_fingerprint_the_disk_cache() -> None:
 
     from helion.runtime.cute import source_dependencies
 
-    dependencies = source_dependencies._WRAPPER_DEPENDENCIES["gdn_recurrence_sm100"]
+    dependencies = source_dependencies.wrapper_dependencies()["gdn_recurrence_sm100"]
     imported = _helion_imports("_compiler/cute/gdn_recurrence_sm100.py")
     assert imported >= {
         "_compiler/cute/gdn_recurrence_sm100.py",
@@ -1496,11 +1497,13 @@ def test_gdn_recurrence_wrapper_calls_external_host_schedule() -> None:
 def test_gdn_recurrence_wrapper_rejects_invalid_abi(
     overrides: dict[str, object],
 ) -> None:
-    from helion.runtime.cute.launcher import _validate_gdn_recurrence_plan
+    from helion.runtime.cute.host_wrappers.recurrences import (
+        validate_gdn_recurrence_plan,
+    )
 
-    _validate_gdn_recurrence_plan(_wrapper_plan())
+    validate_gdn_recurrence_plan(_wrapper_plan())
     # The 64-row MMA on the 64-row tile: no store warps, no update image.
-    _validate_gdn_recurrence_plan(
+    validate_gdn_recurrence_plan(
         _wrapper_plan(
             block_v=64,
             mma_m=64,
@@ -1509,7 +1512,7 @@ def test_gdn_recurrence_wrapper_rejects_invalid_abi(
         )
     )
     with pytest.raises(exc.BackendUnsupported, match="gdn recurrence"):
-        _validate_gdn_recurrence_plan(_wrapper_plan(**overrides))
+        validate_gdn_recurrence_plan(_wrapper_plan(**overrides))
 
 
 def _fake_pointer_patches(
@@ -1536,7 +1539,9 @@ def _fake_pointer_patches(
 
 
 def test_gdn_recurrence_runtime_args_must_match_the_compiled_geometry() -> None:
-    from helion.runtime.cute.launcher import _validate_gdn_recurrence_launch_args
+    from helion.runtime.cute.host_wrappers.recurrences import (
+        validate_gdn_recurrence_launch_args,
+    )
 
     plan = _wrapper_plan()
     with FakeTensorMode():
@@ -1558,17 +1563,17 @@ def test_gdn_recurrence_runtime_args_must_match_the_compiled_geometry() -> None:
     tensors = (k, w, u, g, h, wrong_seqlen, fp16, shared, misaligned)
     storage_patch, tensor_patch = _fake_pointer_patches(tensors)
     with storage_patch, tensor_patch:
-        _validate_gdn_recurrence_launch_args(plan, (k, w, u, g, h, 128))
+        validate_gdn_recurrence_launch_args(plan, (k, w, u, g, h, 128))
         with pytest.raises(exc.BackendUnsupported, match="k_idx"):
-            _validate_gdn_recurrence_launch_args(plan, (wrong_seqlen, w, u, g, h, 128))
+            validate_gdn_recurrence_launch_args(plan, (wrong_seqlen, w, u, g, h, 128))
         with pytest.raises(exc.BackendUnsupported, match="w_idx"):
-            _validate_gdn_recurrence_launch_args(plan, (k, fp16, u, g, h, 128))
+            validate_gdn_recurrence_launch_args(plan, (k, fp16, u, g, h, 128))
         with pytest.raises(exc.BackendUnsupported, match="u_idx"):
-            _validate_gdn_recurrence_launch_args(
+            validate_gdn_recurrence_launch_args(
                 plan, (k, w, u.transpose(1, 2), g, h, 128)
             )
         with pytest.raises(exc.BackendUnsupported, match="must not alias"):
-            _validate_gdn_recurrence_launch_args(
+            validate_gdn_recurrence_launch_args(
                 plan,
                 (
                     k,
@@ -1580,7 +1585,7 @@ def test_gdn_recurrence_runtime_args_must_match_the_compiled_geometry() -> None:
                 ),
             )
         with pytest.raises(exc.BackendUnsupported, match="misaligned"):
-            _validate_gdn_recurrence_launch_args(
+            validate_gdn_recurrence_launch_args(
                 plan,
                 (misaligned[1 : 1 + k.numel()].view(2, 1024, 8, 64), w, u, g, h, 128),
             )
@@ -2423,7 +2428,9 @@ def test_mma_dag_declines_a_non_affine_min_over_the_chunk_index() -> None:
 
 
 def test_mma_dag_seeds_size_only_the_dstate_tile() -> None:
-    from helion._compiler.autotuner_heuristics.cute_mma_dag import CuteMmaDagHeuristic
+    from helion._compiler.cute.autotune.heuristics.cute_mma_dag import (
+        CuteMmaDagHeuristic,
+    )
 
     with _sm100_environment():
         bound = cast("Any", _bind(chunk=64, shape=_SMALL_SHAPE))

@@ -7,8 +7,8 @@ import ast
 import pytest
 
 from helion._compiler.ast_extension import iter_statements
+from helion._compiler.cute.lane_loops.markers import has_lane_reduce_markers
 from helion._compiler.cute.thread_budget import referenced_thread_axes
-from helion._compiler.tile_strategy import has_lane_reduce_markers
 
 pytestmark = pytest.mark.cpu_only
 

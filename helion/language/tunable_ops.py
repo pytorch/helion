@@ -20,7 +20,7 @@ from .._compiler.type_info import _to_proxy
 from ..autotuner.config_fragment import BaseIntegerFragment
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_fragment import assert_integer_power_of_two
-from ..autotuner.config_spec import VALID_KEYS
+from ..autotuner.config_spec import valid_keys
 from ..exc import NotInsideKernel
 from . import _decorators
 from .loops import _normalize_begin_end
@@ -155,6 +155,13 @@ def register_tunable(name: str, fragment: ConfigSpecFragment) -> int:
     raise NotInsideKernel
 
 
+def _tunable_name_conflicts(name: str) -> bool:
+    """Whether ``name`` (or its plural) is a config key some registered backend
+    owns; read live, so a backend registered after import counts."""
+    keys = valid_keys()
+    return name in keys or f"{name}s" in keys
+
+
 @_decorators.type_propagation(register_tunable)
 def _register_tunable_type(
     name: TypeInfo, fragment: TypeInfo, *, origin: Origin
@@ -174,7 +181,7 @@ def _register_tunable_type(
     if not (isinstance(name_val, str) and isinstance(fragment_val, ConfigSpecFragment)):
         raise exc.RegisterTunableArgTypes(name, fragment)
 
-    if name_val in VALID_KEYS or f"{name_val}s" in VALID_KEYS:
+    if _tunable_name_conflicts(name_val):
         raise exc.TunableNameConflict(name_val)
     if (
         name_val in env.config_spec.user_defined_tunables

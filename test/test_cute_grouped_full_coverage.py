@@ -8,13 +8,12 @@ import random
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
 
-from test.test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
+from test._cute_grouped_gemm_split_sizes import _device_offsets_kernel
 from test.test_cute_shared_rhs_grouped import _bind
 from test.test_cute_shared_rhs_grouped import _explicit_offset_mm
 from test.test_cute_shared_rhs_grouped import _offset_initializer_statements
@@ -25,15 +24,17 @@ from test.test_cute_shared_rhs_grouped import _serial_offset_initializer
 from test.test_cute_shared_rhs_grouped import _target
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.cute.autotune.heuristics.cute import (
     CuteTcgen05GroupedSource64Heuristic,
 )
-from helion._compiler.autotuner_heuristics.cute import _tcgen05_grouped_worklist_config
-from helion._compiler.autotuner_heuristics.cute import grouped_full_coverage_configs
+from helion._compiler.cute.autotune.heuristics.cute import (
+    _tcgen05_grouped_worklist_config,
+)
+from helion._compiler.cute.autotune.heuristics.cute import grouped_full_coverage_configs
 from helion._compiler.cute.grouped_full_coverage import full_coverage_index_domain
+from helion._compiler.cute.tcgen05_config import surface
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 
@@ -52,10 +53,7 @@ FLAG = "tcgen05_grouped_full_coverage"
 def _cpu_only() -> Generator[None, None, None]:
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
+    with cpu_render_target():
         yield
     torch.set_num_threads(previous)
 
@@ -155,7 +153,6 @@ def _inverse(candidate: str) -> tuple[ast.Module, dict[str, int]]:
 
 
 @pytest.mark.parametrize("m,n,k", [(640, 128, 128), (32, 512, 64), (128, 256, 192)])
-@skipUnlessBackends(["cute"])
 def test_full_source_inverse_and_unchanged_wrapper(m: int, n: int, k: int) -> None:
     ordinary, dense = _generate(m, n, k)
     reversed_tree, counts = _inverse(dense)
@@ -174,7 +171,6 @@ def test_full_source_inverse_and_unchanged_wrapper(m: int, n: int, k: int) -> No
     assert "init_tensormap_from_atom(tma_atom_b" not in dense
 
 
-@skipUnlessBackends(["cute"])
 def test_off_is_exact_normalized_config_and_source() -> None:
     args = _inputs()
     with _target():
@@ -210,11 +206,9 @@ def test_off_is_exact_normalized_config_and_source() -> None:
         {"tcgen05_sched_stage_count": 2},
         {"tcgen05_cluster_m": 2, "tcgen05_grouped_worklist_source_m_tile": 224},
         {"tcgen05_epilogue_layout": "module_helper_store_tail"},
-        {"tcgen05_ab_producer_advance_mode": "skip"},
     ],
 )
 @pytest.mark.parametrize("mode", ["fixed_tma_dense", "fixed_tma_dense_local"])
-@skipUnlessBackends(["cute"])
 def test_unsupported_schedule_preserves_ordinary_repair(
     updates: dict[str, object],
     mode: str,
@@ -242,7 +236,6 @@ def test_unsupported_schedule_preserves_ordinary_repair(
 
 @pytest.mark.parametrize("bad", ["fp16", "int64", "m_tail", "n_tail", "a_offset"])
 @pytest.mark.parametrize("mode", ["fixed_tma_dense", "fixed_tma_dense_local"])
-@skipUnlessBackends(["cute"])
 def test_binding_domain_declines_new_mode(bad: str, mode: str) -> None:
     a, b, offsets = _inputs()
     if bad == "fp16":
@@ -262,7 +255,6 @@ def test_binding_domain_declines_new_mode(bad: str, mode: str) -> None:
 
 
 @pytest.mark.parametrize("mode", ["fixed_tma_dense", "fixed_tma_dense_local"])
-@skipUnlessBackends(["cute"])
 def test_group_specific_rhs_declines_new_mode(mode: str) -> None:
     a, _b, _offsets = _inputs()
     args = (
@@ -278,7 +270,6 @@ def test_group_specific_rhs_declines_new_mode(mode: str) -> None:
 
 @pytest.mark.parametrize("change", ["alias", "group_epilogue", "extra_store"])
 @pytest.mark.parametrize("mode", ["fixed_tma_dense", "fixed_tma_dense_local"])
-@skipUnlessBackends(["cute"])
 def test_unproved_alias_effect_or_group_dependence_declines(
     change: str, mode: str
 ) -> None:
@@ -338,7 +329,6 @@ def _metadata(
 
 
 @pytest.mark.parametrize("stride", [1, 2])
-@skipUnlessBackends(["cute"])
 def test_actual_typed_metadata_and_union_preserve_holes_wrap_and_overlap(
     sources: tuple[str, str], stride: int
 ) -> None:
@@ -410,7 +400,6 @@ def _run_dense_producer(
 
 
 @pytest.mark.parametrize("m,n", [(640, 128), (32, 512), (128, 256)])
-@skipUnlessBackends(["cute"])
 def test_actual_dense_producer_covers_tiles_once_and_preserves_terminal(
     m: int, n: int
 ) -> None:
@@ -457,7 +446,6 @@ def test_actual_dense_producer_covers_tiles_once_and_preserves_terminal(
 
 
 @pytest.mark.parametrize("mode", ["fixed_tma_dense", "fixed_tma_dense_local"])
-@skipUnlessBackends(["cute"])
 def test_named_config_and_policy_envelope_roundtrip(mode: str) -> None:
     args = _inputs()
     with _target():
@@ -497,7 +485,6 @@ def test_complete_index_domain(args: tuple[int, ...], expected: bool) -> None:
     assert full_coverage_index_domain(*args) is expected
 
 
-@skipUnlessBackends(["cute"])
 def test_coverage_records_are_independent_and_legacy_seeds_are_unchanged() -> None:
     args = _inputs()
     with _target():
@@ -531,14 +518,13 @@ def test_coverage_records_are_independent_and_legacy_seeds_are_unchanged() -> No
         )
         # Keep explicit full-domain configs serializable. The shared coverage
         # facility, not the consumer, suppresses automatic proposals/append.
-        assert KEY in disabled.config_spec._cute_tcgen05_config.optional_fragments(
-            for_search=True
+        assert KEY in surface.optional_fragments(
+            disabled.config_spec._cute_tcgen05_config, for_search=True
         )
         assert FLAG in disabled.to_code(_config())
 
 
 @pytest.mark.parametrize("m,n,k", [(639, 128, 128), (640, 160, 128), (640, 128, 127)])
-@skipUnlessBackends(["cute"])
 def test_missing_full_tile_carrier_keeps_legacy_search_domain(
     m: int, n: int, k: int
 ) -> None:
@@ -547,8 +533,8 @@ def test_missing_full_tile_carrier_keeps_legacy_search_domain(
         bound = _bind(grouped_gemm_jagged.fn, args)
         assert bound.host_function is not None
         assert not bound.config_spec._cute_tcgen05_config.grouped_full_coverage_eligible
-        assert KEY not in bound.config_spec._cute_tcgen05_config.optional_fragments(
-            for_search=True
+        assert KEY not in surface.optional_fragments(
+            bound.config_spec._cute_tcgen05_config, for_search=True
         )
         assert (
             grouped_full_coverage_configs(bound.env, bound.host_function.device_ir)
@@ -557,7 +543,6 @@ def test_missing_full_tile_carrier_keeps_legacy_search_domain(
 
 
 @pytest.mark.parametrize("k_min,k_max,has_carrier", [(16, 32, False), (128, 256, True)])
-@skipUnlessBackends(["cute"])
 def test_restricted_k_domain_exposes_only_a_reachable_carrier(
     k_min: int, k_max: int, has_carrier: bool
 ) -> None:
@@ -596,8 +581,8 @@ def test_restricted_k_domain_exposes_only_a_reachable_carrier(
         )
         assert (
             KEY
-            in bound.config_spec._cute_tcgen05_config.optional_fragments(
-                for_search=True
+            in surface.optional_fragments(
+                bound.config_spec._cute_tcgen05_config, for_search=True
             )
         ) is has_carrier
         assert (
@@ -629,7 +614,6 @@ def test_restricted_k_domain_exposes_only_a_reachable_carrier(
 
 @pytest.mark.parametrize("m,n", [(32, 512), (128, 256)])
 @pytest.mark.parametrize("mode", ["fixed_tma_dense", "fixed_tma_dense_local"])
-@skipUnlessBackends(["cute"])
 def test_supported_explicit_config_does_not_require_an_automatic_carrier(
     m: int, n: int, mode: str
 ) -> None:
@@ -640,7 +624,7 @@ def test_supported_explicit_config_does_not_require_an_automatic_carrier(
         state = bound.config_spec._cute_tcgen05_config
         assert state.grouped_full_coverage_supported
         assert not state.grouped_full_coverage_eligible
-        assert KEY not in state.optional_fragments(for_search=True)
+        assert KEY not in surface.optional_fragments(state, for_search=True)
         assert (
             grouped_full_coverage_configs(bound.env, bound.host_function.device_ir)
             == []

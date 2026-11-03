@@ -1103,8 +1103,8 @@ def _ds_expr(
                 # jax-ml/jax@33c38f50b): only apply when alignment meets
                 # Mosaic's requirement, otherwise the hint could replace
                 # a stronger proof Mosaic already has.
-                from helion._compiler.backend import PallasBackend
                 from helion._compiler.compile_environment import CompileEnvironment
+                from helion._compiler.pallas.backend import PallasBackend
 
                 backend = CompileEnvironment.current().backend
                 assert isinstance(backend, PallasBackend)

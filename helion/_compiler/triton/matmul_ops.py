@@ -17,7 +17,6 @@ from torch._subclasses.fake_tensor import FakeTensor
 from ...language import _decorators
 from ...language.matmul_ops import dot
 from ...language.matmul_ops import dot_scaled
-from ..cute.indexing import CutePackedAffineLoad
 from ..matmul_utils import _emit_tl_dot_scaled
 from ..matmul_utils import emit_tl_dot_with_padding
 
@@ -31,7 +30,7 @@ def _(state: CodegenState) -> object:
     lhs_ast = state.ast_arg(0)
     rhs_ast = state.ast_arg(1)
     acc_ast = state.ast_arg(2)
-    assert isinstance(lhs_ast, (ast.AST, CutePackedAffineLoad))
+    assert isinstance(lhs_ast, ast.AST)
     assert isinstance(rhs_ast, ast.AST)
 
     # Get the dtypes of the inputs from proxy args

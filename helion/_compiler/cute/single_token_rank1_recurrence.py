@@ -27,10 +27,7 @@ avoiding the narrow-domain failure mode of the earlier direct polynomial.
 
 from __future__ import annotations
 
-import ast
 import dataclasses
-import operator
-import textwrap
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -44,8 +41,28 @@ import torch
 from ..compile_environment import CompileEnvironment
 from ._mlir_compat import ir
 from .affine_recurrence_primitives import store_u32x4_if_valid as _store_u32x4_if_valid
+from .analysis.rank1_recurrence import _ADD_TARGETS
+from .analysis.rank1_recurrence import _MUL_TARGETS
+from .analysis.rank1_recurrence import _affine
+from .analysis.rank1_recurrence import _binary_other
+from .analysis.rank1_recurrence import _binary_pair
+from .analysis.rank1_recurrence import _broadcast_source
+from .analysis.rank1_recurrence import _cast_from
+from .analysis.rank1_recurrence import _has_unmatched_side_effect
+from .analysis.rank1_recurrence import _indices
+from .analysis.rank1_recurrence import _is_standard_key_iota
+from .analysis.rank1_recurrence import _match_decay
+from .analysis.rank1_recurrence import _match_factored_output
+from .analysis.rank1_recurrence import _strip_casts
+from .analysis.rank1_recurrence import _strip_state_index_casts
+from .analysis.rank1_recurrence import _sum_input
 from .fx_matcher import _canonical_root_axis_ids
-from .fx_matcher import _GeneratedCodeTemplate
+from .fx_matcher import _is_call
+from .fx_matcher import _load_ref
+from .fx_matcher import _protected_arguments
+from .fx_matcher import _same_ref
+from .fx_matcher import _store_ref
+from .fx_matcher import _TensorRef
 from .fx_matcher import _xyz_grid_fits
 
 if TYPE_CHECKING:
@@ -412,12 +429,6 @@ def rank1_store_u16_or_zero(
 
 
 @dataclasses.dataclass(frozen=True)
-class _TensorRef:
-    fake: torch.Tensor
-    suggested_name: str
-
-
-@dataclasses.dataclass(frozen=True)
 class CuteSingleTokenRank1Plan:
     """Values consumed by the dedicated rank-1 code generator."""
 
@@ -444,268 +455,6 @@ class CuteSingleTokenRank1Plan:
     batch_block_id: int
     head_block_id: int
     value_block_id: int
-
-
-def _is_call(node: object, target: object) -> bool:
-    return (
-        isinstance(node, torch.fx.Node)
-        and node.op == "call_function"
-        and node.target is target
-    )
-
-
-def _host_tensor_ref(node: object) -> _TensorRef | None:
-    from ...language._tracing_ops import _host_tensor
-
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.op != "call_function"
-        or node.target is not _host_tensor
-        or not node.args
-        or not isinstance(node.args[0], str)
-    ):
-        return None
-    value = node.meta.get("val")
-    if not isinstance(value, torch.Tensor):
-        return None
-    return _TensorRef(value, node.args[0])
-
-
-def _load_ref(node: object) -> _TensorRef | None:
-    from ...language import memory_ops
-
-    if not _is_call(node, memory_ops.load):
-        return None
-    assert isinstance(node, torch.fx.Node)
-    return _host_tensor_ref(node.args[0] if node.args else None)
-
-
-def _store_ref(node: object) -> _TensorRef | None:
-    from ...language import memory_ops
-
-    if not _is_call(node, memory_ops.store):
-        return None
-    assert isinstance(node, torch.fx.Node)
-    return _host_tensor_ref(node.args[0] if node.args else None)
-
-
-def _same_ref(left: _TensorRef | None, right: _TensorRef | None) -> bool:
-    return (
-        left is not None
-        and right is not None
-        and left.fake is right.fake
-        and left.suggested_name == right.suggested_name
-    )
-
-
-def _has_unmatched_side_effect(
-    nodes: Sequence[torch.fx.Node], allowed: set[torch.fx.Node]
-) -> bool:
-    from torch.fx.node import _side_effectful_functions
-
-    return any(
-        node.op == "call_function"
-        and node.target in _side_effectful_functions
-        and node not in allowed
-        for node in nodes
-    )
-
-
-def _strip_casts(node: object) -> torch.fx.Node | None:
-    if not isinstance(node, torch.fx.Node):
-        return None
-    current = node
-    for _ in range(8):
-        if current.op != "call_function":
-            return current
-        if current.target in (
-            torch.ops.aten.clone.default,
-            torch.ops.aten.detach.default,
-        ):
-            if (
-                len(current.args) != 1
-                or current.kwargs
-                or not isinstance(current.args[0], torch.fx.Node)
-            ):
-                return None
-            current = current.args[0]
-            continue
-        if current.target is not torch.ops.prims.convert_element_type.default:
-            return current
-        if (
-            len(current.args) != 2
-            or current.kwargs
-            or not isinstance(current.args[0], torch.fx.Node)
-        ):
-            return None
-        source = current.args[0]
-        source_value = source.meta.get("val")
-        output_value = current.meta.get("val")
-        if (
-            not isinstance(source_value, torch.Tensor)
-            or not isinstance(output_value, torch.Tensor)
-            or (source_value.dtype, output_value.dtype)
-            not in (
-                (torch.bfloat16, torch.float32),
-                (torch.float32, torch.bfloat16),
-            )
-        ):
-            return None
-        current = source
-    return None
-
-
-def _strip_state_index_casts(node: object) -> torch.fx.Node | None:
-    """Strip only the exact signed-int widening used by ``Tensor.long``."""
-
-    if not isinstance(node, torch.fx.Node):
-        return None
-    current = node
-    for _ in range(8):
-        if current.op != "call_function":
-            return current
-        if current.target in (
-            torch.ops.aten.clone.default,
-            torch.ops.aten.detach.default,
-        ):
-            if (
-                len(current.args) != 1
-                or current.kwargs
-                or not isinstance(current.args[0], torch.fx.Node)
-            ):
-                return None
-            current = current.args[0]
-            continue
-        if current.target is not torch.ops.prims.convert_element_type.default:
-            return current
-        if (
-            len(current.args) != 2
-            or current.args[1] is not torch.int64
-            or current.kwargs
-            or not isinstance(current.args[0], torch.fx.Node)
-        ):
-            return None
-        source = current.args[0]
-        source_value = source.meta.get("val")
-        if not isinstance(source_value, torch.Tensor) or source_value.dtype not in (
-            torch.int32,
-            torch.int64,
-        ):
-            return None
-        current = source
-    return None
-
-
-def _cast_from(node: object, source: torch.fx.Node, dtype: torch.dtype) -> bool:
-    return bool(
-        isinstance(node, torch.fx.Node)
-        and node.op == "call_function"
-        and node.target is torch.ops.prims.convert_element_type.default
-        and len(node.args) >= 2
-        and node.args[0] is source
-        and node.args[1] is dtype
-        and not node.kwargs
-    )
-
-
-_ADD_TARGETS: set[object] = {operator.add, torch.ops.aten.add.Tensor}
-_MUL_TARGETS: set[object] = {operator.mul, torch.ops.aten.mul.Tensor}
-
-
-def _binary_other(
-    node: object,
-    known: torch.fx.Node,
-    targets: set[object],
-) -> torch.fx.Node | None:
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.op != "call_function"
-        or node.target not in targets
-        or len(node.args) < 2
-        or node.kwargs
-    ):
-        return None
-    left, right = node.args[:2]
-    if left is known and isinstance(right, torch.fx.Node):
-        return right
-    if right is known and isinstance(left, torch.fx.Node):
-        return left
-    return None
-
-
-def _binary_pair(
-    node: object,
-    targets: set[object],
-) -> tuple[torch.fx.Node, torch.fx.Node] | None:
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.op != "call_function"
-        or node.target not in targets
-        or len(node.args) < 2
-        or node.kwargs
-        or not isinstance(node.args[0], torch.fx.Node)
-        or not isinstance(node.args[1], torch.fx.Node)
-    ):
-        return None
-    return node.args[0], node.args[1]
-
-
-def _broadcast_source(
-    node: object,
-    indices: tuple[object, ...],
-) -> torch.fx.Node | None:
-    from ...language import view_ops
-
-    current = _strip_casts(node)
-    if (
-        current is None
-        or current.op != "call_function"
-        or current.target is not view_ops.subscript
-        or len(current.args) < 2
-        or not isinstance(current.args[0], torch.fx.Node)
-        or not isinstance(current.args[1], (list, tuple))
-        or len(current.args[1]) != len(indices)
-    ):
-        return None
-    for actual, expected in zip(current.args[1], indices, strict=True):
-        if expected == slice(None):
-            if actual != slice(None):
-                return None
-        elif actual is not expected:
-            return None
-    return _strip_casts(current.args[0])
-
-
-def _sum_input(
-    node: object,
-    dimensions: tuple[int, ...] | None,
-) -> torch.fx.Node | None:
-    from ...language._tracing_ops import _mask_to
-
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.op != "call_function"
-        or not node.args
-        or not isinstance(node.args[0], torch.fx.Node)
-        or node.kwargs
-    ):
-        return None
-    if dimensions is None:
-        if node.target is not torch.ops.aten.sum.default or len(node.args) != 1:
-            return None
-    elif (
-        node.target is not torch.ops.aten.sum.dim_IntList
-        or len(node.args) != 2
-        or not isinstance(node.args[1], (list, tuple))
-        or tuple(node.args[1]) != dimensions
-    ):
-        return None
-    value = node.args[0]
-    if _is_call(value, _mask_to):
-        if len(value.args) != 2 or value.args[1] != 0 or value.kwargs:
-            return None
-        value = value.args[0]
-    return _strip_casts(value)
 
 
 def _match_normalized_vector(
@@ -761,70 +510,6 @@ def _match_normalized_vector(
     return None
 
 
-def _affine(
-    value: object,
-) -> tuple[int, dict[torch.fx.Node, int]] | None:
-    """Parse integer add/constant-multiply index expressions."""
-
-    if isinstance(value, int):
-        return value, {}
-    if not isinstance(value, torch.fx.Node):
-        return None
-    if value.op != "call_function":
-        return 0, {value: 1}
-    if value.kwargs:
-        return None
-    if value.target in _ADD_TARGETS and len(value.args) >= 2:
-        left = _affine(value.args[0])
-        right = _affine(value.args[1])
-        if left is None or right is None:
-            return None
-        constant = left[0] + right[0]
-        terms = dict(left[1])
-        for leaf, coefficient in right[1].items():
-            terms[leaf] = terms.get(leaf, 0) + coefficient
-        return constant, {leaf: value for leaf, value in terms.items() if value}
-    if value.target in _MUL_TARGETS and len(value.args) >= 2:
-        left, right = value.args[:2]
-        if isinstance(left, int):
-            parsed = _affine(right)
-            scale = left
-        elif isinstance(right, int):
-            parsed = _affine(left)
-            scale = right
-        else:
-            return 0, {value: 1}
-        if parsed is None:
-            return None
-        return (
-            parsed[0] * scale,
-            {leaf: coefficient * scale for leaf, coefficient in parsed[1].items()},
-        )
-    return 0, {value: 1}
-
-
-def _indices(node: torch.fx.Node) -> tuple[object, ...] | None:
-    if len(node.args) < 2 or not isinstance(node.args[1], (list, tuple)):
-        return None
-    return tuple(node.args[1])
-
-
-def _is_standard_key_iota(node: object) -> bool:
-    if (
-        not _is_call(node, torch.ops.prims.iota.default)
-        or not isinstance(node, torch.fx.Node)
-        or node.args != (_KEY_SIZE,)
-        or set(node.kwargs) != {"start", "step", "dtype", "device", "requires_grad"}
-        or node.kwargs["start"] != 0
-        or node.kwargs["step"] != 1
-        or node.kwargs["dtype"] not in (torch.int32, torch.int64)
-        or node.kwargs["requires_grad"] is not False
-    ):
-        return False
-    device = node.kwargs["device"]
-    return isinstance(device, torch.device) and device.type == "cuda"
-
-
 def _static_int(value: object) -> int | None:
     import sympy
 
@@ -873,134 +558,6 @@ def _reduction_signature(info: GraphInfo) -> tuple[tuple[int, ...] | None, ...] 
         else:
             return None
     return tuple(result)
-
-
-def _match_decay(
-    node: torch.fx.Node,
-) -> (
-    tuple[
-        torch.fx.Node,
-        torch.fx.Node,
-        torch.fx.Node,
-        object,
-        object,
-    ]
-    | None
-):
-    """Match the bounded sigmoid decay expression."""
-
-    if node.op != "call_function" or node.target is not torch.ops.aten.exp2.default:
-        return None
-    outer_mul = _binary_pair(node.args[0] if node.args else None, _MUL_TARGETS)
-    if outer_mul is None:
-        return None
-    for log_decay, log2_e in (outer_mul, reversed(outer_mul)):
-        log_pair = _binary_pair(log_decay, _MUL_TARGETS)
-        if log_pair is None:
-            continue
-        for sigmoid, lower_bound in (log_pair, reversed(log_pair)):
-            if (
-                sigmoid.op != "call_function"
-                or sigmoid.target is not torch.ops.aten.sigmoid.default
-                or not sigmoid.args
-                or not isinstance(sigmoid.args[0], torch.fx.Node)
-            ):
-                continue
-            gate_product = _binary_pair(sigmoid.args[0], _MUL_TARGETS)
-            if gate_product is None:
-                continue
-            for a_value, gate_plus_bias in (gate_product, reversed(gate_product)):
-                if (
-                    a_value.op != "call_function"
-                    or a_value.target is not torch.ops.aten.exp2.default
-                    or not a_value.args
-                ):
-                    continue
-                a_mul = _binary_pair(a_value.args[0], _MUL_TARGETS)
-                gate_pair = _binary_pair(gate_plus_bias, _ADD_TARGETS)
-                if a_mul is None or gate_pair is None:
-                    continue
-                a_log: torch.fx.Node | None = None
-                for maybe_a_log, maybe_log2_e in (a_mul, reversed(a_mul)):
-                    if maybe_log2_e is log2_e:
-                        a_log = maybe_a_log
-                        break
-                if a_log is None:
-                    continue
-                gate, bias = gate_pair
-                return (
-                    gate,
-                    bias,
-                    a_log,
-                    lower_bound.meta.get("val"),
-                    log2_e.meta.get("val"),
-                )
-    return None
-
-
-def _match_factored_output(
-    output: torch.fx.Node,
-    decayed: torch.fx.Node,
-    residual: torch.fx.Node,
-    key_broadcast: torch.fx.Node,
-) -> torch.fx.Node | None:
-    """Return the scaled normalized-Q node from an equivalent output graph."""
-
-    outer = _binary_pair(output, _ADD_TARGETS)
-    if outer is None:
-        return None
-    for base_sum, scaled_sum in (outer, reversed(outer)):
-        base_product = _sum_input(base_sum, (1,))
-        scaled_product = _sum_input(scaled_sum, (1,))
-        if base_product is None or scaled_product is None:
-            continue
-        base_pair = _binary_pair(base_product, _MUL_TARGETS)
-        scaled_pair = _binary_pair(scaled_product, _MUL_TARGETS)
-        if base_pair is None or scaled_pair is None:
-            continue
-        q_broadcast: torch.fx.Node | None = None
-        for maybe_decayed, maybe_q in (base_pair, reversed(base_pair)):
-            if maybe_decayed is decayed:
-                q_broadcast = maybe_q
-                break
-        if q_broadcast is None:
-            continue
-        q = _broadcast_source(q_broadcast, (None, slice(None)))
-        if q is None:
-            continue
-        dot_sum_broadcast: torch.fx.Node | None = None
-        for maybe_residual, maybe_dot in (scaled_pair, reversed(scaled_pair)):
-            if _broadcast_source(maybe_residual, (slice(None), None)) is residual:
-                dot_sum_broadcast = maybe_dot
-                break
-        if dot_sum_broadcast is None:
-            continue
-        dot_sum = _broadcast_source(dot_sum_broadcast, (slice(None), None))
-        if dot_sum is None:
-            continue
-        dot_input = _sum_input(dot_sum, (1,))
-        if dot_input is None:
-            continue
-        if (
-            dot_input.op == "call_function"
-            and dot_input.target is torch.ops.aten.expand.default
-            and len(dot_input.args) == 2
-            and isinstance(dot_input.args[0], torch.fx.Node)
-            and isinstance(dot_input.args[1], (list, tuple))
-            and len(dot_input.args[1]) == 2
-            and dot_input.args[1][1] == _KEY_SIZE
-            and not dot_input.kwargs
-        ):
-            dot_input = dot_input.args[0]
-        dot_pair = _binary_pair(dot_input, _MUL_TARGETS)
-        if dot_pair is None:
-            continue
-        if any(
-            maybe_key is key_broadcast and maybe_q is q_broadcast
-            for maybe_key, maybe_q in (dot_pair, reversed(dot_pair))
-        ):
-            return q
-    return None
 
 
 def _match_rank1_else(
@@ -1880,7 +1437,7 @@ def plan_single_token_rank1_recurrence(
 
     device_function = DeviceFunction.current()
     plan = _plan_single_token_rank1_recurrence(graphs, tile_strategy)
-    device_function.cute_state.single_token_rank1_plan = plan
+    device_function.cute_state.root_plans.single_token_rank1_plan = plan
     if plan is not None:
         # These scalars control compile-time specialization below.  CuTe's
         # launcher keys Constexpr arguments by value, so the fast polynomial
@@ -1890,10 +1447,6 @@ def plan_single_token_rank1_recurrence(
         device_function.promote_expr_arg_to_constexpr(plan.scale)
         device_function.promote_expr_arg_to_constexpr(plan.lower_bound)
         device_function.promote_expr_arg_to_constexpr(plan.log2_e)
-
-
-def _tensor_arg(cg: GenerateAST, ref: _TensorRef) -> str:
-    return cg.device_function.tensor_arg(ref.fake, prefer_name=ref.suggested_name).name
 
 
 def _codegen_one_warp_single_token_rank1_recurrence(
@@ -1936,48 +1489,28 @@ def _codegen_one_warp_single_token_rank1_recurrence(
     ]
     df.pid = XYZProgramIDs(pid_info=launch_pid_info)
 
-    state_indices = _tensor_arg(cg, plan.state_indices)
-    output = _tensor_arg(cg, plan.output)
-    gate = _tensor_arg(cg, plan.gate)
-    bias = _tensor_arg(cg, plan.bias)
-    a_log = _tensor_arg(cg, plan.a_log)
-    beta = _tensor_arg(cg, plan.beta)
-    state = _tensor_arg(cg, plan.state)
-    mixed = _tensor_arg(cg, plan.mixed)
-    scale = df.literal_expr(plan.scale)
-    lower_bound = df.literal_expr(plan.lower_bound)
-    log2_e = df.literal_expr(plan.log2_e)
+    arguments = _protected_arguments(
+        cg,
+        "packed_rank1",
+        (
+            plan.state_indices,
+            plan.output,
+            plan.gate,
+            plan.bias,
+            plan.a_log,
+            plan.beta,
+            plan.state,
+            plan.mixed,
+        ),
+        (plan.scale, plan.lower_bound, plan.log2_e),
+    )
+    state_indices, output, gate, bias, a_log, beta, state, mixed = arguments.tensors
+    scale, lower_bound, log2_e = arguments.scalars
     state_index_loader = (
         "_cute_rank1_load_i32_nc"
         if plan.state_indices.fake.dtype is torch.int32
         else "_cute_rank1_load_i64_nc"
     )
-    placeholder_args = {
-        mixed,
-        gate,
-        beta,
-        a_log,
-        bias,
-        state,
-        output,
-        state_indices,
-    }
-    template = _GeneratedCodeTemplate(
-        "packed_rank1",
-        (*tuple(argument.name for argument in df.arguments), *cg._extra_params),
-        df.new_var,
-    )
-    state_indices = template.protect(state_indices)
-    output = template.protect(output)
-    gate = template.protect(gate)
-    bias = template.protect(bias)
-    a_log = template.protect(a_log)
-    beta = template.protect(beta)
-    state = template.protect(state)
-    mixed = template.protect(mixed)
-    scale = template.protect(scale)
-    lower_bound = template.protect(lower_bound)
-    log2_e = template.protect(log2_e)
     rows_per_lane_group = plan.tile_rows // 2
 
     preamble = f"""
@@ -2428,15 +1961,7 @@ for packed_rank1_row in cutlass.range_constexpr({rows_per_lane_group}):
     )
 """
 
-    df.preamble = cast(
-        "list[ast.AST]",
-        ast.parse(textwrap.dedent(template.render(preamble))).body,
-    )
-    df.body = cast(
-        "list[ast.AST]",
-        ast.parse(textwrap.dedent(template.render(body))).body,
-    )
-    df.placeholder_args.update(placeholder_args)
+    arguments.install(df, preamble, body)
     return True
 
 
@@ -2444,7 +1969,7 @@ def codegen_single_token_rank1_recurrence(cg: GenerateAST) -> bool:
     """Replace the matched root with the packed 16-lane rank-1 schedule."""
 
     df = cg.device_function
-    plan = df.cute_state.single_token_rank1_plan
+    plan = df.cute_state.root_plans.single_token_rank1_plan
     root = cg.current_root_graph_info
     if plan is None or root is None or root.graph_id != plan.root_graph_id:
         return False
@@ -2454,50 +1979,30 @@ def codegen_single_token_rank1_recurrence(cg: GenerateAST) -> bool:
     # Keep this specialization's ABI aligned with the compact reference
     # schedule.  Tensor arguments retain insertion order in ``sorted_args``;
     # this order reduces address-setup live ranges in ptxas.
-    state_indices = _tensor_arg(cg, plan.state_indices)
-    output = _tensor_arg(cg, plan.output)
-    gate = _tensor_arg(cg, plan.gate)
-    bias = _tensor_arg(cg, plan.bias)
-    a_log = _tensor_arg(cg, plan.a_log)
-    beta = _tensor_arg(cg, plan.beta)
-    state = _tensor_arg(cg, plan.state)
-    mixed = _tensor_arg(cg, plan.mixed)
-    state_size = plan.state_size
-    state_stride0 = plan.state_stride0
-    scale = df.literal_expr(plan.scale)
-    lower_bound = df.literal_expr(plan.lower_bound)
-    log2_e = df.literal_expr(plan.log2_e)
+    arguments = _protected_arguments(
+        cg,
+        "rank1",
+        (
+            plan.state_indices,
+            plan.output,
+            plan.gate,
+            plan.bias,
+            plan.a_log,
+            plan.beta,
+            plan.state,
+            plan.mixed,
+        ),
+        (plan.scale, plan.lower_bound, plan.log2_e),
+    )
+    state_indices, output, gate, bias, a_log, beta, state, mixed = arguments.tensors
+    scale, lower_bound, log2_e = arguments.scalars
     state_index_loader = (
         "_cute_rank1_load_i32_nc"
         if plan.state_indices.fake.dtype is torch.int32
         else "_cute_rank1_load_i64_nc"
     )
-    placeholder_args = {
-        mixed,
-        gate,
-        beta,
-        a_log,
-        bias,
-        state,
-        output,
-        state_indices,
-    }
-    template = _GeneratedCodeTemplate(
-        "rank1",
-        (*tuple(argument.name for argument in df.arguments), *cg._extra_params),
-        df.new_var,
-    )
-    state_indices = template.protect(state_indices)
-    output = template.protect(output)
-    gate = template.protect(gate)
-    bias = template.protect(bias)
-    a_log = template.protect(a_log)
-    beta = template.protect(beta)
-    state = template.protect(state)
-    mixed = template.protect(mixed)
-    scale = template.protect(scale)
-    lower_bound = template.protect(lower_bound)
-    log2_e = template.protect(log2_e)
+    state_size = plan.state_size
+    state_stride0 = plan.state_stride0
 
     preamble = f"""
 rank1_helper_abi_version = {_RANK1_HELPER_ABI_VERSION}
@@ -2797,13 +2302,5 @@ if True:
         )
 """
 
-    df.preamble = cast(
-        "list[ast.AST]",
-        ast.parse(textwrap.dedent(template.render(preamble))).body,
-    )
-    df.body = cast(
-        "list[ast.AST]",
-        ast.parse(textwrap.dedent(template.render(body))).body,
-    )
-    df.placeholder_args.update(placeholder_args)
+    arguments.install(df, preamble, body)
     return True
