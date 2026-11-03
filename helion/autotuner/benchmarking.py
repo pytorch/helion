@@ -18,6 +18,7 @@ from typing import TypeVar
 from typing import cast
 
 import torch
+from torch.utils._pytree import tree_flatten
 
 from ..runtime.settings import _env_get_bool
 from ..runtime.settings import is_pallas_interpret
@@ -713,6 +714,27 @@ def synchronize_device() -> None:
         torch.accelerator.synchronize()
 
 
+def _execution_failed(output: object) -> bool:
+    """Return whether any TorchTPU tensor in output failed on the device."""
+    tensors = [
+        leaf
+        for leaf in tree_flatten(output)[0]
+        if isinstance(leaf, torch.Tensor) and leaf.device.type == "tpu"
+    ]
+    if not tensors:
+        return False
+    # torch.accelerator.synchronize() can miss async output buffer errors;
+    # _internal.sync.synchronize awaits the PjRtBuffers without a D2H copy.
+    from torch_tpu._internal.sync import synchronize  # pyrefly: ignore[missing-import]
+
+    try:
+        synchronize(tensors, wait=True)
+    except Exception as error:
+        _log.warning("Benchmarked kernel failed on the device: %s", error)
+        return True
+    return False
+
+
 def compute_repeat(
     fn: Callable[[], object],
     *,
@@ -993,6 +1015,9 @@ def interleaved_bench_generic(
     """
     Benchmark multiple functions using wall-clock timing.
     Used for backends that don't have Triton's event-based timing (e.g., Pallas/TPU).
+
+    A function whose device execution fails (see ``_execution_failed``) is not
+    timed again and gets ``inf``.
     """
     # warmup
     _output: object = None
@@ -1004,6 +1029,7 @@ def interleaved_bench_generic(
     if max_total_ms is not None:
         repeat = min(repeat, _interleaved_repeat_cap(fns, clear_l2, max_total_ms))
     all_times: list[list[float]] = [[] for _ in range(len(fns))]
+    failed = [False] * len(fns)
 
     iterator = iter_with_progress(
         range(repeat),
@@ -1013,6 +1039,8 @@ def interleaved_bench_generic(
     )
     for _i in iterator:
         for j in range(len(fns)):
+            if failed[j]:
+                continue
             clear_l2()
             synchronize_device()
             start = time.perf_counter()
@@ -1021,9 +1049,15 @@ def interleaved_bench_generic(
             _output = fns[j]()
             synchronize_device()
             end = time.perf_counter()
+            if _execution_failed(_output):
+                failed[j] = True
+                continue
             all_times[j].append((end - start) * 1000)  # convert to ms
 
-    return [statistics.median(times) for times in all_times]
+    return [
+        math.inf if failed[j] else statistics.median(times)
+        for j, times in enumerate(all_times)
+    ]
 
 
 def mirrored_bench_generic(
@@ -1647,7 +1681,8 @@ def do_bench_generic(
     probe as the timing sample when it already exceeds both timing windows;
     CuTe flash enables it for multi-second attention candidates.
     ``pre_warmed`` skips that setup call when the caller already ran and
-    synchronized the same callable.
+    synchronized the same callable. A timed call whose device execution fails
+    (see ``_execution_failed``) makes the result ``inf``.
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
@@ -1677,6 +1712,8 @@ def do_bench_generic(
             process_group_name=process_group_name,
         )
         if probe_is_sample:
+            if _execution_failed(_output):
+                estimate_ms = math.inf
             return _summarize_statistics_fallback([estimate_ms], quantiles, return_mode)
         n_repeat = max(1, int(rep / estimate_ms))
     elif fixed_repetitions is None:
@@ -1713,5 +1750,7 @@ def do_bench_generic(
         _output = fn()
         synchronize_device()
         t1 = time.perf_counter()
+        if _execution_failed(_output):
+            return _summarize_statistics_fallback([math.inf], quantiles, return_mode)
         times.append((t1 - t0) * 1000)  # convert to ms
     return _summarize_statistics_fallback(times, quantiles, return_mode)
