@@ -4959,6 +4959,10 @@ def _lane_split_reorders_aliasing_memory(
             if isinstance(node, ast.Call) and _is_store_call(node)
         ):
             writes.append((write_index, call, _store_tensor_roots(call, tensor_names)))
+    if not writes:
+        # Without a write in the body the split has nothing to reorder, so a
+        # load whose address is not visible below is no reason to refuse it.
+        return False
 
     address_snapshots: dict[frozenset[str], list[dict[str, ast.expr]] | None] = {}
     definitely_written: set[str] = set()
