@@ -1006,6 +1006,31 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                         masked_copy(x, mask), torch.where(mask, x, 0.0)
                     )
 
+    def test_size_one_broadcast_dim_is_keyed_with_omitted_default(self):
+        """A call omitting a default binds through an alias of the full-args
+        signature.  Code generation publishes the broadcast guard to that
+        signature after the alias was published with no canonical extractor;
+        the alias must key the guard too, or the other bias shape reuses a
+        kernel compiled for the wrong broadcast."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def add_bias(
+            x: torch.Tensor, bias: torch.Tensor, scale: float = 1.0
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + bias[tile] * scale
+            return out
+
+        full, broadcast = (4, 8, 16), (1, 8, 16)
+        for shapes in ((full, broadcast), (broadcast, full)):
+            add_bias.reset()
+            for bias_shape in (*shapes, *shapes):
+                with self.subTest(shapes=shapes, bias_shape=bias_shape):
+                    x = torch.randn(4, 8, 16, device=DEVICE)
+                    bias = torch.randn(bias_shape, device=DEVICE)
+                    torch.testing.assert_close(add_bias(x, bias), x + bias)
+
     def test_store_target_dims_record_no_broadcast_guard(self):
         """A store target never needs to broadcast: ``out.size(0)`` is its
         own symbol, which a tile over ``M = a.size(0)`` cannot prove covers,
