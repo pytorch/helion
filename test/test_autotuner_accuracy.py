@@ -140,6 +140,32 @@ class TestAutotunerAccuracy(AutotunerTestCase):
             poison_cached_device_memory(torch.device(DEVICE))
 
     @skipIfNotCUDA()
+    def test_baseline_releases_the_cached_device_memory(self) -> None:
+        # Free blocks this process caches (here 256 MiB; in a real run the
+        # baseline runs' argument copies and fp32 output comparison) are
+        # memory the benchmark worker, another process, cannot use: the
+        # search starts with them returned to the device.
+        configs = [
+            helion.Config(block_sizes=[32], num_warps=4),
+            helion.Config(block_sizes=[64], num_warps=4),
+        ]
+
+        @helion.kernel(configs=configs, autotune_log_level=0)
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.arange(256, device=DEVICE, dtype=torch.float32)
+        cached = torch.empty(256 << 20, dtype=torch.uint8, device=DEVICE)
+        del cached
+        reserved = torch.cuda.memory_reserved(DEVICE)
+        search = FiniteSearch(add_one.bind((x,)), (x,), configs=configs)
+        search._prepare()
+        self.assertLessEqual(torch.cuda.memory_reserved(DEVICE), reserved - (256 << 20))
+
+    @skipIfNotCUDA()
     def test_accuracy_check_runs_candidates_on_poisoned_memory(self) -> None:
         # ``out`` is read before it is written: the kernel is only "correct"
         # when its fresh buffer already holds the right numbers.  The autotuner
