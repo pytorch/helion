@@ -41,6 +41,7 @@ from .fx_matcher import _strip_value_casts
 from .fx_matcher import _tensor_arg
 from .fx_matcher import _TensorRef
 from .fx_matcher import _xyz_grid_fits
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -1425,6 +1426,7 @@ def codegen_chunk_recurrence(cg: GenerateAST) -> bool:
     """Replace the matched root with the vendored exact device body."""
 
     df = cg.device_function
+    codegen_state = cute_codegen_state(cg)
     plan = df.cute_state.root_plans.chunk_recurrence_plan
     root = cg.current_root_graph_info
     if plan is None or root is None or root.graph_id != plan.root_graph_id:
@@ -1461,7 +1463,7 @@ def codegen_chunk_recurrence(cg: GenerateAST) -> bool:
             or plan.tmem_cols != 512
         ):
             return False
-        cg.cute_wrapper_plans.append(
+        codegen_state.wrapper_plans.append(
             {
                 "kind": "chunk_recurrence_sm100",
                 "kd_name": kd,
@@ -1501,7 +1503,7 @@ def codegen_chunk_recurrence(cg: GenerateAST) -> bool:
         df.placeholder_args.update((*names, output_scale))
         df.preamble = []
         df.body = [ast.Pass()]
-        cg.cute_uses_matmul = True
+        codegen_state.declare_matmul()
         return True
 
     if plan.schedule == "sm100_warp_dv4":
@@ -1534,7 +1536,7 @@ def codegen_chunk_recurrence(cg: GenerateAST) -> bool:
                 "_chunk_recurrence_desc_state_out",
             )
         )
-        cg.cute_wrapper_plans.append(
+        codegen_state.wrapper_plans.append(
             {
                 "kind": "chunk_recurrence_warp_dv4",
                 "kd_name": kd,
@@ -1576,7 +1578,7 @@ def codegen_chunk_recurrence(cg: GenerateAST) -> bool:
         df.placeholder_args.update((*names, output_scale))
         df.preamble = []
         df.body = [ast.Pass()]
-        cg.cute_uses_matmul = True
+        codegen_state.declare_matmul()
         return True
 
     return False

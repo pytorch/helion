@@ -39,6 +39,7 @@ from .matmul_utils import reads_value_of
 from .matmul_utils import strip_new_vars
 from .reduce_call import ReduceCall
 from .reduce_call import ReduceScope
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -365,7 +366,7 @@ def _cute_active_thread_layout(
         block_axes.update(current_grid_state.block_thread_axes)
     # Free ``hl.arange`` dims live on synthetic thread axes outside the
     # strategy loop states, but they are launched thread rows all the same.
-    for axis, size in cg.cute_synthetic_arange_axis_sizes.items():
+    for axis, size in cute_codegen_state(cg).synthetic_arange_axis_sizes.items():
         axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
     return axis_sizes, block_axes
 
@@ -689,8 +690,7 @@ def _emit_cute_matmul_n_collapse(
     from ..generate_ast import GenerateAST
 
     assert isinstance(cg, GenerateAST)
-    if hasattr(cg, "cute_uses_matmul"):
-        cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+    cute_codegen_state(cg).declare_matmul()
 
     reduction_dtype = cute_scalar_reduction_dtype(lhs_dtype, rhs_dtype, acc_dtype)
     value_dtype = reduction_dtype or lhs_dtype or rhs_dtype or torch.float32
@@ -1051,8 +1051,8 @@ def _emit_cute_matmul(
     an ``hl.atomic_*`` user may see per-lane partial sums instead of the
     per-thread running sum (``cute_atomic_consumer_lane_route``).
     """
-    if hasattr(cg, "cute_uses_matmul"):
-        cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+    if isinstance(cg, GenerateAST):
+        cute_codegen_state(cg).declare_matmul()
     reduction_dtype = cute_scalar_reduction_dtype(
         lhs_dtype, rhs_dtype, acc_dtype or out_dtype
     )
@@ -1257,9 +1257,7 @@ def _emit_cute_matmul(
             # Tell ``hoist_warp_reduce`` this is a per-thread running sum: it
             # already combines across V-lanes, so its FINAL value is reduced
             # once after the loop rather than re-folded per lane.
-            running_sums = getattr(cg.device_function, "cute_matmul_running_sums", None)
-            if isinstance(running_sums, set):
-                running_sums.add(dot_acc)
+            cg.device_function.cute_state.lanes.matmul_running_sums.add(dot_acc)
             if running_sum_route == "recurrence":
                 # Exact only once restructured to update once per tile.
                 cg.device_function.cute_state.lanes.chunk_recurrence_running_sums.add(

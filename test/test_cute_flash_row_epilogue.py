@@ -19,8 +19,8 @@ from helion._compiler.cute.flash_row_epilogue import VEC
 from helion._compiler.cute.flash_row_epilogue import FlashRowEpilogueProgram
 from helion._compiler.cute.flash_row_epilogue import RowEpilogueOp
 from helion._testing import DEVICE
-from helion._testing import onlyBackends
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
 
 pytest.importorskip("cutlass")
@@ -67,6 +67,43 @@ def _xsa_like(
         vn = v_self / torch.clamp(v_norm, min=eps)
         proj = torch.sum(o * vn, dim=-1, keepdim=True)
         out[tile_b, tile_m, :] = (o - proj * vn).to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _amin_normalized_rows(
+    q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """``out = o / max(amin(|o|), eps)``: a min reduction over head_dim."""
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kt = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[tile_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        o = acc / l_i[:, :, None]
+        scale = torch.clamp(torch.amin(torch.abs(o), dim=-1, keepdim=True), min=eps)
+        out[tile_b, tile_m, :] = (o / scale).to(out.dtype)
     return out.view(q_in.size())
 
 
@@ -337,6 +374,25 @@ def test_row_program_codegen_every_route(config: dict[str, object]) -> None:
         assert (softmax0.index("cute.math.sqrt") > softmax0.index(anchor)) is bool(
             staged
         )
+
+
+def test_row_mma_completes_a_min_reduction_with_the_lane_group_min() -> None:
+    # The row program's ``amin`` completes over the lanes sharing a row with
+    # ``lane_group_min``, a helper the emitter names by composition
+    # (``lane_group_{sum,max,min}``); render it so the name stays pinned.
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(1, 4, 256, 64, dtype=torch.bfloat16) for _ in range(3))
+    with cpu_codegen():
+        bound = _amin_normalized_rows.bind((q, k, v, 1e-6))
+        config = {
+            "block_sizes": [1, 128, 128],
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "row_mma",
+        }
+        code = bound.to_code(bound._normalized_config_copy(helion.Config(**config)))
+    assert "'kind': 'helion_flash_row_mma'" in code
+    assert "_helion_flash_rowmma.lane_group_min(rm_ep_v2, 8)" in code
+    assert "cute.math.min(rm_ep_v2_0_p0, rm_ep_v1_p0, propagate_nan=True)" in code
+    assert "lane_group_max" not in code and "lane_group_sum" not in code
 
 
 @skipUnlessCuteAvailable("requires the supported CuTe DSL")
@@ -735,7 +791,6 @@ def test_row_epilogue_emitter_forms_agree_bitwise_on_the_xsa_program() -> None:
     assert arithmetic_free(packed_epilogue) == arithmetic_free(scalar_epilogue)
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     "kernel, reference",
     (
@@ -771,7 +826,6 @@ def test_row_programs_with_folded_products_match_reference(
     )
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     "config",
     (

@@ -60,6 +60,15 @@ from ..cute_flash_bwd_row_mma import FlashBwdRowFacts
 from ..cute_flash_bwd_row_mma import flash_bwd_row_legalize
 from ..cute_flash_bwd_row_mma import flash_bwd_row_search_grid
 from ..flash_facts import FlashEnv
+from ..flash_knobs import FLASH_BWD_AUX_SMEM_KEY
+from ..flash_knobs import FLASH_BWD_DS_TMEM_KEY
+from ..flash_knobs import FLASH_BWD_KV_STAGE_KEY
+from ..flash_knobs import FLASH_BWD_PERSISTENT_KEY
+from ..flash_knobs import FLASH_BWD_REGS_KEY
+from ..flash_knobs import FLASH_BWD_S_FIRST_KEY
+from ..flash_knobs import FLASH_BWD_STATS_MMA_KEY
+from ..flash_knobs import FLASH_BWD_TABLE_STEPS_KEY
+from ..flash_knobs import FLASH_BWD_TWO_CTA_KEY
 from ..flash_knobs import FLASH_LEGACY_E2E_CONFIG_KEYS
 from ..flash_knobs import flash_legacy_e2e_params
 from ..flash_knobs import fold_flash_ws_inactive_values
@@ -924,35 +933,35 @@ def _normalize_cute_flash_bwd(
     # (the alias_s and pair plans, the 2-CTA family): one identity.
     if (
         not config_spec._cute_flash_bwd_s_first_allowed
-        or config.get("cute_flash_bwd_two_cta") == 1
-    ) and "cute_flash_bwd_s_first" in config:
-        config["cute_flash_bwd_s_first"] = "auto"
+        or config.get(FLASH_BWD_TWO_CTA_KEY) == 1
+    ) and FLASH_BWD_S_FIRST_KEY in config:
+        config[FLASH_BWD_S_FIRST_KEY] = "auto"
     # A second K / V slot serves the persistent walk alone (a one-tile
     # CTA loads once), nowhere the storage cannot hold it, and not the
     # 2-CTA family: it reads 1 there.
     if (
         not config_spec._cute_flash_bwd_kv_stage_allowed
-        or config.get("cute_flash_bwd_persistent") != 1
-        or config.get("cute_flash_bwd_two_cta") == 1
-    ) and "cute_flash_bwd_kv_stage" in config:
-        config["cute_flash_bwd_kv_stage"] = 1
-    if config.get("cute_flash_bwd_two_cta") != 1:
+        or config.get(FLASH_BWD_PERSISTENT_KEY) != 1
+        or config.get(FLASH_BWD_TWO_CTA_KEY) == 1
+    ) and FLASH_BWD_KV_STAGE_KEY in config:
+        config[FLASH_BWD_KV_STAGE_KEY] = 1
+    if config.get(FLASH_BWD_TWO_CTA_KEY) != 1:
         return
     if not config_spec._cute_flash_bwd_two_cta_allowed:
-        config["cute_flash_bwd_two_cta"] = 0
+        config[FLASH_BWD_TWO_CTA_KEY] = 0
         return
     for key in (
-        "cute_flash_bwd_persistent",
-        "cute_flash_bwd_stats_mma",
-        "cute_flash_bwd_ds_tmem",
-        "cute_flash_bwd_aux_smem",
+        FLASH_BWD_PERSISTENT_KEY,
+        FLASH_BWD_STATS_MMA_KEY,
+        FLASH_BWD_DS_TMEM_KEY,
+        FLASH_BWD_AUX_SMEM_KEY,
     ):
         if key in config:
             config[key] = 0
-    cap = config.get("cute_flash_bwd_table_steps", 0)
+    cap = config.get(FLASH_BWD_TABLE_STEPS_KEY, 0)
     auto = config_spec._cute_flash_bwd_two_cta_table_steps
     if isinstance(cap, int) and auto > 0 and cap >= auto:
-        config["cute_flash_bwd_table_steps"] = 0
+        config[FLASH_BWD_TABLE_STEPS_KEY] = 0
     # The pair's register split: the knob's generic default is the 1-CTA
     # kernel's (FBWD_REG_SPLITS[0]); under the pair it reads as the
     # pair's first seed split, so a config that pins two_cta without a
@@ -960,8 +969,8 @@ def _normalize_cute_flash_bwd(
     # the seed).
     from ..cute_flash_bwd_flex import FBWD_REG_SPLITS
 
-    if config.get("cute_flash_bwd_regs", FBWD_REG_SPLITS[0]) == FBWD_REG_SPLITS[0]:
-        config["cute_flash_bwd_regs"] = "88/168/88"
+    if config.get(FLASH_BWD_REGS_KEY, FBWD_REG_SPLITS[0]) == FBWD_REG_SPLITS[0]:
+        config[FLASH_BWD_REGS_KEY] = "88/168/88"
 
 
 def pdl_searched(config_spec: ConfigSpec) -> bool:
@@ -1017,8 +1026,8 @@ def cute_flash_bwd_seed_configs(config_spec: ConfigSpec) -> list[Config]:
     seeds = []
     for regs in ("88/168/88", "104/152/104"):
         seed = config_spec.default_config()
-        seed.config["cute_flash_bwd_two_cta"] = 1
-        seed.config["cute_flash_bwd_regs"] = regs
+        seed.config[FLASH_BWD_TWO_CTA_KEY] = 1
+        seed.config[FLASH_BWD_REGS_KEY] = regs
         config_spec.normalize(seed, _fix_invalid=True)
         seeds.append(seed)
     return seeds

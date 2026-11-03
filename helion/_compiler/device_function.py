@@ -37,7 +37,6 @@ from .ast_read_writes import ast_rename
 from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import dead_lane_loop_elimination
-from .attribute_alias import AttributeAlias
 from .backend_registry import all_reserved_launch_param_names
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
@@ -339,12 +338,6 @@ def _selects_tma_access(config: Config) -> bool:
 
 
 class DeviceFunction:
-    # Lives on the CuTe device state (``CuteLaneState.matmul_running_sums``);
-    # the flat name is an alias for the readers that still use it.
-    cute_matmul_running_sums: AttributeAlias[set[str]] = AttributeAlias(
-        "cute_state.lanes.matmul_running_sums"
-    )
-
     def __init__(
         self,
         name: str,

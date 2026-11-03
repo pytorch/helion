@@ -42,6 +42,7 @@ from .promote_output_axis import _empty_output
 from .promote_output_axis import _fresh_tensors
 from .promote_output_axis import _indices
 from .promote_output_axis import _ordinary_operation
+from .state import cute_env_state
 
 if TYPE_CHECKING:
     from typing import Any
@@ -874,7 +875,7 @@ def forward_materialized_self_loads(host: HostFunction, device_ir: DeviceIR) -> 
     rounding observable and lets the existing MMA epilogue see every store.
     """
     env = CompileEnvironment.current()
-    assert env.cute_fission_plan is not None
+    assert cute_env_state(env).fission_plan is not None
     fresh = _fresh_tensors(host)
 
     def key(node: torch.fx.Node) -> tuple[torch.Tensor, int, int] | None:

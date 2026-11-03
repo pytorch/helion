@@ -14,6 +14,7 @@ import torch
 
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.state import cute_env_state
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import cpu_render_target
 from helion._testing import import_example
@@ -749,7 +750,7 @@ def test_fission_first_stage_gets_its_own_k_loop() -> None:
     bound = _bind(
         cast("FunctionType", squeeze_and_excitation_net_fwd.fn), (x, a, b), fission=True
     )
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     ir = _host(bound).device_ir
     assert ir.grid_block_ids == [[0, 1], [3, 4]]
     assert [

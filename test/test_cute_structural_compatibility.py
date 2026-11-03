@@ -30,6 +30,7 @@ from test.test_cute_split_k_workspace import _fp32_bias
 
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.state import cute_env_state
 from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target as _split_k_target
@@ -360,7 +361,7 @@ def test_actual_structural_repro_rebinds_under_conflicting_environment(
     assert _host(rebound) == _host(bound)
     assert rebound.to_code() == source
     if marker == "fission":
-        assert rebound.env.cute_fission_plan is not None
+        assert cute_env_state(rebound.env).fission_plan is not None
     else:
         assert marker in _host(rebound)
     (tmp_path / "resolved.py").write_text(source)

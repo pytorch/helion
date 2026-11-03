@@ -32,6 +32,7 @@ from helion._compiler.cute.direct_affine_replay_core import (
 from helion._compiler.cute.direct_affine_replay_core import DirectAffineStateStoreReplay
 from helion._compiler.cute.direct_affine_replay_core import DirectAffineStepReplay
 from helion._compiler.cute.direct_affine_replay_core import DirectAffineValueReplay
+from helion._compiler.cute.state import CuteCodegenState
 from helion._compiler.device_function import TensorArg
 from helion._testing import DEVICE
 from helion._testing import skipUnlessCuteAvailable
@@ -112,7 +113,9 @@ class _CoordinateCodegen:
             row: _expression("_BLOCK_SIZE_10"),
             feature: _expression("ordinary_feature"),
         }
-        self.cute_synthetic_arange_axis_sizes = {0: 32} if synthetic_feature else {}
+        self.backend_state = CuteCodegenState(
+            synthetic_arange_axis_sizes={0: 32} if synthetic_feature else {}
+        )
         if synthetic_feature:
             self.device_function = SimpleNamespace(
                 tile_strategy=SimpleNamespace(block_id_to_strategy=_BlockStrategies())
@@ -202,7 +205,9 @@ def _axis_source_case(*, free_feature: bool = False) -> tuple[Any, Any, Any, Any
         )
     codegen = SimpleNamespace(
         device_function=device_function,
-        cute_synthetic_arange_axis_sizes={0: 32} if free_feature else {},
+        backend_state=CuteCodegenState(
+            synthetic_arange_axis_sizes={0: 32} if free_feature else {}
+        ),
         codegen_result_for_node=lambda node: (
             True,
             _expression("ordinary_feature" if node is feature else "_BLOCK_SIZE_10"),

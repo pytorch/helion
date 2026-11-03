@@ -41,6 +41,7 @@ from .split_k_workspace import atomic_epilogue_geometry
 from .split_k_workspace import cutlass_dtype_name
 from .split_k_workspace import torch_dtype_name
 from .split_k_workspace import workspace_schedule
+from .state import cute_env_state
 from .tcgen05_config import facts
 
 if TYPE_CHECKING:
@@ -111,7 +112,8 @@ def _producer_source(
         # A/B inherit the cache-key-backed base/stride proof checked below;
         # the full chunk is BK-aligned, so every batch offset is 16B-aligned.
         # Partials are a new dense allocation in the outer host function.
-        child.cute_proven_tma_inputs.update(cast("list[torch.Tensor]", arguments))
+        child_state = cute_env_state(child)
+        child_state.proven_tma_inputs.update(cast("list[torch.Tensor]", arguments))
         compiler = KernelCompiler(child)
         with (
             maybe_skip_dtype_check_in_meta_registrations(),
@@ -160,7 +162,7 @@ def _producer_source(
             from ..generate_ast import generate_ast
 
             module = generate_ast(host, config, False)
-            plans = child.cute_resolved_wrapper_plans
+            plans = child_state.resolved_wrapper_plans
             if schedule.atomic_epilogue:
                 plans = _rewrite_producer_for_atomic_epilogue(
                     module, proof, schedule, plans
@@ -1061,5 +1063,5 @@ def generate_split_k_workspace(
         type_ignores=[],
     )
     prepend_missing_imports(result)
-    env.cute_resolved_wrapper_plans = plans
+    cute_env_state(env).resolved_wrapper_plans = plans
     return result

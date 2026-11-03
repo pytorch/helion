@@ -15,12 +15,9 @@ from test.test_cute_aux_read_fence import rank_two_inputs
 from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout
 from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_aux import aux_config as _config
 from helion._testing.cute_aux import cpu_codegen
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @pytest.mark.parametrize("dtype_bits", [8, 16, 32, 64])
@@ -175,7 +172,6 @@ def test_aux_copy_persistent_fringe_host_admission(m: int) -> None:
     )
 
 
-@skipUnlessBackends(["cute"])
 @skipUnlessCuteAvailable("requires the supported CuTe runtime")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

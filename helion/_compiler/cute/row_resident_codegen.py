@@ -20,6 +20,7 @@ from .row_matrix_transport import ROW_MATRIX_MODE
 from .row_matrix_transport import prove_row_matrix_transport
 from .row_resident import ROW_RESIDENT_KEY
 from .row_resident import prove_row_resident
+from .state import cute_env_state
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -288,7 +289,8 @@ def generate_row_resident(
         for stmt in module.body
         if isinstance(stmt, ast.FunctionDef) and stmt.name == func.name
     )
-    fission = env.cute_fission_plan
+    env_state = cute_env_state(env)
+    fission = env_state.fission_plan
     assert fission is not None
     # The ordinary fission emitter records its exact two owned module callees.
     # Verify that metadata and replace only their calls; keep the complete
@@ -371,5 +373,5 @@ def generate_row_resident(
         f"from torch._inductor.codecache import PyCodeCache as {code_cache}\n{module_name} = {code_cache}.load({source!r})\n{kernel}._helion_cute_source_hash = {hashlib.sha256(source.encode()).hexdigest()!r}\n"
     ).body
     metadata[0].value = ast.parse(f"({kernel},)", mode="eval").body
-    env.cute_resolved_wrapper_plans = []
+    env_state.resolved_wrapper_plans = []
     return module

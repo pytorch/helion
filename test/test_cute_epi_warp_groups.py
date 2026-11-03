@@ -60,6 +60,8 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import tcgen05_role_launch_n_width
 from helion._testing import DEVICE
+from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -709,13 +711,6 @@ def gated_pair_device(x: Tensor, w: Tensor) -> tuple[Tensor, Tensor]:
     return out, s
 
 
-def _requires_sm100() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("requires SM100-family")
-
-
 def _inputs(m: int, n: int, seed: int = 20261025) -> tuple[Tensor, Tensor]:
     generator = torch.Generator().manual_seed(seed)
     x = torch.randn((m, n), generator=generator, dtype=torch.float16) * 0.1
@@ -785,6 +780,8 @@ CASES = (
 )
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0))
 @pytest.mark.cuda
 @pytest.mark.parametrize(
     "shape,block_sizes,ab_stages,cluster_m,variants",
@@ -804,7 +801,6 @@ def test_grouped_epilogues_match_torch_and_the_one_group_render_bitwise(
     cluster_m: int,
     variants: tuple[tuple[int, int | None, int, bool, int], ...],
 ) -> None:
-    _requires_sm100()
     x, w = _inputs(*shape)
     ref_out, ref_s = _reference(x, w)
     kernel = helion.kernel(

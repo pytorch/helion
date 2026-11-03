@@ -22,6 +22,7 @@ from ...runtime.config import Config
 from .grouped_prefix_adaptive_n import GroupedPrefixAdaptiveNProfile
 from .grouped_prefix_adaptive_n import GroupedPrefixNBranch
 from .grouped_prefix_adaptive_n import grouped_prefix_adaptive_n_input_domain
+from .state import cute_env_state
 from .tcgen05_config import facts
 from .tcgen05_config import repair
 from .tcgen05_constants import TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY
@@ -1453,5 +1454,5 @@ def generate_grouped_prefix_adaptive_n_candidate(
         and isinstance(node.targets[0], ast.Attribute)
         and node.targets[0].attr == "_helion_cute_wrapper_plans"
     )
-    env.cute_resolved_wrapper_plans = ast.literal_eval(plan_assignment.value)
+    cute_env_state(env).resolved_wrapper_plans = ast.literal_eval(plan_assignment.value)
     return module

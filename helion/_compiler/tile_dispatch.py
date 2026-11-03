@@ -18,6 +18,7 @@ from .device_ir import ReductionLoopGraphInfo
 from .device_ir import RootGraphInfo
 from .host_function import HostFunction
 from .reduction_strategy import LoopedReductionStrategy
+from .reduction_strategy import PersistentReductionStrategy
 from .reduction_strategy import ReductionStrategy
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
@@ -673,11 +674,13 @@ class TileStrategyDispatch:
         sibling_axis = self.collective_sibling_thread_axis(target)
         if sibling_axis is not None:
             return sibling_axis
-        partner = getattr(target, "_cute_axis_partner", None)
-        if partner is not None:
+        if (
+            isinstance(target, PersistentReductionStrategy)
+            and target._cute_axis_partner is not None
+        ):
             # A sibling full-slice block indexing another's axis
             # (``CutePersistentReductionEmitter.plan_axis_partner``).
-            return self.thread_axis_for_strategy(partner)
+            return self.thread_axis_for_strategy(target._cute_axis_partner)
         reserved_axes = self.reserved_reduction_axes()
         reduction_axis_first = (
             CompileEnvironment.current().backend.reduction_axis_first()

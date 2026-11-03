@@ -22,6 +22,8 @@ from test.cute_population_contracts import _target
 import helion
 from helion._compiler.cute.epilogue_fanout import FANOUT_CONFIG_KEY
 from helion._testing import DEVICE
+from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import InvalidConfig
@@ -367,13 +369,6 @@ def test_paired_seeds_carry_2x2_twins_of_the_deep_rings() -> None:
 # --------------------------------------------------------------------------
 
 
-def _requires_sm100() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("requires SM100-family")
-
-
 def _gpu_inputs(m: int, n: int, k: int, seed: int = 1105) -> tuple[Tensor, Tensor]:
     generator = torch.Generator().manual_seed(seed)
     x = torch.randn((m, k), generator=generator, dtype=torch.float16) * 0.5
@@ -409,6 +404,8 @@ GPU_SHAPES = (
     GPU_SHAPES,
     ids=("4_clusters", "non_square", "80_clusters_capped", "bn64"),
 )
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0), reason="requires the SM100 family")
 def test_gpu_pair_2x2_matches_torch_and_the_2x1_pair_bitwise(
     shape: tuple[int, int, int],
     block_sizes: list[int],
@@ -417,7 +414,6 @@ def test_gpu_pair_2x2_matches_torch_and_the_2x1_pair_bitwise(
 ) -> None:
     """The 2x2 cluster (A multicast, pair-split B) computes the same K order
     per CTA as the 2x1 pair: bitwise equal, and ``'two'`` equals ``'auto'``."""
-    _requires_sm100()
     x, w = _gpu_inputs(*shape)
     ref = (x.float() @ w.float()).to(torch.float16)
     bound = _kernel(gemm)._bind_isolated((x, w))
@@ -447,12 +443,13 @@ def test_gpu_pair_2x2_matches_torch_and_the_2x1_pair_bitwise(
     ((1024, 1024, 512), (2048, 2560, 512)),
     ids=("16_clusters", "80_clusters_capped"),
 )
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0), reason="requires the SM100 family")
 def test_gpu_pair_fanout_2x2_matches_the_2x1_fanout_bitwise(
     shape: tuple[int, int, int],
 ) -> None:
     """The two-output shared fanout on the 2x2 cluster: both outputs bitwise
     equal to the 2x1 fanout's, and right against torch."""
-    _requires_sm100()
     x, w = _gpu_inputs(*shape)
     s_ref = torch.sigmoid((x.float() @ w.float()).to(torch.float16))
     out_ref = (2.0 * s_ref.float()).to(torch.float16)
@@ -478,10 +475,11 @@ def test_gpu_pair_fanout_2x2_matches_the_2x1_fanout_bitwise(
     assert torch.equal(outputs[2][1], outputs[1][1])
 
 
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0), reason="requires the SM100 family")
 def test_gpu_2x2_cluster_launch_repeats() -> None:
     """Many back-to-back launches of the capped 2x2 kernel (several clusters
     per CTA) on fresh inputs: every result matches the pair's, no hang."""
-    _requires_sm100()
     m, n, k = 2048, 2560, 512
     x, w = _gpu_inputs(m, n, k)
     bound = _kernel(gemm)._bind_isolated((x, w))

@@ -26,6 +26,7 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from .reduce_call import ReduceCall
 from .reduce_call import ReduceScope
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from ..device_ir import ForLoopGraphInfo
@@ -189,10 +190,11 @@ def prepare(
         for g in cg.codegen_graphs
     ):
         return None
+    codegen_state = cute_codegen_state(cg)
     if (
-        cg._cute_branch_path
-        or cg.cute_synthetic_arange_axes
-        or cg.cute_synthetic_arange_lane_exprs
+        codegen_state.branch_path
+        or codegen_state.synthetic_arange_axes
+        or codegen_state.synthetic_arange_lane_exprs
     ):
         return None
     if any(
@@ -276,7 +278,8 @@ def defer_collective(
         1,
     ):
         return False
-    if cg.cute_synthetic_arange_axes or cg.cute_synthetic_arange_lane_exprs:
+    codegen_state = cute_codegen_state(cg)
+    if codegen_state.synthetic_arange_axes or codegen_state.synthetic_arange_lane_exprs:
         return False
     if plan.extent <= span:
         return False

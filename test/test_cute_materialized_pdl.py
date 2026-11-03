@@ -29,6 +29,7 @@ from helion._compiler.cute.materialized_fission_codegen import (
     _tma_role_waits_before_dependent_loads,
 )
 from helion._compiler.cute.materialized_pdl import prove_materialized_operand_pdl
+from helion._compiler.cute.state import cute_env_state
 from helion._compiler.cute.tcgen05_config import facts
 from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_constants import (
@@ -331,7 +332,7 @@ def test_unsupported_schedules_cannot_inherit_pdl(update: dict[str, object]) -> 
 
 def test_no_typed_materialization_means_no_pdl_fragment() -> None:
     bound = _bind(_direct_rhs, _args())
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
     assert not any(g.key == KEY for g in bound.config_spec.compiler_coverage_groups)
     with bound.env, pytest.raises(InvalidConfig):
         bound.config_spec.normalize(
@@ -397,7 +398,7 @@ def test_unaligned_input_cannot_enable_a_tma_dependent_launch() -> None:
     a, b = _args(packed=True)
     a = torch.empty(a.numel() + 1, dtype=a.dtype)[1:].view(a.shape)
     bound = _bind(matmul_bf16_int4, (a, b))
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     # Input specialization facts are published after semantic edge registration.
     # Actual codegen must reject the unaligned consumer instead of returning a
     # bundle whose sender releases a scalar/fallback consumer without its wait.
@@ -742,7 +743,7 @@ def test_bf16xint16_seeds_match_torch_matmul(
         autotune_effort="none",
         cute_materialize_transformed_operands=True,
     )._bind_isolated((x, w))
-    if bound.env.cute_fission_plan is None:
+    if cute_env_state(bound.env).fission_plan is None:
         # The latency-bound shape stays one launch: the register-MMA family
         # converts the int16 packets in registers; every one of its seeds
         # (and each with the dependent launch) must match torch.

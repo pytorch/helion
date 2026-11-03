@@ -76,7 +76,7 @@ from helion.autotuner.local_cache import _cute_flash_search_policy_hash
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.random_search import RandomSearch
 from helion.autotuner.search_space_logger import canonical_config_id
-from helion.autotuner.surrogate_pattern_search import _FLASH_EXACT_SPACE_RAW_FLOOR
+from helion.autotuner.surrogate_pattern_search import FLASH_EXACT_SPACE_RAW_FLOOR
 from helion.autotuner.surrogate_pattern_search import (
     flash_terminal_measurement_is_valid,
 )
@@ -2515,9 +2515,9 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         # (The enumeration budget floors at the raw-product floor: a space this
         # small is enumerated whatever the initial population size.)
         self.assertEqual(
-            metrics["exact_space_raw_budget"], max(_FLASH_EXACT_SPACE_RAW_FLOOR, 7)
+            metrics["exact_space_raw_budget"], max(FLASH_EXACT_SPACE_RAW_FLOOR, 7)
         )
-        exact_space.assert_called_once_with(max(_FLASH_EXACT_SPACE_RAW_FLOOR, 7))
+        exact_space.assert_called_once_with(max(FLASH_EXACT_SPACE_RAW_FLOOR, 7))
         self.assertEqual(metrics["qualification_passes_planned"], 0)
         leaf_metric = metrics["leaf_results"][0]
         self.assertTrue(leaf_metric["space_exhausted"])

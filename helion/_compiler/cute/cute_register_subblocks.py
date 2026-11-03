@@ -111,6 +111,7 @@ from ..compile_environment import shape_env_var_hints
 from ..variable_origin import BlockSizeOrigin
 from ..variable_origin import GridOrigin
 from .fx_matcher import _is_call
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -4138,7 +4139,7 @@ def codegen_register_subblocks(cg: GenerateAST) -> bool:
         names=_DeviceNames(cg),
     )
     source = emitter.render()
-    cg.cute_wrapper_plans.append(
+    cute_codegen_state(cg).wrapper_plans.append(
         {
             "kind": PLAN_KIND,
             "total_ctas": plan.total_ctas,

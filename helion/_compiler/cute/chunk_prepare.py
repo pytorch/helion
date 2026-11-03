@@ -38,6 +38,7 @@ from .fx_matcher import _strip_value_casts as _shallow_strip_value_casts
 from .fx_matcher import _tensor_arg
 from .fx_matcher import _TensorRef
 from .fx_matcher import _xyz_grid_fits
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -2662,7 +2663,8 @@ def codegen_chunk_prepare(cg: GenerateAST) -> bool:
         "bf16_mma_count": plan.bf16_mma_count,
         "fp16_mma_count": plan.fp16_mma_count,
     }
-    cg.cute_wrapper_plans.append(wrapper_plan)
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(wrapper_plan)
     df.wrapper_only_params.extend(desc_names)
     df.placeholder_args.update(names)
 
@@ -2693,5 +2695,5 @@ def codegen_chunk_prepare(cg: GenerateAST) -> bool:
         "list[ast.AST]",
         ast.parse(f"{helper_name}(\n    {args},\n)").body,
     )
-    cg.cute_uses_matmul = True
+    codegen_state.declare_matmul()
     return True

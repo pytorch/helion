@@ -10,10 +10,7 @@ from helion import exc
 from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipUnlessBackends
 import helion.language as hl
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 def _matmul(

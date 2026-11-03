@@ -125,3 +125,20 @@ def cpu_codegen() -> Generator[None, None, None]:
 def rank_two_code(args: tuple[torch.Tensor, ...], config: helion.Config) -> str:
     with cpu_codegen():
         return rank_two_aux._bind_isolated(args).to_code(config)
+
+
+@contextmanager
+def as_sm100() -> Generator[None, None, None]:
+    """CPU codegen with the flash gates forced on (no CUDA, no CuTe compile)."""
+    with (
+        cpu_codegen(),
+        patch(
+            "helion._compiler.cute.analysis.attention_match._attention_flash_supported",
+            return_value=True,
+        ),
+        patch(
+            "helion._compiler.cute.analysis.attention_match._attention_flash_gate_enabled",
+            return_value=True,
+        ),
+    ):
+        yield

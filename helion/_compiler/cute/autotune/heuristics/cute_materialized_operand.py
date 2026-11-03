@@ -6,6 +6,7 @@ from typing import cast
 from .....runtime.config import Config
 from ....autotuner_heuristics.common import dedupe_configs
 from ....autotuner_heuristics.registry import AutotunerHeuristic
+from ...state import cute_env_state
 from ...tcgen05_config import facts
 from ...tcgen05_config import seeds
 from .cute import _seq_config_list
@@ -65,7 +66,7 @@ class CuteMaterializedOperandHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> tuple[int, tuple[int, ...]] | None:
         """``(region index, grid axes)`` of the single pointwise launch."""
-        plan = env.cute_fission_plan
+        plan = cute_env_state(env).fission_plan
         if plan is not None:
             if len(plan.pointwise_region_indices) != 1:
                 return None
@@ -93,7 +94,7 @@ class CuteMaterializedOperandHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         state = spec._cute_tcgen05_config
         native_seeds = seeds.autotune_seed_configs(state)
-        if env.cute_fission_plan is None:
+        if cute_env_state(env).fission_plan is None:
             if state.materialized_matmul_block_ids:
                 from .cute_materialized import CuteMaterializedMmaHeuristic
 
@@ -140,7 +141,7 @@ class CuteMaterializedOperandHeuristic(AutotunerHeuristic):
         op_facts = [
             fact for fact in spec.memory_op_facts if fact.graph_id in region_graph_ids
         ]
-        if env.cute_fission_plan is not None:
+        if cute_env_state(env).fission_plan is not None:
             # The materialization proof gives the output a contiguous final
             # axis.
             row_id, column_id = axes

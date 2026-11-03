@@ -39,6 +39,7 @@ from helion._compiler.cute.cute_mma_dag_tcgen05 import tcgen05_corner_seeds
 from helion._compiler.cute.cute_mma_dag_tcgen05 import tcgen05_seed_configs
 from helion._compiler.cute.cute_warp_mma_gemm import _swizzled_chunk
 from helion._compiler.cute.cute_warp_mma_gemm import warp_mma_warp_layout
+from helion._compiler.cute.state import cute_env_state
 from helion._compiler.host_function import SymbolOrigin
 from helion._compiler.variable_origin import BlockSizeOrigin
 from helion.exc import BackendUnsupported
@@ -8418,18 +8419,18 @@ def test_a_half_addmm_into_an_fp32_accumulator_is_a_dot() -> None:
     # with no fused owner; at 128 rows the fused owner keeps it. The fused
     # analysis below is pinned on the same program with the rewrite off.
     materialized = _bind_fn(_accumulating_addmm, _accumulating_addmm_inputs())
-    assert materialized.env.cute_fission_plan is not None
+    assert cute_env_state(materialized.env).fission_plan is not None
     assert materialized.config_spec.cute_mma_dag is None
     assert materialized.config_spec.tcgen05.search_enabled is True
     one_tile = _bind_fn(_accumulating_addmm, _accumulating_addmm_inputs(k=128))
-    assert one_tile.env.cute_fission_plan is None
+    assert cute_env_state(one_tile.env).fission_plan is None
     assert one_tile.config_spec.cute_mma_dag is not None
     bound = _bind_fn(
         _accumulating_addmm,
         _accumulating_addmm_inputs(),
         cute_materialize_transformed_operands=False,
     )
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
     spec = bound.config_spec
     assert spec.tcgen05.search_enabled is False
     assert spec.cute_mma_dag is not None
@@ -12869,7 +12870,7 @@ def test_a_half_addmm_into_an_fp32_accumulator_matches_the_references(
         cute_materialize_transformed_operands=False,
     )
     bound = kernel.bind(args)
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
     with bound.env:
         normalized = bound.config_spec.normalized_config(config)
     source = bound.to_code(normalized)
@@ -12918,7 +12919,7 @@ def test_a_half_addmm_whose_recipe_is_reused_materializes_and_matches() -> None:
         cute_materialize_transformed_operands=True,
     )
     bound = kernel.bind(args)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     assert bound.config_spec.cute_mma_dag is None
     out = cast_tensor(bound(*args))
     torch.cuda.synchronize()

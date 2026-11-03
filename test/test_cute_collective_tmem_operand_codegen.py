@@ -29,6 +29,7 @@ from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulH
 from helion._compiler.cute.collective_matmul import (
     has_collective_tmem_operand_candidate,
 )
+from helion._compiler.cute.state import cute_env_state
 from helion._testing import pairwise
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
@@ -252,7 +253,7 @@ def test_tf32_and_packed_a_keep_their_existing_native_paths(
         # operands have separate producer axes and a native consumer below.
         monkeypatch.setenv("HELION_CUTE_MATERIALIZE_TRANSFORMED_OPERANDS", "0")
         bound = _original_bound()
-        assert bound.env.cute_fission_plan is None
+        assert cute_env_state(bound.env).fission_plan is None
         config = _packed_config()
     else:
         bound = cpu_bind(_seeded_contraction, _inputs(torch.float32))
@@ -283,7 +284,7 @@ def test_materialized_packed_operand_keeps_native_shared_a(
             cute_segmented_matmul_tiling=True,
             cute_flatten_nested_reductions=True,
         )
-        plan = bound.env.cute_fission_plan
+        plan = cute_env_state(bound.env).fission_plan
         assert plan is not None and plan.region_count == 2
         assert bound.host_function is not None
         with bound.env, bound.host_function:

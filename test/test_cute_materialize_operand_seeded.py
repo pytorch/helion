@@ -18,6 +18,7 @@ from test.test_cute_materialize_operand import _reference
 
 import helion
 from helion._compiler.cute.materialize_operand import _additive_seed
+from helion._compiler.cute.state import cute_env_state
 from helion._testing import DEVICE
 from helion._testing import default_cute_mma_support
 import helion.language as hl
@@ -122,7 +123,7 @@ def _bind_se(
 
 
 def _roots(bound: BoundKernel[Any]) -> tuple[str, str]:
-    plan = bound.env.cute_fission_plan
+    plan = cute_env_state(bound.env).fission_plan
     assert plan is not None and plan.replacement_body is not None
     roots = [
         statement
@@ -139,7 +140,7 @@ def test_augassign_seed_is_materialized_with_the_seed_in_the_epilogue() -> None:
     is produced into an ``[M, K]`` tensor, the consumer contracts it against
     the transposed ``w`` tile and adds the seed after the contraction."""
     bound = _bind_se(se_block_bwd_dx, _dx_args(_se_args(1024, 512)))
-    plan = bound.env.cute_fission_plan
+    plan = cute_env_state(bound.env).fission_plan
     assert plan is not None and plan.region_count == 2
     assert plan.operand_interleave_factor == 1
     assert plan.pointwise_region_indices == (0,)
@@ -185,7 +186,7 @@ def test_transposed_direct_operand_is_materialized_on_the_rhs() -> None:
     """``x[k, n1].T @ recipe[k, n2]``: the direct A operand is a transposed input
     tile, so K is its leading position; the consumer keeps the ``.T`` read."""
     bound = _bind_se(se_block_bwd_dw, _dw_args(_se_args(1024, 512)))
-    plan = bound.env.cute_fission_plan
+    plan = cute_env_state(bound.env).fission_plan
     assert plan is not None and plan.region_count == 2
     assert bound.config_spec.tcgen05.search_enabled
     producer, consumer = _roots(bound)
@@ -236,12 +237,12 @@ def test_recompute_gate_keeps_small_reused_axes_fused(
     values = _se_args(m, n)
     dx = _bind_se(se_block_bwd_dx, _dx_args(values))
     dw = _bind_se(se_block_bwd_dw, _dw_args(values))
-    assert (dx.env.cute_fission_plan is not None) is dx_expected
-    assert (dw.env.cute_fission_plan is not None) is dw_expected
+    assert (cute_env_state(dx.env).fission_plan is not None) is dx_expected
+    assert (cute_env_state(dw.env).fission_plan is not None) is dw_expected
     for bound in (dx, dw):
         assert bound.host_function is not None
         assert len(bound.host_function.device_ir.root_ids) == (
-            2 if bound.env.cute_fission_plan is not None else 1
+            2 if cute_env_state(bound.env).fission_plan is not None else 1
         )
 
 
@@ -254,15 +255,18 @@ def test_one_source_same_width_recipe_keeps_its_fused_launch_when_static() -> No
         torch.empty((512, 1024), dtype=torch.bfloat16),
         torch.empty((1024, 512), dtype=torch.bfloat16),
     )
-    assert _bind(_computed_rhs, args, static_shapes=True).env.cute_fission_plan is None
-    assert _bind(_computed_rhs, args).env.cute_fission_plan is not None
+    assert (
+        cute_env_state(_bind(_computed_rhs, args, static_shapes=True).env).fission_plan
+        is None
+    )
+    assert cute_env_state(_bind(_computed_rhs, args).env).fission_plan is not None
 
 
 @pytest.mark.parametrize("kernel", (_scaled_seed, _subtracted_from_seed))
 def test_non_additive_seeds_keep_the_original_program(kernel: Kernel[Any]) -> None:
     values = _se_args(64, 32)
     bound = _bind(kernel, (values["grad_out"], values["w"]))
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
     assert bound.host_function is not None
     assert len(bound.host_function.device_ir.root_ids) == 1
 
@@ -270,7 +274,7 @@ def test_non_additive_seeds_keep_the_original_program(kernel: Kernel[Any]) -> No
 def test_assigned_seeds_move_to_the_epilogue_in_order() -> None:
     values = _se_args(64, 32)
     bound = _bind(_assigned_seeds, (values["grad_out"], values["w"]))
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     _, consumer = _roots(bound)
     lines = [line.strip() for line in consumer.splitlines()]
     assert lines[2].startswith("for _helion_materialize_logical_k in")
@@ -314,7 +318,7 @@ def test_cpu_reference_matches_the_original_program_bitwise(
     values = _se_args(24, 40, dyadic=True)
     args = pick(values)
     bound = _bind_se(kernel, args, static_shapes=False)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     actual = _reference(bound, args, transformed=True)
     expected = _reference(bound, args, transformed=False)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -428,7 +432,9 @@ def test_materialized_backward_matches_triton_and_the_fused_form(
     # dx reuses its [M, K] recipe across N (256-column tiles), dw its [K, N]
     # recipe across N1 (128-row tiles): the gate wants two tiles' worth.
     reused_tile = 256 if kernel is se_block_bwd_dx else 128
-    assert (materialized.env.cute_fission_plan is not None) is (n >= 2 * reused_tile)
+    assert (cute_env_state(materialized.env).fission_plan is not None) is (
+        n >= 2 * reused_tile
+    )
     fused = helion.kernel(
         kernel.fn,
         backend="cute",
@@ -436,7 +442,7 @@ def test_materialized_backward_matches_triton_and_the_fused_form(
         autotune_effort="none",
         cute_materialize_transformed_operands=False,
     )._bind_isolated(args)
-    assert fused.env.cute_fission_plan is None
+    assert cute_env_state(fused.env).fission_plan is None
     triton = helion.kernel(
         kernel.fn, backend="triton", static_shapes=True, autotune_effort="none"
     )._bind_isolated(args)

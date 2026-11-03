@@ -30,6 +30,7 @@ from .epilogue_fanout import _fresh_returned_tensors
 from .memory_ops import _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
 from .memory_ops import tensor_has_specialized_tma_alignment
 from .promote_output_axis import _access_tensor
+from .state import cute_env_state
 from .target_facts import static_smem_budget
 
 if TYPE_CHECKING:
@@ -362,7 +363,7 @@ def _stage(
 def prove_row_resident(
     env: CompileEnvironment, host: HostFunction, *, binding: bool = False
 ) -> RowResidentPlan | None:
-    fission = env.cute_fission_plan
+    fission = cute_env_state(env).fission_plan
     ir = host.device_ir
     if (
         env.backend_name != "cute"

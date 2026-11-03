@@ -12,12 +12,11 @@ against torch.
 from __future__ import annotations
 
 import re
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_fp32_dot import _chunk_cumsum
 from test.test_cute_fragment_tile_staging import _anchored_gram
 from test.test_cute_fragment_tile_staging import _anchored_gram_reference
@@ -26,10 +25,9 @@ from test.test_cute_fragment_tile_staging import _gram_inputs
 import helion
 from helion import exc
 from helion._testing import DEVICE
+from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import BooleanFragment
 import helion.language as hl
 
@@ -43,7 +41,6 @@ RSB = "cute_register_subblocks"
 MMA = "_helion_fragment_mma.mma_tf32("
 SYNC = "cute.arch.sync_threads()"
 PACKET = "num_bits_per_copy=128"
-
 pytestmark = skipUnlessBackends(["cute"])
 
 
@@ -65,12 +62,7 @@ def _odd_width_gram(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
 
 @pytest.fixture
 def _cpu_only():
-    with (
-        mock_cuda_unavailable(),
-        _target(),
-        forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
 
 

@@ -15,6 +15,7 @@ from test.test_cute_signed_bitfield_bf16 import _graph
 import helion
 from helion._compiler.cute import target_facts
 from helion._compiler.cute.materialize_operand import _exact_integer_cast
+from helion._compiler.cute.state import cute_env_state
 from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
 
@@ -217,4 +218,4 @@ def test_actual_recipe_admission_uses_integer_precision(
             torch.empty((32, 16), dtype=source),
         )
         bound = kernel._bind_isolated(args)
-        assert (bound.env.cute_fission_plan is not None) is expected
+        assert (cute_env_state(bound.env).fission_plan is not None) is expected

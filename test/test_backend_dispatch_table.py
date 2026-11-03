@@ -10,7 +10,7 @@ import pytest
 
 from helion._compiler import backend_registry
 from helion.language._decorators import APIFunc
-from helion.language._decorators import CodegenDict
+from helion.language._decorators import BackendDispatchTable
 from helion.language._decorators import api
 from helion.language._decorators import codegen
 
@@ -29,25 +29,25 @@ def _stub_pallas(state: object) -> str:
     return "pallas"
 
 
-class TestCodegenDict(unittest.TestCase):
+class TestBackendDispatchTable(unittest.TestCase):
     def setUp(self) -> None:
         patcher = mock.patch("helion._compiler.backend_registry.repair_backend_codegen")
         self.repair_backend_codegen = patcher.start()
         self.addCleanup(patcher.stop)
 
     def test_getitem_exact_match(self) -> None:
-        d = CodegenDict({"triton": _stub_triton, "common": _stub_common})
+        d = BackendDispatchTable({"triton": _stub_triton, "common": _stub_common})
         self.assertIs(d["triton"], _stub_triton)
         self.assertIs(d["common"], _stub_common)
         self.repair_backend_codegen.assert_called_once_with("triton")
 
     def test_getitem_falls_back_to_common(self) -> None:
-        d = CodegenDict({"common": _stub_common})
+        d = BackendDispatchTable({"common": _stub_common})
         self.assertIs(d["pallas"], _stub_common)
         self.repair_backend_codegen.assert_called_once_with("pallas")
 
     def test_getitem_repairs_before_falling_back_to_common(self) -> None:
-        d = CodegenDict({"common": _stub_common})
+        d = BackendDispatchTable({"common": _stub_common})
 
         def repair(key: str) -> None:
             d[key] = _stub_triton
@@ -57,48 +57,48 @@ class TestCodegenDict(unittest.TestCase):
         self.repair_backend_codegen.assert_called_once_with("triton")
 
     def test_getitem_raises_when_empty(self) -> None:
-        d: CodegenDict = CodegenDict()
+        d: BackendDispatchTable = BackendDispatchTable()
         with self.assertRaises(KeyError):
             d["triton"]
 
     def test_getitem_raises_when_no_common(self) -> None:
-        d = CodegenDict({"triton": _stub_triton})
+        d = BackendDispatchTable({"triton": _stub_triton})
         with self.assertRaises(KeyError):
             d["pallas"]
 
     def test_getitem_common_raises_when_not_set(self) -> None:
-        d: CodegenDict = CodegenDict()
+        d: BackendDispatchTable = BackendDispatchTable()
         with self.assertRaises(KeyError):
             d["common"]
         self.repair_backend_codegen.assert_not_called()
 
     def test_get_falls_back_to_common(self) -> None:
-        d = CodegenDict({"common": _stub_common})
+        d = BackendDispatchTable({"common": _stub_common})
         self.assertIs(d.get("triton"), _stub_common)
 
     def test_get_returns_exact_match(self) -> None:
-        d = CodegenDict({"triton": _stub_triton, "common": _stub_common})
+        d = BackendDispatchTable({"triton": _stub_triton, "common": _stub_common})
         self.assertIs(d.get("triton"), _stub_triton)
 
     def test_get_returns_none_when_empty(self) -> None:
-        d: CodegenDict = CodegenDict()
+        d: BackendDispatchTable = BackendDispatchTable()
         self.assertIsNone(d.get("triton"))
 
     def test_get_returns_default_when_no_common(self) -> None:
-        d = CodegenDict({"triton": _stub_triton})
+        d = BackendDispatchTable({"triton": _stub_triton})
         self.assertIs(d.get("pallas", _stub_pallas), _stub_pallas)
 
     def test_get_returns_none_for_missing_common(self) -> None:
-        d: CodegenDict = CodegenDict()
+        d: BackendDispatchTable = BackendDispatchTable()
         self.assertIsNone(d.get("common"))
 
     def test_prefers_backend_over_common(self) -> None:
-        d = CodegenDict({"triton": _stub_triton, "common": _stub_common})
+        d = BackendDispatchTable({"triton": _stub_triton, "common": _stub_common})
         self.assertIs(d["triton"], _stub_triton)
         self.assertIs(d.get("triton"), _stub_triton)
 
     def test_setitem_and_lookup(self) -> None:
-        d: CodegenDict = CodegenDict()
+        d: BackendDispatchTable = BackendDispatchTable()
         d["common"] = _stub_common
         d["triton"] = _stub_triton
         self.assertIs(d["triton"], _stub_triton)

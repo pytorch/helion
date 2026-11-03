@@ -31,6 +31,7 @@ from helion._compiler.cute.autotune.heuristics.cute_split_k_cluster import (
 from helion._compiler.cute.split_k_cluster import CLUSTER_K_SCHEDULE
 from helion._compiler.cute.split_k_cluster_config import CLUSTER8_K4
 from helion._compiler.cute.split_k_cluster_config import SCHEDULE_KEY
+from helion._compiler.cute.state import cute_env_state
 from helion._testing import default_cute_mma_support
 from helion._testing import import_example
 from helion.autotuner.effort_profile import get_effort_profile
@@ -469,7 +470,7 @@ def test_half_output_cluster_facts_follow_the_promotion_setting(promote: bool) -
     output accumulates in place and the schedule declines; with the
     promotion on (the fp32 twin) the facts and the carrier exist."""
     bound, _args = _bind(cute_promote_half_atomic_outputs=promote)
-    assert bool(bound.env.cute_half_atomic_output_promotions) == promote
+    assert bool(cute_env_state(bound.env).half_atomic_output_promotions) == promote
     assert (bound.config_spec.cute_split_k_cluster_facts is not None) == promote
     assert (_carrier(bound) is not None) == promote
 

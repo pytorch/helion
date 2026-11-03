@@ -7,8 +7,8 @@ uniform branches, the nested-reduction normalization, the owner validation,
 the lane / serial-loop interchange, the two-pass lane split, the marker
 restore, the chunk-recurrence hoist and the grid vector-loop sink.  The
 order is a compatibility invariant (each pass recognizes the shapes the
-previous ones leave behind) and the body is the ``backend.name == "cute"``
-block ``GenerateAST.visit_For`` used to hold, moved verbatim.
+previous ones leave behind); the pipeline replaces the
+``backend.name == "cute"`` block ``GenerateAST.visit_For`` used to hold.
 ``sink_root_vector_loops`` is the grid vector-loop sink (the vloop-sink
 tests patch it on this module); ``reject_lane_reads_without_lane_loops`` is
 the end-of-codegen check of a root whose lane loops a collective matmul
@@ -152,7 +152,7 @@ def run_root_lane_passes(codegen: GenerateAST) -> None:
                 name: aliases[0]
                 for name, aliases in codegen.device_function._variable_renames.items()
             },
-            running_sums=codegen.device_function.cute_matmul_running_sums,
+            running_sums=codegen.device_function.cute_state.lanes.matmul_running_sums,
             register_tile_options=RegisterTileOptions(
                 warp_fold=knobs.get("cute_register_tile_warp_fold") is True,
                 store_first=knobs.get("cute_register_tile_store_first") is True,
@@ -173,7 +173,7 @@ def run_root_lane_passes(codegen: GenerateAST) -> None:
             name: aliases[0]
             for name, aliases in codegen.device_function._variable_renames.items()
         },
-        running_sums=codegen.device_function.cute_matmul_running_sums,
+        running_sums=codegen.device_function.cute_state.lanes.matmul_running_sums,
         required=codegen.device_function.cute_state.lanes.chunk_recurrence_running_sums,
     )
     # Interchange a grid constexpr vector loop into the serial

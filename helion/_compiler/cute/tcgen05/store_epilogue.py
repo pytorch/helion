@@ -40,6 +40,7 @@ from ..epilogue_fanout import schedule_supported as fanout_schedule_supported
 from ..epilogue_fanout import (
     store_protocol_supported as fanout_store_protocol_supported,
 )
+from ..state import cute_codegen_state
 from ..strategies import tcgen05_explicit_d_store_tile_expr
 from ..strategies import tcgen05_is_two_cta_m128
 from ..strategies import tcgen05_resolve_epilogue_tile
@@ -2904,7 +2905,8 @@ def _codegen_cute_store_tcgen05_tile(
             d_tma_plan["d_leading_passthrough"] = True
         if tcgen05_value.output_column_major:
             d_tma_plan["d_column_major"] = True
-        state.codegen.cute_wrapper_plans.append(d_tma_plan)
+        wrapper_plans = cute_codegen_state(state.codegen).wrapper_plans
+        wrapper_plans.append(d_tma_plan)
         if d_tma_uses_tail_rank3_mnl_tensor:
             tail_d_tma_plan = {
                 **d_tma_plan,
@@ -2914,7 +2916,7 @@ def _codegen_cute_store_tcgen05_tile(
                 ],
                 "rank3_mnl_tensor": True,
             }
-            state.codegen.cute_wrapper_plans.append(tail_d_tma_plan)
+            wrapper_plans.append(tail_d_tma_plan)
 
     tcgen05_bm = tcgen05_value.bm
     tcgen05_bn = tcgen05_value.bn

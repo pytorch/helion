@@ -68,6 +68,7 @@ from .scalar_recipe import ScalarRecipe
 from .scalar_recipe import build_recipe
 from .scalar_recipe_cache import plan_scalar_recipe_cache
 from .scalar_recipe_rounding import preserve_fp32_multiply_rounding
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1133,7 +1134,7 @@ def _mark_collective(
     sites.append(site)
     if synthetic_dependencies:
         cg.allow_dead_assignments_owned_by_nodes((*synthetic_dependencies, acc_node))
-    cg.cute_uses_matmul = True
+    cute_codegen_state(cg).declare_matmul()
     return cast(
         "ast.expr",
         expr_from_string(

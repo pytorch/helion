@@ -16,6 +16,7 @@ from ..host_function import HostFunction
 from .promote_output_axis import _access_tensor
 from .promote_output_axis import _fresh_tensors
 from .promote_output_axis import _ordinary_operation
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
@@ -253,7 +254,7 @@ def signed_byte_site(state: CodegenState) -> SignedByteSite:
     return SignedByteSite(
         state.codegen.statements_stack[-1],
         _loop_ids(state),
-        bool(state.codegen._cute_branch_path),
+        bool(cute_codegen_state(state.codegen).branch_path),
         all(
             isinstance(loop, DeviceGridState)
             for stack in state.codegen.active_device_loops.values()

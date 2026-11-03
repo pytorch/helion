@@ -6,7 +6,8 @@ tables spelled out four times (``config_spec.py`` and the 185-line
 ``CuteBackend.supports_config_key`` chain).  They are now derived from the
 knob-family tables in ``helion/_compiler/cute/autotune/config_keys.py``; the
 whitespace-separated tables below are the literal sets as recorded on the tree
-before the derivation (commit 34a6915ef) and must not drift.  Keep this file
+before the derivation (commit 34a6915ef), kept in step with every key added
+since, and must not drift from the derived tables.  Keep this file
 until the knob tables themselves become the declaration of record for every
 family.
 """
@@ -32,7 +33,7 @@ from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.search_surface import EMPTY_SEARCH_SURFACE
 from helion.autotuner.search_surface import BackendSearchSurface
 
-# ``VALID_KEYS`` on 34a6915ef (418 keys).
+# ``VALID_KEYS``.
 _BASE_VALID_KEYS = """
     advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
     cute_affine_scan_schedule cute_async_load_cache cute_async_load_group_rows
@@ -188,7 +189,7 @@ _BASE_VALID_KEYS = """
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles
 """
 
-# ``BACKEND_SPECIFIC_KEYS`` on 34a6915ef (395 keys).
+# ``BACKEND_SPECIFIC_KEYS``.
 _BASE_BACKEND_SPECIFIC_KEYS = """
     cross_loop_pipeline cute_affine_scan_schedule cute_async_load_cache
     cute_async_load_group_rows cute_async_load_lookahead cute_async_load_stages
@@ -338,7 +339,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles
 """
 
-# ``_CUTE_IMPLICIT_DEFAULT_KEYS`` on 34a6915ef (144 keys).
+# ``_CUTE_IMPLICIT_DEFAULT_KEYS``.
 _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     atomic_indexing cute_async_load_cache cute_async_load_group_rows
     cute_async_load_lookahead cute_async_load_stages cute_async_store_policy
@@ -393,7 +394,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_pdl_spread cute_split_k_atomic_epilogue
 """
 
-# ``{k in VALID_KEYS: CuteBackend().supports_config_key(k)}`` on 34a6915ef (402 keys).
+# ``{k in VALID_KEYS: CuteBackend().supports_config_key(k)}``.
 _BASE_CUTE_ACCEPTED = """
     advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
     cute_affine_scan_schedule cute_async_load_cache cute_async_load_group_rows
@@ -543,7 +544,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles
 """
 
-# The same census for ``TritonBackend`` (27 keys).
+# The same census for ``TritonBackend``.
 _BASE_TRITON_ACCEPTED = """
     advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
     epilogue_subtile flatten_loops host_tensor_descriptors indexing l2_groupings
@@ -554,7 +555,7 @@ _BASE_TRITON_ACCEPTED = """
     store_cache_modifiers
 """
 
-# The same census for ``TileIRBackend`` (27 keys).
+# The same census for ``TileIRBackend``.
 _BASE_TILEIR_ACCEPTED = """
     advanced_controls_file atomic_indexing block_sizes epilogue_subtile
     flatten_loops indexing l2_groupings load_cache_modifiers load_eviction_policies
@@ -564,7 +565,7 @@ _BASE_TILEIR_ACCEPTED = """
     reduction_loops static_ranges store_cache_modifiers
 """
 
-# The same census for ``PallasBackend`` (12 keys).
+# The same census for ``PallasBackend``.
 _BASE_PALLAS_ACCEPTED = """
     block_sizes flatten_loops loop_orders pallas_emit_pipeline_group_size
     pallas_fold_dot_lhs_cast pallas_indirect_access_mode pallas_internal_scratch

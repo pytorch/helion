@@ -41,7 +41,6 @@ pytest.importorskip("cutlass.cute")
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 import helion.language as hl
 
@@ -155,7 +154,7 @@ def _render(
 ) -> str:
     args, _reference = _inputs(kernel_name, shape, DEVICE)
     with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
-        return _KERNELS[kernel_name].bind(args).to_triton_code(helion.Config(**config))
+        return _KERNELS[kernel_name].bind(args).to_code(helion.Config(**config))
 
 
 def _guard_lines(code: str) -> list[str]:
@@ -171,7 +170,6 @@ def _virtual_pid_lines(code: str) -> set[str]:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_padding_guard_follows_the_scheduler_dims() -> None:
     """The swizzle guard is decided by the tile count on scheduler dim 1."""
     _skip_without_tcgen05()
@@ -206,7 +204,6 @@ def test_padding_guard_follows_the_scheduler_dims() -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_scheduler_mailbox_decodes_the_raster() -> None:
     """Mailbox consumers read each PID axis from the slot of its scheduler dim."""
     _skip_without_tcgen05()
@@ -324,7 +321,6 @@ def _assert_one_digest(digests: dict[str, str]) -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_swizzled_odd_n_tiles_complete_under_both_rasters() -> None:
     """Padded dim-1 slots are skipped on the two-CTA and one-CTA batched grids."""
     _skip_without_tcgen05()
@@ -345,7 +341,6 @@ def test_swizzled_odd_n_tiles_complete_under_both_rasters() -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_scheduler_warp_bmm_completes_under_both_rasters() -> None:
     """The scheduler-warp mailbox feeds the right tiles under either walk."""
     _skip_without_tcgen05()
@@ -367,7 +362,6 @@ def test_scheduler_warp_bmm_completes_under_both_rasters() -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_scheduler_warp_rowvec_bias_completes_under_both_rasters() -> None:
     """The aux C-input warp decodes the mailbox like the MMA and store roles."""
     _skip_without_tcgen05()

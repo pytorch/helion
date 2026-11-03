@@ -7,11 +7,8 @@ import torch
 
 import helion
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 
 jagged_dense_bmm = import_example("jagged_dense_bmm").jagged_dense_bmm
-
-pytestmark = skipUnlessBackends(["cute"])
 
 CUDA_DEVICE = "cuda"
 

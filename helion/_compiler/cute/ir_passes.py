@@ -22,6 +22,7 @@ from . import search_surface
 from .atomic_output_promotions import collect_cute_half_atomic_output_promotions
 from .atomic_output_promotions import promote_cute_root_graph_host_tensors
 from .atomic_output_promotions import rewrite_cute_half_atomic_output_allocations
+from .state import cute_env_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -71,7 +72,9 @@ def canonicalize_traced_graphs_pass(
     expose_mxfp8(device_ir)
     # ``refresh_active_blocks_pass`` needs the count after the core's
     # ``prepare_graph_lowerings``; it crosses that step on the env.
-    CompileEnvironment.current().cute_scaled_contraction_count = scaled_contractions
+    cute_env_state(
+        CompileEnvironment.current()
+    ).scaled_contraction_count = scaled_contractions
     if CompileEnvironment.current().settings.fast_math:
         from .factor_affine_reductions import factor_affine_reductions
 
@@ -85,7 +88,7 @@ def canonicalize_traced_graphs_pass(
     if promotions:
         assert func is not None
         env = CompileEnvironment.current()
-        env.cute_half_atomic_output_promotions = promotions
+        cute_env_state(env).half_atomic_output_promotions = promotions
         rewrite_cute_half_atomic_output_allocations(func, promotions)
         promote_cute_root_graph_host_tensors(device_ir.graphs, promotions)
 
@@ -101,19 +104,20 @@ def promote_partitioned_outputs_pass(
     from .promote_output_axis import promote_partitioned_output_axis
 
     assert func is not None
+    env = CompileEnvironment.current()
+    env_state = cute_env_state(env)
     # After validate_host_tensor_usage: the rewired scale is a host tensor.
-    CompileEnvironment.current().cute_dot_scaled_scales_exposed = any(
+    env_state.dot_scaled_scales_exposed = any(
         [expose_dot_scaled_scales(graph.graph) for graph in device_ir.graphs]
     )
     promote_partitioned_output_axis(func, device_ir, device_ir.root_nodes)
 
-    if CompileEnvironment.current().cute_fission_plan is not None:
+    if env_state.fission_plan is not None:
         from .materialized_fission import forward_materialized_self_loads
         from .scalar_recipe_rounding import FP32_MULTIPLY_ROUNDING_META_KEY
 
         forward_materialized_self_loads(func, device_ir)
-        env = CompileEnvironment.current()
-        plan = env.cute_fission_plan
+        plan = env_state.fission_plan
         assert plan is not None
         env.config_spec.cute_pointwise_region_block_ids = frozenset(
             block_id
@@ -178,7 +182,8 @@ def refresh_active_blocks_pass(
     (after CSE), when ``expose_scaled_contractions`` rewrote a loop or
     ``expose_dot_scaled_scales`` rewired a scale."""
     env = CompileEnvironment.current()
-    if env.cute_scaled_contraction_count or env.cute_dot_scaled_scales_exposed:
+    env_state = cute_env_state(env)
+    if env_state.scaled_contraction_count or env_state.dot_scaled_scales_exposed:
         from ..active_blocks import active_block_ids
 
         device_ir.codegen_active_block_ids = active_block_ids(

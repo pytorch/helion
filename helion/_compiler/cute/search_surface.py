@@ -32,6 +32,7 @@ from ..compile_environment import CompileEnvironment
 from . import target_facts
 from .autotune.flash_surface import enable_cute_flash_gated_search
 from .autotune.flash_surface import enable_cute_flash_search
+from .state import cute_env_state
 from .tcgen05_config import facts
 
 if TYPE_CHECKING:
@@ -182,6 +183,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     lane vector widths, tile packing, exact division, signed bitfields and
     the flash / gated-flash / tcgen05 GEMM search surfaces."""
     env = CompileEnvironment.current()
+    env_state = cute_env_state(env)
     register_lane_vector_width_specs(config_spec)
     from .hoist_loop_invariant_recip import has_hoistable_fp32_divisions
     from .signed_bitfield import has_signed_byte_field
@@ -381,7 +383,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
             planning_results,
             analysis_keys,
         )
-        if env.cute_fission_plan is None and (
+        if env_state.fission_plan is None and (
             env.has_barrier
             and len(device_ir.root_ids) > 1
             and _enable_cute_phase_mma_search(
@@ -410,7 +412,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
                 ),
             )
             config_spec._cute_tcgen05_config.fission_bundle = (
-                env.cute_fission_plan is not None
+                env_state.fission_plan is not None
             )
             enable_cute_tcgen05_search(
                 lhs,
@@ -446,7 +448,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
                 allocation_graphs = pipeline_region_graphs(
                     device_ir,
                     mma_candidates[0][3],
-                    separately_launched=env.cute_fission_plan is not None,
+                    separately_launched=env_state.fission_plan is not None,
                 )
                 smem_facts = (
                     analyze_pipeline_smem_facts(
@@ -463,7 +465,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
                         ),
                         allow_fp8_broadcasts=(
                             len(device_ir.root_ids) == 1
-                            and env.cute_fission_plan is None
+                            and env_state.fission_plan is None
                         ),
                         capacity_bytes=(
                             target_facts.per_cta_smem_capacity_bytes(lhs.device)
@@ -479,7 +481,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
                     tcgen05_config.materialized_operand_pdl_roots = (
                         prove_materialized_operand_pdl(env, device_ir, candidate)
                     )
-        elif env.cute_fission_plan is not None:
+        elif env_state.fission_plan is not None:
             from .materialized_mma import enable_materialized_mma_search
 
             enable_materialized_mma_search(
@@ -734,7 +736,7 @@ def restrict_tcgen05_multi_root_search(
     publishes the plain phases' layout knobs."""
     env = CompileEnvironment.current()
     config_spec = env.config_spec
-    if len(device_ir.root_ids) > 1 and env.cute_fission_plan is None:
+    if len(device_ir.root_ids) > 1 and cute_env_state(env).fission_plan is None:
         if config_spec.tcgen05.search_enabled:
             # The tcgen05 persistent launch grid is derived from a single
             # root's PID space today. Keep persistent pid types out of

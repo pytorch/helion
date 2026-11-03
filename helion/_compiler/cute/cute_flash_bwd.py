@@ -80,6 +80,7 @@ from .cute_flash_bwd_common import fbwd_mma_tile_entry
 from .cute_flash_bwd_common import fbwd_p_store_views
 from .cute_flash_bwd_common import fbwd_tile_loop
 from .cute_flash_bwd_common import fbwd_tmem_warp
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     import sympy
@@ -2077,14 +2078,15 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
         # honored 80/152/128 split is ~4% faster at s8192/d128.
         "topology": "fa4",
     }
-    cg.cute_wrapper_plans.append(wrapper_plan)  # type: ignore[attr-defined]
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(wrapper_plan)
     if two_cta:
         df.wrapper_only_params.extend(_FLASH_BWD_2CTA_KERNEL_PARAMS)
         df.cute_state.tcgen05.cluster_shape = (2, 1, 1)
     else:
         df.wrapper_only_params.extend(_FLASH_BWD_KERNEL_PARAMS)
     df.placeholder_args.update(a.name for a in args.values())  # type: ignore[union-attr]
-    cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+    codegen_state.declare_matmul()
     df.cute_state.flash.threads = 512
 
     if two_cta:
@@ -2150,7 +2152,8 @@ def _codegen_flash_bwd_row_mma(
     emit_flash_bwd_row_mma_module_statements(cg)
     names = {role: arg.name for role, arg in args.items()}
     total_tiles = plan.num_groups * (plan.n_dim // kv_rows)
-    cg.cute_wrapper_plans.append(  # type: ignore[attr-defined]
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(
         {
             "kind": FLASH_BWD_ROW_PLAN_KIND,
             **{f"{role}_name": name for role, name in names.items()},
@@ -2165,7 +2168,7 @@ def _codegen_flash_bwd_row_mma(
         }
     )
     df.placeholder_args.update(names.values())
-    cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+    codegen_state.declare_matmul()
     df.cute_state.flash.threads = 32 * warps
     # The launcher sizes the grid from the plan (one CTA per KV tile), not
     # from the 128-row program-id grid: the dependent-launch release rule

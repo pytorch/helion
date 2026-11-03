@@ -13,6 +13,7 @@ from .gathered_mma import _normalize
 from .gathered_mma import _read_names
 from .gathered_mma import _replace
 from .gathered_mma import _same
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -433,5 +434,6 @@ def emit_gathered_mma_region(
         assert type(value) is int
         plan["m_extent"] = value
     df.wrapper_only_params.extend(parameters)
-    df.codegen.cute_wrapper_plans.append(plan)
-    df.codegen.cute_uses_matmul = True
+    codegen_state = cute_codegen_state(df.codegen)
+    codegen_state.wrapper_plans.append(plan)
+    codegen_state.declare_matmul()

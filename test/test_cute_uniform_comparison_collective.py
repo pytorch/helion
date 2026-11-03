@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -13,22 +12,13 @@ import helion
 from helion._compiler.cute import uniform_comparison
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
-
-if TYPE_CHECKING:
-    from collections.abc import Generator
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only() -> Generator[None, None, None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipUnlessBackends(["cute"]),
+    pytest.mark.cpu_render,
+]
 
 
 def _compare_matmul(

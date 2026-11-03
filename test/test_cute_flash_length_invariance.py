@@ -1586,7 +1586,7 @@ def test_small_flash_search_spaces_are_exhaustive(
     # the distinct rows: the three-tile d64 ws_overlap family multiplies the
     # kv_stage triple by six binary knobs (192 raw rows for 102 distinct) once
     # the single-tile body searches its issue-stream knobs; d128 is 64 raw
-    # rows for 34.  The autotuner's own floor is ``_FLASH_EXACT_SPACE_RAW_FLOOR``
+    # rows for 34.  The autotuner's own floor is ``FLASH_EXACT_SPACE_RAW_FLOOR``
     # (1024); this test's is its own, kept at the next power of two above d64.
     exact = generation.extension.exact_effective_search_space_configs(256)
     assert exact is not None

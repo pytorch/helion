@@ -17,6 +17,7 @@ import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.emitters.memory_access import _cute_combined_mask
 from helion._compiler.cute.memory_ops import _cute_stack_tensor_mask_expr
+from helion._compiler.cute.state import CuteCodegenState
 from helion._testing import import_example
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
@@ -90,6 +91,7 @@ def _predicate(
                     i: [SimpleNamespace(strategy=_MaskStrategy(mask))]
                     for i, mask in enumerate(("mask_m", "mask_n", k_mask, "mask_s"))
                 },
+                backend_state=CuteCodegenState(),
                 lift=lambda value, **kwargs: value,
             ),
             device_function=SimpleNamespace(

@@ -7,11 +7,8 @@ from test.test_cute_tile_packing import _gemv_args
 
 import helion
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 
 _nvfp4_gemv_fp4in_body = import_example("nvfp4_gemv")._nvfp4_gemv_fp4in_body
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 def _config(groups: int, threads: int, unroll: int) -> helion.Config:
@@ -49,7 +46,7 @@ def test_device_loop_lane_loop_unrolls_loads_first(unroll: int) -> None:
     kernel = helion.kernel(
         _nvfp4_gemv_fp4in_body, backend="cute", static_shapes=True, config=config
     )
-    source = kernel.bind(args).to_triton_code(config)
+    source = kernel.bind(args).to_code(config)
     # The load phase and the compute phase: two constexpr copies of the lane
     # body, inside a rolled block loop when the unroll is partial.
     lane = "lane_1" if unroll == 8 else "lane_1_u"
@@ -68,6 +65,6 @@ def test_unrolled_lane_loop_is_off_without_the_knob() -> None:
     kernel = helion.kernel(
         _nvfp4_gemv_fp4in_body, backend="cute", static_shapes=True, config=config
     )
-    source = kernel.bind(args).to_triton_code(config)
+    source = kernel.bind(args).to_code(config)
     assert "for lane_1 in range(8):" in source
     assert "_lane_unroll_loads_" not in source

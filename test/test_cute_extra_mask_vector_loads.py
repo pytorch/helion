@@ -333,3 +333,120 @@ def test_dynamic_shapes_keep_scalar_loads() -> None:
     vloop = _vector_loop(code)
     assert not _packet_loads(_lane_body(code, vloop)), code
     assert len(_scalar_loads(vloop)) == 2, ast.unparse(vloop)
+
+
+# GPU numerics for CuTe vector loads under ``hl.load(extra_mask=...)``.
+#
+# Companion to ``test_cute_extra_mask_vector_loads.py``: the masked concatenation
+# example runs with a vectorized column tile where its ``extra_mask`` terms are
+# lane-uniform (packets) and where they are not (scalar fallback), and a kernel
+# whose mask changes inside every packet.
+
+
+CUDA_DEVICE = "cuda"
+
+
+def _run(kernel: object, args: tuple[object, ...], **config: object) -> torch.Tensor:
+    bound = kernel.bind(args)  # pyrefly: ignore [missing-attribute]
+    return bound.compile_config(helion.Config.from_dict(config))(*args)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("n1", "n2", "dtype", "vec_width"),
+    [
+        (512, 768, torch.float32, 4),  # both loads vectorize
+        (500, 512, torch.float32, 4),  # 500 % 4 == 0: both loads vectorize
+        (512, 768, torch.bfloat16, 8),  # 16-byte bf16 packets
+        (502, 300, torch.float32, 4),  # misaligned bound: scalar fallback
+        (500, 512, torch.bfloat16, 8),  # 500 % 8 != 0: scalar fallback
+    ],
+)
+def test_concat_masked_matches_torch_cat(
+    n1: int, n2: int, dtype: torch.dtype, vec_width: int
+) -> None:
+    kernel = helion.kernel(
+        concat2d_dim1.fn, backend="cute", static_shapes=True, autotune_effort="none"
+    )
+    x = torch.randn((37, n1), dtype=dtype, device=CUDA_DEVICE)
+    y = torch.randn((37, n2), dtype=dtype, device=CUDA_DEVICE)
+    out = _run(
+        kernel,
+        (x, y),
+        block_sizes=[1, 2048],
+        num_threads=[0, 2048 // vec_width],
+        cute_vector_widths=[1, vec_width],
+    )
+    torch.testing.assert_close(out, torch.cat([x, y], dim=1), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_lane_varying_extra_mask_matches_reference() -> None:
+    x = torch.randn((5, 1000), device=CUDA_DEVICE)
+    out = _run(
+        _keep_even_columns,
+        (x,),
+        block_sizes=[1, 1024],
+        num_threads=[0, 256],
+        cute_vector_widths=[1, 4],
+    )
+    keep = (torch.arange(1000, device=CUDA_DEVICE) % 2 == 0)[None, :]
+    torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("last", [511, 512])
+def test_inclusive_bound_matches_reference(last: int) -> None:
+    x = torch.randn((3, 1024), device=CUDA_DEVICE)
+    out = _run(
+        _prefix_columns,
+        (x, last),
+        block_sizes=[1, 1024],
+        num_threads=[0, 256],
+        cute_vector_widths=[1, 4],
+    )
+    keep = (torch.arange(1024, device=CUDA_DEVICE) <= last)[None, :]
+    torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_bitwise_and_mask_matches_reference() -> None:
+    x = torch.randn((5, 1024), device=CUDA_DEVICE)
+    out = _run(_window_columns, (x,), **_ROW_CONFIG)
+    columns = torch.arange(1024, device=CUDA_DEVICE)
+    keep = ((columns >= 256) & (columns < 512))[None, :]
+    torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_loaded_flag_mask_matches_reference() -> None:
+    x = torch.randn((8, 1024), device=CUDA_DEVICE)
+    flags = torch.randint(-1, 2, (8,), dtype=torch.int32, device=CUDA_DEVICE)
+    out = _run(_row_flag_columns, (x, flags), **_ROW_CONFIG)
+    columns = torch.arange(1024, device=CUDA_DEVICE)
+    keep = (flags > 0)[:, None] & (columns < 512)[None, :]
+    torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_atomic_result_mask_matches_reference() -> None:
+    x = torch.randn((8, 1024), device=CUDA_DEVICE)
+    counter = torch.zeros((8, 1024), dtype=torch.int32, device=CUDA_DEVICE)
+    out = _run(_atomic_flag_columns, (x, counter), **_ROW_CONFIG)
+    keep = (torch.arange(1024, device=CUDA_DEVICE) < 512)[None, :]
+    torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
+    assert bool((counter == 1).all())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_device_loop_extra_mask_matches_reference() -> None:
+    x = torch.randn((8, 1024), device=CUDA_DEVICE)
+    out = _run(
+        _prefix_columns_device_loop,
+        (x,),
+        block_sizes=[1, 128],
+        num_threads=[0, 32],
+        cute_vector_widths=[1, 4],
+    )
+    keep = (torch.arange(1024, device=CUDA_DEVICE) < 512)[None, :]
+    torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)

@@ -25,7 +25,6 @@ from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import NumThreadsSpec
 from helion.language import _tracing_ops
 from helion.language._decorators import BackendDispatchTable
-from helion.language._decorators import CodegenDict
 
 
 def _backends() -> dict[str, Backend]:
@@ -299,9 +298,6 @@ class TestBackendDispatchTable(unittest.TestCase):
         patcher = patch("helion._compiler.backend_registry.repair_backend_codegen")
         self.repair = patcher.start()
         self.addCleanup(patcher.stop)
-
-    def test_codegen_dict_is_the_table(self) -> None:
-        self.assertIs(CodegenDict, BackendDispatchTable)
 
     def test_lookup_falls_back_and_names_the_missing_implementation(self) -> None:
         common = object()

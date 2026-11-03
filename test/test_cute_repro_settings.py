@@ -15,6 +15,7 @@ from test.test_cute_materialized_fission import _se_args
 from test.test_cute_shared_rhs_grouped import _offset_mm
 
 import helion
+from helion._compiler.cute.state import cute_env_state
 from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
@@ -176,7 +177,7 @@ def test_structural_binding_and_config_roundtrip(
         **switches,
     )._bind_isolated(args)
     if marker == "fission":
-        assert (bound.env.cute_fission_plan is not None) == enabled
+        assert (cute_env_state(bound.env).fission_plan is not None) == enabled
     else:
         assert (marker in _host(bound)) == enabled
     _check_roundtrip(
@@ -346,7 +347,7 @@ def test_materialized_composed_structural_settings_roundtrip(
         autotune_effort="none",
         **switches,
     )._bind_isolated(args)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     assert "_helion_fullslice_k" in _host(bound)
     _check_roundtrip(bound, args, monkeypatch, conflicting_environment=True)
 
