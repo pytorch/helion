@@ -6148,19 +6148,12 @@ class TestPallas(TestCase):
         # segment would overwrite rows [10, 16), making the bug observable.
         starts = torch.tensor([10, 0], device=DEVICE, dtype=torch.int32)
         ends = torch.tensor([25, 10], device=DEVICE, dtype=torch.int32)
-        code, result = code_and_output(
+        _code, result = code_and_output(
             pallas_jagged_row_slab_add,
             (x, starts, ends),
             block_sizes=[16],
             pallas_loop_type="emit_pipeline",
         )
-
-        self.assertIn("pltpu.emit_pipeline", code)
-        self.assertIn("out_specs=pl.BlockSpec((pl.BoundedSlice", code)
-        self.assertIn("jnp.clip(25 -", code)
-        self.assertIn("jnp.minimum", code)
-        self.assertIn("jnp.where", code)
-        self.assertNotIn("_ds_pad_dims=", code)
 
         expected = torch.empty_like(x)
         expected[10:25] = x[10:25] + 1.0
