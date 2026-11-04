@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Sequence
 
+    from helion.autotuner.config_spec import ConfigSpec
     from helion.runtime.kernel import BoundKernel
 
 pytestmark = [
@@ -2383,17 +2384,21 @@ def _resolved_axes(
 
 
 @pytest.mark.parametrize("kernel", sorted(_REGION_BINDERS))
-def test_region_programs_keep_one_commit_in_flight_and_disjoint_live_slots(
+def test_region_programs_pass_the_tensor_memory_checks_at_their_seeds(
     kernel: str,
 ) -> None:
-    # Three rules over every region program the examples admit
-    # (the kda and anchored kernels included), at its tensor-memory seeds:
-    # a tile-only derived value that a dot reads, a loop carries or another
-    # region reads holds its own tensor-memory columns (``derived_crosses``;
-    # the rest stay in registers, so the renderer never loads or stores
-    # them -- it asserts); the hardware-order check finds no tensor-memory
-    # hazard in the render; and no batch commits while the previous commit
-    # is outstanding (a dots-only batch behind a loop used to).
+    # Four rules over every region program the examples admit (the kda and
+    # anchored kernels included; one case per program, so a failure names
+    # it), at its first two tensor-memory seeds, each rendered once under
+    # both checkers: a tile-only derived value that a dot reads, a loop
+    # carries or another region reads holds its own tensor-memory columns
+    # (``derived_crosses``; the rest stay in registers, so the renderer
+    # never loads or stores them -- it asserts); the hardware-order check
+    # finds no tensor-memory hazard in the render; no batch commits while
+    # the previous commit is outstanding (a dots-only batch behind a loop
+    # used to); and the value-version check is clean (every read finds the
+    # value it expects, every carry slot holds its output at the iteration's
+    # end and every body read of an outer value survives the iteration).
     bound = _REGION_BINDERS[kernel]()
     spec = bound.config_spec
     facts = spec.cute_mma_dag_facts
@@ -2437,8 +2442,8 @@ def test_region_programs_keep_one_commit_in_flight_and_disjoint_live_slots(
     for seed in seeds[:2]:
         with bound.env:
             normalized = spec.normalized_config(seed)
-        with _instrumented_renderer():
-            body = _kernel_body(bound.to_code(normalized))
+        body, versions = _checked_body(bound, normalized)
+        assert versions == [], (kernel, normalized.config["block_sizes"], versions[:3])
         assert _commits_while_one_is_outstanding(body) == []
         _assert_tmem_hardware_order(
             bound, program, body, normalized.config["block_sizes"]
@@ -3770,6 +3775,18 @@ def _instrumented_body(bound: BoundKernel, config: helion.Config) -> str:
         return _kernel_body(_source(bound, config))
 
 
+def _checked_body(bound: BoundKernel, config: helion.Config) -> tuple[str, list[str]]:
+    """One render of ``config`` under both checkers: the kernel body with the
+    tensor-memory marks (for ``_assert_tmem_hardware_order``) and the
+    value-version checker's errors.  The marking hooks are entered first,
+    so the version hooks wrap them: every emission reaches both, the marks
+    land in the body, and the body and the errors are those of the
+    separate renders."""
+    with _instrumented_renderer(), _version_checked() as errors:
+        body = _kernel_body(_source(bound, config))
+    return body, list(errors)
+
+
 def _tmem_trace(body: str) -> list[tuple[object, ...]]:
     """The body's tensor-memory operations as a tree: ``("loop", line,
     trips, children)`` nodes (literal trip counts, at least one and at most
@@ -4844,35 +4861,51 @@ _RENDER_BINDERS: dict[str, Callable[[], BoundKernel]] = {
 }
 
 
-@pytest.mark.parametrize("which", ("default", "first_seed"))
+def _seeded_default(spec: ConfigSpec, seed: helion.Config) -> helion.Config:
+    """``seed`` as ``default_config`` promotes a seed: the sparse seed (the
+    dag knobs it names) over the base defaults, normalized, so it compares
+    with the default config over one field set."""
+    merged = dict(spec.autotune_reference_config().config)
+    merged.update(seed.config)
+    config = helion.Config.from_dict(merged)
+    spec.normalize(config)
+    return config
+
+
 @pytest.mark.parametrize("name", sorted(_RENDER_BINDERS))
-def test_every_admitted_default_and_first_seed_renders(name: str, which: str) -> None:
+def test_every_admitted_default_and_first_seed_renders(name: str) -> None:
     # A config normalization admits must compile: the default config and
     # the first tcgen05 seed of every binder that admits the mode render
-    # (the fp32 GLA default did not): one case per (binder, config), so a
-    # failure names the binder and no case is long.
+    # (the fp32 GLA default did not); one case per binder, so a failure
+    # names it.  The seed is sparse, so the two are compared promoted and
+    # rendered once if they agree (today the default is the warp mode, so
+    # both render).  A region
+    # binder's first two tensor-memory seeds are rendered under the checkers
+    # by test_region_programs_pass_the_tensor_memory_checks_at_their_seeds,
+    # so here it renders only a default outside them (the warp mode's).
     bound = _RENDER_BINDERS[name]()
     spec = bound.config_spec
     if spec.cute_mma_dag is None or "tcgen05" not in spec.cute_mma_dag.choices:
         pytest.skip(f"{name} does not admit tcgen05")
-    default = spec.default_config().config
-    if which == "default":
-        config = default
-    else:
-        seeds = [
-            c.config
-            for c in spec.compiler_seed_configs
-            if c.config["cute_mma_dag"] == "tcgen05"
-        ]
-        if not seeds:
-            pytest.skip(f"{name} has no tcgen05 seed")
-        if seeds[0] == default:
-            pytest.skip(f"{name}: the first tcgen05 seed is the default config")
-        config = seeds[0]
+    seeds = [
+        c for c in spec.compiler_seed_configs if c.config["cute_mma_dag"] == "tcgen05"
+    ]
     with bound.env:
-        spec.normalize(config)
-    source = _source(bound, helion.Config(**config))
-    assert "@cute.kernel" in source, (name, which)
+        configs = {"default": spec.default_config()}
+        if seeds:
+            configs["first_seed"] = _seeded_default(spec, seeds[0])
+        rendered_by_the_region_checks = [
+            _seeded_default(spec, seed).config
+            for seed in (seeds[:2] if name in _REGION_BINDERS else [])
+        ]
+    if "first_seed" in configs and (
+        configs["first_seed"].config == configs["default"].config
+    ):
+        del configs["first_seed"]
+    for which, config in configs.items():
+        if config.config in rendered_by_the_region_checks:
+            continue
+        assert "@cute.kernel" in _source(bound, config), (name, which)
 
 
 def _bind_fwd_scalar_unaligned() -> BoundKernel:
@@ -5578,13 +5611,17 @@ def test_the_hardware_order_checker_catches_shared_columns() -> None:
 
 
 @pytest.mark.parametrize("kernel", sorted(_REGION_BINDERS))
-def test_region_programs_pass_the_hardware_order_check_at_random_configs(
+def test_region_programs_pass_the_tensor_memory_checks_at_random_configs(
     kernel: str,
 ) -> None:
     # Beyond the seeds (checked with the commit order): four random legal
     # tensor-memory configs per region program (power-of-two block sizes,
-    # 4 / 8 warps, 1-4 stages, both loads modes) pass the hardware-order
-    # check.
+    # 4 / 8 warps, 1-4 stages, both loads modes), each rendered once under
+    # both checkers, pass the hardware-order check and the value-version
+    # check (every read finds the value it expects, every carry slot holds
+    # its output at the iteration's end and every body read of an outer
+    # value survives the iteration).  One case per program the examples
+    # admit, so a failure names it.
     bound = _REGION_BINDERS[kernel]()
     spec = bound.config_spec
     program = _match(bound)
@@ -5612,10 +5649,11 @@ def test_region_programs_pass_the_hardware_order_check_at_random_configs(
                 normalized = spec.normalized_config(config)
             if normalized.config["cute_mma_dag"] != "tcgen05":
                 continue
-            body = _instrumented_body(bound, normalized)
+            body, versions = _checked_body(bound, normalized)
         except (InvalidConfig, BackendUnsupported):
             continue
         rendered += 1
+        assert versions == [], (kernel, normalized.config["block_sizes"], versions[:3])
         _assert_tmem_hardware_order(
             bound, program, body, normalized.config["block_sizes"]
         )
@@ -6473,30 +6511,10 @@ def test_region_seeds_skip_the_eight_warp_twin_of_an_unchanged_render() -> None:
     assert ([128, 32, 32], 8, 2) in _first_tcgen05_seeds(_bind_wy(), 2)
 
 
-@pytest.mark.parametrize("kernel", sorted(_REGION_BINDERS))
-def test_region_programs_pass_the_value_version_check(kernel: str) -> None:
-    # The value-version checker over the column checker's sweep: every region
-    # binder at its first two tensor-memory seeds and four random legal configs
-    # renders with every read finding the value it expects, every carry slot
-    # holding its output at the iteration's end and every body read of an outer
-    # value surviving the iteration.
-    bound = _REGION_BINDERS[kernel]()
-    spec = bound.config_spec
-    seeds = [
-        config
-        for config in spec.compiler_seed_configs
-        if config.config["cute_mma_dag"] == "tcgen05"
-    ][:2]
-    with bound.env:
-        configs = [spec.normalized_config(seed) for seed in seeds]
-    configs += _random_tcgen05_configs(bound, kernel + "/versions", 4)
-    assert configs, kernel
-    for config in configs:
-        try:
-            errors = _version_errors(bound, config)
-        except (InvalidConfig, BackendUnsupported):
-            continue
-        assert errors == [], (kernel, config.config["block_sizes"], errors[:3])
+# (The value-version checker's sweep over every region binder -- its first
+# two tensor-memory seeds and four random legal configs -- rides the renders
+# of test_region_programs_pass_the_tensor_memory_checks_at_their_seeds and
+# test_region_programs_pass_the_tensor_memory_checks_at_random_configs.)
 
 
 def test_the_value_version_checker_sees_the_recompute() -> None:
@@ -7856,11 +7874,13 @@ def test_the_streamed_split_seed_checks_the_pass_route_under_its_own_epilogue() 
 
 @pytest.mark.parametrize("kernel", sorted(_REGION_BINDERS))
 def test_region_programs_render_the_split_epilogue_or_decline_it(kernel: str) -> None:
-    # Every region binder: the split either has no subject (reductions,
-    # vectors), refuses the tile (a thread below one packet), or renders the
-    # first tensor-memory seed's tile at eight warps with the hardware-order
-    # checker clean (the warp pair's halves share every slot's columns and
-    # tensor-memory round trips).
+    # Every region binder (one case per program the examples admit): the
+    # split either has no subject (reductions, vectors), refuses the tile (a
+    # thread below one packet), or renders the first tensor-memory seed's
+    # tile at eight warps -- one render under both checkers -- with the
+    # hardware-order checker clean (the warp pair's halves share every
+    # slot's columns and tensor-memory round trips) and the value versions
+    # clean.
     bound = _REGION_BINDERS[kernel]()
     spec = bound.config_spec
     facts = spec.cute_mma_dag_facts
@@ -7887,10 +7907,10 @@ def test_region_programs_render_the_split_epilogue_or_decline_it(kernel: str) ->
     assert values["cute_mma_dag_epilogue"] == "split", values
     assert values["block_sizes"] == sizes
     config = helion.Config(**values)
-    body = _instrumented_body(bound, config)
+    body, versions = _checked_body(bound, config)
     assert "md_epi = md_warp < 8" in body
     _assert_tmem_hardware_order(bound, _match(bound), body, sizes, split=True)
-    assert _version_errors(bound, config) == []
+    assert versions == [], (kernel, versions[:3])
 
 
 # --------------------------------------------------------------------------

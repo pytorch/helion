@@ -26,14 +26,11 @@ reference_jagged_layer_norm_pytorch = (
 
 pytestmark = skipUnlessBackends(["cute"])
 
-_SEED_CODEGEN_SHARDS = 4
-
 
 @pytest.mark.parametrize("columns", [32, 69, 128, 512])
 @pytest.mark.parametrize("static_shapes", [False, True])
-@pytest.mark.parametrize("seed_shard", range(_SEED_CODEGEN_SHARDS))
 def test_nested_jagged_passes_receive_reachable_coherent_seeds(
-    columns: int, static_shapes: bool, seed_shard: int
+    columns: int, static_shapes: bool
 ) -> None:
     kernel = helion.kernel(
         jagged_layer_norm_kernel.fn,
@@ -60,9 +57,8 @@ def test_nested_jagged_passes_receive_reachable_coherent_seeds(
     # view carries a symbolic storage offset, which no bound residue covers.
     sunk = [seed for seed in seeds if seed.config.get("cute_vloop_sink")]
     assert bool(sunk) == (columns % 4 == 0 and static_shapes)
-    # The largest case generates 111 sources; split that work across test cases
-    # so CI's per-test timeout does not terminate a worker mid-codegen.
-    for seed in seeds[seed_shard::_SEED_CODEGEN_SHARDS]:
+    rendered: set[tuple[object, ...]] = set()
+    for seed in seeds:
         normalized = seed.config.copy()
         spec.normalize(normalized)
         assert normalized["num_threads"] == seed.config["num_threads"]
@@ -91,6 +87,13 @@ def test_nested_jagged_passes_receive_reachable_coherent_seeds(
             else:
                 assert reduction_threads == 1
                 assert feature_threads > 1
+        # Render one seed per thread split: the row tile and lane unroll only
+        # resize the loops of the same lowering, which the checks above cover
+        # for every seed.
+        family = (vectorized, tuple(seed.num_threads))
+        if family in rendered:
+            continue
+        rendered.add(family)
         with patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,

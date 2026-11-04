@@ -35,20 +35,25 @@ def _arguments(kind: str, columns: int, dtype: torch.dtype) -> tuple[torch.Tenso
     return (matrix,)
 
 
+# The column extents pick the seed geometries of each kernel and static shapes
+# change the generated source; only softmax has an online sweep to rewrite,
+# so the welford rows run with the rewrite disabled alone.
 @pytest.mark.parametrize(
-    "kind,columns,dtype",
+    "kind,columns,dtype,online_rewrite",
     [
-        ("welford", 512, torch.float32),
-        ("welford", 1024, torch.float32),
-        ("welford", 1536, torch.float32),
-        ("welford", 2048, torch.float32),
-        ("softmax", 256, torch.bfloat16),
-        ("softmax", 1024, torch.bfloat16),
-        ("softmax", 4096, torch.bfloat16),
+        ("welford", 512, torch.float32, False),
+        ("welford", 1024, torch.float32, False),
+        ("welford", 1536, torch.float32, False),
+        ("welford", 2048, torch.float32, False),
+        ("softmax", 256, torch.bfloat16, False),
+        ("softmax", 256, torch.bfloat16, True),
+        ("softmax", 1024, torch.bfloat16, False),
+        ("softmax", 1024, torch.bfloat16, True),
+        ("softmax", 4096, torch.bfloat16, False),
+        ("softmax", 4096, torch.bfloat16, True),
     ],
 )
 @pytest.mark.parametrize("static", [False, True])
-@pytest.mark.parametrize("online_rewrite", [False, True])
 def test_original_sequence_seeds_roundtrip_and_emit(
     kind: str,
     columns: int,
@@ -84,6 +89,7 @@ def test_original_sequence_seeds_roundtrip_and_emit(
             surviving = [
                 config for _flat, config in generation.seed_flat_config_pairs()
             ]
+        rendered: set[tuple[object, ...]] = set()
         for seed in seeds:
             assert (
                 seed.block_sizes[1]
@@ -103,6 +109,20 @@ def test_original_sequence_seeds_roundtrip_and_emit(
                 "cute_cluster_n",
             ):
                 assert roundtrip.config[key] == normalized.config[key]
+            # Render one seed per sequence lowering (the thread count picks
+            # the register-tile or looped reduction form): the row tile only
+            # resizes the loops of the source checked below.
+            family = (
+                roundtrip.config["cute_reduction_sequence"],
+                roundtrip.config["cute_cluster_n"],
+                tuple(cast("list[str]", roundtrip.config["cute_lane_layouts"])),
+                tuple(cast("list[int]", roundtrip.config["cute_vector_widths"])),
+                tuple(cast("list[int]", roundtrip.config["num_threads"])),
+                roundtrip.block_sizes[0],
+            )
+            if family in rendered:
+                continue
+            rendered.add(family)
             source = bound.to_code(roundtrip)
             assert "sequence_acc" in source
             assert "_helion_sequence_reduce" not in source
