@@ -2942,6 +2942,30 @@ class TestMetalReductions(unittest.TestCase):
         ):
             persistent(torch.randn(48, 96, device=DEVICE))
 
+    def test_specialized_dim_walks_lanes(self) -> None:
+        """A dim ``hl.specialize`` pins under dynamic shapes is as static as a
+        literal: wider than num_warps' threads, it walks lanes on them, as it
+        does under static shapes."""
+
+        @helion.kernel(backend="metal", static_shapes=False)
+        def specialized_row_sum(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            hl.specialize(x.size(1))
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        x = torch.randn(8, 256, device=DEVICE)
+        config = helion.Config(block_sizes=[1], num_warps=4, reduction_loops=[None])
+        bound = specialized_row_sum.bind((x,))
+        code = bound.to_code(config)
+        self.assertIn("_block_dims=(128, 1, 1)", code)
+        self.assertRegex(code, r"for slice_lane_\d+ in range\(2\)")
+        torch.testing.assert_close(
+            bound.compile_config(config)(x), x.sum(-1), rtol=3e-3, atol=3e-3
+        )
+
     def test_dynamic_slice_dim_rejects(self) -> None:
         """A ``:`` slice with no reduction takes the same threads and lanes."""
 

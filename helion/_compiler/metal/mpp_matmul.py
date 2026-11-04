@@ -1073,10 +1073,13 @@ def _static_tile(block: int) -> int | None:
     """The block's tile when no config changes it: a ``:`` slice's length
     rounded up to a power of two, a fixed block size, or 1 over an extent of
     1; None otherwise."""
+    from .backend import static_extent
+
     env = CompileEnvironment.current()
     info = env.block_sizes[block]
     if info.reduction:
-        return next_power_of_2(info.size) if isinstance(info.size, int) else None
+        extent = static_extent(info.size)
+        return next_power_of_2(extent) if extent is not None else None
     source = info.block_size_source
     if isinstance(source, FixedBlockSizeSource):
         return source.value if isinstance(source.value, int) else None
