@@ -578,20 +578,23 @@ def _block_effects(
     return live, all_writes
 
 
+def _definitely_written_statement(statement: ast.stmt) -> set[str]:
+    """Names ``statement`` assigns on every path through it."""
+    if isinstance(statement, ast.Assign):
+        return {
+            target.id for target in statement.targets if isinstance(target, ast.Name)
+        }
+    if isinstance(statement, ast.If) and statement.orelse:
+        return _definitely_written_block(statement.body) & _definitely_written_block(
+            statement.orelse
+        )
+    return set()
+
+
 def _definitely_written_block(body: list[ast.stmt]) -> set[str]:
     result: set[str] = set()
     for statement in body:
-        if isinstance(statement, ast.Assign):
-            result.update(
-                target.id
-                for target in statement.targets
-                if isinstance(target, ast.Name)
-            )
-        elif isinstance(statement, ast.If) and statement.orelse:
-            result.update(
-                _definitely_written_block(statement.body)
-                & _definitely_written_block(statement.orelse)
-            )
+        result.update(_definitely_written_statement(statement))
     return result
 
 
@@ -631,20 +634,43 @@ def _live_before_block(
     for statement in body:
         reads = _reads_before_def_statement(statement)
         live.update(reads - defined)
-        if isinstance(statement, ast.Assign):
-            defined.update(
-                target.id
-                for target in statement.targets
-                if isinstance(target, ast.Name)
-            )
-        elif isinstance(statement, ast.If) and statement.orelse:
-            defined.update(
-                _definitely_written_block(statement.body)
-                & _definitely_written_block(statement.orelse)
-            )
+        defined.update(_definitely_written_statement(statement))
     if live_out is not None:
         live.update(live_out - defined)
     return live
+
+
+def _live_before_suffixes(body: list[ast.stmt], live_out: set[str]) -> list[set[str]]:
+    """``_live_before_block(body[index:], live_out=live_out)`` for every index.
+
+    One backward pass over the block: the names live before a suffix are the
+    names its first statement may read before a guaranteed local definition,
+    plus the names live before the rest of the suffix that the statement does
+    not definitely write.  The block walkers below need the live-out set of
+    every statement; re-walking each suffix made them quadratic in the block
+    length (the head-dim-128 gated row programs spend most of their codegen
+    time there).
+    """
+    live = set(live_out)
+    result = [live]
+    for statement in reversed(body):
+        live = _reads_before_def_statement(statement) | (
+            live - _definitely_written_statement(statement)
+        )
+        result.append(live)
+    result.reverse()
+    return result
+
+
+def _names_read_suffixes(body: list[ast.stmt]) -> list[set[str]]:
+    """Names read anywhere in ``body[index:]`` for every index."""
+    reads: set[str] = set()
+    result = [reads]
+    for statement in reversed(body):
+        reads = reads | _names_read(statement)
+        result.append(reads)
+    result.reverse()
+    return result
 
 
 def _nested_live_out(
@@ -2210,10 +2236,9 @@ def _pack_fp32_block(
     fp32_names: set[str],
     live_out: set[str],
 ) -> list[ast.stmt]:
+    live_after_statement = _live_before_suffixes(body, live_out)
     for statement_index, statement in enumerate(body):
-        statement_live_out = _live_before_block(
-            body[statement_index + 1 :], live_out=live_out
-        )
+        statement_live_out = live_after_statement[statement_index + 1]
         for field in ("body", "orelse", "finalbody"):
             child = getattr(statement, field, None)
             if isinstance(child, list) and all(
@@ -2915,10 +2940,9 @@ def _hoist_packed_reduction_block(
     result: list[ast.stmt] = []
     scope_stores = _canonical_counts(_store_name_counts(body), rename_groups)
     scope_loads = _canonical_counts(_load_name_counts(body), rename_groups)
+    reads_after_statement = _names_read_suffixes(body)
     for statement_index, statement in enumerate(body):
-        statement_live_after = live_after | _names_read(
-            ast.Module(body=body[statement_index + 1 :], type_ignores=[])
-        )
+        statement_live_after = live_after | reads_after_statement[statement_index + 1]
         if isinstance(statement, (ast.For, ast.If, ast.While)):
             child_fields = ("body", "orelse")
         else:
@@ -3248,10 +3272,9 @@ def _hoist_factored_block(
     live_out: set[str],
 ) -> list[ast.stmt]:
     result: list[ast.stmt] = []
+    live_after_statement = _live_before_suffixes(body, live_out)
     for statement_index, statement in enumerate(body):
-        statement_live_out = _live_before_block(
-            body[statement_index + 1 :], live_out=live_out
-        )
+        statement_live_out = live_after_statement[statement_index + 1]
         for field in ("body", "orelse", "finalbody"):
             child = getattr(statement, field, None)
             if isinstance(child, list) and all(
