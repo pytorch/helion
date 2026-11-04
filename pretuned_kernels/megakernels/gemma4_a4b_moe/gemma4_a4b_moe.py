@@ -331,7 +331,8 @@ def gemma4_a4b_moe(
             * route_merge_per_expert_scale[route_merge_ids].to(torch.float32)
         )
         topk_ids[route_merge_token, :] = route_merge_ids
-    # vLLM: pre_feedforward_layernorm_2 and Gemma4MoE.experts gate/up projection.
+    # vLLM: pre_feedforward_layernorm_2 and Gemma4DecoderLayer.experts gate/up
+    # projection.
     for (
         expert_gate_up_tile_m,
         expert_gate_up_tile_slot,
@@ -404,7 +405,7 @@ def gemma4_a4b_moe(
             selected_weights[expert_gate_up_token, expert_gate_up_slot] = (
                 expert_gate_up_topk_weights[expert_gate_up_token, expert_gate_up_slot]
             )
-    # vLLM: Gemma4MoE.experts gelu_tanh activation.
+    # vLLM: Gemma4DecoderLayer.experts gelu_tanh activation.
     for expert_geglu_tile_m, expert_geglu_tile_i in hl.tile(
         [expert_geglu_m, expert_geglu_intermediate],
         block_size=[1, None],
@@ -433,7 +434,7 @@ def gemma4_a4b_moe(
                 )
             )
         ).to(expert_geglu_up.dtype) * expert_geglu_up
-    # vLLM: Gemma4MoE.experts down projection and routing-weight application.
+    # vLLM: Gemma4DecoderLayer.experts down projection and routing-weight application.
     for (
         expert_down_tile_m,
         expert_down_tile_slot,
@@ -476,7 +477,7 @@ def gemma4_a4b_moe(
             expert_down_slot,
             expert_down_tile_n,
         ] = (expert_down_acc * expert_down_routing_weight).to(expert_outputs.dtype)
-    # vLLM: Gemma4MoE.experts weighted expert reduction.
+    # vLLM: Gemma4DecoderLayer.experts weighted expert reduction.
     for expert_reduce_tile_m, expert_reduce_tile_n in hl.tile(
         [expert_reduce_m, expert_reduce_hidden_size],
         block_size=[1, None],
@@ -522,7 +523,7 @@ def has_vllm() -> bool:
     """Whether the optional production vLLM comparison is importable."""
     try:
         from vllm.config import VllmConfig  # noqa: F401
-        from vllm.model_executor.models.gemma4 import Gemma4MoE  # noqa: F401
+        from vllm.model_executor.models.gemma4 import Gemma4Router  # noqa: F401
     except ImportError:
         return False
     return True
@@ -680,18 +681,14 @@ def _make_vllm_call(
 ]:
     from vllm.config import set_current_vllm_config
     from vllm.forward_context import set_forward_context
+    from vllm.model_executor.layers.fused_moe import FusedMoEFactory
     from vllm.model_executor.layers.layernorm import RMSNorm
-    from vllm.model_executor.models.gemma4 import Gemma4MoE
     from vllm.model_executor.models.gemma4 import Gemma4Router
     from vllm.model_executor.models.gemma4 import gemma4_fused_routing_kernel_triton
 
     vllm_config = _initialize_vllm()
     config = SimpleNamespace(
-        hidden_size=HIDDEN,
-        rms_norm_eps=EPS,
-        num_experts=NUM_EXPERTS,
-        top_k_experts=TOP_K,
-        moe_intermediate_size=INTERMEDIATE,
+        hidden_size=HIDDEN, rms_norm_eps=EPS, num_experts=NUM_EXPERTS
     )
     try:
         old_dtype = torch.get_default_dtype()
@@ -702,18 +699,32 @@ def _make_vllm_call(
                 router = (
                     Gemma4Router(config, prefix="model.layers.0.router").eval().cuda()
                 )
-                moe = Gemma4MoE(config, prefix="model.layers.0.moe").eval().cuda()
+                # As Gemma4DecoderLayer builds its experts.
+                experts = (
+                    FusedMoEFactory(
+                        num_experts=NUM_EXPERTS,
+                        top_k=TOP_K,
+                        hidden_size=HIDDEN,
+                        intermediate_size=INTERMEDIATE,
+                        renormalize=True,
+                        prefix="model.layers.0.experts",
+                        custom_routing_function=router.routing_function,
+                        activation="gelu_tanh",
+                    )
+                    .eval()
+                    .cuda()
+                )
                 post_norm = RMSNorm(HIDDEN, eps=EPS).eval().cuda()
         finally:
             torch.set_default_dtype(old_dtype)
 
-        routed_experts = moe.experts.routed_experts
+        routed_experts = experts.routed_experts
         backend = routed_experts.quant_method.unquantized_backend.value
         with torch.no_grad():
             pre_norm.weight.copy_(tensors["pre_ff_norm_weight"])
             router.scale.copy_(tensors["router_scale"])
             router.proj.weight.copy_(tensors["router_weight"])
-            moe.per_expert_scale.copy_(tensors["per_expert_scale"])
+            router.per_expert_scale.copy_(tensors["per_expert_scale"])
             routed_experts.w13_weight.copy_(tensors["expert_gate_up_weight"])
             routed_experts.w2_weight.copy_(tensors["expert_down_weight"])
             post_norm.weight.copy_(tensors["post_ff_norm_weight"])
@@ -726,7 +737,7 @@ def _make_vllm_call(
         with set_forward_context(None, vllm_config=vllm_config, num_tokens=BATCH):
             expert_input = pre_norm(tensors["residual"])
             router_logits = router(tensors["residual"])
-            moe_down = moe(expert_input, router_logits)
+            moe_down = experts(expert_input, router_logits)
             moe_branch = post_norm(moe_down)
         return moe_branch, router_logits, moe_down
 
@@ -734,7 +745,7 @@ def _make_vllm_call(
         router_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return gemma4_fused_routing_kernel_triton(
-            router_logits, TOP_K, moe.per_expert_scale
+            router_logits, TOP_K, router.per_expert_scale
         )
 
     def close() -> None:
