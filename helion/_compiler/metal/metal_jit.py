@@ -2,8 +2,9 @@
 
 Helion's codegen produces a Python function decorated with ``@metal_jit``.
 The function body is Python-syntax Metal — valid Python AST that maps to
-MSL C++.  Expressions come from Inductor's MetalOverrides
-(``metal.precise.sin``, ``c10.metal.max``, ``static_cast<float>``),
+MSL C++.  Expressions come from Inductor's MetalOverrides, parsed by
+``msl_expr`` (``metal.precise.sin``, ``c10.metal.max``,
+``static_cast(float, x)``),
 pointer ops from PointerIndexingStrategy (``tl.load``, ``tl.store``),
 and thread indices from MetalBackend (``tgid[0]``, ``tid[0]``).
 

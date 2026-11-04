@@ -56,6 +56,7 @@ from ... import exc
 from ..ast_extension import statement_from_string
 from ._constants import MAX_THREADS_PER_THREADGROUP
 from ._constants import SIMD_WIDTH
+from .msl_expr import cast_source
 from .msl_reduction import REDUCTION_NAMESPACE as NS
 from .msl_reduction import SUPPORTED_ARGREDUCTIONS
 from .msl_reduction import SUPPORTED_REDUCTIONS
@@ -376,7 +377,7 @@ def _cast(expr: str, dtype: torch.dtype | None) -> tuple[str, str]:
     if dtype is None:
         raise exc.BackendUnsupported("metal", "reduction without an accumulator dtype")
     metal_type = _metal_acc_dtype(dtype)
-    return f"(static_cast<{metal_type}>({expr}))", metal_type
+    return cast_source(metal_type, expr), metal_type
 
 
 def reduction_expr(
@@ -457,7 +458,7 @@ def argreduce_result_expr(
     group = resolve_group(DeviceFunction.current(), block_size_var)
     value, value_type = _cast(input_name, dtype)
     index_type = backend.index_type_str(index_dtype)
-    index = f"(static_cast<{index_type}>({index_value}))"
+    index = cast_source(index_type, index_value)
     out_type = backend.dtype_str(output_dtype)
 
     if group is None:
@@ -466,7 +467,7 @@ def argreduce_result_expr(
         )
     span = group.span
     if span <= 1:
-        return f"(static_cast<{out_type}>({index}))"
+        return cast_source(out_type, index)
     if span & (span - 1) or span > MAX_THREADS_PER_THREADGROUP:
         raise _unsupported_span(reduction_type, span)
 
@@ -478,7 +479,7 @@ def argreduce_result_expr(
         f"{index_partials}, {value}, {index}, "
         f"{_group_args(group, span)})"
     )
-    return f"(static_cast<{out_type}>({result}))"
+    return cast_source(out_type, result)
 
 
 def argreduce_loop_update_statements(

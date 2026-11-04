@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import itertools
 import math
 import re
@@ -24,7 +25,10 @@ from helion._compiler.metal.backend import MetalBackend
 from helion._compiler.metal.lane_fold import LaneJam
 from helion._compiler.metal.lane_fold import balanced_combine
 from helion._compiler.metal.lane_fold import unroll_lane_folds
+from helion._compiler.metal.metal_overrides import MetalOverrides
 from helion._compiler.metal.mpp_matmul import names_read
+from helion._compiler.metal.msl_ast_walker import _ast_expr_to_msl
+from helion._compiler.metal.msl_expr import parse_msl_expression
 from helion._compiler.metal.msl_reduction import GROUP_PATHS
 from helion._compiler.metal.row_reduction_heuristic import MetalRowReductionHeuristic
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
@@ -315,6 +319,33 @@ def special_kernel(x: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size(0)):
         v = x[tile]
         out[tile] = torch.erf(v) + torch.lgamma(v.abs() + 1)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def floordiv_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Inductor lowers float ``//`` with logical ops and ``where``."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] // y[tile]
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def atan2_kernel(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Inductor spells atan2 ``::metal::precise::atan2``, from global scope."""
+    out = torch.empty_like(y)
+    for tile in hl.tile(y.size(0)):
+        out[tile] = torch.atan2(y[tile], x[tile])
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def logical_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        a, b = x[tile] > 0, y[tile] > 0
+        out[tile] = torch.logical_and(a, b).float() + 2 * torch.logical_or(a, b)
     return out
 
 
@@ -693,6 +724,30 @@ class TestMetalMathOps(unittest.TestCase):
         expected = torch.erf(x) + torch.lgamma(x.abs() + 1)
         torch.testing.assert_close(special_kernel(x), expected, atol=1e-5, rtol=1e-5)
 
+    def test_atan2(self) -> None:
+        y = torch.randn(1024, device=DEVICE)
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(
+            atan2_kernel(y, x), torch.atan2(y, x), atol=1e-5, rtol=1e-5
+        )
+
+    def test_float_floor_division(self) -> None:
+        """Including the corners Inductor's lowering special-cases: an
+        infinite dividend or divisor, a zero divisor, and NaN."""
+        x = torch.randn(1024, device=DEVICE) * 10
+        y = torch.randn(1024, device=DEVICE)
+        inf, nan = float("inf"), float("nan")
+        x[:6] = torch.tensor([inf, -inf, 1.0, -1.0, 3.0, nan])
+        y[:6] = torch.tensor([2.0, 3.0, inf, inf, 0.0, 1.0])
+        torch.testing.assert_close(floordiv_kernel(x, y), x // y, equal_nan=True)
+
+    def test_logical_ops(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        y = torch.randn(1024, device=DEVICE)
+        a, b = x > 0, y > 0
+        expected = torch.logical_and(a, b).float() + 2 * torch.logical_or(a, b)
+        torch.testing.assert_close(logical_kernel(x, y), expected)
+
     def test_clamp(self) -> None:
         x = torch.randn(1024, device=DEVICE)
         torch.testing.assert_close(
@@ -1013,7 +1068,7 @@ class TestMetalIndexArithmetic(unittest.TestCase):
         out, code = self._run(kernel, args, config)
         torch.testing.assert_close(out, expected)
         self.assertNotIn("triton_helpers", code)
-        self.assertIn("static_cast < long >", code)
+        self.assertIn("static_cast(long, ", code)
 
     def _scale_rows(self, x: torch.Tensor, factors: list[int]) -> torch.Tensor:
         return x * torch.tensor(factors, device=DEVICE, dtype=x.dtype)[:, None]
@@ -1063,7 +1118,7 @@ class TestMetalIndexArithmetic(unittest.TestCase):
         block = bound.config_spec.default_config().block_sizes[0]
         out, code = self._run(add_half_block_row, (x, y))
         self.assertIn("_BLOCK_SIZE_0 // 2", code)
-        self.assertNotIn("static_cast < long >", code)
+        self.assertNotIn("static_cast(long, ", code)
         torch.testing.assert_close(out, x + y[block // 2])
 
     def test_block_size_division_outside_constexpr_exemption(self) -> None:
@@ -1096,7 +1151,7 @@ class TestMetalIndexArithmetic(unittest.TestCase):
         out = torch.zeros(8, 40, device=DEVICE)
         result, code = self._run(gather_square_third, (x, out))
         self.assertIn("offset_0 * offset_0 // 3", code)
-        self.assertNotIn("static_cast < long >", code)
+        self.assertNotIn("static_cast(long, ", code)
         torch.testing.assert_close(result, x[[(b * b) // 3 for b in range(8)]])
 
 
@@ -9052,6 +9107,110 @@ class TestMetalCodegen(unittest.TestCase):
         self.assertNotIn("sync_threads", code)
 
 
+class TestMetalMslExpr(unittest.TestCase):
+    """Inductor's MetalOverrides write MSL; ``msl_expr`` parses it into the
+    device code's Python AST, which ``msl_ast_walker`` prints back."""
+
+    @staticmethod
+    def _round_trip(text: str) -> str:
+        # Device code is printed as Python source and read back before the
+        # walker sees it.
+        source = ast.unparse(parse_msl_expression(text))
+        return _ast_expr_to_msl(ast.parse(source, mode="eval").body)
+
+    def test_round_trip(self) -> None:
+        cases = {
+            "a && b || !c": "((a && b) || (!c))",
+            "a ? static_cast<decltype(b+c)>(b) : static_cast<decltype(b+c)>(c)": (
+                "(a ? static_cast<decltype((b + c))>(b) "
+                ": static_cast<decltype((b + c))>(c))"
+            ),
+            "::metal::precise::atan2(y, x)": "::metal::precise::atan2(y, x)",
+            "c10::metal::hypot(metal::fabs(a), metal::fabs(b))": (
+                "c10::metal::hypot(metal::fabs(a), metal::fabs(b))"
+            ),
+            "as_type<uint>(static_cast<float>(a))": "as_type<uint>(static_cast<float>(a))",
+            "static_cast<decltype(a)>((a > 0) - (a < 0))": (
+                "static_cast<decltype(a)>(((a > 0) - (a < 0)))"
+            ),
+            # A cast binds to its operand, not to a sum around it.
+            "a + static_cast<float>(b) * c": "(a + (static_cast<float>(b) * c))",
+            # ``<`` after a name that isn't a template function compares.
+            "a < b": "(a < b)",
+            "a < b < c": "((a < b) < c)",
+            "-HUGE_VALF": "(-HUGE_VALF)",
+            "x ? true : false": "(x ? true : false)",
+            "a ? b : c ? d : e": "(a ? b : (c ? d : e))",
+        }
+        for text, msl in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(self._round_trip(text), msl)
+
+    def test_outside_the_grammar_is_refused(self) -> None:
+        for text in (
+            "a = b",
+            "[&] { return a; }()",
+            "a ? b",
+            "static_cast<float>",
+            "a.if",
+            "a::1",
+            "lambda",
+            "--a",
+            "a++",
+            "p->x",
+        ):
+            with (
+                self.subTest(text=text),
+                self.assertRaises(helion.exc.BackendUnsupported),
+            ):
+                parse_msl_expression(text)
+
+    def test_every_override_parses(self) -> None:
+        """Each op of Helion's MetalOverrides that renders from operand names
+        alone (no kernel in scope) gives MSL the parser reads.  Ops built from
+        other ops (``ops.*``) render only inside a kernel and are covered by
+        the kernels that use them."""
+
+        class Operand(str):
+            __slots__ = ()
+            dtype = torch.float32
+
+        overrides = MetalOverrides()
+        parsed = set()
+        for name in sorted(dir(overrides)):
+            if name.startswith("_"):
+                continue
+            fn = getattr(overrides, name)
+            try:
+                params = [
+                    p
+                    for p in inspect.signature(fn).parameters.values()
+                    if p.default is p.empty
+                ]
+            except (TypeError, ValueError):
+                continue
+            args = [
+                torch.float32 if "dtype" in p.name else Operand(f"v_{p.name}")
+                for p in params
+            ]
+            try:
+                text = fn(*args)
+            except Exception:
+                continue
+            if not isinstance(text, str):
+                continue
+            with self.subTest(op=name, text=text):
+                self._round_trip(text)
+            parsed.add(name)
+        # The ops whose MSL isn't Python syntax, and the special functions
+        # Helion renders itself.
+        self.assertLessEqual(
+            {"logical_and", "logical_or", "where", "atan2", "erf", "lgamma", "sign"},
+            parsed,
+        )
+        self.assertGreater(len(parsed), 90)
+
+
 class TestMetalLaneFoldRewrite(unittest.TestCase):
     """``unroll_lane_folds`` on hand-written device bodies."""
 
@@ -9094,8 +9253,8 @@ class TestMetalLaneFoldRewrite(unittest.TestCase):
                 carry__lane1 = carry__lane1 + v__lane1
                 carry__lane2 = carry__lane2 + v__lane2
                 lane_fold = (
-                    ((static_cast<float>(v__lane0)) + (static_cast<float>(v__lane1)))
-                    + (static_cast<float>(v__lane2))
+                    (static_cast(float, v__lane0) + static_cast(float, v__lane1))
+                    + static_cast(float, v__lane2)
                 )
                 count = count + 1
                 store(out, indices_2__lane0, v__lane0 * group_sum(lane_fold))
@@ -9103,9 +9262,9 @@ class TestMetalLaneFoldRewrite(unittest.TestCase):
                 store(out, indices_2__lane2, v__lane2 * group_sum(lane_fold))
             lane_fold_1 = c10.metal.max(
                 c10.metal.max(
-                    (static_cast<half>(carry__lane0)), (static_cast<half>(carry__lane1))
+                    static_cast(half, carry__lane0), static_cast(half, carry__lane1)
                 ),
-                (static_cast<half>(carry__lane2)),
+                static_cast(half, carry__lane2),
             )
             store(best, lane_fold_1)
             """
@@ -14085,6 +14244,14 @@ class TestMetalIntTrueDiv(unittest.TestCase):
         )
         self.assertIn("static_cast<float>(n) / 3", msl)
         torch.testing.assert_close(out, x * (4 / 3))
+
+    def test_lane_invariant_cast_runs_once(self) -> None:
+        """A cast is a call in device code; lane-loop placement still moves
+        the lane-invariant quotient ahead of the lane loop."""
+        x = torch.randn(50, 40, device=DEVICE)
+        code = int_arg_truediv.bind((x, 4)).to_code(helion.Config(block_sizes=[16, 16]))
+        quotient = code.index("truediv = static_cast(float, n) / 3")
+        self.assertLess(quotient, code.index("for lane_0 in range("))
 
 
 if __name__ == "__main__":

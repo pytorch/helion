@@ -38,6 +38,7 @@ import copy
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
+from .msl_expr import cast_source
 from .reduction import combine_expr
 
 if TYPE_CHECKING:
@@ -169,24 +170,21 @@ class _RenameLane(ast.NodeTransformer):
         self.lane = lane
         self.index = index
 
-    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+    def visit_Call(self, node: ast.Call) -> ast.AST:
         # Metal miscompiles float -> bfloat conversions that lane copies
         # multiply (exact in float16 and float32 at the same MSL); round
         # them in integer arithmetic, as the MPP path's float tiles do.
         self.generic_visit(node)
         if (
-            isinstance(node.left, ast.Name)
-            and node.left.id == "static_cast"
-            and len(node.ops) == 2
-            and isinstance(node.ops[0], ast.Lt)
-            and isinstance(node.ops[1], ast.Gt)
-            and isinstance(node.comparators[0], ast.Name)
-            and node.comparators[0].id == "bfloat"
+            isinstance(node.func, ast.Name)
+            and node.func.id == "static_cast"
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "bfloat"
         ):
             return ast.copy_location(
                 ast.Call(
                     func=ast.Name(id=BF16_CAST, ctx=ast.Load()),
-                    args=[node.comparators[1]],
+                    args=node.args[1:],
                     keywords=[],
                 ),
                 node,
@@ -370,15 +368,13 @@ class LaneJam:
         assert isinstance(target, ast.Name) and target.id not in self.dependent
         assert isinstance(fold_lane, ast.Name) and fold_lane.id == self.lane
         assert isinstance(op, ast.Constant) and isinstance(op.value, str)
-        assert isinstance(acc_type, ast.Constant)
+        assert isinstance(acc_type, ast.Constant) and isinstance(acc_type.value, str)
         parts = []
         for index in range(self.extent):
             lane_value = ast.unparse(
                 _lane_copy(value, self.dependent, self.lane, index)
             )
-            # The parentheses keep each cast whole: ``static_cast<T>(a) + b``
-            # would parse as one comparison chain.
-            parts.append(f"(static_cast<{acc_type.value}>({lane_value}))")
+            parts.append(cast_source(acc_type.value, lane_value))
         jammed = ast.parse(f"{target.id} = {balanced_combine(op.value, parts)}").body[0]
         return ast.copy_location(jammed, stmt)
 

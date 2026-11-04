@@ -12,14 +12,19 @@ from typing import Sequence
 import torch
 
 from ... import exc
+from ..ast_extension import convert
 from ..backend import Backend
 from ..backend import BackendState
 from ..backend import _largest_divisor_at_most
 from ._constants import MAX_THREAD_AXES
 from ._constants import MAX_THREADS_PER_THREADGROUP
 from ._constants import SIMD_WIDTH
+from .msl_expr import PURE_CALLS
+from .msl_expr import cast_source
+from .msl_expr import parse_msl_expression
 
 if TYPE_CHECKING:
+    import ast
     from collections.abc import Callable
 
     import sympy
@@ -349,17 +354,13 @@ class MetalBackend(Backend):
         return f"{name} = {value}"
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
-        # The outer parens matter: Python parses ``static_cast<T>(x)`` as a
-        # chained comparison, and without them ``a + static_cast<T>(x)`` binds
-        # as ``(a + static_cast) < T > x``, which the MSL walker cannot
-        # recognize as a cast.
         if dtype_str == "bfloat":
             # Metal's int -> bfloat conversion is ~3.4x slower than int ->
             # float -> bfloat, and rounds once where torch CPU and CUDA round
             # through float (c10's BFloat16 is built from a float only).
             # From a floating type the float step is exact.
-            return f"(static_cast<bfloat>(static_cast<float>({expr_str})))"
-        return f"(static_cast<{dtype_str}>({expr_str}))"
+            return cast_source("bfloat", cast_source("float", expr_str))
+        return cast_source(dtype_str, expr_str)
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         from .printer import metal_texpr
@@ -445,6 +446,15 @@ class MetalBackend(Backend):
         from .metal_overrides import MetalOverrides
 
         return MetalOverrides()
+
+    @property
+    def pure_device_calls(self) -> frozenset[str]:
+        return PURE_CALLS
+
+    def parse_op_expression(self, text: str) -> ast.AST:
+        # MetalOverrides writes MSL (``a && b``, ``::metal::precise::atan2``,
+        # ``static_cast<T>(x)``), which is not Python.
+        return convert(parse_msl_expression(text))
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         from ..aten_lowering import squeeze_lowering
