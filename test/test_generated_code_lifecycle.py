@@ -42,8 +42,12 @@ def _add_one(x: torch.Tensor) -> torch.Tensor:
 
 def _run_backward_lowering_race() -> None:
     from torch._dynamo.convert_frame import compile_lock
+    import triton
 
     from helion._compiler._inductor import template_buffer
+
+    expected_backend = "hip" if torch.version.hip is not None else "cuda"
+    assert triton.runtime.driver.active.get_current_target().backend == expected_backend
 
     def make_kernel():
         return helion.kernel(
@@ -264,6 +268,9 @@ class TestGeneratedCodeAutodiff(_GeneratedCodeCacheTestCase):
                 timeout=60,
                 env={
                     **os.environ,
+                    # This exercises the Triton cache even in a TileIR CI job.
+                    "HELION_BACKEND": "triton",
+                    "ENABLE_TILE": "0",
                     "TORCHINDUCTOR_CACHE_DIR": inductor_cache,
                     "TORCHINDUCTOR_COMPILE_THREADS": "1",
                 },

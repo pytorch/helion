@@ -246,6 +246,7 @@ def _dependency_key(value: object, seen: frozenset[int] = frozenset()) -> object
         return _UNCACHEABLE
     if isinstance(value, types.BuiltinFunctionType):
         if value.__module__ == "builtins" and value.__name__ in {
+            "__import__",
             "eval",
             "exec",
             "globals",

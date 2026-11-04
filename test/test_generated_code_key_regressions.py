@@ -32,6 +32,18 @@ def _lazy_scale(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _builtin_import_scale() -> float:
+    return __import__("_helion_cache_test_constant").SCALE
+
+
+def _lazy_builtin_scale(x: torch.Tensor) -> torch.Tensor:
+    scale = _builtin_import_scale()
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * scale
+    return out
+
+
 def _nested_import(x: torch.Tensor) -> torch.Tensor:
     def get_scale() -> float:
         from _helion_cache_test_constant import SCALE
@@ -96,6 +108,27 @@ class TestGeneratedCodeKeyRegressions(RefEagerTestDisabled, TestCase):
         self.assertNotIn("_helion_cache_test_constant", sys.modules)
         self.assertFalse((self.root / "generated_code").exists())
 
+    def test_builtin_imports_do_not_execute_during_lookup(self) -> None:
+        import_module = __import__
+
+        def aliased_import(x: torch.Tensor) -> torch.Tensor:
+            return x * import_module("_helion_cache_test_constant").SCALE
+
+        def nested_import(x: torch.Tensor) -> torch.Tensor:
+            def get_scale() -> float:
+                return __import__("_helion_cache_test_constant").SCALE
+
+            return x * get_scale()
+
+        self.assertNotIn("_helion_cache_test_constant", sys.modules)
+        for fn in (_lazy_builtin_scale, aliased_import, nested_import):
+            with self.subTest(fn=fn.__name__):
+                kernel = self._kernel(fn)
+                self.assertIsNone(cache.binding_input_key(kernel, (self.x,)))
+                self.assertIsNone(self._key(kernel))
+        self.assertNotIn("_helion_cache_test_constant", sys.modules)
+        self.assertFalse((self.root / "generated_code").exists())
+
     def test_unsupported_constexpr_does_not_produce_a_key(self) -> None:
         kernel = self._kernel(_divide_by_len)
         for value in (torch.Size([16]), object(), (torch.Size([16]),)):
@@ -151,6 +184,22 @@ class TestGeneratedCodeKeyRegressions(RefEagerTestDisabled, TestCase):
                     module.SCALE = scale
                     kernel = self._kernel(
                         _lazy_scale, config=helion.Config(block_sizes=[128])
+                    )
+                    torch.testing.assert_close(kernel(x), x * scale)
+        self.assertFalse((self.root / "generated_code").exists())
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA and Triton")
+    def test_builtin_import_change_recompiles_instead_of_serving_stale_code(
+        self,
+    ) -> None:
+        module = ModuleType("_helion_cache_test_constant")
+        x = torch.ones(128, device=DEVICE)
+        with patch.dict(sys.modules, {module.__name__: module}):
+            for scale in (2.0, 3.25):
+                with self.subTest(scale=scale):
+                    module.SCALE = scale
+                    kernel = self._kernel(
+                        _lazy_builtin_scale, config=helion.Config(block_sizes=[128])
                     )
                     torch.testing.assert_close(kernel(x), x * scale)
         self.assertFalse((self.root / "generated_code").exists())
