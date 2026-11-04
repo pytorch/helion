@@ -60,6 +60,7 @@ from helion.autotuner.benchmarking import _estimate_runtime_and_warmup
 from helion.autotuner.benchmarking import do_bench
 from helion.autotuner.benchmarking import do_bench_generic
 from helion.autotuner.kernel_args import load_trusted_kernel_args
+from helion.autotuner.logger import match_device_out_of_memory
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.precompile_future import SerializedCompiledFunction
 from helion.autotuner.precompile_future import _load_compiled_fn
@@ -114,6 +115,33 @@ class _Crash:
     def __call__(self) -> object:
         os.kill(os.getpid(), signal.SIGKILL)
         return None
+
+
+@dataclasses.dataclass
+class _ReturnPid:
+    def __call__(self) -> int:
+        return os.getpid()
+
+
+@dataclasses.dataclass
+class _OutOfMemory:
+    """Runs out of device memory, naming the worker process it ran in."""
+
+    def __call__(self) -> object:
+        raise RuntimeError(f"CUDA out of memory in pid {os.getpid()}")
+
+
+@dataclasses.dataclass
+class _OutOfMemoryInProcess:
+    """Runs out of device memory, as a Triton module load does on a full
+    device, in worker process ``pid``; returns the pid of any other."""
+
+    pid: int
+
+    def __call__(self) -> int:
+        if os.getpid() == self.pid:
+            raise RuntimeError("Triton Error [CUDA]: out of memory")
+        return os.getpid()
 
 
 @dataclasses.dataclass
@@ -1924,6 +1952,94 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             self.assertEqual(worker.run(_ReturnValue(7), timeout=30.0), 7)
         finally:
             worker.shutdown()
+
+    def test_out_of_memory_after_successful_jobs_retries_on_a_fresh_worker(
+        self,
+    ) -> None:
+        # A worker that has run jobs can hold the memory a job needs itself
+        # (free blocks of its caching allocator, which a driver allocation
+        # cannot use; the modules it loaded): every later job would fail the
+        # same way while it lives, so the job reruns on a fresh worker.
+        warnings: list[str] = []
+        worker = BenchmarkWorker(log_warning=warnings.append)
+        try:
+            first_pid = worker.run(_ReturnPid(), timeout=30.0)
+            retried_pid = worker.run(_OutOfMemoryInProcess(first_pid), timeout=30.0)
+            self.assertNotEqual(retried_pid, first_pid)
+            self.assertTrue(worker.alive())
+            self.assertEqual(len(warnings), 1)
+            self.assertIn(
+                "ran out of device memory after 1 successful job(s)", warnings[0]
+            )
+            self.assertIn("Triton Error [CUDA]: out of memory", warnings[0])
+        finally:
+            worker.shutdown()
+
+    def _run_out_of_memory(self, worker: BenchmarkWorker) -> int:
+        """Run a job that runs out of memory wherever it runs; the pid of the
+        worker that raised (the retry's, when retried)."""
+        with self.assertRaisesRegex(RuntimeError, "out of memory") as ctx:
+            worker.run(_OutOfMemory(), timeout=30.0)
+        return int(str(ctx.exception).rsplit(" ", 1)[1])
+
+    def test_out_of_memory_replaces_the_worker_and_backs_off_retries(self) -> None:
+        # Every out-of-memory error replaces the worker that raised it, the
+        # retry's included: the failing kernel can itself raise the
+        # local-memory high-water mark the process keeps. A fresh worker's
+        # error is the job's own and is not retried; one that recurs on the
+        # retry doubles the successful jobs required before the next retry.
+        warnings: list[str] = []
+        worker = BenchmarkWorker(log_warning=warnings.append)
+        try:
+            failed = self._run_out_of_memory(worker)
+            self.assertEqual(warnings, [])
+            self.assertNotEqual(worker.run(_ReturnPid(), timeout=30.0), failed)
+            failed = self._run_out_of_memory(worker)  # retried, runs out again
+            self.assertEqual(len(warnings), 2)
+            self.assertIn("in a fresh benchmark worker too", warnings[1])
+            self.assertIn("the next retry needs 2 successful job(s)", warnings[1])
+            self.assertNotEqual(worker.run(_ReturnPid(), timeout=30.0), failed)
+            failed = self._run_out_of_memory(worker)  # 1 of 2 jobs: not retried
+            self.assertEqual(len(warnings), 2)
+            self.assertNotEqual(worker.run(_ReturnPid(), timeout=30.0), failed)
+        finally:
+            worker.shutdown()
+
+    def test_out_of_memory_retry_that_succeeds_resets_the_back_off(self) -> None:
+        warnings: list[str] = []
+        worker = BenchmarkWorker(log_warning=warnings.append)
+        try:
+            worker.run(_ReturnPid(), timeout=30.0)
+            self._run_out_of_memory(worker)  # retried in vain: 2 jobs from now on
+            worker.run(_ReturnPid(), timeout=30.0)
+            pid = worker.run(_ReturnPid(), timeout=30.0)
+            retried = worker.run(_OutOfMemoryInProcess(pid), timeout=30.0)
+            self.assertNotEqual(retried, pid)
+            # 1 job (the retry) in the new worker suffices again
+            self.assertNotEqual(
+                worker.run(_OutOfMemoryInProcess(retried), timeout=30.0), retried
+            )
+            self.assertEqual(len(warnings), 4)
+        finally:
+            worker.shutdown()
+
+    def test_device_out_of_memory_matches_allocator_runtime_and_driver(self) -> None:
+        for message in (
+            "CUDA out of memory. Tried to allocate 384.00 MiB.",
+            "HIP out of memory. Tried to allocate 2.00 MiB.",
+            "CUDA error: out of memory",
+            "CUDA driver error: out of memory",
+            "Triton Error [CUDA]: out of memory",
+            "Triton Error [HIP]:  Code: 2, Message: out of memory",
+        ):
+            self.assertTrue(match_device_out_of_memory(RuntimeError(message)), message)
+        self.assertTrue(match_device_out_of_memory(torch.OutOfMemoryError()))
+        for message in (
+            "out of resource: shared memory, Required: 262184",
+            "Triton Error [CUDA]: invalid argument",
+            "CUDA error: an illegal memory access was encountered",
+        ):
+            self.assertFalse(match_device_out_of_memory(RuntimeError(message)), message)
 
 
 class TestSuspiciousRebenchmark(unittest.TestCase):

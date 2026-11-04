@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
@@ -36,11 +35,14 @@ from helion._compiler.cute.grouped_row_union import index_domain
 from helion._compiler.cute.grouped_row_union import schedule_supported
 from helion._compiler.program_id import ProgramIDs
 from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if TYPE_CHECKING:
     from collections.abc import Generator

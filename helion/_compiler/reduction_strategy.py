@@ -1727,6 +1727,24 @@ class PersistentReductionStrategy(ReductionStrategy):
         assert block_idx == self.block_index
         return "0"
 
+    def _codegen_index(
+        self, state: CodegenState, block_size_var: str, numel: sympy.Expr
+    ) -> None:
+        """Set this thread's index (and mask) along the reduction dimension.
+
+        Backends whose strategy walks the dimension in a lane loop override
+        this to emit them per lane.
+        """
+        env = CompileEnvironment.current()
+        index_var = self.index_var(self.block_index)
+        state.add_statement(
+            f"{index_var} = {self._index_init_expr(block_size_var, env.index_type(), self.block_index)}"
+        )
+        if self._mask_var is not None:
+            state.add_statement(
+                f"{self._mask_var} = {index_var} < {self.fn.sympy_expr(numel)}"
+            )
+
     def codegen_preamble(self, state: CodegenState) -> None:
         env = CompileEnvironment.current()
         backend = env.backend
@@ -1912,13 +1930,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                     )
                 )
         else:
-            state.add_statement(
-                f"{index_var} = {self._index_init_expr(block_size_var, env.index_type(), block_idx)}"
-            )
-            if mask_var is not None:
-                state.add_statement(
-                    f"{mask_var} = {index_var} < {self.fn.sympy_expr(numel)}"
-                )
+            self._codegen_index(state, block_size_var, numel)
         # Extract end_var_name from the numel expression
         from .tile_strategy import LoopDimInfo
 

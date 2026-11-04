@@ -23,6 +23,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
@@ -183,8 +184,11 @@ def test_owned_marker_restore_when_two_pass_split_is_unsafe() -> None:
     """jagged_layer_norm at 256 threads x 2 lanes: the lane loop carries extra
     cross-lane sums, so the two-pass split is refused and the owned marker is
     restored with its own running accumulator (finalized every lane)."""
-    from examples.jagged_layer_norm import jagged_layer_norm_kernel
-    from examples.jagged_layer_norm import reference_jagged_layer_norm_pytorch
+    _examples_jagged_layer_norm = import_example("jagged_layer_norm")
+    jagged_layer_norm_kernel = _examples_jagged_layer_norm.jagged_layer_norm_kernel
+    reference_jagged_layer_norm_pytorch = (
+        _examples_jagged_layer_norm.reference_jagged_layer_norm_pytorch
+    )
 
     torch.manual_seed(0)
     lengths = torch.randint(1, 65, (32,), device=DEVICE)
@@ -229,8 +233,11 @@ def test_two_lane_nested_row_seeds_match_their_static_twin_under_dynamic_shapes(
     rsqrt(eps)``).  The dynamic render now takes the static twin's per-lane
     schedule, so the two agree bitwise.
     """
-    from examples.jagged_layer_norm import jagged_layer_norm_kernel
-    from examples.jagged_layer_norm import reference_jagged_layer_norm_pytorch
+    _examples_jagged_layer_norm = import_example("jagged_layer_norm")
+    jagged_layer_norm_kernel = _examples_jagged_layer_norm.jagged_layer_norm_kernel
+    reference_jagged_layer_norm_pytorch = (
+        _examples_jagged_layer_norm.reference_jagged_layer_norm_pytorch
+    )
 
     from helion._compiler.autotuner_heuristics.cute import CuteNestedRowHeuristic
 

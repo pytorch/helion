@@ -5,8 +5,6 @@ from typing import Literal
 from typing import cast
 from unittest.mock import patch
 
-from examples.aot_example import row_softmax
-from examples.welford import welford
 import pytest
 import torch
 
@@ -17,8 +15,12 @@ import helion
 from helion._compiler.autotuner_heuristics.cute_resident_sequence import (
     CuteResidentSequenceHeuristic,
 )
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
+
+row_softmax = import_example("aot_example").row_softmax
+welford = import_example("welford").welford
 
 pytestmark = skipUnlessBackends(["cute"])
 

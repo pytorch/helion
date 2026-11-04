@@ -3,13 +3,15 @@ from __future__ import annotations
 from contextlib import contextmanager
 from unittest.mock import patch
 
-from examples.aot_example import row_softmax
 import torch
 
 from test._cute_binding import _mock_cuda_unavailable
 
 from .cute_population_contracts import _target
 import helion
+from helion._testing import import_example
+
+row_softmax = import_example("aot_example").row_softmax
 
 
 @contextmanager

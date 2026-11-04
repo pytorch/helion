@@ -15,7 +15,6 @@ import re
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 
@@ -27,8 +26,11 @@ from test.test_cute_warp_mma_gemm import _repaired
 import helion
 from helion._compiler.cute import cute_warp_mma_gemm as family
 from helion._compiler.cute.grouped_row_union import CONFIG_KEY as ROW_UNION_KEY
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.exc import InvalidConfig
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if TYPE_CHECKING:
     from collections.abc import Generator

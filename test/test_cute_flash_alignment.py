@@ -30,6 +30,7 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 from helion._compiler.cute import cute_flash
+from helion._testing import import_example
 
 FAMILY = cute_flash.FLASH_PIPELINE_FAMILY_KEY
 
@@ -350,7 +351,7 @@ def test_example_attention_under_aligned_q_and_k_match_the_reference(
     family: str,
 ) -> None:
     """The reported case: the example kernel with an 8-byte-aligned q or k."""
-    from examples.attention import attention
+    attention = import_example("attention").attention
 
     kernel = helion.kernel(
         attention.fn, backend="cute", static_shapes=True, autotune_effort="none"

@@ -13,6 +13,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipIfCute
 from helion._testing import skipIfMTIA
@@ -1294,7 +1295,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         "(batch, M, N, K chunk), one more than CuTe's three thread axes"
     )
     def test_example_bmm(self):
-        from examples.bmm import bmm
+        bmm = import_example("bmm").bmm
 
         # examples/bmm.py uses check(16, 512, 768, 1024)
         B, M, K, N = 4, 32, 48, 64
@@ -1314,7 +1315,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         )
 
     def test_example_bmm_square(self):
-        from examples.bmm import bmm
+        bmm = import_example("bmm").bmm
 
         B, M, K, N = 2, 32, 32, 32
         self._check_backward(
@@ -1331,7 +1332,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         )
 
     def test_example_softmax(self):
-        from examples.softmax import softmax
+        softmax = import_example("softmax").softmax
 
         # examples/softmax.py uses check(4096, 2560).
         # Use a reduction dim of 32 (not 160): the autograd-generated softmax
@@ -1350,7 +1351,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         )
 
     def test_example_batch_softmax(self):
-        from examples.batch_softmax import batch_softmax
+        batch_softmax = import_example("batch_softmax").batch_softmax
 
         # examples/batch_softmax.py uses check(16, 512, 1024)
         self._check_backward(
@@ -1363,7 +1364,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         )
 
     def test_example_geglu(self):
-        from examples.geglu import geglu
+        geglu = import_example("geglu").geglu
 
         # examples/geglu.py uses 1D shape from config (typically 8192)
         self._check_backward(
@@ -1376,7 +1377,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         )
 
     def test_example_swiglu(self):
-        from examples.swiglu import swiglu_fwd
+        swiglu_fwd = import_example("swiglu").swiglu_fwd
 
         # examples/swiglu.py uses 1D shape from config (typically 8192)
         self._check_backward(
@@ -1399,7 +1400,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
     # has the full description.
     @skipIfRocm("intermittent wrong rows from looped row reductions on ROCm")
     def test_example_matmul_layernorm(self):
-        from examples.matmul_layernorm import matmul_layernorm
+        matmul_layernorm = import_example("matmul_layernorm").matmul_layernorm
 
         # examples/matmul_layernorm.py uses check(32, 64, 200);
         # use 128 (power-of-2) for clean block_size alignment
@@ -1424,7 +1425,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         "computed gradient carry, which the CuTe matmul fallbacks cannot re-read"
     )
     def test_example_attention(self):
-        from examples.attention import attention
+        attention = import_example("attention").attention
 
         # examples/attention.py uses test(2, 32, 1024, 64, HALF_DTYPE)
         B, H, M, D = 2, 2, 64, 32
@@ -1450,7 +1451,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         # Non-block-divisible sequence length: the scan zero-pads the key dim
         # and must re-apply the forward's OOB mask, else the softmax is
         # polluted. M=100 is not a multiple of typical block sizes.
-        from examples.attention import attention
+        attention = import_example("attention").attention
 
         B, H, M, D = 1, 2, 100, 32
         self._check_backward(

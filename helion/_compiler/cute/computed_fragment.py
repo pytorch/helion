@@ -53,6 +53,7 @@ from ..inductor_lowering import SympyExprLowering
 from ..inductor_lowering import install_inductor_kernel_handlers
 from ..matmul_utils import _compute_out_dtype
 from ..matmul_utils import _needs_f32_accumulator
+from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 from ..variable_origin import GridOrigin
 from ..variable_origin import HostOrigin
 from ..variable_origin import TileBeginOrigin
@@ -83,7 +84,6 @@ from .local_atomic import terminal_loop_symbols
 from .local_atomic import uniform_local_branch_inputs
 from .local_atomic_registers import MAX_SLOTS
 from .local_atomic_registers import local_atomic_register_chains
-from .memory_ops import runtime_tensors_are_proven_disjoint
 from .ordered_selection import is_ordered_selection
 from .ordered_selection import ordered_selection_args
 from .ordered_selection import selection_values_only

@@ -32,7 +32,6 @@ from typing import TYPE_CHECKING
 from typing import Any
 from unittest.mock import patch
 
-from examples.aot_example import rms_norm_batched
 import pytest
 import torch
 
@@ -55,7 +54,10 @@ from helion import exc
 from helion._compiler.cute.host_zero_fill_launches import MAX_FILL_NUMEL
 from helion._compiler.cute.pdl_release import ZERO_FILL_KERNEL_PREFIX
 from helion._compiler.cute.pdl_release import resident_ctas_per_sm
+from helion._testing import import_example
 import helion.language as hl
+
+rms_norm_batched = import_example("aot_example").rms_norm_batched
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

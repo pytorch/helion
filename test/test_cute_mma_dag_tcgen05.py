@@ -57,6 +57,7 @@ import helion
 from helion._compiler.cute import cute_mma_dag as dag
 from helion._compiler.cute import cute_mma_dag_tcgen05 as tc
 from helion._compiler.cute import cute_mma_dag_tcgen05_regions as regions
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
@@ -1253,7 +1254,9 @@ def test_chunk_offset_tiles_and_lead_tile_begins_are_admitted() -> None:
     # tile_m]``: the leading tiles' begins are scalar coordinates and the
     # chunk offset rides the loop tile, in the TMA coordinates and in the
     # byte bases of the side loads.
-    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+    helion_mamba2_chunk_state_kernel = import_example(
+        "mamba2_chunk_state"
+    ).helion_mamba2_chunk_state_kernel
 
     bound = _bind_fn(helion_mamba2_chunk_state_kernel.fn, _chunk_state_inputs())
     spec = bound.config_spec
@@ -1284,7 +1287,9 @@ def test_chunk_offset_tiles_and_lead_tile_begins_are_admitted() -> None:
 def test_loop_invariant_scalar_side_loads_go_out_ahead_of_the_loop() -> None:
     # dA_cumsum[b, h, c, chunk - 1] feeds every iteration's in-place pass:
     # one load ahead of the K loop, not one behind each iteration's TMA wait.
-    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+    helion_mamba2_chunk_state_kernel = import_example(
+        "mamba2_chunk_state"
+    ).helion_mamba2_chunk_state_kernel
 
     bound = _bind_fn(helion_mamba2_chunk_state_kernel.fn, _chunk_state_inputs())
     body = _kernel_body(_source(bound, _config(64, 64, 128, warps=4, stages=1)))
@@ -1302,7 +1307,9 @@ def test_the_persistent_launch_loops_over_tiles_around_one_setup() -> None:
     # ids at k CTAs per SM; the barriers and tensor memory are set up once
     # ahead of the tile loop, re-armed at the end of every tile, and the
     # tensor memory is freed once after it.
-    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+    helion_mamba2_chunk_state_kernel = import_example(
+        "mamba2_chunk_state"
+    ).helion_mamba2_chunk_state_kernel
 
     bound = _bind_fn(helion_mamba2_chunk_state_kernel.fn, _chunk_state_inputs())
     spec = bound.config_spec
@@ -1367,7 +1374,9 @@ def test_the_persistent_launch_loops_over_tiles_around_one_setup() -> None:
 def test_an_offset_tile_that_can_leave_the_tensor_is_not_mine() -> None:
     # seqlen 500: the last chunk's tile reads rows 384..511 of a 500-row x,
     # which the masked scalar lowering zero-fills.
-    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+    helion_mamba2_chunk_state_kernel = import_example(
+        "mamba2_chunk_state"
+    ).helion_mamba2_chunk_state_kernel
 
     bound = _bind_fn(
         helion_mamba2_chunk_state_kernel.fn, _chunk_state_inputs(seqlen=500)

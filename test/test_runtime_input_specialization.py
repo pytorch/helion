@@ -31,16 +31,22 @@ from helion._compiler.compile_environment import _symint_free_symbols
 from helion._compiler.cute.memory_ops import (
     _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
 )
-from helion._compiler.cute.memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
 from helion._compiler.cute.memory_ops import _persistent_vec_alignment_matrix_signature
 from helion._compiler.cute.memory_ops import _persistent_vec_alignment_prepared_guard
-from helion._compiler.cute.memory_ops import _tensor_storage_disjoint_matrix_signature
-from helion._compiler.cute.memory_ops import _tensor_storage_disjoint_prepared_guard
 from helion._compiler.cute.memory_ops import runtime_tensor_has_specialized_alignment
-from helion._compiler.cute.memory_ops import runtime_tensors_are_proven_disjoint
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_function import StaticShape
 from helion._compiler.device_ir import _finalize_cute_tcgen05_search_planning
+from helion._compiler.runtime_tensor_guards import (
+    _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
+)
+from helion._compiler.runtime_tensor_guards import (
+    _tensor_storage_disjoint_matrix_signature,
+)
+from helion._compiler.runtime_tensor_guards import (
+    _tensor_storage_disjoint_prepared_guard,
+)
+from helion._compiler.runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 from helion._compiler.type_info import CallableType
 from helion._compiler.type_info import TensorType
 from helion._compiler.type_info import TypeInfo
@@ -662,7 +668,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         )
 
         with patch(
-            "helion._compiler.cute.memory_ops._tensor_alias_sources",
+            "helion._compiler.runtime_tensor_guards._tensor_alias_sources",
             return_value=sources,
         ):
             self.assertFalse(
@@ -1452,8 +1458,8 @@ class TestDerivedInputStorageProvenance(unittest.TestCase):
                     self.assertIsNone(env.tensor_descriptor_alignment_source(view))
 
     def test_derived_storage_disjointness_uses_real_guard_and_lifetime(self) -> None:
-        from helion._compiler.cute.memory_ops import (
-            register_cute_tensor_alias_specializations,
+        from helion._compiler.runtime_tensor_guards import (
+            register_tensor_alias_specializations,
         )
 
         real_x, real_out = torch.empty(4, 8), torch.empty(4)
@@ -1480,7 +1486,7 @@ class TestDerivedInputStorageProvenance(unittest.TestCase):
                             env, derived, out, allow_unbound=True
                         )
                     )
-                    register_cute_tensor_alias_specializations(env)
+                    register_tensor_alias_specializations(env)
                     self.assertFalse(
                         runtime_tensors_are_proven_disjoint(env, derived, out)
                     )

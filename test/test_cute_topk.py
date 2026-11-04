@@ -39,7 +39,6 @@ from helion._compiler.autotuner_heuristics.cute import CuteTopKHeuristic
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.cute import selection_coarse
-from helion._compiler.cute.memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
 from helion._compiler.cute.row_fragment import RowFragment
 from helion._compiler.cute.row_fragment import RowFragmentLayout
 from helion._compiler.cute.selection_coarse import trace_coarse_rank_selection
@@ -48,6 +47,9 @@ from helion._compiler.cute.selection_network import trace_selection_network
 from helion._compiler.cute.topk import _match_direct_topk_root
 from helion._compiler.cute.topk import match_topk_root
 from helion._compiler.cute.topk import topk_tensors_are_proven_disjoint
+from helion._compiler.runtime_tensor_guards import (
+    _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
+)
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
@@ -56,6 +58,7 @@ from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
+from helion.language._tracing_ops import _get_symnode
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -5711,10 +5714,12 @@ def test_topk_composition_rejects_shape_query_arithmetic() -> None:
         plan = match_topk_root(host.device_ir.graphs, noncanonical_block_ids=set())
         assert plan is not None and plan.fragment_graph is not None
         graph = plan.fragment_graph.root_graph
-        query = next(
-            node for node in graph.nodes if node.target is torch.ops.aten.sym_size.int
+        # The reduction-dim size read reaches the view as its physical extent.
+        view = next(
+            node for node in graph.nodes if node.target is torch.ops.aten.expand.default
         )
-        view = next(iter(query.users))
+        query = view.args[1][-1]
+        assert query.target is _get_symnode
         with graph.inserting_before(view):
             arithmetic = graph.call_function(operator.add, (query, 1))
             arithmetic.meta["val"] = query.meta["val"] + 1

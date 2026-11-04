@@ -1648,6 +1648,8 @@ def _helion_matmul_args(
 
 
 def _prepare_helion(args: argparse.Namespace) -> _PreparedHelion:
+    from helion._testing import import_example
+
     backend = args.helion_backend
     os.environ["HELION_BACKEND"] = backend
 
@@ -1658,9 +1660,9 @@ def _prepare_helion(args: argparse.Namespace) -> _PreparedHelion:
     if args.epilogue == "scaled_mm":
         # fp8 RowWise scaled_mm uses examples/fp8_matmul.py (hl.dot + fused
         # rowwise scale); the example matmul's torch.addmm does not accept fp8.
-        from examples.fp8_matmul import fp8_matmul as matmul
+        matmul = import_example("fp8_matmul").fp8_matmul
     else:
-        from examples.matmul import matmul
+        matmul = import_example("matmul").matmul
 
     bound = matmul.bind(kernel_args)
     config = _make_helion_config_from_args(args) if args.helion_force_config else None

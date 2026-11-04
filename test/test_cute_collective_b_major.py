@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 from unittest.mock import patch
 
-from examples.mamba2_chunk_scan import helion_mamba2_chunk_scan_kernel
 import pytest
 import torch
 
@@ -11,10 +10,15 @@ from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
+
+helion_mamba2_chunk_scan_kernel = import_example(
+    "mamba2_chunk_scan"
+).helion_mamba2_chunk_scan_kernel
 
 pytestmark = skipUnlessBackends(["cute"])
 

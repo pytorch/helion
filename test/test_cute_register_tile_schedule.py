@@ -18,8 +18,6 @@ from typing import Any
 from typing import cast
 from unittest.mock import patch
 
-from examples.linear.linear_attention_engine import recurrent_step_correction_fused
-from examples.linear.linear_attention_engine import recurrent_step_fused
 import pytest
 import torch
 
@@ -34,6 +32,8 @@ from helion._compiler.autotuner_heuristics.cute import CuteRegisterTileHeuristic
 from helion._compiler.cute.register_tile_admission import RegisterTileUnsupported
 from helion._compiler.generate_ast import GenerateAST
 from helion._testing import skipUnlessBackends
+from helion.experimental.linear_attention import recurrent_step_correction_fused
+from helion.experimental.linear_attention import recurrent_step_fused
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

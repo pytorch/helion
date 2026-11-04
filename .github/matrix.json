@@ -108,7 +108,7 @@
       "runner": "linux.idc.xpu",
       "python-version": "3.12",
       "ref-eager": false,
-      "image": "intelgpu/ubuntu-24.04-lts2:2523.40",
+      "image": "intel/compute-runtime:26.31.39395.16-devel-ubuntu24.04",
       "runtime-version": "xpu",
       "container-options": "--group-add 109 --device=/dev/mem --device=/dev/dri -e ZE_AFFINITY_MASK",
       "pytorch-version": "pytorch-2.13",

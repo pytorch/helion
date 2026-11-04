@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-from examples.jagged_layer_norm import jagged_layer_norm_kernel
-from examples.jagged_layer_norm import reference_jagged_layer_norm_pytorch
 import pytest
 import torch
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+_examples_jagged_layer_norm = import_example("jagged_layer_norm")
+jagged_layer_norm_kernel = _examples_jagged_layer_norm.jagged_layer_norm_kernel
+reference_jagged_layer_norm_pytorch = (
+    _examples_jagged_layer_norm.reference_jagged_layer_norm_pytorch
+)
 
 pytestmark = skipUnlessBackends(["cute"])
 

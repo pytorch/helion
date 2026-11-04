@@ -23,8 +23,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_dc
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 
@@ -47,12 +45,21 @@ from helion._compiler.autotuner_heuristics.cute_materialized_operand import (
 )
 from helion._compiler.cute.aux_tensor import analyze_tcgen05_matmul_store_chains
 from helion._compiler.cute.mma_support import CuteMmaSupport
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
+
+_examples_squeeze_and_excitation_net = import_example("squeeze_and_excitation_net")
+squeeze_and_excitation_net_bwd_dc = (
+    _examples_squeeze_and_excitation_net.squeeze_and_excitation_net_bwd_dc
+)
+squeeze_and_excitation_net_fwd = (
+    _examples_squeeze_and_excitation_net.squeeze_and_excitation_net_fwd
+)
 
 pytestmark = skipUnlessBackends(["cute"])
 

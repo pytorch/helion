@@ -7,8 +7,6 @@ import struct
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from examples.low_mem_dropout import low_mem_dropout
-from examples.low_mem_dropout import low_mem_dropout_bwd
 import numpy as np
 import pytest
 import torch
@@ -25,9 +23,14 @@ from helion._compiler.cute.uniform_comparison import UniformComparisonLowering
 from helion._compiler.cute.uniform_comparison import cutoff_function
 from helion._compiler.cute.uniform_comparison import lower_uniform_comparisons
 from helion._compiler.cute.uniform_comparison import match_uniform_float_gt
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.language.random_ops import _uint32_to_uniform_float
+
+_examples_low_mem_dropout = import_example("low_mem_dropout")
+low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
+low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 
 
 @pytest.fixture(autouse=True)

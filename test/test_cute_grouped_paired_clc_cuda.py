@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 
@@ -10,7 +9,10 @@ from helion._compiler.autotuner_heuristics.cute import (
 )
 from helion._compiler.cute.grouped_row_union import AB_STAGES_KEY
 from helion._compiler.cute.grouped_row_union import STARTUP_PREFILL_KEY
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 pytestmark = skipUnlessBackends(["cute"])
 

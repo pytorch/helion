@@ -9,6 +9,7 @@ from test.test_cute_materialize_operand import _computed_rhs
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 
@@ -119,8 +120,9 @@ def test_bf16xint16_seeds_match_torch_matmul(
 ) -> None:
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family")
-    from examples.bf16xint16_gemm import _bf16xint16_gemm
-    from examples.bf16xint16_gemm import _int16xbf16_gemm
+    _examples_bf16xint16_gemm = import_example("bf16xint16_gemm")
+    _bf16xint16_gemm = _examples_bf16xint16_gemm._bf16xint16_gemm
+    _int16xbf16_gemm = _examples_bf16xint16_gemm._int16xbf16_gemm
 
     m, k, n = shape
     generator = torch.Generator().manual_seed(m + k + n)

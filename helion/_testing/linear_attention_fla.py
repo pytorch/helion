@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from typing import Protocol
 
-from .linear_attention_engine import LinearAttentionVariant
+from helion.experimental.linear_attention import LinearAttentionVariant
 
 if TYPE_CHECKING:
     import torch

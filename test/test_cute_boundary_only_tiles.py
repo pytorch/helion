@@ -15,6 +15,7 @@ from test.test_cute_persistent_reduction_coverage import _assert_fragment_norm_c
 import helion
 from helion._compiler.cute.loop_nesting import boundary_only_grid_blocks
 from helion._compiler.cute.thread_budget import tile_loop_thread_count
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.language import tile_ops
@@ -138,8 +139,8 @@ def test_boundary_only_grid_preserves_partial_tile_bounds() -> None:
 
 @pytest.fixture(scope="module", params=("rms_norm", "layer_norm"))
 def norm_bound(request: pytest.FixtureRequest) -> BoundKernel:
-    from examples.layer_norm import layer_norm_bwd
-    from examples.rms_norm import rms_norm_bwd
+    layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
+    rms_norm_bwd = import_example("rms_norm").rms_norm_bwd
 
     x = torch.empty(256, 1024, dtype=torch.float16)
     weight = torch.empty(1024, dtype=torch.float16)

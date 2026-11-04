@@ -18,8 +18,6 @@ from typing import Callable
 from typing import cast
 from unittest.mock import patch
 
-from examples.rms_norm import rms_norm_fwd
-from examples.softmax import softmax
 import pytest
 import torch
 
@@ -30,9 +28,13 @@ from test._cute_binding import _mock_cuda_unavailable
 import helion
 from helion._compiler.autotuner_heuristics import get_heuristics
 from helion._compiler.autotuner_heuristics.cute import CuteReductionTileHeuristic
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
+
+rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
+softmax = import_example("softmax").softmax
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

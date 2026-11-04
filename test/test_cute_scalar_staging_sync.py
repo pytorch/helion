@@ -4,7 +4,6 @@ import ast
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from examples.aot_example import matmul_custom_key
 import pytest
 import torch
 
@@ -15,8 +14,11 @@ import helion
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_consumer_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_if
 from helion._compiler.cute.cute_mma import _Tcgen05ScalarSmemSync
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+matmul_custom_key = import_example("aot_example").matmul_custom_key
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

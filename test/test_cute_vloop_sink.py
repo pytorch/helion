@@ -23,8 +23,6 @@ from typing import Any
 from typing import Callable
 from unittest.mock import patch
 
-from examples.rms_norm import rms_norm_fwd
-from examples.softmax import softmax
 import pytest
 import torch
 
@@ -50,8 +48,12 @@ from helion._compiler import generate_ast
 from helion._compiler.ast_read_writes import ReadWrites
 from helion._compiler.autotuner_heuristics.cute import CuteColumnReductionHeuristic
 from helion._compiler.cute import sink_vector_loops
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
+softmax = import_example("softmax").softmax
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

@@ -42,19 +42,23 @@ benchmarks will be skipped with a warning.
 
 ## Architecture
 
-**`linear_attention_engine.py`** -- All Helion kernels (15 `@helion.kernel()`
-functions including fused recurrent step), `ChunkedLinearAttnFn` autograd wrapper,
-`LinearAttentionEngine` class, and the `chunked_linear_attn()` / `recurrent_step()`
-public entry points.
+**`helion/experimental/linear_attention.py`** -- All Helion kernels (including
+the fused recurrent step), the `ChunkedLinearAttnFn` autograd wrapper, the
+`LinearAttentionEngine` class, and the `chunked_linear_attn()` /
+`recurrent_step()` public entry points.  Its pretuned configs live beside it
+as `_helion_aot_linear_attention_*.py`.
 
-**`linear_attention_utils.py`** -- Pure-PyTorch chunked reference implementation,
-naive recurrent reference, WY decomposition helpers, input generators.
+**`helion/_testing/linear_attention_harness.py`** -- The shared test /
+benchmark / accuracy harness the example scripts here drive, with input
+generators per variant.  **`linear_attention_utils.py`** next to it holds the
+pure-PyTorch chunked and recurrent references; `linear_attention_fla.py` and
+`linear_attention_flashkda.py` adapt the optional FLA and FlashKDA baselines.
 
 ## Running
 
 ```bash
 # Single example (test + benchmark):
-python -m examples.linear.example_simple_gla
+python examples/linear/example_simple_gla.py
 
 # Run all tests via pytest:
 pytest test/test_examples.py -k "test_linear" -v

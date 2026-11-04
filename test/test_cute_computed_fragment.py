@@ -455,6 +455,7 @@ def _fragment_extent_fixture(rows_per_block, columns_per_block):
             var=SimpleNamespace(_sympy_=lambda symbol=symbol: symbol),
             numel=sympy.sympify(numel),
             reduction=i >= 2,
+            is_tile=i < 2,
         )
         for i, (symbol, numel) in enumerate(zip(symbols, numels, strict=True))
     ]

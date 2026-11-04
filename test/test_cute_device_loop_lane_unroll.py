@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from examples.nvfp4_gemv import _nvfp4_gemv_fp4in_body
 import pytest
 import torch
 
 from test.test_cute_tile_packing import _gemv_args
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+_nvfp4_gemv_fp4in_body = import_example("nvfp4_gemv")._nvfp4_gemv_fp4in_body
 
 pytestmark = skipUnlessBackends(["cute"])
 

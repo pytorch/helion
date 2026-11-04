@@ -298,14 +298,17 @@ def _module_source_path(module_name: str) -> Path | None:
 def _helion_source_provenance() -> dict[str, object]:
     helion_module_path = _module_source_path("helion")
     helion_expected_package_path = (REPO_ROOT / "helion").resolve()
-    attention_module_path = _module_source_path("examples.attention")
+    # The example is importable only through this name (examples/ is not a
+    # package); the import_path check below confirms it is this checkout's.
+    from helion._testing import EXAMPLES_PACKAGE
+
+    attention_module_path = _module_source_path(f"{EXAMPLES_PACKAGE}.attention")
     attention_expected_module_path = (REPO_ROOT / "examples" / "attention.py").resolve()
     owns_checkout = _git_worktree_root_matches(REPO_ROOT)
     source_snapshot = _git_source_snapshot(
         REPO_ROOT,
         (
             "helion",
-            "examples/__init__.py",
             "examples/attention.py",
             "benchmarks/cute/compare_attention_backends.py",
             "sitecustomize.py",
@@ -10874,27 +10877,38 @@ def _benchmark_helion_in_environment(
     strict_runtime_environment: dict[str, object] | None,
 ) -> dict[str, Any]:
 
+    from helion._testing import import_example
+
     env_overrides = _apply_helion_env(args)
     backend = args.helion_backend
     os.environ["HELION_BACKEND"] = backend
     impl_label = f"helion-{backend}"
 
-    from examples.attention import _attention_baseline
-    from examples.attention import _attention_output_baseline
-    from examples.attention import _attention_relu_output_baseline
-    from examples.attention import _biased_attention_baseline
-    from examples.attention import _biased_attention_output_baseline
-    from examples.attention import _causal_attention_baseline
-    from examples.attention import _causal_attention_output_baseline
-    from examples.attention import _causal_attention_relu_output_baseline
-    from examples.attention import attention
-    from examples.attention import attention_output
-    from examples.attention import attention_relu_output
-    from examples.attention import biased_attention
-    from examples.attention import biased_attention_output
-    from examples.attention import causal_attention
-    from examples.attention import causal_attention_output
-    from examples.attention import causal_attention_relu_output
+    _examples_attention = import_example("attention")
+    _attention_baseline = _examples_attention._attention_baseline
+    _attention_output_baseline = _examples_attention._attention_output_baseline
+    _attention_relu_output_baseline = (
+        _examples_attention._attention_relu_output_baseline
+    )
+    _biased_attention_baseline = _examples_attention._biased_attention_baseline
+    _biased_attention_output_baseline = (
+        _examples_attention._biased_attention_output_baseline
+    )
+    _causal_attention_baseline = _examples_attention._causal_attention_baseline
+    _causal_attention_output_baseline = (
+        _examples_attention._causal_attention_output_baseline
+    )
+    _causal_attention_relu_output_baseline = (
+        _examples_attention._causal_attention_relu_output_baseline
+    )
+    attention = _examples_attention.attention
+    attention_output = _examples_attention.attention_output
+    attention_relu_output = _examples_attention.attention_relu_output
+    biased_attention = _examples_attention.biased_attention
+    biased_attention_output = _examples_attention.biased_attention_output
+    causal_attention = _examples_attention.causal_attention
+    causal_attention_output = _examples_attention.causal_attention_output
+    causal_attention_relu_output = _examples_attention.causal_attention_relu_output
 
     dtype = _dtype_from_name(args.dtype)
     q, k, v = _make_inputs(args, dtype)

@@ -16,6 +16,7 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
 
 pytest.importorskip("cutlass")
@@ -23,7 +24,7 @@ pytest.importorskip("cutlass.cute")
 
 
 def _attention_kernel() -> helion.Kernel:
-    from examples.attention import attention
+    attention = import_example("attention").attention
 
     return helion.kernel(
         attention.fn, backend="cute", static_shapes=True, autotune_effort="none"

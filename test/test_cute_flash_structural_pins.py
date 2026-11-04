@@ -14,15 +14,18 @@ from __future__ import annotations
 
 import logging
 
-from examples.attention import attention
-from examples.attention import attention_backward
 import pytest
 import torch
 
 from test._cute_binding import _cpu_bind
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+_examples_attention = import_example("attention")
+attention = _examples_attention.attention
+attention_backward = _examples_attention.attention_backward
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")

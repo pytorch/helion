@@ -9,8 +9,6 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-from examples.low_mem_dropout import low_mem_dropout
-from examples.low_mem_dropout import low_mem_dropout_bwd
 import pytest
 import torch
 
@@ -21,9 +19,14 @@ import helion
 from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
 from helion._compiler.cute import affine_vector_io
 from helion._compiler.rng_utils import philox_rand_ref
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
+
+_examples_low_mem_dropout = import_example("low_mem_dropout")
+low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
+low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 
 pytestmark = skipUnlessBackends(["cute"])
 
