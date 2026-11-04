@@ -22,8 +22,10 @@ from test.test_cute_shared_rhs_grouped import _OffsetPointer
 from test.test_cute_shared_rhs_grouped import _plans
 from test.test_cute_shared_rhs_grouped import _target
 
+from helion._compiler.cute.grouped_row_union import AB_STAGES_KEY
 from helion._compiler.cute.grouped_row_union import CONFIG_KEY
 from helion._compiler.cute.grouped_row_union import PAIRED_CLC_SCHEDULE
+from helion._compiler.cute.grouped_row_union import ROUND_SUBTILES_KEY
 from helion._compiler.cute.grouped_row_union import SCHEDULE_KEY
 from helion._compiler.cute.grouped_row_union import TRANSPOSED
 from helion._compiler.cute.grouped_row_union import TRANSPOSED_SCHEDULE
@@ -268,8 +270,21 @@ def test_actual_full_population_transfers_dependent_witness(case):
     previous_seeds = [
         seed for seed in seeds if seed.get(SCHEDULE_KEY) != PAIRED_CLC_SCHEDULE
     ]
-    assert previous_seeds[-1][SCHEDULE_KEY] == TRANSPOSED_SCHEDULE
-    assert all(SCHEDULE_KEY not in seed for seed in previous_seeds[:-1])
+    # The transposed carrier, its measured twin (6-stage ring, epilogue
+    # rounds of two subtiles) and that twin without the setmaxnreg pair close
+    # the non-paired prefix.
+    assert [seed.get(SCHEDULE_KEY) for seed in previous_seeds[-3:]] == [
+        TRANSPOSED_SCHEDULE,
+        TRANSPOSED_SCHEDULE,
+        TRANSPOSED_SCHEDULE,
+    ]
+    for seed in previous_seeds[-2:]:
+        assert seed[AB_STAGES_KEY] == 6
+        assert seed[ROUND_SUBTILES_KEY] == 2
+    assert "tcgen05_warp_register_reallocation" not in previous_seeds[-2]
+    assert previous_seeds[-1]["tcgen05_warp_register_reallocation"] is False
+    assert "tcgen05_consumer_regs" not in previous_seeds[-1]
+    assert all(SCHEDULE_KEY not in seed for seed in previous_seeds[:-3])
     search = _search(bound, args)
     with (
         bound.env,
@@ -509,6 +524,10 @@ def test_actual_interval_normalization_and_dense_guard(case, stride):
 @pytest.mark.parametrize("k", [128, 512, 768, 16384])
 @skipUnlessBackends(["cute"])
 def test_actual_producer_all_ranks_and_ring_wrap(k):
+    # The prologue runtime imports cutlass at module level: CPU-only runners skip.
+    _helion_tc_pro = pytest.importorskip(
+        "helion._compiler.cute._tcgen05_prologue_runtime"
+    )
     bound, _ = _generic_bound(640, 256, k, 4)
     source = bound.to_code(selected(bound))
     device = next(
@@ -581,6 +600,10 @@ def test_actual_producer_all_ranks_and_ring_wrap(k):
                 arch=SimpleNamespace(
                     make_warp_uniform=lambda x: x,
                     block_idx_in_cluster=lambda rank=rank: rank,
+                    # the dependent-launch wait + release sit between stage
+                    # 0's acquire and its loads
+                    griddepcontrol_wait=lambda: None,
+                    griddepcontrol_launch_dependents=lambda: None,
                 ),
                 copy=copy,
             ),
@@ -598,6 +621,7 @@ def test_actual_producer_all_ranks_and_ring_wrap(k):
             "tma_sB": Partition(),
             "tcgen05_a_mcast_mask": 5 << (rank % 2),
             "tcgen05_b_mcast_mask": 1 << rank,
+            "_helion_tc_pro": _helion_tc_pro,
         }
         exec(code, scope)
         count = k // 64
@@ -678,6 +702,8 @@ def test_actual_wrapper_descriptor_and_device_copy_coremlir(case, tmp_path):
     from cutlass._mlir.dialects import func
     import cutlass.cute as cute
 
+    import helion._compiler.cute._tcgen05_prologue_runtime as _helion_tc_pro
+
     # Dynamically exported pybind types are absent from the SDK stubs.
     ir: Any = mlir_ir
     passmanager: Any = mlir_passmanager
@@ -709,13 +735,35 @@ def test_actual_wrapper_descriptor_and_device_copy_coremlir(case, tmp_path):
         for n in work.body
         if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
     }
+    # The TMA partitions of the whole tiled operands run once per CTA in the
+    # role's prelude ahead of its cluster join; the loop slices the tile.
+    prelude = producer.body[: producer.body.index(work)]
     partitions = [
         n
-        for n in work.body
+        for n in prelude
         if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Tuple)
     ]
     assert len(partitions) == 2
-    first = next(n for n in work.body if isinstance(n, ast.If))
+    assert [ast.unparse(n.targets[0]) for n in partitions] == [
+        "(tma_sA, tma_gA_all)",
+        "(tma_sB, tma_gB_all)",
+    ]
+    cluster_wait = next(
+        i
+        for i, n in enumerate(prelude)
+        if ast.unparse(n).startswith("cutlass.pipeline.pipeline_init_wait(")
+    )
+    assert all(prelude.index(n) < cluster_wait for n in partitions)
+    assert ast.unparse(assignments["tma_gA"].value) == (
+        "tma_gA_all[None, _helion_tc_pro.floordiv_nonneg(tile_offset_2, 256), None]"
+    )
+    assert ast.unparse(assignments["tma_gB"].value) == (
+        "tma_gB_all[None, _helion_tc_pro.floordiv_nonneg(tile_offset_1, 80), None]"
+    )
+    assert not any("tma_partition(" in ast.unparse(n) for n in work.body)
+    first = next(
+        n for n in work.body if isinstance(n, ast.If) and "cute.copy(" in ast.unparse(n)
+    )
     copies = {
         ast.unparse(n.value.args[0]): n
         for n in ast.walk(first)
@@ -744,7 +792,11 @@ def test_actual_wrapper_descriptor_and_device_copy_coremlir(case, tmp_path):
                 with ir.InsertionPoint(module.body):
                     function = func.FuncOp(kind, ([], []))
                 with ir.InsertionPoint(function.add_entry_block()):
-                    scope: dict[str, Any] = {"cute": cute, "cutlass": cutlass}
+                    scope: dict[str, Any] = {
+                        "cute": cute,
+                        "cutlass": cutlass,
+                        "_helion_tc_pro": _helion_tc_pro,
+                    }
                     for index, shape, stride, dtype in [
                         (0, (9,), (1,), cutlass.Int32),
                         (1, (2560, 512), (512, 1), cutlass.BFloat16),
@@ -805,10 +857,15 @@ def test_actual_wrapper_descriptor_and_device_copy_coremlir(case, tmp_path):
                                 ),
                                 layout.outer,
                             )
-                        for name in ("gA_tma", "gB_tma", "gA_tma_part", "gB_tma_part"):
+                        # The prelude's once-per-CTA tiled views and
+                        # partitions, then the tile's slices.
+                        for node in prelude:
+                            if isinstance(node, ast.Assign) and "tma_g" in ast.unparse(
+                                node.targets[0]
+                            ):
+                                execute(node, scope)
+                        for name in ("tma_gA", "tma_gB"):
                             execute(assignments[name], scope)
-                        for node in partitions:
-                            execute(node, scope)
                         assert (
                             str(scope["tma_sA"].layout)
                             == "((4096,2),10):((1,4096),8192)"
@@ -1203,7 +1260,14 @@ def test_tma_load_role_is_hoisted_ahead_of_the_cluster_wait(case):
     loop = next(
         i for i, stmt in enumerate(body[tma_role].body) if isinstance(stmt, ast.While)
     )
-    assert role_lines.index(cluster_wait) == scheduler + 1 < loop
+    # Between the scheduler setup and the join: the once-per-CTA TMA
+    # partitions of the whole tiled operands (pure address math that
+    # overlaps the other warps' barrier inits and the peers' arrival).
+    joined = role_lines.index(cluster_wait)
+    assert scheduler < joined < loop
+    between = role_lines[scheduler + 1 : joined]
+    assert sum("tma_partition(" in line for line in between) == 2
+    assert all("tma_" in line or line.startswith("#") for line in between), between
     # No unguarded cluster wait remains at the top level.
     assert not any(
         line.startswith("cutlass.pipeline.pipeline_init_wait(") for line in lines
@@ -1273,7 +1337,7 @@ def test_ab_stage_knob_normalizes_projects_and_launches(case):
     six = deepcopy(config)
     six.config[AB_STAGES_KEY] = 6
     six_source = bound.to_code(six)
-    assert "PipelineTmaUmma.create(num_stages=6," in six_source
+    assert "make_tma_umma_pipeline(num_stages=6," in six_source
     assert "PipelineUserType.Producer, 6)" in six_source
     assert "cutlass.BFloat16, 6, is_k_major=" in six_source
     assert "alloc_smem(cutlass.Int64, cutlass.Int32(12))" in six_source
@@ -1403,4 +1467,353 @@ def test_mma_warp_owns_tmem_on_the_transposed_profile(case):
         line
         == "if tcgen05_epi_active:\n    tcgen05_tmem_allocator.free(tcgen05_epi_acc_tmem_ptr)"
         for line in paired_lines
+    )
+
+
+@skipUnlessBackends(["cute"])
+def test_tma_load_role_waits_per_tile_ahead_of_its_first_stage(case):
+    """Under ``cute_pdl`` the TMA-load role's dependent-launch wait sits inside
+    its persistent loop, after the tile's address math (scheduler step, local
+    tiles, TMA partitions, the stage-0 gate and the stage-0 acquire: its
+    empty-barrier wait and ``expect_tx`` touch only shared memory) and right
+    ahead of the stage-0 loads, so only the TMA issue itself follows the
+    release; the prelude carries no wait and the release follows the wait.
+    Per-CTA stamps on the one-wave grouped kernel put the first TMA issue
+    250-300 ns after the release with the prelude wait; waiting ahead of the
+    first stage read 3.26 -> 3.15 us per call, waiting behind its acquire
+    (with the TMEM allocation overlapping the cluster join) another 35 ns."""
+    from helion._compiler.cute.pdl_coverage import waits_cover_global_reads
+
+    bound, _args, config, _source = case
+    pdl = deepcopy(config)
+    pdl.config["cute_pdl"] = True
+    body = _kernel_body(bound.to_code(pdl))
+    assert waits_cover_global_reads(body)
+    tma_role = next(
+        stmt
+        for stmt in body
+        if isinstance(stmt, ast.If)
+        and ast.unparse(stmt.test).endswith("== cutlass.Int32(5)")
+    )
+    prelude = [ast.unparse(stmt) for stmt in tma_role.body]
+    assert "cute.arch.griddepcontrol_wait()" not in prelude
+    loop = next(stmt for stmt in tma_role.body if isinstance(stmt, ast.While))
+    lines = [ast.unparse(stmt) for stmt in loop.body]
+    wait = lines.index("cute.arch.griddepcontrol_wait()")
+    assert lines[wait + 1] == "cute.arch.griddepcontrol_launch_dependents()"
+    # The tile's operand views are slices of the once-per-CTA partitions
+    # (the role prelude), taken ahead of the wait.
+    slices = [i for i, line in enumerate(lines) if "_all[" in line]
+    assert len(slices) == 2 and max(slices) < wait
+    assert not any("tma_partition(" in line for line in lines)
+    assert sum("tma_partition(" in line for line in prelude) == 2
+    gate = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("tcgen05_tma_initial_full_tile =")
+    )
+    acquire = lines.index(
+        "if tcgen05_tma_initial_full_tile:\n"
+        "    tcgen05_ab_pipeline.producer_acquire(tcgen05_ab_producer_state)"
+    )
+    assert gate < acquire < wait
+    # The stage-0 block itself carries no acquire any more.
+    assert "producer_acquire" not in lines[wait + 2]
+    assert lines[wait + 2].startswith("if tcgen05_tma_initial_full_tile:")
+    assert "cute.copy(tma_atom_a" in lines[wait + 2]
+    assert not any("cute.copy(" in line for line in lines[:wait])
+    # Only the two role waits remain (TMA-load and epilogue); no entry wait.
+    source = bound.to_code(pdl)
+    assert source.count("cute.arch.griddepcontrol_wait()") == 2
+    assert ast.unparse(body[0]) != "cute.arch.griddepcontrol_wait()"
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("rounds", [2, 4])
+def test_epilogue_round_knob_renders_rounds_and_sizes_the_c_ring(case, rounds):
+    """``tcgen05_epi_round_subtiles`` on the transposed profile: the five
+    128x16 subtiles of a tile are staged and stored in rounds of ``rounds``
+    (2, 2, 1 or 4, 1), one async-proxy fence, one named barrier and one bulk
+    commit per round; the C ring holds a buffer per subtile (whole rounds),
+    the bulk-group pipeline a stage per round, and the acquire that guards a
+    buffer's reuse is taken only from the second tile of a CTA on."""
+    bound, _args, config, _source = case
+    knob = deepcopy(config)
+    knob.config[AB_STAGES_KEY] = 6
+    knob.config[ROUND_SUBTILES_KEY] = rounds
+    normalized = bound.config_spec.normalized_config(knob)
+    assert normalized[ROUND_SUBTILES_KEY] == rounds
+    assert normalized[AB_STAGES_KEY] == 6
+    projected = bound.config_spec._cute_tcgen05_config.project_row_union_codegen(
+        normalized
+    )
+    subtiles = TRANSPOSED.epilogue_subtiles
+    assert subtiles == 5
+    n_rounds = -(-subtiles // rounds)
+    c_stages = rounds * n_rounds
+    assert projected["tcgen05_c_stages"] == c_stages
+    source = bound.to_code(knob)
+    kernel = source[source.index("@cute.kernel") :]
+    full_tile = kernel[kernel.index("if tcgen05_full_tile:") : kernel.index("else:")]
+    assert full_tile.count("cute.arch.fence_view_async_shared()") == n_rounds
+    assert full_tile.count("tcgen05_c_pipeline.producer_commit()") == n_rounds
+    assert full_tile.count("cute.copy(tcgen05_tma_store_atom,") == subtiles
+    assert full_tile.count("cute.copy(tcgen05_tiled_copy_t2r,") == subtiles
+    assert full_tile.count("consumer_release(tcgen05_acc_consumer_state)") == 1
+    assert full_tile.count("fence_view_async_tmem_load()") == 1
+    # The reuse guard: an acquire plus a barrier per round, only from the
+    # second tile of the CTA on (the first tile's buffers are fresh).
+    assert (
+        full_tile.count("if tcgen05_tma_store_role_tile >= cutlass.Int32(1):")
+        == n_rounds
+    )
+    # (plus the per-tile first acquire ahead of the setup, a no-op on a ring
+    # with a stage per round)
+    assert full_tile.count("tcgen05_c_pipeline.producer_acquire()") == n_rounds + 1
+    assert (
+        full_tile.count("tcgen05_epilog_sync_barrier.arrive_and_wait()") == 2 * n_rounds
+    )
+    assert f"% cutlass.Int32({c_stages})" in full_tile
+    assert f"tcgen05_store_epi_tile, {c_stages})" in full_tile
+    assert f"'num_c_stage': cutlass.Int32({c_stages})" in full_tile
+    assert f"PipelineTmaStore.create(num_stages={n_rounds}," in kernel
+    # Slot fragments for the round's subtiles beyond the first.
+    assert ("tcgen05_tTR_rAcc_r1 = cute.make_rmem_tensor" in full_tile) == (rounds > 1)
+    assert ("tcgen05_tTR_rAcc_r3 = cute.make_rmem_tensor" in full_tile) == (rounds > 3)
+    assert "for _tcgen05_subtile in" not in full_tile
+    # The wrapper's store contract carries the ring depth.
+    d_plan = next(plan for plan in _plans(source) if plan["kind"] == "tcgen05_d_tma")
+    assert d_plan["c_stage_count"] == c_stages
+    # The knob-off render is unchanged: five per-subtile iterations.
+    plain = bound.to_code(config)
+    assert "for _tcgen05_subtile in cutlass.range(tcgen05_subtile_count" in plain
+    assert "PipelineTmaStore.create(num_stages=2," in plain
+
+
+@skipUnlessBackends(["cute"])
+def test_epilogue_round_knob_normalizes_against_the_profile(case):
+    """The round must be a choice no wider than the tile's subtiles and its C
+    ring must fit beside the physical AB ring; the paired CLC profile keeps
+    its own store tail.  Strict normalization refuses, the repair drops the
+    knob (1 is canonical as absent)."""
+    bound, _args, config, _source = case
+    spec = bound.config_spec
+    fields = spec._cute_tcgen05_config.optional_fragments(for_search=True)
+    assert tuple(fields[ROUND_SUBTILES_KEY].choices) == (1, 2, 4)
+    assert ROUND_SUBTILES_KEY not in spec.normalized_config(config).config
+    one = deepcopy(config)
+    one.config[ROUND_SUBTILES_KEY] = 1
+    assert ROUND_SUBTILES_KEY not in spec.normalized_config(one).config
+    for stages, rounds in ((8, 2), (6, 4), (7, 2), (8, 4)):
+        with_knob = deepcopy(config)
+        with_knob.config.update({AB_STAGES_KEY: stages, ROUND_SUBTILES_KEY: rounds})
+        assert spec.normalized_config(with_knob).config[ROUND_SUBTILES_KEY] == rounds
+    for bad in (
+        # The profile's own 10-stage ring leaves no room for the wider C ring.
+        {ROUND_SUBTILES_KEY: 2},
+        {ROUND_SUBTILES_KEY: 2, AB_STAGES_KEY: 10},
+        {ROUND_SUBTILES_KEY: 4, AB_STAGES_KEY: 10},
+        {ROUND_SUBTILES_KEY: 3, AB_STAGES_KEY: 6},
+        # the legacy one-CTA row-union schedule keeps the per-subtile loop
+        {ROUND_SUBTILES_KEY: 2, SCHEDULE_KEY: "legacy", AB_STAGES_KEY: None},
+        {ROUND_SUBTILES_KEY: 8, AB_STAGES_KEY: 6},
+        {ROUND_SUBTILES_KEY: "2", AB_STAGES_KEY: 6},
+        {ROUND_SUBTILES_KEY: 0, AB_STAGES_KEY: 6},
+        {ROUND_SUBTILES_KEY: 2, SCHEDULE_KEY: PAIRED_CLC_SCHEDULE},
+    ):
+        invalid = deepcopy(config)
+        invalid.config.update(bad)
+        with pytest.raises(InvalidConfig):
+            spec.normalized_config(invalid)
+        repaired = deepcopy(invalid.config)
+        spec.normalize(repaired, _fix_invalid=True)
+        assert ROUND_SUBTILES_KEY not in repaired
+        expected_schedule = bad.get(SCHEDULE_KEY, TRANSPOSED_SCHEDULE)
+        # (the legacy schedule is canonical as absent)
+        assert repaired.get(SCHEDULE_KEY) == (
+            None if expected_schedule == "legacy" else expected_schedule
+        )
+        assert repaired[CONFIG_KEY] is True
+
+
+@skipUnlessBackends(["cute"])
+def test_prologue_trims_on_the_transposed_profile(case):
+    """The TMA-load warp's prologue is the critical path of the CTAs the
+    hardware dispatches last (after the dependent-launch release): the
+    clustered kernel builds its pipelines without the DSL's serial warp-0
+    mbarrier init and spreads the inits over the idle epilogue warps behind
+    ONE guard the TMA-load warp skips (with the two-CTA TMEM dealloc barrier
+    init and epilogue warp 0's store descriptor prefetch) ahead of the
+    cluster arrive, masks the cluster rank to its
+    static range, and divides the (non-negative) tile indices, offsets and
+    pids with shifts / masks instead of floor-division fix-up chains."""
+    _bound, _args, _config, source = case
+    assert (
+        "import helion._compiler.cute._tcgen05_prologue_runtime as _helion_tc_pro"
+        in source
+    )
+    lines = _top_level_lines(source)
+    acc = next(i for i, line in enumerate(lines) if "tcgen05_acc_pipeline = " in line)
+    ab = next(i for i, line in enumerate(lines) if "tcgen05_ab_pipeline = " in line)
+    assert "_helion_tc_pro.make_umma_async_pipeline(num_stages=2, " in lines[acc]
+    assert "_helion_tc_pro.make_tma_umma_pipeline(num_stages=" in lines[ab]
+    assert "defer_sync" not in lines[acc] and "defer_sync" not in lines[ab]
+    assert not any("PipelineTmaUmma.create(" in line for line in lines)
+    assert not any("PipelineUmmaAsync.create(" in line for line in lines)
+    arrive = lines.index(
+        "cutlass.pipeline.pipeline_init_arrive(cluster_shape_mn=tcgen05_cluster_layout_vmnk, is_relaxed=True)"
+    )
+    (inits,) = [
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("if not tcgen05_tma_warp:\n")
+        and "init_pipeline_barriers" in line
+    ]
+    assert max(acc, ab) < inits < arrive
+    block = lines[inits]
+    dealloc_init = (
+        "if tcgen05_warp_idx == cutlass.Int32(4):\n        with cute.arch.elect_one():"
+        "\n            cute.arch.mbarrier_init(tcgen05_tmem_dealloc_mbar_ptr, 32)"
+    )
+    store_prefetch = (
+        "if tcgen05_warp_idx == cutlass.Int32(0):"
+        "\n        cute.nvgpu.cpasync.prefetch_descriptor(tcgen05_tma_store_atom)"
+    )
+    pieces = (
+        dealloc_init,
+        "_helion_tc_pro.init_pipeline_barriers(tcgen05_warp_idx, (0,), tcgen05_acc_pipeline)",
+        "_helion_tc_pro.init_pipeline_barriers_pair(tcgen05_warp_idx, 1, tcgen05_ab_pipeline)",
+        store_prefetch,
+    )
+    assert all(piece in block for piece in pieces)
+    # Nothing of it is emitted anywhere else, and the allocator constructor
+    # no longer inits the dealloc barrier itself.
+    assert not any(
+        "init_pipeline_barriers" in line
+        or "prefetch_descriptor(tcgen05_tma_store_atom)" in line
+        or "mbarrier_init(tcgen05_tmem_dealloc_mbar_ptr" in line
+        for i, line in enumerate(lines)
+        if i != inits
+    )
+    allocator = next(
+        line for line in lines if line.startswith("tcgen05_tmem_allocator = ")
+    )
+    assert allocator.endswith(", initialize_mbarrier=False)")
+    # The cluster rank is masked to its static range (a no-op the compiler
+    # folds the coordinate math with) and the MMA slice uses the mask form.
+    assert (
+        "tcgen05_cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) & cutlass.Int32(3)"
+        in lines
+    )
+    assert (
+        "mma_slice_tidx = _helion_tc_pro.mod_nonneg(cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()), 2)"
+        in lines
+    )
+    # The TMA role's per-tile head: pids by shift / mask, slices by the
+    # non-negative division helper; no floor division or modulo remains.
+    tma_role = next(
+        stmt
+        for stmt in _kernel_body(source)
+        if isinstance(stmt, ast.If)
+        and ast.unparse(stmt.test).endswith("== cutlass.Int32(5)")
+    )
+    loop = next(stmt for stmt in tma_role.body if isinstance(stmt, ast.While))
+    head = [ast.unparse(stmt) for stmt in loop.body]
+    pid_lines = [line for line in head if line.startswith("pid_")]
+    assert pid_lines and all(
+        (" >> cutlass.Int32(" in line or " & cutlass.Int32(" in line)
+        and " // " not in line
+        and " % " not in line
+        for line in pid_lines
+    ), pid_lines
+    virtual_pid = next(line for line in head if line.startswith("virtual_pid = "))
+    assert "tile_idx[0] >> cutlass.Int32(1))" in virtual_pid
+    assert "tile_idx[0] // " not in virtual_pid
+    assert any(
+        line
+        == "tma_gA = tma_gA_all[None, _helion_tc_pro.floordiv_nonneg(tile_offset_2, 256), None]"
+        for line in head
+    )
+    assert any(
+        line
+        == "tma_gB = tma_gB_all[None, _helion_tc_pro.floordiv_nonneg(tile_offset_1, 80), None]"
+        for line in head
+    )
+    assert not any(
+        " // " in line or " % " in line
+        for line in head
+        if line.startswith(("pid_", "tile_offset_", "tma_g"))
+    )
+    assert (
+        "tcgen05_tma_k_tile = _helion_tc_pro.floordiv_nonneg(tile_offset_3, 64)"
+        in source
+    )
+
+
+@skipUnlessBackends(["cute"])
+def test_register_reallocation_optional_on_the_transposed_profile(case):
+    """At one CTA per SM the transposed profile's six warps hold their
+    registers from launch, so ``tcgen05_warp_register_reallocation=False``
+    (no ``setmaxnreg`` pair, a shorter TMA-load warp prologue) is a searchable
+    value of that profile; the consumer-register pin stays incompatible with
+    it, and the legacy one-CTA schedule and the paired profile keep the pair."""
+    bound, _args, config, source = case
+    key = "tcgen05_warp_register_reallocation"
+    spec = bound.config_spec
+    assert "cute.arch.setmaxregister_decrease(" in source
+    off = deepcopy(config)
+    off.config.pop("tcgen05_consumer_regs", None)
+    off.config[key] = False
+    assert spec.normalized_config(off)[key] is False
+    off_source = bound.to_code(off)
+    assert "setmaxregister" not in off_source
+    assert "_helion_tc_pro.init_pipeline_barriers_pair(" in off_source
+    # The default consumer budget is inert without the pair (a full config
+    # materializes it); an explicit other value is refused / repaired.
+    default_regs = deepcopy(off)
+    default_regs.config["tcgen05_consumer_regs"] = 256
+    normalized = spec.normalized_config(default_regs)
+    assert normalized[key] is False and "tcgen05_consumer_regs" not in normalized
+    pinned = deepcopy(off)
+    pinned.config["tcgen05_consumer_regs"] = 240
+    with pytest.raises(InvalidConfig):
+        spec.normalized_config(pinned)
+    repaired = deepcopy(pinned.config)
+    spec.normalize(repaired, _fix_invalid=True)
+    assert repaired.get(key) is False and "tcgen05_consumer_regs" not in repaired
+    for schedule in ("legacy", PAIRED_CLC_SCHEDULE):
+        other = deepcopy(off)
+        other.config[SCHEDULE_KEY] = schedule
+        with pytest.raises(InvalidConfig):
+            spec.normalized_config(other)
+        repaired = deepcopy(other.config)
+        spec.normalize(repaired, _fix_invalid=True)
+        assert key not in repaired
+
+
+@skipUnlessBackends(["cute"])
+def test_split_init_falls_back_to_the_dsl_constructors(case):
+    """When the installed DSL is not the release the runtime's no-init
+    constructors mirror, the clustered kernel keeps the DSL constructors
+    (``defer_sync=True``, the serial warp-0 inits) and emits no split init."""
+    bound, _args, config, _source = case
+    with patch(
+        "helion._compiler.cute.cute_mma.split_barrier_init_supported",
+        return_value=False,
+    ):
+        source = bound.to_code(config)
+    lines = _top_level_lines(source)
+    acc = next(line for line in lines if line.startswith("tcgen05_acc_pipeline = "))
+    ab = next(line for line in lines if line.startswith("tcgen05_ab_pipeline = "))
+    assert acc.startswith(
+        "tcgen05_acc_pipeline = cutlass.pipeline.PipelineUmmaAsync.create("
+    )
+    assert ab.startswith(
+        "tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create("
+    )
+    assert acc.endswith("defer_sync=True)") and ab.endswith("defer_sync=True)")
+    assert not any("init_pipeline_barriers" in line for line in lines)
+    assert (
+        "cutlass.pipeline.pipeline_init_arrive(cluster_shape_mn=tcgen05_cluster_layout_vmnk, is_relaxed=True)"
+        in lines
     )

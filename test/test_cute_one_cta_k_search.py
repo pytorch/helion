@@ -356,7 +356,7 @@ def test_restored_row_scale_anchor_keeps_pre_wait_through_codegen() -> None:
     assert canonical.config["tcgen05_aux_load_placement"] == "pre_acc_wait"
     assert canonical.config["tcgen05_cluster_n"] == 2
     source = bound.to_code(canonical)
-    assert "PipelineTmaUmma.create" in source
+    assert "PipelineTmaUmma.create" in source or "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
 
 
@@ -393,7 +393,7 @@ def test_clc_twins_keep_high_anchor_and_default_geometry() -> None:
         if seed.block_sizes[2] == 128 and seed.config.get("tcgen05_cluster_n", 1) == 1
     )
     source = bound.to_code(anchor)
-    assert "PipelineTmaUmma.create" in source
+    assert "PipelineTmaUmma.create" in source or "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
 
 

@@ -380,7 +380,7 @@ def _is_atomic_write(call: ast.Call) -> bool:
         return func.attr.startswith("atomic_")
     return isinstance(func, ast.Name) and (
         func.id.startswith(("atomic_", "_cute_atomic_"))
-        or func.id == "_cute_red_add_f32_vec"
+        or func.id.startswith("_cute_red_add_")
     )
 
 

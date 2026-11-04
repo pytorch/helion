@@ -8,13 +8,15 @@ whose mask changes inside every packet.
 
 from __future__ import annotations
 
-from examples.concatenate import concat2d_dim1
 import pytest
 import torch
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+concat2d_dim1 = import_example("concatenate").concat2d_dim1
 
 pytestmark = [
     skipUnlessBackends(["cute"]),

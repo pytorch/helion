@@ -408,7 +408,10 @@ class InvalidReductionDim(BaseError):
 
 
 class MultipleReductionDims(BaseError):
-    message = "Multiple reduction dims are not supported."
+    message = (
+        "Only sum, mean, amax and amin over explicit, distinct dims can reduce "
+        "multiple dims at once."
+    )
 
 
 class ReductionDimInvalidForShape(BaseError):
@@ -509,6 +512,13 @@ class BlockPtrIndexingUnavailable(BaseWarning):
     )
 
 
+class TritonOptionUnavailable(BaseWarning):
+    message = (
+        "The config asks for the Triton option {0!r}, which this Triton build "
+        "does not accept; the kernel runs without it."
+    )
+
+
 class TensorOperationInWrapper(BaseWarning):
     message = (
         "A tensor operation outside of the `hl.tile` or `hl.grid` loop will not be fused "
@@ -535,6 +545,18 @@ class WrongDevice(BaseWarning):
 
 class BlockSizeIgnoredInInterpretMode(BaseWarning):
     message = "block_size is specified to be {0}, but in interpret mode, the full dimension size is always used."
+
+
+class FastMathUnused(BaseWarning):
+    message = (
+        "This kernel computes {0}, which the fast_math setting lowers to faster "
+        "approximate forms (approximate fp32 division and reciprocal, ex2.approx "
+        "exponentials, approximate erf/sigmoid/rsqrt, and on Triton max/min without "
+        "NaN propagation) that typically change results by a few ulp, flush denormals "
+        "or drop NaNs; without it the exact forms are used. If the "
+        "kernel's consumers tolerate that, set @helion.kernel(fast_math=True) or "
+        "HELION_FAST_MATH=1. Silence with ignore_warnings=[helion.exc.FastMathUnused]."
+    )
 
 
 class TiledKMatmulAccumulationWarning(BaseWarning):

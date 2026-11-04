@@ -3,16 +3,19 @@ from __future__ import annotations
 import ast
 import re
 
-from examples.nvfp4_gemv import _nvfp4_gemv_bf16in_body
-from examples.nvfp4_gemv import _nvfp4_gemv_fp4in_body
-from examples.nvfp4_gemv import swizzled_scale_numel
 import torch
 
 from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+_examples_nvfp4_gemv = import_example("nvfp4_gemv")
+_nvfp4_gemv_bf16in_body = _examples_nvfp4_gemv._nvfp4_gemv_bf16in_body
+_nvfp4_gemv_fp4in_body = _examples_nvfp4_gemv._nvfp4_gemv_fp4in_body
+swizzled_scale_numel = _examples_nvfp4_gemv.swizzled_scale_numel
 
 pytestmark = skipUnlessBackends(["cute"])
 

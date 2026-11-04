@@ -6,7 +6,6 @@ from __future__ import annotations
 from typing import Any
 from typing import Callable
 
-from examples.linear.linear_attention_engine import recurrent_step_fused
 import pytest
 import torch
 
@@ -25,6 +24,7 @@ from test._cute_register_tile_kernels import column_config
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion.experimental.linear_attention import recurrent_step_fused
 
 pytestmark = [
     skipUnlessBackends(["cute"]),

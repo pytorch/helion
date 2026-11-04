@@ -2716,6 +2716,7 @@ def _codegen_flash_bwd_row_mma(
     warps = flash_bwd_row_warps(kv_rows, q_split)
     emit_flash_bwd_row_mma_module_statements(cg)
     names = {role: arg.name for role, arg in args.items()}
+    total_tiles = plan.num_groups * (plan.n_dim // kv_rows)
     cg.cute_wrapper_plans.append(  # type: ignore[attr-defined]
         {
             "kind": FLASH_BWD_ROW_PLAN_KIND,
@@ -2727,12 +2728,16 @@ def _codegen_flash_bwd_row_mma(
             "q_chunk": q_chunk,
             "stages": stages,
             "row_warps": warps,
-            "total_tiles": plan.num_groups * (plan.n_dim // kv_rows),
+            "total_tiles": total_tiles,
         }
     )
     df.placeholder_args.update(names.values())
     cg.cute_uses_matmul = True  # type: ignore[attr-defined]
     df.cute_state.attention_flash_threads = 32 * warps
+    # The launcher sizes the grid from the plan (one CTA per KV tile), not
+    # from the 128-row program-id grid: the dependent-launch release rule
+    # counts the launch's CTAs from here.
+    df.cute_state.launch_ctas = total_tiles
     body_src = emit_flash_bwd_row_mma_device_body(
         plan=plan,
         io_dtype=io_dtype,

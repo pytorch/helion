@@ -4,7 +4,6 @@ import ast
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 
@@ -20,8 +19,13 @@ from helion._compiler.autotuner_heuristics.cute_materialized import (
     CuteMaterializedMmaHeuristic,
 )
 from helion._compiler.cute.mma_support import CuteMmaSupport
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
+
+squeeze_and_excitation_net_fwd = import_example(
+    "squeeze_and_excitation_net"
+).squeeze_and_excitation_net_fwd
 
 pytestmark = skipUnlessBackends(["cute"])
 

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from ...runtime.config import Config
 from ..cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from ..cute.pipeline_smem import max_pipeline_ab_stages
+from ..cute.split_k_workspace_config import ATOMIC_EPILOGUE_KEY
 from ..cute.split_k_workspace_config import PARTITIONS_KEY
 from ..cute.split_k_workspace_config import STAGES_KEY
 from ..cute.split_k_workspace_config import WORKSPACE_KEY
@@ -52,6 +53,7 @@ class CuteSplitKWorkspaceHeuristic(AutotunerHeuristic):
 
         if device_ir.host_function is None:
             return frozenset()
+        from ..cute.split_k_workspace import atomic_epilogue_admissible
         from ..cute.split_k_workspace import plain_store_partition_choices
 
         with device_ir.host_function:
@@ -61,6 +63,9 @@ class CuteSplitKWorkspaceHeuristic(AutotunerHeuristic):
                 plain_store_partition_choices(proof, env.config_spec.num_sm)
                 if proof is not None
                 else ()
+            )
+            env.config_spec.cute_split_k_atomic_epilogue_available = (
+                proof is not None and atomic_epilogue_admissible(proof)
             )
         return frozenset()
 
@@ -224,6 +229,12 @@ class CuteSplitKWorkspaceHeuristic(AutotunerHeuristic):
                     continue
                 chosen.add(partitions)
                 result.append(candidate)
+                if spec.cute_split_k_atomic_epilogue_available:
+                    # The reducer-free twin: the producer reduces into the
+                    # zero-filled output itself (one kernel per call).
+                    result.append(
+                        Config.from_dict(candidate.config | {ATOMIC_EPILOGUE_KEY: True})
+                    )
                 if maximum > 2:
                     result.append(Config.from_dict(candidate.config | {STAGES_KEY: 2}))
                 if len(chosen) == 2:

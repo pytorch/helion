@@ -11,9 +11,15 @@ import torch
 from ..ast_extension import ExtendedAST
 from ..ast_extension import statement_from_string
 from ..type_info import LiteralType
+from ..type_info import PythonModuleType
 from ..type_info import TensorAttributeType
 from ..type_info import TensorType
 from ..variable_origin import ArgumentOrigin
+from ..variable_origin import AttributeOrigin
+from ..variable_origin import GetItemOrigin
+from ..variable_origin import Origin
+from ..variable_origin import TensorSizeOrigin
+from ..variable_origin import TensorStrideOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -149,15 +155,152 @@ def _sum_cast(statement: ast.AST) -> SumCast | None:
 
 
 def _constant_condition(node: ast.AST, host: HostFunction) -> bool | None:
+    """The fixed truth value of an ``if`` test, or ``None`` when it can vary.
+
+    A ``bool`` constant, or a test the type propagator folded to a boolean
+    literal whose every operand is fixed by the bound kernel's specialization
+    key (``_keyed_test``): constexpr arguments, ``str`` / ``dtype`` / ``device``
+    arguments (keyed by value), tensor ``dtype`` / ``shape`` / ``stride``
+    metadata (keyed by ``_tensor_key``; static shapes), ``torch`` constants,
+    and host names bound once to such expressions (``BT, V = y_pred.shape``,
+    ``n = x.size(0)``).  A literal the key does not cover is not folded: a
+    tensor's ``device`` (``x.device.type == "cuda"`` is a literal at compile
+    time, but ``_tensor_key`` carries no device, so another call may run the
+    other branch), ``is_cuda``, a module global.  A call in the test keeps the
+    branch dynamic too (dropping the test with the untaken branch would skip
+    the call).
+    """
     if isinstance(node, ast.Constant) and type(node.value) is bool:
         return node.value
-    if isinstance(node, ast.Name) and isinstance(info := _type(node), LiteralType):
-        origin = info.origin
-        if isinstance(origin, ArgumentOrigin):
-            value = host.constexpr_args.get(origin.name)
-            if type(value) is bool and value is info.value:
-                return value
+    info = _type(node)
+    if (
+        isinstance(info, LiteralType)
+        and type(info.value) is bool
+        and _keyed_test(node, host)
+    ):
+        return info.value
     return None
+
+
+# Tensor metadata ``_tensor_key`` fixes (dtype; sizes and strides under static
+# shapes, the only regime where they are literals), as attributes and methods.
+_KEYED_TENSOR_ATTRS = frozenset({"dtype", "shape", "ndim"})
+_KEYED_TENSOR_METHODS = frozenset({"size", "stride", "dim", "numel"})
+# Argument types ``_specialization_key`` keys by value (ints, floats and bools
+# key by type only and are symbolic on the host anyway).
+_KEYED_ARGUMENT_TYPES = (str, torch.dtype, torch.device)
+_BINDING_DEPTH = 8
+
+
+def _keyed_test(node: ast.AST, host: HostFunction) -> bool:
+    """Whether every operand of the test is fixed by the specialization key."""
+    return _keyed_expression(node, host, _single_bindings(host), 0)
+
+
+def _single_bindings(host: HostFunction) -> dict[str, ast.expr]:
+    """Host names bound exactly once, by a plain ``name = <expr>`` assignment."""
+    module = ast.Module(body=list(host.body), type_ignores=[])
+    stores: dict[str, int] = {}
+    values: dict[str, ast.expr] = {}
+    for child in ast.walk(module):
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+            stores[child.id] = stores.get(child.id, 0) + 1
+        elif (
+            isinstance(child, ast.Assign)
+            and len(child.targets) == 1
+            and isinstance(child.targets[0], ast.Name)
+        ):
+            values[child.targets[0].id] = child.value
+    arguments = {
+        argument.arg
+        for argument in ast.walk(host.args)
+        if isinstance(argument, ast.arg)
+    }
+    return {
+        name: value
+        for name, value in values.items()
+        if stores.get(name) == 1 and name not in arguments
+    }
+
+
+def _keyed_expression(
+    node: ast.AST, host: HostFunction, bindings: dict[str, ast.expr], depth: int
+) -> bool:
+    if depth > _BINDING_DEPTH:
+        return False
+    if isinstance(node, ast.Constant):
+        return True
+    keyed = lambda child: _keyed_expression(child, host, bindings, depth)  # noqa: E731
+    if isinstance(node, ast.Name):
+        info = _type(node)
+        if not isinstance(info, LiteralType):
+            return False
+        if _keyed_origin(info.origin, info.value, host):
+            return True
+        bound = bindings.get(node.id)
+        return bound is not None and _keyed_expression(bound, host, bindings, depth + 1)
+    if isinstance(node, ast.Attribute):
+        base = node.value
+        base_info = _type(base)
+        if isinstance(base_info, TensorType):
+            return node.attr in _KEYED_TENSOR_ATTRS
+        if isinstance(base_info, PythonModuleType):
+            # ``torch.float16``: a constant of the torch module.
+            return base_info.value is torch
+        if isinstance(base_info, LiteralType):
+            # An attribute of a keyed value (``dev.type`` of a device argument).
+            return keyed(base)
+        return False
+    if isinstance(node, ast.Subscript):
+        return keyed(node.value) and keyed(node.slice)
+    if isinstance(node, ast.Call):
+        func = node.func
+        return (
+            isinstance(func, ast.Attribute)
+            and isinstance(_type(func.value), TensorType)
+            and func.attr in _KEYED_TENSOR_METHODS
+            and not node.keywords
+            and all(keyed(argument) for argument in node.args)
+        )
+    if isinstance(node, ast.Compare):
+        return keyed(node.left) and all(keyed(other) for other in node.comparators)
+    if isinstance(node, ast.BoolOp):
+        return all(keyed(value) for value in node.values)
+    if isinstance(node, ast.UnaryOp):
+        return keyed(node.operand)
+    if isinstance(node, ast.BinOp):
+        return keyed(node.left) and keyed(node.right)
+    if isinstance(node, ast.Tuple):
+        return all(keyed(element) for element in node.elts)
+    return False
+
+
+def _keyed_origin(origin: Origin, value: object, host: HostFunction) -> bool:
+    """Whether a literal's provenance is a keyed argument or keyed tensor metadata."""
+    keys: list[str] = []
+    while isinstance(
+        origin, (AttributeOrigin, GetItemOrigin, TensorSizeOrigin, TensorStrideOrigin)
+    ):
+        if isinstance(origin, AttributeOrigin):
+            keys.append(origin.key)
+        elif isinstance(origin, TensorSizeOrigin):
+            keys.append("size")
+        elif isinstance(origin, TensorStrideOrigin):
+            keys.append("stride")
+        origin = origin.value
+    if not isinstance(origin, ArgumentOrigin):
+        return False
+    if origin.name in host.constexpr_args:
+        return True
+    argument = host.params.arguments.get(origin.name)
+    if isinstance(argument, torch.Tensor):
+        # ``x.shape[0]``, ``x.dtype``, ``x.size(0)``; the leading key names the
+        # metadata, deeper keys index it (``shape[0]``) or read its own
+        # attributes (``dtype.itemsize``).
+        return bool(keys) and keys[-1] in _KEYED_TENSOR_ATTRS | _KEYED_TENSOR_METHODS
+    if keys:
+        return isinstance(argument, _KEYED_ARGUMENT_TYPES)
+    return isinstance(value, _KEYED_ARGUMENT_TYPES)
 
 
 def _folded_body(

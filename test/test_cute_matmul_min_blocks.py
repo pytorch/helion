@@ -7,10 +7,6 @@ import random
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.matmul import matmul
-from examples.matmul_split_k import matmul_split_k
-from examples.softmax import softmax
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 
@@ -24,6 +20,7 @@ from helion._compiler.autotuner_heuristics.cute_launch_bounds import MIN_BLOCKS_
 from helion._compiler.autotuner_heuristics.cute_launch_bounds import (
     register_matmul_min_blocks_coverage,
 )
+from helion._testing import import_example
 from helion.autotuner import LFBOTreeSearch
 from helion.autotuner.compiler_coverage import CoverageDependency
 from helion.autotuner.config_generation import ConfigGeneration
@@ -32,6 +29,13 @@ from helion.autotuner.metrics import AutotuneMetrics
 from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.runtime.settings import default_autotuner_fn
+
+matmul = import_example("matmul").matmul
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
+softmax = import_example("softmax").softmax
+squeeze_and_excitation_net_fwd = import_example(
+    "squeeze_and_excitation_net"
+).squeeze_and_excitation_net_fwd
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -615,6 +619,10 @@ def test_global_positive_override_preserves_other_coverage_groups(
         "cute_structural_policy": automatic,
         "autotune_config_overrides": {MIN_BLOCKS_KEY: value},
         "disable_autotuner_heuristics": disabled,
+        # The cluster-K schedule is validated on fp32 destinations only; the
+        # float16 output accumulates in place by default now, so the
+        # unrelated split-K groups need the promoted output here.
+        "cute_promote_half_atomic_outputs": True,
     }
     with patch(REGISTRATION):
         previous, previous_args = _bind("collective", **settings)

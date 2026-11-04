@@ -16,13 +16,14 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from examples.matmul import matmul
-
 import helion
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
+from helion._testing import import_example
 from helion._testing import run_example
 import helion.language as hl
+
+matmul = import_example("matmul").matmul
 
 # %%
 # MatMul-LayerNorm Kernel

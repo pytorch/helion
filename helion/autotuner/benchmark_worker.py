@@ -19,6 +19,7 @@ from typing import TypeVar
 
 from .benchmarking import steady_graph_dispatch
 from .logger import _UNRECOVERABLE_RUNTIME_ERROR_RE
+from .logger import match_device_out_of_memory
 from .process_utils import signal_process_tree
 from .process_utils import start_isolated_process_group
 
@@ -151,14 +152,26 @@ class BenchmarkWorkerUnkillable(BenchmarkSubprocessError):
 
 class BenchmarkWorker:
     """Single spawn subprocess. Lazily started on first ``run()``;
-    respawned after timeout, sticky CUDA error, or unexpected exit."""
+    respawned after timeout, sticky CUDA error, device out-of-memory error,
+    or unexpected exit."""
 
-    def __init__(self, device: int | None = None) -> None:
+    def __init__(
+        self,
+        device: int | None = None,
+        *,
+        log_warning: Callable[[str], object] | None = None,
+    ) -> None:
         self.device = device
         self._process: mp.process.BaseProcess | None = None
         self._parent_connection: Connection | None = None
         self._lock = threading.Lock()
         self._fatal_error: str | None = None
+        self._log_warning = log_warning
+        # Jobs the current process completed without raising, and how many it
+        # must have completed for a job that runs out of memory there to be
+        # retried in a fresh one (see ``run``).
+        self._jobs_succeeded = 0
+        self._retry_after_jobs = 1
 
     def alive(self) -> bool:
         return self._process is not None and self._process.is_alive()
@@ -174,9 +187,22 @@ class BenchmarkWorker:
 
         Raises ``BenchmarkTimeout`` if the job exceeds ``timeout`` seconds,
         ``BenchmarkWorkerDied`` if the worker crashed, or whatever exception
-        the job raised. Sticky CUDA errors additionally kill the worker so the
-        next call respawns it. If a killed worker remains alive, raises
-        ``BenchmarkWorkerUnkillable`` and permanently disables this instance.
+        the job raised. Sticky CUDA errors and device out-of-memory errors
+        additionally kill the worker so the next call respawns it. If a
+        killed worker remains alive, raises ``BenchmarkWorkerUnkillable`` and
+        permanently disables this instance.
+
+        After an out-of-memory error what the process holds may be what
+        filled the device -- its caching allocator's free blocks, which a
+        driver allocation (a Triton module load, a kernel's local memory)
+        cannot use, the modules it loaded, and the local-memory high-water
+        mark, which a spilling kernel raises for the life of the process, the
+        failing one included -- and only a new process gives it back. A
+        worker that had completed jobs reruns the job once in a fresh one. An
+        out-of-memory error there is the job's own: it is raised and doubles
+        the successful jobs required before the next rerun, so jobs that run
+        out of memory on their own cost few reruns; a rerun that succeeds
+        resets that count.
 
         With ``compile_timeout`` a :class:`PhasedJob` is held to two
         deadlines: ``compile_timeout`` seconds for the compile phase (until
@@ -284,7 +310,39 @@ class BenchmarkWorker:
         if isinstance(result, BaseException):
             if _UNRECOVERABLE_RUNTIME_ERROR_RE.search(str(result)):
                 self._kill_if_current(process, connection)
+            elif match_device_out_of_memory(result):
+                retry = self._jobs_succeeded >= self._retry_after_jobs
+                self._kill_if_current(process, connection)
+                if not retry:
+                    # spawn the replacement now: its imports overlap the
+                    # parent's next steps (it has no CUDA context until a job)
+                    self._start()
+                    raise result
+                if self._log_warning is not None:
+                    first_line = str(result).split("\n", 1)[0]
+                    self._log_warning(
+                        f"Benchmark worker ran out of device memory after "
+                        f"{self._jobs_succeeded} successful job(s) "
+                        f"({type(result).__name__}: {first_line}); "
+                        "retrying the job in a fresh worker"
+                    )
+                try:
+                    # the fresh worker has no successful job: no second retry
+                    retried = self.run(job, timeout, compile_timeout=compile_timeout)
+                except Exception as error:
+                    if match_device_out_of_memory(error):
+                        self._retry_after_jobs *= 2
+                        if self._log_warning is not None:
+                            self._log_warning(
+                                "The job ran out of device memory in a fresh "
+                                "benchmark worker too; the next retry needs "
+                                f"{self._retry_after_jobs} successful job(s) first"
+                            )
+                    raise
+                self._retry_after_jobs = 1
+                return retried
             raise result
+        self._jobs_succeeded += 1
         return result  # type: ignore[return-value]
 
     def shutdown(self) -> None:
@@ -309,6 +367,7 @@ class BenchmarkWorker:
         child_connection.close()
         self._process = process
         self._parent_connection = parent_connection
+        self._jobs_succeeded = 0
 
     def _kill_if_current(
         self,

@@ -32,7 +32,6 @@ from typing import TYPE_CHECKING
 from typing import Any
 from unittest.mock import patch
 
-from examples.aot_example import rms_norm_batched
 import pytest
 import torch
 
@@ -52,8 +51,13 @@ from test.test_cute_dynamic_vector_reduction import _rolled_config
 
 import helion
 from helion import exc
+from helion._compiler.cute.host_zero_fill_launches import MAX_FILL_NUMEL
+from helion._compiler.cute.pdl_release import ZERO_FILL_KERNEL_PREFIX
 from helion._compiler.cute.pdl_release import resident_ctas_per_sm
+from helion._testing import import_example
 import helion.language as hl
+
+rms_norm_batched = import_example("aot_example").rms_norm_batched
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -123,13 +127,18 @@ _MEMORY_TOKENS = (
 
 
 def _launch(code: str) -> tuple[str, int]:
-    """The launcher call's grid expression and its CTA's thread count."""
+    """The kernel's launcher call's grid expression and its CTA's thread
+    count (not the launch of a zero-fill kernel, ``_fill_kernels``)."""
     (call,) = [
         node
         for node in ast.walk(ast.parse(code))
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "_launcher"
+        and not (
+            isinstance(node.args[0], ast.Name)
+            and node.args[0].id.startswith(ZERO_FILL_KERNEL_PREFIX)
+        )
     ]
     (block,) = [keyword.value for keyword in call.keywords if keyword.arg == "block"]
     assert isinstance(block, ast.Tuple)
@@ -141,14 +150,27 @@ def _launch(code: str) -> tuple[str, int]:
 
 
 def _kernel_def(code: str) -> ast.FunctionDef:
+    """The kernel proper (the module may also hold zero-fill kernels)."""
     module = ast.parse(code)
     (kernel,) = [
         node
         for node in module.body
         if isinstance(node, ast.FunctionDef)
         and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
+        and not node.name.startswith(ZERO_FILL_KERNEL_PREFIX)
     ]
     return kernel
+
+
+def _fill_kernels(code: str) -> list[ast.FunctionDef]:
+    """The zero-fill kernels a ``cute_pdl`` kernel's host zero fills launch
+    as (``host_zero_fill_launches``): one per surviving ``torch.zeros``."""
+    return [
+        node
+        for node in ast.parse(code).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name.startswith(ZERO_FILL_KERNEL_PREFIX)
+    ]
 
 
 def _on_and_off(bound: Any, config: dict[str, object]) -> tuple[str, str]:
@@ -165,11 +187,56 @@ def _codes(kernel: helion.Kernel, args: tuple, **config: object) -> tuple[str, s
     return _on_and_off(_cpu_bind(kernel, args), config)
 
 
-def _statements_ahead_of_the_wait(kernel: ast.FunctionDef) -> list[str]:
+def _release_block(kernel: ast.FunctionDef, start: int) -> int:
+    """The number of statements of the entry release at ``start``: the plain
+    release, or ``last_wave``'s CTA index and guard; 0 when none is there."""
+    statements = [ast.unparse(s) for s in kernel.body[start : start + 2]]
+    if statements[:1] == [_RELEASE]:
+        return 1
+    if len(statements) == 2 and statements[0] == _CTA_INDEX:
+        return 2
+    return 0
+
+
+def _late_wait_names(code: str) -> set[str]:
+    """The host names of the zero fills launched as fill kernels: behind
+    them a kernel's wait moves down to the first touch of a filled tensor
+    (``DeviceFunction._place_late_pdl_wait``)."""
+    fills = {fill.name for fill in _fill_kernels(code)}
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(code)):
+        # ``_launcher(fill, (grid,), out.view(-1), block=...)``
+        if not (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and len(node.value.args) >= 3
+            and isinstance(node.value.args[0], ast.Name)
+            and node.value.args[0].id in fills
+        ):
+            continue
+        view = node.value.args[2]
+        if (
+            isinstance(view, ast.Call)
+            and isinstance(view.func, ast.Attribute)
+            and isinstance(view.func.value, ast.Name)
+        ):
+            names.add(view.func.value.id)
+    return names
+
+
+def _statements_ahead_of_the_wait(
+    kernel: ast.FunctionDef, filled: set[str] = frozenset()
+) -> list[str]:
     """The wait is a top-level statement of the kernel body and nothing ahead
     of it touches memory, at any nesting depth: no tensor indexing and no
     call that loads, stores, copies, syncs a barrier or speaks
-    ``griddepcontrol``.  Returns what does precede it."""
+    ``griddepcontrol``.  Returns what does precede it.
+
+    A kernel whose zero fills launch as fill kernels (``filled`` names them)
+    may wait late, below a memory-touching loop, right before the first
+    touch of a filled tensor; its entry release then leads the body.  Such
+    a kernel's statements ahead of the wait may touch memory but never a
+    filled tensor; the release block is left out of the returned list."""
     waits = [
         index
         for index, statement in enumerate(kernel.body)
@@ -177,6 +244,18 @@ def _statements_ahead_of_the_wait(kernel: ast.FunctionDef) -> list[str]:
     ]
     assert len(waits) == 1, ast.unparse(kernel)[:600]
     ahead = kernel.body[: waits[0]]
+    if waits[0] > 0 and _release_block(kernel, 0):
+        # The late form: the entry release leads, a memory-touching loop
+        # runs ahead of the wait and no statement ahead touches a filled
+        # tensor.
+        ahead = ahead[_release_block(kernel, 0) :]
+        for statement in ahead:
+            assert not any(
+                isinstance(node, ast.Name) and node.id in filled
+                for node in ast.walk(statement)
+            ), ast.unparse(statement)
+        assert any(isinstance(statement, (ast.For, ast.While)) for statement in ahead)
+        return [ast.unparse(statement) for statement in ahead]
     for statement in ahead:
         for node in ast.walk(statement):
             assert not isinstance(node, ast.Subscript), ast.unparse(statement)
@@ -189,33 +268,75 @@ def _statements_ahead_of_the_wait(kernel: ast.FunctionDef) -> list[str]:
 
 def _assert_only_the_dependent_launch_differs(on: str, off: str) -> list[str]:
     kernel = _kernel_def(on)
-    ahead = _statements_ahead_of_the_wait(kernel)
-    assert on.count(_WAIT) == 1
-    assert on.count(_ATTRIBUTE) == 1
-    assert f"{kernel.name}{_ATTRIBUTE}" in on
+    ahead = _statements_ahead_of_the_wait(kernel, _late_wait_names(on))
+    main = ast.unparse(kernel)
+    assert main.count(_WAIT) == 1
+    attributes = [
+        ast.unparse(node)
+        for node in ast.parse(on).body
+        if isinstance(node, ast.Assign) and ast.unparse(node).endswith(_ATTRIBUTE)
+    ]
+    assert attributes.count(f"{kernel.name}{_ATTRIBUTE}") == 1
     # The default placement (``auto``) releases the dependents right after
     # the wait while the grid fits in one wave (``_implicit_pdl_release``);
     # a grid that needs more waves, or one sized at runtime, releases from
     # the CTAs of its last wave (``_last_wave_guard``).
-    assert on.count(_RELEASE) == 1
+    assert main.count(_RELEASE) == 1
     _last_wave_guard(on)
+    # A host zero fill the kernel keeps launches as a fill kernel of the
+    # module, itself waiting and releasing at entry, ahead of the kernel.
+    for fill in _fill_kernels(on):
+        assert [ast.unparse(s) for s in fill.body[:2]] == [_WAIT, _RELEASE]
+        assert attributes.count(f"{fill.name}{_ATTRIBUTE}") == 1
     assert _WAIT not in off and _ATTRIBUTE not in off and _RELEASE not in off
+    assert ZERO_FILL_KERNEL_PREFIX not in off
     assert _without_dependent_launch(on) == ast.unparse(ast.parse(off))
     return ahead
 
 
+_ZEROS_OF_EMPTY = {
+    "empty": "zeros",
+    "empty_like": "zeros_like",
+    "new_empty": "new_zeros",
+}
+
+
+def _is_fill_launch(statement: ast.stmt, fills: set[str]) -> bool:
+    """Whether ``statement`` launches one of the ``fills`` kernels: the plain
+    launch, or, for a tensor the host sizes at runtime, the launch behind the
+    host bound on the element count with the memset (``zero_()``) past it
+    (the fill kernel counts in Int32: ``MAX_FILL_NUMEL``)."""
+    if isinstance(statement, ast.If):
+        if len(statement.body) != 1 or not _is_fill_launch(statement.body[0], fills):
+            return False
+        assert ast.unparse(statement.test).endswith(f".numel() < {MAX_FILL_NUMEL}")
+        assert [ast.unparse(s) for s in statement.orelse] == [
+            f"{ast.unparse(statement.test).split('.numel()')[0]}.zero_()"
+        ]
+        return True
+    return (
+        isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Call)
+        and isinstance(statement.value.args[0], ast.Name)
+        and statement.value.args[0].id in fills
+    )
+
+
 def _without_dependent_launch(code: str) -> str:
     """``code`` without the launch attribute, the wait and the release (the
-    plain one or the index and guard of ``last_wave``), unparsed (comments
+    plain one or the index and guard of ``last_wave``), and without the
+    zero-fill kernels (their definitions, attributes and launches; the
+    ``empty`` each launch follows reads ``zeros`` again), unparsed (comments
     dropped) for comparison with the knob-off code."""
     module = ast.parse(code)
     name = _kernel_def(code).name
+    fills = {fill.name for fill in _fill_kernels(code)}
+    attributes = {f"{owner}{_ATTRIBUTE}" for owner in (name, *fills)}
     module.body = [
         node
         for node in module.body
-        if not (
-            isinstance(node, ast.Assign) and ast.unparse(node) == f"{name}{_ATTRIBUTE}"
-        )
+        if not (isinstance(node, ast.Assign) and ast.unparse(node) in attributes)
+        and not (isinstance(node, ast.FunctionDef) and node.name in fills)
     ]
     (kernel,) = [
         node
@@ -224,15 +345,43 @@ def _without_dependent_launch(code: str) -> str:
     ]
     statements = [ast.unparse(s) for s in kernel.body]
     wait = statements.index(_WAIT)
-    end = wait + 2 if statements[wait + 1] == _RELEASE else wait + 3
-    del kernel.body[wait:end]
+    if wait > 0 and _release_block(kernel, 0):
+        # The late wait: the release block leads the body, the wait follows
+        # the loop ahead of the first touch of a filled tensor.
+        del kernel.body[wait]
+        del kernel.body[: _release_block(kernel, 0)]
+    else:
+        del kernel.body[wait : wait + 1 + _release_block(kernel, wait + 1)]
+    if fills:
+        (host,) = [
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name != name
+        ]
+        body: list[ast.stmt] = []
+        for statement in host.body:
+            if not _is_fill_launch(statement, fills):
+                body.append(statement)
+                continue
+            allocation = body[-1]
+            assert isinstance(allocation, ast.Assign)
+            factory = allocation.value
+            assert isinstance(factory, ast.Call) and isinstance(
+                factory.func, ast.Attribute
+            )
+            factory.func.attr = _ZEROS_OF_EMPTY[factory.func.attr]
+        host.body = body
     return ast.unparse(module)
 
 
 def test_the_column_sum_waits_before_its_first_global_access(cpu_only: None) -> None:
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
     on, off = _codes(col_reduce_sum_static, (x,), **_COLUMN_SUM)
-    assert _assert_only_the_dependent_launch_differs(on, off) == []
+    ahead = _assert_only_the_dependent_launch_differs(on, off)
+    # With a fill kernel ahead of it the kernel waits late (its row loop runs
+    # ahead of the wait, which precedes the atomic into ``out``); without one
+    # it waits first.
+    assert (ahead != []) == bool(_fill_kernels(on))
     assert on.count(_RELEASE) == 1  # 64 CTAs: one wave
     assert "_vsink_vec" in on
     # The attribute is set on the kernel object the host code launches.
@@ -245,7 +394,8 @@ def test_dynamic_grids_and_pointwise_kernels_follow_the_grid_rule(
 ) -> None:
     x = torch.empty(1000, 1008, dtype=torch.bfloat16)
     on, off = _codes(col_reduce_sum_dynamic, (x,), **_COLUMN_SUM)
-    assert _assert_only_the_dependent_launch_differs(on, off) == []
+    ahead = _assert_only_the_dependent_launch_differs(on, off)
+    assert (ahead != []) == bool(_fill_kernels(on))
     # A grid the host sizes at runtime releases from its last wave, sized
     # against the launched grid (512-thread CTAs: 4 per SM, 592 slots).
     assert _last_wave_guard(on) == f"if pdl_cta >= {_GRID_CTAS} - 592:"
@@ -280,7 +430,11 @@ def test_column_reductions_take_the_knob_under_their_default_config(
     args = tuple(torch.empty(*shape, dtype=torch.bfloat16) for shape in shapes)
     bound = _cpu_bind(kernel, args)
     on, off = _on_and_off(bound, dict(bound.config_spec.default_config().config))
-    assert _assert_only_the_dependent_launch_differs(on, off) == []
+    ahead = _assert_only_the_dependent_launch_differs(on, off)
+    # A zero-filled accumulator launches as a fill kernel and the wait moves
+    # below the reduction loop, right before the atomic into the filled
+    # tensor; a kernel without one waits first.
+    assert (ahead != []) == bool(_fill_kernels(on))
 
 
 @pytest.mark.parametrize("static_shapes", [False, True])
@@ -442,11 +596,11 @@ def test_the_release_knob_rides_on_cute_pdl(cpu_only: None) -> None:
         "last_wave",
     )
     assert spec._flat_fields()["cute_pdl_release"].search_choices == ("auto",)
-    # The nested-row seeds turn the knob on and leave the placement to its
-    # grid-aware default.
+    # The nested-row seeds turn the knob on, leave the placement to its
+    # grid-aware default and spread the CTAs to one wave's density.
     from helion._compiler.autotuner_heuristics.cute import _dependent_launch
 
-    assert _dependent_launch(spec) == {"cute_pdl": True}
+    assert _dependent_launch(spec) == {"cute_pdl": True, "cute_pdl_spread": True}
     # Pre-Hopper targets search neither the knob nor the placement.
     below = _cpu_bind(col_reduce_sum_static, (x,)).config_spec
     with patch.object(below, "target_device_capability", (8, 0)):
@@ -639,12 +793,16 @@ def _last_wave_guard(code: str) -> str | None:
     index; the release is the guard's only statement, the else branch is
     empty); ``None`` when the kernel releases at plain entry (the release is
     the statement right after the wait)."""
-    statements = [ast.unparse(s) for s in _kernel_def(code).body]
+    kernel = _kernel_def(code)
+    statements = [ast.unparse(s) for s in kernel.body]
     wait = statements.index(_WAIT)
-    if statements[wait + 1] == _RELEASE:
+    # The release block follows the wait, or leads the body ahead of a late
+    # wait (a kernel whose zero fills launch as fill kernels).
+    start = 0 if wait > 0 and _release_block(kernel, 0) else wait + 1
+    if statements[start] == _RELEASE:
         return None
-    assert statements[wait + 1] == _CTA_INDEX
-    condition, body, orelse, nothing = statements[wait + 2].split("\n")
+    assert statements[start] == _CTA_INDEX
+    condition, body, orelse, nothing = statements[start + 1].split("\n")
     assert (body, orelse, nothing) == (f"    {_RELEASE}", "else:", "    pass")
     return condition
 
@@ -779,3 +937,250 @@ def test_the_last_wave_release_counts_the_launch_grid(cpu_only: None) -> None:
             bound, **pointwise, pid_type="persistent_blocked", num_sm_multiplier=16
         )
     assert _last_wave_guard(code) is None
+
+
+_PAD = "pdl_spread_pad = cute.arch.alloc_smem(cutlass.Uint8, {}, alignment=128)"
+_KEEP = "_helion_pdl_spread_keep(pdl_spread_pad.toint())"
+_KEEP_IMPORT = (
+    "from helion._compiler.cute._pdl_spread_runtime import "
+    "keep_smem_live as _helion_pdl_spread_keep"
+)
+
+
+def _without_spread_pad(code: str) -> str:
+    """``code`` without the pad of ``cute_pdl_spread`` and its import."""
+    module = ast.parse(code)
+    module.body = [
+        node
+        for node in module.body
+        if not (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "helion._compiler.cute._pdl_spread_runtime"
+        )
+    ]
+    kernel = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
+    )
+    kernel.body = [
+        statement
+        for statement in kernel.body
+        if "pdl_spread_pad" not in ast.unparse(statement)
+    ]
+    return ast.unparse(module)
+
+
+def test_the_spread_pad_sizes_the_kernel_to_one_wave() -> None:
+    from helion._compiler.cute.pdl_release import DEFAULT_SMEM_PER_SM
+    from helion._compiler.cute.pdl_release import SMEM_RESERVED_PER_CTA
+    from helion._compiler.cute.pdl_release import spread_pad_bytes
+
+    # 128 CTAs on 148 SMs run one per SM: the pad raises a 25600-byte body to
+    # the smallest footprint at which two CTAs, each with the system's
+    # reserved slice, no longer fit an SM while one still does.
+    pad = spread_pad_bytes(128, 148, 25600)
+    assert pad is not None
+    footprint = 25600 + pad
+    assert footprint == 115713
+    assert 2 * (footprint + SMEM_RESERVED_PER_CTA) > DEFAULT_SMEM_PER_SM
+    assert footprint + SMEM_RESERVED_PER_CTA <= DEFAULT_SMEM_PER_SM
+    # Two per SM (296 CTAs): three no longer fit, two still do.
+    pad = spread_pad_bytes(296, 148, 0)
+    assert pad is not None
+    assert 3 * (pad + SMEM_RESERVED_PER_CTA) > DEFAULT_SMEM_PER_SM
+    assert 2 * (pad + SMEM_RESERVED_PER_CTA) <= DEFAULT_SMEM_PER_SM
+    # A body whose own allocation already holds the CTAs to that density
+    # needs no pad (the 164 KB output kernel of the linear attention
+    # forward), nor does a kernel dense enough that the footprint drops
+    # below what it allocates.
+    assert spread_pad_bytes(128, 148, 167936) is None
+    assert spread_pad_bytes(148 * 16, 148, 16384) is None
+    # No grid, no SMs, or a footprint past the per-block maximum: no pad.
+    assert spread_pad_bytes(0, 148, 0) is None
+    assert spread_pad_bytes(128, 0, 0) is None
+    assert spread_pad_bytes(128, 148, 0, max_smem_per_block=65536) is None
+    assert spread_pad_bytes(128, 148, 0, smem_per_sm=2000) is None
+    # Every resident CTA keeps one 1 KB unit of slack beyond its footprint
+    # (rounded up to the 128-byte allocation unit), so the alignment padding
+    # of the body's allocations or a helper's own allocation cannot cost a
+    # resident CTA: 14 per SM still fit with that slack on a 228 KiB SM, 15
+    # do not, and the pad is declined there rather than sized to the edge.
+    from helion._compiler.cute.pdl_release import SMEM_ALLOCATION_UNIT
+    from helion._compiler.cute.pdl_release import SPREAD_SLACK_PER_CTA
+
+    for cap in range(1, 15):
+        pad = spread_pad_bytes(148 * cap, 148, 0)
+        assert pad is not None, cap
+        allocated = -(-pad // SMEM_ALLOCATION_UNIT) * SMEM_ALLOCATION_UNIT
+        per_cta = allocated + SMEM_RESERVED_PER_CTA
+        assert (cap + 1) * per_cta > DEFAULT_SMEM_PER_SM
+        assert cap * (per_cta + SPREAD_SLACK_PER_CTA) <= DEFAULT_SMEM_PER_SM
+    assert spread_pad_bytes(148 * 15, 148, 0) is None
+    assert spread_pad_bytes(148 * 32, 148, 0) is None
+
+
+def test_the_spread_pad_declines_storage_the_sum_cannot_see() -> None:
+    # The sum sees the body's literal ``alloc_smem`` calls; a body that
+    # reserves shared memory through the DSL's ``SmemAllocator`` (the fa4
+    # flash families, the tcgen05 GEMMs: a struct carved out at trace time,
+    # already at the per-block maximum), the dynamic shared memory base, or
+    # a size that is not a literal gets no pad at all: a pad sized against
+    # storage of unknown size would fail every launch past the maximum.
+    from helion._compiler.device_function import _literal_smem_bytes
+
+    def statements(source: str) -> list[ast.AST]:
+        return list(ast.parse(source).body)
+
+    assert _literal_smem_bytes(statements("x = 1")) == 0
+    assert (
+        _literal_smem_bytes(
+            statements(
+                "a = cute.arch.alloc_smem(cutlass.Uint8, 25600, alignment=128)\n"
+                "b = cute.arch.alloc_smem(cutlass.Float32, 512, alignment=16)\n"
+                "c = cute.arch.alloc_smem(cutlass.BFloat16, 8192)\n"
+            )
+        )
+        == 25600 + 512 * 4 + 8192 * 2
+    )
+    for opaque in (
+        (
+            "smem = cutlass_utils_flash.SmemAllocator()\n"
+            "storage = smem.allocate(_fbwd_storage_cls)\n"
+        ),
+        "alloc = cutlass.utils.SmemAllocator()\n",
+        "t = smem.allocate_tensor(cutlass.Float32, layout, 128)\n",
+        "p = smem.allocate_array(cutlass.Int64, 4)\n",
+        "base = cute.arch.get_dyn_smem(cutlass.Uint8, alignment=128)\n",
+        "a = cute.arch.alloc_smem(cutlass.Uint8, size, alignment=128)\n",
+        "a = cute.arch.alloc_smem(dtype, 1024)\n",
+    ):
+        assert _literal_smem_bytes(statements(opaque)) is None, opaque
+
+
+def test_the_spread_knob_pads_the_kernel_after_its_release(cpu_only: None) -> None:
+    # 64 CTAs of 512 threads on 148 SMs: one per SM.  The body allocates no
+    # shared memory itself, so the pad is the whole 115713-byte footprint,
+    # placed right after the wait and the release and kept live by the
+    # helper the module imports; everything else is the knob-on code.
+    x = torch.empty(1024, 1024, dtype=torch.bfloat16)
+    bound = _cpu_bind(col_reduce_sum_static, (x,))
+    spec = bound.config_spec
+    on = bound.to_code(
+        spec.normalized_config(helion.Config(**_COLUMN_SUM, cute_pdl=True))
+    )
+    spread = bound.to_code(
+        spec.normalized_config(
+            helion.Config(**_COLUMN_SUM, cute_pdl=True, cute_pdl_spread=True)
+        )
+    )
+    assert _KEEP_IMPORT in spread and _KEEP_IMPORT not in on
+    statements = [ast.unparse(statement) for statement in _kernel_def(spread).body]
+    index = statements.index(_WAIT)
+    assert statements[index + 1 : index + 4] == [
+        _RELEASE,
+        _PAD.format(115713),
+        _KEEP,
+    ]
+    assert _without_spread_pad(spread) == ast.unparse(ast.parse(on))
+    from helion._compiler.cute.pdl_release import spread_rendered
+
+    assert spread_rendered(spread) and not spread_rendered(on)
+    # The final selection ranks the padded kernel ahead of the released one.
+    from helion._compiler.cute.backend import CuteBackend
+
+    cfg = spec.normalized_config(
+        helion.Config(**_COLUMN_SUM, cute_pdl=True, cute_pdl_spread=True)
+    )
+    assert CuteBackend.finalist_preference(cfg, lambda: spread) == 0
+    assert (
+        CuteBackend.finalist_preference(
+            spec.normalized_config(helion.Config(**_COLUMN_SUM, cute_pdl=True)),
+            lambda: on,
+        )
+        == 1
+    )
+    # Past one wave the pad follows the ``last_wave`` guard: 15 SMs hold 64
+    # CTAs at five per SM, so six must not fit.
+    with patch.object(spec, "num_sm", 15):
+        code = bound.to_code(cfg)
+        statements = [ast.unparse(statement) for statement in _kernel_def(code).body]
+        index = statements.index(_WAIT)
+        assert _last_wave_guard(code) == "if pdl_cta >= 4:"
+        assert statements[index + 3 : index + 5] == [_PAD.format(37889), _KEEP]
+        assert spread_rendered(code)
+    # An unknown SM count (CPU targets) or a device whose shared memory
+    # cannot hold the footprint leaves the body alone.
+    with patch.object(spec, "num_sm", 1):
+        assert bound.to_code(cfg) == on
+    with patch("helion._compiler.device_function._smem_per_sm", return_value=2000):
+        assert bound.to_code(cfg) == on
+
+
+def test_the_spread_pad_follows_the_launch_grid(cpu_only: None) -> None:
+    # 1008 CTAs of 256 threads on 148 SMs: seven per SM, so the footprint is
+    # the smallest at which eight no longer fit.
+    x = torch.empty(1000, 1008, dtype=torch.bfloat16)
+    w = torch.empty(1008, dtype=torch.bfloat16)
+    pointwise = {"block_sizes": [16, 64], "num_threads": [4, 64]}
+    bound = _cpu_bind(scale_rows, (x, w))
+    spec = bound.config_spec
+    code = bound.to_code(
+        spec.normalized_config(
+            helion.Config(**pointwise, cute_pdl=True, cute_pdl_spread=True)
+        )
+    )
+    assert _launch(code) == ("(1008,)", 256)
+    assert _PAD.format(28161) in code and _KEEP in code
+    # A grid the host sizes at runtime gets no pad: its density is unknown.
+    bound = _cpu_bind(col_reduce_sum_dynamic, (x,))
+    spec = bound.config_spec
+    on = bound.to_code(
+        spec.normalized_config(helion.Config(**_COLUMN_SUM, cute_pdl=True))
+    )
+    spread = bound.to_code(
+        spec.normalized_config(
+            helion.Config(**_COLUMN_SUM, cute_pdl=True, cute_pdl_spread=True)
+        )
+    )
+    assert spread == on
+
+
+def test_the_spread_knob_rides_on_cute_pdl(cpu_only: None) -> None:
+    x = torch.empty(1024, 1024, dtype=torch.bfloat16)
+    bound = _cpu_bind(col_reduce_sum_static, (x,))
+    spec = bound.config_spec
+    assert "cute_pdl_spread" not in spec.default_config().config
+    plain = bound.to_code(spec.normalized_config(helion.Config(**_COLUMN_SUM)))
+    # Knob off: the default is dropped, a set value stays (inert, so a flat
+    # configuration round-trips) and the code is the knob-off code.
+    off = spec.normalized_config(
+        helion.Config(**_COLUMN_SUM, cute_pdl=False, cute_pdl_spread=False)
+    )
+    assert "cute_pdl_spread" not in off.config
+    assert bound.to_code(off) == plain
+    off_spread = spec.normalized_config(
+        helion.Config(**_COLUMN_SUM, cute_pdl=False, cute_pdl_spread=True)
+    )
+    assert off_spread.config["cute_pdl_spread"] is True
+    assert bound.to_code(off_spread) == plain
+    with pytest.raises(exc.InvalidConfig, match="cute_pdl_spread must be a boolean"):
+        spec.normalized_config(
+            helion.Config(**_COLUMN_SUM, cute_pdl=True, cute_pdl_spread="yes")
+        )
+    # Searched with the knob where ``griddepcontrol`` exists, and kept by the
+    # flat round trip the search canonicalizes every seed through.
+    assert spec._flat_fields()["cute_pdl_spread"].search_choices == (False, True)
+    from helion.autotuner.config_generation import ConfigGeneration
+
+    generation = ConfigGeneration(spec)
+    for value in (False, True):
+        config = spec.normalized_config(
+            helion.Config(**_COLUMN_SUM, cute_pdl=True, cute_pdl_spread=value)
+        )
+        round_trip = generation.unflatten(generation.flatten(config))
+        assert round_trip.config.get("cute_pdl_spread", False) is value
+        assert bound.to_code(round_trip) == bound.to_code(config)
+    with patch.object(spec, "target_device_capability", (8, 0)):
+        assert spec._flat_fields()["cute_pdl_spread"].search_choices == (False,)

@@ -5,7 +5,6 @@ from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 
@@ -14,11 +13,14 @@ from test.cute_population_contracts import checked_initial_population
 
 import helion
 from helion._compiler.generate_ast import GenerateAST
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 from helion.exc import InvalidConfig
+
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
 KEY = "cute_collective_static_layouts"
 
@@ -32,6 +34,8 @@ def _body(source):
 
 
 def _bound(m=32, k=4096, n=64, **settings):
+    # These codegen facts are stated on the fp32-promoted output form.
+    settings.setdefault("cute_promote_half_atomic_outputs", True)
     kernel = helion.kernel(
         matmul_split_k.fn,
         backend="cute",

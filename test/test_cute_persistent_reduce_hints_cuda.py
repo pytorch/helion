@@ -14,15 +14,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from examples.rms_norm import rms_norm_fwd
 import pytest
 import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
 
 
 def _kernel() -> helion.Kernel:

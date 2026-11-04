@@ -300,6 +300,51 @@ def cp_async_4(
 
 
 @dsl_user_op
+def lds_v4_b32(
+    smem_address: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.shared.v4.b32``: four 32-bit words (an MMA operand packet half)."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),  # pyrefly: ignore[missing-attribute]
+        [cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return _words(result, 4, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def sts_v4_b32(
+    smem_address: object,
+    w0: object,
+    w1: object,
+    w2: object,
+    w3: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """``st.shared.v4.b32``: four 32-bit words."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
+            *[cutlass.Uint32(w).ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
+        ],
+        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+
+
+@dsl_user_op
 def lds_s32(
     smem_address: object, *, loc: object = None, ip: object = None
 ) -> cutlass.Int32:

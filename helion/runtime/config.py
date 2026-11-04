@@ -22,7 +22,7 @@ LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 CuteAsyncLoadCacheLiteral = Literal["cg", "ca"]
 CuteAsyncStorePolicyLiteral = Literal["default", "l2_evict_last"]
-CuteStorePolicyLiteral = Literal["default", "l2_evict_last"]
+CuteStorePolicyLiteral = Literal["default", "streaming", "l2_evict_last"]
 CuteExactDivFormLiteral = Literal["redo", "plain"]
 CuteAffineScanScheduleLiteral = Literal[
     "ordinary",
@@ -79,6 +79,7 @@ class Config(Mapping[str, object]):
         cute_lane_unroll: int | None = None,
         cute_pdl: bool | None = None,
         cute_pdl_release: CutePdlReleaseLiteral | None = None,
+        cute_pdl_spread: bool | None = None,
         cute_warp_aggregated_atomics: bool | None = None,
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
@@ -124,7 +125,8 @@ class Config(Mapping[str, object]):
             load_cache_modifiers: Cache modifiers for load operations ("", ".cg").
             store_cache_modifiers: Cache modifiers for store operations ("", ".cs", ".wt").
             cute_store_policy: Cache policy for proven full aligned 16-byte CuTe
-                global store packets ("default" or "l2_evict_last").
+                global store packets ("default", "streaming" = evict-first
+                ``st.global.cs`` for outputs written once, or "l2_evict_last").
             cute_async_load_stages: Shared-memory ring stages for eligible CuTe
                 in-place 16-byte state loads. Zero disables the transformation.
             cute_async_load_lookahead: Async-copy groups kept ahead of compute.
@@ -167,7 +169,12 @@ class Config(Mapping[str, object]):
             cute_pdl: Launch the kernel as a programmatic dependent of the
                 previous kernel in the stream: its launch and prologue overlap
                 that kernel's tail and it waits (``griddepcontrol.wait``) ahead
-                of its first global memory access. Off by default. Kernels that
+                of its first global memory access; when its own host zero fills
+                launch as dependent fill kernels, ahead of its first access to a
+                filled tensor instead (the fill kernel releases only after its
+                own wait, so every earlier kernel has completed), which lets a
+                split-K kernel's operand loads overlap the fill of its atomic
+                output. Off by default. Kernels that
                 already take part in dependent launch (native plans launched
                 with it, bodies with their own wait or release, the
                 materialized-fission producer) and pre-sm_90 targets generate
@@ -193,9 +200,24 @@ class Config(Mapping[str, object]):
                 or when the grid is sized at runtime; the search leaves the
                 placement at ``auto``. Every placement reads the same data: a
                 dependent's own wait blocks until this grid has completed and
-                flushed. Inert when ``cute_pdl`` is off and on the
-                tcgen05 GEMM families, whose lowering places its own release
-                after the last MMA.
+                flushed. On the tcgen05 GEMM kernels, whose lowering waits in
+                its warp roles and releases after the last MMA, ``entry`` and
+                ``last_wave`` add the release right after each of those waits
+                and ``exit`` / ``none`` keep the late release alone. Inert when
+                ``cute_pdl`` is off.
+            cute_pdl_spread: Pad a ``cute_pdl`` kernel's shared memory so that
+                at most ``ceil(CTAs / SMs)`` of its CTAs fit on one SM, its
+                density on an idle device. A programmatic dependent launches
+                while its primary runs and the hardware dispatches its CTAs
+                onto whatever SMs have room; when the primary's CTAs leave none
+                beside them, a small dependent's CTAs all land on the few SMs
+                the primary left idle and run packed there once it completes.
+                With the pad the CTAs beyond the idle SMs wait for the
+                primary's to retire and take their SMs one each. Off by
+                default; inert when ``cute_pdl`` is off, when the kernel's own
+                allocation already holds its CTAs to that density, when the
+                grid is sized at runtime, and on the families that own their
+                dependent launch.
             cute_warp_aggregated_atomics: Combine relaxed Int32 zero/one ticket
                 reservations for equal addresses within each active warp. Each
                 lane retains its own valid fetch-add return value. Off by default.
@@ -297,6 +319,7 @@ class Config(Mapping[str, object]):
             "cute_lane_unroll": cute_lane_unroll,
             "cute_pdl": cute_pdl,
             "cute_pdl_release": cute_pdl_release,
+            "cute_pdl_spread": cute_pdl_spread,
             "cute_warp_aggregated_atomics": cute_warp_aggregated_atomics,
             "cute_packet_prefetch": cute_packet_prefetch,
             "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,

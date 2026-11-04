@@ -11,7 +11,6 @@ from typing import Any
 from typing import cast
 from unittest.mock import patch
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -31,10 +30,13 @@ from helion._compiler.cute.split_k_cluster import CLUSTER_K_SCHEDULE
 from helion._compiler.cute.split_k_cluster_config import CLUSTER8_K4
 from helion._compiler.cute.split_k_cluster_config import SCHEDULE_KEY
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
+
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -55,6 +57,9 @@ def cpu_only() -> Iterator[None]:
 
 
 def _bind(shape=(32, 4096, 64), *, bias=False, disable_heuristics=False, **settings):
+    # The cluster-K schedule is validated on fp32 (promoted) destinations; the
+    # float16 output accumulates in place by default now.
+    settings.setdefault("cute_promote_half_atomic_outputs", True)
     m, k, n = shape
     a = torch.empty((m, k), dtype=torch.float16)
     b = torch.empty((k, n), dtype=torch.float16)
@@ -247,7 +252,11 @@ def test_unaligned_input_rejects_before_default_launcher(shift):
     a = torch.empty(32 * 4096 + shift, dtype=torch.float16)[shift:].view(32, 4096)
     b = torch.empty((4096, 64), dtype=torch.float16)
     kernel = helion.kernel(
-        matmul_split_k.fn, backend="cute", static_shapes=True, autotune_effort="none"
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     bound = kernel._bind_isolated((a, b))
     with pytest.raises(helion.exc.BackendUnsupported, match="aligned inputs"):
@@ -258,7 +267,11 @@ def test_positive_padded_input_strides_and_non_original_extents():
     a = torch.empty_strided((48, 8192), (8200, 1), dtype=torch.float16)
     b = torch.empty_strided((8192, 80), (88, 1), dtype=torch.float16)
     kernel = helion.kernel(
-        matmul_split_k.fn, backend="cute", static_shapes=True, autotune_effort="none"
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     bound = kernel._bind_isolated((a, b))
     config = _carrier(bound)
@@ -359,6 +372,7 @@ def test_padded_element_offset_int32_boundary(operand, overflow):
             backend="cute",
             static_shapes=True,
             autotune_effort="none",
+            cute_promote_half_atomic_outputs=True,
         )
         args = (a, b, lambda acc, tile: acc + bias[tile[1]])
         bound = kernel._bind_isolated(args)
@@ -416,6 +430,7 @@ def test_generated_module_name_does_not_shadow_host_bindings(
         backend="cute",
         static_shapes=True,
         autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     args = (
         torch.empty((32, 4096), dtype=torch.float16),
@@ -449,3 +464,15 @@ def test_generated_module_name_does_not_shadow_host_bindings(
             and values[4] is outputs[index]
         )
         assert kwargs == {"block": (32, 4, 1)}
+
+
+@pytest.mark.parametrize("promote", (False, True))
+def test_half_output_cluster_facts_follow_the_promotion_setting(promote: bool) -> None:
+    """Cluster-K is validated on fp32 destinations: with the default
+    ``cute_promote_half_atomic_outputs=False`` matmul_split_k's float16
+    output accumulates in place and the schedule declines; with the
+    promotion on (the fp32 twin) the facts and the carrier exist."""
+    bound, _args = _bind(cute_promote_half_atomic_outputs=promote)
+    assert bool(bound.env.cute_half_atomic_output_promotions) == promote
+    assert (bound.config_spec.cute_split_k_cluster_facts is not None) == promote
+    assert (_carrier(bound) is not None) == promote

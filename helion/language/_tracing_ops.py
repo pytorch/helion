@@ -111,8 +111,12 @@ def _(state: CodegenState) -> ast.AST:
     dtype = state.proxy_arg(1)
     assert isinstance(value, (int, float, bool))
     assert isinstance(dtype, torch.dtype)
+    assert state.fx_node is not None
+    shape = ["1"] * state.fx_node.meta["val"].ndim
     return expr_from_string(
-        CompileEnvironment.current().backend.full_expr([], constant_repr(value), dtype)
+        CompileEnvironment.current().backend.full_expr(
+            shape, constant_repr(value), dtype
+        )
     )
 
 

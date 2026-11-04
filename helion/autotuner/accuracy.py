@@ -36,6 +36,8 @@ ACCURACY_POISON_BYTE = 0xDE
 # The caching allocator serves requests of at most this many bytes from its
 # small pool; a free block of the large pool below it is unreachable.
 _ALLOCATOR_SMALL_POOL_MAX_BYTES = 1 << 20
+# The allocator's smallest block.
+_ALLOCATOR_MIN_BLOCK_BYTES = 512
 
 
 def accuracy_poison_value(dtype: torch.dtype) -> torch.Tensor:
@@ -60,7 +62,15 @@ def poison_cached_device_memory(device: torch.device | None = None) -> None:
     Each free block is claimed by an allocation of its exact size (the
     allocator's best fit), filled on the current stream and released; blocks
     of a fully free small-pool segment are claimed in small-pool-sized
-    pieces.  CUDA / ROCm allocators only; a no-op elsewhere.
+    pieces.  Only the blocks of the stream and pool a fresh allocation is
+    routed to (the pool of a probe allocation's segment: the default pool, or
+    a ``torch.cuda.use_mem_pool`` pool the caller allocates into) are
+    claimed: a fresh output can come from no others, and a request for any
+    other free block (one a side stream owns, like each of
+    ``steady_graph_dispatch``'s warm-up segments, or one in a CUDA graph's
+    private pool) cannot be served from it, so it would allocate a new
+    segment instead -- on every call, growing the reservation until the
+    device is full.  CUDA / ROCm allocators only; a no-op elsewhere.
     """
     if not torch.cuda.is_available():
         return
@@ -69,9 +79,32 @@ def poison_cached_device_memory(device: torch.device | None = None) -> None:
     if device.type != "cuda":
         return
     index = device.index if device.index is not None else torch.cuda.current_device()
+    # a block-sized probe, poisoned so that its own block is too once freed
+    probe = torch.full(
+        [_ALLOCATOR_MIN_BLOCK_BYTES],
+        ACCURACY_POISON_BYTE,
+        dtype=torch.uint8,
+        device=device,
+    )
+    address = probe.data_ptr()
+    segments = [s for s in torch.cuda.memory_snapshot() if s["device"] == index]
+    del probe
+    probe_segment = next(
+        (
+            (s["stream"], s["segment_pool_id"])
+            for s in segments
+            if s["address"] <= address < s["address"] + s["total_size"]
+        ),
+        None,
+    )
+    if probe_segment is None:
+        # not from the caching allocator (PYTORCH_NO_CUDA_MEMORY_CACHING=1):
+        # nothing is cached to be recycled
+        return
+    stream, pool = probe_segment
     requests: list[int] = []
-    for segment in torch.cuda.memory_snapshot():
-        if segment["device"] != index:
+    for segment in segments:
+        if segment["stream"] != stream or segment["segment_pool_id"] != pool:
             continue
         small = segment.get("segment_type") == "small"
         for block in segment["blocks"]:

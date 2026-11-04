@@ -6,7 +6,6 @@ import textwrap
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.jagged_layer_norm import jagged_layer_norm_kernel
 import pytest
 import torch
 
@@ -15,8 +14,11 @@ from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._compiler.cute.flatten_nested_reductions import flatten_nested_reductions
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+jagged_layer_norm_kernel = import_example("jagged_layer_norm").jagged_layer_norm_kernel
 
 pytestmark = skipUnlessBackends(["cute"])
 

@@ -5,7 +5,6 @@ import ctypes
 import ctypes.util
 from types import SimpleNamespace
 
-from examples.aot_example import row_softmax
 import numpy as np
 import pytest
 import torch
@@ -19,7 +18,10 @@ from helion._compiler.cute.scaled_sub_fusion import SCALED_SUBTRACTION_ATTR
 from helion._compiler.cute.scaled_sub_fusion import (
     contract_distributed_scale_subtractions,
 )
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+row_softmax = import_example("aot_example").row_softmax
 
 SOURCE = """
 offset = cutlass.Float32(other)

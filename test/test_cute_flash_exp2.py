@@ -3200,8 +3200,11 @@ def test_bfloat16_hd128_degree2_seed_is_deterministic_and_matches_sdpa() -> None
         k.mul_(scale)
         out = bound(q, k, v)
         repeated = bound(q, k, v)
-        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        diff = (out.float() - expected.float()).abs()
+        # A bf16 SDPA reference's own rounding error is comparable to the tolerance.
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q.float(), k.float(), v.float()
+        )
+        diff = (out.float() - expected).abs()
         normalized_rmse = torch.sqrt(
             (diff * diff).mean(dtype=torch.float64)
             / (expected.float() * expected.float()).mean(dtype=torch.float64)

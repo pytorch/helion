@@ -818,6 +818,32 @@ def _append_cute_wrapper_plan(
         )
         return
 
+    if kind == "helion_flash_gated_row_mma":
+        # Register-MMA gated attention row programs (cute_flash_gated_row_mma):
+        # the host grid, plain tensor arguments, no descriptors. The body
+        # moves 16-byte cp.async packets of q/k/v rows and 4-byte output
+        # packets. An under-aligned q/k/v/o binding is staged through a
+        # 16-byte-aligned copy at launch (``_CUTE_STAGED_PLAN_OPERANDS``); a
+        # schema that still proves a base under-aligned for its access width
+        # is refused here rather than faulting on the device.
+        if schema_key is not None:
+            for key, width in (
+                ("q_idx", 16),
+                ("k_idx", 16),
+                ("v_idx", 16),
+                ("o_idx", 4),
+            ):
+                index = plan_optional_int(key)
+                if index is not None and (
+                    _cute_schema_pointer_alignment(schema_key[index]) % width
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "the gated row_mma body requires 16-byte-aligned q/k/v "
+                        "and a 4-byte-aligned o base",
+                    )
+        return
+
     if kind == "helion_flash_bwd_row_mma":
         # Register-MMA backward row programs (cute_flash_bwd_row_mma): one
         # CTA per (KV group, kv_rows) tile, plain tensor arguments, no
@@ -4569,6 +4595,7 @@ _CUTE_STAGED_PLAN_OPERANDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] =
         ("o_idx", "lse_idx"),
     ),
     "helion_flash_gated": (("q_idx", "k_idx", "v_idx"), ("o_idx",)),
+    "helion_flash_gated_row_mma": (("q_idx", "k_idx", "v_idx"), ("o_idx",)),
     "helion_flash_bwd": (
         ("q_idx", "k_idx", "v_idx", "do_idx", "lse_idx", "delta_idx"),
         ("dq_idx", "dk_idx", "dv_idx"),
@@ -7060,9 +7087,12 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
         return False
     if kind != "tcgen05_ab_tma":
         return True
+    # A row-union plan records its extents in MMA order already (``cute_mma``
+    # swaps them with the profile), so only the plain N,M plan pairs the
+    # problem extents crosswise with the MMA tile.
     extent_blocks = (
         (("n_size", "bm"), ("m_size", "bn"), ("k_total_size", "bk"))
-        if _tcgen05_plan_orientation(plan) == "nm"
+        if _tcgen05_plan_orientation(plan) == "nm" and "row_union_schedule" not in plan
         else (("m_size", "bm"), ("n_size", "bn"), ("k_total_size", "bk"))
     )
     for extent_key, block_key in extent_blocks:

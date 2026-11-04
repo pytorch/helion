@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 import dataclasses
-import importlib
 import operator
 import os
 from typing import Any
@@ -242,9 +241,9 @@ def linear_fla_baselines(harness: Any, inputs: Any) -> dict[str, Callable]:
     """
     import dataclasses
 
-    from examples.linear.linear_attention_fla import get_fla_fwd_kernel
-    from examples.linear.linear_attention_harness import _fla_inputs
-    from examples.linear.linear_attention_harness import _is_varlen
+    from helion._testing.linear_attention_fla import get_fla_fwd_kernel
+    from helion._testing.linear_attention_harness import _fla_inputs
+    from helion._testing.linear_attention_harness import _is_varlen
 
     fwd = get_fla_fwd_kernel(harness.variant)
     if fwd is None:
@@ -276,14 +275,15 @@ def linear_fla_baselines(harness: Any, inputs: Any) -> dict[str, Callable]:
 
 def collect(module: str, shape_index: int) -> list[Case]:
     import helion._testing as testing
+    from helion._testing import import_example
 
     if module not in MODULES or shape_index not in range(shape_count(module)):
         raise ValueError((module, shape_index))
     from benchmarks.cute import fla_compat
 
     fla_compat.install()
-    from examples.linear.linear_attention_utils import ACC_BWD_TOL
-    from examples.linear.linear_attention_utils import ACC_FWD_TOL
+    from helion._testing.linear_attention_utils import ACC_BWD_TOL
+    from helion._testing.linear_attention_utils import ACC_FWD_TOL
 
     cases: list[Case] = []
     description = ""
@@ -346,7 +346,7 @@ def collect(module: str, shape_index: int) -> list[Case]:
     with ExitStack() as stack:
         stack.enter_context(patch.object(testing, "run_example", record))
         torch.manual_seed(20260911 + shape_index)
-        m = importlib.import_module(f"examples.{module}")
+        m = import_example(module)
         i = shape_index
         if module in CHECKS:
             fn, shapes = CHECKS[module]
@@ -483,12 +483,10 @@ def collect(module: str, shape_index: int) -> list[Case]:
             shape = LINEAR_SHAPES[i]
             description = f"B,H,T,D,Dv={shape}, chunk=64"
             if module == "linear.example_mamba2_ssd":
-                from examples.linear.linear_attention_engine import (
-                    LinearAttentionVariant,
-                )
-                from examples.linear.linear_attention_harness import (
+                from helion._testing.linear_attention_harness import (
                     LinearAttentionExampleHarness,
                 )
+                from helion.experimental.linear_attention import LinearAttentionVariant
 
                 harness = LinearAttentionExampleHarness(
                     LinearAttentionVariant.MAMBA2_SSD
@@ -500,9 +498,9 @@ def collect(module: str, shape_index: int) -> list[Case]:
             decay = inputs.g
             for tensor_name in harness.grad_tensors:
                 getattr(inputs, tensor_name).requires_grad_()
-            from examples.linear.linear_attention_utils import ACC_BWD_TOL
-            from examples.linear.linear_attention_utils import ACC_FWD_TOL
-            from examples.linear.linear_attention_utils import (
+            from helion._testing.linear_attention_utils import ACC_BWD_TOL
+            from helion._testing.linear_attention_utils import ACC_FWD_TOL
+            from helion._testing.linear_attention_utils import (
                 chunked_linear_attn_reference,
             )
 
@@ -636,10 +634,10 @@ def collect(module: str, shape_index: int) -> list[Case]:
                         auto_compile=compile_recurrent,
                     )
             if module in {"linear.example_kda", "linear.example_vanilla_linear_attn"}:
-                from examples.linear.linear_attention_engine import recurrent_step
-                from examples.linear.linear_attention_utils import (
+                from helion._testing.linear_attention_utils import (
                     recurrent_step_reference,
                 )
+                from helion.experimental.linear_attention import recurrent_step
 
                 batch, heads, d, dv = RECURRENT_STEP_SHAPES[i]
                 q, k, v = (

@@ -90,6 +90,10 @@ jobs:
           }
           retry $SUDO apt-get update
           retry $SUDO apt-get install -y --fix-missing libdw1 curl wget git pkg-config zlib1g-dev build-essential
+          if [[ "${{ matrix.runtime-version }}" == "xpu" ]]; then
+            # Triton's XPU runtime compiles a Python extension; images may omit headers.
+            retry $SUDO apt-get install -y --fix-missing "python${{ matrix.python-version }}-dev"
+          fi
 
       - name: Install NVSHMEM
         if: contains(matrix.alias, 'distributed')
@@ -427,6 +431,15 @@ jobs:
             # calls os._exit(1), which xdist reports as a crashed worker with
             # no traceback. Give it the same headroom as A10G.
             TIMEOUT=180
+          elif [[ "$HELION_BACKEND" == "cute" ]]; then
+            # The CuTe suite runs eight xdist workers on one B200. Tests that
+            # take ~25s alone (the mamba2 chunk-scan backend comparison, the
+            # flat-gather-sink codegen checks) run past 60s under that
+            # contention and lose their worker the same way. Give it the same
+            # headroom, dump stacks before the limit, and list the slowest
+            # tests so near-timeouts show up in the log.
+            TIMEOUT=180
+            EXTRA_FLAGS="$EXTRA_FLAGS -o faulthandler_timeout=120 --durations=20"
           fi
           # Ref-eager re-runs each example's reference path eagerly rather than
           # launching a compiled kernel once; give it headroom on any runner

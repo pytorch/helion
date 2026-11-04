@@ -21,6 +21,8 @@ from benchmarks.cute import compare_attention_backends
 import pytest
 import torch
 
+from helion._testing import EXAMPLES_PACKAGE
+from helion._testing import import_example
 from helion._testing import skipUnlessCuteAvailable
 import helion.autotuner.benchmarking as benchmarking
 import helion.autotuner.metrics as autotune_metrics
@@ -1584,7 +1586,7 @@ def test_attention_source_copy_cannot_inherit_parent_git_provenance(
     monkeypatch.setattr(compare_attention_backends, "REPO_ROOT", copied)
     module_paths = {
         "helion": package / "__init__.py",
-        "examples.attention": example,
+        f"{EXAMPLES_PACKAGE}.attention": example,
     }
     monkeypatch.setattr(
         compare_attention_backends, "_module_source_path", module_paths.__getitem__
@@ -4444,7 +4446,7 @@ def test_attention_bound_varied_b200_compiler_seed_order_and_population(
     from helion._hardware import HardwareInfo
     from helion._testing import patch_cute_mma_support
 
-    attention_example = importlib.import_module("examples.attention")
+    attention_example = import_example("attention")
     compat_module = importlib.import_module("helion._compat")
     compile_environment = importlib.import_module(
         "helion._compiler.compile_environment"
@@ -8689,7 +8691,7 @@ def test_attention_output_epilogue_semantics() -> None:
 
 
 def test_attention_relu_example_baselines_match_relu_sdpa() -> None:
-    attention_example = importlib.import_module("examples.attention")
+    attention_example = import_example("attention")
     q = torch.randn(1, 1, 4, 4)
     k = torch.randn_like(q)
     v = torch.randn_like(q)

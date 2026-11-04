@@ -40,6 +40,7 @@ from helion.autotuner.accuracy import relative_l2_disagreement
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import _MAX_REFERENCE_BASELINE_ATTEMPTS
+from helion.autotuner.benchmark_provider import _MAX_SAMPLED_BASELINE_ATTEMPTS
 from helion.autotuner.benchmark_provider import BASELINE_CONSISTENCY_MAX_RELATIVE_L2
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.finite_search import FiniteSearch
@@ -88,6 +89,81 @@ class TestAutotunerAccuracy(AutotunerTestCase):
                 recycled, torch.full(shape, -439.5, device=DEVICE, dtype=torch.float16)
             )
         )
+
+    @skipIfNotCUDA()
+    def test_poison_cached_device_memory_fills_the_callers_mem_pool(self) -> None:
+        # Under ``torch.cuda.use_mem_pool`` a fresh output comes from that
+        # pool's free blocks, so those are the ones to poison.
+        pool = torch.cuda.MemPool()
+        shape = [3 * 4096 + 1337]
+        with torch.cuda.use_mem_pool(pool):
+            released = torch.zeros(shape, device=DEVICE, dtype=torch.float16)
+            del released
+            poison_cached_device_memory(torch.device(DEVICE))
+            recycled = torch.empty(shape, device=DEVICE, dtype=torch.float16)
+        self.assertTrue(
+            torch.equal(
+                recycled, torch.full(shape, -439.5, device=DEVICE, dtype=torch.float16)
+            )
+        )
+        del recycled
+
+    @skipIfNotCUDA()
+    def test_poison_cached_device_memory_keeps_the_reservation(self) -> None:
+        # Free blocks that side streams own (the benchmark worker's graph
+        # dispatch warm-up leaves one in each of its segments) cannot serve
+        # the current stream: claiming them allocated new segments on every
+        # call, 32 MiB per accuracy check in the worker, until the device was
+        # full and every kernel launch needing driver memory failed.
+        device = torch.device(DEVICE)
+        kept = []
+        for _ in range(4):
+            side = torch.cuda.Stream(device)
+            with torch.cuda.stream(side):
+                kept.append(torch.ones(1024, device=device))
+        torch.cuda.synchronize(device)
+        poison_cached_device_memory(device)
+        before = torch.cuda.memory_stats(device)
+        for _ in range(5):
+            poison_cached_device_memory(device)
+        after = torch.cuda.memory_stats(device)
+        self.assertEqual(after["num_device_alloc"], before["num_device_alloc"])
+        self.assertEqual(
+            after["reserved_bytes.all.current"], before["reserved_bytes.all.current"]
+        )
+
+    @skipIfNotCUDA()
+    def test_poison_cached_device_memory_without_the_caching_allocator(self) -> None:
+        # Under PYTORCH_NO_CUDA_MEMORY_CACHING=1 allocations bypass the
+        # caching allocator and the snapshot has no segments: nothing to do.
+        with patch.object(torch.cuda, "memory_snapshot", return_value=[]):
+            poison_cached_device_memory(torch.device(DEVICE))
+
+    @skipIfNotCUDA()
+    def test_baseline_releases_the_cached_device_memory(self) -> None:
+        # Free blocks this process caches (here 256 MiB; in a real run the
+        # baseline runs' argument copies and fp32 output comparison) are
+        # memory the benchmark worker, another process, cannot use: the
+        # search starts with them returned to the device.
+        configs = [
+            helion.Config(block_sizes=[32], num_warps=4),
+            helion.Config(block_sizes=[64], num_warps=4),
+        ]
+
+        @helion.kernel(configs=configs, autotune_log_level=0)
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.arange(256, device=DEVICE, dtype=torch.float32)
+        cached = torch.empty(256 << 20, dtype=torch.uint8, device=DEVICE)
+        del cached
+        reserved = torch.cuda.memory_reserved(DEVICE)
+        search = FiniteSearch(add_one.bind((x,)), (x,), configs=configs)
+        search._prepare()
+        self.assertLessEqual(torch.cuda.memory_reserved(DEVICE), reserved - (256 << 20))
 
     @skipIfNotCUDA()
     def test_accuracy_check_runs_candidates_on_poisoned_memory(self) -> None:
@@ -374,9 +450,15 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         ):
             search._prepare()
 
-        shrinking = attempted[len(promoted) :]
+        shrinking = attempted[
+            len(promoted) : len(promoted) + _MAX_REFERENCE_BASELINE_ATTEMPTS
+        ]
         self.assertEqual(attempted[: len(promoted)], promoted)
         self.assertEqual(len(shrinking), _MAX_REFERENCE_BASELINE_ATTEMPTS)
+        # After the shrinks, a few configs sampled from the search space are
+        # tried before the refusal is reported.
+        sampled = attempted[len(promoted) + _MAX_REFERENCE_BASELINE_ATTEMPTS :]
+        self.assertLessEqual(len(sampled), _MAX_SAMPLED_BASELINE_ATTEMPTS)
         # Each attempt halves the previous one, starting from the reference
         # config that the error message reports.
         self.assertEqual(shrinking[0], reference_block)
@@ -408,8 +490,15 @@ class TestAutotunerAccuracy(AutotunerTestCase):
                 "Autotuning reference config failed while computing baseline",
             ):
                 search._prepare()
-            self.assertEqual(
+            # The shrinks, then the sampled configs the refusal falls back to.
+            self.assertGreaterEqual(
                 len(attempted), len(promoted) + _MAX_REFERENCE_BASELINE_ATTEMPTS
+            )
+            self.assertLessEqual(
+                len(attempted),
+                len(promoted)
+                + _MAX_REFERENCE_BASELINE_ATTEMPTS
+                + _MAX_SAMPLED_BASELINE_ATTEMPTS,
             )
         else:
             errors.insert(0, RuntimeError("unsupported op"))

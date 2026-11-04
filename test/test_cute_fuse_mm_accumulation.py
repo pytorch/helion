@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.aot_example import matmul_custom_key
 import pytest
 import torch
 
@@ -21,6 +20,7 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.cute_mma import analyze_cute_mma_node
 from helion._compiler.cute.fuse_mm_accumulation import fuse_mm_accumulation
 from helion._compiler.device_ir import ForLoopGraphInfo
+from helion._testing import import_example
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
 import helion.language as hl
@@ -28,6 +28,8 @@ from helion.language import _tracing_ops
 from helion.language import memory_ops
 from helion.language.matmul_ops import MATMUL_DIM_BLOCK_IDS_META
 from helion.language.matmul_ops import MATMUL_FACT_ID_META
+
+matmul_custom_key = import_example("aot_example").matmul_custom_key
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

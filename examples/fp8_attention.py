@@ -198,6 +198,10 @@ def _fp8_attention_pytorch_impl(
         Output tensor of shape [batch, heads, seq_len, head_dim] in FP8 format
     """
     sm_scale = 1.0 / math.sqrt(float(head_dim))
+    # torch._scaled_mm takes its scales as device scalars; fill them on the
+    # device once per call (``torch.tensor(1.0, device=...)`` copies from the
+    # host, which CUDA-graph capture refuses).
+    one = torch.ones((), device=q_fp8.device, dtype=torch.float32)
     outputs = []
     for i in range(batch * heads):
         q_i = q_fp8[i]  # [seq, dim] - already FP8
@@ -209,16 +213,12 @@ def _fp8_attention_pytorch_impl(
         # Direct conversion: k_i -> contiguous -> transpose view
         kt_fp8_col_major = k_i.contiguous().t()  # [dim, seq] in column-major
 
-        # Create scale tensors
-        scale_q = torch.tensor(1.0, device=q_i.device)
-        scale_k = torch.tensor(1.0, device=k_i.device)
-
         # Q @ K^T using torch._scaled_mm
         qk = torch._scaled_mm(
             q_i,
             kt_fp8_col_major,
-            scale_q,
-            scale_k,
+            one,
+            one,
             use_fast_accum=False,
             out_dtype=torch.float32,
         )
@@ -238,16 +238,12 @@ def _fp8_attention_pytorch_impl(
         # Direct conversion: v_i -> contiguous -> transpose view
         vt_fp8_col_major = v_i.contiguous().t()  # [seq, dim] in column-major
 
-        # Create scale tensors for P @ V^T
-        scale_p = torch.tensor(1.0, device=p_fp8.device)
-        scale_v = torch.tensor(1.0, device=v_i.device)
-
         # P @ V^T using torch._scaled_mm
         out_i = torch._scaled_mm(
             p_fp8,
             vt_fp8_col_major,
-            scale_p,
-            scale_v,
+            one,
+            one,
             use_fast_accum=False,
             out_dtype=torch.float32,
         )

@@ -30,8 +30,7 @@ def test_catalog_covers_example_kernel_modules():
             for node in ast.walk(tree)
         ):
             kernel_modules.add(".".join(path.relative_to(root).with_suffix("").parts))
-    # This shared engine is exercised by its eight public linear examples.
-    assert kernel_modules - set(cases.MODULES) == {"linear.linear_attention_engine"}
+    assert kernel_modules - set(cases.MODULES) == set()
     assert len(cases.MODULES) == len(set(cases.MODULES))
     assert all(len(shapes) == 3 for _, shapes in cases.CHECKS.values())
 
@@ -44,8 +43,8 @@ def test_collection_restores_example_recorder():
     def check(rows, cols):
         return testing.run_example(torch.add, torch.add, (torch.ones(2), torch.ones(2)))
 
-    with patch.object(
-        cases.importlib, "import_module", return_value=SimpleNamespace(check=check)
+    with patch(
+        "helion._testing.import_example", return_value=SimpleNamespace(check=check)
     ):
         result = cases.collect("add", 0)
     assert testing.run_example is original
@@ -56,8 +55,8 @@ def test_collection_restores_example_recorder():
         raise ValueError("fixture failed")
 
     with (
-        patch.object(
-            cases.importlib, "import_module", return_value=SimpleNamespace(check=broken)
+        patch(
+            "helion._testing.import_example", return_value=SimpleNamespace(check=broken)
         ),
         pytest.raises(ValueError, match="fixture failed"),
     ):
@@ -105,8 +104,8 @@ def test_collection_mirrors_run_example_comparison_policy():
             max_mismatched_abs_diff=1.5,
         )
 
-    with patch.object(
-        cases.importlib, "import_module", return_value=SimpleNamespace(check=check)
+    with patch(
+        "helion._testing.import_example", return_value=SimpleNamespace(check=check)
     ):
         bwd, fwd = cases.collect("add", 0)
     assert (bwd.mode, bwd.check, bwd.rtol, bwd.atol) == (

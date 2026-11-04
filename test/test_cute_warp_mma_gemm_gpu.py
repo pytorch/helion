@@ -28,6 +28,7 @@ from test.test_cute_warp_mma_gemm import _sliced_output
 import helion
 from helion._compiler.cute import cute_warp_mma_gemm as family
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
 
@@ -131,7 +132,7 @@ def test_m_major_a_gemm_matches_torch(
 def test_matmul_backward_pair_runs_on_the_family() -> None:
     """Both GEMMs of the matmul example's backward (``grad_out @ mat2.T`` and
     ``mat1.T @ grad_out``) run on the family's measured 16x32 two-warp tile."""
-    import examples.matmul as matmul_mod
+    matmul_mod = import_example("matmul")
 
     torch.manual_seed(0)
     mat1 = _randn(256, 256, dtype=torch.float16)
@@ -266,9 +267,9 @@ def test_under_aligned_operand_fails_closed() -> None:
 
 def test_campaign_examples_run_on_the_family() -> None:
     """The three campaign variants on their measured tiles."""
-    import examples.bmm as bmm_mod
-    import examples.fp8_gemm as fp8_mod
-    import examples.matmul as matmul_mod
+    bmm_mod = import_example("bmm")
+    fp8_mod = import_example("fp8_gemm")
+    matmul_mod = import_example("matmul")
 
     torch.manual_seed(0)
     x = _randn(256, 256, dtype=torch.float8_e4m3fn)
@@ -325,7 +326,7 @@ def test_grouped_row_union_matches_the_jagged_kernel(
     catalogue's shape-0 layout, then (same compiled kernel, ``static_shapes=
     False``) a layout with an empty group and one that leaves the tail rows
     outside every group."""
-    import examples.grouped_gemm as grouped_mod
+    grouped_mod = import_example("grouped_gemm")
 
     torch.manual_seed(0)
     a = _randn(640, 128, dtype=torch.bfloat16)
@@ -366,7 +367,7 @@ def test_grouped_row_union_rebinds_per_shape_and_fails_closed_off_the_family() -
     fresh body) instead of reusing the first binding's clamps.  A shape the
     family does not run (1000 rows) rejects the pinned family strictly and
     repairs to the tcgen05 lowering, which stays correct."""
-    import examples.grouped_gemm as grouped_mod
+    grouped_mod = import_example("grouped_gemm")
 
     torch.manual_seed(0)
     b = _randn(128, 128, dtype=torch.bfloat16)
@@ -445,7 +446,7 @@ def test_m_major_int16_cast_operand_matches_torch() -> None:
     # ``x[tile_m, tile_k].to(bf16)`` of an M-contiguous int16 A: the packets
     # are loaded as words, converted in registers into the M-major staging
     # and read by ``ldmatrix.trans``.
-    import examples.bf16xint16_gemm as example
+    example = import_example("bf16xint16_gemm")
 
     torch.manual_seed(0)
     x = torch.randint(-8, 9, (256, 128), device=DEVICE, dtype=torch.int16).T
@@ -536,7 +537,7 @@ def test_sliced_output_leaves_the_rest() -> None:
 def test_bf16xint16_materialized_operand_on_the_family() -> None:
     # The fissioned bf16 x int16 example: region 1 is a plain bf16 GEMM over
     # the materialized operand, admitted (and seeded) at (128, 256, 128).
-    import examples.bf16xint16_gemm as example
+    example = import_example("bf16xint16_gemm")
 
     torch.manual_seed(0)
     x = _randn(128, 256, dtype=torch.bfloat16)

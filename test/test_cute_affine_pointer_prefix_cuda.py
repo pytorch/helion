@@ -13,14 +13,16 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from examples.aot_compile_example import add_2d
 import pytest
 import torch
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
+
+add_2d = import_example("aot_compile_example").add_2d
 
 pytestmark = skipUnlessBackends(["cute"])
 

@@ -202,6 +202,82 @@ def _load_pointer_roots(
     return roots if visit(statements, set(integer_names)) else None
 
 
+def _crd2idx_pointer_arithmetic(
+    pointer: ast.expr, tensor: str, strides: tuple[int, ...]
+) -> ast.expr | None:
+    """``T.iterator + cute.crd2idx((c0, .., cn), T.layout)`` as
+    ``T.iterator + c0 * s0 + .. + cn * sn`` for the static strides ``s``;
+    ``None`` for any other spelling."""
+    if not (
+        isinstance(pointer, ast.BinOp)
+        and isinstance(pointer.op, ast.Add)
+        and isinstance(pointer.left, ast.Attribute)
+        and pointer.left.attr == "iterator"
+        and isinstance(pointer.left.value, ast.Name)
+        and pointer.left.value.id == tensor
+        and isinstance(pointer.right, ast.Call)
+        and ast.unparse(pointer.right.func) == "cute.crd2idx"
+        and len(pointer.right.args) == 2
+        and not pointer.right.keywords
+        and isinstance(pointer.right.args[0], ast.Tuple)
+        and ast.unparse(pointer.right.args[1]) == f"{tensor}.layout"
+        and len(pointer.right.args[0].elts) == len(strides)
+    ):
+        return None
+    result: ast.expr = _clone(pointer.left)
+    for coordinate, stride in zip(pointer.right.args[0].elts, strides, strict=True):
+        term = ast.BinOp(
+            left=ast.Call(
+                func=_expr("cutlass.Int32"), args=[_clone(coordinate)], keywords=[]
+            ),
+            op=ast.Mult(),
+            right=ast.Constant(value=stride),
+        )
+        result = ast.BinOp(left=result, op=ast.Add(), right=term)
+    return result
+
+
+def _split_invariant_prefix(
+    statements: Sequence[ast.stmt], seeds: set[str]
+) -> tuple[list[ast.stmt], list[ast.stmt]]:
+    """Split a proven pure statement list into the assignments that can run
+    once ahead of the loop whose variables ``seeds`` are, and the rest in
+    order.  An assignment moves out when it reads nothing derived from the
+    seeds, its name is bound exactly once in the list and no statement it
+    would move across reads or writes that name; a branch never moves."""
+    bound: dict[str, int] = {}
+    for statement in statements:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                bound[node.id] = bound.get(node.id, 0) + 1
+    varying = set(seeds)
+    crossed: set[str] = set()
+    invariant: list[ast.stmt] = []
+    remaining: list[ast.stmt] = []
+    for statement in statements:
+        rw = ReadWrites.from_ast(statement)
+        reads, writes = set(rw.reads), set(rw.writes)
+        target = (
+            statement.targets[0].id
+            if isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            else None
+        )
+        if (
+            target is not None
+            and not reads & varying
+            and bound.get(target) == 1
+            and target not in crossed
+        ):
+            invariant.append(statement)
+            continue
+        varying |= writes
+        crossed |= reads | writes
+        remaining.append(statement)
+    return invariant, remaining
+
+
 def vectorize_collective_store_epilogue(
     loop: ast.For,
     *,
@@ -227,11 +303,22 @@ def vectorize_collective_store_epilogue(
     """Repartition one complete M/N tile, retaining all scalar expressions.
 
     The collective caller has proved exact 128-thread ownership of this tile.
-    We additionally require a single ordinary output store, pure scalar work,
-    no loop live-outs, and no possible alias between its reads and its output.
+    We additionally require a single ordinary output store (or one relaxed
+    ``cute.arch.atomic_add`` with an unused result, in the exact form
+    ``_relaxed_atomic_add_root`` admits), pure scalar work, no loop
+    live-outs, and no possible alias between its reads and its output.
     The existing contiguous-copy analysis proves output alignment, consecutive
     addresses and masks. Masked output tails still store one scalar at a time.
+
+    A store moves 16-byte packets (8 halves, 4 fp32).  An atomic add becomes
+    one packed reduction per lane: ``red.global.add.v4.f32`` for fp32 and
+    ``red.global.add.noftz.f16x2`` / ``.bf16x2`` for the half dtypes, whose
+    two-element packet keeps a warp's lanes on consecutive 4-byte words (one
+    128-byte row per warp instruction; wider half packets measured slower and
+    the scalar half atomic is a compare-and-swap loop on sm_100).  The packed
+    reduction adds each element exactly as the scalar atomic does.
     """
+    from .collective_matmul import _relaxed_atomic_add_root
     from .collective_matmul import _tensor_roots
     from .collective_matmul import _uses_thread_coordinates
 
@@ -269,20 +356,50 @@ def vectorize_collective_store_epilogue(
             return None
         predicate = terminal.test
         terminal = terminal.body[0]
-    if not (
-        isinstance(terminal, ast.Expr)
-        and isinstance(terminal.value, ast.Call)
-        and isinstance(terminal.value.func, ast.Attribute)
-        and terminal.value.func.attr == "store"
-        and len(terminal.value.args) == 1
-        and not terminal.value.keywords
-    ):
+    if not (isinstance(terminal, ast.Expr) and isinstance(terminal.value, ast.Call)):
         return None
-    store = terminal.value
-    written = _tensor_roots([store], "store")
-    if written is None or len(written) != 1:
-        return None
-    output = next(iter(written))
+    call = terminal.value
+    atomic_root: str | None = None
+    if ast.unparse(call.func) == "cute.arch.atomic_add":
+        atomic_root = _relaxed_atomic_add_root(call)
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        scope = keywords.get("scope")
+        if atomic_root is None or (
+            scope is not None
+            and not (isinstance(scope, ast.Constant) and scope.value == "gpu")
+        ):
+            return None
+        pointer_arg = call.args[0]
+        assert isinstance(pointer_arg, ast.Attribute)
+        output_value: ast.expr = keywords["val"]
+        output = atomic_root
+        facts = output_layouts.get(output)
+        if facts is None:
+            return None
+        # The atomic spells its address as ``T.iterator + cute.crd2idx(coords,
+        # T.layout)``; the address proof needs the plain stride arithmetic
+        # the store epilogue writes.  The layout facts' strides are what the
+        # emitted packet relies on, under the same runtime stride guard as
+        # a store's (``tensors.get(output) == facts`` below).
+        output_pointer = _crd2idx_pointer_arithmetic(
+            pointer_arg.value, output, facts.strides
+        )
+        if output_pointer is None:
+            return None
+    else:
+        if not (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "store"
+            and len(call.args) == 1
+            and not call.keywords
+        ):
+            return None
+        written = _tensor_roots([call], "store")
+        if written is None or len(written) != 1:
+            return None
+        output = next(iter(written))
+        output_pointer = call.func.value
+        output_value = call.args[0]
     facts = output_layouts.get(output)
     if facts is None or facts.dtype not in {
         "cutlass.Float16",
@@ -290,7 +407,19 @@ def vectorize_collective_store_epilogue(
         "cutlass.Float32",
     }:
         return None
-    width = 4 if facts.dtype == "cutlass.Float32" else 8
+    if atomic_root is not None:
+        # ``red.global.add.v4.f32`` and ``.noftz.bf16x2`` need sm_90,
+        # ``.noftz.f16x2`` sm_70; an unknown or older target keeps the scalar
+        # atomics.
+        from ..compile_environment import CompileEnvironment
+
+        capability = CompileEnvironment.current().config_spec.target_device_capability
+        floor = (7, 0) if facts.dtype == "cutlass.Float16" else (9, 0)
+        if capability is None or capability < floor:
+            return None
+        width = 4 if facts.dtype == "cutlass.Float32" else 2
+    else:
+        width = 4 if facts.dtype == "cutlass.Float32" else 8
     if block_n % width or block_m * block_n % (128 * width):
         return None
     boundaries = (
@@ -305,7 +434,7 @@ def vectorize_collective_store_epilogue(
     )
     pure = _scalar_epilogue(
         loop.body[:-1],
-        store.args[0],
+        output_value,
         m_index=m_index,
         n_index=n_index,
         dominating=dominating,
@@ -320,23 +449,27 @@ def vectorize_collective_store_epilogue(
     # while these inline loads/calls must remain protected after repartition.
     guarded_value = ast.IfExp(
         test=_clone(predicate),
-        body=_clone(store.args[0]),
+        body=_clone(output_value),
         orelse=_expr(f"{facts.dtype}(0)"),
     )
     value_recipe = build_recipe(guarded_value, prefix, boundaries)
-    assert isinstance(store.func, ast.Attribute)
     synthetic_load = ast.IfExp(
         test=_clone(predicate),
         body=ast.Call(
-            func=ast.Attribute(_clone(store.func.value), "load", ast.Load()),
+            func=ast.Attribute(_clone(output_pointer), "load", ast.Load()),
             args=[],
             keywords=[],
         ),
         orelse=_expr(f"{facts.dtype}(0)"),
     )
     address_recipe = build_recipe(synthetic_load, prefix, boundaries)
-    if value_recipe is None or address_recipe is None:
+    if address_recipe is None:
         return None
+    # The flat recipe cannot replay a value defined under a branch of the
+    # epilogue (a bias added only by the first K partition): the proven
+    # scalar epilogue then runs once per lane of the packet instead of the
+    # lane-vectorized recipe, with the same register destination.
+    per_lane = value_recipe is None
     proof, value = pure.emit({}, fresh_name)
     address_proof, address_value = address_recipe.emit({}, fresh_name)
     proof.extend([ast.Expr(value), *address_proof, ast.Expr(address_value)])
@@ -393,28 +526,71 @@ def vectorize_collective_store_epilogue(
         coordinate=column,
         tensors={**tensors, output: facts},
         aligned_names=aligned,
+        width=width if atomic_root is not None else None,
     )
     if store_plan is None or store_plan.width != width:
         return None
-    statements, value = value_recipe.emit(replacements, fresh_name)
     registers = fresh_name("epilogue_vector_values")
     body = ast.parse(
         f"{registers} = cute.make_rmem_tensor(cute.make_layout(({width},)), {facts.dtype})"
     ).body
-    body.extend(
-        emit_vector_recipe(
-            statements,
-            value,
-            coordinate=column,
-            width=width,
-            tensors=tensors,
-            aligned_names=aligned,
-            destination=registers,
-            destination_indices=None,
-            fresh_name=fresh_name,
+    if per_lane:
+        value_lane = fresh_name("epilogue_value_lane")
+        lane_statements, lane_value = pure.emit(
+            {
+                m_index: _expr(f"{m_offset} + {row}"),
+                n_index: _expr(f"{n_offset} + {column} + {value_lane}"),
+            },
+            fresh_name,
         )
-    )
-    body.extend(store_plan.emit_from_registers(registers, fresh_name))
+        # Pure statements that read nothing a lane varies (the partition
+        # test ``outer_k.begin == 0`` and its rematerialized tile ids) run
+        # once per packet; only the lane-dependent rest repeats.
+        invariant, varying_statements = _split_invariant_prefix(
+            lane_statements, {value_lane}
+        )
+        body.extend(invariant)
+        lane_loop = cast(
+            "ast.For",
+            ast.parse(
+                f"for {value_lane} in cutlass.range_constexpr({width}):\n    pass"
+            ).body[0],
+        )
+        lane_loop.body = [
+            *varying_statements,
+            ast.Assign(
+                targets=[_expr(f"{registers}[{value_lane}]")],
+                value=lane_value,
+            ),
+        ]
+        body.append(ast.fix_missing_locations(lane_loop))
+    else:
+        assert value_recipe is not None
+        statements, value = value_recipe.emit(replacements, fresh_name)
+        body.extend(
+            emit_vector_recipe(
+                statements,
+                value,
+                coordinate=column,
+                width=width,
+                tensors=tensors,
+                aligned_names=aligned,
+                destination=registers,
+                destination_indices=None,
+                fresh_name=fresh_name,
+            )
+        )
+    if atomic_root is not None:
+        helper = {
+            "cutlass.Float32": "_cute_red_add_f32_vec",
+            "cutlass.Float16": "_cute_red_add_f16_vec",
+            "cutlass.BFloat16": "_cute_red_add_bf16_vec",
+        }[facts.dtype]
+        body.extend(
+            store_plan.emit_red_from_registers(registers, fresh_name, helper=helper)
+        )
+    else:
+        body.extend(store_plan.emit_from_registers(registers, fresh_name))
     count = block_m * block_n // (128 * width)
     iterator = (
         f"cutlass.range_constexpr({count})"

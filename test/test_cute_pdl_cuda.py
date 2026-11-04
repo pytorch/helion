@@ -224,6 +224,7 @@ class TestCutePdl(TestCase):
                 {"cute_pdl_release": "exit"},
                 {"cute_pdl_release": "entry"},
                 {"cute_pdl_release": "last_wave"},
+                {"cute_pdl_spread": True},
             ):
                 _bound, on, on_code = _build(
                     kernel, x, **_COLUMN, cute_pdl=True, **release
@@ -233,6 +234,13 @@ class TestCutePdl(TestCase):
                 self.assertEqual(
                     on_code.count(_RELEASE),
                     int(release.get("cute_pdl_release", "entry") != "none"),
+                )
+                # ``cute_pdl_spread`` pads the static grid's kernel to one
+                # wave's density (one CTA of 512 threads per SM at 64 CTAs);
+                # the pad is a live allocation the kernel never reads.
+                self.assertEqual(
+                    on_code.count("_helion_pdl_spread_keep(pdl_spread_pad.toint())"),
+                    int(bool(release.get("cute_pdl_spread")) and not control),
                 )
                 self.assertEqual(_stale_runs(on, x, sources, references, iterations), 0)
                 # One graph holding producer -> kernel -> producer -> kernel:

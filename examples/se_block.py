@@ -22,6 +22,9 @@ import helion.language as hl
 @helion.kernel(
     # static_shapes=True gives a performance boost for matmuls
     static_shapes=True,
+    # fast_math: approximate sigmoid (exp and divide); the backward kernels
+    # keep exact math, where it measured no gain.
+    fast_math=True,
 )
 def se_block_fwd(x: Tensor, w: Tensor) -> tuple[Tensor, Tensor]:
     """

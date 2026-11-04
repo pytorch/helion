@@ -121,14 +121,19 @@ def test_startup_is_private_before_publication_and_resume_is_once(case):
         for n in fn.body
     )
     assert fn.body.index(prefix) < fn.body.index(publish)
-    assert "griddepcontrol_wait" in ast.unparse(prefix.body[0])
+    body = list(prefix.body)
+    assert "griddepcontrol_wait" in ast.unparse(body[0])
+    # The ``entry`` release placement follows the lowering's own wait; the
+    # startup prefill is otherwise unchanged by it.
+    assert ast.unparse(body[1]) == "cute.arch.griddepcontrol_launch_dependents()"
+    del body[1]
     # The throttled CLC scheduler's credit for the prefilled first tile follows
     # the dependent-launch wait; the private prefill state comes after it.
-    assert ast.unparse(prefix.body[1]) == (
+    assert ast.unparse(body[1]) == (
         "if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):"
         "\n    tcgen05_clc_throttle_barrier.arrive()"
     )
-    assert ast.unparse(prefix.body[2]).endswith("tcgen05_ab_producer_state.clone()")
+    assert ast.unparse(body[2]).endswith("tcgen05_ab_producer_state.clone()")
     writes = {
         n.id
         for n in ast.walk(prefix)

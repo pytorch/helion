@@ -66,6 +66,8 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE
+from .._compiler.cute.tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CHOICES
+from .._compiler.cute.tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_ACC_T2R,
@@ -85,6 +87,8 @@ from .._compiler.cute.tcgen05_constants import (
 )
 from .._compiler.cute.tcgen05_constants import tcgen05_default_epilogue_tile_size
 from .._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_store_shape
+from .._compiler.cute.tcgen05_epilogue_rounds import Tcgen05EpilogueRoundNames
+from .._compiler.cute.tcgen05_epilogue_rounds import render_round_subtile_loop
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCoreParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreSubtileLoopParams
@@ -107,6 +111,8 @@ from . import _decorators
 from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .._compiler.cute.cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
     from .._compiler.cute.cute_epilogue import _AuxiliaryTensorLoadExpr
@@ -5265,6 +5271,24 @@ def _codegen_cute_store_tcgen05_tile(
     # layout, the kernel descriptor and the wrapper's TMA store box take the
     # whole ``tcgen05_value.c_stage_count`` ring).
     tcgen05_c_stage_count = tcgen05_value.c_stages_per_group
+    # ``tcgen05_epi_round_subtiles``: subtiles staged and stored per round
+    # (``tcgen05_epilogue_rounds``).  The bulk-group pipeline counts rounds,
+    # so it has a stage per round of C buffers; the ring itself keeps
+    # ``c_stage_count`` subtile buffers.
+    tcgen05_epi_round_subtiles = state.device_function.config.get(
+        TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, 1
+    )
+    if (
+        type(tcgen05_epi_round_subtiles) is not int
+        or tcgen05_epi_round_subtiles not in TCGEN05_EPI_ROUND_SUBTILES_CHOICES
+        or tcgen05_c_stage_count % tcgen05_epi_round_subtiles != 0
+    ):
+        raise exc.InvalidConfig(
+            f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}={tcgen05_epi_round_subtiles!r} "
+            f"must be one of {TCGEN05_EPI_ROUND_SUBTILES_CHOICES!r} and divide "
+            f"the {tcgen05_c_stage_count}-stage C ring"
+        )
+    tcgen05_c_pipeline_stage_count = tcgen05_c_stage_count // tcgen05_epi_round_subtiles
     tcgen05_is_two_cta = tcgen05_lifecycle.is_two_cta
     tcgen05_thr_mma = tcgen05_value.thr_mma
     # The bm=128 CtaGroup.TWO family stores through the per-CTA epilogue tile
@@ -6479,7 +6503,7 @@ def _codegen_cute_store_tcgen05_tile(
         ),
         (
             f"{c_pipeline} = cutlass.pipeline.PipelineTmaStore.create("
-            f"num_stages={tcgen05_c_stage_count}, "
+            f"num_stages={tcgen05_c_pipeline_stage_count}, "
             f"producer_group={c_pipeline_producer_group})"
         ),
     ]
@@ -7402,6 +7426,116 @@ def _codegen_cute_store_tcgen05_tile(
             f"{tma_store_module_tail_helper_call()}"
         )
 
+    def _round_subtile_loop() -> str:
+        """The TMA-store epilogue in rounds of ``tcgen05_epi_round_subtiles``
+        subtiles (``tcgen05_epilogue_rounds``): the plain single-output,
+        full-tile, role-local store with the identity epilogue and a tile
+        counter; every other shape of the store refuses the knob."""
+        rounds = tcgen05_epi_round_subtiles
+        refused = (
+            diagnose_split_first_t2r
+            or diagnose_split_acc_t2r_store_tail
+            or diagnose_module_helper_acc_t2r
+            or diagnose_module_helper_store_tail
+            or diagnose_acc_wait_before_subtile_loop
+            or diagnose_first_c_acquire_in_loop
+            or diagnose_later_c_acquire_before_barrier
+            or grouped_epilogue
+            or static_subtile_loop
+            or has_store_warp
+            or paired_row_protocol is not None
+            or fanout_plan is not None
+            or bool(aux_steps_in_chain)
+            or tcgen05_m_subtile_count > 1
+            or grouped_dynamic_d_tensormap_edge_only
+            or grouped_full_coverage_predicate is not None
+            or bool(worklist_nm_segment_valid_m_bound)
+            or not is_final_store
+            or is_secondary_store
+            or fanout_late_c_acquire
+            or paired_row_late_c
+            or not tcgen05_value.use_tma_store_epilogue
+            or not tcgen05_value.role_local_tile_counter
+        )
+        if refused:
+            raise exc.InvalidConfig(
+                f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}={rounds} needs the plain "
+                "single-output role-local TMA-store epilogue (no fan-out, auxiliary "
+                "chain, store warp, paired tail, epilogue groups or diagnostic "
+                "placement) with a tile counter"
+            )
+        if tcgen05_value.has_explicit_epilogue_tile:
+            assert tcgen05_value.explicit_epi_tile_m is not None
+            assert tcgen05_value.explicit_epi_tile_n is not None
+            round_epi_tile_m = tcgen05_value.explicit_epi_tile_m
+            round_epi_tile_n = tcgen05_value.explicit_epi_tile_n
+        else:
+            round_epi_tile_m, round_epi_tile_n = tcgen05_default_epilogue_tile_size(
+                tcgen05_value.bm,
+                tcgen05_value.bn,
+                elem_width_d=tensor.dtype.itemsize * 8,
+                elem_width_c=tensor.dtype.itemsize * 8,
+            )
+        round_rows = tcgen05_value.bm // 2 if tcgen05_is_two_cta else tcgen05_value.bm
+        if round_rows % round_epi_tile_m or tcgen05_value.bn % round_epi_tile_n:
+            raise exc.InvalidConfig(
+                f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}={rounds} needs whole "
+                "epilogue subtiles of the CTA tile"
+            )
+        round_subtile_count = (round_rows // round_epi_tile_m) * (
+            tcgen05_value.bn // round_epi_tile_n
+        )
+        if rounds > round_subtile_count:
+            raise exc.InvalidConfig(
+                f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}={rounds} exceeds the "
+                f"{round_subtile_count} epilogue subtiles of the tile"
+            )
+        early_aux_prelude, late_prelude, rhs = _splice_acc_vec(
+            trs_racc,
+            "        ",
+            safe_direct_aux_with_full_tile=partial_tma_needs_full_tile_guard,
+            coord_layout="trs",
+        )
+        if early_aux_prelude or late_prelude:
+            raise exc.InvalidConfig(
+                f"{TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}={rounds} needs the "
+                "identity epilogue (the accumulator cast to the output dtype)"
+            )
+        assert tcgen05_value.role_local_tile_counter is not None
+        return render_round_subtile_loop(
+            Tcgen05EpilogueRoundNames(
+                epi_active=tcgen05_epi_active,
+                epi_leader_predicate=epi_leader_predicate,
+                acc_pipeline=tcgen05_acc_pipeline,
+                acc_consumer_state=tcgen05_acc_consumer_state,
+                tiled_copy_t2r=tiled_copy_t2r,
+                tiled_copy_r2s=tiled_copy_r2s,
+                ttr_tacc=ttr_tacc,
+                ttr_tacc_mn=ttr_tacc_mn,
+                ttr_racc=ttr_racc,
+                trs_racc=trs_racc,
+                ttr_rd=ttr_rd,
+                trs_rd=trs_rd,
+                trs_sd=trs_sd,
+                acc_vec=acc_vec,
+                c_buffer=c_buffer,
+                epilog_sync_barrier=epilog_sync_barrier,
+                tma_store_atom=tcgen05_tma_store_atom,
+                bsg_sd=bsg_sd,
+                bsg_gd=bsg_gd,
+                c_pipeline=c_pipeline,
+                target_dtype=target_dtype,
+                tile_counter=tcgen05_value.role_local_tile_counter,
+                tma_desc_arg=tma_store_desc_arg,
+            ),
+            subtile_count=round_subtile_count,
+            round_subtiles=rounds,
+            c_stage_count=tcgen05_c_stage_count,
+            acc_rhs=rhs,
+            acc_wait=True,
+            acc_release=True,
+        )
+
     def default_tma_store_subtile_loop(
         tma_desc_arg: str | None = None,
         tma_store_atom: str | None = None,
@@ -7424,6 +7558,8 @@ def _codegen_cute_store_tcgen05_tile(
         # The compact SIMT schedule above owns T2R and never instantiates the
         # same-shape TMA renderer. Avoid eagerly formatting that unused body.
         tma_store_subtile_loop = ""
+    elif tcgen05_epi_round_subtiles > 1:
+        tma_store_subtile_loop = _round_subtile_loop()
     elif diagnose_split_first_t2r:
         tma_store_split_first_subtile_body = tma_store_subtile_body(
             first_subtile_acquire=tma_store_split_first_subtile_acquire,
@@ -8469,3 +8605,102 @@ def _(
             valid_mask = valid_mask & in_bounds
 
     return torch.where(valid_mask, values, result)
+
+
+@has_side_effect
+@_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
+def prefetch(
+    tensor: torch.Tensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> None:
+    """Hint that ``tensor[index]`` will be read soon by warming the L2 cache.
+
+    ``index`` and ``extra_mask`` follow :func:`load` (tiles, integers,
+    slices, ``hl.arange`` / integer-tensor gathers).  Nothing is returned and
+    nothing is ordered: a prefetch neither waits for earlier stores nor makes
+    later loads see anything, so dropping it never changes a result.  Unlike
+    :func:`load` it takes no ``indexing``, eviction-policy or cache-modifier
+    config slot, so adding one leaves every load's tunables where they were.
+
+    On NVIDIA GPUs (Triton backend), when the last index is a full slice or a
+    tile of a stride-1 dim and there is no ``extra_mask``, each element of the
+    leading indices issues one ``cp.async.bulk.prefetch.L2`` covering its row
+    segment (sm_90+).  Any other prefetch issues ``prefetch.global.L2`` per
+    element (one 128-byte line each).  Other targets drop it.
+
+    Args:
+        tensor: The tensor to prefetch from
+        index: The indices to use to index into the tensor
+        extra_mask: The extra mask (beyond automatic tile bounds masking) to apply to the tensor
+    Returns:
+        None
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.prepare_args(prefetch)
+def _(
+    tensor: torch.Tensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, list[object], torch.Tensor | None]:
+    from .tile_proxy import Tile
+
+    if not isinstance(tensor, torch.Tensor):
+        raise NotImplementedError(f"Cannot prefetch from type: {type(tensor)}")
+    index = Tile._tiles_to_sizes_for_index(index)
+    return (tensor, normalize_index_slices(tensor.shape, index), extra_mask)
+
+
+def prefetch_is_bulk(
+    tensor: torch.Tensor, index: Sequence[object], has_extra_mask: bool
+) -> bool:
+    """Whether ``hl.prefetch(tensor, index)`` issues one bulk L2 prefetch per
+    element of its leading indices: the last index is a full slice or a tile
+    of a stride-1 dim, there is no extra mask, and the target is sm_90+."""
+    env = CompileEnvironment.current()
+    capability = env.ptx_capability
+    if capability is None or capability < (9, 0) or has_extra_mask:
+        return False
+    if tensor.ndim == 0 or len(index) != tensor.ndim:
+        return False
+    if any(idx is None or idx is Ellipsis for idx in index):
+        return False
+    stride = tensor.stride(-1)
+    if not (isinstance(stride, int) and stride == 1):
+        return False
+    if env.known_equal(tensor.size(-1), 1):
+        return False
+    last = index[-1]
+    if isinstance(last, slice):
+        return last.start is None and last.stop is None and last.step is None
+    return isinstance(last, torch.SymInt) and env.get_block_id(last) is not None
+
+
+@_decorators.register_fake(prefetch)
+def _(
+    tensor: torch.Tensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> None:
+    # Allocate the reduction dims of full slices as ``hl.load`` does, except
+    # a bulk prefetch's row segment, which its byte count covers.
+    if prefetch_is_bulk(tensor, index, extra_mask is not None):
+        index = [*index[:-1], 0]
+    SubscriptIndexing.compute_shape(tensor, index)
+    return None
+
+
+@_decorators.codegen(prefetch, "common")
+def _(state: CodegenState) -> None:
+    return None  # a hint: targets without a prefetch drop it
+
+
+@_decorators.ref(prefetch)
+def _(
+    tensor: torch.Tensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> None:
+    return None

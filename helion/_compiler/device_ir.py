@@ -58,7 +58,9 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
+from .aten_lowering import resolve_reduction_sizes
 from .compile_environment import CompileEnvironment
+from .compile_environment import warning
 from .cute.register_tile_admission import register_tile_body_admitted
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
@@ -67,6 +69,9 @@ from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
+from .merge_reduction_dims import _MERGE_OPS
+from .merge_reduction_dims import chain_reduction_dims
+from .merge_reduction_dims import merge_reduction_dims
 from .node_masking import defer_pallas_load_masks
 from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
@@ -213,6 +218,8 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # node so the cute epilogue chain analyzer can fuse it; the inductor
     # default decomp expands the polynomial form and breaks the chain.
     install_gelu_decomp(decomp_table)
+    for op in _MERGE_OPS.values():
+        decomp_table[op] = chain_reduction_dims(op, decomp_table.get(op))
     return decomp_table
 
 
@@ -294,10 +301,8 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
                 # context. Preserve the proof that a scalar can be lifted as
                 # a uniform runtime argument, rather than a device coordinate.
                 if isinstance(obj, (torch.SymInt, torch.SymFloat)):
-                    origins = HostFunction.current().expr_to_origin
-                    proxy.node.meta["helion_host_scalar"] = all(
-                        symbol in origins and origins[symbol].origin.is_host()
-                        for symbol in obj.node.expr.free_symbols
+                    proxy.node.meta["helion_host_scalar"] = (
+                        HostFunction.current().is_host_scalar_expr(obj.node.expr)
                     )
                 # pyrefly: ignore [missing-attribute]
                 proxy.force = lambda: proxy
@@ -565,24 +570,59 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         return joins
 
 
+def _control_flow_graph_entries(
+    node: torch.fx.Node,
+) -> tuple[tuple[int, int | None], ...]:
+    """Child IDs and direct capture slots, excluding mutable while state."""
+    if node.op != "call_function":
+        return ()
+    if _tracing_ops.is_for_loop_target(node.target):
+        if len(node.args) >= 4 and isinstance(node.args[0], int):
+            return ((node.args[0], 3),)
+    elif node.target is _tracing_ops._if:
+        if (
+            len(node.args) >= 5
+            and isinstance(node.args[1], int)
+            and isinstance(node.args[2], int)
+        ):
+            return ((node.args[1], 3), (node.args[2], 4))
+    elif node.target is _tracing_ops._while_loop and len(node.args) >= 3:
+        if not isinstance(node.args[0], int) or not isinstance(node.args[1], int):
+            return ()
+        # While inputs are loop-carried state, not invariant captures. Graph
+        # ownership follows these edges, but value-origin proofs must stop here.
+        result = ((node.args[0], None), (node.args[1], None))
+        if len(node.args) > 3 and isinstance(node.args[3], int):
+            result = (*result, (node.args[3], None))
+        return result
+    return ()
+
+
+def control_flow_child_graph_ids(node: torch.fx.Node) -> tuple[int, ...]:
+    return tuple(graph_id for graph_id, _slot in _control_flow_graph_entries(node))
+
+
 def control_flow_parent_entries(
     graphs: Sequence[GraphInfo],
 ) -> dict[int, tuple[torch.fx.Node, int]]:
     """Map child graph IDs to their parent call and captured-argument slot."""
-    result: dict[int, tuple[torch.fx.Node, int]] = {}
+    return {
+        child_id: (node, slot)
+        for info in graphs
+        for node in info.graph.nodes
+        for child_id, slot in _control_flow_graph_entries(node)
+        if slot is not None
+    }
+
+
+def control_flow_parent_ids(graphs: Sequence[GraphInfo]) -> dict[int, int]:
+    result: dict[int, int] = {}
     for info in graphs:
         for node in info.graph.nodes:
-            if node.op != "call_function" or not node.args:
-                continue
-            if _tracing_ops.is_for_loop_target(node.target) and isinstance(
-                node.args[0], int
-            ):
-                result[node.args[0]] = (node, 3)
-            elif node.target is _tracing_ops._if and len(node.args) >= 5:
-                if isinstance(node.args[1], int):
-                    result[node.args[1]] = (node, 3)
-                if isinstance(node.args[2], int):
-                    result[node.args[2]] = (node, 4)
+            for child_id in control_flow_child_graph_ids(node):
+                # Rolling appends graph aliases; the original owner is the one
+                # reachable from the root, not a later bookkeeping copy.
+                result.setdefault(child_id, info.graph_id)
     return result
 
 
@@ -1159,10 +1199,10 @@ class DeviceIR:
             from .cute.flat_gather_lane import (
                 register_flat_gather_factor_specializations,
             )
-            from .cute.memory_ops import register_cute_tensor_alias_specializations
             from .cute.memory_ops import (
                 register_persistent_vec_alignment_specializations,
             )
+            from .runtime_tensor_guards import register_tensor_alias_specializations
 
             # Explicit tile loops can also use vector memory transactions,
             # even when no persistent reduction block or contraction exists.
@@ -1174,7 +1214,7 @@ class DeviceIR:
                 # Reduction kernels reorder input reads across warps. Grid
                 # kernels add these storage-dependent dispatch guards below
                 # only when a scan needs them.
-                register_cute_tensor_alias_specializations(env)
+                register_tensor_alias_specializations(env)
             for tile_spec in env.config_spec.block_sizes:
                 if len(tile_spec.block_ids) == 1 and env.is_jagged_tile(
                     tile_spec.block_id
@@ -1192,8 +1232,8 @@ class DeviceIR:
         if env.backend_name == "cute" and not rdims:
             from ..language.scan_ops import _associative_scan
             from .cute.collective_matmul import has_collective_matmul_candidate
-            from .cute.memory_ops import register_cute_tensor_alias_specializations
             from .cute.memory_ops import stores_into_input_storage
+            from .runtime_tensor_guards import register_tensor_alias_specializations
 
             self._register_cute_tile_vec_slots(env)
             # Grid scans also reorder input reads across warps and need the
@@ -1213,7 +1253,7 @@ class DeviceIR:
                 or has_collective_matmul_candidate(self.graphs)
                 or stores_into_input_storage(self.graphs, env)
             ):
-                register_cute_tensor_alias_specializations(env)
+                register_tensor_alias_specializations(env)
         if not rdims:
             return
         from .inductor_lowering import ReductionLowering
@@ -1434,7 +1474,7 @@ class DeviceIR:
         """
         already_registered = set(env.config_spec.cute_vector_widths.valid_block_ids())
         for tile_bs in env.block_sizes:
-            if tile_bs.reduction or tile_bs.block_id in already_registered:
+            if not tile_bs.is_tile or tile_bs.block_id in already_registered:
                 continue
             # Non-static size (jagged / AutoSize) never forms a lane loop.
             if not isinstance(tile_bs.size, (int, torch.SymInt)):
@@ -1872,7 +1912,7 @@ class DeviceIR:
         configured_block_sizes = {
             info.block_id: info.from_config_assert(config)
             for info in env.block_sizes
-            if not info.reduction
+            if info.is_tile
         }
         descriptor_output_nodes_by_graph: dict[int, set[torch.fx.Node]] = {}
         memory_op_index = 0
@@ -3483,6 +3523,67 @@ def _install_dependency_phases(
             graph_info.phase_index = phase_index
 
 
+# Operations whose lowering has a faster approximate form under the fast_math
+# setting on the Triton and CuTe backends (``inductor_lowering`` and the cute
+# ``exp2_fastmath`` / ``exact_division`` / gelu templates), by the name the
+# warning reports them under.
+_FAST_MATH_SENSITIVE_TARGETS: dict[object, str] = {
+    torch.ops.aten.reciprocal.default: "reciprocal",
+    torch.ops.aten.exp.default: "exp",
+    torch.ops.aten.exp2.default: "exp2",
+    torch.ops.aten.sigmoid.default: "sigmoid",
+    torch.ops.aten.rsqrt.default: "rsqrt",
+    torch.ops.aten.erf.default: "erf",
+    torch.ops.aten.gelu.default: "gelu",
+}
+# Triton only: under fast_math the max/min reductions and torch.maximum /
+# torch.minimum lower to ``tl.max`` / ``tl.maximum`` without the NaN
+# propagation torch has (``TritonBackend.reduction_expr``, ``overrides.py``);
+# the CuTe backend keeps the NaN-propagating forms either way.
+_FAST_MATH_SENSITIVE_TRITON_TARGETS: dict[object, str] = {
+    torch.ops.aten.amax.default: "max/min reductions",
+    torch.ops.aten.amin.default: "max/min reductions",
+    torch.ops.aten.maximum.default: "maximum/minimum",
+    torch.ops.aten.minimum.default: "maximum/minimum",
+}
+
+
+def fast_math_sensitive_ops(device_ir: DeviceIR, backend: str) -> list[str]:
+    """Names of the floating-point operations in ``device_ir`` that the
+    ``fast_math`` setting would lower to approximate forms on ``backend``,
+    sorted."""
+    from .inductor_lowering import _is_plain_true_division
+
+    targets = dict(_FAST_MATH_SENSITIVE_TARGETS)
+    if backend == "triton":
+        targets.update(_FAST_MATH_SENSITIVE_TRITON_TARGETS)
+    names: set[str] = set()
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            val = node.meta.get("val")
+            if not (isinstance(val, torch.Tensor) and val.dtype.is_floating_point):
+                continue
+            name = targets.get(node.target)
+            if name is None and _is_plain_true_division(node):
+                name = "fp32 division"
+            if name is not None:
+                names.add(name)
+    return sorted(names)
+
+
+def warn_fast_math_unused(device_ir: DeviceIR) -> None:
+    """Warn once per kernel when ``fast_math`` is off and the kernel has
+    operations the setting would speed up (``exc.FastMathUnused``)."""
+    env = CompileEnvironment.current()
+    if env.settings.fast_math or env.backend.name not in ("triton", "cute"):
+        return
+    ops = fast_math_sensitive_ops(device_ir, env.backend.name)
+    if ops:
+        warning(exc.FastMathUnused(", ".join(ops)))
+
+
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     device_ir.host_function = func
@@ -3507,6 +3608,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             raise exc.NoDeviceLoopsInKernel
         from ..language.random_ops import rewrite_implicit_random_ops
 
+        # Resolve source-level sizes before RNG lowering introduces internal
+        # size queries that identify physical tile coordinates.
+        for graph in device_ir.graphs:
+            resolve_reduction_sizes(graph.graph)
+        merged_rdims = merge_reduction_dims(device_ir.graphs)
         if CompileEnvironment.current().settings.cute_rng_stream in ("auto", "philox4"):
             from .cute.philox_stream import rewrite_random_stream
 
@@ -3514,9 +3620,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 rewrite_random_stream(graph.graph)
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
+        warn_fast_math_unused(device_ir)
         scaled_contractions = 0
         if CompileEnvironment.current().backend.name == "cute":
             from .cute.canonicalize_reductions import canonicalize_reductions
+            from .cute.elide_split_join import elide_split_join_roundtrips
             from .cute.fold_noop_stores import fold_noop_stores
             from .cute.fuse_mm_accumulation import fuse_mm_accumulation
             from .cute.fuse_u32_multiply import fuse_u32_multiply
@@ -3526,6 +3634,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             canonicalize_reductions(device_ir)
             scaled_contractions = expose_scaled_contractions(device_ir)
             for graph_info in device_ir.graphs:
+                elide_split_join_roundtrips(graph_info.graph)
                 fold_noop_stores(graph_info.graph)
                 fuse_mm_accumulation(graph_info)
                 fuse_u32_multiply(graph_info.graph)
@@ -3538,7 +3647,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
             for graph_info in device_ir.graphs:
                 factor_affine_reductions(graph_info.graph, fast_math=True)
-        if CompileEnvironment.current().backend.name == "cute":
+        if (
+            CompileEnvironment.current().backend.name == "cute"
+            and CompileEnvironment.current().settings.cute_promote_half_atomic_outputs
+        ):
             promotions = collect_cute_half_atomic_output_promotions(device_ir.graphs)
             if promotions:
                 env = CompileEnvironment.current()
@@ -3548,14 +3660,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 promote_cute_root_graph_host_tensors(device_ir.graphs, promotions)
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
-        if scaled_contractions:
-            from .cute.active_blocks import active_block_ids
-
-            device_ir.codegen_active_block_ids = active_block_ids(
-                device_ir.graphs,
-                (block_id for ids in device_ir.grid_block_ids for block_id in ids),
-                CompileEnvironment.current(),
-            )
+        dot_scaled_changed = False
         is_pallas = CompileEnvironment.current().backend.name == "pallas"
         if is_pallas:
             from .pallas.canonicalize_jagged_bounds import canonicalize_jagged_bounds
@@ -3590,16 +3695,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             from .cute.promote_output_axis import promote_partitioned_output_axis
 
             # After validate_host_tensor_usage: the rewired scale is a host tensor.
-            if any(
+            dot_scaled_changed = any(
                 [expose_dot_scaled_scales(graph.graph) for graph in device_ir.graphs]
-            ):
-                from .cute.active_blocks import active_block_ids
-
-                device_ir.codegen_active_block_ids = active_block_ids(
-                    device_ir.graphs,
-                    (block_id for ids in device_ir.grid_block_ids for block_id in ids),
-                    CompileEnvironment.current(),
-                )
+            )
             promote_partitioned_output_axis(func, device_ir, visitor.root_nodes)
 
             if CompileEnvironment.current().cute_fission_plan is not None:
@@ -3689,9 +3787,33 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             from .cute.graph_cse import cse_device_ir
 
             cse_device_ir(device_ir)
+        if scaled_contractions or dot_scaled_changed:
+            from .active_blocks import active_block_ids
+
+            device_ir.codegen_active_block_ids = active_block_ids(
+                device_ir.graphs,
+                (block_id for ids in device_ir.grid_block_ids for block_id in ids),
+                CompileEnvironment.current(),
+            )
         # Phase 1: roll + register the reduction_loops spec. The ReductionKernelFact is built
         # in Phase 3 (after analysis derives memory_op_facts) so it can read the enriched
         # load/store facts.
+        if merged_rdims:
+            # Merged dims can leave their per-dim rdims unused.  Stop treating
+            # them as reductions, or they would gain unused tuning slots and
+            # rolling analysis. CuTe would also claim a thread axis for each.
+            # Only rdims nothing uses are demoted: a later slice of the same
+            # extent would come from a subscript that kept the rdim in use.
+            from .active_blocks import unused_block_ids
+
+            unused_rdims = unused_block_ids(
+                device_ir.graphs,
+                merged_rdims,
+                used_block_ids=device_ir.codegen_active_block_ids,
+            )
+            for block_id in unused_rdims:
+                block = CompileEnvironment.current().block_sizes[block_id]
+                block.retire_reduction()
         device_ir.register_rollable_reductions()
         if CompileEnvironment.current().backend.name == "cute":
             _register_cute_lane_vector_width_specs(config_spec)
@@ -3787,6 +3909,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     kv_stage_choices_by_tile=dict(
                         gated_surface.kv_stage_choices_by_tile
                     ),
+                    row_warp_choices_by_tile=dict(
+                        gated_surface.row_warp_choices_by_tile
+                    ),
+                    row_stage_choices=dict(gated_surface.row_stage_choices),
+                    row_seed_programs=gated_surface.row_programs,
                 )
             else:
                 from ..language.matmul_ops import _plan_cute_tcgen05_search_candidate
@@ -4248,12 +4375,12 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             config_spec.kernel_matmul_fact is not None
             or analysis.writes_input_storage(env)
         ):
-            from .cute.memory_ops import register_cute_tensor_alias_specializations
+            from .runtime_tensor_guards import register_tensor_alias_specializations
 
             # Vectorized writes to inputs and collective matmuls need the same
             # guarded disjoint-input facts as reductions. Fresh grid outputs
             # cannot alias inputs and must not add storage-dependent cache keys.
-            register_cute_tensor_alias_specializations(env)
+            register_tensor_alias_specializations(env)
         # Phase 4: compose a matmul + reduction-over-output epilogue fact when a matmul AND a
         # register-resident epilogue reduction co-occur (matmul_rms_norm etc.).
         device_ir.build_matmul_reduction_epilogue_facts()

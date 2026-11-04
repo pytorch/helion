@@ -48,7 +48,7 @@ def test_store_policy_is_independent_of_async_recurrence_config() -> None:
         spec.normalize(config)
         field = cast("EnumFragment", spec._flat_fields()["cute_store_policy"])
     assert config.cute_store_policy == "l2_evict_last"
-    assert field.choices == ("default", "l2_evict_last")
+    assert field.choices == ("default", "streaming", "l2_evict_last")
 
 
 @pytest.mark.parametrize(
@@ -74,14 +74,17 @@ def test_store_policy_target_gate_controls_normalization_and_search(
         field = cast("EnumFragment", spec._flat_fields()["cute_store_policy"])
         prior = CuteBackend().config_value_priors(spec)["cute_store_policy"]
     assert config["cute_store_policy"] == ("l2_evict_last" if supported else "default")
+    # ``streaming`` (evict-first stores) needs no target gate.
     assert field.choices == (
-        ("default", "l2_evict_last") if supported else ("default",)
+        ("default", "streaming", "l2_evict_last")
+        if supported
+        else ("default", "streaming")
     )
     if not supported:
         assert prior(field, 0) == "default"
 
 
-@pytest.mark.parametrize("value", ["streaming", "last", True, 1, None])
+@pytest.mark.parametrize("value", ["evict", "last", True, 1, None])
 def test_store_policy_rejects_invalid_values(value: object) -> None:
     spec = ConfigSpec(backend=CuteBackend())
     with pytest.raises(exc.InvalidConfig, match="cute_store_policy"):
@@ -100,7 +103,8 @@ def test_store_policy_is_cute_only() -> None:
 
 def test_packet_policy_helper_names_are_registered_without_cuda() -> None:
     imports = CuteBackend().library_imports
-    assert set(_STORE_HELPERS.values()) <= imports.keys()
+    hinted = {name for table in _STORE_HELPERS.values() for name in table.values()}
+    assert hinted <= imports.keys()
     # Cache-hinted loads plus the predicated packet loads of the sunk V-loop.
     assert {name for name in imports if name.startswith("_cute_load_")} == (
         _CUTE_CACHE_LOAD_HELPER_NAMES | MASKED_PACKET_LOAD_HELPER_NAMES
@@ -157,7 +161,12 @@ def test_only_full_sixteen_byte_packets_select_hint(
 ) -> None:
     original = _packet_source(helper, int(width * scale))
     rewritten = ast.unparse(_rewrite(original))
-    assert (hinted in rewritten) is (scale == 1)
+    # A lane twice as wide as one 16-byte packet issues two hinted packets
+    # (the u16/u32 helpers); a half-width lane stays on the scalar store.
+    whole_packets = scale == 1 or (
+        scale == 2 and helper in ("_cute_store_u16_vec", "_cute_store_u32_vec")
+    )
+    assert (hinted in rewritten) is whole_packets
     assert "if valid:" in rewritten
     assert "out.iterator, values" in rewritten
 

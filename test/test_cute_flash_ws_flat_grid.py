@@ -38,6 +38,7 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 from helion._compiler.cute import cute_flash
+from helion._testing import import_example
 
 _WS = {
     "block_sizes": [1, 128, 128],
@@ -55,7 +56,7 @@ _M64_ONE_PASS = {**_M64, "cute_flash_ws_one_pass": True}
 
 
 def _attention_kernel() -> helion.Kernel:
-    from examples.attention import attention
+    attention = import_example("attention").attention
 
     return helion.kernel(
         attention.fn, backend="cute", static_shapes=True, autotune_effort="none"
@@ -63,7 +64,7 @@ def _attention_kernel() -> helion.Kernel:
 
 
 def _relu_kernel() -> helion.Kernel:
-    from examples.attention import attention_relu_output
+    attention_relu_output = import_example("attention").attention_relu_output
 
     return helion.kernel(
         attention_relu_output.fn,
@@ -74,7 +75,7 @@ def _relu_kernel() -> helion.Kernel:
 
 
 def _xsa_kernel() -> helion.Kernel:
-    from examples.xsa import xsa_kernel
+    xsa_kernel = import_example("xsa").xsa_kernel
 
     return helion.kernel(
         xsa_kernel.fn, backend="cute", static_shapes=True, autotune_effort="none"
@@ -506,7 +507,7 @@ def test_ws_relu_epilogue_matches_reference(config: dict[str, object]) -> None:
     ),
 )
 def test_ws_row_epilogue_matches_reference(config: dict[str, object]) -> None:
-    from examples.xsa import ref_xsa
+    ref_xsa = import_example("xsa").ref_xsa
 
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     code, out = code_and_output(_xsa_kernel(), (q, k, v), **config)

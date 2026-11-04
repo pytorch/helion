@@ -571,6 +571,37 @@ class TestFinalSelection(TestCase):
         self.assertIsNone(rows[1.0]["disqualified"])
         self.assertEqual(rows[1.0]["rounds_ms"], [1.0] * 4)
 
+    def test_finalists_without_readings_are_reported(self) -> None:
+        # A benchmark worker whose device filled up fails every finalist but
+        # the pinned default (the smallest kernel, it still loads): picking
+        # the default, ~8x slower than the search's best, must not go
+        # unremarked.
+        default = _member(16, 120.0)
+        fast = [_member(32, 15.0), _member(64, 15.5), _member(128, 16.0)]
+        policy = FinalSelectionConfig(top_k=4, rounds=2, screen_rep_ms=0)
+        search = _make_search([*fast, default], policy=policy, pinned=[default])
+        search.log = Mock()
+
+        def model(member: PopulationMember, _window_number: int) -> object:
+            return 120.0 if member is default else None
+
+        with (
+            patch.dict(os.environ, _SHORTLIST_ALL),
+            patch.object(search, "_final_selection_measurer", new=_FakeMeasurer(model)),
+        ):
+            selected = search.final_rebenchmark_best(fast[0])
+
+        self.assertIs(selected, default)
+        self.assertEqual(
+            [row["disqualified"] for row in _rows(search)],
+            [None, "incomplete", "incomplete", "incomplete"],
+        )
+        self.assertIn(
+            "Final selection took no complete steady-window readings for "
+            "3 of 4 finalists; selecting among the rest.",
+            [str(call.args[0]) for call in search.log.warning.call_args_list],
+        )
+
     def test_no_readings_at_all_keeps_the_search_best(self) -> None:
         best = _member(32, 0.9)
         other = _member(64, 1.0)

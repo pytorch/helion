@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import ast
 
-from examples.concatenate import concat2d_dim1
 import pytest
 import torch
 
@@ -21,8 +20,11 @@ from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+concat2d_dim1 = import_example("concatenate").concat2d_dim1
 
 pytestmark = skipUnlessBackends(["cute"])
 

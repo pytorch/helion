@@ -42,7 +42,9 @@ from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
+from .pdl_release import ZERO_FILL_KERNEL_PREFIX
 from .pdl_release import generic_release_rendered
+from .pdl_release import spread_rendered
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -1503,9 +1505,9 @@ def _graph_used_block_ids(
     from ...language import memory_ops
     from ..compile_environment import CompileEnvironment
     from ..device_ir import RootGraphInfo
+    from ..device_ir import control_flow_child_graph_ids
     from ..host_function import HostFunction
     from ..variable_origin import BlockSizeOrigin
-    from .loop_nesting import _child_graph_ids
 
     env = CompileEnvironment.current()
     host_function = HostFunction.current()
@@ -1592,7 +1594,9 @@ def _graph_used_block_ids(
         for node in graph.nodes:
             # A root coordinate can first be read inside a captured device
             # scope. Its thread distribution must remain live there as well.
-            pending.extend(graph_by_id[graph_id] for graph_id in _child_graph_ids(node))
+            pending.extend(
+                graph_by_id[graph_id] for graph_id in control_flow_child_graph_ids(node)
+            )
             if node.target is memory_ops.store:
                 # A store has no value; its index names every tile axis it
                 # writes, including axes a broadcast value does not carry.
@@ -1627,6 +1631,191 @@ def _graph_used_block_ids(
 _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
 
 
+# Config keys the CuTe backend lowers beyond the backend-neutral surface.
+# ``supports_config_key`` runs for every key of every normalized config, so
+# membership is one frozenset lookup rather than a chain of comparisons.
+_CUTE_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        "num_threads",
+        "cute_vector_widths",
+        "cute_lane_layouts",
+        "cute_reduction_reloads",
+        "cute_reduction_schedule",
+        "cute_reduction_group_rows",
+        "cute_reduction_pipeline_depth",
+        "cute_reduction_local_tree",
+        "cute_reduction_row_schedule",
+        "cute_reduction_pack_output",
+        "cute_reduction_sequence",
+        "cute_host_paired_sum",
+        "cute_materialized_schedule",
+        "cute_materialized_operand_schedule",
+        "cute_fragment_scan",
+        "cute_fragment_reduction",
+        "cute_fp32_dot",
+        "cute_fragment_threads",
+        "cute_fragment_register_loads",
+        "cute_fragment_producer_cache",
+        "cute_fragment_warp_scan",
+        "cute_fragment_topk_network",
+        "cute_fragment_cta_topk",
+        "cute_selection_algorithm",
+        "cute_radix_threads",
+        "cute_radix_candidate_key_cache",
+        "cute_radix_scalar_candidates",
+        "cute_radix_valid_domain",
+        "cute_radix_ticket_stores",
+        "cute_radix_cached_payload_inverse",
+        "cute_radix_resident_input",
+        "cute_radix_boundary_early_exit",
+        "cute_radix_defer_output",
+        "cute_radix_partial_scan",
+        "cute_radix_packet_bits",
+        "cute_radix_scan_unroll",
+        "cute_radix_cluster_ctas",
+        "cute_radix_candidate_capacity",
+        "cute_radix_histogram_mode",
+        "cute_fragment_atomic_aggregation",
+        "cute_fragment_integer_atomic_epochs",
+        "cute_fragment_local_atomic_registers",
+        "cute_fragment_register_snapshots",
+        "cute_fragment_register_producers",
+        "cute_fragment_scan_exports",
+        "cute_fragment_warp_producer_regions",
+        "cute_fragment_bounded_gather",
+        "cute_fragment_published_scalars",
+        "cute_fragment_skip_zero_atomics",
+        "cute_fragment_atomic_consumer_fusion",
+        "cute_fragment_pure_producer_regions",
+        "cute_integer_loop_reduction",
+        "cute_fragment_packet_loads",
+        "cute_fragment_padded_rows",
+        "cute_fragment_unrolled_loops",
+        "cute_fragment_vector_io",
+        "cute_fragment_batched_loads",
+        "cute_fragment_split_k",
+        "cute_fragment_mma_rows",
+        "cute_fragment_slab_loads",
+        "cute_fragment_warp_results",
+        "cute_fragment_private_scalar_loops",
+        "cute_pointwise_pid_type",
+        "cute_async_store_policy",
+        "cute_store_policy",
+        "cute_exact_div_form",
+        "cute_bf16x2_recurrence",
+        "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
+        "cute_signed_bitfield_bf16",
+        "cute_collective_mma",
+        "cute_collective_static_layouts",
+        "cute_collective_copy",
+        "cute_collective_recipe",
+        "cute_collective_operand_packets",
+        "cute_collective_epilogue",
+        "cute_collective_stages",
+        "cute_collective_compute",
+        "cute_collective_native_seeded",
+        "cute_collective_tmem_seed",
+        "cute_collective_tmem_a",
+        "cute_gathered_mma_n",
+        "cute_gathered_mma_stages",
+        "cute_proven_bounds",
+        "cute_rng_packet",
+        "cute_independent_reduction",
+        "cute_cluster_warp_online",
+        "cute_register_row",
+        "cute_register_row_tensor_copy",
+        "cute_scalar_epilogue",
+        "cute_scalar_epilogue_keep_inputs",
+        "cute_scalar_epilogue_owner_fold",
+        "cute_warp_fp32_redux",
+        "cute_register_tile_warp_fold",
+        "cute_register_tile_store_first",
+        "cute_replicated_reduction",
+        "cute_vector_packet_unroll",
+        "cute_packet_prefetch",
+        "cute_vloop_sink",
+        "cute_lane_unroll",
+        "cute_dot_fragment_mma",
+        "cute_dot_ring_mma",
+        "cute_dot_ring_stages",
+        "cute_dot_ring_split",
+        "cute_pdl",
+        "cute_pdl_release",
+        "cute_pdl_spread",
+        "cute_warp_aggregated_atomics",
+        "cross_loop_pipeline",
+        "cute_split_k_workspace",
+        "cute_split_k_stages",
+        "cute_split_k_partitions",
+        "cute_split_k_atomic_epilogue",
+        "cute_split_k_schedule",
+        "cute_split_k_finalizer_warps",
+        "cute_grouped_rna_warps",
+        "cute_grouped_rna_block_k",
+        "cute_grouped_ab_stages",
+        "cute_grouped_ctas_per_sm",
+        "cute_grouped_prefix_scan",
+        "cute_grouped_descriptor_policy",
+        "cute_mma_f32_conversion",
+        "cute_chunk_recurrence_dv_partitions",
+        "cute_chunk_recurrence_register_cap",
+        "cute_chunk_prepare_schedule",
+        "cute_gdn_recurrence_stages",
+        "cute_gdn_recurrence_epilogue_warps",
+        "cute_gdn_recurrence_token_groups",
+        "cute_gdn_recurrence_mma_m",
+        "cute_affine_scan_schedule",
+        "cute_cluster_n",
+        "cute_min_blocks_per_mp",
+        "cute_tiles_per_block",
+        "cute_matmul_family",
+        "cute_warp_mma_warps",
+        "cute_register_subblocks",
+        "cute_register_subblocks_warps",
+        "cute_register_subblocks_prefetch",
+        "cute_register_subblocks_mask",
+        "cute_register_subblocks_colside",
+        "cute_register_subblocks_roll",
+        "cute_topk_lanes_per_row",
+        "cute_topk_rows_per_block",
+        "cute_topk_vector_width",
+        "cute_topk_output_vector_width",
+        "cute_topk_value_mode",
+        "cute_topk_key_dtype",
+        "cute_topk_rank_mode",
+        "cute_topk_selection_layout",
+        "cute_topk_sort_network",
+        "cute_topk_key_encoder",
+        "cute_topk_defer_value_gathers",
+        "cute_topk_merge_schedule",
+        "cute_topk_coarse_keys",
+        "cute_topk_key_recovery",
+        "cute_mma_dag",
+        "cute_mma_dag_warps",
+        "cute_mma_dag_stages",
+        "cute_mma_dag_store",
+        "cute_mma_dag_exchange",
+        "cute_mma_dag_pass_warps",
+        "cute_mma_dag_loads",
+        "cute_mma_dag_aux",
+        "cute_mma_dag_persistent",
+        "cute_mma_dag_cluster",
+        "cute_mma_dag_split",
+        "cute_mma_dag_derived",
+        "cute_mma_dag_epilogue",
+        "cute_mma_dag_lookahead",
+    }
+)
+_CUTE_CONFIG_KEY_PREFIXES: tuple[str, ...] = (
+    "tcgen05_",
+    "cute_flash_",
+    "cute_async_load_",
+    "cute_scaled_",
+)
+
+
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
@@ -1635,7 +1824,11 @@ class CuteBackend(Backend):
         """A kernel that renders the generic early release of its programmatic
         dependents (``cute_pdl`` on the generic path, released at entry or
         from the last wave) ranks ahead of one that does not, among finalists
-        the autotuner's final verification cannot tell apart.
+        the autotuner's final verification cannot tell apart, and one that
+        also pads its shared memory to one wave's density
+        (``cute_pdl_spread``, ``spread_rendered``) ranks ahead of both: an
+        early launch of it never packs its CTAs onto the SMs its primary
+        left idle, while its isolated timing reads the pad as a tie.
 
         The knob's own cost or gain is invisible to the kernel's isolated
         timing whenever a plain launch separates its back-to-back calls (the
@@ -1648,16 +1841,21 @@ class CuteBackend(Backend):
         Whether a config renders that release is read off its generated
         module (``generic_release_rendered``), not off its keys: the tcgen05,
         warp-MMA, collective and block-scaled families own their wait and
-        release (``DeviceFunction._cute_pdl_applies``), so on them the knob
-        and its placement are inert and every config ranks alike; a ranking
-        by keys there would break ties between unrelated knobs (matmul
-        backward s2: a clc-persistent finalist 0.5% behind in the autotuner's
-        regime, 7% behind in the catalogue's).  A config without the knob
-        ranks last without a render.
+        release (``DeviceFunction._cute_pdl_applies``; the tcgen05 kernels
+        take the ``entry`` placement after their own waits,
+        ``DeviceFunction._tcgen05_early_pdl_release``), and on them every
+        config ranks alike: their back-to-back timing sees the knob, and a
+        ranking by the release there would break ties between unrelated
+        knobs (matmul backward s2: a clc-persistent finalist 0.5% behind in
+        the autotuner's regime, 7% behind in the catalogue's).  A config
+        without the knob ranks last without a render.
         """
         if config.config.get("cute_pdl") is not True:
-            return 1
-        return 0 if generic_release_rendered(source()) else 1
+            return 2
+        rendered = source()
+        if not generic_release_rendered(rendered):
+            return 2
+        return 0 if spread_rendered(rendered) else 1
 
     def build_standalone_code(
         self,
@@ -2126,187 +2324,7 @@ class CuteBackend(Backend):
             )
 
     def supports_config_key(self, key: str) -> bool:
-        if (
-            key == "num_threads"
-            or key == "cute_vector_widths"
-            or key == "cute_lane_layouts"
-            or key == "cute_reduction_reloads"
-            or key
-            in {
-                "cute_reduction_schedule",
-                "cute_reduction_group_rows",
-                "cute_reduction_pipeline_depth",
-                "cute_reduction_local_tree",
-                "cute_reduction_row_schedule",
-                "cute_reduction_pack_output",
-                "cute_reduction_sequence",
-                "cute_host_paired_sum",
-                "cute_materialized_schedule",
-                "cute_materialized_operand_schedule",
-                "cute_fragment_scan",
-                "cute_fragment_reduction",
-                "cute_fp32_dot",
-                "cute_fragment_threads",
-                "cute_fragment_register_loads",
-                "cute_fragment_producer_cache",
-                "cute_fragment_warp_scan",
-                "cute_fragment_topk_network",
-                "cute_fragment_cta_topk",
-                "cute_selection_algorithm",
-                "cute_radix_threads",
-                "cute_radix_candidate_key_cache",
-                "cute_radix_scalar_candidates",
-                "cute_radix_valid_domain",
-                "cute_radix_ticket_stores",
-                "cute_radix_cached_payload_inverse",
-                "cute_radix_resident_input",
-                "cute_radix_boundary_early_exit",
-                "cute_radix_defer_output",
-                "cute_radix_partial_scan",
-                "cute_radix_packet_bits",
-                "cute_radix_scan_unroll",
-                "cute_radix_cluster_ctas",
-                "cute_radix_candidate_capacity",
-                "cute_radix_histogram_mode",
-                "cute_fragment_atomic_aggregation",
-                "cute_fragment_integer_atomic_epochs",
-                "cute_fragment_local_atomic_registers",
-                "cute_fragment_register_snapshots",
-                "cute_fragment_register_producers",
-                "cute_fragment_scan_exports",
-                "cute_fragment_warp_producer_regions",
-                "cute_fragment_bounded_gather",
-                "cute_fragment_published_scalars",
-                "cute_fragment_skip_zero_atomics",
-                "cute_fragment_atomic_consumer_fusion",
-                "cute_fragment_pure_producer_regions",
-                "cute_integer_loop_reduction",
-                "cute_fragment_packet_loads",
-                "cute_fragment_padded_rows",
-                "cute_fragment_unrolled_loops",
-                "cute_fragment_vector_io",
-                "cute_fragment_batched_loads",
-                "cute_fragment_split_k",
-                "cute_fragment_mma_rows",
-                "cute_fragment_slab_loads",
-                "cute_fragment_warp_results",
-                "cute_fragment_private_scalar_loops",
-                "cute_pointwise_pid_type",
-            }
-            or key == "cute_async_store_policy"
-            or key == "cute_store_policy"
-            or key == "cute_exact_div_form"
-            or key == "cute_bf16x2_recurrence"
-            or key == "cute_register_chain"
-            or key == "cute_simt_mma"
-            or key == "cute_simt_mma_layout"
-            or key == "cute_signed_bitfield_bf16"
-            or key == "cute_collective_mma"
-            or key == "cute_collective_static_layouts"
-            or key == "cute_collective_copy"
-            or key == "cute_collective_recipe"
-            or key == "cute_collective_operand_packets"
-            or key == "cute_collective_epilogue"
-            or key == "cute_collective_stages"
-            or key == "cute_collective_compute"
-            or key == "cute_collective_native_seeded"
-            or key == "cute_collective_tmem_seed"
-            or key == "cute_collective_tmem_a"
-            or key == "cute_gathered_mma_n"
-            or key == "cute_gathered_mma_stages"
-            or key == "cute_proven_bounds"
-            or key == "cute_rng_packet"
-            or key == "cute_independent_reduction"
-            or key == "cute_cluster_warp_online"
-            or key == "cute_register_row"
-            or key == "cute_register_row_tensor_copy"
-            or key == "cute_scalar_epilogue"
-            or key == "cute_scalar_epilogue_keep_inputs"
-            or key == "cute_scalar_epilogue_owner_fold"
-            or key == "cute_warp_fp32_redux"
-            or key == "cute_register_tile_warp_fold"
-            or key == "cute_register_tile_store_first"
-            or key == "cute_replicated_reduction"
-            or key == "cute_vector_packet_unroll"
-            or key == "cute_packet_prefetch"
-            or key == "cute_vloop_sink"
-            or key == "cute_lane_unroll"
-            or key == "cute_pdl"
-            or key == "cute_pdl_release"
-            or key == "cute_warp_aggregated_atomics"
-            or key == "cross_loop_pipeline"
-            or key
-            in (
-                "cute_split_k_workspace",
-                "cute_split_k_stages",
-                "cute_split_k_partitions",
-                "cute_split_k_schedule",
-                "cute_split_k_finalizer_warps",
-            )
-            or key
-            in (
-                "cute_grouped_rna_warps",
-                "cute_grouped_rna_block_k",
-                "cute_grouped_ab_stages",
-                "cute_grouped_ctas_per_sm",
-                "cute_grouped_prefix_scan",
-                "cute_grouped_descriptor_policy",
-                "cute_mma_f32_conversion",
-            )
-            or key == "cute_chunk_recurrence_dv_partitions"
-            or key == "cute_chunk_recurrence_register_cap"
-            or key == "cute_chunk_prepare_schedule"
-            or key == "cute_gdn_recurrence_stages"
-            or key == "cute_gdn_recurrence_epilogue_warps"
-            or key == "cute_gdn_recurrence_token_groups"
-            or key == "cute_gdn_recurrence_mma_m"
-            or key == "cute_affine_scan_schedule"
-            or key == "cute_cluster_n"
-            or key == "cute_min_blocks_per_mp"
-            or key == "cute_tiles_per_block"
-            or key == "cute_matmul_family"
-            or key == "cute_warp_mma_warps"
-            or key == "cute_register_subblocks"
-            or key == "cute_register_subblocks_warps"
-            or key == "cute_register_subblocks_prefetch"
-            or key == "cute_register_subblocks_mask"
-            or key == "cute_register_subblocks_colside"
-            or key == "cute_register_subblocks_roll"
-            or key
-            in (
-                "cute_topk_lanes_per_row",
-                "cute_topk_rows_per_block",
-                "cute_topk_vector_width",
-                "cute_topk_output_vector_width",
-                "cute_topk_value_mode",
-                "cute_topk_key_dtype",
-                "cute_topk_rank_mode",
-                "cute_topk_selection_layout",
-                "cute_topk_sort_network",
-                "cute_topk_key_encoder",
-                "cute_topk_defer_value_gathers",
-                "cute_topk_merge_schedule",
-                "cute_topk_coarse_keys",
-                "cute_topk_key_recovery",
-            )
-            or key == "cute_mma_dag"
-            or key == "cute_mma_dag_warps"
-            or key == "cute_mma_dag_stages"
-            or key == "cute_mma_dag_store"
-            or key == "cute_mma_dag_exchange"
-            or key == "cute_mma_dag_pass_warps"
-            or key == "cute_mma_dag_loads"
-            or key == "cute_mma_dag_aux"
-            or key == "cute_mma_dag_persistent"
-            or key == "cute_mma_dag_cluster"
-            or key == "cute_mma_dag_split"
-            or key == "cute_mma_dag_derived"
-            or key == "cute_mma_dag_epilogue"
-            or key == "cute_mma_dag_lookahead"
-            or key.startswith(
-                ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
-            )
-        ):
+        if key in _CUTE_CONFIG_KEYS or key.startswith(_CUTE_CONFIG_KEY_PREFIXES):
             return True
         return super().supports_config_key(key)
 
@@ -2445,14 +2463,28 @@ class CuteBackend(Backend):
 
     @staticmethod
     def _compiled_kernels(compiled_fn: object, kernel_name: str) -> tuple[object, ...]:
+        """The CuTe kernel objects the generated host function launches: the
+        kernel proper and the zero-fill kernels its host zero fills launch
+        as under ``cute_pdl`` (``host_zero_fill_launches``, named
+        ``_helion_zero_fill_<n>_helion_<kernel_name>``), or the bundle a
+        multi-stage module declares (``_helion_cute_kernels``)."""
         bundled = getattr(compiled_fn, "_helion_cute_kernels", None)
         if isinstance(bundled, tuple):
             return bundled
         fn_globals = getattr(compiled_fn, "__globals__", None)
         if not isinstance(fn_globals, dict):
             return ()
-        kernel = fn_globals.get(f"_helion_{kernel_name}")
-        return () if kernel is None else (kernel,)
+        name = f"_helion_{kernel_name}"
+        kernel = fn_globals.get(name)
+        if kernel is None:
+            return ()
+        fills = sorted(
+            key
+            for key in fn_globals
+            if key.startswith(ZERO_FILL_KERNEL_PREFIX)
+            and key.endswith(f"_{name.lstrip('_')}")
+        )
+        return (kernel, *(fn_globals[key] for key in fills))
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object
@@ -2504,10 +2536,15 @@ class CuteBackend(Backend):
         if not isinstance(fn_name, str):
             return None
         kernels = self._compiled_kernels(compiled_fn, fn_name)
-        if len(kernels) != 1:
+        # One module, one hash: the kernel proper and its zero-fill kernels
+        # carry the same one (``annotate_compiled_module``).
+        hashes = {
+            getattr(cute_kernel, "_helion_cute_source_hash", None)
+            for cute_kernel in kernels
+        }
+        if len(hashes) != 1:
             return None
-        cute_kernel = kernels[0]
-        source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
+        (source_hash,) = hashes
         return source_hash if isinstance(source_hash, str) else None
 
     def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
@@ -2595,6 +2632,7 @@ class CuteBackend(Backend):
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
             "_cute_nan_max": "from helion._compiler.cute.reduce_helpers import _cute_nan_max",
             "_cute_nan_min": "from helion._compiler.cute.reduce_helpers import _cute_nan_min",
+            "_helion_pdl_spread_keep": "from helion._compiler.cute._pdl_spread_runtime import keep_smem_live as _helion_pdl_spread_keep",
             "_cute_aux_copy_layout": "from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout as _cute_aux_copy_layout",
             "_helion_tcgen05_pipeline": (
                 "from helion._compiler.cute import tcgen05_pipeline "
@@ -2608,6 +2646,16 @@ class CuteBackend(Backend):
                 "from helion._compiler.cute.epilogue_helpers import "
                 "sigmoid_approx_ftz_f32 as _cute_sigmoid_approx_ftz_f32"
             ),
+            "_cute_mma_f16": "from helion._compiler.cute._flash_row_mma_runtime import mma_f16 as _cute_mma_f16",
+            "_cute_mma_bf16": "from helion._compiler.cute._flash_row_mma_runtime import mma_bf16 as _cute_mma_bf16",
+            "_cute_ring_cp_async_16": "from helion._compiler.cute._flash_row_mma_runtime import cp_async_16 as _cute_ring_cp_async_16",
+            "_cute_ring_cp_async_16_zfill": "from helion._compiler.cute._mma_dag_runtime import cp_async_16_zfill as _cute_ring_cp_async_16_zfill",
+            "_cute_ring_ldmatrix_x4": "from helion._compiler.cute._flash_row_mma_runtime import ldmatrix_x4 as _cute_ring_ldmatrix_x4",
+            "_cute_ring_lds_b32": "from helion._compiler.cute._mma_dag_runtime import lds_b32 as _cute_ring_lds_b32",
+            "_cute_ring_lds_f32": "from helion._compiler.cute._flash_row_mma_runtime import lds_f32 as _cute_ring_lds_f32",
+            "_cute_ring_sts_f32": "from helion._compiler.cute._flash_row_mma_runtime import sts_f32 as _cute_ring_sts_f32",
+            "_cute_lds_v4_b32": "from helion._compiler.cute._warp_mma_runtime import lds_v4_b32 as _cute_lds_v4_b32",
+            "_cute_sts_v4_b32": "from helion._compiler.cute._warp_mma_runtime import sts_v4_b32 as _cute_sts_v4_b32",
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
             "_cute_grouped_reduce_shared_two_stage_fragment": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage_fragment",
@@ -2656,6 +2704,8 @@ class CuteBackend(Backend):
             "_cute_store_fp8e5m2_vec_l2_evict_last": "from helion._compiler.cute.packet_store_helpers import store_fp8e5m2_vec_l2_evict_last as _cute_store_fp8e5m2_vec_l2_evict_last",
             "_cute_store_u32_vec": "from helion._compiler.cute.vec_utils import store_u32_vec as _cute_store_u32_vec",
             "_cute_red_add_f32_vec": "from helion._compiler.cute.vec_utils import red_add_f32_vec as _cute_red_add_f32_vec",
+            "_cute_red_add_f16_vec": "from helion._compiler.cute.vec_utils import red_add_f16_vec as _cute_red_add_f16_vec",
+            "_cute_red_add_bf16_vec": "from helion._compiler.cute.vec_utils import red_add_bf16_vec as _cute_red_add_bf16_vec",
             "_cute_rank1_pack_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_pack_bf16x2 as _cute_rank1_pack_bf16x2",
             "_cute_rank1_mul_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_mul_bf16x2 as _cute_rank1_mul_bf16x2",
             "_cute_rank1_add_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_add_bf16x2 as _cute_rank1_add_bf16x2",
@@ -2688,6 +2738,10 @@ class CuteBackend(Backend):
             "_cute_load_l1_l2_evict_last_4b": "from helion._compiler.cute.l2_policy import load_v4b_l1_l2_evict_last as _cute_load_l1_l2_evict_last_4b",
             "_cute_store_u16x8_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u16x8_l2_evict_last as _cute_store_u16x8_l2_evict_last",
             "_cute_store_u32x4_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u32x4_l2_evict_last as _cute_store_u32x4_l2_evict_last",
+            "_cute_store_u16x8_streaming": "from helion._compiler.cute.l2_policy import store_u16x8_streaming as _cute_store_u16x8_streaming",
+            "_cute_store_u32x4_streaming": "from helion._compiler.cute.l2_policy import store_u32x4_streaming as _cute_store_u32x4_streaming",
+            "_cute_store_fp8e4m3fn_vec_streaming": "from helion._compiler.cute.packet_store_helpers import store_fp8e4m3fn_vec_streaming as _cute_store_fp8e4m3fn_vec_streaming",
+            "_cute_store_fp8e5m2_vec_streaming": "from helion._compiler.cute.packet_store_helpers import store_fp8e5m2_vec_streaming as _cute_store_fp8e5m2_vec_streaming",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
             "_cute_tmem_store_atom": "from helion._compiler.cute.split_k_exchange import tmem_store_atom as _cute_tmem_store_atom",
             "_cute_join_cast": "from helion._compiler.cute.join_cast import join_cast as _cute_join_cast",

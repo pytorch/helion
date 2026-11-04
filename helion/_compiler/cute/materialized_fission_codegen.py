@@ -23,6 +23,7 @@ from ...exc import InvalidConfig
 from ...language import _tracing_ops
 from ...language.reduce_ops import _reduce
 from ...language.scan_ops import _associative_scan
+from ..active_blocks import active_block_ids
 from ..ast_extension import ExtendedAST
 from ..ast_extension import LoopType
 from ..ast_extension import statement_from_string
@@ -31,7 +32,6 @@ from ..device_ir import KernelPhase
 from ..device_ir import RootGraphInfo
 from ..host_function import HostFunction
 from ..output_header import get_needed_import_lines
-from .active_blocks import active_block_ids
 from .host_zero_fills import lower_host_zero_fills
 from .tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY

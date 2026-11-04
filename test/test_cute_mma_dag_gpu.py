@@ -24,6 +24,7 @@ import torch
 import helion
 from helion import exc
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.runtime.cute import sass_check
@@ -46,7 +47,7 @@ LAUNCHES = 8
 
 
 def _engine() -> object:
-    return importlib.import_module("examples.linear.linear_attention_engine")
+    return importlib.import_module("helion.experimental.linear_attention")
 
 
 def _randn(
@@ -2101,7 +2102,7 @@ def test_varying_bound_loops_mask_the_partial_trip(
 
 
 def test_mamba2_chunk_scan_matches_the_triton_backend() -> None:
-    module = importlib.import_module("examples.mamba2_chunk_scan")
+    module = import_example("mamba2_chunk_scan")
     fn = module.helion_mamba2_chunk_scan_kernel.fn
     g = torch.Generator(device=DEVICE).manual_seed(0)
     batch, heads, groups, seq, chunk, d, ds = 2, 8, 2, 512, 64, 64, 64
@@ -2255,7 +2256,7 @@ def test_a_partial_trip_does_not_read_the_other_operand_past_the_bound() -> None
     # x's rows are now zeroed in shared memory too, so an Inf planted in
     # the chunk's last row (read legitimately only by the second row tile)
     # leaves the first row tile's output finite, as in the reference.
-    module = importlib.import_module("examples.mamba2_chunk_scan")
+    module = import_example("mamba2_chunk_scan")
     fn = module.helion_mamba2_chunk_scan_kernel.fn
     g = torch.Generator(device=DEVICE).manual_seed(1)
     batch, heads, groups, seq, chunk, d, ds = 1, 4, 1, 256, 64, 64, 64

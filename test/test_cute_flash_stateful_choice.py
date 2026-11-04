@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.attention import causal_attention_output
 import pytest
 import torch
 
@@ -29,10 +28,13 @@ from helion._compiler.cute.attention_plan import AttentionScoreModifier
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.flash_tuning import FlashTuningPolicy
 from helion._compiler.cute.mma_support import CuteMmaSupport
+from helion._testing import import_example
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
+
+causal_attention_output = import_example("attention").causal_attention_output
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

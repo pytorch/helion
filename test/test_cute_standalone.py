@@ -9,14 +9,16 @@ import textwrap
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
-from examples.attention import attention_output
 import pytest
 import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+attention_output = import_example("attention").attention_output
 
 if TYPE_CHECKING:
     from pathlib import Path

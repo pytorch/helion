@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 
@@ -10,7 +9,10 @@ from helion._compiler.autotuner_heuristics.cute import (
 )
 from helion._compiler.cute.grouped_row_union import AB_STAGES_KEY
 from helion._compiler.cute.grouped_row_union import STARTUP_PREFILL_KEY
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -55,7 +57,7 @@ def test_ordinary_paired_profile_cuda(
         config.config[AB_STAGES_KEY] = ab_stages
         with bound.env:
             assert bound.config_spec.normalized_config(config)[AB_STAGES_KEY] == 4
-        assert "PipelineTmaUmma.create(num_stages=4," in bound.to_code(config)
+        assert "make_tma_umma_pipeline(num_stages=4," in bound.to_code(config)
     bound.set_config(config)
     # The public function allocates output on every invocation. The partial case
     # covers [17,617), with empty groups and uncovered prefix/suffix rows; its

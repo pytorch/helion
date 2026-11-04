@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import gc
 import math
 import os
 import re
@@ -9,9 +10,8 @@ from typing import Any
 from typing import Callable
 from typing import cast
 import unittest
+import weakref
 
-from examples.geglu import _geglu_pallas as _geglu_pallas_example
-from examples.swiglu import _swiglu_fwd_pallas as _swiglu_fwd_pallas_example
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
@@ -22,6 +22,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import _bound_test_config
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallas
 from helion._testing import skipIfPallasInterpret
@@ -33,6 +34,9 @@ from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
+
+_geglu_pallas_example = import_example("geglu")._geglu_pallas
+_swiglu_fwd_pallas_example = import_example("swiglu")._swiglu_fwd_pallas
 
 if TYPE_CHECKING:
     from helion.autotuner.base_search import PopulationBasedSearch
@@ -287,7 +291,7 @@ def pallas_sum_reduce_multiple(x: torch.Tensor) -> torch.Tensor:
     b, _n, _m = x.size()
     out = torch.empty([b], dtype=x.dtype, device=x.device)
     for tile_b in hl.tile(b):
-        out[tile_b] = x[tile_b, :, :].sum([0, 1])
+        out[tile_b] = x[tile_b, :, :].sum([1, 2])
     return out
 
 
@@ -3222,8 +3226,8 @@ class TestPallas(TestCase):
 
     def test_sum_reduce_multiple(self) -> None:
         x = torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32)
-        with self.assertRaises(NotImplementedError):
-            code_and_output(pallas_sum_reduce_multiple, (x,), block_size=2)
+        _, result = code_and_output(pallas_sum_reduce_multiple, (x,), block_sizes=[2])
+        torch.testing.assert_close(result, x.sum((1, 2)))
 
     def test_max_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
@@ -3575,6 +3579,30 @@ class TestPallas(TestCase):
             f"{(reference.float() - baseline_result.float()).abs().max().item()}).",
         )
 
+    def test_pallas_launcher_cache_does_not_leak_arguments(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scale_rows(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+            m, _ = x.shape
+            out = torch.empty_like(x)
+            for _g in hl.grid(1):
+                for outer in hl.tile(4, m, block_size=8):
+                    for inner in hl.tile(outer.begin, outer.end):
+                        out[inner, :] = x[inner, :] + bias[:, :]
+            return out
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(1, 128, device=DEVICE, dtype=torch.float32)
+        fn = scale_rows.bind((x, bias)).compile_config(
+            helion.Config(block_sizes=[8], pallas_loop_type="fori_loop")
+        )
+        x_ref = weakref.ref(x)
+        bias_ref = weakref.ref(bias)
+        torch.testing.assert_close(fn(x, bias)[4:], (x + bias)[4:])
+        del x, bias
+        gc.collect()
+        self.assertIsNone(x_ref())
+        self.assertIsNone(bias_ref())
+
     def test_pallas_autotuner_final_pick_picks_true_best_on_noisy_initial_rank(
         self,
     ) -> None:
@@ -3895,6 +3923,77 @@ class TestPallas(TestCase):
             5.0,
             f"identical jit_fns should give a near-zero paired delta; got {delta_micros!r}",
         )
+
+    @skipIfPallasInterpret(
+        "device-µs ranking needs a real TPU; CPU-interpret has no /device:TPU events"
+    )
+    def test_pallas_device_micros_waits_for_torch_launched_kernel(self) -> None:
+        from helion.autotuner.benchmarking import _pallas_device_micros_for_fn
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[256, 1024]),
+        )
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        x = torch.randn(32768, 4096, device=DEVICE)  # 512 MiB per operand
+        y = torch.randn(32768, 4096, device=DEVICE)
+        micros = _pallas_device_micros_for_fn(
+            lambda: add(x, y), n_calls=100, n_warmup=5
+        )
+        self.assertTrue(
+            math.isfinite(micros) and micros > 0,
+            f"device µs must be finite for a torch-launched kernel; got {micros!r}",
+        )
+
+    def test_wall_clock_benches_time_failed_executions_as_inf(self) -> None:
+        from unittest.mock import patch
+
+        from helion.autotuner import benchmarking
+
+        with patch.object(benchmarking, "_execution_failed", return_value=True):
+            for probe_long_kernel in (False, True):
+                self.assertEqual(
+                    benchmarking.do_bench_generic(
+                        lambda: None,
+                        return_mode="median",
+                        fixed_repetitions=None if probe_long_kernel else 3,
+                        probe_long_kernel=probe_long_kernel,
+                    ),
+                    math.inf,
+                )
+
+        ok_calls = 0
+        failing_calls = 0
+
+        def ok() -> str:
+            nonlocal ok_calls
+            ok_calls += 1
+            return "ok"
+
+        def failing() -> str:
+            nonlocal failing_calls
+            failing_calls += 1
+            return "failed"
+
+        with patch.object(
+            benchmarking,
+            "_execution_failed",
+            side_effect=lambda output: output == "failed",
+        ):
+            timings = benchmarking.interleaved_bench_generic([ok, failing], repeat=5)
+        self.assertTrue(math.isfinite(timings[0]), timings)
+        # Only the candidate whose output fails on the device is scored as inf.
+        self.assertEqual(timings[1], math.inf)
+        # 1 warm-up + 5 timed repeats for ok; 1 warm-up + 1 failed timed run
+        # for failing (not re-run after failing).
+        self.assertEqual(ok_calls, 6)
+        self.assertEqual(failing_calls, 2)
 
     @skipIfPallasInterpret(
         "device-sync semantics need a real TPU; CPU-interpret executes synchronously"

@@ -27,17 +27,18 @@ from helion._compiler.cute.philox_packets import lower_philox_packets
 from helion._compiler.cute.philox_stream import PACKET_ASM
 from helion._compiler.cute.philox_stream import SCALAR_ASM
 from helion._compiler.cute.philox_stream import SCALAR_CONSTRAINTS
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 
 
 def _source(width=4, predicate="index < length", extra=""):
-    return f"""def kernel(src, out, seed_tensor, start, length, p, scale, other):
+    return f"""def kernel(src, out, seed, start, length, p, scale, other):
     for vec_lane_0 in cutlass.range_constexpr({width}):
         index = cutlass.Int32(start) + cutlass.Int32(vec_lane_0)
         mask = {predicate}
         value = (src.iterator + cutlass.Int32(index) * cutlass.Int32(src.layout.stride[0])).load() if mask else cutlass.Float32(0)
         offset = cutlass.Int64(index)
-        random = _cute_inline_asm_elementwise((seed_tensor[0], offset), asm={SCALAR_ASM!r}, constraints={SCALAR_CONSTRAINTS!r}, dtype=cutlass.Float32, is_pure=True)
+        random = _cute_inline_asm_elementwise((cutlass.Int64(seed), offset), asm={SCALAR_ASM!r}, constraints={SCALAR_CONSTRAINTS!r}, dtype=cutlass.Float32, is_pure=True)
         {extra or "unused = 0"}
         keep = operator.gt(random, p)
         result = cutlass.Float32(value * scale) if keep else cutlass.Float32(0)
@@ -68,7 +69,7 @@ def _rewrite(source, *, aligned=True, disjoint=True, stride=1):
 
     tree.body[0].body = lower_philox_packets(
         tree.body[0].body,
-        seed_names={"seed_tensor"},
+        seed_exprs={"cutlass.Int64(seed)"},
         integer_names={"start", "length"},
         new_name=lambda prefix: f"{prefix}_{next(names)}",
         vectorize_packet=vectorize,
@@ -121,7 +122,7 @@ def _run(tree, *, start=0, length=4, seed=123, p=0.25, scale=4 / 3, stride=1):
     out = _Tensor(
         iterator=_Pointer(output, stats), layout=SimpleNamespace(stride=(stride,))
     )
-    namespace["kernel"](src, out, [seed], start, length, p, scale, [2])
+    namespace["kernel"](src, out, seed, start, length, p, scale, [2])
     # The imported pointer fixture stores Python floats. Model the actual
     # FP32 output storage on both paths; this corpus never rereads the output.
     return [_f32(value) for value in output], stats
@@ -204,7 +205,7 @@ def test_packet_tuple_grant_does_not_allow_other_reads_or_calls(extra):
 @pytest.mark.usefixtures("cpu_only")
 @skipUnlessBackends(["cute"])
 def test_original_dynamic_cpu_emission_composes_packet_and_vector_io(geometry):
-    from examples.low_mem_dropout import low_mem_dropout
+    low_mem_dropout = import_example("low_mem_dropout").low_mem_dropout
 
     block, threads, width = geometry
     bound = helion.kernel(
@@ -222,7 +223,8 @@ def test_original_dynamic_cpu_emission_composes_packet_and_vector_io(geometry):
     )
     source = bound.to_code(config)
     assert "cute.arch.load(" in source and "_cute_store_u32_vec(" in source
-    assert "philox_packet_" in source and "_cute_stage_explicit_seed" in source
+    assert "philox_packet_" in source and "cutlass.Int64(seed)" in source
+    assert "_cute_stage_explicit_seed" not in source
     assert SCALAR_ASM in [
         node.value
         for node in ast.walk(ast.parse(source))

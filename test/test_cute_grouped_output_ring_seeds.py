@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 
@@ -44,10 +43,14 @@ from helion._compiler.autotuner_heuristics.cute import (
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessTcgen05RuntimeNPtx
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -254,9 +257,20 @@ def test_original_shapes_cover_output_ring_and_preserve_seed_prefix(
         previous_tail, seed_tail = previous_tail[:-2], seed_tail[:-2]
         assert all(seed not in suffix for seed in (*previous_tail, *seed_tail))
     if row_union is not None:
-        assert previous_tail[-1] == seed_tail[-1] == row_union
-        previous_tail, seed_tail = previous_tail[:-1], seed_tail[:-1]
-        assert row_union not in previous_tail and row_union not in seed_tail
+        # The transposed carrier and its measured twin (6-stage ring, epilogue
+        # rounds of two subtiles).
+        twin = copy.deepcopy(row_union)
+        twin.config["tcgen05_grouped_row_union_ab_stages"] = 6
+        twin.config["tcgen05_epi_round_subtiles"] = 2
+        # ... and that twin without the setmaxnreg pair (no consumer-register
+        # pin: the knob forbids it).
+        no_reallocation = copy.deepcopy(twin)
+        no_reallocation.config.pop("tcgen05_consumer_regs", None)
+        no_reallocation.config["tcgen05_warp_register_reallocation"] = False
+        transposed = [row_union, twin, no_reallocation]
+        assert previous_tail[-3:] == seed_tail[-3:] == transposed
+        previous_tail, seed_tail = previous_tail[:-3], seed_tail[:-3]
+        assert all(seed not in transposed for seed in (*previous_tail, *seed_tail))
     if source64 is not None:
         assert previous_tail[-1] == seed_tail[-1] == source64
         previous_tail, seed_tail = previous_tail[:-1], seed_tail[:-1]
@@ -366,6 +380,7 @@ def test_rank3_device_metadata_reuses_the_same_output_ring_family(
 
 
 @skipUnlessBackends(["cute"])
+@skipUnlessTcgen05RuntimeNPtx
 def test_external_worklist_keeps_its_existing_policy() -> None:
     values = (
         torch.empty((448, 128), dtype=torch.bfloat16),

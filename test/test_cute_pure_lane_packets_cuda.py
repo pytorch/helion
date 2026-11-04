@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from examples.low_mem_dropout import low_mem_dropout
-from examples.low_mem_dropout import low_mem_dropout_bwd
 import pytest
 import torch
 
@@ -11,8 +9,13 @@ from test.test_cute_philox_stream import _oracle
 
 import helion
 from helion._compiler.rng_utils import philox_rand_ref
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+_examples_low_mem_dropout = import_example("low_mem_dropout")
+low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
+low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 
 CUDA_DEVICE = "cuda"
 

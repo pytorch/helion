@@ -121,6 +121,11 @@ _COMPILE_CONFIG_FAILURE_SOURCE_DOMAIN = b"helion.compile_config_failure.v1\0"
 # How many configs the accuracy baseline may try, counting the autotuning
 # reference config itself, before giving up (see _compute_reference_baseline).
 _MAX_REFERENCE_BASELINE_ATTEMPTS = 4
+# Configs sampled from the search space and tried for the accuracy baseline
+# when the compiler refuses the autotuning reference config (and every shrink
+# of it): a kernel whose conservative lowering a backend declines can still
+# have configs that run.
+_MAX_SAMPLED_BASELINE_ATTEMPTS = 8
 # The relative L2 difference the execution default's outputs (and the
 # arguments it mutates) may show against the autotuning reference config's
 # before the search is refused (``_compute_reference_baseline``): two correct
@@ -761,6 +766,15 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self.mutated_arg_indices,
             self._baseline_post_args,
         ) = self._compute_baseline()
+        # The baseline runs -- two configs, each on its own copy of the
+        # arguments, and the comparison of their outputs in fp32 -- leave this
+        # process's caching allocator holding several times the arguments'
+        # size, freed but reserved.  The benchmark worker is another process
+        # and cannot use that memory: at welford's (262144, 8192) bf16 it was
+        # over 40 GiB of an 80 GB H100, leaving the worker too little to run
+        # some configs.  Give it back to the device before the search starts.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self._effective_atol, self._effective_rtol = (
             self._compute_effective_tolerances()
         )
@@ -1141,7 +1155,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         reference = self.config_spec.autotune_reference_config()
         execution = self.config_spec.default_config()
         if execution.config == reference.config:
-            return self._run_baseline_config(reference, "Autotuning reference config")
+            return self._run_reference_or_sampled_baseline(reference)
         try:
             promoted = self._run_baseline_config(
                 execution, "Execution default", shrink=False
@@ -1161,7 +1175,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 f"accuracy baseline ({e}); retrying with the autotuning "
                 "reference config"
             )
-            return self._run_baseline_config(reference, "Autotuning reference config")
+            return self._run_reference_or_sampled_baseline(reference)
         # The default's output is the baseline, once the reference agrees
         # with it: the accuracy check judges every candidate against the
         # baseline, so a default whose lowering is wrong would reject the
@@ -1202,6 +1216,67 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 "baseline (e.g. a PyTorch eager implementation of your kernel)."
             )
         return promoted
+
+    def _run_reference_or_sampled_baseline(
+        self, reference: Config
+    ) -> tuple[object, Sequence[object]]:
+        """The autotuning reference config's baseline run, or, when the
+        compiler refuses it and every shrink of it, the first of a few configs
+        sampled from the search space that runs (``_sampled_baseline_configs``).
+
+        A backend can decline a kernel's conservative lowering for a reason no
+        block size fixes (the cute backend refuses an ``hl.split`` exchange
+        its lane-loop proof cannot settle under the default layouts) while
+        other points of the search space compile and run; without a baseline
+        the search never starts.  Any config that runs is as good an oracle
+        as the reference was: both are lowerings of the kernel over its
+        input.  An unrecoverable runtime error, or a failure the backend
+        classifies as a bug rather than a config's (``_can_back_off_baseline``),
+        still stops the search right away."""
+        try:
+            return self._run_baseline_config(reference, "Autotuning reference config")
+        except exc.InvalidConfig as error:
+            cause = error.__cause__
+            if _baseline_failure_is_unrecoverable(error) or (
+                isinstance(cause, Exception) and not self._can_back_off_baseline(cause)
+            ):
+                # The device is in a bad state, or a bug no config avoids.
+                raise
+            error.__traceback__ = None
+            reference_error = error
+        for config in self._sampled_baseline_configs(_MAX_SAMPLED_BASELINE_ATTEMPTS):
+            try:
+                result = self._run_baseline_config(
+                    config, "Sampled baseline config", shrink=False
+                )
+            except Exception as e:
+                if _baseline_failure_is_unrecoverable(e):
+                    raise
+                e.__traceback__ = None
+                self.log.warning(f"Sampled baseline config {config} failed ({e})")
+                continue
+            cause = reference_error.__cause__ or reference_error
+            self.log.warning(
+                f"Using the sampled config {config} for the accuracy baseline; "
+                f"the autotuning reference config {reference} failed to run ({cause})"
+            )
+            return result
+        raise reference_error
+
+    def _sampled_baseline_configs(self, count: int) -> list[Config]:
+        """Up to ``count`` random configs of the search space to try for the
+        baseline; none when the spec cannot generate them."""
+        from .config_generation import ConfigGeneration
+
+        try:
+            generation = ConfigGeneration(
+                self.config_spec,
+                process_group_name=self.kernel.env.process_group_name,
+            )
+            return [generation.random_config() for _ in range(count)]
+        except Exception as e:
+            self.log.warning(f"No sampled baseline configs: {e}")
+            return []
 
     def _run_baseline_config(
         self, config: Config, role: str, *, shrink: bool = True
@@ -2850,7 +2925,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return None
 
         if self._benchmark_worker is None:
-            self._benchmark_worker = BenchmarkWorker(device=None)
+            self._benchmark_worker = BenchmarkWorker(
+                device=None, log_warning=self.log.warning
+            )
 
         if (
             len(self.mutated_arg_indices) > 0
@@ -2900,7 +2977,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return None
 
         if self._benchmark_worker is None:
-            self._benchmark_worker = BenchmarkWorker(device=None)
+            self._benchmark_worker = BenchmarkWorker(
+                device=None, log_warning=self.log.warning
+            )
 
         job = BenchmarkJob(
             fn_spec=fn_spec,

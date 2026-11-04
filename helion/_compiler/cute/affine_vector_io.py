@@ -65,12 +65,18 @@ _COORDINATE_CALLS = frozenset(("cute.arch.thread_idx", "cute.arch.block_idx"))
 _COMPARISON_CALLS = frozenset(
     f"operator.{name}" for name in ("lt", "le", "gt", "ge", "eq", "ne")
 )
+# Elementwise ``cute.math`` calls, including the fast-math forms the setting
+# rewrites exp/division into (``exp2(fma(x, log2e, -m), fastmath=True)``,
+# ``div(a, b, approx=True, ftz=True)``): all pure, so a body using them still
+# vectorizes its loads and stores.
 _PURE = frozenset(
     f"cute.math.{name}"
     for name in (
         "abs",
+        "div",
         "exp",
         "exp2",
+        "fma",
         "log",
         "log2",
         "max",
@@ -165,11 +171,17 @@ def _offset_affine_form(
     return ({ast.unparse(node): 1}, 0)
 
 
+# Lane-loop extents the vectorizer packs: every ``cute_vector_widths`` choice
+# above one.  A width wider than one sixteen-byte packet (16 lanes of a 16-bit
+# dtype) issues several packets per access site (``memory_width``).
+_LANE_EXTENTS = (2, 4, 8, 16)
+
+
 def _affine_loop_candidate(loop: ast.For) -> bool:
     return (
         isinstance(loop.target, ast.Name)
         and _LANE.fullmatch(loop.target.id) is not None
-        and _range_extent(loop) in (2, 4, 8)
+        and _range_extent(loop) in _LANE_EXTENTS
     )
 
 
@@ -692,11 +704,12 @@ class _Vectorizer:
         return _definition_snapshots(body)
 
     def memory_width(self, width: int, itemsize: int) -> int:
-        if self.register_accesses:
-            # An eight-lane RNG packet may need two sixteen-byte transactions.
-            # Alignment and the complete-fragment guard still cover all lanes.
-            return min(width, 16 // itemsize)
-        return width
+        # Lanes per memory transaction: a lane loop wider than sixteen bytes
+        # (an eight-lane RNG packet of fp32, a ``cute_vector_widths`` of 16
+        # on a 16-bit dtype) issues several sixteen-byte packets per access
+        # site instead of declining to a scalar loop.  Alignment and the
+        # complete-fragment guard still cover all lanes.
+        return min(width, 16 // itemsize)
 
     def specialize_mask(
         self, loop: ast.For, predicate: ast.expr, lane: str, value: bool
@@ -1015,8 +1028,10 @@ class _Vectorizer:
                     raise _Decline
                 carrier, itemsize, helper = info
                 memory_width = self.memory_width(width, itemsize)
-                if memory_width * itemsize > 16 or self.alignments.get(root, 1) % (
-                    memory_width * itemsize
+                if (
+                    memory_width * itemsize > 16
+                    or width % memory_width
+                    or self.alignments.get(root, 1) % (memory_width * itemsize)
                 ):
                     raise _Decline
                 local = snapshots[site.statement]

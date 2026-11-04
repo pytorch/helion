@@ -16,7 +16,13 @@ import torch
 from ...language import _decorators
 from ...language.memory_ops import _maybe_materialize_tile_index_load
 from ...language.memory_ops import load
+from ...language.memory_ops import prefetch
+from ...language.memory_ops import prefetch_is_bulk
 from ...language.memory_ops import store
+from ..ast_extension import statement_from_string
+from ..compile_environment import CompileEnvironment
+from ..indexing_strategy import SubscriptIndexing
+from ..indexing_strategy import _resolve_codegen_block_id
 from .distributed_ops import inband_load_codegen
 from .distributed_ops import inband_store_codegen
 
@@ -201,3 +207,93 @@ def _(state: CodegenState) -> ast.AST:
             cache_modifier,
         )
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
+
+
+def _prefetch_asm(*, bulk: bool, scalar: bool) -> str:
+    """PTX for one L2 prefetch per element of the pointer operand ($1).
+
+    The plain form issues ``prefetch.global.L2`` unless the int32 predicate
+    ($2) is 0.  The bulk form's $2 is a byte count instead, skipped unless
+    positive, and widens [$1, $1 + $2) to the 16-byte granules
+    ``cp.async.bulk`` requires (a granule never crosses a page).  A scalar
+    prefetch is issued by thread 0 alone instead of by every thread.
+    """
+    if bulk:
+        regs = ".reg .pred p; .reg .b32 t, n; .reg .b64 a, e;"
+        test = "setp.gt.s32 p, $2, 0;"
+        issue = (
+            "and.b64 a, $1, -16; cvt.s64.s32 e, $2; add.s64 e, e, $1; "
+            "add.s64 e, e, 15; and.b64 e, e, -16; sub.s64 e, e, a; "
+            "cvt.u32.u64 n, e; @p cp.async.bulk.prefetch.L2.global [a], n;"
+        )
+    else:
+        regs = ".reg .pred p; .reg .b32 t;"
+        test = "setp.ne.b32 p, $2, 0;"
+        issue = "@p prefetch.global.L2 [$1];"
+    if scalar:
+        test += " mov.u32 t, %tid.x; setp.eq.and.u32 p, t, 0, p;"
+    return f"{{ {regs} {test} {issue} }} mov.u32 $0, 0;"
+
+
+def _prefetch_row_segment(
+    state: CodegenState, tensor: torch.Tensor, last: object
+) -> tuple[str, str] | None:
+    """(first element, element count) of the row segment a bulk prefetch's
+    last index covers, or None when its tile has no block size variable."""
+    size = state.device_function.tensor_size(tensor, tensor.ndim - 1).name
+    if isinstance(last, slice):
+        return "0", size
+    assert isinstance(last, torch.SymInt)
+    block_id = CompileEnvironment.current().get_block_id(last)
+    assert block_id is not None
+    block_id = _resolve_codegen_block_id(state, block_id)
+    block = state.device_function.block_size_var(block_id)
+    if block is None:
+        return None
+    start = state.codegen.offset_var(block_id)
+    if state.codegen.mask_var(block_id) is None:
+        return start, block
+    return start, f"tl.minimum({block}, {size} - {start})"
+
+
+@_decorators.codegen(prefetch, "triton")
+def _(state: CodegenState) -> None:
+    if CompileEnvironment.current().ptx_capability is None:
+        return None  # both prefetch instructions are PTX
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    extra_mask = state.ast_args[2]
+    assert isinstance(extra_mask, (type(None), ast.AST))
+    name = state.device_function.tensor_arg(tensor).name
+    segment = None
+    if prefetch_is_bulk(tensor, [*subscript], extra_mask is not None):
+        segment = _prefetch_row_segment(state, tensor, subscript[-1])
+    if segment is not None:
+        # One bulk prefetch per element of the leading indices.
+        start, count = segment
+        index = [*subscript[:-1], 0]
+        indexing = SubscriptIndexing.create(state, tensor, index)
+        nbytes = f"({count}) * {tensor.element_size()}"
+        operand = f"tl.where({{mask}}, {nbytes}, 0)" if indexing.has_mask() else nbytes
+        pointer = f"{name} + ({{offset}} + {start})"
+    else:
+        index = [*subscript]
+        indexing = SubscriptIndexing.create(state, tensor, index, extra_mask)
+        operand = "{mask}" if indexing.has_mask() else "1"
+        pointer = f"{name} + {{offset}}"
+    scalar = extra_mask is None and not SubscriptIndexing.compute_shape(
+        tensor, index, state
+    )
+    asm = _prefetch_asm(bulk=segment is not None, scalar=scalar)
+    state.add_statement(
+        statement_from_string(
+            f"tl.inline_asm_elementwise({asm!r}, '=r,l,r', "
+            f"[{pointer}, tl.cast({operand}, tl.int32)], "
+            "dtype=tl.int32, is_pure=False, pack=1)",
+            offset=indexing.index_expr,
+            mask=indexing.mask_expr,
+        )
+    )
+    return None

@@ -6,7 +6,6 @@ from itertools import starmap
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from examples.jagged_layer_norm import jagged_layer_norm_kernel
 import pytest
 import torch
 
@@ -18,7 +17,10 @@ from test.test_cute_sibling_loop_threads import _row_ir
 import helion
 from helion._compiler.tile_dispatch import TileStrategyDispatch
 from helion._compiler.tile_strategy import PerThreadNDTileStrategy
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+jagged_layer_norm_kernel = import_example("jagged_layer_norm").jagged_layer_norm_kernel
 
 
 def _code(blocks: list[int], threads: list[int], vec: int = 4) -> str:

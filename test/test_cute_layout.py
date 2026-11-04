@@ -1035,8 +1035,8 @@ def test_unit_tile_beside_a_sliced_dim_matches_reference(correction: bool) -> No
     ``a[:, None]`` broadcast used to get a one-float shared-memory round trip
     written by all D threads (a seed that only saw the unit tile), returning
     garbage for the state and the output."""
-    from examples.linear.linear_attention_engine import recurrent_step_correction_fused
-    from examples.linear.linear_attention_engine import recurrent_step_fused
+    from helion.experimental.linear_attention import recurrent_step_correction_fused
+    from helion.experimental.linear_attention import recurrent_step_fused
 
     source = recurrent_step_correction_fused if correction else recurrent_step_fused
     kernel = helion.kernel(

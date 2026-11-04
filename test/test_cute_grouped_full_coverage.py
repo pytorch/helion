@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 from typing import Any
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
@@ -33,9 +32,12 @@ from helion._compiler.autotuner_heuristics.cute import (
 from helion._compiler.autotuner_heuristics.cute import _tcgen05_grouped_worklist_config
 from helion._compiler.autotuner_heuristics.cute import grouped_full_coverage_configs
 from helion._compiler.cute.grouped_full_coverage import full_coverage_index_domain
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if TYPE_CHECKING:
     from collections.abc import Generator

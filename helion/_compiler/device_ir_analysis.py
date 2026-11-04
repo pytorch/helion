@@ -207,7 +207,7 @@ def _load_needs_eviction_tunable(node: torch.fx.Node) -> bool:
 
 
 # Ops that touch no memory: they route tensors through SSA values and subgraphs,
-# read metadata or only debug.
+# read metadata, only debug or only warm a cache (a prefetch orders nothing).
 _TENSOR_ROUTING_OPS = (
     _tracing_ops._phi,
     _tracing_ops._new_var,
@@ -220,6 +220,7 @@ _TENSOR_ROUTING_OPS = (
     torch.ops.aten.sym_stride.int,
     hl.device_print,
     hl.breakpoint,
+    hl.prefetch,
 )
 
 
@@ -1340,6 +1341,7 @@ class DeviceIRAnalysis:
         from .device_ir import HelperFunctionGraphInfo
         from .device_ir import NodeArgsGraphInfo
         from .device_ir import ReductionLoopGraphInfo
+        from .device_ir import control_flow_parent_ids
 
         dot_targets = frozenset(matmul_operand_positions())
         graph_info_by_graph = {
@@ -1377,7 +1379,7 @@ class DeviceIRAnalysis:
         by_id = {graph.graph_id: graph for graph in graphs}
         child_loops: dict[int, tuple[tuple[int, frozenset[int]], ...]] = {}
         loop_calls: dict[int, list[torch.fx.Node]] = {}
-        graph_parent_of: dict[int, int] = {}
+        graph_parent_of = control_flow_parent_ids(device_ir.graphs)
         for graph in graphs:
             if graph.is_reduction_loop:
                 continue
@@ -1393,8 +1395,6 @@ class DeviceIRAnalysis:
                 body_id = node.args[0]
                 loop_calls.setdefault(body_id, []).append(node)
                 body = by_id.get(body_id)
-                if body is not None:
-                    graph_parent_of[body_id] = graph.graph_id
                 if body is not None and not body.is_reduction_loop:
                     edges.append((body_id, body.block_ids))
             if edges:

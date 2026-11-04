@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
-from examples.jagged_dense_bmm import jagged_dense_bmm
 import pytest
 import torch
 
@@ -15,8 +14,11 @@ from test.test_cute_collective_tf32 import _kernel as _collective_kernel
 from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+jagged_dense_bmm = import_example("jagged_dense_bmm").jagged_dense_bmm
 
 pytestmark = skipUnlessBackends(["cute"])
 

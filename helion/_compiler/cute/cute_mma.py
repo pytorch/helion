@@ -240,6 +240,11 @@ from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from .tcgen05_constants import tcgen05_grouped_worklist_store_shape
 from .tcgen05_constants import tcgen05_role_launch_n_width
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
+from .tcgen05_prologue import floordiv_nonneg_expr
+from .tcgen05_prologue import masked_cluster_rank_expr
+from .tcgen05_prologue import mod_nonneg_expr
+from .tcgen05_prologue import prologue_runtime
+from .tcgen05_prologue import split_barrier_init_supported
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 if TYPE_CHECKING:
@@ -11245,6 +11250,18 @@ def _emit_mma_pipeline(
         assert epi_active is not None
         tcgen05_tmem_setup_emitted = True
 
+        tcgen05_tmem_allocate_stmt = statement_from_string(
+            f"if {tcgen05_plan.exec_active if tcgen05_mma_warp_frees_tmem else epi_active}:\n"
+            f"    {tcgen05_plan.tmem_allocator}.allocate({tcgen05_plan.acc_tmem_cols})"
+            + (
+                f"\n    {tcgen05_plan.tmem_allocator}.relinquish_alloc_permit()"
+                if tcgen05_relinquish_permit_early
+                else ""
+            )
+        )
+        tcgen05_alloc_tmem_before_cluster_wait = (
+            tcgen05_use_cluster_deferred_pipelines and tcgen05_mma_warp_frees_tmem
+        )
         if tcgen05_use_cluster_deferred_pipelines:
             # Keep the two-CTA cluster rendezvous after the AB/acc pipeline
             # objects exist and before any role allocates or retrieves TMEM.
@@ -11253,7 +11270,39 @@ def _emit_mma_pipeline(
                 f"cluster_shape_mn={tcgen05_cluster_layout_vmnk}, "
                 "is_relaxed=True)"
             )
+            # The split mbarrier inits of the deferred pipelines (and the
+            # other one-warp prologue blocks), right ahead of the fence +
+            # cluster arrive that publishes them.
+            if (
+                tcgen05_deferred_barrier_inits
+                and tma_warp is not None
+                and tcgen05_matmul_plan is not None
+                and tcgen05_matmul_plan.tma_warp_id not in tcgen05_deferred_init_warps
+            ):
+                prefix.append(
+                    statement_from_string(
+                        f"if not {tma_warp}:\n"
+                        + "\n".join(
+                            "    " + line
+                            for init_stmt in tcgen05_deferred_barrier_inits
+                            for line in init_stmt.split("\n")
+                        )
+                    )
+                )
+            else:
+                for init_stmt in tcgen05_deferred_barrier_inits:
+                    prefix.append(statement_from_string(init_stmt))
+            tcgen05_deferred_barrier_inits.clear()
             prefix.append(tcgen05_cluster_init_arrive)
+            if tcgen05_alloc_tmem_before_cluster_wait:
+                # The MMA warp's ``tcgen05.alloc`` (cta_group::2: a handshake
+                # with the peer CTA that blocks the issuing warp ~250 ns)
+                # overlaps the cluster rendezvous instead of following it; it
+                # touches no barrier the rendezvous publishes, and the result
+                # is still published by ``wait_for_alloc`` below.  Ahead of
+                # the arrive it would delay the whole cluster's join (+130 ns
+                # per call on grouped_gemm s1).
+                prefix.append(tcgen05_tmem_allocate_stmt)
             tcgen05_cluster_init_wait = (
                 "cutlass.pipeline.pipeline_init_wait("
                 f"cluster_shape_mn={tcgen05_cluster_layout_vmnk})"
@@ -11286,17 +11335,8 @@ def _emit_mma_pipeline(
                     )
                 ).body
             )
-        prefix.append(
-            statement_from_string(
-                f"if {tcgen05_plan.exec_active if tcgen05_mma_warp_frees_tmem else epi_active}:\n"
-                f"    {tcgen05_plan.tmem_allocator}.allocate({tcgen05_plan.acc_tmem_cols})"
-                + (
-                    f"\n    {tcgen05_plan.tmem_allocator}.relinquish_alloc_permit()"
-                    if tcgen05_relinquish_permit_early
-                    else ""
-                )
-            )
-        )
+        if not tcgen05_alloc_tmem_before_cluster_wait:
+            prefix.append(tcgen05_tmem_allocate_stmt)
         prefix.append(
             statement_from_string(
                 f"{tcgen05_exec_acc_tmem_ptr} = cute.make_ptr("
@@ -11659,6 +11699,26 @@ def _emit_mma_pipeline(
         if tcgen05_use_cluster_deferred_pipelines or tcgen05_use_merged_pipeline_init
         else ""
     )
+    # Clustered kernels publish their mbarriers with one fence + cluster
+    # arrive after every pipeline is built (``pipeline_init_arrive``); their
+    # accumulator and A/B pipelines are built without the DSL's serial warp-0
+    # init and the inits are spread over the idle epilogue warps
+    # (``_tcgen05_prologue_runtime``), ahead of that arrive.
+    # ... when the installed DSL is the release the runtime's constructors
+    # mirror (``split_barrier_init_supported``); otherwise the DSL
+    # constructors with their serial inits stay.
+    tcgen05_split_barrier_init = (
+        tcgen05_use_cluster_deferred_pipelines and split_barrier_init_supported()
+    )
+    # Prologue statements the clustered kernel runs from one elected warp each
+    # (mbarrier inits, descriptor prefetches), emitted right ahead of the
+    # cluster arrive, and the warps that execute them: when the TMA-load warp
+    # is none of them, the whole list is emitted behind ONE ``if not tma_warp``
+    # so that warp skips a single branch instead of one per block (every
+    # skipped far branch costs it ~10-20 ns of instruction fetch, on the
+    # critical path of the CTAs the hardware dispatches last).
+    tcgen05_deferred_barrier_inits: list[str] = []
+    tcgen05_deferred_init_warps: set[int] = set()
     # Relinquish the TMEM allocation permit right after the (single)
     # allocation on the plain path, as CUTLASS's sm100 kernels do, so the
     # teardown does not serialize it behind the epilogue drain.
@@ -11689,6 +11749,7 @@ def _emit_mma_pipeline(
     tcgen05_free_tmem_in_epilogue = False
     tcgen05_one_shot_role_scheduler = False
     tcgen05_hoist_tma_role = False
+    tcgen05_effective_scheduler_warps = 0
     tcgen05_hoist_row_union_tma_role = False
     tcgen05_output_stores_value: tuple[Node, ...] | None = None
     tcgen05_tmem_barrier_thread_count_value = 0
@@ -12739,8 +12800,11 @@ def _emit_mma_pipeline(
                     # CTA takes the right MMA slice.
                     f"{mma_slice_linear} = "
                     + (
-                        "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
-                        f"% cutlass.Int32({tcgen05_cluster_m})"
+                        mod_nonneg_expr(
+                            df,
+                            "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())",
+                            tcgen05_cluster_m,
+                        )
                         if tcgen05_cluster_m > 1
                         else "cutlass.Int32(0)"
                     )
@@ -12948,6 +13012,9 @@ def _emit_mma_pipeline(
                 and tcgen05_epi_warp_count_value >= 2
                 else 0
             )
+        tcgen05_defer_dealloc_barrier_init = (
+            tcgen05_split_barrier_init and tcgen05_is_two_cta
+        )
         prefix.append(
             statement_from_string(
                 f"{tcgen05_plan.tmem_allocator} = cutlass.utils.TmemAllocator("
@@ -12955,9 +13022,25 @@ def _emit_mma_pipeline(
                 f"barrier_for_retrieve={tcgen05_plan.tmem_alloc_barrier}, "
                 f"allocator_warp_id={tcgen05_tmem_allocator_warp}, "
                 f"is_two_cta={tcgen05_is_two_cta!s}, "
-                f"two_cta_tmem_dealloc_mbar_ptr={tcgen05_plan.tmem_dealloc_mbar_ptr})"
+                f"two_cta_tmem_dealloc_mbar_ptr={tcgen05_plan.tmem_dealloc_mbar_ptr}"
+                + (
+                    ", initialize_mbarrier=False)"
+                    if tcgen05_defer_dealloc_barrier_init
+                    else ")"
+                )
             )
         )
+        if tcgen05_defer_dealloc_barrier_init:
+            # The constructor's init (one elected thread of the allocator
+            # warp, 32 arrivals) moves into the deferred block; the fence it
+            # pairs with is ``pipeline_init_arrive``'s ``mbarrier_init_fence``.
+            assert warp_idx is not None
+            tcgen05_deferred_barrier_inits.append(
+                f"if {warp_idx} == cutlass.Int32({tcgen05_tmem_allocator_warp}):\n"
+                "    with cute.arch.elect_one():\n"
+                f"        cute.arch.mbarrier_init({tcgen05_plan.tmem_dealloc_mbar_ptr}, 32)"
+            )
+            tcgen05_deferred_init_warps.add(tcgen05_tmem_allocator_warp)
         prefix.append(
             statement_from_string(
                 f"{tcgen05_plan.acc_pipeline_barriers} = cute.arch.alloc_smem("
@@ -12978,17 +13061,37 @@ def _emit_mma_pipeline(
                 f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_acc_consumer_arrive_count_value}))"
             )
         )
-        prefix.append(
-            statement_from_string(
-                f"{tcgen05_plan.acc_pipeline} = cutlass.pipeline.PipelineUmmaAsync.create("
-                f"num_stages={tcgen05_acc_stage_count_value}, "
-                f"producer_group={tcgen05_plan.acc_pipeline_producer_group}, "
-                f"consumer_group={tcgen05_plan.acc_pipeline_consumer_group}, "
-                f"barrier_storage={tcgen05_plan.acc_pipeline_barriers}, "
-                f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk}"
-                f"{tcgen05_defer_pipeline_sync_arg})"
+        if tcgen05_split_barrier_init:
+            # Built without the DSL's warp-0 serial mbarrier init; the inits
+            # are emitted ahead of the cluster arrive
+            # (``tcgen05_deferred_barrier_inits``).
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_plan.acc_pipeline} = {prologue_runtime(df)}.make_umma_async_pipeline("
+                    f"num_stages={tcgen05_acc_stage_count_value}, "
+                    f"producer_group={tcgen05_plan.acc_pipeline_producer_group}, "
+                    f"consumer_group={tcgen05_plan.acc_pipeline_consumer_group}, "
+                    f"barrier_storage={tcgen05_plan.acc_pipeline_barriers}, "
+                    f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk})"
+                )
             )
-        )
+            tcgen05_deferred_barrier_inits.append(
+                f"{prologue_runtime(df)}.init_pipeline_barriers("
+                f"{warp_idx}, (0,), {tcgen05_plan.acc_pipeline})"
+            )
+            tcgen05_deferred_init_warps.add(0)
+        else:
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_plan.acc_pipeline} = cutlass.pipeline.PipelineUmmaAsync.create("
+                    f"num_stages={tcgen05_acc_stage_count_value}, "
+                    f"producer_group={tcgen05_plan.acc_pipeline_producer_group}, "
+                    f"consumer_group={tcgen05_plan.acc_pipeline_consumer_group}, "
+                    f"barrier_storage={tcgen05_plan.acc_pipeline_barriers}, "
+                    f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk}"
+                    f"{tcgen05_defer_pipeline_sync_arg})"
+                )
+            )
         prefix.append(
             statement_from_string(
                 f"{tcgen05_plan.acc_producer_state} = {tcgen05_pipeline_state_ns}.make_pipeline_state("
@@ -14407,15 +14510,18 @@ def _emit_mma_pipeline(
                 d_prefetch_atoms = [tma_store_atom]
                 if tail_tma_store_atom:
                     d_prefetch_atoms.append(tail_tma_store_atom)
-                prefix.append(
-                    statement_from_string(
-                        f"if {warp_idx} == cutlass.Int32(0):\n"
-                        + "\n".join(
-                            f"    cute.nvgpu.cpasync.prefetch_descriptor({atom})"
-                            for atom in d_prefetch_atoms
-                        )
-                    )
+                d_prefetch_src = f"if {warp_idx} == cutlass.Int32(0):\n" + "\n".join(
+                    f"    cute.nvgpu.cpasync.prefetch_descriptor({atom})"
+                    for atom in d_prefetch_atoms
                 )
+                if tcgen05_split_barrier_init:
+                    # Epilogue warp 0's block joins the deferred prologue
+                    # block (flushed ahead of the cluster arrive below).
+                    assert not tcgen05_tmem_setup_emitted
+                    tcgen05_deferred_barrier_inits.append(d_prefetch_src)
+                    tcgen05_deferred_init_warps.add(0)
+                else:
+                    prefix.append(statement_from_string(d_prefetch_src))
         prefix.append(
             statement_from_string(
                 f"{smem_a_ptr} = cute.arch.alloc_smem("
@@ -14647,6 +14753,12 @@ def _emit_mma_pipeline(
             dynamic_ab_tile_trailing_coord = (
                 "" if tcgen05_grouped_dynamic_ab_tensormap_rank == 2 else ", 0"
             )
+            # The plain ``(tile index, None)`` coordinates record their index
+            # expression (``a_tile_index_expr`` / ``b_tile_index_expr``): the
+            # once-per-CTA partition hoist below slices the tiled operand with
+            # it; every other coordinate form keeps the per-tile partition.
+            a_tile_index_expr: str | None = None
+            b_tile_index_expr: str | None = None
             if tcgen05_grouped_fixed_tensormaps:
                 assert tcgen05_grouped_group_idx is not None
                 assert tcgen05_grouped_global_m_start is not None
@@ -14670,52 +14782,54 @@ def _emit_mma_pipeline(
                     f"{tcgen05_worklist_source_m_tile}) + "
                     f"{tcgen05_grouped_cta_tile_idx_m}, None)"
                 )
-            else:
+            elif tcgen05_grouped_dynamic_ab_tensormaps:
                 a_tile_coord = (
-                    (
-                        f"({tcgen05_grouped_cta_tile_idx_n}, None"
-                        f"{dynamic_ab_tile_trailing_coord})"
-                        if tcgen05_nm_orientation
-                        else f"({tcgen05_grouped_cta_tile_idx_m}, None"
-                        f"{dynamic_ab_tile_trailing_coord})"
-                    )
-                    if tcgen05_grouped_dynamic_ab_tensormaps
-                    else f"({m_offset_var} // cutlass.Int32({tcgen05_mma_bm}), None)"
+                    f"({tcgen05_grouped_cta_tile_idx_n}, None"
+                    f"{dynamic_ab_tile_trailing_coord})"
+                    if tcgen05_nm_orientation
+                    else f"({tcgen05_grouped_cta_tile_idx_m}, None"
+                    f"{dynamic_ab_tile_trailing_coord})"
                 )
                 b_tile_coord = (
-                    (
-                        f"({tcgen05_grouped_cta_tile_idx_m}, None"
-                        f"{dynamic_ab_tile_trailing_coord})"
-                        if tcgen05_nm_orientation
-                        else f"({tcgen05_grouped_cta_tile_idx_n}, None"
-                        f"{dynamic_ab_tile_trailing_coord})"
-                    )
-                    if tcgen05_grouped_dynamic_ab_tensormaps
-                    else (
-                        f"({n_offset_var} // cutlass.Int32({bn}), None, "
-                        f"{rhs_rank3_tma_group_expr})"
-                        if rhs_rank3_tma_group_expr is not None
-                        else f"({n_offset_var} // cutlass.Int32({bn}), None)"
-                    )
+                    f"({tcgen05_grouped_cta_tile_idx_m}, None"
+                    f"{dynamic_ab_tile_trailing_coord})"
+                    if tcgen05_nm_orientation
+                    else f"({tcgen05_grouped_cta_tile_idx_n}, None"
+                    f"{dynamic_ab_tile_trailing_coord})"
                 )
+            else:
+                a_tile_index_expr = floordiv_nonneg_expr(
+                    df, m_offset_var, tcgen05_mma_bm
+                )
+                a_tile_coord = f"({a_tile_index_expr}, None)"
+                b_index = floordiv_nonneg_expr(df, n_offset_var, bn)
+                if rhs_rank3_tma_group_expr is not None:
+                    b_tile_coord = f"({b_index}, None, {rhs_rank3_tma_group_expr})"
+                else:
+                    b_tile_index_expr = b_index
+                    b_tile_coord = f"({b_index}, None)"
             if tcgen05_grouped_full_allocation_a and tcgen05_nm_orientation:
                 assert tcgen05_grouped_group_idx is not None
                 assert tcgen05_grouped_cta_tile_idx_n is not None
+                a_tile_index_expr = None
                 a_tile_coord = (
                     f"({tcgen05_grouped_group_idx} * cutlass.Int32("
                     f"{n_size // tcgen05_mma_bm}) + "
                     f"{tcgen05_grouped_cta_tile_idx_n}, None)"
                 )
             if row_profile is not None:
-                a_tile_coord = (
-                    f"({n_offset_var} // cutlass.Int32({row_profile.mma_m}), None)"
+                a_tile_index_expr = floordiv_nonneg_expr(
+                    df, n_offset_var, row_profile.mma_m
                 )
-                b_tile_coord = (
-                    f"({m_offset_var} // cutlass.Int32({row_profile.mma_n}), None)"
+                b_tile_index_expr = floordiv_nonneg_expr(
+                    df, m_offset_var, row_profile.mma_n
                 )
+                a_tile_coord = f"({a_tile_index_expr}, None)"
+                b_tile_coord = f"({b_tile_index_expr}, None)"
             if tcgen05_grouped_full_allocation_b and not tcgen05_nm_orientation:
                 assert tcgen05_grouped_group_idx is not None
                 assert tcgen05_grouped_cta_tile_idx_n is not None
+                b_tile_index_expr = None
                 b_tile_coord = (
                     f"({tcgen05_grouped_cta_tile_idx_n}, None, {tcgen05_grouped_group_idx})"
                     if tcgen05_grouped_full_allocation_b_rank3
@@ -14733,15 +14847,13 @@ def _emit_mma_pipeline(
             if lhs_operand.is_leading_passthrough:
                 assert leading_global is not None
                 gmem_a_tma_tiler = f"({bm}, {bk}, 1)"
-                a_tile_coord = (
-                    f"({m_offset_var} // cutlass.Int32({bm}), None, {leading_global})"
-                )
+                a_tile_index_expr = None
+                a_tile_coord = f"({floordiv_nonneg_expr(df, m_offset_var, bm)}, None, {leading_global})"
             if rhs_operand.is_leading_passthrough:
                 assert leading_global is not None
                 gmem_b_tma_tiler = f"({bn}, {bk}, 1)"
-                b_tile_coord = (
-                    f"({n_offset_var} // cutlass.Int32({bn}), None, {leading_global})"
-                )
+                b_tile_index_expr = None
+                b_tile_coord = f"({floordiv_nonneg_expr(df, n_offset_var, bn)}, None, {leading_global})"
             gmem_a_tma_tensor = tma_tensor_a
             if tcgen05_grouped_full_allocation_a and not tcgen05_nm_orientation:
                 assert tcgen05_grouped_global_m_start is not None
@@ -14793,15 +14905,41 @@ def _emit_mma_pipeline(
                     tma_load=tcgen05_use_role_local_tma_producer,
                 )
                 gmem_b_tma_tensor = tma_tensor_b_tail
-            _emit_per_tile(
-                f"{gmem_a_tma} = cute.local_tile("
-                f"{gmem_a_tma_tensor}, {gmem_a_tma_tiler}, "
-                f"{a_tile_coord})",
-                tma_load=tcgen05_use_role_local_tma_producer,
+            # Persistent role-local producers partition the whole tiled
+            # operands ONCE per CTA, in the TMA-load role's prelude ahead of
+            # its cluster join, and slice the tile's coordinates per tile
+            # (``tma_gA_all[(None, m_tile, None)]``): the per-tile
+            # ``local_tile`` + ``partition`` + ``tma_partition`` chain was
+            # 130-190 ns of uniform-datapath address math ahead of every
+            # tile's first load, exposed on the CTAs the hardware dispatches
+            # last (per-CTA stamps, grouped_gemm s1).  The simple
+            # ``(tile index, None)`` coordinates of the plain and row-union
+            # paths qualify; grouped allocations, runtime-N descriptors,
+            # leading passthroughs and paired M subtiles keep the per-tile
+            # partition.
+            tcgen05_hoist_tma_partitions = (
+                tcgen05_use_role_local_tma_producer
+                and tcgen05_pid_is_persistent
+                and tcgen05_effective_scheduler_warps == 0
+                and not tcgen05_grouped_static_persistent
+                and tcgen05_m_subtile_count == 1
+                and gmem_a_tma_tensor == tma_tensor_a
+                and gmem_b_tma_tensor == tma_tensor_b
+                and gmem_a_tma_tiler.count(",") == 1
+                and gmem_b_tma_tiler.count(",") == 1
+                and a_tile_index_expr is not None
+                and b_tile_index_expr is not None
             )
+            if not tcgen05_hoist_tma_partitions:
+                _emit_per_tile(
+                    f"{gmem_a_tma} = cute.local_tile("
+                    f"{gmem_a_tma_tensor}, {gmem_a_tma_tiler}, "
+                    f"{a_tile_coord})",
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
             if tcgen05_m_subtile_count > 1:
                 a2_tile_coord = (
-                    f"({m_offset_var} // cutlass.Int32({tcgen05_mma_bm})"
+                    f"({floordiv_nonneg_expr(df, m_offset_var, tcgen05_mma_bm)}"
                     " + cutlass.Int32(1), None)"
                 )
                 _emit_per_tile(
@@ -14810,25 +14948,27 @@ def _emit_mma_pipeline(
                     f"{a2_tile_coord})",
                     tma_load=tcgen05_use_role_local_tma_producer,
                 )
-            _emit_per_tile(
-                f"{gmem_b_tma} = cute.local_tile("
-                f"{gmem_b_tma_tensor}, {gmem_b_tma_tiler}, "
-                f"{b_tile_coord})",
-                tma_load=tcgen05_use_role_local_tma_producer,
-            )
-            _emit_per_tile(
-                f"{gmem_a_tma_part} = {tma_thr_mma}.partition_A({gmem_a_tma})",
-                tma_load=tcgen05_use_role_local_tma_producer,
-            )
+            if not tcgen05_hoist_tma_partitions:
+                _emit_per_tile(
+                    f"{gmem_b_tma} = cute.local_tile("
+                    f"{gmem_b_tma_tensor}, {gmem_b_tma_tiler}, "
+                    f"{b_tile_coord})",
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
+                _emit_per_tile(
+                    f"{gmem_a_tma_part} = {tma_thr_mma}.partition_A({gmem_a_tma})",
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
             if tcgen05_m_subtile_count > 1:
                 _emit_per_tile(
                     f"{gmem_a2_tma_part} = {tma_thr_mma}.partition_A({gmem_a2_tma})",
                     tma_load=tcgen05_use_role_local_tma_producer,
                 )
-            _emit_per_tile(
-                f"{gmem_b_tma_part} = {tma_thr_mma}.partition_B({gmem_b_tma})",
-                tma_load=tcgen05_use_role_local_tma_producer,
-            )
+            if not tcgen05_hoist_tma_partitions:
+                _emit_per_tile(
+                    f"{gmem_b_tma_part} = {tma_thr_mma}.partition_B({gmem_b_tma})",
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
             # The guarded clustered CtaGroup.ONE bridge keeps one TMA producer
             # transaction per CTA and duplicates B locally. The B atom is still
             # a multicast TMA atom for cluster_m=2/CtaGroup.ONE, so feed it a
@@ -14864,8 +15004,11 @@ def _emit_mma_pipeline(
             if tcgen05_cluster_m > 1 or tcgen05_is_two_cta:
                 prefix.append(
                     statement_from_string(
-                        f"{tma_cta_rank_in_cluster} = cute.arch.make_warp_uniform("
-                        "cute.arch.block_idx_in_cluster())"
+                        f"{tma_cta_rank_in_cluster} = "
+                        + masked_cluster_rank_expr(
+                            "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())",
+                            tcgen05_cluster_m * tcgen05_cluster_n,
+                        )
                     )
                 )
                 prefix.append(
@@ -14914,14 +15057,57 @@ def _emit_mma_pipeline(
             tma_b_cta_layout_expr = (
                 tma_b_cta_layout if tcgen05_is_two_cta else tma_cta_layout
             )
-            _emit_per_tile(
-                f"{tma_sA}, {tma_gA} = cute.nvgpu.cpasync.tma_partition("
-                f"{tma_atom_a}, {tma_a_cta_coord_expr}, {tma_a_cta_layout_expr}, "
-                f"cute.group_modes({smem_a}, 0, cute.rank({smem_a}) - 1), "
-                f"cute.group_modes({gmem_a_tma_part}, 0, "
-                f"cute.rank({gmem_a_tma_part}) - 1))",
-                tma_load=tcgen05_use_role_local_tma_producer,
-            )
+            if tcgen05_hoist_tma_partitions:
+                assert a_tile_index_expr is not None
+                assert b_tile_index_expr is not None
+                tma_gA_tiles = df.new_var("tma_gA_tiles")
+                tma_gB_tiles = df.new_var("tma_gB_tiles")
+                tma_gA_tiles_part = df.new_var("tma_gA_tiles_part")
+                tma_gB_tiles_part = df.new_var("tma_gB_tiles_part")
+                tma_gA_all = df.new_var("tma_gA_all")
+                tma_gB_all = df.new_var("tma_gB_all")
+                tma_partition_prelude = [
+                    statement_from_string(line)
+                    for line in (
+                        f"{tma_gA_tiles} = cute.local_tile({tma_tensor_a}, {gmem_a_tma_tiler}, (None, None))",
+                        f"{tma_gA_tiles_part} = {tma_thr_mma}.partition_A({tma_gA_tiles})",
+                        (
+                            f"{tma_sA}, {tma_gA_all} = cute.nvgpu.cpasync.tma_partition("
+                            f"{tma_atom_a}, {tma_a_cta_coord_expr}, {tma_a_cta_layout_expr}, "
+                            f"cute.group_modes({smem_a}, 0, cute.rank({smem_a}) - 1), "
+                            f"cute.group_modes({tma_gA_tiles_part}, 0, cute.rank({tma_gA_tiles_part}) - 2))"
+                        ),
+                        f"{tma_gB_tiles} = cute.local_tile({tma_tensor_b}, {gmem_b_tma_tiler}, (None, None))",
+                        f"{tma_gB_tiles_part} = {tma_thr_mma}.partition_B({tma_gB_tiles})",
+                        (
+                            f"{tma_sB}, {tma_gB_all} = cute.nvgpu.cpasync.tma_partition("
+                            f"{tma_atom_b}, {tma_b_cta_coord_expr}, {tma_b_cta_layout_expr}, "
+                            f"cute.group_modes({smem_b}, 0, cute.rank({smem_b}) - 1), "
+                            f"cute.group_modes({tma_gB_tiles_part}, 0, cute.rank({tma_gB_tiles_part}) - 2))"
+                        ),
+                    )
+                ]
+                prefix.extend(tma_partition_prelude)
+                df.cute_state.register_tcgen05_tma_role_prelude_stmts(
+                    tma_partition_prelude
+                )
+                _emit_per_tile(
+                    f"{tma_gA} = {tma_gA_all}[(None, {a_tile_index_expr}, None)]",
+                    tma_load=True,
+                )
+                _emit_per_tile(
+                    f"{tma_gB} = {tma_gB_all}[(None, {b_tile_index_expr}, None)]",
+                    tma_load=True,
+                )
+            else:
+                _emit_per_tile(
+                    f"{tma_sA}, {tma_gA} = cute.nvgpu.cpasync.tma_partition("
+                    f"{tma_atom_a}, {tma_a_cta_coord_expr}, {tma_a_cta_layout_expr}, "
+                    f"cute.group_modes({smem_a}, 0, cute.rank({smem_a}) - 1), "
+                    f"cute.group_modes({gmem_a_tma_part}, 0, "
+                    f"cute.rank({gmem_a_tma_part}) - 1))",
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
             if tcgen05_m_subtile_count > 1:
                 _emit_per_tile(
                     f"{tma_sA2}, {tma_gA2} = cute.nvgpu.cpasync.tma_partition("
@@ -14931,14 +15117,15 @@ def _emit_mma_pipeline(
                     f"cute.rank({gmem_a2_tma_part}) - 1))",
                     tma_load=tcgen05_use_role_local_tma_producer,
                 )
-            _emit_per_tile(
-                f"{tma_sB}, {tma_gB} = cute.nvgpu.cpasync.tma_partition("
-                f"{tma_atom_b}, {tma_b_cta_coord_expr}, {tma_b_cta_layout_expr}, "
-                f"cute.group_modes({smem_b}, 0, cute.rank({smem_b}) - 1), "
-                f"cute.group_modes({gmem_b_tma_part}, 0, "
-                f"cute.rank({gmem_b_tma_part}) - 1))",
-                tma_load=tcgen05_use_role_local_tma_producer,
-            )
+            if not tcgen05_hoist_tma_partitions:
+                _emit_per_tile(
+                    f"{tma_sB}, {tma_gB} = cute.nvgpu.cpasync.tma_partition("
+                    f"{tma_atom_b}, {tma_b_cta_coord_expr}, {tma_b_cta_layout_expr}, "
+                    f"cute.group_modes({smem_b}, 0, cute.rank({smem_b}) - 1), "
+                    f"cute.group_modes({gmem_b_tma_part}, 0, "
+                    f"cute.rank({gmem_b_tma_part}) - 1))",
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
             prefix.append(
                 statement_from_string(
                     f"{tma_pipeline_mbars} = cute.arch.alloc_smem("
@@ -14969,18 +15156,46 @@ def _emit_mma_pipeline(
                     )
                 )
             )
-            prefix.append(
-                statement_from_string(
-                    f"{tma_pipeline} = cutlass.pipeline.PipelineTmaUmma.create("
-                    f"num_stages={tcgen05_ab_stage_count_value}, "
-                    f"producer_group={tma_pipeline_producer_group}, "
-                    f"consumer_group={tma_pipeline_consumer_group}, "
-                    f"tx_count={tma_pipeline_tx_count}, "
-                    f"barrier_storage={tma_pipeline_mbars}, "
-                    f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk}"
-                    f"{tcgen05_defer_pipeline_sync_arg})"
+            if tcgen05_split_barrier_init:
+                prefix.append(
+                    statement_from_string(
+                        f"{tma_pipeline} = {prologue_runtime(df)}.make_tma_umma_pipeline("
+                        f"num_stages={tcgen05_ab_stage_count_value}, "
+                        f"producer_group={tma_pipeline_producer_group}, "
+                        f"consumer_group={tma_pipeline_consumer_group}, "
+                        f"tx_count={tma_pipeline_tx_count}, "
+                        f"barrier_storage={tma_pipeline_mbars}, "
+                        f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk})"
+                    )
                 )
-            )
+                # The A/B ring holds most of the barriers: its full and empty
+                # arrays go to epilogue warps 1 and 2 (idle in the prologue)
+                # when the epilogue has them, else to warp 0 with the rest.
+                if tcgen05_epi_warps_per_group_value >= 3:
+                    tcgen05_deferred_barrier_inits.append(
+                        f"{prologue_runtime(df)}.init_pipeline_barriers_pair("
+                        f"{warp_idx}, 1, {tma_pipeline})"
+                    )
+                    tcgen05_deferred_init_warps.update((1, 2))
+                else:
+                    tcgen05_deferred_barrier_inits.append(
+                        f"{prologue_runtime(df)}.init_pipeline_barriers("
+                        f"{warp_idx}, (0,), {tma_pipeline})"
+                    )
+                    tcgen05_deferred_init_warps.add(0)
+            else:
+                prefix.append(
+                    statement_from_string(
+                        f"{tma_pipeline} = cutlass.pipeline.PipelineTmaUmma.create("
+                        f"num_stages={tcgen05_ab_stage_count_value}, "
+                        f"producer_group={tma_pipeline_producer_group}, "
+                        f"consumer_group={tma_pipeline_consumer_group}, "
+                        f"tx_count={tma_pipeline_tx_count}, "
+                        f"barrier_storage={tma_pipeline_mbars}, "
+                        f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk}"
+                        f"{tcgen05_defer_pipeline_sync_arg})"
+                    )
+                )
             prefix.append(
                 statement_from_string(
                     f"{tma_producer_state} = {tcgen05_pipeline_state_ns}.make_pipeline_state("
@@ -15231,6 +15446,45 @@ def _emit_mma_pipeline(
                             k_loop_iter.args[1] = cast(
                                 "ast.expr", expr_from_string(tcgen05_split_k_end)
                             )
+                        tcgen05_tma_wait_after_first_acquire = False
+                        if (
+                            tcgen05_pdl_launch
+                            and tcgen05_use_role_local_tma_producer
+                            and tcgen05_effective_scheduler_warps == 0
+                            and not tcgen05_grouped_static_persistent
+                        ):
+                            # ``cute_pdl``: the TMA-load role waits for the
+                            # previous kernel here, after the tile's address
+                            # math (scheduler step, local tiles, TMA
+                            # partitions, stage gates) and right ahead of its
+                            # first stage, so the loads issue as soon as the
+                            # dependency resolves.  The role-prelude wait
+                            # ahead of the scheduler setup left that math on
+                            # the post-release critical path: per-CTA stamps
+                            # on the grouped row-union kernel (2560x512x512
+                            # bf16, 128 CTAs, 16-node graph) put the first
+                            # TMA issue 250-300 ns after the wait release;
+                            # waiting here reads 3.26 -> 3.15 us per call.
+                            # A satisfied wait is a no-op, so the per-tile
+                            # repeat costs nothing; ``program_id`` emits no
+                            # prelude wait for the role
+                            # (``cute_state.tcgen05_tma_role_wait_per_tile``)
+                            # and the release placement follows this wait, so
+                            # the ``griddepcontrol_launch_dependents`` repeats
+                            # per tile as well: a repeated release is a no-op
+                            # too (the dependents launch once, at the first).
+                            # Stage 0's acquire below is each tile's own (the
+                            # ring state advances), not a repeat of the
+                            # previous tile's.
+                            # The wait follows stage 0's ``producer_acquire``
+                            # (its empty-barrier wait and ``expect_tx`` arrive
+                            # touch only shared memory) so only the TMA issue
+                            # itself remains behind the release: with the
+                            # MMA warp's TMEM allocation overlapping the
+                            # cluster join, grouped_gemm s1 reads 35 ns per
+                            # call less (fine timer; neither half alone moves it).
+                            df.cute_state.tcgen05_tma_role_wait_per_tile = True
+                            tcgen05_tma_wait_after_first_acquire = True
                         _emit_per_tile(
                             f"{tma_initial_full_tile} = "
                             + _tcgen05_tma_tile_predicate(
@@ -15360,13 +15614,46 @@ def _emit_mma_pipeline(
                                 )
                             # Each stage's gates are assigned directly ahead of
                             # its own prefetch block.
-                            for (
+                            for stage_index, (
                                 gate_sources,
                                 gates,
                                 k_offset,
                                 skip_acquire,
-                            ) in initial_stages:
+                            ) in enumerate(initial_stages):
                                 initial_prefetch.extend(gate_sources)
+                                if (
+                                    tcgen05_tma_wait_after_first_acquire
+                                    and stage_index == 0
+                                ):
+                                    # Stage 0's acquire ahead of the
+                                    # dependent-launch wait, its loads after.
+                                    # (A statement, not gate text: the
+                                    # hoisted one-shot role inserts its init
+                                    # rendezvous ahead of the first block.)
+                                    if not skip_acquire:
+                                        acquire_predicate = " and ".join(
+                                            [
+                                                *gates,
+                                                *(
+                                                    [prefetch_args.tma_warp]
+                                                    if not tcgen05_use_role_local_tma_producer
+                                                    else []
+                                                ),
+                                            ]
+                                        )
+                                        initial_prefetch.append(
+                                            statement_from_string(
+                                                f"if {acquire_predicate}:\n"
+                                                + _initial_producer_acquire_src(
+                                                    prefetch_args,
+                                                    fresh_ring=tcgen05_one_shot_role_scheduler,
+                                                )
+                                            )
+                                        )
+                                    initial_prefetch.append(
+                                        "cute.arch.griddepcontrol_wait()"
+                                    )
+                                    skip_acquire = True
                                 initial_prefetch.append(
                                     _build_initial_prefetch_if(
                                         prefetch_args,
@@ -15377,6 +15664,10 @@ def _emit_mma_pipeline(
                                         fresh_ring=tcgen05_one_shot_role_scheduler,
                                     )
                                 )
+                            assert not (
+                                tcgen05_tma_wait_after_first_acquire
+                                and not initial_stages
+                            )
                         if tcgen05_hoist_tma_role:
                             # The hoisted TMA-load role joins the pipeline-init
                             # rendezvous here (the cluster wait, or the plain
@@ -15576,7 +15867,7 @@ def _emit_mma_pipeline(
                 cg.add_statement(smem_b_mma_stmt)
             if tcgen05_use_tma:
                 tma_k_tile_stmt = statement_from_string(
-                    f"{tma_k_tile} = {k_offset_var} // cutlass.Int32({bk})"
+                    f"{tma_k_tile} = {floordiv_nonneg_expr(df, k_offset_var, bk)}"
                 )
                 tma_full_tile_predicate_src = _tcgen05_tma_tile_predicate(
                     k_tile_start_expr=k_offset_var,
@@ -15792,7 +16083,7 @@ def _emit_mma_pipeline(
                 if tcgen05_use_separate_tma_producer:
                     producer_loop_body = [
                         statement_from_string(
-                            f"{tma_k_tile} = {k_offset_var} // cutlass.Int32({bk})"
+                            f"{tma_k_tile} = {floordiv_nonneg_expr(df, k_offset_var, bk)}"
                         )
                     ]
                     if not tcgen05_static_full_tma_fast_path:

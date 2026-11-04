@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any
 from unittest.mock import patch
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 
@@ -15,8 +14,11 @@ from test.test_cute_split_k_workspace import _plain_store_matmul
 from test.test_cute_split_k_workspace_protocol import _matrix_bias
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.benchmarking import _make_cudagraph_replay
+
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -267,6 +269,174 @@ def test_native_split_k_workspace_partials_and_poisoned_graph(case: WorkspaceCas
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
 
 
+ATOMIC_EPILOGUE_CASES = (
+    # The s2 catalogue winner's geometry: one 64x64 epilogue subtile per CTA.
+    WorkspaceCase(
+        "atomic-fp16-bias",
+        (128, 32768, 256),
+        (128, 64, 128),
+        "split_k",
+        16,
+        6,
+        bias=True,
+    ),
+    WorkspaceCase(
+        "atomic-fp16-plain", (128, 32768, 256), (128, 64, 128), "split_k", 16, 6
+    ),
+    # 64x128 CTA tiles: two subtiles whose columns interleave (the (32, 2)
+    # epilogue tiler), the exactness case below checks every output once.
+    WorkspaceCase(
+        "atomic-fp16-n128-bias",
+        (128, 32768, 256),
+        (128, 128, 64),
+        "split_k",
+        16,
+        12,
+        bias=True,
+    ),
+    WorkspaceCase(
+        "atomic-fp16-exact",
+        (128, 2048, 256),
+        (128, 128, 64),
+        "split_k",
+        4,
+        12,
+        bias=True,
+    ),
+    WorkspaceCase(
+        "atomic-bf16-plain",
+        (128, 4096, 256),
+        (128, 64, 64),
+        "split_k",
+        16,
+        16,
+        dtype=torch.bfloat16,
+    ),
+    # fp32 output (``red.global.add.v2.f32``), 128-row CTA tiles, padded bias.
+    WorkspaceCase(
+        "atomic-fp32-bias",
+        (256, 4096, 256),
+        (256, 128, 128),
+        "partitions",
+        8,
+        2,
+        kind="fp32",
+        bias=True,
+        padding=8,
+    ),
+    # A persistent grid with several tiles per CTA pair (the staging buffers
+    # alternate under the atomics).
+    WorkspaceCase(
+        "atomic-fp16-persistent",
+        (512, 2048, 512),
+        (128, 128, 64),
+        "split_k",
+        16,
+        2,
+        bias=True,
+    ),
+)
+
+
+def _rounded_partition_reference(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None, partitions: int
+) -> torch.Tensor:
+    """What the source's ``hl.atomic_add`` computes when every partial is
+    rounded to the output dtype on its way in (exact for small integers)."""
+    m, k = a.shape
+    chunk = k // partitions
+    total = torch.zeros((m, b.size(1)), dtype=torch.float32, device=a.device)
+    for partition in range(partitions):
+        partial = (
+            a[:, partition * chunk : (partition + 1) * chunk].float()
+            @ b[partition * chunk : (partition + 1) * chunk].float()
+        )
+        if partition == 0 and bias is not None:
+            partial = partial + bias.float()
+        total = total + partial.to(a.dtype).float()
+    return total.to(a.dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("case", ATOMIC_EPILOGUE_CASES, ids=lambda case: case.name)
+def test_native_split_k_atomic_epilogue_reduces_into_the_filled_output(
+    case: WorkspaceCase,
+):
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family")
+    torch.manual_seed(2026103101)
+    bound, config, arguments, (a, b, bias) = workspace_case(case, "cuda")
+    config = helion.Config.from_dict(
+        config.config | {"cute_split_k_atomic_epilogue": True}
+    )
+    code = bound.to_code(config)
+    assert "'epilogue': 'atomic'" in code
+    assert "_reduce_partitions" not in code
+    assert code.count("PyCodeCache.load(") == 1
+    assert (
+        "_helion_zero_fill_split_k" in code
+        and "torch.zeros" not in code.split("def ")[-1].split("return")[0]
+    )
+    bound.set_config(config)
+    output_dtype = torch.float32 if case.kind == "fp32" else case.dtype
+    partitions = case.value
+
+    def run():
+        return bound(*arguments)
+
+    def check(result, *, exact: bool):
+        assert result.dtype is output_dtype
+        reference = a.float() @ b.float()
+        if case.bias:
+            reference = reference + bias.float()
+        if exact:
+            torch.testing.assert_close(
+                result,
+                _rounded_partition_reference(
+                    a, b, bias if case.bias else None, partitions
+                ).to(output_dtype),
+                atol=0,
+                rtol=0,
+            )
+        # The example's numerical contract (atol=1) for the half outputs, a
+        # per-partition rounding error budget for bfloat16.
+        tolerance = {
+            torch.float16: {"atol": 1, "rtol": 1e-2},
+            torch.bfloat16: {"atol": 4, "rtol": 5e-2},
+            torch.float32: {"atol": 1e-2, "rtol": 1e-3},
+        }[output_dtype]
+        torch.testing.assert_close(result, reference.to(output_dtype), **tolerance)
+
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        # Small integers: every partial and every partial sum is exact in the
+        # output dtype (|values| <= chunk <= 2048 and sums <= K <= 2048 for the
+        # exact case), so the result is order independent.
+        a.random_(-1, 2)
+        b.random_(-1, 2)
+        bias.random_(-1, 2)
+        check(run(), exact=case.name == "atomic-fp16-exact")
+        replay = _make_cudagraph_replay(run)
+        for _iteration in range(3):
+            a.normal_()
+            b.normal_()
+            bias.normal_()
+            check(run(), exact=False)
+            for _repeat in range(8):
+                result = replay()
+                check(result, exact=False)
+                # The fill kernel must zero the output on every replay.
+                result.fill_(float("nan"))
+        a.zero_()
+        b.zero_()
+        bias.zero_()
+        result = replay()
+        torch.testing.assert_close(result, torch.zeros_like(result), atol=0, rtol=0)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+
 FALLBACK_SHAPES = ((32, 4096, 64), (64, 16384, 128), (65, 530, 71), (128, 0, 128))
 
 
@@ -274,8 +444,14 @@ def fallback_case(shape, device):
     m, k, n = shape
     a = torch.empty((m, k), dtype=torch.float16, device=device)
     b = torch.empty((k, n), dtype=torch.float16, device=device)
+    # The fallback under test is the fp32-promoted form of the float16 atomic
+    # output (the Setting defaults to accumulating in float16 in place).
     kernel = helion.kernel(
-        matmul_split_k.fn, backend="cute", static_shapes=True, autotune_effort="none"
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     bound = kernel._bind_isolated((a, b))
     assert not bound.config_spec.cute_split_k_workspace_available

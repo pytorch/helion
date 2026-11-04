@@ -16,9 +16,9 @@ from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._compiler.rng_utils import philox_rand_ref
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
-from helion.runtime.cute.rng import stage_explicit_seed
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -97,7 +97,7 @@ def test_effective_default_and_settings_roundtrip(
 @pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
 @skipUnlessBackends(["cute"])
 def test_original_dropout_reference_mapping(name: str, dtype: torch.dtype) -> None:
-    from examples import low_mem_dropout as example
+    example = import_example("low_mem_dropout")
 
     function = vars(example)[name].fn
     values = torch.linspace(-2, 2, 33, dtype=dtype)
@@ -139,7 +139,7 @@ def test_original_dropout_reference_mapping(name: str, dtype: torch.dtype) -> No
 def test_original_codegen_default_matches_explicit_mapping(
     name: str, width: int, layout: str
 ) -> None:
-    from examples import low_mem_dropout as example
+    example = import_example("low_mem_dropout")
 
     function = vars(example)[name].fn
     args = (0.25, torch.empty(1025), -(2**63))
@@ -162,9 +162,8 @@ def test_original_codegen_default_matches_explicit_mapping(
         )
         sources.append(source)
     assert sources[0] == sources[1]
-    assert (
-        "shr.s64 counter" in sources[0] and "_cute_stage_explicit_seed(" in sources[0]
-    )
+    assert "shr.s64 counter" in sources[0] and "cutlass.Int64(seed)" in sources[0]
+    assert "_cute_stage_explicit_seed" not in sources[0]
     assert "shr.s64 counter" not in sources[2]
 
 
@@ -210,13 +209,3 @@ def test_signed_offsets_and_other_apis_keep_their_policy() -> None:
         helion.kernel(
             _other_random, backend="cute", cute_rng_stream="philox4"
         )._bind_isolated((x, 123))
-
-
-def test_staged_seed_is_fresh_and_signed() -> None:
-    x = torch.empty(1)
-    first = stage_explicit_seed(-(2**63), x)
-    second = stage_explicit_seed(-(2**63), x)
-    assert first.dtype == second.dtype == torch.int64
-    assert first.shape == second.shape == (1,)
-    assert first.data_ptr() != second.data_ptr()
-    assert first.item() == second.item() == -(2**63)
