@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 
@@ -17,11 +16,14 @@ from test.test_cute_collective_chunk_seeds import _partitioned_matmul
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
+
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
 pytestmark = skipUnlessBackends(["cute"])
 

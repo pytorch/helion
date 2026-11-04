@@ -28,6 +28,7 @@ from helion._testing import _get_backend
 from helion._testing import check_example
 from helion._testing import float32_matmul_precision
 from helion._testing import get_test_float32_matmul_precision
+from helion._testing import import_example
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
@@ -245,7 +246,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         The bug manifests after multiple kernel executions - errors accumulate
         due to improper handling of the tmp tensor across invocations.
         """
-        from examples.split_k_barrier import split_k_matmul
+        split_k_matmul = import_example("split_k_barrier").split_k_matmul
 
         m, k, n = 64, 33, 64
         config = helion.Config(
@@ -725,8 +726,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         "Test configs require tensor descriptor support",
     )
     def test_welford_bfloat16_accuracy(self, reduction_block_size):
-        from examples.welford import eager_layer_norm
-        from examples.welford import welford
+        _examples_welford = import_example("welford")
+        eager_layer_norm = _examples_welford.eager_layer_norm
+        welford = _examples_welford.welford
 
         if _get_backend() == "cute":
             # The Triton config below pins Triton-only knobs (indexing,
@@ -765,8 +767,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
     def test_low_mem_dropout(self):
-        from examples.low_mem_dropout import low_mem_dropout
-        from examples.low_mem_dropout import low_mem_dropout_bwd
+        _examples_low_mem_dropout = import_example("low_mem_dropout")
+        low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
+        low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 
         p = 0.25
         size = 1024
@@ -816,7 +819,9 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
     @skipIfXPU("precision differences with bf16xint16 operations on xpu")
     def test_bf16xint16(self):
-        from examples.bf16xint16_gemm import reference_bf16xint16_pytorch
+        reference_bf16xint16_pytorch = import_example(
+            "bf16xint16_gemm"
+        ).reference_bf16xint16_pytorch
 
         m, k, n = 2048, 1024, 1280
 
@@ -962,7 +967,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         eps = 1e-5
 
         # Compute forward pass to get rms
-        from examples.rms_norm import rms_norm_fwd
+        rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
 
         # Create configured kernel with explicit config
         config = helion.Config(block_size=32, num_warps=4, num_stages=3)
@@ -1079,6 +1084,25 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
             indexing="pointer",
         )
+
+    @skipIfRefEager("checks the example's reference, not a kernel")
+    @skipIfFn(
+        lambda: DEVICE.type == "tpu",
+        "the reference does not run on TPU (_baseline_unless_tpu)",
+    )
+    def test_attention_baseline_keeps_no_autograd_graph(self):
+        # The autotuner keeps the baseline output for the whole search, and
+        # benchmark harnesses (tritonbench) pass inputs that require grad: a
+        # graph behind the output pinned every score block of the reference's
+        # LSE loop, ~50 GiB at (4, 48, 8192, 128).
+        mod = import_path(EXAMPLES_DIR / "attention.py")
+        args = [
+            torch.randn(1, 2, 128, 64, device=DEVICE, requires_grad=True)
+            for _ in range(3)
+        ]
+        for baseline in (mod._attention_baseline, mod._causal_attention_baseline):
+            for output in baseline(*args):
+                self.assertFalse(output.requires_grad)
 
     def test_attention_output(self):
         args = (
@@ -1637,7 +1661,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
         grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
 
-        from examples.softmax import softmax_two_pass
+        softmax_two_pass = import_example("softmax").softmax_two_pass
 
         config = helion.Config(block_size=[128, 128], num_warps=4, num_stages=3)
         configured_kernel = helion.kernel(softmax_two_pass.fn, config=config)
@@ -2634,7 +2658,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE)
         b = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
 
-        from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
+        squeeze_and_excitation_net_fwd = import_example(
+            "squeeze_and_excitation_net"
+        ).squeeze_and_excitation_net_fwd
 
         config = helion.Config(block_size=[16, 16, 16, 16], num_warps=4, num_stages=3)
         configured_kernel = helion.kernel(
@@ -2768,8 +2794,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         advantages = torch.randn(B, device=DEVICE, dtype=torch.float32)
         completion_mask = torch.ones(B, L, device=DEVICE, dtype=torch.float32)
 
-        from examples.grpo_loss import eager_selected_logits
-        from examples.grpo_loss import torch_grpo_loss
+        _examples_grpo_loss = import_example("grpo_loss")
+        eager_selected_logits = _examples_grpo_loss.eager_selected_logits
+        torch_grpo_loss = _examples_grpo_loss.torch_grpo_loss
 
         # None on the GPU backends (the kernel gathers), eager on Pallas.
         selected_logits = eager_selected_logits(logits, completion_ids)
@@ -2835,8 +2862,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         completion_mask = torch.ones(B, L, device=DEVICE, dtype=torch.float32)
 
         # Run the forward pass to get lse
-        from examples.grpo_loss import eager_selected_logits
-        from examples.grpo_loss import grpo_loss_forward
+        _examples_grpo_loss = import_example("grpo_loss")
+        eager_selected_logits = _examples_grpo_loss.eager_selected_logits
+        grpo_loss_forward = _examples_grpo_loss.grpo_loss_forward
 
         from helion._testing import code_and_output
 
@@ -2865,7 +2893,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         grad_output = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
 
         logits_torch = logits.detach().clone().float().requires_grad_(True)
-        from examples.grpo_loss import torch_grpo_loss
+        torch_grpo_loss = import_example("grpo_loss").torch_grpo_loss
 
         loss_torch, _, _ = torch_grpo_loss(
             logits_torch,
@@ -3348,7 +3376,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     def _skip_linear_engine_autotune(self) -> None:
         # These tests only assert correctness. Pin a fixed default config;
         # restored after the test.
-        from examples.linear import linear_attention_engine as engine
+        from helion.experimental import linear_attention as engine
 
         # Free cached GPU memory after each test so xdist workers
         # sharing one GPU don't OOM.
@@ -3374,10 +3402,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             kernel.reset()
 
     def _run_linear_example(self, name: str, method: str = "test") -> None:
-        import importlib
 
         self._skip_linear_engine_autotune()
-        mod = importlib.import_module(f"examples.linear.{name}")
+        mod = import_example(f"linear.{name}")
         harness = getattr(mod, "HARNESS", None)
         if harness is not None:
             getattr(harness, method)()
@@ -3454,8 +3481,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         # CUDA graph captures it; a fresh, malformed vector still raises.
         import dataclasses
 
-        from examples.linear import linear_attention_harness as harness_mod
-        from examples.linear.example_kda import HARNESS
+        from helion._testing import linear_attention_harness as harness_mod
+
+        HARNESS = import_example("linear.example_kda").HARNESS
 
         self._skip_linear_engine_autotune()
         torch.manual_seed(42)
@@ -3513,8 +3541,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         preprocess=None,
         dtype=torch.bfloat16,
     ):
-        from examples.linear.linear_attention_engine import get_helion_fwd_kernel
-        from examples.linear.linear_attention_utils import head_to_time_first as _tf
+        from helion._testing.linear_attention_utils import head_to_time_first as _tf
+        from helion.experimental.linear_attention import get_helion_fwd_kernel
 
         self._skip_linear_engine_autotune()
         helion_fwd = get_helion_fwd_kernel(variant)
@@ -3576,7 +3604,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     def test_linear_monkeypatch_gla(self):
         """Monkey-patch FLA's GatedLinearAttention to use our engine, verify fwd+bwd."""
-        from examples.linear.linear_attention_engine import LinearAttentionVariant
+        from helion.experimental.linear_attention import LinearAttentionVariant
 
         try:
             import fla.layers.gla as _fla_gla_mod
@@ -3604,7 +3632,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     def test_linear_monkeypatch_delta_rule(self):
         """Monkey-patch FLA's DeltaNet to use our engine, verify fwd+bwd."""
-        from examples.linear.linear_attention_engine import LinearAttentionVariant
+        from helion.experimental.linear_attention import LinearAttentionVariant
 
         try:
             import fla.layers.delta_net as _fla_dn_mod
@@ -3638,7 +3666,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     def test_linear_monkeypatch_gated_delta_rule(self):
         """Monkey-patch FLA's GatedDeltaNet to use our engine, verify fwd+bwd."""
-        from examples.linear.linear_attention_engine import LinearAttentionVariant
+        from helion.experimental.linear_attention import LinearAttentionVariant
 
         try:
             import fla.layers.gated_deltanet as _fla_gdn_mod
@@ -3687,7 +3715,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     def test_linear_monkeypatch_simple_gla(self):
         """Monkey-patch FLA's SimpleGatedLinearAttention to use our engine."""
-        from examples.linear.linear_attention_engine import LinearAttentionVariant
+        from helion.experimental.linear_attention import LinearAttentionVariant
 
         try:
             import fla.layers.simple_gla as _fla_sgla_mod

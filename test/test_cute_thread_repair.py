@@ -4,7 +4,6 @@ import math
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.jagged_layer_norm import jagged_layer_norm_kernel
 import pytest
 import torch
 
@@ -13,12 +12,15 @@ from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._compiler.backend import CuteBackend
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import NumThreadsSpec
+
+jagged_layer_norm_kernel = import_example("jagged_layer_norm").jagged_layer_norm_kernel
 
 if TYPE_CHECKING:
     from helion._compiler.cute.loop_nesting import TileLoopPath

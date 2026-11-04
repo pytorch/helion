@@ -120,3 +120,6 @@ cute_sweep_results.jsonl
 # Scratch home for hillclimb runs (cute-hillclimb skill): raw benchmark
 # output, autotuner configs, probe logs, and the goal file. Never committed.
 /artifacts/
+
+# Claude Code writes its local settings through the .claude -> .agents symlink.
+.agents/settings.local.json

@@ -117,7 +117,7 @@ def example_kernels(module: str) -> dict[str, Any]:
 
     found = live_example_kernels()
     if not found:
-        raise RuntimeError(f"No Helion kernels imported for examples.{module}")
+        raise RuntimeError(f"No Helion kernels imported for examples/{module}.py")
     return found
 
 

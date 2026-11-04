@@ -9287,9 +9287,17 @@ class CuteTcgen05Config:
             projected_config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 1
         return self._is_validated_clc_persistence_search_candidate(projected_config)
 
+    def _offers_pdl_fragment(self) -> bool:
+        """Whether ``optional_fragments`` carries the ``cute_pdl`` knob."""
+        return (
+            self.search_enabled
+            and self.config_spec.supports_config_key("cute_pdl")
+            and not self.fission_bundle
+        )
+
     def implicit_default_keys_to_preserve(self, config: dict[str, object]) -> set[str]:
         preserve_keys: set[str] = set()
-        if "cute_pdl" in self.optional_fragments():
+        if self._offers_pdl_fragment():
             # The dependent-launch knob is one of this kernel's optional
             # tcgen05 fields: a normalized config carries its default like the
             # other optional knobs, so a flat transfer round-trips exactly.
@@ -10309,11 +10317,7 @@ class CuteTcgen05Config:
         # where the plan admitted the family (``warp_mma_admitted``); every
         # tcgen05-enabled kernel validates the keys so an explicit request on
         # a non-admitted problem is refused with the reason.
-        if (
-            self.search_enabled
-            and self.config_spec.supports_config_key("cute_pdl")
-            and not self.fission_bundle
-        ):
+        if self._offers_pdl_fragment():
             # Programmatic dependent launch of the tcgen05 kernel
             # (``cute_mma``'s ``tcgen05_pdl_launch``) and of the
             # register-MMA family: the next kernel in the stream launches

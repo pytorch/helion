@@ -10,6 +10,7 @@ from test._cute_binding import _cpu_bind
 import helion
 from helion import exc
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
 import helion.language as hl
@@ -175,7 +176,7 @@ def test_simt_gemm_knob_requires_fp32_contraction() -> None:
 
 
 def test_split_k_barrier_ordered_phases_and_seeds() -> None:
-    from examples.split_k_barrier import split_k_matmul
+    split_k_matmul = import_example("split_k_barrier").split_k_matmul
 
     kernel = _kernel(split_k_matmul.fn)
     bound = _cpu_bind(kernel, (torch.ones(128, 4096), torch.ones(4096, 128)))
@@ -281,7 +282,7 @@ def test_simt_gemm_matches_reference(shape: tuple[int, int, int], layout: str) -
 
 @skipIfNotCUDA()
 def test_split_k_barrier_simt_gemm_matches_reference() -> None:
-    from examples.split_k_barrier import split_k_matmul
+    split_k_matmul = import_example("split_k_barrier").split_k_matmul
 
     a = torch.randn(64, 8192, device=DEVICE)
     b = torch.randn(64, 8192, device=DEVICE).T

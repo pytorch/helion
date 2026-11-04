@@ -18,6 +18,7 @@ from helion._compiler.cute.philox_packets import lower_philox_packets
 from helion._compiler.cute.philox_stream import PACKET_ASM
 from helion._compiler.cute.philox_stream import SCALAR_ASM
 from helion._compiler.cute.philox_stream import SCALAR_CONSTRAINTS
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
@@ -263,8 +264,9 @@ def _config(width, packet):
 
 @skipUnlessBackends(["cute"])
 def test_original_dynamic_reference_forward_backward_and_stream_choice(cpu_only):
-    from examples.low_mem_dropout import low_mem_dropout
-    from examples.low_mem_dropout import low_mem_dropout_bwd
+    _examples_low_mem_dropout = import_example("low_mem_dropout")
+    low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
+    low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 
     from helion._compiler.rng_utils import philox_rand_ref
     from helion.runtime.ref_mode import RefMode
@@ -322,7 +324,7 @@ def test_original_dynamic_reference_forward_backward_and_stream_choice(cpu_only)
 
 @skipUnlessBackends(["cute"])
 def test_original_emission_scalar_packet_normalizer_and_semantic_cache(cpu_only):
-    from examples.low_mem_dropout import low_mem_dropout
+    low_mem_dropout = import_example("low_mem_dropout").low_mem_dropout
 
     args = (0.25, torch.empty(1025), -(2**63))
     bound = helion.kernel(
@@ -411,7 +413,7 @@ def test_unsupported_opt_in_rng_rejects_instead_of_old_stream(cpu_only):
 
 
 def test_environment_default_and_invalid_policy(cpu_only, monkeypatch):
-    from examples.low_mem_dropout import low_mem_dropout
+    low_mem_dropout = import_example("low_mem_dropout").low_mem_dropout
 
     monkeypatch.delenv("HELION_CUTE_RNG_STREAM", raising=False)
     assert helion.Settings(backend="cute").cute_rng_stream == "auto"
@@ -480,7 +482,7 @@ def test_multiple_distinct_rng_sites_keep_their_own_seed_and_offset(cpu_only):
 )
 @skipUnlessBackends(["cute"])
 def test_unsupported_rng_both_compiled_and_reference(function, cpu_only):
-    from examples.low_mem_dropout import low_mem_dropout
+    low_mem_dropout = import_example("low_mem_dropout").low_mem_dropout
 
     from helion.runtime.ref_mode import RefMode
     from helion.runtime.ref_mode import RefModeContext
@@ -535,7 +537,7 @@ def test_device_derived_seed_keeps_scalar_new_stream(cpu_only):
 
 @skipUnlessBackends(["cute"])
 def test_config_mutation_cannot_change_the_stream_policy(cpu_only):
-    from examples.low_mem_dropout import low_mem_dropout
+    low_mem_dropout = import_example("low_mem_dropout").low_mem_dropout
 
     args = (0.25, torch.empty(1025), 123)
     bound = helion.kernel(

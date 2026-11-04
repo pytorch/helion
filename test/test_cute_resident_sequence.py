@@ -21,6 +21,7 @@ from helion._compiler.cute.resident_sequence import _MARKER
 from helion._compiler.cute.resident_sequence import SequenceRegion
 from helion._compiler.cute.resident_sequence import materialize_resident_sequences
 from helion._compiler.tile_strategy import _lane_reduce_marker_expr
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 
 if TYPE_CHECKING:
@@ -585,8 +586,8 @@ def test_unchanged_examples_emit_logical_reduction_phases(
 ) -> None:
     from unittest.mock import patch
 
-    from examples.aot_example import row_softmax
-    from examples.welford import welford
+    row_softmax = import_example("aot_example").row_softmax
+    welford = import_example("welford").welford
 
     from test._cute_binding import _cpu_bind
 

@@ -24,7 +24,6 @@ from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
 import functools
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -152,7 +151,7 @@ def _fp8_attention_baseline(
 ) -> torch.Tensor:
     # `fp8_attention_pytorch` returns a callable factory; unwrap it to the
     # harness's `baseline_fn(*args) -> Tensor` contract.
-    from examples.fp8_attention import fp8_attention_pytorch
+    fp8_attention_pytorch = import_example("fp8_attention").fp8_attention_pytorch
 
     return fp8_attention_pytorch(q, k, v)()
 
@@ -663,7 +662,7 @@ def _grpo_loss_baseline(
     # outputs comparable.
     # Import via examples.grpo_loss (package) so torch.compile can trace this
     # baseline without hitting importlib spec_from_file_location.
-    from examples.grpo_loss import torch_grpo_loss
+    torch_grpo_loss = import_example("grpo_loss").torch_grpo_loss
 
     return torch_grpo_loss(
         logits.float(),
@@ -853,7 +852,7 @@ def _xsa_baseline(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Te
     # Lazy import so collection works without torch_tpu present at module
     # load. ref_xsa is the manual matmul+softmax+epilogue reference; matches
     # what test_examples checks against.
-    from examples.xsa import ref_xsa
+    ref_xsa = import_example("xsa").ref_xsa
 
     return ref_xsa(q, k, v)
 
@@ -1128,15 +1127,10 @@ class KernelResult:
 
 
 def import_example(module_file: str) -> types.ModuleType:
-    """Import an example module by filename."""
-    module_path = EXAMPLES_DIR / f"{module_file}.py"
-    spec = importlib.util.spec_from_file_location(
-        f"examples.{module_file}", module_path
-    )
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    """Import an example module by filename (``helion._testing.import_example``)."""
+    from helion._testing import import_example as _import_example
+
+    return _import_example(module_file)
 
 
 KERNEL_TIMEOUT = int(os.environ.get("HELION_BENCHMARK_KERNEL_TIMEOUT", "1200"))

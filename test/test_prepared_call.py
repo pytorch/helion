@@ -252,6 +252,25 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             bind.assert_called()
             torch.testing.assert_close(out, x * 3)
 
+    def test_bound_direct_call_guards_specialized_value_from_first_call(
+        self,
+    ) -> None:
+        scale = _make_scale()
+        x = torch.randn(64, device=DEVICE)
+        bound = scale.bind((x, 2))
+        # The direct prepared call is built from the first call's extra
+        # guards, which a memo miss collects.
+        self.assertFalse(scale._fast_dispatch_schemas)  # type: ignore[attr-defined]
+        torch.testing.assert_close(bound(x, 2), x * 2)
+        torch.testing.assert_close(bound(x, 2), x * 2)
+        self.assertTrue(scale._has_specialization_extras)  # type: ignore[attr-defined]
+        self.assertIsNotNone(bound._direct_prepared_call)
+        # The int's value is not in the prepared argument guard, only in the
+        # specialized-value extra guard.
+        torch.testing.assert_close(bound(x, 3), x * 3)
+        torch.testing.assert_close(bound(x, 2), x * 2)
+        torch.testing.assert_close(bound(x, 3), x * 3)
+
     def test_tensor_metadata_changes_use_dispatch(self) -> None:
         add_one = _make_add_one()
         add_one(torch.randn(64, device=DEVICE))
@@ -1124,6 +1143,261 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             bound._dispatch_generation,
             aot_scale._specialization_generation,  # type: ignore[attr-defined]
         )
+
+    def test_warm_keyed_launch_skips_base_specialization_key(self) -> None:
+        aot_scale = _make_aot_scale()
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(aot_scale(x, 2), x * 2)
+        self.assertTrue(aot_scale._has_specialization_extras)  # type: ignore[attr-defined]
+        torch.testing.assert_close(aot_scale(x, 2), x * 2)
+        with patch.object(
+            aot_scale,
+            "_base_specialization_key",
+            side_effect=AssertionError("warm keyed launch rebuilt the base key"),
+        ):
+            for value in (2, 2):
+                torch.testing.assert_close(aot_scale(x, value), x * value)
+
+    def test_keyed_dispatch_reevaluates_only_per_call_extractors(self) -> None:
+        aot_scale = _make_aot_scale()
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(aot_scale(x, 2), x * 2)
+        bound = next(iter(aot_scale._dispatch_cache.values()))  # type: ignore[attr-defined]
+        self.assertTrue(aot_scale._fast_dispatch_schemas)  # type: ignore[attr-defined]
+        calls = [0, 0]
+
+        def tensor_size(values: Sequence[object]) -> int:
+            calls[0] += 1
+            return _tensor_size(values)
+
+        def scalar_value(values: Sequence[object]) -> int:
+            calls[1] += 1
+            return cast("int", values[1])
+
+        aot_scale._extend_bound_kernel_specializations(  # type: ignore[attr-defined]
+            bound,
+            bound._base_spec_key,
+            [
+                kernel_module._PreparedMetadataSpecializationExtractor(tensor_size),
+                scalar_value,
+            ],
+            (x, 2),
+        )
+        # The extension retires every memoized schema.
+        self.assertFalse(aot_scale._fast_dispatch_schemas)  # type: ignore[attr-defined]
+        torch.testing.assert_close(aot_scale(x, 2), x * 2)
+        torch.testing.assert_close(aot_scale(x, 2), x * 2)
+        # (The AOT key holds the scalar, so only value 2 has this schema.)
+        for value in (2, 2, 2):
+            calls[:] = [0, 0]
+            with patch.object(
+                aot_scale,
+                "_base_specialization_key",
+                side_effect=AssertionError("keyed hit rebuilt the base key"),
+            ):
+                key = aot_scale._fast_dispatch_key((x, value))  # type: ignore[attr-defined]
+            self.assertEqual(calls, [0, 1])
+            assert key is not None
+            self.assertEqual(
+                key,
+                aot_scale._fast_dispatch_key(  # type: ignore[attr-defined]
+                    (x, value),
+                    signature=aot_scale._base_specialization_key((x, value)),  # type: ignore[attr-defined]
+                ),
+            )
+            torch.testing.assert_close(aot_scale(x, value), x * value)
+
+    def test_keyed_specialized_scalars_dispatch_to_distinct_bounds(self) -> None:
+        @helion.kernel(
+            static_shapes=False,
+            config=helion.Config(block_sizes=[64]),
+            key=lambda x, value: x.size(0) > 32,
+        )
+        def keyed_scale(x: torch.Tensor, value: int) -> torch.Tensor:
+            value = hl.specialize(value)
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * value
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        for _ in range(3):
+            for value in (2, 3):
+                torch.testing.assert_close(keyed_scale(x, value), x * value)
+        keys = {
+            value: keyed_scale._fast_dispatch_key((x, value))  # type: ignore[attr-defined]
+            for value in (2, 3)
+        }
+        self.assertIsNot(
+            keyed_scale._dispatch_cache[keys[2]],  # type: ignore[attr-defined]
+            keyed_scale._dispatch_cache[keys[3]],  # type: ignore[attr-defined]
+        )
+        # Both values share one exact prefix, hence one memoized schema whose
+        # specialized value is re-read on every call.
+        self.assertEqual(keys[2][:-1], keys[3][:-1])
+        self.assertEqual(len(keyed_scale._fast_dispatch_schemas), 1)  # type: ignore[attr-defined]
+
+    def test_specialization_changes_retire_fast_dispatch_schemas(self) -> None:
+        aot_scale = _make_aot_scale()
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(aot_scale(x, 2), x * 2)
+        torch.testing.assert_close(aot_scale(x, 2), x * 2)
+        self.assertTrue(aot_scale._fast_dispatch_schemas)  # type: ignore[attr-defined]
+        bound = next(iter(aot_scale._dispatch_cache.values()))  # type: ignore[attr-defined]
+        params = tuple(aot_scale.signature.parameters)
+        size = kernel_module.sympy.Symbol("x_size0", integer=True)
+        fact = kernel_module._PreparedMetadataSpecializationExtractor(
+            kernel_module._GuardedInputFact(
+                size,
+                kernel_module.sympy.Integer(1),
+                (
+                    (
+                        size,
+                        kernel_module.TensorPropertySource(
+                            kernel_module.LocalSource("x"),
+                            kernel_module.TensorProperty.SIZE,
+                            0,
+                        ),
+                    ),
+                ),
+                False,
+                False,
+                params,
+            )
+        )
+        aot_scale._publish_guard_facts(bound, [fact])  # type: ignore[attr-defined]
+        self.assertFalse(aot_scale._fast_dispatch_schemas)  # type: ignore[attr-defined]
+        torch.testing.assert_close(aot_scale(x, 2), x * 2)
+        torch.testing.assert_close(aot_scale(x, 2), x * 2)
+        (schema,) = aot_scale._fast_dispatch_schemas.values()  # type: ignore[attr-defined]
+        self.assertIn(fact, schema.extra_fns)
+        aot_scale.reset()
+        self.assertFalse(aot_scale._fast_dispatch_schemas)  # type: ignore[attr-defined]
+        torch.testing.assert_close(aot_scale(x, 3), x * 3)
+
+    def test_new_signature_keys_specialized_values_after_warm_signature(
+        self,
+    ) -> None:
+        """A signature first seen once another has published extras looks up
+        its schema before its own first bind publishes it; the memo must not
+        keep that miss, or its ``hl.specialize``'d values share one kernel."""
+        for static_shapes in (True, False):
+            for keyed in (False, True):
+                settings: dict[str, object] = {
+                    "static_shapes": static_shapes,
+                    "config": helion.Config(block_sizes=[64]),
+                }
+                if keyed:
+                    settings["key"] = lambda x, value: 0
+
+                @helion.kernel(**settings)
+                def scale(x: torch.Tensor, value: int) -> torch.Tensor:
+                    value = hl.specialize(value)
+                    out = torch.empty_like(x)
+                    for tile in hl.tile(x.size(0)):
+                        out[tile] = x[tile] * value
+                    return out
+
+                with self.subTest(static_shapes=static_shapes, keyed=keyed):
+                    a = torch.randn(64, device=DEVICE)
+                    # A new signature under either shape setting.
+                    b = torch.randn(128, device=DEVICE, dtype=torch.float16)
+                    for _ in range(2):
+                        torch.testing.assert_close(scale(a, 2), a * 2)
+                    for value in (2, 3, 2, 3):
+                        torch.testing.assert_close(scale(b, value), b * value)
+
+    def test_omitted_default_alias_implied_by_metadata_leaves_prepared_hits(
+        self,
+    ) -> None:
+        """An omitted-default call keys the canonical signature's broadcast
+        guard facts through its alias.  They read only sizes, which the
+        prepared argument guard pins, so a prepared hit re-checks none of
+        them (only canonical extractors exact metadata does not imply, such
+        as CuTe's pointer-alignment classifier), while the size-1 and full
+        bias shapes keep separate kernels."""
+
+        @helion.kernel(
+            static_shapes=False,
+            config=helion.Config(block_sizes=[1, 8, 16]),
+        )
+        def add_bias(
+            x: torch.Tensor, bias: torch.Tensor, scale: float = 1.0
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + bias[tile] * scale
+            return out
+
+        x = torch.randn(4, 8, 16, device=DEVICE)
+        for bias_shape in ((4, 8, 16), (1, 8, 16)) * 3:
+            bias = torch.randn(bias_shape, device=DEVICE)
+            torch.testing.assert_close(add_bias(x, bias), x + bias)
+            prepared = add_bias._prepared_call  # type: ignore[attr-defined]
+            assert prepared is not None
+            for guard, _expected in prepared._extra_guards:
+                self.assertIsInstance(guard, kernel_module._SpecializationAliasDispatch)
+                for _index, extractor in guard.per_call:  # type: ignore[attr-defined]
+                    self.assertFalse(
+                        kernel_module._implied_by_exact_metadata(extractor)
+                    )
+            with patch.object(
+                add_bias,
+                "_fast_dispatch_key_and_guards",
+                side_effect=AssertionError("prepared call missed"),
+            ):
+                torch.testing.assert_close(add_bias(x, bias), x + bias)
+        (alias,) = add_bias._specialization_aliases.values()  # type: ignore[attr-defined]
+        self.assertTrue(alias.schemas[alias.canonical_signature])
+        self.assertIn([alias], add_bias._specialize_extra.values())  # type: ignore[attr-defined]
+
+    def test_storage_offset_guard_fact_stays_on_prepared_hits(self) -> None:
+        """Neither ``TensorGuards`` nor the Python argument checks pin a
+        storage offset, so a guard fact over one is re-checked on every
+        prepared hit."""
+
+        @helion.kernel(static_shapes=False, config=helion.Config(block_sizes=[64]))
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        storage = torch.randn(144, device=DEVICE)
+        zero, offset = storage[:128], storage[16:]
+        torch.testing.assert_close(add_one(zero), zero + 1)
+        offset_symbol = kernel_module.sympy.Symbol("x_offset", integer=True)
+        fact = kernel_module._PreparedMetadataSpecializationExtractor(
+            kernel_module._GuardedInputFact(
+                offset_symbol,
+                kernel_module.sympy.Integer(0),
+                (
+                    (
+                        offset_symbol,
+                        kernel_module.TensorPropertySource(
+                            kernel_module.LocalSource("x"),
+                            kernel_module.TensorProperty.STORAGE_OFFSET,
+                        ),
+                    ),
+                ),
+                False,
+                True,
+                tuple(add_one.signature.parameters),
+            )
+        )
+        add_one._publish_guard_facts(add_one.bind((zero,)), [fact])  # type: ignore[attr-defined]
+        for _ in range(2):
+            torch.testing.assert_close(add_one(zero), zero + 1)
+        prepared = add_one._prepared_call  # type: ignore[attr-defined]
+        assert prepared is not None
+        self.assertEqual(prepared._extra_guards, ((fact, True),))
+        self.assertTrue(prepared.matches(add_one, (zero,)))
+        self.assertFalse(prepared.matches(add_one, (offset,)))
+        offset_bound = add_one.bind((offset,))
+        self.assertIsNot(offset_bound, prepared.bound)
+        torch.testing.assert_close(add_one(offset), offset + 1)
+        offset_key = add_one._fast_dispatch_key((offset,))  # type: ignore[attr-defined]
+        self.assertIs(add_one._dispatch_cache[offset_key], offset_bound)  # type: ignore[attr-defined]
 
     def test_distributed_aot_late_specialization_stays_locked(self) -> None:
         aot_scale = _make_aot_scale(distributed=True)

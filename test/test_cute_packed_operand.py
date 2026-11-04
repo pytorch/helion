@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 
-from examples.int4_gemm import matmul_bf16_int4
 import pytest
 import torch
 
@@ -12,8 +11,11 @@ import helion
 from helion._compiler.cute.packed_operand import KEY
 from helion._compiler.cute.packed_operand import MODES
 from helion._compiler.cute.packed_operand import prove_packed_operand
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.compiler_coverage import append_compiler_coverage
+
+matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
 
 pytestmark = skipUnlessBackends(["cute"])
 

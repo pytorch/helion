@@ -43,6 +43,8 @@ def _thermal_warmup(seconds: float) -> None:
 
 
 def main() -> None:
+    from helion._testing import import_example
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--m", type=int, required=True)
     parser.add_argument("--n", type=int, required=True)
@@ -71,7 +73,8 @@ def main() -> None:
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from compare_matmul_backends import IdentityEpilogue  # pyrefly: ignore
-    from examples.matmul import matmul
+
+    matmul = import_example("matmul").matmul
 
     config_src = Path(args.helion_config_file).read_text().strip()
     helion_config = eval(config_src, {"helion": helion})

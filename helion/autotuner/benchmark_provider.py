@@ -766,6 +766,15 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self.mutated_arg_indices,
             self._baseline_post_args,
         ) = self._compute_baseline()
+        # The baseline runs -- two configs, each on its own copy of the
+        # arguments, and the comparison of their outputs in fp32 -- leave this
+        # process's caching allocator holding several times the arguments'
+        # size, freed but reserved.  The benchmark worker is another process
+        # and cannot use that memory: at welford's (262144, 8192) bf16 it was
+        # over 40 GiB of an 80 GB H100, leaving the worker too little to run
+        # some configs.  Give it back to the device before the search starts.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self._effective_atol, self._effective_rtol = (
             self._compute_effective_tolerances()
         )
@@ -2916,7 +2925,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return None
 
         if self._benchmark_worker is None:
-            self._benchmark_worker = BenchmarkWorker(device=None)
+            self._benchmark_worker = BenchmarkWorker(
+                device=None, log_warning=self.log.warning
+            )
 
         if (
             len(self.mutated_arg_indices) > 0
@@ -2966,7 +2977,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return None
 
         if self._benchmark_worker is None:
-            self._benchmark_worker = BenchmarkWorker(device=None)
+            self._benchmark_worker = BenchmarkWorker(
+                device=None, log_warning=self.log.warning
+            )
 
         job = BenchmarkJob(
             fn_spec=fn_spec,

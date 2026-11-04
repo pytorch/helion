@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from itertools import accumulate
 
-from examples.jagged_dense_bmm import jagged_dense_bmm
 import pytest
 import torch
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+jagged_dense_bmm = import_example("jagged_dense_bmm").jagged_dense_bmm
 
 pytestmark = skipUnlessBackends(["cute"])
 

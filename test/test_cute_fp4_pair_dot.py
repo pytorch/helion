@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import ast
 
-from examples.nvfp4_gemv import _nvfp4_gemv_fp4in_body
-from examples.nvfp4_gemv import reference_nvfp4_gemv_fp4in
-from examples.nvfp4_gemv import swizzle_fp8_scales
 import pytest
 import torch
 
@@ -13,7 +10,13 @@ from test.test_cute_tile_packing import _gemv_args
 import helion
 from helion._compiler.cute.fuse_fp4_pair_dot import fuse_fp4_pair_dot
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+_examples_nvfp4_gemv = import_example("nvfp4_gemv")
+_nvfp4_gemv_fp4in_body = _examples_nvfp4_gemv._nvfp4_gemv_fp4in_body
+reference_nvfp4_gemv_fp4in = _examples_nvfp4_gemv.reference_nvfp4_gemv_fp4in
+swizzle_fp8_scales = _examples_nvfp4_gemv.swizzle_fp8_scales
 
 pytestmark = skipUnlessBackends(["cute"])
 

@@ -286,6 +286,7 @@ from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import default_cute_mma_support
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfNotCUDA
@@ -4938,7 +4939,7 @@ class TestTritonH100MatmulHeuristic(TestCase):
         # the seed pins every batch/outer axis to 1 (one CTA per batch — a no-reuse parallel axis)
         # while sizing only the dot's M/N/K by the budget. fp32 inputs keep this torch-version
         # independent (16-bit baddbmm needs torch>=2.8); the levers tested here are dtype-agnostic.
-        from examples.bmm import bmm
+        bmm = import_example("bmm").bmm
 
         a = torch.randn(16, 512, 512, device=DEVICE, dtype=torch.float32)
         b = torch.randn(16, 512, 512, device=DEVICE, dtype=torch.float32)
@@ -11504,7 +11505,7 @@ class TestTritonReductionHeuristic(TestCase):
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
     def test_rms_norm_wide_seeds_persistent_with_warps(self) -> None:
-        from examples.rms_norm import rms_norm_fwd
+        rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
 
         m, n = 2048, 16384
         args = (
@@ -11554,7 +11555,7 @@ class TestTritonReductionHeuristic(TestCase):
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
     def test_kl_div_wide_seeds_liveness_r_block_cap(self) -> None:
-        from examples.kl_div import kl_div_forward
+        kl_div_forward = import_example("kl_div").kl_div_forward
 
         m, n = 4096, 131072
         # Binding only inspects tensor metadata. Keep the wide, contiguous shape
@@ -12140,7 +12141,7 @@ def test_cute_dot_row_reduction_seed_keeps_the_softmax_axis_in_thread() -> None:
     """``hl.dot`` over head_dim whose result is reduced (``amax``/``sum``) over
     the key tile: the key tile's ``num_threads`` slot seeds (and defaults to) 1,
     so the row statistics and the ``p @ v`` running sum stay in registers."""
-    from examples.fp8_attention import fp8_attention_kernel
+    fp8_attention_kernel = import_example("fp8_attention").fp8_attention_kernel
 
     from helion._compiler.autotuner_heuristics.cute_dot_row_reduction import (
         CuteDotRowReductionHeuristic,

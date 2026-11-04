@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 from typing import cast
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 
@@ -11,7 +10,10 @@ from test.test_cute_split_k_workspace import _fp32_bias
 
 import helion
 from helion._compiler.autotuner_heuristics.cute_split_k_cluster import cluster_carrier
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
 CUDA_DEVICE = "cuda"
 pytestmark = [

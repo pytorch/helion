@@ -10,6 +10,10 @@ import torch
 from helion._compiler.ast_extension import ExtendedAST
 from helion._compiler.ast_extension import convert
 from helion._compiler.ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from helion._compiler.cute.factor_affine_reductions import _live_before_block
+from helion._compiler.cute.factor_affine_reductions import _live_before_suffixes
+from helion._compiler.cute.factor_affine_reductions import _names_read
+from helion._compiler.cute.factor_affine_reductions import _names_read_suffixes
 from helion._compiler.cute.factor_affine_reductions import factor_affine_reductions
 from helion._compiler.cute.factor_affine_reductions import hoist_factored_reductions
 from helion._compiler.cute.factor_affine_reductions import (
@@ -1218,3 +1222,31 @@ def test_packed_fp32_loop_is_idempotent() -> None:
     )
 
     assert ast.unparse(ast.Module(body=twice, type_ignores=[])) == once_code
+
+
+def test_block_suffix_liveness_matches_per_suffix_walks() -> None:
+    body = ast.parse(
+        """
+a = f(x)
+if a > 0:
+    b = g(a)
+else:
+    b = h(y)
+    c = b
+for i in cutlass.range_constexpr(4):
+    acc = acc + b * i
+    d = acc
+while d < lim:
+    d = d + c
+e = d + c + z
+"""
+    ).body
+    live_out = {"e", "q"}
+    suffixes = range(len(body) + 1)
+    assert _live_before_suffixes(body, live_out) == [
+        _live_before_block(body[index:], live_out=live_out) for index in suffixes
+    ]
+    assert _names_read_suffixes(body) == [
+        _names_read(ast.Module(body=body[index:], type_ignores=[]))
+        for index in suffixes
+    ]

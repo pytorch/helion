@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from examples.moe_matmul_ogs import moe_matmul_ogs
 import pytest
 import torch
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+moe_matmul_ogs = import_example("moe_matmul_ogs").moe_matmul_ogs
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),

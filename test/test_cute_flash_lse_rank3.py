@@ -19,6 +19,7 @@ import helion
 from helion._compiler.cute import cute_flash
 from helion._testing import DEVICE
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
@@ -168,7 +169,7 @@ def test_rank3_store_of_a_non_lse_value_declines() -> None:
 
 @skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_canonical_attention_example_reaches_the_flash_path() -> None:
-    from examples.attention import attention
+    attention = import_example("attention").attention
 
     kernel = helion.kernel(
         attention.fn,

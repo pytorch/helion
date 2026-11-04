@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 
@@ -13,9 +12,12 @@ from test.test_cute_fuse_mm_accumulation import _cpu_target
 import helion
 from helion import exc
 from helion._compiler.cute.collective_matmul import _region_write_roots
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
+
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
 CUDA_DEVICE = "cuda"
 

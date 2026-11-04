@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any
 from unittest.mock import patch
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 
@@ -15,8 +14,11 @@ from test.test_cute_split_k_workspace import _plain_store_matmul
 from test.test_cute_split_k_workspace_protocol import _matrix_bias
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.benchmarking import _make_cudagraph_replay
+
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
 pytestmark = skipUnlessBackends(["cute"])
 

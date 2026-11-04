@@ -98,7 +98,7 @@ select = [
     "RUF015", "RUF016", "RUF017", "RUF018", "RUF019", "RUF020", "RUF022", "RUF024",
     "RUF026", "RUF030", "RUF034", "RUF036", "RUF037", "RUF041", "RUF047", "RUF051",
     "RUF056", "RUF100", "RUF200", "S324", "SIM", "SLOT", "TCH", "TD001", "TD002",
-    "TD004", "TRY002", "TRY203", "TRY401", "UP", "W", "YTT",
+    "TD004", "TID251", "TRY002", "TRY203", "TRY401", "UP", "W", "YTT",
 ]
 ignore = [
     "C409", "C419", "COM812", "E501", "ERA001", "FURB189", "G004", "PERF203", "PERF401",
@@ -107,6 +107,12 @@ ignore = [
 extend-safe-fixes = ["TC", "UP045", "RUF013", "RSE102"]
 preview = true
 exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb", "_helion_aot_*.py"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+# examples/ is a directory of standalone scripts, not a package; a bare
+# ``import examples`` finds whichever ``examples`` directory is first on
+# sys.path.  Load an example by path instead.
+"examples".msg = "load example modules with helion._testing.import_example"
 
 [tool.ruff.lint.per-file-ignores]
 "test/*" = ["ANN"]

@@ -15,7 +15,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import os
 from typing import Any
@@ -161,6 +160,8 @@ def write_results_json(
 
 
 def main() -> None:
+    from helion._testing import import_example
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--kernel",
@@ -188,7 +189,7 @@ def main() -> None:
     for name in names:
         print(f"=== {name} ===")
         base = FUSED_PREAMBLE_VARIANTS.get(name) or VARLEN_VARIANTS.get(name, name)
-        mod = importlib.import_module(f"examples.linear.example_{base}")
+        mod = import_example(f"linear.example_{base}")
         harness = mod.HARNESS
         if name in VARLEN_VARIANTS:
             # Each varlen row carries its own sequence lengths, so the rows run one at

@@ -11,6 +11,9 @@ import helion.language as hl
 
 @helion.aot_kernel(
     static_shapes=True,
+    # NaN-propagating amax (the default since #3877) spills the persistent
+    # 128K-vocab sm90 config to local memory and runs ~10x slower.
+    fast_math=True,
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def cross_entropy(

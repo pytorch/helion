@@ -5,7 +5,6 @@ import random
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 
@@ -13,12 +12,15 @@ from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_shared_rhs_grouped import _target
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner import LFBOTreeSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.exc import InvalidConfig
 from helion.runtime.settings import default_autotuner_fn
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 pytestmark = skipUnlessBackends(["cute"])
 

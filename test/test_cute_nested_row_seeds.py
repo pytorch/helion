@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from examples.jagged_layer_norm import jagged_layer_norm_kernel
-from examples.jagged_layer_norm import reference_jagged_layer_norm_pytorch
 import pytest
 import torch
 
@@ -17,8 +15,15 @@ from helion._compiler.autotuner_heuristics.cute import CuteSiblingRowHeuristic
 from helion._compiler.cute.loop_nesting import tile_loop_paths
 from helion._compiler.cute.thread_budget import tile_loop_thread_count
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+_examples_jagged_layer_norm = import_example("jagged_layer_norm")
+jagged_layer_norm_kernel = _examples_jagged_layer_norm.jagged_layer_norm_kernel
+reference_jagged_layer_norm_pytorch = (
+    _examples_jagged_layer_norm.reference_jagged_layer_norm_pytorch
+)
 
 pytestmark = skipUnlessBackends(["cute"])
 

@@ -18,6 +18,7 @@ import helion
 from helion._compiler.cute.promote_output_axis import _PromotedGridAxisGraphInfo
 from helion._compiler.cute.tcgen05_flat_grouped_ir import prove_flat_grouped_rna
 from helion._compiler.device_ir import ForLoopGraphInfo
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.language import _tracing_ops
@@ -199,7 +200,7 @@ def cuda_binding(
         function = flat_contract
         arguments = (*inputs, mode, scalar_group)
         if original:
-            from examples.jagged_dense_bmm import jagged_dense_bmm
+            jagged_dense_bmm = import_example("jagged_dense_bmm").jagged_dense_bmm
 
             function = jagged_dense_bmm.fn
             arguments = tuple(inputs)

@@ -1704,6 +1704,35 @@ class SearchDimensionInfo(NamedTuple):
     num_items: int
 
 
+@functools.lru_cache(maxsize=4096)
+def _fa4_register_budget_repair(
+    softmax_choices: tuple[int, ...],
+    corr_choices: tuple[int, ...],
+    other_choices: tuple[int, ...],
+    current: tuple[int, int, int],
+) -> tuple[int, int, int] | None:
+    """The legal FA4 register split closest to ``current``, or None.
+
+    Memoized: normalization repairs the same few over-budget splits against
+    the same fragment choices for every sampled config.
+    """
+    best: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
+    for softmax_candidate in softmax_choices:
+        for corr_candidate in corr_choices:
+            for other_candidate in other_choices:
+                candidate = (softmax_candidate, corr_candidate, other_candidate)
+                if 2 * softmax_candidate + corr_candidate + other_candidate > 512:
+                    continue
+                score = (
+                    sum(a != b for a, b in zip(candidate, current, strict=True)),
+                    sum(abs(a - b) for a, b in zip(candidate, current, strict=True)),
+                    -softmax_candidate,
+                )
+                if best is None or score < best[0]:
+                    best = (score, candidate)
+    return None if best is None else best[1]
+
+
 class ConfigSpec:
     def __init__(
         self,
@@ -1720,6 +1749,16 @@ class ConfigSpec:
         self.backend = backend
         self.backend_name = backend.name
         self.device = device
+        # ``VALID_KEYS`` split into (supported, unsupported), keyed on the
+        # backend and target it was computed for; see ``_config_key_support``.
+        self._config_key_support_cache: (
+            tuple[tuple[object, ...], frozenset[str], frozenset[str]] | None
+        ) = None
+        # Memoized ``_resolve_cute_flash_pins`` results; reset by
+        # ``enable_cute_flash_search``.
+        self._cute_flash_pin_resolutions: dict[
+            tuple[object, ...], FlashAttentionConfig
+        ] = {}
         # When True, search-space restriction decisions are logged live (at
         # INFO) the moment they are applied, in addition to being recorded for
         # the end-of-run summary. Sourced from
@@ -2596,6 +2635,23 @@ class ConfigSpec:
             flex_hook_ops=self._cute_flash_flex_hook_ops,
         )
 
+    def _resolve_cute_flash_pins(
+        self, pins: tuple[tuple[str, object], ...]
+    ) -> FlashAttentionConfig:
+        """``_resolve_cute_flash_config`` of a few pinned keys, memoized.
+
+        Override validation resolves the same pinned family or packet for
+        every config a generation produces.  The result depends only on the
+        pins, this spec's flash parameters, the target capability, and the
+        flash env vars.
+        """
+        key = (pins, self.target_device_capability, flash_env_fingerprint())
+        resolved = self._cute_flash_pin_resolutions.get(key)
+        if resolved is None:
+            resolved = self._resolve_cute_flash_config(dict(pins))
+            self._cute_flash_pin_resolutions[key] = resolved
+        return resolved
+
     def _cute_flash_config_topology(self, config: Mapping[str, object]) -> str:
         """Resolve only structural selectors before validating lowering children."""
         assert self._cute_flash_num_kv is not None
@@ -2771,8 +2827,8 @@ class ConfigSpec:
                     requested_family.tensor_4d_tma
                     and not self._cute_flash_supports_tensor_4d_tma
                 ):
-                    effective_family = self._resolve_cute_flash_config(
-                        {FLASH_PIPELINE_FAMILY_KEY: requested_family_name}
+                    effective_family = self._resolve_cute_flash_pins(
+                        ((FLASH_PIPELINE_FAMILY_KEY, requested_family_name),)
                     ).pipeline_family
                     pipeline_family_override = effective_family
                     effective_flags = _flash_pipeline_family_flags(effective_family)
@@ -2806,12 +2862,12 @@ class ConfigSpec:
             and self._cute_flash_output_requires_tma
             and pipeline_family_override is not None
         ):
-            requested_effective = self._resolve_cute_flash_config(
-                {
-                    FLASH_PIPELINE_FAMILY_KEY: pipeline_family_override,
-                    FLASH_EPI_TMA_KEY: True,
-                    FLASH_EPI_STG_KEY: False,
-                }
+            requested_effective = self._resolve_cute_flash_pins(
+                (
+                    (FLASH_PIPELINE_FAMILY_KEY, pipeline_family_override),
+                    (FLASH_EPI_TMA_KEY, True),
+                    (FLASH_EPI_STG_KEY, False),
+                )
             )
             if not requested_effective.epi_tma:
                 config.pop(FLASH_PIPELINE_FAMILY_KEY, None)
@@ -3062,26 +3118,15 @@ class ConfigSpec:
             fragment = cast("EnumFragment", fragments[key])
             return tuple(value for value in fragment.choices if type(value) is int)
 
-        current = (softmax_regs, corr_regs, other_regs)
-        best: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
-        for softmax_candidate in _int_choices(FLASH_SOFTMAX_REGS_KEY):
-            for corr_candidate in _int_choices(FLASH_CORR_REGS_KEY):
-                for other_candidate in _int_choices(FLASH_OTHER_REGS_KEY):
-                    candidate = (softmax_candidate, corr_candidate, other_candidate)
-                    if 2 * softmax_candidate + corr_candidate + other_candidate > 512:
-                        continue
-                    score = (
-                        sum(a != b for a, b in zip(candidate, current, strict=True)),
-                        sum(
-                            abs(a - b) for a, b in zip(candidate, current, strict=True)
-                        ),
-                        -softmax_candidate,
-                    )
-                    if best is None or score < best[0]:
-                        best = (score, candidate)
-        if best is None:
+        repaired = _fa4_register_budget_repair(
+            _int_choices(FLASH_SOFTMAX_REGS_KEY),
+            _int_choices(FLASH_CORR_REGS_KEY),
+            _int_choices(FLASH_OTHER_REGS_KEY),
+            (softmax_regs, corr_regs, other_regs),
+        )
+        if repaired is None:
             raise InvalidConfig(message)
-        _score, (softmax_regs, corr_regs, other_regs) = best
+        softmax_regs, corr_regs, other_regs = repaired
         config[FLASH_SOFTMAX_REGS_KEY] = softmax_regs
         config[FLASH_CORR_REGS_KEY] = corr_regs
         config[FLASH_OTHER_REGS_KEY] = other_regs
@@ -3128,6 +3173,7 @@ class ConfigSpec:
         self.cute_attention_generic_fallback_enabled = False
         self._cute_attention_generic_fallback_block_size_targets = {}
         self.cute_flash_search_enabled = True
+        self._cute_flash_pin_resolutions = {}
         # The pipeline family picks the flash body (the alternating-warpgroup
         # single tile vs the two-tile pair, the 2-CTA cluster, ...; the Q
         # tiles per CTA follow from it); the bodies' energy per call differs,
@@ -5128,7 +5174,36 @@ class ConfigSpec:
             self.log_restrictions_verbose,
         )
 
+    def _config_key_support(self) -> tuple[frozenset[str], frozenset[str]]:
+        """``VALID_KEYS`` partitioned into (supported, unsupported) keys.
+
+        ``normalize`` asks about every key of every config it sees, and the
+        answer depends only on the backend and target.  Tests reassign those
+        after construction, so the partition is cached against them.
+        """
+        state = (
+            self.backend,
+            self.backend_name,
+            self.device,
+            self.target_device_capability,
+        )
+        cached = self._config_key_support_cache
+        if cached is None or cached[0] != state:
+            supported = frozenset(
+                key for key in VALID_KEYS if self._supports_config_key_uncached(key)
+            )
+            cached = (state, supported, VALID_KEYS - supported)
+            self._config_key_support_cache = cached
+        return cached[1], cached[2]
+
     def supports_config_key(self, key: str) -> bool:
+        if key in VALID_KEYS:
+            return key in self._config_key_support()[0]
+        return self._supports_config_key_uncached(key)
+
+    def _supports_config_key_uncached(self, key: str) -> bool:
+        # Reads only the attributes in ``_config_key_support``'s state tuple;
+        # a new dependency here must join that tuple or the cache goes stale.
         if key == "reduction_fusion":
             return self.backend_name != "cute" and self.backend.supports_config_key(key)
         if key == "host_tensor_descriptors":
@@ -6812,7 +6887,7 @@ class ConfigSpec:
                 )
 
     def supported_config_keys(self) -> frozenset[str]:
-        return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
+        return self._config_key_support()[0]
 
     def _default_num_stages(self) -> int:
         return DEFAULT_NUM_STAGES
@@ -6872,11 +6947,7 @@ class ConfigSpec:
         self._cute_tcgen05_config._clamp_l2_swizzle_size_to_shape(config)
 
     def unsupported_config_keys(self, config: Mapping[str, object]) -> list[str]:
-        return sorted(
-            key
-            for key in config
-            if key in VALID_KEYS and not self.supports_config_key(key)
-        )
+        return sorted(self._config_key_support()[1].intersection(config))
 
     def is_supported_config(self, config: Mapping[str, object]) -> bool:
         return not self.unsupported_config_keys(config)
@@ -8717,8 +8788,8 @@ class ConfigSpec:
             family = overrides.get(FLASH_PIPELINE_FAMILY_KEY)
             family_flags = _flash_pipeline_family_flags(family)
             if self.cute_flash_search_enabled and family_flags is not None:
-                effective_family = self._resolve_cute_flash_config(
-                    {FLASH_PIPELINE_FAMILY_KEY: family}
+                effective_family = self._resolve_cute_flash_pins(
+                    ((FLASH_PIPELINE_FAMILY_KEY, family),)
                 ).pipeline_family
                 if effective_family != family:
                     raise InvalidConfig(
@@ -8764,11 +8835,11 @@ class ConfigSpec:
                             f"{overrides[key]!r}"
                         )
                 if family_flags is not None:
-                    effective_packet = self._resolve_cute_flash_config(
-                        {
-                            FLASH_PIPELINE_FAMILY_KEY: family,
-                            FLASH_EXP2_PACKET_KEY: requested_packet,
-                        }
+                    effective_packet = self._resolve_cute_flash_pins(
+                        (
+                            (FLASH_PIPELINE_FAMILY_KEY, family),
+                            (FLASH_EXP2_PACKET_KEY, requested_packet),
+                        )
                     ).exp2_packet
                     if effective_packet != requested_packet:
                         raise InvalidConfig(

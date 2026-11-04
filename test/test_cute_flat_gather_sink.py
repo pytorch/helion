@@ -18,9 +18,6 @@ import ast
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.jagged_mean import jagged_mean_kernel
-from examples.jagged_softmax import jagged_softmax_kernel
-from examples.jagged_sum import jagged_sum_kernel
 import pytest
 import torch
 
@@ -29,8 +26,13 @@ from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+jagged_mean_kernel = import_example("jagged_mean").jagged_mean_kernel
+jagged_softmax_kernel = import_example("jagged_softmax").jagged_softmax_kernel
+jagged_sum_kernel = import_example("jagged_sum").jagged_sum_kernel
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -390,7 +392,9 @@ def _jagged_inputs(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fold_mask_hoist_matches_the_reference_on_a_jagged_feature_tile() -> None:
-    from examples.jagged_mean import reference_jagged_mean_kernel_pytorch
+    reference_jagged_mean_kernel_pytorch = import_example(
+        "jagged_mean"
+    ).reference_jagged_mean_kernel_pytorch
 
     x, offsets, counts, features = _jagged_inputs(64, 128, 64)
     kernel = helion.kernel(jagged_mean_kernel.fn, backend="cute", fast_math=True)

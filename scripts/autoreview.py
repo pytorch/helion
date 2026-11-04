@@ -6,6 +6,7 @@ Usage:
     scripts/autoreview.py --head           # review last commit (git diff HEAD~ HEAD)
     scripts/autoreview.py FILE_OR_URL      # review the thing described by args
     scripts/autoreview.py --no-codex       # skip codex
+    scripts/autoreview.py --codex-sandbox workspace-write  # codex may write /tmp
     scripts/autoreview.py --fix            # ask claude to fix the reported issues
     scripts/autoreview.py --fix --add      # also `git add` modified files after fixing
     scripts/autoreview.py --meta           # add Meta-internal launcher flags
@@ -362,11 +363,20 @@ class ClaudeSession:
 
 
 def run_codex_review(
-    prompt: str, log_path: Path, meta: bool, no_sandbox: bool = False
+    prompt: str,
+    log_path: Path,
+    meta: bool,
+    no_sandbox: bool = False,
+    sandbox: str = "read-only",
 ) -> str:
     """Run codex one-shot, return the last message text. Codex only ever
     reviews — fixes are performed by the claude session — so by default the
     sandbox is read-only regardless of how the parent script was invoked.
+
+    ``sandbox="workspace-write"`` also lets codex write under the workdir and
+    ``/tmp``.  The read-only sandbox has no writable temporary directory, and
+    importing torch creates its cache directory under ``tempfile`` at import
+    time, so a read-only codex cannot run any Python that imports Helion.
 
     ``no_sandbox=True`` is a trust-the-model escape hatch for hosts without
     bubblewrap: it switches Codex to ``-s danger-full-access`` and passes
@@ -385,9 +395,9 @@ def run_codex_review(
         f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
         "exec",
         # danger-full-access avoids the sandbox launcher path entirely when
-        # bubblewrap is unavailable; read-only otherwise.
+        # bubblewrap is unavailable; the requested sandbox otherwise.
         "-s",
-        "danger-full-access" if no_sandbox else "read-only",
+        "danger-full-access" if no_sandbox else sandbox,
     ]
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tf:
         out_path = Path(tf.name)
@@ -487,6 +497,17 @@ def main() -> int:
         help="Skip the codex review and just run claude.",
     )
     parser.add_argument(
+        "--codex-sandbox",
+        choices=("read-only", "workspace-write"),
+        default="read-only",
+        help=(
+            "Codex sandbox (default: read-only). workspace-write also allows "
+            "writes under the workdir and /tmp, which codex needs to run any "
+            "Python that imports torch (its cache directory is created under "
+            "tempfile at import)."
+        ),
+    )
+    parser.add_argument(
         "--codex-no-sandbox",
         action="store_true",
         help=(
@@ -542,6 +563,7 @@ def main() -> int:
                 log_dir / "codex.log",
                 args.meta,
                 no_sandbox=args.codex_no_sandbox,
+                sandbox=args.codex_sandbox,
             )
         results = run_parallel(spinner, jobs)
         claude_review = results["claude review"]

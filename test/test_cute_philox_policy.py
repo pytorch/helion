@@ -16,6 +16,7 @@ from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._compiler.rng_utils import philox_rand_ref
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
@@ -96,7 +97,7 @@ def test_effective_default_and_settings_roundtrip(
 @pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
 @skipUnlessBackends(["cute"])
 def test_original_dropout_reference_mapping(name: str, dtype: torch.dtype) -> None:
-    from examples import low_mem_dropout as example
+    example = import_example("low_mem_dropout")
 
     function = vars(example)[name].fn
     values = torch.linspace(-2, 2, 33, dtype=dtype)
@@ -138,7 +139,7 @@ def test_original_dropout_reference_mapping(name: str, dtype: torch.dtype) -> No
 def test_original_codegen_default_matches_explicit_mapping(
     name: str, width: int, layout: str
 ) -> None:
-    from examples import low_mem_dropout as example
+    example = import_example("low_mem_dropout")
 
     function = vars(example)[name].fn
     args = (0.25, torch.empty(1025), -(2**63))
