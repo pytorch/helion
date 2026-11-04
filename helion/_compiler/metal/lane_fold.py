@@ -159,6 +159,28 @@ def _writes(tree: ast.AST) -> set[str]:
     }
 
 
+#: The element store into a lane array (``lane_reduction``'s kept loads,
+#: ``mpp_matmul``'s staged loads): ``_metal_lane_put(array, index, value)``.
+LANE_PUT = "_metal_lane_put"
+
+
+def _array_writes(tree: ast.AST, lane: str) -> set[str]:
+    """The lane arrays *tree* stores into at an index that doesn't read
+    *lane*.  Such an array is one per lane once a stored value depends on
+    the lane: every lane's copy of the store writes the same element.  An
+    array indexed by *lane* itself has one element per lane and stays
+    shared."""
+    return {
+        node.args[0].id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == LANE_PUT
+        and isinstance(node.args[0], ast.Name)
+        and lane not in _reads(node.args[1])
+    }
+
+
 #: The integer-rounded float -> bfloat conversion every lane copy uses
 #: (``metal_jit`` emits its definition when it is referenced).
 BF16_CAST = "helion_bf16_cast"
@@ -262,8 +284,8 @@ class LaneJam:
 
     def _lane_dependent(self) -> set[str]:
         """The lane and, to a fixpoint, every name written by a statement
-        that reads a lane-dependent name.  A unit's targets are
-        lane-independent."""
+        that reads a lane-dependent name, a lane array stored into included
+        (see ``_array_writes``).  A unit's targets are lane-independent."""
         dependent = {self.lane}
         simple = [
             stmt
@@ -274,7 +296,7 @@ class LaneJam:
         while changed:
             changed = False
             for stmt in simple:
-                written = _writes(stmt)
+                written = _writes(stmt) | _array_writes(stmt, self.lane)
                 if written - dependent and _reads(stmt) & dependent:
                     dependent |= written
                     changed = True
