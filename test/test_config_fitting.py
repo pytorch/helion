@@ -98,6 +98,7 @@ def demo(x, *, _launcher=default_launcher):
         )
 
 
+@skipUnlessBackends(["triton"])
 class TestFitEligibility:
     def test_same_device_selection_is_not_wrapped(self) -> None:
         bound = _FakeBoundKernel(300_000, _buffers)
