@@ -56,6 +56,12 @@ def resolve_pruned_lane_owners(
     must match its recorded proof and the actual innermost enclosing lane.
     Other markers retain their original owner and all strict validation.
     """
+    if not any(lanes._find_lane_reduce_call(top) for top in body):
+        # Only a marker's owner is ever rewritten here (or finished by the
+        # physical fallback); a body without one is left untouched. (The
+        # codegen skips the whole lane-reduction pass group without markers;
+        # this check keeps direct callers cheap too.)
+        return
     live_names = {
         node.id for top in body for node in ast.walk(top) if isinstance(node, ast.Name)
     }

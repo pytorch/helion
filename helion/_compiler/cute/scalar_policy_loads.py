@@ -60,5 +60,14 @@ def lower_scalar_policy_loads(body: list[ast.stmt]) -> list[ast.stmt]:
     changing the selected cache hints. Earlier scheduling and alias passes
     must still see their original ``cute.arch.load`` nodes.
     """
+    policy_keywords = {name for name, _ in _POLICIES}
+    if not any(
+        isinstance(node, ast.keyword) and node.arg in policy_keywords
+        for statement in body
+        for node in ast.walk(statement)
+    ):
+        # Every lowered load carries a policy keyword; without one the
+        # transformer would return each statement unchanged.
+        return list(body)
     lower = _LowerScalarPolicyLoads()
     return [cast("ast.stmt", lower.visit(statement)) for statement in body]

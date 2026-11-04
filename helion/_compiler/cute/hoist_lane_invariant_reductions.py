@@ -37,6 +37,7 @@ from typing import cast
 from ..ast_extension import ExtendedAST
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
+from ..ast_extension import iter_statements
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
@@ -751,21 +752,29 @@ def _is_uniform_name(
     )
 
 
+def _mentions_thread_coordinates(stmt: ast.stmt) -> bool:
+    source = ast.unparse(stmt)
+    return any(token in source for token in ("thread_idx", "lane_idx", "warp_idx"))
+
+
 def _update_uniform_names(
     stmt: ast.stmt,
     uniform_names: set[str],
     rename_groups: dict[str, str],
+    effects: _Effects | None = None,
 ) -> None:
-    effects = _statement_effects(stmt)
+    if effects is None:
+        effects = _statement_effects(stmt)
     writes = {_canonical_name(name, rename_groups) for name in effects.writes}
     if not writes:
         return
-    source = ast.unparse(stmt)
+    # Only a plain assignment can establish uniformity; the source scan is
+    # the expensive check, so a compound statement never pays for it.
     if (
         not isinstance(stmt, ast.Assign)
         or _mutation_roots(stmt)
         or not _has_only_known_effects(stmt)
-        or any(token in source for token in ("thread_idx", "lane_idx", "warp_idx"))
+        or _mentions_thread_coordinates(stmt)
         or not all(
             _is_uniform_name(name, uniform_names, rename_groups)
             for name in effects.live_in
@@ -2509,17 +2518,9 @@ def _rewrite_block(
     known_uniform = set(uniform_names)
     known_rmem = dict(rmem)
     for stmt in body:
-        lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
-        extent = _static_lane_extent(stmt) if isinstance(stmt, ast.For) else None
-        if (
-            isinstance(stmt, ast.For)
-            and isinstance(lane_var, str)
-            and isinstance(stmt.target, ast.Name)
-            and stmt.target.id == lane_var
-            and not stmt.orelse
-            and extent is not None
-            and extent > 1
-        ):
+        if (candidate := _lane_loop_candidate(stmt)) is not None:
+            assert isinstance(stmt, ast.For)
+            lane_var, extent = candidate
             stmt = _simplify_full_lane_bounds(
                 stmt,
                 lane_var,
@@ -2603,19 +2604,40 @@ def _rewrite_block(
                     ),
                 )
         result.append(stmt)
-        _update_uniform_names(stmt, known_uniform, rename_groups)
+        effects = _statement_effects(stmt)
+        _update_uniform_names(stmt, known_uniform, rename_groups, effects)
         declaration = _rmem_declaration(stmt)
-        written = set(_statement_effects(stmt).writes)
-        for name in written:
+        for name in effects.writes:
             known_rmem.pop(name, None)
         if declaration is not None:
             known_rmem[declaration[0]] = declaration[1]
     return result
 
 
+def _lane_loop_candidate(stmt: ast.AST) -> tuple[str, int] | None:
+    """The lane variable and static extent of a loop ``_rewrite_block``
+    rewrites (a generated lane loop whose static extent repeats its body),
+    else ``None``."""
+    if not isinstance(stmt, ast.For) or stmt.orelse:
+        return None
+    lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
+    if not (
+        isinstance(lane_var, str)
+        and isinstance(stmt.target, ast.Name)
+        and stmt.target.id == lane_var
+    ):
+        return None
+    extent = _static_lane_extent(stmt)
+    if extent is None or extent <= 1:
+        return None
+    return lane_var, extent
+
+
 def _prune_obsolete_rmem_declarations(
     body: list[ast.stmt], obsolete_rmem: set[str]
 ) -> list[ast.stmt]:
+    if not obsolete_rmem:
+        return body
     loaded = {
         node.id
         for stmt in body
@@ -2657,6 +2679,10 @@ def hoist_lane_invariant_reductions(
     thread_block_dims: tuple[int, int, int] | None = None,
 ) -> list[ast.stmt]:
     """Hoist profitable row-invariant reductions from grid lane loops."""
+    if all(_lane_loop_candidate(stmt) is None for stmt in iter_statements(body)):
+        # No lane loop to rewrite: the block walk below would only track
+        # uniform names and rmem declarations without changing a statement.
+        return [ast.fix_missing_locations(stmt) for stmt in body]
     renames = rename_groups or {}
     initial_uniform = {
         _canonical_name(name, renames)

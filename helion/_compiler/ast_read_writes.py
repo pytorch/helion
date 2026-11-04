@@ -189,15 +189,6 @@ class ReadWrites(typing.NamedTuple):
         return visitor.rw
 
 
-class _RenameVisitor(ast.NodeVisitor):
-    def __init__(self, renames: dict[str, str]) -> None:
-        super().__init__()
-        self.renames = renames
-
-    def visit_Name(self, node: ast.Name) -> None:
-        node.id = self.renames.get(node.id, node.id)
-
-
 def ast_rename(node: _A, renames: dict[str, str]) -> _A:
     """
     Rename variables in an Abstract Syntax Tree (AST) node, in-place.
@@ -212,8 +203,11 @@ def ast_rename(node: _A, renames: dict[str, str]) -> _A:
     Returns:
         The modified AST node with variables renamed.
     """
-    visitor = _RenameVisitor(renames)
-    visitor.visit(node)
+    # Every ``Name`` is reached the same way a visitor would reach it; the
+    # flat walk only saves the per-node dispatch of ``NodeVisitor``.
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name):
+            child.id = renames.get(child.id, child.id)
     return node
 
 
@@ -221,6 +215,7 @@ class _DeleteAssignments(ast.NodeTransformer):
     def __init__(self, to_remove: set[str]) -> None:
         super().__init__()
         self.to_remove = to_remove
+        self.changed = False
 
     def visit_Assign(self, node: ast.Assign) -> ast.Assign | None:
         """
@@ -235,18 +230,23 @@ class _DeleteAssignments(ast.NodeTransformer):
         if len(node.targets) == 1:
             (target,) = node.targets
             if isinstance(target, ast.Name) and target.id in self.to_remove:
+                self.changed = True
                 return None
         return node
 
 
-def ast_delete_assignments(body: list[ast.AST], to_remove: set[str]) -> list[ast.AST]:
+def _delete_assignments(
+    body: list[ast.AST], to_remove: set[str]
+) -> tuple[list[ast.AST], bool]:
+    """``body`` without the plain assignments to ``to_remove``, and whether any
+    assignment was removed."""
     new_body = []
     transformer = _DeleteAssignments(to_remove)
     for node in body:
         new_node = transformer.visit(node)
         if new_node is not None:
             new_body.append(new_node)
-    return new_body
+    return new_body, transformer.changed
 
 
 class _DeleteDeadLaneLoops(ast.NodeTransformer):
@@ -510,13 +510,14 @@ def dead_assignment_elimination(
     dce_vars: list[str],
     num_iterations: int = 8,
     input_rw: ReadWrites | None = None,
-) -> None:
+) -> bool:
     """
-    Eliminates dead assignments from body
+    Eliminates dead assignments from body; returns whether any was removed.
     """
 
     # num_iterations and input_rw are not compatible with each other
     assert num_iterations == 1 or input_rw is None
+    changed = False
     for _ in range(num_iterations):
         rw = input_rw if input_rw is not None else ReadWrites.from_list(body)
         to_remove = set()
@@ -525,7 +526,13 @@ def dead_assignment_elimination(
                 to_remove.add(name)
         if not to_remove:
             break
-        body[:] = ast_delete_assignments(body, to_remove)
+        body[:], removed = _delete_assignments(body, to_remove)
+        if not removed:
+            # The dead names are not simple assignments: another pass over
+            # the same body would find the same statements to keep.
+            break
+        changed = True
+    return changed
 
 
 def is_string_expr(node: ast.AST) -> bool:

@@ -1188,6 +1188,19 @@ def validate_cluster_reduce_placement(
     mbarrier would deadlock on the second execution)."""
     from ... import exc
 
+    cluster_reduces = (
+        "_cute_grouped_reduce_cluster",
+        "_cute_grouped_reduce_cluster_online_pair",
+        "_cute_grouped_reduce_cluster_warp_online_pair",
+    )
+    if not any(
+        isinstance(node, ast.Name) and node.id in cluster_reduces
+        for stmt in body
+        for node in ast.walk(stmt)
+    ):
+        # No cluster reduce site: nothing the nested loop walk could reject.
+        return
+
     def walk(stmts: list[ast.stmt], multi_trip: bool) -> None:
         for stmt in stmts:
             inner_multi = multi_trip
@@ -1199,12 +1212,7 @@ def validate_cluster_reduce_placement(
                     if (
                         isinstance(sub, ast.Call)
                         and isinstance(sub.func, ast.Name)
-                        and sub.func.id
-                        in (
-                            "_cute_grouped_reduce_cluster",
-                            "_cute_grouped_reduce_cluster_online_pair",
-                            "_cute_grouped_reduce_cluster_warp_online_pair",
-                        )
+                        and sub.func.id in cluster_reduces
                     ):
                         raise exc.BackendUnsupported(
                             "cute",

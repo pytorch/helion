@@ -3275,14 +3275,15 @@ class DeviceFunction:
         }
         rw = ReadWrites.from_list([*self.preamble, *self.body])
         while True:
-            previous_rw = rw
-            dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
-            dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
-            dead_lane_loop_elimination(self.body, rename_groups)
-            dead_lane_loop_elimination(self.preamble, rename_groups)
-            rw = ReadWrites.from_list([*self.preamble, *self.body])
-            if rw == previous_rw:
+            # An unchanged body reads and writes exactly what ``rw`` recorded,
+            # so the fixed point is reached without recounting it.
+            changed = dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
+            changed |= dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
+            changed |= dead_lane_loop_elimination(self.body, rename_groups)
+            changed |= dead_lane_loop_elimination(self.preamble, rename_groups)
+            if not changed:
                 break
+            rw = ReadWrites.from_list([*self.preamble, *self.body])
 
         # Drop unused args, but keep placeholder_args (fusion-injected tensor
         # pointers referenced only by placeholder strings, not the AST body).
