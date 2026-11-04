@@ -58,7 +58,17 @@ def test_cpu_n64_is_in_both_config_vocabularies() -> None:
             )
 
 
-@pytest.mark.parametrize("cluster,bk", [(1, 128), (1, 256), (2, 128), (2, 256)])
+# Each case compiles the pipeline in a fresh interpreter: the first is the
+# smoke test, the other cluster/BK combinations are the slow tier.
+@pytest.mark.parametrize(
+    "cluster,bk",
+    [
+        (1, 128),
+        pytest.param(1, 256, marks=pytest.mark.slow),
+        pytest.param(2, 128, marks=pytest.mark.slow),
+        pytest.param(2, 256, marks=pytest.mark.slow),
+    ],
+)
 def test_cpu_n64_native_pipeline_compiles(
     cluster: int, bk: int, tmp_path: Path
 ) -> None:

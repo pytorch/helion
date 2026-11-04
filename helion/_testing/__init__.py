@@ -612,6 +612,18 @@ def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() != "triton", reason)
 
 
+def slowIfBackends(backends: Sequence[str]) -> Callable[[Callable], Callable]:
+    """Mark a test ``slow`` only under one of ``backends``.
+
+    For tests whose cost comes from one backend (a CuTe cold compile of
+    every candidate) while the others run them as cheap correctness checks
+    that pull requests should keep.
+    """
+    if matchesBackends(backends):
+        return pytest.mark.slow
+    return lambda test_item: test_item
+
+
 def onlyBackends(
     backends: Sequence[str],
 ) -> Callable[[type[unittest.TestCase]], type[unittest.TestCase]]:

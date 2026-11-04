@@ -5,6 +5,7 @@ import re
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -22,6 +23,9 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -1783,10 +1787,6 @@ def _atomic_logical_axes_codegen(kernel, inputs, tiles):
 
     from test.cute_population_contracts import _target
 
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
-
     with (
         mock_cuda_unavailable(),
         _target(),
@@ -1889,6 +1889,7 @@ def _execute_atomic_thread_program(source, inputs):
     return result, atomic_calls
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestAtomicLogicalAxesCPU(unittest.TestCase):
     def test_data_dependent_and_broadcast_atomic_contributions(self):
@@ -1975,6 +1976,7 @@ def _atomic_logical_axes_reduced(out, values):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestAtomicLogicalAxisLeadersCPU(unittest.TestCase):
     def test_ghost_axis_contributes_once_after_nested_loop(self):
@@ -2296,6 +2298,8 @@ def _simulate_local_atomic_program(source, x, shape):
     return torch.from_numpy(output), calls
 
 
+@pytest.mark.cpu_only
+@onlyBackends(["cute"])
 class TestLocalAtomicCPU(unittest.TestCase):
     def test_local_atomic_generated_counts_repeats_tails(self):
         for rows, width, bins, repeats in (
@@ -2494,10 +2498,6 @@ def _register_load_codegen(x, enabled, threads=128, repeats=3):
     from unittest.mock import patch
 
     from test.cute_population_contracts import _target
-
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
 
     with (
         mock_cuda_unavailable(),
@@ -2897,6 +2897,7 @@ def _simulate_register_load_program(
     return out, state["barriers"]
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentRegisterLoadsCPU(unittest.TestCase):
     def test_register_loads_typing_tails_and_loop_refresh(self):
@@ -3056,16 +3057,13 @@ def _register_load_mutation(x):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentRegisterLifetimeCPU(unittest.TestCase):
     def test_register_load_snapshots_survive_alias_store_and_reload(self):
         from unittest.mock import patch
 
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         x = torch.arange(64).reshape(2, 32).float()
         expected = torch.zeros((2, 17))
@@ -3127,16 +3125,13 @@ def _register_load_cross_lane_effect(x, y, z, mode: hl.constexpr):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentRegisterEffectsCPU(unittest.TestCase):
     def test_cross_warp_host_effects_and_aliased_arguments(self):
         from unittest.mock import patch
 
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         x = torch.arange(256).reshape(2, 128).float()
         z = torch.full_like(x, 2)
@@ -3213,8 +3208,6 @@ class TestFragmentRegisterEffectsCPU(unittest.TestCase):
 
         from helion._compiler.cute.local_atomic import _reachable_graphs
         from helion._compiler.cute.register_loads import host_load_is_readonly
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.language import memory_ops
 
         kernel = helion.kernel(
@@ -3375,6 +3368,7 @@ def _local_atomic_index_domain_reference(x, bins, mode):
     return result
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentAtomicIndexDomainCPU(unittest.TestCase):
     def test_loaded_factory_and_carried_index_domains(self):
@@ -3506,16 +3500,13 @@ def _register_load_index_domain(x):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentRegisterDomainCPU(unittest.TestCase):
     def test_promoted_indices_retain_logical_tail_domain(self):
         from unittest.mock import patch
 
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         for width in (17, 31, 65, 129):
             x = (torch.arange(2 * width).reshape(2, width) % 7).int()
@@ -3577,10 +3568,6 @@ def _fragment_global_fetch_add(
 def _fragment_fetch_add_codegen(args, enabled, threads=128):
     from test.cute_population_contracts import _target
 
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
-
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(_fragment_global_fetch_add, args)
         config = bound.config_spec.default_config()
@@ -3590,6 +3577,7 @@ def _fragment_fetch_add_codegen(args, enabled, threads=128):
         return bound.to_code(config)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentGlobalFetchAddCPU(unittest.TestCase):
     def test_once_per_element_reuse_alias_snapshots_and_tails(self):
@@ -3914,10 +3902,6 @@ def _local_histogram_consumer_codegen(kernel, args, scan="serial", threads=128):
 
     from test.cute_population_contracts import _target
 
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
-
     with (
         mock_cuda_unavailable(),
         _target(),
@@ -3952,6 +3936,7 @@ def _local_histogram_consumer_reference(x, bins, mode):
     return histogram * 2 + 1
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestLocalHistogramConsumersCPU(unittest.TestCase):
     def test_local_histogram_non_neutral_padding_for_each_reduction(self):
@@ -4178,10 +4163,6 @@ def _warp_reservation_args(groups, device="cpu"):
 def _warp_reservation_codegen(args, enabled, threads, reduction="serial"):
     from test.cute_population_contracts import _target
 
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
-
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(_fragment_warp_reservations, args)
         config = bound.config_spec.default_config()
@@ -4229,6 +4210,7 @@ def _check_warp_reservations(args, actual, masked):
     torch.testing.assert_close(actual.to(torch.int32), expected_local, rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentWarpResultsCPU(unittest.TestCase):
     def test_generated_register_reservations_reuse_masks_and_alias_order(self):
@@ -4381,14 +4363,11 @@ def _fragment_warp_result_decline(x, counter, mode: hl.constexpr):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentWarpResultsConfigCPU(unittest.TestCase):
     def test_scope_layout_and_width_declines_preserve_fallback(self):
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         with mock_cuda_unavailable(), _target(), forbid_native_compile():
             for mode, width in (
@@ -4422,9 +4401,6 @@ class TestFragmentWarpResultsConfigCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
         from test.cute_population_contracts import checked_initial_population
 
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.autotuner.pattern_search import InitialPopulationStrategy
         from helion.autotuner.pattern_search import PatternSearch
 
@@ -4510,6 +4486,7 @@ def _fragment_warp_reservation_bonus(
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentWarpResultStorageConflictCPU(unittest.TestCase):
     def test_independent_operand_four_storage_combinations(self):
@@ -4518,9 +4495,6 @@ class TestFragmentWarpResultStorageConflictCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
         from test.cute_population_contracts import checked_initial_population
 
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.autotuner.pattern_search import InitialPopulationStrategy
         from helion.autotuner.pattern_search import PatternSearch
 
@@ -4642,6 +4616,7 @@ class TestFragmentWarpResultStorageConflictCPU(unittest.TestCase):
                         )
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentPredicatePreprocessingCPU(unittest.TestCase):
     def test_boolean_prefixes_preserve_short_circuit_order_and_refresh(self):
@@ -4712,47 +4687,52 @@ class TestFragmentPredicatePreprocessingCPU(unittest.TestCase):
         program = r"""
 import ast, importlib.util, inspect, sys
 from pathlib import Path
-sys.path.insert(0, sys.argv[2])
+sys.path.insert(0, sys.argv[1])
 from cutlass.base_dsl.ast_preprocessor import DSLPreprocessor
-path = Path(sys.argv[1])
-spec = importlib.util.spec_from_file_location("predicate_sdk_case", path)
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
-name = next(node.name for node in ast.parse(path.read_text()).body
-            if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_"))
-raw = inspect.unwrap(getattr(module, name))
-with DSLPreprocessor(["cutlass"]).get_session() as session:
-    tree = session.transform(raw, dict(raw.__globals__))
-    compile(tree, str(path), "exec", dont_inherit=True)
-assert sum(1 for node in ast.walk(tree)) < 100000
-print("SDK_PREPROCESS_PASS")
+for path in map(Path, sys.argv[2:]):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    name = next(node.name for node in ast.parse(path.read_text()).body
+                if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_"))
+    raw = inspect.unwrap(getattr(module, name))
+    with DSLPreprocessor(["cutlass"]).get_session() as session:
+        tree = session.transform(raw, dict(raw.__globals__))
+        compile(tree, str(path), "exec", dont_inherit=True)
+    assert sum(1 for node in ast.walk(tree)) < 100000
+    print("SDK_PREPROCESS_PASS", path.name)
 """
-        for enabled, groups, threads, masked in (
+        cases = (
             (False, 4, 128, False),
             (True, 4, 128, False),
             (True, 16, 512, True),
-        ):
-            with self.subTest(enabled=enabled, groups=groups, masked=masked):
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for enabled, groups, threads, masked in cases:
                 args = (*_warp_reservation_args(groups), masked)
                 source = _warp_reservation_codegen(args, enabled, threads)
-                with tempfile.TemporaryDirectory() as directory:
-                    path = Path(directory) / "generated.py"
-                    path.write_text(source)
-                    result = subprocess.run(
-                        [
-                            sys.executable,
-                            "-c",
-                            program,
-                            str(path),
-                            str(Path(helion.__file__).resolve().parent.parent),
-                        ],
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
-                self.assertIn("SDK_PREPROCESS_PASS", result.stdout)
+                path = Path(directory) / f"generated_{len(paths)}.py"
+                path.write_text(source)
+                paths.append(path)
+            # One interpreter preprocesses every case: importing torch and the
+            # SDK takes seconds per process, the transforms milliseconds.
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    program,
+                    str(Path(helion.__file__).resolve().parent.parent),
+                    *map(str, paths),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+        for path in paths:
+            self.assertIn(f"SDK_PREPROCESS_PASS {path.name}", result.stdout)
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -4789,14 +4769,11 @@ def _local_atomic_disjoint_reference(x, mode):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentAtomicBarriersCPU(unittest.TestCase):
     def test_disjoint_targets_and_repeated_epochs(self):
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         for width in (17, 65):
             for mode in ("disjoint", "shift", "repeat"):
@@ -4885,6 +4862,7 @@ def _local_atomic_disjoint_consumer_reference(x, bins, mode):
     return derived
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentAtomicConsumerBarriersCPU(unittest.TestCase):
     def test_final_derived_consumers_observe_both_pending_allocations(self):
@@ -5079,10 +5057,6 @@ def _fragment_ordered_local(x, sem: hl.constexpr):
 def _fragment_ordered_codegen(kernel, args, threads=128):
     from test.cute_population_contracts import _target
 
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
-
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(kernel, args)
         config = bound.config_spec.default_config()
@@ -5126,6 +5100,7 @@ def _check_fragment_publication(args):
     )
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentOrderedAtomicsCPU(unittest.TestCase):
     def test_scalar_publication_ownership_barriers_and_fresh_loads(self):
@@ -5458,6 +5433,7 @@ def _check_terminal_finalizer(args):
     )
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentTerminalFinalizerCPU(unittest.TestCase):
     def test_generated_uniform_branch_alias_reads_and_collectives(self):
@@ -5766,6 +5742,7 @@ def _check_terminal_loop(args):
         torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentTerminalLoopCPU(unittest.TestCase):
     def test_generated_scalar_carries_zero_trips_and_runtime_bounds(self):
@@ -6123,10 +6100,6 @@ class TestFragmentTerminalLoopNative(TestCase):
 def _private_loop_codegen(args, enabled, threads=128):
     from test.cute_population_contracts import _target
 
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
-
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(_fragment_terminal_loop_finalizer, args)
         config = bound.config_spec.default_config()
@@ -6137,6 +6110,7 @@ def _private_loop_codegen(args, enabled, threads=128):
         return bound.to_code(config)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentPrivateScalarLoopCPU(unittest.TestCase):
     def test_generated_values_zero_trip_aliases_and_wide_bounds(self):
@@ -6246,10 +6220,6 @@ class TestFragmentPrivateScalarLoopCPU(unittest.TestCase):
 
         from test.cute_population_contracts import _target
 
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
-
         args = _terminal_loop_args(3, 17, torch.int32, -3, 19, 1)
         source = _private_loop_codegen(args, True)
         with tempfile.TemporaryDirectory() as directory:
@@ -6294,9 +6264,6 @@ class TestFragmentPrivateScalarLoopCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
         from test.cute_population_contracts import checked_initial_population
 
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.autotuner.pattern_search import InitialPopulationStrategy
         from helion.autotuner.pattern_search import PatternSearch
 
@@ -6399,14 +6366,11 @@ def _fragment_private_masked_loop(x, counter, result, begin: int, end: int):
     return result
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentPrivateMaskedLoopCPU(unittest.TestCase):
     def test_readonly_conditional_global_loads_keep_masks_and_order(self):
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         x = torch.arange(51, dtype=torch.float32).reshape(3, 17) * 0.125
         for begin, end in ((-3, 21), (20, 25), (5, 2)):
@@ -6469,10 +6433,6 @@ def _aggregation_reference(x, indices, bins, initial, repeats):
 def _aggregation_codegen(kernel, args, enabled, threads=128):
     from test.cute_population_contracts import _target
 
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
-
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(kernel, args)
         config = bound.config_spec.default_config()
@@ -6510,6 +6470,7 @@ def _fragment_aggregation_masked_tail(x):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentAtomicAggregationCPU(unittest.TestCase):
     def test_masked_logical_tail_and_index_conversions_stay_guarded(self):
@@ -7002,6 +6963,7 @@ def _check_local_fetch(args, actual):
     return int(valid.sum()) * x.size(0) * epochs
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentLocalFetchAddCPU(unittest.TestCase):
     def test_scalar_result_is_one_arrival_broadcast_to_all_consumers(self):
@@ -7363,6 +7325,7 @@ def _check_local_fetch_shapes(x, direct, reverse, shifted, actual):
         )
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentLocalFetchShapeCPU(unittest.TestCase):
     def test_scalar_and_vector_returns_keep_logical_views_and_index_domains(self):
@@ -7472,10 +7435,6 @@ def _fragment_local_registers(x, tickets, reused, scalar: hl.constexpr):
 def _local_register_codegen(kernel, args, enabled, threads=128):
     from test.cute_population_contracts import _target
 
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
-
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(kernel, args)
         config = bound.config_spec.default_config()
@@ -7511,6 +7470,7 @@ def _fragment_local_register_escape(x, tickets, counter, mode: hl.constexpr):
     return tickets
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentLocalRegistersCPU(unittest.TestCase):
     def test_tails_wrapped_indices_values_reuse_and_epoch_parity(self):
@@ -7639,9 +7599,6 @@ class TestFragmentLocalRegistersCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
         from test.cute_population_contracts import checked_initial_population
 
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.autotuner.pattern_search import InitialPopulationStrategy
         from helion.autotuner.pattern_search import PatternSearch
 
@@ -7794,10 +7751,6 @@ class TestFragmentLocalRegistersCPU(unittest.TestCase):
         from unittest.mock import patch
 
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         tiny = torch.finfo(torch.float32).tiny
         x = torch.full((2, 2), tiny / 2)
@@ -8024,6 +7977,7 @@ def _check_local_buffer_extrema(args):
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentLocalBufferConditionalsCPU(unittest.TestCase):
     def test_float_buffer_and_extrema_uniform_host_bound(self):
@@ -8510,6 +8464,7 @@ def _check_branch_refinement(args):
         )
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentBranchLocalAtomicsCPU(unittest.TestCase):
     def test_exact_compact_refinement_and_full_row_fallback(self):
@@ -8843,10 +8798,6 @@ def _fragment_register_atomic_branches(x, out, capacity: hl.constexpr):
 def _register_consumer_codegen(kernel, args, enabled, aggregate, threads):
     from test.cute_population_contracts import _target
 
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
-
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(kernel, args)
         config = bound.config_spec.default_config()
@@ -9017,10 +8968,6 @@ def _fragment_atomic_consumer_typed(x, out):
 def _atomic_consumer_fusion_codegen(kernel, args, enabled, threads=32, **extra):
     from test.cute_population_contracts import _target
 
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
-
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(kernel, args)
         config = bound.config_spec.default_config()
@@ -9096,6 +9043,7 @@ class TestFragmentAtomicConsumerFusionNative(TestCase):
                 torch.testing.assert_close(x, before, rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentAtomicConsumerFusionCPU(unittest.TestCase):
     def test_default_strict_domain_and_complete_population_prefix(self):
@@ -9106,9 +9054,6 @@ class TestFragmentAtomicConsumerFusionCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
         from test.cute_population_contracts import checked_initial_population
 
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.autotuner.pattern_search import InitialPopulationStrategy
         from helion.autotuner.pattern_search import PatternSearch
 
@@ -9380,6 +9325,7 @@ class TestFragmentAtomicConsumerFusionCPU(unittest.TestCase):
                     self.assertCountEqual(outputs[0][2], outputs[1][2])
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentRegisterAtomicConsumersCPU(unittest.TestCase):
     def test_root_and_branch_compaction_events_masks_and_epochs(self):
@@ -9438,8 +9384,6 @@ class TestFragmentRegisterAtomicConsumersCPU(unittest.TestCase):
             computed_fragment_discovery_supported,
         )
         from helion._compiler.cute.computed_fragment import computed_fragment_supported
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         x = torch.ones((4, 65), dtype=torch.float32)
         out = torch.empty_like(x, dtype=torch.int32)[:, :35]
@@ -9613,6 +9557,7 @@ class TestFragmentRegisterAtomicConsumersNative(TestCase):
                         torch.testing.assert_close(args[0], before, rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentThreadCoverageCompatibilityCPU(unittest.TestCase):
     def test_previous_population_and_rng_with_dependent_witnesses(self):
@@ -9628,9 +9573,6 @@ class TestFragmentThreadCoverageCompatibilityCPU(unittest.TestCase):
         )
         from helion._compiler.autotuner_heuristics import cute_fragment_threads
         from helion._compiler.autotuner_heuristics import cute_fragment_warp_results
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.autotuner.pattern_search import InitialPopulationStrategy
         from helion.autotuner.pattern_search import PatternSearch
 
@@ -9737,9 +9679,6 @@ class TestFragmentThreadCoverageCompatibilityCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
         from test.cute_population_contracts import checked_initial_population
 
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.autotuner.pattern_search import InitialPopulationStrategy
         from helion.autotuner.pattern_search import PatternSearch
 
@@ -9824,14 +9763,11 @@ def _fragment_snapshot_branch(x, positive: hl.constexpr):
     return out, counts
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentReadonlySnapshotAtomicCPU(TestCase):
     def test_uniform_captured_snapshot_epochs_and_aggregation(self):
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         for positive in (False, True):
             for aggregate in (False, True):
@@ -9927,10 +9863,6 @@ def _integer_epoch_histogram(x, repeats: int, bins: hl.constexpr, chunk: hl.cons
 def _integer_epoch_codegen(x, repeats, *, enabled, register=True, threads=32):
     from test.cute_population_contracts import _target
 
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
-
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(_integer_epoch_histogram, (x, repeats, 17, 32))
         config = bound.config_spec.default_config()
@@ -9942,6 +9874,7 @@ def _integer_epoch_codegen(x, repeats, *, enabled, register=True, threads=32):
         return bound.to_code(config)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentIntegerAtomicEpochsCPU(unittest.TestCase):
     @skipUnlessCuteAvailable("requires CuTe DSL")
@@ -10101,9 +10034,6 @@ for index in range(thread, 32, 32):
         from test.cute_population_contracts import _target
         from test.test_compiler_coverage import make_search
 
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.autotuner.pattern_search import InitialPopulationStrategy
 
         key = "cute_fragment_integer_atomic_epochs"
@@ -10223,16 +10153,13 @@ def _integer_epoch_effect_boundary(x, repeats: int, mode: hl.constexpr):
     return out, floating_out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentIntegerAtomicEpochBoundariesCPU(unittest.TestCase):
     def test_incoming_epoch_float_order_and_repeated_target(self):
         import ast
 
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         x = (torch.arange(65).reshape(1, 65) % 7 - 3).int()
         for repeats, mode in ((0, "single"), (3, "single"), (3, "repeat_target")):
@@ -10323,10 +10250,6 @@ if __name__ == "__main__":
 def _skip_zero_codegen(kernel, args, enabled, threads=32, **options):
     from test.cute_population_contracts import _target
 
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
-
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(kernel, args)
         config = bound.config_spec.default_config()
@@ -10389,6 +10312,7 @@ def _dead_zero_tickets(x, indices, mode: hl.constexpr, initial: hl.constexpr):
     return out, second, totals
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentDeadZeroResultsCPU(unittest.TestCase):
     def test_existing_register_snapshot_storage_composes(self):
@@ -10557,9 +10481,6 @@ class TestFragmentDeadZeroResultsCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
 
         from helion._compiler.cute.dead_zero_atomics import dead_zero_atomic_results
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         for width in (17, 32):
             x = torch.ones((2, width))
@@ -10626,6 +10547,7 @@ class TestFragmentDeadZeroResultsNative(TestCase):
                     torch.testing.assert_close(x, before, rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentSkipZeroAtomicsCPU(unittest.TestCase):
     def test_signed_cast_wrap_epochs_and_zero_events(self):
@@ -10807,10 +10729,6 @@ class TestFragmentSkipZeroAtomicsCPU(unittest.TestCase):
 
         from test.cute_population_contracts import _target
 
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
-
         key = "cute_fragment_skip_zero_atomics"
         x = torch.ones((1, 17), dtype=torch.int32)
         args = (x, torch.zeros_like(x), 17, 0, 1)
@@ -10957,6 +10875,7 @@ def _fragment_computed_register_producer(x):
     return out, counts, other_counts
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentRegisterProducerCPU(unittest.TestCase):
     def test_coordinate_guarded_first_use_and_later_domain(self):
@@ -11075,10 +10994,6 @@ for second_slot in cutlass.range_constexpr(2):
         import ast
 
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         for width, threads in ((17, 32), (65, 32), (129, 128)):
             with self.subTest(width=width, threads=threads):
@@ -11428,9 +11343,6 @@ for b in cutlass.range_constexpr(2):
         from test.cute_population_contracts import checked_initial_population
 
         from helion._compiler import autotuner_heuristics
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.autotuner.pattern_search import InitialPopulationStrategy
         from helion.autotuner.pattern_search import PatternSearch
 
@@ -11600,6 +11512,7 @@ def _fragment_register_fused_scatter(x, mode: hl.constexpr = "valid"):
     return out, packed
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentRegisterAtomicFusionCPU(unittest.TestCase):
     def test_independent_ticket_chains_register_tails_and_scatter(self):
@@ -11768,9 +11681,6 @@ class TestFragmentRegisterAtomicFusionCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
 
         from helion._compiler.cute.atomic_consumer_fusion import atomic_consumer_regions
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.language import _tracing_ops
         from helion.language import memory_ops
 
@@ -11897,6 +11807,7 @@ def _fragment_scoped_ticket_epochs(x, rounds: hl.constexpr):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentIterationLocalReturnsCPU(unittest.TestCase):
     def test_wrap_masks_zero_trip_and_later_allocation_epochs(self):
@@ -12101,6 +12012,7 @@ def _check_completed_local(args):
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestCompletedLocalIndexedReadCPU(unittest.TestCase):
     def test_cross_lane_duplicates_bounds_masks_tails_and_storage_reuse(self):
@@ -12215,6 +12127,7 @@ def _fragment_completed_local_tiled_owner(x, out):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestCompletedLocalIndexedReadLifetimeCPU(unittest.TestCase):
     def test_index_and_mask_read_source_before_result_allocation(self):
@@ -12234,10 +12147,6 @@ class TestCompletedLocalIndexedReadLifetimeCPU(unittest.TestCase):
 
     def test_more_than_one_row_owner_is_rejected(self):
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         x = torch.ones((2, 17), dtype=torch.int32)
         with mock_cuda_unavailable(), _target(), forbid_native_compile():
@@ -12278,6 +12187,7 @@ def _fragment_completed_local_index_semantics(x, indices, out, mode: hl.constexp
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestCompletedLocalIndexedReadSemanticsCPU(unittest.TestCase):
     def test_negative_tensor_scalar_and_mask_semantics_match_load_reference(self):
@@ -12418,6 +12328,7 @@ def _fragment_uniform_local_rejected(x, lengths, out, mode: hl.constexpr):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentUniformLocalBranchesCPU(unittest.TestCase):
     def test_fresh_both_arms_tail_and_post_join_epoch(self):
@@ -12510,9 +12421,6 @@ class TestFragmentUniformLocalBranchesCPU(unittest.TestCase):
         from helion._compiler.cute.uniform_region_tree import (
             uniform_output_stores_are_writeonly,
         )
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         x = torch.ones((3, 17), dtype=torch.int32)
         out = torch.zeros_like(x)
@@ -12568,6 +12476,7 @@ def _fragment_uniform_local_epochs(x, lengths, out):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentUniformLocalBranchEpochsCPU(unittest.TestCase):
     def test_pending_arms_retire_and_sequential_join_preserves_outer_capture(self):
@@ -12826,6 +12735,7 @@ def _fragment_uniform_local_while_rejected(x, limits, out, mode: hl.constexpr):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentUniformLocalWhilesCPU(unittest.TestCase):
     def test_fresh_epochs_zero_trip_simultaneous_carries_and_unused_updates(self):
@@ -13022,14 +12932,11 @@ def _fragment_uniform_composed_checkpoint(x, flags, limits, out):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestUniformRegionTreeCheckpointCPU(unittest.TestCase):
     def _bound(self):
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         args = (
             torch.ones((3, 17), dtype=torch.int32),
@@ -13161,9 +13068,6 @@ class TestUniformRegionTreeCheckpointCPU(unittest.TestCase):
     def test_composed_tree_has_complete_codegen_admission(self):
         from test.cute_population_contracts import _target
 
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
-
         bound = self._bound()
         config = bound.config_spec.default_config()
         config.config["cute_fragment_threads"] = 128
@@ -13175,6 +13079,7 @@ class TestUniformRegionTreeCheckpointCPU(unittest.TestCase):
             bound.to_code(config)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestUniformLocalRegionsCPU(unittest.TestCase):
     def test_composed_histogram_both_arms_zero_trips_and_padding(self):
@@ -13346,8 +13251,6 @@ class TestUniformLocalRegionsCPU(unittest.TestCase):
 
         from helion._compiler.cute.gather_domains import GatherDomainFacts
         from helion._compiler.cute.uniform_region_tree import uniform_region_domains
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         x = torch.arange(51, dtype=torch.int32).reshape(3, 17)
         flags = torch.tensor([0, 1, 1], dtype=torch.int32)
@@ -13465,6 +13368,7 @@ def _uniform_nested_expected(x, limits, bins):
     return torch.tensor(expected, dtype=x.dtype)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestUniformNestedRecurrenceCPU(unittest.TestCase):
     def test_padded_min_max_simultaneous_carries_and_unused_arm_epoch(self):
@@ -13632,6 +13536,7 @@ def _completed_frame_reference(x, indices, mask, limits, mode):
     return torch.stack(expected).to(x.dtype)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestCompletedLocalFrameReadsCPU(unittest.TestCase):
     def test_logical_extent_and_publication_mutants_change_execution(self):
@@ -13694,9 +13599,6 @@ class TestCompletedLocalFrameReadsCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
 
         from helion._compiler.cute.uniform_region_tree import uniform_local_regions
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.language import atomic_ops
 
         for scope in ("while", "ancestor_while"):
@@ -13908,6 +13810,7 @@ class TestCompletedLocalFrameReadsNative(TestCase):
                     torch.testing.assert_close(actual.cpu(), original, rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestCompletedLocalCaptureIdentityCPU(unittest.TestCase):
     @skipUnlessCuteAvailable("requires CuTe DSL")
@@ -13974,6 +13877,7 @@ def _fragment_uniform_called_scans(
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestUniformCalledScanHelpersCPU(unittest.TestCase):
     def test_closed_add_scans_composed_frames_both_orders_and_padding(self):
@@ -14024,10 +13928,6 @@ class TestUniformCalledScanHelpersCPU(unittest.TestCase):
     def _bound(self):
         from test.cute_population_contracts import _target
 
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
-
         with mock_cuda_unavailable(), _target(), forbid_native_compile():
             return cpu_bind(
                 _fragment_uniform_called_scans,
@@ -14044,8 +13944,6 @@ class TestUniformCalledScanHelpersCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
 
         from helion._compiler.cute.uniform_region_tree import uniform_local_regions
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         bound = self._bound()
         graphs = bound.host_function.device_ir.graphs
@@ -14194,10 +14092,6 @@ def _fragment_scan_logical_tail(
 def _fragment_scan_tail_codegen(args, mode):
     from test.cute_population_contracts import _target
 
-    from helion._testing.cute_codegen import cpu_bind
-    from helion._testing.cute_codegen import forbid_native_compile
-    from helion._testing.cute_codegen import mock_cuda_unavailable
-
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(_fragment_scan_logical_tail, args)
         config = bound.config_spec.default_config()
@@ -14242,6 +14136,7 @@ def _fragment_scan_tail_reference(values, mode, reverse):
     return result.flip(0) if reverse else result
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentScanLogicalTailsCPU(unittest.TestCase):
     def test_declared_local_tails_pointwise_and_explicit_padding(self):
@@ -14378,6 +14273,7 @@ class TestFragmentScanLogicalTailsNative(TestCase):
                 torch.testing.assert_close(device_x.cpu(), x, rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestUniformRegionWorkerDiscoveryCPU(unittest.TestCase):
     def test_composed_histogram_existing_worker_domain(self):
@@ -14553,6 +14449,7 @@ def _fragment_discovery_reference(x, limits):
     return torch.tensor(result, dtype=x.dtype)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestUniformLocalDiscoveryCPU(unittest.TestCase):
     def test_discovery_uses_registered_facts_and_existing_domains(self):
@@ -14561,9 +14458,6 @@ class TestUniformLocalDiscoveryCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
 
         from helion._compiler.cute import computed_fragment
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         original = computed_fragment.computed_fragment_supported
         live_success = []
@@ -14613,10 +14507,6 @@ class TestUniformLocalDiscoveryCPU(unittest.TestCase):
 
     def test_generated_scan_reduction_and_atomic_choices(self):
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         choices = (
             {},
@@ -14680,8 +14570,6 @@ class TestUniformLocalDiscoveryCPU(unittest.TestCase):
             computed_fragment_discovery_supported,
         )
         from helion._compiler.cute.computed_fragment import computed_fragment_supported
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         key = "tensor_storage_disjoint_matrix_v1"
         x = torch.ones((3, 35), dtype=torch.int32)
@@ -14748,9 +14636,6 @@ class TestUniformLocalDiscoveryCPU(unittest.TestCase):
         from helion._compiler.autotuner_heuristics.cute_fragment_common import (
             computed_fragment_discovery_supported,
         )
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.language import _tracing_ops
 
         args = (
@@ -14831,14 +14716,11 @@ def _fragment_uniform_bitcasts(x, limits, out, word_dtype: hl.constexpr):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestUniformLocalBitcastsCPU(unittest.TestCase):
     def _bound(self, dtype=torch.float32, word_dtype=torch.int32):
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         args = (
             torch.arange(51, dtype=dtype).reshape(3, 17),
@@ -15210,6 +15092,7 @@ def _fragment_output_store_reference(x, controls, mode):
     return result
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestUniformOutputStoresCPU(unittest.TestCase):
     def test_fresh_and_external_outputs_keep_order_and_logical_tails(self):
@@ -15248,8 +15131,6 @@ class TestUniformOutputStoresCPU(unittest.TestCase):
             computed_fragment_discovery_supported,
         )
         from helion._compiler.cute.computed_fragment import computed_fragment_supported
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.language import memory_ops
 
         unused = torch.empty((3, 19), dtype=torch.int32)
@@ -15329,9 +15210,6 @@ class TestUniformOutputStoresCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
 
         from helion._compiler.cute.uniform_region_tree import uniform_local_regions
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.language import _tracing_ops
         from helion.language import atomic_ops
         from helion.language import memory_ops
@@ -15504,6 +15382,7 @@ def _singleton_reference(x, limits, column_first):
     return output
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestUniformSingletonSubscriptCPU(unittest.TestCase):
     def test_loaded_and_completed_views_keep_padded_masks(self):
@@ -15534,10 +15413,6 @@ class TestUniformSingletonSubscriptCPU(unittest.TestCase):
     @staticmethod
     def _bound():
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         args = (
             torch.ones((3, 17), dtype=torch.int32),
@@ -15782,14 +15657,11 @@ def _frame_snapshot_expected(args, branch):
     return torch.tensor(expected, dtype=torch.int32)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestUniformFrameSnapshotsCPU(unittest.TestCase):
     def test_masked_multislot_captures_across_current_frames(self):
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         for branch, kernel in (
             (False, _fragment_frame_root_snapshot),
@@ -15830,9 +15702,6 @@ class TestUniformFrameSnapshotsCPU(unittest.TestCase):
 
         from helion._compiler.cute.register_snapshots import frame_snapshot_captures
         from helion._compiler.cute.register_snapshots import snapshot_chains
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.language import _tracing_ops
 
         args = _frame_snapshot_args(torch.int32)
@@ -15881,8 +15750,6 @@ class TestUniformFrameSnapshotsCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
 
         from helion._compiler.cute.register_snapshots import snapshot_chains
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         args = list(_frame_snapshot_args(torch.int32))
         args[-1] = torch.empty_like(args[0])[:, 0]
@@ -15964,6 +15831,7 @@ def _fragment_snapshot_mixed_prerequisites(x, limits, out):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestUniformSnapshotPrerequisitesCPU(unittest.TestCase):
     def test_mixed_loops_retain_each_bounded_gather_prerequisite(self):
@@ -15971,9 +15839,6 @@ class TestUniformSnapshotPrerequisitesCPU(unittest.TestCase):
 
         from helion._compiler.cute.computed_fragment import computed_fragment_supported
         from helion._compiler.cute.resident_while import resident_while_plan
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.language import _tracing_ops
 
         args = (
@@ -16027,14 +15892,11 @@ def _fragment_snapshot_unsupported_vector_carry(x, limits, out):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestSnapshotDiscoveryDeclineCPU(unittest.TestCase):
     def test_unsupported_snapshot_loop_preserves_ordinary_codegen(self):
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         with mock_cuda_unavailable(), _target(), forbid_native_compile():
             args = (
@@ -16160,16 +16022,13 @@ def _derived_snapshot_expected(args):
     return torch.tensor(result, dtype=torch.int64)
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestDerivedFrameSnapshotsCPU(unittest.TestCase):
     def test_typed_multislot_keys_masks_and_nested_loops(self):
         import ast
 
         from test.cute_population_contracts import _target
-
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         class Bitcasts(ast.NodeTransformer):
             def visit_Attribute(self, node):
@@ -16221,9 +16080,6 @@ class TestDerivedFrameSnapshotsCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
 
         from helion._compiler.cute.register_snapshots import frame_snapshot_recipes
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.language import _tracing_ops
 
         with mock_cuda_unavailable(), _target(), forbid_native_compile():
@@ -16303,9 +16159,6 @@ class TestDerivedFrameSnapshotsCPU(unittest.TestCase):
         from test.cute_population_contracts import _target
 
         from helion._compiler.cute.computed_fragment import FragmentCompiler
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         original = FragmentCompiler.derived_snapshot
         checked = []
@@ -16382,15 +16235,13 @@ def _fragment_two_snapshot_recipe(x, y, limits, out):
     return out
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestMultipleDerivedSnapshotsCPU(unittest.TestCase):
     def test_two_initialized_inputs_keep_distinct_register_leaves(self):
         from test.cute_population_contracts import _target
 
         from helion._compiler.cute.register_snapshots import frame_snapshot_recipes
-        from helion._testing.cute_codegen import cpu_bind
-        from helion._testing.cute_codegen import forbid_native_compile
-        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.language import _tracing_ops
 
         x = (torch.arange(3 * 129).reshape(3, 129) % 17 - 8).to(torch.int32)
@@ -16463,6 +16314,7 @@ def _fragment_captured_atomic_index_reference(x, limits):
     )
 
 
+@pytest.mark.cpu_only
 @onlyBackends(["cute"])
 class TestFragmentCapturedAtomicIndexCPU(unittest.TestCase):
     def test_capture_reads_follow_logical_domain(self):

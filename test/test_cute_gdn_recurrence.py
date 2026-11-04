@@ -2136,15 +2136,22 @@ def test_gdn_recurrence_tightest_smem_budget_cuda(
 # store warps) registers, at the group counts that used to spill; then the
 # 64-row MMA's widest slices (a whole 256-token chunk per warp) and its
 # register-capped CTAs.
+# Each case compiles in a fresh interpreter with the SASS kept (~10s): the
+# first is the smoke test of the spill check, the rest are the slow tier.
 _WIDE_SLICE_CASES = (
     (128, 4, 1, 1, 128),
-    (128, 8, 1, 2, 128),
-    (128, 16, 1, 1, 128),
-    (128, 16, 1, 4, 128),
-    (64, 16, 1, 1, 128),
-    (64, 4, 1, 1, 64),
-    (64, 16, 1, 1, 64),
-    (32, 16, 1, 1, 64),
+    *(
+        pytest.param(*case, marks=pytest.mark.slow)
+        for case in (
+            (128, 8, 1, 2, 128),
+            (128, 16, 1, 1, 128),
+            (128, 16, 1, 4, 128),
+            (64, 16, 1, 1, 128),
+            (64, 4, 1, 1, 64),
+            (64, 16, 1, 1, 64),
+            (32, 16, 1, 1, 64),
+        )
+    ),
 )
 
 
