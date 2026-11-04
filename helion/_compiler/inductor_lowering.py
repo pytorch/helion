@@ -1174,9 +1174,9 @@ class ReductionLowering(InductorLowering):
                 self.block_index
             )
         else:
-            from .reduction_strategy import BlockReductionStrategy
-
-            strategy = BlockReductionStrategy(state, self.block_index)
+            strategy = env.backend.create_block_reduction_strategy(
+                state, self.block_index
+            )
 
         env.backend.validate_reduction_input(strategy.block_index, repr_input)
         from .reduction_strategy import cute_mark_cross_block_vec_lanes
