@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from builtins import __import__ as _import_module
 from pathlib import Path
 import sys
 import tempfile
@@ -109,10 +110,8 @@ class TestGeneratedCodeKeyRegressions(RefEagerTestDisabled, TestCase):
         self.assertFalse((self.root / "generated_code").exists())
 
     def test_builtin_imports_do_not_execute_during_lookup(self) -> None:
-        import_module = __import__
-
         def aliased_import(x: torch.Tensor) -> torch.Tensor:
-            return x * import_module("_helion_cache_test_constant").SCALE
+            return x * _import_module("_helion_cache_test_constant").SCALE
 
         def nested_import(x: torch.Tensor) -> torch.Tensor:
             def get_scale() -> float:
