@@ -325,6 +325,12 @@ def _shared_memory_limit(limit: int) -> Iterator[None]:
         yield
 
 
+def _matmul_reference(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # Some cuBLAS BF16 paths truncate intermediate reductions. The tested
+    # kernels accumulate in FP32; use an independent, higher-precision oracle.
+    return (x.double() @ y.double()).to(x.dtype)
+
+
 class _FakeTritonKernel:
     """Stands in for the Triton kernel generated for *config*.
 
@@ -1204,8 +1210,10 @@ class TestFitOnFirstLaunchGPU:
             assert config is not None
             # Later calls run the fitted config directly.
             assert bound_kernel._run is bound_kernel._compile_cache[config]
-            torch.testing.assert_close(kernel(x, y), x @ y, atol=1e-1, rtol=1e-2)
-        torch.testing.assert_close(out, x @ y, atol=1e-1, rtol=1e-2)
+            torch.testing.assert_close(
+                kernel(x, y), _matmul_reference(x, y), atol=1e-1, rtol=1e-2
+            )
+        torch.testing.assert_close(out, _matmul_reference(x, y), atol=1e-1, rtol=1e-2)
         # Fewer stages are enough on every GPU: the tiles must stay as tuned.
         assert config.block_sizes == [64, 128, 128]
         assert 2 <= config.num_stages < 8
@@ -1227,7 +1235,7 @@ class TestFitOnFirstLaunchGPU:
             assert calls.item() == 1
             kernel(x, y, calls)
             assert calls.item() == 2
-        torch.testing.assert_close(out, x @ y, atol=1e-1, rtol=1e-2)
+        torch.testing.assert_close(out, _matmul_reference(x, y), atol=1e-1, rtol=1e-2)
 
     @skipIfNotCUDA()
     @skipIfRefEager("ref-eager mode bypasses AOT heuristic config selection")
@@ -1257,7 +1265,7 @@ class TestFitOnFirstLaunchGPU:
             x, y = self._inputs()
             out = kernel(x, y)
             fitted = kernel.bind((x, y))._config
-        torch.testing.assert_close(out, x @ y, atol=1e-1, rtol=1e-2)
+        torch.testing.assert_close(out, _matmul_reference(x, y), atol=1e-1, rtol=1e-2)
         assert fitted is not None
         assert fitted.num_stages < 3
 
@@ -1282,7 +1290,7 @@ class TestFitOnFirstLaunchGPU:
                 for _ in range(2):
                     torch.testing.assert_close(
                         kernel(x, y, scale),
-                        (scale * (x.float() @ y.float())).to(x.dtype),
+                        (scale.double() * (x.double() @ y.double())).to(x.dtype),
                         atol=2e-1,
                         rtol=2e-2,
                     )
@@ -1300,7 +1308,7 @@ class TestFitOnFirstLaunchGPU:
             x, y = self._inputs()
             out = kernel(x, y)
             config = kernel.bind((x, y))._config
-        torch.testing.assert_close(out, x @ y, atol=1e-1, rtol=1e-2)
+        torch.testing.assert_close(out, _matmul_reference(x, y), atol=1e-1, rtol=1e-2)
         assert config == fits
 
     @skipIfNotCUDA()
@@ -1325,7 +1333,9 @@ class TestFitOnFirstLaunchGPU:
                 return kernel(a, b) * 2
 
             out = double_matmul(x, y)
-        torch.testing.assert_close(out, 2 * (x @ y), atol=2e-1, rtol=1e-2)
+        torch.testing.assert_close(
+            out, 2 * (_matmul_reference(x, y)), atol=2e-1, rtol=1e-2
+        )
         assert "exceeds this device's shared memory limit" in caplog.text
 
     @skipIfNotCUDA()
@@ -1345,7 +1355,9 @@ class TestFitOnFirstLaunchGPU:
                 bound._run
                 is bound._compile_cache[bound._normalized_config_copy(selected)]
             )
-            torch.testing.assert_close(kernel(x, y), x @ y, atol=1e-1, rtol=1e-2)
+            torch.testing.assert_close(
+                kernel(x, y), _matmul_reference(x, y), atol=1e-1, rtol=1e-2
+            )
 
     @skipIfNotCUDA()
     @skipIfRefEager("ref-eager mode bypasses local search")
@@ -1377,7 +1389,7 @@ class TestFitOnFirstLaunchGPU:
                 is bound._compile_cache[bound._normalized_config_copy(selected)]
             )
         torch.testing.assert_close(
-            kernel(*args), args[0] @ args[1], atol=1e-1, rtol=1e-2
+            kernel(*args), _matmul_reference(args[0], args[1]), atol=1e-1, rtol=1e-2
         )
 
     @skipIfNotCUDA()
@@ -1401,5 +1413,5 @@ class TestFitOnFirstLaunchGPU:
                 ].__globals__
             )
             torch.testing.assert_close(
-                kernel(*args), args[0] @ args[1], atol=1e-1, rtol=1e-2
+                kernel(*args), _matmul_reference(args[0], args[1]), atol=1e-1, rtol=1e-2
             )
