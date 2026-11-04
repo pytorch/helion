@@ -63,6 +63,11 @@ tests and parametrization grids, so new tests must follow these rules:
 - Mark tests that spawn interpreters, run a real autotune search, or need more
   than ~20s with `@pytest.mark.slow`; pull requests skip them.
 - Check `pytest --durations=20 <file>` before landing a new test file.
+- The CuTe CI jobs split test modules across shards by the seconds recorded in
+  `test/shard_durations.json`; re-record a module that is new or changed by
+  more than a minute with `scripts/shard_durations.py` (see its docstring),
+  otherwise it is weighed as the median module; after deleting or renaming a
+  test module, run the script without reports to drop its entry.
 
 ### PyTest Debugging Tips
 

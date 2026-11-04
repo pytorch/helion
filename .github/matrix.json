@@ -9,7 +9,8 @@
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-nightly",
       "alias": "a10g",
-      "backend": "triton"
+      "backend": "triton",
+      "pr": false
     },
     {
       "runner": "mt-l-x86aavx2-11-41-a10g",
@@ -33,7 +34,8 @@
       "alias": "a10g-dtype-asserts",
       "dtype-asserts": true,
       "expecttest-accept": true,
-      "backend": "triton"
+      "backend": "triton",
+      "pr": false
     },
     {
       "runner": "mt-l-x86aavx2-11-41-a10g",
@@ -44,7 +46,8 @@
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-nightly",
       "alias": "a10g-ref-eager",
-      "backend": "triton"
+      "backend": "triton",
+      "pr": false
     },
     {
       "runner": "mt-l-x86iamx-22-225-h100",
@@ -67,7 +70,8 @@
       "pytorch-version": "pytorch-nightly",
       "alias": "h100",
       "backend": "triton",
-      "triton-package": "fbtriton"
+      "triton-package": "fbtriton",
+      "pr": false
     },
     {
       "runner": "mt-l-x86iamx-88-900-h100-4",
@@ -138,17 +142,6 @@
       "backend": "pallas"
     },
     {
-      "runner": "linux.dgx.b200",
-      "python-version": "3.12",
-      "ref-eager": false,
-      "image": "nvidia/cuda:13.1.0-devel-ubuntu24.04",
-      "runtime-version": "cu130",
-      "container-options": "--gpus all",
-      "pytorch-version": "pytorch-nightly",
-      "alias": "b200",
-      "backend": "cute"
-    },
-    {
       "runner": "macos-m2-26",
       "python-version": "3.12",
       "ref-eager": false,
@@ -169,6 +162,30 @@
       "pytorch-version": "pytorch-nightly",
       "alias": "pallas-interpret",
       "backend": "pallas"
+    },
+    {
+      "runner": "linux.dgx.b200",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "nvidia/cuda:13.1.0-devel-ubuntu24.04",
+      "runtime-version": "cu130",
+      "container-options": "--gpus all",
+      "pytorch-version": "pytorch-nightly",
+      "alias": "b200",
+      "backend": "cute",
+      "shards": 2
+    },
+    {
+      "runner": "mt-l-x86iavx512-8-64",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "ubuntu:24.04",
+      "runtime-version": "cu130",
+      "container-options": "",
+      "pytorch-version": "pytorch-nightly",
+      "alias": "cpu-lane",
+      "lane": "cpu",
+      "backend": "cute"
     }
   ]
 }
