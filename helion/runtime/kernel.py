@@ -673,7 +673,7 @@ def _specialization_alias_per_call(
     not imply; None when the whole alias stays per call (a mutable trailing
     default, or no canonical schema, which makes the alias raise).
 
-    Cached per canonical list.
+    Cached per canonical list: every re-prepared call looks it up.
     """
     canonical = alias.schemas.get(alias.canonical_signature)
     cached = alias.per_call_cache
@@ -754,7 +754,9 @@ def _partition_prepared_extra_guards(
     """Split guards into always-check classifiers and prepared fact guards.
 
     Tensor type/shape/stride/dtype/device facts are already checked by the
-    prepared argument guard.  A runtime input specialization may supply a
+    prepared argument guard, so metadata extractors are dropped, and an
+    omitted-default alias keeps only its per-call part
+    (``_prepared_alias_guard``).  A runtime input specialization may supply a
     ``prepared_guard_factory`` that turns its expected result into a direct
     check of the pointer/storage facts those pins leave open, so repeat calls
     with fresh output tensors never re-run the full classifier.  Classifiers
@@ -765,6 +767,11 @@ def _partition_prepared_extra_guards(
     always_check: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]] = []
     fact_guards: list[Callable[[Sequence[object]], bool]] = []
     for extractor, expected in extra_guards:
+        if isinstance(extractor, _SpecializationAlias):
+            alias_guard = _prepared_alias_guard(extractor, expected, args)
+            if alias_guard is not None:
+                always_check.append((alias_guard, expected))
+            continue
         if isinstance(extractor, _PreparedMetadataSpecializationExtractor):
             continue
         guard = (
@@ -777,6 +784,35 @@ def _partition_prepared_extra_guards(
         else:
             fact_guards.append(guard)
     return tuple(always_check), tuple(fact_guards)
+
+
+def _prepared_alias_guard(
+    alias: _SpecializationAlias,
+    expected: Hashable,
+    args: tuple[object, ...],
+) -> Callable[[Sequence[object]], Hashable] | None:
+    """What a prepared call re-evaluates for an omitted-default alias slot.
+
+    Looks through to the canonical schema like the fast-key memo
+    (``_specialization_alias_per_call``): None when exact metadata, which the
+    prepared argument guard pins, implies every canonical extractor, else a
+    ``_SpecializationAliasDispatch`` that re-evaluates only the rest and
+    takes the implied slots from ``expected``, the fast key's value for these
+    arguments (as the guards of non-alias extractors exact metadata implies
+    are dropped unevaluated; evaluating them would cost a few microseconds
+    each time a call re-prepares).  The whole alias stays when its defaults
+    are mutable or its canonical schema is missing, and, failing closed, when
+    ``expected`` does not have the canonical shape or the re-evaluated slots
+    do not reproduce it.
+    """
+    split = _specialization_alias_per_call(alias)
+    if split is None or type(expected) is not tuple or len(expected) != len(split[0]):
+        return alias
+    per_call = split[1]
+    if not per_call:
+        return None
+    dispatch = _SpecializationAliasDispatch(alias.trailing_defaults, expected, per_call)
+    return dispatch if dispatch(args) == expected else alias
 
 
 def _build_prepared_fact_guard(
@@ -1708,15 +1744,13 @@ class Kernel(Generic[_R]):
             new_facts = [fact for fact in facts if fact not in published]
             if not new_facts:
                 return
+            aliases = {
+                alias_signature: alias
+                for alias_signature, alias in self._specialization_aliases.items()
+                if alias.canonical_signature == signature
+            }
             for key, bound in list(self._bound_kernels.items()):
-                if key.specialization_key not in (
-                    signature,
-                    *(
-                        alias_signature
-                        for alias_signature, alias in self._specialization_aliases.items()
-                        if alias.canonical_signature == signature
-                    ),
-                ):
+                if key.specialization_key not in (signature, *aliases):
                     continue
                 del self._bound_kernels[key]
                 # Alias keys pack the canonical results; let them rebind.
@@ -1734,6 +1768,11 @@ class Kernel(Generic[_R]):
                     ] = bound
             # Replacing a published list requires the generation bump below.
             self._specialize_extra[signature] = [*published, *new_facts]
+            for alias_signature, alias in aliases.items():
+                # An alias published while the canonical schema was empty
+                # keys no canonical extractor; let it key the new facts.
+                if alias_signature in self._specialize_extra:
+                    self._specialize_extra[alias_signature] = [alias]
             self._has_specialization_extras = True
             self._specialization_generation += 1
             self._fast_dispatch_schemas = {}

@@ -1305,6 +1305,50 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
                     for value in (2, 3, 2, 3):
                         torch.testing.assert_close(scale(b, value), b * value)
 
+    def test_omitted_default_alias_implied_by_metadata_leaves_prepared_hits(
+        self,
+    ) -> None:
+        """An omitted-default call keys the canonical signature's broadcast
+        guard facts through its alias.  They read only sizes, which the
+        prepared argument guard pins, so a prepared hit re-checks none of
+        them (only canonical extractors exact metadata does not imply, such
+        as CuTe's pointer-alignment classifier), while the size-1 and full
+        bias shapes keep separate kernels."""
+
+        @helion.kernel(
+            static_shapes=False,
+            config=helion.Config(block_sizes=[1, 8, 16]),
+        )
+        def add_bias(
+            x: torch.Tensor, bias: torch.Tensor, scale: float = 1.0
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + bias[tile] * scale
+            return out
+
+        x = torch.randn(4, 8, 16, device=DEVICE)
+        for bias_shape in ((4, 8, 16), (1, 8, 16)) * 3:
+            bias = torch.randn(bias_shape, device=DEVICE)
+            torch.testing.assert_close(add_bias(x, bias), x + bias)
+            prepared = add_bias._prepared_call  # type: ignore[attr-defined]
+            assert prepared is not None
+            for guard, _expected in prepared._extra_guards:
+                self.assertIsInstance(guard, kernel_module._SpecializationAliasDispatch)
+                for _index, extractor in guard.per_call:  # type: ignore[attr-defined]
+                    self.assertFalse(
+                        kernel_module._implied_by_exact_metadata(extractor)
+                    )
+            with patch.object(
+                add_bias,
+                "_fast_dispatch_key_and_guards",
+                side_effect=AssertionError("prepared call missed"),
+            ):
+                torch.testing.assert_close(add_bias(x, bias), x + bias)
+        (alias,) = add_bias._specialization_aliases.values()  # type: ignore[attr-defined]
+        self.assertTrue(alias.schemas[alias.canonical_signature])
+        self.assertIn([alias], add_bias._specialize_extra.values())  # type: ignore[attr-defined]
+
     def test_distributed_aot_late_specialization_stays_locked(self) -> None:
         aot_scale = _make_aot_scale(distributed=True)
         x = torch.randn(64, device=DEVICE)

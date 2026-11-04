@@ -1683,6 +1683,74 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
         with self.assertRaises(KeyError):
             _unmemoized_key(add, (x,))
 
+    def test_prepared_guards_look_through_omitted_default_alias(self) -> None:
+        x = torch.empty(64)
+        size = _PreparedMetadataSpecializationExtractor(
+            _Counted(lambda values: values[0].size(0))  # type: ignore[union-attr]
+        )
+        default = operator.itemgetter(1)
+
+        def partition(
+            trailing_default: object,
+            canonical: Sequence[Callable[[Sequence[object]], Hashable]] | None,
+            expected: Hashable | None = None,
+        ) -> tuple[_SpecializationAlias, tuple[object, ...]]:
+            add = self._omitted_default_kernel(trailing_default, canonical)
+            (alias,) = add._specialization_aliases.values()  # type: ignore[attr-defined]
+            if expected is None:
+                expected = alias((x,))
+            always_check, fact_guards = kernel_module._partition_prepared_extra_guards(
+                (x,), ((alias, expected),)
+            )
+            self.assertEqual(fact_guards, ())
+            return alias, always_check
+
+        # Exact metadata implies every canonical extractor.
+        _alias, always_check = partition(1e-5, [size], (64,))
+        self.assertEqual(always_check, ())
+        # Only the default's value is re-read, on the normalized arguments;
+        # the implied slot comes from the expected value, unevaluated.
+        calls = size.extractor.calls  # type: ignore[attr-defined]
+        _alias, always_check = partition(1e-5, [size, default], (64, 1e-5))
+        ((dispatch, expected),) = always_check
+        self.assertIsInstance(dispatch, kernel_module._SpecializationAliasDispatch)
+        self.assertEqual(dispatch.per_call, ((1, default),))  # type: ignore[attr-defined]
+        self.assertEqual(dispatch((x,)), expected)  # type: ignore[operator]
+        self.assertEqual(size.extractor.calls, calls)  # type: ignore[attr-defined]
+        # The whole alias stays for a mutable default, a missing canonical
+        # schema, and (failing closed) an expected value that the re-read
+        # slots do not reproduce or that does not have the canonical shape.
+        for trailing_default, canonical, expected in (
+            ([1], [size], None),
+            (1e-5, None, (64,)),
+            (1e-5, [size, default], (64, 2e-5)),
+            (1e-5, [size, default], (64,)),
+            (1e-5, [size], 64),
+        ):
+            alias, always_check = partition(trailing_default, canonical, expected)
+            self.assertEqual(len(always_check), 1)
+            self.assertIs(always_check[0][0], alias)  # type: ignore[index]
+
+    def test_alias_per_call_split_follows_replaced_canonical_list(self) -> None:
+        """The split of the canonical schema is cached per published list,
+        which a schema extension replaces rather than mutates."""
+        size = _PreparedMetadataSpecializationExtractor(
+            lambda values: values[0].size(0)  # type: ignore[union-attr]
+        )
+        default = operator.itemgetter(1)
+        add = self._omitted_default_kernel(1e-5, [size])
+        (alias,) = add._specialization_aliases.values()  # type: ignore[attr-defined]
+        x = torch.empty(64)
+        for _ in range(2):
+            self.assertIsNone(kernel_module._prepared_alias_guard(alias, (64,), (x,)))
+        add._specialize_extra[alias.canonical_signature] = [size, default]  # type: ignore[attr-defined]
+        guard = kernel_module._prepared_alias_guard(alias, (64, 1e-5), (x,))
+        self.assertIsInstance(guard, kernel_module._SpecializationAliasDispatch)
+        self.assertEqual(guard.per_call, ((1, default),))  # type: ignore[union-attr]
+        self.assertEqual(
+            kernel_module._evaluate_specialization_alias(alias, (x,))[0], (64, 1e-5)
+        )
+
     def _assert_guards_match_unmemoized(
         self,
         kernel: helion.Kernel,
