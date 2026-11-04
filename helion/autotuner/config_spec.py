@@ -1872,6 +1872,7 @@ class ConfigSpec:
         # logging. De-duplicated; ordered by first occurrence.
         self.restriction_reasons: list[tuple[str, str]] = []
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
+        self.default_num_sm_multiplier: int = backend.default_num_sm_multiplier()
         self.grid_block_ids: list[int] = []
         # Ordered root grids and nested-graph ownership, independent of any
         # specialized matmul/reduction policy.
@@ -8321,7 +8322,7 @@ class ConfigSpec:
                         f"Invalid value for 'num_sm_multiplier': {val!r} must be an integer between {MIN_NUM_SM_MULTIPLIER} and {MAX_NUM_SM_MULTIPLIER}"
                     )
             else:
-                config["num_sm_multiplier"] = DEFAULT_NUM_SM_MULTIPLIER
+                config["num_sm_multiplier"] = self.default_num_sm_multiplier
 
         # Only validate maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
@@ -8368,9 +8369,9 @@ class ConfigSpec:
         if pid_type in ("flat", "xyz"):
             # Handle num_sm_multiplier
             num_sm_multiplier = config.get(
-                "num_sm_multiplier", DEFAULT_NUM_SM_MULTIPLIER
+                "num_sm_multiplier", self.default_num_sm_multiplier
             )
-            if num_sm_multiplier != DEFAULT_NUM_SM_MULTIPLIER:
+            if num_sm_multiplier != self.default_num_sm_multiplier:
                 if _fix_invalid:
                     # Silently fix during autotuning config generation
                     config.pop("num_sm_multiplier", None)
@@ -8449,6 +8450,8 @@ class ConfigSpec:
                 ("range_multi_buffers", self.range_multi_buffers),
                 ("range_flattens", self.range_flattens),
             ):
+                if not self.supports_config_key(name):
+                    continue
                 config[name] = mapping._reset_config_to_default(
                     name, config.get(name, ()), block_ids=self.grid_block_ids
                 )
@@ -10005,7 +10008,7 @@ class ConfigSpec:
             fields["num_sm_multiplier"] = PowerOfTwoFragment(
                 MIN_NUM_SM_MULTIPLIER,
                 self.max_num_sm_multiplier,
-                DEFAULT_NUM_SM_MULTIPLIER,
+                self.default_num_sm_multiplier,
             )
         if self.supports_config_key("load_eviction_policies"):
             fields["load_eviction_policies"] = self.load_eviction_policies
