@@ -325,6 +325,39 @@ def _shared_memory_limit(limit: int) -> Iterator[None]:
         yield
 
 
+def _shared_memory_usage(
+    kernel: helion.Kernel, args: Sequence[object], config: Config
+) -> int:
+    """Compile without loading handles, so a later cap still checks resources."""
+    from helion.runtime.precompile_shim import _KernelLoaded
+    from helion.runtime.precompile_shim import compile_only_launch_args
+
+    usage: list[int] = []
+
+    def inspect_launch(
+        triton_kernel: Any, grid: tuple[int, ...], *args: object, **kwargs: object
+    ) -> None:
+        launch_args, launch_kwargs = compile_only_launch_args(*args, **kwargs)  # pyrefly: ignore [bad-argument-type]
+        compiled = triton_kernel.run(
+            *launch_args, grid=grid, warmup=True, **launch_kwargs
+        )
+        usage.append(compiled.metadata.shared)
+        raise _KernelLoaded
+
+    with pytest.raises(_KernelLoaded):
+        kernel.bind(args).compile_config(config)(*args, _launcher=inspect_launch)
+    assert len(usage) == 1
+    return usage[0]
+
+
+def _resource_limit(large: int, small: int) -> int:
+    import triton.compiler.compiler as triton_compiler
+
+    physical = triton_compiler.max_shared_mem(torch.cuda.current_device())
+    assert 0 <= small < min(large, physical)
+    return (small + min(large, physical)) // 2
+
+
 def _matmul_reference(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     # Some cuBLAS BF16 paths truncate intermediate reductions. The tested
     # kernels accumulate in FP32; use an independent, higher-precision oracle.
@@ -1169,8 +1202,8 @@ class TestFitConfigForRendering:
         assert cache.kernel._config_from_other_device is expected
 
 
-# Each stage of [64, 128, 128] bf16 tiles buffers 48 KiB, so 8 stages need far
-# more shared memory per block than any current GPU has.
+# This large pipeline requires fitting on the GPUs covered by this test.
+# Emulated limits below are calibrated from the installed compiler's metadata.
 _OVERSIZED_MATMUL_CONFIG: dict[str, object] = {
     "block_sizes": [64, 128, 128],
     "num_stages": 8,
@@ -1255,19 +1288,37 @@ class TestFitOnFirstLaunchGPU:
     @skipIfRefEager("ref-eager mode bypasses AOT heuristic config selection")
     @skipIfTileIR("checks Triton's num_stages and shared memory accounting")
     def test_fits_to_a_gpu_with_less_shared_memory(self, tmp_path: Path) -> None:
-        # Three stages fit every GPU in CI, but not one with 64 KiB per block.
-        config = {**_OVERSIZED_MATMUL_CONFIG, "num_stages": 3}
+        import triton.compiler.compiler as triton_compiler
+
+        kernel = _make_aot_fit_matmul_small_gpu()
+        x, y = self._inputs()
+        small = _shared_memory_usage(
+            kernel, (x, y), Config(block_sizes=[32, 64, 64], num_stages=1, num_warps=4)
+        )
+        physical = triton_compiler.max_shared_mem(torch.cuda.current_device())
+        for stages in (8, 4, 3, 2):
+            config = Config(block_sizes=[32, 64, 64], num_stages=stages, num_warps=4)
+            large = _shared_memory_usage(kernel, (x, y), config)
+            if small < large <= physical:
+                break
+        else:
+            pytest.fail(
+                "compiler produced no pipeline that fits here but exceeds a smaller cap"
+            )
+        limit = _resource_limit(large, small)
         with (
-            _heuristic_for_older_gpu(tmp_path, {"aot_fit_matmul_small_gpu": config}),
-            _shared_memory_limit(64 * 1024),
+            _heuristic_for_older_gpu(
+                tmp_path, {"aot_fit_matmul_small_gpu": config.config}
+            ),
+            _shared_memory_limit(limit),
         ):
-            kernel = _make_aot_fit_matmul_small_gpu()
-            x, y = self._inputs()
             out = kernel(x, y)
             fitted = kernel.bind((x, y))._config
         torch.testing.assert_close(out, _matmul_reference(x, y), atol=1e-1, rtol=1e-2)
         assert fitted is not None
-        assert fitted.num_stages < 3
+        assert fitted.num_stages < config.num_stages
+        assert fitted.block_sizes == config.block_sizes
+        assert _shared_memory_usage(kernel, (x, y), fitted) <= limit
 
     @skipIfNotCUDA()
     @skipIfRefEager("ref-eager mode bypasses AOT heuristic config selection")
@@ -1301,11 +1352,18 @@ class TestFitOnFirstLaunchGPU:
     def test_autotuner_skips_configs_too_big_for_a_smaller_gpu(self) -> None:
         too_big = helion.Config(block_sizes=[64, 128, 128], num_stages=4, num_warps=4)
         fits = helion.Config(block_sizes=[32, 64, 64], num_stages=2, num_warps=4)
-        with _shared_memory_limit(48 * 1024):
-            kernel = helion.kernel(configs=[too_big, fits])(
-                _make_aot_fit_matmul_small_gpu().fn
-            )
-            x, y = self._inputs()
+        # The cap is process-local, so candidate measurements must see it here.
+        kernel = helion.kernel(
+            configs=[too_big, fits], autotune_benchmark_subprocess=False
+        )(_make_aot_fit_matmul_small_gpu().fn)
+        x, y = self._inputs()
+        limit = _resource_limit(
+            _shared_memory_usage(kernel, (x, y), too_big),
+            _shared_memory_usage(kernel, (x, y), fits),
+        )
+        with _shared_memory_limit(limit):
+            with pytest.raises(OutOfResources, match="shared memory"):
+                kernel.bind((x, y)).compile_config(too_big)(x, y)
             out = kernel(x, y)
             config = kernel.bind((x, y))._config
         torch.testing.assert_close(out, _matmul_reference(x, y), atol=1e-1, rtol=1e-2)
