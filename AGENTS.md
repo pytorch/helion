@@ -98,6 +98,35 @@ Many pull requests on github are managed with the `stack-pr` tool.  This tool cr
 - Modify by amending the git history with an interactive rebase
 - `stack-pr --help` for more info
 
+## Automatic Code Review
+
+`scripts/autoreview.py` runs an independent reviewer over a change and prints
+its findings (`LGTM` when it has none). Run it yourself at these points, without
+being asked:
+
+- After every new commit you make: `scripts/autoreview.py --head` reviews that
+  commit alone.
+- When a complete unit of work is finished but not committed (a feature, a fix,
+  a refactor that is ready to hand back): `scripts/autoreview.py` with no
+  arguments reviews the staged and uncommitted changes.
+
+Then, before ending the turn, fix every issue the review reports (or explain in
+your reply why a finding does not apply). If the fixes are more than trivial,
+run the review again on the result and repeat until it comes back clean or only
+cosmetic. Fold fixes for a commit you just made into that commit (amending a
+commit you were asked to make is fine; for an earlier commit in a stack, a
+fixup commit followed by `GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash
+<base>`, which runs without an editor, keeping one commit per pull request as
+the stack-pr section requires); an amend that only folds in review fixes does
+not need a review of its own.
+
+Do not run the script when `HELION_AUTOREVIEW_SESSION` is set: you are then the
+reviewer or fixer that `autoreview.py` launched, and the outer run reviews the
+result. Review from the checkout you are working in with `--head` or no
+arguments; to review an older commit, check it out in a throwaway `git
+worktree` and run that worktree's own `scripts/autoreview.py --head` (the
+script reviews the checkout it lives in).
+
 ## Agent-Specific Instructions
 
 - Do NOT run `git commit` unless asked to.
