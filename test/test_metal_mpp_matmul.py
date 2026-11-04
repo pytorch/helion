@@ -52,6 +52,11 @@ if TYPE_CHECKING:
 
 DEVICE = "mps"
 S = {"backend": "metal", "static_shapes": True}
+# metal/literal_dims.py's refusal of two unrelated tiles meeting by position,
+# which runs before the MPP planner sees the kernel (matched literally).
+PAIRS_TILES = "index both operands with the same tiles"
+# Every refusal of metal/literal_dims.py: two blocks met at one position.
+SWAPPED_TILES = "A Metal thread holds each element by the block ids of its dims"
 TILE16 = helion.Config(block_sizes=[16, 16, 16], num_threads=[16, 16, 1])
 TILE32 = helion.Config(block_sizes=[32, 32, 16], num_threads=[32, 32, 1])
 FREE32 = helion.Config(block_sizes=[32, 32, 16])
@@ -4395,12 +4400,12 @@ class TestMppMatmulRejects(_MppCase):
         c = torch.randn(48, 48, device=DEVICE)
         b = torch.randn(48, device=DEVICE)
         lim = torch.randn(48, device=DEVICE)
-        msg = "an MPP epilogue re-run at each cooperative element would read another"
-        self._rejects(swapped_store, (x, y), TILE16, msg)
-        self._rejects(swapped_epi_load, (x, y, c), TILE16, msg)
-        self._rejects(bias_row_swapped, (x, y, b), TILE16, msg)
-        self._rejects(where_swapped, (x, y, c), TILE16, msg)
-        self._rejects(epi_mask_swapped, (x, y, c, lim), TILE16, msg)
+        self._rejects(swapped_store, (x, y), TILE16, SWAPPED_TILES)
+        self._rejects(swapped_epi_load, (x, y, c), TILE16, SWAPPED_TILES)
+        # b[tm] at tn's position.
+        self._rejects(bias_row_swapped, (x, y, b), TILE16, PAIRS_TILES)
+        self._rejects(where_swapped, (x, y, c), TILE16, SWAPPED_TILES)
+        self._rejects(epi_mask_swapped, (x, y, c, lim), TILE16, SWAPPED_TILES)
 
 
 def _nan_padded(data: torch.Tensor, before: int = 0) -> torch.Tensor:
@@ -4766,12 +4771,7 @@ class TestMppStagingRejects(_MppCase):
 
     def test_staged_positional(self) -> None:
         z = torch.randn(72, 48, device=DEVICE, dtype=torch.float16)
-        self._rejects(
-            swapped_staged,
-            (self.x, z, self.y),
-            TILE16,
-            "a staged MPP operand is written into its tile by block",
-        )
+        self._rejects(swapped_staged, (self.x, z, self.y), TILE16, SWAPPED_TILES)
 
     def test_lane_carry(self) -> None:
         """A carry over K's lane-looped block beside a staged op, folded or
@@ -5904,26 +5904,9 @@ class TestMppConversionRejects(_MppCase):
         seed computed from a tile that does."""
         y = torch.randn(72, 48, device=DEVICE, dtype=torch.float16)
         c = torch.randn(48, 48, device=DEVICE)
-        self._rejects(
-            seed_relabel,
-            (self.x, y, c, c),
-            TILE16,
-            "a staged MPP operand is written into its tile by block, so it would "
-            "hold another element",
-        )
-        self._rejects(
-            swapped_mat_store,
-            (self.x, y, c),
-            TILE16,
-            "a value read from an MPP result in the Scalar layout would hold "
-            "another element",
-        )
-        self._rejects(
-            seed_swapped,
-            (self.x, y, c),
-            TILE16,
-            "an MPP accumulator seed whose dims are not M and N",
-        )
+        self._rejects(seed_relabel, (self.x, y, c, c), TILE16, SWAPPED_TILES)
+        self._rejects(swapped_mat_store, (self.x, y, c), TILE16, SWAPPED_TILES)
+        self._rejects(seed_swapped, (self.x, y, c), TILE16, SWAPPED_TILES)
 
     def test_acc_loaded_in_loop(self) -> None:
         """An acc read from a tensor in the K loop is no value of the carry,
@@ -6473,7 +6456,7 @@ class TestMppRootAddmmRejects(_MppCase):
             root_store_swapped,
             (xf, torch.randn(72, 48, device=DEVICE)),
             None,
-            "a store (store) meets dimension 0",
+            SWAPPED_TILES,
         )
         self._rejects(
             root_other_loop,
@@ -8203,7 +8186,7 @@ class TestMppLaneJamRejects(_MppCase):
             colon_seed_relabel,
             (xs, ys, c, d),
             None,
-            "an element-wise operand (add) meets",
+            SWAPPED_TILES,
         )
 
 
@@ -9962,9 +9945,9 @@ class TestMppBatchedRejects(_MppCase):
         z = torch.randn(3, 32, 32, device=DEVICE)
         msg = "a batched matmul whose acc's dims are not its batch, M and N blocks"
         config = (helion.Config(block_sizes=[1, 32, 32]),)
+        self._rejects_at(baddbmm_acc_swapped, (x, y, z), config, SWAPPED_TILES)
         for kernel, acc in (
             (baddbmm_acc_swapped_store, z),
-            (baddbmm_acc_swapped, z),
             (baddbmm_acc_2d, z[0]),
             (baddbmm_acc_unit, z[:1]),
             (baddbmm_acc_0d, z[0, 0]),
@@ -11425,13 +11408,10 @@ class TestMppCarryUpdateRejects(_MppCase):
         p = self.p
         v = torch.randn(72, 48, device=DEVICE, dtype=torch.float16)
         w = torch.randn(48, 48, device=DEVICE)
-        for kernel in (upd_swapped_load, upd_swapped_carry):
-            self._rejects_at(kernel, (p, v, w), (TILE16,), mpp_matmul._REBIND)
+        for kernel in (upd_swapped_load, upd_swapped_carry, upd_vec_relabel):
+            self._rejects_at(kernel, (p, v, w), (TILE16,), SWAPPED_TILES)
         self._rejects_at(
-            upd_swapped_operand, (p, v, w, w.clone()), (TILE16,), mpp_matmul._REBIND
-        )
-        self._rejects_at(
-            upd_vec_relabel, (p, v, w), (TILE16,), mpp_matmul._STAGE_REBIND
+            upd_swapped_operand, (p, v, w, w.clone()), (TILE16,), SWAPPED_TILES
         )
 
     def test_operand_dims(self) -> None:
@@ -11440,11 +11420,12 @@ class TestMppCarryUpdateRejects(_MppCase):
         w = torch.randn(48, 40, device=DEVICE)
         msg = "neither recomputable at any element nor a value over the tile's M or N"
         self._rejects_at(upd_vec11, (self.p, self.v, w), (None, TILE16), msg)
+        # w[tm, tb] scales acc[tm, tn]: tb meets tn.
         self._rejects_at(
             upd_other_tile,
             (self.p, self.v, w),
             (None, helion.Config(block_sizes=[16, 16, 16, 16])),
-            msg,
+            PAIRS_TILES,
         )
 
     def test_written_tensors(self) -> None:
@@ -11945,9 +11926,10 @@ class TestMppEpilogueVectorsRejects(_MppCase):
         v = torch.randn(72, 48, device=DEVICE, dtype=h)
         w = torch.randn(48, 48, device=DEVICE)
         configs = (None, TILE16)
-        self._rejects_at(epi_vec_relabel, (p, v, w), configs, mpp_matmul._STAGE_REBIND)
+        self._rejects_at(epi_vec_relabel, (p, v, w), configs, SWAPPED_TILES)
+        # The vector's tile meets the other tile at its position.
         for kernel in (epi_row_as_col, epi_col_as_row):
-            self._rejects_at(kernel, (p, v), configs, mpp_matmul._REBIND)
+            self._rejects_at(kernel, (p, v), configs, PAIRS_TILES)
 
 
 # --- Lane reductions beside a cooperative op ------------------------------

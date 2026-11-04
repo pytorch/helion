@@ -532,12 +532,14 @@ class MetalBackend(Backend):
         from ..compile_environment import CompileEnvironment
         from .free_arange import check_free_lanes
         from .free_arange import plan_free_aranges
+        from .literal_dims import reject_literal_dims
         from .mpp_matmul import plan_mpp_matmuls
         from .positional_rebind import reject_positional_rebinds
         from .reduction import plan_reduced_tile_axes
         from .repeated_blocks import plan_repeated_blocks
 
         reject_positional_rebinds(graphs)
+        reject_literal_dims(graphs, config)
         plan_repeated_blocks(graphs, tile_strategy)
         plan_reduced_tile_axes(graphs, tile_strategy)
         self._tid_axes = set()
