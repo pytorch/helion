@@ -12,6 +12,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 # Optional vLLM baseline: the production kernel this is benchmarked against. The
@@ -23,6 +24,7 @@ try:
     _HAS_VLLM = hasattr(torch.ops._C, "rms_norm_dynamic_per_token_quant")
 except ImportError:
     _HAS_VLLM = False
+
 
 # fp8 e4m3 quant traits (matches vLLM get_fp8_min_max / min_scaling_factor on
 # non-fnuz NVIDIA platforms).
@@ -212,12 +214,12 @@ def correctness_check() -> None:
     """Assert the Helion kernel matches the torch reference for every bench shape."""
     torch.manual_seed(0)
     for hidden_size, num_tokens in _bench_shapes():
-        x_in = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        x_in = torch.randn(num_tokens, hidden_size, device=DEVICE, dtype=torch.bfloat16)
         weight = torch.normal(
-            mean=1.0, std=1.0, size=(hidden_size,), dtype=x_in.dtype, device="cuda"
+            mean=1.0, std=1.0, size=(hidden_size,), dtype=x_in.dtype, device=DEVICE
         )
         result = torch.empty_like(x_in, dtype=_FP8_DTYPE)
-        scale = torch.empty((num_tokens, 1), device="cuda", dtype=torch.float32)
+        scale = torch.empty((num_tokens, 1), device=DEVICE, dtype=torch.float32)
         result_ref = torch.empty_like(result)
         scale_ref = torch.empty_like(scale)
         rms_norm_dynamic_per_token_quant(result, x_in, weight, scale, 1e-6)
@@ -244,12 +246,12 @@ def main(verbose: bool = True) -> dict:
 
     def make_calls(shape: tuple[int, int]) -> tuple:
         hidden_size, num_tokens = shape
-        x_in = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        x_in = torch.randn(num_tokens, hidden_size, device=DEVICE, dtype=torch.bfloat16)
         weight = torch.normal(
-            mean=1.0, std=1.0, size=(hidden_size,), dtype=x_in.dtype, device="cuda"
+            mean=1.0, std=1.0, size=(hidden_size,), dtype=x_in.dtype, device=DEVICE
         )
         result = torch.empty_like(x_in, dtype=_FP8_DTYPE)
-        scale = torch.empty((num_tokens, 1), device="cuda", dtype=torch.float32)
+        scale = torch.empty((num_tokens, 1), device=DEVICE, dtype=torch.float32)
         result_ref = torch.empty_like(result)
         scale_ref = torch.empty_like(scale)
 
