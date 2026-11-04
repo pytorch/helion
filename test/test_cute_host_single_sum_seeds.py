@@ -5,7 +5,6 @@ from copy import deepcopy
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.rms_norm import rms_norm_bwd
 import pytest
 import torch
 
@@ -17,8 +16,11 @@ from test.test_cute_host_single_sum import _single
 
 import helion
 from helion._compiler.cute.host_paired_sum import PAIRED_SUM_KEY
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
+
+rms_norm_bwd = import_example("rms_norm").rms_norm_bwd
 
 pytestmark = skipUnlessBackends(["cute"])
 

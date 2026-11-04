@@ -5,7 +5,6 @@ from copy import deepcopy
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 
@@ -21,9 +20,12 @@ from helion._compiler.cute.grouped_full_coverage import (
     full_allocation_b_two_cta_smem_upper_bound,
 )
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if TYPE_CHECKING:
     from collections.abc import Generator

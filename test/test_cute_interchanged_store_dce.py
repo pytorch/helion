@@ -18,6 +18,7 @@ import helion
 from helion import exc
 from helion._compiler import tile_strategy
 from helion._compiler.cute.interchanged_store_dce import eliminate_interchanged_stores
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
@@ -302,8 +303,8 @@ def test_pending_scalar_alias_in_address_preserves_store() -> None:
 @pytest.mark.parametrize("name", ["rms_norm", "layer_norm"])
 @skipUnlessBackends(["cute"])
 def test_norm_backward_emits_one_dx_store(name: str) -> None:
-    from examples.layer_norm import layer_norm_bwd
-    from examples.rms_norm import rms_norm_bwd
+    layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
+    rms_norm_bwd = import_example("rms_norm").rms_norm_bwd
 
     x = torch.empty(256, 1024, dtype=torch.float16)
     weight = torch.empty(1024, dtype=torch.float16)

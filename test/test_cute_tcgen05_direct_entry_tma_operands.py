@@ -6,8 +6,6 @@ from typing import TYPE_CHECKING
 import unittest
 from unittest.mock import patch
 
-from examples.broadcast_matmul import broadcast_matmul
-from examples.grouped_gemm import grouped_gemm_jagged
 import torch
 
 from test._cute_binding import _mock_cuda_unavailable
@@ -25,10 +23,14 @@ from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._hardware import HardwareInfo
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 import helion.language as hl
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
+
+broadcast_matmul = import_example("broadcast_matmul").broadcast_matmul
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

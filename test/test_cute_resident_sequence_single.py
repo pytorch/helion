@@ -9,7 +9,6 @@ from typing import Any
 from typing import cast
 from unittest.mock import patch
 
-from examples.softmax import softmax_bwd
 import numpy as np
 import pytest
 import torch
@@ -31,8 +30,11 @@ from helion._compiler.cute.resident_sequence import _MARKER
 from helion._compiler.cute.resident_sequence import SequenceRegion
 from helion._compiler.cute.resident_sequence import materialize_resident_sequences
 from helion._compiler.tile_strategy import _lane_reduce_marker_expr
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
+
+softmax_bwd = import_example("softmax").softmax_bwd
 
 
 def _source(threads: int, slots: int, vector: int) -> str:

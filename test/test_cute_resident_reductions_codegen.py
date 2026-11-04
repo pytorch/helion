@@ -4,8 +4,6 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
-from examples.layer_norm import layer_norm_bwd
-from examples.rms_norm import rms_norm_bwd
 import pytest
 import torch
 
@@ -21,8 +19,12 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.resident_reductions import proven_resident_tensor_alignments
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_function import TensorArg
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
+
+layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
+rms_norm_bwd = import_example("rms_norm").rms_norm_bwd
 
 
 def _kernel_and_arguments(

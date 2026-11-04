@@ -14,6 +14,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
@@ -450,7 +451,7 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
     def test_split_k_matmul_default_config(self) -> None:
         """The example's default config (no explicit config) must launch a
         persistent kernel whose two phases agree on the thread layout."""
-        from examples.split_k_barrier import split_k_matmul
+        split_k_matmul = import_example("split_k_barrier").split_k_matmul
 
         torch.manual_seed(0)
         a = torch.randn(16, 4096, device=DEVICE)
@@ -468,7 +469,7 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
         lanes per axis-0 thread instead of shuffling consecutive lanes, and the
         launch must match the axes the body indexes (previously block=(16, 8, 1)
         was launched for a body indexing axes 1 and 2)."""
-        from examples.split_k_barrier import split_k_matmul
+        split_k_matmul = import_example("split_k_barrier").split_k_matmul
 
         torch.manual_seed(0)
         a = torch.randn(16, 4096, device=DEVICE)

@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.aot_example import row_softmax
 import pytest
 import torch
 
@@ -26,7 +25,10 @@ from helion._compiler.cute.online_to_3pass import rewrite_online_to_3pass
 from helion._compiler.host_function import HostFunction
 from helion._compiler.host_function import KernelDefinition
 from helion._compiler.source_location import UnknownLocation
+from helion._testing import import_example
 import helion.language as hl
+
+row_softmax = import_example("aot_example").row_softmax
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

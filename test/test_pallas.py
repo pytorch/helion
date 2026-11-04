@@ -12,8 +12,6 @@ from typing import cast
 import unittest
 import weakref
 
-from examples.geglu import _geglu_pallas as _geglu_pallas_example
-from examples.swiglu import _swiglu_fwd_pallas as _swiglu_fwd_pallas_example
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
@@ -24,6 +22,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import _bound_test_config
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallas
 from helion._testing import skipIfPallasInterpret
@@ -35,6 +34,9 @@ from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
+
+_geglu_pallas_example = import_example("geglu")._geglu_pallas
+_swiglu_fwd_pallas_example = import_example("swiglu")._swiglu_fwd_pallas
 
 if TYPE_CHECKING:
     from helion.autotuner.base_search import PopulationBasedSearch

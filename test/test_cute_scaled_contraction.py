@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.nvfp4_gemm import _nvfp4_w4a4_matmul_kernel
 import pytest
 import torch
 
@@ -18,6 +17,7 @@ from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuri
 from helion._compiler.cute.collective_matmul import _tensor_roots
 from helion._compiler.cute.packed_matmul import interleaved_matrix_terms
 from helion._compiler.cute.scaled_contraction import expose_scaled_contractions
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
@@ -25,6 +25,8 @@ from helion.language import creation_ops
 from helion.language import memory_ops
 from helion.language.matmul_ops import dot
 from helion.language.quantized_ops import float4_e2m1fn_x2_to_float32
+
+_nvfp4_w4a4_matmul_kernel = import_example("nvfp4_gemm")._nvfp4_w4a4_matmul_kernel
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -563,7 +565,9 @@ def test_one_scale_narrow_operand_is_exposed(dtype: torch.dtype) -> None:
 
 @skipUnlessBackends(["cute"])
 def test_w4a16_example_exposes_a_bf16_contraction() -> None:
-    from examples.nvfp4_gemm import _nvfp4_matmul_single_pass_kernel
+    _nvfp4_matmul_single_pass_kernel = import_example(
+        "nvfp4_gemm"
+    )._nvfp4_matmul_single_pass_kernel
 
     inputs = (
         torch.empty((512, 64, 16), dtype=torch.bfloat16),

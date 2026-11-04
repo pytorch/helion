@@ -6,8 +6,6 @@ import json
 import random
 from unittest.mock import patch
 
-from examples.low_mem_dropout import low_mem_dropout
-from examples.low_mem_dropout import low_mem_dropout_bwd
 import pytest
 import torch
 
@@ -23,12 +21,17 @@ from helion._compiler.cute.full_tile_bounds import FullTilePlan
 from helion._compiler.cute.full_tile_bounds import specialize_full_tile_bounds
 from helion._compiler.cute.tensor_layout_relations import TensorLayoutRelation
 from helion._compiler.rng_utils import philox_rand_ref
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 import helion.language as hl
+
+_examples_low_mem_dropout = import_example("low_mem_dropout")
+low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
+low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 
 pytestmark = skipUnlessBackends(["cute"])
 

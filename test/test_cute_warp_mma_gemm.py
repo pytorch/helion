@@ -29,6 +29,7 @@ from test.test_cute_tcgen05_fixed_cost import _gemm_with_epilogue
 
 import helion
 from helion._compiler.cute import cute_warp_mma_gemm as family
+from helion._testing import import_example
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
@@ -867,7 +868,7 @@ def test_cast_operand_kernel_stays_fused_and_converts_in_registers() -> None:
     # alone, and converts the int16 packets in registers on the way to
     # shared memory (eight words per 16-byte packet, every packet of a
     # thread in flight before the first convert).
-    import examples.bf16xint16_gemm as example
+    example = import_example("bf16xint16_gemm")
 
     bound = _bind(
         example._bf16xint16_gemm.fn,
@@ -906,7 +907,7 @@ def test_cast_operand_kernel_stays_fused_and_converts_in_registers() -> None:
 
 
 def test_cast_operand_on_the_lhs_converts_a_packets() -> None:
-    import examples.bf16xint16_gemm as example
+    example = import_example("bf16xint16_gemm")
 
     bound = _bind(
         example._int16xbf16_gemm.fn,
@@ -959,7 +960,7 @@ def test_fissioned_kernel_region_renders_the_family() -> None:
     # graphs).  The complete-root rule inspects the root that calls the K
     # loop; the other region keeps its own lowering, so the family is
     # admitted, seeded and renders the GEMM region.
-    import examples.bf16xint16_gemm as example
+    example = import_example("bf16xint16_gemm")
 
     bound = helion.kernel(
         example._bf16xint16_gemm.fn,  # pyrefly: ignore[bad-argument-type]

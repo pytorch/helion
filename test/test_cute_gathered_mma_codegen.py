@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 
-from examples.moe_matmul_ogs import moe_matmul_ogs
 import pytest
 import torch
 
@@ -10,9 +9,12 @@ from test._cute_binding import _cpu_bind
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.cute.launcher import _cute_wrapper_plan_bakes_tensor_shapes
+
+moe_matmul_ogs = import_example("moe_matmul_ogs").moe_matmul_ogs
 
 pytestmark = skipUnlessBackends(["cute"])
 

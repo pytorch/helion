@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
-from examples.aot_example import matmul_custom_key
 import pytest
 import torch
 
@@ -13,7 +12,10 @@ from test.test_cute_fuse_mm_accumulation import _cpu_target
 from test.test_cute_scalar_staging_sync import _native_matmul
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+matmul_custom_key = import_example("aot_example").matmul_custom_key
 
 pytestmark = skipUnlessBackends(["cute"])
 

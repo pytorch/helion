@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING
 from typing import Any
 from unittest.mock import patch
 
-from examples.linear.linear_attention_engine import recurrent_step_fused
 import pytest
 import torch
 
@@ -63,6 +62,7 @@ from helion._compiler.cute.register_tile_admission import (
 from helion._compiler.cute.register_tile_admission import RegisterTileUnsupported
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion.experimental.linear_attention import recurrent_step_fused
 import helion.language as hl
 from helion.language import _tracing_ops
 

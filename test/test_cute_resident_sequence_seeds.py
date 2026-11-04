@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.softmax import softmax_bwd
 import pytest
 import torch
 
@@ -16,11 +15,14 @@ import helion
 from helion._compiler.autotuner_heuristics.cute_resident_sequence import (
     CuteResidentSequenceHeuristic,
 )
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
+
+softmax_bwd = import_example("softmax").softmax_bwd
 
 pytestmark = skipUnlessBackends(["cute"])
 

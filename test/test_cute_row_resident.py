@@ -6,7 +6,6 @@ from copy import deepcopy
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 
@@ -18,12 +17,17 @@ from helion._compiler.cute.row_resident import ROW_RESIDENT_KEY
 from helion._compiler.cute.row_resident import _matrix
 from helion._compiler.cute.row_resident import prove_row_resident
 from helion._compiler.cute.row_resident_codegen import _scalar_epilogue
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language import creation_ops
 from helion.language import memory_ops
+
+squeeze_and_excitation_net_fwd = import_example(
+    "squeeze_and_excitation_net"
+).squeeze_and_excitation_net_fwd
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

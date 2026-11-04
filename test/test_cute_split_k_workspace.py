@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 from typing import Any
 from unittest.mock import patch
 
-from examples.matmul_split_k import matmul_split_k
 import numpy as np
 import pytest
 import torch
@@ -35,6 +34,7 @@ from helion._compiler.cute.split_k_workspace_codegen import (
     _rewrite_producer_for_atomic_epilogue,
 )
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.effort_profile import get_effort_profile
@@ -43,6 +43,8 @@ from helion.autotuner.pattern_search import PatternSearch
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
+
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
 pytestmark = skipUnlessBackends(["cute"])
 

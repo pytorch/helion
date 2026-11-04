@@ -6,15 +6,17 @@ import json
 import os
 from pathlib import Path
 
-from examples.aot_example import row_softmax
 import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.runtime import default_cute_launcher
+
+row_softmax = import_example("aot_example").row_softmax
 
 pytestmark = skipUnlessBackends(["cute"])
 

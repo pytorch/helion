@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.jagged_dense_bmm import jagged_dense_bmm
 import pytest
 import torch
 
@@ -23,6 +22,9 @@ from helion._compiler.ast_extension import ExtendedAST
 from helion._compiler.cute.tcgen05_flat_grouped_host import prove_flat_grouped_host
 from helion._compiler.cute.tcgen05_flat_grouped_ir import prove_flat_grouped_rna
 from helion._compiler.type_info import LiteralType
+from helion._testing import import_example
+
+jagged_dense_bmm = import_example("jagged_dense_bmm").jagged_dense_bmm
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

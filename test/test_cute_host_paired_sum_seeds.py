@@ -6,7 +6,6 @@ import random
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.layer_norm import layer_norm_bwd
 import pytest
 import torch
 
@@ -22,12 +21,15 @@ from helion._compiler.autotuner_heuristics.cute_host_paired_sum import (
     add_host_sum_seeds,
 )
 from helion._compiler.cute.host_paired_sum import PAIRED_SUM_KEY
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 import helion.language as hl
+
+layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
 
 pytestmark = skipUnlessBackends(["cute"])
 

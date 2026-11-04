@@ -5,9 +5,6 @@ import math
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
-from examples.jagged_dense_bmm import jagged_dense_bmm
-from examples.moe_matmul_ogs import moe_matmul_ogs
 import pytest
 import torch
 
@@ -23,8 +20,13 @@ from helion._compiler.type_info import GridIndexType
 from helion._compiler.type_info import IterType
 from helion._compiler.type_info import SequenceType
 from helion._compiler.type_info import TileIndexType
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
+jagged_dense_bmm = import_example("jagged_dense_bmm").jagged_dense_bmm
+moe_matmul_ogs = import_example("moe_matmul_ogs").moe_matmul_ogs
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -727,7 +729,7 @@ def test_fp8_attention_promotes_its_query_tile() -> None:
     (the promoted tile at position 2 of a contiguous allocation whose
     unbacked strides are spelled ``Max(1, u)``) launches one CTA per
     (batch-head, query tile)."""
-    from examples.fp8_attention import fp8_attention_kernel
+    fp8_attention_kernel = import_example("fp8_attention").fp8_attention_kernel
 
     kernel = helion.kernel(
         fp8_attention_kernel.fn,

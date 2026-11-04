@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 
-from examples.mamba2_chunk_scan import helion_mamba2_chunk_scan_kernel
 import pytest
 import torch
 
@@ -15,11 +14,16 @@ import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_tcgen05 import CollectiveTcgen05Plan
 from helion._compiler.cute.collective_tcgen05 import CollectiveTmemResource
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
+
+helion_mamba2_chunk_scan_kernel = import_example(
+    "mamba2_chunk_scan"
+).helion_mamba2_chunk_scan_kernel
 
 CUDA_DEVICE = "cuda"
 

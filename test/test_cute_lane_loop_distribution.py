@@ -33,7 +33,6 @@ import re
 import textwrap
 from typing import TYPE_CHECKING
 
-from examples.concatenate import concat2d_dim1_simple
 import pytest
 import sympy
 import torch
@@ -50,9 +49,12 @@ from helion._compiler.ast_read_writes import HELION_ACCESS_REGIONS_ATTR
 from helion._compiler.cute import lane_loop_distribution
 from helion._compiler.cute.block_uniform import block_uniform
 from helion._compiler.device_ir import ReductionLoopGraphInfo
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.language import _tracing_ops
+
+concat2d_dim1_simple = import_example("concatenate").concat2d_dim1_simple
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

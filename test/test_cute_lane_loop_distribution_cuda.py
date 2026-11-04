@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from examples.concatenate import concat2d_dim1_simple
 import pytest
 import torch
 
@@ -101,8 +100,11 @@ from test.test_cute_lane_loop_distribution import _zero_first_row_then_copy_plus
 
 import helion
 from helion import exc
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+concat2d_dim1_simple = import_example("concatenate").concat2d_dim1_simple
 
 pytestmark = [
     skipUnlessBackends(["cute"]),

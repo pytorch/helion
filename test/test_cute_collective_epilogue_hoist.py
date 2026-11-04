@@ -18,6 +18,7 @@ from test.test_cute_tcgen05_fixed_chain import _cpu_only  # noqa: F401
 
 import helion
 from helion._compiler.cute.collective_matmul import _hoist_invariant_epilogue_loads
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -39,7 +40,7 @@ def _collective_config() -> helion.Config:
 
 
 def test_jagged_dense_bmm_bias_load_precedes_the_pipeline() -> None:
-    import examples.jagged_dense_bmm as example
+    example = import_example("jagged_dense_bmm")
 
     torch.manual_seed(0)
     batch, features, length = 16, 32, 319

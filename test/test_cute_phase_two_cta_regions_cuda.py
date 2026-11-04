@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from typing import cast
 
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_dc
 import pytest
 import torch
 
@@ -25,8 +24,13 @@ from test._cute_se_bwd_chains import se_bwd_dx_chain
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+squeeze_and_excitation_net_bwd_dc = import_example(
+    "squeeze_and_excitation_net"
+).squeeze_and_excitation_net_bwd_dc
 
 pytestmark = skipUnlessBackends(["cute"])
 

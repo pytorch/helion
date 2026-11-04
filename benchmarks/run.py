@@ -1527,7 +1527,13 @@ def run_kernel_variants(
     for module_path, func_name in variants:
         # Import the kernel function
         try:
-            module = importlib.import_module(module_path)
+            if module_path.startswith("examples."):
+                # examples/ is a directory of scripts, not a package.
+                from helion._testing import import_example
+
+                module = import_example(module_path.removeprefix("examples."))
+            else:
+                module = importlib.import_module(module_path)
             if not hasattr(module, func_name):
                 print(
                     f"Error: Module '{module_path}' does not have a function named '{func_name}'",

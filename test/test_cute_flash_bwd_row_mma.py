@@ -39,6 +39,7 @@ from test.test_cute_pdl import _last_wave_guard
 from test.test_cute_pdl import _on_and_off
 
 from helion._compiler.cute import cute_flash_bwd_row_mma as row
+from helion._testing import import_example
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -58,7 +59,7 @@ def _knobs(kv_rows: int, q_split: int, q_chunk: int) -> dict[str, object]:
 
 
 def _kernel() -> helion.Kernel:
-    from examples.attention import attention_backward
+    attention_backward = import_example("attention").attention_backward
 
     return helion.kernel(
         attention_backward.fn,

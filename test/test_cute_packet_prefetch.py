@@ -5,7 +5,6 @@ from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from examples.aot_example import vector_scale
 import pytest
 import torch
 
@@ -21,11 +20,14 @@ from helion._compiler.cute.full_tile_bounds import FullTilePlan
 from helion._compiler.cute.full_tile_bounds import specialize_full_tile_bounds
 from helion._compiler.cute.tensor_layout_relations import TensorLayoutRelation
 from helion._compiler.device_function import DeviceFunction
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
 import helion.language as hl
+
+vector_scale = import_example("aot_example").vector_scale
 
 
 @pytest.fixture(autouse=True)

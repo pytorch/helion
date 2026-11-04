@@ -193,6 +193,8 @@ def _check(actual, expected) -> None:  # noqa: ANN001
 def _run_impl(args: argparse.Namespace) -> dict[str, Any]:
     import torch
 
+    from helion._testing import import_example
+
     x = _make_input(args)
     expected = torch.nn.functional.softmax(x, dim=-1)
     elem_bytes = x.element_size()
@@ -223,8 +225,9 @@ def _run_impl(args: argparse.Namespace) -> dict[str, Any]:
             "driver must set HELION_BACKEND to match --impl"
         )
         os.environ["HELION_BACKEND"] = backend
-        from examples.softmax import softmax as softmax_simple
-        from examples.softmax import softmax_two_pass
+        _examples_softmax = import_example("softmax")
+        softmax_simple = _examples_softmax.softmax
+        softmax_two_pass = _examples_softmax.softmax_two_pass
 
         import helion
 

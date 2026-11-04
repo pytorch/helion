@@ -15,9 +15,6 @@ then the default. These tests render on the CPU except the GPU equality test.
 
 from __future__ import annotations
 
-from examples.attention import attention
-from examples.attention import biased_attention
-from examples.attention import biased_attention_output
 import pytest
 import torch
 
@@ -26,10 +23,16 @@ from test._cute_binding import _cpu_bind
 import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion.exc import InvalidConfig
+
+_examples_attention = import_example("attention")
+attention = _examples_attention.attention
+biased_attention = _examples_attention.biased_attention
+biased_attention_output = _examples_attention.biased_attention_output
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")

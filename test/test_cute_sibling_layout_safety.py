@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.welford import welford
 import numpy as np
 import pytest
 import torch
@@ -28,7 +27,10 @@ import helion
 from helion._compiler.cute.layout_propagation import _plan_warp_per_row_execution
 from helion._compiler.cute.memory_ops import _cute_vector_load_mask_is_lane_only
 from helion._compiler.tile_dispatch import TileStrategyDispatch
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+welford = import_example("welford").welford
 
 if TYPE_CHECKING:
     from collections.abc import Callable

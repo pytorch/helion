@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-from examples.concatenate import concat2d_dim1_simple
 import pytest
 import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
 import helion.language as hl
 from helion.runtime.settings import _get_backend
+
+concat2d_dim1_simple = import_example("concatenate").concat2d_dim1_simple
 
 pytestmark = skipUnlessBackends(["triton", "cute"])
 

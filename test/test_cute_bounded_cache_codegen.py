@@ -5,7 +5,6 @@ from contextlib import contextmanager
 import hashlib
 from unittest.mock import patch
 
-from examples.aot_example import row_softmax
 import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
@@ -14,10 +13,13 @@ from test._cute_binding import _mock_cuda_unavailable
 
 from .cute_population_contracts import _target
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.precompile_future import _load_compiled_fn
 from helion.autotuner.precompile_future import _serialize_compiled_fn
 from helion.autotuner.precompile_future import _unload_compiled_fn
+
+row_softmax = import_example("aot_example").row_softmax
 
 pytestmark = skipUnlessBackends(["cute"])
 
