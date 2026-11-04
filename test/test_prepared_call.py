@@ -1349,6 +1349,54 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         self.assertTrue(alias.schemas[alias.canonical_signature])
         self.assertIn([alias], add_bias._specialize_extra.values())  # type: ignore[attr-defined]
 
+    def test_storage_offset_guard_fact_stays_on_prepared_hits(self) -> None:
+        """Neither ``TensorGuards`` nor the Python argument checks pin a
+        storage offset, so a guard fact over one is re-checked on every
+        prepared hit."""
+
+        @helion.kernel(static_shapes=False, config=helion.Config(block_sizes=[64]))
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        storage = torch.randn(144, device=DEVICE)
+        zero, offset = storage[:128], storage[16:]
+        torch.testing.assert_close(add_one(zero), zero + 1)
+        offset_symbol = kernel_module.sympy.Symbol("x_offset", integer=True)
+        fact = kernel_module._PreparedMetadataSpecializationExtractor(
+            kernel_module._GuardedInputFact(
+                offset_symbol,
+                kernel_module.sympy.Integer(0),
+                (
+                    (
+                        offset_symbol,
+                        kernel_module.TensorPropertySource(
+                            kernel_module.LocalSource("x"),
+                            kernel_module.TensorProperty.STORAGE_OFFSET,
+                        ),
+                    ),
+                ),
+                False,
+                True,
+                tuple(add_one.signature.parameters),
+            )
+        )
+        add_one._publish_guard_facts(add_one.bind((zero,)), [fact])  # type: ignore[attr-defined]
+        for _ in range(2):
+            torch.testing.assert_close(add_one(zero), zero + 1)
+        prepared = add_one._prepared_call  # type: ignore[attr-defined]
+        assert prepared is not None
+        self.assertEqual(prepared._extra_guards, ((fact, True),))
+        self.assertTrue(prepared.matches(add_one, (zero,)))
+        self.assertFalse(prepared.matches(add_one, (offset,)))
+        offset_bound = add_one.bind((offset,))
+        self.assertIsNot(offset_bound, prepared.bound)
+        torch.testing.assert_close(add_one(offset), offset + 1)
+        offset_key = add_one._fast_dispatch_key((offset,))  # type: ignore[attr-defined]
+        self.assertIs(add_one._dispatch_cache[offset_key], offset_bound)  # type: ignore[attr-defined]
+
     def test_distributed_aot_late_specialization_stays_locked(self) -> None:
         aot_scale = _make_aot_scale(distributed=True)
         x = torch.randn(64, device=DEVICE)
