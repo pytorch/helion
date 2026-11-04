@@ -17,9 +17,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import traceback
+from typing import TYPE_CHECKING
 from typing import Any
 
 import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from helion._testing.linear_attention_harness import LinearAttentionExampleHarness
 
 # (name, B, T, H, D); D is both the query/key and the value dim (D = DV).
 # The six production shapes from flash-linear-attention/benchmarks/ops/registry.
@@ -67,6 +74,33 @@ VARLEN_SHAPES: list[tuple[str, list[int], int, int]] = [
 
 # benchmark() takes (B, H, T, D, DV); our shapes use D == DV.
 _CONFIGS = [(name, b, h, t, d, d) for (name, b, t, h, d) in SHAPES]
+
+
+def benchmark_rows(
+    harness: LinearAttentionExampleHarness,
+    configs: Sequence[tuple[int, ...]],
+    fused_preamble: bool = False,
+    varlen: bool = False,
+    varlen_lengths: list[int] | None = None,
+) -> list[tuple[Any, ...]]:
+    """harness.benchmark() one shape at a time. A shape that raises (say, a
+    pretuned config that no longer fits in shared memory) gets an all-zero row,
+    which the dashboard reads as "did not run" for that shape, instead of taking
+    down the variant's other shapes with it."""
+    rows: list[tuple[Any, ...]] = []
+    for cfg in configs:
+        try:
+            rows += harness.benchmark(
+                [cfg],
+                fused_preamble=fused_preamble,
+                varlen=varlen,
+                varlen_lengths=varlen_lengths,
+            )
+        except Exception:
+            traceback.print_exc()
+            torch.cuda.empty_cache()
+            rows.append((f"({','.join(map(str, cfg))})", 0.0, 0.0, 0.0, 0.0, 0.0))
+    return rows
 
 
 def write_results_json(
@@ -202,14 +236,18 @@ def main() -> None:
                 cfg = [(len(lens), h, sum(lens), d, d)]
                 kw = {"varlen": True, "varlen_lengths": lens}
                 verdicts[name] += harness.accuracy(cfg, **kw)
-                results[name] += harness.benchmark(cfg, **kw)
+                results[name] += benchmark_rows(
+                    harness, cfg, varlen=True, varlen_lengths=lens
+                )
             continue
 
         kw = {"fused_preamble": True} if name in FUSED_PREAMBLE_VARIANTS else {}
         configs = _CONFIGS if args.num_shapes is None else _CONFIGS[: args.num_shapes]
         bench_configs = [c[1:] for c in configs]
         verdicts[name] = harness.accuracy(bench_configs, **kw)
-        results[name] = harness.benchmark(bench_configs, **kw)
+        results[name] = benchmark_rows(
+            harness, bench_configs, fused_preamble=name in FUSED_PREAMBLE_VARIANTS
+        )
 
     if args.output:
         write_results_json(args.output, results, verdicts)
