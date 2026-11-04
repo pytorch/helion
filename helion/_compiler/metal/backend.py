@@ -103,6 +103,11 @@ class MetalBackend(Backend):
     def constexpr_type(self) -> str:
         return "int"
 
+    def supports_num_threads_deferral(self) -> bool:
+        # Metal derives its threadgroup size from num_warps; there is no
+        # driver default to defer to.
+        return False
+
     @property
     def default_launcher_name(self) -> str:
         return "_default_metal_launcher"
@@ -894,6 +899,14 @@ class MetalBackend(Backend):
         # simdgroup has 32 threads.  tid[0] must be large enough for both
         # MPP's cooperative operation and any scalar indexing on the first
         # root axis.
+        if config.num_warps is None:
+            # Backstop: normalize() rejects this first via
+            # supports_num_threads_deferral().
+            raise exc.InvalidConfig(
+                "the metal backend requires an explicit num_warps "
+                "(num_warps=None deferral is only supported by backends "
+                "that defer to the triton driver)"
+            )
         mpp_threads = config.num_warps * 32
         used_threads = max(mpp_threads, first_axis_threads)
         changed = False
