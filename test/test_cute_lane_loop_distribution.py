@@ -2249,6 +2249,51 @@ def test_subscript_assignment_is_an_access_of_the_local_tensor(
     assert ("smem" in analyzed.reads) == (not defines)
 
 
+@pytest.mark.parametrize(
+    ("statement", "read", "written"),
+    [
+        pytest.param(
+            "v = tl.load(x + (indices_0 * 64 + indices_1 * 1), mask_0, other=0)",
+            {"x"},
+            set(),
+            id="load",
+        ),
+        pytest.param(
+            "tl.store(out + (tile_id * 40 + indices_1 * 1), v, mask_1)",
+            set(),
+            {"out"},
+            id="store",
+        ),
+        pytest.param(
+            "tl.store(out + indices_0, tl.load(out + indices_1, mask_0, other=0), mask_0)",
+            {"out"},
+            {"out"},
+            id="store_of_a_load",
+        ),
+        pytest.param(
+            "tl.atomic_add(out + indices_0, v, mask=mask_0, sem='relaxed')",
+            {"out"},
+            {"out"},
+            id="atomic",
+        ),
+    ],
+)
+def test_pointer_strategy_access_addresses_its_base_tensor(
+    statement: str, read: set[str], written: set[str]
+) -> None:
+    # The shared pointer indexing strategy's ``tl.load(x + offset, ...)`` and
+    # ``tl.store(x + offset, value, mask)`` access ``x``, so a store and a
+    # later load of one tensor keep their order when lane loops are placed.
+    node = ast.parse(statement).body[0]
+    analyzed = lane_loop_distribution._analyze(0, node, {})
+    assert set(analyzed.tensors_read) == read
+    assert set(analyzed.tensors_written) == written
+    # Every mention has one address.
+    mentions = lane_loop_distribution._tensor_mentions(node)
+    addresses = lane_loop_distribution._access_addresses(node)
+    assert {name: len(found) for name, found in addresses.items()} == dict(mentions)
+
+
 _STAGING = """\
 smem_ptr = cute.arch.alloc_smem(cutlass.Float32, 64)
 smem = cute.make_tensor(smem_ptr, (64,))
