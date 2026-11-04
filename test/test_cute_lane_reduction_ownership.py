@@ -8,8 +8,6 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
-from examples.layer_norm import layer_norm_bwd
-from examples.welford import welford
 import numpy as np
 import pytest
 import torch
@@ -31,10 +29,14 @@ from helion._compiler.ast_read_writes import ast_rename
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
+
+layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
+welford = import_example("welford").welford
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

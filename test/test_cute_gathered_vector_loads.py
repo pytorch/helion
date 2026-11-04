@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 
-from examples.embedding import embedding
 import pytest
 import torch
 
@@ -12,8 +11,11 @@ from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+embedding = import_example("embedding").embedding
 
 
 def _generate(kernel: object, args: tuple[torch.Tensor, ...], **config: object) -> str:

@@ -7,8 +7,8 @@ Chunked linear attention with no decay and no correction term.
 
 from __future__ import annotations
 
-from .linear_attention_engine import LinearAttentionVariant
-from .linear_attention_harness import LinearAttentionExampleHarness
+from helion._testing.linear_attention_harness import LinearAttentionExampleHarness
+from helion.experimental.linear_attention import LinearAttentionVariant
 
 HARNESS = LinearAttentionExampleHarness(variant=LinearAttentionVariant.VANILLA)
 

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from examples.split_k_barrier import split_k_matmul
 import pytest
 import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
+
+split_k_matmul = import_example("split_k_barrier").split_k_matmul
 
 pytestmark = skipUnlessBackends(["cute"])
 

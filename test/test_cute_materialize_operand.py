@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.int4_gemm import matmul_bf16_int4
 import pytest
 import torch
 
@@ -18,12 +17,15 @@ from test.test_cute_materialized_fission import _CpuRefMode
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.runtime.ref_mode import RefMode
 from helion.runtime.ref_mode import RefModeContext
+
+matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
 
 pytestmark = skipUnlessBackends(["cute"])
 

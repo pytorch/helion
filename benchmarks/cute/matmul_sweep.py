@@ -410,6 +410,8 @@ def _group_rows(total: int, groups: int, seed: int) -> list[int]:
 def build(cell: Cell, provider: str) -> Built:
     import torch.nn.functional as F
 
+    from helion._testing import import_example
+
     torch.manual_seed(0)
     helion_fn: Callable[[], Any] | None = None
     kernels: list[Any] = []
@@ -442,7 +444,7 @@ def build(cell: Cell, provider: str) -> Built:
                 torch_impl = "torch._addmm_activation (cuBLASLt relu epilogue)"
                 reference_fn = lambda: torch.relu(torch.matmul(x, y) + bias)  # noqa: E731
         if want_helion:
-            from examples.matmul import matmul
+            matmul = import_example("matmul").matmul
 
             kernels = [matmul]
             if fam == "mm":
@@ -482,8 +484,11 @@ def build(cell: Cell, provider: str) -> Built:
             torch_fn = torch.compile(ref_aux)
             torch_impl = "torch.compile(bf16 mm + fused fp32 epilogue, 2 outputs)"
         if want_helion:
-            from examples.epilogue_subtiling import matmul_bias_gelu_aux
-            from examples.epilogue_subtiling import matmul_bias_residual_gelu_cast
+            _examples_epilogue_subtiling = import_example("epilogue_subtiling")
+            matmul_bias_gelu_aux = _examples_epilogue_subtiling.matmul_bias_gelu_aux
+            matmul_bias_residual_gelu_cast = (
+                _examples_epilogue_subtiling.matmul_bias_residual_gelu_cast
+            )
 
             if fam == "gelu":
                 kernels = [matmul_bias_residual_gelu_cast]
@@ -499,21 +504,26 @@ def build(cell: Cell, provider: str) -> Built:
         weight = torch.randn(n, device="cuda", dtype=dtype)
         bias = torch.randn(n, device="cuda", dtype=dtype)
         inputs = {"x": x, "y": y, "weight": weight, "bias": bias}
-        from examples.matmul_layernorm import matmul_layernorm_pytorch
+        matmul_layernorm_pytorch = import_example(
+            "matmul_layernorm"
+        ).matmul_layernorm_pytorch
 
         reference_fn = lambda: matmul_layernorm_pytorch(x, y, weight, bias)  # noqa: E731
         torch_fn = torch.compile(reference_fn)
         torch_impl = "torch.compile(matmul + layer_norm)"
         if want_helion:
             if fam == "mmln":
-                from examples.matmul_layernorm import matmul_layernorm
+                matmul_layernorm = import_example("matmul_layernorm").matmul_layernorm
 
                 kernels = [matmul_layernorm]
                 helion_fn = lambda: matmul_layernorm(x, y, weight, bias)  # noqa: E731
             else:
-                from examples.matmul import matmul
-                from examples.matmul_layernorm import layernorm_rows
-                from examples.matmul_layernorm import matmul_layernorm_unfused
+                matmul = import_example("matmul").matmul
+                _examples_matmul_layernorm = import_example("matmul_layernorm")
+                layernorm_rows = _examples_matmul_layernorm.layernorm_rows
+                matmul_layernorm_unfused = (
+                    _examples_matmul_layernorm.matmul_layernorm_unfused
+                )
 
                 kernels = [matmul, layernorm_rows]
                 helion_fn = lambda: matmul_layernorm_unfused(x, y, weight, bias)  # noqa: E731
@@ -530,7 +540,7 @@ def build(cell: Cell, provider: str) -> Built:
         torch_impl = "torch.bmm (cuBLAS)"
         reference_fn = torch_fn
         if want_helion:
-            from examples.bmm import bmm
+            bmm = import_example("bmm").bmm
 
             kernels = [bmm]
             helion_fn = lambda: bmm(A, B)  # noqa: E731
@@ -544,7 +554,7 @@ def build(cell: Cell, provider: str) -> Built:
         torch_impl = "torch.matmul (cuBLAS, folded batch)"
         reference_fn = torch_fn
         if want_helion:
-            from examples.broadcast_matmul import broadcast_matmul
+            broadcast_matmul = import_example("broadcast_matmul").broadcast_matmul
 
             kernels = [broadcast_matmul]
             helion_fn = lambda: broadcast_matmul(x, w)  # noqa: E731
@@ -558,7 +568,7 @@ def build(cell: Cell, provider: str) -> Built:
         torch_impl = "torch.matmul (cuBLAS)"
         reference_fn = torch_fn
         if want_helion:
-            from examples.matmul_split_k import matmul_split_k
+            matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
             kernels = [matmul_split_k]
             helion_fn = lambda: matmul_split_k(x, y)  # noqa: E731
@@ -570,7 +580,9 @@ def build(cell: Cell, provider: str) -> Built:
             y = y.T.contiguous().T
         inputs = {"x": x, "y": y}
         if fam == "fp8":
-            from examples.fp8_gemm import reference_fp8_gemm_pytorch
+            reference_fp8_gemm_pytorch = import_example(
+                "fp8_gemm"
+            ).reference_fp8_gemm_pytorch
 
             scale_a = torch.tensor(0.5, device="cuda")
             scale_b = torch.tensor(0.25, device="cuda")
@@ -579,12 +591,12 @@ def build(cell: Cell, provider: str) -> Built:
             torch_impl = "torch._scaled_mm tensor-wise (cuBLASLt)"
             reference_fn = torch_fn
             if want_helion:
-                from examples.fp8_gemm import fp8_gemm
+                fp8_gemm = import_example("fp8_gemm").fp8_gemm
 
                 kernels = [fp8_gemm]
                 helion_fn = lambda: fp8_gemm(x, y, scale_a, scale_b)  # noqa: E731
         else:
-            from examples.fp8_matmul import reference_scaled_mm
+            reference_scaled_mm = import_example("fp8_matmul").reference_scaled_mm
 
             scale_a = (torch.rand(m, 1, device="cuda") + 0.5).float()
             scale_b = (torch.rand(1, n, device="cuda") + 0.5).float()
@@ -595,14 +607,15 @@ def build(cell: Cell, provider: str) -> Built:
             torch_impl = "torch._scaled_mm row-wise (cuBLASLt)"
             reference_fn = torch_fn
             if want_helion:
-                from examples.fp8_matmul import fp8_matmul
+                fp8_matmul = import_example("fp8_matmul").fp8_matmul
 
                 kernels = [fp8_matmul]
                 helion_fn = lambda: fp8_matmul(x, y, scale_a2d, scale_b1d)  # noqa: E731
     elif fam == "int4":
         m, n, k = cell.shape
-        from examples.int4_gemm import _pack_int4_matrix
-        from examples.int4_gemm import reference_matmul_bf16_int4
+        _examples_int4_gemm = import_example("int4_gemm")
+        _pack_int4_matrix = _examples_int4_gemm._pack_int4_matrix
+        reference_matmul_bf16_int4 = _examples_int4_gemm.reference_matmul_bf16_int4
 
         A = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
         B_unpacked = torch.randint(-8, 8, (k, n), dtype=torch.int8, device="cuda")
@@ -612,13 +625,15 @@ def build(cell: Cell, provider: str) -> Built:
         torch_fn = torch.compile(reference_fn)
         torch_impl = "torch.compile(int4 unpack + bf16 matmul)"
         if want_helion:
-            from examples.int4_gemm import matmul_bf16_int4
+            matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
 
             kernels = [matmul_bf16_int4]
             helion_fn = lambda: matmul_bf16_int4(A, B_packed)  # noqa: E731
     elif fam == "i16":
         m, n, k = cell.shape
-        from examples.bf16xint16_gemm import reference_bf16xint16_pytorch
+        reference_bf16xint16_pytorch = import_example(
+            "bf16xint16_gemm"
+        ).reference_bf16xint16_pytorch
 
         transpose = cell.layout == "t"
         if transpose:
@@ -636,9 +651,10 @@ def build(cell: Cell, provider: str) -> Built:
         torch_fn = torch.compile(reference_fn)
         torch_impl = "torch.compile(int16->bf16 cast + bf16 matmul)"
         if want_helion:
-            from examples.bf16xint16_gemm import _bf16xint16_gemm
-            from examples.bf16xint16_gemm import _int16xbf16_gemm
-            from examples.bf16xint16_gemm import bf16xint16_gemm
+            _examples_bf16xint16_gemm = import_example("bf16xint16_gemm")
+            _bf16xint16_gemm = _examples_bf16xint16_gemm._bf16xint16_gemm
+            _int16xbf16_gemm = _examples_bf16xint16_gemm._int16xbf16_gemm
+            bf16xint16_gemm = _examples_bf16xint16_gemm.bf16xint16_gemm
 
             kernels = [_int16xbf16_gemm if transpose else _bf16xint16_gemm]
             helion_fn = lambda: bf16xint16_gemm(x, w, transpose)  # noqa: E731
@@ -659,14 +675,21 @@ def build(cell: Cell, provider: str) -> Built:
         torch_impl = "torch.matmul over the packed rows (shared B)"
         reference_fn = torch_fn
         if want_helion:
-            from examples.grouped_gemm import grouped_gemm_jagged
-            from examples.grouped_gemm import grouped_gemm_jagged_persistent
-            from examples.grouped_gemm import grouped_gemm_shared_weight
+            _examples_grouped_gemm = import_example("grouped_gemm")
+            grouped_gemm_jagged = _examples_grouped_gemm.grouped_gemm_jagged
+            grouped_gemm_jagged_persistent = (
+                _examples_grouped_gemm.grouped_gemm_jagged_persistent
+            )
+            grouped_gemm_shared_weight = (
+                _examples_grouped_gemm.grouped_gemm_shared_weight
+            )
 
-            kernel = {
-                "groupedp": grouped_gemm_jagged_persistent,
-                "groupedv2": grouped_gemm_shared_weight,
-            }.get(fam, grouped_gemm_jagged)
+            if fam == "groupedp":
+                kernel = grouped_gemm_jagged_persistent
+            elif fam == "groupedv2":
+                kernel = grouped_gemm_shared_weight
+            else:
+                kernel = grouped_gemm_jagged
             kernels = [kernel]
             helion_fn = lambda: kernel(A_packed, B, offsets)  # noqa: E731
     else:

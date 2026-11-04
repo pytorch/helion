@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 import dataclasses
 import enum
+import functools
 
 from .attention_plan import flash_pair_head_dims_supported
 
@@ -838,10 +839,15 @@ def fa4_schedule_fits(
     return _shared_memory_bytes(spec) <= limits.shared_memory_bytes
 
 
+@functools.lru_cache(maxsize=4096)
 def max_fa4_kv_depth(
     spec: FlashScheduleSpec, limits: FlashScheduleLimits | None = None
 ) -> int:
-    """Return the largest K/V depth allowed by the schedule's SMEM layout."""
+    """Return the largest K/V depth allowed by the schedule's SMEM layout.
+
+    Memoized on the frozen spec and limits: the flash resolver asks this for
+    every normalized config, and the search revisits a few hundred specs.
+    """
     if limits is None:
         limits = FlashScheduleLimits()
     if spec.uneven_kv_ring:

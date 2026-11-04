@@ -6,8 +6,6 @@ import operator
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-from examples.int4_gemm import _unpack_int4_matrix
-from examples.int4_gemm import matmul_bf16_int4
 import pytest
 import torch
 
@@ -19,11 +17,16 @@ from helion._compiler.cute.collective_matmul import _tensor_roots
 from helion._compiler.cute.packed_matmul import packed_axis_for_fact
 from helion._compiler.cute.packed_matmul import packed_matmul_axis
 from helion._compiler.tile_strategy import PerThreadNDTileStrategy
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import BackendUnsupported
 import helion.language as hl
 from helion.language.matmul_ops import dot
+
+_examples_int4_gemm = import_example("int4_gemm")
+_unpack_int4_matrix = _examples_int4_gemm._unpack_int4_matrix
+matmul_bf16_int4 = _examples_int4_gemm.matmul_bf16_int4
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel

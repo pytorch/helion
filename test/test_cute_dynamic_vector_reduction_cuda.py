@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from examples.aot_example import rms_norm_batched
 import pytest
 import torch
 
@@ -24,9 +23,12 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 import helion.language as hl
+
+rms_norm_batched = import_example("aot_example").rms_norm_batched
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel

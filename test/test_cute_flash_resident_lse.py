@@ -28,6 +28,7 @@ from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeurist
 from helion._compiler.cute import cute_flash
 from helion._testing import DEVICE
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
@@ -50,7 +51,7 @@ def _meta_args(shape: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
 
 
 def _example_kernel(name: str) -> helion.Kernel:
-    import examples.attention as attention_module
+    attention_module = import_example("attention")
 
     kernel = getattr(attention_module, name)
     return helion.Kernel(kernel.fn, settings=kernel.settings.copy(backend="cute"))
@@ -134,7 +135,7 @@ def test_lse_surface_offers_and_seeds_the_resident_lowering() -> None:
 def test_relu_row_program_surface_keeps_the_resident_lowering_off() -> None:
     """The fused row program on ``O`` is not ``out + lse``: no resident seed,
     no resident choice (``has_row_epilogue`` fails closed)."""
-    import examples.attention as attention_module
+    attention_module = import_example("attention")
 
     if not hasattr(attention_module, "attention_relu_output"):
         pytest.skip("no relu row-program example")
@@ -168,7 +169,7 @@ def test_resident_two_tile_body_stores_the_lse(family: str, scale: float) -> Non
     """The two-tile fa4 body (and its 2-CTA sibling) with the resident
     lowering on the LSE example: output and LSE against the standard lowering
     of the same body and the fp32 reference."""
-    import examples.attention as attention_module
+    attention_module = import_example("attention")
 
     kernel = attention_module.attention
     torch.manual_seed(0)
@@ -220,7 +221,7 @@ def _flex_args(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block_mask: Any
 ) -> tuple[Any, ...]:
     """The dense-BlockMask arguments the flex example's wrapper builds."""
-    import examples.flex_attention as flex_module
+    flex_module = import_example("flex_attention")
 
     full_num = block_mask.full_kv_num_blocks
     full_idx = block_mask.full_kv_indices
@@ -255,7 +256,7 @@ def test_resident_two_tile_body_stores_the_flex_lse(family: str, kv_heads: int) 
     scalar argument) with the resident lowering on the two-tile fa4 body, its
     2-CTA sibling and a 4:2 GQA head layout: output and LSE against the
     standard lowering and ``flex_attention``."""
-    import examples.flex_attention as flex_module
+    flex_module = import_example("flex_attention")
 
     kernel = flex_module.helion_flex_attention_kernel
     torch.manual_seed(0)

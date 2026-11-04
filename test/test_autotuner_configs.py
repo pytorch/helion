@@ -24,6 +24,7 @@ from helion._compiler.tile_dispatch import BlockIDStrategyMapping
 from helion._compiler.tile_dispatch import TileStrategyDispatch
 from helion._testing import DEVICE
 from helion._testing import TestCase
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipIfCute
 from helion._testing import skipIfRocm
@@ -361,7 +362,7 @@ class TestAutotunerConfigs(AutotunerTestCase):
 
     def test_block_size_fragment_autotuner_min_clamp(self):
         """random_config() must not crash when autotuner_min > max_size."""
-        from examples.attention import attention
+        attention = import_example("attention").attention
 
         q, k, v = [
             torch.randn(4, 48, 128, 128, dtype=torch.bfloat16, device=DEVICE)

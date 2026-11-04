@@ -14,6 +14,7 @@ from test.cute_population_contracts import _target
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteReductionTileHeuristic
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
@@ -56,7 +57,7 @@ def _seeds(fn, args):
 
 
 def test_batched_softmax_gets_two_and_four_rows_per_cta() -> None:
-    from examples.batch_softmax import batch_softmax
+    batch_softmax = import_example("batch_softmax").batch_softmax
 
     bound, spec, seeds = _seeds(
         batch_softmax.fn, (torch.empty(8, 256, 1024, dtype=torch.float16),)

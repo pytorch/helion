@@ -8,8 +8,6 @@ import re
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.layer_norm import layer_norm_bwd
-from examples.rms_norm import rms_norm_bwd
 import pytest
 import torch
 
@@ -21,6 +19,7 @@ from helion._compiler.autotuner_heuristics import compiler_seed_configs
 from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
     CuteResidentReductionHeuristic,
 )
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner import LFBOTreeSearch
 from helion.autotuner.config_generation import ConfigGeneration
@@ -28,6 +27,9 @@ from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.metrics import AutotuneMetrics
 import helion.language as hl
 from helion.runtime.settings import default_autotuner_fn
+
+layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
+rms_norm_bwd = import_example("rms_norm").rms_norm_bwd
 
 pytestmark = skipUnlessBackends(["cute"])
 

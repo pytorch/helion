@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.nvfp4_gemm import _nvfp4_w4a4_matmul_kernel
 import pytest
 import torch
 
@@ -29,11 +28,14 @@ from helion._compiler.cute.block_scaled_provenance import IntegerRecipe
 from helion._compiler.cute.block_scaled_provenance import _plain_load
 from helion._compiler.cute.block_scaled_provenance import integer_recipe
 from helion._compiler.cute.block_scaled_provenance import operand_fingerprint
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 from helion.language import creation_ops
 from helion.language import memory_ops
+
+_nvfp4_w4a4_matmul_kernel = import_example("nvfp4_gemm")._nvfp4_w4a4_matmul_kernel
 
 pytestmark = skipUnlessBackends(["cute"])
 

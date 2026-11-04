@@ -14,7 +14,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 
@@ -23,7 +22,10 @@ from test.test_cute_grouped_coverage_search import _target
 
 import helion
 from helion import exc
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if TYPE_CHECKING:
     from collections.abc import Generator

@@ -8,7 +8,6 @@ from typing import Any
 from typing import cast
 from unittest.mock import patch
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 
@@ -17,11 +16,14 @@ from test.test_cute_collective_chunk_seeds import _partitioned_matmul
 
 import helion
 from helion._compiler.cute.atomic_output_promotions import fresh_half_atomic_outputs
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 import helion.language as hl
+
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
 CUDA_DEVICE = "cuda"
 

@@ -38,6 +38,7 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 from helion._compiler.cute import cute_flash
+from helion._testing import import_example
 
 _FA4_2CTA = {
     "block_sizes": [1, 128, 128],
@@ -70,7 +71,7 @@ _CORRECTION = {"cute_flash_row_epilogue_warps": "correction"}
 
 
 def _xsa_kernel(*, fast_math: bool = False) -> helion.Kernel:
-    from examples.xsa import xsa_kernel
+    xsa_kernel = import_example("xsa").xsa_kernel
 
     return helion.kernel(
         xsa_kernel.fn,
@@ -82,7 +83,7 @@ def _xsa_kernel(*, fast_math: bool = False) -> helion.Kernel:
 
 
 def _attention_kernel() -> helion.Kernel:
-    from examples.attention import attention
+    attention = import_example("attention").attention
 
     return helion.kernel(
         attention.fn, backend="cute", static_shapes=True, autotune_effort="none"
@@ -704,7 +705,7 @@ def test_ws_staged_route_stages_aux_and_ignores_the_knob() -> None:
 def test_xsa_matches_reference_on_every_family(
     config: dict[str, object], seq: int
 ) -> None:
-    from examples.xsa import ref_xsa
+    ref_xsa = import_example("xsa").ref_xsa
 
     if config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4_2cta" and seq < 512:
         pytest.skip("fa4_2cta needs at least four KV tiles")
@@ -726,7 +727,7 @@ def test_xsa_matches_reference_on_every_family(
     ),
 )
 def test_xsa_routes_match_reference(config: dict[str, object]) -> None:
-    from examples.xsa import ref_xsa
+    ref_xsa = import_example("xsa").ref_xsa
 
     q, k, v = _qkv(1, 4, 1024, 128, torch.bfloat16)
     _, out = code_and_output(_xsa_kernel(), (q, k, v), **config)
@@ -735,7 +736,7 @@ def test_xsa_routes_match_reference(config: dict[str, object]) -> None:
 
 @onlyBackends(["cute"])
 def test_xsa_head_dim_64_and_fp16_stage_aux() -> None:
-    from examples.xsa import ref_xsa
+    ref_xsa = import_example("xsa").ref_xsa
 
     for dtype in (torch.bfloat16, torch.float16):
         q, k, v = _qkv(1, 4, 512, 64, dtype)
@@ -748,7 +749,7 @@ def test_xsa_head_dim_64_and_fp16_stage_aux() -> None:
 def test_xsa_two_inputs_do_not_alias_the_staged_aux() -> None:
     """The aux tile is TMA-loaded per work item; the same compiled kernel run
     on a second input set must not see the first one's rows."""
-    from examples.xsa import ref_xsa
+    ref_xsa = import_example("xsa").ref_xsa
 
     q, k, v = _qkv(1, 4, 2048, 128, torch.bfloat16)
     bound = _xsa_kernel().bind((q, k, v))
@@ -790,7 +791,7 @@ def test_persistent_ctas_run_several_xsa_work_items(
     items (both phase parities), and fresh inputs go through the same
     compiled kernel; the ``pfor`` pre-arrive race only showed at such shapes.
     """
-    from examples.xsa import ref_xsa
+    ref_xsa = import_example("xsa").ref_xsa
 
     batch, heads, seq, head_dim = shape
     sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
@@ -807,7 +808,7 @@ def test_persistent_ctas_run_several_xsa_work_items(
 
 @onlyBackends(["cute"])
 def test_packed_and_scalar_row_programs_agree() -> None:
-    from examples.xsa import ref_xsa
+    ref_xsa = import_example("xsa").ref_xsa
 
     q, k, v = _qkv(1, 4, 512, 128, torch.bfloat16)
     _, packed = code_and_output(_xsa_kernel(), (q, k, v), **_FA4)

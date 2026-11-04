@@ -11,7 +11,6 @@ from typing import Any
 from typing import cast
 from unittest.mock import patch
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -31,10 +30,13 @@ from helion._compiler.cute.split_k_cluster import CLUSTER_K_SCHEDULE
 from helion._compiler.cute.split_k_cluster_config import CLUSTER8_K4
 from helion._compiler.cute.split_k_cluster_config import SCHEDULE_KEY
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
+
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
 pytestmark = skipUnlessBackends(["cute"])
 

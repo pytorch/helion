@@ -18,16 +18,16 @@ import warnings
 import torch
 import torch.nn.functional as F
 
-from .linear_attention_engine import LinearAttentionVariant
-from .linear_attention_engine import get_helion_fwd_kernel
-from .linear_attention_engine import recurrent_step
-from .linear_attention_harness import make_mamba2_ssd_inputs
-from .linear_attention_utils import chunked_linear_attn_reference
-from .linear_attention_utils import head_to_time_first as _htf
-from .linear_attention_utils import naive_recurrent_reference
-from .linear_attention_utils import rel_error as _rel_error
 from helion._testing import DEVICE
 from helion._testing import do_bench
+from helion._testing.linear_attention_harness import make_mamba2_ssd_inputs
+from helion._testing.linear_attention_utils import chunked_linear_attn_reference
+from helion._testing.linear_attention_utils import head_to_time_first as _htf
+from helion._testing.linear_attention_utils import naive_recurrent_reference
+from helion._testing.linear_attention_utils import rel_error as _rel_error
+from helion.experimental.linear_attention import LinearAttentionVariant
+from helion.experimental.linear_attention import get_helion_fwd_kernel
+from helion.experimental.linear_attention import recurrent_step
 
 if TYPE_CHECKING:
     from collections.abc import Callable

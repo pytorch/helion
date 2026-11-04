@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.mamba2_chunk_scan import helion_mamba2_chunk_scan_kernel
 import pytest
 import torch
 
@@ -21,8 +20,13 @@ from helion import exc
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_matmul import _is_scalar_carry_alias
 from helion._compiler.cute.collective_matmul import _remove_dead_staged_operands
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+helion_mamba2_chunk_scan_kernel = import_example(
+    "mamba2_chunk_scan"
+).helion_mamba2_chunk_scan_kernel
 
 
 @helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")

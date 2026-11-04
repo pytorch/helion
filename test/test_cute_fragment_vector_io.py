@@ -829,7 +829,7 @@ def test_engine_varlen_gram_plans_three_slabs(_cpu_only: None) -> None:
 
     from helion._compiler.cute.fragment_slab_loads import plan_slab_loads
 
-    engine = importlib.import_module("examples.linear.linear_attention_engine")
+    engine = importlib.import_module("helion.experimental.linear_attention")
     fn = engine.chunk_fwd_A_diag_anchored_varlen_helion.fn
     kernel = helion.kernel(fn, backend="cute", static_shapes=True)
     token_base, valid_len, nt = _varlen_tables((100, 64, 90), 64)

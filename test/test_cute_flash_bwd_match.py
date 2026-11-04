@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import math
 
-from examples.attention import attention_backward
 import pytest
 import sympy
 import torch
@@ -28,6 +27,9 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 from helion._compiler.cute.cute_flash_bwd import match_attention_bwd
+from helion._testing import import_example
+
+attention_backward = import_example("attention").attention_backward
 
 RCP_LN2 = 1.4426950408889634
 

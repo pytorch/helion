@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 from unittest.mock import patch
 
-from examples.aot_compile_example import add_2d
 import pytest
 import torch
 
@@ -17,8 +16,11 @@ import helion
 from helion._compiler.runtime_tensor_guards import (
     _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
 )
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+add_2d = import_example("aot_compile_example").add_2d
 
 
 def _prefix_source(prefix: str) -> str:

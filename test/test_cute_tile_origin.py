@@ -9,7 +9,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.int4_gemm import matmul_bf16_int4
 import pytest
 import torch
 
@@ -17,10 +16,13 @@ from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.language import _decorators
 from helion.language import tile_ops
+
+matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
 
 pytestmark = skipUnlessBackends(["cute"])
 

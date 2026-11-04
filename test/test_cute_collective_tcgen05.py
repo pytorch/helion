@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 
-from examples.moe_matmul_ogs import moe_matmul_ogs
 import pytest
 import torch
 
@@ -17,8 +16,11 @@ import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_tcgen05 import CollectiveTcgen05Plan
 from helion._compiler.cute.collective_tcgen05 import CollectiveTmemResource
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.exc import InvalidConfig
+
+moe_matmul_ogs = import_example("moe_matmul_ogs").moe_matmul_ogs
 
 CUDA_DEVICE = "cuda"
 

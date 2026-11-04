@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 
@@ -20,9 +19,14 @@ from helion._compiler.ast_read_writes import dead_assignment_elimination
 from helion._compiler.cute.memory_ops import _pure_epilogue_ancestors
 from helion._compiler.cute.mma_support import CuteMmaSupport
 from helion._compiler.generate_ast import GenerateAST
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.language import memory_ops
+
+squeeze_and_excitation_net_fwd = import_example(
+    "squeeze_and_excitation_net"
+).squeeze_and_excitation_net_fwd
 
 if TYPE_CHECKING:
     from collections.abc import Generator

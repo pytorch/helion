@@ -40,7 +40,7 @@ BHN, C, D = 2048, 64, 128
 
 
 def _engine():
-    from examples.linear import linear_attention_engine
+    from helion.experimental import linear_attention as linear_attention_engine
 
     return linear_attention_engine
 

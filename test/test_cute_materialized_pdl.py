@@ -8,7 +8,6 @@ import textwrap
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.int4_gemm import matmul_bf16_int4
 import pytest
 import torch
 
@@ -35,10 +34,13 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.compiler_coverage import append_compiler_coverage
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
+
+matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
 
 pytestmark = skipUnlessBackends(["cute"])
 

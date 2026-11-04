@@ -54,6 +54,7 @@ from helion.runtime.cute.launcher import _MmaDagAliasGuard
 pytest.importorskip("cuda.bindings.driver")
 pytest.importorskip("cutlass")
 
+from helion._testing import import_example
 from helion.autotuner.config_fragment import EnumFragment
 from helion.runtime.cute.standalone_launcher import _standalone_validate_mma_dag_aliases
 
@@ -330,7 +331,7 @@ def test_seeds_rank_cta_count_then_the_squarest_largest_tile() -> None:
 
 
 def _engine() -> object:
-    return importlib.import_module("examples.linear.linear_attention_engine")
+    return importlib.import_module("helion.experimental.linear_attention")
 
 
 def _tensors(
@@ -5403,9 +5404,7 @@ def test_region_programs_seed_the_far_corner_of_the_tile_warp_stage_box() -> Non
     # eight warps and one stage, two knob moves away with both single-knob
     # neighbours slower.  The heuristic now seeds, per fragment-row tile,
     # the largest column tile at the most warps and the fewest stages too.
-    fn = importlib.import_module(
-        "examples.mamba2_chunk_scan"
-    ).helion_mamba2_chunk_scan_kernel.fn
+    fn = import_example("mamba2_chunk_scan").helion_mamba2_chunk_scan_kernel.fn
     bound = _bind_fn(fn, _chunk_scan_s2_inputs())
     facts = bound.config_spec.cute_mma_dag_facts
     assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
@@ -6468,9 +6467,7 @@ def _chunk_scan_inputs(chunk: int = 64) -> tuple[torch.Tensor, ...]:
 
 
 def _bind_chunk_scan(chunk: int = 64) -> BoundKernel:
-    fn = importlib.import_module(
-        "examples.mamba2_chunk_scan"
-    ).helion_mamba2_chunk_scan_kernel.fn
+    fn = import_example("mamba2_chunk_scan").helion_mamba2_chunk_scan_kernel.fn
     return _bind_fn(fn, _chunk_scan_inputs(chunk))
 
 
@@ -6728,7 +6725,7 @@ def test_a_loop_less_batched_matmul_program_is_admitted_on_the_warp_emitter() ->
     assert f"{RT}.octet_sum(" in body and f"{RT}.ldg_s32(" in body
     assert f"{RT}.stg_f32(" in body and f"{RT}.stg_v4_b32(" not in body
     # The example kernel is the same program.
-    example = importlib.import_module("examples.sparse_attn_indexer")
+    example = import_example("sparse_attn_indexer")
     example_bound = _bind_fn(example.mqa_logits_decode.fn, args)
     assert example_bound.config_spec.cute_mma_dag is not None
     assert example_bound.config_spec.default_config().config["cute_mma_dag"] == "warp"

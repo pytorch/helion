@@ -13,7 +13,6 @@ from typing import cast
 from unittest.mock import Mock
 from unittest.mock import patch
 
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 
@@ -26,6 +25,7 @@ from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.mma_support import CuteMmaSupport
 from helion._compiler.cute.promote_output_axis import _access_tensor
 from helion._compiler.device_ir import ForLoopGraphInfo
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.precompile_future import SerializedCompiledFunction
@@ -38,6 +38,10 @@ from helion.runtime.ref_mode import RefMode
 from helion.runtime.ref_mode import RefModeContext
 from helion.runtime.ref_mode import RefModeTorchFunctionMode
 from helion.runtime.settings import Settings
+
+squeeze_and_excitation_net_fwd = import_example(
+    "squeeze_and_excitation_net"
+).squeeze_and_excitation_net_fwd
 
 CPU_DEVICE = "cpu"
 

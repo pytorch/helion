@@ -1631,6 +1631,191 @@ def _graph_used_block_ids(
 _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
 
 
+# Config keys the CuTe backend lowers beyond the backend-neutral surface.
+# ``supports_config_key`` runs for every key of every normalized config, so
+# membership is one frozenset lookup rather than a chain of comparisons.
+_CUTE_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        "num_threads",
+        "cute_vector_widths",
+        "cute_lane_layouts",
+        "cute_reduction_reloads",
+        "cute_reduction_schedule",
+        "cute_reduction_group_rows",
+        "cute_reduction_pipeline_depth",
+        "cute_reduction_local_tree",
+        "cute_reduction_row_schedule",
+        "cute_reduction_pack_output",
+        "cute_reduction_sequence",
+        "cute_host_paired_sum",
+        "cute_materialized_schedule",
+        "cute_materialized_operand_schedule",
+        "cute_fragment_scan",
+        "cute_fragment_reduction",
+        "cute_fp32_dot",
+        "cute_fragment_threads",
+        "cute_fragment_register_loads",
+        "cute_fragment_producer_cache",
+        "cute_fragment_warp_scan",
+        "cute_fragment_topk_network",
+        "cute_fragment_cta_topk",
+        "cute_selection_algorithm",
+        "cute_radix_threads",
+        "cute_radix_candidate_key_cache",
+        "cute_radix_scalar_candidates",
+        "cute_radix_valid_domain",
+        "cute_radix_ticket_stores",
+        "cute_radix_cached_payload_inverse",
+        "cute_radix_resident_input",
+        "cute_radix_boundary_early_exit",
+        "cute_radix_defer_output",
+        "cute_radix_partial_scan",
+        "cute_radix_packet_bits",
+        "cute_radix_scan_unroll",
+        "cute_radix_cluster_ctas",
+        "cute_radix_candidate_capacity",
+        "cute_radix_histogram_mode",
+        "cute_fragment_atomic_aggregation",
+        "cute_fragment_integer_atomic_epochs",
+        "cute_fragment_local_atomic_registers",
+        "cute_fragment_register_snapshots",
+        "cute_fragment_register_producers",
+        "cute_fragment_scan_exports",
+        "cute_fragment_warp_producer_regions",
+        "cute_fragment_bounded_gather",
+        "cute_fragment_published_scalars",
+        "cute_fragment_skip_zero_atomics",
+        "cute_fragment_atomic_consumer_fusion",
+        "cute_fragment_pure_producer_regions",
+        "cute_integer_loop_reduction",
+        "cute_fragment_packet_loads",
+        "cute_fragment_padded_rows",
+        "cute_fragment_unrolled_loops",
+        "cute_fragment_vector_io",
+        "cute_fragment_batched_loads",
+        "cute_fragment_split_k",
+        "cute_fragment_mma_rows",
+        "cute_fragment_slab_loads",
+        "cute_fragment_warp_results",
+        "cute_fragment_private_scalar_loops",
+        "cute_pointwise_pid_type",
+        "cute_async_store_policy",
+        "cute_store_policy",
+        "cute_exact_div_form",
+        "cute_bf16x2_recurrence",
+        "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
+        "cute_signed_bitfield_bf16",
+        "cute_collective_mma",
+        "cute_collective_static_layouts",
+        "cute_collective_copy",
+        "cute_collective_recipe",
+        "cute_collective_operand_packets",
+        "cute_collective_epilogue",
+        "cute_collective_stages",
+        "cute_collective_compute",
+        "cute_collective_native_seeded",
+        "cute_collective_tmem_seed",
+        "cute_collective_tmem_a",
+        "cute_gathered_mma_n",
+        "cute_gathered_mma_stages",
+        "cute_proven_bounds",
+        "cute_rng_packet",
+        "cute_independent_reduction",
+        "cute_cluster_warp_online",
+        "cute_register_row",
+        "cute_register_row_tensor_copy",
+        "cute_scalar_epilogue",
+        "cute_scalar_epilogue_keep_inputs",
+        "cute_scalar_epilogue_owner_fold",
+        "cute_warp_fp32_redux",
+        "cute_register_tile_warp_fold",
+        "cute_register_tile_store_first",
+        "cute_replicated_reduction",
+        "cute_vector_packet_unroll",
+        "cute_packet_prefetch",
+        "cute_vloop_sink",
+        "cute_lane_unroll",
+        "cute_dot_fragment_mma",
+        "cute_dot_ring_mma",
+        "cute_dot_ring_stages",
+        "cute_dot_ring_split",
+        "cute_pdl",
+        "cute_pdl_release",
+        "cute_pdl_spread",
+        "cute_warp_aggregated_atomics",
+        "cross_loop_pipeline",
+        "cute_split_k_workspace",
+        "cute_split_k_stages",
+        "cute_split_k_partitions",
+        "cute_split_k_atomic_epilogue",
+        "cute_split_k_schedule",
+        "cute_split_k_finalizer_warps",
+        "cute_grouped_rna_warps",
+        "cute_grouped_rna_block_k",
+        "cute_grouped_ab_stages",
+        "cute_grouped_ctas_per_sm",
+        "cute_grouped_prefix_scan",
+        "cute_grouped_descriptor_policy",
+        "cute_mma_f32_conversion",
+        "cute_chunk_recurrence_dv_partitions",
+        "cute_chunk_recurrence_register_cap",
+        "cute_chunk_prepare_schedule",
+        "cute_gdn_recurrence_stages",
+        "cute_gdn_recurrence_epilogue_warps",
+        "cute_gdn_recurrence_token_groups",
+        "cute_gdn_recurrence_mma_m",
+        "cute_affine_scan_schedule",
+        "cute_cluster_n",
+        "cute_min_blocks_per_mp",
+        "cute_tiles_per_block",
+        "cute_matmul_family",
+        "cute_warp_mma_warps",
+        "cute_register_subblocks",
+        "cute_register_subblocks_warps",
+        "cute_register_subblocks_prefetch",
+        "cute_register_subblocks_mask",
+        "cute_register_subblocks_colside",
+        "cute_register_subblocks_roll",
+        "cute_topk_lanes_per_row",
+        "cute_topk_rows_per_block",
+        "cute_topk_vector_width",
+        "cute_topk_output_vector_width",
+        "cute_topk_value_mode",
+        "cute_topk_key_dtype",
+        "cute_topk_rank_mode",
+        "cute_topk_selection_layout",
+        "cute_topk_sort_network",
+        "cute_topk_key_encoder",
+        "cute_topk_defer_value_gathers",
+        "cute_topk_merge_schedule",
+        "cute_topk_coarse_keys",
+        "cute_topk_key_recovery",
+        "cute_mma_dag",
+        "cute_mma_dag_warps",
+        "cute_mma_dag_stages",
+        "cute_mma_dag_store",
+        "cute_mma_dag_exchange",
+        "cute_mma_dag_pass_warps",
+        "cute_mma_dag_loads",
+        "cute_mma_dag_aux",
+        "cute_mma_dag_persistent",
+        "cute_mma_dag_cluster",
+        "cute_mma_dag_split",
+        "cute_mma_dag_derived",
+        "cute_mma_dag_epilogue",
+        "cute_mma_dag_lookahead",
+    }
+)
+_CUTE_CONFIG_KEY_PREFIXES: tuple[str, ...] = (
+    "tcgen05_",
+    "cute_flash_",
+    "cute_async_load_",
+    "cute_scaled_",
+)
+
+
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
@@ -2139,193 +2324,7 @@ class CuteBackend(Backend):
             )
 
     def supports_config_key(self, key: str) -> bool:
-        if (
-            key == "num_threads"
-            or key == "cute_vector_widths"
-            or key == "cute_lane_layouts"
-            or key == "cute_reduction_reloads"
-            or key
-            in {
-                "cute_reduction_schedule",
-                "cute_reduction_group_rows",
-                "cute_reduction_pipeline_depth",
-                "cute_reduction_local_tree",
-                "cute_reduction_row_schedule",
-                "cute_reduction_pack_output",
-                "cute_reduction_sequence",
-                "cute_host_paired_sum",
-                "cute_materialized_schedule",
-                "cute_materialized_operand_schedule",
-                "cute_fragment_scan",
-                "cute_fragment_reduction",
-                "cute_fp32_dot",
-                "cute_fragment_threads",
-                "cute_fragment_register_loads",
-                "cute_fragment_producer_cache",
-                "cute_fragment_warp_scan",
-                "cute_fragment_topk_network",
-                "cute_fragment_cta_topk",
-                "cute_selection_algorithm",
-                "cute_radix_threads",
-                "cute_radix_candidate_key_cache",
-                "cute_radix_scalar_candidates",
-                "cute_radix_valid_domain",
-                "cute_radix_ticket_stores",
-                "cute_radix_cached_payload_inverse",
-                "cute_radix_resident_input",
-                "cute_radix_boundary_early_exit",
-                "cute_radix_defer_output",
-                "cute_radix_partial_scan",
-                "cute_radix_packet_bits",
-                "cute_radix_scan_unroll",
-                "cute_radix_cluster_ctas",
-                "cute_radix_candidate_capacity",
-                "cute_radix_histogram_mode",
-                "cute_fragment_atomic_aggregation",
-                "cute_fragment_integer_atomic_epochs",
-                "cute_fragment_local_atomic_registers",
-                "cute_fragment_register_snapshots",
-                "cute_fragment_register_producers",
-                "cute_fragment_scan_exports",
-                "cute_fragment_warp_producer_regions",
-                "cute_fragment_bounded_gather",
-                "cute_fragment_published_scalars",
-                "cute_fragment_skip_zero_atomics",
-                "cute_fragment_atomic_consumer_fusion",
-                "cute_fragment_pure_producer_regions",
-                "cute_integer_loop_reduction",
-                "cute_fragment_packet_loads",
-                "cute_fragment_padded_rows",
-                "cute_fragment_unrolled_loops",
-                "cute_fragment_vector_io",
-                "cute_fragment_batched_loads",
-                "cute_fragment_split_k",
-                "cute_fragment_mma_rows",
-                "cute_fragment_slab_loads",
-                "cute_fragment_warp_results",
-                "cute_fragment_private_scalar_loops",
-                "cute_pointwise_pid_type",
-            }
-            or key == "cute_async_store_policy"
-            or key == "cute_store_policy"
-            or key == "cute_exact_div_form"
-            or key == "cute_bf16x2_recurrence"
-            or key == "cute_register_chain"
-            or key == "cute_simt_mma"
-            or key == "cute_simt_mma_layout"
-            or key == "cute_signed_bitfield_bf16"
-            or key == "cute_collective_mma"
-            or key == "cute_collective_static_layouts"
-            or key == "cute_collective_copy"
-            or key == "cute_collective_recipe"
-            or key == "cute_collective_operand_packets"
-            or key == "cute_collective_epilogue"
-            or key == "cute_collective_stages"
-            or key == "cute_collective_compute"
-            or key == "cute_collective_native_seeded"
-            or key == "cute_collective_tmem_seed"
-            or key == "cute_collective_tmem_a"
-            or key == "cute_gathered_mma_n"
-            or key == "cute_gathered_mma_stages"
-            or key == "cute_proven_bounds"
-            or key == "cute_rng_packet"
-            or key == "cute_independent_reduction"
-            or key == "cute_cluster_warp_online"
-            or key == "cute_register_row"
-            or key == "cute_register_row_tensor_copy"
-            or key == "cute_scalar_epilogue"
-            or key == "cute_scalar_epilogue_keep_inputs"
-            or key == "cute_scalar_epilogue_owner_fold"
-            or key == "cute_warp_fp32_redux"
-            or key == "cute_register_tile_warp_fold"
-            or key == "cute_register_tile_store_first"
-            or key == "cute_replicated_reduction"
-            or key == "cute_vector_packet_unroll"
-            or key == "cute_packet_prefetch"
-            or key == "cute_vloop_sink"
-            or key == "cute_lane_unroll"
-            or key == "cute_dot_fragment_mma"
-            or key == "cute_dot_ring_mma"
-            or key == "cute_dot_ring_stages"
-            or key == "cute_dot_ring_split"
-            or key == "cute_pdl"
-            or key == "cute_pdl_release"
-            or key == "cute_pdl_spread"
-            or key == "cute_warp_aggregated_atomics"
-            or key == "cross_loop_pipeline"
-            or key
-            in (
-                "cute_split_k_workspace",
-                "cute_split_k_stages",
-                "cute_split_k_partitions",
-                "cute_split_k_atomic_epilogue",
-                "cute_split_k_schedule",
-                "cute_split_k_finalizer_warps",
-            )
-            or key
-            in (
-                "cute_grouped_rna_warps",
-                "cute_grouped_rna_block_k",
-                "cute_grouped_ab_stages",
-                "cute_grouped_ctas_per_sm",
-                "cute_grouped_prefix_scan",
-                "cute_grouped_descriptor_policy",
-                "cute_mma_f32_conversion",
-            )
-            or key == "cute_chunk_recurrence_dv_partitions"
-            or key == "cute_chunk_recurrence_register_cap"
-            or key == "cute_chunk_prepare_schedule"
-            or key == "cute_gdn_recurrence_stages"
-            or key == "cute_gdn_recurrence_epilogue_warps"
-            or key == "cute_gdn_recurrence_token_groups"
-            or key == "cute_gdn_recurrence_mma_m"
-            or key == "cute_affine_scan_schedule"
-            or key == "cute_cluster_n"
-            or key == "cute_min_blocks_per_mp"
-            or key == "cute_tiles_per_block"
-            or key == "cute_matmul_family"
-            or key == "cute_warp_mma_warps"
-            or key == "cute_register_subblocks"
-            or key == "cute_register_subblocks_warps"
-            or key == "cute_register_subblocks_prefetch"
-            or key == "cute_register_subblocks_mask"
-            or key == "cute_register_subblocks_colside"
-            or key == "cute_register_subblocks_roll"
-            or key
-            in (
-                "cute_topk_lanes_per_row",
-                "cute_topk_rows_per_block",
-                "cute_topk_vector_width",
-                "cute_topk_output_vector_width",
-                "cute_topk_value_mode",
-                "cute_topk_key_dtype",
-                "cute_topk_rank_mode",
-                "cute_topk_selection_layout",
-                "cute_topk_sort_network",
-                "cute_topk_key_encoder",
-                "cute_topk_defer_value_gathers",
-                "cute_topk_merge_schedule",
-                "cute_topk_coarse_keys",
-                "cute_topk_key_recovery",
-            )
-            or key == "cute_mma_dag"
-            or key == "cute_mma_dag_warps"
-            or key == "cute_mma_dag_stages"
-            or key == "cute_mma_dag_store"
-            or key == "cute_mma_dag_exchange"
-            or key == "cute_mma_dag_pass_warps"
-            or key == "cute_mma_dag_loads"
-            or key == "cute_mma_dag_aux"
-            or key == "cute_mma_dag_persistent"
-            or key == "cute_mma_dag_cluster"
-            or key == "cute_mma_dag_split"
-            or key == "cute_mma_dag_derived"
-            or key == "cute_mma_dag_epilogue"
-            or key == "cute_mma_dag_lookahead"
-            or key.startswith(
-                ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
-            )
-        ):
+        if key in _CUTE_CONFIG_KEYS or key.startswith(_CUTE_CONFIG_KEY_PREFIXES):
             return True
         return super().supports_config_key(key)
 

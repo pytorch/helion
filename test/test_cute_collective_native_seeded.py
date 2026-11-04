@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 
-from examples.mamba2_chunk_scan import helion_mamba2_chunk_scan_kernel
 import pytest
 import torch
 
@@ -15,11 +14,16 @@ import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_tcgen05 import CollectiveTcgen05Plan
 from helion._compiler.cute.collective_tcgen05 import CollectiveTmemResource
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
+
+helion_mamba2_chunk_scan_kernel = import_example(
+    "mamba2_chunk_scan"
+).helion_mamba2_chunk_scan_kernel
 
 CUDA_DEVICE = "cuda"
 
@@ -370,6 +374,14 @@ def test_seeded_native_original_mamba_strict_accuracy_and_mutated_graphs(
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family")
     sizes = _mamba_sizes(shape)
+    bm, bn, bk = tile
+    chunk_size = sizes[0][3]
+    if bm > chunk_size:
+        # ``block_m`` is registered up to ``chunk_size`` and the autotuner
+        # never exceeds it, but a hand-written config can: the kernel's causal
+        # sweep ``(tile_m.id + 1) * block_m`` assumes whole row tiles, and a
+        # larger block reads ``cb`` past the row.
+        pytest.skip(f"block_m={bm} exceeds the kernel's chunk_size={chunk_size}")
     torch.manual_seed(20260911 + shape)
     x = torch.randn(sizes[1], device=CUDA_DEVICE, dtype=torch.bfloat16)
     dt = torch.rand(sizes[2], device=CUDA_DEVICE, dtype=x.dtype)
@@ -385,7 +397,6 @@ def test_seeded_native_original_mamba_strict_accuracy_and_mutated_graphs(
     reference = kernel._bind_isolated(arguments)
     reference.set_config(reference.config_spec.autotune_reference_config())
     bound = kernel._bind_isolated(arguments)
-    bm, bn, bk = tile
     config = helion.Config(
         block_sizes=[bm, bn, bk],
         num_threads=[128 // bn, bn, 1, 1],

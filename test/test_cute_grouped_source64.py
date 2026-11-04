@@ -6,7 +6,6 @@ import random
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 
@@ -25,10 +24,13 @@ from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_constants import (
     resolve_tcgen05_grouped_worklist_mma_shape,
 )
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if TYPE_CHECKING:
     from collections.abc import Generator

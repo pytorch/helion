@@ -4,6 +4,8 @@ import collections
 import contextlib
 import functools
 import importlib
+import importlib.machinery
+import importlib.util
 import inspect
 import io
 import logging
@@ -33,42 +35,42 @@ import torch.distributed as dist
 import torch.nn.functional
 from torch.utils._pytree import tree_map
 
-from ._compat import get_mtia_tunable_fragments
-from ._compat import get_tensor_descriptor_fn_name
-from ._compat import requires_torch_version
-from ._compat import supports_amd_cdna_tunables
-from ._compat import supports_block_ptr
-from ._compat import supports_host_tensor_descriptor
-from ._compat import supports_tensor_descriptor
-from ._compat import target_device_capability
-from ._dist_utils import is_master_rank
-from ._dist_utils import sync_object as sync_object
-from ._utils import counters
-from .autotuner.benchmarking import synchronize_device
-from .runtime.settings import _get_backend
-from .runtime.settings import is_pallas_interpret
+from .._compat import get_mtia_tunable_fragments
+from .._compat import get_tensor_descriptor_fn_name
+from .._compat import requires_torch_version
+from .._compat import supports_amd_cdna_tunables
+from .._compat import supports_block_ptr
+from .._compat import supports_host_tensor_descriptor
+from .._compat import supports_tensor_descriptor
+from .._compat import target_device_capability
+from .._dist_utils import is_master_rank
+from .._dist_utils import sync_object as sync_object
+from .._utils import counters
+from ..autotuner.benchmarking import synchronize_device
+from ..runtime.settings import _get_backend
+from ..runtime.settings import is_pallas_interpret
 from helion.autotuner.benchmark_provider import _clone_args
 
 if _get_backend() == "pallas":
-    from .autotuner.benchmarking import compute_repeat_generic as compute_repeat
-    from .autotuner.benchmarking import do_bench_generic as do_bench
-    from .autotuner.benchmarking import interleaved_bench_generic as interleaved_bench
+    from ..autotuner.benchmarking import compute_repeat_generic as compute_repeat
+    from ..autotuner.benchmarking import do_bench_generic as do_bench
+    from ..autotuner.benchmarking import interleaved_bench_generic as interleaved_bench
 else:
-    from .autotuner.benchmarking import compute_repeat
-    from .autotuner.benchmarking import do_bench as do_bench
-    from .autotuner.benchmarking import interleaved_bench
+    from ..autotuner.benchmarking import compute_repeat
+    from ..autotuner.benchmarking import do_bench as do_bench
+    from ..autotuner.benchmarking import interleaved_bench
 
 import typing
 
-from .runtime.config import Config
-from .runtime.ref_mode import is_ref_mode_enabled
-from .runtime.settings import RefMode
+from ..runtime.config import Config
+from ..runtime.ref_mode import is_ref_mode_enabled
+from ..runtime.settings import RefMode
 
 if TYPE_CHECKING:
     import types
 
-    from .runtime.kernel import BoundKernel
-    from .runtime.kernel import Kernel
+    from ..runtime.kernel import BoundKernel
+    from ..runtime.kernel import Kernel
 
 _R = TypeVar("_R")
 _P = ParamSpec("_P")
@@ -238,8 +240,23 @@ def is_xpu() -> bool:
     return _get_triton_backend() == "xpu" and torch.xpu.is_available()
 
 
-PROJECT_ROOT: Path = Path(__file__).parent.parent
+PROJECT_ROOT: Path = Path(__file__).parent.parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+
+# ``examples/`` holds standalone scripts and is deliberately not a package:
+# a bare ``import examples`` resolves to whichever ``examples`` directory is
+# first on sys.path.  Expose the directory under this unique dotted name
+# instead, so ``import_example("matmul")`` is an ordinary import of
+# ``helion._testing.examples.matmul``: the module gets a real spec and file,
+# is cached in ``sys.modules``, can be re-imported by name in a benchmark
+# worker process (``PortableFunction``), and can be traced by torch.compile.
+EXAMPLES_PACKAGE = f"{__name__}.examples"
+if EXAMPLES_PACKAGE not in sys.modules:
+    _examples_spec = importlib.machinery.ModuleSpec(
+        EXAMPLES_PACKAGE, None, is_package=True
+    )
+    _examples_spec.submodule_search_locations = [str(EXAMPLES_DIR)]
+    sys.modules[EXAMPLES_PACKAGE] = importlib.util.module_from_spec(_examples_spec)
 PRETUNED_KERNELS_DIR: Path = PROJECT_ROOT / "pretuned_kernels"
 DEVICE = None
 
@@ -385,7 +402,7 @@ def skipUnlessMultiXCD(reason: str) -> Callable[[Callable], Callable]:
 
 def skipUnlessMTIA(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless running on MTIA hardware."""
-    from ._compat import supports_mtia_tunables
+    from .._compat import supports_mtia_tunables
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: not supports_mtia_tunables(), reason)
@@ -399,7 +416,7 @@ def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
 
 @functools.cache
 def _has_cute_dsl() -> bool:
-    from ._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
+    from .._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 
     return _cute_backend_requirement_error() is None
 
@@ -410,7 +427,7 @@ def skipUnlessCuteAvailable(reason: str) -> Callable[[Callable], Callable]:
 
 
 def _tcgen05_runtime_n_ptx_compatible() -> bool:
-    from ._compiler.cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
+    from .._compiler.cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 
     return tcgen05_runtime_n_ptx_compatible()
 
@@ -787,7 +804,7 @@ def track_run_ref_calls() -> Generator[list[int], None, None]:
     Yields:
         A list that will contain the count of run_ref calls.
     """
-    from .runtime.kernel import BoundKernel
+    from ..runtime.kernel import BoundKernel
 
     original_run_ref = BoundKernel.run_ref
     run_ref_count = [0]
@@ -1103,7 +1120,22 @@ class RefEagerTestBase:
             super().assertIsInstance(obj, cls, msg)  # type: ignore[misc]
 
 
+def import_example(name: str) -> types.ModuleType:
+    """Import ``examples/<name>.py`` as ``helion._testing.examples.<name>``.
+
+    ``name`` may be dotted for a subdirectory (``"linear.example_kda"``).
+    Every caller shares one instance of each example and its kernels.
+    """
+    return importlib.import_module(f"{EXAMPLES_PACKAGE}.{name}")
+
+
 def import_path(filename: Path) -> types.ModuleType:
+    filename = filename.resolve()
+    examples_dir = EXAMPLES_DIR.resolve()
+    if filename.is_relative_to(examples_dir):
+        # One module per example everywhere; see ``import_example``.
+        relative = filename.relative_to(examples_dir).with_suffix("")
+        return import_example(".".join(relative.parts))
     module_name = f"{__name__}.{filename.stem}"
     if module_name not in sys.modules:
         # pyrefly: ignore [implicit-import]
@@ -1546,7 +1578,7 @@ def _example_kernel(
     fn_name: str | None = None,
     static_shapes: bool | None = None,
 ) -> Kernel:
-    kernel_fn = getattr(import_path(EXAMPLES_DIR / f"{name}.py"), fn_name or name)
+    kernel_fn = getattr(import_example(name), fn_name or name)
     if static_shapes is not None:
         assert static_shapes in (True, False)
         kernel_fn.settings.static_shapes = static_shapes

@@ -896,7 +896,9 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
     if module == "int4_gemm" and forward:
 
         def quack_int4_gemm() -> Callable:
-            from examples.int4_gemm import _unpack_int4_matrix
+            from helion._testing import import_example
+
+            _unpack_int4_matrix = import_example("int4_gemm")._unpack_int4_matrix
 
             gemm = importlib.import_module("quack.gemm_interface").gemm
 

@@ -5,13 +5,6 @@ from __future__ import annotations
 import inspect
 import re
 
-from examples.nvfp4_gemm import _nvfp4_w4a4_matmul_kernel
-from examples.nvfp4_gemm import pack_fp4
-from examples.nvfp4_gemm import pack_fp4_last_dim
-from examples.nvfp4_gemm import quantize_fp4_e2m1
-from examples.nvfp4_gemm import reference_nvfp4_w4a4_matmul
-from examples.nvfp4_gemm import swizzle_fp8_scales
-from examples.nvfp4_gemm import swizzled_scale_offsets
 import pytest
 import torch
 
@@ -25,9 +18,19 @@ from helion._compiler.cute.block_scaled_config import normalize_block_scaled_con
 from helion._compiler.cute.block_scaled_fused import fused_geometry
 from helion._compiler.cute.block_scaled_prepare import preparation_source
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
+
+_examples_nvfp4_gemm = import_example("nvfp4_gemm")
+_nvfp4_w4a4_matmul_kernel = _examples_nvfp4_gemm._nvfp4_w4a4_matmul_kernel
+pack_fp4 = _examples_nvfp4_gemm.pack_fp4
+pack_fp4_last_dim = _examples_nvfp4_gemm.pack_fp4_last_dim
+quantize_fp4_e2m1 = _examples_nvfp4_gemm.quantize_fp4_e2m1
+reference_nvfp4_w4a4_matmul = _examples_nvfp4_gemm.reference_nvfp4_w4a4_matmul
+swizzle_fp8_scales = _examples_nvfp4_gemm.swizzle_fp8_scales
+swizzled_scale_offsets = _examples_nvfp4_gemm.swizzled_scale_offsets
 
 pytestmark = skipUnlessBackends(["cute"])
 

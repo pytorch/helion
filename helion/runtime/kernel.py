@@ -170,6 +170,51 @@ class _FastDispatchEntry(NamedTuple):
     specialization_generation: int
 
 
+class _FastDispatchSchema:
+    """What one exact fast-key prefix resolves to.
+
+    The prefix (exact per-argument metadata, ``is_distributed``, the custom
+    key and the input-alias partition) of a call the memo admits determines
+    the base specialization signature for fixed kernel settings
+    (``Kernel._memoized_fast_dispatch_key``), hence which published
+    ``_specialize_extra`` list applies and the result of every extractor that
+    exact metadata implies (``_implied_by_exact_metadata``).  ``results``
+    holds the extras tuple of the call that resolved the prefix; ``per_call``
+    names the slots every call re-evaluates (pointer alignment, runtime input
+    classifiers, ``hl.specialize``'d scalar values, ...).
+    """
+
+    __slots__ = (
+        "extra_fns",
+        "full_key",
+        "generation",
+        "per_call",
+        "results",
+        "settings",
+    )
+
+    def __init__(
+        self,
+        generation: int,
+        settings: tuple[Hashable, ...],
+        extra_fns: list[Callable[[Sequence[object]], Hashable]],
+        results: tuple[Hashable, ...],
+        per_call: tuple[tuple[int, Callable[[Sequence[object]], Hashable]], ...],
+        prefix: tuple[Hashable, ...],
+    ) -> None:
+        self.generation = generation
+        self.settings = settings
+        # Held so the list cannot be collected while this entry is alive.
+        self.extra_fns = extra_fns
+        self.results = results
+        self.per_call = per_call
+        # Without per-call slots, the whole fast key: one object shared by
+        # every call, so dispatch-cache lookups compare it by identity.
+        self.full_key: tuple[Hashable, ...] | None = None
+        if not per_call:
+            self.full_key = (*prefix, results) if extra_fns else prefix
+
+
 def _nested_fast_dispatch_key(
     value: object, *, specialize_numeric: bool = False
 ) -> tuple[Hashable, bool] | None:
@@ -382,11 +427,29 @@ def _input_tensor_aliases(values: Sequence[object]) -> tuple[int, ...] | None:
         ):
             tensors = [tensor for _path, tensor in _walk_input_tensors(values)]
             break
+    return _tensor_aliases(tensors)
+
+
+def _tensor_aliases(tensors: Sequence[torch.Tensor]) -> tuple[int, ...] | None:
+    """Canonical alias partition of ``tensors``; None when all are distinct."""
     if len(tensors) < 2:
         return None
-
-    aliases: list[int] = []
+    # Identity comparisons only: ``id()`` fires an audit event per call once
+    # any audit hook is installed (importing inductor installs one).  The
+    # common all-distinct case returns before building the partition.
     unique_tensors: list[torch.Tensor] = []
+    for tensor in tensors:
+        for previous_tensor in unique_tensors:
+            if tensor is previous_tensor:
+                break
+        else:
+            unique_tensors.append(tensor)
+            continue
+        break
+    else:
+        return None
+    aliases: list[int] = []
+    unique_tensors = []
     for tensor in tensors:
         for index, previous_tensor in enumerate(unique_tensors):
             if tensor is previous_tensor:
@@ -395,7 +458,7 @@ def _input_tensor_aliases(values: Sequence[object]) -> tuple[int, ...] | None:
         else:
             aliases.append(len(unique_tensors))
             unique_tensors.append(tensor)
-    return tuple(aliases) if len(unique_tensors) != len(tensors) else None
+    return tuple(aliases)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -439,10 +502,19 @@ def _compiler_seed_specialization_extractors(
     )
 
 
+# (slot index, extractor) pairs of an extras tuple re-evaluated on every call.
+_PerCallSlots = tuple[tuple[int, Callable[[Sequence[object]], Hashable]], ...]
+
+
 class _SpecializationAlias:
     """An omitted-default signature backed by a normalized signature."""
 
-    __slots__ = ("schemas", "canonical_signature", "trailing_defaults")
+    __slots__ = (
+        "schemas",
+        "canonical_signature",
+        "trailing_defaults",
+        "per_call_cache",
+    )
 
     def __init__(
         self,
@@ -453,6 +525,15 @@ class _SpecializationAlias:
         self.schemas = schemas
         self.canonical_signature = canonical_signature
         self.trailing_defaults = trailing_defaults
+        # The canonical list ``_specialization_alias_per_call`` last split and
+        # its result: published lists are replaced, never mutated.
+        self.per_call_cache: (
+            tuple[
+                list[Callable[[Sequence[object]], Hashable]] | None,
+                _PerCallSlots | None,
+            ]
+            | None
+        ) = None
 
     def __call__(self, values: Sequence[object]) -> Hashable:
         normalized = (*values, *self.trailing_defaults)
@@ -464,12 +545,177 @@ class _SpecializationAlias:
 
 @dataclasses.dataclass(frozen=True)
 class _PreparedMetadataSpecializationExtractor:
-    """Specialization already implied by ``_make_prepared_arg_guard``."""
+    """Specialization read from input tensor metadata.
+
+    Exact metadata, which ``_make_prepared_arg_guard`` checks, implies its
+    result unless it reads a storage offset (``_implied_by_exact_metadata``).
+    """
 
     extractor: Callable[[Sequence[object]], Hashable]
 
     def __call__(self, args: Sequence[object]) -> Hashable:
         return self.extractor(args)
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _TensorDescriptorAlignmentExtractor:
+    """Whether a host-descriptor tensor's base pointer meets its alignment
+    guard.  Prepared metadata guards do not cover base pointers, so this runs
+    on every call."""
+
+    extract_tensor: Callable[[Sequence[object]], Hashable]
+    requires_zero_storage_offset: bool
+
+    def __call__(self, args: Sequence[object]) -> Hashable:
+        tensor = self.extract_tensor(args)
+        tensor_type = type(tensor)
+        if tensor_type is torch.Tensor or tensor_type is torch.nn.Parameter:
+            # ``_concrete_tensor_satisfies_alignment_guard`` for a concrete
+            # tensor, inline: this runs on every dispatch.
+            tensor = cast("torch.Tensor", tensor)
+            return tensor.data_ptr() % 16 == 0 and (
+                not self.requires_zero_storage_offset or tensor.storage_offset() == 0
+            )
+        return _concrete_tensor_satisfies_alignment_guard(
+            tensor, self.requires_zero_storage_offset
+        )
+
+
+def _implied_by_exact_metadata(
+    extractor: Callable[[Sequence[object]], Hashable],
+) -> bool:
+    """Whether exact argument metadata implies ``extractor``'s result.
+
+    Both the fast-key prefix and the prepared argument guard
+    (``_make_prepared_arg_guard``) pin each tensor's exact
+    dtype/shape/stride/device but not its storage offset (symbolic in a
+    dynamic-shape compile), so a guard fact over a storage-offset symbol is
+    evaluated on every call like pointer alignment and scalar values.
+    """
+    if not isinstance(extractor, _PreparedMetadataSpecializationExtractor):
+        return False
+    inner = extractor.extractor
+    return not (
+        isinstance(inner, _GuardedInputFact)
+        and any(
+            source.prop == TensorProperty.STORAGE_OFFSET
+            for _symbol, source in inner.sources
+        )
+    )
+
+
+# Omitted defaults an alias can look through: immutable, so the canonical
+# extractors exact metadata implies read nothing a later call can change.
+_IMMUTABLE_DEFAULT_TYPES: tuple[type[object], ...] = (
+    int,
+    float,
+    bool,
+    str,
+    type(None),
+    torch.dtype,
+    torch.device,
+)
+
+
+class _SpecializationAliasDispatch:
+    """The per-call part of an omitted-default ``_SpecializationAlias`` slot.
+
+    Produces the alias's result tuple from memoized canonical results,
+    re-evaluating only the canonical extractors that exact metadata does not
+    imply, on the arguments with the trailing defaults appended.
+    """
+
+    __slots__ = ("per_call", "results", "trailing_defaults")
+
+    def __init__(
+        self,
+        trailing_defaults: tuple[object, ...],
+        results: tuple[Hashable, ...],
+        per_call: tuple[tuple[int, Callable[[Sequence[object]], Hashable]], ...],
+    ) -> None:
+        self.trailing_defaults = trailing_defaults
+        self.results = results
+        self.per_call = per_call
+
+    def __call__(self, args: Sequence[object]) -> Hashable:
+        normalized = (*args, *self.trailing_defaults)
+        results = list(self.results)
+        for index, extractor in self.per_call:
+            results[index] = extractor(normalized)
+        return tuple(results)
+
+
+def _evaluate_fast_dispatch_extras(
+    extra_fns: Sequence[Callable[[Sequence[object]], Hashable]],
+    args: Sequence[object],
+) -> tuple[
+    tuple[Hashable, ...],
+    tuple[tuple[int, Callable[[Sequence[object]], Hashable]], ...],
+]:
+    """Evaluate a published schema on ``args``, in order, and split off the
+    slots the exact fast-key prefix does not imply (with what re-evaluates
+    each)."""
+    results: list[Hashable] = []
+    per_call: list[tuple[int, Callable[[Sequence[object]], Hashable]]] = []
+    for index, extractor in enumerate(extra_fns):
+        dispatch: Callable[[Sequence[object]], Hashable] | None
+        if isinstance(extractor, _SpecializationAlias):
+            result, dispatch = _evaluate_specialization_alias(extractor, args)
+        else:
+            result = extractor(args)
+            dispatch = None if _implied_by_exact_metadata(extractor) else extractor
+        results.append(result)
+        if dispatch is not None:
+            per_call.append((index, dispatch))
+    return tuple(results), tuple(per_call)
+
+
+def _specialization_alias_per_call(
+    alias: _SpecializationAlias,
+) -> tuple[list[Callable[[Sequence[object]], Hashable]], _PerCallSlots] | None:
+    """The canonical schema behind ``alias`` and its slots exact metadata does
+    not imply; None when the whole alias stays per call (a mutable trailing
+    default, or no canonical schema, which makes the alias raise).
+
+    Cached per canonical list: every re-prepared call looks it up.
+    """
+    canonical = alias.schemas.get(alias.canonical_signature)
+    cached = alias.per_call_cache
+    if cached is None or cached[0] is not canonical:
+        per_call = None
+        if canonical is not None and all(
+            type(default) in _IMMUTABLE_DEFAULT_TYPES
+            for default in alias.trailing_defaults
+        ):
+            per_call = tuple(
+                (index, extractor)
+                for index, extractor in enumerate(canonical)
+                if not _implied_by_exact_metadata(extractor)
+            )
+        cached = alias.per_call_cache = (canonical, per_call)
+    canonical, per_call = cached
+    if canonical is None or per_call is None:
+        return None
+    return canonical, per_call
+
+
+def _evaluate_specialization_alias(
+    alias: _SpecializationAlias,
+    args: Sequence[object],
+) -> tuple[Hashable, Callable[[Sequence[object]], Hashable] | None]:
+    """``alias(args)`` and what re-evaluates it per call (None when exact
+    metadata implies all of it)."""
+    if (split := _specialization_alias_per_call(alias)) is None:
+        return alias(args), alias
+    canonical, per_call = split
+    normalized = (*args, *alias.trailing_defaults)
+    # The same tuple ``alias(args)`` builds.
+    results = tuple(extractor(normalized) for extractor in canonical)
+    if not per_call:
+        return results, None
+    return results, _SpecializationAliasDispatch(
+        alias.trailing_defaults, results, per_call
+    )
 
 
 def _capture_safe_specialization(
@@ -512,7 +758,9 @@ def _partition_prepared_extra_guards(
     """Split guards into always-check classifiers and prepared fact guards.
 
     Tensor type/shape/stride/dtype/device facts are already checked by the
-    prepared argument guard.  A runtime input specialization may supply a
+    prepared argument guard, so extractors exact metadata implies are
+    dropped, and an omitted-default alias keeps only its per-call part
+    (``_prepared_alias_guard``).  A runtime input specialization may supply a
     ``prepared_guard_factory`` that turns its expected result into a direct
     check of the pointer/storage facts those pins leave open, so repeat calls
     with fresh output tensors never re-run the full classifier.  Classifiers
@@ -523,7 +771,12 @@ def _partition_prepared_extra_guards(
     always_check: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]] = []
     fact_guards: list[Callable[[Sequence[object]], bool]] = []
     for extractor, expected in extra_guards:
-        if isinstance(extractor, _PreparedMetadataSpecializationExtractor):
+        if isinstance(extractor, _SpecializationAlias):
+            alias_guard = _prepared_alias_guard(extractor, expected, args)
+            if alias_guard is not None:
+                always_check.append((alias_guard, expected))
+            continue
+        if _implied_by_exact_metadata(extractor):
             continue
         guard = (
             _build_prepared_fact_guard(extractor, expected, args)
@@ -535,6 +788,35 @@ def _partition_prepared_extra_guards(
         else:
             fact_guards.append(guard)
     return tuple(always_check), tuple(fact_guards)
+
+
+def _prepared_alias_guard(
+    alias: _SpecializationAlias,
+    expected: Hashable,
+    args: tuple[object, ...],
+) -> Callable[[Sequence[object]], Hashable] | None:
+    """What a prepared call re-evaluates for an omitted-default alias slot.
+
+    Looks through to the canonical schema like the fast-key memo
+    (``_specialization_alias_per_call``): None when exact metadata, which the
+    prepared argument guard pins, implies every canonical extractor, else a
+    ``_SpecializationAliasDispatch`` that re-evaluates only the rest and
+    takes the implied slots from ``expected``, the fast key's value for these
+    arguments (as the guards of non-alias extractors exact metadata implies
+    are dropped unevaluated; evaluating them would cost a few microseconds
+    each time a call re-prepares).  The whole alias stays when its defaults
+    are mutable or its canonical schema is missing, and, failing closed, when
+    ``expected`` does not have the canonical shape or the re-evaluated slots
+    do not reproduce it.
+    """
+    split = _specialization_alias_per_call(alias)
+    if split is None or type(expected) is not tuple or len(expected) != len(split[0]):
+        return alias
+    per_call = split[1]
+    if not per_call:
+        return None
+    dispatch = _SpecializationAliasDispatch(alias.trailing_defaults, expected, per_call)
+    return dispatch if dispatch(args) == expected else alias
 
 
 def _build_prepared_fact_guard(
@@ -938,6 +1220,44 @@ def _resolve_index_dtype(
     return index_dtype
 
 
+def _argument_device_is_fixed(args: Sequence[object]) -> bool:
+    """Whether the device ``_device_specialization_key`` keys is the same for
+    every insertion order of ``args``' dicts and every current device.
+
+    True when every tensor and ``torch.device`` that ``_find_device`` can
+    reach is one device, and that device is indexed (or has no index to
+    resolve).  The fast-key prefix sorts dict entries, so with several devices
+    a dict's insertion order can change which one is found first.  ``args``
+    are arguments ``_fast_dispatch_key`` admits, every value of an exact
+    type, so exact type checks walk what ``_find_device``'s ``isinstance``
+    checks do (a ``ConstExpr`` is not a plain tuple).
+    """
+    device: torch.device | None = None
+    pending = list(args)
+    while pending:
+        value = pending.pop()
+        value_type = type(value)
+        if value_type is torch.Tensor or value_type is torch.nn.Parameter:
+            value_device = cast("torch.Tensor", value).device
+        elif value_type is torch.device:
+            value_device = cast("torch.device", value)
+        else:
+            if value_type is tuple or value_type is list:
+                pending.extend(cast("Sequence[object]", value))
+            elif value_type is dict:
+                pending.extend(cast("dict[object, object]", value).values())
+            continue
+        if device is None:
+            device = value_device
+        elif value_device != device:
+            return False
+    return (
+        device is None
+        or device.index is not None
+        or device.type in ("cpu", "meta", "mps")
+    )
+
+
 def _device_specialization_key(
     args: Sequence[object],
     *,
@@ -1016,6 +1336,7 @@ class Kernel(Generic[_R]):
         self.name: str = fn.__name__
         # pyrefly: ignore [read-only]
         self.fn: types.FunctionType = fn
+        self._kernel_source: str | None = None
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings, selected_configs, self._cute_structural_policy = (
             select_structural_policy(
@@ -1039,7 +1360,19 @@ class Kernel(Generic[_R]):
         # dtype/shape/stride/device per tensor) directly to a BoundKernel,
         # skipping the full specialization-key machinery on repeat calls.
         self._dispatch_cache: dict[Hashable, BoundKernel] = {}
+        # Fast-key prefix -> the schema it resolves to (``_FastDispatchSchema``),
+        # so repeat ``_fast_dispatch_key`` calls skip the base specialization
+        # key and the extractors exact metadata implies.  Entries are valid for
+        # one ``_specialization_generation``; every generation bump drops them.
+        self._fast_dispatch_schemas: dict[
+            tuple[Hashable, ...], _FastDispatchSchema
+        ] = {}
         self._prepared_call: _PreparedCall | None = None
+        # Signature -> its published extractor list.  Writers either fill a
+        # missing (None) slot or bump ``_specialization_generation``, and a
+        # published list is replaced, never mutated in place: memoized fast
+        # dispatch schemas (and any cache keyed by a list's id(), which must
+        # also hold the list) rely on both.
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
         ] = {}
@@ -1105,7 +1438,6 @@ class Kernel(Generic[_R]):
 
             self._capture_op = register_decoration_op(self)
 
-    @functools.cache  # noqa: B019
     def kernel_source(self) -> str:
         """
         Return the kernel's source text.
@@ -1113,7 +1445,9 @@ class Kernel(Generic[_R]):
         This is the stable identifier across processes/runs, suitable for
         grouping telemetry rows by kernel during analysis.
         """
-        return inspect.getsource(self.fn)
+        if self._kernel_source is None:
+            self._kernel_source = inspect.getsource(self.fn)
+        return self._kernel_source
 
     def _validate_structural_policy(self) -> None:
         # Legacy kernels retain their existing mutable Settings behavior. An
@@ -1229,6 +1563,8 @@ class Kernel(Generic[_R]):
                 else:
                     published_extra_fns = self._specialize_extra.get(signature)
                     if published_extra_fns is None:
+                        # Fills an unpublished slot, which no memoized fast
+                        # dispatch schema references, without a generation bump.
                         self._specialize_extra[signature] = extra_fns
                         self._compiler_seed_specialize_extra[signature] = (
                             compiler_seed_fns
@@ -1345,7 +1681,8 @@ class Kernel(Generic[_R]):
 
                 # Publish the extended specialization only after every extractor
                 # succeeds. Otherwise a failed extension could leave a prepared
-                # call guarding an already-mutated extractor list.
+                # call guarding an already-mutated extractor list.  Replacing
+                # published lists requires the generation bump below.
                 self._has_specialization_extras = True
                 self._specialize_extra[signature] = updated_extractors
                 for alias_signature, alias in aliases.items():
@@ -1354,6 +1691,8 @@ class Kernel(Generic[_R]):
                         compiler_seed_fns
                     )
                 self._specialization_generation += 1
+                # Every memoized fast dispatch schema is stale now.
+                self._fast_dispatch_schemas = {}
 
             affected_signatures = {signature, *aliases}
             stale_keys = [
@@ -1409,15 +1748,13 @@ class Kernel(Generic[_R]):
             new_facts = [fact for fact in facts if fact not in published]
             if not new_facts:
                 return
+            aliases = {
+                alias_signature: alias
+                for alias_signature, alias in self._specialization_aliases.items()
+                if alias.canonical_signature == signature
+            }
             for key, bound in list(self._bound_kernels.items()):
-                if key.specialization_key not in (
-                    signature,
-                    *(
-                        alias_signature
-                        for alias_signature, alias in self._specialization_aliases.items()
-                        if alias.canonical_signature == signature
-                    ),
-                ):
+                if key.specialization_key not in (signature, *aliases):
                     continue
                 del self._bound_kernels[key]
                 # Alias keys pack the canonical results; let them rebind.
@@ -1433,9 +1770,16 @@ class Kernel(Generic[_R]):
                             compiler_seed_results=key.compiler_seed_results,
                         )
                     ] = bound
+            # Replacing a published list requires the generation bump below.
             self._specialize_extra[signature] = [*published, *new_facts]
+            for alias_signature, alias in aliases.items():
+                # An alias published while the canonical schema was empty
+                # keys no canonical extractor; let it key the new facts.
+                if alias_signature in self._specialize_extra:
+                    self._specialize_extra[alias_signature] = [alias]
             self._has_specialization_extras = True
             self._specialization_generation += 1
+            self._fast_dispatch_schemas = {}
             for fast_key, cached_bound in list(self._dispatch_cache.items()):
                 if cached_bound._base_spec_key == signature:
                     del self._dispatch_cache[fast_key]
@@ -1472,15 +1816,31 @@ class Kernel(Generic[_R]):
         _extra_guards: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]]
         | None = None,
     ) -> tuple[Hashable, ...] | None:
-        """Build a specialization-safe eager key, optionally collecting guards."""
+        """Build a specialization-safe eager key, optionally collecting guards.
+
+        Without ``signature``, a kernel with specialization extras reads them
+        through the schema memoized for the key's prefix
+        (``_memoized_fast_dispatch_key``); the key's value is the same.
+        """
         key: list[Hashable] = []
         has_tensor = False
+        # Top-level tensors, for the alias partition below; a container
+        # argument defers to the recursive ``_input_tensor_aliases`` walk.
+        tensors: list[torch.Tensor] = []
+        has_container = False
+        # A constexpr-annotated tensor keys the base signature by identity,
+        # which its metadata in the prefix does not pin, and an index-less
+        # accelerator device resolves against the current device.
+        memoizable = True
         for index, a in enumerate(args):
             t = type(a)
             annotation = self._annotations[index] if index < self._num_params else None
             if t is torch.Tensor or t is torch.nn.Parameter:
                 tensor = cast("torch.Tensor", a)
                 has_tensor = True
+                tensors.append(tensor)
+                if annotation is ConstExpr:
+                    memoizable = False
                 si = getattr(tensor, "_dynamo_static_indices", None)
                 key.append(
                     (
@@ -1503,8 +1863,15 @@ class Kernel(Generic[_R]):
                 key.append((t, a.value))
             elif a is None:
                 key.append(None)
-            elif t is torch.dtype or t is torch.device:
+            elif t is torch.dtype:
                 key.append(a)
+            elif t is torch.device:
+                key.append(a)
+                device = cast("torch.device", a)
+                # (Even behind a tensor, which ``_find_device`` would find
+                # first: rare enough to stay conservative.)
+                if device.index is None and device.type not in ("cpu", "meta", "mps"):
+                    memoizable = False
             elif (
                 t is tuple
                 or t is list
@@ -1521,6 +1888,9 @@ class Kernel(Generic[_R]):
                 nested_key, nested_has_tensor = nested
                 key.append(nested_key)
                 has_tensor = has_tensor or nested_has_tensor
+                # Callables are flat to the alias walk and the device lookup.
+                if t is tuple or t is list or t is dict:
+                    has_container = True
             else:
                 return None
         if not has_tensor:
@@ -1528,25 +1898,123 @@ class Kernel(Generic[_R]):
         if is_distributed is None:
             is_distributed = self._compute_is_distributed(args)
         key.append(is_distributed)
-        if signature is None and self._has_specialization_extras:
-            signature = self._base_specialization_key(
-                args, is_distributed=is_distributed
-            )
+        custom_key: object = _CUSTOM_KEY_UNSET
         if self._key_fn is not None:
-            key.append(self._key_fn(*args) if signature is None else signature[-1])
-        if (tensor_aliases := _input_tensor_aliases(args)) is not None:
+            # User key functions execute exactly once per launch.
+            custom_key = self._key_fn(*args) if signature is None else signature[-1]
+            key.append(custom_key)
+        # ``_input_tensor_aliases(args)`` without re-walking flat arguments.
+        tensor_aliases = (
+            _input_tensor_aliases(args) if has_container else _tensor_aliases(tensors)
+        )
+        if tensor_aliases is not None:
             key.append(("input_tensor_aliases", tensor_aliases))
-        if signature is not None:
-            extra_fns = self._specialize_extra.get(signature)
-            if extra_fns:
-                extra_results: list[Hashable] = []
-                for extractor in extra_fns:
-                    result = extractor(args)
-                    extra_results.append(result)
-                    if _extra_guards is not None:
-                        _extra_guards.append((extractor, result))
-                key.append(tuple(extra_results))
-        return tuple(key)
+        prefix = tuple(key)
+        if signature is None:
+            if not self._has_specialization_extras:
+                return prefix
+            # Dynamo would guard on the memo's contents and replay its writes.
+            if memoizable and not torch.compiler.is_compiling():
+                return self._memoized_fast_dispatch_key(
+                    prefix,
+                    args,
+                    is_distributed,
+                    custom_key,
+                    _extra_guards,
+                    has_container,
+                )
+            signature = self._base_specialization_key(
+                args, is_distributed=is_distributed, custom_key=custom_key
+            )
+        extra_fns = self._specialize_extra.get(signature)
+        if not extra_fns:
+            return prefix
+        extra_results: list[Hashable] = []
+        for extractor in extra_fns:
+            result = extractor(args)
+            extra_results.append(result)
+            if _extra_guards is not None:
+                _extra_guards.append((extractor, result))
+        return (*prefix, tuple(extra_results))
+
+    def _memoized_fast_dispatch_key(
+        self,
+        prefix: tuple[Hashable, ...],
+        args: tuple[object, ...],
+        is_distributed: bool,
+        custom_key: object,
+        extra_guards: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]]
+        | None,
+        has_container: bool,
+    ) -> tuple[Hashable, ...]:
+        """``_fast_dispatch_key``'s value from the schema memoized for ``prefix``.
+
+        The base signature is a function of the prefix and the kernel settings
+        it reads: every per-argument component of ``_base_specialization_key``
+        derives from the exact metadata/values the prefix records, and the
+        alias partition, custom key and ``is_distributed`` are in it.  Its
+        device component comes from the first device-bearing argument, which
+        the prefix pins for flat arguments, except an index-less accelerator
+        ``torch.device`` resolving against the *current* device (such calls
+        never get here).  The prefix sorts dict entries, so with container
+        arguments a miss memoizes only when every reachable device is one
+        indexed device (``_argument_device_is_fixed``).  Nor is a signature
+        without a published schema memoized: its first publication does not
+        bump the generation.  A hit skips ``_base_specialization_key`` and
+        every extractor exact metadata implies.
+        """
+        settings = self.settings
+        # The settings ``_base_specialization_key`` reads.
+        base_key_settings = (
+            settings.static_shapes,
+            settings.index_dtype,
+            settings.backend,
+            settings.disable_autotuner_heuristics,
+        )
+        schema = self._fast_dispatch_schemas.get(prefix)
+        if (
+            schema is not None
+            and schema.generation == self._specialization_generation
+            and schema.settings == base_key_settings
+        ):
+            if (key := schema.full_key) is not None:
+                extras = schema.results
+            else:
+                results = list(schema.results)
+                for index, extractor in schema.per_call:
+                    results[index] = extractor(args)
+                extras = tuple(results)
+                key = (*prefix, extras)
+            if extra_guards is not None:
+                extra_guards.extend(zip(schema.extra_fns, extras, strict=True))
+            return key
+        # Read before the schema: an extension publishes its list before
+        # bumping the generation, so a racing resolve can only memoize an
+        # entry that is already stale.
+        generation = self._specialization_generation
+        signature = self._base_specialization_key(
+            args, is_distributed=is_distributed, custom_key=custom_key
+        )
+        extra_fns = self._specialize_extra.get(signature)
+        if extra_fns is None:
+            return prefix
+        if has_container and not _argument_device_is_fixed(args):
+            # The signature is not a function of the prefix: evaluate the
+            # schema as for an explicit signature.
+            extras = tuple(extractor(args) for extractor in extra_fns)
+            if extra_guards is not None:
+                extra_guards.extend(zip(extra_fns, extras, strict=True))
+            return (*prefix, extras) if extra_fns else prefix
+        extras, per_call = _evaluate_fast_dispatch_extras(extra_fns, args)
+        if extra_guards is not None:
+            extra_guards.extend(zip(extra_fns, extras, strict=True))
+        schema = _FastDispatchSchema(
+            generation, base_key_settings, extra_fns, extras, per_call, prefix
+        )
+        self._fast_dispatch_schemas[prefix] = schema
+        if schema.full_key is not None:
+            return schema.full_key
+        return (*prefix, extras)
 
     def _fast_dispatch_key_and_guards(
         self,
@@ -2422,6 +2890,7 @@ class Kernel(Generic[_R]):
             with self._specialize_extra_lock:
                 # Replace rather than clear: in-flight omitted-default aliases
                 # retain the old schema mapping while new work starts fresh.
+                # The generation bump below retires every published list.
                 self._specialize_extra = {}
                 self._compiler_seed_specialize_extra = {}
                 self._specialization_aliases = {}
@@ -2430,6 +2899,7 @@ class Kernel(Generic[_R]):
                 self._has_specialization_extras = False
                 self._specialization_generation += 1
                 self._reset_generation += 1
+                self._fast_dispatch_schemas = {}
 
     @property
     def jax_fn(self) -> Callable[..., Any]:
@@ -3617,24 +4087,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         ):
             if not guard_is_active(guard):
                 continue
-            extract_tensor = make_extractor(source)
-
-            def td_alignment_extractor(
-                args: Sequence[object],
-                _extract_tensor: Callable[
-                    [Sequence[object]], Hashable
-                ] = extract_tensor,
-                _requires_zero_storage_offset: bool = (
-                    guard.requires_zero_storage_offset
-                ),
-            ) -> Hashable:
-                tensor = cast("torch.Tensor", _extract_tensor(args))
-                return _concrete_tensor_satisfies_alignment_guard(
-                    tensor, _requires_zero_storage_offset
-                )
-
             # Prepared metadata guards do not cover base pointers.
-            extractors.append(td_alignment_extractor)
+            extractors.append(
+                _TensorDescriptorAlignmentExtractor(
+                    make_extractor(source), guard.requires_zero_storage_offset
+                )
+            )
 
         for key, specialization in sorted(
             self.env.runtime_input_specializations.items(),

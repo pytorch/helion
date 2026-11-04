@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from examples.jagged_layer_norm import jagged_layer_norm_kernel
-from examples.jagged_mean import jagged_mean_kernel
 import pytest
 import torch
 
@@ -11,7 +9,11 @@ from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+
+jagged_layer_norm_kernel = import_example("jagged_layer_norm").jagged_layer_norm_kernel
+jagged_mean_kernel = import_example("jagged_mean").jagged_mean_kernel
 
 pytestmark = skipUnlessBackends(["cute"])
 

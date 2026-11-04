@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.softmax import softmax_two_pass
 import pytest
 import sympy
 import torch
@@ -25,6 +24,7 @@ from helion._compiler.autotuner_heuristics.cute import CuteTileVecWarpPerRowHeur
 from helion._compiler.autotuner_heuristics.cute import CuteTileVecWarpReduceHeuristic
 from helion._compiler.autotuner_heuristics.cute import _cute_tile_inner_block_dtype
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
@@ -32,6 +32,8 @@ from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 from helion.language._tracing_ops import _host_tensor
 from helion.language.memory_ops import load as language_load
+
+softmax_two_pass = import_example("softmax").softmax_two_pass
 
 if TYPE_CHECKING:
     from collections.abc import Callable
