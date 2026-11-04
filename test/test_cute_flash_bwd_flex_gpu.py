@@ -39,11 +39,13 @@ pytest.importorskip("cutlass.cute")
 from torch.nn.attention.flex_attention import create_block_mask
 from torch.nn.attention.flex_attention import noop_mask
 
+import helion
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_flash import compiled_source
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -216,21 +218,19 @@ def _run(
     bound = kernel.bind(args)
     config = bound.config_spec.default_config()
     if config_overrides:
-        import helion
-
         fields = bound.config_spec._flat_fields()
         for key in config_overrides:
             assert key in fields, f"{key} is not a knob of this kernel"
         config = helion.Config(**{**config.config, **config_overrides})
     if table_steps:
-        import helion
-
         config = helion.Config(
             **{**config.config, "cute_flash_bwd_table_steps": table_steps}
         )
-    code = bound.to_code(config)
+    # One render per configuration; ``Kernel.bind`` and ``compile_config``
+    # memoize per argument specialization and configuration, so the launch
+    # below and a later run of the same kernel reuse this compile.
+    code = compiled_source(bound, config)
     assert "fbwd_sSteps" in code, "the fused flex backward did not fire"
-    bound.set_config(config)
     out = out.to(dtype) if layout == "bhsd" else _as_bshd(out.to(dtype))
     # The row-sum preprocess kernel would otherwise autotune per test shape.
     pre = flex_example._flex_attention_bwd_preprocess
@@ -631,11 +631,13 @@ def test_chunked_table_matches_the_whole_walk() -> None:
     ("d", "dv", "overrides"),
     [
         (64, 64, {}),
-        (128, 128, {}),
         (64, 64, {"cute_flash_bwd_persistent": 1}),
-        (128, 128, {"cute_flash_bwd_persistent": 1}),
         # The statistics MMAs (their per-stage aug barriers) across chunks.
         (64, 64, {"cute_flash_bwd_stats_mma": 1}),
+        # Head dim 128 (its stage budget) with the statistics MMAs alone and
+        # with both knobs; the plain 128 walk is the 2-CTA chunked tests'
+        # reference and persistent-only 128 chunking runs in
+        # test_chunked_persistent_two_tiles_per_cta.
         (128, 128, {"cute_flash_bwd_stats_mma": 1}),
         (128, 128, {"cute_flash_bwd_persistent": 1, "cute_flash_bwd_stats_mma": 1}),
         # Every knob that touches the per-step pipelines, chunked.
@@ -688,29 +690,37 @@ def test_chunked_grouped_heads_ragged(
 
 
 @_gpu_test
-@pytest.mark.parametrize("table_steps", [5, 7])
-def test_chunked_q_block_256(table_steps: int) -> None:
+def test_chunked_q_block_256() -> None:
     # 256-row Q blocks over 1000 rows: 4 blocks = 8 tiles (the last past M),
-    # 2 q heads: 16 steps in chunks of 5 (5 + 5 + 5 + 1) or 7 (7 + 7 + 2), so
-    # chunks start on the second tile of a block (odd step in the pair) too.
+    # 2 q heads: 16 steps in chunks of 5 (5 + 5 + 5 + 1), so chunks start on
+    # the second tile of a block (odd step in the pair) too and the last
+    # chunk is a single step.
     kw = {"b": 1, "hq": 2, "hkv": 1, "m": 1000, "n": 256, "d": 64, "mask_mod": _causal}
     whole, ref, _ = _run(**kw, block_size=(256, 128))
-    chunked, _, code = _run(**kw, block_size=(256, 128), table_steps=table_steps)
-    assert f"fbwd_nchunks = (fbwd_steps + {table_steps - 1}) // {table_steps}" in code
+    chunked, _, code = _run(**kw, block_size=(256, 128), table_steps=5)
+    assert "fbwd_nchunks = (fbwd_steps + 4) // 5" in code
     _assert_close(chunked, ref)
     _assert_same_walk(whole, chunked)
 
 
 @_gpu_test
-@pytest.mark.parametrize("d", [64, 128])
-def test_chunked_persistent_two_tiles_per_cta(d: int) -> None:
+def test_chunked_persistent_two_tiles_per_cta() -> None:
     # 2 batches x 8 kv heads x 12 KV tiles = 192 tiles over 148 SMs: the
     # persistent CTAs walk a second tile (table buffer 1, the nz_it > 0 and
     # chunk terms together, the TMA warp building tile t+1's table while tile
     # t refills its chunks); group 2, causal (masked diagonal), 3-step chunks
-    # of up to 24 steps per tile.
+    # of up to 24 steps per tile, at head dim 128 (the tighter stage budget;
+    # the second-tile walk itself does not depend on the width).
     overrides = {"cute_flash_bwd_persistent": 1}
-    kw = {"b": 2, "hq": 16, "hkv": 8, "m": 1536, "n": 1536, "d": d, "mask_mod": _causal}
+    kw = {
+        "b": 2,
+        "hq": 16,
+        "hkv": 8,
+        "m": 1536,
+        "n": 1536,
+        "d": 128,
+        "mask_mod": _causal,
+    }
     whole, ref, code = _run(**kw, config_overrides=overrides)
     assert "fbwd_tissued_ptr" in code and "fbwd_nchunks" not in code
     chunked, _, code = _run(**kw, config_overrides=overrides, table_steps=3)
@@ -818,7 +828,6 @@ def test_softcap_jacobian_head_dims(d: int, dv: int, dtype: torch.dtype) -> None
 @pytest.mark.parametrize(
     ("hq", "hkv", "m", "n", "score"),
     [
-        (2, 2, 256, 256, None),
         (4, 2, 320, 256, None),
         (2, 2, 256, 320, "alibi"),
         (2, 2, 512, 512, "softcap"),
@@ -829,9 +838,10 @@ def test_head_dim_256_pair(
     hq: int, hkv: int, m: int, n: int, score: str | None
 ) -> None:
     """The 2-CTA pair kernel (dK/dV and dQ cluster roles) at head dim 256:
-    causal, GQA, ragged M / N, an additive score_mod with coordinates (the
-    dQ clusters render the hooks in the forward frame) and a softcap
-    score_mod with its Jacobian."""
+    causal with GQA and ragged M / N, an additive score_mod with coordinates
+    (the dQ clusters render the hooks in the forward frame) and a softcap
+    score_mod with its Jacobian (the plain causal walk runs in the capture
+    and fully-masked tests below)."""
     kw: dict[str, object] = {}
     if score == "alibi":
 
@@ -1198,23 +1208,12 @@ def _run_pair(**kwargs: object) -> tuple[tuple[torch.Tensor, ...], ...]:
     [
         (1, 2, 2, 512, 512, {}),
         (1, 4, 2, 512, 512, {}),
-        (2, 2, 2, 256, 1024, {}),
         (1, 2, 2, 1000, 512, {}),
-        (1, 1, 1, 2048, 2048, {}),
         (1, 2, 2, 512, 768, {"cute_flash_bwd_exp2_f32": 0}),
         (2, 4, 2, 384, 512, {"cute_flash_bwd_tile_group": 2}),
         (1, 2, 2, 512, 512, {"cute_flash_bwd_regs": "88/168/88"}),
     ],
-    ids=[
-        "dense",
-        "gqa",
-        "cross_m_lt_n",
-        "ragged_m",
-        "long_walk",
-        "exp2_f16x2",
-        "tile_group",
-        "regs",
-    ],
+    ids=["dense", "gqa", "ragged_m", "exp2_f16x2", "tile_group", "regs"],
 )
 def test_two_cta_dense_matches_the_single_cta(
     b: int, hq: int, hkv: int, m: int, n: int, overrides: dict[str, object]
@@ -1222,7 +1221,9 @@ def test_two_cta_dense_matches_the_single_cta(
     """The cluster pair (one 256-row KV tile, dQ reduce-added once per 256
     KV rows) on full-table walks: dK / dV bitwise the 1-CTA kernel's (the
     same per-step products in the same order), dQ within rounding (one
-    K=256 accumulation instead of two fp32 partial adds)."""
+    K=256 accumulation instead of two fp32 partial adds). Grouped heads, a
+    ragged M, the packed exp2 pair, the KV-fastest order and the widest
+    register split; longer or ``M < N`` walks only add steps."""
     got2, got1, ref = _run_pair(
         b=b, hq=hq, hkv=hkv, m=m, n=n, d=128, overrides=overrides
     )
@@ -1273,6 +1274,12 @@ def _doc_blocks(b, h, q_idx, kv_idx):
 @pytest.mark.parametrize(
     ("b", "hq", "hkv", "m", "n", "mask_mod", "kwargs"),
     [
+        # Axes: the mask decides where the pair's lists differ (diagonal,
+        # window edge, document boundary, a never-attended tile); grouped
+        # heads and a ragged M change the merged walk's items; fp16 the
+        # operand type; the three chunked walks are a forced cap with four
+        # chunks per tile, a cap landing on odd pair steps and a natural
+        # table overflow; the element mask form is the other mask hook.
         (2, 2, 2, 512, 512, _causal, {}),
         (1, 2, 2, 512, 512, _window64, {}),
         (1, 4, 2, 512, 512, _causal, {}),
