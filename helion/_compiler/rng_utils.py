@@ -140,7 +140,12 @@ def philox_randint_ref(
     if low >= high:
         raise ValueError(f"low ({low}) must be less than high ({high})")
     signed = philox_int32_ref(seed, offset).to(torch.int64)
-    magnitude = torch.where(signed < 0, -signed, signed)
+    # Preserve the existing stream for narrow ranges. Wider ranges need all
+    # 32 random bits; abs(int32) only has 31 bits of magnitude.
+    if high - low > 1 << 31:
+        magnitude = signed & 0xFFFFFFFF
+    else:
+        magnitude = torch.where(signed < 0, -signed, signed)
     return (low + (magnitude % (high - low))).to(torch.int32)
 
 
