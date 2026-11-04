@@ -978,7 +978,7 @@ class TestPallasRNGRegression(TestCase):
         self.assertTrue(torch.equal(seed_buffer.cpu(), seeds64))
 
 
-@onlyBackends(["triton", "cute"])
+@onlyBackends(["cute"])
 @skipUnlessCuteAvailable("requires CUTLASS CuTe Python DSL")
 @unittest.skipIf(
     is_fbcode(),

@@ -7,13 +7,6 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _forbid_cuda_work
-from test._cute_dense_tcgen05 import blackwell_capability
-from test._cute_dense_tcgen05 import cpu_codegen_target
-from test._cute_dense_tcgen05 import extra_store_mm
-from test._cute_dense_tcgen05 import scaled_args
-from test._cute_dense_tcgen05 import vector_scaled_mm
-
 import helion
 from helion._compiler.cute.tcgen05_config import _TWO_CTA_PERSISTENT_PID_VETO
 from helion._compiler.cute.tcgen05_schedule_facts import Tcgen05FullTileScheduleFacts
@@ -24,6 +17,12 @@ from helion._compiler.cute.tcgen05_schedule_facts import (
     n_edge_cluster_schedule_supported,
 )
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import blackwell_capability
+from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
+from helion._testing.cute_dense_tcgen05 import extra_store_mm
+from helion._testing.cute_dense_tcgen05 import scaled_args
+from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
 from helion.autotuner.config_generation import ConfigGeneration
 
 if TYPE_CHECKING:
@@ -32,12 +31,12 @@ if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
 
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.fixture(autouse=True)
 def _cpu_codegen() -> Iterator[None]:
-    with cpu_codegen_target(), _forbid_cuda_work():
+    with cpu_codegen_target(), forbid_cuda_work():
         yield
 
 

@@ -17,6 +17,8 @@ from helion.language.inline_asm_ops import inline_asm_elementwise
 from helion.language.random_ops import _mulhi_lo_u32
 from helion.language.random_ops import _philox_uint32x4
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from typing import Any

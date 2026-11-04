@@ -22,19 +22,18 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion import exc
 from helion._compiler.tile_strategy import _lane_invariant_tail_after_consume
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 # --- the placement rules, on generated-code-shaped statements ---------------
@@ -368,8 +367,8 @@ def test_persistent_vector_markers_are_loads_and_stores_of_their_tensors() -> No
 
 
 def _generate(kernel: object, args: tuple[torch.Tensor, ...], **config: object) -> str:
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, args)
         return bound.to_code(helion.Config.from_dict(config))
 
 
@@ -628,8 +627,8 @@ def test_store_between_two_per_lane_stores_of_its_tensor_rejects_the_config(
 
 
 def test_generated_pure_inline_asm_runs_once_between_lane_passes() -> None:
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(_reduction_inline_asm, (*_ARGS, True))
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_reduction_inline_asm, (*_ARGS, True))
         code = bound.to_code(helion.Config.from_dict(_CONFIG_FEW_THREADS))
     function = _kernel_function(code)
     passes = _pass_indices(function)
@@ -656,7 +655,7 @@ def test_generated_pure_inline_asm_runs_once_between_lane_passes() -> None:
 
 
 def test_generated_impure_inline_asm_rejects_the_lane_split() -> None:
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(_reduction_inline_asm, (*_ARGS, False))
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_reduction_inline_asm, (*_ARGS, False))
         with pytest.raises(exc.BackendUnsupported, match="between per-lane statements"):
             bound.to_code(helion.Config.from_dict(_CONFIG_FEW_THREADS))

@@ -1,4 +1,4 @@
-"""Shared kernels and CPU code generation for TCgen05 AUX regressions."""
+"""Shared kernels and CPU code generation for tcgen05 AUX regressions."""
 
 from __future__ import annotations
 
@@ -9,17 +9,18 @@ from unittest.mock import patch
 
 import torch
 
+from . import patch_cute_mma_support
+from .cute_codegen import mock_cuda_unavailable
 import helion
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
-from helion._testing import patch_cute_mma_support
 import helion.language as hl
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _batched_aux(
+def batched_aux(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
     bias: torch.Tensor,
@@ -37,7 +38,7 @@ def _batched_aux(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _rank_two_aux(
+def rank_two_aux(
     lhs: torch.Tensor, rhs: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
     m, k = lhs.shape
@@ -51,7 +52,7 @@ def _rank_two_aux(
     return out
 
 
-def _config(**overrides: Any) -> helion.Config:
+def aux_config(**overrides: object) -> helion.Config:
     values: dict[str, Any] = {
         "block_sizes": [64, 256, 64],
         "num_warps": 8,
@@ -67,10 +68,11 @@ def _config(**overrides: Any) -> helion.Config:
         "tcgen05_warp_spec_c_input_warps": 1,
         "tcgen05_aux_load_mode": "tma",
     }
-    return helion.Config(**(values | overrides))
+    values.update(overrides)
+    return helion.Config(**values)
 
 
-def _inputs(
+def aux_inputs(
     *,
     batches: int = 3,
     m: int = 128,
@@ -84,7 +86,7 @@ def _inputs(
     )
 
 
-def _rank_two_inputs() -> tuple[torch.Tensor, ...]:
+def rank_two_inputs() -> tuple[torch.Tensor, ...]:
     return tuple(
         torch.empty(shape, dtype=torch.bfloat16)
         for shape in ((128, 128), (128, 512), (128, 512))
@@ -92,22 +94,16 @@ def _rank_two_inputs() -> tuple[torch.Tensor, ...]:
 
 
 @contextmanager
-def _cpu_codegen() -> Iterator[None]:
+def cpu_codegen() -> Generator[None, None, None]:
+    """Generate tcgen05 AUX source on CPU for a 148-SM sm103 target.
+
+    These tests inspect generated source without compiling or launching CuTe.
+    ``mock_cuda_unavailable`` supplies the CPU-only device probes; the patches
+    below pin the target the schedule heuristics read.
+    """
     with (
         patch_cute_mma_support(),
-        # These tests inspect generated source without compiling or launching
-        # CuTe. They do not require the installed runtime DSL or TVM FFI.
-        patch("helion._compiler.cute.cutedsl_compat.check_cute_backend_requirements"),
-        patch("torch.cuda.is_available", return_value=False),
-        # The capability probes below read torch.cuda.is_available() and are
-        # functools.cache'd for the process: the first ConfigSpec built under
-        # the patch above would otherwise cache "no CUDA" answers that later
-        # tests (test_tensor_descriptor.py) read as "tensor descriptors
-        # unsupported".  Patch the probes themselves, as _mock_cuda_unavailable
-        # in _cute_binding.py does, so nothing is computed under the patch.
-        patch("helion._compat._supports_tensor_descriptor", return_value=False),
-        patch("helion._compat._supports_maxnreg", return_value=False),
-        patch("helion._compat._is_hip", return_value=False),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")),
         patch(
             "helion._compiler.compile_environment.target_device_capability",
@@ -121,6 +117,6 @@ def _cpu_codegen() -> Iterator[None]:
         yield
 
 
-def _rank_two_code(args: tuple[torch.Tensor, ...], config: helion.Config) -> str:
-    with _cpu_codegen():
-        return _rank_two_aux._bind_isolated(args).to_code(config)
+def rank_two_code(args: tuple[torch.Tensor, ...], config: helion.Config) -> str:
+    with cpu_codegen():
+        return rank_two_aux._bind_isolated(args).to_code(config)

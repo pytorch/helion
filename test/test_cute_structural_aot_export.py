@@ -35,6 +35,8 @@ from helion.runtime.cute_structural_config import StructuralPolicyError
 from helion.runtime.cute_structural_policy import CUTE_STRUCTURAL_SETTINGS
 from helion.runtime.cute_structural_policy import CuteStructuralPolicy
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator

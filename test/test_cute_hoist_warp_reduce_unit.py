@@ -27,8 +27,12 @@ from __future__ import annotations
 import ast
 import textwrap
 
+import pytest
+
 from helion._compiler.cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
 from helion._testing import TestCase
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _run(src: str, running_sums: set[str] | None = None) -> str:

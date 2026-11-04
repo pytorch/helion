@@ -7,8 +7,6 @@ import unittest
 
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
 from helion import exc
 from helion._testing import DEVICE
@@ -16,6 +14,7 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
 
 # K (head_dim) on the third ``num_threads`` slot: 32 threads x 2 lanes.
@@ -46,7 +45,7 @@ def _fp8_attention_cpu_render(config: dict[str, object], **settings: object) -> 
         autotune_effort="none",
         **settings,
     )
-    return _cpu_bind(kernel, args).to_code(helion.Config(**config))
+    return cpu_bind(kernel, args).to_code(helion.Config(**config))
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -99,7 +98,7 @@ class TestCuteDotLaneFold(unittest.TestCase):
         """Only e4m3 has a scalar decode: e5m2 operands keep the refusal."""
         q = torch.empty(2, 64, 64, dtype=torch.float8_e5m2)
         k = torch.empty(2, 64, 64, dtype=torch.float8_e5m2)
-        bound = _cpu_bind(_e5m2_scores, (q, k))
+        bound = cpu_bind(_e5m2_scores, (q, k))
         with self.assertRaisesRegex(exc.BackendUnsupported, "synthetic lanes"):
             bound.to_code(helion.Config(block_sizes=[64, 32], num_threads=[0, 1, 32]))
 

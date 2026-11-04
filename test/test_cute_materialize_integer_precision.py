@@ -10,14 +10,16 @@ import torch
 from torch.fx import Graph
 from torch.fx import Node
 
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 from test.test_cute_signed_bitfield_bf16 import _graph
 
 import helion
 from helion._compiler.cute.materialize_operand import _exact_integer_cast
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from torch._ops import OpOverload
@@ -202,7 +204,7 @@ def test_actual_recipe_admission_uses_integer_precision(
     # integer arithmetic still needs the proved-range check.
     expected = derived_expected if derived else True
     with (
-        _cpu_target(),
+        cpu_target(),
         patch.object(
             CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
         ),

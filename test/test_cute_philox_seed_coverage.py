@@ -15,7 +15,11 @@ from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 import helion.language as hl
 
-pytestmark = [pytest.mark.usefixtures("cpu_only"), skipUnlessBackends(["cute"])]
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.usefixtures("cpu_only"),
+    skipUnlessBackends(["cute"]),
+]
 
 
 def _uniform_pointwise(x: torch.Tensor, seed: int) -> torch.Tensor:

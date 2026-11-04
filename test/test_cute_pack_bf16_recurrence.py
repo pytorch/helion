@@ -9,6 +9,8 @@ from helion._compiler.ast_extension import ExtendedAST
 from helion._compiler.ast_extension import convert
 from helion._compiler.cute.pack_bf16_recurrence import pack_bf16_recurrences
 
+pytestmark = pytest.mark.cpu_only
+
 SOURCE = """
 key_fragment = cute.make_rmem_tensor(8, cutlass.Float32)
 state_fragment = cute.make_rmem_tensor(8, cutlass.BFloat16)

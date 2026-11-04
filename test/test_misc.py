@@ -25,10 +25,6 @@ from torch.testing._internal.common_utils import parametrize
 from torch.utils._sympy.functions import PowByNatural
 from torch.utils._sympy.value_ranges import ValueRanges
 
-from ._cute_binding import _codegen_skip_reason
-from ._cute_binding import _cpu_bind
-from ._cute_binding import _forbid_native_compile
-from ._cute_binding import _mock_cuda_unavailable
 from .cute_population_contracts import _target
 import helion
 from helion import _compat
@@ -46,6 +42,7 @@ from helion._testing import get_test_dot_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCute
+from helion._testing import skipIfFbTriton
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
@@ -55,6 +52,10 @@ from helion._testing import skipIfXPU
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing.cute_codegen import codegen_skip_reason
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -654,6 +655,10 @@ class TestMisc(RefEagerTestBase, TestCase):
                     )
 
     @skipIfXPU("one wrapped 8-bit result differs from XPU eager by 256")
+    @skipIfFbTriton(
+        "fbtriton crashes the test worker on 8- and 16-bit integer math "
+        "(every fbtriton-h100 CI run, Nov 2026)"
+    )
     def test_narrow_integer_math_wraps_like_eager(self):
         # Eager wraps every 8- and 16-bit integer result, and converts a
         # Python number operand to the tensor's dtype first (x_uint8 % -7
@@ -1915,14 +1920,14 @@ class TestHelionCutePrinter(TestCase):
         backends = [
             backend
             for backend in ("cute", "triton")
-            if _codegen_skip_reason(backend) is None
+            if codegen_skip_reason(backend) is None
         ]
         if not backends:
             raise unittest.SkipTest("no backend can generate device source")
         with (
-            _mock_cuda_unavailable(),
+            mock_cuda_unavailable(),
             _target(),
-            _forbid_native_compile(),
+            forbid_native_compile(),
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         ):
             for backend in backends:
@@ -1931,7 +1936,7 @@ class TestHelionCutePrinter(TestCase):
                 )
                 for bits in (5, 31, 62):
                     with self.subTest(backend=backend, bits=bits):
-                        bound = _cpu_bind(
+                        bound = cpu_bind(
                             kernel, (torch.ones(3, dtype=torch.int64), bits)
                         )
                         code = bound.to_code(bound.config_spec.default_config())
@@ -2053,14 +2058,14 @@ class TestHelionCutePrinter(TestCase):
             return result
 
         with (
-            _mock_cuda_unavailable(),
+            mock_cuda_unavailable(),
             _target(),
-            _forbid_native_compile(),
+            forbid_native_compile(),
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         ):
             for begin, end, step in ((0, 63, 1), (3, 63, 2), (62, -1, -1)):
                 with self.subTest(begin=begin, end=end, step=step):
-                    bound = _cpu_bind(
+                    bound = cpu_bind(
                         powers, (torch.ones(5, dtype=torch.int64), begin, end, step)
                     )
                     code = bound.to_code(bound.config_spec.default_config())
@@ -2095,7 +2100,7 @@ class TestHelionCutePrinter(TestCase):
                                 },
                             )
                             self.assertEqual(actual, 1 << value)
-            bound = _cpu_bind(powers, (torch.ones(5, dtype=torch.int64), 0, 64, 1))
+            bound = cpu_bind(powers, (torch.ones(5, dtype=torch.int64), 0, 64, 1))
             with self.assertRaisesRegex(exc.BackendUnsupported, "proved exponent"):
                 bound.to_code(bound.config_spec.default_config())
 
@@ -2554,8 +2559,8 @@ def _run_narrow_shift_generated(code, x, shifts):
 def test_cute_narrow_integer_shifts_generated(dtype, count_kind):
     args = _narrow_shift_inputs(dtype, count_kind)
     snapshots = [a.clone() for a in args[:2]]
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_narrow_integer_shift_chain, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_narrow_integer_shift_chain, args)
         for block_size in (32, 128):
             code = bound.to_code(
                 helion.Config(block_sizes=[block_size], num_threads=[32])
@@ -2681,8 +2686,8 @@ def _unsigned_load_input(dtype, device):
 @pytest.mark.parametrize("dtype", (torch.uint8, torch.uint32))
 def test_cute_unsigned_scalar_load_codegen(dtype):
     x = _unsigned_load_input(dtype, "cpu")
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_unsigned_scalar_widen, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_unsigned_scalar_widen, (x,))
         for size in (32, 128):
             code = bound.to_code(helion.Config(block_sizes=[size], num_threads=[32]))
             branches = [

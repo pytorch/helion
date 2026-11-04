@@ -9,17 +9,19 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_radix_selection import _custom_payload
 from test.test_cute_radix_selection import _payload_selection
 
 from helion._compiler.cute.radix_selection import radix_schedule
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.compiler_coverage import CoverageDependency
 from helion.exc import InvalidConfig
 from helion.runtime.config import Config
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -30,9 +32,9 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
         yield
@@ -72,7 +74,7 @@ def _config(bound: BoundKernel[object], **changes: object) -> Config:
 def test_inverse_uses_exact_typed_payload_and_preserves_masks(
     dtype: torch.dtype,
 ) -> None:
-    bound = _cpu_bind(_custom_payload, (*_args(dtype), False, True, True))
+    bound = cpu_bind(_custom_payload, (*_args(dtype), False, True, True))
     graph = bound.config_spec.cute_radix_selection_graph
     assert graph is not None
     enabled = _config(bound)
@@ -107,23 +109,23 @@ def test_inverse_uses_exact_typed_payload_and_preserves_masks(
     ],
 )
 def test_inverse_requires_complete_valid_ticket_plan(dependency: str) -> None:
-    bound = _cpu_bind(_custom_payload, (*_args(), False, False, False))
+    bound = cpu_bind(_custom_payload, (*_args(), False, False, False))
     with pytest.raises(InvalidConfig):
         bound.to_code(_config(bound, **{dependency: False}))
 
 
 def test_inverse_declines_shifted_reads_and_smallest_domain() -> None:
-    shifted = _cpu_bind(_custom_payload, (*_args(), True, False, False))
+    shifted = cpu_bind(_custom_payload, (*_args(), True, False, False))
     with pytest.raises(InvalidConfig):
         shifted.to_code(_config(shifted))
-    smallest = _cpu_bind(_payload_selection, (*_args(), False, False))
+    smallest = cpu_bind(_payload_selection, (*_args(), False, False))
     with pytest.raises(InvalidConfig):
         smallest.to_code(_config(smallest))
 
 
 def test_inverse_has_a_scoped_deferred_coverage_witness() -> None:
     key = "cute_radix_cached_payload_inverse"
-    bound = _cpu_bind(_custom_payload, (*_args(), False, False, False))
+    bound = cpu_bind(_custom_payload, (*_args(), False, False, False))
     groups = {group.key: group for group in bound.config_spec.compiler_coverage_groups}
     group = groups[key]
     assert group.deferred and group.legacy is False and group.domain == (False, True)
@@ -145,7 +147,7 @@ def test_inverse_has_a_scoped_deferred_coverage_witness() -> None:
         (_custom_payload, (*_args(), True, False, False)),
         (_payload_selection, (*_args(), False, False)),
     ):
-        declined = _cpu_bind(kernel, args)
+        declined = cpu_bind(kernel, args)
         declined_group = next(
             group
             for group in declined.config_spec.compiler_coverage_groups

@@ -25,8 +25,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_lane_loop_distribution import _accesses
 from test.test_cute_lane_loop_distribution import _escaping_names
 from test.test_cute_lane_loop_distribution import _kernel_function
@@ -34,9 +32,11 @@ from test.test_cute_lane_loop_distribution import _loops
 
 import helion
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def _row_sum_then_zero_rows_fn(
@@ -181,8 +181,8 @@ def _render(
     variant: str, d: int, shape: tuple[int, int, int], rolled: int | None
 ) -> str:
     args = row_sum_store_args(variant, d, d, shape)
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(row_sum_store_kernel(variant), args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(row_sum_store_kernel(variant), args)
         config = row_sum_store_config(bound, rolled=rolled)
         return bound.to_code(helion.Config(**config))
 

@@ -19,9 +19,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_fp32_dot import _batched_dot
 from test.test_cute_fp32_dot import _chunk_cumsum
@@ -30,6 +27,9 @@ import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import BooleanFragment
 import helion.language as hl
 
@@ -214,9 +214,9 @@ def _chunk_cumsum_input_load_between(
 @pytest.fixture
 def _cpu_only():
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
         yield
@@ -233,7 +233,7 @@ def _lane_loop(code: str) -> str:
 
 def test_the_stored_dot_writes_from_the_lanes(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = _cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(_chunk_cumsum, (g,))
     simt = bound.to_code(_config(bound))
     tf32 = bound.to_code(_config(bound, **{DOT: "tf32_mma"}))
     vec = bound.to_code(_config(bound, **{DOT: "tf32_mma", VEC: True}))
@@ -270,7 +270,7 @@ def test_unproved_packets_store_scalars(_cpu_only: None) -> None:
     x = torch.ones(2, 24, 20)
     y = torch.ones(2, 20, 10)
     z = torch.ones(2, 24, 10)
-    bound = _cpu_bind(_batched_dot, (x, y, z))
+    bound = cpu_bind(_batched_dot, (x, y, z))
     code = bound.to_code(_config(bound, **{DOT: "tf32_mma", VEC: True}))
     loop = _lane_loop(code)
     assert PACKET not in loop and PAIR not in loop
@@ -285,7 +285,7 @@ def test_unproved_packets_store_scalars(_cpu_only: None) -> None:
 )
 def test_other_readers_keep_the_staged_tile(_cpu_only: None, kernel: object) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = _cpu_bind(kernel, (g,))  # type: ignore[arg-type]
+    bound = cpu_bind(kernel, (g,))  # type: ignore[arg-type]
     code = bound.to_code(_config(bound, **{DOT: "tf32_mma", VEC: True}))
     assert code.count(MMA) == 1
     assert PACKET not in code and PAIR not in code
@@ -326,7 +326,7 @@ def test_accesses_between_the_dot_and_its_store_keep_the_staged_tile(
     # store or load of that window (or of a view of its storage, or of a
     # nested loop that may do either) the program places before the store.
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = _cpu_bind(kernel, (g, *extra_args))  # type: ignore[arg-type]
+    bound = cpu_bind(kernel, (g, *extra_args))  # type: ignore[arg-type]
     for knobs in (
         {DOT: "tf32_mma", VEC: True},
         {DOT: "tf32_mma", VEC: True, ROWS: True},
@@ -340,25 +340,25 @@ def test_disjoint_accesses_between_the_dot_and_its_store_stay_direct(
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
     knobs = {DOT: "tf32_mma", VEC: True}
     # A store into a fresh allocation cannot alias the window.
-    bound = _cpu_bind(_chunk_cumsum_fresh_store_between, (g,))
+    bound = cpu_bind(_chunk_cumsum_fresh_store_between, (g,))
     _assert_direct(bound.to_code(_config(bound, **knobs)))
     # Two inputs are disjoint only by the bound key's alias matrix: distinct
     # tensors prove it; the same tensor (or an overlapping view of it) in
     # both slots keeps the staged tile.
     other = torch.ones(4, 64, 128)
     out = torch.ones(4, 64, 128)
-    bound = _cpu_bind(_chunk_cumsum_input_load_between, (g, other, out))
+    bound = cpu_bind(_chunk_cumsum_input_load_between, (g, other, out))
     _assert_direct(bound.to_code(_config(bound, **knobs)))
-    bound = _cpu_bind(_chunk_cumsum_input_load_between, (g, out, out))
+    bound = cpu_bind(_chunk_cumsum_input_load_between, (g, out, out))
     _assert_staged(bound.to_code(_config(bound, **knobs)))
     storage = torch.ones(5, 64, 128)
-    bound = _cpu_bind(_chunk_cumsum_input_load_between, (g, storage[1:], storage[:4]))
+    bound = cpu_bind(_chunk_cumsum_input_load_between, (g, storage[1:], storage[:4]))
     _assert_staged(bound.to_code(_config(bound, **knobs)))
 
 
 def test_split_k_keeps_the_staged_partials(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 16, dtype=torch.bfloat16)
-    bound = _cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(_chunk_cumsum, (g,))
     code = bound.to_code(
         _config(bound, **{DOT: "tf32_mma", VEC: True, SPLIT: True, THREADS: 512})
     )
@@ -375,7 +375,7 @@ def test_split_k_keeps_the_staged_partials(_cpu_only: None) -> None:
 
 def test_mma_rows_joins_the_search_surface(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = _cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(_chunk_cumsum, (g,))
     spec = bound.config_spec
     assert spec.cute_fragment_mma_rows_root_ids
     assert isinstance(spec._flat_fields()[ROWS], BooleanFragment)
@@ -413,7 +413,7 @@ def test_mma_rows_joins_the_search_surface(_cpu_only: None) -> None:
 
 def test_mma_rows_hoists_the_a_words(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = _cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(_chunk_cumsum, (g,))
     tiles = bound.to_code(_config(bound, **{DOT: "tf32_mma", VEC: True}))
     rows = bound.to_code(_config(bound, **{DOT: "tf32_mma", VEC: True, ROWS: True}))
     assert "fragment_mma_tile_row" not in tiles and "fragment_mma_step" in tiles

@@ -7,8 +7,6 @@ from typing import cast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_matmul import _is_direct_zero_seed
@@ -16,10 +14,13 @@ from helion._compiler.cute.collective_matmul import has_collective_native_seed_c
 from helion._compiler.cute.matmul_utils import cute_matmul_root_placements
 from helion._testing import TestCase
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_spec import KernelGridFact
 from helion.autotuner.config_spec import MatmulFact
 from helion.autotuner.config_spec import RootGridFact
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
@@ -57,7 +58,7 @@ def _admitted_inputs() -> tuple[torch.Tensor, ...]:
 
 @skipUnlessBackends(["cute"])
 def test_independent_contractions_receive_complete_collective_seeds() -> None:
-    bound = _cpu_bind(_independent_matmuls, _admitted_inputs())
+    bound = cpu_bind(_independent_matmuls, _admitted_inputs())
     assert bound.host_function is not None
     with bound.env:
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
@@ -217,7 +218,7 @@ def test_serial_loop_carried_accumulator_receives_no_collective_seeds() -> None:
     # The full-slice K contraction accumulates the chunk loop's carry, so only
     # the first chunk starts from the captured zero. The lowering refuses such
     # a site under every config, so the heuristic must not seed the kernel.
-    bound = _cpu_bind(_serial_state_recurrence, _state_inputs())
+    bound = cpu_bind(_serial_state_recurrence, _state_inputs())
     assert bound.host_function is not None
     ir = bound.host_function.device_ir
     (fact,) = bound.config_spec.matmul_facts
@@ -243,7 +244,7 @@ def test_serial_loop_carried_accumulator_receives_no_collective_seeds() -> None:
 def test_serial_loop_indexed_operands_receive_no_collective_seeds() -> None:
     # A zero created in every chunk passes the seed proof, but the operands
     # index the chunk loop's coordinate, which no scalar recipe can replay.
-    bound = _cpu_bind(_serial_fresh_zero, _state_inputs())
+    bound = cpu_bind(_serial_fresh_zero, _state_inputs())
     assert bound.host_function is not None
     ir = bound.host_function.device_ir
     with bound.env:
@@ -289,7 +290,7 @@ def test_branch_between_grid_rows_and_reduction_receives_no_collective_seeds() -
         torch.empty((256, 256), dtype=torch.float16),
         torch.empty((1,), dtype=torch.float32),
     )
-    bound = _cpu_bind(_branch_around_reduction, inputs)
+    bound = cpu_bind(_branch_around_reduction, inputs)
     assert bound.host_function is not None
     ir = bound.host_function.device_ir
     with bound.env:
@@ -304,7 +305,7 @@ def test_enclosing_loop_block_size_keeps_collective_seeds() -> None:
     # position (grid index, tile begin, or the tile as a load coordinate)
     # would deny the operands a scalar recipe.
     inputs = tuple(torch.empty((256, 256), dtype=torch.float16) for _ in range(2))
-    bound = _cpu_bind(_block_size_scaled_operand, inputs)
+    bound = cpu_bind(_block_size_scaled_operand, inputs)
     assert bound.host_function is not None
     with bound.env:
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
@@ -319,7 +320,7 @@ class TestCollectiveSeedCodegen(TestCase):
     def test_admitted_contractions_keep_their_seeds_and_code(self) -> None:
         # The structural seed filter must leave an admitted kernel untouched:
         # pin the seed count and the first seed's generated code.
-        bound = _cpu_bind(_independent_matmuls, _admitted_inputs())
+        bound = cpu_bind(_independent_matmuls, _admitted_inputs())
         assert bound.host_function is not None
         with bound.env:
             seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(

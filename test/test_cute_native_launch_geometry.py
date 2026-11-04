@@ -13,7 +13,6 @@ import pytest
 import torch
 
 from test.test_cute_full_slice_matmul import _bind
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 from test.test_cute_materialized_fission import _se_args
 from test.test_cute_materialized_fission import _sources
 
@@ -22,13 +21,14 @@ from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 
 matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
 squeeze_and_excitation_net_fwd = import_example(
     "squeeze_and_excitation_net"
 ).squeeze_and_excitation_net_fwd
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _cpu_b200() -> Iterator[None]:
     with (
-        _cpu_target(),
+        cpu_target(),
         patch.object(
             CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
         ),

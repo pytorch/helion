@@ -11,6 +11,8 @@ from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion.autotuner.block_id_sequence import BlockIdSequence
 from helion.autotuner.config_spec import L2GroupingSpec
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion.autotuner.config_spec import ConfigSpec
 

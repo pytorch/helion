@@ -9,7 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_native_compile
 from test.test_cute_bounded_cache_codegen import _cpu_target
 from test.test_cute_full_reduction_loop_encoding import rms_norm
 
@@ -18,11 +17,14 @@ from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.fuse_two_pass_loads import fuse_two_pass_loads
 import helion._compiler.cute.prefetch_reduction_packets as prefetch_module
 from helion._compiler.cute.prefetch_reduction_packets import prefetch_reduction_packets
+from helion._testing.cute_codegen import forbid_native_compile
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import CuteReductionReloadSpec
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 
 def source(*, lanes: int = 1, width: int = 4, carrier: str = "Uint16") -> str:
@@ -370,7 +372,7 @@ def test_actual_strict_configs_keep_control_math_and_reach_bounded_lane_domains(
     initialized = torch.cuda.is_initialized()
     with (
         _cpu_target(),
-        _forbid_native_compile() as calls,
+        forbid_native_compile() as calls,
         patch("helion.runtime.kernel.target_device_capability", return_value=(10, 3)),
         patch(
             "helion._compiler.compile_environment.target_device_capability",
@@ -464,7 +466,7 @@ def test_multirow_launch_dimensions_allow_prefetch_without_changing_math(
     initialized = torch.cuda.is_initialized()
     with (
         _cpu_target(),
-        _forbid_native_compile() as native,
+        forbid_native_compile() as native,
         patch.object(
             BaseSearch, "autotune", side_effect=AssertionError("autotune forbidden")
         ) as tune,

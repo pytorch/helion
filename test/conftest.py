@@ -8,6 +8,7 @@ import sys
 from typing import TYPE_CHECKING
 from typing import Any
 import warnings
+import zlib
 
 from _pytest._io.saferepr import saferepr
 import psutil
@@ -150,27 +151,42 @@ def _free_device_memory_gib() -> float | None:
     return None
 
 
-def _gpu_num_workers() -> int | None:
-    """Workers that fit the GPU: 0 (serial) below two, None without a GPU."""
+def _cpu_lane(config: pytest.Config) -> bool:
+    """Whether this run selects the ``cpu_only`` modules (``-m cpu_only``)."""
+    return "cpu_only" in (config.getoption("markexpr", None) or "")
+
+
+def _default_num_workers(config: pytest.Config) -> int | None:
+    """Workers that fit the GPU: 0 (serial) below two, None without a GPU.
+
+    The CPU lane only generates source, so without a GPU it gets one
+    single-threaded worker per CPU (under the GPU cap, for memory). Other runs
+    without an NVIDIA, ROCm, or XPU device (Metal, TPU, plain CPU) stay serial,
+    as their device runtimes expect.
+    """
     free_gib = _free_device_memory_gib()
     if free_gib is None:
-        return None
-    workers = min(
-        int(free_gib // _GPU_GIB_PER_WORKER),
-        _num_cpus() // _CPUS_PER_WORKER,
-        _MAX_WORKERS,
-    )
+        if not _cpu_lane(config):
+            return None
+        workers = min(_num_cpus(), _MAX_WORKERS)
+    else:
+        workers = min(
+            int(free_gib // _GPU_GIB_PER_WORKER),
+            _num_cpus() // _CPUS_PER_WORKER,
+            _MAX_WORKERS,
+        )
     # A single worker only adds xdist's startup cost to a serial run.
     return workers if workers >= 2 else 0
 
 
 @pytest.hookimpl(optionalhook=True)
 def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
-    # Size ``-n auto`` to the GPU rather than xdist's default of one worker per
-    # CPU, unless PYTEST_XDIST_AUTO_NUM_WORKERS (read by xdist) overrides it.
+    # Size ``-n auto`` to the GPU (or the CPUs without one) rather than xdist's
+    # default of one worker per CPU, unless PYTEST_XDIST_AUTO_NUM_WORKERS (read
+    # by xdist) overrides it.
     if os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS"):
         return None
-    return _gpu_num_workers()
+    return _default_num_workers(config)
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -180,10 +196,10 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
     if not config.pluginmanager.hasplugin("xdist") or hasattr(config, "workerinput"):
         return
     option = config.option
-    # Without -n, run in parallel on a GPU, except where one process is
-    # expected: -s, --pdb, --trace, --collect-only, and a pytest run started
-    # from inside a test (PYTEST_CURRENT_TEST is set while one runs), which
-    # observes its own reports in order.  -n0 runs serially.
+    # Without -n, run in parallel, except where one process is expected: -s,
+    # --pdb, --trace, --collect-only, and a pytest run started from inside a
+    # test (PYTEST_CURRENT_TEST is set while one runs), which observes its own
+    # reports in order.  -n0 runs serially.
     if (
         option.numprocesses is None
         and not option.tx
@@ -191,12 +207,58 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
         and not (option.usepdb or option.trace or option.collectonly)
         and "PYTEST_CURRENT_TEST" not in os.environ
     ):
-        option.numprocesses = _gpu_num_workers()
+        option.numprocesses = _default_num_workers(config)
     # worksteal lets idle workers take tests queued behind a long-running one;
     # xdist's default "load" scheduler leaves them stuck on a single worker
     # (e.g. the FLA-backed linear examples serialized into a ~16 min tail).
     if option.numprocesses and option.dist == "no":
         option.dist = "worksteal"
+
+
+def _active_backend() -> str:
+    # Mirrors helion.runtime.settings._get_backend without importing torch into
+    # the xdist controller; tileir shares the Triton tests (matchesBackends).
+    backend = os.environ.get("HELION_BACKEND", "triton").strip().lower()
+    return "triton" if backend == "tileir" else backend
+
+
+def _shard_of(item: pytest.Item, shards: int) -> int:
+    # Whole modules stay in one shard so module-level kernels, fixtures and
+    # reference compiles are built once per lane.
+    return zlib.crc32(str(item.path).encode()) % shards
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    deselected: list[pytest.Item] = []
+    kept: list[pytest.Item] = []
+    # test_cute_*.py modules hard-code backend="cute" on their kernels, so they
+    # test the same code under every HELION_BACKEND; only the CuTe lane runs
+    # them. Other modules gate CuTe-only tests with onlyBackends and friends.
+    cute_lane = _active_backend() == "cute"
+    # HELION_TEST_SHARD=i/n splits one lane across n CI runners.
+    shard = os.environ.get("HELION_TEST_SHARD")
+    index, shards = 0, 1
+    if shard:
+        try:
+            index, shards = (int(part) for part in shard.split("/"))
+        except ValueError:
+            index, shards = -1, 0
+        if not 0 <= index < shards:
+            raise pytest.UsageError(
+                f"HELION_TEST_SHARD={shard!r} is not of the form i/n with 0 <= i < n"
+            )
+    for item in items:
+        if (not cute_lane and item.path.name.startswith("test_cute_")) or (
+            shards > 1 and _shard_of(item, shards) != index
+        ):
+            deselected.append(item)
+        else:
+            kept.append(item)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = kept
 
 
 def _worker_status_dir(config: pytest.Config) -> Path | None:

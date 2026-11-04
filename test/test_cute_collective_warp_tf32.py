@@ -9,8 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_collective_tf32 import _config
 from test.test_cute_collective_tf32 import _jagged_inputs
 from test.test_cute_collective_tf32 import _kernel
@@ -19,6 +17,8 @@ from test.test_cute_collective_tf32 import _round_tf32
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 @pytest.fixture
 def cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
@@ -63,7 +63,7 @@ def _seeded_fp32(a: torch.Tensor, b: torch.Tensor, seed: torch.Tensor) -> torch.
 def test_computed_tail_uses_tf32_warp_fragments(
     cpu_only: None, tile: tuple[int, int, int], static_shapes: bool
 ) -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _kernel(batched=True, static_shapes=static_shapes),
         (torch.empty((3, 130, 78)), torch.empty((3, 78, 70))),
     )
@@ -81,7 +81,7 @@ def test_computed_tail_uses_tf32_warp_fragments(
 def test_warp_precision_policy_keeps_fp32_fallback(
     cpu_only: None, precision: str
 ) -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _kernel(precision=precision),
         _jagged_inputs(batch=3, rows=137, k=64, n=64),
     )
@@ -97,7 +97,7 @@ def test_warp_precision_policy_keeps_fp32_fallback(
 def test_warp_tf32_requires_sm80_or_newer(
     cpu_only: None, capability: tuple[int, int], enabled: bool
 ) -> None:
-    bound = _cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=137, k=64, n=64))
+    bound = cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=137, k=64, n=64))
     bound.config_spec.target_device_capability = capability
     source = bound.to_code(_config(32, 32, 32, compute="warp"))
     assert ("MmaTF32Op" in source) is enabled
@@ -115,7 +115,7 @@ def test_async_tf32_rounds_in_registers_with_one_barrier_per_stage(
     cpu_only: None, stages: int
 ) -> None:
     arguments = _jagged_inputs(batch=3, rows=137, k=128, n=64)
-    bound = _cpu_bind(_kernel(), arguments)
+    bound = cpu_bind(_kernel(), arguments)
     config = _config(32, 32, 32, compute="warp", copy="async_cached")
     config.config["cute_collective_stages"] = stages
     source = bound.to_code(config)
@@ -216,7 +216,7 @@ def test_single_stage_async_tf32_keeps_shared_publication_barriers(
     cpu_only: None,
 ) -> None:
     arguments = _jagged_inputs(batch=3, rows=137, k=128, n=64)
-    bound = _cpu_bind(_kernel(), arguments)
+    bound = cpu_bind(_kernel(), arguments)
     config = _config(32, 32, 32, compute="warp", copy="async_cached")
     config.config["cute_collective_stages"] = 1
     source = bound.to_code(config)
@@ -244,7 +244,7 @@ def test_single_stage_async_tf32_keeps_shared_publication_barriers(
 
 def test_fp32_seed_uses_exact_register_accumulator(cpu_only: None) -> None:
     arguments = (torch.empty((65, 48)), torch.empty((48, 70)), torch.empty((65, 70)))
-    bound = _cpu_bind(_seeded_fp32, arguments)
+    bound = cpu_bind(_seeded_fp32, arguments)
     config = helion.Config(
         block_sizes=[32, 32, 32],
         num_threads=[4, 32, 1],
@@ -262,7 +262,7 @@ def test_fp32_seed_uses_exact_register_accumulator(cpu_only: None) -> None:
 
 def test_collective_kernel_honors_cute_pdl(cpu_only: None) -> None:
     arguments = _jagged_inputs(batch=3, rows=137, k=64, n=64)
-    bound = _cpu_bind(_kernel(), arguments)
+    bound = cpu_bind(_kernel(), arguments)
     bound.config_spec.target_device_capability = (10, 0)
     config = _config(32, 32, 32, compute="warp", copy="async_cached")
     config.config["cute_collective_stages"] = 4

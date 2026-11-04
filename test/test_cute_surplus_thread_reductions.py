@@ -23,12 +23,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -82,7 +81,7 @@ def _config(
 @contextmanager
 def _cpu_codegen() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -106,7 +105,7 @@ def _k2_reduce_lines(code: str) -> list[str]:
 def test_the_k2_reduction_spans_the_launch_threads_of_its_axis() -> None:
     """The K2 tile of 16 rows sits on the K loop's 32-thread axis; its reduction is the cross-warp two-stage combine over all 64 launched threads of the row, not a warp group of the 16 real ones."""
     with _cpu_codegen():
-        bound = _cpu_bind(_matmul_then_k2_scaled_rows, _inputs("cpu"))
+        bound = cpu_bind(_matmul_then_k2_scaled_rows, _inputs("cpu"))
         code = bound.to_code(
             _config(bound, block_sizes=[16, 64, 16], num_threads=[1, 32])
         )
@@ -121,7 +120,7 @@ def test_the_k2_reduction_spans_the_launch_threads_of_its_axis() -> None:
 def test_a_lane_looped_reduction_narrower_than_the_launch_is_declined() -> None:
     """A K2 tile of 32 rows on 16 threads walks a lane loop; the 16 surplus threads of the 32-thread launch walk it too, so neither a group of 16 (their partial races on every owner-guarded store) nor one of 32 (a strided layout counts their aliased elements twice) is a reduction."""
     with _cpu_codegen():
-        bound = _cpu_bind(_matmul_then_k2_scaled_rows, _inputs("cpu", k2=32))
+        bound = cpu_bind(_matmul_then_k2_scaled_rows, _inputs("cpu", k2=32))
         with pytest.raises(
             helion.exc.BackendUnsupported, match="narrower than the launch"
         ):
@@ -145,13 +144,13 @@ def test_a_thread_shape_beyond_the_launch_limits_is_declined_at_codegen() -> Non
         return out
 
     with _cpu_codegen():
-        bound = _cpu_bind(_matmul_then_k2_scaled_rows, _inputs("cpu", k=256))
+        bound = cpu_bind(_matmul_then_k2_scaled_rows, _inputs("cpu", k=256))
         code = bound.to_code(
             _config(bound, block_sizes=[16, 128, 16], num_threads=[2, 128])
         )
         assert "block=(2, 128, 1)" in code
 
-        bound = _cpu_bind(add, (torch.empty(2, 2, 128),))
+        bound = cpu_bind(add, (torch.empty(2, 2, 128),))
         with pytest.raises(helion.exc.BackendUnsupported, match="per-axis limits"):
             bound.to_code(
                 helion.Config(block_sizes=[2, 2, 128], num_threads=[2, 2, 128])

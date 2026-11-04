@@ -20,10 +20,12 @@ import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language import memory_ops
 
-# Metal runs on macOS only: CI's Linux jobs skip the whole file.
-pytestmark = pytest.mark.skipif(
-    sys.platform != "darwin", reason="Metal tests require macOS"
-)
+# Metal runs on macOS only: CI's Linux jobs skip the whole file. It needs no
+# GPU where it does run, so it belongs to the cpu_only lane.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.skipif(sys.platform != "darwin", reason="Metal tests require macOS"),
+]
 
 
 def _target_names(graph: Graph) -> list[str]:

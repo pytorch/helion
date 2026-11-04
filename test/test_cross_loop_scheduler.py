@@ -7,6 +7,7 @@ from typing import Literal
 from typing import cast
 from unittest import mock
 
+import pytest
 import sympy
 
 from helion import exc
@@ -36,6 +37,8 @@ from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import instantiate_coordinate_domains
 from helion._testing import TestCase
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _domain(

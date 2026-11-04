@@ -5,7 +5,6 @@ import ast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.test_cute_collective_dot import _invariant_seed_dot
 from test.test_cute_collective_seeds import _independent_matmuls
 from test.test_cute_collective_tcgen05 import _scalar_epilogues
@@ -16,6 +15,7 @@ from helion._compiler.cute.collective_tcgen05 import CollectiveTcgen05Plan
 from helion._compiler.cute.collective_tcgen05 import CollectiveTmemResource
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
@@ -87,7 +87,7 @@ def _inputs(dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tenso
 def test_native_uploads_float32_carry_before_accumulating(
     dtype: torch.dtype, tile: tuple[int, int, int]
 ) -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(dtype))
+    bound = cpu_bind(_seeded_contraction, _inputs(dtype))
     source = bound.to_code(_config(*tile))
     warp = bound.to_code(_config(*tile, compute="warp"))
     assert "tcgen05.CtaGroup.ONE" in source
@@ -102,7 +102,7 @@ def test_native_uploads_float32_carry_before_accumulating(
 
 @skipUnlessBackends(["cute"])
 def test_seeded_native_is_optional_and_survives_config_roundtrip() -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
+    bound = cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
     assert "tcgen05.CtaGroup.ONE" not in bound.to_code(_config(enabled=False))
     assert "tcgen05.CtaGroup.ONE" not in bound.to_code(_config(compute="warp"))
     with bound.env:
@@ -116,9 +116,9 @@ def test_seeded_native_is_optional_and_survives_config_roundtrip() -> None:
 @skipUnlessBackends(["cute"])
 def test_seed_search_distinguishes_nonzero_carries(seeded: bool) -> None:
     if seeded:
-        bound = _cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
+        bound = cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
     else:
-        bound = _cpu_bind(
+        bound = cpu_bind(
             _independent_matmuls,
             tuple(
                 torch.empty(shape, dtype=torch.bfloat16)
@@ -164,9 +164,9 @@ def test_seed_search_distinguishes_nonzero_carries(seeded: bool) -> None:
 def test_seeded_native_does_not_relax_carry_dtype_or_alias_proofs(reason: str) -> None:
     a, b, seed, _limit = _inputs(torch.float16)
     if reason == "invariant":
-        bound = _cpu_bind(_invariant_seed_dot, (a, b.T, seed))
+        bound = cpu_bind(_invariant_seed_dot, (a, b.T, seed))
     elif reason == "written_seed":
-        bound = _cpu_bind(_seed_written_in_place, (a, b, seed))
+        bound = cpu_bind(_seed_written_in_place, (a, b, seed))
         for enabled in (False, True):
             with pytest.raises(
                 helion.exc.BackendUnsupported,
@@ -175,7 +175,7 @@ def test_seeded_native_does_not_relax_carry_dtype_or_alias_proofs(reason: str) -
                 bound.to_code(_config(enabled=enabled))
         return
     else:
-        bound = _cpu_bind(_seeded_contraction, (a, b, seed.half(), 78))
+        bound = cpu_bind(_seeded_contraction, (a, b, seed.half(), 78))
     source = bound.to_code(_config())
     assert "tcgen05.CtaGroup.ONE" not in source
     assert "fence_view_async_tmem_store" not in source
@@ -206,7 +206,7 @@ def test_seed_store_wait_precedes_cta_handoff(bm: int, bn: int) -> None:
 @pytest.mark.parametrize("value", [0, 1, "true", None])
 @skipUnlessBackends(["cute"])
 def test_seeded_native_requires_boolean_config(value: object) -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(torch.float16))
+    bound = cpu_bind(_seeded_contraction, _inputs(torch.float16))
     config = helion.Config.from_dict(
         _config().config | {"cute_collective_native_seeded": value}
     )
@@ -219,7 +219,7 @@ def test_seeded_native_requires_boolean_config(value: object) -> None:
 def test_seeded_native_is_available_only_on_sm100(
     capability: tuple[int, int] | None,
 ) -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
+    bound = cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
     bound.config_spec.target_device_capability = capability
     with pytest.raises(
         helion.exc.InvalidConfig,
@@ -265,7 +265,7 @@ def test_native_seed_search_covers_both_original_contractions(
     inputs = tuple(
         torch.empty(size, dtype=torch.bfloat16) for size in _mamba_sizes(shape)
     )
-    bound = _cpu_bind(_mamba_kernel(static_shapes=static_shapes), inputs)
+    bound = cpu_bind(_mamba_kernel(static_shapes=static_shapes), inputs)
     assert bound.host_function is not None
     with bound.env:
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(

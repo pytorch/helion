@@ -20,8 +20,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test._cute_vloop_sink_kernels import col_reduce_sum_static
 from test.test_cute_pdl import _COLUMN_SUM
 from test.test_cute_tcgen05_fixed_chain import _bind_gemm
@@ -33,8 +31,13 @@ import helion
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.pdl_release import generic_release_rendered
 from helion._compiler.triton.backend import TritonBackend
+from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.runtime.settings import Settings
+
+pytestmark = pytest.mark.cpu_only
 
 _ENV = "HELION_AUTOTUNE_FINAL_SELECTION_PREFERENCE_TOLERANCE"
 _WAIT = "    cute.arch.griddepcontrol_wait()\n"
@@ -247,6 +250,7 @@ def test_the_tolerance_is_an_environment_override(raw: str, expected: float) -> 
         search.log.warning.assert_called_once()
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.usefixtures("_cpu_only")
 def test_rendered_kernels_rank_as_their_lowering() -> None:
     # Real renders: a column reduction on the generic path releases at entry
@@ -254,8 +258,8 @@ def test_rendered_kernels_rank_as_their_lowering() -> None:
     # a tcgen05 GEMM on the entry-wait path gets
     # the generic wait but its MMA warp owns the release, so its configs
     # rank last whatever placement they carry: a pair of them is a tie.
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable():
+        bound = cpu_bind(
             col_reduce_sum_static, (torch.empty(1024, 1024, dtype=torch.bfloat16),)
         )
         generic = bound.config_spec.normalized_config(

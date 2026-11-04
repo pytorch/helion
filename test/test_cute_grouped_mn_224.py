@@ -8,9 +8,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_grouped_d_shift import _assignment
 from test.test_cute_grouped_d_shift import _config
@@ -28,10 +25,15 @@ from helion._compiler.cute.tcgen05_constants import (
     tcgen05_grouped_worklist_epilogue_shape,
 )
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
+
+pytestmark = pytest.mark.cpu_only
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -88,8 +90,8 @@ def _args(*, n: int = 512, groups: int = 8, dtype=torch.int64):
 
 
 def _source(args=None, config=None):
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped, _args() if args is None else args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped, _args() if args is None else args)
         config = bound.config_spec.normalized_config(
             _profile() if config is None else config
         )
@@ -206,7 +208,7 @@ def test_resolved_device_store_and_host_ir_agree_on_stage_bytes_and_tma_rank():
     source = _source()
     tree = ast.parse(source)
     _, ab, output = _plans(source)
-    with _forbid_cuda_work(), _sdk() as sdk:
+    with forbid_cuda_work(), _sdk() as sdk:
         c, cute = sdk.cutlass, sdk.cute
         function = sdk.func.FuncOp("mn224", ([], []))
         with sdk.ir.InsertionPoint(function.add_entry_block()):
@@ -320,8 +322,8 @@ def test_exact_capacity_and_proved_descriptor_discounts():
 
 
 def test_resource_config_fails_closed():
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped, _args(groups=32))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped, _args(groups=32))
         model = bound.config_spec._cute_tcgen05_config
         assert model.grouped_d_shift_supported
         assert bound.config_spec.normalized_config(_profile())["tcgen05_ab_stages"] == 7
@@ -346,24 +348,24 @@ def test_resource_config_fails_closed():
 
 @pytest.mark.parametrize("variant", [1, 2, 3])
 def test_tail_descriptor_requires_closed_zero_seeded_pure_contraction(variant):
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped, (*_args(n=160), variant))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped, (*_args(n=160), variant))
         assert not bound.config_spec._cute_tcgen05_config.grouped_d_shift_supported
         with pytest.raises((InvalidConfig, BackendUnsupported)):
             bound.to_code(_profile(depth=2))
 
 
 def test_feature_tail_keeps_output_tma_stride_alignment_guard():
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped, _args(n=513))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped, _args(n=513))
         with pytest.raises((InvalidConfig, BackendUnsupported)):
             bound.to_code(_profile(depth=2))
 
 
 @pytest.mark.parametrize("variant", [0, 1])
 def test_feature_tail_cannot_relax_fresh_contiguous_output_ownership(variant):
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_unsafe_output, (*_args(n=256), variant))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_unsafe_output, (*_args(n=256), variant))
         with pytest.raises((InvalidConfig, BackendUnsupported)):
             bound.to_code(_profile(depth=2))
 

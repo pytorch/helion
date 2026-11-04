@@ -10,6 +10,8 @@ from test.test_cute_grouped_device_panel import _config
 from test.test_cute_grouped_device_panel import _emit
 from test.test_cute_grouped_device_panel import _panel_block
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("cluster_n", [1, 2])
 @pytest.mark.parametrize(

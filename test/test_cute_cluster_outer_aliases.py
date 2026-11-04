@@ -3,8 +3,12 @@ from __future__ import annotations
 import ast
 import unittest
 
+import pytest
+
 from helion._compiler.cute import cluster_online_pair as pair
 from helion._compiler.cute import rolled_cluster_online_pair as rolled
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _program() -> list[ast.stmt]:

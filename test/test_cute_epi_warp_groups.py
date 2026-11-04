@@ -56,7 +56,7 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_role_launch_n_width
 from helion._testing import skipUnlessBackends
 from helion.exc import InvalidConfig
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 GROUPS = TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
 SUBTILE = TCGEN05_EPI_SUBTILE_N_CONFIG_KEY

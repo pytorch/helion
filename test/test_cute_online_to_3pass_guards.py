@@ -16,8 +16,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.cute.online_to_3pass import _detect_online_softmax
 from helion._compiler.cute.online_to_3pass import _OnlineToThreePassTransformer
@@ -26,7 +24,10 @@ from helion._compiler.host_function import HostFunction
 from helion._compiler.host_function import KernelDefinition
 from helion._compiler.source_location import UnknownLocation
 from helion._testing import import_example
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 row_softmax = import_example("aot_example").row_softmax
 
@@ -70,7 +71,7 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.delenv("HELION_DISABLE_ONLINE_TO_3PASS", raising=False)
     monkeypatch.setenv("HELION_ONLINE_TO_3PASS_MIN_N", "0")
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",

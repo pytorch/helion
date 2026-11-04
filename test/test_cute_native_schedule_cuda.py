@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_dense_tcgen05 import vector_scaled_mm
 from test.test_cute_epilogue_fanout import bias_gelu_aux
 from test.test_cute_epilogue_fanout import gelu_aux_scaled
 from test.test_cute_epilogue_fanout import paired
@@ -31,6 +30,7 @@ from helion._compiler.cute.grouped_row_union import SCHEDULE_KEY
 from helion._compiler.cute.grouped_row_union import TRANSPOSED_SCHEDULE
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
 
 grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 

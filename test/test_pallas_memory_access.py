@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from helion import Config
@@ -24,6 +25,8 @@ from helion._compiler.pallas.tracing_ops import _annotate_provable_sublane_align
 from helion._compiler.tile_strategy import LoopDimInfo
 from helion.language import memory_ops
 from helion.language.atomic_ops import atomic_add
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from helion._compiler.inductor_lowering import CodegenState

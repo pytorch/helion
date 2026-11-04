@@ -14,12 +14,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_cuda_work
-from test._cute_dense_tcgen05 import gb300_target
-from test._cute_dense_tcgen05 import scaled_args
-from test._cute_dense_tcgen05 import scaled_mm
-from test._cute_dense_tcgen05 import wrapper_plans
-
 import helion
 from helion._compiler.cute import cute_mma
 from helion._compiler.cute.dense_aligned_n import ALIGNED_N_CHOICES
@@ -29,6 +23,11 @@ from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import tcgen05_two_cta_m128_epilogue_tile_expr
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import gb300_target
+from helion._testing.cute_dense_tcgen05 import scaled_args
+from helion._testing.cute_dense_tcgen05 import scaled_mm
+from helion._testing.cute_dense_tcgen05 import wrapper_plans
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
@@ -45,12 +44,12 @@ h = pytest.importorskip("cutlass.utils.blackwell_helpers")
 epi = pytest.importorskip("cutlass.utils.gemm.sm100")
 LayoutEnum = pytest.importorskip("cutlass.utils.layout").LayoutEnum
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.fixture(autouse=True)
 def _gb300() -> Iterator[None]:
-    with gb300_target(), _forbid_cuda_work():
+    with gb300_target(), forbid_cuda_work():
         yield
 
 

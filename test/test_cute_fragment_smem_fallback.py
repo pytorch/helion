@@ -8,12 +8,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 
 layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
 
@@ -29,7 +28,7 @@ pytestmark = skipUnlessBackends("cute")
 def _cpu_only() -> Iterator[None]:
     # The CPU model has no device to query: pin the B200 CTA capacity.
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch(
             "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_capacity_bytes",
             return_value=232448,
@@ -55,7 +54,7 @@ def _bind(rows: int, columns: int) -> BoundKernel:
         autotune_effort="full",
         ignore_warnings=[helion.exc.TensorOperationInWrapper],
     )
-    return _cpu_bind(kernel, args)
+    return cpu_bind(kernel, args)
 
 
 def test_wide_rows_fall_back_to_the_scalar_lowering() -> None:

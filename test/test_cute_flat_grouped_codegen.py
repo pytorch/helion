@@ -27,6 +27,8 @@ from helion._compiler.cute.tcgen05_flat_grouped_ir import prove_flat_grouped_rna
 from helion._compiler.cute.tcgen05_flat_grouped_plan import flat_grouped_rna_schedule
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandRolePlan
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion._compiler.cute.tcgen05_flat_grouped_plan import FlatGroupedRnaSchedule
     from helion.runtime.kernel import BoundKernel

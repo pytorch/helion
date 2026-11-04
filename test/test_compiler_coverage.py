@@ -41,6 +41,8 @@ from helion.runtime.config import Config
 from helion.runtime.settings import Settings
 from helion.runtime.settings import default_autotuner_fn
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion.autotuner.config_generation import ConfigGeneration
 

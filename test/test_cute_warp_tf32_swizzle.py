@@ -9,9 +9,8 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from test._cute_binding import _mock_cuda_unavailable
-
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import mock_cuda_unavailable
 
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
@@ -49,7 +48,7 @@ def test_recast_tf32_swizzle_preserves_vectors_and_stage_bounds(bits: int) -> No
     storage = (ctypes.c_int32 * count)()
     address = ctypes.addressof(storage)
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         # This is a host JIT function. It evaluates layout address arithmetic and

@@ -13,7 +13,6 @@ import torch
 
 from test import test_cute_rank3_rhs_b_tma as grouped
 from test.test_autotuner_heuristics import _grouped_worklist_bind_patches
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
 from helion._compiler.cute.cute_mma import _MmaSearchGraphView
@@ -25,7 +24,10 @@ from helion._compiler.cute.cute_mma import (
 from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 from helion.language import memory_ops
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -38,7 +40,7 @@ def _target(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("HELION_CUTE_MMA_IMPL", "tcgen05")
     monkeypatch.setattr(grouped, "DEVICE", torch.device("cpu"))
     with (
-        _cpu_target(),
+        cpu_target(),
         _grouped_worklist_bind_patches(),
         patch(
             "helion._compiler.cute.tcgen05_config."

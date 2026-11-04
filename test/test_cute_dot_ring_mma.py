@@ -9,12 +9,11 @@ import pytest
 import torch
 from torch import Tensor
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -106,7 +105,7 @@ def _cpu_code(
     fn: Callable[..., object], args: tuple[object, ...], config: helion.Config
 ) -> str:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         kernel = helion.kernel(
@@ -115,19 +114,19 @@ def _cpu_code(
             static_shapes=True,
             ignore_warnings=[helion.exc.TensorOperationInWrapper],
         )
-        bound = _cpu_bind(kernel, args)
+        bound = cpu_bind(kernel, args)
         return bound.to_code(config)
 
 
 def _cpu_spec(fn: Callable[..., object], args: tuple[object, ...]) -> Any:
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         kernel = helion.kernel(
             fn,
             backend="cute",
             static_shapes=True,
             ignore_warnings=[helion.exc.TensorOperationInWrapper],
         )
-        return _cpu_bind(kernel, args).config_spec
+        return cpu_bind(kernel, args).config_spec
 
 
 @pytest.mark.parametrize(

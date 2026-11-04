@@ -10,6 +10,8 @@ from typing import cast
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _CollectiveYields(ast.NodeTransformer):
     """Run the actual helper, stopping threads at CUDA collective operations."""

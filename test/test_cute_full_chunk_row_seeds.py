@@ -8,7 +8,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_native_compile
 from test.test_cute_bounded_cache_codegen import _cpu_target
 
 import helion
@@ -18,9 +17,12 @@ from helion._compiler.autotuner_heuristics.cute_full_chunk_row import (
 from helion._compiler.autotuner_heuristics.cute_rolled_cluster_packet import (
     CuteRolledClusterPacketHeuristic,
 )
+from helion._testing.cute_codegen import forbid_native_compile
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -79,7 +81,7 @@ def cpu_only() -> Iterator[None]:
     # families; the packet-cluster suite checks their complete integration.
     with (
         _cpu_target(),
-        _forbid_native_compile() as native,
+        forbid_native_compile() as native,
         patch.object(
             CuteRolledClusterPacketHeuristic, "get_seed_configs", return_value=[]
         ),

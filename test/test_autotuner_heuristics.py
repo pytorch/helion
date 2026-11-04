@@ -23,10 +23,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._argument_device import _ArgumentDeviceResolver as _DeviceResolver
 from helion._compiler.autotuner_heuristics import compiler_promotion_specialization_key
@@ -293,6 +289,9 @@ from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner import IntegerFragment
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
@@ -5710,6 +5709,7 @@ _FP8_SKINNY_M_SEED_NUM_THREADS = [0, 32]
 _FP8_SKINNY_M_SEED_VECTOR_WIDTHS = [4, 8]
 
 
+@onlyBackends(["cute"])
 class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
     """Skinny-M FP8 GEMM heuristic: fires only for a single FP8 matmul with
     static M <= 16 and seeds the [1, 256] / nt=[0, 32] / vec=[4, 8] config that
@@ -5929,6 +5929,7 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
                 )
 
 
+@onlyBackends(["cute"])
 class TestCuteTcgen05ClusterM2Heuristic(TestCase):
     # Structural-coverage enumeration keeps a few of these tests above the
     # suite's default 60s per-test timeout on slower CI runners, which kills
@@ -11849,6 +11850,7 @@ class TestTritonReductionHeuristic(TestCase):
             self.assertEqual(seed["num_warps"], 8)
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "width,strided",
@@ -11879,8 +11881,8 @@ def test_cute_narrow_pointwise_seeds_with_safe_loads(
 
     x = torch.empty(16384, width * (2 if strided else 1), dtype=dtype)
     args = (x[:, ::2] if strided else x,) * 2
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(add, args)
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(add, args)
         spec = bound.config_spec
         assert "cute_pointwise_vec" in spec.autotuner_heuristics
         if width <= 8:
@@ -11930,6 +11932,7 @@ def test_cute_narrow_pointwise_seeds_with_safe_loads(
         assert len(lists) == len(set(lists))
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("width", [4095, 4096])
 def test_cute_pointwise_transposed_axis_does_not_flatten(width: int) -> None:
     @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -11939,8 +11942,8 @@ def test_cute_pointwise_transposed_axis_does_not_flatten(width: int) -> None:
             out[rows, columns] = x[rows, columns] + 1
         return out
 
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(add, (torch.empty(8, width, dtype=torch.bfloat16).T,))
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(add, (torch.empty(8, width, dtype=torch.bfloat16).T,))
         assert bound.host_function is not None
         seeds = CutePointwiseVecHeuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
@@ -11977,7 +11980,7 @@ def _bind_cute_matmul_without_cutlass() -> None:
     assert sys.modules.get("cutlass", 0) is None
     with (
         _grouped_worklist_bind_patches(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         # This checks planning imports only; no CuTe source generation runs.
         patch("helion._compiler.cute.backend.CuteBackend.validate_environment"),
     ):
@@ -11993,6 +11996,7 @@ def _bind_cute_matmul_without_cutlass() -> None:
     assert bound.host_function is not None
 
 
+@skipUnlessBackends(["cute"])
 def test_cute_heuristics_register_facts_without_cutlass() -> None:
     # Most CI runners lack the CuTe DSL, yet CPU binds still run every cute
     # heuristic's register_facts. Their planning imports must stay importable
@@ -12110,8 +12114,8 @@ def test_cute_row_hints_preserve_fixed_leading_axis(
             out[batch, row, col] = x[batch, row, col]
         return out
 
-    with _mock_cuda_unavailable(), patch_cute_mma_support():
-        bound = _cpu_bind(copy, (torch.empty(2, 16, 2048), reversed_registration))
+    with mock_cuda_unavailable(), patch_cute_mma_support():
+        bound = cpu_bind(copy, (torch.empty(2, 16, 2048), reversed_registration))
     row, col = (1, 0) if reversed_registration else (0, 1)
     spec = bound.config_spec
     assert len(spec.block_sizes) == 2
@@ -12133,6 +12137,7 @@ def test_cute_row_hints_preserve_fixed_leading_axis(
         )
 
 
+@skipUnlessBackends(["cute"])
 def test_cute_dot_row_reduction_seed_keeps_the_softmax_axis_in_thread() -> None:
     """``hl.dot`` over head_dim whose result is reduced (``amax``/``sum``) over
     the key tile: the key tile's ``num_threads`` slot seeds (and defaults to) 1,
@@ -12152,8 +12157,8 @@ def test_cute_dot_row_reduction_seed_keeps_the_softmax_axis_in_thread() -> None:
     batch, heads, seq_len, head_dim = 1, 4, 256, 64
     q = torch.empty((batch * heads, seq_len, head_dim), dtype=torch.float8_e4m3fn)
     v = torch.empty((batch * heads, head_dim, seq_len), dtype=torch.float8_e4m3fn)
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, (q, q, v, batch, heads))
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(kernel, (q, q, v, batch, heads))
         assert bound.host_function is not None
         device_ir = bound.host_function.device_ir
         assert CuteDotRowReductionHeuristic.is_eligible(bound.env, device_ir)
@@ -12177,6 +12182,7 @@ def test_cute_dot_row_reduction_seed_keeps_the_softmax_axis_in_thread() -> None:
         assert "l_ij_lane_acc" in code
 
 
+@skipUnlessBackends(["cute"])
 def test_cute_dot_row_reduction_seed_needs_a_row_reduction() -> None:
     """A dot whose N axis is only stored (no reduction over it) gets no seed."""
     from helion._compiler.autotuner_heuristics.cute_dot_row_reduction import (
@@ -12198,8 +12204,8 @@ def test_cute_dot_row_reduction_seed_needs_a_row_reduction() -> None:
         return out
 
     q = torch.empty(2, 64, 64, dtype=torch.bfloat16)
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(scores, (q, q))
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(scores, (q, q))
         assert bound.host_function is not None
         assert not CuteDotRowReductionHeuristic.is_eligible(
             bound.env, bound.host_function.device_ir

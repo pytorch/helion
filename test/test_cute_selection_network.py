@@ -5,9 +5,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
@@ -18,7 +15,12 @@ from helion._compiler.cute.selection_coarse import coarse_rank_recover
 from helion._compiler.cute.selection_coarse import trace_coarse_rank_selection
 from helion._compiler.cute.selection_network import selection_network
 from helion._compiler.device_ir import IfGraphInfo
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _expected(
@@ -217,8 +219,8 @@ def test_selection_tensor_helpers_trace_directly_in_helion(coarse):
         if coarse
         else torch.ones((3, 4, 8), dtype=torch.int64)
     )
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, (x,))
     graphs = bound.host_function.device_ir.graphs
     targets = {node.target for info in graphs for node in info.graph.nodes}
     assert torch.ops.aten.topk.default not in targets

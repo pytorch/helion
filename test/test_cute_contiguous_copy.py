@@ -17,6 +17,8 @@ from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.cute.contiguous_copy import CopyTensorFacts
 from helion._compiler.cute.contiguous_copy import plan_contiguous_copy
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 

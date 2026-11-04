@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 
+import pytest
 import torch
 
 from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
@@ -21,7 +22,7 @@ from helion._compiler.cute.collective_matmul import _hoist_invariant_epilogue_lo
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def _collective_config() -> helion.Config:

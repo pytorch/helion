@@ -10,19 +10,21 @@ import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_resident_reductions_codegen import _kernel_and_arguments
 
 from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
     CuteResidentReductionHeuristic,
 )
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.precompile_future import _load_compiled_fn
 from helion.autotuner.precompile_future import _serialize_compiled_fn
 from helion.autotuner.precompile_future import _unload_compiled_fn
 from helion.runtime.cute import launcher
 from helion.runtime.cute import source_dependencies
+
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture
@@ -183,14 +185,14 @@ def test_ordinary_resident_codegen_tracks_helper_edits_and_missing_source(
     monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")
     kernel, args = _kernel_and_arguments("layer_norm", torch.bfloat16)
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(kernel, args)
+        bound = cpu_bind(kernel, args)
         host = bound.host_function
         assert host is not None
         seeds = CuteResidentReductionHeuristic.get_seed_configs(

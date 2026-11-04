@@ -9,7 +9,6 @@ from typing import cast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test._cute_register_tile_kernels import col_scale_three
 from test._cute_register_tile_kernels import col_softmax
 from test._cute_register_tile_kernels import col_sum_dynamic
@@ -28,7 +27,10 @@ from helion._compiler.autotuner_heuristics import get_heuristics
 from helion._compiler.autotuner_heuristics.cute import CuteColumnReductionHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteRegisterTileHeuristic
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -102,7 +104,7 @@ def test_seed_compiles_bodies_the_register_tile_cannot_schedule(
     # live-value budget overrun) and the seed compiles with the rolled lane
     # nesting instead of raising.
     arguments = make_arguments()
-    bound = _cpu_bind(kernel, arguments)
+    bound = cpu_bind(kernel, arguments)
     bound.config_spec.target_device_capability = capability
     host = bound.host_function
     assert host is not None
@@ -120,7 +122,7 @@ def test_seed_compiles_bodies_the_register_tile_cannot_schedule(
 @skipUnlessBackends(["cute"])
 def test_seed_keeps_bf16_to_fp32_column_store_on_sm100() -> None:
     arguments = (torch.empty((128, 1024), dtype=torch.bfloat16),)
-    bound = _cpu_bind(col_sum_f32_out, arguments)
+    bound = cpu_bind(col_sum_f32_out, arguments)
     bound.config_spec.target_device_capability = (10, 0)
     host = bound.host_function
     assert host is not None
@@ -162,7 +164,7 @@ def test_seed_retries_wide_extents_as_the_looped_reduction(
     # the seed as the same geometry without the register tile: the looped
     # reduction (reduction_loops=[128]), not a 32-thread scalar lane.
     arguments = make_arguments()
-    bound = _cpu_bind(kernel, arguments)
+    bound = cpu_bind(kernel, arguments)
     host = bound.host_function
     assert host is not None
     seed = CuteRegisterTileHeuristic.get_seed_config(bound.env, host.device_ir)
@@ -192,7 +194,7 @@ def test_seed_skips_bodies_outside_the_register_tile_shape() -> None:
         ),
         (col_sum_dynamic, (torch.empty((1024, 1024), dtype=torch.float32),)),
     ):
-        bound = _cpu_bind(kernel, arguments)
+        bound = cpu_bind(kernel, arguments)
         host = bound.host_function
         assert host is not None
         assert not CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
@@ -206,7 +208,7 @@ def test_chained_reductions_seed_half_the_lanes_per_level() -> None:
     # tile on 8 vector threads.  The chained body is also the autotune-off
     # default and renders the two-level register tile.
     arguments = (torch.empty((128, 1024), dtype=torch.float32),)
-    bound = _cpu_bind(col_softmax, arguments)
+    bound = cpu_bind(col_softmax, arguments)
     host = bound.host_function
     assert host is not None
     assert CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
@@ -244,7 +246,7 @@ def test_register_tile_and_column_reduction_seeds_are_disjoint() -> None:
     assert CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
     assert not CuteColumnReductionHeuristic.is_eligible(bound.env, host.device_ir)
     arguments = (torch.empty((1024, 1024), dtype=torch.bfloat16),)
-    bound = _cpu_bind(col_reduce_sum_static, arguments)
+    bound = cpu_bind(col_reduce_sum_static, arguments)
     host = bound.host_function
     assert host is not None
     assert not bound.config_spec.reduction_loops
@@ -296,7 +298,7 @@ def test_seed_skips_bodies_whose_lane_split_would_order_memory() -> None:
     # the reduction block keeps each element in one thread and keeps the seed.
     for kernel in (_col_sum_accumulate, _col_sum_reload):
         arguments = (torch.empty((128, 1024), dtype=torch.float32),)
-        bound = _cpu_bind(kernel, arguments)
+        bound = cpu_bind(kernel, arguments)
         host = bound.host_function
         assert host is not None
         assert not CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
@@ -305,7 +307,7 @@ def test_seed_skips_bodies_whose_lane_split_would_order_memory() -> None:
         assert "num_threads" not in default.config
         bound.to_code(default)
     arguments = (torch.empty((128, 1024), dtype=torch.float32),)
-    bound = _cpu_bind(_col_sum_scale_in_place, arguments)
+    bound = cpu_bind(_col_sum_scale_in_place, arguments)
     host = bound.host_function
     assert host is not None
     assert CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)

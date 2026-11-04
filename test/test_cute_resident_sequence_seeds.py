@@ -8,15 +8,14 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics.cute_resident_sequence import (
     CuteResidentSequenceHeuristic,
 )
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
@@ -24,7 +23,7 @@ from helion.autotuner.pattern_search import PatternSearch
 
 softmax_bwd = import_example("softmax").softmax_bwd
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -35,7 +34,7 @@ if TYPE_CHECKING:
 @pytest.fixture(scope="module", autouse=True)
 def _forbid_cuda() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -63,7 +62,7 @@ def _bind(
         torch.empty((rows, columns), dtype=torch.float16),
         torch.empty((rows, columns), dtype=torch.float16),
     )
-    return _cpu_bind(kernel, args), args
+    return cpu_bind(kernel, args), args
 
 
 def _seeds(bound: BoundKernel) -> list[helion.Config]:

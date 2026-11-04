@@ -11,13 +11,14 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.test_cute_fuse_mm_accumulation import _cpu_target
-
 import helion
 from helion._compiler.cute import cute_epilogue
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
 @pytest.fixture
 def cpu_b200() -> Iterator[None]:
     with (
-        _cpu_target(),
+        cpu_target(),
         patch.object(
             CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
         ),

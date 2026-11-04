@@ -7,6 +7,10 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 _BUILDER_PATH = (
     Path(__file__).resolve().parents[1]
     / ".github"

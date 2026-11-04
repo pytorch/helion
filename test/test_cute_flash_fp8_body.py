@@ -21,7 +21,6 @@ import torch
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
-from test._cute_aux import _cpu_codegen
 from test.test_cute_flash_fp8_facts import dot_attention_k_major
 from test.test_cute_flash_fp8_facts import dot_attention_rows
 from test.test_cute_flash_fp8_facts import fp8_dot_attention_k_major
@@ -32,6 +31,7 @@ from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
 from helion.runtime.kernel import Kernel
 
@@ -136,7 +136,7 @@ def _render(
 ) -> str:
     """CPU render of the default flash config (plus ``overrides``)."""
     with (
-        _cpu_codegen(),
+        cpu_codegen(),
         patch("helion._compiler.backend._attention_flash_supported", return_value=True),
         patch(
             "helion._compiler.backend._attention_flash_gate_enabled", return_value=True

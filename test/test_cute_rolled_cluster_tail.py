@@ -12,15 +12,16 @@ import pytest
 import sympy
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.host_function import HostFunction
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -29,13 +30,13 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
-        _forbid_native_compile() as compiles,
+        forbid_native_compile() as compiles,
     ):
         yield
         for compile_mock in compiles:
@@ -69,7 +70,7 @@ def _source(
     stride = -(-columns // 8) * 8
     x = torch.empty((4, stride), dtype=torch.bfloat16)[:, :columns]
     weight = torch.empty(columns, dtype=torch.bfloat16)
-    bound = _cpu_bind(kernel, (x, weight))
+    bound = cpu_bind(kernel, (x, weight))
     config = bound.config_spec.normalized_config(
         helion.Config(
             block_sizes=[1],

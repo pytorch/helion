@@ -17,7 +17,7 @@ from helion._testing import skipUnlessBackends
 from helion.exc import InvalidConfig
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")

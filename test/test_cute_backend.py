@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 from dataclasses import dataclass
@@ -25,8 +24,6 @@ import weakref
 import pytest
 import torch
 
-from test._cute_aux import _cpu_codegen
-
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.attention_plan import DENSE_SCORE_KIND
@@ -45,6 +42,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_aux import cpu_codegen
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -9461,7 +9459,7 @@ class TestCuteBackend(TestCase):
                 cute_flash_o_over_q=True,
                 cute_flash_row_bound_tiling=tiling,
             )
-            with _cpu_codegen():
+            with cpu_codegen():
                 codes[tiling] = cute_row_kv_begin_mask_attention._bind_isolated(
                     (q, k, v, kv_begin)
                 ).to_code(config)

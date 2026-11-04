@@ -13,7 +13,7 @@ from test.test_cute_split_k_workspace import _embedded_sources
 from helion._compiler.cute.split_k_cluster_codegen import _a_copy_coordinates
 from helion._testing import skipUnlessBackends
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def test_a_packet_coordinates_preserve_flat_index_for_every_bk_residue():

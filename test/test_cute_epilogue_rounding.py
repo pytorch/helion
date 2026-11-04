@@ -10,6 +10,8 @@ import torch
 
 from helion._compiler.cute import cute_epilogue
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _call(
     graph: torch.fx.Graph,

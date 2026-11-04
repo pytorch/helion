@@ -14,6 +14,8 @@ from helion._compiler.cute import cute_flash
 from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion.autotuner.config_fragment import EnumFragment
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 

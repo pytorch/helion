@@ -17,6 +17,8 @@ import helion
 from helion._compiler import tile_strategy as lanes
 from helion._compiler.ast_read_writes import ast_rename
 
+pytestmark = pytest.mark.cpu_only
+
 _RENAMES = {"acc_next": "acc", "extra_next": "extra"}
 
 

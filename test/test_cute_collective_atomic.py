@@ -5,15 +5,15 @@ import ast
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_collective_effects import _lower
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
 from helion import exc
 from helion._compiler.cute.collective_matmul import _region_write_roots
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
 
@@ -141,7 +141,7 @@ def test_split_k_collective_keeps_atomic_epilogue(compute: str) -> None:
         torch.empty((64, 1024), dtype=torch.float16),
         torch.empty((1024, 128), dtype=torch.float16),
     )
-    with _mock_cuda_unavailable(), _cpu_target():
+    with mock_cuda_unavailable(), cpu_target():
         bound = kernel._bind_isolated(inputs)
         code = bound.to_code(_config(compute))
     assert "cute.gemm(" in code
@@ -269,7 +269,7 @@ def test_tile_counter_beside_a_collective_matmul_runs_at_the_first_lane(
         torch.zeros((1,), dtype=torch.int32),
         torch.zeros((256,), dtype=torch.int32),
     )
-    with _mock_cuda_unavailable(), _cpu_target():
+    with mock_cuda_unavailable(), cpu_target():
         bound = _matmul_counting_tiles._bind_isolated(inputs)
         code = bound.to_code(_counting_config(compute))
     assert "cute.gemm(" in code
@@ -289,7 +289,7 @@ def test_tile_counter_into_the_collective_output_rejects_the_config(
         torch.empty((256, 512), dtype=torch.float16),
         torch.empty((512, 256), dtype=torch.float16),
     )
-    with _mock_cuda_unavailable(), _cpu_target():
+    with mock_cuda_unavailable(), cpu_target():
         bound = _matmul_counting_into_its_output._bind_isolated(inputs)
         with pytest.raises(
             exc.BackendUnsupported,
@@ -374,7 +374,7 @@ def test_split_k_vector_epilogue_packs_the_atomic_add(
     y = torch.empty((1024, 128), dtype=dtype)
     b = torch.empty((128,), dtype=dtype)
     args = (x, y, lambda acc, tiles: acc + b[tiles[1]]) if bias else (x, y)
-    with _mock_cuda_unavailable(), _cpu_target():
+    with mock_cuda_unavailable(), cpu_target():
         bound = kernel._bind_isolated(args)
         code = bound.to_code(_vector_epilogue_config())
     # Only float16 outputs are promoted; a bfloat16 output always keeps its dtype.
@@ -466,7 +466,7 @@ def test_half_atomic_output_seeds_carry_the_vector_epilogue(promote: bool) -> No
     )
     x = torch.empty((64, 1024), dtype=torch.float16)
     y = torch.empty((1024, 128), dtype=torch.float16)
-    with _mock_cuda_unavailable(), _cpu_target():
+    with mock_cuda_unavailable(), cpu_target():
         bound = kernel._bind_isolated((x, y))
         with bound.env:
             seeds = [
@@ -534,7 +534,7 @@ def test_packed_atomic_epilogue_respects_the_target_capability(
     """``red.global.add.noftz.f16x2`` needs sm_70, the ``bf16x2`` and
     ``v4.f32`` forms sm_90; an unknown or older target keeps the scalar
     atomic lane loop."""
-    from test._cute_binding import _cpu_bind
+    from helion._testing.cute_codegen import cpu_bind
 
     kernel = helion.kernel(
         matmul_split_k.fn,
@@ -547,8 +547,8 @@ def test_packed_atomic_epilogue_respects_the_target_capability(
         (64, 1024), dtype=torch.float16 if dtype is torch.float32 else dtype
     )
     y = torch.empty((1024, 128), dtype=x.dtype)
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, (x, y), capability=capability)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, (x, y), capability=capability)
         code = bound.to_code(_vector_epilogue_config())
     assert ("_cute_red_add_" in code) == packed
     assert "cute.arch.atomic_add(" in code

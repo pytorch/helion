@@ -9,9 +9,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
@@ -20,10 +18,12 @@ from helion._compiler.cute.tcgen05_flat_grouped_ir import prove_flat_grouped_rna
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cuda_fake
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.language import _tracing_ops
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 META_DEVICE = "meta"
 
@@ -110,19 +110,6 @@ def flat_contract(
     return result.reshape(rows, columns)
 
 
-def _cuda_fake(backend: object, tensor: torch.Tensor) -> torch.Tensor:
-    assert isinstance(tensor, FakeTensor)
-    with torch._C._DisableTorchDispatch():
-        meta = torch.empty_strided(
-            tensor.shape,
-            tensor.stride(),
-            dtype=tensor.dtype,
-            device=META_DEVICE,
-            requires_grad=tensor.requires_grad,
-        )
-    return FakeTensor(tensor.fake_mode, meta, torch.device("cuda:0"))
-
-
 @contextmanager
 def cuda_binding(
     *,
@@ -172,7 +159,7 @@ def cuda_binding(
         _target(),
         patch.dict(os.environ, flags),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda.current_device", return_value=0),
         patch("torch.cuda.get_device_capability", return_value=(10, 0)),
         patch(
@@ -180,7 +167,7 @@ def cuda_binding(
         ),
         patch(
             "helion._compiler.cute.backend.CuteBackend.normalize_input_fake_tensor",
-            new=_cuda_fake,
+            new=cuda_fake,
         ),
         patch(
             "torch._inductor.runtime.hints.DeviceProperties.create",

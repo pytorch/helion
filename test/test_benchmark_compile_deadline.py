@@ -18,6 +18,7 @@ import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -36,6 +37,8 @@ from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.runtime.config import Config
 from helion.runtime.settings import Settings
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from helion.autotuner.precompile_future import SerializedCompiledFunction

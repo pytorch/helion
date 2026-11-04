@@ -12,17 +12,16 @@ from torch.fx import Node
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
-from test._cute_aux import _config
-from test._cute_aux import _cpu_codegen
-
 import helion
 from helion import exc
 from helion._compiler.cute import cute_epilogue as epilogue
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import aux_config as _config
+from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
 from helion.language import memory_ops
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 class _AuxGraph:
@@ -319,7 +318,7 @@ def test_computed_aux_cast_codegen_keeps_both_rounding_boundaries(
         torch.empty((256, 512), dtype=dtype),
         torch.empty((256, 512), dtype=dtype),
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _computed_cast_aux._bind_isolated(args).to_code(
             _config(block_sizes=[128, 128, 64], tcgen05_aux_load_mode=mode)
         )
@@ -356,7 +355,7 @@ def test_aux_cast_does_not_widen_tma_transport_dtype_admission(
         torch.empty((256, 512), dtype=torch.float32),
     )
     with (
-        _cpu_codegen(),
+        cpu_codegen(),
         pytest.raises(exc.BackendUnsupported, match="auxiliary tensor dtype to match"),
     ):
         _computed_cast_aux._bind_isolated(args).to_code(

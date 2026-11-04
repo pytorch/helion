@@ -85,7 +85,7 @@ _CACHE_POLICY_BASELINE_SCALE = 1
 _CACHE_POLICY_DYNAMIC_HELPER: object = None
 
 
-@onlyBackends(["triton", "cute"])
+@onlyBackends(["cute"])
 class TestAutotunerCuteFlash(AutotunerTestCase):
     def test_lfbo_flash_terminal_coordinate_refinement_runs_two_rounds(self):
         def make_fn(source_id: int):
@@ -7187,6 +7187,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         self.assertIn(ordinary.config, visited)
 
 
+@onlyBackends(["cute"])
 class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
     @staticmethod
     def _search(

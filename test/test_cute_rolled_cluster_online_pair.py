@@ -16,9 +16,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
@@ -28,6 +25,9 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 PAIR = "_cute_grouped_reduce_cluster_online_pair("
@@ -86,15 +86,15 @@ ROLLED = {
 
 def _render(kernel: object, **patch: object) -> str:
     x = torch.empty((4096, 32768), dtype=torch.float16)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, (x,))
         return bound.to_code(helion.Config(**(ROLLED | patch)))
 
 
 def _seed_values(kernel: object) -> dict[str, set[object]]:
     x = torch.empty((4096, 32768), dtype=torch.float16)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, (x,))
         with bound.env:
             seeds = CuteMaskedRolledClusterHeuristic.get_seed_configs(
                 bound.env, bound.host_function.device_ir

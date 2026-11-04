@@ -18,7 +18,7 @@ from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
 from helion._compiler.autotuner_heuristics.cute_resident_reductions import _seed_vector
 from helion._testing import skipUnlessBackends
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 _UNITS = (
     "helion._compiler.autotuner_heuristics.cute_resident_reductions.num_compute_units"

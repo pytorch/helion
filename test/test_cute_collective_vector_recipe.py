@@ -15,6 +15,8 @@ import pytest
 from helion._compiler.cute.collective_vector_recipe import emit_vector_recipe
 from helion._compiler.cute.contiguous_copy import CopyTensorFacts
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _expr(source: str) -> ast.expr:
     return ast.parse(source, mode="eval").body

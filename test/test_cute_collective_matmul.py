@@ -7,12 +7,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
 from helion._compiler.cute.collective_matmul import _uniform_reuse_names
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
 
 moe_matmul_ogs = import_example("moe_matmul_ogs").moe_matmul_ogs
@@ -97,7 +96,7 @@ def test_grid_collective_uses_physical_thread_order(n_first: bool) -> None:
         torch.empty((78, 70), dtype=torch.float16),
         torch.empty(130, dtype=torch.int32),
     )
-    bound = _cpu_bind(_grid_computed_matmul, inputs)
+    bound = cpu_bind(_grid_computed_matmul, inputs)
     source = bound.to_code(_grid_config(n_first=n_first))
     assert "cute.gemm(" in source
     assert f"block=({32 if n_first else 4}, {4 if n_first else 32}, 1)" in source
@@ -132,7 +131,7 @@ def test_grid_collective_correctness(
 @pytest.mark.parametrize("bk", [16, 32, 64, 128])
 @skipUnlessBackends(["cute"])
 def test_computed_gathered_source_uses_collective(dtype: torch.dtype, bk: int) -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _computed_gathered_matmul,
         (
             torch.empty((193, 78), dtype=dtype),
@@ -176,7 +175,7 @@ def test_computed_gathered_matmul_correctness(
 
 @skipUnlessBackends(["cute"])
 def test_input_mutation_keeps_original_serial_schedule() -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _aliased_matmul,
         (
             torch.empty((3, 64, 64), dtype=torch.float16),
@@ -193,7 +192,7 @@ def test_uniform_metadata_is_read_once_before_row_loop() -> None:
     kernel = helion.kernel(
         moe_matmul_ogs.fn, backend="cute", static_shapes=False, autotune_effort="none"
     )
-    bound = _cpu_bind(
+    bound = cpu_bind(
         kernel,
         (
             torch.empty((193, 78), dtype=torch.float16),
@@ -248,7 +247,7 @@ def test_async_copies_have_cache_safe_alignment_and_stride_facts() -> None:
         moe_matmul_ogs.fn, backend="cute", static_shapes=False, autotune_effort="none"
     )
     inputs = (*_padded_inputs("cpu", torch.float16), 97)
-    bound = _cpu_bind(kernel, inputs)
+    bound = cpu_bind(kernel, inputs)
     assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
     source = bound.to_code(_config(bk=64, copy="async"))
     assert source.count("cute.arch.cp_async_shared_global(") == 2
@@ -262,7 +261,7 @@ def test_cached_copy_keeps_gather_loads_outside_reduction_loop() -> None:
         moe_matmul_ogs.fn, backend="cute", static_shapes=False, autotune_effort="none"
     )
     inputs = (*_padded_inputs("cpu", torch.float16), 97)
-    bound = _cpu_bind(kernel, inputs)
+    bound = cpu_bind(kernel, inputs)
     source = bound.to_code(_config(bk=64, copy="async_cached"))
     assert source.count("cute.arch.cp_async_shared_global(") == 2
     assert "cute.make_rmem_tensor((4,), cutlass.Int32)" in source

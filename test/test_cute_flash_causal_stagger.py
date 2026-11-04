@@ -27,6 +27,8 @@ from helion._compiler.cute.attention_plan import CAUSAL_MASK_KIND
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.attention_plan import dense_score_plan
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     import helion
     from helion._compiler.device_function import DeviceFunction

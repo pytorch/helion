@@ -9,10 +9,11 @@ from typing import Any
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-
 from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_FLAGS
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import mock_cuda_unavailable
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -29,7 +30,7 @@ flash_fa4_shared_storage = importlib.import_module(
 @pytest.fixture(autouse=True)
 def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     initialized = torch.cuda.is_initialized()
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
 
         def forbidden(*args: object, **kwargs: object) -> None:
             raise AssertionError("GPU initialization forbidden in the layout proof")

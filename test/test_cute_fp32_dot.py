@@ -11,15 +11,15 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 
@@ -90,9 +90,9 @@ def _chunk_cumsum_ieee(g: torch.Tensor) -> torch.Tensor:
 @pytest.fixture
 def _cpu_only():
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
         yield
@@ -105,7 +105,7 @@ def _config(bound: object, mode: str, **extra: object) -> helion.Config:
 
 def test_fp32_dot_enum_defaults_to_simt(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = _cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(_chunk_cumsum, (g,))
     spec = bound.config_spec
     assert spec.cute_fp32_dot_root_ids
     assert spec.cute_fp32_dot_seed_worthy
@@ -133,7 +133,7 @@ def test_fp32_dot_enum_defaults_to_simt(_cpu_only: None) -> None:
 
 def test_fp32_dot_lowers_the_fragment_dot_through_mma_sync(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = _cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(_chunk_cumsum, (g,))
     simt = bound.to_code(_config(bound, "simt"))
     assert "fragment_dot" in simt
     assert MMA not in simt
@@ -153,7 +153,7 @@ def test_fp32_dot_partial_tiles_are_predicated(_cpu_only: None) -> None:
     x = torch.ones(2, 24, 20)
     y = torch.ones(2, 20, 12)
     z = torch.ones(2, 24, 12)
-    bound = _cpu_bind(_batched_dot, (x, y, z))
+    bound = cpu_bind(_batched_dot, (x, y, z))
     assert bound.config_spec.cute_fp32_dot_root_ids
     # Nothing of a 24 x 12 x 20 dot reaches 64: the field is searchable (the
     # group owns it) but no witness seeds the mode.
@@ -172,7 +172,7 @@ def test_the_seed_counts_the_roots_multiply_adds(_cpu_only: None) -> None:
     # No axis of a [16, 128] x [128, 128] dot reaches 64, yet it is one
     # 64^3 of multiply-adds: the anchored chunk grams issue eight such
     # 16-row dots per tile, and the seed must offer them the tensor cores.
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _sixteen_row_dot, (torch.ones(4, 16, 128), torch.ones(4, 128, 128))
     )
     assert bound.config_spec.cute_fp32_dot_root_ids
@@ -182,7 +182,7 @@ def test_the_seed_counts_the_roots_multiply_adds(_cpu_only: None) -> None:
         for group in bound.config_spec.compiler_coverage_groups
     )
     # Half the contraction is half the work: below the seed.
-    half = _cpu_bind(_sixteen_row_dot, (torch.ones(4, 16, 64), torch.ones(4, 64, 128)))
+    half = cpu_bind(_sixteen_row_dot, (torch.ones(4, 16, 64), torch.ones(4, 64, 128)))
     assert half.config_spec.cute_fp32_dot_root_ids
     assert not half.config_spec.cute_fp32_dot_seed_worthy
 
@@ -192,7 +192,7 @@ def test_bf16_packet_loads_feed_the_tf32_dot(_cpu_only: None) -> None:
     # bf16 per load) instead of one 2-byte load per element; with the dot on
     # tensor cores that load phase was the kernel's remaining bottleneck.
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = _cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(_chunk_cumsum, (g,))
     assert "cute_fragment_packet_loads" in bound.config_spec._flat_fields()
     code = bound.to_code(_config(bound, "tf32_mma", cute_fragment_packet_loads=True))
     assert MMA in code
@@ -202,7 +202,7 @@ def test_bf16_packet_loads_feed_the_tf32_dot(_cpu_only: None) -> None:
 
 def test_ieee_dot_precision_never_offers_tf32(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = _cpu_bind(_chunk_cumsum_ieee, (g,))
+    bound = cpu_bind(_chunk_cumsum_ieee, (g,))
     assert not bound.config_spec.cute_fp32_dot_root_ids
     assert KEY not in bound.config_spec._flat_fields()
     with pytest.raises(exc.InvalidConfig, match="fp32 hl.dot"):

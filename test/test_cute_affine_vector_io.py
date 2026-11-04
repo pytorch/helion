@@ -11,6 +11,8 @@ import pytest
 from helion._compiler.cute.affine_vector_io import _Vectorizer
 from helion._compiler.cute.scalar_integer import _integer_expression
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _Float32(float):
     def bitcast(self, target):

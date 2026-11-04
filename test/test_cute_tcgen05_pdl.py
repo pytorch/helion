@@ -29,7 +29,7 @@ import helion
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 WAIT = "cute.arch.griddepcontrol_wait()"
 RELEASE = "cute.arch.griddepcontrol_launch_dependents()"

@@ -11,14 +11,13 @@ from typing import cast
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandDescriptorPlan
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandTransformKind
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandTransformPlan
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandType
 from helion._compiler.cute.tcgen05_operand_transform import prove_operand_stage_span
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.runtime.cute.launcher import _cute_disk_cache_key
 
 if TYPE_CHECKING:
@@ -32,7 +31,7 @@ sm100 = pytest.importorskip("cutlass.utils.blackwell_helpers")
 
 @pytest.fixture(autouse=True)
 def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
 
         def forbidden(*args: object, **kwargs: object) -> None:
             raise AssertionError("GPU forbidden in the operand plan proof")

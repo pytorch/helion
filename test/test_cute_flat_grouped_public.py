@@ -41,6 +41,8 @@ from helion.autotuner.pattern_search import PatternSearch
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
 from helion.exc import InvalidConfig
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from pathlib import Path
 

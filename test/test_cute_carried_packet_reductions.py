@@ -8,14 +8,16 @@ import numpy as np
 import pytest
 import torch
 
-from test._cute_binding import _forbid_native_compile
 from test.test_cute_bounded_cache_codegen import _cpu_target
 from test.test_cute_full_reduction_loop_encoding import rms_norm
 
 import helion
 from helion._compiler.cute.vector_reduction_packets import _bounded_count
 from helion._compiler.cute.vector_reduction_packets import optimize_vector_reductions
+from helion._testing.cute_codegen import forbid_native_compile
 from helion.autotuner.config_generation import ConfigGeneration
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _source(
@@ -276,7 +278,7 @@ def test_actual_carried_and_padded_codegen(
     initialized = torch.cuda.is_initialized()
     with (
         _cpu_target(),
-        _forbid_native_compile() as native,
+        forbid_native_compile() as native,
         patch("helion.runtime.kernel.target_device_capability", return_value=(10, 3)),
         patch(
             "helion._compiler.compile_environment.target_device_capability",

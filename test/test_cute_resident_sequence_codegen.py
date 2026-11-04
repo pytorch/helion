@@ -8,21 +8,20 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics.cute_resident_sequence import (
     CuteResidentSequenceHeuristic,
 )
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 
 row_softmax = import_example("aot_example").row_softmax
 welford = import_example("welford").welford
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def _arguments(kind: str, columns: int, dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
@@ -66,14 +65,14 @@ def test_original_sequence_seeds_roundtrip_and_emit(
         autotune_effort="none",
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(kernel, _arguments(kind, columns, dtype))
+        bound = cpu_bind(kernel, _arguments(kind, columns, dtype))
         host = bound.host_function
         assert host is not None
         with bound.env:
@@ -147,7 +146,7 @@ def test_original_sequence_seeds_roundtrip_and_emit(
 @pytest.mark.parametrize("value", ["other", 0, True, ["resident"]])
 def test_sequence_config_rejects_unknown_schedule(value: object) -> None:
     kernel = helion.kernel(welford.fn, backend="cute", autotune_effort="none")
-    bound = _cpu_bind(kernel, _arguments("welford", 2048, torch.float32))
+    bound = cpu_bind(kernel, _arguments("welford", 2048, torch.float32))
     with pytest.raises(helion.exc.InvalidConfig):
         bound.config_spec.normalized_config(
             helion.Config(cute_reduction_sequence=value)
@@ -158,7 +157,7 @@ def test_sequence_uses_realized_shared_sibling_thread_extent() -> None:
     kernel = helion.kernel(
         welford.fn, backend="cute", static_shapes=True, autotune_effort="none"
     )
-    bound = _cpu_bind(kernel, _arguments("welford", 2048, torch.float32))
+    bound = cpu_bind(kernel, _arguments("welford", 2048, torch.float32))
     config = helion.Config(
         block_sizes=[1, 2048, 2048],
         num_threads=[1, 32, 128],
@@ -183,7 +182,7 @@ def test_sequence_vector_cache_policies_remain_eligible(
     kernel = helion.kernel(
         welford.fn, backend="cute", static_shapes=True, autotune_effort="none"
     )
-    bound = _cpu_bind(kernel, _arguments("welford", 2048, torch.float32))
+    bound = cpu_bind(kernel, _arguments("welford", 2048, torch.float32))
     config = helion.Config(
         block_sizes=[4, 2048, 2048],
         num_threads=[4, 32, 32],

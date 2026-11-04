@@ -21,6 +21,8 @@ from helion._compiler.cute.scaled_sub_fusion import (
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 
+pytestmark = pytest.mark.cpu_only
+
 row_softmax = import_example("aot_example").row_softmax
 
 SOURCE = """

@@ -32,6 +32,8 @@ from helion._testing import skipUnlessCuteAvailable
 from helion.exc import InvalidConfig
 import helion.language as hl
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -1988,10 +1990,9 @@ def _codegen_with_flex_plan(seq: int, config: dict[str, object]) -> str:
     """Render the probe kernel on CPU with the flex plan injected at codegen
     (what the matcher will do): the tables become ``kv_walk_args`` and the
     score plan carries a 128-row BlockMask walk with a mask region."""
-    from test._cute_aux import _cpu_codegen
-
     import helion
     from helion._compiler.host_function import HostFunction
+    from helion._testing.cute_aux import cpu_codegen
 
     batch, heads = 2, 4
     rows = -(-seq // 128)
@@ -2029,7 +2030,7 @@ def _codegen_with_flex_plan(seq: int, config: dict[str, object]) -> str:
         _probe_attention, backend="cute", static_shapes=True, autotune_effort="none"
     )
     with (
-        _cpu_codegen(),
+        cpu_codegen(),
         patch.object(cute_flash, "flash_attention_tensor_plan", patched),
     ):
         bound = kernel._bind_isolated((q, k, v, part_cnt, part_idx, full_cnt, full_idx))

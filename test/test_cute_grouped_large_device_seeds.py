@@ -5,16 +5,18 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 
 import helion
 from helion._compiler.autotuner_heuristics import cute as heuristics
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 SOURCE = "tcgen05_grouped_worklist_source_m_tile"
 IMMUTABLE = "tcgen05_grouped_full_allocation_a"
@@ -89,18 +91,18 @@ def test_actual_k1_metadata_adds_deep_immutable_seed_without_changing_the_prefix
             return []
         return original(*arguments, **keywords)
 
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
         with patch.object(
             heuristics, "_tcgen05_grouped_device_tile_seeds", side_effect=legacy
         ):
-            before = _cpu_bind(_kernel(), args)
+            before = cpu_bind(_kernel(), args)
             old_seeds = [
                 seed
                 for seed in before.config_spec.compiler_seed_configs
                 if seed.get(SHIFTED) is not True
             ]
             old_default = before.config_spec.compiler_default_config
-        bound = _cpu_bind(_kernel(), args)
+        bound = cpu_bind(_kernel(), args)
         spec = bound.config_spec
         seeds = spec.compiler_seed_configs
         unshifted = [seed for seed in seeds if seed.get(SHIFTED) is not True]
@@ -140,8 +142,8 @@ def test_split_sizes_receive_the_same_large_source_device_pipeline(offset_dtype)
         static_shapes=True,
         autotune_effort="none",
     )
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(kernel, args)
         assert bound.config_spec.block_sizes[2].max_size == 64
         seeds = _matching(bound.config_spec.compiler_seed_configs)
         assert seeds
@@ -168,8 +170,8 @@ def test_large_source_helper_keeps_feature_signed_domain_and_resource_guards(
         torch.empty((2, 256, 256), dtype=torch.bfloat16),
         torch.tensor([0, 256, 512], dtype=torch.int32),
     )
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(), args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), args)
         seeds = heuristics._tcgen05_grouped_device_tile_seeds(
             bound.config_spec,
             groups=groups,

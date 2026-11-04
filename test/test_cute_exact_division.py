@@ -37,9 +37,6 @@ import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
@@ -51,6 +48,9 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import BackendUnsupported
 import helion.language as hl
@@ -517,8 +517,8 @@ def _hard_rows(
 
 
 def _bind(kernel: helion.Kernel, args: tuple[object, ...]) -> BoundKernel:
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        return _cpu_bind(kernel, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        return cpu_bind(kernel, args)
 
 
 def _render(kernel: helion.Kernel, args: tuple[object, ...], **config: Any) -> str:

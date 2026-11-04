@@ -5,20 +5,22 @@ import ast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_atomic_ops import _simulate_register_load_program
 from test.test_cute_int64_value_network import _integer_data
 from test.test_cute_int64_value_network import _value_selection
 
 import helion
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _codegen(x, k, largest, threads):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_value_selection, (x, k, largest, "topk"))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_value_selection, (x, k, largest, "topk"))
         config = bound.config_spec.default_config()
         config.config.update(
             block_sizes=[1],

@@ -754,8 +754,9 @@ def _assert_device_split_seed_family_policy(
 
 
 def test_grouped_device_split_seed_family_policy_without_gpu() -> None:
-    from test._cute_binding import _mock_cuda_unavailable
     from test.cute_population_contracts import _target
+
+    from helion._testing.cute_codegen import mock_cuda_unavailable
 
     values = (
         torch.empty((2048, 64), dtype=torch.bfloat16),
@@ -764,7 +765,7 @@ def test_grouped_device_split_seed_family_policy_without_gpu() -> None:
     )
     with (
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         bound = _device_split_sizes_kernel._bind_isolated(values)

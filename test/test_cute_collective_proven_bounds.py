@@ -5,7 +5,6 @@ import ast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.test_cute_collective_native_seeded import _mamba_kernel
 from test.test_cute_collective_native_seeded import _mamba_sizes
 from test.test_cute_collective_tmem_seed import _dependent_config
@@ -16,6 +15,7 @@ from test.test_cute_collective_vector_epilogue_codegen import _mamba_config
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
 
@@ -42,7 +42,7 @@ def test_original_dependent_contraction_codegen(
     static_shapes: bool, m: int, n: int
 ) -> None:
     args = tuple(torch.empty(size, dtype=torch.bfloat16) for size in _mamba_sizes(2))
-    bound = _cpu_bind(_mamba_kernel(static_shapes=static_shapes), args)
+    bound = cpu_bind(_mamba_kernel(static_shapes=static_shapes), args)
     enabled = bound.to_code(_config(m, n))
     control = bound.to_code(
         helion.Config.from_dict(_config(m, n).config | {"cute_proven_bounds": False})
@@ -59,7 +59,7 @@ def test_original_dependent_contraction_codegen(
 
 def test_search_exposes_proved_bounds_with_complete_collective_configuration() -> None:
     args = tuple(torch.empty(size, dtype=torch.bfloat16) for size in _mamba_sizes(2))
-    bound = _cpu_bind(_mamba_kernel(static_shapes=True), args)
+    bound = cpu_bind(_mamba_kernel(static_shapes=True), args)
     assert bound.host_function is not None
     with bound.env:
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(

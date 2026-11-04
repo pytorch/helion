@@ -39,7 +39,7 @@ import helion.language as hl
 if TYPE_CHECKING:
     import contextlib
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 FAMILY = family.WARP_MMA_FAMILY_KEY
 WARPS = family.WARP_MMA_WARPS_KEY

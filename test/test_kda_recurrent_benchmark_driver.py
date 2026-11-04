@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 from benchmarks.cute import compare_kda_recurrent_backends as recurrent
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from pathlib import Path
 

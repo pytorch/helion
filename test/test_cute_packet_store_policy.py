@@ -8,24 +8,23 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
 from helion._compiler.cute.packet_store_policy import lower_packet_store_policy
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-pytestmark = skipUnlessBackends("cute")
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends("cute")]
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         yield
 
 
@@ -38,7 +37,7 @@ def _add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 def _code(width: int, policy: str, *, static: bool) -> str:
     kernel = helion.kernel(_add, backend="cute", static_shapes=static)
-    bound = _cpu_bind(
+    bound = cpu_bind(
         kernel,
         (
             torch.empty(512, 4096, dtype=torch.bfloat16),
@@ -146,7 +145,7 @@ _cute_store_u32_vec(out.iterator + base * 8, words)
 
 def test_pointwise_seeds_offer_a_streaming_store_alternate() -> None:
     kernel = helion.kernel(_add, backend="cute", static_shapes=True)
-    bound = _cpu_bind(
+    bound = cpu_bind(
         kernel,
         (
             torch.empty(4096, 4096, dtype=torch.bfloat16),

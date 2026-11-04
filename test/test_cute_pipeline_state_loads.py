@@ -25,6 +25,8 @@ from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_function import TensorArg
 from helion._compiler.device_function import TensorSizeArg
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 

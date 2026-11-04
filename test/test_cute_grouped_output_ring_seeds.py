@@ -9,7 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
 from test.test_autotuner_heuristics import _grouped_worklist_kernel_body
@@ -46,9 +45,12 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_sme
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessTcgen05RuntimeNPtx
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
+
+pytestmark = pytest.mark.cpu_only
 
 grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
@@ -75,7 +77,7 @@ def _cpu_target() -> Iterator[None]:
     torch.set_num_threads(1)
     with (
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield

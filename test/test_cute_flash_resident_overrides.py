@@ -14,6 +14,8 @@ from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 @pytest.mark.timeout(240)

@@ -11,9 +11,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
 from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
@@ -21,6 +18,8 @@ from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
 )
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner import LFBOTreeSearch
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.local_cache import LocalAutotuneCache
@@ -31,7 +30,7 @@ from helion.runtime.settings import default_autotuner_fn
 layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
 rms_norm_bwd = import_example("rms_norm").rms_norm_bwd
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -90,7 +89,7 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     ):
         monkeypatch.delenv(name, raising=False)
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -138,7 +137,7 @@ def _bind(
         ignore_warnings=[helion.exc.TensorOperationInWrapper],
         **settings,
     )
-    return _cpu_bind(kernel, args), args
+    return cpu_bind(kernel, args), args
 
 
 def _family(bound: BoundKernel) -> list[helion.Config]:
@@ -201,7 +200,7 @@ def _initial_population_with_legacy_prefix(
             stack.enter_context(
                 patch("helion._compiler.autotuner_heuristics." + registration)
             )
-        old_bound = _cpu_bind(bound.kernel, args)
+        old_bound = cpu_bind(bound.kernel, args)
     _old_search, old, old_rng = _capture_initial_population(old_bound, args, seed)
     search, delivered, rng = _capture_initial_population(bound, args, seed)
     assert len(old) == 100
@@ -445,7 +444,7 @@ def _unreturned_feature_partial(x: torch.Tensor) -> torch.Tensor:
 
 
 def test_structural_family_without_host_sum_has_only_ordinary_producer() -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _unreturned_feature_partial, (torch.empty((17, 128), dtype=torch.float16),)
     )
     assert not bound.config_spec.cute_host_paired_sum_available

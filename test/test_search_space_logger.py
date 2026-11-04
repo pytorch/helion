@@ -9,6 +9,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import pytest
+
 from helion.autotuner.config_spec import SearchDimensionInfo
 from helion.autotuner.search_space_logger import DimensionStats
 from helion.autotuner.search_space_logger import SearchSpaceReport
@@ -17,6 +19,8 @@ from helion.autotuner.search_space_logger import _dimension_from_info
 from helion.autotuner.search_space_logger import analyze_search_space
 from helion.autotuner.search_space_logger import canonical_config_id
 from helion.runtime.config import Config
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_canonical_config_id_preserves_existing_ids() -> None:

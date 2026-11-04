@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
     from helion._compiler.device_function import DeviceFunction
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 # Length-invariance is an equality chain, so comparing the two extreme lengths
 # of a legality class gives the same guarantee as comparing every member;

@@ -7,7 +7,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.test_cute_collective_dot import _config as _dot_config
 from test.test_cute_collective_dot import _full_slice_dot
 from test.test_cute_collective_native_seeded import _config as _seeded_config
@@ -22,7 +21,6 @@ from test.test_cute_collective_tmem_seed import _dependent_contractions
 from test.test_cute_collective_tmem_seed import _dependent_inputs
 from test.test_cute_collective_vector_epilogue_codegen import _mamba_config
 from test.test_cute_collective_vector_epilogue_codegen import _residual_matmul
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 from test.test_cute_packed_collective_matmul import _config as _packed_config
 from test.test_cute_packed_collective_matmul import _original_bound
 
@@ -33,6 +31,8 @@ from helion._compiler.cute.collective_matmul import (
 )
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import cpu_target
 from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
@@ -90,7 +90,7 @@ def test_original_three_mamba_sizes_keep_b_staging_and_seed_arithmetic(
     shape: int, dtype: torch.dtype, static_shapes: bool
 ) -> None:
     args = tuple(torch.empty(size, dtype=dtype) for size in _sizes(shape))
-    bound = _cpu_bind(_mamba_kernel(static_shapes=static_shapes), args)
+    bound = cpu_bind(_mamba_kernel(static_shapes=static_shapes), args)
     control = bound.to_code(_mamba_tmem_config(shape, enabled=False))
     source = bound.to_code(_mamba_tmem_config(shape))
     assert source.count("tcgen05.CtaGroup.ONE") == 2
@@ -110,7 +110,7 @@ def test_original_three_mamba_sizes_keep_b_staging_and_seed_arithmetic(
 def test_computed_a_tails_preserve_original_scalar_epilogue(
     bm: int, bn: int, bk: int, recipe: str
 ) -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
+    bound = cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
     config = helion.Config.from_dict(
         _seeded_config(bm, bn, bk).config | {"cute_collective_recipe": recipe}
     )
@@ -127,7 +127,7 @@ def test_computed_a_tails_preserve_original_scalar_epilogue(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_partial_synthetic_k_keeps_inactive_recipe_guard(dtype: torch.dtype) -> None:
     args = (torch.empty((130, 21), dtype=dtype), torch.empty((21, 70), dtype=dtype))
-    bound = _cpu_bind(_full_slice_dot, args)
+    bound = cpu_bind(_full_slice_dot, args)
     source = bound.to_code(_full_slice_tmem_config())
     assert source.count("OperandSource.TMEM") == 1
     first = _loop(source, "collective_ai")
@@ -151,7 +151,7 @@ def _full_slice_tmem_config() -> helion.Config:
 
 def test_tmem_a_coupled_seeds_and_roundtrip_include_bounds_and_seed_reuse() -> None:
     args = tuple(torch.empty(size, dtype=torch.bfloat16) for size in _sizes(2))
-    bound = _cpu_bind(_mamba_kernel(static_shapes=False), args)
+    bound = cpu_bind(_mamba_kernel(static_shapes=False), args)
     assert bound.host_function is not None
     with bound.env:
         assert has_collective_tmem_operand_candidate(
@@ -186,7 +186,7 @@ def test_direct_load_operands_do_not_add_duplicate_tmem_seeds() -> None:
         torch.empty(shape, dtype=torch.bfloat16)
         for shape in ((128, 256), (256, 64), (128, 64), (128, 64))
     )
-    bound = _cpu_bind(_residual_matmul, inputs)
+    bound = cpu_bind(_residual_matmul, inputs)
     assert bound.host_function is not None
     assert not has_collective_tmem_operand_candidate(
         bound.host_function.device_ir.graphs
@@ -200,7 +200,7 @@ def test_direct_load_operands_do_not_add_duplicate_tmem_seeds() -> None:
 
 @pytest.mark.parametrize("flag", [None, 0, 1, "true"])
 def test_tmem_a_requires_a_boolean(flag: object) -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(torch.float16))
+    bound = cpu_bind(_seeded_contraction, _inputs(torch.float16))
     with pytest.raises(helion.exc.InvalidConfig, match="cute_collective_tmem_a"):
         bound.to_code(
             helion.Config.from_dict(
@@ -211,7 +211,7 @@ def test_tmem_a_requires_a_boolean(flag: object) -> None:
 
 @pytest.mark.parametrize("capability", [None, (8, 0), (9, 0), (12, 0)])
 def test_tmem_a_requires_sm100(capability: tuple[int, int] | None) -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(torch.float16))
+    bound = cpu_bind(_seeded_contraction, _inputs(torch.float16))
     bound.config_spec.target_device_capability = capability
     config = helion.Config.from_dict(
         _seeded_config(compute="warp", enabled=False).config
@@ -224,7 +224,7 @@ def test_tmem_a_requires_sm100(capability: tuple[int, int] | None) -> None:
 
 
 def test_warp_compute_retains_original_operand_path() -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(torch.float16))
+    bound = cpu_bind(_seeded_contraction, _inputs(torch.float16))
     config = helion.Config.from_dict(
         _seeded_config(compute="warp").config | {"cute_collective_tmem_a": True}
     )
@@ -243,7 +243,7 @@ def test_tf32_and_packed_a_keep_their_existing_native_paths(
         assert bound.env.cute_fission_plan is None
         config = _packed_config()
     else:
-        bound = _cpu_bind(_seeded_contraction, _inputs(torch.float32))
+        bound = cpu_bind(_seeded_contraction, _inputs(torch.float32))
         config = _seeded_config()
     control = bound.to_code(config)
     source = bound.to_code(
@@ -259,7 +259,7 @@ def test_materialized_packed_operand_keeps_native_shared_a(
     dtype: torch.dtype,
 ) -> None:
     with (
-        _cpu_target(),
+        cpu_target(),
         patch.object(
             CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
         ),
@@ -318,7 +318,7 @@ def test_materialized_packed_operand_keeps_native_shared_a(
 
 def test_tmem_a_preserves_operand_alias_rejection() -> None:
     a, b, seed, _limit = _inputs(torch.float16)
-    bound = _cpu_bind(_seed_written_in_place, (a, b, seed))
+    bound = cpu_bind(_seed_written_in_place, (a, b, seed))
     config = helion.Config.from_dict(
         _seeded_config().config | {"cute_collective_tmem_a": True}
     )

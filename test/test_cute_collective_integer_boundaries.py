@@ -10,7 +10,6 @@ from typing import cast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.test_cute_collective_tf32 import _config as _jagged_config
 from test.test_cute_collective_tf32 import _jagged_inputs
 from test.test_cute_collective_tf32 import _kernel as _jagged_kernel
@@ -22,7 +21,10 @@ from helion._compiler.cute.collective_matmul import _uniform_reuse_names
 from helion._compiler.cute.contiguous_copy import recipe_has_integer_result
 from helion._compiler.cute.scalar_recipe import build_recipe
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _expr(source: str) -> ast.expr:
@@ -205,7 +207,7 @@ def test_declared_metadata_dtype_controls_collective_vector_copy(
         torch.empty((3, 64, 128), dtype=torch.float32),
         torch.empty((4,), dtype=offset_dtype),
     )
-    bound = _cpu_bind(_offset_rows_matmul, inputs)
+    bound = cpu_bind(_offset_rows_matmul, inputs)
     source = bound.to_code(
         helion.Config(
             block_sizes=[1, 64, 32, 32],
@@ -244,7 +246,7 @@ def test_original_jagged_async_copy_retains_alignment_guard(
         compute=compute,
         copy="async_cached",
     )
-    source = _cpu_bind(_jagged_kernel(), arguments).to_code(config)
+    source = cpu_bind(_jagged_kernel(), arguments).to_code(config)
     assert "collective_a_raw" in source and "collective_b_raw" in source
     if compute == "warp":
         # The warp MMA partitions the raw FP32 ring and rounds in registers.
@@ -257,7 +259,7 @@ def test_original_jagged_async_copy_retains_alignment_guard(
         assert "cute.arch.cvt_f32_tf32(collective_b_raw[" in source
     offsets, a, b, bias = arguments
     unaligned_a = torch.empty(a.numel() + 1, dtype=a.dtype)[1:].view_as(a)
-    unaligned = _cpu_bind(_jagged_kernel(), (offsets, unaligned_a, b, bias)).to_code(
+    unaligned = cpu_bind(_jagged_kernel(), (offsets, unaligned_a, b, bias)).to_code(
         config
     )
     assert "collective_a_raw" not in unaligned

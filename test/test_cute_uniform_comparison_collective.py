@@ -7,16 +7,16 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_collective_native_seeded import _config
 
 import helion
 from helion._compiler.cute import uniform_comparison
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Generator[None, None, None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
@@ -74,7 +74,7 @@ def _code(*, static_shapes: bool, structural_flags: bool, config: helion.Config)
         78,
         0.25,
     )
-    return _cpu_bind(kernel, arguments).to_code(config)
+    return cpu_bind(kernel, arguments).to_code(config)
 
 
 def _without_local_names(source: str) -> str:

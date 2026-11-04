@@ -26,8 +26,6 @@ import pytest
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
 
-from test._cute_aux import _cpu_codegen
-
 import helion
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute.attention_plan import FLASH_ASYMMETRIC_HEAD_DIM_PAIRS
@@ -43,8 +41,11 @@ from helion._compiler.cute.flash_schedule import verify_flash_schedule
 from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
 from helion.runtime.kernel import Kernel
+
+pytestmark = pytest.mark.cpu_only
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
@@ -449,7 +450,7 @@ def _render_flex(
     values = dict(FLEX_CONFIG)
     if config:
         values.update(config)
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = kernel.bind(args)
         return bound.to_code(bound._normalized_config_copy(helion.Config(**values)))
 
@@ -718,7 +719,7 @@ def _render_dense(
     )
     kernel = _dense_causal_attention if causal else _dense_attention
     kernel.reset()
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = kernel.bind((q, k, v))
         values = dict(bound.config_spec.default_config().config)
         if config:
@@ -752,7 +753,7 @@ def test_dense_surface_opens_at_the_new_widths(head_dim: int) -> None:
         torch.randn(2, 4, 2048, head_dim, dtype=torch.bfloat16) for _ in range(3)
     )
     _dense_causal_attention.reset()
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = _dense_causal_attention.bind((q, k, v))
         spec = bound.config_spec
         assert spec.cute_flash_search_enabled
@@ -1106,7 +1107,7 @@ def test_dense_surface_opens_above_128_on_the_single_tile_body(
         torch.randn(2, 4, 2048, head_dim, dtype=torch.bfloat16) for _ in range(3)
     )
     _dense_causal_attention.reset()
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = _dense_causal_attention.bind((q, k, v))
         spec = bound.config_spec
         assert spec.cute_flash_search_enabled
@@ -1223,7 +1224,7 @@ def test_flex_list_walk_runs_on_the_cooperative_pair_above_128() -> None:
         1.0 / math.sqrt(256),
         False,
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = kernel.bind(args)
         spec = bound.config_spec
         assert spec.cute_flash_search_enabled
@@ -1356,7 +1357,7 @@ def test_flex_list_walk_above_128_declines_what_the_pair_cannot_host() -> None:
             False,
         )
         kernel.reset()
-        with _cpu_codegen():
+        with cpu_codegen():
             bound = kernel.bind(args)
             return not bound.config_spec.cute_flash_search_enabled
 
@@ -1733,7 +1734,7 @@ def test_cooperative_pair_cell_space_enumerates_under_the_qualification_floor() 
     torch.manual_seed(0)
     q, k, v = (torch.randn(4, 8, 4096, 256, dtype=torch.bfloat16) for _ in range(3))
     _dense_causal_attention.reset()
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = _dense_causal_attention.bind((q, k, v))
         gen = ConfigGeneration(bound.config_spec)
         assert gen.flash_structural_coverage_uncovered_values() == []
@@ -1887,7 +1888,7 @@ def test_d256_causal_pair_cell_identities_render_distinct_texts() -> None:
     torch.manual_seed(0)
     q, k, v = (torch.randn(4, 8, 4096, 256, dtype=torch.bfloat16) for _ in range(3))
     _dense_causal_attention.reset()
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = _dense_causal_attention.bind((q, k, v))
         gen = ConfigGeneration(bound.config_spec)
         space = gen.flash_exact_effective_search_space_configs(

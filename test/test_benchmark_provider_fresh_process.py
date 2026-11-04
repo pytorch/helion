@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from helion._testing import skipIfRefEager
@@ -17,6 +18,8 @@ from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.kernel_args import load_trusted_kernel_args
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.runtime.settings import Settings
+
+pytestmark = pytest.mark.cpu_only
 
 
 @dataclass

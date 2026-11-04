@@ -9,6 +9,7 @@ from typing import cast
 from unittest.mock import Mock
 from unittest.mock import patch
 
+import pytest
 import sympy
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -26,6 +27,8 @@ from helion._compiler.variable_origin import BlockSizeOrigin
 from helion.language._tracing_ops import _get_symnode
 from helion.language._tracing_ops import _host_tensor
 from helion.language.memory_ops import store
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_reduction_metadata_survives_copy_and_pickle() -> None:

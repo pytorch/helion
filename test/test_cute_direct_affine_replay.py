@@ -37,6 +37,8 @@ from helion._compiler.cute.direct_affine_replay import resolve_direct_affine_coo
 from helion._compiler.cute.direct_affine_replay import resolve_direct_affine_replay
 from helion._compiler.cute.direct_affine_replay import resolve_direct_affine_templates
 
+pytestmark = pytest.mark.cpu_only
+
 validate_direct_affine_templates = replay_impl._validate_direct_affine_templates
 
 

@@ -5,13 +5,13 @@ import ast
 import pytest
 import torch
 
-from ._cute_binding import _cpu_bind
-from ._cute_binding import _forbid_native_compile
-from ._cute_binding import _mock_cuda_unavailable
 from .cute_population_contracts import _target
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 
@@ -46,8 +46,8 @@ def _mixed_atomic_orders(
 
 
 def test_warp_atomic_preserves_strong_and_nonboolean_operations() -> None:
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(
             _mixed_atomic_orders,
             (
                 torch.empty((135,), dtype=torch.int32),

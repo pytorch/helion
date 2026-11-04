@@ -21,6 +21,8 @@ from helion.language import memory_ops
 from helion.language.barrier import barrier
 from helion.language.inline_asm_ops import inline_asm_elementwise
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 

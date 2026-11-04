@@ -5,8 +5,6 @@ import ast
 import pytest
 import torch
 
-from ._cute_binding import _cpu_bind
-from ._cute_binding import _mock_cuda_unavailable
 from .cute_population_contracts import _target
 from .test_cute_grouped_fp32_output import _grouped_fp32_output
 from .test_cute_grouped_grid_multiplier import _config
@@ -16,6 +14,10 @@ from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY as REGISTER_REALLOCATION,
 )
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
+
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("multiplier", [1, 2])
@@ -25,8 +27,8 @@ def test_grouped_static_registers_preserve_pipeline_lifecycle(multiplier: int) -
         torch.empty((4, 256, 128), dtype=torch.bfloat16),
         torch.tensor([0, 0, 1, 129, 640], dtype=torch.int32),
     )
-    with _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped_fp32_output, args)
+    with _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped_fp32_output, args)
         original = dict(_config(multiplier).config)
         default_code = bound.to_code(helion.Config.from_dict(original))
         original[REGISTER_REALLOCATION] = False
@@ -93,8 +95,8 @@ def test_static_registers_reject_conflicting_consumer_ceiling() -> None:
         torch.empty((4, 256, 128), dtype=torch.bfloat16),
         torch.tensor([0, 0, 1, 129, 640], dtype=torch.int32),
     )
-    with _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped_fp32_output, args)
+    with _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped_fp32_output, args)
         config = dict(_config(2).config)
         config[REGISTER_REALLOCATION] = False
         config["tcgen05_consumer_regs"] = 240

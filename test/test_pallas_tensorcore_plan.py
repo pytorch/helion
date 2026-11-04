@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from helion._compiler.pallas.memory_access import MEMORY_ACCESS_META
@@ -22,6 +23,8 @@ from helion._compiler.pallas.tensorcore_plan import dma_access_admission
 from helion._compiler.pallas.tensorcore_plan import dma_autotuner_floor
 from helion.language import distributed_ops
 from helion.language import memory_ops
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from helion._compiler.device_ir import GraphInfo

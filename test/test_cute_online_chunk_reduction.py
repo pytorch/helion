@@ -13,6 +13,8 @@ import pytest
 from helion._compiler.cute.online_chunk_reduction import lower_online_chunk_reduction
 from helion._compiler.cute.uniform_packet_mask import uniform_packet_mask
 
+pytestmark = pytest.mark.cpu_only
+
 SOURCE = """
 maximum = cutlass.Float32(float('-inf'))
 denominator = cutlass.Float32(0)

@@ -8,8 +8,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_host_paired_sum import _config
 from test.test_cute_host_paired_sum import _host
 
@@ -18,10 +16,12 @@ from helion._compiler.ast_extension import ExtendedAST
 from helion._compiler.cute.host_single_sum import lower_host_single_sum
 from helion._compiler.cute.host_single_sum import prove_host_single_sum
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import InvalidConfig
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
@@ -86,7 +86,7 @@ def _arguments(
 
 @pytest.fixture(scope="module")
 def single_bound() -> BoundKernel:
-    return _cpu_bind(_single, _arguments())
+    return cpu_bind(_single, _arguments())
 
 
 @pytest.mark.parametrize("layout", ("mapped", "narrow"))
@@ -140,7 +140,7 @@ def test_terminal_sum_preserves_complete_producer_and_original_return(
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
 def test_typed_destination_dtypes(dtype: torch.dtype) -> None:
-    bound = _cpu_bind(_single, _arguments(dtype))
+    bound = cpu_bind(_single, _arguments(dtype))
     assert bound.config_spec.cute_host_paired_sum_available
     assert "_cute_try_single_sum_cast(" in bound.to_code(_config(bound, "mapped"))
 
@@ -150,7 +150,7 @@ def test_direct_and_singleton_tuple_return_keep_result_type(
     kernel: helion.Kernel,
 ) -> None:
     args = (torch.arange(17 * 20, dtype=torch.float32).view(17, 20),)
-    bound = _cpu_bind(kernel, args)
+    bound = cpu_bind(kernel, args)
     bound.set_config(_config(bound, "narrow"))
     host = bound._run
     assert host is not None
@@ -173,7 +173,7 @@ def test_direct_and_singleton_tuple_return_keep_result_type(
 
 
 def test_pair_and_terminal_sum_are_independent() -> None:
-    bound = _cpu_bind(_pair_and_single, (torch.ones(17, 20),))
+    bound = cpu_bind(_pair_and_single, (torch.ones(17, 20),))
     source = bound.to_code(_config(bound, "narrow"))
     assert source.count("_cute_try_paired_sum_cast(") == 1
     assert source.count("_cute_try_single_sum_cast(") == 1
@@ -288,7 +288,7 @@ def test_final_return_requires_full_ast_and_original_boolean(
 def test_negative_admission_has_no_seeds_and_rejects_explicit_choice(
     enabled: bool, dtype: torch.dtype
 ) -> None:
-    bound = _cpu_bind(_single, _arguments(dtype, enabled))
+    bound = cpu_bind(_single, _arguments(dtype, enabled))
     assert not bound.config_spec.cute_host_paired_sum_available
     assert all(
         "cute_host_paired_sum" not in seed

@@ -16,6 +16,7 @@ from typing import cast
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from helion import Config
@@ -38,6 +39,8 @@ from helion.autotuner.handoff import find_handoff
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.metrics import KernelMetadata
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Callable

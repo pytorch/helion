@@ -4038,8 +4038,8 @@ class TestPallas(TestCase):
                 best = min(best, (time.perf_counter() - start) * 1000)
             return best
 
-        from torch_tpu._internal.sync import (  # pyrefly: ignore[missing-import]
-            synchronize as tpu_sync,
+        from torch_tpu._internal.sync import (
+            synchronize as tpu_sync,  # pyrefly: ignore[missing-import]
         )
 
         device_sync_ms = best_ms(lambda out: synchronize_device())
