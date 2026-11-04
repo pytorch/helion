@@ -255,8 +255,7 @@ class FlyDSLBackend(Backend):
             "arith": "from flydsl.expr import arith",
             "rocdl": "from flydsl.expr import rocdl",
             "gpu": "from flydsl.expr import gpu",
-            "full": "from flydsl.expr.vector import full",
-            "ReductionOp": "from flydsl.expr.vector import ReductionOp",
+            "ReductionOp": "from flydsl.expr import ReductionOp",
             "helion": "import helion",
             "hl": "import helion.language as hl",
             "_default_flydsl_launcher": (
@@ -358,6 +357,9 @@ class FlyDSLBackend(Backend):
 
         spec = bound_kernel.config_spec
         default = spec.default_config()
+        # Surface unsupported kernels (e.g. grid-tiled columns) with their own
+        # error instead of the search's generic "baseline config failed".
+        bound_kernel.to_triton_code(default)
         default_bs = default.config.get("block_sizes")
         if not isinstance(default_bs, list) or not default_bs:
             return default
@@ -503,6 +505,17 @@ class FlyDSLBackend(Backend):
         # Reset per-compilation state so helpers are re-emitted on each compile.
         self._flydsl_needs_warp_helpers = False
         self._flydsl_helpers_emitted = False
+        from ..host_function import HostFunction
+        from .memory_ops import ROWS_ONLY_HINT
+
+        # Only rows are mapped to the grid; a second grid-tiled dimension would
+        # silently compute wrong results (see _reject_unsupported_subscript).
+        for grid_ids in HostFunction.current().device_ir.grid_block_ids:
+            if len(grid_ids) > 1:
+                raise exc.BackendUnsupported(
+                    self.name,
+                    f"a top-level hl.tile over more than one dimension; {ROWS_ONLY_HINT}",
+                )
         # Two regimes, encoded in block_sizes:
         #   W=1 (small-N): [bm, 256] -> bm rows/block, 1 warp/row, block = 64*bm.
         #   W>1 (large-N): [1, ...]  -> 1 row/block, W warps cooperate, 64*W,
