@@ -16,7 +16,10 @@ from ...exc import InvalidConfig
 from ...runtime.config import Config
 from ..cute.epilogue_fanout import FANOUT_CONFIG_KEY
 from ..cute.epilogue_fanout import FANOUT_MODES
+from ..cute.epilogue_fanout import FANOUT_STORE_COMMIT_CONFIG_KEY
+from ..cute.epilogue_fanout import FANOUT_STORE_COMMIT_MODES
 from ..cute.epilogue_fanout import schedule_supported
+from ..cute.shared_epilogue_dag import SharedDagFanoutPlan
 from ..cute.shared_epilogue_dag import prove_epilogue_fanout
 from ..cute.shared_epilogue_dag import schedule_supported as plan_schedule_supported
 from ..cute.tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
@@ -195,6 +198,14 @@ def register_epilogue_fanout_coverage(
     if prepare_only:
         from ..cute.shared_gemm_seeds import register_shared_gemm_seed_encoding
 
+        # Latch the shared-DAG store commit field here, before the first
+        # coverage fingerprint: the registration pass below re-proves the
+        # plans, and its answer must not add or remove a search field.
+        state.shared_dag_store_commit_search_enabled = (
+            not state.materialized_matmul_block_ids
+            and any(isinstance(plan, SharedDagFanoutPlan) for plan in plans)
+        )
+
         # Preparation runs before ANY coverage group records a fingerprint.
         # It uses the unchanged complete carrier/proof admission, publishes no
         # witnesses or seeds, and leaves the later registration order intact.
@@ -216,7 +227,68 @@ def register_epilogue_fanout_coverage(
             ),
         )
     )
+    _register_fanout_store_commit_coverage(env, chosen)
     _register_materialized_aux_coverage(env)
+
+
+def _register_fanout_store_commit_coverage(
+    env: CompileEnvironment, carriers: Sequence[Config]
+) -> None:
+    """Cover both store commit modes of a proved shared-DAG fanout.
+
+    The field itself was exposed before the first coverage group: the pure
+    preparation pass latched ``shared_dag_store_commit_search_enabled`` from
+    its plans. A registration pass whose re-proof lost the plan registers no
+    witness (each must normalize with ``grouped`` under the current proof); a
+    pass that recovered a plan the preparation lacked cannot add the field.
+    The witnesses
+    reuse the fanout group's ranked carriers, already normalized with the
+    shared fanout, in rank order; each must admit ``grouped`` under strict
+    normalization or it is skipped. No seed, default or older witness changes.
+    """
+    spec = env.config_spec
+    state = spec._cute_tcgen05_config
+    if not state.shared_dag_store_commit_search_enabled:
+        return
+    grouped = FANOUT_STORE_COMMIT_MODES[1]
+    shared_carriers: list[Config] = []
+    for carrier in carriers:
+        base = Config.from_dict(
+            deepcopy(carrier.config) | {FANOUT_CONFIG_KEY: "shared"}
+        )
+        trial = Config.from_dict(
+            deepcopy(base.config) | {FANOUT_STORE_COMMIT_CONFIG_KEY: grouped}
+        )
+        try:
+            spec.normalize(trial)
+        except InvalidConfig:
+            continue
+        if trial.config.get(FANOUT_STORE_COMMIT_CONFIG_KEY) != grouped:
+            continue
+        shared_carriers.append(base)
+        if (len(shared_carriers) + 1) * len(
+            FANOUT_STORE_COMMIT_MODES
+        ) > MAX_COMPILER_COVERAGE_CONFIGS:
+            break
+    if not shared_carriers:
+        return
+    spec.register_compiler_coverage_group(
+        CompilerCoverageGroup(
+            mechanism="cute.shared_dag_store_commit",
+            version=1,
+            key=FANOUT_STORE_COMMIT_CONFIG_KEY,
+            domain=FANOUT_STORE_COMMIT_MODES,
+            legacy=FANOUT_STORE_COMMIT_MODES[0],
+            witnesses=tuple(
+                CoverageWitness(carrier, mode)
+                for carrier in shared_carriers
+                for mode in FANOUT_STORE_COMMIT_MODES
+            ),
+            dependencies=(
+                CoverageDependency("cute.epilogue_fanout", FANOUT_CONFIG_KEY, "shared"),
+            ),
+        )
+    )
 
 
 def _register_materialized_aux_coverage(env: CompileEnvironment) -> None:

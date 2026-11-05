@@ -17,6 +17,7 @@ import torch
 
 from ... import exc
 from . import cute_epilogue as epi
+from .epilogue_fanout import FANOUT_STORE_COMMIT_MODES
 from .epilogue_fanout import PairedFanoutPlan
 from .epilogue_fanout import _fresh_returned_tensors
 from .epilogue_fanout import prove_paired_fanout
@@ -428,6 +429,63 @@ def render_dag(
     return "".join(lines), names[id(dag.nodes[-1])]
 
 
+def grouped_store_commit(stores: Sequence[FanoutStore]) -> bool:
+    """Whether the merged scope publishes its stores as ONE commit group.
+
+    The grouped protocol writes every output's ring slot after one published
+    acquire, then pays one fence, one barrier and one bulk commit group for all
+    the outputs' TMA stores. It is sound only when the stores' recorded protocol
+    facts (not their generated names) agree:
+
+    - one named barrier (id and participant count), so a single barrier orders
+      every thread's writes to every ring;
+    - one TMA issuer, so every store's bulk copy lands in the same thread's
+      bulk-group FIFO and one commit closes them all;
+    - each bulk pipeline has exactly one stage per ring buffer (no rounds), and
+      every ring has the same depth: slot ``u % c_stages`` is next written
+      ``c_stages`` subtiles -- hence ``c_stages`` commit groups -- later, and
+      the acquire's ``wait_group.read(c_stages - 1)`` proves its reader done.
+
+    The schedule gate (``schedule_supported``, re-judged at every emission)
+    keeps every other bulk producer off the issuer: register auxiliary reads
+    only, no store or C-input warps, one epilogue warp group.
+    """
+    modes = {store.commit_mode for store in stores}
+    if len(modes) != 1:
+        raise exc.BackendUnsupported("cute", "mixed shared-DAG store commit modes")
+    (mode,) = modes
+    if mode == FANOUT_STORE_COMMIT_MODES[0]:
+        return False
+    if mode != FANOUT_STORE_COMMIT_MODES[1]:
+        raise exc.BackendUnsupported(
+            "cute", f"unknown shared-DAG store commit mode {mode!r}"
+        )
+    first = stores[0]
+    for store in stores:
+        if (
+            store.barrier_id is None
+            or store.barrier_threads is None
+            or store.pipeline_stages is None
+            or not store.issuer
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "grouped store commit lost a recorded protocol fact"
+            )
+        if (
+            store.barrier_id != first.barrier_id
+            or store.barrier_threads != first.barrier_threads
+            or store.issuer != first.issuer
+            or store.c_stages != first.c_stages
+            or store.pipeline_stages != store.c_stages
+            or not store.tma.startswith(f"        if {store.issuer}:\n")
+            or not store.commit.endswith(".producer_commit()\n")
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "grouped store commit needs one barrier, issuer and ring depth"
+            )
+    return True
+
+
 def combine_dag_stores(stores: Sequence[FanoutStore]) -> None:
     if not stores:
         raise exc.BackendUnsupported("cute", "empty shared-DAG fanout stores")
@@ -563,14 +621,20 @@ def combine_dag_stores(stores: Sequence[FanoutStore]) -> None:
             local[leaf] = aux_names[key]
         chunks.append(loads)
         bindings.append(local)
+    grouped = grouped_store_commit(stores)
     pre_wait = first.iteration.pre_wait_aux
     body = "".join(chunk for group in chunks for chunk in group) if pre_wait else ""
     body += (
-        "".join(store.acquire for store in stores)
+        # Every ring's acquire is the same bulk-group wait on the issuer's FIFO
+        # (``grouped_store_commit``): the grouped protocol keeps the first.
+        (first.acquire if grouped else "".join(store.acquire for store in stores))
         + first.wait
         + first.iteration.tmem_read
         + first.iteration.chain.carrier_prelude
     )
+    if grouped:
+        # Publish the issuer's acquire before any thread writes any ring.
+        body += f"        {first.barrier}.arrive_and_wait()\n"
     carrier = first.iteration.chain.carrier
     for index, store in enumerate(stores):
         chain = plan.chains[index]
@@ -614,13 +678,34 @@ def combine_dag_stores(stores: Sequence[FanoutStore]) -> None:
             + f"        {store.iteration.value_name} = ({result}).to({store.iteration.target_dtype})\n"
             + store.iteration.release
             + store.iteration.register_store
-            + f"        {store.barrier}.arrive_and_wait()\n"
-            + f"        {store.buffer} = ({store.buffer_expr}) % cutlass.Int32({store.c_stages})\n"
+        )
+        if grouped:
+            body += (
+                f"        {store.buffer} = ({store.buffer_expr}) % cutlass.Int32({store.c_stages})\n"
+                + store.r2s
+            )
+            continue
+        body += (
+            f"        {store.barrier}.arrive_and_wait()\n"
+            f"        {store.buffer} = ({store.buffer_expr}) % cutlass.Int32({store.c_stages})\n"
             + store.r2s
             + "        cute.arch.fence_view_async_shared()\n"
             + f"        {store.barrier}.arrive_and_wait()\n"
             + store.tma
             + store.commit
+        )
+    if grouped:
+        # One fence orders each thread's writes to every ring for the async
+        # proxy; the barrier then holds the issuer until every thread fenced.
+        # The issuer's TMA stores keep the original output order and close ONE
+        # bulk commit group (``grouped_store_commit``).
+        header = f"        if {first.issuer}:\n"
+        body += (
+            "        cute.arch.fence_view_async_shared()\n"
+            f"        {first.barrier}.arrive_and_wait()\n"
+            + header
+            + "".join(store.tma[len(header) :] for store in stores)
+            + first.commit
         )
     checks = "".join(
         f"assert cutlass.const_expr({first.subtile_count} == {s.subtile_count})\n"

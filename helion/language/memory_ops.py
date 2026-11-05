@@ -29,6 +29,8 @@ from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from .._compiler.cute.device_state import Tcgen05GroupedDMode
 from .._compiler.cute.device_state import Tcgen05Orientation
 from .._compiler.cute.epilogue_fanout import FANOUT_CONFIG_KEY
+from .._compiler.cute.epilogue_fanout import FANOUT_STORE_COMMIT_CONFIG_KEY
+from .._compiler.cute.epilogue_fanout import FANOUT_STORE_COMMIT_MODES
 from .._compiler.cute.epilogue_fanout import FanoutIteration
 from .._compiler.cute.epilogue_fanout import FanoutStore
 from .._compiler.cute.epilogue_fanout import render_chain as render_fanout_chain
@@ -2776,6 +2778,24 @@ def _codegen_cute_store_tcgen05_tile(
             raise exc.BackendUnsupported(
                 "cute", "shared fanout requires the standard full-tile TMA protocol"
             )
+    # ``tcgen05_fanout_store_commit``: only a proved shared-DAG fanout has the
+    # grouped store protocol. Any other request is refused, never served by
+    # the serial protocol (the normalizer mirrors this).
+    fanout_store_commit = df.config.get(
+        FANOUT_STORE_COMMIT_CONFIG_KEY, FANOUT_STORE_COMMIT_MODES[0]
+    )
+    if not (
+        type(fanout_store_commit) is str
+        and fanout_store_commit == FANOUT_STORE_COMMIT_MODES[0]
+    ) and not (
+        type(fanout_store_commit) is str
+        and fanout_store_commit in FANOUT_STORE_COMMIT_MODES
+        and isinstance(fanout_plan, SharedDagFanoutPlan)
+    ):
+        raise exc.InvalidConfig(
+            f"{FANOUT_STORE_COMMIT_CONFIG_KEY}={fanout_store_commit!r} requires a "
+            f"proved shared-DAG fanout ({FANOUT_CONFIG_KEY}='shared')"
+        )
     if has_store_fanout and fragment_epilogue is not None:
         raise exc.BackendUnsupported(
             "cute", "tcgen05 fragment epilogues require one output store"
@@ -8606,6 +8626,15 @@ def _codegen_cute_store_tcgen05_tile(
             loop_header=tma_store_subtile_loop_header,
             body_indent=tma_store_subtile_body_extra_indent,
             post_loop=tma_store_grouped_post_loop_release,
+            # The epilogue warp groups add a runtime group offset to the
+            # barrier id, so no single id is recorded for them.
+            barrier_id=(
+                None if grouped_epilogue else int(tcgen05_epilog_sync_barrier_id)
+            ),
+            barrier_threads=tcgen05_value.epi_warp_count * 32,
+            pipeline_stages=tcgen05_c_pipeline_stage_count,
+            issuer=epi_leader_predicate,
+            commit_mode=fanout_store_commit,
         )
         if isinstance(fanout_plan, SharedDagFanoutPlan):
             if df.cute_state.register_shared_dag_fanout_store(store):

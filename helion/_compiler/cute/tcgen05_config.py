@@ -45,6 +45,8 @@ from .dense_aligned_n import dense_aligned_n_defaults
 from .dense_aligned_n import dense_aligned_n_plan
 from .epilogue_fanout import FANOUT_CONFIG_KEY
 from .epilogue_fanout import FANOUT_MODES
+from .epilogue_fanout import FANOUT_STORE_COMMIT_CONFIG_KEY
+from .epilogue_fanout import FANOUT_STORE_COMMIT_MODES
 from .grouped_ab_k import physical_grouped_ab_k
 from .grouped_full_coverage import full_coverage_pipeline_supported
 from .grouped_full_coverage import full_coverage_smem_upper_bound
@@ -502,6 +504,7 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     STARTUP_PREFILL_KEY,
     GROUPED_RESIDENT_CTAS_KEY,
     FANOUT_CONFIG_KEY,
+    FANOUT_STORE_COMMIT_CONFIG_KEY,
     TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY,
     TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY,
     TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY,
@@ -752,6 +755,12 @@ class CuteTcgen05Config:
         # a primitive encoding fact, never a tensor/source admission certificate.
         self._shared_gemm_seed_encoding_available: bool = False
         self.epilogue_fanout_search_enabled: bool = False
+        # Latched once by the epilogue-fanout preparation pass, before the
+        # first coverage group records its field fingerprint: whether
+        # ``tcgen05_fanout_store_commit`` is on the search surface. Never
+        # recomputed from the later (re-proved) ``epilogue_fanout_plans``, so
+        # a late proof loss or recovery cannot move the published layout.
+        self.shared_dag_store_commit_search_enabled: bool = False
         self.deep_direct_entry_validation_enabled: bool = False
         self.pipeline_smem_facts: Tcgen05PipelineSmemFacts | None = None
         # Seed-only certificate from the fully guarded ordinary MMA source
@@ -6052,6 +6061,56 @@ class CuteTcgen05Config:
     def epilogue_fanout_config_supported(self, config: dict[str, object]) -> bool:
         return self.epilogue_fanout_refusal(config) is None
 
+    def fanout_store_commit_refusal(self, config: dict[str, object]) -> str | None:
+        """Why ``tcgen05_fanout_store_commit='grouped'`` is refused; None if admitted.
+
+        The grouped protocol (``shared_epilogue_dag.grouped_store_commit``)
+        exists only for a proved shared-DAG fanout on its standard role-local
+        TMA epilogue: one epilogue warp group, register auxiliary reads, no
+        store or C-input warps, one bulk group per subtile (no store rounds).
+        A paired fanout already commits once per subtile and has no mode.
+        """
+        if config.get(FANOUT_CONFIG_KEY, "off") != "shared":
+            return f"requires the shared fanout ({FANOUT_CONFIG_KEY}='shared')"
+        plans = self.epilogue_fanout_plans
+        if not plans or not all(
+            isinstance(plan, SharedDagFanoutPlan) for plan in plans
+        ):
+            return "requires every proved fanout to be a shared-DAG fanout"
+        if self.materialized_matmul_block_ids:
+            return "is not composed with materialized matmul chains"
+        if not all(dag_fanout_schedule_supported(plan, config) for plan in plans):
+            return "requires the shared-DAG fanout's standard role-local TMA epilogue"
+        if config.get(TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY, 1) != 1:
+            return (
+                "keeps one bulk commit group per subtile "
+                f"({TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY}=1)"
+            )
+        return None
+
+    def _normalize_fanout_store_commit(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """Keep ``serial`` implicit; admit ``grouped`` only where it is proved."""
+        key = FANOUT_STORE_COMMIT_CONFIG_KEY
+        if key not in config:
+            return
+        value = config[key]
+        if type(value) is str and value == FANOUT_STORE_COMMIT_MODES[0]:
+            config.pop(key)
+            return
+        reason = (
+            self.fanout_store_commit_refusal(config)
+            if type(value) is str and value in FANOUT_STORE_COMMIT_MODES
+            else f"must be one of {FANOUT_STORE_COMMIT_MODES!r}"
+        )
+        if reason is None:
+            return
+        if fix_invalid:
+            config.pop(key)
+            return
+        raise InvalidConfig(f"{key}={value!r} {reason}")
+
     def epilogue_fanout_refusal(self, config: dict[str, object]) -> str | None:
         """Why ``tcgen05_epilogue_fanout='shared'`` is refused; None if admitted.
 
@@ -10677,6 +10736,15 @@ class CuteTcgen05Config:
                         ),
                     }
                 )
+        if not for_search or self.shared_dag_store_commit_search_enabled:
+            # Appended last: a kernel without a proved shared-DAG fanout keeps
+            # its search fields, and a shared-DAG kernel's older fields keep
+            # their order ahead of this one. Searched only where the
+            # preparation pass latched it; a value is still admitted only by
+            # the current proof (``fanout_store_commit_refusal``).
+            fragments[FANOUT_STORE_COMMIT_CONFIG_KEY] = EnumFragment(
+                FANOUT_STORE_COMMIT_MODES
+            )
         if for_search and self._modular_aux_protocol_subject is not None:
             for key, value in self._modular_aux_protocol_subject.inert_options():
                 if key in fragments:
@@ -12322,6 +12390,9 @@ class CuteTcgen05Config:
         # Other family projections may have changed geometry or protocol after
         # the initial pass. Judge the final config before any source is emitted.
         self._normalize_modular_aux_protocol(config, fix_invalid=fix_invalid)
+        # The fanout's store commit mode is judged on the final fanout,
+        # schedule and C rings.
+        self._normalize_fanout_store_commit(config, fix_invalid=fix_invalid)
 
     def flat_fields(
         self,

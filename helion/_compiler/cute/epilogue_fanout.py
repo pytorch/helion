@@ -37,6 +37,13 @@ if TYPE_CHECKING:
 
 FANOUT_CONFIG_KEY = "tcgen05_epilogue_fanout"
 FANOUT_MODES = ("off", "shared")
+# How a shared-DAG fanout publishes its per-output stores in each subtile.
+# ``serial`` (the default) keeps every output's own barriers, fence and bulk
+# commit group. ``grouped`` writes every output's ring slot after one published
+# acquire, then pays one fence, one barrier and ONE bulk commit group for all
+# the outputs' TMA stores (the paired fanout's protocol, for N outputs).
+FANOUT_STORE_COMMIT_CONFIG_KEY = "tcgen05_fanout_store_commit"
+FANOUT_STORE_COMMIT_MODES = ("serial", "grouped")
 
 
 def _fresh_returned_tensors(
@@ -833,6 +840,16 @@ class FanoutStore:
     loop_header: str = ""
     body_indent: str = ""
     post_loop: str = ""
+    # Facts of the store protocol, as the store lowering configured it (not
+    # names): the epilogue named barrier's id and participant count, the bulk
+    # store pipeline's stage count, the TMA issuer predicate, and the requested
+    # ``tcgen05_fanout_store_commit`` mode. The grouped shared-DAG protocol
+    # requires them present and equal across every store it merges.
+    barrier_id: int | None = None
+    barrier_threads: int | None = None
+    pipeline_stages: int | None = None
+    issuer: str = ""
+    commit_mode: str = FANOUT_STORE_COMMIT_MODES[0]
 
 
 def combine_stores(first: FanoutStore, second: FanoutStore) -> None:
@@ -858,6 +875,14 @@ def combine_stores(first: FanoutStore, second: FanoutStore) -> None:
         or second.pre_loop_wait
     ):
         raise exc.BackendUnsupported("cute", "incomplete shared epilogue lifetime")
+    if any(
+        store.commit_mode != FANOUT_STORE_COMMIT_MODES[0] for store in (first, second)
+    ):
+        # The pair already owns one commit group per subtile; the grouped
+        # shared-DAG mode is not a pair protocol.
+        raise exc.BackendUnsupported(
+            "cute", "the paired fanout has no tcgen05_fanout_store_commit mode"
+        )
     left, right = first.iteration, second.iteration
     assert _chain_key(left.chain.chain) == _chain_key(plan.chains[0])
     suffix, result = render_shared_suffix(
