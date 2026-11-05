@@ -92,11 +92,32 @@ def test_pdl_source_changes_only_entry_release_and_consumer_launch(
     release = producer.body.pop(0)
     assert ast.unparse(release) == "cute.arch.griddepcontrol_launch_dependents()"
     assert ast.dump(producer) == ast.dump(_device(before[0]))
-    # The paired consumer always waits ahead of its whole TMA role (the wait
-    # is inert without a programmatic dependency), so only the launch flag
-    # changes; the one-CTA family splits its loads around the wait instead
-    # (see test_cute_materialize_operand.py).
-    assert ast.dump(_device(after[1])) == ast.dump(_device(before[1]))
+    # On a paired serial consumer, PDL-OFF now removes exactly the
+    # inert dependency instructions. The materialized handoff still owns
+    # its wait/release, and every non-PDL statement/order remains unchanged.
+    if "CtaGroup.TWO" in before[1]:
+
+        class WithoutPDL(ast.NodeTransformer):
+            def visit_Expr(self, node):
+                if isinstance(node.value, ast.Call) and ast.unparse(
+                    node.value.func
+                ) in (
+                    "cute.arch.griddepcontrol_wait",
+                    "cute.arch.griddepcontrol_launch_dependents",
+                ):
+                    return None
+                return self.generic_visit(node)
+
+            def visit_If(self, node):
+                self.generic_visit(node)
+                return node if node.body else None
+
+        assert "griddepcontrol" not in before[1]
+        assert ast.dump(WithoutPDL().visit(_device(after[1]))) == ast.dump(
+            _device(before[1])
+        )
+    else:
+        assert ast.dump(_device(after[1])) == ast.dump(_device(before[1]))
     assert "cute.arch.griddepcontrol_wait()" in after[1]
     assert after[1].index("cute.arch.griddepcontrol_wait()") < after[1].index(
         "cute.copy(tma_atom_"
@@ -108,7 +129,13 @@ def test_pdl_source_changes_only_entry_release_and_consumer_launch(
     assert "sync_threads()" not in after[1]
     assert "pipeline_init_wait(" in after[1]
     assert after[1].count("wait_for_alloc()") == 1
-    assert after[1].replace(", 'use_pdl': True", "") == before[1]
+    if "CtaGroup.TWO" in before[1]:
+        without_launch_flag = after[1].replace(", 'use_pdl': True", "")
+        assert ast.dump(WithoutPDL().visit(ast.parse(without_launch_flag))) == ast.dump(
+            ast.parse(before[1])
+        )
+    else:
+        assert after[1].replace(", 'use_pdl': True", "") == before[1]
     # Full caller/allocation/ABI inverse, including the embedded source hashes.
     restored = changed
     for old, new in zip(before, after, strict=True):

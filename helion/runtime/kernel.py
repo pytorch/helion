@@ -3200,6 +3200,20 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         self.env.snapshot_runtime_input_specialization_results(
                             runtime_args
                         )
+                if (
+                    not self.env.settings.disable_autotuner_heuristics
+                    and self.env.config_spec.cute_result_fission_available
+                ):
+                    # Named before the seed-specialization facts are derived:
+                    # the result-fission seeds appended below read the SM
+                    # count through the producer's normalizer.
+                    from .._compiler.autotuner_heuristics.cute_result_fission import (
+                        CuteResultFissionHeuristic,
+                    )
+
+                    self.env.config_spec.autotuner_heuristics.append(
+                        CuteResultFissionHeuristic.name
+                    )
                 self._compiler_seed_specialization_extractors = (
                     _compiler_seed_specialization_extractors(
                         compiler_seed_specialization_facts(
@@ -3244,6 +3258,42 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     register_compiler_coverage_groups(
                         self.env, self.host_function.device_ir
                     )
+                if (
+                    not self.env.settings.disable_autotuner_heuristics
+                    and self.env.config_spec.cute_result_fission_available
+                ):
+                    # Appended after every existing seed and coverage carrier:
+                    # producer schedules transferred from the complete list.
+                    from .._compiler.autotuner_heuristics.cute_result_fission import (
+                        CuteResultFissionHeuristic,
+                    )
+
+                    try:
+                        with self.env.use_runtime_arg_values(runtime_args):
+                            fission_seeds = (
+                                CuteResultFissionHeuristic.transferred_seed_configs(
+                                    self.env,
+                                    self.host_function.device_ir,
+                                    list(self.env.config_spec.compiler_seed_configs),
+                                )
+                            )
+                    except Exception as error:
+                        # Optional additive seeds: a failure drops them and
+                        # never fails a bind the fused path supports.
+                        log.debug(
+                            "result-fission seed transfer failed: %s",
+                            error,
+                            exc_info=True,
+                        )
+                        fission_seeds = []
+                    for seed_config in fission_seeds:
+                        if (
+                            seed_config
+                            not in self.env.config_spec.compiler_seed_configs
+                        ):
+                            self.env.config_spec.compiler_seed_configs.append(
+                                seed_config
+                            )
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """

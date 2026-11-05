@@ -683,6 +683,17 @@ class HelionTemplateBuffer(TemplateBuffer):
                 elif node.id in module_level_vars:
                     node.id = module_level_vars[node.id]
 
+        # Multi-stage host shells attach metadata to the host function at
+        # module level (``host_fn._helion_cute_kernels = ...``); those
+        # top-level references follow the host function's new name.  Names
+        # inside function bodies (parameters, locals) are left alone.
+        for statement in root.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(statement):
+                if isinstance(node, ast.Name) and node.id == host_fn:
+                    node.id = str(Placeholder.KERNEL_NAME)
+
     def _build_and_unparse(
         self,
         config: Config,

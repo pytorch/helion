@@ -41,7 +41,10 @@ if TYPE_CHECKING:
 
 
 def register_epilogue_fanout_coverage(
-    env: CompileEnvironment, device_ir: DeviceIR
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    *,
+    prepare_only: bool = False,
 ) -> None:
     from ...language import matmul_ops
     from ...language import memory_ops
@@ -189,6 +192,16 @@ def register_epilogue_fanout_coverage(
         if one_wave is not None:
             chosen.append(one_wave)
     state.epilogue_fanout_search_enabled = True
+    if prepare_only:
+        from ..cute.shared_gemm_seeds import register_shared_gemm_seed_encoding
+
+        # Preparation runs before ANY coverage group records a fingerprint.
+        # It uses the unchanged complete carrier/proof admission, publishes no
+        # witnesses or seeds, and leaves the later registration order intact.
+        register_shared_gemm_seed_encoding(env, device_ir)
+        return
+    # A failed early optional proof must not be retried here: an earlier group
+    # already owns the prepared layout and late recovery would change it.
     spec.register_compiler_coverage_group(
         CompilerCoverageGroup(
             mechanism="cute.epilogue_fanout",

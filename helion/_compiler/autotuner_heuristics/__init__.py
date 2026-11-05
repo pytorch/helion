@@ -21,6 +21,7 @@ from ..cute.grouped_row_union import (
 from ..cute.grouped_row_union import SCHEDULE_KEY as GROUPED_ROW_UNION_SCHEDULE_KEY
 from ..cute.grouped_row_union import STARTUP_PREFILL_KEY
 from ..cute.grouped_row_union import TRANSPOSED_SCHEDULE
+from ..cute.shared_gemm_seeds import append_shared_gemm_seed_configs
 from ..cute.split_k_cluster_config import FINALIZER_KEY
 from ..cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
@@ -190,6 +191,7 @@ from .cute_radix_selection import register_radix_selection_coverage
 from .cute_register_subblocks import CuteRegisterSubblocksHeuristic
 from .cute_resident_reductions import CuteResidentReductionHeuristic
 from .cute_resident_sequence import CuteResidentSequenceHeuristic
+from .cute_result_fission import CuteResultFissionHeuristic
 from .cute_rolled_cluster_packet import CuteRolledClusterPacketHeuristic
 from .cute_row_resident import register_row_resident_coverage
 from .cute_signed_bitfield import add_signed_bitfield_seeds
@@ -325,6 +327,8 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentBoundedGatherHeuristic,
         CuteFragmentPureProducerRegionsHeuristic,
         CuteRadixSelectionHeuristic,
+        # Last: additive seeds only; earlier seed lists are unchanged.
+        CuteResultFissionHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -630,6 +634,9 @@ def register_compiler_coverage_groups(
     """
     if env.backend_name != "cute":
         return
+    # Complete optional seed encodings must be known before the first group,
+    # including cluster coverage. Pure preparation changes no witness order.
+    register_epilogue_fanout_coverage(env, device_ir, prepare_only=True)
     register_cluster_coverage(env, device_ir)
     register_epilogue_fanout_coverage(env, device_ir)
     register_aux_fragment_hoist_coverage(env, device_ir)
@@ -916,3 +923,6 @@ def register_compiler_coverage_groups(
     from .cute_mxfp8_epilogue_coverage import register_mxfp8_epilogue_coverage
 
     register_mxfp8_epilogue_coverage(env)
+    # Full shared-output seeds are optional and use the already-finalized
+    # proof/arena schema. No earlier coverage carrier or random field changes.
+    append_shared_gemm_seed_configs(env, device_ir)

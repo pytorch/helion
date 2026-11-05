@@ -2900,6 +2900,21 @@ def _generate_ast(
                     "split-K workspace does not support external memory transforms",
                 )
             return generate_split_k_workspace(func, config, emit_repro_caller)
+        if config.get("cute_result_fission", False) is True:
+            from .cute.result_fission_codegen import generate_result_fission
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+                or _codegen_graphs is not None
+                or _memory_counters is not None
+                or _host_prefix is not None
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "result fission excludes external lowering transforms"
+                )
+            return generate_result_fission(func, config, emit_repro_caller)
         if env.cute_fission_plan is not None and len(func.device_ir.root_ids) > 1:
             from .cute.materialized_fission_codegen import generate_materialized_fission
 

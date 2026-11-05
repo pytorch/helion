@@ -1,8 +1,34 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import TYPE_CHECKING
 
+from ... import exc
 from .cutedsl_compat import emit_producer_tail_tma_umma
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+
+def tcgen05_launch_uses_pdl(
+    config: Mapping[str, object], *, clc_persistent: bool, fission_bundle: bool
+) -> bool:
+    """The effective AB-TMA launch contract, not merely ``cute_pdl``.
+
+    CLC cancellation and a materialized handoff force the launch attribute.
+    General PDL is inert inside a materialized-fission bundle, whose stages
+    own their protocol. Device waits/releases must use these same facts.
+    """
+    pdl = config.get("cute_pdl", False)
+    materialized = config.get("tcgen05_materialized_pdl", False)
+    if any(
+        type(value) is not bool
+        for value in (pdl, materialized, clc_persistent, fission_bundle)
+    ):
+        raise exc.InvalidConfig("tcgen05 PDL launch facts must be proved booleans")
+    return (
+        clc_persistent or materialized is True or (pdl is True and not fission_bundle)
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -53,9 +79,13 @@ class Tcgen05LifecycleContext:
     # allocation on both paths.
     free_tmem_in_epilogue: bool = False
     # ``cute_pdl`` on a one-CTA kernel: release the dependent grid after the
-    # MMA warp has issued its last MMA (the two-CTA path always does), so
-    # the next kernel's launch and prologue overlap this kernel's drain.
+    # MMA warp has issued its last MMA, so the next kernel's launch and
+    # prologue overlap this kernel's drain. This legacy field is unchanged.
     pdl_release: bool = False
+    # The compiler always supplies the same effective launch facts as the
+    # AB-TMA wrapper for a CTA pair. True keeps standalone lifecycle builders'
+    # historical default; it is never inferred from pair geometry at codegen.
+    paired_pdl_release: bool = True
     # Two-CTA row-union kernels (one tile per CTA at the catalogue shapes, so
     # the whole teardown is exposed): the store warp's ``cp.async.bulk.wait_group
     # 0`` is independent of the TMEM handshake, and ``free`` is a cross-CTA
@@ -112,6 +142,10 @@ class Tcgen05LifecycleContext:
     ) -> list[str]:
         """Return post-loop store/TMEM cleanup owned by the lifecycle context."""
 
+        if self.is_two_cta and type(self.paired_pdl_release) is not bool:
+            raise exc.InvalidConfig(
+                "paired tcgen05 PDL release fact must be a proved boolean"
+            )
         post_loop_lines: list[str] = []
         short_teardown = self.use_merged_pipeline_init and not self.is_two_cta
         # The store warp's ``cp.async.bulk.wait_group 0`` is independent of
@@ -138,7 +172,7 @@ class Tcgen05LifecycleContext:
                     skip_advances=self.skip_ab_producer_advance,
                 )
             )
-        if self.is_two_cta or self.pdl_release:
+        if self.is_two_cta and self.paired_pdl_release or self.pdl_release:
             # PDL parity with Quack/CUTLASS: after all MMAs are issued, hint
             # dependent kernels before this role starts the final acc drain.
             post_loop_lines.append(

@@ -738,6 +738,10 @@ class CuteTcgen05Config:
         self.grouped_row_union_eligible: bool = False
         self.grouped_row_union_multi_resident_supported: bool = False
         self.epilogue_fanout_plans: tuple[FanoutPlan, ...] = ()
+        # Optional seed serialization capability, derived from the complete
+        # shared-seeder proof before coverage freezes the field layout. This is
+        # a primitive encoding fact, never a tensor/source admission certificate.
+        self._shared_gemm_seed_encoding_available: bool = False
         self.epilogue_fanout_search_enabled: bool = False
         self.deep_direct_entry_validation_enabled: bool = False
         self.pipeline_smem_facts: Tcgen05PipelineSmemFacts | None = None
@@ -10961,6 +10965,23 @@ class CuteTcgen05Config:
             )
         }
 
+    def _shared_gemm_seed_encoding_pid_types(self) -> tuple[str, ...]:
+        """Declare only encoding values before the shared coverage snapshot.
+
+        Shared full-kernel seeds are appended after coverage registration. A
+        seed-only enum value must therefore be encodable when that snapshot is
+        taken, not first appear when the optional registry is filled later.
+        This reads the already complete shared proof and all-output arena facts;
+        it changes neither random search choices nor config/codegen admission.
+        Established seed registries retain their original field surface.
+        """
+        if (
+            self.config_spec.compiler_seed_configs
+            or not self._shared_gemm_seed_encoding_available
+        ):
+            return ()
+        return ("persistent_interleaved",)
+
     def persistence_model_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         pid_default_models = tuple(
             dict.fromkeys(
@@ -10968,12 +10989,15 @@ class CuteTcgen05Config:
                 for pid_type in self.allowed_pid_types
             )
         )
-        seed_pid_types = _compiler_seed_values(
-            self.config_spec.compiler_seed_configs,
-            "pid_type",
-            str,
-            lambda pid_type: pid_type in TCGEN05_PERSISTENCE_MODEL_PID_TYPES,
-            exact_type=False,
+        seed_pid_types = (
+            *_compiler_seed_values(
+                self.config_spec.compiler_seed_configs,
+                "pid_type",
+                str,
+                lambda pid_type: pid_type in TCGEN05_PERSISTENCE_MODEL_PID_TYPES,
+                exact_type=False,
+            ),
+            *self._shared_gemm_seed_encoding_pid_types(),
         )
         seed_pid_default_models = tuple(
             dict.fromkeys(
@@ -12380,12 +12404,15 @@ class CuteTcgen05Config:
         if self.config_spec.supports_config_key("pid_type"):
             fields["pid_type"] = _enum_fragment_with_seed_values(
                 self.allowed_pid_types,
-                _compiler_seed_values(
-                    seeds,
-                    "pid_type",
-                    str,
-                    lambda _value: True,
-                    exact_type=False,
+                (
+                    *_compiler_seed_values(
+                        seeds,
+                        "pid_type",
+                        str,
+                        lambda _value: True,
+                        exact_type=False,
+                    ),
+                    *self._shared_gemm_seed_encoding_pid_types(),
                 ),
                 search_choices=self.allowed_pid_types,
                 search_only_if_widened=True,

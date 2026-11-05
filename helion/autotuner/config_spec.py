@@ -201,6 +201,11 @@ from .._compiler.cute.radix_selection_config import (
     PIPELINE_CHOICES as RADIX_PIPELINE_CHOICES,
 )
 from .._compiler.cute.radix_selection_config import normalize_radix_selection
+from .._compiler.cute.result_fission_config import RESULT_FISSION_CONFIG_KEYS
+from .._compiler.cute.result_fission_config import RESULT_FISSION_KEY
+from .._compiler.cute.result_fission_config import ProducerAdmission
+from .._compiler.cute.result_fission_config import normalize_result_fission_config
+from .._compiler.cute.result_fission_config import result_fission_search_fields
 from .._compiler.cute.ring_mma_dot import RING_DEFAULT_SPLIT
 from .._compiler.cute.ring_mma_dot import RING_DEFAULT_STAGES
 from .._compiler.cute.ring_mma_dot import RING_MMA_KEY
@@ -1147,6 +1152,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | BLOCK_SCALED_CONFIG_KEYS
     | {SPLIT_K_SCHEDULE_KEY, SPLIT_K_FINALIZER_KEY}
     | WORKSPACE_CONFIG_KEYS
+    | RESULT_FISSION_CONFIG_KEYS
     | GROUPED_RNA_CONFIG_KEYS
     | frozenset(FLASH_CONFIG_KEYS)
     | {
@@ -1481,6 +1487,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         SPLIT_K_SCHEDULE_KEY,
         SPLIT_K_FINALIZER_KEY,
         *WORKSPACE_CONFIG_KEYS,
+        *RESULT_FISSION_CONFIG_KEYS,
         *GROUPED_RNA_CONFIG_KEYS,
     ]
 )
@@ -1635,6 +1642,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         SPLIT_K_SCHEDULE_KEY,
         SPLIT_K_FINALIZER_KEY,
         *WORKSPACE_CONFIG_KEYS,
+        *RESULT_FISSION_CONFIG_KEYS,
     }
 )
 
@@ -2035,6 +2043,14 @@ class ConfigSpec:
         # reduction is an atomic add into an output kept in a dtype with a
         # packed atomic add (``split_k_workspace.atomic_epilogue_admissible``).
         self.cute_split_k_atomic_epilogue_available: bool = False
+        # ``cute_result_fission``: a registration-time proof of one pure FP32
+        # identity output beside computed FP32 epilogue stores
+        # (``result_fission.analyze_result_fission``); (m, n, k) of its GEMM.
+        self.cute_result_fission_available: bool = False
+        self.cute_result_fission_shape: tuple[int, int, int] | None = None
+        # The producer child's own AB-ring admission per producer schedule:
+        # prices the producer's AB ring at normalization.
+        self.cute_result_fission_producer_facts: ProducerAdmission | None = None
         self.cute_materialized_schedule_available: bool = False
         self.cute_materialized_schedule_search_enabled: bool = False
         self.cute_row_matrix_transport_available: bool = False
@@ -7320,6 +7336,13 @@ class ConfigSpec:
                 partition_choices=self.cute_split_k_partition_choices,
                 atomic_epilogue_available=self.cute_split_k_atomic_epilogue_available,
             )
+            normalize_result_fission_config(
+                config,
+                available=self.cute_result_fission_available,
+                fix_invalid=_fix_invalid,
+                shape=self.cute_result_fission_shape,
+                producer_facts=self.cute_result_fission_producer_facts,
+            )
             normalize_grouped_rna_config(
                 config,
                 available_k=self.cute_grouped_rna_k_choices,
@@ -8517,6 +8540,13 @@ class ConfigSpec:
                 fix_invalid=_fix_invalid,
             )
 
+        if (
+            self.backend_name == "cute"
+            and _fix_invalid
+            and config.get(RESULT_FISSION_KEY, False) is True
+        ):
+            self._canonicalize_result_fission_inert_keys(config)
+
         # Allow tunable parameter keys in addition to backend-supported keys.
         unknown_keys = {*config} - VALID_KEYS
         invalid_keys = (unknown_keys | {*self.unsupported_config_keys(config)}) - {
@@ -8911,6 +8941,31 @@ class ConfigSpec:
         self._shrink_for_numel_constraints(config)
         return config
 
+    def _canonicalize_result_fission_inert_keys(
+        self, config: dict[str, object]
+    ) -> None:
+        """Under the result-fission schedule the fused kernel's own keys are
+        inert (the producer and consumer read only their stage keys), so a
+        search config takes the base default for every fused key: mutations
+        of inert coordinates never become distinct candidates."""
+        base = self._base_default_config().config
+        stage = {
+            key: value
+            for key, value in config.items()
+            if key in RESULT_FISSION_CONFIG_KEYS
+        }
+        config.clear()
+        config.update(
+            {
+                key: _copy_config_structure(value)
+                for key, value in base.items()
+                if key not in RESULT_FISSION_CONFIG_KEYS
+            }
+        )
+        if "cute_pdl" in config:
+            config["cute_pdl"] = False
+        config.update(stage)
+
     @staticmethod
     def _drop_inert_workspace_knobs(config: helion.Config) -> None:
         """The split-K workspace schedule is a seeded search alternative; the
@@ -8918,6 +8973,11 @@ class ConfigSpec:
         stage and partition knobs (flat search still represents them), so a
         GEMM's default does not depend on whether its operands admit the
         schedule's proof."""
+        if config.config.get(RESULT_FISSION_KEY, False) is False:
+            # Likewise the result-fission schedule: the public default is the
+            # fused kernel and does not depend on the schedule's proof.
+            for key in RESULT_FISSION_CONFIG_KEYS:
+                config.config.pop(key, None)
         if config.config.get(SPLIT_K_WORKSPACE_KEY, False) is False:
             for key in (
                 SPLIT_K_WORKSPACE_KEY,
@@ -9941,6 +10001,10 @@ class ConfigSpec:
                     (key, EnumFragment(choices=choices))
                     for key, choices in RADIX_PIPELINE_CHOICES.items()
                 )
+            if self.cute_result_fission_available:
+                # Independent of the fused kernel's search family (a native
+                # TCGEN05 GEMM): the schedule and its stage coordinates.
+                fields.update(result_fission_search_fields())
             return fields
 
         # Only add sequence keys that the backend supports

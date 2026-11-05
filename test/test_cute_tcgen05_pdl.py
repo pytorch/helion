@@ -334,9 +334,8 @@ def test_the_entry_wait_path_takes_the_release_placement() -> None:
 
 
 def test_two_cta_kernels_add_the_launch_attribute_and_the_epilogue_wait() -> None:
-    # The CtaGroup.TWO path already waits in its TMA role and releases after
-    # the MMAs (griddepcontrol is a no-op without the launch attribute): the
-    # knob adds ``use_pdl`` to its launch and the epilogue-role wait.
+    # The paired knob-off contract emits no dependent-grid instructions.
+    # Knob-on retains its TMA/epilogue waits, final release and host flag.
     bound = _bind_gemm((1024, 1024, 1024), torch.float16)
     config = helion.Config(
         block_sizes=[256, 128, 64],
@@ -354,7 +353,7 @@ def test_two_cta_kernels_add_the_launch_attribute_and_the_epilogue_wait() -> Non
     plain = _source(bound, normalized)
     assert "'use_pdl': True" not in plain
     plain_body = _kernel_body(plain)
-    assert plain_body.count(WAIT) == 1 and plain_body.count(RELEASE) == 1
+    assert plain_body.count(WAIT) == plain_body.count(RELEASE) == 0
     with bound.env:
         with_knob = bound.config_spec.normalized_config(
             helion.Config(**{**normalized.config, "cute_pdl": True})

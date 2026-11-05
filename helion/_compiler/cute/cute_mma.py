@@ -244,6 +244,7 @@ from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from .tcgen05_constants import tcgen05_grouped_worklist_store_shape
 from .tcgen05_constants import tcgen05_role_launch_n_width
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
+from .tcgen05_lifecycle import tcgen05_launch_uses_pdl
 from .tcgen05_prologue import floordiv_nonneg_expr
 from .tcgen05_prologue import masked_cluster_rank_expr
 from .tcgen05_prologue import mod_nonneg_expr
@@ -9548,9 +9549,8 @@ def _emit_mma_pipeline(
         # (``tcgen05_materialized_pdl``); the knob stays inert on them.
         and CompileEnvironment.current().cute_fission_plan is None
     )
-    # The two-CTA kernel releases after its MMAs through
-    # ``Tcgen05LifecycleContext.is_two_cta``; the one-CTA flat kernel's
-    # release is emitted below.
+    # The two-CTA kernel releases after its MMAs through the lifecycle's
+    # explicit paired launch contract; the one-CTA flat release stays below.
     tcgen05_pdl = tcgen05_pdl_launch and not tcgen05_is_two_cta
     if tcgen05_pdl_launch:
         df.cute_state.cute_pdl_entry_wait = True
@@ -14747,10 +14747,11 @@ def _emit_mma_pipeline(
             # ``use_pdl`` only added to the dict when True so the
             # static-path kernels' wrapper-plan literals stay
             # byte-identical to the pre-G2-H golden.
-            if (
-                tcgen05_matmul_plan.is_clc_persistent
-                or df.config.get("tcgen05_materialized_pdl", False)
-                or tcgen05_pdl_launch
+            if tcgen05_launch_uses_pdl(
+                df.config,
+                clc_persistent=tcgen05_matmul_plan.is_clc_persistent,
+                fission_bundle=CompileEnvironment.current().cute_fission_plan
+                is not None,
             ):
                 ab_tma_plan["use_pdl"] = True
             cg.cute_wrapper_plans.append(ab_tma_plan)
@@ -16990,6 +16991,12 @@ def _emit_mma_pipeline(
             tmem_allocator_warp=tcgen05_tmem_allocator_warp,
             free_tmem_in_epilogue=tcgen05_free_tmem_in_epilogue,
             pdl_release=tcgen05_pdl and tcgen05_use_role_local_mma_exec,
+            paired_pdl_release=tcgen05_launch_uses_pdl(
+                df.config,
+                clc_persistent=tcgen05_matmul_plan.is_clc_persistent,
+                fission_bundle=CompileEnvironment.current().cute_fission_plan
+                is not None,
+            ),
             drain_after_dealloc=tcgen05_is_two_cta and row_union_plan is not None,
             mma_warp_frees_tmem=tcgen05_mma_warp_frees_tmem,
             exec_acc_tmem_ptr=tcgen05_exec_acc_tmem_ptr,

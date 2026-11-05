@@ -11105,31 +11105,26 @@ class TestCuteLowerings(unittest.TestCase):
                 l2_groupings=[4],
                 pid_type="persistent_blocked",
                 tcgen05_cluster_m=2,
-                # The two-CTA kernel emits its own Quack-aligned wait/release pair; the
-                # ``cute_pdl`` (default True on sm_90+) would add the role waits.
+                # PDL-OFF on the pair has neither dependent-grid operation;
+                # all TMA, accumulator and store ownership remains unchanged.
                 cute_pdl=False,
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
 
-        self.assertEqual(code.count("cute.arch.griddepcontrol_wait()"), 1)
-        self.assertEqual(code.count("cute.arch.griddepcontrol_launch_dependents()"), 1)
+        self.assertEqual(code.count("cute.arch.griddepcontrol_wait()"), 0)
+        self.assertEqual(code.count("cute.arch.griddepcontrol_launch_dependents()"), 0)
+        self.assertNotIn("'use_pdl': True", code)
         tma_role_pos = code.index(
             "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5):"
         )
-        wait_pos = code.index("cute.arch.griddepcontrol_wait()", tma_role_pos)
         tma_sched_pos = code.index(
             "StaticPersistentTileScheduler.create(", tma_role_pos
         )
         tma_acquire_pos = code.index(
             "tcgen05_ab_pipeline.producer_acquire", tma_role_pos
         )
-        pdl_launch_pos = code.index("cute.arch.griddepcontrol_launch_dependents()")
-        tmem_arrive_pos = code.index("tcgen05_tmem_alloc_barrier.arrive()")
-
-        self.assertLess(wait_pos, tma_sched_pos)
-        self.assertLess(wait_pos, tma_acquire_pos)
-        self.assertLess(pdl_launch_pos, tmem_arrive_pos)
+        self.assertLess(tma_sched_pos, tma_acquire_pos)
 
     def test_tcgen05_persistent_cluster_m2_two_cta_single_tile_runtime_correctness(
         self,
@@ -11178,17 +11173,18 @@ class TestCuteLowerings(unittest.TestCase):
                 l2_groupings=[4],
                 pid_type="persistent_blocked",
                 tcgen05_cluster_m=2,
-                # The two-CTA kernel emits its own Quack-aligned wait/release pair; the
-                # ``cute_pdl`` (default True on sm_90+) would add the role waits.
+                # PDL-OFF on the pair has neither dependent-grid operation;
+                # all TMA, accumulator and store ownership remains unchanged.
                 cute_pdl=False,
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
             self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
-            self.assertEqual(code.count("cute.arch.griddepcontrol_wait()"), 1)
+            self.assertEqual(code.count("cute.arch.griddepcontrol_wait()"), 0)
             self.assertEqual(
-                code.count("cute.arch.griddepcontrol_launch_dependents()"), 1
+                code.count("cute.arch.griddepcontrol_launch_dependents()"), 0
             )
+            self.assertNotIn("'use_pdl': True", code)
             self.assertIn(
                 "tcgen05_role_local_0_tile_sched = "
                 "cutlass.utils.StaticPersistentTileScheduler.create(",
@@ -11255,7 +11251,6 @@ class TestCuteLowerings(unittest.TestCase):
                 code,
             )
             tmem_arrive_pos = code.index("tcgen05_tmem_alloc_barrier.arrive()")
-            pdl_launch_pos = code.index("cute.arch.griddepcontrol_launch_dependents()")
             acc_tail_marker = (
                 "tcgen05_acc_pipeline.producer_tail"
                 if "tcgen05_acc_pipeline.producer_tail" in code
@@ -11270,7 +11265,6 @@ class TestCuteLowerings(unittest.TestCase):
             )
             tmem_wait_pos = code.index("tcgen05_tmem_alloc_barrier.arrive_and_wait()")
             tmem_free_pos = code.index("tcgen05_tmem_allocator.free(")
-            self.assertLess(pdl_launch_pos, tmem_arrive_pos)
             self.assertLess(tmem_arrive_pos, acc_tail_pos)
             # One tile per CTA on the clustered path: the permit is relinquished
             # right after the allocation, the epilogue meets the MMA warp and
@@ -11334,12 +11328,9 @@ class TestCuteLowerings(unittest.TestCase):
                 test_src = ast.unparse(node.test)
                 role_src = ast.unparse(node)
                 if test_src == tma_role_predicate:
+                    self.assertNotIn("cute.arch.griddepcontrol_wait()", role_src)
                     self.assertLess(
-                        role_src.index("cute.arch.griddepcontrol_wait()"),
                         role_src.index("StaticPersistentTileScheduler.create("),
-                    )
-                    self.assertLess(
-                        role_src.index("cute.arch.griddepcontrol_wait()"),
                         role_src.index("tcgen05_ab_pipeline.producer_acquire"),
                     )
                     self.assertIn("tcgen05_ab_pipeline.producer_acquire", role_src)
@@ -22129,6 +22120,8 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
             store_warp_id=7,
             c_input_warp_id=7,
             is_two_cta=two_cta,
+            # The ordinary mailbox schedule mirrors the real plan's static default.
+            is_clc_persistent=False,
             sched_stage_count=2 if staged else 1,
             grouped=None,
             row_union=None,
@@ -22375,6 +22368,8 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
                     grouped.device_split_sizes = True
                     grouped.layout = "problem_sizes"
                     plan.grouped = grouped
+                    # Real grouped runtime-CLC plans force the PDL launch fact.
+                    plan.is_clc_persistent = mode == "runtime_clc"
                     splitter._tcgen05_uses_grouped_worklist_nm_runtime_table = (
                         lambda runtime_table=runtime_table: runtime_table
                     )

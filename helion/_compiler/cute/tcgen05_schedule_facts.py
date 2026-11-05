@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from typing import Protocol
 from typing import cast
 
 import torch
@@ -19,6 +20,22 @@ if TYPE_CHECKING:
     from ..device_ir import DeviceIR
     from .cute_epilogue import Tcgen05UnaryEpilogueChain
     from .cute_mma import _CuteMmaNode
+
+
+class Tcgen05MmaGeometry(Protocol):
+    """Read-only geometric interface; carries no output-allocation assertion."""
+
+    @property
+    def shape(self) -> tuple[int, int, int]: ...
+
+    @property
+    def dtype(self) -> torch.dtype: ...
+
+    @property
+    def rhs_k_major(self) -> bool: ...
+
+    @property
+    def lhs_k_major(self) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -61,7 +78,7 @@ def n_edge_cluster_schedule_defaults() -> dict[str, object]:
 
 
 def n_edge_cluster_geometry_supported(
-    facts: Tcgen05FullTileScheduleFacts, tile: tuple[int, int, int]
+    facts: Tcgen05MmaGeometry, tile: tuple[int, int, int]
 ) -> bool:
     """Prove real tile origins for every peer in a partial-N 2x2 cluster.
 
@@ -91,7 +108,7 @@ def n_edge_cluster_geometry_supported(
 
 
 def n_edge_cluster_schedule_supported(
-    facts: Tcgen05FullTileScheduleFacts,
+    facts: Tcgen05MmaGeometry,
     tile: tuple[int, int, int],
     config: Mapping[str, object],
 ) -> bool:
@@ -110,7 +127,7 @@ def n_edge_cluster_schedule_supported(
 
 
 def full_tile_schedule_supported(
-    facts: Tcgen05FullTileScheduleFacts,
+    facts: Tcgen05MmaGeometry,
     tile: tuple[int, int, int],
     *,
     cluster_m: int,
@@ -149,7 +166,7 @@ def full_tile_schedule_supported(
 
 
 def paired_k_tail_schedule_supported(
-    facts: Tcgen05FullTileScheduleFacts,
+    facts: Tcgen05MmaGeometry,
     tile: tuple[int, int, int],
     *,
     cluster_m: int,
@@ -186,7 +203,7 @@ def paired_k_tail_schedule_supported(
 
 
 def native_tma_schedule_supported(
-    facts: Tcgen05FullTileScheduleFacts,
+    facts: Tcgen05MmaGeometry,
     tile: tuple[int, int, int],
     *,
     cluster_m: int,

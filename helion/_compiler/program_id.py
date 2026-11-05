@@ -38,6 +38,7 @@ from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
 from .cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
+from .cute.tcgen05_lifecycle import tcgen05_launch_uses_pdl
 from .cute.tcgen05_prologue import inline_floordiv_nonneg_expr
 from .cute.tcgen05_prologue import inline_mod_nonneg_expr
 from .device_function import DeviceFunction
@@ -1679,6 +1680,33 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if (plan := self._tcgen05_plan()) is not None:
             return plan.is_two_cta
         return False
+
+    def _tcgen05_pair_launch_uses_pdl(self, device_function: DeviceFunction) -> bool:
+        """Use the same complete launch facts as the AB-TMA wrapper plan."""
+        plan = self._tcgen05_plan()
+        if plan is None:
+            raise exc.BackendUnsupported(
+                "cute", "paired PDL emission requires a tcgen05 launch plan"
+            )
+        config = device_function.config
+        clc_persistent = plan.is_clc_persistent
+        # Validate all launch flags even when the bundle fact is irrelevant.
+        # Fission can suppress only the general-PDL term. This counterfactual
+        # value is not used as an assertion about a missing compile environment.
+        without_bundle = tcgen05_launch_uses_pdl(
+            config, clc_persistent=clc_persistent, fission_bundle=False
+        )
+        if (
+            config.get("cute_pdl", False) is False
+            or clc_persistent
+            or config.get("tcgen05_materialized_pdl", False) is True
+        ):
+            return without_bundle
+        return tcgen05_launch_uses_pdl(
+            config,
+            clc_persistent=clc_persistent,
+            fission_bundle=CompileEnvironment.current().cute_fission_plan is not None,
+        )
 
     def _tcgen05_has_scheduler_warp(self) -> bool:
         plan = self._tcgen05_plan()
@@ -3862,8 +3890,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # ``cute_pdl`` (``cute_mma``'s ``tcgen05_pdl_launch``): the TMA-load
         # warp waits before its first load and the epilogue warps before
         # their first auxiliary load; every other global access follows one
-        # of those waits through the pipelines.  (The two-CTA TMA role waits
-        # below regardless; the epilogue-role wait is new for it.)  Kernel
+        # of those waits through the pipelines. The two-CTA TMA role follows
+        # the effective host-launch PDL facts too; pair geometry alone is not
+        # a programmatic dependency. Kernel
         # shapes whose reads this does not cover get an entry wait from
         # ``DeviceFunction._cute_pdl_applies`` instead.
         general_pdl = (
@@ -3878,6 +3907,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if emit_pdl_wait and (
             (
                 self._tcgen05_is_two_cta()
+                and self._tcgen05_pair_launch_uses_pdl(device_function)
                 and (
                     tma_load_role
                     or materialized_pdl
@@ -4390,6 +4420,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if (
             emit_pdl_wait
             and plan.is_two_cta
+            and self._tcgen05_pair_launch_uses_pdl(device_function)
             and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
         ):
             prelude.append(statement_from_string("cute.arch.griddepcontrol_wait()"))
@@ -4962,6 +4993,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if emit_pdl_wait and (
             (
                 self._tcgen05_is_two_cta()
+                and self._tcgen05_pair_launch_uses_pdl(device_function)
                 and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
             )
             or epilogue_pdl

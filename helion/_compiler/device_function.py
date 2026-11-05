@@ -3162,6 +3162,19 @@ class DeviceFunction:
             return not waits_cover_global_reads([*self.preamble, *self.body])
         if any(plan.get("use_pdl") for plan in self.codegen.cute_wrapper_plans):
             return False
+        plan = self.cute_state.matmul_plan
+        if plan is not None and plan.is_two_cta:
+            from .cute.tcgen05_lifecycle import tcgen05_launch_uses_pdl
+
+            if not tcgen05_launch_uses_pdl(
+                self.config,
+                clc_persistent=plan.is_clc_persistent,
+                fission_bundle=env.cute_fission_plan is not None,
+            ):
+                # An inert general knob in a serial materialized bundle
+                # must not regain an entry wait/launch attribute merely
+                # because the paired PDL-OFF body now has no such calls.
+                return False
         return not any(
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
