@@ -23,6 +23,7 @@ from ..runtime.kernel import Kernel
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
+from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
 from .compile_environment import warning
 from .output_header import library_imports
@@ -209,6 +210,7 @@ class TypePropagation(ast.NodeVisitor):
         self.scope = scope
         self.device_loop_depth = 0
         self.device_loop_count = 0
+        self._filtered_comprehension_loop = False
         # Names bound inside device code; they never exist on the host.
         self.device_names: set[str] = set()
 
@@ -963,7 +965,7 @@ class TypePropagation(ast.NodeVisitor):
         return NoType(origin=self.origin())
 
     def visit_Assign(self, node: ast.Assign) -> TypeInfo:
-        type_info = self.visit(node.value)
+        type_info = self._assignment_value(node.value)
         for target in node.targets:
             self._assign(target, type_info)
         return NoType(origin=self.origin())
@@ -971,9 +973,18 @@ class TypePropagation(ast.NodeVisitor):
     def visit_AnnAssign(self, node: ast.AnnAssign) -> TypeInfo:
         # TODO(jansel): handle constexpr in annotation
         if node.value is not None:
-            type_info = self.visit(node.value)
+            type_info = self._assignment_value(node.value)
             self._assign(node.target, type_info)
         return NoType(origin=self.origin())
+
+    def _assignment_value(self, value: ast.expr) -> TypeInfo:
+        # Loop bodies are analyzed more than once. Keep the current value for
+        # constant filters while retaining merged annotations for later passes.
+        if self._filtered_comprehension_loop and definitely_does_not_have_side_effects(
+            value
+        ):
+            return self._visit_comprehension_iteration(value)
+        return self.visit(value)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> TypeInfo:
         assert isinstance(node.target, ExtendedAST)
@@ -1061,13 +1072,29 @@ class TypePropagation(ast.NodeVisitor):
             self.visit(stmt)
         return self.pop_scope()
 
+    @staticmethod
+    def _contains_filtered_comprehension(stmts: list[ast.stmt]) -> bool:
+        return any(
+            isinstance(child, (ast.ListComp, ast.GeneratorExp))
+            and any(generator.ifs for generator in child.generators)
+            for stmt in stmts
+            for child in ast.walk(stmt)
+        )
+
     def _loop_body(self, stmts: list[ast.stmt]) -> LocalScope:
         self.push_scope()
         exit_scopes = [self.scope]
-        for stmt in stmts:
-            self.visit(stmt)
-            if isinstance(stmt, (ast.Break, ast.Continue)):
-                exit_scopes.append(self.scope.clone())
+        previous = self._filtered_comprehension_loop
+        self._filtered_comprehension_loop |= (
+            self.device_loop_depth > 0 and self._contains_filtered_comprehension(stmts)
+        )
+        try:
+            for stmt in stmts:
+                self.visit(stmt)
+                if isinstance(stmt, (ast.Break, ast.Continue)):
+                    exit_scopes.append(self.scope.clone())
+        finally:
+            self._filtered_comprehension_loop = previous
         self.pop_scope()
         return functools.reduce(lambda x, y: x.merge(y), exit_scopes)
 
@@ -1081,12 +1108,7 @@ class TypePropagation(ast.NodeVisitor):
             and not node.orelse
             and (
                 not iter_type.element_types
-                or any(
-                    isinstance(child, (ast.ListComp, ast.GeneratorExp))
-                    and any(generator.ifs for generator in child.generators)
-                    for statement in node.body
-                    for child in ast.walk(statement)
-                )
+                or self._contains_filtered_comprehension(node.body)
             )
         ):
             assert isinstance(node, ExtendedAST)

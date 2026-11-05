@@ -181,6 +181,32 @@ def repeated_static_range_comprehension(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(autotune_effort="none")
+def computed_literal_filter(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        acc = torch.zeros([tile], dtype=x.dtype, device=x.device)
+        for j in (0, 1):
+            n = j + 1
+            values = [i for i in (1, 2) if i == n]
+            acc = acc + x[tile] * values[0]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def computed_static_range_filter(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        acc = torch.zeros([tile], dtype=x.dtype, device=x.device)
+        for j in hl.static_range(2):
+            n = j + 1
+            values = [i for i in (1, 2) if i == n]
+            acc = acc + x[tile] * values[0]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
 def iteration_dependent_iterable(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.numel()):
@@ -350,6 +376,16 @@ def test_static_range_comprehension_uses_each_iteration_scope() -> None:
 
 
 @pytest.mark.parametrize(
+    "kernel", [computed_literal_filter, computed_static_range_filter]
+)
+def test_computed_filter_per_iteration(kernel: helion.Kernel) -> None:
+    bound = kernel.bind((torch.ones(32),))
+    graph = str(bound.host_function.device_ir.graphs[0].graph)
+    assert graph.count("aten.mul.Tensor") == 2
+    assert all(f", {factor})" in graph for factor in (1, 2))
+
+
+@pytest.mark.parametrize(
     "kernel", [iteration_dependent_iterable, heterogeneous_filter, mixed_literal_filter]
 )
 def test_filtered_sequence_types_per_iteration(kernel: helion.Kernel) -> None:
@@ -417,6 +453,16 @@ def test_filtered_multidimensional_tensor_cuda() -> None:
 def test_repeated_static_range_comprehension_cuda() -> None:
     x = torch.randn(128, device=DEVICE)
     torch.testing.assert_close(repeated_static_range_comprehension(x), x * 6)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize(
+    "kernel", [computed_literal_filter, computed_static_range_filter]
+)
+def test_computed_filter_per_iteration_cuda(kernel: helion.Kernel) -> None:
+    x = torch.randn(128, device=DEVICE)
+    torch.testing.assert_close(kernel(x), x * 3)
 
 
 @pytest.mark.cuda

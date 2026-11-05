@@ -122,6 +122,7 @@ if TYPE_CHECKING:
 tls: _TLS = cast("_TLS", threading.local())
 
 log = logging.getLogger(__name__)
+_SKIP_UNROLLED_RESULT = object()
 
 
 def _cute_tcgen05_output_store_facts(
@@ -2247,7 +2248,7 @@ class WalkDeviceAST(NodeVisitor):
         self,
         sequence_iter: ast.AST,
         target: ast.AST,
-        element_processor: Callable[[], object | None],
+        element_processor: Callable[[], object],
         preserve_scope: bool = False,
     ) -> list[object]:
         """Common logic for unrolling sequences in both loops and comprehensions."""
@@ -2262,15 +2263,17 @@ class WalkDeviceAST(NodeVisitor):
             if preserve_scope:
                 # For loops: don't create new scope, allow state to persist
                 self._assign(target, element_value)
-                results.append(element_processor())
+                result = element_processor()
             else:
                 # For comprehensions: create isolated scope for each iteration
                 old_scope = self.scope.copy()
                 try:
                     self._assign(target, element_value)
-                    results.append(element_processor())
+                    result = element_processor()
                 finally:
                     self.scope = old_scope
+            if result is not _SKIP_UNROLLED_RESULT:
+                results.append(result)
 
         return results
 
@@ -2280,9 +2283,9 @@ class WalkDeviceAST(NodeVisitor):
     ) -> None:
         """Handle unrolling of loops that iterate over tuples of tensors."""
 
-        def execute_body() -> None:
+        def execute_body() -> object:
             self._body(node.body)
-            return None  # No result to collect for loops
+            return _SKIP_UNROLLED_RESULT
 
         self._handle_sequence_unrolling(
             node.iter, node.target, execute_body, preserve_scope=True
@@ -2750,8 +2753,6 @@ class WalkDeviceAST(NodeVisitor):
     ) -> tuple[object, ...]:
         """Handle unrolling of comprehensions (list comp or generator exp) over sequences."""
 
-        skip = object()
-
         def evaluate_expression() -> object:
             for condition in generator.ifs:
                 value = self.visit(condition)
@@ -2760,7 +2761,7 @@ class WalkDeviceAST(NodeVisitor):
                         "Comprehension filters must be compile-time constant expressions"
                     )
                 if not value:
-                    return skip
+                    return _SKIP_UNROLLED_RESULT
             # Evaluate the comprehension expression
             result = self.visit(elt)
             # If the result is a SymInt that can be evaluated to a concrete value, do so
@@ -2775,7 +2776,7 @@ class WalkDeviceAST(NodeVisitor):
             generator.iter, generator.target, evaluate_expression, preserve_scope=False
         )
         # Return as tuple to match the expected type for tuple unrolling
-        return tuple(result for result in results if result is not skip)
+        return tuple(results)
 
     def visit_DictComp(self, node: ast.DictComp) -> dict[object, object]:
         """Handle dict comprehension unrolling."""
@@ -2797,10 +2798,11 @@ class WalkDeviceAST(NodeVisitor):
 
         result: dict[object, object] = {}
 
-        def evaluate_key_value() -> None:
+        def evaluate_key_value() -> object:
             key = self.visit(node.key)
             value = self.visit(node.value)
             result[key] = value
+            return _SKIP_UNROLLED_RESULT
 
         self._handle_sequence_unrolling(
             generator.iter, generator.target, evaluate_key_value, preserve_scope=False
