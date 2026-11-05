@@ -66,6 +66,10 @@ def cpu_only():
             ) as synchronize,
             _forbid_native_compile() as native_compilation,
             _target(),
+            patch(
+                "helion._compiler.cute.cute_mma.split_barrier_init_supported",
+                return_value=True,
+            ),
         ):
             yield
             for prohibited in (
