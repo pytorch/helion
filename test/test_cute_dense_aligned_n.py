@@ -28,6 +28,7 @@ from helion._compiler.cute.dense_aligned_n import dense_aligned_n_defaults
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import tcgen05_two_cta_m128_epilogue_tile_expr
+from helion._compiler.cute.tcgen05_prologue import split_barrier_init_supported
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import BackendUnsupported
@@ -46,6 +47,12 @@ epi = pytest.importorskip("cutlass.utils.gemm.sm100")
 LayoutEnum = pytest.importorskip("cutlass.utils.layout").LayoutEnum
 
 pytestmark = skipUnlessBackends(["cute"])
+
+_AB_PIPELINE = (
+    "make_tma_umma_pipeline("
+    if split_barrier_init_supported()
+    else "PipelineTmaUmma.create"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -145,7 +152,7 @@ def test_native_selection_uses_physical_n(mode, acc_stages):
             )
         source = bound.to_code(config)
     assert results and all(result == "tcgen05" for result in results), results
-    assert "make_tma_umma_pipeline(" in source
+    assert _AB_PIPELINE in source
     assert "PipelineTmaStore.create" in source
     assert "(128, 80, 128)" in source
 
@@ -500,7 +507,7 @@ def test_every_advertised_width_emits_native_complete_budget(width, acc_stages):
     assert descriptors[0]["bn"] == width
     assert descriptors[0]["ab_stage_count"] == plan.max_ab_stages
     assert descriptors[1]["epi_tile_raw_expr"] == _d_tile_expr(width)
-    assert "make_tma_umma_pipeline(" in source
+    assert _AB_PIPELINE in source
     assert "PipelineTmaStore.create" in source
     assert "block=(32, 6, 1)" in source
     # The TMEM load atom that the ownership proofs above model.
@@ -571,7 +578,7 @@ def test_explicit_native_implementation_contract(implementation, monkeypatch):
     else:
         assert seeds and fragments["tcgen05_tile_n"].choices == (0, 80, 160)
         code = bound.to_code(_config())
-        assert "make_tma_umma_pipeline(" in code
+        assert _AB_PIPELINE in code
     ordinary = _config(tcgen05_tile_n=0, tcgen05_ab_stages=2)
     omitted = helion.Config.from_dict(
         {
@@ -700,7 +707,7 @@ def test_direct_roundtrip_keeps_budget_and_collective_release(
     source = bound.to_code(canonical)
     assert [plan["kind"] for plan in wrapper_plans(source)] == ["tcgen05_ab_tma"]
     assert "CopyR2GOp" in source
-    assert "make_tma_umma_pipeline(" in source
+    assert _AB_PIPELINE in source
     assert "PipelineTmaStore.create" not in source
     assert "tcgen05_sD_ptr = cute.arch.alloc_smem" not in source
     assert "tcgen05_tiled_copy_r2s" not in source
