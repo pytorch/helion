@@ -76,6 +76,21 @@ lets Helion apply the masking implicitly for indices beyond each lane's true len
 
 `static_range()` behaves like a compile-time unrolled range for small loops. It hints the compiler to fully unroll the loop body where profitable.
 
+### Filtered comprehensions
+
+Inside device loops, a list comprehension can filter a fixed sequence when each
+condition can be resolved at compile time:
+
+```python
+factors = [i + 1 for i in (0, 1, 2, 3) if i % 2 == 0]  # [1, 3]
+```
+
+The resulting sequence is expanded while compiling. Filters may use literals,
+comprehension targets, and `hl.constexpr` arguments, but not function calls or
+assignment expressions. A filter depending on a runtime value or tensor is not
+supported because the result would have a runtime-dependent length. Multiple
+`if` clauses are evaluated in order, with short-circuiting.
+
 ### barrier()
 
 ```{eval-rst}

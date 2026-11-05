@@ -22,6 +22,7 @@ from ..language._decorators import is_api_func
 from ..runtime.kernel import Kernel
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
+from .ast_extension import clone_ast
 from .ast_extension import create
 from .compile_environment import CompileEnvironment
 from .compile_environment import warning
@@ -1184,19 +1185,19 @@ class TypePropagation(ast.NodeVisitor):
         raise exc.StatementNotSupported(type(node).__name__)
 
     def _visit_comprehension_iteration(self, node: ast.AST) -> TypeInfo:
-        nodes = [n for n in ast.walk(node) if isinstance(n, ExtendedAST)]
-        previous = [n._type_info for n in nodes]
-        for n in nodes:
-            n._type_info = None
-        try:
-            result = self.visit(node)
-        except BaseException:
-            for n, old in zip(nodes, previous, strict=True):
-                n._type_info = old
-            raise
-        for n, old in zip(nodes, previous, strict=True):
-            if old is not None:
-                n._type_info = old if n._type_info is None else old.merge(n._type_info)
+        fresh = clone_ast(node)
+        assert isinstance(fresh, ast.AST)
+        for child in ast.walk(fresh):
+            if isinstance(child, ExtendedAST):
+                child._type_info = None
+        result = self.visit(fresh)
+        for original, inferred in zip(ast.walk(node), ast.walk(fresh), strict=True):
+            if (
+                isinstance(original, ExtendedAST)
+                and isinstance(inferred, ExtendedAST)
+                and inferred._type_info is not None
+            ):
+                original.update_type_info(inferred._type_info)
         return result
 
     def _comprehension_filter(self, node: ast.expr) -> bool:
@@ -1215,11 +1216,27 @@ class TypePropagation(ast.NodeVisitor):
             for op, comparator in zip(node.ops, node.comparators, strict=True):
                 right = self._visit_comprehension_iteration(comparator)
                 if left.is_literal() and right.is_literal():
+                    left_value = left.as_literal()
+                    right_value = right.as_literal()
+                    if (
+                        isinstance(op, (ast.Is, ast.IsNot))
+                        and left_value is not None
+                        and right_value is not None
+                        and type(left_value) is not bool
+                        and type(right_value) is not bool
+                    ):
+                        raise exc.StatementNotSupported(
+                            "Comprehension filters must be compile-time constant expressions"
+                        )
                     result = LiteralType(
                         self.origin(),
-                        _eval_compare(op, left.as_literal(), right.as_literal()),
+                        _eval_compare(op, left_value, right_value),
                     )
                 else:
+                    if isinstance(op, (ast.In, ast.NotIn)):
+                        raise exc.StatementNotSupported(
+                            "Comprehension filters must be compile-time constant expressions"
+                        )
                     result = self._compare(op, left, right)
                 if not self._constant_comprehension_truth(result):
                     return False

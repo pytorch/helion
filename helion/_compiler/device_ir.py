@@ -2262,15 +2262,13 @@ class WalkDeviceAST(NodeVisitor):
             if preserve_scope:
                 # For loops: don't create new scope, allow state to persist
                 self._assign(target, element_value)
-                result = element_processor()
-                results.append(result)
+                results.append(element_processor())
             else:
                 # For comprehensions: create isolated scope for each iteration
                 old_scope = self.scope.copy()
                 try:
                     self._assign(target, element_value)
-                    result = element_processor()
-                    results.append(result)
+                    results.append(element_processor())
                 finally:
                     self.scope = old_scope
 

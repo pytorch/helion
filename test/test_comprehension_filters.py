@@ -68,6 +68,36 @@ def dynamic_filter(x: torch.Tensor, limit: int) -> torch.Tensor:
 
 
 @helion.kernel(autotune_effort="none")
+def dynamic_membership(x: torch.Tensor, limit: int) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [i for i in (0, 1, 2) if i in (limit, 5)]
+        for value in values:
+            out[tile] = x[tile] * value
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def tensor_filter(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [i for i in (0, 1, 2) if x[tile] > 0]
+        for value in values:
+            out[tile] = x[tile] * value
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def identity_filter(x: torch.Tensor, limit: hl.constexpr) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [i for i in (10000, 20000) if i is limit]
+        for value in values:
+            out[tile] = x[tile] * value
+    return out
+
+
+@helion.kernel(autotune_effort="none")
 def shadowed_target(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     i = 7
@@ -84,6 +114,18 @@ def filtered_tensors(x: torch.Tensor) -> torch.Tensor:
         pairs = ((0, 1), (1, 2), (2, 3))
         values = [x[tile] * factor for index, factor in pairs if index != 1]
         out[tile] = values[0] + values[1]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def repeated_comprehension(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        acc = torch.zeros([tile], dtype=x.dtype, device=x.device)
+        for selected in (0, 2):
+            values = [i + 1 for i in (0, 1, 2) if i == selected]
+            acc = acc + x[tile] * values[0]
+        out[tile] = acc
     return out
 
 
@@ -127,6 +169,21 @@ def test_runtime_filter_is_rejected() -> None:
         dynamic_filter.bind((torch.ones(32), 2))
 
 
+def test_runtime_membership_is_rejected() -> None:
+    with pytest.raises(exc.StatementNotSupported, match="compile-time constant"):
+        dynamic_membership.bind((torch.ones(32), 2))
+
+
+def test_tensor_filter_is_rejected() -> None:
+    with pytest.raises(exc.StatementNotSupported, match="compile-time constant"):
+        tensor_filter.bind((torch.ones(32),))
+
+
+def test_identity_filter_is_rejected() -> None:
+    with pytest.raises(exc.StatementNotSupported, match="compile-time constant"):
+        identity_filter.bind((torch.ones(32), 10000))
+
+
 def test_comprehension_target_does_not_shadow_outer_value() -> None:
     bound = shadowed_target.bind((torch.ones(32),))
     graph = str(bound.host_function.device_ir.graphs[0].graph)
@@ -135,6 +192,14 @@ def test_comprehension_target_does_not_shadow_outer_value() -> None:
 
 def test_filtered_tensor_bodies_are_traced_only_for_selected_elements() -> None:
     bound = filtered_tensors.bind((torch.ones(32),))
+    graph = str(bound.host_function.device_ir.graphs[0].graph)
+    assert graph.count("aten.mul.Tensor") == 2
+    assert ", 1)" in graph
+    assert ", 3)" in graph
+
+
+def test_repeated_comprehension_uses_each_iteration_scope() -> None:
+    bound = repeated_comprehension.bind((torch.ones(32),))
     graph = str(bound.host_function.device_ir.graphs[0].graph)
     assert graph.count("aten.mul.Tensor") == 2
     assert ", 1)" in graph
