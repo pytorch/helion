@@ -17,6 +17,8 @@ import torch
 
 from ... import exc
 from . import cute_epilogue as epi
+from .epilogue_fanout import FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS
+from .epilogue_fanout import FANOUT_STORE_COMMIT_GROUP_SIZES
 from .epilogue_fanout import FANOUT_STORE_COMMIT_MODES
 from .epilogue_fanout import PairedFanoutPlan
 from .epilogue_fanout import _fresh_returned_tensors
@@ -486,6 +488,62 @@ def grouped_store_commit(stores: Sequence[FanoutStore]) -> bool:
     return True
 
 
+def grouped_commit_groups(
+    stores: Sequence[FanoutStore], grouped: bool
+) -> tuple[tuple[int, ...], ...]:
+    """The output indices each bulk commit group of a grouped scope closes, in order.
+
+    ``tcgen05_fanout_store_commit_group_size='all'`` (the default) keeps the
+    grouped protocol's single commit group. ``2`` closes contiguous groups of
+    two outputs (three outputs: 2+1, four: 2+2), at most two groups per subtile.
+    Splitting is sound on the facts ``grouped_store_commit`` already proved:
+
+    - every ``PipelineTmaStore`` is the SDK's stateless ``TmaStoreFence``: its
+      ``producer_commit`` is ``cp.async.bulk.commit_group`` and its
+      ``producer_acquire`` is ``cp.async.bulk.wait_group.read(num_stages - 1)``
+      on the calling thread's bulk-group FIFO, with no index or phase state, so
+      one issuer's commits may close any contiguous run of its own stores;
+    - ring ``r``'s slot ``u % S`` (``S = c_stages``, one stage per slot) is next
+      written ``S`` subtiles later. With ``k >= 1`` groups committed per subtile,
+      the published acquire at subtile ``u`` leaves only the newest ``S - 1``
+      groups pending; those come from subtiles ``>= u - (S - 1)``, so every group
+      of subtile ``u - S`` -- every reader of slot ``u % S`` -- has completed.
+      The pre-loop acquires are the same wait and every ring keeps its own
+      tail, so no acquire, drain or teardown moves.
+
+    Each group then pays its own fence, all-thread barrier, issuer TMA copies
+    and commit (``combine_dag_stores``). Any other size, a serial scope with a
+    bounded size, or an output count outside
+    ``FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS`` is refused, never served.
+    """
+    sizes = {store.commit_group_size for store in stores}
+    if len(sizes) != 1 or len({type(size) for size in sizes}) != 1:
+        raise exc.BackendUnsupported(
+            "cute", "mixed shared-DAG store commit group sizes"
+        )
+    (size,) = sizes
+    if type(size) is str and size == FANOUT_STORE_COMMIT_GROUP_SIZES[0]:
+        return (tuple(range(len(stores))),) if grouped else ()
+    if type(size) is not int or size != FANOUT_STORE_COMMIT_GROUP_SIZES[1]:
+        raise exc.BackendUnsupported(
+            "cute", f"unknown shared-DAG store commit group size {size!r}"
+        )
+    if not grouped:
+        raise exc.BackendUnsupported(
+            "cute", "a bounded store commit group size needs the grouped protocol"
+        )
+    if len(stores) not in FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS:
+        raise exc.BackendUnsupported(
+            "cute",
+            "a bounded store commit group size needs "
+            f"{FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS} outputs",
+        )
+    return tuple(
+        tuple(range(start, min(start + size, len(stores))))
+        for start in range(0, len(stores), size)
+    )
+
+
 def combine_dag_stores(stores: Sequence[FanoutStore]) -> None:
     if not stores:
         raise exc.BackendUnsupported("cute", "empty shared-DAG fanout stores")
@@ -622,6 +680,22 @@ def combine_dag_stores(stores: Sequence[FanoutStore]) -> None:
         chunks.append(loads)
         bindings.append(local)
     grouped = grouped_store_commit(stores)
+    commit_groups = grouped_commit_groups(stores, grouped)
+    issue_header = f"        if {first.issuer}:\n"
+
+    def commit_group(indices: tuple[int, ...]) -> str:
+        # One fence orders each thread's ring writes for the async proxy; the
+        # barrier then holds the issuer until every thread fenced. The issuer's
+        # TMA stores keep the output order and close one bulk commit group.
+        return (
+            "        cute.arch.fence_view_async_shared()\n"
+            f"        {first.barrier}.arrive_and_wait()\n"
+            + issue_header
+            + "".join(stores[i].tma[len(issue_header) :] for i in indices)
+            + first.commit
+        )
+
+    early_groups = {group[-1]: group for group in commit_groups[:-1]}
     pre_wait = first.iteration.pre_wait_aux
     body = "".join(chunk for group in chunks for chunk in group) if pre_wait else ""
     body += (
@@ -684,6 +758,10 @@ def combine_dag_stores(stores: Sequence[FanoutStore]) -> None:
                 f"        {store.buffer} = ({store.buffer_expr}) % cutlass.Int32({store.c_stages})\n"
                 + store.r2s
             )
+            if index in early_groups:
+                # A bounded group closes as soon as its last output's ring
+                # slot is written (``grouped_commit_groups``).
+                body += commit_group(early_groups[index])
             continue
         body += (
             f"        {store.barrier}.arrive_and_wait()\n"
@@ -695,18 +773,9 @@ def combine_dag_stores(stores: Sequence[FanoutStore]) -> None:
             + store.commit
         )
     if grouped:
-        # One fence orders each thread's writes to every ring for the async
-        # proxy; the barrier then holds the issuer until every thread fenced.
-        # The issuer's TMA stores keep the original output order and close ONE
-        # bulk commit group (``grouped_store_commit``).
-        header = f"        if {first.issuer}:\n"
-        body += (
-            "        cute.arch.fence_view_async_shared()\n"
-            f"        {first.barrier}.arrive_and_wait()\n"
-            + header
-            + "".join(store.tma[len(header) :] for store in stores)
-            + first.commit
-        )
+        # The last (by default the only) bulk commit group
+        # (``grouped_store_commit``, ``grouped_commit_groups``).
+        body += commit_group(commit_groups[-1])
     checks = "".join(
         f"assert cutlass.const_expr({first.subtile_count} == {s.subtile_count})\n"
         for s in stores[1:]

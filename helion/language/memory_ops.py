@@ -29,7 +29,10 @@ from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from .._compiler.cute.device_state import Tcgen05GroupedDMode
 from .._compiler.cute.device_state import Tcgen05Orientation
 from .._compiler.cute.epilogue_fanout import FANOUT_CONFIG_KEY
+from .._compiler.cute.epilogue_fanout import FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS
 from .._compiler.cute.epilogue_fanout import FANOUT_STORE_COMMIT_CONFIG_KEY
+from .._compiler.cute.epilogue_fanout import FANOUT_STORE_COMMIT_GROUP_SIZE_CONFIG_KEY
+from .._compiler.cute.epilogue_fanout import FANOUT_STORE_COMMIT_GROUP_SIZES
 from .._compiler.cute.epilogue_fanout import FANOUT_STORE_COMMIT_MODES
 from .._compiler.cute.epilogue_fanout import FanoutIteration
 from .._compiler.cute.epilogue_fanout import FanoutStore
@@ -2795,6 +2798,30 @@ def _codegen_cute_store_tcgen05_tile(
         raise exc.InvalidConfig(
             f"{FANOUT_STORE_COMMIT_CONFIG_KEY}={fanout_store_commit!r} requires a "
             f"proved shared-DAG fanout ({FANOUT_CONFIG_KEY}='shared')"
+        )
+    # ``tcgen05_fanout_store_commit_group_size``: a bounded group size exists
+    # only for the grouped commit of a proved shared-DAG fanout of
+    # ``FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS`` outputs; ``all`` is the
+    # default. Any other request is refused (the normalizer mirrors this).
+    fanout_store_commit_group_size = df.config.get(
+        FANOUT_STORE_COMMIT_GROUP_SIZE_CONFIG_KEY, FANOUT_STORE_COMMIT_GROUP_SIZES[0]
+    )
+    if not (
+        type(fanout_store_commit_group_size) is str
+        and fanout_store_commit_group_size == FANOUT_STORE_COMMIT_GROUP_SIZES[0]
+    ) and not (
+        type(fanout_store_commit_group_size) is int
+        and fanout_store_commit_group_size == FANOUT_STORE_COMMIT_GROUP_SIZES[1]
+        and type(fanout_store_commit) is str
+        and fanout_store_commit == FANOUT_STORE_COMMIT_MODES[1]
+        and isinstance(fanout_plan, SharedDagFanoutPlan)
+        and len(fanout_plan.stores) in FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS
+    ):
+        raise exc.InvalidConfig(
+            f"{FANOUT_STORE_COMMIT_GROUP_SIZE_CONFIG_KEY}="
+            f"{fanout_store_commit_group_size!r} requires the grouped store commit "
+            f"({FANOUT_STORE_COMMIT_CONFIG_KEY}='grouped') of a proved shared-DAG "
+            f"fanout with {FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS} outputs"
         )
     if has_store_fanout and fragment_epilogue is not None:
         raise exc.BackendUnsupported(
@@ -8635,6 +8662,7 @@ def _codegen_cute_store_tcgen05_tile(
             pipeline_stages=tcgen05_c_pipeline_stage_count,
             issuer=epi_leader_predicate,
             commit_mode=fanout_store_commit,
+            commit_group_size=fanout_store_commit_group_size,
         )
         if isinstance(fanout_plan, SharedDagFanoutPlan):
             if df.cute_state.register_shared_dag_fanout_store(store):

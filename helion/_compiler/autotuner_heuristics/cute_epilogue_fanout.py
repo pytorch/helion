@@ -16,7 +16,10 @@ from ...exc import InvalidConfig
 from ...runtime.config import Config
 from ..cute.epilogue_fanout import FANOUT_CONFIG_KEY
 from ..cute.epilogue_fanout import FANOUT_MODES
+from ..cute.epilogue_fanout import FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS
 from ..cute.epilogue_fanout import FANOUT_STORE_COMMIT_CONFIG_KEY
+from ..cute.epilogue_fanout import FANOUT_STORE_COMMIT_GROUP_SIZE_CONFIG_KEY
+from ..cute.epilogue_fanout import FANOUT_STORE_COMMIT_GROUP_SIZES
 from ..cute.epilogue_fanout import FANOUT_STORE_COMMIT_MODES
 from ..cute.epilogue_fanout import schedule_supported
 from ..cute.shared_epilogue_dag import SharedDagFanoutPlan
@@ -205,6 +208,16 @@ def register_epilogue_fanout_coverage(
             not state.materialized_matmul_block_ids
             and any(isinstance(plan, SharedDagFanoutPlan) for plan in plans)
         )
+        # The bounded commit group size, under the same rule: only where every
+        # prepared plan is a shared-DAG fanout of a bounded output count.
+        state.shared_dag_store_commit_group_search_enabled = (
+            state.shared_dag_store_commit_search_enabled
+            and all(
+                isinstance(plan, SharedDagFanoutPlan)
+                and len(plan.stores) in FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS
+                for plan in plans
+            )
+        )
 
         # Preparation runs before ANY coverage group records a fingerprint.
         # It uses the unchanged complete carrier/proof admission, publishes no
@@ -227,13 +240,15 @@ def register_epilogue_fanout_coverage(
             ),
         )
     )
-    _register_fanout_store_commit_coverage(env, chosen)
+    _register_fanout_store_commit_group_coverage(
+        env, _register_fanout_store_commit_coverage(env, chosen)
+    )
     _register_materialized_aux_coverage(env)
 
 
 def _register_fanout_store_commit_coverage(
     env: CompileEnvironment, carriers: Sequence[Config]
-) -> None:
+) -> list[Config]:
     """Cover both store commit modes of a proved shared-DAG fanout.
 
     The field itself was exposed before the first coverage group: the pure
@@ -245,11 +260,12 @@ def _register_fanout_store_commit_coverage(
     reuse the fanout group's ranked carriers, already normalized with the
     shared fanout, in rank order; each must admit ``grouped`` under strict
     normalization or it is skipped. No seed, default or older witness changes.
+    Returns the registered shared carriers (none when nothing was registered).
     """
     spec = env.config_spec
     state = spec._cute_tcgen05_config
     if not state.shared_dag_store_commit_search_enabled:
-        return
+        return []
     grouped = FANOUT_STORE_COMMIT_MODES[1]
     shared_carriers: list[Config] = []
     for carrier in carriers:
@@ -271,7 +287,7 @@ def _register_fanout_store_commit_coverage(
         ) > MAX_COMPILER_COVERAGE_CONFIGS:
             break
     if not shared_carriers:
-        return
+        return []
     spec.register_compiler_coverage_group(
         CompilerCoverageGroup(
             mechanism="cute.shared_dag_store_commit",
@@ -286,6 +302,74 @@ def _register_fanout_store_commit_coverage(
             ),
             dependencies=(
                 CoverageDependency("cute.epilogue_fanout", FANOUT_CONFIG_KEY, "shared"),
+            ),
+        )
+    )
+    return shared_carriers
+
+
+def _register_fanout_store_commit_group_coverage(
+    env: CompileEnvironment, shared_carriers: Sequence[Config]
+) -> None:
+    """Cover both commit group sizes of a proved grouped shared-DAG store commit.
+
+    The field was exposed before the first coverage group, latched by the
+    preparation pass (``shared_dag_store_commit_group_search_enabled``). The
+    witnesses reuse the store-commit group's registered shared carriers in rank
+    order, with the grouped mode explicit (both dependencies are declared);
+    each must keep the bounded size under strict normalization -- the current
+    proof -- or it is skipped. Nothing is registered when the store-commit group
+    registered nothing. No seed, default or older witness changes.
+    """
+    spec = env.config_spec
+    state = spec._cute_tcgen05_config
+    if not state.shared_dag_store_commit_group_search_enabled or not shared_carriers:
+        return
+    grouped = FANOUT_STORE_COMMIT_MODES[1]
+    bounded = FANOUT_STORE_COMMIT_GROUP_SIZES[1]
+    grouped_carriers: list[Config] = []
+    for carrier in shared_carriers:
+        base = Config.from_dict(
+            deepcopy(carrier.config) | {FANOUT_STORE_COMMIT_CONFIG_KEY: grouped}
+        )
+        trial = Config.from_dict(
+            deepcopy(base.config) | {FANOUT_STORE_COMMIT_GROUP_SIZE_CONFIG_KEY: bounded}
+        )
+        try:
+            spec.normalize(trial)
+        except InvalidConfig:
+            continue
+        if (
+            trial.config.get(FANOUT_STORE_COMMIT_CONFIG_KEY) != grouped
+            or trial.config.get(FANOUT_STORE_COMMIT_GROUP_SIZE_CONFIG_KEY) != bounded
+        ):
+            continue
+        grouped_carriers.append(base)
+        if (len(grouped_carriers) + 1) * len(
+            FANOUT_STORE_COMMIT_GROUP_SIZES
+        ) > MAX_COMPILER_COVERAGE_CONFIGS:
+            break
+    if not grouped_carriers:
+        return
+    spec.register_compiler_coverage_group(
+        CompilerCoverageGroup(
+            mechanism="cute.shared_dag_store_commit_group_size",
+            version=1,
+            key=FANOUT_STORE_COMMIT_GROUP_SIZE_CONFIG_KEY,
+            domain=FANOUT_STORE_COMMIT_GROUP_SIZES,
+            legacy=FANOUT_STORE_COMMIT_GROUP_SIZES[0],
+            witnesses=tuple(
+                CoverageWitness(carrier, size)
+                for carrier in grouped_carriers
+                for size in FANOUT_STORE_COMMIT_GROUP_SIZES
+            ),
+            dependencies=(
+                CoverageDependency("cute.epilogue_fanout", FANOUT_CONFIG_KEY, "shared"),
+                CoverageDependency(
+                    "cute.shared_dag_store_commit",
+                    FANOUT_STORE_COMMIT_CONFIG_KEY,
+                    grouped,
+                ),
             ),
         )
     )

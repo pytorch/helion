@@ -44,6 +44,15 @@ FANOUT_MODES = ("off", "shared")
 # the outputs' TMA stores (the paired fanout's protocol, for N outputs).
 FANOUT_STORE_COMMIT_CONFIG_KEY = "tcgen05_fanout_store_commit"
 FANOUT_STORE_COMMIT_MODES = ("serial", "grouped")
+# How many outputs a ``grouped`` shared-DAG store commit closes per bulk commit
+# group. ``all`` (the default) is the grouped protocol above: one group per
+# subtile. ``2`` closes contiguous groups of two outputs in output order (three
+# outputs: 2+1, four: 2+2), each after its own fence and barrier, so at most two
+# bulk groups are committed per subtile. Admitted only for a grouped commit of a
+# shared-DAG fanout with ``FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS`` outputs.
+FANOUT_STORE_COMMIT_GROUP_SIZE_CONFIG_KEY = "tcgen05_fanout_store_commit_group_size"
+FANOUT_STORE_COMMIT_GROUP_SIZES: tuple[str | int, ...] = ("all", 2)
+FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS = (3, 4)
 
 
 def _fresh_returned_tensors(
@@ -850,6 +859,8 @@ class FanoutStore:
     pipeline_stages: int | None = None
     issuer: str = ""
     commit_mode: str = FANOUT_STORE_COMMIT_MODES[0]
+    # The requested ``tcgen05_fanout_store_commit_group_size``.
+    commit_group_size: str | int = FANOUT_STORE_COMMIT_GROUP_SIZES[0]
 
 
 def combine_stores(first: FanoutStore, second: FanoutStore) -> None:
@@ -876,7 +887,10 @@ def combine_stores(first: FanoutStore, second: FanoutStore) -> None:
     ):
         raise exc.BackendUnsupported("cute", "incomplete shared epilogue lifetime")
     if any(
-        store.commit_mode != FANOUT_STORE_COMMIT_MODES[0] for store in (first, second)
+        store.commit_mode != FANOUT_STORE_COMMIT_MODES[0]
+        or type(store.commit_group_size) is not str
+        or store.commit_group_size != FANOUT_STORE_COMMIT_GROUP_SIZES[0]
+        for store in (first, second)
     ):
         # The pair already owns one commit group per subtile; the grouped
         # shared-DAG mode is not a pair protocol.

@@ -45,7 +45,10 @@ from .dense_aligned_n import dense_aligned_n_defaults
 from .dense_aligned_n import dense_aligned_n_plan
 from .epilogue_fanout import FANOUT_CONFIG_KEY
 from .epilogue_fanout import FANOUT_MODES
+from .epilogue_fanout import FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS
 from .epilogue_fanout import FANOUT_STORE_COMMIT_CONFIG_KEY
+from .epilogue_fanout import FANOUT_STORE_COMMIT_GROUP_SIZE_CONFIG_KEY
+from .epilogue_fanout import FANOUT_STORE_COMMIT_GROUP_SIZES
 from .epilogue_fanout import FANOUT_STORE_COMMIT_MODES
 from .grouped_ab_k import physical_grouped_ab_k
 from .grouped_full_coverage import full_coverage_pipeline_supported
@@ -505,6 +508,7 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     GROUPED_RESIDENT_CTAS_KEY,
     FANOUT_CONFIG_KEY,
     FANOUT_STORE_COMMIT_CONFIG_KEY,
+    FANOUT_STORE_COMMIT_GROUP_SIZE_CONFIG_KEY,
     TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY,
     TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY,
     TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY,
@@ -761,6 +765,9 @@ class CuteTcgen05Config:
         # recomputed from the later (re-proved) ``epilogue_fanout_plans``, so
         # a late proof loss or recovery cannot move the published layout.
         self.shared_dag_store_commit_search_enabled: bool = False
+        # Latched by the same preparation pass, under the same rule: whether
+        # ``tcgen05_fanout_store_commit_group_size`` is on the search surface.
+        self.shared_dag_store_commit_group_search_enabled: bool = False
         self.deep_direct_entry_validation_enabled: bool = False
         self.pipeline_smem_facts: Tcgen05PipelineSmemFacts | None = None
         # Seed-only certificate from the fully guarded ordinary MMA source
@@ -6088,6 +6095,61 @@ class CuteTcgen05Config:
             )
         return None
 
+    def fanout_store_commit_group_size_refusal(
+        self, config: dict[str, object]
+    ) -> str | None:
+        """Why ``tcgen05_fanout_store_commit_group_size=2`` is refused; None if admitted.
+
+        A bounded group size splits the grouped protocol's one bulk commit
+        group (``shared_epilogue_dag.grouped_commit_groups``), so it needs an
+        admitted grouped store commit, and it keeps at most two groups per
+        subtile: every proved fanout is a shared-DAG fanout of
+        ``FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS`` outputs. The emission
+        re-proves the recorded store protocol facts.
+        """
+        mode = config.get(FANOUT_STORE_COMMIT_CONFIG_KEY)
+        if type(mode) is not str or mode != FANOUT_STORE_COMMIT_MODES[1]:
+            return (
+                "requires the grouped store commit "
+                f"({FANOUT_STORE_COMMIT_CONFIG_KEY}='grouped')"
+            )
+        reason = self.fanout_store_commit_refusal(config)
+        if reason is not None:
+            return reason
+        if not all(
+            isinstance(plan, SharedDagFanoutPlan)
+            and len(plan.stores) in FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS
+            for plan in self.epilogue_fanout_plans
+        ):
+            return (
+                "requires every proved shared-DAG fanout to have "
+                f"{FANOUT_STORE_COMMIT_BOUNDED_STORE_COUNTS} outputs"
+            )
+        return None
+
+    def _normalize_fanout_store_commit_group_size(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """Keep ``all`` implicit; admit ``2`` only where it is proved."""
+        key = FANOUT_STORE_COMMIT_GROUP_SIZE_CONFIG_KEY
+        if key not in config:
+            return
+        value = config[key]
+        if type(value) is str and value == FANOUT_STORE_COMMIT_GROUP_SIZES[0]:
+            config.pop(key)
+            return
+        reason = (
+            self.fanout_store_commit_group_size_refusal(config)
+            if type(value) is int and value == FANOUT_STORE_COMMIT_GROUP_SIZES[1]
+            else f"must be one of {FANOUT_STORE_COMMIT_GROUP_SIZES!r}"
+        )
+        if reason is None:
+            return
+        if fix_invalid:
+            config.pop(key)
+            return
+        raise InvalidConfig(f"{key}={value!r} {reason}")
+
     def _normalize_fanout_store_commit(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -10745,6 +10807,13 @@ class CuteTcgen05Config:
             fragments[FANOUT_STORE_COMMIT_CONFIG_KEY] = EnumFragment(
                 FANOUT_STORE_COMMIT_MODES
             )
+        if not for_search or self.shared_dag_store_commit_group_search_enabled:
+            # Appended after the store commit mode, under the same latched
+            # rule; a value is admitted only by the current proof
+            # (``fanout_store_commit_group_size_refusal``).
+            fragments[FANOUT_STORE_COMMIT_GROUP_SIZE_CONFIG_KEY] = EnumFragment(
+                FANOUT_STORE_COMMIT_GROUP_SIZES
+            )
         if for_search and self._modular_aux_protocol_subject is not None:
             for key, value in self._modular_aux_protocol_subject.inert_options():
                 if key in fragments:
@@ -12393,6 +12462,8 @@ class CuteTcgen05Config:
         # The fanout's store commit mode is judged on the final fanout,
         # schedule and C rings.
         self._normalize_fanout_store_commit(config, fix_invalid=fix_invalid)
+        # Its group size is judged on the final store commit mode.
+        self._normalize_fanout_store_commit_group_size(config, fix_invalid=fix_invalid)
 
     def flat_fields(
         self,
