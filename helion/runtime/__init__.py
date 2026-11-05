@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
-
-import torch
+from typing import TYPE_CHECKING
 
 from .. import _compat as _compat  # ensure Triton compatibility patches run
 from .. import exc
+from .._compiler.metal.metal_launcher import (
+    default_metal_launcher as default_metal_launcher,
+)
 from .config import Config as Config
 from .cute.launcher import _CUTE_LAUNCH_ARG_CACHE_LIMIT as _CUTE_LAUNCH_ARG_CACHE_LIMIT
 from .cute.launcher import (
@@ -60,6 +62,9 @@ from .triton.launcher import default_launcher as _triton_default_launcher
 from .triton.launcher import get_num_sm as _triton_get_num_sm
 from .triton.launcher import get_num_xcd as get_num_xcd
 from .triton.launcher import set_triton_allocator as set_triton_allocator
+
+if TYPE_CHECKING:
+    import torch
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -135,49 +140,6 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
     if device.type == "tpu":
         return 1
     return _triton_get_num_sm(device, reserved_sms=reserved_sms)
-
-
-def default_metal_launcher(
-    metal_kernel: object,
-    grid: tuple[int, ...],
-    *args: object,
-    _block_dims: tuple[int, int, int] = (256, 1, 1),
-    **kwargs: object,
-) -> None:
-    """Default launcher for Metal kernels on Apple MPS devices.
-
-    The ``metal_kernel`` is a ``@metal_jit`` decorated function that
-    translates its Python AST body to MSL and compiles it via
-    ``torch.mps.compile_shader`` on each call.
-    This launcher dispatches the compiled kernel with the given grid and
-    threadgroup dimensions.
-
-    Uses a 3D threadgroup dispatch model: ``_block_dims`` specifies the
-    threadgroup size as ``(x, y, z)``.  The grid specifies the number of
-    threadgroups per dimension.
-    """
-    kwargs.pop("num_warps", None)
-    kwargs.pop("num_stages", None)
-    if kwargs:
-        raise exc.BackendUnsupported(
-            "metal", f"unexpected launcher kwargs: {sorted(kwargs)}"
-        )
-
-    from .._compiler.metal.metal_launcher import set_required_threads_per_threadgroup
-
-    set_required_threads_per_threadgroup(metal_kernel, _block_dims)
-    lib, kernel_name = metal_kernel(*args)  # type: ignore[operator]
-
-    tensor_args = [a for a in args if isinstance(a, torch.Tensor)]
-    dispatch_fn = getattr(lib, kernel_name)
-    bx, by, bz = _block_dims
-    # Pad grid to 3D
-    gx = grid[0] if len(grid) > 0 else 1
-    gy = grid[1] if len(grid) > 1 else 1
-    gz = grid[2] if len(grid) > 2 else 1
-    total_threads = (gx * bx, gy * by, gz * bz)
-    group_size = (bx, by, bz)
-    dispatch_fn(*tensor_args, threads=total_threads, group_size=group_size)
 
 
 # cache_key -> @flyc.jit-wrapped launcher / flyc.CompiledFunction. Both grow

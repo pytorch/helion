@@ -17,7 +17,7 @@ span (reduction lanes)  emission                                    cost
 ======================  ==========================================  =============
 ``< 32``                ``helion_red::seg_*`` butterfly             shuffles only
 ``== 32``               ``helion_red::simd_*``                      shuffles only
-``% 32 == 0``           ``helion_red::tg_*`` + threadgroup scratch  3 barriers
+``% 32 == 0``           ``helion_red::tg_*`` + threadgroup scratch  2 barriers
 ======================  ==========================================  =============
 
 Spans are always powers of two (``static_rdim_size`` rounds the reduction
@@ -25,16 +25,35 @@ extent up), so a span above the SIMD width is automatically a whole number of
 SIMD groups.  Spans wider than one threadgroup never reach here: the config
 spec rolls those into a ``for`` loop over the reduction dimension, and only the
 per-thread accumulator is combined across threads.
+
+Launched-axis collectives
+-------------------------
+A sibling loop, another root, or an MPP graph can launch a tile's axis wider
+than its input span. The collective covers the launched width; extra positions
+contribute the identity and receive their row's result. Final launch extents
+are known only after codegen, so metal_jit chooses each site's collective and
+scratch size from the actual launch.
+
+Contiguous power-of-two axes use the seg/simd/tg helpers at the launched width.
+Strided rows mask all but one row at a time and reduce the entire contiguous
+group with those helpers. Each thread retains its own row's result. Groups
+that are not aligned whole SIMD groups or power-of-two segments use the same
+row masks with a bounded shared-memory tree.
+
+A reduction over a user tile is owned by the tile's strategy, so its axis
+follows loop nesting rather than ``reduction_axis_first``;
+:func:`plan_reduced_tile_axes` ranks such tiles onto the lowest axes, where
+they take the contiguous paths.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 
 from ... import exc
 from ..ast_extension import statement_from_string
-from ._constants import MAX_SIMD_GROUPS
 from ._constants import MAX_THREADS_PER_THREADGROUP
 from ._constants import SIMD_WIDTH
 from .msl_reduction import REDUCTION_NAMESPACE as NS
@@ -45,16 +64,22 @@ if TYPE_CHECKING:
     import torch
 
     from ..device_function import DeviceFunction
+    from ..device_ir import GraphInfo
+    from ..tile_dispatch import TileStrategyDispatch
 
 #: Prefix of the generated module-level globals that carry threadgroup scratch
 #: declarations from codegen to ``metal_jit._generate_msl``.  Mirrors how
 #: ``_BLOCK_SIZE_*`` globals reach the same place.
 TG_BUFFER_GLOBAL_PREFIX = "_METAL_TG_BUF_"
 
-#: Name of the MSL kernel parameter bound to
-#: ``[[simdgroup_index_in_threadgroup]]``, used to pick a reduction group's
-#: slice of the shared scratch buffer.
-SIMD_GROUP_VAR = "_simd_group"
+#: Prefix of the generated module-level globals that describe a group
+#: reduction site, ``(site, axis)``, for ``metal_jit``: it picks
+#: the site's ``group_path`` from the launch and declares the site name as that
+#: path's index.
+RED_SITE_GLOBAL_PREFIX = "_METAL_RED_SITE_"
+
+#: MSL constants ``metal_jit`` declares with the launch's threadgroup size.
+LAUNCH_DIM_VARS = ("_TG_SIZE_X", "_TG_SIZE_Y", "_TG_SIZE_Z")
 
 
 def _metal_acc_dtype(dtype: torch.dtype) -> str:
@@ -72,22 +97,24 @@ def _metal_acc_dtype(dtype: torch.dtype) -> str:
     return CompileEnvironment.current().backend.acc_type(dtype)
 
 
-def alloc_threadgroup_buffer(metal_dtype: str) -> str:
+def alloc_threadgroup_buffer(
+    metal_dtype: str, slots: int | str, prefix: str = "_red_scratch"
+) -> str:
     """Reserve a ``threadgroup`` scratch array and return its MSL name.
 
     Every reduction site gets its own buffer.  Sharing one buffer between two
     reductions in the same kernel (LayerNorm's mean and variance, say) races on
-    Apple GPUs even with barriers in between, and ``slots`` is only 32 entries,
-    so the isolation is cheap.
+    Apple GPUs even with barriers in between.  *slots* is a count, or a group
+    reduction's site name, which ``metal_jit`` sizes with
+    :func:`group_scratch_slots` once the launch is known.
     """
     from ..device_function import DeviceFunction
 
     device_fn = DeviceFunction.current()
-    name = device_fn.new_var("_red_scratch")
+    name = device_fn.new_var(prefix)
     device_fn.codegen.module_statements.append(
         statement_from_string(
-            f"{TG_BUFFER_GLOBAL_PREFIX}{name} = "
-            f"({name!r}, {metal_dtype!r}, {MAX_SIMD_GROUPS})"
+            f"{TG_BUFFER_GLOBAL_PREFIX}{name} = ({name!r}, {metal_dtype!r}, {slots!r})"
         )
     )
     return name
@@ -97,20 +124,13 @@ def alloc_threadgroup_buffer(metal_dtype: str) -> str:
 class ReductionGroup:
     """Where a reduction's threads live in the Metal threadgroup.
 
-    ``axis`` is the ``tid`` component the reduction spans, ``span`` how many
-    threads it spans, and ``stride`` the distance between consecutive members
-    on the linear thread index (``tid[0] + tid[1] * dim0 + ...``).  Only
-    ``stride == 1`` groups map onto SIMD lanes, which every Metal reduction
-    primitive requires.
+    ``axis`` is the ``tid`` component the reduction spans and ``span`` how
+    many threads it spans.  How those threads lie on SIMD lanes depends on the
+    launch, so ``metal_jit`` resolves it (see :func:`group_path`).
     """
 
     axis: int
     span: int
-    stride: int
-
-    @property
-    def index_expr(self) -> str:
-        return f"tid[{self.axis}]"
 
 
 def resolve_group(
@@ -121,21 +141,13 @@ def resolve_group(
     from ..tile_strategy import BlockSizeTileStrategy
 
     tile_strategy = device_fn.tile_strategy
-    dims = tile_strategy.thread_block_dims()
-
-    def make(axis: int, span: int) -> ReductionGroup:
-        stride = 1
-        for lower in range(min(axis, len(dims))):
-            stride *= max(1, dims[lower])
-        return ReductionGroup(axis, span, stride)
-
     for strategy in tile_strategy.strategies:
         if not isinstance(strategy, ReductionStrategy):
             continue
         if strategy.block_size_var(strategy.block_index) != block_size_var:
             continue
         span = strategy._reduction_thread_count()
-        return make(strategy._get_thread_axis(), span) if span > 0 else None
+        return ReductionGroup(strategy._get_thread_axis(), span) if span > 0 else None
 
     # ``BlockReductionStrategy`` reduces over a user tile, so the block size var
     # belongs to the tile strategy that owns the axis instead.
@@ -149,12 +161,121 @@ def resolve_group(
             extent = tile_strategy.thread_extent_for_block_id(block_id)
             if axis is None or extent is None or extent <= 0:
                 return None
-            return make(axis, extent)
+            return ReductionGroup(axis, extent)
     return None
 
 
+def plan_reduced_tile_axes(
+    graphs: list[GraphInfo], tile_strategy: TileStrategyDispatch
+) -> None:
+    """Rank the strategies owning a reduced tile block onto the lowest axes.
+
+    Thread axes follow loop nesting, so in ``for tile_m in hl.tile(m): for
+    tile_n in hl.tile(n): torch.amax(x[tile_m, tile_n], dim=1)`` the outer
+    grid takes ``tid[0]`` and the reduced ``tile_n`` lands ``block_m`` lanes
+    apart: every reduction pays the strided path, and loads along the reduced
+    dimension (usually the contiguous one) do not coalesce.  This is the tile
+    counterpart of ``reduction_axis_first``, which already puts reduction
+    *strategies* first.  Emitted as a grid execution plan (the mechanism the
+    CuTe layout planner uses), which both the body's axis offsets and the
+    launch block dims follow.
+
+    A reduced tile on ``tid[0]`` takes a contiguous group path, also when
+    another loop launches the axis wider.  The plan is skipped:
+
+    - while a reduction strategy reserves the leading axes (those keep them);
+    - with an MPP graph: ``MetalBackend._config_with_mpp_thread_budget``
+      sizes the root grid's axes around the cooperative matmul's ``tid[0]``
+      in the grid's own block order;
+    - when two threaded tile loops are siblings (``for tile_n ...`` next to
+      ``for tile_k ...`` with different block ids): the body lets siblings
+      share their nesting level's axes, but a plan ranks every block-id set
+      onto axes of its own, so the sibling would claim a fresh axis and every
+      thread on it would repeat the body.
+
+    Blocks within one multi-block strategy keep their order (``loop_orders``
+    does not move Metal thread axes), so a reduction over the inner block of
+    ``hl.tile([m, n])`` stays strided and takes the ``strided`` collective
+    (``masked`` when the stride is not a power of two).
+    """
+    from ..cute.layout import CuTeGridExecutionPlan
+    from ..cute.loop_nesting import tile_loop_paths
+    from ..device_ir import RootGraphInfo
+    from ..host_function import HostFunction
+    from ..inductor_lowering import ReductionLowering
+    from ..reduction_strategy import ReductionStrategy
+    from .mpp_graph_codegen import MPPGraphInfo
+
+    device_ir = HostFunction.current().device_ir
+    if (
+        tile_strategy.reserved_reduction_axes()
+        or any(isinstance(graph, MPPGraphInfo) for graph in graphs)
+        or _has_threaded_sibling_loops(
+            tile_loop_paths(device_ir, graphs), tile_strategy
+        )
+    ):
+        return
+    tile_blocks = [
+        block_id
+        for strategy in tile_strategy.strategies
+        if not isinstance(strategy, ReductionStrategy)
+        for block_id in strategy.block_ids
+    ]
+    reduced = {
+        lowering.block_index
+        for graph in graphs
+        for node in graph.graph.nodes
+        if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
+    }
+    if not any(
+        (tile_strategy.thread_extent_for_block_id(block_id) or 0) > 1
+        for block_id in reduced.intersection(tile_blocks)
+    ):
+        return
+    plan = CuTeGridExecutionPlan(
+        scoped_block_ids=frozenset(tile_blocks),
+        block_axis_priority={
+            block_id: 0 if block_id in reduced else 1 for block_id in tile_blocks
+        },
+        disable_reduction_axis_reservation_for=frozenset(),
+    )
+    for graph in graphs:
+        if isinstance(graph, RootGraphInfo):
+            graph.cute_grid_execution_plans = (*graph.cute_grid_execution_plans, plan)
+
+
+def _has_threaded_sibling_loops(
+    paths: tuple[tuple[tuple[int, ...], ...], ...],
+    tile_strategy: TileStrategyDispatch,
+) -> bool:
+    """Whether two mutually exclusive tile loops of one root both use threads.
+
+    *paths* are the maximal stacks of simultaneously active tile loops, root
+    grid first.  Dropping the loops that occupy no thread axis, the threaded
+    loops of each root must form a single stack.
+    """
+
+    def threaded(block_ids: tuple[int, ...]) -> bool:
+        return any(
+            (tile_strategy.thread_extent_for_block_id(block_id) or 0) > 1
+            for block_id in block_ids
+        )
+
+    stacks: dict[tuple[int, ...], set[tuple[tuple[int, ...], ...]]] = {}
+    for root, *loops in paths:
+        stacks.setdefault(root, set()).add(
+            tuple(block_ids for block_ids in loops if threaded(block_ids))
+        )
+    for root_stacks in stacks.values():
+        longest = max(root_stacks, key=len)
+        if any(stack != longest[: len(stack)] for stack in root_stacks):
+            return True
+    return False
+
+
 def _tile_thread_axis(device_fn: DeviceFunction, block_id: int) -> int | None:
-    """Thread axis a tile block occupies in the active loop nest, if any."""
+    """Thread axis a tile block occupies in the active loop nest or, once its
+    loop has exited, the one it used there (:func:`exited_block_thread_axis`)."""
     from ..tile_strategy import DeviceGridState
     from ..tile_strategy import DeviceLoopState
 
@@ -171,7 +292,77 @@ def _tile_thread_axis(device_fn: DeviceFunction, block_id: int) -> int | None:
             axis = loop_state.block_thread_axes.get(block_id)
             if axis is not None:
                 return axis
+    if not codegen.active_device_loops.get(block_id):
+        return exited_block_thread_axis(device_fn, block_id)
     return None
+
+
+def exited_block_thread_axis(device_fn: DeviceFunction, block_id: int) -> int | None:
+    """Thread axis a tile block used in its loop, after that loop has exited.
+
+    Only the dispatcher's plan is left once the loop state is gone.  Under a
+    grid execution plan that gives the block an axis priority, the body took
+    its axis offset from ``thread_axis_for_strategy``
+    (``BlockSizeTileStrategy._compute_thread_axis_offset``), which
+    ``thread_axis_for_block_id`` is built on, so the two agree.  Without such a
+    plan the body counts the active loops' axes instead, and the two diverge:
+    threaded sibling loops share their nesting level's axis in the body but
+    get separate axes from the dispatcher.  Then there is no axis to trust and
+    this returns ``None``.
+    """
+    tile_strategy = device_fn.tile_strategy
+    plan = tile_strategy.current_cute_grid_execution_plan(block_ids=(block_id,))
+    if plan is None or plan.priority_for_block(block_id) is None:
+        return None
+    return tile_strategy.thread_axis_for_block_id(block_id)
+
+
+def group_path(axis: int, dims: tuple[int, int, int]) -> str:
+    """Choose a launched-axis collective from the physical thread layout."""
+    extent = dims[axis]
+    below = math.prod(dims[:axis])
+    if below == 1 and extent & (extent - 1) == 0:
+        return "contiguous"
+    size = extent * below
+    if size % SIMD_WIDTH == 0 or (size < SIMD_WIDTH and size & (size - 1) == 0):
+        return "strided" if below & (below - 1) == 0 else "masked"
+    return "shared_tree"
+
+
+def group_scratch_slots(path: str, dims: tuple[int, int, int], axis: int) -> int:
+    """Scratch for one scalar pass of a launched-axis collective."""
+    threads = math.prod(dims)
+    below = math.prod(dims[:axis])
+    size = dims[axis] * below
+    if path in ("contiguous", "masked"):
+        return threads // SIMD_WIDTH if size > SIMD_WIDTH else 0
+    if path == "strided":
+        # One partial per SIMD group and run.
+        return (
+            threads // SIMD_WIDTH * min(below, SIMD_WIDTH) if size > SIMD_WIDTH else 0
+        )
+    assert path == "shared_tree"
+    return threads
+
+
+def _group_site(group: ReductionGroup) -> str:
+    """Register a group reduction site for ``metal_jit`` and return its name."""
+    from ..device_function import DeviceFunction
+
+    device_fn = DeviceFunction.current()
+    site = device_fn.new_var("_red_site")
+    device_fn.codegen.module_statements.append(
+        statement_from_string(
+            f"{RED_SITE_GLOBAL_PREFIX}{site} = ({site!r}, {group.axis})"
+        )
+    )
+    return site
+
+
+def _group_args(group: ReductionGroup, span: int) -> str:
+    """The axis, input span, and final launch dimensions of a collective."""
+    dims = ", ".join(LAUNCH_DIM_VARS)
+    return f"tid, {group.axis}, {span}, {dims}"
 
 
 def _unsupported_span(reduction_type: str, span: int) -> exc.BackendUnsupported:
@@ -196,24 +387,11 @@ def _cast(expr: str, dtype: torch.dtype | None) -> tuple[str, str]:
     return f"(static_cast<{metal_type}>({expr}))", metal_type
 
 
-def _reject_strided_group(reduction_type: str, group: ReductionGroup | None) -> None:
-    """Metal's SIMD reductions fold adjacent lanes, so a group whose members are
-    not lane-contiguous would combine unrelated rows."""
-    if group is not None and group.stride != 1:
-        raise exc.BackendUnsupported(
-            "metal",
-            f"{reduction_type} over a strided thread axis (axis {group.axis}, "
-            f"lane stride {group.stride}); Metal needs the reduced dimension to "
-            "be the fastest-varying thread axis",
-        )
-
-
 def reduction_expr(
     input_name: str,
     reduction_type: str,
     *,
     block_size_var: str | None,
-    threads_in_group: int | None,
     dtype: torch.dtype | None,
 ) -> str:
     from ..device_function import DeviceFunction
@@ -221,59 +399,38 @@ def reduction_expr(
     if reduction_type not in SUPPORTED_REDUCTIONS:
         raise exc.BackendUnsupported("metal", f"reduction {reduction_type!r}")
 
-    device_fn = DeviceFunction.current()
-    group = resolve_group(device_fn, block_size_var)
-    span = (
-        threads_in_group
-        if threads_in_group is not None
-        else (group.span if group is not None else None)
-    )
+    group = resolve_group(DeviceFunction.current(), block_size_var)
     value, metal_type = _cast(input_name, dtype)
 
-    if span is None:
+    if group is None:
         raise exc.BackendUnsupported(
             "metal", f"unresolved thread group for reduction {reduction_type!r}"
         )
+    span = group.span
     if span <= 1:
         return value
-    if span & (span - 1):
-        raise _unsupported_span(reduction_type, span)
-    _reject_strided_group(reduction_type, group)
-
-    if span < SIMD_WIDTH:
-        return f"{NS}.seg_{reduction_type}({value}, {span})"
-    if span == SIMD_WIDTH:
-        return f"{NS}.simd_{reduction_type}({value})"
-    if span % SIMD_WIDTH or span > MAX_THREADS_PER_THREADGROUP:
+    if span & (span - 1) or span > MAX_THREADS_PER_THREADGROUP:
         raise _unsupported_span(reduction_type, span)
 
-    if group is None:
-        # ``c10::metal::threadgroup_*`` needs each thread's index *within* the
-        # reduction group to pick its scratch slot; guessing ``tid[0]`` would
-        # make every thread claim slot 0 and race.  The sub-SIMD-group and
-        # single-SIMD-group tiers above need no such index, so only the shared
-        # path has to bail.
-        raise exc.BackendUnsupported(
-            "metal",
-            f"{reduction_type} reduction over {span} threads whose thread axis "
-            "could not be resolved",
-        )
-    buffer = alloc_threadgroup_buffer(metal_type)
+    site = _group_site(group)
+    partials = alloc_threadgroup_buffer(metal_type, site)
     return (
-        f"{NS}.tg_{reduction_type}("
-        f"{buffer} + {_group_base_expr(span)}, {value}, {group.index_expr}, {span})"
+        f"{NS}.group_{reduction_type}({site}, {partials}, {value}, "
+        f"{_group_args(group, span)})"
     )
 
 
-def _group_base_expr(span: int) -> str:
-    """Offset of this reduction group's slice of the shared scratch buffer.
-
-    ``[[simdgroup_index_in_threadgroup]]`` counts SIMD groups over the whole
-    threadgroup, and a span that is a multiple of the SIMD width means each
-    reduction group owns ``span / 32`` consecutive SIMD groups.
-    """
-    simd_groups = span // SIMD_WIDTH
-    return f"({SIMD_GROUP_VAR} / {simd_groups}) * {simd_groups}"
+def combine_expr(reduction_type: str, lhs: str, rhs: str) -> str:
+    """*lhs* and *rhs* combined by *reduction_type*, one of
+    ``SUPPORTED_REDUCTIONS``.  Needs no compile environment, so it also
+    serves rewrites that run at launch."""
+    assert reduction_type in SUPPORTED_REDUCTIONS, reduction_type
+    if reduction_type == "sum":
+        return f"({lhs} + {rhs})"
+    if reduction_type == "prod":
+        return f"({lhs} * {rhs})"
+    # c10::metal::max/min propagate NaN, matching torch semantics; ::metal:: does not.
+    return f"c10.metal.{reduction_type}({lhs}, {rhs})"
 
 
 def reduction_combine_expr(
@@ -281,14 +438,9 @@ def reduction_combine_expr(
 ) -> str:
     """Per-iteration combine for ``LoopedReductionStrategy``'s accumulator."""
     value, _ = _cast(val, dtype)
-    if reduction_type == "sum":
-        return f"({acc} + {value})"
-    if reduction_type == "prod":
-        return f"({acc} * {value})"
-    # c10::metal::max/min propagate NaN, matching torch semantics; ::metal:: does not.
-    if reduction_type in ("max", "min"):
-        return f"c10.metal.{reduction_type}({acc}, {value})"
-    raise exc.BackendUnsupported("metal", f"reduction combine {reduction_type!r}")
+    if reduction_type not in SUPPORTED_REDUCTIONS:
+        raise exc.BackendUnsupported("metal", f"reduction combine {reduction_type!r}")
+    return combine_expr(reduction_type, acc, value)
 
 
 def argreduce_result_expr(
@@ -299,7 +451,6 @@ def argreduce_result_expr(
     *,
     block_size_var: str | None,
     index_dtype: torch.dtype | None,
-    threads_in_group: int | None,
     dtype: torch.dtype | None,
 ) -> str:
     from ..compile_environment import CompileEnvironment
@@ -311,51 +462,29 @@ def argreduce_result_expr(
         raise exc.BackendUnsupported("metal", "missing index_dtype for argreduce")
 
     backend = CompileEnvironment.current().backend
-    device_fn = DeviceFunction.current()
-    group = resolve_group(device_fn, block_size_var)
-    span = (
-        threads_in_group
-        if threads_in_group is not None
-        else (group.span if group is not None else None)
-    )
+    group = resolve_group(DeviceFunction.current(), block_size_var)
     value, value_type = _cast(input_name, dtype)
     index_type = backend.index_type_str(index_dtype)
     index = f"(static_cast<{index_type}>({index_value}))"
     out_type = backend.dtype_str(output_dtype)
 
-    if span is None:
+    if group is None:
         raise exc.BackendUnsupported(
             "metal", f"unresolved thread group for reduction {reduction_type!r}"
         )
+    span = group.span
     if span <= 1:
         return f"(static_cast<{out_type}>({index}))"
     if span & (span - 1) or span > MAX_THREADS_PER_THREADGROUP:
         raise _unsupported_span(reduction_type, span)
-    _reject_strided_group(reduction_type, group)
-    if span < SIMD_WIDTH:
-        result = f"{NS}.seg_{reduction_type}({value}, {index}, {span})"
-        return f"(static_cast<{out_type}>({result}))"
 
-    if span == SIMD_WIDTH:
-        result = f"{NS}.simd_{reduction_type}({value}, {index})"
-        return f"(static_cast<{out_type}>({result}))"
-
-    if span % SIMD_WIDTH:
-        raise _unsupported_span(reduction_type, span)
-    if group is None:
-        # See reduction_expr: the shared tier needs the in-group thread index.
-        raise exc.BackendUnsupported(
-            "metal",
-            f"{reduction_type} over {span} threads whose thread axis could not "
-            "be resolved",
-        )
-    base = _group_base_expr(span)
-    value_buffer = alloc_threadgroup_buffer(value_type)
-    index_buffer = alloc_threadgroup_buffer(index_type)
+    site = _group_site(group)
+    value_partials = alloc_threadgroup_buffer(value_type, site)
+    index_partials = alloc_threadgroup_buffer(index_type, site)
     result = (
-        f"{NS}.tg_{reduction_type}("
-        f"{value_buffer} + {base}, {index_buffer} + {base}, "
-        f"{value}, {index}, {group.index_expr}, {span})"
+        f"{NS}.group_{reduction_type}({site}, {value_partials}, "
+        f"{index_partials}, {value}, {index}, "
+        f"{_group_args(group, span)})"
     )
     return f"(static_cast<{out_type}>({result}))"
 

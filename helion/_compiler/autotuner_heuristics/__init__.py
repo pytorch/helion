@@ -24,6 +24,7 @@ from ..cute.grouped_row_union import TRANSPOSED_SCHEDULE
 from ..cute.split_k_cluster_config import FINALIZER_KEY
 from ..cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
+from ..metal.row_reduction_heuristic import MetalRowReductionHeuristic
 from .common import dedupe_configs
 from .cute import CuteAffineScanHeuristic
 from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
@@ -344,6 +345,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         TileIRSmallReductionHeuristic,
         TileIRChunkReductionHeuristic,
     ),
+    "metal": (MetalRowReductionHeuristic,),
     "pallas": (
         PallasMatmulNoTilingSeedHeuristic,
         PallasMatmulF32NoTilingSeedHeuristic,
