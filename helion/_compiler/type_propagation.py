@@ -1198,6 +1198,7 @@ class TypePropagation(ast.NodeVisitor):
         raise exc.StatementNotSupported(type(node).__name__)
 
     def _visit_comprehension_iteration(self, node: ast.AST) -> TypeInfo:
+        # Return this iteration's type while retaining merged AST annotations.
         nodes = [n for n in ast.walk(node) if isinstance(n, ExtendedAST)]
         previous = [n._type_info for n in nodes]
         for n in nodes:
@@ -1218,10 +1219,10 @@ class TypePropagation(ast.NodeVisitor):
 
     def _comprehension_value(self, node: ast.expr) -> TypeInfo:
         if isinstance(node, ast.BoolOp):
+            short_circuit_on = isinstance(node.op, ast.Or)
             for value in node.values[:-1]:
                 result = self._comprehension_value(value)
-                truth = self._constant_comprehension_truth(result)
-                if truth == isinstance(node.op, ast.Or):
+                if self._constant_comprehension_truth(result) == short_circuit_on:
                     return result
             return self._comprehension_value(node.values[-1])
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
