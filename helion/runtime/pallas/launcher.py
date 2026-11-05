@@ -432,7 +432,9 @@ def _estimate_pallas_vmem_bytes(
 
     if scratch_shapes:
         for scratch in scratch_shapes:
-            if type(scratch).__name__ == "VMEM":
+            # ``pltpu.VMEM(shape, dtype)`` builds a ``MemoryRef`` tagged with
+            # the VMEM memory space; DMA semaphores carry their own space.
+            if getattr(scratch, "memory_space", None) == getattr(pltpu, "VMEM", None):
                 numel = 1
                 shape = getattr(scratch, "shape", ())
                 for d in shape:

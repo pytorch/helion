@@ -1484,6 +1484,50 @@ class TestPallas(TestCase):
         )
         self.assertEqual(estimated, 8 * 128 * 4 * 2)
 
+    def test_estimate_pallas_vmem_bytes_counts_vmem_scratch(self) -> None:
+        """VMEM scratch (fori_loop / DMA buffers) counts; DMA semaphores do not."""
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        import jax.numpy as jnp
+
+        from helion.runtime.pallas.launcher import _estimate_pallas_vmem_bytes
+
+        estimated = _estimate_pallas_vmem_bytes(
+            pl,
+            pltpu,
+            None,
+            None,
+            [
+                pltpu.VMEM((4096, 2048), jnp.float32),
+                pltpu.VMEM((2, 4096, 2048), jnp.float32),
+                pltpu.SemaphoreType.DMA((2,)),
+            ],
+            (),
+            [],
+            [],
+            None,
+        )
+        self.assertEqual(estimated, 3 * 4096 * 2048 * 4)
+
+    def test_vmem_check_counts_fori_loop_dma_buffers(self) -> None:
+        """fori_loop inputs stay in HBM; their VMEM DMA buffers must still count."""
+        # Two inputs, two 2048x2048 fp32 DMA buffers each = 128MB of scratch.
+        args = (
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Ran out of memory in memory space vmem.*Estimated [0-9.]+MB exceeds",
+        ):
+            code_and_output(
+                pallas_inner_loop_add,
+                args,
+                block_sizes=[2048, 2048],
+                pallas_loop_type="fori_loop",
+                pallas_load_buffer_count=[2, 2],
+            )
+
     @xfailIfPallasInterpret(
         "torch.float8_e4m3fn has no JAX dtype mapping in interpret mode; "
         "conversion errors before the VMEM check fires"
