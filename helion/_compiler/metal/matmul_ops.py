@@ -6,8 +6,10 @@ it, the way the scalar path lowers ``(a[:, :, None] * b[None]).sum(1)``.
 Helion masks every ``hl.dot`` operand to 0 past each block's extent
 (``_mask_to``), so a K tail or a surplus K thread adds nothing.
 
-A canonical K-loop matmul never gets here: ``rewrite_mpp_graphs`` replaces
-its dot with an MPP region before codegen.
+A canonical K-loop ``hl.dot`` never gets here (``rewrite_mpp_graphs``
+replaces it with an MPP region before codegen), and one the MPP planner
+admits (a K held as per-thread parts) is forwarded to
+``mpp_matmul.codegen_dot_metal``.
 """
 
 from __future__ import annotations
@@ -73,8 +75,12 @@ def _(state: CodegenState) -> ast.AST:
     # Imported here: reduction_strategy imports device_ir, which needs the
     # helion package that is still initializing when this module registers.
     from ..reduction_strategy import LoopedReductionStrategy
+    from .mpp_matmul import codegen_dot_metal
+    from .mpp_matmul import planned
     from .reduction_strategy import MetalPersistentReductionStrategy
 
+    if planned(state.fx_node):
+        return codegen_dot_metal(state)
     env = CompileEnvironment.current()
     backend = env.backend
     lhs, rhs, acc, out_dtype = state.proxy_args

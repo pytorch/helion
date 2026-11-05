@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from ..tile_dispatch import TileStrategyDispatch
     from ..tile_strategy import TileStrategy
     from .free_arange import FreeArangePlan
+    from .mpp_matmul import MppPlan
 
     InductorOpOverrides = OpsHandler[Any]
 
@@ -104,12 +105,17 @@ class MetalBackend(Backend):
 
     def __init__(self) -> None:
         super().__init__()
-        # Both are reset by ``pre_codegen`` and read after the codegen of the
-        # same config, by the iota lowering and ``launcher_keyword_args``:
+        # These are reset by ``pre_codegen`` and read after the codegen of the
+        # same config, by the lowerings and ``launcher_keyword_args``:
         # pre_codegen, codegen and the launcher call run in that order for one
         # config at a time.
         self.free_arange_plan: FreeArangePlan = {}
+        self.mpp_plan: MppPlan | None = None
         self._tid_axes: set[int] = set()
+        # Set by ``pre_codegen`` (see ``_uniform_thread_extent``), and cleared
+        # by ``create_loop_strategy`` because strategies of the next config
+        # are built, and may read ``force_tile_mask``, before it runs.
+        self._uniform_extent: int | None = None
 
     @property
     def name(self) -> str:
@@ -183,7 +189,7 @@ class MetalBackend(Backend):
 
         return metal_texpr(expr)
 
-    def _tid(self, axis: int) -> str:
+    def thread_index(self, axis: int) -> str:
         """The ``tid`` component for a thread axis, rejecting a fourth one.
 
         Metal provides three.  A kernel wanting more -- a 3-D tile whose
@@ -206,7 +212,7 @@ class MetalBackend(Backend):
     def lane_index_expr(
         self, offset_var: str, elements_per_thread: int, *, axis: int
     ) -> str:
-        return f"{offset_var} + {self._tid(axis)} * {elements_per_thread}"
+        return f"{offset_var} + {self.thread_index(axis)} * {elements_per_thread}"
 
     def lane_offset_expr(self, lane_var: str) -> str:
         return lane_var
@@ -219,14 +225,14 @@ class MetalBackend(Backend):
     ) -> str:
         if block_size_var == "1":
             return offset_var
-        return f"{offset_var} + {self._tid(axis)}"
+        return f"{offset_var} + {self.thread_index(axis)}"
 
     def loop_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
         if block_size_var == "1":
             return offset_var
-        return f"{offset_var} + {self._tid(axis)}"
+        return f"{offset_var} + {self.thread_index(axis)}"
 
     def arange_expr(
         self,
@@ -237,15 +243,20 @@ class MetalBackend(Backend):
         *,
         axis: int = 0,
     ) -> str:
-        return f"{offsets_var} = ({lid}) * ({block_size_var}) + {self._tid(axis)}"
+        return (
+            f"{offsets_var} = ({lid}) * ({block_size_var}) + {self.thread_index(axis)}"
+        )
 
     def thread_in_tile_mask_expr(
         self, block_size_var: str, *, axis: int = 0
     ) -> str | None:
-        return f"{self._tid(axis)} < ({block_size_var})"
+        return f"{self.thread_index(axis)} < ({block_size_var})"
 
     def force_tile_mask(self) -> bool:
-        return True
+        # The shared per-tile rule judges surplus threads by the dispatch's
+        # planned thread axes, which can differ from the ones Metal emits and
+        # launches, so it only applies to a uniform launch.
+        return self._uniform_extent is None
 
     def launches_surplus_tile_threads(self) -> bool:
         # MPP requires num_warps * 32 threads on tid[0], which is independent
@@ -314,6 +325,7 @@ class MetalBackend(Backend):
         tile_strategy: TileStrategyDispatch,
     ) -> None:
         from .free_arange import plan_free_aranges
+        from .mpp_matmul import plan_mpp_matmuls
         from .positional_rebind import reject_positional_rebinds
         from .reduction import plan_reduced_tile_axes
         from .repeated_blocks import plan_repeated_blocks
@@ -323,6 +335,41 @@ class MetalBackend(Backend):
         plan_reduced_tile_axes(graphs, tile_strategy)
         self._tid_axes = set()
         self.free_arange_plan = plan_free_aranges(graphs, config, tile_strategy)
+        self.mpp_plan = plan_mpp_matmuls(graphs)
+        self._uniform_extent = self._uniform_thread_extent(graphs, tile_strategy)
+
+    def _uniform_thread_extent(
+        self, graphs: list[GraphInfo], tile_strategy: TileStrategyDispatch
+    ) -> int | None:
+        """The one thread extent E of every strategy's thread axes, or
+        ``None`` if their extents differ, or the kernel has an MPP op or a
+        free ``hl.arange``.
+
+        The launch is the largest extent of each emitted thread axis, so with
+        a single E every launch axis is 1 or E (``launcher_keyword_args``
+        asserts it), and no tile runs surplus threads on whichever axis the
+        emitted code gives it.  Free aranges and the MPP graph pass claim
+        threads that no strategy owns, and a cooperative MPP matmul result
+        holds its tile in MPP's layout rather than one element per thread.
+        """
+        if self.free_arange_plan or self._has_mpp_op(graphs):
+            return None
+        extents = {
+            extent
+            for strategy in tile_strategy.strategies
+            for extent in strategy.thread_block_sizes()
+        }
+        if len(extents) > 1:
+            return None
+        return max(extents, default=1)
+
+    def _has_mpp_op(self, graphs: list[GraphInfo]) -> bool:
+        from .mpp_graph_codegen import MPPGraphInfo
+
+        assert self.mpp_plan is not None
+        return bool(self.mpp_plan.by_matmul) or any(
+            isinstance(graph, MPPGraphInfo) for graph in graphs
+        )
 
     def reduction_axis_first(self) -> bool:
         # Metal linearizes ``tid`` with ``tid[0]`` fastest-varying and assigns
@@ -361,7 +408,7 @@ class MetalBackend(Backend):
     ) -> str:
         # TileStrategyDispatch.thread_axis_for_strategy gives every threaded
         # reduction dimension its own axis, so their indices never alias.
-        return self._tid(axis)
+        return self.thread_index(axis)
 
     def reduction_index_zero_expr(self, dtype: str) -> str:
         return "0"
@@ -663,9 +710,17 @@ class MetalBackend(Backend):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         from ..device_function import DeviceFunction
         from .free_arange import check_free_arange_launch
+        from .mpp_matmul import check_mpp_launch
 
         dims = tuple(DeviceFunction.current().codegen.max_thread_block_dims)
+        if self._uniform_extent is not None:
+            assert all(dim in (1, self._uniform_extent) for dim in dims), (
+                f"tile masks are elided only if every launch axis is 1 or "
+                f"{self._uniform_extent}, but the kernel launches {dims}"
+            )
         check_free_arange_launch(self.free_arange_plan, self._tid_axes, dims)
+        if self.mpp_plan is not None:
+            check_mpp_launch(self.mpp_plan, dims)
         return [f"_block_dims=({dims[0]}, {dims[1]}, {dims[2]})"]
 
     def build_launcher_args(
@@ -709,6 +764,7 @@ class MetalBackend(Backend):
         threads explicitly is rejected.  Users hitting that rejection should
         lower ``num_threads`` or ``block_sizes``.
         """
+        self._uniform_extent = None
         # Claim the MPP matmul's threads before the tiles take the whole budget.
         config = self._config_with_mpp_thread_budget(fn, block_ids, config)
         # Cap tile thread counts so the reduction axes and free hl.arange axes

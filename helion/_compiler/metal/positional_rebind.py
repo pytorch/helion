@@ -33,6 +33,7 @@ from ..indexing_strategy import SubscriptIndexing
 from ..inductor_lowering import PointwiseLowering
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from collections.abc import Sequence
 
     from ..device_ir import GraphInfo
@@ -57,27 +58,36 @@ def reject_positional_rebinds(graphs: list[GraphInfo]) -> None:
     ]
     if not any(node.target is torch.ops.aten.permute.default for node in nodes):
         return
+    check_positional_merges(
+        nodes, "in a kernel that permutes it would read another element"
+    )
+
+
+def check_positional_merges(nodes: Iterable[Node], why: str) -> None:
+    """Raise ``BackendUnsupported`` where one of *nodes* meets a dim by
+    position with another block, or a tile with a dim that has none.  *why*
+    says what the by-block reading would get wrong there."""
     for node in nodes:
-        _check_node(node)
+        _check_node(node, why)
 
 
-def _check_node(node: Node) -> None:
+def _check_node(node: Node, why: str) -> None:
     result = node.meta.get("val")
     if node.target is store:
-        access = _access_shape(node)
+        access = _access_shape(node, why)
         if access is None:
             return
-        _check_operand("a store", node, node.args[2], access)
-        _check_operand("a store mask", node, node.args[3], access)
+        _check_operand("a store", node, node.args[2], access, why)
+        _check_operand("a store mask", node, node.args[3], access, why)
     elif node.target is load:
-        access = _access_shape(node)
+        access = _access_shape(node, why)
         if access is None:
             return
         # A traced load's value has its access shape; a load a graph rewrite
         # inserts (MPP's reload of a materialized result) can carry another.
         assert isinstance(result, torch.Tensor)
-        _check("a load result", node, result.shape, access)
-        _check_operand("a load mask", node, node.args[2], access)
+        _check("a load result", node, result.shape, access, why)
+        _check_operand("a load mask", node, node.args[2], access, why)
     elif isinstance(node.meta.get("lowering"), PointwiseLowering) and isinstance(
         result, torch.Tensor
     ):
@@ -86,25 +96,26 @@ def _check_node(node: Node) -> None:
             if value is None or value.ndim == 0:
                 continue
             if value.ndim == result.ndim:
-                _check("an element-wise operand", node, value.shape, result.shape)
+                _check("an element-wise operand", node, value.shape, result.shape, why)
             else:
                 _check(
                     "a broadcast element-wise operand",
                     node,
                     value.shape,
                     result.shape,
+                    why,
                     lower_rank=True,
                 )
     elif node.target is torch.ops.aten.where.self:
         assert isinstance(result, torch.Tensor)
         for operand in node.all_input_nodes:
-            _check_operand("a where operand", node, operand, result.shape)
+            _check_operand("a where operand", node, operand, result.shape, why)
     elif node.target is dot:
         assert isinstance(result, torch.Tensor)
-        _check_operand("a matmul accumulator", node, node.args[2], result.shape)
+        _check_operand("a matmul accumulator", node, node.args[2], result.shape, why)
     elif node.target in (torch.ops.aten.addmm.default, torch.ops.aten.baddbmm.default):
         assert isinstance(result, torch.Tensor)
-        _check_operand("a matmul accumulator", node, node.args[0], result.shape)
+        _check_operand("a matmul accumulator", node, node.args[0], result.shape, why)
     elif node.target is _tracing_ops._phi:
         # A loop's or branch's result has the fake value its body assigns, so
         # this compares the layout a carry leaves with the one it enters with
@@ -114,10 +125,12 @@ def _check_node(node: Node) -> None:
         initial, merged = node.args
         initial_value = _tensor(initial)
         if initial_value is not None:
-            _check_operand("a control-flow carry", node, merged, initial_value.shape)
+            _check_operand(
+                "a control-flow carry", node, merged, initial_value.shape, why
+            )
 
 
-def _access_shape(node: Node) -> list[int | torch.SymInt] | None:
+def _access_shape(node: Node, why: str) -> list[int | torch.SymInt] | None:
     """The shape a load or store addresses, after checking the tensor
     indexers it broadcasts together; None for a target Metal's load and store
     reject anyway (a stack tensor)."""
@@ -135,7 +148,7 @@ def _access_shape(node: Node) -> list[int | torch.SymInt] | None:
     ):
         shape = env.tensor_indexer_broadcast_shape(indexers)
         for indexer in indexers:
-            _check("an index tensor", node, indexer.shape, shape)
+            _check("an index tensor", node, indexer.shape, shape, why)
     return SubscriptIndexing.compute_shape(tensor, list(subscript))
 
 
@@ -147,10 +160,12 @@ def _tensor(arg: object) -> torch.Tensor | None:
     return None
 
 
-def _check_operand(what: str, node: Node, operand: object, consumer: Shape) -> None:
+def _check_operand(
+    what: str, node: Node, operand: object, consumer: Shape, why: str
+) -> None:
     value = _tensor(operand)
     if value is not None:
-        _check(what, node, value.shape, consumer)
+        _check(what, node, value.shape, consumer, why)
 
 
 def _check(
@@ -158,6 +173,7 @@ def _check(
     node: Node,
     value: Shape,
     consumer: Shape,
+    why: str,
     *,
     lower_rank: bool = False,
 ) -> None:
@@ -169,7 +185,7 @@ def _check(
         if position < 0:
             continue
         consumer_size = consumer[position]
-        block, consumer_block = _block(size), _block(consumer_size)
+        block, consumer_block = canonical_block(size), canonical_block(consumer_size)
         if block is not None and consumer_block is not None:
             if block != consumer_block:
                 raise _rebind_unsupported(
@@ -179,6 +195,7 @@ def _check(
                     value,
                     consumer,
                     f"block {block} meets block {consumer_block}",
+                    why,
                 )
             continue
         # Two dims without a tile need equal sizes, which Helion's broadcast
@@ -194,6 +211,7 @@ def _check(
                 consumer,
                 f"{_describe(size)} meets {_describe(consumer_size)}, one of them "
                 "without a tile",
+                why,
             )
 
 
@@ -211,10 +229,10 @@ def _operand_positions(value: Shape, consumer: Shape, *, lower_rank: bool) -> li
     if not (lower_rank and 0 < len(value) < len(consumer)):
         offset = len(consumer) - len(value)
         return [dim + offset for dim in range(len(value))]
-    consumer_blocks = [_block(size) for size in consumer]
+    consumer_blocks = [canonical_block(size) for size in consumer]
     matched: list[int] = []
     for size in value:
-        block = _block(size)
+        block = canonical_block(size)
         free = [p for p in range(len(consumer)) if p not in matched]
         if block is not None:
             candidates = [p for p in free if consumer_blocks[p] == block]
@@ -228,7 +246,7 @@ def _operand_positions(value: Shape, consumer: Shape, *, lower_rank: bool) -> li
     return sorted(matched)
 
 
-def _block(size: int | torch.SymInt) -> int | None:
+def canonical_block(size: int | torch.SymInt) -> int | None:
     env = CompileEnvironment.current()
     block_id = env.get_block_id(size)
     return None if block_id is None else env.canonical_block_id(block_id)
@@ -238,7 +256,7 @@ def _is_tile(size: int | torch.SymInt) -> bool:
     """Whether *size* is a tile's dim.  A ``:`` slice is a plain int in traced
     values but its reduction block in an access shape, so a reduction block
     counts as a dim without a tile."""
-    block = _block(size)
+    block = canonical_block(size)
     return (
         block is not None
         and not CompileEnvironment.current().block_sizes[block].reduction
@@ -246,7 +264,7 @@ def _is_tile(size: int | torch.SymInt) -> bool:
 
 
 def _describe(size: int | torch.SymInt) -> str:
-    block = _block(size)
+    block = canonical_block(size)
     if block is None:
         return f"a dimension of size {size}"
     info = CompileEnvironment.current().block_sizes[block]
@@ -256,13 +274,18 @@ def _describe(size: int | torch.SymInt) -> str:
 
 
 def _rebind_unsupported(
-    what: str, node: Node, dim: int, value: Shape, consumer: Shape, reason: str
+    what: str,
+    node: Node,
+    dim: int,
+    value: Shape,
+    consumer: Shape,
+    reason: str,
+    why: str,
 ) -> exc.BackendUnsupported:
     return exc.BackendUnsupported(
         "metal",
         f"{what} ({node.name}) meets dimension {dim} of a value of shape "
         f"{list(value)} at the same position of {list(consumer)}: {reason}.  A "
-        "Metal thread holds values by block id, so in a kernel that permutes it "
-        "would read another element; index both sides with the same tiles in "
-        "the same order",
+        f"Metal thread holds values by block id, so {why}; index both sides "
+        "with the same tiles in the same order",
     )

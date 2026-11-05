@@ -97,8 +97,6 @@ class MPPSetupParams:
     NUM_SG: int
     in_dtype: str
     acc_dtype: str
-    bias: str | None
-    bias_dtype: str | None
     fx_name: str | None
     lhs_transposed: bool
     rhs_transposed: bool
@@ -113,7 +111,6 @@ class MPPSetupParams:
             f"{self.M}, {self.N}, {self.K}, "
             f"{self.TILE_M}, {self.TILE_N}, {self.TILE_K}, {self.NUM_SG}, "
             f'"{self.in_dtype}", "{self.acc_dtype}", '
-            f'"{self.bias or ""}", "{self.bias_dtype or ""}", '
             f'"{self.fx_name or ""}", '
             f"{int(self.lhs_transposed)}, {int(self.rhs_transposed)}, "
             f"{self.lhs_storage_row_width}, {self.rhs_storage_row_width}, "
@@ -213,7 +210,6 @@ class MPPGraphInfo(NodeArgsGraphInfo):
     result_name: str
     lhs_tensor: torch.Tensor | None = None
     rhs_tensor: torch.Tensor | None = None
-    bias_tensor: torch.Tensor | None = None
     acc_dtype: torch.dtype | None = None
     out_tensor: torch.Tensor | None = None
     out_dtype: torch.dtype | None = None
@@ -238,7 +234,6 @@ class MPPGraphInfo(NodeArgsGraphInfo):
             "result_name": self.result_name,
             "lhs_tensor": self.lhs_tensor,
             "rhs_tensor": self.rhs_tensor,
-            "bias_tensor": self.bias_tensor,
             "acc_dtype": self.acc_dtype,
             "out_tensor": self.out_tensor,
             "out_dtype": self.out_dtype,
@@ -440,13 +435,6 @@ class MPPGraphInfo(NodeArgsGraphInfo):
                 "metal",
                 f"unsupported output dtype for MPP matmul: {self.out_dtype}",
             )
-        if self.bias_tensor is not None and self.bias_tensor.dtype != acc_dtype:
-            # The bias preload (coop.load) requires matching dtypes.
-            raise exc.BackendUnsupported(
-                "metal",
-                f"MPP matmul bias dtype {self.bias_tensor.dtype} must match the "
-                f"accumulator dtype {acc_dtype}",
-            )
         assert self.lhs_tensor.ndim == 2 and self.rhs_tensor.ndim == 2
         assert self.lhs_tensor.dtype == self.rhs_tensor.dtype
 
@@ -495,13 +483,6 @@ class MPPGraphInfo(NodeArgsGraphInfo):
         df.placeholder_args.add(lhs_arg_name)
         df.placeholder_args.add(rhs_arg_name)
 
-        acc_arg_name = ""
-        acc_metal_dtype = ""
-        if self.bias_tensor is not None:
-            acc_arg_name = df.tensor_arg(self.bias_tensor).name
-            df.placeholder_args.add(acc_arg_name)
-            acc_metal_dtype = dtype_map.get(self.bias_tensor.dtype, "")
-
         setup = MPPSetupParams(
             lhs=lhs_arg_name,
             rhs=rhs_arg_name,
@@ -514,8 +495,6 @@ class MPPGraphInfo(NodeArgsGraphInfo):
             NUM_SG=num_sg,
             in_dtype=dtype_map[self.lhs_tensor.dtype],
             acc_dtype=dtype_map[acc_dtype],
-            bias=acc_arg_name or None,
-            bias_dtype=acc_metal_dtype or None,
             fx_name=self.result_name,
             lhs_transposed=self.lhs_layout.transposed,
             rhs_transposed=self.rhs_layout.transposed,

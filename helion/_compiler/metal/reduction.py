@@ -97,7 +97,9 @@ def _metal_acc_dtype(dtype: torch.dtype) -> str:
     return CompileEnvironment.current().backend.acc_type(dtype)
 
 
-def alloc_threadgroup_buffer(metal_dtype: str, slots: int | str) -> str:
+def alloc_threadgroup_buffer(
+    metal_dtype: str, slots: int | str, prefix: str = "_red_scratch"
+) -> str:
     """Reserve a ``threadgroup`` scratch array and return its MSL name.
 
     Every reduction site gets its own buffer.  Sharing one buffer between two
@@ -109,7 +111,7 @@ def alloc_threadgroup_buffer(metal_dtype: str, slots: int | str) -> str:
     from ..device_function import DeviceFunction
 
     device_fn = DeviceFunction.current()
-    name = device_fn.new_var("_red_scratch")
+    name = device_fn.new_var(prefix)
     device_fn.codegen.module_statements.append(
         statement_from_string(
             f"{TG_BUFFER_GLOBAL_PREFIX}{name} = ({name!r}, {metal_dtype!r}, {slots!r})"

@@ -21,12 +21,13 @@ plan rejects every layout where those differ:
   different block (:func:`_check_positional_merges`);
 - a matmul other than one accumulating a carry of its own single-thread K
   loop (:func:`_check_matmuls`), and any other carry of a lane-looped loop
-  (:func:`_check_lane_carries`);
+  (:func:`check_lane_carries`);
 - a stored tensor with another access (:func:`_check_write_once`);
 - more thread axes than Metal has.
 
 The iota length must be exactly a free block's symbol: a tile-bound, derived
-or literal length is rejected by the lowering.
+or literal length is rejected by the lowering, except a tile widened by a
+constant, which :mod:`factored_dims` holds as per-thread parts.
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ from ._constants import MAX_THREADS_PER_THREADGROUP
 
 if TYPE_CHECKING:
     import ast
+    from collections.abc import Callable
     from collections.abc import Iterator
     from collections.abc import Sequence
 
@@ -61,6 +63,7 @@ if TYPE_CHECKING:
     from ..aten_lowering import LoweringContext
     from ..device_ir import GraphInfo
     from ..tile_dispatch import TileStrategyDispatch
+    from .factored_dims import FactoredValue
 
 #: Each free block's ``(thread axis, configured size)``, by block id.
 FreeArangePlan = dict[int, tuple[int, int]]
@@ -68,7 +71,7 @@ FreeArangePlan = dict[int, tuple[int, int]]
 _IOTA_TARGETS = (torch.ops.prims.iota.default, torch.ops.aten.arange.default)
 
 #: The lhs argument of each matmul op.
-_MATMUL_LHS: dict[object, int] = {
+MATMUL_LHS: dict[object, int] = {
     torch.ops.aten.addmm.default: 1,
     torch.ops.aten.baddbmm.default: 1,
     torch.ops.aten.mm.default: 0,
@@ -130,7 +133,7 @@ def plan_free_aranges(
 
     if any(isinstance(graph, MPPGraphInfo) for graph in graphs):
         raise _unsupported("an MPP matmul claims tid[0] cooperatively")
-    live = _live_graphs(graphs)
+    live = live_graphs(graphs)
     if any(
         isinstance(node.meta.get("lowering"), ReductionLowering)
         for node in _nodes(live)
@@ -141,7 +144,7 @@ def plan_free_aranges(
         )
     _check_positional_merges(live, set(free))
     _check_matmuls(live, tile_strategy)
-    _check_lane_carries(live, tile_strategy, config)
+    check_lane_carries(live, tile_strategy, config)
     _check_write_once(live)
     return _assign_axes(free, config, tile_strategy)
 
@@ -194,7 +197,7 @@ def _graph_children(node: Node) -> list[int]:
     return [graph_id for graph_id in ids if isinstance(graph_id, int)]
 
 
-def _live_graphs(graphs: list[GraphInfo]) -> list[GraphInfo]:
+def live_graphs(graphs: list[GraphInfo]) -> list[GraphInfo]:
     """The roots and every graph they run, once each.
 
     Rolled reduction copies that this config doesn't use are not among them,
@@ -420,13 +423,13 @@ def _check_positional_merges(live: list[GraphInfo], free: set[int]) -> None:
 
 
 def _matmul_k_block(node: Node) -> int | None:
-    lhs = node.args[_MATMUL_LHS[node.target]]
+    lhs = node.args[MATMUL_LHS[node.target]]
     assert isinstance(lhs, Node)
     return CompileEnvironment.current().get_block_id(lhs.meta["val"].shape[-1])
 
 
 def _is_matmul(node: Node) -> bool:
-    return node.op == "call_function" and node.target in _MATMUL_LHS
+    return node.op == "call_function" and node.target in MATMUL_LHS
 
 
 def _check_matmuls(live: list[GraphInfo], tile_strategy: TileStrategyDispatch) -> None:
@@ -525,8 +528,11 @@ def _not_accumulating(
     return "no parent loop runs it"
 
 
-def _check_lane_carries(
-    live: list[GraphInfo], tile_strategy: TileStrategyDispatch, config: Config
+def check_lane_carries(
+    live: list[GraphInfo],
+    tile_strategy: TileStrategyDispatch,
+    config: Config,
+    unsupported: Callable[[str], exc.BackendUnsupported] = _unsupported,
 ) -> None:
     """A lane-looped device loop runs its whole body once per lane on one
     thread, so a carried register folds every lane.  Its only allowed carries
@@ -555,7 +561,7 @@ def _check_lane_carries(
             if not (
                 _is_matmul(producer) and graph.block_ids == [_matmul_k_block(producer)]
             ):
-                raise _unsupported(
+                raise unsupported(
                     f"the loop over block(s) {graph.block_ids} carries "
                     f"{producer.name} through a lane loop, which folds every lane "
                     "into one register"
@@ -626,9 +632,10 @@ def _assign_axes(
 
 def _codegen_iota(
     ctx: LoweringContext, node: Node, start: object, step: object
-) -> ast.AST:
+) -> ast.AST | FactoredValue:
     from ..generate_ast import GenerateAST
     from .backend import MetalBackend
+    from .factored_dims import factored_iota
 
     env = CompileEnvironment.current()
     backend = env.backend
@@ -637,10 +644,13 @@ def _codegen_iota(
     block_id = env.get_block_id(length)
     planned = None if block_id is None else backend.free_arange_plan.get(block_id)
     if planned is None:
+        if (factored := factored_iota(ctx, node)) is not None:
+            return factored
         raise exc.BackendUnsupported(
             "metal",
             f"hl.arange() of length {length}: Metal lowers only a range over a "
-            "block size that no loop owns (hl.register_block_size)",
+            "block size that no loop owns (hl.register_block_size), or a tile "
+            "widened by a constant c (start c * tile.begin, length c * block_size)",
         )
     axis, size = planned
     assert isinstance(ctx.cg, GenerateAST)
@@ -650,7 +660,7 @@ def _codegen_iota(
     dtype_str = backend.dtype_str(
         dtype if isinstance(dtype, torch.dtype) else env.index_dtype
     )
-    # Not ``backend._tid``: that records the axes loops read, which must
+    # Not ``backend.thread_index``: that records the axes loops read, which must
     # exclude this one.  ``tid`` and a grid index are unsigned, so both the
     # thread index and the sum are cast, keeping a negative start or step
     # signed.

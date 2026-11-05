@@ -23,6 +23,11 @@ lanes, so the lane loop is split into passes, as CuTe's
   loop body, so every thread of the threadgroup reaches it in the same
   iteration.
 
+A narrow load that several passes recompute is read once: the first pass
+keeps each lane's value in a per-thread array that the later passes read, as
+CuTe's register stash does for the values it keeps across a split
+(``_split_lane_loop_with_register_stash``).
+
 Only register statements move relative to each other or to stores: a tensor
 stored in the body is not otherwise accessed in it, under its own name or any
 other that may share its memory.  :func:`check_schedule` replays the result
@@ -33,6 +38,7 @@ against the original body.  Every other layout raises
 from __future__ import annotations
 
 import ast
+import collections
 import dataclasses
 import itertools
 from typing import TYPE_CHECKING
@@ -67,6 +73,12 @@ if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
 
 MARKER = "_metal_lane_reduce"
+
+#: Most bytes of lane arrays one split keeps per thread.  Measured on Apple
+#: GPUs: arrays of 16-bit loads up to 64 bytes were neutral or faster than
+#: reloading, 128 bytes mixed and 256 bytes up to 2.3x slower; 32-bit arrays
+#: were neutral to 5% slower at any size, so only narrower loads are kept.
+MAX_LANE_ARRAY_BYTES = 64
 
 #: A definition no single execution of the original body sees: a lane-variant
 #: value after its pass (the last lane's), or a fold result inside its pass.
@@ -168,7 +180,7 @@ class LaneSplit:
         schedule = _schedule(body, groups.get(self.lane_var, self.lane_var))
         check_schedule(body, schedule)
         position = next(i for i, stmt in enumerate(parent) if stmt is lane_loop)
-        parent[position : position + 1] = _emit(body, schedule, lane_loop)
+        parent[position : position + 1] = _emit(body, schedule, lane_loop, self.fn)
         # The passes now hold the body; statements added to the loop later go
         # beside them.
         loop.inner_statements = parent
@@ -461,16 +473,94 @@ def check_schedule(body: LaneBody, schedule: Sequence[int | LanePass]) -> None:
             )
 
 
+def _lane_arrays(
+    body: LaneBody,
+    schedule: Sequence[int | LanePass],
+    lane_loop: ast.For,
+    fn: DeviceFunction,
+) -> dict[int, tuple[str, str]]:
+    """The loads that more than one pass recomputes and that a lane array
+    keeps instead, by statement index, each with its array's name and the
+    array's declaration.
+
+    A later pass reads the same masked load the same thread made for the same
+    lane, and ``_lane_body`` has already rejected any store to a loaded
+    tensor, so the kept value is the one a reload would read.
+    """
+    passes = [item.statements for item in schedule if isinstance(item, LanePass)]
+    counts = collections.Counter(itertools.chain.from_iterable(passes))
+    iterator = lane_loop.iter
+    # Block sizes and thread counts are compile-time constants, and so is the
+    # lane count.
+    assert isinstance(iterator, ast.Call)
+    (lanes,) = iterator.args
+    assert isinstance(lanes, ast.Constant) and isinstance(lanes.value, int)
+    tensors = {arg.name: arg for arg in fn.arguments if isinstance(arg, TensorArg)}
+    backend = CompileEnvironment.current().backend
+    budget = MAX_LANE_ARRAY_BYTES
+    arrays: dict[int, tuple[str, str]] = {}
+    for index in sorted(index for index, count in counts.items() if count > 1):
+        stmt = body.statements[index]
+        if not _is_name_assign(stmt):
+            continue
+        assert isinstance(stmt, ast.Assign)
+        load = _tl_call(stmt.value, "load")
+        if load is None:
+            continue
+        (tensor,) = {
+            node.id for node in ast.walk(load.args[0]) if isinstance(node, ast.Name)
+        } & tensors.keys()
+        dtype = tensors[tensor].fake_value.dtype
+        size = lanes.value * dtype.itemsize
+        if dtype.itemsize >= 4 or size > budget:
+            continue
+        budget -= size
+        (target,) = stmt.targets
+        assert isinstance(target, ast.Name)
+        arrays[index] = (
+            fn.new_var(f"{target.id}_lanes", dce=True),
+            f"_metal_lane_array({backend.dtype_str(dtype)!r}, {lanes.value})",
+        )
+    return arrays
+
+
 def _emit(
-    body: LaneBody, schedule: list[int | LanePass], lane_loop: ast.For
+    body: LaneBody,
+    schedule: list[int | LanePass],
+    lane_loop: ast.For,
+    fn: DeviceFunction,
 ) -> list[ast.AST]:
     init_expr = CompileEnvironment.current().backend.reduction_acc_init_expr
+    arrays = _lane_arrays(body, schedule, lane_loop, fn)
+    lane = cast("ast.Name", lane_loop.target).id
+    kept: set[int] = set()
     emitted: list[ast.AST] = []
     for item in schedule:
         if isinstance(item, int):
             emitted.append(body.statements[item])
             continue
-        lane_body = [body.statements[index] for index in item.statements]
+        lane_body: list[ast.AST] = []
+        for index in item.statements:
+            stmt = body.statements[index]
+            if index not in arrays:
+                lane_body.append(stmt)
+                continue
+            array, declaration = arrays[index]
+            (target,) = cast("ast.Assign", stmt).targets
+            value = cast("ast.Name", target).id
+            if index in kept:
+                lane_body.append(
+                    statement_from_string(f"{value} = _metal_lane_get({array}, {lane})")
+                )
+                continue
+            emitted.append(statement_from_string(f"{array} = {declaration}"))
+            lane_body.extend(
+                (
+                    stmt,
+                    statement_from_string(f"_metal_lane_put({array}, {lane}, {value})"),
+                )
+            )
+            kept.add(index)
         for fold in item.folds:
             reduction = body.reductions[fold]
             identity = init_expr(

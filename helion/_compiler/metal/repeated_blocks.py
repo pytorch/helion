@@ -10,10 +10,11 @@ Pointwise ops and stores broadcast right-aligned, so in a kernel built only
 from loads, stores, constants and pointwise ops, a block and a position
 counted from the right name one coordinate in every value and access.  The
 block's lowest position keeps its thread axis (or its starved lane loop).
-Every other position gets a full-extent lane loop of its own
-(``MetalPersistentReductionStrategy.add_position_lanes``), and loads and
-stores index each slice dimension with the coordinate of its position
-(``memory_ops``).
+Every other position gets the thread axis of another ``:`` slice block that
+no value meets it with (``_position_hosts``), or else a full-extent lane
+loop of its own (``MetalPersistentReductionStrategy.add_position_lanes``),
+and loads and stores index each slice dimension with the coordinate of its
+position (``memory_ops``).
 """
 
 from __future__ import annotations
@@ -51,8 +52,8 @@ _ELEMENTWISE_OPS = (load, store, full, _host_tensor, _get_symnode)
 def plan_repeated_blocks(
     graphs: list[GraphInfo], tile_strategy: TileStrategyDispatch
 ) -> None:
-    """Give each block a value or access repeats a lane loop per extra
-    position, or raise ``BackendUnsupported`` where the lanes would be wrong.
+    """Give each block a value or access repeats a thread axis or a lane loop
+    per extra position, or raise ``BackendUnsupported`` where the lanes would be wrong.
 
     Load indices are read as well as values and store targets: ``x[t, :, :h]
     + hl.zeros([t, h, h])`` has a value of concrete sizes, but its load
@@ -87,6 +88,7 @@ def plan_repeated_blocks(
                 f"the kernel uses {_op_name(node.target)}, and the lanes only "
                 "follow loads, stores, constants and pointwise ops",
             )
+    residents: dict[int, set[tuple[int, int | None]]] = {}
     for block_id, repeat in repeats.items():
         size = env.block_sizes[block_id].size
         if not isinstance(size, int):
@@ -100,7 +102,120 @@ def plan_repeated_blocks(
             )
         thread_position, *lane_positions = sorted(positions[block_id])
         _check_single_owner(graphs, block_id, thread_position)
-        strategy.add_position_lanes(lane_positions, size)
+        hosts = _position_hosts(
+            graphs, tile_strategy, block_id, lane_positions, size, residents
+        )
+        strategy.add_position_lanes(lane_positions, size, hosts)
+
+
+def _position_hosts(
+    graphs: list[GraphInfo],
+    tile_strategy: TileStrategyDispatch,
+    block_id: int,
+    lane_positions: list[int],
+    extent: int,
+    residents: dict[int, set[tuple[int, int | None]]],
+) -> dict[int, tuple[int, int]]:
+    """Position -> (thread axis, its threads) for each lane position of
+    *block_id* that can take another `:` slice block's thread axis instead
+    of a lane loop.
+
+    A Metal statement runs on every thread of every axis, so a statement that
+    never meets the axis's block repeats its work once per thread there; a
+    position lane's statements meet only the blocks of their own values.  The
+    position takes axis A, held by slice block B with at least *extent*
+    threads, when no value, load or store depends (through its inputs as well
+    as its shape) on both the position and on anything already on A.  Its
+    index is then ``tid[A]``: each value and access holding it reads a
+    thread's own coordinate, and nothing on A is read beside it.  A store
+    whose value or mask depends on the position must also index it, or the
+    threads of A would write one element with different values where the
+    lane loop wrote it in order.
+    """
+    # Each grid root numbers its thread axes from 0, so B's axis in one root
+    # can be the block's own axis in another.
+    if len(HostFunction.current().device_ir.grid_block_ids) != 1:
+        return {}
+    deps = _dependencies(graphs)
+    hosts: dict[int, tuple[int, int]] = {}
+    for position in lane_positions:
+        dim = (block_id, position)
+        for strategy in tile_strategy.strategies:
+            if (
+                not isinstance(strategy, MetalPersistentReductionStrategy)
+                or strategy.block_index == block_id
+            ):
+                continue
+            threads = strategy._reduction_thread_count()
+            axis = tile_strategy.thread_axis_for_strategy(strategy)
+            if threads < extent or axis is None:
+                continue
+            on_axis = residents.setdefault(axis, {(strategy.block_index, None)})
+            if any(
+                dim in dims and any(_holds(dims, r) for r in on_axis)
+                for dims in deps.values()
+            ):
+                continue
+            if not _stores_index(graphs, deps, dim):
+                continue
+            on_axis.add(dim)
+            hosts[position] = (axis, threads)
+            break
+    return hosts
+
+
+def _holds(dims: set[tuple[int, int]], resident: tuple[int, int | None]) -> bool:
+    """Whether *dims* holds *resident*; a None position stands for all of its
+    block's positions."""
+    block_id, position = resident
+    if position is None:
+        return any(b == block_id for b, _ in dims)
+    return resident in dims
+
+
+def _dependencies(graphs: list[GraphInfo]) -> dict[torch.fx.Node, set[tuple[int, int]]]:
+    """Each node's (block, position) dims: those of its own value, load index
+    or store target, and every dim its inputs depend on."""
+    deps: dict[torch.fx.Node, set[tuple[int, int]]] = {}
+    for node in _nodes(graphs):
+        dims: set[tuple[int, int]] = set()
+        for _, shape in _shapes(node):
+            dims |= _block_positions(shape)
+        for inp in node.all_input_nodes:
+            dims |= deps[inp]
+        deps[node] = dims
+    return deps
+
+
+def _stores_index(
+    graphs: list[GraphInfo],
+    deps: dict[torch.fx.Node, set[tuple[int, int]]],
+    dim: tuple[int, int],
+) -> bool:
+    """Whether every store whose value or mask depends on *dim* indexes it."""
+    for node in _nodes(graphs):
+        if node.target is not store:
+            continue
+        inputs = [a for a in node.args[2:] if isinstance(a, torch.fx.Node)]
+        if not any(dim in deps[a] for a in inputs):
+            continue
+        tensor, subscript = _access(node)
+        assert isinstance(tensor, torch.Tensor)
+        if dim not in _block_positions(
+            SubscriptIndexing.compute_shape(tensor, subscript)
+        ):
+            return False
+    return True
+
+
+def _block_positions(shape: list[int | torch.SymInt]) -> set[tuple[int, int]]:
+    """The (block, position from the right) of each block dim of *shape*."""
+    env = CompileEnvironment.current()
+    return {
+        (block_id, len(shape) - 1 - dim)
+        for dim, size in enumerate(shape)
+        if (block_id := env.get_block_id(size)) is not None
+    }
 
 
 def slice_output_dims(subscript: list[object]) -> dict[int, tuple[int, slice]] | None:

@@ -12,7 +12,8 @@ lane loop of its own (see ``repeated_blocks``).
 A reduction over a tile block after the block's loop has exited must still
 combine across the threads that loop used (``MetalBlockReductionStrategy``).
 One over a block that its own loop walks in a lane loop, on one thread or
-several, splits that lane loop into passes (``lane_reduction.py``).
+several, splits that lane loop into passes (``lane_reduction.py``).  A count
+it sums there (``_is_count``) folds and combines in int32, not torch's int64.
 
 A reduction block that is only the power-of-two padding of a ``:`` slice
 block (see ``padded_twin``) owns no threads, lanes or mask: its reductions
@@ -23,7 +24,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+
 from ... import exc
+from ...language import _tracing_ops
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -32,7 +36,9 @@ from ..reduction_strategy import PersistentReductionStrategy
 from ..reduction_strategy import reduction_acc_dtype
 from ..tile_strategy import LoopDimInfo
 from ..tile_strategy import PersistentReductionState
+from .backend import MetalBackend
 from .lane_fold import LANE_FOLD
+from .lane_fold import MAX_LANE_COPIES
 from .lane_reduction import lane_split_for
 from .msl_reduction import SUPPORTED_REDUCTIONS
 from .padded_twin import cone_violation
@@ -43,16 +49,9 @@ if TYPE_CHECKING:
     import ast
 
     import sympy
-    import torch
 
     from ..device_function import DeviceFunction
     from ..inductor_lowering import CodegenState
-
-#: Most lanes one thread folds.  The fold unrolls every lane, and each lane
-#: keeps its own copy of every value that depends on it, so code size and
-#: register pressure grow with the count.  The bound is CuTe's for an
-#: unrolled per-thread register tile (``CUTE_REGISTER_TILE_MAX_ELEMENTS``).
-MAX_FOLD_LANES = 64
 
 
 class MetalPersistentReductionStrategy(PersistentReductionStrategy):
@@ -65,6 +64,7 @@ class MetalPersistentReductionStrategy(PersistentReductionStrategy):
     _folds = False
     _position_lanes: dict[int, str] | None = None
     _position_extent = 1
+    _position_hosts: dict[int, tuple[int, int]] | None = None
 
     @property
     def serializes_lanes(self) -> bool:
@@ -90,6 +90,15 @@ class MetalPersistentReductionStrategy(PersistentReductionStrategy):
         if span == 1:
             self._thread_count = 0
 
+    def thread_lanes(self) -> tuple[int | None, int, str | None]:
+        """``(axis, threads, lane)``: position ``e`` of the dimension is on
+        thread ``e % threads`` of ``axis`` and on lane ``e // threads`` of the
+        lane loop ``lane`` (None without one).  One thread walking every
+        position has ``threads`` 0 and no axis (``serialize_lanes``)."""
+        threads = self._reduction_thread_count()
+        axis = self._get_thread_axis() if threads else None
+        return axis, threads, self._lane_var
+
     def fold_lanes(self) -> None:
         """Make reductions over the laned dimension fold each thread's lanes
         before combining across threads (``codegen_reduction``)."""
@@ -111,14 +120,14 @@ class MetalPersistentReductionStrategy(PersistentReductionStrategy):
                 f"reduction over persistent dim {block_id} in a lane loop beside "
                 f"other reduction dims {others}",
             )
-        if self._lane_extent > MAX_FOLD_LANES:
+        if self._lane_extent > MAX_LANE_COPIES:
             span = self._lane_span
             threads = "1 thread" if span == 1 else f"{span} threads"
             raise exc.BackendUnsupported(
                 "metal",
                 f"persistent reduction over {self._serialized_extent} elements "
                 f"would need {self._lane_extent} lanes per thread on {threads} "
-                f"(max {MAX_FOLD_LANES})",
+                f"(max {MAX_LANE_COPIES})",
             )
         self._folds = True
 
@@ -162,10 +171,17 @@ class MetalPersistentReductionStrategy(PersistentReductionStrategy):
             state, fold, reduction_type, dim, fake_input, fake_output
         )
 
-    def add_position_lanes(self, positions: list[int], extent: int) -> None:
-        """Walk the block's whole *extent* in a lane loop at each of
-        *positions*, counted from the right of a value's shape; the lowest
-        position keeps the block's own index."""
+    def add_position_lanes(
+        self,
+        positions: list[int],
+        extent: int,
+        hosts: dict[int, tuple[int, int]],
+    ) -> None:
+        """Walk the block's whole *extent* at each of *positions*, counted
+        from the right of a value's shape.  *hosts* maps a position to the
+        thread axis it takes and that axis's thread count; a position it
+        lacks walks a lane loop.  The lowest position keeps the block's own
+        index."""
         self._position_lanes = {
             position: self.fn.new_var(
                 f"position_lane_{self.block_index}_{position}", dce=False
@@ -173,6 +189,17 @@ class MetalPersistentReductionStrategy(PersistentReductionStrategy):
             for position in positions
         }
         self._position_extent = extent
+        self._position_hosts = hosts
+
+    def position_lane_mask(self, position: int) -> str | None:
+        """The mask of a position on a thread axis with more threads than
+        the block's extent."""
+        assert self._position_hosts is not None
+        host = self._position_hosts.get(position)
+        if host is None or host[1] == self._position_extent:
+            return None
+        assert self._position_lanes is not None
+        return f"({self._position_lanes[position]} < {self._position_extent})"
 
     def position_lane(self, position: int) -> str | None:
         if self._position_lanes is None:
@@ -190,9 +217,16 @@ class MetalPersistentReductionStrategy(PersistentReductionStrategy):
             raise exc.BackendUnsupported(
                 "metal", "a repeated `:` slice block's lane loops need a grid loop"
             )
-        # Full extent, so a lane needs no mask.
-        for lane in self._position_lanes.values():
-            current_grid.add_lane_loop(self.block_index, lane, self._position_extent)
+        backend = CompileEnvironment.current().backend
+        assert isinstance(backend, MetalBackend) and self._position_hosts is not None
+        for position, lane in self._position_lanes.items():
+            if (host := self._position_hosts.get(position)) is not None:
+                state.add_statement(f"{lane} = {backend.thread_index(host[0])}")
+            else:
+                # Full extent, so a lane needs no mask.
+                current_grid.add_lane_loop(
+                    self.block_index, lane, self._position_extent
+                )
 
     def _codegen_thread_index(
         self, state: CodegenState, block_size_var: str, numel: sympy.Expr
@@ -302,6 +336,24 @@ class MetalPaddedTwinStrategy(MetalPersistentReductionStrategy):
         )
 
 
+def _is_count(node: torch.fx.Node) -> bool:
+    """Whether every element of an FX value is 0 or 1: a bool, widened to any
+    integer dtype, its masked-off elements filled with 0."""
+    if node.target is _tracing_ops._mask_to:
+        operand, fill = node.args
+        # Helion masks a sum's operand with the sum's identity.
+        assert fill == 0, fill
+    elif node.target is torch.ops.prims.convert_element_type.default:
+        operand, dtype = node.args
+        assert isinstance(dtype, torch.dtype)
+        if dtype.is_floating_point or dtype.is_complex or dtype == torch.bool:
+            return False
+    else:
+        return node.meta["val"].dtype == torch.bool
+    assert isinstance(operand, torch.fx.Node)
+    return _is_count(operand)
+
+
 class MetalBlockReductionStrategy(BlockReductionStrategy):
     """A tile-block reduction that also combines after the block's loop exits.
 
@@ -328,6 +380,9 @@ class MetalBlockReductionStrategy(BlockReductionStrategy):
             )
         threads = self._reduction_thread_count()
         assert (threads > 1) == (self.block_index in split.loop.block_thread_axes)
+        if self._sums_count_in_int32(state, reduction_type, fake_output):
+            fake_input = fake_input.new_empty(fake_input.shape, dtype=torch.int32)
+            fake_output = fake_output.new_empty(fake_output.shape, dtype=torch.int32)
         across_threads = None
         if threads > 1:
 
@@ -342,6 +397,25 @@ class MetalBlockReductionStrategy(BlockReductionStrategy):
         return expr_from_string(
             self.maybe_reshape(result, dim, fake_input, fake_output)
         )
+
+    def _sums_count_in_int32(
+        self, state: CodegenState, reduction_type: str, fake_output: torch.Tensor
+    ) -> bool:
+        """Whether a sum into torch's int64 may fold and combine in int32.
+
+        An int64 threadgroup collective is markedly slower than an int32 one
+        on Apple GPUs.  A count over one block of fewer than 2**31 elements
+        never leaves [0, 2**31 - 1] in any partial or combine, so int32 holds
+        it exactly; the reduction's lowering widens the result back.
+        """
+        if reduction_type != "sum" or fake_output.dtype != torch.int64:
+            return False
+        assert state.fx_node is not None
+        operand = state.fx_node.args[0]
+        assert isinstance(operand, torch.fx.Node)
+        block = self.fn.resolved_block_size(self.block_index)
+        assert isinstance(block, int)
+        return block < 2**31 and _is_count(operand)
 
     def _needs_loop_carried_accumulator(self) -> bool:
         """Combine an exited block across its thread axis when the layout is
