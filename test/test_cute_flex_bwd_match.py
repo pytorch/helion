@@ -400,6 +400,38 @@ def test_softcap_jacobian_region() -> None:
             assert all(not isinstance(a, float) for a in node.args), node.args
 
 
+def _softcap_20(score, b, h, q_idx, kv_idx):
+    return 20.0 * torch.tanh(score / 20.0)
+
+
+def _softcap_20_bwd_scaled(grad, score, b, h, q_idx, kv_idx):
+    th = torch.tanh(score / 20.0)
+    return (grad * 20.0) * (1.0 - th * th) / 20.0
+
+
+def _softcap_20_bwd_divided(grad, score, b, h, q_idx, kv_idx):
+    th = torch.tanh(score / 20.0)
+    return grad / 20.0 * (20.0 * (1.0 - th * th))
+
+
+@pytest.mark.parametrize(
+    "score_mod_bwd", [_softcap_20_bwd_scaled, _softcap_20_bwd_divided]
+)
+def test_softcap_jacobian_region_with_gradient_arithmetic(
+    score_mod_bwd: Callable[..., Any],
+) -> None:
+    """A ``score_mod_bwd`` whose gradient meets literal arithmetic before (or
+    besides) the Jacobian factor, as in a VJP traced from ``score_mod``: the
+    unit gradient and ``grad * c`` stand in as typed literal nodes, so the
+    region nodes consuming them keep their prepared lowerings and the
+    Jacobian hook renders."""
+    t = _tensors()
+    bound = _bind(_args(t, _causal, _softcap_20, score_mod_bwd))
+    plan = _match_or_fail(bound).plan
+    assert plan.grad_region is not None
+    assert "fbwd_mul_pairs_packed" in _render(bound)
+
+
 def test_ragged_lengths_match() -> None:
     t = _tensors(q_seq=192, kv_seq=320)
     match = _match_or_fail(_bind(_args(t, _causal)))
