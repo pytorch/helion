@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
+
 import pytest
 import torch
 
 import helion
 from helion import exc
+from helion._compiler.loop_dependency_checker import _holds_no_storage
 from helion._testing import DEVICE
 import helion.language as hl
 
@@ -218,6 +221,15 @@ def heterogeneous_result(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(autotune_effort="none")
+def tensor_and_scalar_result(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [v for v in (x, 1) if v is not None]
+        out[tile] = values[0][tile] * values[1]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
 def changing_comprehension_length(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.numel()):
@@ -355,6 +367,18 @@ def test_filtered_heterogeneous_result() -> None:
     assert any(node.target is hl.store for node in graph.nodes)
 
 
+def test_filtered_mixed_result_preserves_tensor_alias_information() -> None:
+    bound = tensor_and_scalar_result.bind((torch.ones(32),))
+    comprehension = next(
+        node
+        for stmt in bound.host_function.body
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.ListComp)
+    )
+    assert isinstance(comprehension.elt, ast.Name)
+    assert not _holds_no_storage(comprehension.elt)
+
+
 def test_changing_comprehension_length_is_rejected() -> None:
     with pytest.raises(exc.StatementNotSupported, match="changing lengths"):
         changing_comprehension_length.bind((torch.ones(32),))
@@ -393,6 +417,13 @@ def test_filtered_multidimensional_tensor_cuda() -> None:
 def test_repeated_static_range_comprehension_cuda() -> None:
     x = torch.randn(128, device=DEVICE)
     torch.testing.assert_close(repeated_static_range_comprehension(x), x * 6)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_tensor_and_scalar_result_cuda() -> None:
+    x = torch.randn(128, device=DEVICE)
+    torch.testing.assert_close(tensor_and_scalar_result(x), x)
 
 
 @pytest.mark.cuda

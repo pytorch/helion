@@ -1210,10 +1210,13 @@ class TypePropagation(ast.NodeVisitor):
                 n._type_info = old
             raise
         for n, old in zip(nodes, previous, strict=True):
-            # These names are resolved from the current iteration's scope.
-            if old is not None and not (
-                n is node and isinstance(n, ast.Name) and n.id in self.scope.variables
-            ):
+            if old is None:
+                continue
+            if n is node and isinstance(n, ast.Name) and n.id in self.scope.variables:
+                # Tracing uses the current value; retain tensor provenance for analysis.
+                if isinstance(old, TensorType):
+                    n._type_info = old
+            else:
                 n._type_info = old if n._type_info is None else old.merge(n._type_info)
         return result
 

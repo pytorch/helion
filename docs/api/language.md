@@ -91,7 +91,8 @@ assignment expressions. A filter depending on a runtime value or tensor is not
 supported because the result would have a runtime-dependent length. Multiple
 `if` clauses are evaluated in order, with short-circuiting. Inside an enclosing
 unrolled loop, the same comprehension must produce the same number of elements
-in every iteration.
+in every iteration. As with unfiltered comprehensions, result expressions with
+types or tensor shapes that cannot be merged across iterations may be rejected.
 
 ### barrier()
 
