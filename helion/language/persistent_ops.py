@@ -29,8 +29,8 @@ def computes_persistent_num_workers(device: torch.device) -> bool:
     """Whether :func:`persistent_num_workers` scales the SM count on ``device``.
 
     On XPU, get_num_sm() is the Xe-core count, but one work-group per Xe-core
-    often leaves hardware threads idle: how many fit depends on num_warps and
-    the GRF mode.  Elsewhere one program per SM is kept.
+    often leaves hardware threads idle: how many fit depends on num_warps, the
+    GRF mode and shared local memory.  Elsewhere one program per SM is kept.
     """
     return device.type == "xpu"
 
@@ -43,10 +43,13 @@ def persistent_num_workers(device: torch.device, *, reserved_sms: int = 0) -> in
     On XPU, several work-groups can share an Xe-core, so this is
     ``helion.runtime.get_num_sm(device, reserved_sms=reserved_sms)`` times the
     number of work-groups that fit on one Xe-core, as computed by
-    :func:`helion.runtime.get_xpu_programs_per_xecore` from ``num_warps`` and
-    the ``grf_mode`` config value.  The kernel is compiled with that GRF mode,
-    which is autotuned over :func:`helion.runtime.get_xpu_grf_modes`.
-    Elsewhere it is ``get_num_sm()``.
+    :func:`helion.runtime.get_xpu_programs_per_xecore` from ``num_warps``, the
+    ``grf_mode`` config value and the kernel's shared local memory.  The kernel
+    is compiled with that GRF mode, which is autotuned over
+    :func:`helion.runtime.get_xpu_grf_modes`.  Shared local memory is only
+    known once Triton has compiled the kernel, so the first launch of each
+    config counts threads alone, and later launches also count shared local
+    memory.  Elsewhere it is ``get_num_sm()``.
 
     Args:
         device: Device the kernel runs on.
@@ -90,7 +93,8 @@ def _persistent_num_workers_type(
     # registering it as a tunable symbol passes it to the device code as a
     # constexpr for each config.
     env.tunable_symbols.add(expr)
-    # Mirrors get_xpu_programs_per_xecore().
+    # Mirrors get_xpu_programs_per_xecore(), without shared local memory, which
+    # is unknown before Triton compiles the kernel.
     eus, max_threads, grf_per_eu = get_xpu_eu_resources(device_val)
     threads_per_eu = ConfigValueExpression(
         "floordiv", (grf_per_eu, ConfigValueExpression("config", (GRF_MODE_KEY,)))
@@ -139,7 +143,9 @@ def _persistent_num_workers_codegen(state: CodegenState) -> ast.AST:
     _check_explicit_grf_mode(grf_mode)
     return expr_from_string(
         "{call} * helion.runtime.get_xpu_programs_per_xecore("
-        f"{{device}}, num_warps={state.config.num_warps}, grf_mode={grf_mode})",
+        f"{{device}}, num_warps={state.config.num_warps}, grf_mode={grf_mode}, "
+        f"shared=helion.runtime.get_xpu_kernel_shared({state.device_function.name}, "
+        "{device}))",
         call=call,
         device=device,
     )

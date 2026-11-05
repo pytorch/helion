@@ -5,8 +5,9 @@ Triton code depends on at execution time:
 
 * :func:`default_launcher` -- invokes a compiled ``triton.jit`` kernel.
 * :func:`get_num_sm` -- persistent-kernel grid size (host statement).
-* :func:`get_xpu_programs_per_xecore` -- resident work-groups per Xe-core
-  (host statement for ``hl.persistent_num_workers`` on XPU).
+* :func:`get_xpu_programs_per_xecore` and :func:`get_xpu_kernel_shared` --
+  resident work-groups per Xe-core (host statement for
+  ``hl.persistent_num_workers`` on XPU).
 * :func:`set_triton_allocator` -- installs the scratch allocator used by TMA /
   tensor-descriptor kernels (device-function prefix statement).
 
@@ -122,7 +123,10 @@ def get_xpu_grf_modes(device: torch.device) -> tuple[int, ...]:
 
     Xe2 offers 128 and 256, with 256 preferred when a size must be fixed.  A
     target that allocates its register file in finer steps, such as Xe3's
-    variable register file in blocks of 32, can list more modes here.
+    variable register file in blocks of 32, can list more modes here, but
+    :func:`get_xpu_programs_per_xecore` then needs its threads per EU: on Xe3
+    they do not scale with the register count (compute-runtime's
+    ``calculateAvailableThreadCount`` gives 6 threads at 160 GRF, not 8).
     """
     return (256, 128)
 
@@ -150,28 +154,81 @@ def get_xpu_eu_resources(device: torch.device) -> tuple[int, int, int]:
     )
 
 
+# Shared local memory of an Xe-core, as compute-runtime budgets it for Xe2
+# (``maxProgrammableSlmSize``).  An Arc Pro B70 measured up to 160 KB resident,
+# but the driver's figure is the documented one.
+XPU_SLM_PER_XECORE = 128 * 1024
+
+# Sizes a work-group's shared local memory is rounded up to when allocated
+# (compute-runtime's ``EncodeDispatchKernel::alignSlmSizePerThreadGroup``).
+XPU_SLM_ALLOCATION_SIZES = tuple(
+    kb * 1024 for kb in (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)
+)
+
+
+def get_xpu_kernel_shared(kernel: object, device: torch.device) -> int:
+    """
+    Shared local memory in bytes that a work-group of ``kernel`` uses on ``device``.
+
+    The size is only known once Triton has compiled the kernel, so this reads
+    the specializations of ``triton.jit`` ``kernel`` already compiled for
+    ``device`` and returns the largest, or 0 before the first compile.
+    """
+    index = device.index if device.index is not None else torch.xpu.current_device()
+    # ``device_caches`` is a defaultdict; ``get`` leaves it untouched.
+    caches = kernel.device_caches.get(index)  # pyrefly: ignore[missing-attribute]
+    if caches is None:
+        return 0
+    kernel_cache = caches[0]
+    return max(
+        (
+            compiled.metadata.shared
+            for compiled in kernel_cache.values()
+            # Async compilation stores a future until the kernel is ready.
+            if isinstance(compiled, triton.compiler.CompiledKernel)  # pyrefly: ignore[missing-attribute]
+        ),
+        default=0,
+    )
+
+
 def get_xpu_programs_per_xecore(
-    device: torch.device, *, num_warps: int, grf_mode: int
+    device: torch.device, *, num_warps: int, grf_mode: int, shared: int = 0
 ) -> int:
     """
     Work-groups that can be resident on one Xe-core of XPU ``device`` at once.
 
     Each sub-group (warp) occupies one hardware thread.  An EU holds as many
     threads as its GRF registers allow at ``grf_mode`` registers per thread, up
-    to its hardware thread limit.  Shared local memory is not counted.
+    to its hardware thread limit.  Each work-group also takes ``shared`` bytes
+    of the Xe-core's shared local memory, rounded up to an allocation size.
+
+    This follows compute-runtime's ``KernelHelper::getMaxWorkGroupCount``,
+    behind Level Zero's ``zeKernelSuggestMaxCooperativeGroupCount``, except that
+    shared local memory is divided per Xe-core rather than over the device, and
+    the driver's limit of 32 work-groups with barriers per Xe-core is left out:
+    only work-groups of a single sub-group can exceed it, and those were
+    measured resident 64 per Xe-core.
 
     Args:
         device: XPU device to query.
         num_warps: Sub-groups per work-group.
         grf_mode: GRF registers per hardware thread, one of
             :func:`get_xpu_grf_modes`.
+        shared: Shared local memory per work-group in bytes, as from
+            :func:`get_xpu_kernel_shared`.
 
     Returns:
         Resident work-groups per Xe-core.  Always at least 1.
     """
     eus, max_threads, grf_per_eu = get_xpu_eu_resources(device)
     threads = eus * min(max_threads, grf_per_eu // grf_mode)
-    return max(threads // num_warps, 1)
+    programs = threads // num_warps
+    if shared > 0:
+        allocation = next(
+            (size for size in XPU_SLM_ALLOCATION_SIZES if shared <= size), shared
+        )
+        programs = min(programs, XPU_SLM_PER_XECORE // allocation)
+    return max(programs, 1)
 
 
 # CUs per XCD by base CDNA architecture.  Used to derive the live,
