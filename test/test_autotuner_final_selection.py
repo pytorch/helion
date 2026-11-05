@@ -614,6 +614,39 @@ class TestFinalSelection(TestCase):
         ):
             self.assertIs(search.final_rebenchmark_best(best), best)
 
+    def test_unanswered_incumbent_keeps_its_title_over_a_slower_seed(self) -> None:
+        # The h100 flash_attention nightly: the worker broke late in the
+        # search and answered only the first finalist, the 120 ms default
+        # seed; every other finalist, the 16 ms incumbent among them, got no
+        # reading. The seed must not win by being the only one timed, but a
+        # timed finalist that beats the incumbent's search reading still does.
+        for seed_reading, expect_seed in ((120.0, False), (15.0, True)):
+            seed = _member(16, 120.0)
+            incumbent = _member(128, 16.0)
+            other = _member(256, 16.1)
+            policy = FinalSelectionConfig(top_k=4, rounds=4, screen_rep_ms=0)
+            search = _make_search(
+                [incumbent, other, seed], policy=policy, pinned=[seed]
+            )
+            with (
+                patch.dict(os.environ, _SHORTLIST_ALL),
+                patch.object(
+                    search,
+                    "_final_selection_measurer",
+                    new=_FakeMeasurer(
+                        lambda member, _n, r=seed_reading, s=seed: (
+                            r if member is s else None
+                        )
+                    ),
+                ),
+            ):
+                selected = search.final_rebenchmark_best(incumbent)
+            self.assertIs(selected, seed if expect_seed else incumbent)
+            self.assertEqual(incumbent.perf, 16.0)
+            rows = {row["search_ms"]: row for row in _rows(search)}
+            self.assertEqual(rows[16.0]["disqualified"], "incomplete")
+            self.assertEqual(rows[120.0]["median_ms"], seed_reading)
+
     def test_incumbent_is_always_a_finalist(self) -> None:
         # A later phase re-timed the incumbent above the shortlist's search
         # numbers; it still defends its title in the shootout: shortlisted,

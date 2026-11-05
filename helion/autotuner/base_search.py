@@ -3803,6 +3803,25 @@ class PopulationBasedSearch(BaseSearch):
             after = self._break_tie_by_second_column(
                 after, members, second_by_position, pinned_configs, policy
             )
+        # An incumbent left without a complete reading that neither failed nor
+        # timed out lost its windows to the timer, not to a rival (a benchmark
+        # worker that broke late in the search answers only the first finalist,
+        # the default-config seed): it keeps its title unless a timed finalist
+        # beats its search reading.
+        incumbent_index = finalists.index(incumbent)
+        if (
+            after is not incumbent
+            and incumbent_index not in medians
+            and failures[incumbent_index] is None
+            and math.isfinite(incumbent.perf)
+            and after.perf > incumbent.perf
+        ):
+            self.log.warning(
+                "Final selection took no complete readings of the search's best "
+                f"config ({self.format_performance(incumbent.perf)}); keeping it "
+                f"over the timed {self.format_performance(after.perf)}."
+            )
+            after = incumbent
         self._log_final_selection(
             finalists,
             survivors,
