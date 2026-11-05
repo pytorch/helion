@@ -182,6 +182,7 @@ from .cute_launch_bounds import register_matmul_min_blocks_coverage
 from .cute_materialized import CuteMaterializedMmaHeuristic
 from .cute_materialized_operand import CuteMaterializedOperandHeuristic
 from .cute_materialized_pdl import register_materialized_pdl_coverage
+from .cute_mixed_output import CuteMixedOutputStoreHeuristic
 from .cute_mma_dag import CuteMmaDagHeuristic
 from .cute_packed_operand import register_packed_operand_coverage
 from .cute_radix_selection import CuteRadixSelectionHeuristic
@@ -239,6 +240,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteChunkRecurrenceHeuristic,
         CuteGdnRecurrenceHeuristic,
         CuteMmaDagHeuristic,
+        CuteMixedOutputStoreHeuristic,
         CuteRegisterSubblocksHeuristic,
         CuteChunkPrepareHeuristic,
         CuteAffineScanHeuristic,

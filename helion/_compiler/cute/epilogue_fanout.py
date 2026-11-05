@@ -29,22 +29,29 @@ if TYPE_CHECKING:
     from ..host_function import HostFunction
     from .cute_epilogue import Tcgen05UnaryEpilogueChain
     from .cute_epilogue import _AuxiliaryTensorExprStep
+    from .cute_epilogue import _AuxiliaryTensorLoadExpr
     from .cute_epilogue import _LeafBindings
     from .device_state import CuteTcgen05StoreValue
+    from .shared_epilogue_dag import SharedDagFanoutPlan
 
 
 FANOUT_CONFIG_KEY = "tcgen05_epilogue_fanout"
 FANOUT_MODES = ("off", "shared")
 
 
-def _fresh_returned_tensors(host: HostFunction) -> frozenset[torch.Tensor]:
+def _fresh_returned_tensors(
+    host: HostFunction, *, allow_external: bool = False
+) -> frozenset[torch.Tensor]:
     """Prove direct fresh factories and a host without intervening alias effects.
 
     Fake storage identity alone is insufficient: an opaque host helper or a
     later ``set_`` could change ownership on the next call. Admit only direct
     known factories, metadata assignments, device roots and a literal return of
     names. This also works for the typed stage views of materialized fission,
-    which retain the owning host's allocation prelude.
+    which retain the owning host's allocation prelude. With ``allow_external``
+    the result is only a host-purity eligibility set: argument members are NOT
+    fresh or disjoint and need the separate dispatch/cache-backed alias proof.
+    That fallback admits one grid root only; the paired default stays unchanged.
     """
     from ... import language as hl
     from ...language.constexpr import specialize
@@ -212,15 +219,38 @@ def _fresh_returned_tensors(host: HostFunction) -> frozenset[torch.Tensor]:
             and isinstance(stmt, ExtendedAST)
             and stmt._loop_type is LoopType.GRID
         ):
+            if allow_external and seen_root:
+                return frozenset()
             seen_root = True
             continue
         if isinstance(stmt, ast.Return) and index == len(host.body) - 1:
+            if (
+                allow_external
+                and seen_root
+                and (
+                    stmt.value is None
+                    or isinstance(stmt.value, ast.Constant)
+                    and stmt.value.value is None
+                )
+            ):
+                return frozenset(allocations.values()) | frozenset(
+                    value
+                    for value in host.params.arguments.values()
+                    if isinstance(value, torch.Tensor)
+                )
             returned_names = returned(stmt.value)
             if not seen_root or returned_names is None:
                 return frozenset()
-            return frozenset(
+            result = frozenset(
                 value for name, value in allocations.items() if name in returned_names
             )
+            if allow_external:
+                result |= frozenset(
+                    value
+                    for value in host.params.arguments.values()
+                    if isinstance(value, torch.Tensor)
+                )
+            return result
         if seen_root or not isinstance(stmt, ast.Assign):
             return frozenset()
         names: list[str] = []
@@ -258,6 +288,12 @@ def _fresh_returned_tensors(host: HostFunction) -> frozenset[torch.Tensor]:
             if not metadata(value):
                 return frozenset()
             metadata_names.update(names)
+    if allow_external and seen_root:
+        return frozenset(allocations.values()) | frozenset(
+            value
+            for value in host.params.arguments.values()
+            if isinstance(value, torch.Tensor)
+        )
     return frozenset()
 
 
@@ -594,6 +630,8 @@ class RenderedChain:
     # Every old name is allocated in its old order, even for a shared-away step.
     # Later regions, wrapper plans and unaffected setup consequently keep names.
     step_variables: tuple[tuple[tuple[str, str], ...], ...]
+    carrier: str = ""
+    carrier_prelude: str = ""
 
 
 def render_chain(
@@ -604,6 +642,7 @@ def render_chain(
     aux: _LeafBindings,
 ) -> RenderedChain:
     source: list[str] = []
+    original_carrier = carrier
     all_variables: list[tuple[tuple[str, str], ...]] = []
     for step in chain.steps:
         variables: list[tuple[str, str]] = []
@@ -616,7 +655,9 @@ def render_chain(
         prelude, carrier = step.render_prelude_and_expr(carrier, aux, record, indent)
         source.append(prelude)
         all_variables.append(tuple(variables))
-    return RenderedChain(chain, "".join(source), carrier, tuple(all_variables))
+    return RenderedChain(
+        chain, "".join(source), carrier, tuple(all_variables), original_carrier
+    )
 
 
 def _chain_key(chain: Tcgen05UnaryEpilogueChain) -> tuple[object, ...]:
@@ -746,11 +787,12 @@ class FanoutIteration:
     chain: RenderedChain
     auxiliary_names: _LeafBindings
     pre_wait_aux: bool = False
+    auxiliary_load_sources: tuple[tuple[_AuxiliaryTensorLoadExpr, str], ...] = ()
 
 
 @dataclass(frozen=True)
 class FanoutStore:
-    plan: PairedFanoutPlan
+    plan: PairedFanoutPlan | SharedDagFanoutPlan
     site: torch.fx.Node
     main: ast.If
     setup: tuple[str, ...]
@@ -786,6 +828,7 @@ class FanoutStore:
 def combine_stores(first: FanoutStore, second: FanoutStore) -> None:
     """Replace the first marked body with one ordered two-output traversal."""
     plan = first.plan
+    assert isinstance(plan, PairedFanoutPlan)
     if (
         first.site is not plan.stores[0]
         or second.site is not plan.stores[1]

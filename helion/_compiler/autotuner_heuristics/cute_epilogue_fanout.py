@@ -16,8 +16,9 @@ from ...exc import InvalidConfig
 from ...runtime.config import Config
 from ..cute.epilogue_fanout import FANOUT_CONFIG_KEY
 from ..cute.epilogue_fanout import FANOUT_MODES
-from ..cute.epilogue_fanout import prove_paired_fanout
 from ..cute.epilogue_fanout import schedule_supported
+from ..cute.shared_epilogue_dag import prove_epilogue_fanout
+from ..cute.shared_epilogue_dag import schedule_supported as plan_schedule_supported
 from ..cute.tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENTS
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
 
     from ...autotuner.config_spec import ConfigSpec
     from ..compile_environment import CompileEnvironment
-    from ..cute.epilogue_fanout import PairedFanoutPlan
+    from ..cute.shared_epilogue_dag import FanoutPlan
     from ..cute.tcgen05_config import CuteTcgen05Config
     from ..device_ir import DeviceIR
 
@@ -53,7 +54,9 @@ def register_epilogue_fanout_coverage(
     targets = (
         torch.ops.aten.addmm.default,
         torch.ops.aten.mm.default,
+        torch.ops.aten.mm.dtype,
         torch.ops.aten.bmm.default,
+        torch.ops.aten.bmm.dtype,
         torch.ops.aten.baddbmm.default,
         matmul_ops.dot,
     )
@@ -66,7 +69,13 @@ def register_epilogue_fanout_coverage(
             if stores is None:
                 continue
             with host:
-                plan = prove_paired_fanout(env, host, device_ir.graphs, stores, {node})
+                # Managed binds publish the complete immutable snapshot only
+                # after construction. This anchored coverage proof may read the
+                # already registered live classifier, never publish a partial
+                # snapshot or grant unbound metadata to unrelated readers.
+                plan = prove_epilogue_fanout(
+                    env, host, device_ir.graphs, stores, {node}, allow_unbound=True
+                )
             if plan is not None:
                 plans.append(plan)
     state.epilogue_fanout_plans = tuple(plans)
@@ -88,7 +97,7 @@ def register_epilogue_fanout_coverage(
             # namespace. Their ordinary search handling is unchanged; they
             # cannot prove a new additive witness for this complete schema.
             continue
-        if not schedule_supported(candidate.config):
+        if not all(plan_schedule_supported(plan, candidate.config) for plan in plans):
             continue
         # One-CTA seeds only. The CTA pair's fanout recipe enters the search
         # through the aux fragment hoist group, which builds a carrier per
@@ -333,7 +342,7 @@ def _one_wave_fanout_carrier(
 
 
 def _synthesized_fanout_carriers(
-    spec: ConfigSpec, state: CuteTcgen05Config, plans: Sequence[PairedFanoutPlan]
+    spec: ConfigSpec, state: CuteTcgen05Config, plans: Sequence[FanoutPlan]
 ) -> list[Config]:
     """One-CTA full-tile carriers for a proved fanout no compiler seed carries.
 
@@ -417,7 +426,7 @@ def _synthesized_fanout_carriers(
         spec.normalize(candidate)
     except InvalidConfig:
         return []
-    if not schedule_supported(candidate.config):
+    if not all(plan_schedule_supported(plan, candidate.config) for plan in plans):
         return []
     carriers: list[Config] = []
     for stages in (4, 2):

@@ -230,30 +230,82 @@ def test_dispatch_and_prepared_guard_do_not_reuse_early_disjoint_admission_for_a
         assert not guard(tuple(alias_args))
 
 
+def _genuinely_aligned_cpu_tensor(
+    count: int, dtype: torch.dtype, alignment_bytes: int = 256
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Own a real aligned storage slice, with zero-based typed view offsets."""
+    itemsize = dtype.itemsize
+    assert count > 0 and alignment_bytes > 0
+    assert alignment_bytes % itemsize == 0
+    byte_count = count * itemsize
+    raw = torch.empty(byte_count + alignment_bytes, dtype=torch.uint8, device="cpu")
+    byte_offset = (-raw.data_ptr()) % alignment_bytes
+    assert 0 <= byte_offset < alignment_bytes
+    assert byte_offset + byte_count <= raw.numel()
+    # A real UntypedStorage slice retains its parent allocation. Rebase the
+    # storage view itself: packed-region offsets must start at zero, not at
+    # the alignment padding within raw. No pointer/metadata is fabricated.
+    storage = raw.untyped_storage()[byte_offset : byte_offset + byte_count]
+    root = torch.empty(0, dtype=dtype, device="cpu").set_(storage, 0, (count,), (1,))
+    aligned = root.view(count)
+    assert aligned.data_ptr() == raw.data_ptr() + byte_offset
+    assert aligned.data_ptr() % alignment_bytes == 0
+    assert aligned.storage_offset() == 0
+    assert aligned.untyped_storage().nbytes() == byte_count
+    return aligned, raw
+
+
+def _genuinely_aligned_recurrence_args() -> tuple[object, ...]:
+    from test.test_cute_chunk_recurrence import _dv4_runtime_args
+
+    original = _dv4_runtime_args(
+        torch.device("cpu"), value=0.125, decay=0.5, identity_aq=True
+    )
+    factors = original[:5]
+    assert all(isinstance(value, torch.Tensor) for value in factors)
+    workspace_bytes = sum(value.numel() * value.element_size() for value in factors)
+    storage, _owner = _genuinely_aligned_cpu_tensor(workspace_bytes, torch.uint8)
+    cursor = 0
+    original_base_offset = factors[0].storage_offset() * factors[0].element_size()
+    packed = []
+    for value in factors:
+        size = value.numel() * value.element_size()
+        # Preserve exact region offsets relative to the original physical base;
+        # its raw allocation can have leading alignment padding.
+        assert (
+            value.storage_offset() * value.element_size() - original_base_offset
+            == cursor
+        )
+        assert value.data_ptr() - factors[0].data_ptr() == cursor
+        assert cursor % 256 == 0
+        tensor = storage[cursor : cursor + size].view(value.dtype).view(value.shape)
+        tensor.copy_(value)
+        assert tensor.shape == value.shape and tensor.stride() == value.stride()
+        assert tensor.dtype == value.dtype and tensor.device == value.device
+        assert tensor.data_ptr() == storage.data_ptr() + cursor
+        assert tensor.data_ptr() % 256 == 0
+        assert tensor.storage_offset() * tensor.element_size() == cursor
+        assert cursor + size <= storage.untyped_storage().nbytes()
+        packed.append(tensor)
+        cursor += size
+    assert cursor == workspace_bytes
+    return (*packed, *original[5:])
+
+
 @pytest.mark.parametrize("dv_partitions", [2, 4])
 def test_managed_recurrence_bind_records_complete_late_packed_workspace_snapshot(
     dv_partitions,
 ):
     from test.test_cute_chunk_recurrence import _CONFIG
     from test.test_cute_chunk_recurrence import _bt16_resident_chain
-    from test.test_cute_chunk_recurrence import _dv4_runtime_args
 
     from helion._compiler.cute.chunk_prepare import _PACKED_WORKSPACE_SPECIALIZATION_KEY
     from helion._compiler.cute.chunk_prepare import _packed_workspace_runtime_signature
 
-    # Real CPU tensors, real 256-byte alignment, and the authentic packed
-    # recurrence carrier. Keep rejected allocations alive instead of faking
-    # an address or teaching the classifier to accept an unaligned workspace.
-    allocated = []
-    for _ in range(32):
-        args = _dv4_runtime_args(
-            torch.device("cpu"), value=0.125, decay=0.5, identity_aq=True
-        )
-        allocated.append(args)
-        if _packed_workspace_runtime_signature(args[:5]):
-            break
-    else:
-        pytest.fail("could not allocate a genuinely aligned CPU workspace")
+    # Preserve the authentic packed carrier and classifier, but remove the
+    # CPU allocator-alignment lottery with a genuinely owned aligned view.
+    args = _genuinely_aligned_recurrence_args()
+    assert _packed_workspace_runtime_signature(args[:5])
     assert args[0].data_ptr() % 256 == 0
     bound = _bt16_resident_chain.bind(args)
     env = bound.env
@@ -277,3 +329,77 @@ def test_managed_recurrence_bind_records_complete_late_packed_workspace_snapshot
     )
     assert expected in source
     assert "dot_acc = dot_acc +" not in source
+
+
+@pytest.mark.parametrize(
+    "dtype", (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+)
+@pytest.mark.parametrize("count", (1, 17))
+def test_genuine_aligned_cpu_view_has_exact_pointer_offsets_bounds_and_owner(
+    dtype, count
+):
+    import gc
+    import weakref
+
+    tensor, raw = _genuinely_aligned_cpu_tensor(count, dtype)
+    pointer = tensor.data_ptr()
+    byte_offset = pointer - raw.data_ptr()
+    byte_count = count * dtype.itemsize
+    assert 0 <= byte_offset < 256
+    assert byte_offset + byte_count <= raw.numel()
+    assert tensor.shape == (count,) and tensor.stride() == (1,)
+    assert tensor.dtype == dtype and tensor.device.type == "cpu"
+    assert tensor.storage_offset() == 0 and tensor.data_ptr() % 256 == 0
+    assert tensor._base is not None
+    raw.fill_(0x5A)
+    fill = 7 if dtype is torch.uint8 else 0.125
+    tensor.fill_(fill)
+    assert torch.equal(
+        raw[byte_offset : byte_offset + byte_count], tensor.view(torch.uint8)
+    )
+    assert torch.all(raw[:byte_offset] == 0x5A)
+    assert torch.all(raw[byte_offset + byte_count :] == 0x5A)
+    # Physical aliasing is real in both directions, not just equal metadata.
+    raw[byte_offset : byte_offset + byte_count].zero_()
+    assert torch.equal(tensor, torch.zeros(count, dtype=dtype))
+    tensor.fill_(fill)
+    owner = weakref.ref(raw)
+    del raw
+    gc.collect()
+    assert owner() is None
+    # The tensor/storage view, not the raw Python object, owns the allocation.
+    assert tensor.data_ptr() == pointer
+    assert torch.equal(tensor, torch.full((count,), fill, dtype=dtype))
+    tensor[-1] = fill
+
+
+def test_aligned_recurrence_fixture_keeps_real_packed_aliases_data_and_guard_rejection():
+    from test.test_cute_chunk_recurrence import _dv4_runtime_args
+
+    from helion._compiler.cute.chunk_prepare import _packed_workspace_runtime_signature
+
+    args = _genuinely_aligned_recurrence_args()
+    original = _dv4_runtime_args(
+        torch.device("cpu"), value=0.125, decay=0.5, identity_aq=True
+    )
+    factors = args[:5]
+    shared = factors[0].untyped_storage()
+    cursor = 0
+    for actual, wanted in zip(factors, original[:5], strict=True):
+        assert actual.untyped_storage() is shared
+        assert actual.storage_offset() * actual.element_size() == cursor
+        assert actual.data_ptr() == factors[0].data_ptr() + cursor
+        assert actual.data_ptr() % 256 == 0
+        assert actual.shape == wanted.shape and actual.stride() == wanted.stride()
+        assert actual.dtype == wanted.dtype and torch.equal(actual, wanted)
+        cursor += actual.numel() * actual.element_size()
+    assert cursor == shared.nbytes()
+    assert args[5] is args[6]
+    assert _packed_workspace_runtime_signature(factors)
+    unaligned = list(factors)
+    unaligned[0] = factors[0].as_strided(factors[0].shape, factors[0].stride(), 1)
+    assert unaligned[0].data_ptr() % 256 != 0
+    assert not _packed_workspace_runtime_signature(unaligned)
+    independent = list(factors)
+    independent[1] = factors[1].clone()
+    assert not _packed_workspace_runtime_signature(independent)

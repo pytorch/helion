@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from .grouped_balanced_workers import GroupedBalancedWorkersPlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
+    from .mixed_store import MixedPrecisionStorePlan
     from .published_scalars import PublishedScalarRequest
     from .radix_selection import RadixSelectionPlan
     from .register_producers import RegisterProducerRequest
@@ -338,8 +339,10 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     tma_store_full_tiles_only: bool = False
     partial_output_tma_store: bool = False
     # Output element dtype (cutlass type string, e.g. "cutlass.BFloat16")
-    # used when computing the tcgen05 epilogue tile.
+    # used when computing the tcgen05 epilogue tile. A proved mixed-output
+    # contract uses a common FP32 T2R plan and independent typed stores.
     epi_elem_dtype_str: str = ""
+    mixed_precision_stores: MixedPrecisionStorePlan | None = None
     explicit_epi_tile_m: int | None = None
     explicit_epi_tile_n: int | None = None
     explicit_d_store_box_n: int | None = None
@@ -366,6 +369,13 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     def __post_init__(self) -> None:
         if self.pure_matmul_object is not None:
             assert self.pure_matmul_object.lifecycle_context is self.lifecycle_context
+        if self.mixed_precision_stores is not None:
+            assert self.output_stores is not None
+            assert set(self.output_stores) == set(self.mixed_precision_stores.stores)
+            assert self.epi_elem_dtype_str == "cutlass.Float32"
+            assert self.orientation is Tcgen05Orientation.MN
+            assert not self.output_column_major
+            assert self.has_explicit_epilogue_tile
         explicit_tile_values = (
             self.explicit_epi_tile_m,
             self.explicit_epi_tile_n,
@@ -828,6 +838,7 @@ class CuteDeviceFunctionState:
         # every output has read TMEM. Each TMA store gets separate descriptors.
         self._tcgen05_emitted_store_nodes: dict[int, set[Node | None]] = {}
         self._tcgen05_pending_paired_stores: dict[Node, FanoutStore] = {}
+        self._tcgen05_pending_dag_stores: dict[Node, list[FanoutStore]] = {}
         # FX matmul / hl.dot / addmm nodes lowered through tcgen05. The store
         # path uses this to recognize fused epilogue chains that must use the
         # tcgen05 store splice instead of falling through to SIMT store codegen.
@@ -1207,6 +1218,30 @@ class CuteDeviceFunctionState:
             return
         self.matmul_plan = plan
 
+    def register_shared_dag_fanout_store(self, store: FanoutStore) -> bool:
+        """Merge a complete ordered scope, retaining every store's drain."""
+        from .shared_epilogue_dag import SharedDagFanoutPlan
+        from .shared_epilogue_dag import combine_dag_stores
+
+        plan = store.plan
+        assert isinstance(plan, SharedDagFanoutPlan)
+        first = plan.stores[0]
+        pending = self._tcgen05_pending_dag_stores.setdefault(first, [])
+        if (
+            len(pending) >= len(plan.stores)
+            or store.site is not plan.stores[len(pending)]
+        ):
+            raise exc.BackendUnsupported("cute", "unordered shared-DAG fanout stores")
+        pending.append(store)
+        secondary = len(pending) > 1
+        if secondary:
+            self._per_tile_stmt_ids.remove(id(store.main))
+            self._epi_role_stmt_ids.remove(id(store.main))
+        if len(pending) == len(plan.stores):
+            combine_dag_stores(pending)
+            del self._tcgen05_pending_dag_stores[first]
+        return secondary
+
     def register_paired_fanout_store(
         self, store: FanoutStore, post_loop_stmts: Sequence[ast.AST]
     ) -> bool:
@@ -1515,6 +1550,8 @@ class CuteDeviceFunctionState:
         self.finalize_tcgen05_owned_kloop_cleanup(device_loop)
 
     def finalize_tcgen05_pure_lifecycle_stores(self) -> None:
+        if self._tcgen05_pending_dag_stores:
+            raise exc.BackendUnsupported("cute", "incomplete shared-DAG fanout stores")
         if self._tcgen05_pending_paired_stores:
             raise exc.BackendUnsupported("cute", "incomplete paired fanout stores")
         if not self._tcgen05_pure_lifecycle_pending_store_loops:

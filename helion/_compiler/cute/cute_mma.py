@@ -115,6 +115,8 @@ from .matmul_utils import cute_f32_mma_matches_dot
 from .matmul_utils import loop_carries
 from .matmul_utils import reads_loop_carry
 from .matmul_utils import strip_new_vars
+from .mixed_store import MixedPrecisionStorePlan
+from .mixed_store import prove_mixed_precision_stores
 from .mma_support import cute_fp32_dot_uses_tf32
 from .mma_support import get_cute_mma_support
 from .mma_support import tcgen05_supports_input_dtype
@@ -7463,6 +7465,38 @@ def _analyze_mma_output_stores(
     )
 
 
+def tcgen05_mixed_precision_store_plan(
+    graphs: Sequence[GraphInfo], node: Node, operands: _MmaOperandAnalysis
+) -> MixedPrecisionStorePlan | None:
+    """A separate complete-store proof for ordinary mixed half/FP32 outputs."""
+    if (
+        operands.lhs.mma_dtype not in (torch.bfloat16, torch.float16)
+        or operands.has_leading_passthrough
+        or operands.rhs.rhs_is_grouped
+    ):
+        return None
+    output = _analyze_mma_output_stores(node, operands, graphs=list(graphs))
+    if (
+        output is None
+        or output.output_column_major
+        or output.requires_fragment_epilogue
+    ):
+        return None
+    stores = analyze_tcgen05_matmul_store_chains(list(graphs), node)
+    if stores is None:
+        return None
+    return prove_mixed_precision_stores(
+        CompileEnvironment.current(),
+        graphs,
+        stores,
+        input_dtype=operands.lhs.mma_dtype,
+        input_device=operands.lhs.source_fake.device,
+        m=operands.lhs.matrix_rows,
+        n=operands.rhs.matrix_cols,
+        input_loads=(operands.lhs.load, operands.rhs.load),
+    )
+
+
 def tcgen05_half_source_store_eligible(
     graphs: Sequence[GraphInfo], node: Node, operands: _MmaOperandAnalysis
 ) -> bool:
@@ -7483,6 +7517,7 @@ def tcgen05_half_source_store_eligible(
     return (
         output.requires_fragment_epilogue
         or _trace_mma_to_store_dtype(node, list(graphs)) is not None
+        or tcgen05_mixed_precision_store_plan(graphs, node, operands) is not None
     )
 
 
@@ -8350,8 +8385,17 @@ def _emit_mma_pipeline(
     # `CuteTcgen05StoreValue` is the loud-failure backstop and
     # surfaces `BackendUnsupported` if the runtime D-tensor dtype
     # disagrees with the matmul plan's assumption.
+    mixed_precision_stores = (
+        tcgen05_mixed_precision_store_plan(cg.codegen_graphs, fx_node, analysis)
+        if fx_node is not None and analysis is not None
+        else None
+    )
     epi_elem_dtype: torch.dtype | None = None
-    if fx_node is not None:
+    if mixed_precision_stores is not None:
+        # A dtype-independent integer epilogue tile and FP32 T2R coordinates
+        # keep each branch unrounded until its own original output conversion.
+        epi_elem_dtype = torch.float32
+    elif fx_node is not None:
         traced = _trace_mma_to_store_dtype(fx_node, cg.codegen_graphs)
         if traced in _dtype_map:
             epi_elem_dtype = traced
@@ -12381,6 +12425,40 @@ def _emit_mma_pipeline(
         tcgen05_narrow_subtile_nounroll_k_loop = (
             tcgen05_promoted_rowvec_subtile or tcgen05_plain_narrow_subtile
         )
+        if mixed_precision_stores is not None:
+            if not (
+                tcgen05_use_tma_pipeline
+                and not tcgen05_nm_orientation
+                and not output_column_major
+                and tcgen05_grouped_plan is None
+                and tcgen05_m_subtile_count == 1
+                and not tcgen05_requested_pure_matmul_role_lifecycle
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "mixed-output native stores require the ordinary row-major "
+                    "AB-TMA epilogue without grouped or paired-M protocols",
+                )
+            configured_tile = (
+                tcgen05_explicit_epi_tile_m,
+                tcgen05_explicit_epi_tile_n,
+                tcgen05_explicit_d_store_box_n,
+            )
+            if all(value is None for value in configured_tile):
+                common_tile = mixed_precision_stores.default_tile(
+                    tcgen05_mma_bm, tcgen05_mma_bn, tcgen05_is_two_cta
+                )
+                if common_tile is None:
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "mixed-output stores need a common integer epilogue tile",
+                    )
+                (
+                    tcgen05_explicit_epi_tile_m,
+                    tcgen05_explicit_epi_tile_n,
+                    tcgen05_explicit_d_store_box_n,
+                ) = common_tile
+                tcgen05_explicit_epi_tile_configured = True
         explicit_epi_tile_requested = any(
             value is not None
             for value in (
@@ -13556,7 +13634,11 @@ def _emit_mma_pipeline(
                 )
             if aux_productive_body_gate_open:
                 aux_descriptor_dtype_strs = tuple(
-                    env.backend.dtype_str(desc.host_tensor_val.dtype)
+                    # Bool tensors are byte-backed. The accepted explicit
+                    # cast normalizes nonzero bytes after their staged read.
+                    "cutlass.Uint8"
+                    if desc.host_tensor_val.dtype is torch.bool
+                    else env.backend.dtype_str(desc.host_tensor_val.dtype)
                     for desc in c_input_aux_tensor_descriptors
                 )
                 # With dynamic M/N output shapes, a TMA-store epilogue is only
@@ -17026,6 +17108,7 @@ def _emit_mma_pipeline(
                 # to enforce the kernel/store equality contract on
                 # `compute_epilogue_tile_shape`'s dtype kwargs.
                 epi_elem_dtype_str=epi_elem_dtype_str,
+                mixed_precision_stores=mixed_precision_stores,
                 explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
                 explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
                 explicit_d_store_box_n=tcgen05_explicit_d_store_box_n,

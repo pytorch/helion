@@ -89,6 +89,8 @@ from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
 from .gelu_tanh_approx import FAST_MATH_UNARY_OPS
 from .gelu_tanh_approx import fast_math_unary_template
+from .mapped_aux import MappedAuxLoadMap
+from .mapped_aux import mapped_aux_load_map
 from .math_templates import SIGMOID_TEMPLATE
 
 if TYPE_CHECKING:
@@ -240,6 +242,22 @@ class _AuxiliaryTensorLoadExpr:
     template: str
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ReadonlyBoolAuxLoadExpr(_AuxiliaryTensorLoadExpr):
+    """An exact-index readonly byte load consumed by an explicit FP32 cast.
+
+    The renderer preserves noncanonical nonzero bool bytes. This tagged leaf
+    is not a general boolean/numeric cast or an MMA operand admission.
+    """
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _MappedAuxiliaryTensorLoadExpr(_AuxiliaryTensorLoadExpr):
+    """A complete readonly DAG leaf with a proved tile-local source-plane view."""
+
+    mapping: MappedAuxLoadMap
+
+
 # Splice-side bindings of chain leaves to pre-bound locals: every auxiliary
 # load leaf (its per-subtile ``aux_loaded`` value) and, optionally, the
 # rank-0 device scalars (bound once per output tile ahead of the accumulator
@@ -285,6 +303,9 @@ class _PointwiseDagExpr:
     """
 
     nodes: tuple[_TensorExpr, ...]
+    # Optional typed FX origins for cross-store sharing. Ordinary and paired
+    # renderers deliberately ignore them; missing origins cannot prove sharing.
+    provenance: tuple[tuple[torch.fx.Node, torch.dtype], ...] = ()
 
 
 _TensorExpr = (
@@ -862,6 +883,76 @@ def _auxiliary_cast_operand(
     ):
         return None
     return operand, source.dtype, target_dtype
+
+
+def _readonly_bool_auxiliary_cast(
+    node: torch.fx.Node,
+    *,
+    carrier_tile_shape: tuple[object, ...],
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    carrier_global_shape: tuple[object, ...] | None,
+    graphs: Sequence[GraphInfo],
+    allow_unbound: bool = False,
+) -> _ReadonlyBoolAuxLoadExpr | None:
+    """Prove only ``readonly_bool[same_tile].to(float32)``.
+
+    Keep this outside the floating cast/linear-chain whitelist. The complete
+    single-anchor DAG proof also checks every effect and every output alias.
+    """
+    from .register_loads import host_load_is_readonly
+
+    if (
+        node.op != "call_function"
+        or node.target is not torch.ops.prims.convert_element_type.default
+        or node.kwargs
+        or len(node.args) != 2
+        or node.args[1] is not torch.float32
+        or not isinstance(node.args[0], torch.fx.Node)
+        or carrier_tile_index_nodes is None
+        or carrier_global_shape is None
+        or not CompileEnvironment.has_current()
+    ):
+        return None
+    load = node.args[0]
+    source = load.meta.get("val")
+    result = node.meta.get("val")
+    tensor_node = load.args[0] if load.args else None
+    tensor = (
+        tensor_node.meta.get("val") if isinstance(tensor_node, torch.fx.Node) else None
+    )
+    if (
+        load.graph is not node.graph
+        or not isinstance(source, torch.Tensor)
+        or not isinstance(result, torch.Tensor)
+        or not isinstance(tensor, torch.Tensor)
+        or source.dtype is not torch.bool
+        or tensor.dtype is not torch.bool
+        or tensor.ndim != 2
+        or tensor.device != source.device
+        or result.dtype is not torch.float32
+        or source.shape != result.shape
+        or source.stride() != result.stride()
+        or source.device != result.device
+        or aux_tensor_load_kind(
+            load,
+            carrier_tile_shape=carrier_tile_shape,
+            carrier_tile_index_nodes=carrier_tile_index_nodes,
+            carrier_global_shape=carrier_global_shape,
+        )
+        != ("exact", None)
+    ):
+        return None
+    env = CompileEnvironment.current()
+    if not host_load_is_readonly(
+        load,
+        env,
+        graphs,
+        allow_unbound=allow_unbound or env.early_mma_metadata_scope_active,
+    ):
+        return None
+    return _ReadonlyBoolAuxLoadExpr(
+        load, None, "(({aux}) != cutlass.Uint8(0)).to(cutlass.Float32)"
+    )
 
 
 def _canonical_aux_load_operand(node: torch.fx.Node) -> tuple[torch.fx.Node, str]:
@@ -2042,8 +2133,14 @@ def analyze_tcgen05_unary_epilogue_chain(
         target_fx_nodes=target_fx_nodes,
         inner_outputs_by_graph_id=inner_outputs_by_graph_id,
     )
-    if linear is not None:
+    if linear is not None and not any(
+        _node_tensor_dtype(leaf.load_node) is torch.bool
+        for leaf in linear[0].auxiliary_tensor_loads
+    ):
         return linear
+    # Bare boolean leaves in the older linear classifier do not prove readonly
+    # storage or byte normalization. Only the complete DAG's explicit cast
+    # path may admit a bool auxiliary load; floating/comparison paths stay put.
     if state is not None:
         if target_fx_nodes is None:
             target_fx_nodes = state.device_function.cute_state.matmul_fx_nodes
@@ -2064,7 +2161,15 @@ def _analyze_tcgen05_pointwise_dag(
     graphs: Sequence[GraphInfo],
     target_fx_nodes: set[torch.fx.Node],
     output_global_shape: tuple[object, ...] | None,
+    *,
+    allow_unbound: bool = False,
 ) -> tuple[Tcgen05UnaryEpilogueChain, torch.fx.Node] | None:
+    """Prove the complete anchored DAG, with bound alias facts by default.
+
+    Coverage registration may read an already registered live classifier before
+    the normal managed-bind snapshot. It neither registers nor publishes facts;
+    final lowering never opts into that constructor-only read.
+    """
     from ...language import matmul_ops
     from ...language import memory_ops
     from ..host_function import HostFunction
@@ -2162,9 +2267,13 @@ def _analyze_tcgen05_pointwise_dag(
 
     nodes: list[_TensorExpr] = []
     memo: dict[torch.fx.Node, _TensorExpr] = {}
+    bool_loads: dict[torch.fx.Node, _ReadonlyBoolAuxLoadExpr] = {}
     active: set[torch.fx.Node] = set()
     current = _CurrentTensorExpr()
     nodes.append(current)
+    provenance: dict[int, tuple[torch.fx.Node, torch.dtype]] = {
+        id(current): (anchor, torch.float32)
+    }
     promoted_operands: dict[tuple[int, torch.dtype], _TensorExpr] = {}
 
     def normalize_operand(
@@ -2195,6 +2304,7 @@ def _analyze_tcgen05_pointwise_dag(
                     expr,
                 )
             promoted_operands[key] = promoted
+            provenance[id(promoted)] = (node, dtype)
             nodes.append(promoted)
         return promoted
 
@@ -2203,7 +2313,7 @@ def _analyze_tcgen05_pointwise_dag(
             return memo[node]
         if (
             depth > 32
-            or len(memo) >= 64
+            or len(memo) + len(bool_loads) >= 64
             or node in active
             or node.graph is not value_node.graph
         ):
@@ -2237,6 +2347,20 @@ def _analyze_tcgen05_pointwise_dag(
             return None
         active.add(node)
         expr: _TensorExpr | None = _scalar_constant(node) or _runtime_scalar(node)
+        if expr is None and depth < 32:
+            boolean = _readonly_bool_auxiliary_cast(
+                node,
+                carrier_tile_shape=shape,
+                carrier_tile_index_nodes=indices,
+                carrier_global_shape=output_global_shape,
+                graphs=graphs,
+                allow_unbound=allow_unbound,
+            )
+            if boolean is not None:
+                # A raw bool load remains unparsable on its own. Only this
+                # explicit cast owns the tagged byte-normalizing FP32 leaf.
+                # Count the underlying load toward the existing node bound.
+                expr = bool_loads.setdefault(boolean.load_node, boolean)
         if expr is None and node.target is memory_ops.load:
             kind = aux_tensor_load_kind(
                 node,
@@ -2252,6 +2376,17 @@ def _analyze_tcgen05_pointwise_dag(
                 expr = _AuxiliaryTensorLoadExpr(
                     node, kind[1] if kind[0] == "broadcast" else None, "{aux}"
                 )
+            elif indices is not None:
+                mapping = mapped_aux_load_map(
+                    node,
+                    carrier_tile_shape=shape,
+                    carrier_tile_index_nodes=indices,
+                    carrier_global_shape=output_global_shape,
+                )
+                if mapping is not None:
+                    # Only this complete-graph DAG path admits mapped sources;
+                    # its whole-effect and registered-alias proof ran above.
+                    expr = _MappedAuxiliaryTensorLoadExpr(node, None, "{aux}", mapping)
         if (
             expr is None
             and node.target is _tracing_ops._new_var
@@ -2427,13 +2562,14 @@ def _analyze_tcgen05_pointwise_dag(
                             operand,
                         )
         active.remove(node)
-        if expr is None or len(memo) >= 64:
+        if expr is None or len(memo) + len(bool_loads) >= 64:
             return None
         # Every non-scalar DAG value must have the carrier's logical tile
         # or a proved trailing-axis aux shape; shape-changing ops never enter.
         if node_shape == shape and value.stride() != carrier_value.stride():
             return None
         memo[node] = expr
+        provenance.setdefault(id(expr), (node, value.dtype))
         if not any(expr is existing for existing in nodes):
             nodes.append(expr)
         return expr
@@ -2455,7 +2591,7 @@ def _analyze_tcgen05_pointwise_dag(
         # Live metadata may be consumed only during MMA construction admission,
         # under a previously registered cache/prepared-call classifier. This
         # proof never registers a classifier or publishes general bound facts.
-        allow_unbound = env.early_mma_metadata_scope_active
+        allow_unbound = allow_unbound or env.early_mma_metadata_scope_active
         if not all(
             host_load_is_readonly(node, env, graphs, allow_unbound=allow_unbound)
             for node in load_sources
@@ -2472,7 +2608,7 @@ def _analyze_tcgen05_pointwise_dag(
                 )
             ):
                 return None
-    dag = _PointwiseDagExpr(tuple(nodes))
+    dag = _PointwiseDagExpr(tuple(nodes), tuple(provenance[id(node)] for node in nodes))
     return Tcgen05UnaryEpilogueChain((_AuxiliaryTensorExprStep(dag),)), anchor
 
 

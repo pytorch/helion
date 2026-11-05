@@ -6059,19 +6059,29 @@ class _Matcher:
         # collective / warp-MMA search, or a dot their operand analyzer
         # accepts) keep their search surface: this owner exists for the
         # kernels that would otherwise run SIMT.
-        if self.env.config_spec.cute_tcgen05_search_enabled:
+        mixed_store_certificate = (
+            self.env.config_spec._cute_tcgen05_config.mixed_output_store_plan
+        )
+        if (
+            self.env.config_spec.cute_tcgen05_search_enabled
+            and mixed_store_certificate is None
+        ):
             raise _NotMine
         for graph in graphs:
             for node in graph.graph.nodes:
                 if not _is_dot(node):
                     continue
                 candidate = analyze_cute_mma_node(node, graphs=graphs)
-                if candidate is not None and tcgen05_half_source_store_eligible(
-                    graphs, node, candidate.operands
+                if (
+                    mixed_store_certificate is None
+                    and candidate is not None
+                    and tcgen05_half_source_store_eligible(
+                        graphs, node, candidate.operands
+                    )
                 ):
-                    # Operand compatibility alone cannot exclude this owner:
-                    # the ordinary half-native path must lower every final
-                    # store, including all output dtypes, before claiming it.
+                    # Keep the legacy standalone exclusion, except for the
+                    # certified mixed-output source where this independently
+                    # proved owner remains an explicit alternative.
                     raise _NotMine
         if len(device_ir.grid_block_ids) != 1:
             raise _NotMine

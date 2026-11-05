@@ -88,7 +88,7 @@ def _candidate(bound):
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
-@pytest.mark.parametrize("mode", ("bool_mask", "sin"))
+@pytest.mark.parametrize("mode", ("sin",))
 def test_unsupported_half_final_store_keeps_full_fallback_surface(mode, dtype):
     bound = _bind(mode, dtype)
     spec = bound.config_spec
@@ -130,7 +130,7 @@ def test_unsupported_half_final_store_keeps_full_fallback_surface(mode, dtype):
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
-@pytest.mark.parametrize("mode", ("supported", "intermediate_cast"))
+@pytest.mark.parametrize("mode", ("supported", "intermediate_cast", "bool_mask"))
 def test_supported_half_full_store_retains_native_lowering(mode, dtype):
     bound = _bind(mode, dtype)
     graphs, node, candidate = _candidate(bound)
@@ -159,19 +159,25 @@ def _mixed_output_dtypes(a: torch.Tensor, b: torch.Tensor):
 
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
-def test_mixed_output_dtype_releases_ordinary_claim_and_keeps_dag_incumbent(dtype):
+def test_proved_mixed_output_dtype_keeps_the_explicit_dag_alternative(dtype):
     a = torch.empty((256, 128), dtype=dtype)
     b = torch.empty((128, 256), dtype=dtype)
     bound = cpu_bind(_mixed_output_dtypes, (a, b))
     graphs, node, candidate = _candidate(bound)
     with bound.env, bound.host_function:
-        assert not cute_mma.tcgen05_half_source_store_eligible(
+        assert cute_mma.tcgen05_half_source_store_eligible(
             graphs, node, candidate.operands
         )
-    assert not bound.config_spec.cute_tcgen05_search_enabled
+        assert (
+            cute_mma.tcgen05_mixed_precision_store_plan(
+                graphs, node, candidate.operands
+            )
+            is not None
+        )
+    assert bound.config_spec.cute_tcgen05_search_enabled
     assert bound.config_spec.cute_mma_dag is not None
-    # An explicit existing DAG config remains available; output casts and
-    # the two original output dtypes survive the independent whole-root plan.
+    # The new independent typed native stores do not remove the old proved
+    # whole-root DAG choice. Original casts and both output dtypes remain.
     source = bound.to_code(
         helion.Config(
             block_sizes=[64, 64, 32],
@@ -206,7 +212,7 @@ def test_half_rejection_keeps_planning_guard_publication():
         "_finalize_cute_tcgen05_search_planning",
         wraps=device_ir._finalize_cute_tcgen05_search_planning,
     ) as finalize:
-        bound = _bind("bool_mask", torch.bfloat16)
+        bound = _bind("sin", torch.bfloat16)
     assert not bound.config_spec.cute_tcgen05_search_enabled
     results = finalize.call_args.args[1]
     assert len(results) == 1 and results[0].plan is not None

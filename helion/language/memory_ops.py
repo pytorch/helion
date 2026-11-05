@@ -30,13 +30,14 @@ from .._compiler.cute.device_state import Tcgen05Orientation
 from .._compiler.cute.epilogue_fanout import FANOUT_CONFIG_KEY
 from .._compiler.cute.epilogue_fanout import FanoutIteration
 from .._compiler.cute.epilogue_fanout import FanoutStore
-from .._compiler.cute.epilogue_fanout import prove_paired_fanout
 from .._compiler.cute.epilogue_fanout import render_chain as render_fanout_chain
-from .._compiler.cute.epilogue_fanout import (
-    schedule_supported as fanout_schedule_supported,
+from .._compiler.cute.shared_epilogue_dag import SharedDagFanoutPlan
+from .._compiler.cute.shared_epilogue_dag import (
+    protocol_supported as fanout_store_protocol_supported,
 )
-from .._compiler.cute.epilogue_fanout import (
-    store_protocol_supported as fanout_store_protocol_supported,
+from .._compiler.cute.shared_epilogue_dag import prove_epilogue_fanout
+from .._compiler.cute.shared_epilogue_dag import (
+    schedule_supported as fanout_schedule_supported,
 )
 from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from .._compiler.cute.strategies import tcgen05_is_two_cta_m128
@@ -2693,19 +2694,30 @@ def _codegen_cute_store_tcgen05_tile(
     fanout_plan = None
     fanout_chain: RenderedChain | None = None
     fanout_iteration: FanoutIteration | None = None
+    fanout_auxiliary_sources: tuple[tuple[_AuxiliaryTensorLoadExpr, str], ...] = ()
     fanout_advance: str | None = None
     if has_store_fanout and df.config.get(FANOUT_CONFIG_KEY, "off") == "shared":
         assert tcgen05_value.output_stores is not None
-        fanout_plan = prove_paired_fanout(
+        fanout_plan = prove_epilogue_fanout(
             env,
             state.codegen.host_function,
             state.codegen.codegen_graphs,
             tcgen05_value.output_stores,
             df.cute_state.matmul_fx_nodes,
         )
+        if fanout_plan is None and any(
+            isinstance(plan, SharedDagFanoutPlan)
+            for plan in env.config_spec._cute_tcgen05_config.epilogue_fanout_plans
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "shared-DAG fanout lost its complete typed or alias proof"
+            )
+        if isinstance(fanout_plan, SharedDagFanoutPlan):
+            assert store_node is not None
+            epilogue_chain = fanout_plan.chains[fanout_plan.stores.index(store_node)]
         if fanout_plan is not None and not (
-            fanout_schedule_supported(df.config.config)
-            and fanout_store_protocol_supported(tcgen05_value)
+            fanout_schedule_supported(fanout_plan, df.config.config)
+            and fanout_store_protocol_supported(fanout_plan, tcgen05_value)
             and fragment_epilogue is None
             and grouped_tail_epilogue is None
             and epilogue_chain is not None
@@ -2747,15 +2759,23 @@ def _codegen_cute_store_tcgen05_tile(
     backend = env.backend
     tensor_name = df.tensor_arg(tensor).name
     target_dtype = backend.dtype_str(tensor.dtype)
-    # The matmul plan computed `tcgen05_epi_tile` (role-local t2r
-    # partition) with `epi_elem_dtype_str`; the store path below
-    # recomputes `tcgen05_store_epi_tile` with `target_dtype`. They must
-    # match or `compute_epilogue_tile_shape` selects different `tile_n`
-    # values on the two sides and the t2r / r2s SMEM staging silently
-    # corrupts. The loud-failure backstop covers cases where MMA-codegen-
-    # time forward-tracing of the matmul fx_node could not pin a unique
-    # store target dtype.
-    if (
+    mixed_precision_stores = tcgen05_value.mixed_precision_stores
+    # Ordinary implicit tiling must keep its single output dtype. A proved
+    # mixed contract instead records every original store and uses identical
+    # integer tile coordinates, with FP32 T2R and per-store R2S/SMEM/descriptor.
+    if mixed_precision_stores is not None:
+        if (
+            store_node is None
+            or mixed_precision_stores.dtype_for(store_node) is not tensor.dtype
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "mixed-output store does not match its proved identity/dtype"
+            )
+        if df.config.get(FANOUT_CONFIG_KEY, "off") == "shared":
+            raise exc.InvalidConfig(
+                "mixed-output native stores require independent epilogues"
+            )
+    elif (
         tcgen05_value.epi_elem_dtype_str
         and tcgen05_value.epi_elem_dtype_str != target_dtype
     ):
@@ -2950,6 +2970,11 @@ def _codegen_cute_store_tcgen05_tile(
     trs_cc_subtile = df.new_var("tcgen05_tRS_cC_subtile")
     acc_vec = df.new_var("tcgen05_acc_vec")
     kernel_desc = df.new_var("tcgen05_kernel_desc")
+    tmem_kernel_desc = (
+        df.new_var("tcgen05_fp32_tmem_desc")
+        if mixed_precision_stores is not None
+        else kernel_desc
+    )
     mcld = df.new_var("tcgen05_mcld")
     num_bits = df.new_var("tcgen05_num_bits")
     simt_atom = df.new_var("tcgen05_simt_atom")
@@ -3348,7 +3373,35 @@ def _codegen_cute_store_tcgen05_tile(
         aux_torch_tensor = aux_tensor_node.meta.get("val")
         assert isinstance(aux_torch_tensor, torch.Tensor)
         aux_tensor_name = df.tensor_arg(aux_torch_tensor).name
-        aux_dtype = backend.dtype_str(aux_torch_tensor.dtype)
+        from .._compiler.cute.cute_epilogue import _MappedAuxiliaryTensorLoadExpr
+        from .._compiler.cute.cute_epilogue import _ReadonlyBoolAuxLoadExpr
+
+        if isinstance(aux_step, _MappedAuxiliaryTensorLoadExpr):
+            if (
+                tcgen05_value.source_tile_m != tcgen05_value.bm
+                or tcgen05_value.source_tile_n != tcgen05_value.bn
+                or tcgen05_nm_store
+                or compact_fragment_store
+                or tcgen05_m_subtile_count != 1
+            ):
+                raise exc.InvalidConfig(
+                    "mapped auxiliary loads require matching ordinary logical/native tile geometry"
+                )
+            reason = aux_step.mapping.tile_reason(tcgen05_value.bm, tcgen05_value.bn)
+            if reason is not None:
+                raise exc.InvalidConfig(reason)
+            if grouped_epilogue or tcgen05_aux_fragment_hoist:
+                raise exc.InvalidConfig(
+                    "mapped auxiliary loads require the ordinary per-subtile SIMT path"
+                )
+            state.codegen.allow_dead_assignments_owned_by_nodes(
+                aux_step.mapping.owned_index_nodes
+            )
+        aux_dtype = (
+            "cutlass.Uint8"
+            if isinstance(aux_step, _ReadonlyBoolAuxLoadExpr)
+            else backend.dtype_str(aux_torch_tensor.dtype)
+        )
         aux_dtype_bits = aux_torch_tensor.dtype.itemsize * 8
         # Aux tensors must be passed through to the device function as
         # placeholder args so the wrapper plumbs them into the cute
@@ -3369,7 +3422,10 @@ def _codegen_cute_store_tcgen05_tile(
                 expr=aux_step,
                 aux_tensor_name=aux_tensor_name,
                 broadcast_axis=aux_step.broadcast_axis,
-                has_leading_passthrough=aux_torch_tensor.ndim == 3,
+                has_leading_passthrough=(
+                    aux_torch_tensor.ndim == 3
+                    and not isinstance(aux_step, _MappedAuxiliaryTensorLoadExpr)
+                ),
                 aux_tile=df.new_var(f"tcgen05_aux_tile_{aux_idx}"),
                 aux_part_base=df.new_var(f"tcgen05_tCgAux_base_{aux_idx}"),
                 aux_xfm=df.new_var(f"tcgen05_tCgAux_xfm_{aux_idx}"),
@@ -4371,6 +4427,14 @@ def _codegen_cute_store_tcgen05_tile(
         for aux_idx, rec in enumerate(aux_step_records):
             staged_ring_name = aux_ring_smem_names[aux_idx]
             rowvec_stage = rowvec_aux_stage_records[aux_idx]
+            local_tile_coordinates = (tile_coord_m, tile_coord_n)
+            if (
+                isinstance(rec.expr, _MappedAuxiliaryTensorLoadExpr)
+                and staged_ring_name is not None
+            ):
+                raise exc.InvalidConfig(
+                    "mapped auxiliary sources do not use the C-input TMA pipeline"
+                )
             if (
                 use_aux_smem_source
                 and staged_ring_name is not None
@@ -4429,7 +4493,19 @@ def _codegen_cute_store_tcgen05_tile(
                 # Exact-shape aux (or the colvec form) uses the trailing matrix
                 # directly. For a rank-3 residual, first select the current
                 # leading-passthrough slice without changing its M/N strides.
-                if rec.has_leading_passthrough:
+                if isinstance(rec.expr, _MappedAuxiliaryTensorLoadExpr):
+                    assert rec.aux_view2d is not None
+                    view_source, local_tile_coordinates = rec.expr.mapping.view_source(
+                        rec.aux_view2d,
+                        rec.aux_tensor_name,
+                        tile_coord_m,
+                        tile_coord_n,
+                        tcgen05_value.bm,
+                        tcgen05_value.bn,
+                    )
+                    lines.append(view_source)
+                    source_for_local_tile = rec.aux_view2d
+                elif rec.has_leading_passthrough:
                     assert leading_index is not None
                     assert rec.aux_view2d is not None
                     lines.append(
@@ -4505,7 +4581,7 @@ def _codegen_cute_store_tcgen05_tile(
                 lines.append(
                     f"{rec.aux_tile} = cute.local_tile("
                     f"{source_for_local_tile}, ({tcgen05_bm}, {tcgen05_bn}), "
-                    f"({tile_coord_m}, {tile_coord_n}))"
+                    f"({local_tile_coordinates[0]}, {local_tile_coordinates[1]}))"
                 )
             lines.extend(
                 [
@@ -4605,6 +4681,7 @@ def _codegen_cute_store_tcgen05_tile(
         force_simt_edge_aux: bool = False,
         safe_direct_aux_with_full_tile: bool = False,
         unconditional_full_tile: bool = False,
+        selected_aux_index: int | None = None,
     ) -> str:
         """Per-subtile aux GMEM-load source lines (one per aux step).
 
@@ -4799,6 +4876,8 @@ def _codegen_cute_store_tcgen05_tile(
                 )
             return "".join(lines)
         for aux_idx, rec in enumerate(aux_step_records):
+            if selected_aux_index is not None and aux_idx != selected_aux_index:
+                continue
             rowvec_stage = rowvec_aux_stage_records[aux_idx]
             if (
                 use_aux_smem_source
@@ -5055,7 +5134,7 @@ def _codegen_cute_store_tcgen05_tile(
         the aux load through a predicated copy before rendering the
         chain.
         """
-        nonlocal fanout_chain
+        nonlocal fanout_chain, fanout_auxiliary_sources
         load_expr = f"{carrier_name}.load()"
         if fragment_epilogue is not None:
             coordinate_setup, coordinate_name = _coord_subtile_source(
@@ -5095,13 +5174,29 @@ def _codegen_cute_store_tcgen05_tile(
             return "", late_prelude, f"({rhs}).to({target_dtype})"
         loaded = df.new_var("tcgen05_acc_loaded")
         prelude_load = f"{prelude_indent}{loaded} = {load_expr}\n"
-        early_aux_prelude = _aux_subtile_load_source(
-            prelude_indent,
-            carrier_name,
-            force_simt_edge_aux=force_simt_edge_aux,
-            safe_direct_aux_with_full_tile=safe_direct_aux_with_full_tile,
-            unconditional_full_tile=unconditional_full_tile,
-        )
+        if isinstance(fanout_plan, SharedDagFanoutPlan):
+            fanout_auxiliary_sources = tuple(
+                (
+                    rec.expr,
+                    _aux_subtile_load_source(
+                        prelude_indent,
+                        carrier_name,
+                        selected_aux_index=index,
+                    ),
+                )
+                for index, rec in enumerate(aux_step_records)
+            )
+            early_aux_prelude = "".join(
+                source for _, source in fanout_auxiliary_sources
+            )
+        else:
+            early_aux_prelude = _aux_subtile_load_source(
+                prelude_indent,
+                carrier_name,
+                force_simt_edge_aux=force_simt_edge_aux,
+                safe_direct_aux_with_full_tile=safe_direct_aux_with_full_tile,
+                unconditional_full_tile=unconditional_full_tile,
+            )
         aux_locals_by_expr: _LeafBindings = {
             rec.expr: rec.aux_loaded for rec in aux_step_records
         }
@@ -5136,6 +5231,9 @@ def _codegen_cute_store_tcgen05_tile(
         if fanout_plan is not None and coord_layout == "trs":
             fanout_chain = render_fanout_chain(
                 epilogue_chain, loaded, df.new_var, prelude_indent, aux_locals_by_expr
+            )
+            fanout_chain = dataclasses.replace(
+                fanout_chain, carrier_prelude=prelude_load
             )
             chain_prelude, final_expr = fanout_chain.source, fanout_chain.result
         else:
@@ -5455,6 +5553,20 @@ def _codegen_cute_store_tcgen05_tile(
             f"({coord}[1] // {vector}) * {vector} + {vector} > {n_size}"
         )
 
+    def kernel_description_source(variable: str, dtype: str) -> str:
+        return (
+            f"{variable} = type('Tcgen05KernelDesc', (), {{"
+            f"'cta_tile_shape_mnk': ({tcgen05_store_tile_m}, {tcgen05_bn}, {tcgen05_bk}), "
+            f"'c_layout': {tcgen05_d_store_layout}, "
+            f"'c_dtype': {dtype}, "
+            "'acc_dtype': cutlass.Float32, "
+            f"'epilog_sync_bar_id': cutlass.Int32({tcgen05_epilog_sync_barrier_id}), "
+            f"'epilogue_warp_id': ({epi_warp_ids}), "
+            f"'num_c_stage': cutlass.Int32({tcgen05_value.c_stage_count}), "
+            f"'use_2cta_instrs': {tcgen05_is_two_cta!s}"
+            "})()"
+        )
+
     def store_common_setup(
         gmem_tensor: str,
         *,
@@ -5470,17 +5582,11 @@ def _codegen_cute_store_tcgen05_tile(
         store_bn = tcgen05_tma_store_bn if tma_store else tcgen05_bn
         epi_tile_expr = tcgen05_store_epi_tile_expr
         static_setup = [
-            (
-                f"{kernel_desc} = type('Tcgen05KernelDesc', (), {{"
-                f"'cta_tile_shape_mnk': ({tcgen05_store_tile_m}, {tcgen05_bn}, {tcgen05_bk}), "
-                f"'c_layout': {tcgen05_d_store_layout}, "
-                f"'c_dtype': {target_dtype}, "
-                "'acc_dtype': cutlass.Float32, "
-                f"'epilog_sync_bar_id': cutlass.Int32({tcgen05_epilog_sync_barrier_id}), "
-                f"'epilogue_warp_id': ({epi_warp_ids}), "
-                f"'num_c_stage': cutlass.Int32({tcgen05_value.c_stage_count}), "
-                f"'use_2cta_instrs': {tcgen05_is_two_cta!s}"
-                "})()"
+            kernel_description_source(kernel_desc, target_dtype),
+            *(
+                [kernel_description_source(tmem_kernel_desc, "cutlass.Float32")]
+                if mixed_precision_stores is not None
+                else []
             ),
             (
                 # The fallback helper must receive the D-output dtype through
@@ -6072,7 +6178,7 @@ def _codegen_cute_store_tcgen05_tile(
         (
             f"{tiled_copy_t2r}, {ttr_tacc_base}, {ttr_racc} = "
             "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
-            f"{kernel_desc}, {tcgen05_value.epi_tidx}, {tacc}, {tcgc_planned}, {epi_tile}, {tcgen05_lifecycle.is_two_cta!s})"
+            f"{tmem_kernel_desc}, {tcgen05_value.epi_tidx}, {tacc}, {tcgc_planned}, {epi_tile}, {tcgen05_lifecycle.is_two_cta!s})"
         ),
         f"{thr_copy_t2r} = {tiled_copy_t2r}.get_slice({tcgen05_value.epi_tidx})",
         f"{tcgc_epi} = cute.flat_divide({tcgc_planned}, {epi_tile})",
@@ -7057,6 +7163,7 @@ def _codegen_cute_store_tcgen05_tile(
                 auxiliary_names={rec.expr: rec.aux_loaded for rec in aux_step_records}
                 | runtime_scalar_locals,
                 pre_wait_aux=pre_wait_aux,
+                auxiliary_load_sources=fanout_auxiliary_sources,
             )
         return (
             f"{early_aux_prelude if pre_wait_aux else ''}"
@@ -7795,7 +7902,7 @@ def _codegen_cute_store_tcgen05_tile(
             (
                 f"{tiled_copy_t2r}, {ttr_tacc_base}, {ttr_racc} = "
                 "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
-                f"{kernel_desc}, {tcgen05_aux_epi_tidx}, {tacc}, "
+                f"{tmem_kernel_desc}, {tcgen05_aux_epi_tidx}, {tacc}, "
                 f"{tcgc_planned}, {epi_tile}, {tcgen05_lifecycle.is_two_cta!s})"
             ),
             *(
@@ -8257,6 +8364,7 @@ def _codegen_cute_store_tcgen05_tile(
                 (
                     f"        if {epi_leader_predicate}:\n"
                     if not is_secondary_store
+                    or isinstance(fanout_plan, SharedDagFanoutPlan)
                     else ""
                 )
                 + f"            cute.copy({tcgen05_tma_store_atom}, {bsg_sd}[(None, {c_buffer})], {bsg_gd}[(None, {tma_store_d_subtile_expr})])\n"
@@ -8276,7 +8384,11 @@ def _codegen_cute_store_tcgen05_tile(
             body_indent=tma_store_subtile_body_extra_indent,
             post_loop=tma_store_grouped_post_loop_release,
         )
-        if df.cute_state.register_paired_fanout_store(store, post_loop_stmts):
+        if isinstance(fanout_plan, SharedDagFanoutPlan):
+            if df.cute_state.register_shared_dag_fanout_store(store):
+                main_stmts.remove(main_stmt)
+            # Every original pipeline keeps its own drain and teardown facts.
+        elif df.cute_state.register_paired_fanout_store(store, post_loop_stmts):
             main_stmts.remove(main_stmt)
             # The first pipeline now owns both copies in each commit group.
             # Its existing wait.read0 precedes the original TMEM teardown.

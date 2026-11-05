@@ -45,7 +45,6 @@ from .dense_aligned_n import dense_aligned_n_defaults
 from .dense_aligned_n import dense_aligned_n_plan
 from .epilogue_fanout import FANOUT_CONFIG_KEY
 from .epilogue_fanout import FANOUT_MODES
-from .epilogue_fanout import schedule_supported as fanout_schedule_supported
 from .grouped_ab_k import physical_grouped_ab_k
 from .grouped_full_coverage import full_coverage_pipeline_supported
 from .grouped_full_coverage import full_coverage_smem_upper_bound
@@ -79,6 +78,8 @@ from .pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
 from .pipeline_smem import Tcgen05PipelineSmemFacts
 from .pipeline_smem import max_pipeline_ab_stages
 from .pipeline_smem import pipeline_smem_bytes
+from .shared_epilogue_dag import SharedDagFanoutPlan
+from .shared_epilogue_dag import schedule_supported as dag_fanout_schedule_supported
 from .split_k_workspace_config import PARTITIONS_KEY
 from .split_k_workspace_config import STAGES_KEY
 from .split_k_workspace_config import WORKSPACE_KEY
@@ -317,9 +318,10 @@ if TYPE_CHECKING:
     from ..compile_environment import BlockSizeInfo
     from ..compile_environment import CompileEnvironment
     from .dense_gemm import DenseGemmFacts
-    from .epilogue_fanout import PairedFanoutPlan
     from .grouped_prefix_adaptive_n import GroupedPrefixAdaptiveNProfile
     from .materialized_pdl import MaterializedOperandPdl
+    from .mixed_store import MixedPrecisionStorePlan
+    from .shared_epilogue_dag import FanoutPlan
 
 
 class Tcgen05ClusterM2SearchConstraints(NamedTuple):
@@ -734,10 +736,20 @@ class CuteTcgen05Config:
         self.grouped_row_union_paired_clc_eligible: bool = False
         self.grouped_row_union_eligible: bool = False
         self.grouped_row_union_multi_resident_supported: bool = False
-        self.epilogue_fanout_plans: tuple[PairedFanoutPlan, ...] = ()
+        self.epilogue_fanout_plans: tuple[FanoutPlan, ...] = ()
         self.epilogue_fanout_search_enabled: bool = False
         self.deep_direct_entry_validation_enabled: bool = False
         self.pipeline_smem_facts: Tcgen05PipelineSmemFacts | None = None
+        # Seed-only certificate from the fully guarded ordinary MMA source
+        # admission. Late lowering independently re-proves the actual aliases.
+        self.mixed_output_store_plan: MixedPrecisionStorePlan | None = None
+        # Seed-only source subject: (anchor, complete stores, tagged bool loads).
+        # Set only after full ordinary source admission; no Tensor owners or
+        # public runtime-fact snapshot are published by this certificate.
+        self._readonly_bool_aux_seed_subject: (
+            tuple[torch.fx.Node, tuple[torch.fx.Node, ...], tuple[torch.fx.Node, ...]]
+            | None
+        ) = None
         self.dense_gemm_facts: DenseGemmFacts | None = None
         self.one_cta_pipeline_facts: Tcgen05OneCtaPipelineFacts | None = None
         # (K block id, owned max_size revision, exact owning object) of the
@@ -1817,7 +1829,10 @@ class CuteTcgen05Config:
         if fanout == "shared":
             if not (
                 self.epilogue_fanout_plans
-                and fanout_schedule_supported(config)
+                and all(
+                    dag_fanout_schedule_supported(plan, config)
+                    for plan in self.epilogue_fanout_plans
+                )
                 and self.epilogue_fanout_config_supported(config)
             ):
                 return None
@@ -5008,8 +5023,65 @@ class CuteTcgen05Config:
         seed_config["l2_groupings"] = [TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING]
         return Config(**seed_config)
 
+    def _multi_output_seed_configs(self) -> list[Config]:
+        """Compact ordinary tiles when several proved stores keep C rings.
+
+        The two-CTA seeds price one output ring and may all exceed SMEM for
+        multi-output epilogues. Keep them subject to normal seed validation;
+        add bounded one-CTA alternatives charged by the existing arena model.
+        This extends only proved tagged readonly-bool sources; legacy nonbool
+        multi-output seed/carrier registries remain exactly unchanged.
+        """
+        if self._readonly_bool_aux_seed_subject is None:
+            return []
+        facts = self.rowvec_aux_facts
+        fragments = self._matmul_block_fragments()
+        if (
+            not self.search_enabled
+            or facts is None
+            or facts.output_count < 2
+            or fragments is None
+        ):
+            return []
+        seeds = []
+        for bn in (64, 32):
+            for bk in (64, 32):
+                tile = (128, bn, bk)
+                if not all(
+                    fragment.low <= value <= fragment.high
+                    for fragment, value in zip(fragments, tile, strict=True)
+                ):
+                    continue
+                block_sizes = self._matmul_seed_block_sizes(bm=128, bn=bn, bk=bk)
+                if block_sizes is None:
+                    continue
+                config: dict[str, object] = {
+                    "block_sizes": block_sizes,
+                    "pid_type": "flat",
+                    "tcgen05_cluster_m": 1,
+                    "tcgen05_cluster_n": 1,
+                    "tcgen05_ab_stages": 2,
+                    "tcgen05_acc_stages": 2,
+                    "tcgen05_c_stages": 2,
+                    "tcgen05_num_epi_warps": 4,
+                }
+                if self.default_layout_smem_fits(
+                    bm=128,
+                    bn=bn,
+                    bk=bk,
+                    cluster_m=1,
+                    ab_stages=2,
+                    c_stages=2,
+                    stage_rows=self._store_lowering_stages_rows(config),
+                    epi_warps=4,
+                    acc_stages=2,
+                ):
+                    seeds.append(Config.from_dict(config))
+        return seeds
+
     def autotune_seed_configs(self) -> list[Config]:
         seeds = self._paired_pipeline_seed_configs()
+        seeds.extend(self._multi_output_seed_configs())
         seeds.extend(self._small_grid_seed_configs())
         seeds.extend(self._split_k_seed_configs())
         seeds.extend(self._warp_mma_seed_configs())
@@ -5899,7 +5971,10 @@ class CuteTcgen05Config:
         next to both outputs' C rings in the static arena; the ring depth
         itself is judged by ``_normalize_multi_output_rings``.
         """
-        if not self.epilogue_fanout_plans or not fanout_schedule_supported(config):
+        if not self.epilogue_fanout_plans or not all(
+            dag_fanout_schedule_supported(plan, config)
+            for plan in self.epilogue_fanout_plans
+        ):
             return "the fanout needs the standard role-local TMA epilogue schedule"
         if (
             self.materialized_matmul_block_ids
@@ -5925,6 +6000,13 @@ class CuteTcgen05Config:
                         f"the fanout stores whole tiles: {block!r} does not "
                         f"divide the output extent {extent}"
                     )
+            if isinstance(plan, SharedDagFanoutPlan):
+                m_index = self._config_block_index(plan.block_ids[0])
+                assert m_index is not None
+                bm = blocks[m_index]
+                assert type(bm) is int
+                if bm > TCGEN05_ONE_CTA_MAX_BLOCK_M:
+                    return "shared-DAG fanout requires one ordinary CTA M tile, without extra M-subtile loops"
             if config.get("tcgen05_cluster_m", 1) == 2:
                 reason = self._pair_fanout_refusal(config, plan, blocks)
                 if reason is not None:
@@ -5957,7 +6039,7 @@ class CuteTcgen05Config:
     def _pair_fanout_refusal(
         self,
         config: dict[str, object],
-        plan: PairedFanoutPlan,
+        plan: FanoutPlan,
         blocks: list[object],
     ) -> str | None:
         """Budget admission of the shared fanout on a tcgen05 CTA pair.
@@ -8742,6 +8824,10 @@ class CuteTcgen05Config:
                         config["tcgen05_ab_stages"] = ab
                         config["tcgen05_c_stages"] = c
                         return
+        raise InvalidConfig(
+            "tcgen05 multi-output rings have no fitting AB/C stage tuple at "
+            f"a {bm}x{bn}x{bk} tile with {facts.output_count} output stores"
+        )
 
     def _fix_rowvec_stage_search_config(self, config: dict[str, object]) -> None:
         """Demote a sampled ``pre_acc_wait`` whose row stages overflow SMEM.

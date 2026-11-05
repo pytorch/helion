@@ -3588,6 +3588,12 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     device_ir.host_function = func
     with func, device_ir, compile_lock:
+        # These private certificates describe this source-lowering pass only.
+        # A reused ConfigSpec must not export seeds from a previous source if
+        # the new pass declines or no longer contains the proved subject.
+        source_state = CompileEnvironment.current().config_spec._cute_tcgen05_config
+        source_state._readonly_bool_aux_seed_subject = None
+        source_state.mixed_output_store_plan = None
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
@@ -4123,6 +4129,27 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     config_spec._cute_tcgen05_config.fission_bundle = (
                         env.cute_fission_plan is not None
                     )
+                    from .cute.aux_tensor import analyze_tcgen05_matmul_store_chains
+                    from .cute.cute_epilogue import _MappedAuxiliaryTensorLoadExpr
+                    from .cute.cute_epilogue import _ReadonlyBoolAuxLoadExpr
+
+                    source_chains = analyze_tcgen05_matmul_store_chains(
+                        device_ir.graphs, mma_candidates[0][3]
+                    )
+                    bool_loads = tuple(
+                        dict.fromkeys(
+                            leaf.load_node
+                            for _, chain in source_chains or ()
+                            for leaf in chain.auxiliary_tensor_loads
+                            if isinstance(leaf, _ReadonlyBoolAuxLoadExpr)
+                        )
+                    )
+                    bool_auxiliary = bool(bool_loads)
+                    mapped_auxiliary = any(
+                        isinstance(leaf, _MappedAuxiliaryTensorLoadExpr)
+                        for _, chain in source_chains or ()
+                        for leaf in chain.auxiliary_tensor_loads
+                    )
                     enable_cute_tcgen05_search(
                         lhs,
                         plan=search_plan,
@@ -4143,10 +4170,38 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         # The register-MMA family replaces the whole device
                         # body of ONE GEMM (its root tile loop around its K
                         # loop); kernels with several matmuls keep tcgen05.
-                        warp_mma_plain_kernel=len(mma_candidates) == 1,
+                        # The register-MMA emitter owns only canonical rank-1/2
+                        # floating aux loads. Byte-normalized bools and mapped
+                        # source-plane views belong to ordinary tcgen05 stores.
+                        warp_mma_plain_kernel=len(mma_candidates) == 1
+                        and not (bool_auxiliary or mapped_auxiliary),
                         output_dtype_bytes=output_store_facts[0],
                         output_stores=output_store_facts[1],
                     )
+                    if len(mma_candidates) == 1 and env.cute_fission_plan is None:
+                        if bool_loads and source_chains is not None:
+                            # Tagged leaves exist only after the complete
+                            # anchored store/readonly/alias proof accepts.
+                            # Transfer immutable source identities to compact
+                            # seeding, not a partial public metadata snapshot.
+                            config_spec._cute_tcgen05_config._readonly_bool_aux_seed_subject = (
+                                mma_candidates[0][3],
+                                tuple(store for store, _ in source_chains),
+                                bool_loads,
+                            )
+                        from .cute.cute_mma import tcgen05_mixed_precision_store_plan
+
+                        # This is a seed-only semantic certificate, not a public
+                        # runtime snapshot. Construction has already proved the
+                        # complete anchored MMA/alias contract; final emission
+                        # still re-proves it with the normal bound facts.
+                        config_spec._cute_tcgen05_config.mixed_output_store_plan = (
+                            tcgen05_mixed_precision_store_plan(
+                                device_ir.graphs,
+                                mma_candidates[0][3],
+                                candidate.operands,
+                            )
+                        )
                     if (
                         len(mma_candidates) == 1
                         and not cast_candidates
