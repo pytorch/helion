@@ -22,7 +22,6 @@ from ..language._decorators import is_api_func
 from ..runtime.kernel import Kernel
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
-from .ast_extension import clone_ast
 from .ast_extension import create
 from .compile_environment import CompileEnvironment
 from .compile_environment import warning
@@ -1079,12 +1078,26 @@ class TypePropagation(ast.NodeVisitor):
         if (
             self.device_loop_depth > 0
             and isinstance(iter_type, SequenceType)
-            and not iter_type.element_types
             and not node.orelse
+            and (
+                not iter_type.element_types
+                or any(
+                    isinstance(child, (ast.ListComp, ast.GeneratorExp))
+                    and any(generator.ifs for generator in child.generators)
+                    for statement in node.body
+                    for child in ast.walk(statement)
+                )
+            )
         ):
             assert isinstance(node, ExtendedAST)
             node._loop_type = LoopType.DEVICE
-            self.pop_scope()
+            if not iter_type.element_types:
+                self.pop_scope()
+                return NoType(origin=self.origin())
+            # Filters can depend on the concrete value of each unrolled iteration.
+            for element in iter_type.unpack():
+                self._assign(node.target, element)
+                self.scope.overwrite(self._loop_body(node.body))
             return NoType(origin=self.origin())
         self._assign(node.target, iter_type.propagate_iter(self.origin()))
         device_loop = (
@@ -1185,36 +1198,47 @@ class TypePropagation(ast.NodeVisitor):
         raise exc.StatementNotSupported(type(node).__name__)
 
     def _visit_comprehension_iteration(self, node: ast.AST) -> TypeInfo:
-        fresh = clone_ast(node)
-        assert isinstance(fresh, ast.AST)
-        for child in ast.walk(fresh):
-            if isinstance(child, ExtendedAST):
-                child._type_info = None
-        result = self.visit(fresh)
-        for original, inferred in zip(ast.walk(node), ast.walk(fresh), strict=True):
-            if (
-                isinstance(original, ExtendedAST)
-                and isinstance(inferred, ExtendedAST)
-                and inferred._type_info is not None
-            ):
-                original.update_type_info(inferred._type_info)
+        nodes = [n for n in ast.walk(node) if isinstance(n, ExtendedAST)]
+        previous = [n._type_info for n in nodes]
+        for n in nodes:
+            n._type_info = None
+        try:
+            result = self.visit(node)
+        except BaseException:
+            for n, old in zip(nodes, previous, strict=True):
+                n._type_info = old
+            raise
+        for n, old in zip(nodes, previous, strict=True):
+            if old is not None:
+                n._type_info = old if n._type_info is None else old.merge(n._type_info)
         return result
 
     def _comprehension_filter(self, node: ast.expr) -> bool:
+        return self._constant_comprehension_truth(self._comprehension_value(node))
+
+    def _comprehension_value(self, node: ast.expr) -> TypeInfo:
         if isinstance(node, ast.BoolOp):
-            if isinstance(node.op, ast.And):
-                return all(self._comprehension_filter(v) for v in node.values)
-            return any(self._comprehension_filter(v) for v in node.values)
+            for value in node.values[:-1]:
+                result = self._comprehension_value(value)
+                truth = self._constant_comprehension_truth(result)
+                if truth == isinstance(node.op, ast.Or):
+                    return result
+            return self._comprehension_value(node.values[-1])
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-            return not self._comprehension_filter(node.operand)
+            return LiteralType(
+                self.origin(), not self._comprehension_filter(node.operand)
+            )
+        if isinstance(node, ast.IfExp):
+            branch = node.body if self._comprehension_filter(node.test) else node.orelse
+            return self._comprehension_value(branch)
         if any(isinstance(n, (ast.Call, ast.NamedExpr)) for n in ast.walk(node)):
             raise exc.StatementNotSupported(
                 "Comprehension filters must be compile-time constant expressions"
             )
         if isinstance(node, ast.Compare):
-            left = self._visit_comprehension_iteration(node.left)
+            left = self._comprehension_value(node.left)
             for op, comparator in zip(node.ops, node.comparators, strict=True):
-                right = self._visit_comprehension_iteration(comparator)
+                right = self._comprehension_value(comparator)
                 if left.is_literal() and right.is_literal():
                     left_value = left.as_literal()
                     right_value = right.as_literal()
@@ -1239,14 +1263,19 @@ class TypePropagation(ast.NodeVisitor):
                         )
                     result = self._compare(op, left, right)
                 if not self._constant_comprehension_truth(result):
-                    return False
+                    return LiteralType(self.origin(), False)
                 left = right
-            return True
-        result = self._visit_comprehension_iteration(node)
-        return self._constant_comprehension_truth(result)
+            return LiteralType(self.origin(), True)
+        if any(isinstance(n, (ast.BoolOp, ast.IfExp)) for n in ast.walk(node)):
+            raise exc.StatementNotSupported(
+                "Comprehension filters must be compile-time constant expressions"
+            )
+        return self._visit_comprehension_iteration(node)
 
     @staticmethod
     def _constant_comprehension_truth(result: TypeInfo) -> bool:
+        if isinstance(result, (SequenceType, DictType)):
+            return bool(result.element_types)
         if not isinstance(result, LiteralType) or type(result.value) not in (
             bool,
             int,
@@ -1261,7 +1290,7 @@ class TypePropagation(ast.NodeVisitor):
 
     def _evaluate_filtered_comprehension(
         self, generator: ast.comprehension, expression: ast.AST
-    ) -> TypeInfo:
+    ) -> SequenceType:
         iterable = self.visit(generator.iter)
         if not isinstance(iterable, SequenceType):
             raise exc.StatementNotSupported(
@@ -1335,7 +1364,16 @@ class TypePropagation(ast.NodeVisitor):
             )
         generator = node.generators[0]
         if self.device_loop_depth and generator.ifs:
-            return self._evaluate_filtered_comprehension(generator, node.elt)
+            result = self._evaluate_filtered_comprehension(generator, node.elt)
+            assert isinstance(node, ExtendedAST)
+            previous = node._type_info
+            if isinstance(previous, SequenceType) and len(
+                previous.element_types
+            ) != len(result.element_types):
+                raise exc.StatementNotSupported(
+                    "Filtered comprehensions with changing lengths in an unrolled loop"
+                )
+            return result
         return self._evaluate_comprehension(generator, node.elt)
 
     def visit_ListComp(self, node: ast.ListComp) -> TypeInfo:

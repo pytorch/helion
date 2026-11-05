@@ -49,6 +49,24 @@ def membership_filter(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(autotune_effort="none")
+def nested_boolean_filter(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [i for i in (0, 1, 2) if (i != 0 and 8 // i >= 4) == 1]
+        out[tile] = x[tile] * (values[0] + values[1])
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def sequence_truth_filter(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [i for i in (1, 2) if (i,) if not ()]
+        out[tile] = x[tile] * (values[0] + values[1])
+    return out
+
+
+@helion.kernel(autotune_effort="none")
 def none_values(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.numel()):
@@ -129,6 +147,40 @@ def repeated_comprehension(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(autotune_effort="none")
+def repeated_static_range_comprehension(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        acc = torch.zeros([tile], dtype=x.dtype, device=x.device)
+        for selected in hl.static_range(3):
+            values = [i + 1 for i in (0, 1, 2) if i == selected]
+            acc = acc + x[tile] * values[0]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def changing_comprehension_length(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        acc = torch.zeros([tile], dtype=x.dtype, device=x.device)
+        for limit in hl.static_range(1, 4):
+            values = [i for i in (0, 1, 2) if i < limit]
+            for value in values:
+                acc = acc + x[tile] * value
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def filtered_multidimensional_tensor(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        values = [x[tile] * i for i in (1, 2, 3) if i != 2]
+        out[tile] = values[0] + values[1]
+    return out
+
+
 @pytest.mark.parametrize("limit, factors", [(0, ()), (1, (1,)), (4, (1, 3))])
 def test_filtered_values_bind(limit: int, factors: tuple[int, ...]) -> None:
     bound = filtered_values.bind((torch.ones(32), limit))
@@ -154,6 +206,13 @@ def test_membership_filter() -> None:
     bound = membership_filter.bind((torch.ones(32),))
     graph = str(bound.host_function.device_ir.graphs[0].graph)
     assert ", 4)" in graph
+
+
+@pytest.mark.parametrize("kernel", [nested_boolean_filter, sequence_truth_filter])
+def test_nested_constant_conditions(kernel: helion.Kernel) -> None:
+    bound = kernel.bind((torch.ones(32),))
+    graph = str(bound.host_function.device_ir.graphs[0].graph)
+    assert ", 3)" in graph
 
 
 def test_none_is_an_element() -> None:
@@ -206,6 +265,24 @@ def test_repeated_comprehension_uses_each_iteration_scope() -> None:
     assert ", 3)" in graph
 
 
+def test_static_range_comprehension_uses_each_iteration_scope() -> None:
+    bound = repeated_static_range_comprehension.bind((torch.ones(32),))
+    graph = str(bound.host_function.device_ir.graphs[0].graph)
+    assert graph.count("aten.mul.Tensor") == 3
+    assert all(f", {factor})" in graph for factor in (1, 2, 3))
+
+
+def test_changing_comprehension_length_is_rejected() -> None:
+    with pytest.raises(exc.StatementNotSupported, match="changing lengths"):
+        changing_comprehension_length.bind((torch.ones(32),))
+
+
+def test_filtered_body_preserves_subscript_rewrites() -> None:
+    bound = filtered_multidimensional_tensor.bind((torch.ones(16, 4),))
+    graph = str(bound.host_function.device_ir.graphs[0].graph)
+    assert graph.count("aten.mul.Tensor") == 2
+
+
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 @pytest.mark.parametrize("limit, multiplier", [(0, 0), (1, 1), (4, 4)])
@@ -219,3 +296,17 @@ def test_filtered_values_cuda(limit: int, multiplier: int) -> None:
 def test_filtered_tensor_bodies_cuda() -> None:
     x = torch.randn(128, device=DEVICE)
     torch.testing.assert_close(filtered_tensors(x), x * 4)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_filtered_multidimensional_tensor_cuda() -> None:
+    x = torch.randn(16, 4, device=DEVICE)
+    torch.testing.assert_close(filtered_multidimensional_tensor(x), x * 4)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_repeated_static_range_comprehension_cuda() -> None:
+    x = torch.randn(128, device=DEVICE)
+    torch.testing.assert_close(repeated_static_range_comprehension(x), x * 6)
