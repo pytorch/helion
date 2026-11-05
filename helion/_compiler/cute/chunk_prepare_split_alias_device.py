@@ -667,7 +667,7 @@ def emit_bt16_prepare(
             cute.arch.mbarrier_init(mbar_raw_released, PREPARE_DEVICE_WARPS)
             cute.arch.mbarrier_init(mbar_pairwise, 1)
             cute.arch.mbarrier_init(mbar_q_released, 2)
-            cute.arch.mbarrier_init(mbar_k_released, 2)
+            cute.arch.mbarrier_init(mbar_k_released, 3)
             cute.arch.mbarrier_init_fence()
             fence_tensormap_acquire(desc_q)
             fence_tensormap_acquire(desc_k)
@@ -1052,6 +1052,10 @@ def emit_bt16_prepare(
                 if lc + 1 < CPC:
                     if lc + 1 < my_chunks:
                         warp_arrive(mbar_q_released, lane)
+                        # QK reads Ki as well as Qd.  Raw K aliases Ki, so its
+                        # next TMA must also wait for this reader, in addition
+                        # to the two Ak producer warps below.
+                        warp_arrive(mbar_k_released, lane)
 
             # ---- warp 1: release raw G, then prefetch the next gate ------
             if warp_id == 1:
@@ -1241,8 +1245,8 @@ def emit_bt16_prepare(
 
                     if lc + 1 < CPC:
                         if lc + 1 < my_chunks:
-                            # Ki aliases raw K.  Both Ak producer warps arrive
-                            # only after their final Ki fragment load.
+                            # Ki aliases raw K.  Wait for the QK reader and
+                            # both Ak producers to finish their Ki loads.
                             warp_arrive(mbar_k_released, lane)
                             if warp_id == 1:
                                 mbar_spin_wait(mbar_k_released, phase)
