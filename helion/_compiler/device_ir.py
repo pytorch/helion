@@ -2263,16 +2263,14 @@ class WalkDeviceAST(NodeVisitor):
                 # For loops: don't create new scope, allow state to persist
                 self._assign(target, element_value)
                 result = element_processor()
-                if result is not None:
-                    results.append(result)
+                results.append(result)
             else:
                 # For comprehensions: create isolated scope for each iteration
                 old_scope = self.scope.copy()
                 try:
                     self._assign(target, element_value)
                     result = element_processor()
-                    if result is not None:
-                        results.append(result)
+                    results.append(result)
                 finally:
                     self.scope = old_scope
 
@@ -2727,8 +2725,7 @@ class WalkDeviceAST(NodeVisitor):
         """Handle list comprehension or generator expression unrolling."""
         assert isinstance(node, ExtendedAST)
 
-        # Only handle simple cases with single generator and no if conditions
-        if len(node.generators) != 1 or node.generators[0].ifs:
+        if len(node.generators) != 1:
             raise exc.StatementNotSupported(f"Complex {name}s are not supported")
 
         generator = node.generators[0]
@@ -2755,7 +2752,17 @@ class WalkDeviceAST(NodeVisitor):
     ) -> tuple[object, ...]:
         """Handle unrolling of comprehensions (list comp or generator exp) over sequences."""
 
+        skip = object()
+
         def evaluate_expression() -> object:
+            for condition in generator.ifs:
+                value = self.visit(condition)
+                if isinstance(value, _tracing_ops._symbolic_types):
+                    raise exc.StatementNotSupported(
+                        "Comprehension filters must be compile-time constant expressions"
+                    )
+                if not value:
+                    return skip
             # Evaluate the comprehension expression
             result = self.visit(elt)
             # If the result is a SymInt that can be evaluated to a concrete value, do so
@@ -2770,7 +2777,7 @@ class WalkDeviceAST(NodeVisitor):
             generator.iter, generator.target, evaluate_expression, preserve_scope=False
         )
         # Return as tuple to match the expected type for tuple unrolling
-        return tuple(results)
+        return tuple(result for result in results if result is not skip)
 
     def visit_DictComp(self, node: ast.DictComp) -> dict[object, object]:
         """Handle dict comprehension unrolling."""
