@@ -1210,11 +1210,17 @@ class TypePropagation(ast.NodeVisitor):
             raise exc.StatementNotSupported(
                 "Comprehension filters must be compile-time constant expressions"
             )
-        if isinstance(node, ast.Compare) and len(node.ops) > 1:
+        if isinstance(node, ast.Compare):
             left = self._visit_comprehension_iteration(node.left)
             for op, comparator in zip(node.ops, node.comparators, strict=True):
                 right = self._visit_comprehension_iteration(comparator)
-                result = self._compare(op, left, right)
+                if left.is_literal() and right.is_literal():
+                    result = LiteralType(
+                        self.origin(),
+                        _eval_compare(op, left.as_literal(), right.as_literal()),
+                    )
+                else:
+                    result = self._compare(op, left, right)
                 if not self._constant_comprehension_truth(result):
                     return False
                 left = right

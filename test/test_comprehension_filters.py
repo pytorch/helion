@@ -5,6 +5,7 @@ import torch
 
 import helion
 from helion import exc
+from helion._testing import DEVICE
 import helion.language as hl
 
 
@@ -39,6 +40,15 @@ def chained_filter(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(autotune_effort="none")
+def membership_filter(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [i + 1 for i in (0, 1, 2, 3) if i in (0, 2)]
+        out[tile] = x[tile] * (values[0] + values[1])
+    return out
+
+
+@helion.kernel(autotune_effort="none")
 def none_values(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.numel()):
@@ -67,6 +77,16 @@ def shadowed_target(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(autotune_effort="none")
+def filtered_tensors(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        pairs = ((0, 1), (1, 2), (2, 3))
+        values = [x[tile] * factor for index, factor in pairs if index != 1]
+        out[tile] = values[0] + values[1]
+    return out
+
+
 @pytest.mark.parametrize("limit, factors", [(0, ()), (1, (1,)), (4, (1, 3))])
 def test_filtered_values_bind(limit: int, factors: tuple[int, ...]) -> None:
     bound = filtered_values.bind((torch.ones(32), limit))
@@ -88,6 +108,12 @@ def test_chained_filter_short_circuits() -> None:
     assert ", 3)" in graph
 
 
+def test_membership_filter() -> None:
+    bound = membership_filter.bind((torch.ones(32),))
+    graph = str(bound.host_function.device_ir.graphs[0].graph)
+    assert ", 4)" in graph
+
+
 def test_none_is_an_element() -> None:
     bound = none_values.bind((torch.ones(32),))
     assert any(
@@ -105,3 +131,26 @@ def test_comprehension_target_does_not_shadow_outer_value() -> None:
     bound = shadowed_target.bind((torch.ones(32),))
     graph = str(bound.host_function.device_ir.graphs[0].graph)
     assert ", 12)" in graph
+
+
+def test_filtered_tensor_bodies_are_traced_only_for_selected_elements() -> None:
+    bound = filtered_tensors.bind((torch.ones(32),))
+    graph = str(bound.host_function.device_ir.graphs[0].graph)
+    assert graph.count("aten.mul.Tensor") == 2
+    assert ", 1)" in graph
+    assert ", 3)" in graph
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("limit, multiplier", [(0, 0), (1, 1), (4, 4)])
+def test_filtered_values_cuda(limit: int, multiplier: int) -> None:
+    x = torch.randn(128, device=DEVICE)
+    torch.testing.assert_close(filtered_values(x, limit), x * multiplier)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_filtered_tensor_bodies_cuda() -> None:
+    x = torch.randn(128, device=DEVICE)
+    torch.testing.assert_close(filtered_tensors(x), x * 4)
