@@ -195,10 +195,21 @@ def _generate_msl(
     """
     from torch._inductor.codegen.mps import DTYPE_TO_METAL
 
+    from .mpp_matmul import ROUND
+    from .mpp_matmul import ROUND_PREAMBLE
     from .mpp_matmul import elementize
 
+    tensor_dtypes = {
+        name: arg.dtype
+        for name, arg in zip(param_names, args, strict=True)
+        if isinstance(arg, torch.Tensor)
+    }
+    for dtype in tensor_dtypes.values():
+        if dtype not in DTYPE_TO_METAL:
+            raise ValueError(f"Unsupported Metal dtype: {dtype}")
     body_stmts = elementize(
         body_stmts,
+        tensor_dtypes,
         frozenset(
             k[len(TG_BUFFER_GLOBAL_PREFIX) :]
             for k in fn_globals
@@ -249,6 +260,8 @@ def _generate_msl(
                 "using namespace mpp::tensor_ops;",
             ]
         )
+        if ROUND in referenced:
+            msl_parts.append(ROUND_PREAMBLE)
     msl_parts.append("")
 
     params: list[str] = []
@@ -267,8 +280,6 @@ def _generate_msl(
             # one recompiles rather than reusing a stale shader.
             scalar_preamble.append(f"    {_constexpr_decl(name, arg)}")
             continue
-        if arg.dtype not in DTYPE_TO_METAL:
-            raise ValueError(f"Unsupported Metal dtype: {arg.dtype}")
         metal_dtype = DTYPE_TO_METAL[arg.dtype]
         is_scalar = arg.ndim == 0
         if is_scalar:

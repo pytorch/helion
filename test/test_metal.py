@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
 
@@ -45,6 +46,11 @@ if TYPE_CHECKING:
 
 if sys.platform == "darwin":
     from helion._compiler.metal.metal_jit import _MetalKernel
+
+# Metal runs on macOS only: CI's Linux jobs skip the whole file.
+pytestmark = pytest.mark.skipif(
+    sys.platform != "darwin", reason="Metal tests require macOS"
+)
 
 _requires_darwin = unittest.skipIf(
     sys.platform != "darwin", "Metal tests require macOS"
@@ -729,6 +735,111 @@ class TestMetalDtypes(unittest.TestCase):
         x = torch.randn(1024, device=DEVICE, dtype=torch.bfloat16)
         y = torch.randn(1024, device=DEVICE, dtype=torch.bfloat16)
         torch.testing.assert_close(vector_mul(x, y), x * y)
+
+
+# ---------------------------------------------------------------------------
+# Dtype conversions
+# ---------------------------------------------------------------------------
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def to_bfloat16(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile].to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def to_float16(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(x.shape, dtype=torch.float16, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile].to(torch.float16)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def to_float32(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile].to(torch.float32)
+    return out
+
+
+_VIA_FLOAT = "static_cast<bfloat>(static_cast<float>("
+
+
+def _bits_mismatch(out: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """Where two equal-dtype float tensors differ in bits, NaNs aside."""
+    nan = torch.isnan(out) & torch.isnan(ref)
+    return (out.view(torch.int16) != ref.view(torch.int16)) & ~nan
+
+
+@_requires_darwin
+class TestMetalBfloatConversion(unittest.TestCase):
+    """Every conversion to bfloat goes through float, the way torch CPU and
+    CUDA convert, since c10's BFloat16 is built from a float only."""
+
+    def test_integers_round_through_float(self) -> None:
+        # The large values are ones where a direct int -> bfloat cast rounds
+        # once and lands one ulp away from rounding through float.
+        sources = {
+            "int32": torch.tensor(
+                [33685505, 34471935, -2034237486, 0, 1, -1, 7, -8, 2**24 + 1],
+                dtype=torch.int32,
+            ),
+            "int64": torch.tensor(
+                [
+                    3810045181170676896,
+                    -1391612340377475687,
+                    3954160416921393058,
+                    0,
+                    -8,
+                ],
+                dtype=torch.int64,
+            ),
+            "int8": torch.arange(-128, 128, dtype=torch.int8),
+        }
+        for name, x in sources.items():
+            with self.subTest(source=name):
+                out, _, msl = _run_with_msl(to_bfloat16, (x.to(DEVICE),))
+                self.assertIn(_VIA_FLOAT, msl)
+                ref = x.to(torch.bfloat16)
+                self.assertFalse(_bits_mismatch(out.cpu(), ref).any())
+
+    def test_floating_sources_keep_their_values(self) -> None:
+        gen = torch.Generator().manual_seed(0)
+        random_bits = torch.randint(
+            -(2**31), 2**31 - 1, (1 << 16,), generator=gen, dtype=torch.int32
+        )
+        specials = torch.tensor(
+            [0.0, -0.0, 1.0, -1.5, 65504.0, 1e30, -3.4e38, math.inf, -math.inf],
+            dtype=torch.float32,
+        )
+        sources = {
+            "float16": torch.arange(-(2**15), 2**15, dtype=torch.int16).view(
+                torch.float16
+            ),
+            "float32": torch.cat([specials, random_bits.view(torch.float32)]),
+        }
+        smallest_normal = torch.finfo(torch.bfloat16).smallest_normal
+        for name, x in sources.items():
+            with self.subTest(source=name):
+                out = to_bfloat16(x.to(DEVICE)).cpu()
+                ref = x.to(torch.bfloat16)
+                # Metal's float -> bfloat cast flushes bfloat subnormals to
+                # zero, with or without the float step.
+                subnormal = (ref != 0) & (ref.float().abs() < smallest_normal)
+                self.assertFalse((_bits_mismatch(out, ref) & ~subnormal).any())
+
+    def test_other_targets_keep_the_direct_cast(self) -> None:
+        x = torch.randint(-1000, 1000, (1000,), device=DEVICE, dtype=torch.int32)
+        for kernel, dtype in ((to_float16, "half"), (to_float32, "float")):
+            with self.subTest(target=dtype):
+                out, _, msl = _run_with_msl(kernel, (x,))
+                self.assertRegex(msl, rf"static_cast<{dtype}>\(load")
+                self.assertNotIn(f"static_cast<{dtype}>(static_cast<float>(", msl)
+                torch.testing.assert_close(out, x.to(out.dtype))
 
 
 # ---------------------------------------------------------------------------

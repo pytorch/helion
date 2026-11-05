@@ -182,6 +182,12 @@ class MetalBackend(Backend):
         # chained comparison, and without them ``a + static_cast<T>(x)`` binds
         # as ``(a + static_cast) < T > x``, which the MSL walker cannot
         # recognize as a cast.
+        if dtype_str == "bfloat":
+            # Metal's int -> bfloat conversion is ~3.4x slower than int ->
+            # float -> bfloat, and rounds once where torch CPU and CUDA round
+            # through float (c10's BFloat16 is built from a float only).
+            # From a floating type the float step is exact.
+            return f"(static_cast<bfloat>(static_cast<float>({expr_str})))"
         return f"(static_cast<{dtype_str}>({expr_str}))"
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
