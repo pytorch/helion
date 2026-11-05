@@ -108,6 +108,7 @@ Measured impact on (4096, 12672) fp16 softmax_two_pass on B200:
 from __future__ import annotations
 
 import ast
+from collections import Counter
 import operator
 from typing import TYPE_CHECKING
 from typing import Literal
@@ -239,16 +240,13 @@ def _collect_assigns_in_body(
 
     _walk(body, True)
 
-    def _reads(node: ast.AST, canon: str) -> int:
-        return sum(
-            1
-            for sub in ast.walk(node)
-            if isinstance(sub, ast.Name)
-            and isinstance(sub.ctx, ast.Load)
-            and _canonical(sub.id) == canon
-        )
+    def _reads(node: ast.AST) -> Iterator[str]:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                yield _canonical(sub.id)
 
-    assigns_by_target: dict[str, list[ast.expr]] = {}
+    # canonical name -> (its one plain assignment, statement list, index)
+    candidates: dict[str, tuple[ast.Assign, list[ast.stmt], int]] = {}
     for canon, entries in bindings.items():
         if len(entries) != 1:
             continue
@@ -261,12 +259,28 @@ def _collect_assigns_in_body(
             and _names_bound_by(stmt) == {stmt.targets[0].id}
         ):
             continue
-        # Every read of the name must follow the write in its own list.
-        total_reads = sum(_reads(top, canon) for top in body)
-        dominated_reads = sum(_reads(later, canon) for later in stmts[idx + 1 :])
-        if total_reads != dominated_reads:
-            continue
-        assigns_by_target[canon] = [stmt.value]
+        candidates[canon] = (stmt, stmts, idx)
+
+    # Every read of the name must follow the write in its own list.  The
+    # reads after each write come from one backward sweep per list instead
+    # of a walk of the list's tail per name.
+    total_reads = Counter(name for top in body for name in _reads(top))
+    by_list: dict[int, tuple[list[ast.stmt], dict[int, list[str]]]] = {}
+    for canon, (_stmt, stmts, idx) in candidates.items():
+        _stmts, written_at = by_list.setdefault(id(stmts), (stmts, {}))
+        written_at.setdefault(idx, []).append(canon)
+    dominated_reads: dict[str, int] = {}
+    for stmts, written_at in by_list.values():
+        later_reads: Counter[str] = Counter()
+        for idx in range(len(stmts) - 1, min(written_at) - 1, -1):
+            for canon in written_at.get(idx, ()):
+                dominated_reads[canon] = later_reads[canon]
+            later_reads.update(_reads(stmts[idx]))
+    assigns_by_target: dict[str, list[ast.expr]] = {
+        canon: [stmt.value]
+        for canon, (stmt, _stmts, _idx) in candidates.items()
+        if total_reads[canon] == dominated_reads[canon]
+    }
     return assigns_by_target, all_written
 
 
