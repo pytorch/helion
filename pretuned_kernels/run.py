@@ -43,6 +43,7 @@ KERNELS = [
     "vector_add",
     "rope",
     "rms_norm",
+    "rms_norm_cute",
     "layer_norm",
     "softmax",
     "scaled_mm",
@@ -78,7 +79,7 @@ KERNELS = [
 
 # Map a compute capability (heuristic file suffix) to a hardware alias. The
 # nightly runs one GPU per alias.
-_HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200"}
+_HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200", "sm103": "gb300"}
 
 
 def _kernel_directory(name: str) -> Path:
