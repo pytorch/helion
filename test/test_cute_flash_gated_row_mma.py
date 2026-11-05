@@ -7,22 +7,34 @@ programs need none of it, but the surface is detected with it) and compile
 the device kernel through the CuTe DSL without a GPU.  GPU tests check the
 numerics against an fp32 reference at jagged lengths (1, the maximum, lengths
 that are not multiples of any tile, a last sequence shorter than the maximum
-so the tail rows of its last tile lie past the tensor end), bitwise
-determinism of the fixed-order warp combine, and the exact-division twin.
+so the tail rows of its last tile lie past the tensor end) and bitwise
+determinism of the fixed-order warp combine.
+
+Every test that renders, compiles or runs the example takes it as shipped,
+with ``fast_math=True`` (the gate's division is an approximate reciprocal
+multiply).  The exact-division twin (``fast_math=False``) is tested as a
+program of its own: it compiles, it matches the reference, and it differs
+from the shipped program only in the gate-division lines.  Codegen of the
+unrolled row program is most of the cost of a test, so each (shape, config)
+is rendered once per process, and the GPU tests read back the source their
+run compiled instead of rendering it again.
 """
 
 from __future__ import annotations
 
+import functools
 import operator
 import os
+from pathlib import Path
 import types
-from typing import TYPE_CHECKING
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from test.test_cute_flash_gated import _APPROX_GATE_DIVISION
+from test.test_cute_flash_gated import _IEEE_GATE_DIVISION
 from test.test_cute_flash_gated import _assert_matches
 from test.test_cute_flash_gated import _bind_hstu
 from test.test_cute_flash_gated import _causal_keep
@@ -44,9 +56,6 @@ from helion.exc import InvalidConfig
 
 pytestmark = skipUnlessBackends(["cute"])
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
@@ -59,6 +68,42 @@ def _row_config(q_tile: int, kv_tile: int, kv_stage: int, warps: int) -> helion.
         cute_flash_kv_stage=kv_stage,
         cute_flash_gated_row_warps=warps,
     )
+
+
+def _example_kernel(*, fast_math: bool) -> Any:
+    """The example's kernel as shipped (``fast_math=True``), or its
+    exact-division twin (``fast_math=False``)."""
+    kernel = _hstu_module()._helion_jagged_attention_kernel
+    assert kernel.settings.fast_math, "the example ships with fast_math=True"
+    return kernel if fast_math else _with_fast_math(kernel, False)
+
+
+@functools.cache
+def _cpu_bound(head_dim: int, *, fast_math: bool) -> Any:
+    """``_example_kernel(fast_math=...)`` bound at the default test shape for
+    CPU codegen; binding takes about a second and several tests render from
+    it."""
+    kernel = _example_kernel(fast_math=fast_math)
+    with _cpu_codegen_patches():
+        kernel.reset()
+        return kernel.bind(_hstu_args(head_dim=head_dim))
+
+
+@functools.cache
+def _cpu_row_code(
+    head_dim: int,
+    q_tile: int,
+    kv_tile: int,
+    kv_stage: int,
+    warps: int,
+    *,
+    fast_math: bool,
+) -> str:
+    """Generated source of one row config, rendered once per process."""
+    with _cpu_codegen_patches():
+        return _cpu_bound(head_dim, fast_math=fast_math).to_code(
+            _row_config(q_tile, kv_tile, kv_stage, warps)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -228,11 +273,12 @@ def test_row_launcher_refuses_an_under_aligned_schema_and_stages_o() -> None:
 # ---------------------------------------------------------------------------
 
 
+# Rows of head dim 32 are four 16-byte packets, of head dim 64 eight and of
+# head dim 128 sixteen.
 @pytest.mark.parametrize("head_dim", [32, 64, 128])
 def test_row_tiles_take_the_row_program(head_dim: int) -> None:
     with _cpu_codegen_patches():
-        bound = _bind_hstu(_hstu_args(head_dim=head_dim))
-        spec = bound.config_spec
+        spec = _cpu_bound(head_dim, fast_math=True).config_spec
         assert spec.cute_flash_gated_search_enabled
         assert list(spec._flat_fields()) == [
             "block_sizes",
@@ -240,97 +286,138 @@ def test_row_tiles_take_the_row_program(head_dim: int) -> None:
             "cute_flash_gate_warpgroups",
             "cute_flash_gated_row_warps",
         ]
-        code = bound.to_code(_row_config(16, 16, 2, 4))
-        assert ROW_KIND in code
-        assert not _gated_markers(code)
-        # Four warps on one 16-row m-tile: every warp walks every fourth KV
-        # chunk and the key groups combine through shared memory.
-        assert "block=(128, 1, 1)" in code
-        assert "grm_ks = warp_idx // 1" in code
-        assert (
-            "grm_nchunks = cutlass.max((flash_num_kv_active - grm_ks + cutlass.Int32(3)) // cutlass.Int32(4), cutlass.Int32(0))"
-            in code
-        )
-        assert "cute.arch.barrier()" in code
-        assert "_helion_flash_rowmma.sts_v2_f32(" in code
-        assert code.count("_helion_flash_rowmma.lds_v2_f32(") == 3 * 2 * (head_dim // 8)
-        # Zero-filling cp.async packets, ldmatrix operands, mma.sync.  Q rows
-        # are read below the query extent, the tensor end and the jagged
-        # length the store-skip term names (``flash_g3 = ends - starts``).
-        assert "_helion_flash_rowmma.cp_async_16_zfill(" in code
-        assert (
-            "grm_q_lim = cutlass.min(cutlass.min(flash_q_extent, grm_q_rows - "
-            "flash_row_base), flash_g3) - grm_row0"
-        ) in code
-        assert "_helion_flash_rowmma.ldmatrix_x4(" in code
-        assert "_helion_flash_rowmma.ldmatrix_x4_trans(" in code
-        assert "_helion_flash_rowmma.mma_bf16(" in code
-        # Two chunks in flight: the ring is two slots deep and the loop waits
-        # for all but the most recent group.
-        assert "cute.arch.cp_async_wait_group(1)" in code
-        assert "grm_stage = grm_i % cutlass.Int32(2)" in code
-        assert "if grm_i + cutlass.Int32(2) < grm_nchunks:" in code
-        # The gate program replays the frontend chain with its bf16 rounding
-        # points on 4-wide fragment-row vectors (one pass per 16-key chunk).
-        assert (
-            "flash_g10 = _helion_flash_rt.gated_round_vec(flash_s_v, cutlass.BFloat16)"
-            in code
-        )
-        assert "grm_sv = cute.make_rmem_tensor((4,), cutlass.Float32)" in code
-        assert "cute.math.exp2(" in code
-        assert "approx=True" in code
-        # The per-chunk ``P @ V`` product is rounded to bf16 before the fp32 add.
-        assert "_helion_flash_rt._cvt_rn_bf16_hi(grm_o_0_0_0)" in code
-        # Rows the frontend masks at the store (the jagged length) are skipped;
-        # the output is packed and stored as 4-byte words.
-        assert (
-            "grm_store_ok = flash_row_in_tile & flash_g5 & (flash_o_row < grm_o_rows)"
-            in code
-        )
-        assert "_helion_flash_rowmma.stg_b32(" in code
-        # No TMA / TMEM / tcgen05 and no wrapper-built kernel parameters.
-        assert "_flash_qk_mma" not in code
-        assert (
-            "tcgen05"
-            not in code.split("def _helion__helion_jagged_attention_kernel")[1].split(
-                "def _helion_jagged_attention_kernel"
-            )[0]
-        )
+    code = _cpu_row_code(head_dim, 16, 16, 2, 4, fast_math=True)
+    assert ROW_KIND in code
+    assert not _gated_markers(code)
+    # Four warps on one 16-row m-tile: every warp walks every fourth KV
+    # chunk and the key groups combine through shared memory.
+    assert "block=(128, 1, 1)" in code
+    assert "grm_ks = warp_idx // 1" in code
+    assert (
+        "grm_nchunks = cutlass.max((flash_num_kv_active - grm_ks + cutlass.Int32(3)) // cutlass.Int32(4), cutlass.Int32(0))"
+        in code
+    )
+    assert "cute.arch.barrier()" in code
+    assert "_helion_flash_rowmma.sts_v2_f32(" in code
+    assert code.count("_helion_flash_rowmma.lds_v2_f32(") == 3 * 2 * (head_dim // 8)
+    # Every warp publishes its partials before the barrier and key group 0
+    # reads them only after it (a misplaced barrier is a race the numerics
+    # tests see only at some shapes).
+    assert (
+        code.rindex("_helion_flash_rowmma.sts_v2_f32(")
+        < code.index("cute.arch.barrier()")
+        < code.index("_helion_flash_rowmma.lds_v2_f32(")
+    )
+    # Zero-filling cp.async packets, ldmatrix operands, mma.sync.  Q rows
+    # are read below the query extent, the tensor end and the jagged
+    # length the store-skip term names (``flash_g3 = ends - starts``).
+    assert "_helion_flash_rowmma.cp_async_16_zfill(" in code
+    assert (
+        "grm_q_lim = cutlass.min(cutlass.min(flash_q_extent, grm_q_rows - "
+        "flash_row_base), flash_g3) - grm_row0"
+    ) in code
+    # The packets of a row are XOR-swizzled by the row: ``row % 8`` for rows
+    # of eight or more packets, ``(row >> 1) & 3`` for the four of head dim 32.
+    shift, mask = (1, 3) if head_dim == 32 else (0, 7)
+    assert (
+        f"grm_q_w + grm_irow * {2 * head_dim} + "
+        f"(grm_icol ^ grm_irow >> {shift} & {mask}) * 16"
+    ) in code
+    assert "_helion_flash_rowmma.ldmatrix_x4(" in code
+    assert "_helion_flash_rowmma.ldmatrix_x4_trans(" in code
+    assert "_helion_flash_rowmma.mma_bf16(" in code
+    # Two chunks in flight: the ring is two slots deep, and the entry wait and
+    # the in-loop wait both leave the most recent group in flight.
+    assert code.count("cute.arch.cp_async_wait_group(1)") == 2
+    assert "grm_stage = grm_i % cutlass.Int32(2)" in code
+    assert "if grm_i + cutlass.Int32(2) < grm_nchunks:" in code
+    # The gate program replays the frontend chain with its bf16 rounding
+    # points on 4-wide fragment-row vectors (one pass per 16-key chunk), and
+    # under the shipped ``fast_math`` divides by an approximate reciprocal:
+    # one division per pass and row half.
+    assert (
+        "flash_g10 = _helion_flash_rt.gated_round_vec(flash_s_v, cutlass.BFloat16)"
+        in code
+    )
+    assert "grm_sv = cute.make_rmem_tensor((4,), cutlass.Float32)" in code
+    assert "cute.math.exp2(" in code
+    assert len(_APPROX_GATE_DIVISION.findall(code)) == 2
+    assert not _IEEE_GATE_DIVISION.search(code)
+    # The per-chunk ``P @ V`` product is rounded to bf16 before the fp32 add.
+    assert "_helion_flash_rt._cvt_rn_bf16_hi(grm_o_0_0_0)" in code
+    # Rows the frontend masks at the store (the jagged length) are skipped;
+    # the output is packed and stored as 4-byte words.
+    assert (
+        "grm_store_ok = flash_row_in_tile & flash_g5 & (flash_o_row < grm_o_rows)"
+        in code
+    )
+    assert "_helion_flash_rowmma.stg_b32(" in code
+    # No TMA / TMEM / tcgen05 and no wrapper-built kernel parameters.
+    assert "_flash_qk_mma" not in code
+    assert (
+        "tcgen05"
+        not in code.split("def _helion__helion_jagged_attention_kernel")[1].split(
+            "def _helion_jagged_attention_kernel"
+        )[0]
+    )
 
-        # A single warp: no combine; 32 rows over two warps: one m-tile each.
-        one = bound.to_code(_row_config(16, 64, 1, 1))
-        assert ROW_KIND in one
-        assert "block=(32, 1, 1)" in one
-        assert "cute.arch.barrier()" not in one
-        assert "grm_s_part" not in one
-        assert "grm_stage = cutlass.Int32(0)" in one
-        # A 64-key chunk: the gate runs two 8-element passes per row half,
-        # each packing its P values into the A-fragments of its two k-steps.
-        assert "grm_sv = cute.make_rmem_tensor((8,), cutlass.Float32)" in one
-        assert (
-            one.count("flash_chunk_base = flash_kv_col0 + cutlass.Int32(32) + grm_c")
-            == 2
-        )
-        assert (
-            "grm_pa_0_2_0 = _helion_flash_rowmma.pack_bf16x2(grm_pv[0], grm_pv[1])"
-            in one
-        )
-        assert (
-            "grm_pa_0_3_1 = _helion_flash_rowmma.pack_bf16x2(grm_pv[4], grm_pv[5])"
-            in one
-        )
-        rows32 = bound.to_code(_row_config(32, 32, 4, 2))
-        assert ROW_KIND in rows32
-        assert "block=(64, 1, 1)" in rows32
-        assert "grm_ms = warp_idx % 2" in rows32
-        assert "grm_ks = cutlass.Int32(0)" in rows32
-        assert "cute.arch.barrier()" not in rows32
-        assert "grm_row0 = flash_q_row0 + grm_ms * cutlass.Int32(16)" in rows32
-        # Eight warps on 32 rows: two row groups of four key groups.
-        rows32_8 = bound.to_code(_row_config(32, 16, 2, 8))
-        assert "grm_ms = warp_idx % 2" in rows32_8
-        assert "grm_ks = warp_idx // 2" in rows32_8
-        assert "grm_part_p = grm_part + (grm_ms + cutlass.Int32(6)) * " in rows32_8
+    # A single warp: no combine; 32 rows over two warps: one m-tile each.
+    one = _cpu_row_code(head_dim, 16, 64, 1, 1, fast_math=True)
+    assert ROW_KIND in one
+    assert "block=(32, 1, 1)" in one
+    assert "cute.arch.barrier()" not in one
+    assert "grm_s_part" not in one
+    assert "grm_stage = cutlass.Int32(0)" in one
+    # A 64-key chunk: the gate runs two 8-element passes per row half,
+    # each packing its P values into the A-fragments of its two k-steps.
+    assert "grm_sv = cute.make_rmem_tensor((8,), cutlass.Float32)" in one
+    assert len(_APPROX_GATE_DIVISION.findall(one)) == 4
+    assert (
+        one.count("flash_chunk_base = flash_kv_col0 + cutlass.Int32(32) + grm_c") == 2
+    )
+    assert (
+        "grm_pa_0_2_0 = _helion_flash_rowmma.pack_bf16x2(grm_pv[0], grm_pv[1])" in one
+    )
+    assert (
+        "grm_pa_0_3_1 = _helion_flash_rowmma.pack_bf16x2(grm_pv[4], grm_pv[5])" in one
+    )
+    rows32 = _cpu_row_code(head_dim, 32, 32, 4, 2, fast_math=True)
+    assert ROW_KIND in rows32
+    assert "block=(64, 1, 1)" in rows32
+    assert "grm_ms = warp_idx % 2" in rows32
+    assert "grm_ks = cutlass.Int32(0)" in rows32
+    assert "cute.arch.barrier()" not in rows32
+    assert "grm_row0 = flash_q_row0 + grm_ms * cutlass.Int32(16)" in rows32
+    # Eight warps on 32 rows: two row groups of four key groups.
+    rows32_8 = _cpu_row_code(head_dim, 32, 16, 2, 8, fast_math=True)
+    assert "grm_ms = warp_idx % 2" in rows32_8
+    assert "grm_ks = warp_idx // 2" in rows32_8
+    assert "grm_part_p = grm_part + (grm_ms + cutlass.Int32(6)) * " in rows32_8
+
+
+def test_row_fast_math_changes_only_the_gate_division() -> None:
+    """The exact-division twin (``fast_math=False``) renders the shipped row
+    program with the IEEE divide on the gate-division lines and nowhere
+    else."""
+    # One gate pass per row half of a 16-key chunk, and two of a 64-key one.
+    for tile, divisions in (((16, 16, 2, 4), 2), ((16, 64, 1, 1), 4)):
+        fast = _cpu_row_code(32, *tile, fast_math=True)
+        exact = _cpu_row_code(32, *tile, fast_math=False)
+        assert ROW_KIND in exact
+        fast_lines, exact_lines = fast.splitlines(), exact.splitlines()
+        assert len(fast_lines) == len(exact_lines)
+        changed = [
+            (fast_line.strip(), exact_line.strip())
+            for fast_line, exact_line in zip(fast_lines, exact_lines, strict=True)
+            if fast_line != exact_line
+        ]
+        assert len(changed) == divisions, tile
+        for fast_line, exact_line in changed:
+            assert _APPROX_GATE_DIVISION.fullmatch(fast_line)
+            assert _IEEE_GATE_DIVISION.fullmatch(exact_line)
+            assert exact_line == fast_line.replace(
+                " * cute.math.rcp(", " / "
+            ).removesuffix(", approx=True, ftz=True)")
 
 
 def test_row_knobs_are_validated_and_repaired() -> None:
@@ -480,7 +567,7 @@ def test_row_seed_configs(head_dim: int) -> None:
         )
     # Every seed is legal for its own tile (the normalizer keeps it).
     with _cpu_codegen_patches():
-        spec = _bind_hstu(_small_hstu_args(head_dim)).config_spec
+        spec = bound.config_spec
         for seed in seeds:
             assert spec.normalized_config(helion.Config(**seed)).config == {
                 **spec.normalized_config(helion.Config(**seed)).config,
@@ -488,13 +575,17 @@ def test_row_seed_configs(head_dim: int) -> None:
             }
 
 
+# The shipped program up to head dim 128 at a 64-key tile (200 fragment
+# registers per lane), and the exact twin.  Two of the shipped tiles are ones
+# ``test_row_tiles_take_the_row_program`` renders (once per process); the GPU
+# tests compile and run more, head dim 128 at two warps among them.
 @pytest.mark.parametrize(
     ("head_dim", "q_tile", "kv_tile", "kv_stage", "warps", "fast_math"),
     [
         (32, 16, 16, 2, 4, True),
         (32, 16, 32, 4, 2, False),
         (64, 32, 64, 2, 4, True),
-        (128, 16, 64, 2, 2, True),
+        (128, 16, 64, 1, 1, True),
     ],
 )
 def test_row_kernel_compiles_without_gpu(
@@ -512,21 +603,20 @@ def test_row_kernel_compiles_without_gpu(
         if torch.cuda.is_available() or "CUTE_DSL_ARCH" in os.environ
         else {"CUTE_DSL_ARCH": "sm_100a"}
     )
-    args = _hstu_args(head_dim=head_dim)
-    kernel = _with_fast_math(_hstu_module()._helion_jagged_attention_kernel, fast_math)
+    code = _cpu_row_code(
+        head_dim, q_tile, kv_tile, kv_stage, warps, fast_math=fast_math
+    )
+    assert ROW_KIND in code
+    assert bool(_APPROX_GATE_DIVISION.search(code)) is fast_math
+    assert bool(_IEEE_GATE_DIVISION.search(code)) is not fast_math
     with _cpu_codegen_patches(), patch.dict(os.environ, env_patch):
-        kernel.reset()
-        bound = kernel.bind(args)
-        code = bound.to_code(_row_config(q_tile, kv_tile, kv_stage, warps))
-        assert ROW_KIND in code
-        assert ("approx=True" in code) is fast_math
         source_path = tmp_path / "gated_row_hstu.py"
         source_path.write_text(code)
         namespace: dict[str, object] = {}
         exec(compile(code, str(source_path), "exec"), namespace)
         host_fn = namespace["_helion_jagged_attention_kernel"]
         assert callable(host_fn)
-        host_fn(*args, _launcher=_compile_only_launcher)
+        host_fn(*_hstu_args(head_dim=head_dim), _launcher=_compile_only_launcher)
 
 
 # ---------------------------------------------------------------------------
@@ -534,34 +624,51 @@ def test_row_kernel_compiles_without_gpu(
 # ---------------------------------------------------------------------------
 
 
-def _run_row(kernel: Any, args: tuple[Any, ...], config: helion.Config) -> torch.Tensor:
+def _run_row(
+    kernel: Any, args: tuple[Any, ...], config: helion.Config
+) -> tuple[torch.Tensor, str]:
+    """Compile and run ``config`` once; returns the output and the generated
+    source, read back from the module ``set_config`` loaded (rendering it a
+    second time would double the cost of the test)."""
     kernel.reset()
     bound = kernel.bind(args)
     bound.set_config(config)
-    assert ROW_KIND in bound.to_code(config)
+    source_path = bound.get_cached_path(config)
+    assert source_path is not None
+    code = Path(source_path).read_text()
+    assert ROW_KIND in code
     out = bound(*args)
     torch.cuda.synchronize()
-    return out
+    return out, code
 
 
-# The head-dim 64/128 row programs at 64- and 128-wide KV tiles take about a
-# minute to generate and compile (CPU-bound codegen over the unrolled body),
-# past the default per-test CI timeout under xdist contention.
-@pytest.mark.timeout(300)
 # pyrefly: ignore [bad-argument-type]
 @onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("head_dim", "q_tile", "kv_tile", "kv_stage", "warps"),
     [
+        # Head dim 32: one 16-row m-tile over four and two key groups (4- and
+        # 8-wide gate passes, two- and four-slot rings) ...
         (32, 16, 16, 2, 4),
         (32, 16, 32, 4, 2),
+        # ... over one warp: four gate passes per row half, a one-slot ring;
         (32, 16, 128, 1, 1),
+        # 32 rows in one warp: its second m-tile stores 16 rows down.
+        (32, 32, 32, 2, 1),
+        # Head dim 64: the eight-packet swizzle at two and four gate passes
+        # per row half, over one warp;
         (64, 16, 64, 2, 1),
+        (64, 16, 128, 1, 1),
+        # eight key groups on one m-tile, where a combine that read the
+        # partials before every warp had stored them would fail every launch
+        # (at head dim 32 that race goes unseen);
         (64, 16, 16, 4, 8),
+        # 32 rows in two row groups of one and of four key groups.
         (64, 32, 32, 4, 2),
         (64, 32, 16, 2, 8),
-        (64, 16, 128, 1, 1),
+        # Head dim 128: sixteen-packet rows at the widest KV tile the register
+        # budget admits, one row group of two key groups and two of two.
         (128, 16, 64, 2, 2),
         (128, 32, 64, 1, 4),
     ],
@@ -583,9 +690,11 @@ def test_row_program_matches_reference_at_jagged_lengths(
         keep=_causal_keep,
         kv_end="tile_end",
     )
-    kernel = _hstu_module()._helion_jagged_attention_kernel
+    kernel = _example_kernel(fast_math=True)
     config = _row_config(q_tile, kv_tile, kv_stage, warps)
-    out = _run_row(kernel, args, config)
+    out, code = _run_row(kernel, args, config)
+    assert _APPROX_GATE_DIVISION.search(code)
+    assert not _IEEE_GATE_DIVISION.search(code)
     _assert_matches(out, expected, 2e-2)
     # The warp combine runs in fixed order: repeated launches of the compiled
     # kernel (``bind`` returns the bound kernel ``_run_row`` compiled) are
@@ -602,7 +711,8 @@ def test_row_program_matches_reference_at_jagged_lengths(
 def test_row_program_last_sequence_shorter_than_max(fast_math: bool) -> None:
     """The last sequence is shorter than ``max_seq_len``: its last query
     tile's tail rows lie past the tensor end (zero-filled loads, no store),
-    and the first sequence's tail rows alias the second sequence's rows."""
+    and the first sequence's tail rows alias the second sequence's rows.
+    Checked for the shipped program and for its exact-division twin."""
     torch.manual_seed(11)
     max_seq_len = 128
     q, k, v, seq_offsets = _jagged_inputs([128, 86], 4, 32)
@@ -617,8 +727,8 @@ def test_row_program_last_sequence_shorter_than_max(fast_math: bool) -> None:
         keep=_causal_keep,
         kv_end="tile_end",
     )
-    kernel = _with_fast_math(_hstu_module()._helion_jagged_attention_kernel, fast_math)
-    out = _run_row(kernel, args, _row_config(16, 32, 2, 4))
+    kernel = _example_kernel(fast_math=fast_math)
+    out, code = _run_row(kernel, args, _row_config(16, 32, 2, 4))
+    assert bool(_APPROX_GATE_DIVISION.search(code)) is fast_math
+    assert bool(_IEEE_GATE_DIVISION.search(code)) is not fast_math
     _assert_matches(out, expected, 2e-2)
-    code = kernel.bind(args).to_code(_row_config(16, 32, 2, 4))
-    assert ("approx=True" in code) is fast_math
