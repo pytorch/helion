@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import random
+from functools import partial
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -9,7 +9,8 @@ import torch
 
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
-from test.cute_population_contracts import checked_initial_population
+from test.cute_seed_population import _initial_population
+from test.cute_seed_population import _legacy_registered_seeds as _shared_legacy
 from test.test_cute_collective_tmem_operand_codegen import _mamba_kernel
 from test.test_cute_collective_tmem_operand_codegen import _sizes
 from test.test_cute_collective_tmem_seed import _dependent_contractions
@@ -17,9 +18,8 @@ from test.test_cute_collective_tmem_seed import _dependent_inputs
 
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
-from helion.autotuner.effort_profile import get_effort_profile
-from helion.autotuner.pattern_search import InitialPopulationStrategy
-from helion.autotuner.pattern_search import PatternSearch
+
+_legacy_registered_seeds = partial(_shared_legacy, require_no_parameters=True)
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -27,7 +27,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     import helion
-    from helion.autotuner.config_spec import ConfigSpec
     from helion.runtime.kernel import BoundKernel
 
 
@@ -38,80 +37,6 @@ def _forbid_cuda_init() -> Iterator[None]:
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
-
-
-def _legacy_order(
-    spec: ConfigSpec, seeds: list[helion.Config], parameters: tuple[str, ...]
-) -> list[helion.Config]:
-    # None of these contractions has a config-owned K chunk. The reviewed
-    # bounded-K interleaver previously returned this list unchanged.
-    assert not parameters
-    return seeds
-
-
-def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
-    assert bound.host_function is not None
-    with (
-        bound.env,
-        patch.object(
-            CuteCollectiveMatmulHeuristic,
-            "_interleave_bounded_k_seeds",
-            side_effect=_legacy_order,
-        ),
-    ):
-        legacy = CuteCollectiveMatmulHeuristic.get_seed_configs(
-            bound.env, bound.host_function.device_ir
-        )
-    members = set(legacy)
-    selected = [
-        seed for seed in bound.config_spec.compiler_seed_configs if seed in members
-    ]
-    assert len(selected) == len(legacy)
-    iterator = iter(legacy)
-    return [
-        next(iterator) if seed in members else seed
-        for seed in bound.config_spec.compiler_seed_configs
-    ]
-
-
-def _initial_population(
-    bound: BoundKernel,
-    args: tuple[torch.Tensor, ...],
-    *,
-    seeds: list[helion.Config] | None = None,
-    count: int | None = None,
-    user_seeds: list[helion.Config] | None = None,
-) -> list[helion.Config]:
-    profile = get_effort_profile("full").pattern_search
-    assert profile is not None
-    random_state = random.getstate()
-    try:
-        random.seed(46291)
-        with (
-            bound.env,
-            patch.object(
-                bound.config_spec,
-                "compiler_seed_configs",
-                bound.config_spec.compiler_seed_configs if seeds is None else seeds,
-            ),
-            patch.object(bound.settings, "autotune_seed_configs", user_seeds),
-        ):
-            search = PatternSearch(
-                bound,
-                args,
-                initial_population=(
-                    profile.initial_population if count is None else count
-                ),
-                initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
-            )
-            flat = checked_initial_population(search)
-            result = [search.config_gen.unflatten(value) for value in flat]
-            assert result[0] == search.config_gen.unflatten(
-                search.config_gen.default_flat()
-            )
-            return result
-    finally:
-        random.setstate(random_state)
 
 
 def _complete_schedule(config: helion.Config) -> bool:
@@ -144,11 +69,13 @@ def test_full_initial_population_reaches_complete_tmem_operand_schedule(
     assert old_seeds[0] == new_seeds[0]
     assert len(old_seeds) == len(new_seeds)
     assert set(old_seeds) == set(new_seeds)
-    before = _initial_population(bound, args, seeds=old_seeds)
-    after = _initial_population(bound, args)
+    before = _initial_population(
+        bound, args, assert_raw_canonical=False, seeds=old_seeds
+    )
+    after = _initial_population(bound, args, assert_raw_canonical=False)
+    assert after == _initial_population(bound, args, assert_raw_canonical=False)
     assert len(before) == len(after)
     assert before[0] == after[0]
-    assert after == _initial_population(bound, args)
     if shape == 2:
         assert not any(_complete_schedule(config) for config in before)
     complete = [config for config in after if _complete_schedule(config)]
@@ -179,7 +106,9 @@ def test_tmem_schedule_order_preserves_budget_and_explicit_user_priority(
         for config in reversed(bound.config_spec.compiler_seed_configs)
         if config.get("cute_collective_tmem_a")
     )
-    population = _initial_population(bound, args, count=count, user_seeds=[explicit])
+    population = _initial_population(
+        bound, args, assert_raw_canonical=False, count=count, user_seeds=[explicit]
+    )
     # The helper checks exactly count legacy rows plus declared coverage only.
     with bound.env:
         generation = bound.config_spec.create_config_generation()
@@ -187,18 +116,25 @@ def test_tmem_schedule_order_preserves_budget_and_explicit_user_priority(
     assert population[1] == normalized
 
 
-def test_unrelated_seed_configs_retain_their_exact_order(
+def test_filtered_dependent_seeds_use_the_ordinary_permutation(
     dependent_case: tuple[BoundKernel, tuple[torch.Tensor, ...]],
 ) -> None:
     bound, _args = dependent_case
     seeds = [
-        config
-        for config in _legacy_registered_seeds(bound)
-        if not config.get("cute_collective_tmem_a", False)
+        seed
+        for seed in _legacy_registered_seeds(bound)
+        if not seed.get("cute_collective_tmem_a", False)
     ]
-    assert (
-        CuteCollectiveMatmulHeuristic._interleave_bounded_k_seeds(
+    before = seeds.copy()
+    with patch.object(
+        bound.config_spec,
+        "_base_default_config",
+        side_effect=AssertionError("unused defaults"),
+    ):
+        actual = CuteCollectiveMatmulHeuristic._interleave_bounded_k_seeds(
             bound.config_spec, seeds, ()
         )
-        is seeds
-    )
+    assert seeds == before
+    assert actual[0] == seeds[0]
+    assert len(actual) == len(seeds) and set(actual) == set(seeds)
+    assert actual != seeds

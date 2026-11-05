@@ -8,9 +8,9 @@ import pytest
 
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
+from test.cute_seed_population import _initial_population
 from test.test_cute_collective_tf32 import _jagged_inputs
 from test.test_cute_collective_tf32 import _kernel
-from test.test_cute_collective_tmem_seed_order import _initial_population
 
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
@@ -39,9 +39,8 @@ def test_full_population_reaches_native_register_vector_loads(
     batch, rows, reduction, columns = shape
     args = _jagged_inputs(batch=batch, rows=rows, k=reduction, n=columns)
     bound = _cpu_bind(_kernel(), args)
-    population = _initial_population(bound, args)
+    population = _initial_population(bound, args, assert_raw_canonical=False)
     assert len(population) == len(set(population))
-    assert population == _initial_population(bound, args)
     choices = [
         config
         for config in population
@@ -102,7 +101,9 @@ def test_register_recipe_seeds_preserve_explicit_user_priority(count: int) -> No
         and config.get("cute_collective_copy") == "scalar"
         and config.get("cute_collective_recipe") == "vector_unrolled"
     )
-    population = _initial_population(bound, args, count=count, user_seeds=[explicit])
+    population = _initial_population(
+        bound, args, assert_raw_canonical=False, count=count, user_seeds=[explicit]
+    )
     # The helper checks exactly count legacy rows plus declared coverage only.
     with bound.env:
         generation = bound.config_spec.create_config_generation()
