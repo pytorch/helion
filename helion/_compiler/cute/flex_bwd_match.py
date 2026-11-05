@@ -506,6 +506,7 @@ def _build_with_grad_literal(
     1.0)`` (a typed literal the renderer folds)."""
     from ...language import creation_ops
     from ...language import memory_ops
+    from ..inductor_lowering import prepare_added_node_lowering
     from .flex_match import _FULL_TARGETS
     from .flex_match import _is_identity_view
 
@@ -526,6 +527,23 @@ def _build_with_grad_literal(
         placeholder.meta["flex_source_name"] = name
         placeholders[f"hs:{name}"] = placeholder
     mapping: dict[torch.fx.Node, Argument] = {}
+    literals: list[torch.fx.Node] = []
+
+    def literal(source: torch.fx.Node, value: float) -> torch.fx.Node:
+        """``full([], value)`` in ``source``'s dtype, standing in for ``source``.
+
+        A node rather than a Python number: every copied node keeps its source
+        node's prepared lowering, which binds the tensor operands
+        positionally, so an operand that was a node must stay one.
+        """
+        val = typing.cast("torch.Tensor", source.meta["val"])
+        node = graph.call_function(
+            _aten.full.default, ([], value), {"dtype": val.dtype, "device": val.device}
+        )
+        node.meta["val"] = val.new_full((), value)
+        node.meta["location"] = source.meta["location"]
+        literals.append(node)
+        return node
 
     def transform(node: torch.fx.Node) -> Argument:
         if node in mapping:
@@ -537,10 +555,9 @@ def _build_with_grad_literal(
         if leaf.kind == "score":
             result = placeholders["score"]
         elif leaf.kind == "grad":
-            # The gradient argument as the Python literal 1.0: the region then
-            # evaluates to the Jacobian (a VJP is linear in its gradient), and
-            # the pointwise lowerings take a number in any operand position.
-            result = 1.0
+            # The unit gradient: the region then evaluates to the Jacobian (a
+            # VJP is linear in its gradient).
+            result = literal(node, 1.0)
         elif leaf.kind == "coord":
             result = placeholders[leaf.key]
         else:
@@ -568,12 +585,16 @@ def _build_with_grad_literal(
             lhs, rhs = node.args
             if is_grad(lhs) and not is_grad(rhs):
                 mapping[node] = (
-                    transform(rhs) if isinstance(rhs, torch.fx.Node) else rhs
+                    transform(rhs)
+                    if isinstance(rhs, torch.fx.Node)
+                    else literal(node, typing.cast("float", rhs))
                 )
                 continue
             if is_grad(rhs) and not is_grad(lhs):
                 mapping[node] = (
-                    transform(lhs) if isinstance(lhs, torch.fx.Node) else lhs
+                    transform(lhs)
+                    if isinstance(lhs, torch.fx.Node)
+                    else literal(node, typing.cast("float", lhs))
                 )
                 continue
         if node.target in _FULL_TARGETS or node.target is creation_ops.full:
@@ -606,31 +627,15 @@ def _build_with_grad_literal(
             copied.meta["flex_index_class"] = builder.classify_load(node)
             mapping[node] = copied
             continue
-        reads_grad = any(is_grad(arg) for arg in node.args)
-        copied = graph.node_copy(node, transform)
-        if reads_grad:
-            if (
-                copied.target in (_aten.mul.Tensor, _aten.add.Tensor)
-                and len(copied.args) == 2
-                and not isinstance(copied.args[0], torch.fx.Node)
-                and isinstance(copied.args[1], torch.fx.Node)
-            ):
-                # The lowering preparation binds tensor inputs positionally:
-                # keep the tensor operand first now that the gradient is a
-                # literal.
-                copied.args = (copied.args[1], copied.args[0])
-            # The copy keeps the source node's prepared lowering, built for
-            # two tensor operands; with the gradient now a literal it is
-            # stale, so drop it and let the renderer re-prepare it. Nodes
-            # whose operands are unchanged keep theirs (the tracer encodes a
-            # repeated operand as None next to its prepared lowering, which
-            # a fresh preparation could not rebuild).
-            copied.meta.pop("lowering", None)
-        mapping[node] = copied
+        mapping[node] = graph.node_copy(node, transform)
     result = mapping[output] if output in mapping else transform(output)
     assert isinstance(result, torch.fx.Node)
     graph.output(result)
     graph.lint()
+    # The literals are the only nodes without a lowering prepared on the
+    # source graph (preparing one needs the graph's output).
+    for node in literals:
+        prepare_added_node_lowering(graph, node)
     return graph, result
 
 
