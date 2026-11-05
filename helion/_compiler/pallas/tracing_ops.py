@@ -1954,6 +1954,40 @@ def _is_static_int(expr: str) -> bool:
     return True
 
 
+_STATIC_DIM_BINOPS: dict[type[ast.operator], Callable[[int, int], int]] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.FloorDiv: operator.floordiv,
+}
+
+
+def _static_block_dim(state: CodegenState, expr: ast.expr) -> int | None:
+    """Value of a generated BlockSpec dim expression, if it is a static int.
+
+    Dims combine integer literals and block-size constexprs with ``+ - * //``
+    (e.g. ``(_BLOCK_SIZE_1) * 2``); ``pl.BoundedSlice(n)`` holds ``n`` rows.
+    """
+    if isinstance(expr, ast.Constant) and type(expr.value) is int:
+        return expr.value
+    if isinstance(expr, ast.Name):
+        return state.device_function.resolved_int_constexpr(expr.id)
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "BoundedSlice"
+        and len(expr.args) == 1
+    ):
+        return _static_block_dim(state, expr.args[0])
+    if isinstance(expr, ast.BinOp) and type(expr.op) in _STATIC_DIM_BINOPS:
+        lhs = _static_block_dim(state, expr.left)
+        rhs = _static_block_dim(state, expr.right)
+        if lhs is None or rhs is None:
+            return None
+        return _STATIC_DIM_BINOPS[type(expr.op)](lhs, rhs)
+    return None
+
+
 def _compute_grid_and_block_sizes(
     state: CodegenState,
     block_ids: list[int],
@@ -3459,6 +3493,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             )
             _bid_to_pid_var[pid.block_id] = pid_var
 
+    # VMEM bytes of this pipeline's double-buffered blocks (static dims only).
+    pipeline_block_bytes: list[int] = []
+
     def _make_block_spec(
         fake: torch.Tensor, subscript_meta: Sequence[object], is_store: bool = False
     ) -> str:
@@ -3683,6 +3720,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                     lambda_parts.append("0")
 
+        numel = 1
+        for part in block_shape_parts:
+            dim = _static_block_dim(state, ast.parse(part, mode="eval").body)
+            if dim is None:
+                break
+            numel *= dim
+        else:
+            pipeline_block_bytes.append(2 * numel * fake.dtype.itemsize)
+
         block_shape_str = ", ".join(block_shape_parts)
         lambda_body = ", ".join(lambda_parts)
         lambda_param_str = ", ".join(lambda_params)
@@ -3805,6 +3851,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         out_specs.append(_make_store_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
         pipeline_out_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
+
+    # Each emit_pipeline scopes its buffers to its own call, so sequential
+    # pipelines never hold them at the same time.
+    state.device_function.pallas_pipeline_vmem_bytes = max(
+        state.device_function.pallas_pipeline_vmem_bytes, sum(pipeline_block_bytes)
+    )
 
     # Build the body function
     body_fn_name = state.device_function.new_var("_pipeline_body")

@@ -1755,6 +1755,11 @@ class PallasBackend(Backend):
                 shape_sources.append(dims)
             launcher_args.append(f"_scratch_shape_sources={shape_sources!r}")
 
+        if device_fn.pallas_pipeline_vmem_bytes:
+            launcher_args.append(
+                f"_pipeline_vmem_bytes={device_fn.pallas_pipeline_vmem_bytes}"
+            )
+
         if device_fn.requires_remote_copy:
             launcher_args.append("_uses_remote_copy=True")
 
