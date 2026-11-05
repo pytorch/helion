@@ -79,6 +79,7 @@ from .cute_mma_dag import MMA_DAG_EPILOGUE_ROW
 from .cute_mma_dag import MMA_DAG_EPILOGUE_SPLIT
 from .cute_mma_dag import MMA_DAG_EPILOGUE_STREAMED
 from .cute_mma_dag import MMA_DAG_EXCHANGE_AUTO
+from .cute_mma_dag import MMA_DAG_K_STEP
 from .cute_mma_dag import MMA_DAG_LOADS_TMA
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
@@ -124,6 +125,7 @@ from .cute_mma_dag_tcgen05 import REGION_LOOP
 from .cute_mma_dag_tcgen05 import SLAB_ALIGNMENT
 from .cute_mma_dag_tcgen05 import TCGEN05_EPILOGUE_WARPS
 from .cute_mma_dag_tcgen05 import TCGEN05_LD_COLS
+from .cute_mma_dag_tcgen05 import TCGEN05_M_CHOICES
 from .cute_mma_dag_tcgen05 import TCGEN05_MAX_ROWS
 from .cute_mma_dag_tcgen05 import TCGEN05_MAX_TMEM_COLS
 from .cute_mma_dag_tcgen05 import TCGEN05_SLOT_ALIGN
@@ -230,6 +232,84 @@ def region_program_reason(program: MmaDagProgram) -> str | None:
             program.vec_slots[slot].axis is not None
         ):
             return "a store of a column vector"
+    return None
+
+
+def mapped_store_region_reason(program: MmaDagProgram) -> str | None:
+    """Bounded native proof for split stores, separate from warp admission.
+
+    One static, complete K loop updates independent zero-seeded carries from
+    unchanged half-precision load operands.  Root stores are the only effects;
+    existing map ownership / alias checks still apply.  No tail, window,
+    fragment operand, derived recurrence or extra launch axis is introduced.
+    """
+    mapped = [store for store in program.stores if store.access.store_map is not None]
+    if not mapped:
+        return "no proved mapped root store"
+    if (
+        len(program.loops) != 1
+        or not program.loops[0].innermost
+        or len(program.loops[0].axes) != 1
+        or program.loops[0].tile_end is not None
+        or program.windowed
+        or program.derived
+        or program.vec_slots
+        or program.reduces
+        or program.vec_ops
+        or program.vec_stores
+        or program.scans
+        or any(store.loop >= 0 or store.swap for store in program.stores)
+    ):
+        return "mapped tcgen05 needs a plain full-K loop and unwindowed root stores"
+    loop = program.loops[0]
+    root_axes = {axis.index for axis in program.axes if axis.kind == AXIS_ROOT}
+    if program.lead_axes or root_axes != {
+        axis.index for axis in mapped[0].access.tile_dims
+    }:
+        return "mapped tcgen05 needs exactly the two mapped root axes"
+    k = loop.axes[0]
+    if k.kind != AXIS_LOOP or k.size is not None or k.extent % MMA_DAG_K_STEP:
+        return "mapped tcgen05 needs automatic full-K geometry, not a fixed or partial loop"
+    if loop.small_carries or len(loop.carries) != len(program.dots):
+        return "mapped tcgen05 needs one independent dot per carry"
+    carry_slots = {carry.slot: carry for carry in loop.carries}
+    if len(carry_slots) != len(loop.carries):
+        return "mapped tcgen05 carries must have independent slots"
+    for dot in program.dots:
+        carry = carry_slots.get(dot.slot)
+        if (
+            carry is None
+            or dot.loop != loop.index
+            or dot.k is not k
+            or dot.acc_frag is None
+            or program.resolve(dot.acc_frag) is not carry.placeholder
+            or carry.init is not None
+            or carry.init_frag is not None
+            or carry.init_value is not None
+            or program.resolve(carry.output) is not dot.node
+        ):
+            return "mapped tcgen05 needs independent zero-seeded accumulating dots"
+        for operand in (dot.a, dot.b):
+            if (
+                operand.kind != "load"
+                or operand.load is None
+                or operand.pointwise
+                or operand.load.dtype != operand.dtype
+                or operand.dtype not in (torch.bfloat16, torch.float16)
+            ):
+                return "mapped tcgen05 needs unchanged half-precision load operands"
+    for store in program.stores:
+        store_map = store.access.store_map
+        if store_map is None:
+            continue
+        rows, cols = store.access.tile_dims
+        if any(axis.kind != AXIS_ROOT for axis in (rows, cols)):
+            return "mapped tcgen05 needs two root store axes"
+        if any(dot.rows is not rows or dot.cols is not cols for dot in program.dots):
+            return "mapped tcgen05 store axes must match the independent fragments"
+        row_period, _col_period = store_map.periods
+        if not any(row_period % height == 0 for height in TCGEN05_M_CHOICES):
+            return "mapped store row period admits no native tcgen05 height"
     return None
 
 
@@ -1935,8 +2015,15 @@ def tmem_conflicts(program: MmaDagProgram) -> tuple[tuple[int, int], ...]:
     return tuple(sorted(pairs))
 
 
-def region_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
+def region_facts(
+    program: MmaDagProgram, *, mapped_store_regions: bool = False
+) -> Tcgen05Facts | None:
     """The tcgen05 facts of a region program (None: declined)."""
+    mapped = any(store.access.store_map is not None for store in program.stores)
+    if mapped != mapped_store_regions or (
+        mapped and mapped_store_region_reason(program) is not None
+    ):
+        return None
     if region_program_reason(program) is not None:
         return None
     items = tuple(item for item, _payload in region_items(program))
@@ -2008,7 +2095,12 @@ def region_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
         derived_cols=derived_cols,
         general_loop=True,
         regions=True,
-        persistent_reason=persistent_reason,
+        persistent_reason=(
+            "mapped tcgen05 stores require a flat single-CTA tile launch"
+            if mapped_store_regions
+            else persistent_reason
+        ),
+        mapped_store_regions=mapped_store_regions,
         live_groups=region_live_slots(program),
         items=items,
         tmem_slots=tmem_slots(program),
@@ -2032,7 +2124,8 @@ def region_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
         staged_regions=staged_regions,
         aux_items=sum(1 for item in items if item.kind == ITEM_AUX),
         derived_frags=derived_frag_axes(program),
-        split_epilogue=region_split_reason(program) is None,
+        split_epilogue=not mapped_store_regions
+        and region_split_reason(program) is None,
         lookahead_loop=lookahead_loop,
         lookahead_slot=lookahead_slot,
         streamed_loops=len(streamed_loop_candidates(program)),
@@ -2205,6 +2298,26 @@ def plan_tcgen05_regions(
     env = CompileEnvironment.current()
     tc = facts.tcgen05
     assert tc is not None and tc.regions
+    mapped = any(store.access.store_map is not None for store in program.stores)
+    if mapped:
+        reason = mapped_store_region_reason(program)
+        if not tc.mapped_store_regions or reason is not None:
+            raise _decline(reason or "mapped store region proof is missing")
+        if (
+            persistent
+            or mma_warp
+            or epilogue != MMA_DAG_EPILOGUE_ROW
+            or lookahead != MMA_DAG_LOOKAHEAD_OFF
+        ):
+            raise _decline(
+                "mapped tcgen05 stores require flat single-CTA row epilogues"
+            )
+        for rows, cols, store_map in facts.mapped_stores:
+            reason = store_map.tile_reason(sizes[rows], sizes[cols])
+            if reason is not None:
+                raise _decline(reason)
+        if any(dot.k.extent % sizes[dot.k.index] for dot in program.dots):
+            raise _decline("mapped tcgen05 has no partial static K proof")
     split = epilogue == MMA_DAG_EPILOGUE_SPLIT
     if split and (warps != 8 or not tc.split_epilogue):
         # (``tcgen05_config_reason`` refused the config; fail closed.)
@@ -2670,6 +2783,10 @@ def plan_tcgen05_regions(
     # against Triton's 18).
     store_tma: dict[Node, TmaSpec] = {}
     for store in staged:
+        if store.access.store_map is not None:
+            # The inherited packet drain uses the map-derived base and
+            # local affine strides.  No global output tensor map exists.
+            continue
         slot = slots[program.frag_slots[store.frag]]
         row_bytes = slot.cols * store.access.dtype.itemsize
         # Rows of one swizzle atom are one box; an epilogue store's wider

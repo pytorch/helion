@@ -624,14 +624,48 @@ def _chain_key(chain: Tcgen05UnaryEpilogueChain) -> tuple[object, ...]:
     from .cute_epilogue import _AuxiliaryTensorLoadExpr
     from .cute_epilogue import _BinaryTensorExpr
     from .cute_epilogue import _CurrentTensorExpr
+    from .cute_epilogue import _PointwiseDagExpr
     from .cute_epilogue import _RuntimeScalarExpr
+    from .cute_epilogue import _ScalarConstantExpr
     from .cute_epilogue import _UnaryTensorExpr
+    from .cute_epilogue import _WhereTensorExpr
 
     def key(expr: object) -> object:
+        if isinstance(expr, _PointwiseDagExpr):
+            indices = {id(node): index for index, node in enumerate(expr.nodes)}
+            entries: list[object] = []
+            for node in expr.nodes:
+                if isinstance(node, _UnaryTensorExpr):
+                    entries.append(("unary", node.step, indices[id(node.operand)]))
+                elif isinstance(node, _BinaryTensorExpr):
+                    entries.append(
+                        (
+                            "binary",
+                            node.op_name,
+                            node.op_template,
+                            indices[id(node.lhs)],
+                            indices[id(node.rhs)],
+                        )
+                    )
+                elif isinstance(node, _WhereTensorExpr):
+                    entries.append(
+                        (
+                            "where",
+                            node.op_template,
+                            indices[id(node.predicate)],
+                            indices[id(node.lhs)],
+                            indices[id(node.rhs)],
+                        )
+                    )
+                else:
+                    entries.append(key(node))
+            return ("pointwise_dag", tuple(entries))
         if isinstance(expr, _CurrentTensorExpr):
             return ("current",)
         if isinstance(expr, _RuntimeScalarExpr):
             return ("runtime_scalar", expr.source)
+        if isinstance(expr, _ScalarConstantExpr):
+            return ("scalar_constant", expr.literal, expr.dtype)
         if isinstance(expr, _AuxiliaryTensorLoadExpr):
             return ("aux", expr.load_node, expr.broadcast_axis, expr.template)
         if isinstance(expr, _UnaryTensorExpr):

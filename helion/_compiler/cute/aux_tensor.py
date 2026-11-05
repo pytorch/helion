@@ -173,6 +173,7 @@ def analyze_tcgen05_matmul_store_chains(
                 output_global_shape=_output_global_shape_from_store(store_node),
                 target_fx_nodes=target_fx_nodes,
                 inner_outputs_by_graph_id=inner_outputs,
+                graphs=graphs,
             )
             if analyzed is None:
                 return None
@@ -395,7 +396,8 @@ def host_function_has_tcgen05_aux_kernel_pattern(
     if not mma_nodes:
         return False
     for mma_node in mma_nodes:
-        analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        with host_function:
+            analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
         if analyzed_stores is not None and any(
             chain.auxiliary_tensor_loads for _, chain in analyzed_stores
         ):
@@ -417,7 +419,8 @@ def host_function_tcgen05_exact_shape_aux_tensors(
     graphs = host_function.device_ir.graphs
     tensors: dict[int, torch.Tensor] = {}
     for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
-        analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        with host_function:
+            analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
         if analyzed_stores is None:
             continue
         for _store_node, chain in analyzed_stores:
@@ -451,7 +454,8 @@ def host_function_tcgen05_rowvec_aux_facts(
     output_count = 0
     exact_aux_count = 0
     for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
-        analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        with host_function:
+            analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
         if analyzed_stores is None:
             continue
         output_count = max(output_count, len(analyzed_stores))
@@ -520,7 +524,8 @@ def host_function_tcgen05_aux_loads_on_every_store(
         return False
     found = False
     for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
-        analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        with host_function:
+            analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
         if analyzed_stores is None:
             continue
         found = True

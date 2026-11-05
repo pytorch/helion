@@ -4741,6 +4741,29 @@ def _tcgen05_split_k_plan_present(cute_kernel: object) -> bool:
     )
 
 
+def _cute_exchange_workspace_plan_present(cute_kernel: object) -> bool:
+    """Whether a launch carries a mutable split/fixup temporary pointer."""
+    return any(
+        plan.get("kind") in ("helion_tcgen05_split_k", "helion_mma_dag_fixup")
+        for plan in getattr(cute_kernel, "_helion_cute_wrapper_plans", ())
+    )
+
+
+def _cute_owned_exchange_capture(cute_kernel: object, args: tuple[object, ...]) -> bool:
+    """Reuse temporaries only while the existing Helion graph owns capture.
+
+    A stream/capture ID alone does not identify the Python graph lifetime.
+    Eager calls may allocate inside an external GraphTrees warmup private pool;
+    they must not publish a persistent owner merely because capture is inactive.
+    """
+    if not _cute_exchange_workspace_plan_present(cute_kernel):
+        return False
+    if _CUTE_ACTIVE_CUDA_GRAPH.get() is None:
+        return False
+    device = next((arg.device for arg in args if isinstance(arg, torch.Tensor)), None)
+    return device is not None and _cuda_stream_capture_context(device)[1] is not None
+
+
 def _tcgen05_grouped_device_split_sizes(plan: dict[str, object]) -> bool:
     return bool(plan.get("device_split_sizes"))
 
@@ -4920,11 +4943,17 @@ def _cached_exchange_workspace(
     capture_id: int | None,
     limit: int,
 ) -> torch.Tensor:
-    """A launcher-owned exchange workspace cached on ``cute_kernel`` under
-    ``attribute`` per ``cache_key`` (which ends in the capture id): bytes
-    from ``zero_from`` on are zeroed once at allocation; a captured graph's
-    entry is tracked with the graph, eager entries are bounded by ``limit``.
+    """An exchange temporary, reusable only by an owned Helion capture.
+
+    Without a graph owner, allocate per call and let stream-ordered allocator
+    lifetime protect the queued producer/reducer. Raw capture's pool owns its
+    recorded allocation lifetime; retaining Python tensors in kernel caches
+    would instead leak external GraphTrees warmup allocations outside outputs.
     """
+    if capture_id is None or _CUTE_ACTIVE_CUDA_GRAPH.get() is None:
+        workspace = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        workspace[zero_from:].zero_()
+        return workspace
     try:
         cache = cast(
             "OrderedDict[tuple[object, ...], torch.Tensor]",
@@ -4939,14 +4968,12 @@ def _cached_exchange_workspace(
     workspace = torch.empty(nbytes, dtype=torch.uint8, device=device)
     workspace[zero_from:].zero_()
     cache[cache_key] = workspace
-    if capture_id is not None:
-        _track_cute_cuda_graph_cache_entry(
-            cute_kernel, attribute, cache_key, workspace, (workspace,)
-        )
-    else:
-        eager_keys = [key for key in cache if key[-1] is None]
-        while len(eager_keys) > limit:
-            cache.pop(eager_keys.pop(0))
+    _track_cute_cuda_graph_cache_entry(
+        cute_kernel, attribute, cache_key, workspace, (workspace,)
+    )
+    while len(cache) > limit:
+        # Graph resources retain evicted entries until that graph is reset.
+        cache.popitem(last=False)
     return workspace
 
 
@@ -4960,12 +4987,10 @@ def _tcgen05_split_k_workspace(
 ) -> torch.Tensor:
     """The exchange workspace of a ``tcgen05_split_k`` GEMM: per output tile
     the ``splits`` fp32 partial slabs of ``tile_elems`` elements, then one
-    u32 arrival counter per tile. The counters are zeroed once (the slabs
-    are written before they are read) and the workspace is kept per
-    (device, geometry, stream, capture): the counters only ever grow (a
-    launch's CTAs derive their base from their ticket's period), so no
-    launch resets them, and the cached pointer stays valid for a captured
-    graph."""
+    u32 arrival counter per tile. New per-call temporaries start at zero; an
+    owned Helion capture reuses its graph-tracked workspace and recorded reset.
+    The ticket protocol permits counters to grow without a per-launch reset.
+    Unowned/eager calls retain no workspace or argument-pointer cache entry."""
     partial_bytes = tiles * splits * tile_elems * 4
     counter_bytes = -(-tiles * 4 // 256) * 256
     stream_handle, capture_id = _cuda_stream_capture_context(device)
@@ -5001,10 +5026,9 @@ def _mma_dag_fixup_workspace(
 ) -> torch.Tensor:
     """The exchange workspace of a ``cute_mma_dag`` fixup split: per partial
     slab and row tile the ``tiles x rows`` fp32 partials, then one u32
-    arrival counter per row tile (``rounds`` arrivals per launch).  Zeroed once and kept per (device, geometry,
-    stream, capture): the counters only ever grow (a launch's CTAs derive
-    their base from their first ticket), so no launch resets them, and the
-    cached pointer stays valid for a captured graph."""
+    arrival counter per row tile (``rounds`` arrivals per launch). New unowned
+    calls allocate a zeroed temporary; owned Helion capture retains its exact
+    stream/capture workspace. The counter ticket protocol is unchanged."""
     partial_bytes = slabs * tiles * row_tiles * rows * 4
     counter_bytes = -(-row_tiles * 4 // 256) * 256
     stream_handle, capture_id = _cuda_stream_capture_context(device)
@@ -5489,11 +5513,9 @@ def _cute_grouped_launch_contexts(
             continue
         if context not in contexts:
             contexts.append(context)
-    if _tcgen05_split_k_plan_present(cute_kernel):
-        # The split-K workspace is cached per (stream, capture)
-        # (``_tcgen05_split_k_workspace``): the same pointers relaunched on
-        # another stream or under capture must miss the last-launch cache
-        # too, or they would reuse the earlier launch's workspace pointer.
+    if _cute_exchange_workspace_plan_present(cute_kernel):
+        # Both split-K and DAG-fixup mutable workspaces are isolated by stream
+        # and owned capture. Unowned calls never enter launch/last caches.
         device = next(
             (arg.device for arg in args if isinstance(arg, torch.Tensor)), None
         )
@@ -6911,10 +6933,9 @@ def _cute_launch_arg_cache_key(
 ) -> tuple[object, ...]:
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
     key: list[object] = [len(args), grid, _cute_bake_tensor_shapes_guard(cute_kernel)]
-    if _tcgen05_split_k_plan_present(cute_kernel):
-        # The split-K workspace pointer in the launch arguments is cached per
-        # (stream, capture) (``_tcgen05_split_k_workspace``); a captured
-        # graph must not reuse the arguments of an eager launch.
+    if _cute_exchange_workspace_plan_present(cute_kernel):
+        # Owned captures may cache either exchange pointer only within their
+        # exact stream/capture context; unowned launches bypass this cache.
         device = next(
             (arg.device for arg in args if isinstance(arg, torch.Tensor)), None
         )
@@ -7020,6 +7041,12 @@ def _build_cached_cute_schema_and_args(
     args: tuple[object, ...],
     grid: tuple[int, int, int],
 ) -> _CuteLaunchArgCacheEntry:
+    if _cute_exchange_workspace_plan_present(
+        cute_kernel
+    ) and not _cute_owned_exchange_capture(cute_kernel, args):
+        # Per-call workspaces must not be retained by pointer argument caches,
+        # including raw external capture and external private-pool warmup.
+        return _build_cute_schema_and_args(cute_kernel, args, grid)
     dynamic_tensormap_contexts = _cute_dynamic_tensormap_contexts(cute_kernel, args)
     grouped_launch_contexts = _cute_grouped_launch_contexts(
         cute_kernel,
@@ -7057,6 +7084,16 @@ def _build_cached_cute_schema_and_args(
 
     built = _build_cute_schema_and_args(cute_kernel, args, grid)
     cache[cache_key] = built
+    if _cute_exchange_workspace_plan_present(cute_kernel):
+        # The launch entry also owns the workspace: graph reset must remove
+        # this strong reference, not only the exchange and tensor caches.
+        _track_cute_cuda_graph_cache_entry(
+            cute_kernel,
+            "_helion_cute_launch_arg_cache",
+            cache_key,
+            built,
+            built.owned_tensors,
+        )
     if built.owned_tensors:
         _retain_cute_capture_owned_launch_tensors(
             cute_kernel,
@@ -8894,6 +8931,11 @@ def _cute_last_launch_cache_entry(
     block: tuple[int, int, int],
     compile_options: str | None,
 ) -> _CuteLastLaunchCacheEntry | None:
+    if _cute_exchange_workspace_plan_present(cute_kernel):
+        # Exchange launches rebuild unowned temporary pointers; owned captures
+        # use their graph-tracked argument cache instead of a scalar attribute
+        # whose strong tensor owner would survive graph-resource release.
+        return None
     entry = getattr(cast("Any", cute_kernel), "_helion_cute_last_launch_cache", None)
     if not isinstance(entry, _CuteLastLaunchCacheEntry):
         return None
@@ -8924,6 +8966,8 @@ def _set_cute_last_launch_cache_entry(
     launch: _CuteLaunchArgCacheEntry,
     compiled: object,
 ) -> None:
+    if _cute_exchange_workspace_plan_present(cute_kernel):
+        return
     arg_guard = _cute_last_launch_arg_guard(cute_kernel, args, grid)
     compiled_discriminator = _cute_compiled_launcher_discriminator(
         launch.schema,

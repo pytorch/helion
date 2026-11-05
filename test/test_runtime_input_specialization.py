@@ -261,6 +261,11 @@ class TestCuteRuntimeInputSpecialization(unittest.TestCase):
                 "helion._compiler.cute.mma_support.get_cute_mma_support",
                 return_value=SimpleNamespace(tcgen05_f8=True, tcgen05_f16bf16=True),
             ),
+            # This is a synthetic FakeTensor planning test: the SM count is a
+            # hardware input, not permission to initialize an actual CUDA GPU.
+            patch(
+                "helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148
+            ) as num_sms,
         ):
             planning_results = []
             for m_hint, expected_plan in ((32, False), (256, True)):
@@ -297,6 +302,7 @@ class TestCuteRuntimeInputSpecialization(unittest.TestCase):
                         )
                         self.assertEqual(planning_result, repeated_result)
             self.assertEqual(len(planning_results), 2)
+            self.assertEqual(num_sms.call_count, 2)
             required_specialized_vars = frozenset().union(
                 *(result.required_specialized_vars for result in planning_results)
             )
@@ -422,6 +428,9 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY: specialization
         }
         env.bound_runtime_input_specialization_results = {}
+        env._capture_runtime_metadata = contextvars.ContextVar(
+            "test_capture_metadata", default=False
+        )
         env._runtime_arg_values_by_name = contextvars.ContextVar(
             "test_runtime_arg_values", default=None
         )
@@ -513,6 +522,9 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         env = cast("CompileEnvironment", object.__new__(CompileEnvironment))
         env.runtime_input_specializations = {key: specialization}
         env.bound_runtime_input_specialization_results = {}
+        env._capture_runtime_metadata = contextvars.ContextVar(
+            "test_capture_metadata", default=False
+        )
         env._runtime_arg_values_by_name = contextvars.ContextVar(
             "test_late_rekey_runtime_args", default=None
         )

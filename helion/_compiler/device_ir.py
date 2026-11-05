@@ -3920,9 +3920,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 from ..language.matmul_ops import enable_cute_tcgen05_search
                 from .cute.cute_mma import _rank3_grouped_root_axes
                 from .cute.cute_mma import analyze_cute_mma_node
+                from .cute.cute_mma import tcgen05_fp32_source_eligible
                 from .cute.cute_mma import (
                     tcgen05_fragment_epilogue_source_tiles_reachable,
                 )
+                from .cute.cute_mma import tcgen05_half_source_store_eligible
 
                 # The same structural analyzer gates tcgen05 search and codegen
                 # for every matrix rank. This prevents transformed loads from
@@ -4015,7 +4017,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 )
                 search_candidates = []
                 planning_results = []
-                for candidate, lhs, rhs, _node in mma_candidates:
+                sources_eligible = True
+                for candidate, lhs, rhs, node in mma_candidates:
                     planning_result = _plan_cute_tcgen05_search_candidate(
                         lhs,
                         rhs,
@@ -4042,6 +4045,19 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         operand_casts=candidate in cast_candidates,
                     )
                     planning_results.append(planning_result)
+                    if not tcgen05_half_source_store_eligible(
+                        device_ir.graphs, node, candidate.operands
+                    ) or (
+                        lhs.dtype == torch.float32
+                        and not tcgen05_fp32_source_eligible(
+                            device_ir.graphs,
+                            node,
+                            lhs_operand=candidate.operands.lhs,
+                            rhs_operand=candidate.operands.rhs,
+                        )
+                    ):
+                        sources_eligible = False
+                        continue
                     search_plan = planning_result.plan
                     if (
                         search_plan is None
@@ -4053,6 +4069,12 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     ):
                         continue
                     search_candidates.append((candidate, lhs, search_plan))
+                if not sources_eligible:
+                    # Do not promote a surviving subset into a native-only
+                    # family while another contraction's final stores require
+                    # scalar/collective lowering. Preserve every planning
+                    # result's guards and the fallback surface for this kernel.
+                    search_candidates.clear()
                 analysis_keys = {
                     (
                         candidate.operands.output_block_ids,

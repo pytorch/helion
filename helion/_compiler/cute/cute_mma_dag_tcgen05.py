@@ -402,6 +402,9 @@ class Tcgen05Facts:
     # (``cute_mma_dag_persistent``; None: it can, given the shared memory
     # of the persistent layout and a program-order schedule).
     persistent_reason: str | None = None
+    # Proved split/permuted root stores on the flat region renderer.  Their
+    # bases are map-derived; they never have output TMA descriptors.
+    mapped_store_regions: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -447,7 +450,9 @@ def derived_items(
 
 def _tma_dims(access: Access) -> tuple[int, ...]:
     """The tensor dims of ``access`` in TMA order (innermost first), unit
-    dims dropped."""
+    dims dropped.  A split store has only tile-local affine strides."""
+    if access.store_map is not None:
+        raise _decline("a split/permuted store has no output TMA descriptor proof")
     sizes = [int(s) for s in access.fake.shape]
     dims = [d for d in range(len(sizes)) if sizes[d] != 1]
     dims.sort(key=lambda d: access.strides[d])
@@ -466,6 +471,12 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
     target = env.config_spec.target_device_capability
     if target is None or target[0] != 10:
         return None
+    if any(store.access.store_map is not None for store in program.stores):
+        # A separate proof owns only full-K independent carries and complete
+        # mapped root tiles, on the flat region renderer with non-TMA stores.
+        from .cute_mma_dag_tcgen05_regions import region_facts
+
+        return region_facts(program, mapped_store_regions=True)
     if not program.loops or program.scans or program.windowed_stores:
         # A loop-less program (one GEMM over tiles staged once per CTA
         # with a fused epilogue) runs on the warp emitter: neither

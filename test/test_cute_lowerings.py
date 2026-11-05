@@ -320,6 +320,107 @@ def _make_tcgen05_persistent_config(**overrides: object) -> helion.Config:
     return helion.Config(**defaults)  # type: ignore[arg-type]
 
 
+def _assert_tcgen05_epilogue_source_declines(
+    bound, *, invalid_aux_kind: str | None = None
+) -> None:
+    """Pin the full source proof before a forced config's earlier backstop."""
+    from helion._compiler.cute import cute_epilogue
+    from helion._compiler.cute import cute_mma
+    from helion._compiler.cute.aux_tensor import analyze_tcgen05_matmul_store_chains
+    from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
+    from helion.language import memory_ops
+
+    assert not bound.config_spec.cute_tcgen05_search_enabled
+    with bound.env, bound.host_function:
+        graphs = bound.host_function.device_ir.graphs
+        anchors = [
+            node
+            for graph in graphs
+            for node in graph.graph.nodes
+            if node.target is torch.ops.aten.addmm.default
+        ]
+        assert len(anchors) == 1
+        (anchor,) = anchors
+        lhs, rhs = anchor.args[1:3]
+        assert isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)
+        operands = cute_mma._analyze_mma_operands(lhs, rhs, bound.env)
+        assert operands is not None
+        # These are valid half-MMA inputs; only the original final-store
+        # contract declines, not a malformed operand or absent MMA anchor.
+        assert operands.lhs.mma_dtype == operands.rhs.mma_dtype
+        assert operands.lhs.mma_dtype in (torch.float16, torch.bfloat16)
+        assert analyze_tcgen05_matmul_store_chains(graphs, anchor) is None
+        assert not cute_mma.tcgen05_half_source_store_eligible(graphs, anchor, operands)
+        if invalid_aux_kind is not None:
+            stores = [
+                node
+                for graph in graphs
+                for node in graph.graph.nodes
+                if node.target is memory_ops.store
+            ]
+            assert len(stores) == 1
+            store = stores[0]
+            value = store.args[2]
+            destination = store.args[0]
+            assert isinstance(value, torch.fx.Node) and isinstance(
+                destination, torch.fx.Node
+            )
+            tile_shape = cute_epilogue._carrier_tile_shape(value)
+            tile_indices = cute_epilogue._carrier_tile_index_nodes(value)
+            assert (
+                tile_shape is not None
+                and tile_indices is not None
+                and len(tile_indices) == 2
+            )
+            loads = [
+                node for node in store.graph.nodes if node.target is memory_ops.load
+            ]
+            source_name = (
+                "colvec"
+                if invalid_aux_kind == "leading_axis"
+                else "residual3d"
+                if invalid_aux_kind == "rank"
+                else "residual"
+            )
+            aux = [
+                node
+                for node in loads
+                if isinstance(node.args[0], torch.fx.Node)
+                and node.args[0].args == (source_name,)
+            ]
+            assert len(aux) == 1
+            load = aux[0]
+            source = load.args[0]
+            assert isinstance(source, torch.fx.Node)
+            source_value, loaded_value = source.meta["val"], load.meta["val"]
+            assert isinstance(source_value, torch.Tensor) and isinstance(
+                loaded_value, torch.Tensor
+            )
+            if invalid_aux_kind == "mask":
+                assert source_value.ndim == loaded_value.ndim == 2
+                assert tuple(loaded_value.shape) == tile_shape
+                assert isinstance(load.args[2], torch.fx.Node)
+                assert load.args[2].meta["val"].dtype is torch.bool
+            elif invalid_aux_kind == "rank":
+                assert source_value.ndim == 3 and loaded_value.ndim == 2
+                assert tuple(loaded_value.shape) == tile_shape
+                assert load.args[1][-1] == 0
+            else:
+                assert invalid_aux_kind == "leading_axis"
+                assert source_value.ndim == loaded_value.ndim == 1
+                assert load.args[1][0] is tile_indices[0]
+                assert load.args[1][0] is not tile_indices[1]
+            assert (
+                aux_tensor_load_kind(
+                    load,
+                    carrier_tile_shape=tile_shape,
+                    carrier_tile_index_nodes=tile_indices,
+                    carrier_global_shape=tuple(destination.meta["val"].shape),
+                )
+                is None
+            )
+
+
 def _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
     **overrides: object,
 ) -> helion.Config:
@@ -7425,34 +7526,25 @@ class TestCuteLowerings(unittest.TestCase):
         x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
-            cute_matmul_residual_transposed.bind((x, y, residual)).set_config(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
+        with patch_cute_mma_support():
+            bound = cute_matmul_residual_transposed.bind((x, y, residual))
+            _assert_tcgen05_epilogue_source_declines(bound)
+            with self.assertRaises(exc.BackendUnsupported) as cm:
+                bound.to_triton_code(
+                    _make_tcgen05_persistent_config(
+                        block_sizes=[128, 128, 32],
+                        pid_type="persistent_interleaved",
+                    )
                 )
-            )
-            cute_matmul_residual_transposed(x, y, residual)
-        # The diagnostic message points at the right invariant and
-        # specifically calls out the index-reordering rejection so
-        # the test pins which classifier branch fired (the input
-        # uses M == N == 128, so a non-square shape mismatch could
-        # not have triggered the rejection — without this message
-        # text assertion, a future change that flipped the rejection
-        # to "rank mismatch" or another path would silently pass).
-        # The pointwise re-binding check defers to this classifier
-        # for tcgen05 epilogue chains.
+        # Admission declines before native lane suppression. The original
+        # square, swapped-index expression is then rejected by the exact
+        # scalar lane-coordinate proof, before compilation or any store.
         message = str(cm.exception)
-        self.assertIn("tcgen05 MMA path", message)
-        self.assertIn("indices and masks", message)
-        self.assertIn("Identity stores", message)
-        self.assertIn(
-            "loads whose index expression is not exactly the carrier tile-id symbol",
-            message,
-        )
+        self.assertIn("aten.add.Tensor operand load", message)
+        self.assertIn("dim 0 (block id 1) bound to block id 0", message)
+        self.assertIn("dim 1 (block id 0) bound to block id 1", message)
+        self.assertIn("inside a lane loop", message)
+        self.assertIn("whole thread block at one barrier", message)
 
     def test_tcgen05_aux_load_placement_config(self) -> None:
         """The placement knob moves only aux loads across the acc wait."""
@@ -8076,18 +8168,21 @@ class TestCuteLowerings(unittest.TestCase):
         x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_scaled_residual_swapped.bind((x, y, residual))
+            _assert_tcgen05_epilogue_source_declines(bound)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             cfg = _make_tcgen05_persistent_config(
                 block_sizes=[128, 128, 32],
                 pid_type="persistent_interleaved",
             )
-            bound.to_triton_code(cfg)
-        self.assertIn("tcgen05 MMA path", str(cm.exception))
+            with self.assertRaises(exc.BackendUnsupported) as cm:
+                bound.to_triton_code(cfg)
+        self.assertIn("aten.add.Tensor operand _phi", str(cm.exception))
+        self.assertIn("dim 0 (block id 0) bound to block id 1", str(cm.exception))
+        self.assertIn("dim 1 (block id 1) bound to block id 0", str(cm.exception))
+        self.assertIn("inside a lane loop", str(cm.exception))
+        self.assertIn("whole thread block at one barrier", str(cm.exception))
 
     def test_tcgen05_fused_colvec_broadcast_rejected_at_classify_time(
         self,
@@ -8137,23 +8232,25 @@ class TestCuteLowerings(unittest.TestCase):
         x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         colvec = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
-            cute_matmul_colvec.bind((x, y, colvec)).set_config(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
-                )
+        with patch_cute_mma_support():
+            bound = cute_matmul_colvec.bind((x, y, colvec))
+            _assert_tcgen05_epilogue_source_declines(
+                bound, invalid_aux_kind="leading_axis"
             )
-            cute_matmul_colvec(x, y, colvec)
-        # The diagnostic message points at the loud-failure backstop
-        # for non-whitelisted fused epilogues (the pointwise re-binding
-        # check defers to it for tcgen05 epilogue chains).
+            with self.assertRaises(exc.BackendUnsupported) as cm:
+                bound.to_triton_code(
+                    _make_tcgen05_persistent_config(
+                        block_sizes=[128, 128, 32],
+                        pid_type="persistent_interleaved",
+                    )
+                )
+        # The full classifier above pins the original invalid leading-axis
+        # source; forcing a persistent-native config hits the earlier guard.
         message = str(cm.exception)
-        self.assertIn("tcgen05 MMA path", message)
-        self.assertIn("rowvec", message)
+        self.assertIn(
+            "persistent tcgen05 pid_type requires the tcgen05 matmul plan", message
+        )
+        self.assertIn("generic SIMT lowering", message)
 
     def test_tcgen05_fused_bias_broadcast_codegen_marker(self) -> None:
         """The spliced rowvec broadcast emits an ``aux_view2d`` local
@@ -8313,20 +8410,21 @@ class TestCuteLowerings(unittest.TestCase):
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         mask = torch.ones(128, 128, dtype=torch.bool, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
-            cute_matmul_residual_masked.bind((x, y, residual, mask)).set_config(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
+        with patch_cute_mma_support():
+            bound = cute_matmul_residual_masked.bind((x, y, residual, mask))
+            _assert_tcgen05_epilogue_source_declines(bound, invalid_aux_kind="mask")
+            with self.assertRaises(exc.BackendUnsupported) as cm:
+                bound.to_triton_code(
+                    _make_tcgen05_persistent_config(
+                        block_sizes=[128, 128, 32],
+                        pid_type="persistent_interleaved",
+                    )
                 )
-            )
-            cute_matmul_residual_masked(x, y, residual, mask)
-        # The diagnostic must point at the cute MMA path (the
-        # loud-failure backstop message).
-        self.assertIn("tcgen05 MMA path", str(cm.exception))
+        self.assertIn(
+            "persistent tcgen05 pid_type requires the tcgen05 matmul plan",
+            str(cm.exception),
+        )
+        self.assertIn("generic SIMT lowering", str(cm.exception))
 
     def test_tcgen05_fused_aux_rejects_rank_mismatch(self) -> None:
         """Reject 2-D aux loads whose underlying tensor is rank-3
@@ -8364,18 +8462,21 @@ class TestCuteLowerings(unittest.TestCase):
         x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         residual3d = torch.randn(128, 128, 1, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
-            cute_matmul_residual_3d.bind((x, y, residual3d)).set_config(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
+        with patch_cute_mma_support():
+            bound = cute_matmul_residual_3d.bind((x, y, residual3d))
+            _assert_tcgen05_epilogue_source_declines(bound, invalid_aux_kind="rank")
+            with self.assertRaises(exc.BackendUnsupported) as cm:
+                bound.to_triton_code(
+                    _make_tcgen05_persistent_config(
+                        block_sizes=[128, 128, 32],
+                        pid_type="persistent_interleaved",
+                    )
                 )
-            )
-            cute_matmul_residual_3d(x, y, residual3d)
-        self.assertIn("tcgen05 MMA path", str(cm.exception))
+        self.assertIn(
+            "persistent tcgen05 pid_type requires the tcgen05 matmul plan",
+            str(cm.exception),
+        )
+        self.assertIn("generic SIMT lowering", str(cm.exception))
 
     def test_tcgen05_fused_aux_partial_single_edge_runtime_correctness(self) -> None:
         """Aux fusion on the SIMT-store fallback predicates aux loads too.
@@ -8660,6 +8761,7 @@ class TestCuteLowerings(unittest.TestCase):
         # facing ``add(acc, 2.0)`` with empty kwargs, the splice
         # would fire, and no ``BackendUnsupported`` would surface;
         # the test would pass for the wrong reason.
+        from helion._compiler.cute import aux_tensor
         from helion._compiler.cute import cute_epilogue
         from helion._compiler.cute import memory_ops
 
@@ -8681,19 +8783,25 @@ class TestCuteLowerings(unittest.TestCase):
         x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
             patch_cute_mma_support(),
             patch.object(cute_epilogue, "analyze_tcgen05_unary_epilogue_chain", spy),
             patch.object(memory_ops, "analyze_tcgen05_unary_epilogue_chain", spy),
+            patch.object(aux_tensor, "analyze_tcgen05_unary_epilogue_chain", spy),
         ):
-            cute_matmul_add_alpha.bind((x, y)).set_config(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
+            bound = cute_matmul_add_alpha.bind((x, y))
+            _assert_tcgen05_epilogue_source_declines(bound)
+            with self.assertRaises(exc.BackendUnsupported) as cm:
+                bound.to_triton_code(
+                    _make_tcgen05_persistent_config(
+                        block_sizes=[128, 128, 32],
+                        pid_type="persistent_interleaved",
+                    )
                 )
-            )
-            cute_matmul_add_alpha(x, y)
-        self.assertIn("tcgen05 MMA path", str(cm.exception))
+        self.assertIn(
+            "persistent tcgen05 pid_type requires the tcgen05 matmul plan",
+            str(cm.exception),
+        )
+        self.assertIn("generic SIMT lowering", str(cm.exception))
         # The analyzer must have seen at least one `aten.add.Tensor`
         # node carrying the `alpha` kwarg — otherwise the test is
         # passing because of some other unrelated rejection (e.g.,
@@ -8902,12 +9010,10 @@ class TestCuteLowerings(unittest.TestCase):
         Entrance test for the ``F.gelu(approximate="tanh")`` -> single
         FX node mapping. The eager Python form
         ``0.5 * acc * (1 + torch.tanh(acc * (a + b * acc * acc)))``
-        references ``acc`` four times and is rejected by the chain
-        analyzer's linear-chain assumption (negative pinned by
-        ``test_tcgen05_fused_gelu_tanh_approx_eager_polynomial_rejected``);
-        the device_ir decomp folds the whole expression into a single
-        ``_UnaryOp`` row so the splice site emits the polynomial
-        against the already-bound carrier local.
+        references ``acc`` four times and is covered separately by the bounded
+        same-anchor DAG runtime test. The device_ir decomp still folds the
+        functional GELU expression into a single ``_UnaryOp`` row so the splice
+        site emits the polynomial against the already-bound carrier local.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -9280,24 +9386,17 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("0.044715", code)
         self.assertNotIn("tcgen05_chain_step_in", code)
 
-    def test_tcgen05_fused_gelu_tanh_approx_eager_polynomial_rejected(
+    def test_tcgen05_fused_gelu_tanh_approx_eager_polynomial_runtime_correctness(
         self,
     ) -> None:
-        """The eager Python form of the tanh-approx GELU polynomial
-        (``0.5 * acc * (1 + torch.tanh(acc * (a + b * acc * acc)))``)
-        is rejected by the chain analyzer's linear-chain assumption
-        and bails to the loud-failure ``BackendUnsupported`` backstop.
+        """The original four-use polynomial now has a proved single-anchor DAG.
 
-        Pins the chain analyzer's reuse limitation: the carrier
-        ``acc`` appears four times in the FX graph for the eager
-        form, but each chain step consumes exactly one tensor input
-        (the previous step's output). Folding the polynomial behind
-        the ``_gelu_tanh_approx`` decomp (driven by
-        ``F.gelu(approximate="tanh")``) is the load-bearing reason
-        this test exists — without it, the user cannot fuse the
-        tanh-approx GELU into a tcgen05 epilogue.
+        Preserve the eager expression's association and literal coefficients;
+        compare against FP32 eager arithmetic before the original output cast,
+        not a rounded low-precision matmul or a rewritten GELU decomposition.
         """
-
+        from helion._compiler.cute.aux_tensor import analyze_tcgen05_matmul_store_chains
+        from helion._compiler.cute.cute_epilogue import _PointwiseDagExpr
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
         if not get_cute_mma_support().tcgen05_f16bf16:
@@ -9323,35 +9422,108 @@ class TestCuteLowerings(unittest.TestCase):
                 ).to(x.dtype)
             return out
 
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32], pid_type="persistent_interleaved"
+        )
+        torch.manual_seed(0)
+        for dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                x = torch.randn(128, 128, dtype=dtype, device=DEVICE) * 0.25
+                y = torch.randn(128, 128, dtype=dtype, device=DEVICE) * 0.25
+                original_x, original_y = x.clone(), y.clone()
+                bound = cute_matmul_gelu_eager.bind((x, y))
+                self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+                with bound.env, bound.host_function:
+                    graphs = bound.host_function.device_ir.graphs
+                    anchor = next(
+                        node
+                        for graph in graphs
+                        for node in graph.graph.nodes
+                        if node.target is torch.ops.aten.addmm.default
+                    )
+                    stores = analyze_tcgen05_matmul_store_chains(graphs, anchor)
+                    assert stores is not None and len(stores) == 1
+                    self.assertTrue(
+                        any(
+                            isinstance(step.expr, _PointwiseDagExpr)
+                            for step in stores[0][1].steps
+                        )
+                    )
+                bound.set_config(cfg)
+                code = bound.to_triton_code(cfg)
+                self.assertIn("tcgen05_ab_tma", code)
+                self.assertIn("tcgen05_acc_loaded", code)
+                self.assertIn("tcgen05_dag_step", code)
+                self.assertIn("cute.math.tanh", code)
+                self.assertIn("0.7978845608", code)
+                self.assertIn("0.0356774081", code)
+                self.assertNotIn("dot_acc = dot_acc +", code)
+                acc = x.float() @ y.float()
+                expected = (
+                    0.5
+                    * acc
+                    * (
+                        1.0
+                        + torch.tanh(acc * (0.7978845608 + 0.0356774081 * acc * acc))
+                    )
+                ).to(dtype)
+                actual = bound(x, y)
+                torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
+                self.assertEqual(actual.dtype, dtype)
+                self.assertEqual(actual.shape, expected.shape)
+                torch.testing.assert_close(x, original_x, atol=0, rtol=0)
+                torch.testing.assert_close(y, original_y, atol=0, rtol=0)
+
+    def test_tcgen05_fused_eager_polynomial_with_unknown_unary_rejected(self) -> None:
+        """Reconvergence support must not admit an unknown pointwise operation."""
+        from helion._compiler.cute.aux_tensor import analyze_tcgen05_matmul_store_chains
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_unknown(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (0.5 * acc * (1.0 + torch.sin(acc * acc))).to(
+                    x.dtype
+                )
+            return out
+
         x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
-            bound = cute_matmul_gelu_eager.bind((x, y))
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[128, 128, 32],
-                pid_type="persistent_interleaved",
+        bound = cute_matmul_unknown.bind((x, y))
+        self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
+        with bound.env, bound.host_function:
+            graphs = bound.host_function.device_ir.graphs
+            anchor = next(
+                node
+                for graph in graphs
+                for node in graph.graph.nodes
+                if node.target is torch.ops.aten.addmm.default
             )
+            self.assertIsNone(analyze_tcgen05_matmul_store_chains(graphs, anchor))
+        # The complete source gate now declines this chain before assigning
+        # a native-only launch layout. An explicit persistent-native request
+        # must fail at that earlier backstop, not execute unknown DAG math.
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32], pid_type="persistent_interleaved"
+        )
+        with self.assertRaises(exc.BackendUnsupported) as cm:
             bound.set_config(cfg)
             bound(x, y)
-        msg = str(cm.exception)
-        # Pin the loud-failure backstop wording so an unrelated
-        # rejection path (e.g. an aux load misclassification) cannot
-        # accidentally satisfy this assertion. The backstop fires
-        # because the eager ``acc * acc`` multiply has two tensor
-        # operands (both reach the matmul carrier), which the
-        # whitelist rejects as a non-scalar binary op.
         self.assertIn(
-            "non-whitelisted fused epilogues",
-            msg,
+            "persistent tcgen05 pid_type requires the tcgen05 matmul plan",
+            str(cm.exception),
         )
-        self.assertIn(
-            "non-scalar binary ops",
-            msg,
-        )
+        self.assertIn("generic SIMT lowering", str(cm.exception))
 
     def test_tcgen05_fused_symfloat_scalar_epilogue_runtime_correctness(
         self,
@@ -26686,9 +26858,9 @@ class TestCuteLivePermuteKeepsThreadElement(unittest.TestCase):
             )
 
     def test_deferred_rebound_epilogue_into_atomic_is_checked(self) -> None:
-        # The pointwise check is deferred for tcgen05 epilogue chains; an
-        # atomic consumer takes no store path, so the end-of-codegen drain
-        # must raise it.
+        # Source admission now declines the atomic's rebound expression before
+        # native lane suppression; the retained lane-coordinate guard rejects
+        # the original invalid read before any atomic execution.
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
         if not get_cute_mma_support().tcgen05_f16bf16:
@@ -26696,18 +26868,19 @@ class TestCuteLivePermuteKeepsThreadElement(unittest.TestCase):
         x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaisesRegex(
-                exc.BackendUnsupported, "at the position of another block's lane"
-            ),
-            patch_cute_mma_support(),
-        ):
+        with patch_cute_mma_support():
             bound = _cute_matmul_rebound_epilogue_into_atomic.bind((x, y, residual))
-            # A flat pid: beside persistent warp roles the atomic is refused
-            # before the drain runs.
-            bound.to_triton_code(
-                _make_tcgen05_persistent_config(block_sizes=[128, 128, 32])
-            )
+            _assert_tcgen05_epilogue_source_declines(bound)
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "aten.add.Tensor operand convert_element_type .*re-binds .*inside a lane loop; "
+                "the exchange needs the whole thread block at one barrier",
+            ):
+                # Keep the original flat pid and geometry; the invalid
+                # expression must be rejected during source generation.
+                bound.to_triton_code(
+                    _make_tcgen05_persistent_config(block_sizes=[128, 128, 32])
+                )
 
     def test_atomic_into_slice_keeps_its_own_diagnostic(self) -> None:
         # The slice is not a tile for the re-binding check (compute_shape
@@ -26752,19 +26925,20 @@ class TestCuteLivePermuteKeepsThreadElement(unittest.TestCase):
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
         x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaisesRegex(
-                exc.BackendUnsupported, "re-binds .* of a tcgen05 matmul epilogue"
-            ),
-            patch_cute_mma_support(),
-        ):
+        with patch_cute_mma_support():
             bound = _cute_matmul_transposed_accumulator_store.bind((x, y))
-            bound.to_triton_code(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
+            _assert_tcgen05_epilogue_source_declines(bound)
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "store of .*re-binds .*inside a lane loop; "
+                "the exchange needs the whole thread block at one barrier",
+            ):
+                bound.to_triton_code(
+                    _make_tcgen05_persistent_config(
+                        block_sizes=[128, 128, 32],
+                        pid_type="persistent_interleaved",
+                    )
                 )
-            )
 
 
 @onlyBackends(["cute"])

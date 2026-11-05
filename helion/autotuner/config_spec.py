@@ -4465,7 +4465,12 @@ class ConfigSpec:
         )
         if not facts.identity_candidates and not tcgen05_exchange:
             config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
-        if not facts.staging:
+        mapped_root_stores = (
+            config[MMA_DAG_KEY] == MMA_DAG_TCGEN05
+            and facts.tcgen05 is not None
+            and facts.tcgen05.mapped_store_regions
+        )
+        if not facts.staging and not mapped_root_stores:
             config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
         if not facts.aux_candidates:
             config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]

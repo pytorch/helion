@@ -1640,32 +1640,66 @@ def test_the_fixup_counters_survive_the_wrap() -> None:
     fn = bound.compile_config(bound.config_spec.normalized_config(config))
     expected = fn(x, y, weight, bias)
     kernel = fn.__globals__["_helion__matmul_layernorm"]
-    caches = kernel._helion_mma_dag_fixup_workspace_cache
-    (workspace,) = caches.values()
+    # Eager workspaces are deliberately temporary. Exercise the unchanged
+    # growing-ticket protocol through the existing owned graph API instead.
+    from unittest.mock import patch
+
+    from helion.runtime.cute import launcher
+
     tiles, rounds, rows, row_tiles = 8, 1, 64, m // 64
     period = 1 << (rounds * tiles - 1).bit_length()
-    counters = workspace[tiles * row_tiles * rows * 4 * 2 :][: row_tiles * 4].view(
-        torch.int32
-    )
-    # The compiled module, and with it this workspace, is shared with every
-    # earlier compile of this kernel at this shape and config in the process
-    # (the deterministic-split test below is one), and each of their launches
-    # advanced every counter by one period.
-    launched = counters[0].item()
-    assert launched >= period and launched % period == 0
-    assert counters.tolist() == [launched] * row_tiles
-    for seed in (2**31 - period, 2**32 - period, 2**32 - 2 * period):
-        counters.fill_(seed - 2**32 if seed >= 2**31 else seed)
-        torch.cuda.synchronize()
-        for launch in range(3):
-            out = fn(x, y, weight, bias)
+    allocate = launcher._cached_exchange_workspace
+    for seed in (0, 2**31 - period, 2**32 - period, 2**32 - 2 * period):
+        initialized = set()
+        workspace_values = []
+        counters_by_launch = []
+        outputs = []
+
+        def seed_owned_workspace(
+            *args,
+            _seed=seed,
+            _initialized=initialized,
+            _workspace_values=workspace_values,
+            **kwargs,
+        ):
+            workspace = allocate(*args, **kwargs)
+            if id(workspace) not in _initialized:
+                _initialized.add(id(workspace))
+                _workspace_values.append(workspace)
+                counters = workspace[tiles * row_tiles * rows * 4 * 2 :][
+                    : row_tiles * 4
+                ].view(torch.int32)
+                counters.fill_(_seed - 2**32 if _seed >= 2**31 else _seed)
+            return workspace
+
+        with (
+            patch.object(
+                launcher, "_cached_exchange_workspace", side_effect=seed_owned_workspace
+            ),
+            launcher.cute_cuda_graph() as graph,
+        ):
+            for _ in range(3):
+                outputs.append(fn(x, y, weight, bias))
+                counters = workspace_values[0][tiles * row_tiles * rows * 4 * 2 :][
+                    : row_tiles * 4
+                ].view(torch.int32)
+                counters_by_launch.append(counters.clone())
+        assert len(workspace_values) == 1
+        for _ in range(3):
+            graph.replay()
             torch.cuda.synchronize()
-            assert torch.equal(out, expected), (seed, launch)
-            value = (seed + (launch + 1) * period) % 2**32
-            assert (
-                counters.tolist()
-                == [value - 2**32 if value >= 2**31 else value] * row_tiles
-            )
+            for launch, (out, counters) in enumerate(
+                zip(outputs, counters_by_launch, strict=True)
+            ):
+                assert torch.equal(out, expected), (seed, launch)
+                value = (seed + (launch + 1) * period) % 2**32
+                assert (
+                    counters.tolist()
+                    == [value - 2**32 if value >= 2**31 else value] * row_tiles
+                )
+        graph.reset()
+        assert kernel._helion_mma_dag_fixup_workspace_cache == {}
+        assert kernel._helion_cute_launch_arg_cache == {}
 
 
 @pytest.mark.parametrize(

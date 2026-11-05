@@ -24,6 +24,8 @@ from collections.abc import Mapping
 import contextlib
 from dataclasses import dataclass
 from dataclasses import replace
+from itertools import pairwise
+from itertools import starmap
 import os
 import textwrap
 from typing import TYPE_CHECKING
@@ -430,6 +432,9 @@ class _MmaOperandInfo:
     # the tensor core and never sees a cast operand (``allow_integer_casts``
     # on ``analyze_cute_mma_node`` is opt-in for exactly that reason).
     cast_dtype: torch.dtype | None = None
+    # A proved load -> FP32 -> same half dtype identity. The FX casts remain
+    # untouched; transport consumes the original bits only under this proof.
+    exact_round_trip_casts: tuple[Node, ...] = ()
 
     @property
     def mma_dtype(self) -> torch.dtype:
@@ -911,6 +916,9 @@ def _sole_user_is(node: Node, expected_user: Node) -> bool:
 def _operand_load_path_exclusive(info: _MmaOperandInfo, fx_node: Node) -> bool:
     if info.collective_dependency_nodes:
         return False
+    if info.exact_round_trip_casts:
+        path = (info.load, *info.exact_round_trip_casts, fx_node)
+        return info.terminal is path[-2] and all(starmap(_sole_user_is, pairwise(path)))
     if info.terminal is info.load:
         return _sole_user_is(info.load, fx_node)
     return _sole_user_is(info.load, info.terminal) and _sole_user_is(
@@ -2640,6 +2648,18 @@ def _trace_to_mma_operand(
         if rank3_rhs is not None:
             return rank3_rhs
 
+    round_trip = _exact_half_mma_operand_round_trip(node)
+    if round_trip is not None:
+        load_node, casts = round_trip
+        traced = _direct_load_tensor(load_node)
+        assert traced is not None
+        return _MmaOperandInfo(
+            load=load_node,
+            terminal=node,
+            source_fake=traced[2],
+            logical_fake=traced[2],
+            exact_round_trip_casts=casts,
+        )
     original_node = node
     unwrapped_node, mask_to_node = _unwrap_zero_mask_to(node)
     grouped_k_mask = None
@@ -3695,6 +3715,62 @@ def ensure_tcgen05_fragment_epilogue_plan(
     return True
 
 
+def _exact_half_mma_operand_round_trip(
+    node: Node,
+) -> tuple[Node, tuple[Node, ...]] | None:
+    """Prove only a direct, unmasked half -> FP32 -> same-half identity.
+
+    Share MMA-DAG's exact-width proof; retain node positions for ownership and
+    source-format planning. No mutation of the source graph or casts occurs.
+    """
+    from .cute_mma_dag import _exact_round_trip
+
+    casts: list[Node] = []
+    current = node
+    for _ in range(2):
+        if (
+            current.op != "call_function"
+            or current.target is not torch.ops.prims.convert_element_type.default
+            or current.kwargs
+            or len(current.args) != 2
+            or not isinstance(current.args[0], Node)
+            or not isinstance(current.args[1], torch.dtype)
+        ):
+            return None
+        casts.append(current)
+        current = current.args[0]
+    direct = _direct_load_tensor(current)
+    if direct is None or not _is_unmasked_load(current):
+        return None
+    source = current.meta.get("val")
+    backing = direct[2]
+    if (
+        not isinstance(source, torch.Tensor)
+        or source.ndim != 2
+        or source.dtype not in (torch.float16, torch.bfloat16)
+        or backing.dtype != source.dtype
+        or backing.ndim != 2
+        or casts[1].args[1] is not torch.float32
+    ):
+        return None
+    key = tuple(
+        (cast_node.target, ("source", cast_node.args[1]), (), ()) for cast_node in casts
+    )
+    if not _exact_round_trip(key, source.dtype):
+        return None
+    for cast_node in casts:
+        value = cast_node.meta.get("val")
+        if (
+            cast_node.graph is not current.graph
+            or not isinstance(value, torch.Tensor)
+            or value.dtype != cast_node.args[1]
+            or value.shape != source.shape
+            or value.stride() != source.stride()
+        ):
+            return None
+    return current, tuple(reversed(casts))
+
+
 def _unwrap_lossless_mma_upcast(node: Node) -> Node:
     """Recover only the single half/BF16-to-FP32 conversion MMA can absorb."""
     if (
@@ -3843,8 +3919,13 @@ def _analyze_mma_operand(
         return None
     load_value, source_to_logical_order = permute
     cast_dtype: torch.dtype | None = None
+    round_trip_casts: tuple[Node, ...] = ()
     if source_to_logical_order is None:
-        load_value = _unwrap_lossless_mma_upcast(load_value)
+        round_trip = _exact_half_mma_operand_round_trip(load_value)
+        if round_trip is not None:
+            load_value, round_trip_casts = round_trip
+        else:
+            load_value = _unwrap_lossless_mma_upcast(load_value)
         if allow_integer_casts:
             unwrapped = _unwrap_integer_operand_cast(load_value)
             if unwrapped is not None:
@@ -3891,6 +3972,7 @@ def _analyze_mma_operand(
         block_ids=block_ids,
         source_to_logical_order=source_to_logical_order,
         cast_dtype=cast_dtype,
+        exact_round_trip_casts=round_trip_casts,
     )
 
 
@@ -5718,6 +5800,10 @@ def prepare_cute_collective_lane_loop_suppression(
                 != "tcgen05"
             ):
                 continue
+            if not tcgen05_half_source_store_eligible(
+                cg.codegen_graphs, node, analysis
+            ):
+                continue
             if lhs_fake.dtype == torch.float32 and _tcgen05_fp32_lowering_blocked(
                 cg,
                 node,
@@ -7153,6 +7239,28 @@ def _trace_mma_to_stores(
     mma_node: Node,
     graphs: list[GraphInfo],
 ) -> tuple[Node, ...] | None:
+    linear = _trace_mma_to_stores_linear(mma_node, graphs)
+    if linear is not None:
+        return linear
+    # New DAG operations cannot silently fall back to an unknown single-store
+    # lifetime. Reuse the complete anchored/store/read-only proof so TMEM stays
+    # live through every original output, including a pre-activation store.
+    from .cute_epilogue import _PointwiseDagExpr
+
+    chains = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+    if chains is None or not any(
+        isinstance(step.expr, _PointwiseDagExpr)
+        for _, chain in chains
+        for step in chain.steps
+    ):
+        return None
+    return tuple(store for store, _ in chains)
+
+
+def _trace_mma_to_stores_linear(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> tuple[Node, ...] | None:
     """Forward-trace ``mma_node`` to all reachable supported stores."""
     import operator
 
@@ -7355,6 +7463,60 @@ def _analyze_mma_output_stores(
     )
 
 
+def tcgen05_half_source_store_eligible(
+    graphs: Sequence[GraphInfo], node: Node, operands: _MmaOperandAnalysis
+) -> bool:
+    """The ordinary half-precision native path must own every final store.
+
+    Its native grid omits SIMT indices/masks just like FP32.  Prove complete
+    store lowering (including the existing committed fragment-epilogue path)
+    before search admission or lane suppression.  Leading/grouped protocols
+    retain their separate existing store proofs; no new protocol is admitted.
+    """
+    if operands.lhs.mma_dtype not in (torch.bfloat16, torch.float16):
+        return True
+    if operands.has_leading_passthrough or operands.rhs.rhs_is_grouped:
+        return True
+    output = _analyze_mma_output_stores(node, operands, graphs=list(graphs))
+    if output is None:
+        return False
+    return (
+        output.requires_fragment_epilogue
+        or _trace_mma_to_store_dtype(node, list(graphs)) is not None
+    )
+
+
+def tcgen05_fp32_source_eligible(
+    graphs: Sequence[GraphInfo],
+    node: Node,
+    *,
+    lhs_operand: _MmaOperandInfo,
+    rhs_operand: _MmaOperandInfo,
+) -> bool:
+    """Config-independent source proof for the native FP32 TMA/epilogue path.
+
+    Search admission and final lowering must agree before a kernel receives
+    the role-specialized search surface. FP32 cannot use the scalar AB
+    producer, grouped/leading-axis protocols, or an unsupported store chain.
+    Tile geometry, TensorMap pointer/stride alignment, grouped-mode requests
+    and epilogue subtiling remain separate lowering checks; this proof does
+    not admit those requests or replace the final TMA pipeline guard.
+    """
+    if not (
+        lhs_operand.matrix_major == "row" and rhs_operand.matrix_major in ("row", "col")
+    ):
+        return False
+    if (
+        lhs_operand.is_leading_passthrough
+        or rhs_operand.is_leading_passthrough
+        or rhs_operand.rhs_rank3_grouped_nt
+        or rhs_operand.rhs_segment_group is not None
+        or rhs_operand.rhs_packed_group is not None
+    ):
+        return False
+    return analyze_tcgen05_matmul_store_chains(graphs, node) is not None
+
+
 def _tcgen05_fp32_lowering_blocked(
     cg: GenerateAST,
     node: Node,
@@ -7381,25 +7543,17 @@ def _tcgen05_fp32_lowering_blocked(
     drop the index/mask definitions the universal fallback needs (see the
     mirror-bailout comment in the suppression planner).
     """
-    if not (
-        lhs_operand.matrix_major == "row" and rhs_operand.matrix_major in ("row", "col")
-    ):
-        return True
-    # Batched (leading-passthrough) and grouped/worklist/rank-3 forms are
-    # validated 16-bit/fp8 families only.
-    if (
-        lhs_operand.is_leading_passthrough
-        or rhs_operand.is_leading_passthrough
-        or rhs_operand.rhs_rank3_grouped_nt
-        or rhs_operand.rhs_segment_group is not None
-        or rhs_operand.rhs_packed_group is not None
-        or _tcgen05_grouped_mode(cast("_ConfigLike", config)) is not None
-    ):
+    if _tcgen05_grouped_mode(cast("_ConfigLike", config)) is not None:
         return True
     subtile = cast("_ConfigLike", config).get("epilogue_subtile")
     if subtile is not None and (isinstance(subtile, bool) or subtile != 1):
         return True
-    return analyze_tcgen05_matmul_store_chains(cg.codegen_graphs, node) is None
+    return not tcgen05_fp32_source_eligible(
+        cg.codegen_graphs,
+        node,
+        lhs_operand=lhs_operand,
+        rhs_operand=rhs_operand,
+    )
 
 
 def _rank3_rhs_worklist_store_info(
@@ -8694,6 +8848,17 @@ def _emit_mma_pipeline(
         raise exc.BackendUnsupported(
             "cute", "physical grouped K128 requires native tcgen05 MMA"
         )
+    if (
+        mma_impl == "tcgen05"
+        and input_dtype in (torch.bfloat16, torch.float16)
+        and analysis is not None
+        and fx_node is not None
+        and not tcgen05_half_source_store_eligible(cg.codegen_graphs, fx_node, analysis)
+    ):
+        # Match preflight/lane-suppression admission.  Native output lowering
+        # cannot fall through to SIMT stores after their indices are omitted.
+        # Keep the existing universal result for the full unsupported chain.
+        mma_impl = "universal"
     if mma_impl == "tcgen05" and input_dtype == torch.float32:
         # fp32 operands run the tcgen05 MMA as tf32 (permitted by
         # settings.dot_precision, checked in _mma_impl_matches_problem_shape).

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from dataclasses import replace
 from itertools import starmap
 import operator
 from typing import TYPE_CHECKING
@@ -2276,6 +2277,54 @@ def _lower_site(
         if len(bound_values) == 1
         else (bound_values[0], bound_values[1])
     )
+    if native is not None and df.config.get("cute_collective_stages", 1) == 2:
+        recipes: list[ast.stmt] = [
+            *a_statements,
+            *b_statements,
+            ast.Expr(a_value),
+            ast.Expr(b_value),
+        ]
+        recipe_rw = ReadWrites.from_list(recipes)
+        external_reads = set(recipe_rw.reads) - set(recipe_rw.writes)
+        changing = set(ReadWrites.from_list(k_loop.body).writes) - {site.k_offset}
+        independent = not external_reads.intersection(changing)
+        unmasked = not any(
+            isinstance(node, (ast.If, ast.IfExp, ast.Compare, ast.BoolOp))
+            for statement in recipes
+            for node in ast.walk(statement)
+        )
+        no_other_smem = not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("alloc_smem", "SmemAllocator")
+            for statement in body
+            for node in ast.walk(statement)
+        )
+        env = CompileEnvironment.current()
+        capacity = (
+            env.config_spec._cute_tcgen05_config.per_cta_smem_capacity_bytes(env.device)
+            if native.a_in_tmem
+            and env.settings.static_shapes
+            and independent
+            and unmasked
+            and no_other_smem
+            and len(df.cute_state.collective_mma_sites) == 1
+            else 0
+        )
+        native = replace(
+            native,
+            operand_stages=native.pipeline_stages(
+                2,
+                k_start,
+                k_stop,
+                static_shapes=env.settings.static_shapes,
+                unmasked_recipes=unmasked,
+                independent_recipes=independent,
+                single_site=len(df.cute_state.collective_mma_sites) == 1,
+                no_other_smem=no_other_smem,
+                capacity_bytes=capacity,
+            ),
+        )
     stages = (
         cast("int", df.config.get("cute_collective_stages", 1))
         if native is None
@@ -2716,7 +2765,9 @@ for {rounding_slot} in cutlass.range({elements // 128}, unroll=1):
                 preserve_pointer_swizzle=native is not None or tf32,
             )
             slot_guard = ast.parse(f"{flat} < {elements}", mode="eval").body
-            if copy_strategy == "async_cached":
+            if copy_strategy == "async_cached" and (
+                native is None or native.operand_stages == 1
+            ):
                 prefix_end = next(
                     (
                         i
@@ -2850,7 +2901,17 @@ for {prefix}_ki in {mma_range}:
         k_loop,
     )
     reduction_schedule = (
-        pipeline_collective_loop(
+        native.pipeline_loop(
+            collective_k,
+            a_copy,
+            a_publish,
+            b_copy,
+            k_start,
+            k_stop,
+            async_copies=async_copies,
+        )
+        if native is not None and native.operand_stages == 2
+        else pipeline_collective_loop(
             collective_k,
             [a_copy, b_copy],
             mma_loop,

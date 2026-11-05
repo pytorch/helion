@@ -1,8 +1,9 @@
 """Native SM100 compute for independently proven collective scalar recipes.
 
 The caller retains operand generation, masks, row traversal, and the scalar
-epilogue. This module owns only shared operand layouts and a synchronous
-single-CTA TCGEN05/TMEM lifetime. It does not require a unique scatter index.
+epilogue. This module owns shared operand layouts and a single-CTA
+TCGEN05/TMEM lifetime. A guarded two-stage path overlaps operand production,
+but every dependent MMA and TMEM publication still waits for completion.
 """
 
 from __future__ import annotations
@@ -10,7 +11,9 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 
+from ..ast_read_writes import ast_rename
 from .collective_tmem_operand import CollectiveTmemOperand
+from .scalar_recipe import _clone
 
 
 def _statements(source: str) -> list[ast.stmt]:
@@ -129,6 +132,73 @@ class CollectiveTcgen05Plan:
     zero_seed: bool = True
     operands: CollectiveOperandSmem | None = None
     a_in_tmem: bool = False
+    operand_stages: int = 1
+
+    def b_stage_stride_aligned(self) -> bool:
+        # K_SW/MN_SW atoms span eight swizzle-width byte vectors. The base
+        # is 1024-byte aligned; each slot must keep those same swizzle bits.
+        element_bytes = 4 if self.dtype == "cutlass.TFloat32" else 2
+        swizzle_bytes = min(
+            128, element_bytes * (self.bk if self.b_k_major else self.bn)
+        )
+        atom_bytes = 8 * swizzle_bytes
+        slot_bytes = self.bn * self.bk * element_bytes
+        return 1024 % atom_bytes == 0 and slot_bytes % atom_bytes == 0
+
+    def pipeline_stages(
+        self,
+        requested: int,
+        start: ast.expr,
+        stop: ast.expr,
+        *,
+        static_shapes: bool,
+        unmasked_recipes: bool,
+        independent_recipes: bool,
+        single_site: bool,
+        no_other_smem: bool,
+        capacity_bytes: int,
+    ) -> int:
+        """Admit one register-produced A ahead of the live TMEM A.
+
+        B has two disjoint shared slots. The existing A register fragment is
+        the producer slot; the current MMA reads only the published TMEM slot.
+        Wider rings, masked ranges and unknown arenas retain stage one.
+        """
+
+        def literal(value: ast.expr) -> int | None:
+            if (
+                isinstance(value, ast.Call)
+                and ast.unparse(value.func) == "cutlass.Int32"
+                and len(value.args) == 1
+                and not value.keywords
+            ):
+                value = value.args[0]
+            if isinstance(value, ast.Constant) and type(value.value) is int:
+                return value.value
+            return None
+
+        first, last = literal(start), literal(stop)
+        if not (
+            type(requested) is int
+            and requested == 2
+            and self.a_in_tmem
+            and self.dtype in ("cutlass.Float16", "cutlass.BFloat16")
+            and self.b_stage_stride_aligned()
+            and static_shapes
+            and unmasked_recipes
+            and independent_recipes
+            and single_site
+            and no_other_smem
+            and first is not None
+            and last is not None
+            and 0 <= first < last < (1 << 31)
+            and last - first >= 2 * self.bk
+            and (last - first) % self.bk == 0
+        ):
+            return 1
+        # Three allocator-alignment gaps plus the TMEM/barrier runtime arena.
+        required = 2 * self.bn * self.bk * 2 + self.bm * self.bn * 4 + 4096
+        return 2 if required <= capacity_bytes else 1
 
     @property
     def tmem_a(self) -> CollectiveTmemOperand | None:
@@ -166,6 +236,17 @@ class CollectiveTcgen05Plan:
             "cutlass.TFloat32",
         ):
             raise ValueError("native collective requires FP16, BF16 or TF32 operands")
+        if (
+            type(self.operand_stages) is not int
+            or self.operand_stages not in (1, 2)
+            or (
+                self.operand_stages == 2
+                and (not self.a_in_tmem or self.dtype == "cutlass.TFloat32")
+            )
+        ):
+            raise ValueError("two-stage native operands require FP16/BF16 TMEM A")
+        if self.operand_stages == 2 and not self.b_stage_stride_aligned():
+            raise ValueError("native B stage stride must preserve the swizzle atom")
         if self.resource.columns < self.bn:
             raise ValueError("TMEM allocation is smaller than the accumulator")
         if (operand := self.tmem_a) is not None:
@@ -190,15 +271,16 @@ class CollectiveTcgen05Plan:
         c_bits, c_base, c_shift = self.c_swizzle
         tmem_a = self.tmem_a
         a_elements = 0 if tmem_a is not None else bm * bk
+        b_elements = bn * bk * self.operand_stages
         operand_pointers = (
-            self.operands.pointers(p, dtype, a_elements, bn * bk)
+            self.operands.pointers(p, dtype, a_elements, b_elements)
             if self.operands is not None
             else (
                 f"{p}_ap = cute.arch.alloc_smem({dtype}, {a_elements}, alignment=1024)\n"
                 if a_elements
                 else ""
             )
-            + f"{p}_bp = cute.arch.alloc_smem({dtype}, {bn * bk}, alignment=1024)\n"
+            + f"{p}_bp = cute.arch.alloc_smem({dtype}, {b_elements}, alignment=1024)\n"
         )
         a_setup = (
             f"""
@@ -262,6 +344,9 @@ cute.arch.sync_threads()
 """)
 
     def compute(self, k_offset: ast.expr, k_start: ast.expr) -> list[ast.stmt]:
+        return [*self.issue_mma(k_offset, k_start), *self.wait_mma()]
+
+    def issue_mma(self, k_offset: ast.expr, k_start: ast.expr) -> list[ast.stmt]:
         p, r = self.prefix, self.resource.prefix
         # All ordinary shared stores happen-before the async proxy fence and
         # CTA barrier. The commit covers every MMA read of this A/B stage;
@@ -280,10 +365,123 @@ if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == 0:
         cute.gemm({p}_mma, {p}_acc, {p}_ra[None, None, {p}_ki], {p}_rb[None, None, {p}_ki], {p}_acc)
     with cute.arch.elect_one():
         cute.nvgpu.tcgen05.commit({r}_done)
+""")
+
+    def wait_mma(self) -> list[ast.stmt]:
+        r = self.resource.prefix
+        return _statements(f"""
 cute.arch.mbarrier_wait({r}_done, {r}_phase)
 {r}_phase = {r}_phase ^ 1
 cute.arch.sync_threads()
 """)
+
+    def bind_b_stage(
+        self, stage: str, view: str, *, fragment: str | None = None
+    ) -> list[ast.stmt]:
+        p = self.prefix
+        result = _statements(f"""
+{view} = cute.make_tensor(cute.recast_ptr({p}_bp + ({stage}) * {self.bn * self.bk}, {p}_bl.inner, dtype={self.dtype}), {p}_bl.outer)
+""")
+        if fragment is not None:
+            result.extend(
+                _statements(
+                    f"{fragment} = {p}_thr.make_fragment_B({p}_thr.partition_B({view}))"
+                )
+            )
+        return result
+
+    def pipeline_loop(
+        self,
+        loop: ast.For,
+        a_copy: ast.stmt,
+        a_publish: list[ast.stmt],
+        b_copy: ast.stmt,
+        start: ast.expr,
+        stop: ast.expr,
+        *,
+        async_copies: bool,
+    ) -> list[ast.stmt]:
+        """Keep current A in TMEM while producing next A in registers.
+
+        Every MMA completes before the next TMEM publication or accumulator
+        update. The alternate B slot is never the slot an outstanding MMA
+        reads. The original recipes and typed index arithmetic are unchanged.
+        """
+        if self.operand_stages != 2 or not self.a_in_tmem:
+            raise ValueError("native operand overlap requires a two-stage TMEM-A plan")
+        if not isinstance(loop.target, ast.Name):
+            raise ValueError("native operand overlap requires one induction variable")
+        p = self.prefix
+        offset = loop.target.id
+        recipe_k, next_k, stage = f"{p}_recipe_k", f"{p}_next_k", f"{p}_b_stage"
+        prefill_b, current_b, prefetch_b = (
+            f"{p}_b_prefill",
+            f"{p}_b_current",
+            f"{p}_b_prefetch",
+        )
+        current_rb = f"{p}_rb_current"
+
+        def recipe(statement: ast.stmt, b_view: str | None = None) -> ast.stmt:
+            renames = {offset: recipe_k}
+            if b_view is not None:
+                renames[f"{p}_b"] = b_view
+            return ast_rename(_clone(statement), renames)
+
+        commit = (
+            _statements("cute.arch.cp_async_commit_group()") if async_copies else []
+        )
+        wait = (
+            _statements("cute.arch.cp_async_wait_group(0)\ncute.arch.sync_threads()")
+            if async_copies
+            else []
+        )
+        prefill = [
+            *_statements(f"{recipe_k} = cutlass.Int32({ast.unparse(start)})"),
+            *self.bind_b_stage("0", prefill_b),
+            recipe(a_copy),
+            *(_clone(statement) for statement in a_publish),
+            recipe(b_copy, prefill_b),
+            *(_clone(statement) for statement in commit),
+            *(_clone(statement) for statement in wait),
+        ]
+        prefetch = ast.If(
+            test=ast.parse(
+                f"{next_k} < cutlass.Int64({ast.unparse(stop)})", mode="eval"
+            ).body,
+            body=[
+                *_statements(f"{recipe_k} = cutlass.Int32({next_k})"),
+                recipe(a_copy),
+                *self.bind_b_stage(f"{stage} ^ 1", prefetch_b),
+                recipe(b_copy, prefetch_b),
+                *(_clone(statement) for statement in commit),
+            ],
+            orelse=[],
+        )
+        publish = ast.If(
+            test=_clone(prefetch.test),
+            body=[_clone(statement) for statement in a_publish],
+            orelse=[],
+        )
+        reduction = _clone(loop)
+        reduction.body = [
+            *_statements(
+                f"{stage} = cutlass.Int32(((cutlass.Int64({offset}) - "
+                f"cutlass.Int64({ast.unparse(start)})) // {self.bk}) % 2)"
+            ),
+            *self.bind_b_stage(stage, current_b, fragment=current_rb),
+            *ast_rename(
+                ast.Module(body=self.issue_mma(loop.target, start), type_ignores=[]),
+                {f"{p}_rb": current_rb},
+            ).body,
+            *_statements(f"{next_k} = cutlass.Int64({offset}) + {self.bk}"),
+            prefetch,
+            *self.wait_mma(),
+            *wait,
+            publish,
+        ]
+        return ast.fix_missing_locations(
+            ast.Module(body=[*prefill, reduction], type_ignores=[])
+        ).body
 
     def finish(self, k_start: ast.expr, k_stop: ast.expr) -> list[ast.stmt]:
         p = self.prefix

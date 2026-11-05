@@ -1052,5 +1052,46 @@ def test_unsupported_epilogue_fails_closed_at_codegen() -> None:
         torch.empty((256, 256), dtype=torch.float16, device=CPU_DEVICE),
         torch.empty((256, 256), dtype=torch.float16, device=CPU_DEVICE),
     )
-    with pytest.raises(BackendUnsupported, match="warp_mma GEMM family"):
+    from helion._compiler.cute import cute_mma
+    from helion._compiler.cute.aux_tensor import analyze_tcgen05_matmul_store_chains
+
+    assert not bound.config_spec.cute_tcgen05_search_enabled
+    with bound.env, bound.host_function:
+        graphs = bound.host_function.device_ir.graphs
+        anchors = [
+            node
+            for graph in graphs
+            for node in graph.graph.nodes
+            if node.target is torch.ops.aten.addmm.default
+        ]
+        assert len(anchors) == 1
+        (anchor,) = anchors
+        lhs, rhs = anchor.args[1:3]
+        assert isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)
+        operands = cute_mma._analyze_mma_operands(lhs, rhs, bound.env)
+        assert operands is not None
+        assert analyze_tcgen05_matmul_store_chains(graphs, anchor) is None
+        assert not cute_mma.tcgen05_half_source_store_eligible(graphs, anchor, operands)
+        with pytest.raises(
+            BackendUnsupported,
+            match="warp_mma GEMM family: every store of the accumulator must be a supported epilogue",
+        ):
+            family.warp_mma_store_matches(graphs, anchor, operands, env=bound.env)
+    with pytest.raises(
+        InvalidConfig,
+        match="cute_matmul_family is only supported for tcgen05-enabled CuTe matmul kernels",
+    ):
         _source(bound, _warp_config([16, 8, 128], 1))
+    # The unavailable whole-kernel family must not erase the original ordinary
+    # fallback. Verify its full config round trip and source still contain both
+    # scalar contraction and the user's non-pointwise tile maximum.
+    generation = bound.config_spec.create_config_generation()
+    config = helion.Config(block_sizes=[16, 8, 128], pid_type="flat")
+    flat, normalized = generation.canonicalize_flat(generation.flatten(config))
+    repeated, normalized2 = generation.canonicalize_flat(flat)
+    assert flat == repeated and normalized == normalized2
+    fallback = _source(bound, normalized)
+    assert "dot_acc" in fallback and "cute.gemm(" not in fallback
+    assert "_cute_grouped_reduce_shared_two_stage(acc, 'max'" in fallback
+    assert "amax = cutlass.Float32(strided_reduce_result)" in fallback
+    assert "acc - amax" in fallback and FAMILY not in normalized

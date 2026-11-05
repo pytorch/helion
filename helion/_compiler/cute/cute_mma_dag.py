@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     from .cute_mma_dag_tcgen05 import StreamedLoopFacts
     from .cute_mma_dag_tcgen05 import Tcgen05Facts
     from .cute_mma_dag_tcgen05 import Tcgen05Plan
+    from .split_store import SplitStoreMap
 
     Layouts = dict[tuple[int, int], tuple[int, int]]
 
@@ -657,6 +658,12 @@ class Access:
     # without an explicit policy in program order, as the ordinary lowering
     # numbers its sites); None for a store.
     eviction_slot: int | None = None
+    # A proved split/permuted store retains the original fake tensor (and
+    # hence its storage identity / pointer offset), but dims, strides and
+    # subscripts describe its two logical axes and TILE-LOCAL affine strides.
+    # The warp emitter must derive its global base through this map; the
+    # globally affine / TMA consumers must never interpret those strides.
+    store_map: SplitStoreMap | None = None
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1393,6 +1400,12 @@ class AxisFacts:
     # The block size of a fixed-size tile loop axis (``Axis.size``); None
     # for an axis the config sizes.
     fixed: int | None = None
+    # A static single-axis K loop whose half-precision load operands can be
+    # packet-zero-filled on the warp path. Separate from ragged root axes.
+    partial_k: bool = False
+    # Cache-key-backed packet alignment permits DIRECT/INPLACE at binding.
+    # Unknown or unaligned sources never seed or admit actual partial trips.
+    partial_k_packets: bool = False
 
     @property
     def tunable(self) -> bool:
@@ -1613,6 +1626,9 @@ class CuteMmaDagFacts:
     # innermost ring loop of the bound inputs): the smem estimate's and the
     # per-thread cap's inputs under ``MMA_DAG_AUX_RING``.
     aux_loads: tuple[AuxLoadFacts, ...] = ()
+    # (logical row axis, logical column axis, proved split store map).
+    # The warp path only: every tile must stay within both split periods.
+    mapped_stores: tuple[tuple[int, int, SplitStoreMap], ...] = ()
 
     def block_size(self, axis: int, sizes: Mapping[int, object]) -> int | None:
         facts = self.axes[axis]
@@ -1781,6 +1797,9 @@ class MmaDagPlan:
     # ``threads`` stays the config's warps (the passes, the epilogue), the
     # launch adds the warp (``launch_threads``).
     mma_warp: bool = False
+    # Actual static K tails owned by the packet-only warp emitter. Every
+    # affected operand is load-backed; no fragment K extent is padded.
+    partial_k_axes: frozenset[int] = frozenset()
 
     @property
     def threads(self) -> int:
@@ -3041,9 +3060,30 @@ def mma_dag_config_reason(
             # A root tile past its extent (a 16-row MMA atom over M = 8)
             # runs on the warp path where the emitter predicates the ragged
             # rows; the tensor-memory renderers keep whole tiles.
-            if not (axis.ragged and mode == MMA_DAG_WARP):
+            if mode == MMA_DAG_WARP and axis.partial_k and index in facts.k_axes:
+                if not axis.partial_k_packets:
+                    return "partial static K needs cache-key-proved DIRECT/INPLACE packet routes"
+            elif not (mode == MMA_DAG_WARP and axis.ragged):
                 return f"block size {size} must divide the extent {axis.extent} of tile axis {axis.block_id}"
         resolved.append(size)
+    for rows, cols, store_map in facts.mapped_stores:
+        if mode == MMA_DAG_TCGEN05:
+            tc = facts.tcgen05
+            if tc is None or not tc.regions or not tc.mapped_store_regions:
+                return "split/permuted stores have no tcgen05 region-store proof"
+            if (
+                persistent
+                or pass_warps != MMA_DAG_PASS_WARPS_OFF
+                or epilogue != MMA_DAG_EPILOGUE_ROW
+                or lookahead != MMA_DAG_LOOKAHEAD_OFF
+                or facts.cluster_of(sizes) != 1
+            ):
+                return "mapped tcgen05 stores require flat single-CTA row epilogues"
+        elif mode != MMA_DAG_WARP:
+            return "split/permuted stores have no proof for this mode"
+        reason = store_map.tile_reason(resolved[rows], resolved[cols])
+        if reason is not None:
+            return reason
     for index in facts.k_axes:
         if resolved[index] % MMA_DAG_K_STEP:
             return f"the dot K extent {resolved[index]} must be a multiple of {MMA_DAG_K_STEP}"
@@ -3436,8 +3476,9 @@ def mma_dag_seed_configs(
 ) -> list[tuple[dict[int, int], int, int]]:
     """Ranked ``(sizes, warps, stages)`` seeds.
 
-    Tunable axes walk the ladder {16, 32, 64, 128} (divisors of the extent);
-    warps are the most that tile every fragment within the register budget
+    Tunable axes walk the ladder {16, 32, 64, 128} (divisors of the extent,
+    or partial tiles along a proven ragged axis); warps are the most that
+    tile every fragment within the register budget
     and, when fewer warps let every fragment operand of the loop take a
     register route (no exchange tile, no extra barrier per iteration), the
     most such warps as well, ranked first unless a loop operand needs a
@@ -3589,12 +3630,18 @@ def mma_dag_seed_configs(
 
 
 def mma_dag_seed_ladder(axis: AxisFacts) -> list[int]:
-    """The seed tiles of a tunable axis: the ladder's divisors of the
-    extent and, for an axis that may run ragged, the smallest ladder tile
-    covering the extent (a 16-row atom over M = 8, 32 over 24: the padded
-    rows cost MMA work the tensor core does not notice at these sizes)."""
-    ladder = [tile for tile in MMA_DAG_TILE_LADDER if axis.extent % tile == 0]
-    if axis.ragged:
+    """The seed tiles of a tunable axis: divisors of the extent or, for an
+    axis already proved ragged, every in-range ladder tile and the smallest
+    tile covering the extent (a 16-row atom over M = 8, 32 over 24).  The
+    config validator still checks each seed's mode, geometry and budgets.
+    """
+    ladder = [
+        tile
+        for tile in MMA_DAG_TILE_LADDER
+        if axis.extent % tile == 0
+        or ((axis.ragged or axis.partial_k) and tile <= axis.extent)
+    ]
+    if axis.ragged or axis.partial_k:
         padded = next(
             (tile for tile in MMA_DAG_TILE_LADDER if tile >= axis.extent), None
         )
@@ -4916,6 +4963,141 @@ class _Matcher:
             raise _NotMine
         return {position: (extent, limit)}
 
+    def split_store_access(
+        self, node: Node, fake: torch.Tensor, name: str, indices: Sequence[object]
+    ) -> Access:
+        """A rank-four store through two complete mixed-radix digit pairs.
+
+        Only root coordinates, their positional broadcasts, and exact int32
+        arithmetic enter the proof.  The original tensor remains the access
+        identity; no view, graph rewrite or replacement output is made.
+        """
+        from ...language import tile_ops
+        from .split_store import integer_bounds
+        from .split_store import prove_split_store_map
+
+        value = node.args[2]
+        if node.args[3] is not None or not isinstance(value, torch.fx.Node):
+            raise _NotMine
+        dims = self.shape_axes(value)
+        if len(dims) != 2 or any(
+            axis is None or axis.kind != AXIS_ROOT for axis in dims
+        ):
+            raise _NotMine
+        rows, cols = cast("tuple[Axis, Axis]", dims)
+        if set(self.root_block_ids) != {rows.block_id, cols.block_id}:
+            # These two digit pairs cover the complete output once.  An
+            # additional grid/lead axis would make multiple CTAs write the
+            # same mapped elements; it needs a separate ownership proof.
+            raise _NotMine
+        symbols = cast(
+            "tuple[sympy.Symbol, sympy.Symbol]",
+            sympy.symbols("split_row split_col", integer=True, nonnegative=True),
+        )
+        axis_symbols = {rows: symbols[0], cols: symbols[1]}
+        bounds = {symbol: (0, axis.extent - 1) for axis, symbol in axis_symbols.items()}
+        expressions: dict[Node, sympy.Expr] = {}
+        visited: set[Node] = set()
+
+        def expression(index: object) -> sympy.Expr:
+            if type(index) is int:
+                if not 0 <= index < 2**31:
+                    raise _NotMine
+                return sympy.Integer(index)
+            if not isinstance(index, torch.fx.Node):
+                raise _NotMine
+            if index in expressions:
+                return expressions[index]
+            if index in visited or len(visited) >= 64:
+                raise _NotMine
+            visited.add(index)
+            val = index.meta.get("val")
+            if not isinstance(val, torch.Tensor) or val.dtype != torch.int32:
+                raise _NotMine
+            if _is_call(index, tile_ops.tile_index):
+                axes = self.shape_axes(index)
+                if len(axes) != 1 or axes[0] not in axis_symbols:
+                    raise _NotMine
+                result = axis_symbols[cast("Axis", axes[0])]
+            elif _is_call(index, torch.ops.aten.view.default) or _is_call(
+                index, torch.ops.aten.reshape.default
+            ):
+                source = cast("Node", index.args[0])
+                axes = self.shape_axes(source)
+                if len(axes) != 1 or axes[0] not in axis_symbols or index.kwargs:
+                    raise _NotMine
+                expected = (rows, None) if axes[0] is rows else (None, cols)
+                if self.shape_axes(index) != expected:
+                    raise _NotMine
+                result = expression(source)
+            else:
+                if len(index.args) != 2:
+                    raise _NotMine
+                if self.shape_axes(index) not in (
+                    (rows, None),
+                    (None, cols),
+                    (rows, cols),
+                ):
+                    raise _NotMine
+                left, right = index.args
+                lhs = expression(left)
+                if _is_call(index, torch.ops.aten.add.Tensor) and not index.kwargs:
+                    result = sympy.Add(lhs, expression(right))
+                elif _is_call(index, torch.ops.aten.mul.Tensor) and not index.kwargs:
+                    result = sympy.Mul(lhs, expression(right))
+                elif (
+                    isinstance(right, int)
+                    and type(right) is int
+                    and not isinstance(right, bool)
+                    and 0 < right < 2**31
+                ):
+                    if _is_call(
+                        index, torch.ops.aten.div.Tensor_mode
+                    ) and index.kwargs == {"rounding_mode": "floor"}:
+                        result = sympy.floor(sympy.Mul(lhs, sympy.Rational(1, right)))
+                    elif (
+                        _is_call(index, torch.ops.aten.remainder.Scalar)
+                        and not index.kwargs
+                    ):
+                        result = sympy.Mod(lhs, right)
+                    else:
+                        raise _NotMine
+                else:
+                    raise _NotMine
+            if not isinstance(result, sympy.Expr):
+                raise _NotMine
+            interval = integer_bounds(result, bounds)
+            # Mathematical simplification is valid only when each FX
+            # intermediate fits its actual integer dtype (no wrapped product).
+            if interval is None or interval[0] < 0 or interval[1] >= 2**31:
+                raise _NotMine
+            expressions[index] = result
+            return result
+
+        shape = tuple(_static_int(size) for size in fake.shape)
+        strides = tuple(_static_int(stride) for stride in fake.stride())
+        if any(value is None for value in (*shape, *strides)):
+            raise _NotMine
+        store_map = prove_split_store_map(
+            tuple(expression(index) for index in indices),
+            symbols,
+            (rows.extent, cols.extent),
+            cast("tuple[int, ...]", shape),
+            cast("tuple[int, ...]", strides),
+        )
+        if store_map is None:
+            raise _NotMine
+        return Access(
+            node=node,
+            fake=fake,
+            name=name,
+            strides=store_map.inner_strides,
+            subscripts=(Subscript("axis", rows), Subscript("axis", cols)),
+            dims=(rows, cols),
+            dim_strides=store_map.inner_strides,
+            store_map=store_map,
+        )
+
     def access(self, node: Node) -> Access:
         """Decode a load / store site; ``_NotMine`` for unsupported indexing."""
         from ...language import memory_ops
@@ -4949,6 +5131,16 @@ class _Matcher:
         )
         if not isinstance(value_fake, torch.Tensor):
             raise _NotMine
+        if (
+            not is_load
+            and fake.ndim == 4
+            and all(
+                isinstance(index, torch.fx.Node)
+                and isinstance(index.meta.get("val"), torch.Tensor)
+                for index in indices
+            )
+        ):
+            return self.split_store_access(node, fake, ref.name, indices)
         value_sizes = list(value_fake.shape)
         limits = self.window_limits(mask, value_fake.ndim) if mask is not None else {}
         subscripts: list[Subscript] = []
@@ -5820,6 +6012,7 @@ class _Matcher:
         from ..device_ir import RootGraphInfo
         from ..host_function import HostFunction
         from .cute_mma import analyze_cute_mma_node
+        from .cute_mma import tcgen05_half_source_store_eligible
 
         graphs = self.graphs
         roots = [graph for graph in graphs if isinstance(graph, RootGraphInfo)]
@@ -5870,9 +6063,15 @@ class _Matcher:
             raise _NotMine
         for graph in graphs:
             for node in graph.graph.nodes:
-                if _is_dot(node) and (
-                    analyze_cute_mma_node(node, graphs=graphs) is not None
+                if not _is_dot(node):
+                    continue
+                candidate = analyze_cute_mma_node(node, graphs=graphs)
+                if candidate is not None and tcgen05_half_source_store_eligible(
+                    graphs, node, candidate.operands
                 ):
+                    # Operand compatibility alone cannot exclude this owner:
+                    # the ordinary half-native path must lower every final
+                    # store, including all output dtypes, before claiming it.
                     raise _NotMine
         if len(device_ir.grid_block_ids) != 1:
             raise _NotMine
@@ -6054,6 +6253,15 @@ class _Matcher:
         stored = {
             _storage(store.access) for store in (*program.stores, *program.vec_stores)
         }
+        for access in program.accesses:
+            if access.store_map is not None and any(
+                other.node is not access.node and _storage(other) == _storage(access)
+                for other in program.accesses
+            ):
+                # No mapped store shares storage with another access, even
+                # under a different argument or view: disjoint subregions
+                # would need their own cross-access proof.
+                raise _NotMine
         if any(
             not _is_call(access.node, memory_ops.store) and _storage(access) in stored
             for access in program.accesses
@@ -7058,6 +7266,10 @@ class _Matcher:
 
         region = "loop" if loop >= 0 else "epilogue"
         access = self.access(node)
+        if access.store_map is not None and loop >= 0:
+            # The split store proof owns only complete root tiles; no
+            # per-iteration snapshot or device-loop address map is admitted.
+            raise _NotMine
         value = node.args[2]
         if not isinstance(value, torch.fx.Node):
             raise _NotMine
@@ -7243,6 +7455,118 @@ def _whole_k_words(program: MmaDagProgram, dot: Dot, operand: Operand) -> bool:
     return operand.dtype.itemsize == 2 or program.frag_slots[operand.frag] == dot.slot
 
 
+def partial_static_k_axes(program: MmaDagProgram) -> frozenset[int]:
+    """Prove the packet-aligned static K-tail slice of the warp emitter.
+
+    One innermost loop carries independent FP32 dots. Both operands are
+    same-width half loads with an aligned contiguous packet dimension;
+    their recipes may cast or compute from that load but read no side
+    tensor. No effects, fragment operands, offsets, windows or scans can
+    observe the padded K elements. Runtime base alignment is still checked
+    by ``plan_mma_dag`` before either operand is staged.
+    """
+    if len(program.loops) != 1 or program.scans:
+        return frozenset()
+    (loop,) = program.loops
+    if (
+        loop.parent != -1
+        or not loop.innermost
+        or len(loop.axes) != 1
+        or loop.tile_end is not None
+        or loop.vec_carries
+        or not loop.steps
+        or any(not isinstance(step, Dot) for step in loop.steps)
+        or len(loop.carries) != len(loop.steps)
+    ):
+        return frozenset()
+    (axis,) = loop.axes
+    if axis.size is not None or axis.extent % 8:
+        # The fixed-loop Min/Max fold still assumes whole floor-count trips.
+        # Its range must not be reused for the new partial-K slice.
+        return frozenset()
+    carries = {carry.slot: carry for carry in loop.carries}
+    loads: set[Node] = set()
+    seen_slots: set[int] = set()
+    for dot in program.dots:
+        carry = carries.get(dot.slot)
+        if (
+            dot.loop != loop.index
+            or dot.k is not axis
+            or carry is None
+            or dot.slot in seen_slots
+            or dot.acc is None
+            or program.resolve(dot.acc) is not carry.placeholder
+            or program.resolve(carry.output) is not dot.node
+        ):
+            return frozenset()
+        seen_slots.add(dot.slot)
+        for operand in (dot.a, dot.b):
+            load = operand.load
+            if (
+                operand.kind != "load"
+                or load is None
+                or operand.dtype not in (torch.float16, torch.bfloat16)
+                or load.dtype != operand.dtype
+                or operand.transposed_tile
+                or operand.aux_loads
+                or axis not in load.tile_dims
+                or load.repeated_axes
+                or load.windows
+                or any(subscript.offset is not None for subscript in load.subscripts)
+                or load.tile_dim_strides[operand.cols_pos] != 1
+                or any(
+                    stride != 1 and stride * load.dtype.itemsize % 16
+                    for stride in load.strides
+                )
+            ):
+                return frozenset()
+            loads.add(load.node)
+    if any(
+        axis in access.dims and access.node not in loads for access in program.accesses
+    ):
+        return frozenset()
+    return frozenset({axis.index})
+
+
+def partial_static_k_packet_axes(
+    program: MmaDagProgram, eligible: frozenset[int]
+) -> frozenset[int]:
+    """The geometrically eligible K axes whose packet routes are proved.
+
+    Read the existing cache-key-backed input alignment projection, never a
+    fake pointer or assumed allocator alignment.  Registration/fact gathering
+    may precede the runtime snapshot; classify real bound values if available
+    and restore the prior snapshot afterwards.  Unknown alignment stays out.
+    The planner and prepared launch guards still enforce these same facts.
+    """
+    if not eligible:
+        return frozenset()
+    from .memory_ops import register_persistent_vec_alignment_specializations
+
+    env = CompileEnvironment.current()
+    register_persistent_vec_alignment_specializations(env)
+    saved = env.bound_runtime_input_specialization_results
+    try:
+        if env.runtime_arg_values_by_name:
+            env.snapshot_runtime_input_specialization_results(
+                env.runtime_arg_values_by_name
+            )
+        return frozenset(
+            index
+            for index in eligible
+            if all(
+                async_route_reason(env, operand) is None
+                and operand.load is not None
+                and operand.load.dtype == operand.dtype
+                for dot in program.dots
+                if dot.k.index == index
+                for operand in (dot.a, dot.b)
+            )
+        )
+    finally:
+        env.bound_runtime_input_specialization_results = saved
+
+
 def ragged_root_axes(program: MmaDagProgram) -> frozenset[int]:
     """The root axes (by index) whose tile may overshoot the extent on the
     warp path.  Each access along such an axis is predicated per element
@@ -7257,6 +7581,10 @@ def ragged_root_axes(program: MmaDagProgram) -> frozenset[int]:
     candidates = {axis.index for axis in program.axes if axis.kind == AXIS_ROOT}
     candidates.difference_update(dot.k.index for dot in program.dots)
     for access in program.accesses:
+        if access.store_map is not None:
+            # Mapped stores require complete tiles inside the split periods;
+            # the initial proof admits no ragged or boundary-crossing tile.
+            candidates.difference_update(axis.index for axis in access.dims)
         if access.repeated_axes:
             candidates.difference_update(axis.index for axis in access.dims)
         if len(access.tile_dims) == 2:
@@ -7326,6 +7654,8 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
 
     env = CompileEnvironment.current()
     ragged = ragged_root_axes(program)
+    partial_k = partial_static_k_axes(program)
+    partial_k_packets = partial_static_k_packet_axes(program, partial_k)
     grid_blocks = 1
     for axis in program.lead_axes:
         grid_blocks *= axis.extent
@@ -7414,7 +7744,16 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
     aux_loads = mma_dag_aux_loads(env, program)
     return CuteMmaDagFacts(
         axes=tuple(
-            AxisFacts(a.block_id, a.kind, a.extent, a.loop, a.index in ragged, a.size)
+            AxisFacts(
+                a.block_id,
+                a.kind,
+                a.extent,
+                a.loop,
+                a.index in ragged,
+                a.size,
+                partial_k=a.index in partial_k,
+                partial_k_packets=a.index in partial_k_packets,
+            )
             for a in program.axes
         ),
         frags=tuple((rows.index, cols.index) for rows, cols in program.slots),
@@ -7479,6 +7818,15 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
                 ),
             )
             for loop in program.loops
+        ),
+        mapped_stores=tuple(
+            (
+                store.access.dims[0].index,
+                store.access.dims[1].index,
+                store.access.store_map,
+            )
+            for store in program.stores
+            if store.access.store_map is not None
         ),
         staging_frames=tuple(store.loop for store in snapshots),
         vecs=tuple(
@@ -8096,6 +8444,23 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
             epilogue=cast("str", epilogue),
             mma_warp=tc.mma_warp,
         )
+    partial_k_axes = frozenset(
+        index
+        for index in facts.k_axes
+        if facts.axes[index].partial_k and facts.axes[index].extent % sizes[index]
+    )
+    if partial_k_axes:
+        for dot in program.dots:
+            for operand in (dot.a, dot.b):
+                if dot.k.index in partial_k_axes and routes[
+                    (dot.node, operand.role)
+                ] not in (
+                    ROUTE_DIRECT,
+                    ROUTE_INPLACE,
+                ):
+                    raise _decline(
+                        "partial static K requires aligned half-precision packet operands"
+                    )
     plan = MmaDagPlan(
         program=program,
         sizes=sizes,
@@ -8111,6 +8476,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         blocks=blocks,
         derived_mode=cast("str", derived_mode),
         load_hints=mma_dag_load_hints(program, get("load_eviction_policies", [])),
+        partial_k_axes=partial_k_axes,
     )
     if aux_mode == MMA_DAG_AUX_RING:
         aux_rings, aux_bytes = mma_dag_aux_rings(plan)

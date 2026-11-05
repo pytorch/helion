@@ -442,6 +442,21 @@ def strip_unused_inputs(
         return None
 
     assert len(input_names) == len(node._input_nodes)
+    if CompileEnvironment.current().backend_name == "cute":
+        # Source-level epilogue analysis needs repeated semantic operands even
+        # when the lowered buffer loads that input only once. Store positions,
+        # not Node references, so copied codegen graphs retain their own inputs.
+        first_position: dict[torch.fx.Node, int] = {}
+        duplicates = []
+        for position, arg in enumerate(node.args):
+            if not isinstance(arg, torch.fx.Node):
+                continue
+            if arg in first_position:
+                duplicates.append((position, first_position[arg]))
+            else:
+                first_position[arg] = position
+        if duplicates:
+            node.meta["cute_duplicate_arg_positions"] = tuple(duplicates)
     seen_names: dict[str, None] = {}
     node.args = map_arg(node.args, mask_unused_inputs)
     node.kwargs = map_arg(node.kwargs, mask_unused_inputs)

@@ -43,6 +43,7 @@ from helion._compiler.cute.cute_warp_mma_gemm import warp_mma_warp_layout
 from helion._compiler.host_function import SymbolOrigin
 from helion._compiler.variable_origin import BlockSizeOrigin
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_cuda_work
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -7861,6 +7862,123 @@ def test_a_non_finite_fill_beside_a_fragment_renders_as_a_call() -> None:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("extent", "ragged", "expected"),
+    (
+        (1, True, [16]),
+        (8, True, [16]),
+        (24, True, [16, 32]),
+        (48, True, [16, 32, 64]),
+        (96, True, [16, 32, 64, 128]),
+        (160, True, [16, 32, 64, 128]),
+        (1000, True, [16, 32, 64, 128]),
+        (1024, True, [16, 32, 64, 128]),
+        (24, False, []),
+        (160, False, [16, 32]),
+        (1000, False, []),
+        (1024, False, [16, 32, 64, 128]),
+    ),
+)
+def test_seed_ladder_keeps_proven_ragged_tiles_and_padding(
+    extent: int, ragged: bool, expected: list[int]
+) -> None:
+    axis = dag.AxisFacts(0, dag.AXIS_ROOT, extent, ragged=ragged)
+    assert dag.mma_dag_seed_ladder(axis) == expected
+
+
+def _ragged_shared_a_gemm(
+    a: torch.Tensor, b: torch.Tensor, b1: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty((m, n), dtype=torch.float32, device=a.device)
+    out1 = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile((m, n)):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        acc1 = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            shared_a = a[tile_m, tile_k].to(torch.float32).to(a.dtype)
+            rhs = b[tile_k, tile_n].to(torch.float32).to(b.dtype)
+            rhs1 = b1[tile_k, tile_n].to(torch.float32).to(b1.dtype)
+            acc = torch.addmm(acc, shared_a, rhs)
+            acc1 = torch.addmm(acc1, shared_a, rhs1)
+        out[tile_m, tile_n] = acc.to(a.dtype).to(torch.float32)
+        out1[tile_m, tile_n] = acc1.to(a.dtype)
+    return out, out1
+
+
+def test_proven_ragged_rows_seed_shared_operands_and_independent_carries() -> None:
+    with forbid_cuda_work():
+        bound = _bind_fn(
+            _ragged_shared_a_gemm,
+            (
+                torch.empty((1000, 512), dtype=torch.bfloat16, device=CPU_DEVICE),
+                torch.empty((512, 1024), dtype=torch.bfloat16, device=CPU_DEVICE),
+                torch.empty((512, 1024), dtype=torch.bfloat16, device=CPU_DEVICE),
+            ),
+        )
+        program = _program(bound)
+        spec = bound.config_spec
+        facts = spec.cute_mma_dag_facts
+        assert facts is not None
+        rows = next(
+            a for a in facts.axes if a.kind == dag.AXIS_ROOT and a.extent == 1000
+        )
+        assert rows.ragged
+        assert len(program.carries) == len(program.dots) == 2
+        first, second = program.dots
+        assert first.slot != second.slot
+        assert first.a.chain_key == second.a.chain_key
+        assert not first.a.pointwise and not second.a.pointwise
+        # Operand round trips stay identities; the output's BF16 rounding
+        # before its FP32 upcast is not an operand round trip to elide.
+        assert [store.access.dtype for store in program.stores] == [
+            torch.float32,
+            torch.bfloat16,
+        ]
+        rounded = cast("torch.fx.Node", program.stores[0].value.args[0])
+        assert rounded.meta["val"].dtype == torch.bfloat16
+        raw = dag.mma_dag_seed_configs(facts)
+        assert raw
+        assert all(
+            dag.mma_dag_config_reason(facts, sizes, warps, stages) is None
+            for sizes, warps, stages in raw
+        )
+        seeds = [
+            c.config
+            for c in spec.compiler_seed_configs
+            if c.config.get("cute_mma_dag") == "warp"
+        ]
+        assert seeds
+        assert not any(
+            c.config.get("cute_mma_dag") == "tcgen05"
+            for c in spec.compiler_seed_configs
+        )
+        body = _kernel_body(_source(bound, helion.Config.from_dict(seeds[0])))
+        assert f"{RT}.mma_bf16(" in body
+        assert "< 1000" in body
+        assert "tcgen05_mma(" not in body
+
+
+def test_ragged_row_seeds_do_not_admit_an_unsupported_partial_static_k_loop() -> None:
+    with forbid_cuda_work():
+        bound = _bind_fn(
+            _ragged_shared_a_gemm,
+            (
+                torch.empty((1000, 1001), dtype=torch.bfloat16, device=CPU_DEVICE),
+                torch.empty((1001, 256), dtype=torch.bfloat16, device=CPU_DEVICE),
+                torch.empty((1001, 256), dtype=torch.bfloat16, device=CPU_DEVICE),
+            ),
+        )
+        facts = bound.config_spec.cute_mma_dag_facts
+        # The odd row pitch fails the existing packet-layout matcher before seeds.
+        assert facts is None
+        assert not any(
+            c.config.get("cute_mma_dag") in ("warp", "tcgen05")
+            for c in bound.config_spec.compiler_seed_configs
+        )
+
+
 def _ragged_rows_summed(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """``(a @ b + 1).sum(0)`` over the rows of one root tile (the rows fit
     one tile): the sum's input is masked to zero past the row extent by
@@ -7993,7 +8111,7 @@ def test_a_block_below_the_atom_guards_against_the_block_and_the_extent() -> Non
     bound = _bind_fn(_head_sum_logits, _head_sum_inputs(m=24))
     facts = bound.config_spec.cute_mma_dag_facts
     assert facts is not None and facts.axes[0].ragged
-    assert dag.mma_dag_seed_ladder(facts.axes[0]) == [32]
+    assert dag.mma_dag_seed_ladder(facts.axes[0]) == [16, 32]
     assert dag.mma_dag_padded_sizes(facts, [8, 128, 128]) == [16, 128, 128]
     assert dag.mma_dag_cta_count(facts, [8, 128, 128]) == 12
     assert dag.mma_dag_cta_count(facts, [16, 128, 128]) == 8

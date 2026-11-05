@@ -503,6 +503,12 @@ class CompileEnvironment:
             f"helion_runtime_arg_values_{id(self)}",
             default=None,
         )
+        self._capture_runtime_metadata: contextvars.ContextVar[bool] = (
+            contextvars.ContextVar(
+                f"helion_capture_runtime_metadata_{id(self)}",
+                default=False,
+            )
+        )
         self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
         # Dynamic reduction extents whose CuTe persistent thread layout was
         # sized from the size hint; the bound kernel keys their power-of-2
@@ -720,14 +726,29 @@ class CompileEnvironment:
     def runtime_arg_values_by_name(self) -> dict[str, object]:
         return self._runtime_arg_values_by_name.get() or {}
 
+    @property
+    def early_mma_metadata_scope_active(self) -> bool:
+        """Construction metadata is available to the anchored MMA reader.
+
+        This ambient flag covers construction, not a general capability. Only
+        the fully proved single-MMA epilogue reader may opt into it. It is not
+        a bound snapshot and must not expose unrelated fragment domains.
+        """
+        return self._capture_runtime_metadata.get()
+
     @contextlib.contextmanager
     def use_runtime_arg_values(
-        self, values: dict[str, object]
+        self,
+        values: dict[str, object],
+        *,
+        capture_metadata: bool = False,
     ) -> typing.Iterator[None]:
         token = self._runtime_arg_values_by_name.set(values)
+        capture_token = self._capture_runtime_metadata.set(capture_metadata)
         try:
             yield
         finally:
+            self._capture_runtime_metadata.reset(capture_token)
             self._runtime_arg_values_by_name.reset(token)
 
     @property
@@ -1107,6 +1128,10 @@ class CompileEnvironment:
         previous = self.runtime_input_specializations.setdefault(key, specialization)
         if previous != specialization:
             raise RuntimeError(f"conflicting runtime input specializations for {key!r}")
+        # Registration is declarative. Publishing a bound snapshot here would
+        # expose unrelated fragment modes during construction-time discovery.
+        # MMA admission may read registered live facts in its private scope;
+        # cache/prepared-call facts are still captured in the normal phase.
 
     def snapshot_runtime_input_specialization_results(
         self,

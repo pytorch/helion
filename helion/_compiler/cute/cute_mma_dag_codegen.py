@@ -2164,6 +2164,15 @@ class _Emitter:
             self.df.placeholder_args.add(name)
             es = access.dtype.itemsize
             terms = [f"{name}.iterator.toint()"]
+            if access.store_map is not None:
+                rows, cols = access.tile_dims
+                terms.extend(
+                    access.store_map.base_terms(
+                        self.axis_base(rows), self.axis_base(cols), es
+                    )
+                )
+                self.base_vars[access.node] = self.bind("md_base", " + ".join(terms))
+                continue
             for subscript, stride in zip(
                 access.subscripts, access.strides, strict=True
             ):
@@ -2208,6 +2217,8 @@ class _Emitter:
 
     def iteration_base_expr(self, access: Access, values: dict[int, str]) -> str:
         """``iteration_base`` as an expression (nothing bound)."""
+        if access.store_map is not None:
+            return self.base_vars[access.node]
         terms = [self.base_vars[access.node]]
         es = access.dtype.itemsize
         for subscript, stride in zip(access.subscripts, access.strides, strict=True):
@@ -2295,7 +2306,7 @@ class _Emitter:
                 return lo
             trips = 1
             for axis in loop.axes:
-                trips *= axis.extent // self.plan.size(axis)
+                trips *= -(-axis.extent // self.plan.size(axis))
             return trips
         trip = loop.static_trip
         return trip if trip is not None else 2
@@ -2900,7 +2911,12 @@ class _Emitter:
         ``tma_tile_source``), and ring slots at the swizzle pattern's
         period.  Other tiles keep their packets."""
         plan = self.plan
-        if plan.compute != MMA_DAG_WARP or plan.loads != MMA_DAG_LOADS_TMA:
+        if (
+            plan.compute != MMA_DAG_WARP
+            or plan.loads != MMA_DAG_LOADS_TMA
+            or plan.partial_k_axes
+        ):
+            # The first static K-tail protocol owns packet zero-fill only.
             return
         from .cute_mma_dag_tcgen05 import _tma_dims
 
@@ -3107,11 +3123,29 @@ class _Emitter:
             dst = f"{smem} + {pk.offset(row_bytes)} + {pk.swz} * 16"
             src = f"{gbase} + cutlass.Int64({pk.pr}) * {row_stride} + cutlass.Int64({pk.pch} * 16){gofs}"
             guard = self.row_exists(load, rows_pos, pk.prow)
+            tail_guards = []
+            for position, axis in enumerate(load.tile_dims):
+                if axis.index not in self.plan.partial_k_axes:
+                    continue
+                # Prologue/refill copies use future loop values. The current
+                # axis_base belongs to the consumer and must not guard them.
+                offset = self.axis_offset(axis, values[axis.loop])
+                coord = pk.prow if position == rows_pos else f"({pk.pch} * 8 + 7)"
+                tail_guards.append(
+                    f"(({offset}) * {self.plan.size(axis)} + {coord} < {axis.extent})"
+                )
+            if tail_guards:
+                guard = " and ".join(
+                    ([guard] if guard is not None else []) + tail_guards
+                )
             if guard is not None:
                 src_bytes = self.bind(
                     "md_zf",
                     f"cutlass.Int32(16) if {guard} else cutlass.Int32(0)",
                 )
+                if tail_guards:
+                    name = self.df.tensor_arg(load.fake, prefer_name=load.name).name
+                    src = f"({src}) if {guard} else {name}.iterator.toint()"
                 self.emit(
                     f"{_RUNTIME}.cp_async_16{suffix}_zfill({dst}, {src}, {src_bytes}{policy})"
                 )
@@ -4672,7 +4706,7 @@ class _Emitter:
             return "0", self.trip_var(loop), None
         trip = 1
         for axis in loop.axes:
-            trip *= axis.extent // self.plan.size(axis)
+            trip *= -(-axis.extent // self.plan.size(axis))
         return "0", str(trip), trip
 
     def trip_var(self, loop: Loop) -> str:
@@ -4693,7 +4727,11 @@ class _Emitter:
     def masked(self, dot: Dot, operand: Operand, coords: Coords, value: str) -> str:
         """``value`` (the operand element at ``coords`` of the operand value)
         zeroed where its K position is at or past the loop bound."""
-        end = self.bound_mask_end(dot, operand)
+        end = (
+            str(dot.k.extent)
+            if dot.k.index in self.plan.partial_k_axes
+            else self.bound_mask_end(dot, operand)
+        )
         if end is None:
             return value
         position = operand.dims.index(dot.k)
