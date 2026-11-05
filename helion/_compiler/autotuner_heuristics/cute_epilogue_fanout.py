@@ -44,6 +44,7 @@ def register_epilogue_fanout_coverage(
     env: CompileEnvironment, device_ir: DeviceIR
 ) -> None:
     from ...language import matmul_ops
+    from ...language import memory_ops
     from ..cute.cute_mma import _trace_mma_to_stores
 
     spec = env.config_spec
@@ -67,7 +68,19 @@ def register_epilogue_fanout_coverage(
                 continue
             stores = _trace_mma_to_stores(node, device_ir.graphs)
             if stores is None:
-                continue
+                # This forward walk's DAG fallback is bound-only. A managed
+                # constructor has not published its normal snapshot yet, so it
+                # may decline before the registration-only proof below runs.
+                # Discover actual store identities, not store eligibility: the
+                # complete fanout proof still owns every store, anchor, effect,
+                # type and registered-live alias check (and rejects foreign
+                # stores). Never widen the final lifetime/codegen walk.
+                stores = tuple(
+                    store
+                    for graph_info in device_ir.graphs
+                    for store in graph_info.graph.nodes
+                    if store.target is memory_ops.store
+                )
             with host:
                 # Managed binds publish the complete immutable snapshot only
                 # after construction. This anchored coverage proof may read the

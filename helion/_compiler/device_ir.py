@@ -3594,6 +3594,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         source_state = CompileEnvironment.current().config_spec._cute_tcgen05_config
         source_state._readonly_bool_aux_seed_subject = None
         source_state.mixed_output_store_plan = None
+        source_state._modular_aux_protocol_subject = None
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
@@ -4021,6 +4022,12 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     candidate.supports_small_n_scalar_fallback
                     for candidate, _lhs, _rhs, _node in mma_candidates
                 )
+                from .cute.modular_aux_protocol import ModularAuxProtocolSubject
+                from .cute.modular_aux_protocol import (
+                    analyze_modular_aux_protocol_subject,
+                )
+
+                modular_subjects: dict[torch.fx.Node, ModularAuxProtocolSubject] = {}
                 search_candidates = []
                 planning_results = []
                 sources_eligible = True
@@ -4064,6 +4071,24 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     ):
                         sources_eligible = False
                         continue
+                    modular, modular_subject = analyze_modular_aux_protocol_subject(
+                        device_ir.graphs,
+                        node,
+                        (candidate.operands.m_block_id, candidate.operands.n_block_id),
+                    )
+                    if modular and (
+                        modular_subject is None
+                        or len(mma_candidates) != 1
+                        or CompileEnvironment.current().cute_fission_plan is not None
+                    ):
+                        # The current modular leaf has only an implicit ordinary
+                        # one-CTA store transport. In particular mixed-width
+                        # stores require an explicit tile the leaf cannot own.
+                        # Preserve all planner guards and the collective domain.
+                        sources_eligible = False
+                        continue
+                    if modular_subject is not None:
+                        modular_subjects[node] = modular_subject
                     search_plan = planning_result.plan
                     if (
                         search_plan is None
@@ -4131,7 +4156,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     )
                     from .cute.aux_tensor import analyze_tcgen05_matmul_store_chains
                     from .cute.cute_epilogue import _MappedAuxiliaryTensorLoadExpr
+                    from .cute.cute_epilogue import _MVectorBroadcastAuxLoadExpr
                     from .cute.cute_epilogue import _ReadonlyBoolAuxLoadExpr
+                    from .cute.cute_epilogue import _ReadonlyBoolPredicateLoadExpr
 
                     source_chains = analyze_tcgen05_matmul_store_chains(
                         device_ir.graphs, mma_candidates[0][3]
@@ -4144,9 +4171,18 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             if isinstance(leaf, _ReadonlyBoolAuxLoadExpr)
                         )
                     )
-                    bool_auxiliary = bool(bool_loads)
+                    bool_auxiliary = bool(bool_loads) or any(
+                        isinstance(leaf, _ReadonlyBoolPredicateLoadExpr)
+                        for _, chain in source_chains or ()
+                        for leaf in chain.auxiliary_tensor_loads
+                    )
                     mapped_auxiliary = any(
                         isinstance(leaf, _MappedAuxiliaryTensorLoadExpr)
+                        for _, chain in source_chains or ()
+                        for leaf in chain.auxiliary_tensor_loads
+                    )
+                    m_vector_auxiliary = any(
+                        isinstance(leaf, _MVectorBroadcastAuxLoadExpr)
                         for _, chain in source_chains or ()
                         for leaf in chain.auxiliary_tensor_loads
                     )
@@ -4174,11 +4210,16 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         # floating aux loads. Byte-normalized bools and mapped
                         # source-plane views belong to ordinary tcgen05 stores.
                         warp_mma_plain_kernel=len(mma_candidates) == 1
-                        and not (bool_auxiliary or mapped_auxiliary),
+                        and not (
+                            bool_auxiliary or mapped_auxiliary or m_vector_auxiliary
+                        ),
                         output_dtype_bytes=output_store_facts[0],
                         output_stores=output_store_facts[1],
                     )
                     if len(mma_candidates) == 1 and env.cute_fission_plan is None:
+                        config_spec._cute_tcgen05_config._modular_aux_protocol_subject = modular_subjects.get(
+                            mma_candidates[0][3]
+                        )
                         if bool_loads and source_chains is not None:
                             # Tagged leaves exist only after the complete
                             # anchored store/readonly/alias proof accepts.

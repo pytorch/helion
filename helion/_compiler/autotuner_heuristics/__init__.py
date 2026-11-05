@@ -483,6 +483,10 @@ def compiler_seed_configs(
             )
             continue
         ranked = [c for c in ranked if c is not None]
+        if env.backend_name == "cute":
+            ranked = env.config_spec._cute_tcgen05_config.admit_modular_seed_configs(
+                ranked
+            )
         if not ranked:
             continue
         configs.extend(ranked)

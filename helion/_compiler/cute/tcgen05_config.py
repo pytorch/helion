@@ -321,6 +321,7 @@ if TYPE_CHECKING:
     from .grouped_prefix_adaptive_n import GroupedPrefixAdaptiveNProfile
     from .materialized_pdl import MaterializedOperandPdl
     from .mixed_store import MixedPrecisionStorePlan
+    from .modular_aux_protocol import ModularAuxProtocolSubject
     from .shared_epilogue_dag import FanoutPlan
 
 
@@ -743,6 +744,9 @@ class CuteTcgen05Config:
         # Seed-only certificate from the fully guarded ordinary MMA source
         # admission. Late lowering independently re-proves the actual aliases.
         self.mixed_output_store_plan: MixedPrecisionStorePlan | None = None
+        # Immutable complete-source identities/geometry, never Tensor owners or
+        # runtime alias snapshots. Reset by every source lowering pass.
+        self._modular_aux_protocol_subject: ModularAuxProtocolSubject | None = None
         # Seed-only source subject: (anchor, complete stores, tagged bool loads).
         # Set only after full ordinary source admission; no Tensor owners or
         # public runtime-fact snapshot are published by this certificate.
@@ -5216,7 +5220,7 @@ class CuteTcgen05Config:
             seeds = [
                 Config.from_dict({**seed.config, "cute_pdl": True}) for seed in seeds
             ]
-        return seeds
+        return self.admit_modular_seed_configs(seeds)
 
     def _pdl_searched(self) -> bool:
         """Whether this kernel's tcgen05 surface launches as a dependent by default.
@@ -10585,6 +10589,12 @@ class CuteTcgen05Config:
                         ),
                     }
                 )
+        if for_search and self._modular_aux_protocol_subject is not None:
+            for key, value in self._modular_aux_protocol_subject.inert_options():
+                if key in fragments:
+                    fragments[key] = EnumFragment((value,))
+            if TCGEN05_CTA_GROUP_CONFIG_KEY in fragments:
+                fragments[TCGEN05_CTA_GROUP_CONFIG_KEY] = EnumFragment(("auto",))
         return fragments
 
     @staticmethod
@@ -11070,7 +11080,7 @@ class CuteTcgen05Config:
             )
         else:
             layout_choices = (Tcgen05LayoutStrategy.DEFAULT.value,)
-        return {
+        fragments: dict[str, ConfigSpecFragment] = {
             TCGEN05_STRATEGY_CONFIG_KEY: _enum_fragment_with_seed_values(
                 strategy_choices,
                 strategy_seed_choices,
@@ -11101,6 +11111,13 @@ class CuteTcgen05Config:
                 (ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC.register_split[1],)
             ),
         }
+        if self._modular_aux_protocol_subject is not None:
+            # Warp-role options live in this second search table, not in the
+            # ordinary optional fragments. Apply the same source constraint.
+            for key, value in self._modular_aux_protocol_subject.inert_options():
+                if key in fragments:
+                    fragments[key] = EnumFragment((value,))
+        return fragments
 
     def strategy_validation_fragments(self) -> dict[str, ConfigSpecFragment]:
         fragments = self.strategy_autotune_fragments()
@@ -11270,9 +11287,69 @@ class CuteTcgen05Config:
         )
         config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = clamped
 
+    def _modular_aux_block_indices(self) -> tuple[int, int] | None:
+        subject = self._modular_aux_protocol_subject
+        if subject is None:
+            return None
+        m = self._config_block_index(subject.block_ids[0])
+        n = self._config_block_index(subject.block_ids[1])
+        return (m, n) if m is not None and n is not None else None
+
+    def _normalize_modular_aux_protocol(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        subject = self._modular_aux_protocol_subject
+        if subject is None or not self.search_enabled:
+            return
+        indices = self._modular_aux_block_indices()
+        if fix_invalid:
+            subject.repair(config, indices)
+        reason = subject.refusal(config, indices)
+        if reason is not None:
+            raise InvalidConfig(reason)
+
+    def admit_modular_seed_configs(self, seeds: list[Config]) -> list[Config]:
+        """Use strict existing normalization, only for proved modular subjects.
+
+        Keep accepted seed objects/order unchanged; unsupported families are not
+        repaired into a hand-selected promoted seed. Non-modular registries take
+        the original path byte-for-byte.
+        """
+        if self._modular_aux_protocol_subject is None:
+            return seeds
+        accepted = []
+        for seed in seeds:
+            try:
+                self.config_spec.normalized_config(seed)
+            except InvalidConfig:
+                continue
+            accepted.append(seed)
+        return accepted
+
     def normalize_pre_pid_type(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
+        if self._modular_aux_protocol_subject is not None:
+            # Preserve the earlier generic hoist refusal before the groups pass
+            # (whose later size diagnostic describes a different failure).
+            if (
+                not fix_invalid
+                and config.get(TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY) is True
+                and not self.aux_fragment_hoist_admissible(config)
+            ):
+                raise InvalidConfig(
+                    f"{TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY}=True requires an "
+                    "exact-shape auxiliary operand, "
+                    f"{TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
+                    f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}, the SIMT aux "
+                    "load mode, the normal TMA store and a tile fragment of at "
+                    f"most {TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD} "
+                    "bytes per epilogue thread (per epilogue warp group)"
+                )
+            # Keep existing typed subtile/group/hoist/prefetch refusals before
+            # the narrower modular backstop, without widening those protocols.
+            self._normalize_epilogue_groups(config, fix_invalid=fix_invalid)
+        self._normalize_modular_aux_protocol(config, fix_invalid=fix_invalid)
         reserved_sms_key = TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
         if reserved_sms_key in config and not self.search_enabled:
             if fix_invalid:
@@ -11789,7 +11866,9 @@ class CuteTcgen05Config:
             )
 
     def fix_search_config(self, config: dict[str, object]) -> None:
+        self._normalize_modular_aux_protocol(config, fix_invalid=True)
         self._fix_search_config_body(config)
+        self._normalize_modular_aux_protocol(config, fix_invalid=True)
         # These repairs read the repaired pid type, cluster and tile, so they
         # run last, on every path of the body (its early returns included:
         # the one-CTA pipeline, the dense-N tile, the materialized chains
@@ -12132,6 +12211,9 @@ class CuteTcgen05Config:
             # strict normalization (the autotuner compiled such neighbours of
             # the 256x128 hoist witness and lost them to the strict refusal).
             config[TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY] = False
+        # Other family projections may have changed geometry or protocol after
+        # the initial pass. Judge the final config before any source is emitted.
+        self._normalize_modular_aux_protocol(config, fix_invalid=fix_invalid)
 
     def flat_fields(
         self,

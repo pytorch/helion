@@ -665,6 +665,7 @@ def _chain_key(chain: Tcgen05UnaryEpilogueChain) -> tuple[object, ...]:
     from .cute_epilogue import _AuxiliaryTensorLoadExpr
     from .cute_epilogue import _BinaryTensorExpr
     from .cute_epilogue import _CurrentTensorExpr
+    from .cute_epilogue import _MVectorScalarPrefixLoadExpr
     from .cute_epilogue import _PointwiseDagExpr
     from .cute_epilogue import _RuntimeScalarExpr
     from .cute_epilogue import _ScalarConstantExpr
@@ -707,6 +708,15 @@ def _chain_key(chain: Tcgen05UnaryEpilogueChain) -> tuple[object, ...]:
             return ("runtime_scalar", expr.source)
         if isinstance(expr, _ScalarConstantExpr):
             return ("scalar_constant", expr.literal, expr.dtype)
+        if isinstance(expr, _MVectorScalarPrefixLoadExpr):
+            from .shared_epilogue_dag import dag_keys
+
+            return (
+                "M_scalar_prefix",
+                expr.load_node,
+                expr.broadcast_axis,
+                dag_keys(expr.prefix),
+            )
         if isinstance(expr, _AuxiliaryTensorLoadExpr):
             return ("aux", expr.load_node, expr.broadcast_axis, expr.template)
         if isinstance(expr, _UnaryTensorExpr):

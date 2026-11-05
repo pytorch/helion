@@ -52,6 +52,19 @@ FanoutPlan = PairedFanoutPlan | SharedDagFanoutPlan
 def _atom(node: epi._TensorExpr) -> object:
     if isinstance(node, epi._CurrentTensorExpr):
         return ("current",)
+    # A map is a function of the original load and carrier shape. The shared
+    # plan pins that shape, so existing rank-three keys remain unchanged;
+    # the new rank-two repetition tag additionally records its transport map.
+    if isinstance(node, epi._MVectorScalarPrefixLoadExpr):
+        return (type(node), node.load_node, node.broadcast_axis, dag_keys(node.prefix))
+    if isinstance(node, epi._ModularAuxiliaryTensorLoadExpr):
+        return (
+            type(node),
+            node.load_node,
+            node.broadcast_axis,
+            node.template,
+            node.mapping,
+        )
     if isinstance(node, epi._AuxiliaryTensorLoadExpr):
         return (type(node), node.load_node, node.broadcast_axis, node.template)
     if isinstance(node, epi._RuntimeScalarExpr):
@@ -97,6 +110,20 @@ def dag_keys(dag: epi._PointwiseDagExpr) -> tuple[object, ...]:
 
 
 def raw_aux_key(leaf: epi._AuxiliaryTensorLoadExpr) -> object:
+    if isinstance(leaf, epi._MVectorScalarPrefixLoadExpr):
+        return (
+            leaf.load_node,
+            leaf.broadcast_axis,
+            epi._node_tensor_dtype(leaf.load_node),
+            dag_keys(leaf.prefix),
+        )
+    if isinstance(leaf, epi._ModularAuxiliaryTensorLoadExpr):
+        return (
+            leaf.load_node,
+            leaf.broadcast_axis,
+            epi._node_tensor_dtype(leaf.load_node),
+            leaf.mapping,
+        )
     return (leaf.load_node, leaf.broadcast_axis, epi._node_tensor_dtype(leaf.load_node))
 
 
@@ -227,6 +254,7 @@ def prove_shared_dag_fanout(
             return None
         if len(keys) > 64 or any(
             leaf.broadcast_axis not in (None, 1)
+            and not isinstance(leaf, epi._MVectorBroadcastAuxLoadExpr)
             for leaf in chain.auxiliary_tensor_loads
         ):
             return None

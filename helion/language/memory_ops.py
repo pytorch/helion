@@ -52,6 +52,7 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD,
 )
+from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
 from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
@@ -69,6 +70,7 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CHOICES
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_ACC_T2R,
@@ -3373,9 +3375,52 @@ def _codegen_cute_store_tcgen05_tile(
         aux_torch_tensor = aux_tensor_node.meta.get("val")
         assert isinstance(aux_torch_tensor, torch.Tensor)
         aux_tensor_name = df.tensor_arg(aux_torch_tensor).name
+        from .._compiler.cute.cute_epilogue import _M_VECTOR_BROADCAST_AXIS
         from .._compiler.cute.cute_epilogue import _MappedAuxiliaryTensorLoadExpr
+        from .._compiler.cute.cute_epilogue import _ModularAuxiliaryTensorLoadExpr
+        from .._compiler.cute.cute_epilogue import _MVectorBroadcastAuxLoadExpr
         from .._compiler.cute.cute_epilogue import _ReadonlyBoolAuxLoadExpr
+        from .._compiler.cute.cute_epilogue import _ReadonlyBoolPredicateLoadExpr
 
+        if (
+            isinstance(aux_step, _ReadonlyBoolPredicateLoadExpr)
+            and df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, "simt") != "simt"
+        ):
+            raise exc.InvalidConfig(
+                "readonly bool where predicates require byte-width SIMT auxiliary transport"
+            )
+        if isinstance(aux_step, _ModularAuxiliaryTensorLoadExpr) and (
+            tcgen05_lifecycle.is_two_cta
+            or df.config.get("tcgen05_cluster_m", 1) != 1
+            or df.config.get("tcgen05_cluster_n", 1) != 1
+            or df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, "simt") != "simt"
+            or df.config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY) is not None
+            or tcgen05_value.has_explicit_epilogue_tile
+            or tcgen05_aux_prefetch_depth > 0
+        ):
+            raise exc.InvalidConfig(
+                "rank-two modular auxiliary loads require the plain single-CTA per-subtile protocol"
+            )
+        if isinstance(aux_step, _MVectorBroadcastAuxLoadExpr):
+            if df.config.get("tcgen05_aux_load_mode", "simt") != "simt":
+                raise exc.InvalidConfig(
+                    "M-vector singleton auxiliaries require the proved SIMT fragment load, not auxiliary TMA"
+                )
+            if (
+                tcgen05_value.source_tile_m != tcgen05_value.bm
+                or tcgen05_value.source_tile_n != tcgen05_value.bn
+                or tcgen05_nm_store
+                or compact_fragment_store
+                or tcgen05_m_subtile_count != 1
+            ):
+                raise exc.InvalidConfig(
+                    "M-vector auxiliary views require matching ordinary row-major tile geometry"
+                )
+            # Only proven pure load/cast/view assignments may become dead;
+            # shared CSE users and ordinary collective fallbacks stay live.
+            state.codegen.allow_dead_assignments_owned_by_nodes(
+                (*aux_step.owned_nodes, aux_step.view_node)
+            )
         if isinstance(aux_step, _MappedAuxiliaryTensorLoadExpr):
             if (
                 tcgen05_value.source_tile_m != tcgen05_value.bm
@@ -3399,7 +3444,9 @@ def _codegen_cute_store_tcgen05_tile(
             )
         aux_dtype = (
             "cutlass.Uint8"
-            if isinstance(aux_step, _ReadonlyBoolAuxLoadExpr)
+            if isinstance(
+                aux_step, (_ReadonlyBoolAuxLoadExpr, _ReadonlyBoolPredicateLoadExpr)
+            )
             else backend.dtype_str(aux_torch_tensor.dtype)
         )
         aux_dtype_bits = aux_torch_tensor.dtype.itemsize * 8
@@ -3414,7 +3461,12 @@ def _codegen_cute_store_tcgen05_tile(
         # The colvec form (2) already carries an (M, N) stride-(1, 0) view.
         aux_view2d = (
             df.new_var(f"tcgen05_aux_view2d_{aux_idx}")
-            if aux_step.broadcast_axis in (0, 1) or aux_torch_tensor.ndim == 3
+            if (
+                aux_step.broadcast_axis in (0, 1)
+                or isinstance(aux_step, _MVectorBroadcastAuxLoadExpr)
+                or aux_torch_tensor.ndim == 3
+                or isinstance(aux_step, _MappedAuxiliaryTensorLoadExpr)
+            )
             else None
         )
         aux_step_records.append(
@@ -4489,7 +4541,23 @@ def _codegen_cute_store_tcgen05_tile(
                 )
                 continue
 
-            if rec.broadcast_axis is None or rec.broadcast_axis == 2:
+            if isinstance(rec.expr, _MVectorBroadcastAuxLoadExpr):
+                assert (
+                    rec.broadcast_axis == _M_VECTOR_BROADCAST_AXIS
+                    and rec.aux_view2d is not None
+                )
+                # The original rank-one pointer/stride stays an argument. A
+                # device-side zero-N-stride view implements only the proved
+                # PyTorch (Mtile,1) broadcast, with one real address per M row.
+                lines.append(
+                    f"{rec.aux_view2d} = cute.make_tensor("
+                    f"{rec.aux_tensor_name}.iterator, "
+                    f"cute.make_layout(({m_size}, {n_size}), "
+                    f"stride=({rec.aux_tensor_name}.layout.stride[0], 0)))"
+                )
+                source_for_local_tile = rec.aux_view2d
+                aux_tile_is_local = False
+            elif rec.broadcast_axis is None or rec.broadcast_axis == 2:
                 # Exact-shape aux (or the colvec form) uses the trailing matrix
                 # directly. For a rank-3 residual, first select the current
                 # leading-passthrough slice without changing its M/N strides.

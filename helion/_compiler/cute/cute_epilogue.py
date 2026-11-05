@@ -92,6 +92,8 @@ from .gelu_tanh_approx import fast_math_unary_template
 from .mapped_aux import MappedAuxLoadMap
 from .mapped_aux import mapped_aux_load_map
 from .math_templates import SIGMOID_TEMPLATE
+from .modular_aux import ModularAuxLoadMap
+from .modular_aux import modular_aux_load_map
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -252,10 +254,50 @@ class _ReadonlyBoolAuxLoadExpr(_AuxiliaryTensorLoadExpr):
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
+class _ReadonlyBoolPredicateLoadExpr(_AuxiliaryTensorLoadExpr):
+    """Exact readonly byte load used only as a full-tile where predicate.
+
+    Distinct from explicit Bool->FP32 casts: a numeric parse may not reuse
+    this Boolean-valued leaf, and it is not a compact-seed source subject.
+    """
+
+
+# Private dispatch value for a proved rank-one M-load -> (Mtile,1) view.
+# Legacy axes 0/1/2 keep their existing meanings; raw axis 3 is never a proof.
+_M_VECTOR_BROADCAST_AXIS = 3
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _MVectorBroadcastAuxLoadExpr(_AuxiliaryTensorLoadExpr):
+    """A direct readonly M-vector load owned by an explicit singleton view.
+
+    Axis 3 is private to this tagged proof: it is not the existing bare
+    N-vector, rank-two row broadcast or expanded zero-N-stride protocol.
+    """
+
+    view_node: torch.fx.Node
+    owned_nodes: tuple[torch.fx.Node, ...]
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _MVectorScalarPrefixLoadExpr(_MVectorBroadcastAuxLoadExpr):
+    """One raw M transport with a typed pure prefix before the singleton view."""
+
+    prefix: _PointwiseDagExpr
+    raw_expr: _AuxiliaryTensorLoadExpr
+    prefix_depth: int
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
 class _MappedAuxiliaryTensorLoadExpr(_AuxiliaryTensorLoadExpr):
     """A complete readonly DAG leaf with a proved tile-local source-plane view."""
 
-    mapping: MappedAuxLoadMap
+    mapping: MappedAuxLoadMap | ModularAuxLoadMap
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _ModularAuxiliaryTensorLoadExpr(_MappedAuxiliaryTensorLoadExpr):
+    """A complete readonly DAG leaf with tile-contained rank-two repetition."""
 
 
 # Splice-side bindings of chain leaves to pre-bound locals: every auxiliary
@@ -955,6 +997,310 @@ def _readonly_bool_auxiliary_cast(
     )
 
 
+def _readonly_bool_predicate_load(
+    node: torch.fx.Node,
+    *,
+    carrier_tile_shape: tuple[object, ...],
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    carrier_global_shape: tuple[object, ...] | None,
+    carrier_device: torch.device,
+    graphs: Sequence[GraphInfo],
+    allow_unbound: bool = False,
+) -> _ReadonlyBoolPredicateLoadExpr | None:
+    """Prove raw bool storage only in the where-predicate parse context."""
+    from .register_loads import host_load_is_readonly
+
+    tensor_node = node.args[0] if node.args else None
+    host = (
+        tensor_node.meta.get("val") if isinstance(tensor_node, torch.fx.Node) else None
+    )
+    value = node.meta.get("val")
+    if (
+        not CompileEnvironment.has_current()
+        or carrier_tile_index_nodes is None
+        or carrier_global_shape is None
+        or len(carrier_tile_shape) != 2
+        or len(carrier_tile_index_nodes) != 2
+        or carrier_tile_index_nodes[0] is carrier_tile_index_nodes[1]
+        or len(carrier_global_shape) != 2
+        or not isinstance(host, torch.Tensor)
+        or not isinstance(tensor_node, torch.fx.Node)
+        or tensor_node.graph is not node.graph
+        or not isinstance(value, torch.Tensor)
+        or host.ndim != 2
+        or value.ndim != 2
+        or host.dtype is not torch.bool
+        or value.dtype is not torch.bool
+        or host.device != value.device
+        or value.device != carrier_device
+        or tuple(value.shape) != carrier_tile_shape
+        or aux_tensor_load_kind(
+            node,
+            carrier_tile_shape=carrier_tile_shape,
+            carrier_tile_index_nodes=carrier_tile_index_nodes,
+            carrier_global_shape=carrier_global_shape,
+        )
+        != ("exact", None)
+    ):
+        return None
+    env = CompileEnvironment.current()
+    if not host_load_is_readonly(
+        node,
+        env,
+        graphs,
+        allow_unbound=allow_unbound or env.early_mma_metadata_scope_active,
+    ):
+        return None
+    # Bool's existing pointer ABI is Uint8. Compare every nonzero byte to
+    # zero; no one-bit load or canonical-0/1 storage assumption is made.
+    return _ReadonlyBoolPredicateLoadExpr(node, None, "(({aux}) != cutlass.Uint8(0))")
+
+
+def _where_scalar_branch_owned(expr: _TensorExpr) -> bool:
+    """A rank-zero branch must be made only of already proved scalar leaves."""
+    memo: dict[int, bool] = {}
+
+    def owned(item: _TensorExpr) -> bool:
+        identity = id(item)
+        if identity in memo:
+            return memo[identity]
+        if len(memo) >= 64:
+            return False
+        memo[identity] = False
+        result = isinstance(item, _ScalarConstantExpr)
+        if isinstance(item, _RuntimeScalarExpr):
+            if isinstance(item.source, sympy.Expr):
+                result = True
+            else:
+                from ...language import memory_ops
+
+                load = item.source
+                tensor_node = load.args[0] if load.args else None
+                host = (
+                    tensor_node.meta.get("val")
+                    if isinstance(tensor_node, torch.fx.Node)
+                    else None
+                )
+                value = load.meta.get("val")
+                result = (
+                    load.op == "call_function"
+                    and load.target is memory_ops.load
+                    and not load.kwargs
+                    and 2 <= len(load.args) <= 4
+                    and isinstance(load.args[1], (tuple, list))
+                    and not load.args[1]
+                    and all(argument is None for argument in load.args[2:])
+                    and isinstance(tensor_node, torch.fx.Node)
+                    and tensor_node.graph is load.graph
+                    and isinstance(host, torch.Tensor)
+                    and isinstance(value, torch.Tensor)
+                    and host.ndim == value.ndim == 0
+                    and host.dtype == value.dtype
+                    and host.dtype in _FLOAT_CAST_TYPES
+                    and host.device == value.device
+                )
+        if isinstance(item, _UnaryTensorExpr):
+            result = owned(item.operand)
+        elif isinstance(item, _BinaryTensorExpr):
+            result = owned(item.lhs) and owned(item.rhs)
+        memo[identity] = result
+        return result
+
+    return owned(expr)
+
+
+def _m_vector_broadcast_view(
+    node: torch.fx.Node,
+    *,
+    carrier_tile_shape: tuple[object, ...],
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    carrier_global_shape: tuple[object, ...] | None,
+    graphs: Sequence[GraphInfo],
+    allow_unbound: bool = False,
+) -> _MVectorBroadcastAuxLoadExpr | None:
+    """Prove a readonly M-load/view, optionally with a bounded typed scalar prefix.
+
+    The unchanged direct-load/float-cast contract is tried first; arithmetic
+    prefixes require the separate exact FP32 scalar-only proof.
+
+    A rank-one operand is otherwise N-aligned by PyTorch, even on a square
+    tile. The explicit singleton view owns the M-axis meaning. Rank-one
+    positive-stride to (Mtile, 1) is view-compatible; view-copy, inferred or
+    unrelated shape arguments and arbitrary operations are not admitted.
+    """
+    from ...language import memory_ops
+    from .register_loads import host_load_is_readonly
+
+    if (
+        node.op != "call_function"
+        or node.target
+        not in (torch.ops.aten.view.default, torch.ops.aten.reshape.default)
+        or node.kwargs
+        or len(node.args) != 2
+        or not isinstance(node.args[0], torch.fx.Node)
+        or not isinstance(node.args[1], (tuple, list))
+        or len(node.args[1]) != 2
+        or type(node.args[1][1]) is not int
+        or node.args[1][1] != 1
+        or len(carrier_tile_shape) != 2
+        or carrier_tile_index_nodes is None
+        or len(carrier_tile_index_nodes) != 2
+        or carrier_tile_index_nodes[0] is carrier_tile_index_nodes[1]
+        or carrier_global_shape is None
+        or len(carrier_global_shape) != 2
+        or not CompileEnvironment.has_current()
+    ):
+        return None
+    env = CompileEnvironment.current()
+    tile_m, global_m = carrier_tile_shape[0], carrier_global_shape[0]
+    if not isinstance(tile_m, (int, torch.SymInt)) or not isinstance(
+        global_m, (int, torch.SymInt)
+    ):
+        return None
+    dimension = node.args[1][0]
+    if isinstance(dimension, torch.fx.Node):
+        if dimension is not carrier_tile_index_nodes[0]:
+            return None
+    elif type(dimension) is not int or not env.known_equal(dimension, tile_m):
+        return None
+    result = node.meta.get("val")
+    source = node.args[0].meta.get("val")
+    if (
+        not isinstance(result, torch.Tensor)
+        or not isinstance(source, torch.Tensor)
+        or result.dtype not in _FLOAT_CAST_TYPES
+        or source.dtype != result.dtype
+        or source.device != result.device
+        or tuple(source.shape) != carrier_tile_shape[:1]
+        or tuple(result.shape) != (carrier_tile_shape[0], 1)
+        or source.ndim != 1
+        or result.ndim != 2
+        or type(source.stride(0)) is not int
+        or source.stride(0) <= 0
+        or result.stride() != (source.stride(0), source.stride(0))
+        or result.storage_offset() != source.storage_offset()
+    ):
+        return None
+    load = node.args[0]
+    cast_steps: list[_UnaryOp] = []
+    owned: list[torch.fx.Node] = []
+    while load.target is torch.ops.prims.convert_element_type.default:
+        if len(owned) >= 30 or load in owned or load.graph is not node.graph:
+            return None
+        cast = _floating_cast_step(load)
+        if cast is None:
+            return None
+        step, operand = cast
+        before, after = operand.meta.get("val"), load.meta.get("val")
+        if (
+            not isinstance(before, torch.Tensor)
+            or not isinstance(after, torch.Tensor)
+            or tuple(before.shape) != carrier_tile_shape[:1]
+            or before.device != after.device
+            or before.stride() != after.stride()
+        ):
+            return None
+        owned.append(load)
+        cast_steps.append(step)
+        load = operand
+    prefix = None
+    if load.target is not memory_ops.load:
+        from .m_vector_scalar_prefix import prove_m_vector_scalar_prefix
+
+        prefix = prove_m_vector_scalar_prefix(
+            node.args[0], carrier_tile_shape[:1], result.device
+        )
+        if prefix is None:
+            return None
+        load = prefix.load_node
+        owned = list(prefix.owned_nodes)
+        cast_steps = []
+    tensor_node = load.args[0] if load.args else None
+    tensor = (
+        tensor_node.meta.get("val") if isinstance(tensor_node, torch.fx.Node) else None
+    )
+    value = load.meta.get("val")
+    if (
+        load.op != "call_function"
+        or load.target is not memory_ops.load
+        or load.kwargs
+        or not 2 <= len(load.args) <= 4
+        or any(argument is not None for argument in load.args[2:])
+        or load.graph is not node.graph
+        or not isinstance(load.args[1], (tuple, list))
+        or len(load.args[1]) != 1
+        or load.args[1][0] is not carrier_tile_index_nodes[0]
+        or not isinstance(tensor, torch.Tensor)
+        or not isinstance(value, torch.Tensor)
+        or tensor.ndim != 1
+        or value.ndim != 1
+        or tensor.dtype not in _FLOAT_CAST_TYPES
+        or value.dtype != tensor.dtype
+        or tensor.device != value.device
+        or value.device != result.device
+        or tuple(value.shape) != carrier_tile_shape[:1]
+        or not env.known_equal(tensor.shape[0], global_m)
+        or type(tensor.stride(0)) is not int
+        or tensor.stride(0) <= 0
+        or not host_load_is_readonly(
+            load,
+            env,
+            graphs,
+            allow_unbound=allow_unbound or env.early_mma_metadata_scope_active,
+        )
+    ):
+        return None
+    if prefix is not None:
+        if not isinstance(prefix.raw_expr, _AuxiliaryTensorLoadExpr):
+            return None
+        return _MVectorScalarPrefixLoadExpr(
+            load,
+            _M_VECTOR_BROADCAST_AXIS,
+            "{aux}",
+            node,
+            prefix.owned_nodes,
+            prefix.dag,
+            prefix.raw_expr,
+            prefix.depth,
+        )
+    template = "{aux}"
+    for step in reversed(cast_steps):
+        template = step.template.format(inner=template)
+    return _MVectorBroadcastAuxLoadExpr(
+        load, _M_VECTOR_BROADCAST_AXIS, template, node, (*owned, load)
+    )
+
+
+def _m_vector_shape_owned(expr: _TensorExpr) -> bool:
+    """Only proved M leaves/scalars, with bounded identity-memoized traversal."""
+    memo: dict[int, bool] = {}
+
+    def owned(value: _TensorExpr) -> bool:
+        key = id(value)
+        if key in memo:
+            return memo[key]
+        if len(memo) >= 64:
+            return False
+        # A repeated child must not expand a reconvergent DAG exponentially;
+        # this also fails closed on a fabricated expression cycle.
+        memo[key] = False
+        result = False
+        if isinstance(value, _MVectorBroadcastAuxLoadExpr):
+            result = True
+        elif isinstance(value, _UnaryTensorExpr):
+            result = owned(value.operand)
+        elif isinstance(value, _BinaryTensorExpr):
+            left, right = owned(value.lhs), owned(value.rhs)
+            scalar = (_RuntimeScalarExpr, _ScalarConstantExpr)
+            result = (left and (right or isinstance(value.rhs, scalar))) or (
+                right and isinstance(value.lhs, scalar)
+            )
+        memo[key] = result
+        return result
+
+    return owned(expr)
+
+
 def _canonical_aux_load_operand(node: torch.fx.Node) -> tuple[torch.fx.Node, str]:
     """Return the underlying aux load plus its local-value template.
 
@@ -1251,6 +1597,17 @@ def _render_auxiliary_tensor_expr(
             lines.append(f"{prelude_indent}{name} = {rendered}\n")
             names[id(node)] = name
         return "".join(lines), names[id(expr.nodes[-1])]
+    if isinstance(expr, _MVectorScalarPrefixLoadExpr):
+        # The original typed prefix runs on the fully materialized M fragment;
+        # the same raw vector may have distinct prefixes in separate branches.
+        raw_local = aux_locals_by_expr[expr]
+        return _render_auxiliary_tensor_expr(
+            expr.prefix,
+            carrier_name,
+            {expr.raw_expr: raw_local},
+            local_name_factory,
+            prelude_indent,
+        )
     if isinstance(expr, _ScalarConstantExpr):
         typed_literal = f"{_FLOAT_CAST_TYPES[expr.dtype]}({expr.literal})"
         return "", (
@@ -2268,6 +2625,10 @@ def _analyze_tcgen05_pointwise_dag(
     nodes: list[_TensorExpr] = []
     memo: dict[torch.fx.Node, _TensorExpr] = {}
     bool_loads: dict[torch.fx.Node, _ReadonlyBoolAuxLoadExpr] = {}
+    m_vector_nodes: set[torch.fx.Node] = set()
+    # Weak Python literals need one synthetic typed constant in the prefix DAG.
+    # Count those too, keyed by original FX operation/literal provenance.
+    m_prefix_literals: set[tuple[torch.fx.Node, torch.dtype, str]] = set()
     active: set[torch.fx.Node] = set()
     current = _CurrentTensorExpr()
     nodes.append(current)
@@ -2308,12 +2669,26 @@ def _analyze_tcgen05_pointwise_dag(
             nodes.append(promoted)
         return promoted
 
-    def parse(node: torch.fx.Node, depth: int = 0) -> _TensorExpr | None:
+    def parse(
+        node: torch.fx.Node, depth: int = 0, *, predicate_context: bool = False
+    ) -> _TensorExpr | None:
         if node in memo:
-            return memo[node]
+            cached = memo[node]
+            # Predicate-only byte leaves must never become numeric bool
+            # operands via memo reuse in another branch of the same graph.
+            if (
+                isinstance(cached, _ReadonlyBoolPredicateLoadExpr)
+                and not predicate_context
+            ):
+                return None
+            return cached
         if (
             depth > 32
-            or len(memo) + len(bool_loads) >= 64
+            or len(memo)
+            + len(bool_loads)
+            + len(m_vector_nodes)
+            + len(m_prefix_literals)
+            >= 64
             or node in active
             or node.graph is not value_node.graph
         ):
@@ -2327,7 +2702,12 @@ def _analyze_tcgen05_pointwise_dag(
         )
         if value.dtype not in _FLOAT_CAST_TYPES and not (
             value.dtype is torch.bool
-            and (comparison or node.target is _tracing_ops._new_var)
+            and (
+                comparison
+                or node.target is _tracing_ops._new_var
+                or predicate_context
+                and node.target is memory_ops.load
+            )
         ):
             return None
         if comparison and value.dtype is not torch.bool:
@@ -2347,6 +2727,16 @@ def _analyze_tcgen05_pointwise_dag(
             return None
         active.add(node)
         expr: _TensorExpr | None = _scalar_constant(node) or _runtime_scalar(node)
+        if expr is None and predicate_context and value.dtype is torch.bool:
+            expr = _readonly_bool_predicate_load(
+                node,
+                carrier_tile_shape=shape,
+                carrier_tile_index_nodes=indices,
+                carrier_global_shape=output_global_shape,
+                carrier_device=carrier_value.device,
+                graphs=graphs,
+                allow_unbound=allow_unbound,
+            )
         if expr is None and depth < 32:
             boolean = _readonly_bool_auxiliary_cast(
                 node,
@@ -2361,7 +2751,41 @@ def _analyze_tcgen05_pointwise_dag(
                 # explicit cast owns the tagged byte-normalizing FP32 leaf.
                 # Count the underlying load toward the existing node bound.
                 expr = bool_loads.setdefault(boolean.load_node, boolean)
-        if expr is None and node.target is memory_ops.load:
+        if expr is None:
+            m_vector = _m_vector_broadcast_view(
+                node,
+                carrier_tile_shape=shape,
+                carrier_tile_index_nodes=indices,
+                carrier_global_shape=output_global_shape,
+                graphs=graphs,
+                allow_unbound=allow_unbound,
+            )
+            m_depth = (
+                m_vector.prefix_depth + 1
+                if isinstance(m_vector, _MVectorScalarPrefixLoadExpr)
+                else len(m_vector.owned_nodes)
+                if m_vector is not None
+                else 0
+            )
+            if m_vector is not None and depth + m_depth <= 32:
+                expr = m_vector
+                m_vector_nodes.update(m_vector.owned_nodes)
+                if isinstance(m_vector, _MVectorScalarPrefixLoadExpr):
+                    m_prefix_literals.update(
+                        (origin, dtype, item.literal)
+                        for item, (origin, dtype) in zip(
+                            m_vector.prefix.nodes,
+                            m_vector.prefix.provenance,
+                            strict=True,
+                        )
+                        if isinstance(item, _ScalarConstantExpr)
+                        and origin.target is not creation_ops.full
+                    )
+        if (
+            expr is None
+            and node.target is memory_ops.load
+            and value.dtype is not torch.bool
+        ):
             kind = aux_tensor_load_kind(
                 node,
                 carrier_tile_shape=shape,
@@ -2387,6 +2811,19 @@ def _analyze_tcgen05_pointwise_dag(
                     # Only this complete-graph DAG path admits mapped sources;
                     # its whole-effect and registered-alias proof ran above.
                     expr = _MappedAuxiliaryTensorLoadExpr(node, None, "{aux}", mapping)
+                else:
+                    modular = modular_aux_load_map(
+                        node,
+                        carrier_tile_shape=shape,
+                        carrier_tile_index_nodes=indices,
+                        carrier_global_shape=output_global_shape,
+                    )
+                    if modular is not None:
+                        # Index-only modular transport still needs this DAG's
+                        # complete original-store, readonly and alias proofs.
+                        expr = _ModularAuxiliaryTensorLoadExpr(
+                            node, None, "{aux}", modular
+                        )
         if (
             expr is None
             and node.target is _tracing_ops._new_var
@@ -2400,7 +2837,9 @@ def _analyze_tcgen05_pointwise_dag(
                 and source.shape == value.shape
                 and source.stride() == value.stride()
             ):
-                expr = parse(node.args[0], depth + 1)
+                expr = parse(
+                    node.args[0], depth + 1, predicate_context=predicate_context
+                )
         cast = _floating_cast_step(node) if expr is None else None
         unary = _unary_step_for(node.target) if expr is None and cast is None else None
         if (
@@ -2449,6 +2888,31 @@ def _analyze_tcgen05_pointwise_dag(
                     lhs_node.meta.get("val"),
                     rhs_node.meta.get("val"),
                 )
+                same_shapes = (
+                    isinstance(predicate_value, torch.Tensor)
+                    and isinstance(lhs_value, torch.Tensor)
+                    and isinstance(rhs_value, torch.Tensor)
+                    and predicate_value.shape
+                    == lhs_value.shape
+                    == rhs_value.shape
+                    == value.shape
+                )
+                fp32_scalar_broadcast = (
+                    value.dtype is torch.float32
+                    and tuple(value.shape) == shape
+                    and isinstance(predicate_value, torch.Tensor)
+                    and tuple(predicate_value.shape) == shape
+                    and isinstance(lhs_value, torch.Tensor)
+                    and isinstance(rhs_value, torch.Tensor)
+                    and lhs_value.dtype is rhs_value.dtype is torch.float32
+                    and lhs_value.device
+                    == rhs_value.device
+                    == value.device
+                    == carrier_value.device
+                    and tuple(lhs_value.shape) in (shape, ())
+                    and tuple(rhs_value.shape) in (shape, ())
+                    and shape in (tuple(lhs_value.shape), tuple(rhs_value.shape))
+                )
                 if (
                     isinstance(predicate_value, torch.Tensor)
                     and predicate_value.dtype is torch.bool
@@ -2456,13 +2920,21 @@ def _analyze_tcgen05_pointwise_dag(
                     and lhs_value.dtype in _FLOAT_CAST_TYPES
                     and isinstance(rhs_value, torch.Tensor)
                     and rhs_value.dtype in _FLOAT_CAST_TYPES
-                    and predicate_value.shape
-                    == lhs_value.shape
-                    == rhs_value.shape
-                    == value.shape
+                    and (same_shapes or fp32_scalar_broadcast)
                 ):
-                    predicate_expr = parse(predicate_node, depth + 1)
+                    predicate_expr = parse(
+                        predicate_node, depth + 1, predicate_context=True
+                    )
                     left, right = parse(lhs_node, depth + 1), parse(rhs_node, depth + 1)
+                    if not same_shapes and (
+                        left is None
+                        or right is None
+                        or not lhs_value.shape
+                        and not _where_scalar_branch_owned(left)
+                        or not rhs_value.shape
+                        and not _where_scalar_branch_owned(right)
+                    ):
+                        left = right = None
                     if left is not None and right is not None:
                         left = normalize_operand(left, lhs_node, value.dtype)
                         right = normalize_operand(right, rhs_node, value.dtype)
@@ -2501,11 +2973,21 @@ def _analyze_tcgen05_pointwise_dag(
                 ):
                     output_shape = tuple(value.shape)
                     allowed_shapes = (output_shape, (), output_shape[-1:])
+                    m_shape = (shape[0], 1)
+                    lhs_shape, rhs_shape = (
+                        tuple(lhs_value.shape),
+                        tuple(rhs_value.shape),
+                    )
+                    left_shape_allowed = lhs_shape in allowed_shapes or (
+                        lhs_shape == m_shape and _m_vector_shape_owned(left)
+                    )
+                    right_shape_allowed = rhs_shape in allowed_shapes or (
+                        rhs_shape == m_shape and _m_vector_shape_owned(right)
+                    )
                     if (
-                        tuple(lhs_value.shape) in allowed_shapes
-                        and tuple(rhs_value.shape) in allowed_shapes
-                        and output_shape
-                        in (tuple(lhs_value.shape), tuple(rhs_value.shape))
+                        left_shape_allowed
+                        and right_shape_allowed
+                        and output_shape in (lhs_shape, rhs_shape)
                     ):
                         if comparison:
                             # The result is bool, not the comparison's compute
@@ -2562,10 +3044,25 @@ def _analyze_tcgen05_pointwise_dag(
                             operand,
                         )
         active.remove(node)
-        if expr is None or len(memo) + len(bool_loads) >= 64:
+        if (
+            expr is None
+            or len(memo)
+            + len(bool_loads)
+            + len(m_vector_nodes)
+            + len(m_prefix_literals)
+            >= 64
+        ):
             return None
         # Every non-scalar DAG value must have the carrier's logical tile
         # or a proved trailing-axis aux shape; shape-changing ops never enter.
+        # A singleton M shape is admitted only with its owned view/broadcast
+        # proof. It is never a shape-only permission for arbitrary reshapes.
+        if (
+            node_shape == (shape[0], 1)
+            and node_shape != shape
+            and not _m_vector_shape_owned(expr)
+        ):
+            return None
         if node_shape == shape and value.stride() != carrier_value.stride():
             return None
         memo[node] = expr

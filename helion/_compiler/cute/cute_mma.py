@@ -7511,6 +7511,13 @@ def tcgen05_half_source_store_eligible(
         return True
     if operands.has_leading_passthrough or operands.rhs.rhs_is_grouped:
         return True
+    from .modular_aux_protocol import analyze_modular_aux_protocol_subject
+
+    modular, subject = analyze_modular_aux_protocol_subject(
+        graphs, node, (operands.m_block_id, operands.n_block_id)
+    )
+    if modular and subject is None:
+        return False
     output = _analyze_mma_output_stores(node, operands, graphs=list(graphs))
     if output is None:
         return False
@@ -7549,7 +7556,19 @@ def tcgen05_fp32_source_eligible(
         or rhs_operand.rhs_packed_group is not None
     ):
         return False
-    return analyze_tcgen05_matmul_store_chains(graphs, node) is not None
+    chains = analyze_tcgen05_matmul_store_chains(graphs, node)
+    if chains is None:
+        return False
+    from .cute_epilogue import _MVectorBroadcastAuxLoadExpr
+
+    # The new singleton-M protocol is proved for ordinary half-input MMA.
+    # Keep the pre-existing TF32-input source/fallback contract until that
+    # separate native protocol has its own coordinate/numerical validation.
+    return not any(
+        isinstance(leaf, _MVectorBroadcastAuxLoadExpr)
+        for _, chain in chains
+        for leaf in chain.auxiliary_tensor_loads
+    )
 
 
 def _tcgen05_fp32_lowering_blocked(

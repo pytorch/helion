@@ -407,6 +407,12 @@ def _config_int(config: object, key: str, default: int) -> int:
 def _aux_kind(
     leaf: _AuxiliaryTensorLoadExpr, fake: torch.Tensor, strides: tuple[int, ...]
 ) -> str:
+    from .cute_epilogue import _ModularAuxiliaryTensorLoadExpr
+
+    if isinstance(leaf, _ModularAuxiliaryTensorLoadExpr):
+        raise _decline(
+            "rank-two modular auxiliary loads require the tcgen05 DAG protocol"
+        )
     axis = leaf.broadcast_axis
     if axis == 1:
         if fake.ndim != 1:
