@@ -66,12 +66,54 @@ def _render(
 def _evaluate(source: str, expression: str, values: torch.Tensor) -> torch.Tensor:
     class Constructors(ast.NodeTransformer):
         def visit_Call(self, node: ast.Call) -> ast.AST:
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "bitcast":
+                constructor = node.func.value
+                if (
+                    not isinstance(constructor, ast.Call)
+                    or not isinstance(constructor.func, ast.Attribute)
+                    or not isinstance(constructor.func.value, ast.Name)
+                    or constructor.func.value.id != "cutlass"
+                    or constructor.func.attr not in ("Int16", "Int32")
+                    or len(constructor.args) != 1
+                    or constructor.keywords
+                    or len(node.args) != 1
+                    or node.keywords
+                    or not isinstance(node.args[0], ast.Attribute)
+                    or not isinstance(node.args[0].value, ast.Name)
+                    or node.args[0].value.id != "cutlass"
+                ):
+                    raise ValueError("unknown integer bitcast pattern")
+                value = ast.literal_eval(constructor.args[0])
+                integer_name = constructor.func.attr
+                floating_name = node.args[0].attr
+                expected = -32768 if integer_name == "Int16" else -2147483648
+                if (
+                    type(value) is not int
+                    or value != expected
+                    or (
+                        integer_name == "Int16"
+                        and floating_name not in ("Float16", "BFloat16")
+                        or integer_name == "Int32"
+                        and floating_name != "Float32"
+                    )
+                ):
+                    raise ValueError("mismatched integer bitcast width or value")
+                return ast.copy_location(
+                    ast.Call(
+                        func=ast.Name(id="bitcast_integer", ctx=ast.Load()),
+                        args=[ast.Constant(value), constructor.func, node.args[0]],
+                        keywords=[],
+                    ),
+                    node,
+                )
             self.generic_visit(node)
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "cutlass"
             ):
+                if node.func.attr in ("Int16", "Int32"):
+                    raise ValueError("integer constructor outside exact bitcast")
                 return ast.copy_location(
                     ast.Call(
                         func=ast.Name(id="cast", ctx=ast.Load()),
@@ -87,14 +129,32 @@ def _evaluate(source: str, expression: str, values: torch.Tensor) -> torch.Tenso
             return value.to(dtype)
         return torch.tensor(value, dtype=dtype, device="cpu")
 
+    def bitcast_integer(
+        value: int, integer_dtype: torch.dtype, floating_dtype: torch.dtype
+    ) -> torch.Tensor:
+        if (integer_dtype, floating_dtype) not in (
+            (torch.int16, torch.float16),
+            (torch.int16, torch.bfloat16),
+            (torch.int32, torch.float32),
+        ):
+            raise ValueError("mismatched integer and floating storage widths")
+        return torch.tensor(value, dtype=integer_dtype, device="cpu").view(
+            floating_dtype
+        )
+
     tree = ast.fix_missing_locations(
         Constructors().visit(ast.parse(source + f"result = {expression}\n"))
     )
     namespace = {
         "values": values,
         "cast": cast,
+        "bitcast_integer": bitcast_integer,
         "cutlass": SimpleNamespace(
-            Float16=torch.float16, BFloat16=torch.bfloat16, Float32=torch.float32
+            Float16=torch.float16,
+            BFloat16=torch.bfloat16,
+            Float32=torch.float32,
+            Int16=torch.int16,
+            Int32=torch.int32,
         ),
     }
     exec(compile(tree, "<cpu_epilogue_constants>", "exec"), namespace)
@@ -124,7 +184,15 @@ def test_typed_constant_leaf_preserves_value_dtype_and_operand_order(
     assert chain.auxiliary_tensor_loads == ()
     assert chain.runtime_scalars == ()
     source, expression = _render(chain)
-    assert f"{cute_epilogue._FLOAT_CAST_TYPES[dtype]}({expected_literal})" in source
+    if expected_literal == "-0.0":
+        integer = (
+            "cutlass.Int32(-2147483648)"
+            if dtype is torch.float32
+            else "cutlass.Int16(-32768)"
+        )
+        assert f"{integer}.bitcast({cute_epilogue._FLOAT_CAST_TYPES[dtype]})" in source
+    else:
+        assert f"{cute_epilogue._FLOAT_CAST_TYPES[dtype]}({expected_literal})" in source
     values = torch.linspace(-2, 2, 64, device="cpu").reshape(4, 16)
     rounded = torch.tensor(literal, dtype=dtype, device="cpu").float()
     expected = rounded - values if reverse else values - rounded

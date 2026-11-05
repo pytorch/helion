@@ -565,17 +565,107 @@ def test_rendered_m_vector_float_association_and_ieee_values_are_exact(dtype):
         )
 
 
-def test_identity_first_output_retains_both_stores_without_new_shared_identity_proof():
+def test_identity_first_output_retains_both_stores_with_scoped_shared_identity_proof():
+    from helion._compiler.cute import shared_epilogue_dag as shared
+
     a, b, u, _v, _bias, first, second = arguments()
     bound = cpu_bind(identity_then_m_vector, (a, b, u, first, second))
     assert bound.config_spec.cute_tcgen05_search_enabled
-    assert not bound.config_spec._cute_tcgen05_config.epilogue_fanout_plans
-    _, _, analyzed = chains(bound)
+    (plan,) = bound.config_spec._cute_tcgen05_config.epilogue_fanout_plans
+    assert isinstance(plan, shared.SharedDagFanoutPlan)
+    graphs, anchor, analyzed = chains(bound)
     assert analyzed is not None and len(analyzed) == 2
+    assert plan.stores == tuple(store for store, _chain in analyzed)
+    identity_dag = plan.chains[0].steps[0].expr
+    assert isinstance(identity_dag, epi._PointwiseDagExpr)
+    assert len(identity_dag.nodes) == 1
+    assert isinstance(identity_dag.nodes[0], epi._CurrentTensorExpr)
+    assert identity_dag.provenance == ((anchor, torch.float32),)
+    identity_value = plan.stores[0].args[2]
+    assert isinstance(identity_value, torch.fx.Node)
+    with bound.env, bound.host_function:
+        assert (
+            epi._analyze_tcgen05_pointwise_dag(
+                identity_value, graphs, {anchor}, plan.shape
+            )
+            is None
+        )
+        assert (
+            shared.prove_shared_dag_fanout(
+                bound.env, bound.host_function, graphs, plan.stores, {anchor}
+            )
+            is not None
+        )
     source = bound.to_code(helion.Config(block_sizes=[128, 32, 64], pid_type="flat"))
     assert source.count("'kind': 'tcgen05_d_tma'") == 2
     assert source.count("tcgen05_acc_pipeline.consumer_release(") == 1
     assert "first" in source and "second" in source
+    config = helion.Config(
+        block_sizes=[128, 32, 64],
+        pid_type="persistent_interleaved",
+        tcgen05_ab_stages=2,
+        tcgen05_acc_stages=2,
+        tcgen05_c_stages=2,
+        tcgen05_epilogue_fanout="shared",
+    )
+    shared_source = bound.to_code(config)
+    copies = [
+        node
+        for node in ast.walk(ast.parse(shared_source))
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "cute.copy"
+        and node.args
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id.startswith("tcgen05_tiled_copy_t2r")
+    ]
+    assert len(copies) == 1
+    assert shared_source.count("'kind': 'tcgen05_d_tma'") == 2
+    assert shared_source.count("PipelineTmaStore.create(") == 2
+    assert shared_source.count("producer_commit()") == 2
+    assert shared_source.count("producer_tail()") == 2
+    assert shared_source.count("tcgen05_acc_pipeline.consumer_release(") == 1
+    assert shared_source.count("tcgen05_acc_consumer_state.advance()") == 1
+    assert "first" in shared_source and "second" in shared_source
+    key = "tensor_storage_disjoint_matrix_v1"
+    for table in (
+        bound.env.bound_runtime_input_specialization_results,
+        bound.env.runtime_input_specializations,
+    ):
+        saved = table.pop(key)
+        try:
+            with pytest.raises(
+                (helion.exc.BackendUnsupported, helion.exc.InvalidConfig)
+            ):
+                bound.to_code(config)
+            assert key not in table
+        finally:
+            table[key] = saved
+    table = bound.env.bound_runtime_input_specialization_results
+    saved = table[key]
+    try:
+        table[key] = tuple(False for _ in saved)
+        with pytest.raises((helion.exc.BackendUnsupported, helion.exc.InvalidConfig)):
+            bound.to_code(config)
+    finally:
+        table[key] = saved
+    second_store = plan.stores[1]
+    original_args = second_store.args
+    try:
+        second_store.args = (
+            original_args[0],
+            original_args[1],
+            identity_value,
+            original_args[3],
+        )
+        with bound.env, bound.host_function:
+            assert (
+                shared.prove_shared_dag_fanout(
+                    bound.env, bound.host_function, graphs, plan.stores, {anchor}
+                )
+                is None
+            )
+    finally:
+        second_store.args = original_args
 
 
 def test_m_shape_ownership_is_identity_bounded_under_reconvergent_dag():

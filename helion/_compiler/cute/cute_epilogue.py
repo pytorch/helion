@@ -1610,6 +1610,16 @@ def _render_auxiliary_tensor_expr(
         )
     if isinstance(expr, _ScalarConstantExpr):
         typed_literal = f"{_FLOAT_CAST_TYPES[expr.dtype]}({expr.literal})"
+        if float(expr.literal) == 0.0 and math.copysign(1.0, float(expr.literal)) < 0:
+            # CUTLASS's IR constant cache keys Python floats by equality, so
+            # +0.0 and -0.0 collide in one insertion scope. An integer bitcast
+            # preserves the original storage sign without changing arithmetic.
+            bits = (
+                "cutlass.Int32(-2147483648)"
+                if expr.dtype is torch.float32
+                else "cutlass.Int16(-32768)"
+            )
+            typed_literal = f"{bits}.bitcast({_FLOAT_CAST_TYPES[expr.dtype]})"
         return "", (
             typed_literal
             if expr.dtype is torch.float32
@@ -2520,12 +2530,17 @@ def _analyze_tcgen05_pointwise_dag(
     output_global_shape: tuple[object, ...] | None,
     *,
     allow_unbound: bool = False,
+    allow_identity_output: bool = False,
 ) -> tuple[Tcgen05UnaryEpilogueChain, torch.fx.Node] | None:
     """Prove the complete anchored DAG, with bound alias facts by default.
 
     Coverage registration may read an already registered live classifier before
     the normal managed-bind snapshot. It neither registers nor publishes facts;
     final lowering never opts into that constructor-only read.
+
+    Only the complete shared-fanout boundary may admit an identity-current
+    output. The default standalone DAG contract still requires a computation;
+    the shared prover owns the other original outputs and their full lifetime.
     """
     from ...language import matmul_ops
     from ...language import memory_ops
@@ -3072,7 +3087,12 @@ def _analyze_tcgen05_pointwise_dag(
         return expr
 
     root = parse(value_node)
-    if root is None or root is current or nodes[-1] is not root:
+    if (
+        root is None
+        or root is current
+        and (not allow_identity_output or not 2 <= len(destinations) <= 4)
+        or nodes[-1] is not root
+    ):
         return None
     load_sources = [node for node in all_nodes if node.target is memory_ops.load]
     if load_sources or len(destinations) > 1:

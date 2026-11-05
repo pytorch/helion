@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from ..host_function import HostFunction
     from .device_state import CuteTcgen05StoreValue
     from .epilogue_fanout import FanoutStore
+    from .shared_semantic_memo import SharedSemanticMemo
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class SharedDagFanoutPlan:
     block_ids: tuple[int, int]
     shape: tuple[int, int]
     pre_wait_aux_safe: bool
+    semantic_memo: SharedSemanticMemo | None = None
 
 
 FanoutPlan = PairedFanoutPlan | SharedDagFanoutPlan
@@ -200,6 +202,7 @@ def prove_shared_dag_fanout(
     axes: tuple[int, int] | None = None
     anchor: torch.fx.Node | None = None
     keys: set[object] = set()
+    identity_outputs = 0
     for store in ordered:
         if (
             store.target is not memory_ops.store
@@ -241,6 +244,7 @@ def prove_shared_dag_fanout(
             anchors,
             tuple(tensor.shape),
             allow_unbound=allow_unbound,
+            allow_identity_output=True,
         )
         if analyzed is None or anchor is not None and anchor is not analyzed[1]:
             return None
@@ -248,6 +252,12 @@ def prove_shared_dag_fanout(
         dag = chain.steps[0].expr
         if not isinstance(dag, epi._PointwiseDagExpr):
             return None
+        if isinstance(dag.nodes[-1], epi._CurrentTensorExpr):
+            # Admit one identity alongside computed epilogues, not a new
+            # standalone/duplicate pure-GEMM subject or an early release.
+            identity_outputs += 1
+            if identity_outputs > 1:
+                return None
         try:
             keys.update(dag_keys(dag))
         except ValueError:
@@ -280,7 +290,12 @@ def prove_shared_dag_fanout(
     )
     if not pre_wait_aux_safe:
         return None
-    assert axes is not None
+    assert axes is not None and anchor is not None
+    from .shared_semantic_memo import build_shared_semantic_memo
+
+    # Optimization keys are constructed only after every original typed DAG,
+    # whole-store inventory, budget, readonly and disjointness proof passed.
+    semantic_memo = build_shared_semantic_memo(chains, ordered[0], anchor)
     return SharedDagFanoutPlan(
         ordered,
         tuple(chains),
@@ -288,6 +303,7 @@ def prove_shared_dag_fanout(
         axes,
         (int(outputs[0].shape[0]), int(outputs[0].shape[1])),
         pre_wait_aux_safe,
+        semantic_memo,
     )
 
 
@@ -374,10 +390,13 @@ def render_dag(
     factory: Callable[[str], str],
     memo: dict[object, str],
     indent: str,
+    *,
+    semantic_keys: tuple[object, ...] | None = None,
 ) -> tuple[str, str]:
     names: dict[int, str] = {}
     lines: list[str] = []
-    for node, key in zip(dag.nodes, dag_keys(dag), strict=True):
+    keys = dag_keys(dag) if semantic_keys is None else semantic_keys
+    for node, key in zip(dag.nodes, keys, strict=True):
         if isinstance(node, epi._UnaryTensorExpr):
             expression = node.step.template.format(inner=names[id(node.operand)])
         elif isinstance(node, epi._BinaryTensorExpr):
@@ -455,11 +474,68 @@ def combine_dag_stores(stores: Sequence[FanoutStore]) -> None:
         or len({s.commit for s in stores}) != len(stores)
     ):
         raise exc.BackendUnsupported("cute", "incomplete shared-DAG full-tile lifetime")
+    semantic = plan.semantic_memo
+    if semantic is not None:
+        from .shared_semantic_memo import load_signature
+
+        # Strict source/proof identities remain separate and authoritative.
+        # Validate every store before a semantic load/value key is consumed.
+        if semantic.scope is not plan.stores[0] or any(
+            len(values) != len(stores)
+            for values in (
+                semantic.strict_keys,
+                semantic.value_keys,
+                semantic.raw_keys,
+                semantic.load_signatures,
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "incomplete shared semantic memo scope"
+            )
+        for index, store in enumerate(stores):
+            if len(store.iteration.chain.chain.steps) != 1:
+                raise exc.BackendUnsupported(
+                    "cute", "shared-DAG source/proof disagreement"
+                )
+            expected = plan.chains[index].steps[0].expr
+            actual = store.iteration.chain.chain.steps[0].expr
+            try:
+                signatures = tuple(
+                    load_signature(leaf)
+                    for leaf in store.iteration.chain.chain.auxiliary_tensor_loads
+                )
+            except ValueError as error:
+                raise exc.BackendUnsupported(
+                    "cute", "shared semantic memo lost typed load provenance"
+                ) from error
+            if (
+                not isinstance(expected, epi._PointwiseDagExpr)
+                or not isinstance(actual, epi._PointwiseDagExpr)
+                or dag_keys(actual) != dag_keys(expected)
+                or dag_keys(actual) != semantic.strict_keys[index]
+                or signatures != semantic.load_signatures[index]
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "shared semantic memo lost strict source/proof identity"
+                )
+        from .shared_semantic_memo import build_shared_semantic_memo
+
+        first_dag = plan.chains[0].steps[0].expr
+        assert isinstance(first_dag, epi._PointwiseDagExpr)
+        rebuilt = build_shared_semantic_memo(
+            tuple(store.iteration.chain.chain for store in stores),
+            plan.stores[0],
+            first_dag.provenance[0][0],
+        )
+        if rebuilt != semantic:
+            raise exc.BackendUnsupported(
+                "cute", "shared semantic memo does not match checked values"
+            )
     memo: dict[object, str] = {}
     aux_names: dict[object, str] = {}
     chunks: list[list[str]] = []
     bindings: list[epi._LeafBindings] = []
-    for store in stores:
+    for store_index, store in enumerate(stores):
         loads: list[str] = []
         local = dict(store.iteration.auxiliary_names)
         if (
@@ -469,12 +545,18 @@ def combine_dag_stores(stores: Sequence[FanoutStore]) -> None:
             raise exc.BackendUnsupported(
                 "cute", "incomplete shared-DAG auxiliary load proof"
             )
-        for leaf, source in store.iteration.auxiliary_load_sources:
+        for load_index, (leaf, source) in enumerate(
+            store.iteration.auxiliary_load_sources
+        ):
             if not source or leaf not in local:
                 raise exc.BackendUnsupported(
                     "cute", "incomplete shared-DAG auxiliary load source"
                 )
-            key = raw_aux_key(leaf)
+            key = (
+                raw_aux_key(leaf)
+                if semantic is None
+                else semantic.raw_keys[store_index][load_index]
+            )
             if key not in aux_names:
                 aux_names[key] = local[leaf]
                 loads.append(source)
@@ -516,7 +598,13 @@ def combine_dag_stores(stores: Sequence[FanoutStore]) -> None:
             return name
 
         arithmetic, result = render_dag(
-            actual, carrier, bindings[index], original_name, memo, "        "
+            actual,
+            carrier,
+            bindings[index],
+            original_name,
+            memo,
+            "        ",
+            semantic_keys=None if semantic is None else semantic.value_keys[index],
         )
         assert next(variables, None) is None
         if not pre_wait:
