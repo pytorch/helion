@@ -1234,7 +1234,7 @@ class TypePropagation(ast.NodeVisitor):
             return self._comprehension_value(branch)
         if any(isinstance(n, (ast.Call, ast.NamedExpr)) for n in ast.walk(node)):
             raise exc.StatementNotSupported(
-                "Comprehension filters must be compile-time constant expressions"
+                "Calls and assignment expressions in comprehension filters"
             )
         if isinstance(node, ast.Compare):
             left = self._comprehension_value(node.left)
@@ -1251,7 +1251,7 @@ class TypePropagation(ast.NodeVisitor):
                         and type(right_value) is not bool
                     ):
                         raise exc.StatementNotSupported(
-                            "Comprehension filters must be compile-time constant expressions"
+                            "Identity comparisons in comprehension filters except with None or bool"
                         )
                     result = LiteralType(
                         self.origin(),
@@ -1269,7 +1269,7 @@ class TypePropagation(ast.NodeVisitor):
             return LiteralType(self.origin(), True)
         if any(isinstance(n, (ast.BoolOp, ast.IfExp)) for n in ast.walk(node)):
             raise exc.StatementNotSupported(
-                "Comprehension filters must be compile-time constant expressions"
+                "Short-circuit expressions inside this comprehension filter"
             )
         return self._visit_comprehension_iteration(node)
 

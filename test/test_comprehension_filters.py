@@ -264,7 +264,7 @@ def test_tensor_filter_is_rejected() -> None:
 
 
 def test_identity_filter_is_rejected() -> None:
-    with pytest.raises(exc.StatementNotSupported, match="compile-time constant"):
+    with pytest.raises(exc.StatementNotSupported, match="Identity comparisons"):
         identity_filter.bind((torch.ones(32), 10000))
 
 
