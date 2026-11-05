@@ -426,7 +426,13 @@ class TritonBackend(Backend):
             launcher_symbol="default_launcher",
             launcher_alias="_default_launcher",
             deps="torch + triton",
-            runtime_helper_names=("get_num_sm", "get_num_xcd", "set_triton_allocator"),
+            runtime_helper_names=(
+                "get_num_sm",
+                "get_num_xcd",
+                "get_xpu_kernel_shared",
+                "get_xpu_programs_per_xecore",
+                "set_triton_allocator",
+            ),
         )
 
     @property
