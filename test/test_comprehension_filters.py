@@ -49,6 +49,24 @@ def membership_filter(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(autotune_effort="none")
+def static_range_filter(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [i + 1 for i in hl.static_range(4) if i % 2 == 0]
+        out[tile] = x[tile] * (values[0] + values[1])
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def filtered_generator(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = tuple(i + 1 for i in (0, 1, 2, 3) if i % 2 == 0)
+        out[tile] = x[tile] * (values[0] + values[1])
+    return out
+
+
+@helion.kernel(autotune_effort="none")
 def nested_boolean_filter(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.numel()):
@@ -204,6 +222,13 @@ def test_chained_filter_short_circuits() -> None:
 
 def test_membership_filter() -> None:
     bound = membership_filter.bind((torch.ones(32),))
+    graph = str(bound.host_function.device_ir.graphs[0].graph)
+    assert ", 4)" in graph
+
+
+@pytest.mark.parametrize("kernel", [static_range_filter, filtered_generator])
+def test_filtered_sequence_forms(kernel: helion.Kernel) -> None:
+    bound = kernel.bind((torch.ones(32),))
     graph = str(bound.host_function.device_ir.graphs[0].graph)
     assert ", 4)" in graph
 
