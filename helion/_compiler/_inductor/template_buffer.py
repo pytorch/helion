@@ -335,6 +335,10 @@ class HelionTemplateBuffer(TemplateBuffer):
                 bk.ensure_config_exists(
                     self._autotune_args,  # pyrefly: ignore[bad-argument-type]
                 )
+                bk.env.backend.fit_config_for_rendering(
+                    bk,
+                    self._autotune_args,  # pyrefly: ignore[bad-argument-type]
+                )
             cfg = bk._config
 
         # Generate final AST with chosen config.
