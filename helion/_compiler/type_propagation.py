@@ -1210,7 +1210,10 @@ class TypePropagation(ast.NodeVisitor):
                 n._type_info = old
             raise
         for n, old in zip(nodes, previous, strict=True):
-            if old is not None:
+            # These names are resolved from the current iteration's scope.
+            if old is not None and not (
+                n is node and isinstance(n, ast.Name) and n.id in self.scope.variables
+            ):
                 n._type_info = old if n._type_info is None else old.merge(n._type_info)
         return result
 
@@ -1292,7 +1295,7 @@ class TypePropagation(ast.NodeVisitor):
     def _evaluate_filtered_comprehension(
         self, generator: ast.comprehension, expression: ast.AST
     ) -> SequenceType:
-        iterable = self.visit(generator.iter)
+        iterable = self._visit_comprehension_iteration(generator.iter)
         if not isinstance(iterable, SequenceType):
             raise exc.StatementNotSupported(
                 "Filtered comprehensions require a fixed sequence"
