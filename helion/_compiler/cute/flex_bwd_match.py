@@ -48,9 +48,11 @@ import dataclasses
 import logging
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import cast
 
 import torch
 
+from ..inductor_lowering import prepare_added_node_lowering
 from .analysis.match_common import host_tensor_name as _host_tensor_name
 from .analysis.match_common import is_call as _is_call
 from .analysis.match_common import is_full_slice as _is_full_slice
@@ -444,6 +446,8 @@ class _BwdRegionBuilder(_RegionBuilder):
     def __init__(self, ctx: _Ctx, graph_id: int, score_root: torch.fx.Node) -> None:
         super().__init__(ctx, graph_id, score_root)
         self.grad_root: torch.fx.Node | None = None
+        # The ``full([], value)`` literals of the region being built.
+        self._literals: list[torch.fx.Node] = []
 
     def _classify_leaf(self, node: torch.fx.Node) -> _Leaf | None:
         if self.grad_root is not None:
@@ -464,14 +468,51 @@ class _BwdRegionBuilder(_RegionBuilder):
         leaf = self.leaf_of(arg)
         return leaf is not None and leaf.kind == "grad"
 
+    def build(
+        self,
+        nodes: list[torch.fx.Node],
+        output: torch.fx.Node,
+        aux_order: list[str],
+        host_scalars: list[str],
+        coord_meta: dict[str, object],
+    ) -> tuple[torch.fx.Graph, torch.fx.Node]:
+        self._literals = []
+        graph, result = super().build(
+            nodes, output, aux_order, host_scalars, coord_meta
+        )
+        # The literals are the only nodes without a lowering prepared on the
+        # source graph (preparing one needs the graph's output).
+        for node in self._literals:
+            prepare_added_node_lowering(graph, node)
+        return graph, result
+
+    def _literal(
+        self, graph: torch.fx.Graph, source: torch.fx.Node, value: float
+    ) -> torch.fx.Node:
+        """``full([], value)`` in ``source``'s dtype, standing in for ``source``.
+
+        A node rather than a Python number: every copied node keeps its source
+        node's prepared lowering, which binds the tensor operands
+        positionally, so an operand that was a node must stay one.
+        """
+        val = cast("torch.Tensor", source.meta["val"])
+        node = graph.call_function(
+            _aten.full.default, ([], value), {"dtype": val.dtype, "device": val.device}
+        )
+        node.meta["val"] = val.new_full((), value)
+        node.meta["location"] = source.meta["location"]
+        self._literals.append(node)
+        return node
+
     def _leaf_value(
         self, leaf: _Leaf, placeholders: dict[str, torch.fx.Node]
     ) -> Argument:
         if leaf.kind == "grad":
-            # The gradient argument as the Python literal 1.0: the region then
-            # evaluates to the Jacobian (a VJP is linear in its gradient), and
-            # the pointwise lowerings take a number in any operand position.
-            return 1.0
+            # The unit gradient: the region then evaluates to the Jacobian (a
+            # VJP is linear in its gradient).
+            # (``placeholders`` all live on the region graph being built.)
+            assert self.grad_root is not None
+            return self._literal(placeholders["score"].graph, self.grad_root, 1.0)
         return super()._leaf_value(leaf, placeholders)
 
     def _copy_node(
@@ -485,30 +526,14 @@ class _BwdRegionBuilder(_RegionBuilder):
             # its gradient, so the product with the unit gradient is ``J``).
             lhs, rhs = node.args
             if self._is_grad(lhs) and not self._is_grad(rhs):
-                return transform(rhs) if isinstance(rhs, torch.fx.Node) else rhs
+                if isinstance(rhs, torch.fx.Node):
+                    return transform(rhs)
+                return self._literal(graph, node, cast("float", rhs))
             if self._is_grad(rhs) and not self._is_grad(lhs):
-                return transform(lhs) if isinstance(lhs, torch.fx.Node) else lhs
-        reads_grad = any(self._is_grad(arg) for arg in node.args)
-        copied = graph.node_copy(node, transform)
-        if reads_grad:
-            if (
-                copied.target in (_aten.mul.Tensor, _aten.add.Tensor)
-                and len(copied.args) == 2
-                and not isinstance(copied.args[0], torch.fx.Node)
-                and isinstance(copied.args[1], torch.fx.Node)
-            ):
-                # The lowering preparation binds tensor inputs positionally:
-                # keep the tensor operand first now that the gradient is a
-                # literal.
-                copied.args = (copied.args[1], copied.args[0])
-            # The copy keeps the source node's prepared lowering, built for
-            # two tensor operands; with the gradient now a literal it is
-            # stale, so drop it and let the renderer re-prepare it. Nodes
-            # whose operands are unchanged keep theirs (the tracer encodes a
-            # repeated operand as None next to its prepared lowering, which
-            # a fresh preparation could not rebuild).
-            copied.meta.pop("lowering", None)
-        return copied
+                if isinstance(lhs, torch.fx.Node):
+                    return transform(lhs)
+                return self._literal(graph, node, cast("float", lhs))
+        return super()._copy_node(graph, node, transform)
 
 
 # -- entry ---------------------------------------------------------------------

@@ -597,6 +597,44 @@ def test_softcap_score_mod_with_jacobian() -> None:
     _assert_close(got, ref)
 
 
+def _softcap_20(score, b, h, q_idx, kv_idx):
+    return 20.0 * torch.tanh(score / 20.0)
+
+
+def _softcap_20_bwd_scaled(grad, score, b, h, q_idx, kv_idx):
+    t = torch.tanh(score / 20.0)
+    return (grad * 20.0) * (1.0 - t * t) / 20.0
+
+
+def _softcap_20_bwd_divided(grad, score, b, h, q_idx, kv_idx):
+    t = torch.tanh(score / 20.0)
+    return grad / 20.0 * (20.0 * (1.0 - t * t))
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    "score_mod_bwd", [_softcap_20_bwd_scaled, _softcap_20_bwd_divided]
+)
+def test_softcap_jacobian_with_gradient_arithmetic(
+    score_mod_bwd: Callable[..., torch.Tensor],
+) -> None:
+    """``score_mod_bwd`` forms whose gradient meets literal arithmetic before
+    (or besides) the Jacobian factor, as in a VJP traced from ``score_mod``."""
+    got, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=256,
+        n=256,
+        d=64,
+        score_mod=_softcap_20,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=_causal,
+    )
+    assert "fbwd_spre" in code and "fbwd_mul_pairs_packed" in code
+    _assert_close(got, ref)
+
+
 def _assert_same_walk(
     whole: tuple[torch.Tensor, ...], chunked: tuple[torch.Tensor, ...]
 ) -> None:
