@@ -267,6 +267,8 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
+    from .cute_epilogue import Tcgen05UnaryEpilogueChain
+    from .mapped_output import BatchDigitOutputMap
     from .strategies import Tcgen05WarpSpec
 
 
@@ -1481,6 +1483,33 @@ def host_function_matmul_operands_tma_provable(
     return True
 
 
+def host_function_batch_digit_plane_store_seedable(
+    env: CompileEnvironment, host_function: HostFunction
+) -> bool:
+    """Whether every MMA candidate is a batch-digit plane store with TMA operands.
+
+    Such kernels fail ``host_function_matmul_operands_tma_provable`` only
+    through their output, which the SIMT plane view stores without a D
+    TensorMap. Both A/B operands must still pass the TensorMap proof, since
+    the seeds request the TMA load pipeline.
+    """
+    device_ir = host_function.device_ir
+    found = False
+    with _host_function_tma_proof_scope(env, host_function):
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                candidate = analyze_cute_mma_node(node, device_ir=device_ir)
+                if candidate is None:
+                    continue
+                if _candidate_batch_digit_output(candidate) is None:
+                    return False
+                for operand in (candidate.operands.lhs, candidate.operands.rhs):
+                    if not _tcgen05_tma_operand_is_aligned(env, operand):
+                        return False
+                found = True
+    return found
+
+
 def host_function_exact_aux_tma_provable(
     env: CompileEnvironment, host_function: HostFunction
 ) -> bool:
@@ -1496,9 +1525,12 @@ def host_function_exact_aux_tma_provable(
     seeds and the normalizer never offer the staged modes to a kernel whose
     residual, gate or seed is an offset, strided or column-major view.
     """
+    from .aux_tensor import host_function_has_quotient_aux_transport
     from .aux_tensor import host_function_tcgen05_exact_shape_aux_tensors
 
     with _host_function_tma_proof_scope(env, host_function):
+        if host_function_has_quotient_aux_transport(host_function):
+            return False
         return all(
             _tcgen05_tma_aux_tensor_is_legal(env, tensor)
             for tensor in host_function_tcgen05_exact_shape_aux_tensors(host_function)
@@ -3494,6 +3526,57 @@ class _MmaOutputStoreAnalysis:
     explicit_epi_tile_compatible: bool
     output_column_major: bool
     requires_fragment_epilogue: bool = False
+    # A proved batch-digit destination (``mapped_output.py``): the batched
+    # output is stored through the per-batch plane view of the SIMT store.
+    batch_digit_output: BatchDigitOutputMap | None = None
+
+
+def _candidate_batch_digit_output(
+    candidate: _CuteMmaNode | None,
+) -> BatchDigitOutputMap | None:
+    """The candidate's proved batch-digit destination, if it has one."""
+    if candidate is None or candidate.output_store_analysis is None:
+        return None
+    return candidate.output_store_analysis.batch_digit_output
+
+
+def _codegen_batch_digit_output(
+    candidate: _CuteMmaNode | None,
+    traced_stores: tuple[Node, ...] | None,
+    graphs: list[GraphInfo],
+) -> BatchDigitOutputMap | None:
+    """Re-prove the analyzed batch-digit destination on the codegen store node.
+
+    The analysis ran over the DeviceIR graphs; the store lowering sees the
+    codegen graphs' nodes. The same proof must hold on that one traced store
+    with the identical destination dims, or the configuration is refused.
+    """
+    from ..compile_environment import CompileEnvironment
+    from .mapped_output import batch_digit_output_map
+
+    analyzed = _candidate_batch_digit_output(candidate)
+    if analyzed is None:
+        return None
+    assert candidate is not None
+    mapping = (
+        batch_digit_output_map(
+            CompileEnvironment.current(),
+            graphs,
+            traced_stores[0],
+            output_block_ids=candidate.operands.output_block_ids,
+            input_tensors=(
+                candidate.operands.lhs.source_fake,
+                candidate.operands.rhs.source_fake,
+            ),
+        )
+        if traced_stores is not None and len(traced_stores) == 1
+        else None
+    )
+    if mapping is None or mapping.layout_key() != analyzed.layout_key():
+        raise exc.BackendUnsupported(
+            "cute", "batch-digit output proof does not hold on the codegen store"
+        )
+    return mapping
 
 
 def _mma_tiles_are_static_full(
@@ -3720,11 +3803,16 @@ def ensure_tcgen05_fragment_epilogue_plan(
 
 def _exact_half_mma_operand_round_trip(
     node: Node,
+    *,
+    allow_leading_axis: bool = False,
 ) -> tuple[Node, tuple[Node, ...]] | None:
     """Prove only a direct, unmasked half -> FP32 -> same-half identity.
 
     Share MMA-DAG's exact-width proof; retain node positions for ownership and
     source-format planning. No mutation of the source graph or casts occurs.
+    ``allow_leading_axis`` also admits a rank-3 (batched) operand: the proof is
+    elementwise, and every cast must keep the source's exact shape and strides.
+    Only the operand analysis that plans leading-axis matmuls opts in.
     """
     from .cute_mma_dag import _exact_round_trip
 
@@ -3747,12 +3835,13 @@ def _exact_half_mma_operand_round_trip(
         return None
     source = current.meta.get("val")
     backing = direct[2]
+    ranks = (2, 3) if allow_leading_axis else (2,)
     if (
         not isinstance(source, torch.Tensor)
-        or source.ndim != 2
+        or source.ndim not in ranks
         or source.dtype not in (torch.float16, torch.bfloat16)
         or backing.dtype != source.dtype
-        or backing.ndim != 2
+        or backing.ndim != source.ndim
         or casts[1].args[1] is not torch.float32
     ):
         return None
@@ -3924,7 +4013,9 @@ def _analyze_mma_operand(
     cast_dtype: torch.dtype | None = None
     round_trip_casts: tuple[Node, ...] = ()
     if source_to_logical_order is None:
-        round_trip = _exact_half_mma_operand_round_trip(load_value)
+        round_trip = _exact_half_mma_operand_round_trip(
+            load_value, allow_leading_axis=True
+        )
         if round_trip is not None:
             load_value, round_trip_casts = round_trip
         else:
@@ -4006,11 +4097,14 @@ def _analyze_mma_operands(
     leading_passthrough_block_id = (
         next(iter(leading_block_ids)) if leading_block_ids else None
     )
-    # Leading-axis TMA descriptors currently require row-major trailing
-    # matrices. Keep other layouts out of the shared search/planning/codegen
-    # capability until their rank-3 descriptor mapping is supported.
+    # Leading-axis TMA descriptors view each batched operand through a
+    # permuted (rows, K, L) TensorMap (``lhs_tma_order`` / ``rhs_tma_order``)
+    # that keeps the source's unit stride. A must be K-major (row-major) per
+    # batch; B may be MN-major (row-major) or K-major (column-major), the same
+    # two B majors the rank-2 descriptor stages. Other layouts stay out of the
+    # shared search/planning/codegen capability.
     if leading_passthrough_block_id is not None and any(
-        operand.matrix_major != "row"
+        operand.matrix_major not in (("row",) if operand is lhs else ("row", "col"))
         for operand in (lhs, rhs)
         if operand.is_leading_passthrough
     ):
@@ -5815,10 +5909,17 @@ def prepare_cute_collective_lane_loop_suppression(
                 config=cg.device_function.config,
             ):
                 continue
-            if (
-                analysis.has_leading_passthrough
-                and not _mma_tiles_are_static_full(analysis, bm=bm, bn=bn, bk=bk)
-                and not _ragged_batched_tcgen05_config(cg.device_function.config, bn)
+            if not _batched_tcgen05_tiles_admitted(
+                analysis,
+                cg.device_function.config,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                whole_tiles_only=_candidate_batch_digit_output(candidate) is not None,
+            ):
+                continue
+            if not _batched_tcgen05_root_threads_admitted(
+                candidate, cg.device_function.config
             ):
                 continue
             if not _operand_infos_exclusive_for_mma(lhs_operand, rhs_operand, node):
@@ -7143,6 +7244,82 @@ def _flat_one_cta_tcgen05_config(config: Config) -> bool:
     )
 
 
+def _batched_tcgen05_tiles_admitted(
+    analysis: _MmaOperandAnalysis,
+    config: Config,
+    *,
+    bm: int,
+    bn: object,
+    bk: int,
+    whole_tiles_only: bool = False,
+) -> bool:
+    """Whether a leading-axis (batched) GEMM's tiles may take tcgen05.
+
+    Shared by the planning loop, the specialized-MMA thread layout and the
+    emitter, which must agree (see ``_ragged_batched_tcgen05_config``). Whole
+    tiles always qualify. Partial tiles take the flat one-CTA fringe path,
+    which was validated with an MN-major batched B only; a K-major batched B
+    keeps whole tiles. ``whole_tiles_only`` (a batch-digit destination) also
+    keeps whole tiles.
+    """
+    if not analysis.has_leading_passthrough:
+        return True
+    if isinstance(bn, int) and _mma_tiles_are_static_full(
+        analysis, bm=bm, bn=bn, bk=bk
+    ):
+        return True
+    rhs_k_major_batched = (
+        analysis.rhs.is_leading_passthrough and analysis.rhs.matrix_major == "col"
+    )
+    return (
+        not whole_tiles_only
+        and not rhs_k_major_batched
+        and _ragged_batched_tcgen05_config(config, bn)
+    )
+
+
+def _batched_tcgen05_root_threads_admitted(
+    candidate: _CuteMmaNode, config: Config
+) -> bool:
+    """Whether a batched GEMM's explicit root thread counts fit the role launch.
+
+    The specialized-loop detection declines an explicit M/N ``num_threads``
+    that is not the width the tcgen05 role launch resolves
+    (``_specialized_mma_root_threads_support_impl``). A rank-2 GEMM then keeps
+    its K-loop lanes, which the planning loop and emitter already refuse; a
+    batched GEMM absorbs its serialized K loop, so both must check the same
+    predicate here, or a 12-thread launch would be emitted without the TMA
+    and MMA role warps. Automatic counts are resolved by the launch planning.
+    The root M/N block ids come from the detection's own
+    ``_specialized_mma_root_mn_block_ids``.
+    """
+    from ..backend import _specialized_mma_root_mn_block_ids
+    from .backend import _specialized_mma_root_thread_layout
+    from .backend import _specialized_mma_root_threads_support_impl
+
+    if not candidate.operands.has_leading_passthrough:
+        return True
+    root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidate, config)
+    if root_mn_block_ids is None:
+        return False
+    layout = _specialized_mma_root_thread_layout(root_mn_block_ids, config)
+    if layout is None:
+        return False
+    bm, bn, m_threads, n_threads, m_explicit, n_explicit = layout
+    if not (m_explicit or n_explicit):
+        return True
+    return _specialized_mma_root_threads_support_impl(
+        "tcgen05",
+        bm=bm,
+        bn=bn,
+        root_m_threads=m_threads,
+        root_n_threads=n_threads,
+        root_m_threads_explicit=m_explicit,
+        root_n_threads_explicit=n_explicit,
+        epi_warp_groups=_tcgen05_epi_warp_groups(config),
+    )
+
+
 def _ragged_batched_tcgen05_config(config: Config, bn: object) -> bool:
     """Whether a partial-tile batched GEMM may take the flat tcgen05 path.
 
@@ -7445,7 +7622,9 @@ def _analyze_mma_output_stores(
         if not isinstance(subscripts, (list, tuple)):
             return None
         if exact_tile_block_ids(env, subscripts) != analysis.output_block_ids:
-            return None
+            return _analyze_batch_digit_output_store(
+                analysis, analyzed_stores, graphs=graphs
+            )
         if len(store.args) > 3 and store.args[3] is not None:
             return None
         explicit_epi_tile_compatible &= (
@@ -7463,6 +7642,48 @@ def _analyze_mma_output_stores(
     return _MmaOutputStoreAnalysis(
         explicit_epi_tile_compatible=explicit_epi_tile_compatible,
         output_column_major=bool(output_column_major),
+    )
+
+
+def _analyze_batch_digit_output_store(
+    analysis: _MmaOperandAnalysis,
+    analyzed_stores: Sequence[tuple[Node, Tcgen05UnaryEpilogueChain]],
+    *,
+    graphs: list[GraphInfo],
+) -> _MmaOutputStoreAnalysis | None:
+    """A batched matmul's one store through a proved batch-digit destination.
+
+    The first version admits exactly one store, with no auxiliary tensor
+    operand in its chain, of a matmul with a leading (batch) axis and no
+    grouped operand. The store keeps the existing value-chain proof; only its
+    addressing is proved here.
+    """
+    from ..compile_environment import CompileEnvironment
+    from .mapped_output import batch_digit_output_map
+
+    if (
+        not analysis.has_leading_passthrough
+        or analysis.rhs.rhs_is_grouped
+        or len(analyzed_stores) != 1
+    ):
+        return None
+    store, chain = analyzed_stores[0]
+    if chain.auxiliary_tensor_loads:
+        return None
+    mapping = batch_digit_output_map(
+        CompileEnvironment.current(),
+        graphs,
+        store,
+        output_block_ids=analysis.output_block_ids,
+        input_tensors=(analysis.lhs.source_fake, analysis.rhs.source_fake),
+        allow_unbound=True,
+    )
+    if mapping is None:
+        return None
+    return _MmaOutputStoreAnalysis(
+        explicit_epi_tile_compatible=False,
+        output_column_major=mapping.plane_column_major,
+        batch_digit_output=mapping,
     )
 
 
@@ -9012,13 +9233,19 @@ def _emit_mma_pipeline(
     )
     if (
         analysis is not None
-        and analysis.has_leading_passthrough
         and not mma_tiles_are_static_full
         # Ragged batched tiles run on the flat one-CTA pipeline, which loads
         # them through TMA and stores them with predicated copies
         # (``tcgen05_flat_edge_tma`` below); the persistent and clustered
         # batched schedules keep requiring whole tiles.
-        and not _ragged_batched_tcgen05_config(df.config, bn)
+        and not _batched_tcgen05_tiles_admitted(
+            analysis,
+            df.config,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            whole_tiles_only=_candidate_batch_digit_output(candidate) is not None,
+        )
     ):
         return None
     # A leading-passthrough collective absorbs its serialized K loop. Other
@@ -9029,10 +9256,12 @@ def _emit_mma_pipeline(
     )
     if _has_non_root_lane_loops(cg, allowed_loop_states=allowed_k_lane_loops):
         return None
-    if (
-        mma_impl == "tcgen05"
-        and m_block_id is not None
-        and _grid_thread_extent(cg, m_block_id) > 32
+    if mma_impl == "tcgen05" and (
+        (m_block_id is not None and _grid_thread_extent(cg, m_block_id) > 32)
+        or (
+            candidate is not None
+            and not _batched_tcgen05_root_threads_admitted(candidate, df.config)
+        )
     ):
         # The tcgen05 role launch is one physical warp per role row (see
         # ``_tcgen05_root_m_threads``).  Only an explicit ``num_threads``
@@ -9872,7 +10101,16 @@ def _emit_mma_pipeline(
     # lowering still refuses a destination known to break the rules. The
     # structural grouped exemption is shared with the bind-time direct-entry
     # seed gate (``_tcgen05_mma_output_tma_store_provable``).
-    tcgen05_output_tma_store_proven = (
+    # A batch-digit destination is stored through the SIMT body's per-batch
+    # plane view; no D TensorMap is built for it.
+    tcgen05_batch_digit_output = (
+        _codegen_batch_digit_output(
+            candidate, tcgen05_traced_output_stores, cg.codegen_graphs
+        )
+        if mma_impl == "tcgen05"
+        else None
+    )
+    tcgen05_output_tma_store_proven = tcgen05_batch_digit_output is None and (
         tcgen05_nm_orientation
         or row_union_plan is not None
         or _tcgen05_grouped_rhs_keeps_store_protocol(rhs_info)
@@ -17098,6 +17336,7 @@ def _emit_mma_pipeline(
                 output_block_ids=output_block_ids,
                 pure_matmul_object=tcgen05_pure_matmul_object,
                 output_stores=tcgen05_output_stores_value,
+                batch_digit_output=tcgen05_batch_digit_output,
                 bm=tcgen05_mma_bm,
                 bn=tcgen05_mma_bn,
                 bk=bk,

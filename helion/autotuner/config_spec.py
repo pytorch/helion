@@ -2533,6 +2533,14 @@ class ConfigSpec:
         self._cute_tcgen05_config.matmul_operands_tma_provable = value
 
     @property
+    def cute_tcgen05_batch_digit_plane_store_seeds_available(self) -> bool:
+        return self._cute_tcgen05_config.batch_digit_plane_store_seeds_available
+
+    @cute_tcgen05_batch_digit_plane_store_seeds_available.setter
+    def cute_tcgen05_batch_digit_plane_store_seeds_available(self, value: bool) -> None:
+        self._cute_tcgen05_config.batch_digit_plane_store_seeds_available = value
+
+    @property
     def cute_tcgen05_exact_aux_tma_provable(self) -> bool:
         return self._cute_tcgen05_config.exact_aux_tma_provable
 

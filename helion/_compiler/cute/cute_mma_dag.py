@@ -3063,7 +3063,15 @@ def mma_dag_config_reason(
             if mode == MMA_DAG_WARP and axis.partial_k and index in facts.k_axes:
                 if not axis.partial_k_packets:
                     return "partial static K needs cache-key-proved DIRECT/INPLACE packet routes"
-            elif not (mode == MMA_DAG_WARP and axis.ragged):
+            elif not (
+                (mode == MMA_DAG_WARP and axis.ragged)
+                or (
+                    mode == MMA_DAG_TCGEN05
+                    and facts.tcgen05 is not None
+                    and facts.tcgen05.shared_a_m_edge_axes is not None
+                    and index == facts.tcgen05.shared_a_m_edge_axes[0]
+                )
+            ):
                 return f"block size {size} must divide the extent {axis.extent} of tile axis {axis.block_id}"
         resolved.append(size)
     for rows, cols, store_map in facts.mapped_stores:

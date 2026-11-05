@@ -34,6 +34,7 @@ from ...language import memory_ops
 from ..compile_environment import CompileEnvironment
 from .cute_epilogue import Tcgen05UnaryEpilogueChain
 from .cute_epilogue import _AuxiliaryTensorLoadExpr
+from .cute_epilogue import _QuotientAuxiliaryTensorLoadExpr
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_epilogue import aux_leaf_promoted_by_f32_root
 from .cute_epilogue import aux_leaf_takes_promoted_f32_stage
@@ -302,6 +303,9 @@ def discover_tcgen05_aux_tensor_descriptors(
             continue
         seen_values.add(store_value)
         for step in chain.auxiliary_tensor_loads:
+            if isinstance(step, _QuotientAuxiliaryTensorLoadExpr):
+                # Scalar projection reads have no C-input TMA/SMEM ring.
+                continue
             descriptors.append(_aux_descriptor_from_step(step, store_value))
     return tuple(descriptors)
 
@@ -405,6 +409,21 @@ def host_function_has_tcgen05_aux_kernel_pattern(
     return False
 
 
+def host_function_has_quotient_aux_transport(host_function: HostFunction) -> bool:
+    """Quotient leaves have scalar transport, never the global aux-TMA mode."""
+    graphs = host_function.device_ir.graphs
+    for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
+        with host_function:
+            stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        if stores is not None and any(
+            isinstance(leaf, _QuotientAuxiliaryTensorLoadExpr)
+            for _, chain in stores
+            for leaf in chain.auxiliary_tensor_loads
+        ):
+            return True
+    return False
+
+
 def host_function_tcgen05_exact_shape_aux_tensors(
     host_function: HostFunction,
 ) -> tuple[torch.Tensor, ...]:
@@ -425,7 +444,9 @@ def host_function_tcgen05_exact_shape_aux_tensors(
             continue
         for _store_node, chain in analyzed_stores:
             for leaf in chain.auxiliary_tensor_loads:
-                if leaf.broadcast_axis is not None:
+                if leaf.broadcast_axis is not None or isinstance(
+                    leaf, _QuotientAuxiliaryTensorLoadExpr
+                ):
                     continue
                 host_tensor = _step_host_tensor(leaf)[1]
                 if host_tensor.ndim == 2:
@@ -472,6 +493,7 @@ def host_function_tcgen05_rowvec_aux_facts(
                     1
                     for leaf in chain.auxiliary_tensor_loads
                     if leaf.broadcast_axis is None
+                    and not isinstance(leaf, _QuotientAuxiliaryTensorLoadExpr)
                     and _step_host_tensor(leaf)[1].ndim == 2
                     and _step_host_tensor(leaf)[1].dtype == output.dtype
                 ),

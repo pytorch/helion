@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from .grouped_balanced_workers import GroupedBalancedWorkersPlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
+    from .mapped_output import BatchDigitOutputMap
     from .mixed_store import MixedPrecisionStorePlan
     from .published_scalars import PublishedScalarRequest
     from .radix_selection import RadixSelectionPlan
@@ -305,6 +306,9 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     output_block_ids: tuple[int, ...]
     pure_matmul_object: Tcgen05PureMatmulObjectModel | None = None
     output_stores: tuple[Node, ...] | None = None
+    # The proved batch-digit destination of a batched matmul's one store
+    # (``mapped_output.py``); the store lowering renders its plane view.
+    batch_digit_output: BatchDigitOutputMap | None = None
     bm: int = 0
     bn: int = 0
     bk: int = 0

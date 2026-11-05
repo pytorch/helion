@@ -405,6 +405,11 @@ class Tcgen05Facts:
     # Proved split/permuted root stores on the flat region renderer.  Their
     # bases are map-derived; they never have output TMA descriptors.
     mapped_store_regions: bool = False
+    # A complete independent shared-A proof for the otherwise unseeded
+    # contiguous-M input slice. This does not change warp ragged admission.
+    shared_a_m_edge_axes: tuple[int, int, int] | None = dataclasses.field(
+        default=None, repr=False
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -621,6 +626,8 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
         )
         for step in program.derived
     )
+    from .cute_mma_dag_tma_m_edge import discover_shared_a_m_edge_axes
+
     return Tcgen05Facts(
         tiles=tuple(tiles),
         exchanges=tuple(exchanges),
@@ -629,6 +636,7 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
         derived_cols=derived_cols,
         general_loop=program_order_loop(program),
         derived_frags=derived_frag_axes(program),
+        shared_a_m_edge_axes=discover_shared_a_m_edge_axes(program),
     )
 
 
@@ -917,6 +925,29 @@ def tcgen05_config_reason(
     tc = facts.tcgen05
     if tc is None:
         return f"the kernel or the target does not admit {MMA_DAG_TCGEN05}"
+    if tc.shared_a_m_edge_axes is not None:
+        m, n, k = tc.shared_a_m_edge_axes
+        if (
+            warps != TCGEN05_EPILOGUE_WARPS
+            or persistent
+            or pass_warps != MMA_DAG_PASS_WARPS_OFF
+            or epilogue != MMA_DAG_EPILOGUE_ROW
+            or lookahead != MMA_DAG_LOOKAHEAD_OFF
+            or derived != MMA_DAG_DERIVED_EXCHANGE
+            or facts.axes[n].extent % resolved[n]
+            or facts.axes[k].extent % resolved[k]
+            or resolved[k] > facts.axes[k].extent
+            or facts.cluster_of(
+                {
+                    axis.block_id: value
+                    for axis, value in zip(facts.axes, resolved, strict=True)
+                }
+            )
+            != 1
+        ):
+            return (
+                "shared-A TMA M edges require flat one-CTA four-warp full-N/K schedules"
+            )
     split = epilogue == MMA_DAG_EPILOGUE_SPLIT
     if split:
         from .cute_mma_dag import mma_dag_epilogue_reason
@@ -1126,8 +1157,11 @@ def tcgen05_repair(
     ]
     for choice in itertools.product(*ladders):
         candidate = dict(current)
-        for (_index, axis), tile in zip(tunable, choice, strict=True):
-            if axis.extent % tile:
+        for (index, axis), tile in zip(tunable, choice, strict=True):
+            if axis.extent % tile and not (
+                tc.shared_a_m_edge_axes is not None
+                and index == tc.shared_a_m_edge_axes[0]
+            ):
                 break
             candidate[axis.block_id] = tile
         else:
@@ -1164,6 +1198,8 @@ def tcgen05_persistent_ctas(
 
     tc = facts.tcgen05
     assert tc is not None
+    if tc.shared_a_m_edge_axes is not None:
+        return 0
     resolved = [cast("int", facts.block_size(i, sizes)) for i in range(len(facts.axes))]
     if tc.regions:
         from .cute_mma_dag_tcgen05_regions import region_config_reason
@@ -1353,7 +1389,15 @@ def tcgen05_seed_configs(
     tunable = _tunable_axes(facts)
     fixed = _fixed_sizes(facts)
     ladders = [
-        [tile for tile in _ladder_for(facts, index) if axis.extent % tile == 0]
+        [
+            tile
+            for tile in _ladder_for(facts, index)
+            if axis.extent % tile == 0
+            or (
+                tc.shared_a_m_edge_axes is not None
+                and index == tc.shared_a_m_edge_axes[0]
+            )
+        ]
         for index, axis in tunable
     ]
     ranked: list[tuple[tuple[int, ...], tuple[dict[int, int], int, int]]] = []
@@ -1442,7 +1486,7 @@ def tcgen05_seed_configs(
                     slices = axis.extent // tile
                     ctas *= slices
                 elif axis.kind == AXIS_ROOT:
-                    ctas *= axis.extent // tile
+                    ctas *= -(-axis.extent // tile)
                     root_area *= tile
                     root_perimeter += tile
                 else:
@@ -1818,6 +1862,8 @@ class Tcgen05Plan:
     smem_bytes: int
     # The epilogue staging tile's size (it starts at epilogue_staging_offset).
     epilogue_staging_bytes: int = 0
+    # Only a re-proved complete shared-A TMA edge plan supplies this axis.
+    shared_a_m_edge_axis: Axis | None = dataclasses.field(default=None, repr=False)
     # Region programs (``cute_mma_dag_tcgen05_regions``).
     regions: bool = False
     ring_offsets: dict[int, int] = dataclasses.field(default_factory=dict)
@@ -1902,6 +1948,22 @@ def plan_tcgen05(
     env = CompileEnvironment.current()
     tc = facts.tcgen05
     assert tc is not None
+    shared_a_m_edge_axis = None
+    if tc.shared_a_m_edge_axes is not None:
+        from .cute_mma_dag_tma_m_edge import prove_shared_a_m_edge_axes
+
+        axes = prove_shared_a_m_edge_axes(program)
+        if axes is None or axes != tc.shared_a_m_edge_axes:
+            raise _decline("shared-A TMA M-edge proof was lost before lowering")
+        if (
+            loads_mode != MMA_DAG_LOADS_TMA
+            or persistent
+            or pass_warps
+            or warps != TCGEN05_EPILOGUE_WARPS
+            or tcgen05_config_reason(facts, sizes, warps, stages) is not None
+        ):
+            raise _decline("shared-A TMA M edges require the proved flat TMA schedule")
+        shared_a_m_edge_axis = program.axes[axes[0]]
     if tc.regions:
         from .cute_mma_dag_tcgen05_regions import plan_tcgen05_regions
 
@@ -2109,6 +2171,16 @@ def plan_tcgen05(
                     exchange_tiles.append(tile)
                 by_key[operand.chain_key] = tile
             tiles[(dot.node, operand.role)] = tile
+    if shared_a_m_edge_axis is not None and (
+        len(loop_tiles) != 1 + len(program.dots)
+        or any(
+            tile.tma is None or tile.raw_tma is not None or tile.route != ROUTE_DIRECT
+            for tile in loop_tiles
+        )
+    ):
+        raise _decline(
+            "shared-A M edges require A once and every B on direct TMA routes"
+        )
     stage_bytes = stage_offset
     tx_bytes = sum(spec.bytes for spec in tma)
     fixed_offset = stages * stage_bytes
@@ -2196,6 +2268,10 @@ def plan_tcgen05(
                     atom,
                     staging_offsets[store.access.node],
                 )
+    if shared_a_m_edge_axis is not None and store_tma:
+        # The initial M-edge family proves predicated packet drains only.
+        # Do not borrow hardware OOB-store semantics from an untested path.
+        raise _decline("shared-A TMA M edges require predicated non-TMA output stores")
     epilogue_staging = max(
         (
             slots[program.frag_slots[store.frag]].rows
@@ -2253,6 +2329,7 @@ def plan_tcgen05(
         staging_offsets=staging_offsets,
         epilogue_staging_offset=epilogue_staging_offset,
         epilogue_staging_bytes=epilogue_staging,
+        shared_a_m_edge_axis=shared_a_m_edge_axis,
         tmem_cols=tcgen05_tmem_cols(column),
         smem_bytes=fixed_offset + fixed,
         store_tma=store_tma,
@@ -2850,13 +2927,22 @@ class _Tcgen05Emitter(_Emitter):
         lane-divergent: ``row_guards`` counts the open ones so a vector
         relayout (two epilogue barriers) declines inside."""
         guard = self.half_rows(slot) and not self.half_cols(slot)
-        if not guard:
+        m_edge = (
+            self.tc.shared_a_m_edge_axis if isinstance(self.tc, Tcgen05Plan) else None
+        )
+        if m_edge is None:
+            condition = "md_rowok" if guard else None
+        else:
+            condition = f"{self.axis_base(m_edge)} + {self.row_var(slot)} < cutlass.Int32({m_edge.extent})"
+            if guard:
+                condition = f"md_rowok and {condition}"
+        if condition is None:
             with self.block(None):
                 yield
             return
         self.row_guards += 1
         try:
-            with self.block("if md_rowok:"):
+            with self.block(f"if {condition}:"):
                 yield
         finally:
             self.row_guards -= 1
@@ -4414,15 +4500,26 @@ class _Tcgen05Emitter(_Emitter):
         base = self.staging_base(store, parity)
 
         def body(prow: str, pch: str) -> None:
-            words = [self.df.new_var("md_w") for _ in range(4)]
-            self.emit(
-                f"{', '.join(words)} = {_RUNTIME}.lds_v4_b32("
-                f"{self.staging_address(base, geometry.rows, row_bytes, prow, pch)})"
+            m_edge = (
+                self.tc.shared_a_m_edge_axis
+                if isinstance(self.tc, Tcgen05Plan)
+                else None
             )
-            self.emit(
-                f"{_RUNTIME}.stg_v4_b32({gbase} + cutlass.Int64({prow}) * {row_stride} "
-                f"+ cutlass.Int64({pch} * 16), {', '.join(words)})"
+            predicate = (
+                f"if {self.axis_base(m_edge)} + cutlass.Int32({prow}) < cutlass.Int32({int(access.fake.shape[0])}):"
+                if m_edge is not None
+                else None
             )
+            with self.block(predicate):
+                words = [self.df.new_var("md_w") for _ in range(4)]
+                self.emit(
+                    f"{', '.join(words)} = {_RUNTIME}.lds_v4_b32("
+                    f"{self.staging_address(base, geometry.rows, row_bytes, prow, pch)})"
+                )
+                self.emit(
+                    f"{_RUNTIME}.stg_v4_b32({gbase} + cutlass.Int64({prow}) * {row_stride} "
+                    f"+ cutlass.Int64({pch} * 16), {', '.join(words)})"
+                )
 
         guard = self.pass_guard(threads)
         with self.block(guard) if guard else contextlib.nullcontext():
@@ -4446,6 +4543,13 @@ class _Tcgen05Emitter(_Emitter):
         buffers (two iterations after the write): the batch's commit in
         the program-order loop, the next iteration's barrier in the simple
         loop (whose drain follows its own barrier, after the MMA issue)."""
+        if (
+            isinstance(self.tc, Tcgen05Plan)
+            and self.tc.shared_a_m_edge_axis is not None
+        ):
+            raise _decline(
+                "shared-A TMA M edges require predicated non-TMA output stores"
+            )
         for store in stores:
             spec = self.tc.store_tma[store.access.node]
             slot = self.slot(self.program.frag_slots[store.frag])

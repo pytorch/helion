@@ -170,6 +170,15 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
         # ``cute_mma_dag`` knob), not the autotune-off lowering.
         if env.config_spec.cute_gdn_recurrence_stages is not None:
             return False
+        facts = env.config_spec.cute_mma_dag_facts
+        if (
+            facts is not None
+            and facts.tcgen05 is not None
+            and facts.tcgen05.shared_a_m_edge_axes is not None
+        ):
+            # New optional M-edge seeds never replace the existing fallback
+            # default before the parent-owned hardware/IEEE gates.
+            return False
         return super().should_promote(env)
 
     @classmethod

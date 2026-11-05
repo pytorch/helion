@@ -1,4 +1,4 @@
-"""Immutable source constraints of the complete rank-two modular epilogue.
+"""Immutable source constraints of complete scalar modular/quotient epilogues.
 
 This certificate is source/FX geometry, not an alias fact or tensor owner. It is
 created only from complete anchored store chains and consumed by the existing
@@ -15,6 +15,7 @@ import torch
 
 from .modular_aux import ModularAuxLoadMap
 from .pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
+from .quotient_aux import QuotientAuxLoadMap
 from .strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from .strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
 from .strategies import Tcgen05LayoutStrategy
@@ -38,7 +39,7 @@ if TYPE_CHECKING:
 class ModularAuxProtocolSubject:
     anchor: torch.fx.Node
     stores: tuple[torch.fx.Node, ...]
-    maps: tuple[ModularAuxLoadMap, ...]
+    maps: tuple[ModularAuxLoadMap | QuotientAuxLoadMap, ...]
     block_ids: tuple[int, int]
     output_dtype: torch.dtype
 
@@ -141,7 +142,17 @@ class ModularAuxProtocolSubject:
             # than the sampled tile that every actual modular leaf can own.
             while value > 1 and any(
                 mapping.extents[axis] % value
-                or (mapping.split_axis == axis and mapping.period % value)
+                or (
+                    isinstance(mapping, ModularAuxLoadMap)
+                    and mapping.split_axis == axis
+                    and mapping.period % value
+                )
+                or (
+                    isinstance(mapping, QuotientAuxLoadMap)
+                    and mapping.quotient_axis == axis
+                    and value % mapping.divisor
+                    and mapping.divisor % value
+                )
                 for mapping in self.maps
             ):
                 value //= 2
@@ -156,22 +167,26 @@ def prove_modular_aux_protocol_subject(
 ) -> ModularAuxProtocolSubject | None:
     """The caller already proved the complete anchored stores and readonly DAG."""
     from .cute_epilogue import _ModularAuxiliaryTensorLoadExpr
+    from .cute_epilogue import _QuotientAuxiliaryTensorLoadExpr
 
     leaves = tuple(
         leaf
         for _, chain in stores
         for leaf in chain.auxiliary_tensor_loads
-        if isinstance(leaf, _ModularAuxiliaryTensorLoadExpr)
+        if isinstance(
+            leaf, (_ModularAuxiliaryTensorLoadExpr, _QuotientAuxiliaryTensorLoadExpr)
+        )
     )
     if not leaves or any(
-        not isinstance(leaf.mapping, ModularAuxLoadMap) for leaf in leaves
+        not isinstance(leaf.mapping, (ModularAuxLoadMap, QuotientAuxLoadMap))
+        for leaf in leaves
     ):
         return None
     maps = tuple(
         dict.fromkeys(
             leaf.mapping
             for leaf in leaves
-            if isinstance(leaf.mapping, ModularAuxLoadMap)
+            if isinstance(leaf.mapping, (ModularAuxLoadMap, QuotientAuxLoadMap))
         )
     )
     dtype: torch.dtype | None = None
@@ -207,12 +222,28 @@ def analyze_modular_aux_protocol_subject(
     """Distinguish no modular subject from an uncomposed modular-store protocol."""
     from .aux_tensor import analyze_tcgen05_matmul_store_chains
     from .cute_epilogue import _ModularAuxiliaryTensorLoadExpr
+    from .cute_epilogue import _QuotientAuxiliaryTensorLoadExpr
 
     stores = analyze_tcgen05_matmul_store_chains(graphs, anchor)
     if stores is None or not any(
-        isinstance(leaf, _ModularAuxiliaryTensorLoadExpr)
+        isinstance(
+            leaf, (_ModularAuxiliaryTensorLoadExpr, _QuotientAuxiliaryTensorLoadExpr)
+        )
         for _, chain in stores
         for leaf in chain.auxiliary_tensor_loads
     ):
         return False, None
-    return True, prove_modular_aux_protocol_subject(anchor, stores, block_ids)
+    subject = prove_modular_aux_protocol_subject(anchor, stores, block_ids)
+    if subject is not None and any(
+        isinstance(mapping, QuotientAuxLoadMap) for mapping in subject.maps
+    ):
+        from ..compile_environment import CompileEnvironment
+
+        spec = CompileEnvironment.current().config_spec._cute_tcgen05_config
+        if any(spec._config_block_index(block_id) is None for block_id in block_ids):
+            # Compose the proved read only with the existing tunable protocol.
+            # Both source preflight and final MMA/lane admission use this same
+            # boundary, so fixed axes retain their original default/fallback.
+            # Do not publish fields or invent fixed-axis normalization rules.
+            return True, None
+    return True, subject

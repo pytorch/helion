@@ -94,6 +94,8 @@ from .mapped_aux import mapped_aux_load_map
 from .math_templates import SIGMOID_TEMPLATE
 from .modular_aux import ModularAuxLoadMap
 from .modular_aux import modular_aux_load_map
+from .quotient_aux import QuotientAuxLoadMap
+from .quotient_aux import quotient_aux_load_map
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -292,7 +294,12 @@ class _MVectorScalarPrefixLoadExpr(_MVectorBroadcastAuxLoadExpr):
 class _MappedAuxiliaryTensorLoadExpr(_AuxiliaryTensorLoadExpr):
     """A complete readonly DAG leaf with a proved tile-local source-plane view."""
 
-    mapping: MappedAuxLoadMap | ModularAuxLoadMap
+    mapping: MappedAuxLoadMap | ModularAuxLoadMap | QuotientAuxLoadMap
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _QuotientAuxiliaryTensorLoadExpr(_MappedAuxiliaryTensorLoadExpr):
+    """Readonly many-to-one projection with regular scalar fragment transport."""
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -2839,6 +2846,17 @@ def _analyze_tcgen05_pointwise_dag(
                         expr = _ModularAuxiliaryTensorLoadExpr(
                             node, None, "{aux}", modular
                         )
+                    else:
+                        quotient = quotient_aux_load_map(
+                            node,
+                            carrier_tile_shape=shape,
+                            carrier_tile_index_nodes=indices,
+                            carrier_global_shape=output_global_shape,
+                        )
+                        if quotient is not None:
+                            expr = _QuotientAuxiliaryTensorLoadExpr(
+                                node, None, "{aux}", quotient
+                            )
         if (
             expr is None
             and node.target is _tracing_ops._new_var

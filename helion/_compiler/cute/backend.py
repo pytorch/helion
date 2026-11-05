@@ -754,10 +754,10 @@ def _detect_specialized_mma_loop(
     config: Config,
 ) -> bool:
     from ..host_function import HostFunction
+    from .cute_mma import _batched_tcgen05_tiles_admitted
+    from .cute_mma import _candidate_batch_digit_output
     from .cute_mma import _choose_mma_impl
     from .cute_mma import _loop_subrange_parent_block_id
-    from .cute_mma import _mma_tiles_are_static_full
-    from .cute_mma import _ragged_batched_tcgen05_config
     from .cute_mma import _tcgen05_epi_warp_groups
     from .cute_mma import analyze_cute_mma_node
     from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
@@ -839,9 +839,14 @@ def _detect_specialized_mma_loop(
     candidates = [
         (node, candidate)
         for node, candidate in candidates
-        if not candidate.operands.has_leading_passthrough
-        or _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
-        or _ragged_batched_tcgen05_config(config, bn)
+        if _batched_tcgen05_tiles_admitted(
+            candidate.operands,
+            config,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            whole_tiles_only=_candidate_batch_digit_output(candidate) is not None,
+        )
     ]
     if not candidates:
         return False

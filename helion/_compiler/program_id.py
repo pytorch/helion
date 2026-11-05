@@ -7411,6 +7411,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "operator.le",
             "operator.gt",
             "operator.ge",
+            # Python-semantics integer remainder (``integer_helpers.python_mod``)
+            # is the same pure scalar arithmetic as ``operator.mod``.
+            "_cute_python_mod",
         }
     )
 

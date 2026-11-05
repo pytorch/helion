@@ -791,6 +791,7 @@ def enable_cute_tcgen05_search(
     explicit_epi_tile_compatible: bool,
     leading_block_id: int | None = None,
     warp_mma_plain_kernel: bool = True,
+    preserve_collective_tile_sizes: bool = False,
     output_dtype_bytes: int | None = None,
     output_stores: int = 1,
 ) -> None:
@@ -1001,7 +1002,20 @@ def enable_cute_tcgen05_search(
         else:
             floor = plan.min_search_n
             min_size = min(WARP_MMA_MIN_BN, floor) if warp_mma_admitted else floor
-        env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
+        if preserve_collective_tile_sizes and axis_name != "k":
+            # A newly proved aux leaf must not resize an archived collective
+            # replay. Native normalization still imposes its own hard floor;
+            # the existing soft floor keeps native sampling at that geometry.
+            # Fixed tiles have no tunable BlockSizeSpec or floor to soften.
+            with contextlib.suppress(KeyError):
+                block_spec = spec.block_sizes.block_id_lookup(block_idx)
+                block_spec.autotuner_min = max(block_spec.autotuner_min, min_size)
+                if block_spec.default_size is None:
+                    block_spec.default_size = max(
+                        block_spec._fragment(spec).default(), floor
+                    )
+        else:
+            env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
         if axis_name == "k":
             spec._cute_tcgen05_config.cap_k_search(env.block_sizes[block_idx], max_size)
         else:

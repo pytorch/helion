@@ -473,6 +473,14 @@ def analyze_result_fission(
     )
     if plan is None or plan.output_dtype is not torch.float32:
         return None
+    # Quotient-read transport is proved only for the ordinary scalar native
+    # epilogue. Do not silently extend RF's separate consumer/vector protocol.
+    if any(
+        isinstance(leaf, epi._QuotientAuxiliaryTensorLoadExpr)
+        for chain in plan.chains
+        for leaf in chain.auxiliary_tensor_loads
+    ):
+        return None
     identities = [
         index
         for index, chain in enumerate(plan.chains)

@@ -8492,6 +8492,7 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
         host_function = device_ir.host_function
         if host_function is None or not env.config_spec.cute_tcgen05_search_enabled:
             return frozenset()
+        from ..cute.cute_mma import host_function_batch_digit_plane_store_seedable
         from ..cute.cute_mma import host_function_exact_aux_tma_provable
         from ..cute.cute_mma import host_function_matmul_operands_tma_provable
 
@@ -8516,10 +8517,19 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
             # strided or column-major residual / gate view (codegen refuses
             # them with ``TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON``).
             aux_provable = host_function_exact_aux_tma_provable(env, host_function)
+            # A proved batch-digit destination fails ``provable`` through its
+            # output alone; its own non-D-TMA seed family reads this fact.
+            batch_digit_seedable = (
+                not provable
+                and host_function_batch_digit_plane_store_seedable(env, host_function)
+            )
         finally:
             env.compiler_fact_specialization_facts = saved
         env.config_spec.cute_tcgen05_matmul_operands_tma_provable = provable
         env.config_spec.cute_tcgen05_exact_aux_tma_provable = aux_provable
+        env.config_spec.cute_tcgen05_batch_digit_plane_store_seeds_available = (
+            batch_digit_seedable
+        )
         return facts
 
     @classmethod

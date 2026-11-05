@@ -706,6 +706,15 @@ class CuteTcgen05Config:
         # search surface, the seeds and the normalizer mirror the proof.
         # Decided beside ``matmul_operands_tma_provable``.
         self.exact_aux_tma_provable: bool = True
+        # True when every analyzed matmul is a batched GEMM whose one store
+        # goes through a proved batch-digit destination (``mapped_output.py``,
+        # stored by the SIMT plane view, never a D TensorMap) and both A/B
+        # operands pass the TensorMap proof. Such a kernel fails
+        # ``matmul_operands_tma_provable`` because of its output alone; it
+        # gets the seeds of ``_batch_digit_plane_store_seed_configs``, which
+        # never request a D-TMA/FFI-only schedule. Decided beside
+        # ``matmul_operands_tma_provable``.
+        self.batch_digit_plane_store_seeds_available: bool = False
         self.cluster_m_search_choices: tuple[int, ...] | None = None
         self.cluster_m2_search_constraints: Tcgen05ClusterM2SearchConstraints | None = (
             None
@@ -5210,6 +5219,7 @@ class CuteTcgen05Config:
                     )
                     if clc_aux_tma_narrow_n_seed is not None:
                         seeds.append(clc_aux_tma_narrow_n_seed)
+        seeds.extend(self._optional_batch_digit_plane_store_seed_configs())
         if self._pdl_searched():
             # Every seed launches as a programmatic dependent where the knob
             # is searched.  The catalogue times a kernel back to back with
@@ -5225,6 +5235,80 @@ class CuteTcgen05Config:
                 Config.from_dict({**seed.config, "cute_pdl": True}) for seed in seeds
             ]
         return self.admit_modular_seed_configs(seeds)
+
+    def _optional_batch_digit_plane_store_seed_configs(self) -> list[Config]:
+        """Additive seeds, consulted only under the proved plane-store fact."""
+        if not self.batch_digit_plane_store_seeds_available:
+            return []
+        return self._batch_digit_plane_store_seed_configs()
+
+    def _batch_digit_plane_store_seed_configs(self) -> list[Config]:
+        """One-CTA native seeds for batched GEMMs with a batch-digit output.
+
+        The output is stored by the ordinary SIMT epilogue through a per-batch
+        plane view, so these seeds request only the A/B TensorMap pipeline
+        and the one-CTA tcgen05 MMA, never a D TensorMap, a TMA store, the
+        flat-role/FFI direct entry or a two-CTA cluster. Whole tiles only (the
+        batch-digit store admits no ragged tile). The AB ring depth is the
+        largest the per-CTA SMEM model admits for the tile, capped by the K
+        loop; the accumulator ring keeps two stages, ``2 * bn <= 512`` TMEM
+        columns for every offered ``bn``. Geometry only: no shape keys.
+        """
+        extents = self.matmul_compile_time_static_extents
+        fragments = self._matmul_block_fragments()
+        if (
+            not self.search_enabled
+            or not self.matmul_has_leading_passthrough
+            or self.matmul_has_non_tcgen05_operand
+            or self.matmul_input_dtype not in (torch.float16, torch.bfloat16)
+            or extents is None
+            or fragments is None
+            or any(value is None or value <= 0 for value in extents)
+        ):
+            return []
+        m, n, k = cast("tuple[int, int, int]", extents)
+        bm_fragment, bn_fragment, bk_fragment = fragments
+        bk = bk_fragment.high
+        while bk >= bk_fragment.low and (k % bk or bk % 16):
+            bk //= 2
+        if bk < bk_fragment.low or bk < 16:
+            return []
+        pid_types = [
+            pid_type
+            for pid_type in ("persistent_interleaved", "flat")
+            if pid_type in self.allowed_pid_types
+        ]
+        seeds: list[Config] = []
+        for bm in (128, 64):
+            if not bm_fragment.low <= bm <= bm_fragment.high or m % bm:
+                continue
+            for bn in (256, 128, 64):
+                if not bn_fragment.low <= bn <= bn_fragment.high or n % bn:
+                    continue
+                fit = self.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=1)
+                if fit <= 0:
+                    continue
+                block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+                if block_sizes is None:
+                    continue
+                for pid_type in pid_types:
+                    seed_config: dict[str, Any] = {
+                        "block_sizes": block_sizes,
+                        "pid_type": pid_type,
+                        "tcgen05_cta_group": "auto",
+                        "tcgen05_cluster_m": 1,
+                        "tcgen05_cluster_n": 1,
+                        "tcgen05_ab_stages": max(1, min(k // bk, fit)),
+                        "tcgen05_c_stages": 2,
+                        "tcgen05_acc_stages": 2,
+                        "tcgen05_strategy": "role_local_monolithic",
+                        "tcgen05_layout_strategy": "default",
+                        **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
+                    }
+                    if pid_type == "persistent_interleaved":
+                        seed_config["tcgen05_persistence_model"] = "static_persistent"
+                    seeds.append(Config(**seed_config))
+        return seeds
 
     def _pdl_searched(self) -> bool:
         """Whether this kernel's tcgen05 surface launches as a dependent by default.

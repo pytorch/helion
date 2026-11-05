@@ -124,6 +124,19 @@ tls: _TLS = cast("_TLS", threading.local())
 log = logging.getLogger(__name__)
 
 
+def _warp_mma_store_contract_holds(
+    device_ir: DeviceIR, node: torch.fx.Node, candidate: _CuteMmaNode
+) -> bool:
+    """Whether the register-MMA family's own store proof accepts the GEMM."""
+    from .cute.cute_warp_mma_gemm import warp_mma_store_matches
+
+    try:
+        warp_mma_store_matches(device_ir.graphs, node, candidate.operands)
+    except exc.BackendUnsupported:
+        return False
+    return True
+
+
 def _cute_tcgen05_output_store_facts(
     device_ir: DeviceIR, node: torch.fx.Node
 ) -> tuple[int | None, int]:
@@ -4143,13 +4156,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     pass
                 elif single_analysis:
                     candidate, lhs, search_plan = search_candidates[0]
+                    candidate_node = next(
+                        node
+                        for item, _lhs, _rhs, node in mma_candidates
+                        if item is candidate
+                    )
                     output_store_facts = _cute_tcgen05_output_store_facts(
-                        device_ir,
-                        next(
-                            node
-                            for item, _lhs, _rhs, node in mma_candidates
-                            if item is candidate
-                        ),
+                        device_ir, candidate_node
                     )
                     config_spec._cute_tcgen05_config.fission_bundle = (
                         env.cute_fission_plan is not None
@@ -4157,6 +4170,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     from .cute.aux_tensor import analyze_tcgen05_matmul_store_chains
                     from .cute.cute_epilogue import _MappedAuxiliaryTensorLoadExpr
                     from .cute.cute_epilogue import _MVectorBroadcastAuxLoadExpr
+                    from .cute.cute_epilogue import _QuotientAuxiliaryTensorLoadExpr
                     from .cute.cute_epilogue import _ReadonlyBoolAuxLoadExpr
                     from .cute.cute_epilogue import _ReadonlyBoolPredicateLoadExpr
 
@@ -4209,9 +4223,20 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         # The register-MMA emitter owns only canonical rank-1/2
                         # floating aux loads. Byte-normalized bools and mapped
                         # source-plane views belong to ordinary tcgen05 stores.
+                        # Its own store contract (whole-problem exact-tile
+                        # stores) must also hold, so no seed or search draw
+                        # selects a family the codegen then declines.
                         warp_mma_plain_kernel=len(mma_candidates) == 1
                         and not (
                             bool_auxiliary or mapped_auxiliary or m_vector_auxiliary
+                        )
+                        and _warp_mma_store_contract_holds(
+                            device_ir, candidate_node, candidate
+                        ),
+                        preserve_collective_tile_sizes=any(
+                            isinstance(leaf, _QuotientAuxiliaryTensorLoadExpr)
+                            for _, chain in source_chains or ()
+                            for leaf in chain.auxiliary_tensor_loads
                         ),
                         output_dtype_bytes=output_store_facts[0],
                         output_stores=output_store_facts[1],

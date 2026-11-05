@@ -11,6 +11,7 @@ from typing import cast
 
 import sympy
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx import has_side_effect
 
 from .. import exc
@@ -2606,14 +2607,62 @@ def _codegen_cute_store_tcgen05_tile(
             "cute",
             "tcgen05 pure role-lifecycle store requires a rank-2 tensor target",
         )
-    if tensor.ndim not in (2, 3):
+    # A proved batch-digit destination (``mapped_output.py``) is stored
+    # through the per-batch plane view of the ordinary SIMT store only.
+    batch_digit_output = tcgen05_value.batch_digit_output
+    if batch_digit_output is not None:
+        unsupported = [
+            reason
+            for reason, refused in (
+                ("another store", batch_digit_output.store_node is not state.fx_node),
+                (
+                    "destination layout",
+                    tuple(tensor.shape) != batch_digit_output.shape
+                    or tuple(tensor.stride()) != batch_digit_output.strides,
+                ),
+                ("store mask", extra_mask is not None),
+                ("segment store", proved_segment_store or row_union is not None),
+                (
+                    "grouped/fragment epilogue",
+                    grouped_tail_epilogue is not None or fragment_epilogue is not None,
+                ),
+                (
+                    "auxiliary operand",
+                    epilogue_chain is not None
+                    and bool(epilogue_chain.auxiliary_tensor_loads),
+                ),
+                ("TMA store", tcgen05_value.use_tma_store_epilogue),
+                ("pure role lifecycle", tcgen05_value.pure_matmul_role_lifecycle),
+                ("mixed precision", tcgen05_value.mixed_precision_stores is not None),
+                (
+                    "N,M orientation",
+                    tcgen05_value.orientation is not Tcgen05Orientation.MN,
+                ),
+            )
+            if refused
+        ]
+        if unsupported:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 batch-digit output requires its proved store and the "
+                f"ordinary SIMT plane store ({', '.join(unsupported)})",
+            )
+    if tensor.ndim not in (2, 3) and batch_digit_output is None:
         return None
-    leading_passthrough_output = tensor.ndim == 3
+    leading_passthrough_output = tensor.ndim == 3 or batch_digit_output is not None
     env = CompileEnvironment.current()
     store_node = state.fx_node
     store_subscripts = store_node.args[1] if store_node is not None else None
     actual_block_ids = None
-    if isinstance(store_subscripts, (list, tuple)):
+    if batch_digit_output is not None:
+        # The batch-digit proof normalized every subscript to the complete
+        # batch digits and the whole M/N indices of these output tiles.
+        expected_block_ids = tcgen05_value.output_block_ids
+        actual_block_ids = expected_block_ids
+        state.codegen.allow_dead_assignments_owned_by_nodes(
+            batch_digit_output.owned_index_nodes
+        )
+    elif isinstance(store_subscripts, (list, tuple)):
         if proved_segment_store:
             # The registered segment proof ties the dynamic row index to the
             # work and M axes. The remaining N index must still be the exact
@@ -2818,7 +2867,14 @@ def _codegen_cute_store_tcgen05_tile(
             f"epi_tile={tcgen05_nm_store_shape[:2]} and "
             f"d_store_box_n={tcgen05_nm_store_shape[2]}",
         )
-    if len(subscript) != (3 if leading_passthrough_output else 2):
+    expected_subscripts = (
+        tensor.ndim
+        if batch_digit_output is not None
+        else 3
+        if leading_passthrough_output
+        else 2
+    )
+    if len(subscript) != expected_subscripts:
         if tcgen05_value.pure_matmul_role_lifecycle:
             raise exc.BackendUnsupported(
                 "cute",
@@ -2848,6 +2904,12 @@ def _codegen_cute_store_tcgen05_tile(
             "",
             _cute_tile_begin_expr(state, subscript[1]),
         ]
+    elif batch_digit_output is not None:
+        # (batch, M, N) tile origins; the batch tile is one coordinate.
+        base_indices = [
+            _cute_tile_begin_expr(state, env.block_sizes[block_id].var)
+            for block_id in tcgen05_value.output_block_ids
+        ]
     else:
         base_indices = [
             _cute_tile_begin_expr(
@@ -2857,8 +2919,13 @@ def _codegen_cute_store_tcgen05_tile(
         ]
     leading_index = base_indices[0] if leading_passthrough_output else None
     m_index, n_index = base_indices[-2:]
-    m_size = _cute_tensor_dim_size_expr(state, tensor, tensor.ndim - 2)
-    n_size = _cute_tensor_dim_size_expr(state, tensor, tensor.ndim - 1)
+    output_m_dim, output_n_dim = (
+        (batch_digit_output.m_dim, batch_digit_output.n_dim)
+        if batch_digit_output is not None
+        else (tensor.ndim - 2, tensor.ndim - 1)
+    )
+    m_size = _cute_tensor_dim_size_expr(state, tensor, output_m_dim)
+    n_size = _cute_tensor_dim_size_expr(state, tensor, output_n_dim)
     if row_union is not None:
         m_size, n_size = str(row_union.m), str(row_union.n)
     segment_store_local_m = tcgen05_value.segment_store_m_offset
@@ -3379,6 +3446,7 @@ def _codegen_cute_store_tcgen05_tile(
         from .._compiler.cute.cute_epilogue import _MappedAuxiliaryTensorLoadExpr
         from .._compiler.cute.cute_epilogue import _ModularAuxiliaryTensorLoadExpr
         from .._compiler.cute.cute_epilogue import _MVectorBroadcastAuxLoadExpr
+        from .._compiler.cute.cute_epilogue import _QuotientAuxiliaryTensorLoadExpr
         from .._compiler.cute.cute_epilogue import _ReadonlyBoolAuxLoadExpr
         from .._compiler.cute.cute_epilogue import _ReadonlyBoolPredicateLoadExpr
 
@@ -3389,6 +3457,62 @@ def _codegen_cute_store_tcgen05_tile(
             raise exc.InvalidConfig(
                 "readonly bool where predicates require byte-width SIMT auxiliary transport"
             )
+        if isinstance(aux_step, _QuotientAuxiliaryTensorLoadExpr):
+            from .._compiler.cute.memory_ops import cute_tensor_base_is_aligned
+            from .._compiler.cute.memory_ops import (
+                runtime_tensor_has_specialized_alignment,
+            )
+
+            if (
+                tcgen05_lifecycle.is_two_cta
+                or df.config.get("tcgen05_cluster_m", 1) != 1
+                or df.config.get("tcgen05_cluster_n", 1) != 1
+                or df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, "simt") != "simt"
+                or df.config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY) is not None
+                or tcgen05_value.has_explicit_epilogue_tile
+                or tcgen05_aux_prefetch_depth > 0
+                or tcgen05_value.partial_output_tma_store
+            ):
+                raise exc.InvalidConfig(
+                    "quotient auxiliary reads require plain single-CTA scalar transport"
+                )
+            runtime_aux = CompileEnvironment.current().runtime_value_for_tensor(
+                aux_torch_tensor
+            )
+            from .._compiler.cute.quotient_aux import QuotientAuxLoadMap
+            from .._compiler.cute.register_loads import host_load_is_readonly
+
+            assert isinstance(aux_step.mapping, QuotientAuxLoadMap)
+            if (
+                isinstance(runtime_aux, torch.Tensor)
+                and not isinstance(runtime_aux, FakeTensor)
+                and (
+                    runtime_aux.dtype != aux_torch_tensor.dtype
+                    or not aux_step.mapping.runtime_view_matches(runtime_aux)
+                )
+            ) or not host_load_is_readonly(
+                aux_step.load_node,
+                CompileEnvironment.current(),
+                state.codegen.codegen_graphs,
+            ):
+                raise exc.InvalidConfig(
+                    "quotient auxiliary bound view or readonly facts changed"
+                )
+            alignment = aux_torch_tensor.dtype.itemsize
+            aligned = (
+                runtime_tensor_has_specialized_alignment(
+                    CompileEnvironment.current(), aux_torch_tensor, alignment
+                )
+                if isinstance(runtime_aux, torch.Tensor)
+                and not isinstance(runtime_aux, FakeTensor)
+                else cute_tensor_base_is_aligned(
+                    CompileEnvironment.current(), aux_torch_tensor, alignment
+                )
+            )
+            if not aligned:
+                raise exc.InvalidConfig(
+                    "quotient auxiliary scalar alignment is not cache-proved"
+                )
         if isinstance(aux_step, _ModularAuxiliaryTensorLoadExpr) and (
             tcgen05_lifecycle.is_two_cta
             or df.config.get("tcgen05_cluster_m", 1) != 1
@@ -4947,6 +5071,27 @@ def _codegen_cute_store_tcgen05_tile(
             if selected_aux_index is not None and aux_idx != selected_aux_index:
                 continue
             rowvec_stage = rowvec_aux_stage_records[aux_idx]
+            if isinstance(rec.expr, _QuotientAuxiliaryTensorLoadExpr):
+                # Repeated logical coordinates are readonly scalar reads, not
+                # permission to overread compact storage with an autovec load.
+                if force_simt_edge_aux:
+                    raise exc.InvalidConfig(
+                        "quotient auxiliary scalar transport requires complete tiles"
+                    )
+                lines.append(
+                    f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                    f"{rec.ttr_aux_grouped}[(None, None, None, "
+                    "cutlass.Int32(_tcgen05_subtile))]\n"
+                    f"{prelude_indent}{rec.aux_rmem} = "
+                    f"cute.make_rmem_tensor(cute.make_layout({carrier_name}.shape), "
+                    f"{rec.aux_dtype})\n"
+                    f"{prelude_indent}cute.copy(cute.make_copy_atom("
+                    f"cute.nvgpu.CopyUniversalOp(), {rec.aux_dtype}, "
+                    f"num_bits_per_copy={rec.aux_dtype_bits}), "
+                    f"{rec.ttr_aux_subtile}, {rec.aux_rmem})\n"
+                    f"{prelude_indent}{rec.aux_loaded} = {rec.aux_rmem}.load()\n"
+                )
+                continue
             if (
                 use_aux_smem_source
                 and not force_simt_edge_aux
@@ -5731,7 +5876,11 @@ def _codegen_cute_store_tcgen05_tile(
             assert leading_index is not None
             local_gmem_tensor = df.new_var("tcgen05_gmem2d")
             tile_setup.append(
-                _cute_leading_passthrough_view_2d(
+                batch_digit_output.plane_view_source(
+                    local_gmem_tensor, gmem_tensor, leading_index
+                )
+                if batch_digit_output is not None
+                else _cute_leading_passthrough_view_2d(
                     local_gmem_tensor,
                     gmem_tensor,
                     leading_index,
@@ -5836,8 +5985,8 @@ def _codegen_cute_store_tcgen05_tile(
         tcgen05_value.tma_store_full_tiles_only
         and not grouped_dynamic_d_tensormap_edge_only
     )
-    static_m_size = tensor.shape[-2]
-    static_n_size = tensor.shape[-1]
+    static_m_size = tensor.shape[output_m_dim]
+    static_n_size = tensor.shape[output_n_dim]
     simt_edge_only = simt_edge_only or (
         isinstance(static_m_size, int)
         and isinstance(static_n_size, int)
@@ -5923,10 +6072,16 @@ def _codegen_cute_store_tcgen05_tile(
     # are identical, and a fringe tile only narrows the predicate.
     direct_store_align_bytes: int | None = None
     if direct_full_tile_store or simt_mixed_store:
+        from .._compiler.cute.cute_mma import _tcgen05_tma_tensor_is_aligned
+
         elem_bytes = tensor.element_size()
         strides = tuple(tensor.stride())
         if (
-            all(isinstance(stride, int) for stride in strides)
+            # A batch-digit plane base adds whole digit strides to the output
+            # pointer; claim 16-byte chunks only with the bound kernel's
+            # guarded base/stride alignment proof.
+            (batch_digit_output is None or _tcgen05_tma_tensor_is_aligned(env, tensor))
+            and all(isinstance(stride, int) for stride in strides)
             and strides[-1] == 1
             and not tcgen05_value.output_column_major
             and all((stride * elem_bytes) % 16 == 0 for stride in strides[:-1])
