@@ -1440,6 +1440,7 @@ class DeviceFunction:
         scalar_preamble: list[ast.AST] = []
         for arg in param_args:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
+        kernel_prologue = backend.kernel_prologue(self)
 
         function_decorator = backend.function_decorator_for_args(param_args)
         decorators = (
@@ -1533,6 +1534,7 @@ class DeviceFunction:
                 *dependent_launch,
                 *[statement_from_string(pdl[op]) for op in env.pdl_entry],
                 *scalar_preamble,
+                *kernel_prologue,
                 *self.preamble,
                 *cluster_sync,
                 *self.body,
