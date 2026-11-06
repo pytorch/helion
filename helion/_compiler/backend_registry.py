@@ -22,6 +22,11 @@ if TYPE_CHECKING:
     from ..autotuner.search_surface import BackendSearchSurface
     from .backend import Backend
 
+# Version of the out-of-tree backend contract in ``helion.backend_api``; covers
+# only the names and hooks listed in docs/api/backend_api.md, bumped per the
+# version policy there.
+BACKEND_API_VERSION = 1
+
 _BUILTIN_BACKENDS: list[type[Backend]] = [
     TritonBackend,
     PallasBackend,
@@ -47,6 +52,12 @@ def register_compiler_backend(backend_class: type[Backend]) -> None:
     The backend's ``name`` property is used as the registry key.
     Built-in backends are registered at module load time below.
 
+    Registering the same class twice is a no-op, and the class a reloaded
+    module defines under the same name replaces the old one.  Registering a
+    *different* class under an already-registered name (including built-in
+    names) raises ``ValueError``; ``helion.backend_api`` has no unregister, so
+    a name is owned by its first registering class.
+
     Args:
         backend_class: A :class:`Backend` subclass.
     """
@@ -54,10 +65,32 @@ def register_compiler_backend(backend_class: type[Backend]) -> None:
 
     backend = backend_class()
     with _CODEGEN_REPAIR_LOCK:
+        existing = _REGISTRY.get(backend.name)
+        if existing is backend_class:
+            return
+        if existing is not None and not _is_reloaded(existing, backend_class):
+            raise ValueError(
+                f"Backend name {backend.name!r} is already registered to "
+                f"{existing.__module__}.{existing.__qualname__}; "
+                f"refusing to overwrite it with "
+                f"{backend_class.__module__}.{backend_class.__qualname__}"
+            )
         _REGISTRY[backend.name] = backend_class
         _GENERATION += 1
         codegen_names, _ = _codegen_repair_scope(backend.codegen_name)
         _REPAIRED_CODEGEN_NAMES = _REPAIRED_CODEGEN_NAMES.difference(codegen_names)
+
+
+def _is_reloaded(existing: type[Backend], backend_class: type[Backend]) -> bool:
+    # importlib.reload re-runs the module and defines a new class object under
+    # the same name; the module then holds the new class.
+    name = backend_class.__qualname__
+    return (existing.__module__, existing.__qualname__) == (
+        backend_class.__module__,
+        name,
+    ) and getattr(
+        sys.modules.get(backend_class.__module__), name, None
+    ) is backend_class
 
 
 def unregister_compiler_backend(name: str) -> None:
