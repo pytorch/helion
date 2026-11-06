@@ -32,7 +32,7 @@ refers to hydrogen-3.
 
 Helion can be viewed as *PyTorch with tiles*. Compared to writing kernels directly in a
 lower-level language such as Triton, Helion reduces manual coding effort through autotuning.
-Helion spends more time (approx 10 min) autotuning as it evaluates hundreds of potential
+Helion spends more time autotuning as it evaluates hundreds of potential
 implementations generated from a single Helion kernel. This larger search space also makes
 kernels more performance portable between different hardware. Helion automates and autotunes over:
 
