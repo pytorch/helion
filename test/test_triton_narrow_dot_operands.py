@@ -75,11 +75,13 @@ def test_other_dots_do_not_rewrite(case):
     elif case == "output_dtype":
         product.args = (*product.args[:3], torch.float16)
     else:
-        acc = graph.placeholder("acc")
+        with graph.inserting_before(product):
+            acc = graph.placeholder("acc")
         acc.meta["val"] = torch.empty((32, 32), dtype=torch.float16)
         product.args = (*product.args[:2], acc, None)
     assert narrow_dot_operands(graph, facts) == 0
     assert facts[0].lhs_dtype == torch.float32
+    graph.lint()
 
 
 def _matmul(a, b):
