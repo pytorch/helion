@@ -30,6 +30,7 @@ from helion._compiler.metal.row_reduction_heuristic import MetalRowReductionHeur
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._testing import import_example
 from helion._testing import skipIfRefEager
+from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
 helion_gdn_fwd_h = import_example("gdn_fwd_h").helion_gdn_fwd_h
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 if sys.platform == "darwin":
+    from helion._compiler.metal.metal_jit import _constexpr_decl
     from helion._compiler.metal.metal_jit import _MetalKernel
 
 # Metal runs on macOS only: CI's Linux jobs skip the whole file.
@@ -13371,6 +13373,480 @@ class TestMetalThreadgroupBudget(unittest.TestCase):
                             rtol=1e-4,
                             atol=1e-4,
                         )
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def persistent_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Worker w of ``get_num_sm`` workers computes output tiles w, w + W, ..."""
+    num_workers = helion.runtime.get_num_sm(a.device)
+    block_m = hl.register_block_size(32, 128)
+    block_n = hl.register_block_size(32, 128)
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.empty(m, n, dtype=a.dtype, device=a.device)
+    for worker in hl.grid(num_workers):
+        m_tiles = (m + block_m - 1) // block_m
+        tiles = m_tiles * ((n + block_n - 1) // block_n)
+        for step in hl.grid((tiles + num_workers - 1) // num_workers):
+            t = step * num_workers + worker
+            if t < tiles:
+                rows = (t % m_tiles) * block_m + hl.arange(block_m)
+                cols = (t // m_tiles) * block_n + hl.arange(block_n)
+                acc = hl.zeros([block_m, block_n], dtype=torch.float32)
+                for tk in hl.tile(k):
+                    x = hl.load(a, [rows, tk.index], extra_mask=(rows < m)[:, None])
+                    y = hl.load(b, [tk.index, cols], extra_mask=(cols < n)[None, :])
+                    acc = torch.addmm(acc, x, y)
+                hl.store(
+                    out,
+                    [rows, cols],
+                    acc.to(out.dtype),
+                    extra_mask=(rows < m)[:, None] & (cols < n)[None, :],
+                )
+    return out
+
+
+@_requires_darwin
+class TestMetalPersistentGrid(unittest.TestCase):
+    """On MPS, ``get_num_sm`` is the GPU core count."""
+
+    def test_grid_is_the_core_count(self) -> None:
+        """``reserved_sms`` reserves cores; 0 or less reserves none, and at
+        least one is left."""
+        device = torch.device(DEVICE)
+        cores = torch.backends.mps.get_core_count()
+        with self.subTest(reserved_sms="default"):
+            self.assertEqual(helion.runtime.get_num_sm(device), cores)
+        for reserved, workers in (
+            (-1, cores),
+            (0, cores),
+            (1, cores - 1),
+            (2, cores - 2),
+            (cores, 1),
+        ):
+            with self.subTest(reserved_sms=reserved):
+                self.assertEqual(
+                    helion.runtime.get_num_sm(device, reserved_sms=reserved), workers
+                )
+
+    def test_persistent_kernel_launches_the_grid(self) -> None:
+        """Workers that loop over several tiles, non-dividing tails, and more
+        workers than tiles."""
+        workers = torch.backends.mps.get_core_count()
+        config = helion.Config(block_sizes=[32, 32, 32], num_warps=4)
+        for m, k, n in ((300, 64, 300), (200, 96, 136), (48, 40, 40)):
+            with self.subTest(m=m, k=k, n=n):
+                a = torch.randn(m, k, device=DEVICE, dtype=torch.float16)
+                b = torch.randn(k, n, device=DEVICE, dtype=torch.float16)
+                out, code, _ = _run_with_msl(persistent_matmul, (a, b), config)
+                self.assertIn(
+                    f"_launcher(_helion_persistent_matmul, ({workers},)", code
+                )
+                torch.testing.assert_close(
+                    out.cpu().float(),
+                    a.cpu().float() @ b.cpu().float(),
+                    rtol=1e-2,
+                    atol=1e-2,
+                )
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_scale(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] * 2
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_row_sum(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(x.size(0), dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile, :].sum(-1)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty(m, n, dtype=a.dtype, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+        out[tm, tn] = acc.to(a.dtype)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_after_barrier(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + 1
+    hl.barrier()
+    for tile in hl.tile(x.size(0)):
+        out[tile] = out[tile] * 2
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_to_tensor_extent(x: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tile in hl.tile(n, block_size=32):
+        out[tile] = x[tile] + 1
+    return out
+
+
+@_requires_darwin
+class TestMetalPersistentPid(unittest.TestCase):
+    """``pid_type`` persistent_blocked and persistent_interleaved launch
+    ``_NUM_SM * num_sm_multiplier`` threadgroups that loop over a plain
+    ``hl.tile`` loop's tiles, where ``_NUM_SM`` is the GPU core count and the
+    multiplier defaults to 4."""
+
+    def test_workers_loop_over_tiles(self) -> None:
+        """More tiles than workers, so each worker takes several, and fewer, so
+        some take none; both shapes have tails."""
+        cores = torch.backends.mps.get_core_count()
+        workers = helion.runtime.get_num_sm(torch.device(DEVICE))
+        rows = 16 * (3 * workers // 13 + 1) + 5
+        for pid_type in ("persistent_blocked", "persistent_interleaved"):
+            for multiplier in (1, 3):
+                config = helion.Config(
+                    block_sizes=[16, 16],
+                    pid_type=pid_type,
+                    num_sm_multiplier=multiplier,
+                )
+                grid = "_NUM_SM" if multiplier == 1 else f"_NUM_SM * {multiplier}"
+                for m, n in ((rows, 200), (40, 50)):
+                    with self.subTest(pid_type=pid_type, multiplier=multiplier, m=m):
+                        x = torch.randn(m, n, device=DEVICE)
+                        out, code, msl = _run_with_msl(tile_scale, (x,), config)
+                        self.assertIn(f"_launcher(_helion_tile_scale, ({grid},)", code)
+                        self.assertIn(f"constexpr int _NUM_SM = {cores};", msl)
+                        self.assertIn("for (int virtual_pid = ", msl)
+                        torch.testing.assert_close(out, x * 2)
+
+    def test_default_multiplier_is_four_per_core(self) -> None:
+        """A persistent config naming no multiplier launches 4 threadgroups per
+        core, and the search's persistent neighbours of the default config
+        start there."""
+        cores = torch.backends.mps.get_core_count()
+        x = torch.randn(70, 50, device=DEVICE)
+        for pid_type in ("persistent_blocked", "persistent_interleaved"):
+            config = helion.Config(block_sizes=[16, 16], pid_type=pid_type)
+            with self.subTest(pid_type=pid_type):
+                out, code, msl = _run_with_msl(tile_scale, (x,), config)
+                self.assertIn("_launcher(_helion_tile_scale, (_NUM_SM * 4,)", code)
+                self.assertIn(f"constexpr int _NUM_SM = {cores};", msl)
+                torch.testing.assert_close(out, x * 2)
+        spec = tile_scale.bind((x,)).config_spec
+        generation = ConfigGeneration(spec)
+        base = generation.flatten(spec.default_config())
+        multipliers = set()
+        for index, fragment in enumerate(generation.flat_spec):
+            for value in fragment.pattern_neighbors(base[index]):
+                neighbor = [*base]
+                neighbor[index] = value
+                config = generation.unflatten(neighbor).config
+                if config.get("pid_type", "flat").startswith("persistent"):
+                    multipliers.add(config["num_sm_multiplier"])
+        with self.subTest("persistent neighbours of the default config"):
+            self.assertEqual(multipliers, {4})
+
+    def test_threadgroup_memory_is_reused_across_tiles(self) -> None:
+        """A row reduction and an MPP matmul, each worker taking at least four
+        tiles, repeated so a missing barrier between tiles would show."""
+        workers = helion.runtime.get_num_sm(torch.device(DEVICE))
+        x = torch.randn(4 * workers + 3, 256, device=DEVICE)
+        a = torch.randn(32 * workers - 5, 40, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(40, 125, device=DEVICE, dtype=torch.float16)
+        cases = (
+            (
+                tile_row_sum,
+                (x,),
+                [1],
+                "helion_red::group_sum",
+                x.cpu().double().sum(-1),
+            ),
+            (
+                tile_matmul,
+                (a, b),
+                [32, 32, 32],
+                "matmul2d",
+                a.cpu().float() @ b.cpu().float(),
+            ),
+        )
+        for kernel, args, block_sizes, feature, expected in cases:
+            for pid_type in ("persistent_blocked", "persistent_interleaved"):
+                config = helion.Config(
+                    block_sizes=block_sizes, pid_type=pid_type, num_sm_multiplier=1
+                )
+                with self.subTest(kernel=kernel.name, pid_type=pid_type):
+                    _, _, msl = _run_with_msl(kernel, args, config)
+                    self.assertIn("for (int virtual_pid = ", msl)
+                    self.assertIn(feature, msl)
+                    compiled = kernel.bind(args).compile_config(config)
+                    for _ in range(50):
+                        torch.testing.assert_close(
+                            compiled(*args).cpu().to(expected.dtype),
+                            expected,
+                            rtol=1e-2,
+                            atol=1e-2,
+                        )
+
+    def test_default_config_stays_flat(self) -> None:
+        """The default launches one threadgroup per tile, and normalizing it
+        drops the multiplier and the ``range_*`` keys Metal doesn't support."""
+        x = torch.randn(70, 50, device=DEVICE)
+        bound = tile_scale.bind((x,))
+        config = bound.config_spec.default_config()
+        self.assertEqual(config.config.get("pid_type"), "flat")
+        self.assertEqual(
+            [
+                k
+                for k in config.config
+                if k.startswith("range_") or k == "num_sm_multiplier"
+            ],
+            [],
+        )
+        self.assertNotIn("virtual_pid", bound.to_code(config))
+
+    def test_barrier_stays_rejected(self) -> None:
+        """``hl.barrier`` forces persistent_blocked, and Metal has no grid-wide
+        barrier to lower it to."""
+        x = torch.randn(100, device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.BackendImplementationMissing, "codegen for API function barrier"
+        ):
+            bound = tile_after_barrier.bind((x,))
+            bound.to_code(bound.config_spec.default_config())
+
+    def test_extent_from_a_tensor_stays_rejected(self) -> None:
+        """A root tile over a tensor's value takes a persistent pid_type, whose
+        loop would read the extent with a scalar load Metal lacks."""
+        x = torch.randn(100, device=DEVICE)
+        n = torch.tensor(77, device=DEVICE)
+        bound = tile_to_tensor_extent.bind((x, n))
+        for pid_type in ("persistent_blocked", "persistent_interleaved"):
+            config = helion.Config(
+                **{**bound.config_spec.default_config().config, "pid_type": pid_type}
+            )
+            with (
+                self.subTest(pid_type=pid_type),
+                self.assertRaisesRegex(exc.BackendUnsupported, "scalar load"),
+            ):
+                bound.to_code(config)
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_count_grid(x: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    bm = hl.register_block_size(8, 32)
+    nt = (m + bm - 1) // bm
+    out = torch.zeros_like(x)
+    for i, j in hl.grid([nt, k]):
+        rows = i * bm + hl.arange(bm)
+        v = hl.load(x, [rows, j], extra_mask=rows < m)
+        hl.store(out, [rows, j], v * 2, extra_mask=rows < m)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_count_device_loop(x: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    bk = hl.register_block_size(8, 16)
+    nk = (k + bk - 1) // bk
+    out = torch.zeros_like(x)
+    for tm in hl.tile(m):
+        for j in hl.grid(nk):
+            cols = j * bk + hl.arange(bk)
+            v = hl.load(x, [tm.index, cols], extra_mask=(cols < k)[None, :])
+            hl.store(out, [tm.index, cols], v * 3, extra_mask=(cols < k)[None, :])
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_count_grid_plus_int(x: torch.Tensor, off: int) -> torch.Tensor:
+    m, k = x.size()
+    bm = hl.register_block_size(8, 32)
+    nt = (m + bm - 1) // bm
+    out = torch.zeros_like(x)
+    for i, j in hl.grid([nt, k]):
+        rows = i * bm + hl.arange(bm)
+        v = hl.load(x, [rows, j], extra_mask=rows < m)
+        hl.store(out, [rows, j], v + off, extra_mask=rows < m)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def scale_by_float(x: torch.Tensor, s: float) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] * s
+    return out
+
+
+@_requires_darwin
+class TestMetalConfigFixedScalars(unittest.TestCase):
+    """A runtime scalar whose free symbols are all block sizes, such as a tile
+    count under static shapes, is fixed by the config, so it is baked into the
+    shader as a ``constexpr int`` like a block size.  Other scalars stay bound
+    by value as ``float``."""
+
+    def test_tile_count_as_grid_extent(self) -> None:
+        """Tail tiles at every block size: 50 rows divide by none of them."""
+        x = torch.randn(50, 40, device=DEVICE)
+        for bm in (8, 16, 32):
+            with self.subTest(bm=bm):
+                out, code, msl = _run_with_msl(
+                    tile_count_grid, (x,), helion.Config(block_sizes=[bm])
+                )
+                self.assertIn(f"constexpr int nt = {(50 + bm - 1) // bm};", msl)
+                self.assertNotIn("_by_value", code)
+                torch.testing.assert_close(out, x * 2)
+
+    def test_tile_count_as_device_loop_extent(self) -> None:
+        x = torch.randn(50, 40, device=DEVICE)
+        for bk in (8, 16):
+            with self.subTest(bk=bk):
+                out, _, msl = _run_with_msl(
+                    tile_count_device_loop, (x,), helion.Config(block_sizes=[bk, 16])
+                )
+                self.assertIn(f"constexpr int nk = {(40 + bk - 1) // bk};", msl)
+                torch.testing.assert_close(out, x * 3)
+
+    def test_user_scalars_stay_by_value(self) -> None:
+        """An int argument beside a tile count, and a float argument."""
+        x = torch.randn(50, 40, device=DEVICE)
+        for kernel, args, config, expected, by_value in (
+            (
+                tile_count_grid_plus_int,
+                (x, 7),
+                helion.Config(block_sizes=[16]),
+                x + 7,
+                ("_by_value=(3,)", "constant long& off [[buffer"),
+            ),
+            (
+                scale_by_float,
+                (x, 1.5),
+                helion.Config(block_sizes=[16, 16]),
+                x * 1.5,
+                ("_by_value=(2,)", "constant float& s [[buffer"),
+            ),
+        ):
+            with self.subTest(kernel=kernel.name):
+                out, code, msl = _run_with_msl(kernel, args, config)
+                self.assertIn(by_value[0], code)
+                self.assertIn(by_value[1], msl)
+                torch.testing.assert_close(out, expected)
+
+    def test_dynamic_shape_tile_count_stays_by_value(self) -> None:
+        """Without static shapes the tile count also depends on ``m``, which
+        the config doesn't fix."""
+        kernel = helion.kernel(tile_count_grid.fn, backend="metal", static_shapes=False)
+        x = torch.randn(50, 40, device=DEVICE)
+        out, code, msl = _run_with_msl(kernel, (x,), helion.Config(block_sizes=[16]))
+        self.assertRegex(code, r"_launcher\(.*\bnt\b.*_by_value=\(\d+, \d+\)")
+        self.assertIn("constant long& nt [[buffer", msl)
+        torch.testing.assert_close(out, x * 2)
+
+    def test_baked_int_must_fit_int32(self) -> None:
+        for value in (2**31 - 1, -(2**31)):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    _constexpr_decl("n", value), f"constexpr int n = {value};"
+                )
+        for value in (2**31, -(2**31) - 1):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(exc.BackendUnsupported, "does not fit an int"),
+            ):
+                _constexpr_decl("n", value)
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_count_truediv(x: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    bm = hl.register_block_size(8, 32)
+    nt = (m + bm - 1) // bm
+    out = torch.empty_like(x)
+    for tm in hl.tile(m, block_size=bm):
+        for tk in hl.tile(k):
+            out[tm, tk] = x[tm, tk] * (nt / 3)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_count_grid_truediv(x: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    bm = hl.register_block_size(8, 32)
+    nt = (m + bm - 1) // bm
+    out = torch.zeros_like(x)
+    for i, j in hl.grid([nt, k]):
+        rows = i * bm + hl.arange(bm)
+        v = hl.load(x, [rows, j], extra_mask=rows < m)
+        hl.store(out, [rows, j], v * (nt / 3), extra_mask=rows < m)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def block_size_truediv(x: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    bm = hl.register_block_size(8, 32)
+    out = torch.empty_like(x)
+    for tm in hl.tile(m, block_size=bm):
+        for tk in hl.tile(k):
+            out[tm, tk] = x[tm, tk] * (bm / 3)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def int_arg_truediv(x: torch.Tensor, n: int) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] * (n / 3)
+    return out
+
+
+@_requires_darwin
+class TestMetalIntTrueDiv(unittest.TestCase):
+    """Python's ``/`` on integers divides in floating point; MSL's ``/`` on two
+    ints truncates, so the operands are cast first."""
+
+    def test_tile_count_truediv(self) -> None:
+        """The tile count inlined as a ``floor_divide`` of block sizes, beside
+        a tile loop and beside a grid over the same tile count."""
+        x = torch.randn(50, 40, device=DEVICE)
+        for kernel in (tile_count_truediv, tile_count_grid_truediv):
+            for bm in (8, 16, 32):
+                config = helion.Config(
+                    block_sizes=[bm, 16] if kernel is tile_count_truediv else [bm]
+                )
+                with self.subTest(kernel=kernel.name, bm=bm):
+                    out, _, msl = _run_with_msl(kernel, (x,), config)
+                    self.assertIn("static_cast<float>(c10::metal::floor_divide(", msl)
+                    torch.testing.assert_close(out, x * ((50 + bm - 1) // bm / 3))
+
+    def test_block_size_truediv(self) -> None:
+        x = torch.randn(50, 40, device=DEVICE)
+        for bm in (8, 16):
+            with self.subTest(bm=bm):
+                out, _, msl = _run_with_msl(
+                    block_size_truediv, (x,), helion.Config(block_sizes=[bm, 16])
+                )
+                self.assertIn("static_cast<float>(_BLOCK_SIZE_0) / 3", msl)
+                torch.testing.assert_close(out, x * (bm / 3))
+
+    def test_int_argument_truediv(self) -> None:
+        """The argument is bound as a float already; the cast keeps it one."""
+        x = torch.randn(50, 40, device=DEVICE)
+        out, _, msl = _run_with_msl(
+            int_arg_truediv, (x, 4), helion.Config(block_sizes=[16, 16])
+        )
+        self.assertIn("static_cast<float>(n) / 3", msl)
+        torch.testing.assert_close(out, x * (4 / 3))
 
 
 if __name__ == "__main__":
