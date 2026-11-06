@@ -19,7 +19,7 @@ Helion generates kernels through one of several backends, selected with the
 `HELION_BACKEND` environment variable:
 
 * [Triton] (default)
-* [TileIR](#tileir-backend-blackwell-gpus), for NVIDIA Blackwell GPUs
+* [TileIR](#tileir-backend), for NVIDIA Blackwell GPUs
 * [CuTe DSL](#cute-backend-cuda-13), for NVIDIA GPUs
 * [Pallas], for Google TPUs
 * Metal (Apple GPUs) and FlyDSL (AMD GPUs), both experimental
@@ -295,7 +295,7 @@ Changing these options results in often significantly different
 output Triton code, allowing the autotuner to explore a wide range of
 implementations from a single Helion kernel.
 
-## TileIR Backend (Blackwell GPUs)
+## TileIR Backend
 
 Helion supports the [Triton-TileIR backend](https://github.com/triton-lang/Triton-to-tile-IR) for NVIDIA Blackwell GPUs (compute capability 10.x/12.x). This backend provides optimized code generation targeting [TileIR](https://docs.nvidia.com/cuda/tile-ir/latest/index.html) with additional tuning knobs.
 
