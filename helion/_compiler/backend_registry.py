@@ -21,6 +21,11 @@ from .flydsl.backend import FlyDSLBackend
 if TYPE_CHECKING:
     from .backend import Backend
 
+# Version of the out-of-tree backend contract in ``helion.backend_api``; covers
+# only the names and hooks listed in docs/api/backend_api.md, bumped per the
+# version policy there.
+BACKEND_API_VERSION = 1
+
 _BUILTIN_BACKENDS: list[type[Backend]] = [
     TritonBackend,
     PallasBackend,
@@ -41,6 +46,11 @@ def register_compiler_backend(backend_class: type[Backend]) -> None:
     The backend's ``name`` property is used as the registry key.
     Built-in backends are registered at module load time below.
 
+    Registering the same class twice is a no-op.  Registering a *different*
+    class under an already-registered name (including built-in names) raises
+    ``ValueError``; there is no public unregister, so a name is owned by its
+    first registering class for the lifetime of the process.
+
     Args:
         backend_class: A :class:`Backend` subclass.
     """
@@ -48,6 +58,16 @@ def register_compiler_backend(backend_class: type[Backend]) -> None:
 
     backend = backend_class()
     with _CODEGEN_REPAIR_LOCK:
+        existing = _REGISTRY.get(backend.name)
+        if existing is backend_class:
+            return
+        if existing is not None:
+            raise ValueError(
+                f"Backend name {backend.name!r} is already registered to "
+                f"{existing.__module__}.{existing.__qualname__}; "
+                f"refusing to overwrite it with "
+                f"{backend_class.__module__}.{backend_class.__qualname__}"
+            )
         _REGISTRY[backend.name] = backend_class
         codegen_names, _ = _codegen_repair_scope(backend.codegen_name)
         _REPAIRED_CODEGEN_NAMES = _REPAIRED_CODEGEN_NAMES.difference(codegen_names)
