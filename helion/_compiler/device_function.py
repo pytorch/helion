@@ -9,6 +9,7 @@ import itertools
 import math
 import threading
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import NamedTuple
 from typing import Protocol
 from typing import TypeVar
@@ -499,10 +500,9 @@ class DeviceFunction:
             tuple[str, tuple[str, ...], tuple[ast.stmt, ...], bool]
         ] = []
         self.triton_outlined_helper_constexprs: dict[str, int] = {}
-        # FlyDSL: (tensor_name, is_vec, is_rolled_col) → loop-invariant buffer/
-        # div/copy-atom setup, memoized per generated function so load and store
-        # reuse the same lifted AST vars.
-        self._flydsl_setup: dict[tuple[object, ...], dict[str, int | str]] = {}
+        # Per-backend codegen state for this function, keyed by backend name
+        # (covered by helion.backend_api; see docs/api/backend_api.md).
+        self.backend_codegen_state: dict[str, Any] = {}
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
         # Pallas: tensor dimensions selected by scalar metadata indexed by one

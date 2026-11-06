@@ -108,6 +108,10 @@ other attributes of the classes listed here, may change without notice.
 5. **Sympy helper.** `symint_sympy_expr(x)` returns the `sympy.Expr` behind a
    `torch.SymInt`; its signature (takes a SymInt, returns `sympy.Expr`) is
    covered, which is all codegen sites rely on.
+6. **Per-function state.** `DeviceFunction.backend_codegen_state`, a dict for
+   codegen state shared across a backend's op handlers while one device
+   function is generated. Use your backend's name as the key; the value is
+   yours.
 
 ## What is not covered
 
@@ -120,6 +124,7 @@ subclassable, and what `InductorOpOverrides` aliases (torch's private
 | Change | Action |
 |---|---|
 | Add an optional hook with a safe default | No bump |
+| Add a covered attribute or exported name | No bump |
 | Make a hook required | Bump |
 | Remove, rename, or change the signature of a covered member | Bump |
 | Change anything not covered | No bump |

@@ -17,7 +17,6 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.compile_environment import LoopSpecBlockSizeSource
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_ir import ReductionLoopGraphInfo
-from helion._compiler.flydsl.backend import FlyDSLBackend
 from helion._compiler.metal.backend import MetalBackend
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._testing import import_example
@@ -42,11 +41,29 @@ if TYPE_CHECKING:
     from helion._compiler.backend import Backend
 
 
-@pytest.mark.parametrize("backend_type", [MetalBackend, FlyDSLBackend])
+class _ThreadLevel64Backend(MetalBackend):
+    # A thread-level backend whose reductions use at most 64 threads (one AMD
+    # wavefront); stands in for FlyDSL's thread cap only, so this test does not
+    # import FlyDSL (test_flydsl_launcher.py pins the cap to the real backend).
+    @property
+    def name(self) -> str:
+        return "_test_thread_level_64"
+
+    def max_reduction_threads(self) -> int | None:
+        return 64
+
+
+@pytest.mark.parametrize(
+    ("backend_type", "max_threads"),
+    [(MetalBackend, 1024), (_ThreadLevel64Backend, 64)],
+)
 @pytest.mark.parametrize("tile_size", [4, 8, 16])
 @pytest.mark.parametrize("graph_reduction", [False, True])
 def test_merged_reduction_preserves_backend_thread_coverage(
-    backend_type: type[Backend], tile_size: int, graph_reduction: bool
+    backend_type: type[Backend],
+    max_threads: int,
+    tile_size: int,
+    graph_reduction: bool,
 ) -> None:
     # Exercise the real backend hooks without requiring Metal or ROCm devices.
     # Small merged reductions must not acquire CuTe lanes; larger reductions
@@ -103,7 +120,7 @@ def test_merged_reduction_preserves_backend_thread_coverage(
     ):
         strategy = PersistentReductionStrategy(fn, 0)
 
-    expected_threads = min(tile_size**2, 64 if backend.name == "flydsl" else 1024)
+    expected_threads = min(tile_size**2, max_threads)
     assert strategy._reduction_thread_count() == expected_threads
     assert strategy._synthetic_cute_lane_var is None
 
