@@ -128,7 +128,9 @@ class FlexHookCode(NamedTuple):
     # the top of every PASS1 iteration ahead of the t2r copy and the issue
     # block right after it for chunk ``ci + S`` (the walk's next tile once
     # past the chunk count), issues chunks ``0 .. S - 1`` of the first tile
-    # before the KV loop and of the next tile at an absent step.
+    # before the KV loop and of the next tile at an absent step, and
+    # re-issues them with the masked hook's block for a partial tile that
+    # follows a full one (whose PASS1 issued fewer runs or none).
     chunk_issue: str = ""
     chunk_consume: str = ""
     coop_slots: int = 0
