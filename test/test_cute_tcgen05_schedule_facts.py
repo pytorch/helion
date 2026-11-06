@@ -35,6 +35,7 @@ from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_dense_tcgen05 import blackwell_capability
 from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
 from helion._testing.cute_dense_tcgen05 import extra_store_mm
+from helion._testing.cute_dense_tcgen05 import plain_mm
 from helion._testing.cute_dense_tcgen05 import scaled_args
 from helion._testing.cute_dense_tcgen05 import scaled_mm
 from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
@@ -376,3 +377,102 @@ def test_k_tail_does_not_widen_other_instruction_families() -> None:
         assert not native_tma_schedule_supported(
             replace(facts, dtype=dtype), (128, 128, 128), cluster_m=2, cluster_n=1
         )
+
+
+def _plain_bind(
+    m: int, n: int, k: int, dtype: torch.dtype = torch.bfloat16
+) -> BoundKernel:
+    return plain_mm._bind_isolated(
+        (torch.empty((m, k), dtype=dtype), torch.empty((n, k), dtype=dtype).T)
+    )
+
+
+def _k_block_max(bound: BoundKernel) -> int:
+    fragments = facts._matmul_block_fragments(bound.config_spec._cute_tcgen05_config)
+    assert fragments is not None
+    return fragments[2].high
+
+
+def test_output_edge_admits_two_cta_pairs_and_flattens_one_cta_partial_tiles() -> None:
+    """Ragged M, whole K: persistent and CtaGroup.TWO search on 64-deep K tiles.
+
+    One-CTA persistent kernels run whole tiles only (the host multi-tile
+    guard), so the search flattens their partial-tile samples while the
+    two-CTA pairs keep their persistent schedule.
+    """
+    bound = _plain_bind(1000, 4096, 2880)
+    state = bound.config_spec._cute_tcgen05_config
+    assert "persistent_interleaved" in bound.config_spec.allowed_pid_types
+    constraints = state.cluster_m2_search_constraints
+    assert constraints is not None and not constraints.allow_edge_k_tail_family
+    assert state.output_edge_persistent_admitted
+    assert _k_block_max(bound) == 64
+    # the FFI direct-entry seed assumes whole 256x256 tiles
+    assert not seeds.full_tile_direct_entry_seed_eligible(state)
+    one_cta = {
+        "block_sizes": [128, 256, 64],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 1,
+    }
+    repair._fix_cluster_m1_persistent_search_config(state, one_cta)
+    assert one_cta["pid_type"] == "flat"
+    pair = {
+        "block_sizes": [256, 256, 64],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 2,
+    }
+    repair._fix_cluster_m1_persistent_search_config(state, pair)
+    assert pair["pid_type"] == "persistent_interleaved"
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype"),
+    (
+        # Ragged M below the 256-row pair tile.
+        ((16, 14336, 4096), torch.bfloat16),
+        # Ragged in both M and N.
+        ((3000, 3000, 3072), torch.bfloat16),
+        # FP8 keeps its exact-tile restoration.
+        ((1000, 4096, 2880), torch.float8_e4m3fn),
+    ),
+)
+def test_output_edge_admission_excludes_unpaired_and_double_edge_shapes(
+    shape: tuple[int, int, int], dtype: torch.dtype
+) -> None:
+    bound = _plain_bind(*shape, dtype=dtype)
+    assert not bound.config_spec._cute_tcgen05_config.output_edge_persistent_admitted
+
+
+def test_n_edge_cluster_n_seeds_take_one_n_cluster() -> None:
+    """4096x1000x4096 with an N-major B: the CtaGroup.TWO seeds' cluster_n=2
+    variants (L2 grouped, or with a scheduler warp) fall outside the proved
+    N-edge multicast schedule, which codegen requires; normalization takes
+    them to one N cluster, and they render."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = plain_mm._bind_isolated(
+            (
+                torch.empty((4096, 4096), dtype=torch.bfloat16),
+                torch.empty((4096, 1000), dtype=torch.bfloat16),
+            )
+        )
+        spec = bound.config_spec
+        generation = spec.create_config_generation()
+        paired = [
+            generation.unflatten(generation.flatten(seed))
+            for seed in spec.compiler_seed_configs
+            if seed.config.get("tcgen05_cluster_n") == 2
+        ]
+        assert paired
+        assert all(seed.config["tcgen05_cluster_n"] == 1 for seed in paired)
+        bound.to_code(paired[0])
+
+
+def test_k_cap_applies_only_where_whole_k_tiles_admit_persistence() -> None:
+    """200x1000x2880 is ragged in both M and N: no persistent schedule, no cap."""
+    capped = _plain_bind(1000, 4096, 2880)
+    uncapped = _plain_bind(200, 1000, 2880)
+    assert _k_block_max(capped) == 64
+    assert _k_block_max(uncapped) > 64

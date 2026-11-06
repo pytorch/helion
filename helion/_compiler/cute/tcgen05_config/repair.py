@@ -282,6 +282,44 @@ def _fix_full_tile_schedule_search_config(
         config["pid_type"] = "flat"
 
 
+def _drop_unproved_n_edge_cluster_n(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> None:
+    """A persistent N-edge sample (whole M and K tiles, a partial last N
+    tile) left at ``tcgen05_cluster_n=2`` outside the proved N-multicast
+    schedule takes one N cluster: codegen refuses it (``tcgen05 N-edge
+    cluster_n=2 requires ...``), e.g. on a 16-deep K tile, or on a tile
+    order that a projection running after the schedule's own
+    (``n_edge_cluster_schedule_defaults``) grouped again. A post-pass over
+    the projected sample judges the final config, whichever projection
+    moved it."""
+    pid_type = config.get("pid_type", "flat")
+    extents = state.matmul_compile_time_static_extents
+    view = facts._matmul_config_view(state, config)
+    if (
+        config.get("tcgen05_cluster_n") != 2
+        or not (isinstance(pid_type, str) and pid_type.startswith("persistent"))
+        or extents is None
+        or view is None
+    ):
+        return
+    blocks, mi, ni, ki = view
+    tile = (blocks[mi], blocks[ni], blocks[ki])
+    if not all(type(value) is int and value > 0 for value in (*tile, *extents)):
+        return
+    (m, n, k), (bm, bn, bk) = (
+        cast("tuple[int, int, int]", extents),
+        cast("tuple[int, int, int]", tile),
+    )
+    if (
+        m % bm == 0
+        and n % bn != 0
+        and k % bk == 0
+        and not n_edge_cluster_schedule_config_supported(state, config)
+    ):
+        config["tcgen05_cluster_n"] = 1
+
+
 def n_edge_cluster_schedule_config_supported(
     state: CuteTcgen05Config, config: dict[str, object]
 ) -> bool:
@@ -4163,7 +4201,19 @@ def _fix_cluster_m1_persistent_search_config(
         return
     bm = block_sizes[m_index]
     if isinstance(bm, int) and not isinstance(bm, bool):
-        block_sizes[m_index] = min(bm, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+        block_sizes[m_index] = bm = min(bm, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+    bn, bk = block_sizes[n_index], block_sizes[k_index]
+    if (
+        state.output_edge_persistent_admitted
+        and isinstance(bm, int)
+        and isinstance(bn, int)
+        and isinstance(bk, int)
+        and not facts._static_full_tiles(state, bm=bm, bn=bn, bk=bk)
+    ):
+        # The output-edge admission's persistent schedules belong to its
+        # CtaGroup.TWO pairs; one-CTA persistent kernels run whole tiles
+        # only (the host multi-tile guard), so partial tiles go flat.
+        config["pid_type"] = "flat"
 
 
 def _fix_target1_tvm_ffi_search_config(
@@ -5038,6 +5088,7 @@ def _validate_diagnostic_mode(
 
 def fix_search_config(state: CuteTcgen05Config, config: dict[str, object]) -> None:
     _fix_search_config_body(state, config)
+    _drop_unproved_n_edge_cluster_n(state, config)
     # These repairs read the repaired pid type, cluster and tile, so they
     # run last, on every path of the body (its early returns included:
     # the one-CTA pipeline, the dense-N tile, the materialized chains
