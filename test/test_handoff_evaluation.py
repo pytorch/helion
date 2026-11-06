@@ -137,6 +137,10 @@ def _fp8_reference(x: torch.Tensor) -> torch.Tensor:
     return (x + 1).to(torch.float8_e4m3fn)
 
 
+# evaluate_handoff spawns a real worker per call (most tests below run the
+# case job in-process instead): the slow tier, except the one evaluation in
+# test_fp8_one_ulp_flips_follow_the_recorded_mode[ulp], the smoke test.
+@pytest.mark.slow
 def test_worker_snapshot_survives_source_edits(tmp_path: Path) -> None:
     _bundle(tmp_path)
     first = evaluate_handoff(tmp_path, repetitions=2, timeout=30)
@@ -373,6 +377,7 @@ def test_invalid_source_is_recorded(tmp_path: Path, source: str, message: str) -
     assert message in (outcome.error or "")
 
 
+@pytest.mark.slow
 def test_timeout_keeps_the_failed_source(tmp_path: Path) -> None:
     _bundle(
         tmp_path,

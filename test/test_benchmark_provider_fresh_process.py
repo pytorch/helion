@@ -42,9 +42,14 @@ class _UpdateCachedArgument:
     "xdist worker with no traceback) on the single-GPU A10G ref-eager runner."
 )
 class TestFreshFinalistProcess(unittest.TestCase):
-    def run_candidates(self, *, fail_first: bool) -> None:
+    @pytest.mark.slow
+    def test_finalists_do_not_inherit_cached_arguments(self) -> None:
         # Exercise real spawn workers and the real cached-argument loader.
         # Only kernel serialization/device execution is replaced with a CPU job.
+        # One ordinary search first (its worker and loaded inputs are reused),
+        # then two fresh-process finalists: the first fails after updating its
+        # loaded argument, and the second must still see the saved input, which
+        # also proves a failed finalist leaks nothing (each worker is a spawn).
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             args_path = Path(directory) / "args.pt"
             torch.save((torch.zeros(1),), args_path)
@@ -98,36 +103,29 @@ class TestFreshFinalistProcess(unittest.TestCase):
                 patch("helion.autotuner.benchmark_provider.BenchmarkWorker", new_worker)
             )
             try:
-                if not fail_first:
-                    # Ordinary search still reuses its worker and loaded inputs.
-                    self.assertEqual(
-                        provider.benchmark_isolated(
-                            [lambda: False, lambda: False], warmup=1, rep=1
-                        ),
-                        [1.0, 2.0],
-                    )
-                    self.assertTrue(workers[0].alive())
+                # Ordinary search still reuses its worker and loaded inputs.
+                self.assertEqual(
+                    provider.benchmark_isolated(
+                        [lambda: False, lambda: False], warmup=1, rep=1
+                    ),
+                    [1.0, 2.0],
+                )
+                self.assertTrue(workers[0].alive())
                 results = provider.benchmark_isolated(
-                    [lambda: fail_first, lambda: False],
+                    [lambda: True, lambda: False],
                     warmup=1,
                     rep=1,
                     fresh_process=True,
                 )
-                self.assertEqual(results, [None if fail_first else 1.0, 1.0])
+                self.assertEqual(results, [None, 1.0])
                 self.assertIsNone(provider._benchmark_worker)
                 self.assertTrue(all(not worker.alive() for worker in workers))
-                self.assertEqual(len(workers), 2 if fail_first else 3)
+                self.assertEqual(len(workers), 3)
                 (unchanged,) = torch.load(args_path, weights_only=True)
                 self.assertEqual(float(unchanged.item()), 0.0)
             finally:
                 for worker in workers:
                     worker.shutdown()
-
-    def test_finalists_do_not_inherit_cached_arguments(self) -> None:
-        self.run_candidates(fail_first=False)
-
-    def test_failed_finalist_does_not_leak_cached_arguments(self) -> None:
-        self.run_candidates(fail_first=True)
 
 
 def test_clear_fast_path_caches_handles_single_and_multi_kernel_hosts(monkeypatch):

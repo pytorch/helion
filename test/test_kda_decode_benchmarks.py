@@ -24,11 +24,13 @@ def test_benchmark_imports_resolve_inside_checkout() -> None:
     assert Path(packed.helion.__file__).resolve().is_relative_to(REPO_ROOT)
 
 
+# Each script runs in a fresh interpreter that imports torch and Helion: the
+# decode script is the smoke test, the recurrent one is the slow tier.
 @pytest.mark.parametrize(
     "script",
     (
         "compare_kda_decode_backends.py",
-        "compare_kda_recurrent_backends.py",
+        pytest.param("compare_kda_recurrent_backends.py", marks=pytest.mark.slow),
     ),
 )
 def test_benchmark_direct_entrypoint_imports_clean_checkout(

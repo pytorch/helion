@@ -188,6 +188,7 @@ class _FakeTimingEvent:
         return self.elapsed_times.pop(0)
 
 
+@pytest.mark.cpu_only
 class TestAutotuneDataclassCompatibility(unittest.TestCase):
     def test_benchmark_job_preserves_fixed_repetitions_position(self) -> None:
         job = BenchmarkJob(
@@ -365,6 +366,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         modules_after = {name for name in sys.modules if name.startswith(module_prefix)}
         self.assertEqual(modules_after, modules_before)
 
+    @pytest.mark.slow
     def test_benchmark_job_classifies_wrapper_load_failure(self) -> None:
         fn_spec = SerializedCompiledFunction(
             function_name="call",
@@ -1565,6 +1567,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertIsInstance(loaded[0], _ReturnValue)
         self.assertEqual(loaded[0].value, 3)
 
+    @pytest.mark.slow
     @skipIfPallasTpu("spawned workers cannot acquire an initialized TPU device")
     def test_spawn_precompile_loads_trusted_python_args(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1599,6 +1602,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                     process.kill()
                     process.join(timeout=5)
 
+    @pytest.mark.slow
     @skipIfPallasTpu("spawned workers cannot acquire an initialized TPU device")
     def test_spawn_loads_source_module_from_file(self) -> None:
         # Regression: a kernel loaded by path / notebook / exec lives under a
@@ -1651,6 +1655,9 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                     process.kill()
                     process.join(timeout=5)
 
+    # The one real worker spawn outside the slow tier: the smoke test of the
+    # killable worker (its timeout, kill and respawn). The other spawning
+    # tests below carry @pytest.mark.slow.
     def test_timeout_kills_worker(self) -> None:
         worker = BenchmarkWorker()
         try:
@@ -1832,6 +1839,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertEqual(provider._anchor_fns_by_materialized_key, {})
         self.assertEqual(provider._effective_source_repairs, {})
 
+    @pytest.mark.slow
     def test_timeout_kills_worker_process_group(self) -> None:
         worker = BenchmarkWorker()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1854,6 +1862,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             finally:
                 worker.shutdown()
 
+    @pytest.mark.slow
     def test_watchdog_kills_worker_when_poll_timeout_is_ignored(self) -> None:
         original_poll = Connection.poll
 
@@ -1920,6 +1929,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             child_connection.close()
             worker.shutdown()
 
+    @pytest.mark.slow
     def test_sticky_error_kills_worker(self) -> None:
         # Errors matching _UNRECOVERABLE_RUNTIME_ERROR_RE force the worker
         # to be killed so the next call spawns a fresh CUDA context.
@@ -1933,6 +1943,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    @pytest.mark.slow
     def test_worker_crash_raises_died(self) -> None:
         worker = BenchmarkWorker()
         try:
@@ -1942,6 +1953,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    @pytest.mark.slow
     def test_unpickleable_worker_exception_is_serialized(self) -> None:
         worker = BenchmarkWorker()
         try:
@@ -1953,6 +1965,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    @pytest.mark.slow
     def test_out_of_memory_after_successful_jobs_retries_on_a_fresh_worker(
         self,
     ) -> None:
@@ -1982,6 +1995,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             worker.run(_OutOfMemory(), timeout=30.0)
         return int(str(ctx.exception).rsplit(" ", 1)[1])
 
+    @pytest.mark.slow
     def test_out_of_memory_replaces_the_worker_and_backs_off_retries(self) -> None:
         # Every out-of-memory error replaces the worker that raised it, the
         # retry's included: the failing kernel can itself raise the
@@ -2005,6 +2019,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    @pytest.mark.slow
     def test_out_of_memory_retry_that_succeeds_resets_the_back_off(self) -> None:
         warnings: list[str] = []
         worker = BenchmarkWorker(log_warning=warnings.append)
@@ -2042,6 +2057,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             self.assertFalse(match_device_out_of_memory(RuntimeError(message)), message)
 
 
+@pytest.mark.cpu_only
 class TestSuspiciousRebenchmark(unittest.TestCase):
     def test_isolated_unkillable_worker_is_fatal(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
@@ -2615,36 +2631,39 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         self.assertEqual(measured.perfs, [0.8, 0.75])
 
 
+def _inplace_add_kernel(*block_sizes: int) -> helion.Kernel:
+    """A small kernel timed and checked in the benchmark worker, searched over
+    one config per block size (a fresh kernel, so each test autotunes)."""
+
+    def inplace_add(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        for tile in hl.tile(out.size()):
+            out[tile] += a[tile]
+        return out
+
+    return helion.kernel(
+        inplace_add,
+        configs=[
+            helion.Config(block_sizes=[size], num_warps=4) for size in block_sizes
+        ],
+        autotune_log_level=0,
+        autotune_benchmark_subprocess=True,
+    )
+
+
 @onlyBackends(["triton", "cute"])
 class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase):
-    @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
-    def test_autotune_with_subprocess_bench(self) -> None:
-        if not torch.cuda.is_available():
-            self.skipTest("requires CUDA")
+    """Real searches through the benchmark worker. The slow tier holds every
+    test but test_autotune_runs_mutated_arg_kernels_in_the_worker, the smoke
+    test of a small kernel timed and checked in the worker."""
 
-        examples_dir = Path(__file__).parent.parent / "examples"
-        matmul = import_path(examples_dir / "matmul.py").matmul
-
-        args = (
-            torch.randn([512, 512], device=DEVICE),
-            torch.randn([512, 512], device=DEVICE),
-        )
-        bound_kernel = matmul.bind(args)
-        bound_kernel.settings.autotune_benchmark_subprocess = True
-        bound_kernel.settings.autotune_benchmark_timeout = 60
-        bound_kernel.settings.autotune_precompile = None
-        # The autotuner reseeds `random` from this setting, so pinning it (not
-        # random.seed) is what makes the config sequence reproducible.
-        bound_kernel.settings.autotune_random_seed = 123
-
-        random.seed(123)
-        RandomSearch(bound_kernel, args, 10).autotune()
-
+    @pytest.mark.slow
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_continues_when_subprocess_reports_inf(self) -> None:
         # Patches _benchmark_function_subprocess to return inf for a
         # fraction of configs, simulating BenchmarkTimeout / worker death;
-        # autotune must still pick a best config from the rest.
+        # autotune must still pick a best config from the rest. The other two
+        # thirds of the configs run the real worker path, so this is also the
+        # happy-path search through the worker.
         if not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
@@ -2692,12 +2711,15 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         self.assertGreaterEqual(call_count[1], 2)
         self.assertEqual(search._autotune_metrics.num_worker_failures, call_count[1])
 
-    @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
+    @pytest.mark.slow
     def test_autotune_continues_when_accuracy_check_crashes(self) -> None:
         # A config can pass the timed run and then crash in the accuracy
         # check. Patches the accuracy job to raise a sticky CUDA error for one
         # config; the worker dies and respawns, and autotune must still pick a
-        # best config from the rest instead of aborting.
+        # best config from the rest instead of aborting. The crash hook does
+        # not depend on the kernel: a small in-place add with three configs
+        # (one checked before the crash, the crash, one after) replaces the
+        # matmul search this test used to run.
         if not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
@@ -2725,39 +2747,23 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
                 )
             return original(self, fn)
 
-        examples_dir = Path(__file__).parent.parent / "examples"
-        matmul = import_path(examples_dir / "matmul.py").matmul
+        inplace_add = _inplace_add_kernel(32, 64, 128)
 
-        args = (
-            torch.randn([512, 512], device=DEVICE),
-            torch.randn([512, 512], device=DEVICE),
-        )
-        # Bind outside the shared cache: an earlier test in this process can
-        # leave compiled configs on the cached BoundKernel whose generated
-        # module files were deleted with that test's fresh inductor cache. Those
-        # cannot be serialized into the benchmark worker, so they silently
-        # fall back in-process and are not counted below.
-        bound_kernel = matmul._bind_isolated(args)
-        bound_kernel.settings.autotune_benchmark_subprocess = True
-        bound_kernel.settings.autotune_benchmark_timeout = 60
-        bound_kernel.settings.autotune_precompile = None
-        # The autotuner reseeds `random` from this setting, so pinning it (not
-        # random.seed) is what makes the config sequence reproducible.
-        bound_kernel.settings.autotune_random_seed = 123
-
-        random.seed(123)
+        a = torch.full([256], 2.0, device=DEVICE)
+        out = torch.zeros([256], device=DEVICE)
         with patch.object(
             LocalBenchmarkProvider,
             "_run_subprocess_accuracy_check_job",
             maybe_crash,
         ):
-            best = RandomSearch(bound_kernel, args, 8).autotune()
+            result = inplace_add(a, out)
 
-        self.assertIsNotNone(best)
-        # The second accuracy-check attempt crashes. A third proves the search
-        # continued; random configs can fail compilation before reaching this hook.
+        # The second accuracy check crashes; the third proves the search
+        # continued past it and the crashed worker's replacement served it.
         self.assertGreaterEqual(call_count[0], 3)
         self.assertEqual(call_count[1], 1)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(result, torch.full([256], 2.0, device=DEVICE))
 
     def test_autotune_runs_mutated_arg_kernels_in_the_worker(self) -> None:
         # A kernel that writes into an input (``out[tile] += ...``) is timed
@@ -2767,18 +2773,7 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         if not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
-        @helion.kernel(
-            configs=[
-                helion.Config(block_sizes=[32], num_warps=4),
-                helion.Config(block_sizes=[64], num_warps=4),
-            ],
-            autotune_log_level=0,
-            autotune_benchmark_subprocess=True,
-        )
-        def inplace_add(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-            for tile in hl.tile(out.size()):
-                out[tile] += a[tile]
-            return out
+        inplace_add = _inplace_add_kernel(32, 64)
 
         a = torch.full([256], 2.0, device=DEVICE)
         out = torch.zeros([256], device=DEVICE)
@@ -2828,6 +2823,7 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         # The autotuning runs mutated copies: the real ``out`` saw one call.
         torch.testing.assert_close(result, torch.full([256], 2.0, device=DEVICE))
 
+    @pytest.mark.slow
     def test_autotune_survives_a_device_fault_in_a_mutated_arg_candidate(
         self,
     ) -> None:
@@ -2840,19 +2836,7 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         if not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
-        @helion.kernel(
-            configs=[
-                helion.Config(block_sizes=[32], num_warps=4),
-                helion.Config(block_sizes=[64], num_warps=4),
-                helion.Config(block_sizes=[128], num_warps=4),
-            ],
-            autotune_log_level=0,
-            autotune_benchmark_subprocess=True,
-        )
-        def inplace_add(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-            for tile in hl.tile(out.size()):
-                out[tile] += a[tile]
-            return out
+        inplace_add = _inplace_add_kernel(32, 64, 128)
 
         a = torch.full([256], 2.0, device=DEVICE)
         out = torch.zeros([256], device=DEVICE)

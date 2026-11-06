@@ -61,6 +61,9 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
 
+# Every test here compiles and launches in fresh subprocesses under a watchdog.
+pytestmark = pytest.mark.slow
+
 _SHAPE = (2, 16, 2048, 128)
 # The flex list walk: 16 query rows x 16 KV tiles per (batch, head).
 _FLEX_SHAPE = (2, 16, 2048, 64)

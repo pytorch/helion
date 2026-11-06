@@ -1186,6 +1186,8 @@ class TestMisc(RefEagerTestBase, TestCase):
             self.assertNotIn("b_size_1", code)
             self.assertIn("b_size_0", code)
 
+    # Each repro test runs its script in a fresh interpreter; this one is the
+    # smoke test, the custom-argument variants below are the slow tier.
     @skipIfRefEager("no code execution")
     def test_triton_repro_add(self):
         mod = import_path(EXAMPLES_DIR / "add.py")
@@ -1209,6 +1211,7 @@ class TestMisc(RefEagerTestBase, TestCase):
             )
             self.assertEqual(result.returncode, 0, msg=f"stderr:\n{result.stderr}")
 
+    @pytest.mark.slow
     @skipIfRefEager("no code execution")
     @parametrize("static_shapes", (True, False))
     def test_triton_repro_custom(self, static_shapes):
@@ -2554,6 +2557,7 @@ def _run_narrow_shift_generated(code, x, shifts):
     return tuple(outputs)
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("dtype", (torch.int8, torch.uint8, torch.int16))
 @pytest.mark.parametrize("count_kind", ("scalar", "narrow", "wide"))
 def test_cute_narrow_integer_shifts_generated(dtype, count_kind):
@@ -2597,6 +2601,7 @@ class TestNarrowIntegerShifts(TestCase):
                             torch.testing.assert_close(arg, original, rtol=0, atol=0)
 
 
+@skipUnlessBackends(["cute"])
 @skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("dtype", (torch.uint8, torch.uint32))
 def test_cute_unsigned_scalar_load_sdk_type(dtype):
@@ -2635,6 +2640,7 @@ def test_cute_unsigned_scalar_load_sdk_type(dtype):
         assert "arith.extsi" not in assembly
 
 
+@skipUnlessBackends(["cute"])
 def test_cute_scalar_load_non_unsigned_paths_unchanged():
     from helion._compiler.cute.backend import CuteBackend
     from helion.language.memory_ops import _cute_scalar_load_expr
@@ -2683,6 +2689,7 @@ def _unsigned_load_input(dtype, device):
     return values[1:515:2]
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("dtype", (torch.uint8, torch.uint32))
 def test_cute_unsigned_scalar_load_codegen(dtype):
     x = _unsigned_load_input(dtype, "cpu")

@@ -19,6 +19,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import _has_cute_dsl
 from helion._testing import skipIfRefEager
+from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import FiniteSearch
 from helion.autotuner import HandoffBundle
@@ -206,10 +207,20 @@ class _EquivalentSource(ast.NodeTransformer):
 
 # The bundle replays below each start a fresh Python process that imports torch
 # and Helion and compiles the kernel again: 20-33s alone on a B200, past the 60s
-# CI default once eight xdist workers share the runner's CPUs.
+# CI default once eight xdist workers share the runner's CPUs. A bundle's kernel
+# backend is fixed at definition, so each test runs in the lane of its backend
+# (skipUnlessBackends); the replays are the slow tier except one smoke test per
+# lane: this one for CuTe and the numerical-reference test below for Triton.
+_LANE_BACKENDS = [
+    pytest.param("cute", marks=skipUnlessBackends(["cute"])),
+    pytest.param("triton", marks=skipUnlessBackends(["triton"])),
+]
+
+
 @pytest.mark.timeout(300)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipIfRefEager("Native handoff requires compilation")
+@skipUnlessBackends(["cute"])
 @skipUnlessCuteAvailable("Native CuTe handoff requires the supported CuTe DSL")
 def test_namedtuple_bundle_replays_in_fresh_process(tmp_path: Path) -> None:
     class Pair(NamedTuple):
@@ -239,11 +250,16 @@ def test_namedtuple_bundle_replays_in_fresh_process(tmp_path: Path) -> None:
     _replay_bundle(bundle, tmp_path)
 
 
+@pytest.mark.slow
 @pytest.mark.timeout(300)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipIfRefEager("Native handoff requires compilation")
+@skipUnlessBackends(["cute"])
 @skipUnlessCuteAvailable("Native CuTe handoff requires the supported CuTe DSL")
-@pytest.mark.parametrize("scale", [2.0, math.inf, -math.inf, math.nan])
+# The kernel below maps every scale but 2.0 to 1.0, so +-inf replay exactly as
+# nan does (a nonfinite constexpr scalar through the metadata and the fresh
+# process); test_nonfinite_input_metadata covers the JSON encoding of all three.
+@pytest.mark.parametrize("scale", [2.0, math.nan])
 def test_dlpack_and_nonfinite_bundle_inputs(scale: float, tmp_path: Path) -> None:
     @helion.kernel(
         backend="cute",
@@ -273,10 +289,11 @@ def test_dlpack_and_nonfinite_bundle_inputs(scale: float, tmp_path: Path) -> Non
     _replay_bundle(bundle, tmp_path)
 
 
+@pytest.mark.slow
 @pytest.mark.timeout(300)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipIfRefEager("Native handoff requires compilation")
-@pytest.mark.parametrize("backend", ["cute", "triton"])
+@pytest.mark.parametrize("backend", _LANE_BACKENDS)
 @pytest.mark.parametrize("multi_shape", [False, True])
 def test_native_source_handoff(backend: str, multi_shape: bool, tmp_path: Path) -> None:
     if backend == "cute" and not _has_cute_dsl():
@@ -348,12 +365,17 @@ def test_native_source_handoff(backend: str, multi_shape: bool, tmp_path: Path) 
     assert (tmp_path / "bundle" / "case_0" / "original.py").read_text() == originals[
         "case_0/kernel.py"
     ]
+    if multi_shape:
+        return
     # A replay needs only the workspace; the original search is no longer used.
-    if not multi_shape:
-        replay = HandoffBundle(bundle.directory).evaluate(repetitions=1)
-        assert replay.ok, replay
-        assert replay.cases[0].source_hash == result.cases[0].source_hash
+    replay = HandoffBundle(bundle.directory).evaluate(repetitions=1)
+    assert replay.ok, replay
+    assert replay.cases[0].source_hash == result.cases[0].source_hash
 
+    # The accuracy-error round below is evaluated per case, the same for the
+    # multi-shape bundle (test_handoff_evaluation covers a failed case disabling
+    # its aggregate), so it runs once per backend: each round cold-compiles the
+    # kernel in a fresh worker.
     def invalid_agent(workspace: HandoffBundle) -> dict[str, str]:
         source = workspace.sources["case_0/kernel.py"]
         return {
@@ -366,7 +388,7 @@ def test_native_source_handoff(backend: str, multi_shape: bool, tmp_path: Path) 
     assert invalid.cases[0].status == "accuracy_error"
     torch.testing.assert_close(x, original)
 
-    if not multi_shape and backend == "triton":
+    if backend == "triton":
         with pytest.raises(RuntimeError, match="baseline failed"):
             build_handoff(
                 search,
@@ -377,9 +399,11 @@ def test_native_source_handoff(backend: str, multi_shape: bool, tmp_path: Path) 
             )
 
 
+# The Triton lane's one unmarked fresh-process replay (see _LANE_BACKENDS).
 @pytest.mark.timeout(300)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipIfRefEager("Native handoff requires compilation")
+@skipUnlessBackends(["triton"])
 def test_numerical_reference_preserves_original_mutation_and_aliases(
     tmp_path: Path,
 ) -> None:

@@ -420,6 +420,9 @@ def _launch_batched_gemm_in_subprocess(
     assert result.returncode == 0 and "PROBE_OK" in result.stdout, result.stderr[-4000:]
 
 
+# The deadlock probes each compile and launch in a fresh interpreter; the
+# four-K-tile case below is the smoke test, these two are the slow tier.
+@pytest.mark.slow
 @pytest.mark.parametrize("ab_stages", [1, 2], ids=["ab1", "ab2"])
 def test_narrow_n8_one_shot_chain_completes_with_more_k_tiles_than_stages(
     tmp_path: Path, ab_stages: int

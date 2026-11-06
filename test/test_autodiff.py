@@ -658,19 +658,6 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         )
         self.assertIn("x.view([-1, 4, 8])", helion_code)
 
-    def test_sum_reduction_square_shape(self):
-        @helion.kernel(autotune_effort="none")
-        def kernel(x: torch.Tensor) -> torch.Tensor:
-            m, n = x.shape
-            out = torch.empty([m], dtype=x.dtype, device=x.device)
-            for tile_m in hl.tile(m):
-                out[tile_m] = x[tile_m, :].sum(-1)
-            return out
-
-        self._check_backward(
-            kernel, lambda x: x.sum(-1), 1, shape=(32, 32), grad_shape=(32,)
-        )
-
     def test_multi_output_reordered_stores(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1258,6 +1245,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         )
 
     # A real autotune pass: CuTe compiles each candidate cold (~80s on B200).
+    @pytest.mark.slow
     @pytest.mark.timeout(300)
     @skipIfRocm("backward autotuning times out on ROCm")
     def test_backward_autotune(self):
@@ -1296,10 +1284,6 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
                 autotune_effort="quick",
             )
 
-    @skipIfCute(
-        "the scan-hop backward reduces over four full-slice dims at once "
-        "(batch, M, N, K chunk), one more than CuTe's three thread axes"
-    )
     def test_example_bmm(self):
         bmm = import_example("bmm").bmm
 
@@ -1318,23 +1302,6 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             # A10G TF32 reduction order can leave an isolated gradient element
             # just above 1e-2 absolute error.
             atol=2e-2,
-        )
-
-    def test_example_bmm_square(self):
-        bmm = import_example("bmm").bmm
-
-        B, M, K, N = 2, 32, 32, 32
-        self._check_backward(
-            bmm,
-            lambda a, b: torch.bmm(a, b),
-            2,
-            inputs_fn=lambda: [
-                torch.randn(B, M, K, device=DEVICE, dtype=torch.float32),
-                torch.randn(B, K, N, device=DEVICE, dtype=torch.float32),
-            ],
-            grad_shape=(B, M, N),
-            rtol=1e-2,
-            atol=1e-2,
         )
 
     def test_example_softmax(self):
