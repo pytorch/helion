@@ -623,9 +623,11 @@ class DeviceFunction:
         # emit_pipeline allocates them inside the kernel, so the launcher's
         # VMEM estimate cannot see them unless codegen passes them along.
         self.pallas_pipeline_vmem_bytes: int = 0
-        # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
-        # using pl.ds() that may need host-side padding.
-        self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
+        # Pallas: id(fake_tensor) → {dim: {block_id: extra_pad}} for dims
+        # using pl.ds() that may need host-side padding.  A dim can be tiled
+        # by several loops (e.g. a reduction loop then an elementwise loop),
+        # each with its own block size, so every block_id is kept.
+        self.pallas_pad_info: dict[int, dict[int, dict[int, int]]] = {}
         # Pallas ordered carry: jagged row block_id -> CarryBoundaryTile.  Filled by
         # the inner-loop codegen when the tile is a legal map axis; read by
         # the store codegen to stitch the boundary across neighbouring groups.

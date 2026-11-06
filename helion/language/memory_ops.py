@@ -337,15 +337,12 @@ def _record_pad_info(
     at offset 0, ``begin % block_size`` for a constant begin, or
     ``block_size - 1`` for a data-dependent begin.
 
-    Note: stores one entry per (tensor, dim).  If two inner loops tile the
-    same dim with different block_ids, the last one wins.  This is fine when
-    both loops use the same block size (the common case).
+    Every block_id that tiles the dim is kept: two inner loops can tile the
+    same dim with different block sizes, and the pad must cover both.
     """
     pad_info = state.device_function.pallas_pad_info
-    tensor_id = id(tensor)
-    if tensor_id not in pad_info:
-        pad_info[tensor_id] = {}
-    pad_info[tensor_id][tensor_dim] = (block_id, extra_pad)
+    blocks = pad_info.setdefault(id(tensor), {}).setdefault(tensor_dim, {})
+    blocks[block_id] = max(blocks.get(block_id, 0), extra_pad)
 
 
 def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
