@@ -4832,9 +4832,7 @@ class TestTritonH100MatmulHeuristic(TestCase):
                 [self._matmul_fact(static_m=None)],
                 False,
             ),
-            # fp8 (both operands 1-byte float) is declined: the budget tile would trigger the
-            # Triton fp8-accumulator bug (block_m>=64 -> never-promoted QGMMA accumulator). See
-            # TritonH100FormulaMatmulHeuristic.is_eligible. bf16/fp16/fp32 stay eligible above.
+            # FP8 remains declined for default promotion pending wider performance evidence.
             (
                 "fp8_declined",
                 HOPPER_HARDWARE,

@@ -56,6 +56,7 @@ def _emit_tl_dot(
     input_precision: str | None = None,
     acc: ast.AST | None = None,
     out_dtype: torch.dtype | None = None,
+    precise_fp8: bool = False,
 ) -> ast.AST:
     """Build a tl.dot AST with optional acc/input_precision/out_dtype.
 
@@ -73,6 +74,8 @@ def _emit_tl_dot(
         parts.append(
             f", out_dtype={CompileEnvironment.current().backend.dtype_str(out_dtype)}"
         )
+    if precise_fp8:
+        parts.append(", max_num_imprecise_acc=0")
     parts.append(")")
     return expr_from_string("".join(parts), **kwargs)
 
@@ -382,6 +385,16 @@ def emit_tl_dot_with_padding(
         # Unsupported dtype (like bfloat16), use float32 and cast afterward
         dot_out_dtype = torch.float32
 
+    # Hopper's native FP8 accumulator otherwise loses accuracy across long K loops.
+    precise_fp8 = (
+        env.backend.name == "triton"
+        and env.ptx_capability == (9, 0)
+        and lhs_dtype.is_floating_point
+        and rhs_dtype.is_floating_point
+        and lhs_dtype.itemsize == rhs_dtype.itemsize == 1
+        and dot_out_dtype == torch.float32
+    )
+
     # Squeeze literal and symbolic unit batch dimensions consistently so shared
     # operands keep the same dot rank.
     need_squeeze_dim = (
@@ -452,6 +465,7 @@ def emit_tl_dot_with_padding(
                 acc=acc_final,
                 input_precision=input_precision,
                 out_dtype=dot_out_dtype,
+                precise_fp8=precise_fp8,
             )
 
         def split_half(x: ast.AST, last_dim: object, index: int) -> ast.AST:
@@ -473,6 +487,7 @@ def emit_tl_dot_with_padding(
                     else None,
                     input_precision=input_precision,
                     out_dtype=dot_out_dtype,
+                    precise_fp8=precise_fp8,
                 )
             )
         # pyrefly: ignore [bad-argument-type]

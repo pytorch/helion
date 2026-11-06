@@ -155,7 +155,7 @@ def _is_fp8_matmul_fact(fact: MatmulFact) -> bool:
     """True when BOTH dot operands are fp8 (a 1-byte floating dtype). A 1-byte float is fp8
     by construction (int8/uint8/bool are not ``is_floating_point``), so this needs no explicit
     enum of the fp8 variants. The budget seed deliberately declines this case — see
-    ``TritonH100MatmulHeuristic.is_eligible`` for the (Triton fp8-accumulator) reason."""
+    ``TritonH100MatmulHeuristic.is_eligible`` for the promotion policy."""
     return all(
         d.is_floating_point and d.itemsize == 1
         for d in (fact.lhs_dtype, fact.rhs_dtype)
@@ -2987,33 +2987,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         fact = cls._eligible_fact(env.config_spec)
         if fact is None:
             return False
-        # Decline fp8 (both operands 1-byte float). CAVEAT: this is disabled because of an fp8
-        # `fast_accum` (is_fast_accum) precision issue, NOT a perf choice. In fp8 tensor-core
-        # terms the wide-tile path we would emit is effectively the `fast_accum=True`
-        # (max-throughput) accumulate, and Helion has no knob today to force the full-precision
-        # accumulate back on, so we decline rather than silently ship reduced-precision fp8. It
-        # dodges a Triton fp8-accumulator bug that our budget tile would otherwise trigger:
-        #
-        #   The budget formula sizes fp8 GEMMs at block_m=128 (>= 64). At block_m >= 64 Triton
-        #   lowers ``tl.dot`` to the native fp8 warp-group MMA (QGMMA/warp_group_dot), reading
-        #   raw fp8 from shared memory. Because Helion never passes ``max_num_imprecise_acc``,
-        #   Triton falls back to its sm90 default of 2**30 (the "never promote" sentinel), so the
-        #   fp32 accumulator is NEVER flushed across the K loop -> results wrong by an error that
-        #   grows with K (~0.03% at K=512 up to ~5% at K=8192). block_m <= 32 dodges it (Triton
-        #   upcasts fp8->fp16 and uses HMMA with a real fp32 accumulate), but that is exactly the
-        #   small tile ``_base_default_config`` already emits.
-        #
-        #   In max-autotune the accuracy gate (bitwise 0/0 for all-fp8 output) correctly REJECTS
-        #   the wide-tile config, so it can never win -- planting it only wastes a search trial.
-        #   Worse, this heuristic sets ``promote_seed_to_default=True``: an eligible fp8 seed would
-        #   become the effort=none compiler default, which runs NO accuracy check -> silently wrong
-        #   fp8 GEMMs. Declining here disables BOTH the wasted seed and the unsafe promotion (fp8
-        #   falls back to the correct ``_base_default_config`` small tile).
-        #
-        #   The real fix (a follow-up) is to emit ``max_num_imprecise_acc=0`` on fp8 ``tl.dot`` in
-        #   _emit_tl_dot; that forces the correct accumulate AND is faster than either path here,
-        #   so the fp8 seed should be re-enabled once that lands. The CuTe backend is unaffected --
-        #   it bakes fp32 accumulation into the MMA op type, with no tunable cadence to get wrong.
+        # Wide FP8 tiles can be slower than the narrow default even with
+        # accurate accumulation. Do not promote them without broader evidence.
         return not _is_fp8_matmul_fact(fact)
 
     @classmethod
@@ -3379,9 +3354,7 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
             for resolved in mm.matmuls
         ):
             return False
-        # Decline fp8 for exactly the reason front end 1 does: Helion cannot force the
-        # full-precision fp8 accumulate today, and this heuristic promotes, so an eligible
-        # fp8 seed would become a silently reduced-precision autotune-off default.
+        # Keep the conservative FP8 promotion policy for multiple dots too.
         return not any(_is_fp8_matmul_fact(resolved.fact) for resolved in mm.matmuls)
 
     @classmethod

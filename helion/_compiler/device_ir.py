@@ -3658,6 +3658,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 env.cute_half_atomic_output_promotions = promotions
                 rewrite_cute_half_atomic_output_allocations(host_fn, promotions)
                 promote_cute_root_graph_host_tensors(device_ir.graphs, promotions)
+        env = CompileEnvironment.current()
+        if (
+            env.backend.name == "triton"
+            and env.ptx_capability == (9, 0)
+            and env.settings.fast_math
+            and env.backend.map_dot_precision(env.settings.dot_precision) == "tf32"
+        ):
+            from .triton.narrow_dot_operands import narrow_dot_operands
+
+            for graph in device_ir.graphs:
+                narrow_dot_operands(graph.graph, env.config_spec.matmul_facts)
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         dot_scaled_changed = False
