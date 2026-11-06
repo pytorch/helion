@@ -6,6 +6,7 @@ previously scattered across backend.py and tile_strategy.py.
 
 from __future__ import annotations
 
+import ast
 import math
 from typing import TYPE_CHECKING
 
@@ -13,7 +14,7 @@ from ... import exc
 from .simplify_proven_bounds import _axis_index
 
 if TYPE_CHECKING:
-    import ast
+    from collections.abc import Iterable
     from collections.abc import Sequence
 
     from ...runtime.config import Config
@@ -44,6 +45,21 @@ CUTE_REGISTER_TILE_MAX_LIVE_VALUES = 3 * CUTE_REGISTER_TILE_MAX_ELEMENTS
 def thread_idx_axis(node: ast.AST) -> int | None:
     """The axis of a ``cute.arch.thread_idx()[k]`` subscript, else ``None``."""
     return _axis_index(node, "thread_idx")
+
+
+def referenced_thread_axes(statements: Iterable[ast.AST]) -> list[int]:
+    """The axis of every ``cute.arch.thread_idx()[axis]`` in ``statements``.
+
+    A structural walk with ``thread_idx_axis`` (a subscript of the bare call
+    by an integer literal in ``range(3)``). An axis may be reported more than
+    once; the callers take maxima or sets.
+    """
+    return [
+        axis
+        for statement in statements
+        for node in ast.walk(statement)
+        if (axis := thread_idx_axis(node)) is not None
+    ]
 
 
 def tile_loop_thread_count(

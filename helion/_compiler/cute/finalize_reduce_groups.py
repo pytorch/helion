@@ -130,6 +130,15 @@ def _finalize(
 ) -> tuple[list[ast.stmt], bool]:
     if any(dim <= 0 for dim in thread_block_dims):
         return body, False
+    if not any(
+        (isinstance(node, ast.Name) and node.id in _GROUPED_SHARED_REDUCES)
+        or (isinstance(node, ast.Attribute) and node.attr == "block_dim")
+        for stmt in body
+        for node in ast.walk(stmt)
+    ):
+        # Neither a grouped shared reduce nor the runtime lane expression
+        # (which reads ``cute.arch.block_dim()``) occurs: nothing to rewrite.
+        return body, False
     transformer = _Finalize(thread_block_dims)
     result = [transformer.visit(stmt) for stmt in body]
     if not transformer.changed:
