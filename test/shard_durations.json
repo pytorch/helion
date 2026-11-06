@@ -17,6 +17,7 @@
  "test/test_autotuner_search.py": 11.3,
  "test/test_autotuner_search_facts.py": 0.3,
  "test/test_autotuner_settings.py": 8.4,
+ "test/test_backend_api_compile.py": 0.1,
  "test/test_barrier.py": 8.9,
  "test/test_benchmark_graph_warmup.py": 0.1,
  "test/test_benchmark_worker.py": 0.4,
