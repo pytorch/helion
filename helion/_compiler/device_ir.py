@@ -2722,7 +2722,7 @@ class WalkDeviceAST(NodeVisitor):
 
     def _visit_comprehension(
         self, node: ast.ListComp | ast.GeneratorExp, name: str
-    ) -> tuple[object, ...]:
+    ) -> list[object]:
         """Handle list comprehension or generator expression unrolling."""
         assert isinstance(node, ExtendedAST)
 
@@ -2742,15 +2742,15 @@ class WalkDeviceAST(NodeVisitor):
             f"{name.capitalize()}s over non-sequence types are not supported"
         )
 
-    def visit_ListComp(self, node: ast.ListComp) -> tuple[object, ...]:
+    def visit_ListComp(self, node: ast.ListComp) -> list[object]:
         return self._visit_comprehension(node, "list comprehension")
 
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> tuple[object, ...]:
-        return self._visit_comprehension(node, "generator expression")
+        return tuple(self._visit_comprehension(node, "generator expression"))
 
     def _handle_comprehension_unrolling(
         self, elt: ast.expr, generator: ast.comprehension
-    ) -> tuple[object, ...]:
+    ) -> list[object]:
         """Handle unrolling of comprehensions (list comp or generator exp) over sequences."""
 
         def evaluate_expression() -> object:
@@ -2772,11 +2772,9 @@ class WalkDeviceAST(NodeVisitor):
                     return result
             return result
 
-        results = self._handle_sequence_unrolling(
+        return self._handle_sequence_unrolling(
             generator.iter, generator.target, evaluate_expression, preserve_scope=False
         )
-        # Return as tuple to match the expected type for tuple unrolling
-        return tuple(results)
 
     def visit_DictComp(self, node: ast.DictComp) -> dict[object, object]:
         """Handle dict comprehension unrolling."""
@@ -2862,7 +2860,7 @@ class WalkDeviceAST(NodeVisitor):
         if isinstance(target, ast.Tuple):
             # Handle tuple unpacking
             value = self.visit(node.value)
-            if not isinstance(value, tuple):
+            if not isinstance(value, (tuple, list)):
                 raise exc.InvalidAssignment
             if len(target.elts) != len(value):
                 raise exc.InvalidAssignment

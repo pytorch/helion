@@ -33,7 +33,9 @@ from .type_info import BarrierResultType
 from .type_info import CallableType
 from .type_info import CollectionType
 from .type_info import DictType
+from .type_info import GeneratorType
 from .type_info import LiteralType
+from .type_info import MixedSequenceType
 from .type_info import NestedFunctionType
 from .type_info import NoType
 from .type_info import NumericType
@@ -60,6 +62,7 @@ from .variable_origin import SourceOrigin
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+    from collections.abc import Sequence
 
     from .host_function import HostFunction
 
@@ -403,7 +406,15 @@ class TypePropagation(ast.NodeVisitor):
             and isinstance(right, SequenceType)
             and isinstance(op, ast.Eq)
         ):
-            if len(left.element_types) != len(right.element_types):
+            if isinstance(left, GeneratorType) or isinstance(right, GeneratorType):
+                raise exc.StatementNotSupported("Generator equality comparisons")
+            if isinstance(left, MixedSequenceType) or isinstance(
+                right, MixedSequenceType
+            ):
+                return SymBoolType.new_unbacked(self.origin())
+            if left.python_type is not right.python_type or len(
+                left.element_types
+            ) != len(right.element_types):
                 return LiteralType(origin=self.origin(), value=False)
 
             can_determine_statically = True
@@ -1073,12 +1084,12 @@ class TypePropagation(ast.NodeVisitor):
         return self.pop_scope()
 
     @staticmethod
-    def _contains_filtered_comprehension(stmts: list[ast.stmt]) -> bool:
+    def _contains_filtered_comprehension(nodes: Sequence[ast.AST]) -> bool:
         return any(
-            isinstance(child, (ast.ListComp, ast.GeneratorExp))
+            isinstance(child, ast.ListComp)
             and any(generator.ifs for generator in child.generators)
-            for stmt in stmts
-            for child in ast.walk(stmt)
+            for node in nodes
+            for child in ast.walk(node)
         )
 
     def _loop_body(self, stmts: list[ast.stmt]) -> LocalScope:
@@ -1102,14 +1113,20 @@ class TypePropagation(ast.NodeVisitor):
         parent_scope = self.scope
         self.push_scope()
         iter_type = self.visit(node.iter)
+        has_filtered_comprehension = self.device_loop_depth > 0 and (
+            self._contains_filtered_comprehension(node.body)
+        )
+        if has_filtered_comprehension and self._expression_contains_generator(
+            node.iter, iter_type
+        ):
+            raise exc.StatementNotSupported(
+                "Generator values in loops containing filtered comprehensions"
+            )
         if (
             self.device_loop_depth > 0
             and isinstance(iter_type, SequenceType)
             and not node.orelse
-            and (
-                not iter_type.element_types
-                or self._contains_filtered_comprehension(node.body)
-            )
+            and (not iter_type.element_types or has_filtered_comprehension)
         ):
             assert isinstance(node, ExtendedAST)
             node._loop_type = LoopType.DEVICE
@@ -1299,7 +1316,39 @@ class TypePropagation(ast.NodeVisitor):
             raise exc.StatementNotSupported(
                 "Short-circuit expressions inside this comprehension filter"
             )
-        return self._visit_comprehension_iteration(node)
+        return self._visit_filtered_comprehension_expression(node)
+
+    def _visit_filtered_comprehension_expression(self, node: ast.AST) -> TypeInfo:
+        result = self._visit_comprehension_iteration(node)
+        if self._expression_contains_generator(node, result):
+            raise exc.StatementNotSupported(
+                "Generator values in filtered comprehensions"
+            )
+        return result
+
+    @staticmethod
+    def _expression_contains_generator(node: ast.AST, result: TypeInfo) -> bool:
+        return TypePropagation._contains_generator_value(result) or any(
+            isinstance(child, ExtendedAST)
+            and TypePropagation._contains_generator_value(child._type_info)
+            for child in ast.walk(node)
+        )
+
+    @staticmethod
+    def _contains_generator_value(result: TypeInfo | None) -> bool:
+        if isinstance(result, GeneratorType):
+            return True
+        if isinstance(result, SequenceType):
+            return any(
+                TypePropagation._contains_generator_value(x)
+                for x in result.element_types
+            )
+        if isinstance(result, DictType):
+            return any(
+                TypePropagation._contains_generator_value(x)
+                for x in result.element_types.values()
+            )
+        return False
 
     @staticmethod
     def _constant_comprehension_truth(result: TypeInfo) -> bool:
@@ -1320,7 +1369,7 @@ class TypePropagation(ast.NodeVisitor):
     def _evaluate_filtered_comprehension(
         self, generator: ast.comprehension, expression: ast.AST
     ) -> SequenceType:
-        iterable = self._visit_comprehension_iteration(generator.iter)
+        iterable = self._visit_filtered_comprehension_expression(generator.iter)
         if not isinstance(iterable, SequenceType):
             raise exc.StatementNotSupported(
                 "Filtered comprehensions require a fixed sequence"
@@ -1331,10 +1380,24 @@ class TypePropagation(ast.NodeVisitor):
             try:
                 self._assign(generator.target, element, local=True)
                 if all(self._comprehension_filter(cond) for cond in generator.ifs):
-                    results.append(self._visit_comprehension_iteration(expression))
+                    results.append(
+                        self._visit_filtered_comprehension_expression(expression)
+                    )
             finally:
                 self.pop_scope()
         return SequenceType(self.origin(), results)
+
+    def _check_enclosing_comprehension_iterable(
+        self, iterable: ast.AST, iter_type: TypeInfo, expressions: Sequence[ast.AST]
+    ) -> None:
+        if (
+            self.device_loop_depth > 0
+            and self._contains_filtered_comprehension(expressions)
+            and self._expression_contains_generator(iterable, iter_type)
+        ):
+            raise exc.StatementNotSupported(
+                "Generator values in comprehensions containing filtered lists"
+            )
 
     def _evaluate_comprehension(
         self, generator: ast.comprehension, expression: ast.AST
@@ -1342,6 +1405,9 @@ class TypePropagation(ast.NodeVisitor):
         """Helper method to evaluate comprehension type propagation."""
         # Visit the iterable to get its type
         iter_type = self.visit(generator.iter)
+        self._check_enclosing_comprehension_iterable(
+            generator.iter, iter_type, [expression]
+        )
 
         # Get element type and evaluate expression in scope
         self.push_scope()
@@ -1393,6 +1459,10 @@ class TypePropagation(ast.NodeVisitor):
             )
         generator = node.generators[0]
         if self.device_loop_depth and generator.ifs:
+            if isinstance(node, ast.GeneratorExp):
+                raise exc.StatementNotSupported(
+                    "Filtered generator expressions inside device loops"
+                )
             result = self._evaluate_filtered_comprehension(generator, node.elt)
             assert isinstance(node, ExtendedAST)
             previous = node._type_info
@@ -1402,8 +1472,12 @@ class TypePropagation(ast.NodeVisitor):
                 raise exc.StatementNotSupported(
                     "Filtered comprehensions with changing lengths in an unrolled loop"
                 )
-            return result
-        return self._evaluate_comprehension(generator, node.elt)
+        else:
+            result = self._evaluate_comprehension(generator, node.elt)
+        if isinstance(node, ast.GeneratorExp):
+            assert isinstance(result, SequenceType)
+            return GeneratorType(result.origin, result.element_types)
+        return result
 
     def visit_ListComp(self, node: ast.ListComp) -> TypeInfo:
         return self._visit_comprehension(node, "list comprehension")
@@ -1420,6 +1494,9 @@ class TypePropagation(ast.NodeVisitor):
 
         generator = node.generators[0]
         iter_type = self.visit(generator.iter)
+        self._check_enclosing_comprehension_iterable(
+            generator.iter, iter_type, [node.key, node.value]
+        )
 
         # Try to unpack the iterable
         try:
