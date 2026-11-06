@@ -239,10 +239,10 @@ class FlyDSLBackend(Backend):
         # ``cute_vector_widths`` for a rolled reduction. cute registers its own
         # slot in its own analysis block (device_ir.py), so this override is
         # flydsl-only and avoids a duplicate slot for the same rdim.
-        from ...autotuner.config_spec import CuteVectorWidthSpec
+        from ...autotuner.config_spec import VectorWidthSpec
 
         env.config_spec.cute_vector_widths.append(
-            CuteVectorWidthSpec(block_id=block_id, size_hint=size_hint)
+            VectorWidthSpec(block_id=block_id, size_hint=size_hint)
         )
 
     @property
