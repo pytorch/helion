@@ -40,6 +40,7 @@ from .._compat import target_device_capability
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import BackendState
+from .backend_registry import find_backend_for_device
 from .backend_registry import get_backend_class
 from .fake_tensor import create_fake_tensor_mode
 from .source_location import SourceLocation
@@ -458,7 +459,30 @@ class CompileEnvironment:
         )
         self._is_distributed = is_distributed
         self.process_group_name = None
-        self._backend = get_backend_class(settings.backend)()
+        backend_name = settings.backend
+        # Device routing: when the backend is the default ('triton', i.e. the
+        # user set neither a backend kwarg nor HELION_BACKEND) and it does not
+        # declare the active device type while another registered backend
+        # does, use that backend instead.  An explicit choice — a
+        # Settings/kernel backend kwarg (including backend='triton') or
+        # HELION_BACKEND=<name> — is always honored unchanged; both are
+        # recorded in Settings._backend_explicit at construction time.
+        if backend_name == "triton" and not settings._backend_explicit:
+            routed = find_backend_for_device(device.type)
+            if routed not in (None, backend_name):
+                log.info(
+                    "Device %s: using the '%s' backend (the default '%s' "
+                    "backend does not target this device)",
+                    device.type,
+                    routed,
+                    backend_name,
+                )
+                backend_name = routed
+        # Note: only self._backend is routed; settings.backend keeps the
+        # user-facing value ('triton'). Host-side readers of settings.backend
+        # (cache keys, backend-specific feature checks) see the unrouted
+        # value by design — routing only picks the code generator.
+        self._backend = get_backend_class(backend_name)()
         self._backend.validate_environment()
         if (
             settings.debug_dtype_asserts
