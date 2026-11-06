@@ -114,6 +114,17 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
     return max(available_sms - reserved_sms, 1)
 
 
+def get_xpu_grf_modes(device: torch.device) -> tuple[int, ...]:
+    """
+    GRF registers per hardware thread that XPU kernels can be compiled with.
+
+    Xe2 offers 128 and 256, with 256 preferred when a size must be fixed.  A
+    target that allocates its register file in finer steps, such as Xe3's
+    variable register file in blocks of 32, can list more modes here.
+    """
+    return (256, 128)
+
+
 # CUs per XCD by base CDNA architecture.  Used to derive the live,
 # partition-visible XCD count from the observed CU count (see get_num_xcd).
 _CUS_PER_XCD: dict[str, int] = {

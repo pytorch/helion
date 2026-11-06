@@ -130,6 +130,8 @@ class TritonBackend(Backend):
             return _compat.is_hip()
         if key == "matrix_instr_nonkdim":
             return _compat.supports_amd_cdna_tunables()
+        if key == "grf_mode":
+            return _compat.is_xpu()
         if key == "xcd_remap":
             # Accepted on all AMD CDNA.  On single-XCD devices it normalizes to a
             # no-op (ConfigSpec.normalize) and is excluded from the search space
@@ -143,13 +145,21 @@ class TritonBackend(Backend):
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         from ..._compat import get_mtia_tunable_fragments
         from ..._compat import is_hip
+        from ..._compat import is_xpu
         from ..._compat import supports_amd_cdna_tunables
         from ..._compat import supports_mtia_tunables
         from ...autotuner.config_fragment import EnumFragment
+        from ...runtime.triton.launcher import get_xpu_grf_modes
 
-        if not is_hip() and not supports_mtia_tunables():
+        if not is_hip() and not supports_mtia_tunables() and not is_xpu():
             return {}
         fragments: dict[str, ConfigSpecFragment] = {}
+        if is_xpu():
+            # 0 leaves the GRF size to Triton, which builds at the default size
+            # and rebuilds at a larger one when the kernel spills.
+            fragments["grf_mode"] = EnumFragment(
+                choices=(0, *get_xpu_grf_modes(torch.device("xpu")))
+            )
         if is_hip():
             # A value of 0 leaves occupancy unconstrained, matching Triton's default.
             fragments["waves_per_eu"] = EnumFragment(choices=(0, 1, 2, 3, 4))
@@ -600,10 +610,15 @@ class TritonBackend(Backend):
         ):
             args.append("generate_native_code=True")
 
+        from ...autotuner.config_spec import GRF_MODE_KEY
         from ...autotuner.config_spec import _get_backend_tunable_keys
 
         for key in _get_backend_tunable_keys():
-            if key in config:
+            if key == GRF_MODE_KEY:
+                # Triton takes the GRF size as a string; 0 leaves it to Triton.
+                if config.get(key):
+                    args.append(f"grf_mode='{config[key]}'")
+            elif key in config:
                 args.append(f"{key}={config[key]!r}")
 
         if "maxnreg" in config and config["maxnreg"] is not None and supports_maxnreg():

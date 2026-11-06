@@ -1065,6 +1065,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
     {
         "waves_per_eu",
         "matrix_instr_nonkdim",
+        "grf_mode",
         "num_ctas",
         "occupancy",
         "pallas_worklist_grouping",
@@ -1494,6 +1495,9 @@ VALID_PID_TYPES = (
     "persistent_blocked",
     "persistent_interleaved",
 )
+# Intel XPU backend tunable: GRF registers per hardware thread.  0 leaves the
+# choice to Triton.
+GRF_MODE_KEY = "grf_mode"
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
 DEFAULT_NUM_SM_MULTIPLIER = 1

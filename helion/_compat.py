@@ -523,6 +523,11 @@ def num_compute_units() -> int:
     return 128
 
 
+def is_xpu() -> bool:
+    """Check if the current device is an Intel XPU."""
+    return torch.xpu.is_available()
+
+
 def supports_amd_cdna_tunables() -> bool:
     # Keep is_hip() outside the cache: tests patch is_hip/_is_hip to model
     # other targets, and a result cached under such a patch would leak into
