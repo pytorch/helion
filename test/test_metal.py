@@ -24,12 +24,15 @@ from helion._compiler.metal.backend import MetalBackend
 from helion._compiler.metal.lane_fold import LaneJam
 from helion._compiler.metal.lane_fold import balanced_combine
 from helion._compiler.metal.lane_fold import unroll_lane_folds
+from helion._compiler.metal.mpp_matmul import names_read
 from helion._compiler.metal.msl_reduction import GROUP_PATHS
 from helion._compiler.metal.row_reduction_heuristic import MetalRowReductionHeuristic
+from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._testing import import_example
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
+helion_gdn_fwd_h = import_example("gdn_fwd_h").helion_gdn_fwd_h
 jsd_forward = import_example("jsd").jsd_forward
 kl_div_forward = import_example("kl_div").kl_div_forward
 layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
@@ -55,6 +58,14 @@ pytestmark = pytest.mark.skipif(
 _requires_darwin = unittest.skipIf(
     sys.platform != "darwin", "Metal tests require macOS"
 )
+
+
+def _full_threadgroup(test: Callable[..., None]) -> Callable[..., None]:
+    """For a test that pins the layout of a full 1024-thread threadgroup:
+    configs that leave ``num_warps`` unset take 32 instead of the default 4,
+    whose 128-thread budget walks more of each block in lanes."""
+    return patch("helion.autotuner.config_spec.DEFAULT_NUM_WARPS", 32)(test)
+
 
 DEVICE = "mps"
 
@@ -487,7 +498,7 @@ class TestMetalBoundsMasking(unittest.TestCase):
 
         @helion.kernel(
             backend="metal",
-            configs=[helion.Config(block_sizes=[32, 32], num_warps=4)],
+            configs=[helion.Config(block_sizes=[32, 32], num_warps=32)],
         )
         def add2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
@@ -1124,25 +1135,15 @@ class TestMetalLargeBlock(unittest.TestCase):
         y = torch.randn(3000, device=DEVICE)
         torch.testing.assert_close(large_block_add(x, y), x + y)
 
-    def test_thread_budget_error_names_metal(self) -> None:
-        """The shared thread-budget check must not blame the CuTe backend.
-
-        Metal runs CuTe's loop-strategy planner, so before this was fixed a Mac
-        user who over-subscribed a threadgroup was told their *cute* kernel had
-        too large a thread block.
-        """
+    def test_explicit_count_past_the_budget_is_capped(self) -> None:
+        """An explicit ``num_threads`` past the threadgroup budget is capped to
+        it, as an auto count is; lanes walk the rest of the block."""
         x = torch.randn(4096, device=DEVICE)
         y = torch.randn(4096, device=DEVICE)
-        kernel = helion.kernel(
-            large_block_add.fn,
-            backend="metal",
-            configs=[helion.Config(block_sizes=[2048], num_threads=[4096])],
-        )
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported, r"thread block too large for metal kernel"
-        ) as caught:
-            kernel(x, y)
-        self.assertNotIn("cute", str(caught.exception))
+        config = helion.Config(block_sizes=[2048], num_threads=[4096], num_warps=4)
+        out, code, _ = _run_with_msl(large_block_add, (x, y), config)
+        self.assertIn("_block_dims=(128, 1, 1)", code)
+        torch.testing.assert_close(out, x + y)
 
     def test_codegen_lane_loop(self) -> None:
         """Generated MSL must contain a for loop when block_size > 1024."""
@@ -2125,7 +2126,7 @@ class TestMetalScalarDot(unittest.TestCase):
         out, code = self._run(
             dot_recurrence,
             (q, q.T.contiguous(), v, chunk),
-            helion.Config(block_sizes=[16]),
+            helion.Config(block_sizes=[16], num_threads=[8], num_warps=32),
         )
         self.assertIn("for lane_0 in range(2)", code)
         qd, vd = q.cpu().double(), v.cpu().double()
@@ -2718,6 +2719,7 @@ class TestMetalReductions(unittest.TestCase):
 
     # -- codegen ------------------------------------------------------------
 
+    @_full_threadgroup
     def test_codegen_uses_c10_metal_helpers(self) -> None:
         """Cross-SIMD-group reductions go through Inductor's reduction_utils.
 
@@ -2737,6 +2739,7 @@ class TestMetalReductions(unittest.TestCase):
         self.assertGreater(_static_threadgroup_memory(msl), 0)
         self.assertNotIn("[[simdgroup_index_in_threadgroup]]", msl)
 
+    @_full_threadgroup
     def test_codegen_simdgroup_span_needs_no_shared_memory(self) -> None:
         x = torch.randn(64, 32, device=DEVICE)
         msl = _get_msl(row_sum, (x,))
@@ -3037,7 +3040,12 @@ class TestMetalReductions(unittest.TestCase):
         @helion.kernel(
             backend="metal",
             configs=[
-                helion.Config(block_sizes=[4], num_warps=4, reduction_loops=[None])
+                helion.Config(
+                    block_sizes=[4],
+                    num_threads=[1],
+                    num_warps=32,
+                    reduction_loops=[None],
+                )
             ],
         )
         def wide_tail(x: torch.Tensor) -> torch.Tensor:
@@ -3048,7 +3056,8 @@ class TestMetalReductions(unittest.TestCase):
             return out
 
         x = torch.randn(4, 128, 44, device=DEVICE)
-        # 44 positions on 8 threads take 6 lanes, not 64 // 8 = 8.
+        # The rows on one thread leave 128 x 8 threads: 44 positions on 8
+        # threads take 6 lanes, not 64 // 8 = 8.
         self.assertRegex(
             wide_tail.bind((x,)).to_code(), r"for slice_lane_\w+ in range\(6\)"
         )
@@ -3112,7 +3121,7 @@ class TestMetalReductions(unittest.TestCase):
 
         @helion.kernel(
             backend="metal",
-            configs=[helion.Config(block_sizes=[32, 32], num_warps=4)],
+            configs=[helion.Config(block_sizes=[32, 32], num_warps=32)],
         )
         def tile_row_sum(w: torch.Tensor) -> torch.Tensor:
             o, d = w.shape
@@ -3153,7 +3162,7 @@ class TestMetalReductions(unittest.TestCase):
             tile_inner_reductions.fn,
             backend="metal",
             static_shapes=True,
-            configs=[helion.Config(block_sizes=block_sizes, num_warps=4)],
+            configs=[helion.Config(block_sizes=block_sizes, num_warps=32)],
         )
         return _get_msl(kernel, (w,)), kernel(w)
 
@@ -3217,7 +3226,7 @@ class TestMetalReductions(unittest.TestCase):
         for block_sizes in ([1, 32, 32], [4, 8, 16], [4, 32, 8], [2, 4, 8]):
             with self.subTest(block_sizes=block_sizes):
                 bound = max_then_shift.bind((x, y))
-                config = helion.Config(block_sizes=block_sizes, num_warps=4)
+                config = helion.Config(block_sizes=block_sizes, num_warps=32)
                 code = bound.to_code(config)
                 dims = re.search(r"_block_dims=\(([^)]*)\)", code)
                 assert dims is not None
@@ -3237,7 +3246,7 @@ class TestMetalReductions(unittest.TestCase):
 
         @helion.kernel(
             backend="metal",
-            configs=[helion.Config(block_sizes=[2, 512], num_warps=4)],
+            configs=[helion.Config(block_sizes=[2, 512], num_warps=32)],
         )
         def five_reductions(x: torch.Tensor) -> torch.Tensor:
             o, d = x.shape
@@ -3259,7 +3268,7 @@ class TestMetalReductions(unittest.TestCase):
         many_rows = helion.kernel(
             five_reductions.fn,
             backend="metal",
-            configs=[helion.Config(block_sizes=[32, 32], num_warps=4)],
+            configs=[helion.Config(block_sizes=[32, 32], num_warps=32)],
         )
         x = torch.randint(-100, 100, (32, 32), dtype=torch.int64, device=DEVICE)
         expected = torch.stack(
@@ -3273,7 +3282,9 @@ class TestMetalReductions(unittest.TestCase):
             ["masked", "masked", "strided", "strided", "strided"],
         )
 
-        @helion.kernel(backend="metal", configs=[helion.Config(block_sizes=[])])
+        @helion.kernel(
+            backend="metal", configs=[helion.Config(block_sizes=[], num_warps=32)]
+        )
         def tree_beside_literal_root(
             x: torch.Tensor, z: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -3364,7 +3375,7 @@ class TestMetalReductions(unittest.TestCase):
             with self.subTest(block_n=block_n, block_k=block_k):
                 x = torch.randn(64, block_n, device=DEVICE)
                 y = torch.randn(64, block_k, device=DEVICE)
-                config = helion.Config(block_sizes=[1, block_n, block_k], num_warps=4)
+                config = helion.Config(block_sizes=[1, block_n, block_k], num_warps=32)
                 torch.testing.assert_close(
                     argmax_then_add.bind((x, y)).compile_config(config)(x, y),
                     y + x.argmax(1, keepdim=True).to(torch.float32),
@@ -3445,7 +3456,7 @@ class TestMetalReductions(unittest.TestCase):
                 max_and_double.fn,
                 backend="metal",
                 static_shapes=True,
-                configs=[helion.Config(block_sizes=[1, block_n], num_warps=4)],
+                configs=[helion.Config(block_sizes=[1, block_n], num_warps=32)],
             )
             msl = _get_msl(kernel, args)
             out, doubled = kernel(*args)
@@ -3500,14 +3511,17 @@ class TestMetalReductions(unittest.TestCase):
 
         A reduction loop whose span is narrower than its chunk reduces only
         part of each chunk and returns a plausible wrong answer.  The budget
-        passes make that unreachable, so this forces the condition directly --
-        the point is that the invariant is checked rather than trusted, since
-        it silently broke once already.
+        passes make that unreachable (a chunk wider than its threads steps by
+        them), so this forces the condition directly -- the point is that the
+        invariant is checked rather than trusted, since it silently broke once
+        already.
         """
 
         @helion.kernel(
             backend="metal",
-            configs=[helion.Config(block_sizes=[8], reduction_loops=[64])],
+            configs=[
+                helion.Config(block_sizes=[8], reduction_loops=[64], num_warps=32)
+            ],
         )
         def row_sum(x: torch.Tensor) -> torch.Tensor:
             m, _ = x.size()
@@ -3522,16 +3536,16 @@ class TestMetalReductions(unittest.TestCase):
         # Starve the reduction: hand it half the threads its chunk needs.
         with (
             patch.object(
-                MetalBackend,
-                "adjust_reduction_thread_count",
-                lambda self, requested, existing: min(requested, 32),
+                LoopedReductionStrategy, "_reduction_thread_count", lambda self: 32
             ),
             self.assertRaisesRegex(exc.BackendUnsupported, "reduction loop"),
         ):
             helion.kernel(
                 row_sum.fn,
                 backend="metal",
-                configs=[helion.Config(block_sizes=[8], reduction_loops=[64])],
+                configs=[
+                    helion.Config(block_sizes=[8], reduction_loops=[64], num_warps=32)
+                ],
             )(x)
 
     def test_block_reduction_over_a_user_tile(self) -> None:
@@ -3844,7 +3858,16 @@ class TestMetalRepeatedSliceBlocks(unittest.TestCase):
         that axis has at least as many threads: q's 8 heads beside k's 4
         have too few for q's second position, which keeps its lane loop.
         Six heads on 32 threads mask the surplus ones."""
-        tuned = helion.Config(block_sizes=[1, 16], num_threads=[1, 0], num_warps=16)
+        # The t tile on 4 threads leaves the slices 256 of 1024.
+        configs = (
+            helion.Config(
+                block_sizes=[1, 32],
+                num_threads=[1, 4],
+                num_warps=32,
+                reduction_loops=[None],
+            ),
+            helion.Config(block_sizes=[1, 16], num_threads=[1, 4], num_warps=32),
+        )
         for kernel, q_heads, k_heads, head_dim, dtype, hosted in (
             (rope_fwd, 32, 8, 16, torch.float32, 1),
             (rope_fwd, 8, 4, 16, torch.float32, 0),
@@ -3862,7 +3885,7 @@ class TestMetalRepeatedSliceBlocks(unittest.TestCase):
             bound = helion.kernel(kernel.fn, backend="metal", static_shapes=True).bind(
                 (q, k, cos, sin)
             )
-            for config in (bound.config_spec.default_config(), tuned):
+            for config in configs:
                 with self.subTest(
                     kernel=kernel.name,
                     q_heads=q_heads,
@@ -4281,6 +4304,7 @@ class TestMetalRepeatedSliceBlocks(unittest.TestCase):
             ):
                 call()
 
+    @_full_threadgroup
     def test_position_on_an_idle_slice_axis(self) -> None:
         """b's second position takes a's thread axis, which no b statement
         reads; 6 positions on 32 threads mask the surplus, and a's 6
@@ -4360,6 +4384,7 @@ class TestMetalRepeatedSliceBlocks(unittest.TestCase):
             rotated = torch.cat([-x[..., 8:], x[..., :8]], -1)
             torch.testing.assert_close(out, x * cos2 + rotated * sin2)
 
+    @_full_threadgroup
     def test_one_hosted_position_per_axis(self) -> None:
         """b's two extra positions both meet each other, so only one can take
         a's axis; the other keeps its lane loop."""
@@ -4372,6 +4397,7 @@ class TestMetalRepeatedSliceBlocks(unittest.TestCase):
         torch.testing.assert_close(out_a, a * 2)
         torch.testing.assert_close(out_b, b + 1)
 
+    @_full_threadgroup
     def test_in_place_update_through_a_hosted_position(self) -> None:
         """Each element of b has one owner, the thread whose ``tid`` names its
         position; in a lane loop all 64 threads of a's axis would run it.
@@ -4398,6 +4424,7 @@ class TestMetalRepeatedSliceBlocks(unittest.TestCase):
                         buffer[37:], torch.full((27, 8, 8), 7.0, device=DEVICE)
                     )
 
+    @_full_threadgroup
     def test_repeated_blocks_share_an_axis_unless_a_value_holds_both(self) -> None:
         """y's 1000 columns starve a's and c's blocks of threads, so each
         block's extra position walks a lane loop unless it takes y's axis.
@@ -4639,7 +4666,7 @@ class TestMetalReductionAfterTileLoop(unittest.TestCase):
         kernel = helion.kernel(
             sum_after_loop.fn,
             backend="metal",
-            configs=[helion.Config(block_sizes=[32, 32], num_warps=4)],
+            configs=[helion.Config(block_sizes=[32, 32], num_warps=32)],
         )
         msl = _get_msl(kernel, (x,))
         self.assertEqual(
@@ -6059,6 +6086,7 @@ class TestMetalLaneLoopReductions(unittest.TestCase):
         torch.testing.assert_close(out, expected)
         self.assertEqual(lane_loops, 2)
 
+    @_full_threadgroup
     def test_persistent_lane_fold_in_the_passes(self) -> None:
         """The persistent k dim, 1500 wide on 1024 threads, folds 2 lanes in
         both passes that recompute v.  The split runs inside k's lane loop,
@@ -6734,6 +6762,7 @@ class TestMetalTileMaskElision(unittest.TestCase):
             rtol=2e-2,
         )
 
+    @_full_threadgroup
     def test_2d_tile_on_two_thread_axes(self) -> None:
         x = torch.randn(64, 256, device=DEVICE)
         w = torch.randn(256, device=DEVICE)
@@ -7104,9 +7133,13 @@ class TestMetalLaneFold(unittest.TestCase):
     def test_rownorm(self) -> None:
         """2 lanes, 3 lanes with a masked tail, and 12 lanes on one thread."""
         for n, config, lanes in (
-            (2048, helion.Config(block_sizes=[32, 32], num_warps=4), 2),
-            (3000, helion.Config(block_sizes=[32, 32], num_warps=4), 3),
-            (12, helion.Config(block_sizes=[32, 32], num_threads=[32, 32]), 12),
+            (2048, helion.Config(block_sizes=[32, 32], num_warps=32), 2),
+            (3000, helion.Config(block_sizes=[32, 32], num_warps=32), 3),
+            (
+                12,
+                helion.Config(block_sizes=[32, 32], num_threads=[32, 32], num_warps=32),
+                12,
+            ),
         ):
             with self.subTest(n=n):
                 x = torch.randn(64, n, device=DEVICE)
@@ -7121,7 +7154,7 @@ class TestMetalLaneFold(unittest.TestCase):
 
     def test_dependent_folds(self) -> None:
         """Softmax: a max fold, then an exp-sum fold that depends on it."""
-        config = helion.Config(block_sizes=[32, 32], num_warps=4)
+        config = helion.Config(block_sizes=[32, 32], num_warps=32)
         for dtype in (torch.float32, torch.float16):
             with self.subTest(dtype=dtype):
                 x = torch.randn(64, 4100, device=DEVICE, dtype=dtype)
@@ -7134,7 +7167,7 @@ class TestMetalLaneFold(unittest.TestCase):
                 )
 
     def test_min_and_prod_folds(self) -> None:
-        config = helion.Config(block_sizes=[32, 32], num_warps=4)
+        config = helion.Config(block_sizes=[32, 32], num_warps=32)
         x = torch.randn(64, 1500, device=DEVICE)
         (lo, prod), _ = self._run(nested_rowmin_prod, config, (x,), 2)
         xd = x.cpu().double()
@@ -7161,7 +7194,7 @@ class TestMetalLaneFold(unittest.TestCase):
 
     def test_carry_folded_after_its_loop(self) -> None:
         """A full-width carry becomes one scalar per lane across the loop."""
-        config = helion.Config(block_sizes=[16], num_warps=4)
+        config = helion.Config(block_sizes=[16], num_warps=32)
         x = torch.randn(16, 2048, device=DEVICE)
         out, _ = self._run(carry_then_fold, config, (x,), 2)
         acc = x.cpu().double().sum(0, keepdim=True)
@@ -7170,14 +7203,16 @@ class TestMetalLaneFold(unittest.TestCase):
     def test_replicated_tile_combine(self) -> None:
         """A combine over a threaded tile of a lane-dependent value runs once
         per lane, back to back on one scratch buffer."""
+        # 64 columns reserve 32 of 512 threads (2 lanes each), which leaves
+        # the 16-row tile one thread per row.
+        config = helion.Config(block_sizes=[32], num_threads=[1], num_warps=16)
         for (m, n), dtype, lanes in (
-            ((64, 2048), torch.float32, 32),
-            ((64, 2048), torch.float16, 32),
-            ((50, 1024), torch.float32, 16),
+            ((64, 64), torch.float32, 2),
+            ((64, 64), torch.float16, 2),
+            ((50, 64), torch.float32, 2),
         ):
             with self.subTest(m=m, n=n, dtype=dtype):
                 x = torch.randn(m, n, device=DEVICE, dtype=dtype)
-                config = helion.Config(block_sizes=[32])
                 (out, cols), msl = self._run(colsum_threaded, config, (x,), lanes)
                 xd = x.cpu().double()
                 y = xd - xd.mean(-1, keepdim=True)
@@ -7195,13 +7230,14 @@ class TestMetalLaneFold(unittest.TestCase):
                 self.assertEqual(len(set(tile_combines)), 1)
 
     def test_lane_independent_carry_runs_once(self) -> None:
-        config = helion.Config(block_sizes=[32, 32], num_warps=4)
+        config = helion.Config(block_sizes=[32, 32], num_warps=32)
         x = torch.randn(64, 2048, device=DEVICE)
         out, _ = self._run(count_beside_fold, config, (x,), 2)
         torch.testing.assert_close(
             out, (x.cpu().double().sum(-1) + 4).float(), rtol=1e-4, atol=1e-4
         )
 
+    @_full_threadgroup
     def test_dot_k(self) -> None:
         """2 lanes on 1024 threads, for a K the matmul facts name."""
         x = torch.randn(32, 2048, device=DEVICE)
@@ -7215,6 +7251,7 @@ class TestMetalLaneFold(unittest.TestCase):
                     out, _matmul_reference(x, y), rtol=1e-4, atol=1e-3
                 )
 
+    @_full_threadgroup
     def test_dot_k_unnamed_by_matmul_facts(self) -> None:
         """``dot_chained``'s d is K of one dot and N of the other, so the
         matmul facts name no K: 2 lanes, and 3 with a tail.  The kernel rounds
@@ -7241,13 +7278,13 @@ class TestMetalLaneFold(unittest.TestCase):
             (
                 12,
                 torch.float32,
-                helion.Config(block_sizes=[32, 32], num_threads=[32, 32]),
+                helion.Config(block_sizes=[32, 32], num_threads=[32, 32], num_warps=32),
                 12,
             ),
             (
                 3000,
                 torch.float16,
-                helion.Config(block_sizes=[32, 32], num_warps=4),
+                helion.Config(block_sizes=[32, 32], num_warps=32),
                 3,
             ),
         ):
@@ -7261,6 +7298,7 @@ class TestMetalLaneFold(unittest.TestCase):
                 if lanes == 12:
                     self.assertNotIn("helion_red::", msl)
 
+    @_full_threadgroup
     def test_dot_k_beside_a_fold(self) -> None:
         """A row sum folds d's lanes from strategy creation, and the dot over
         d asks for the fold again."""
@@ -7273,6 +7311,7 @@ class TestMetalLaneFold(unittest.TestCase):
         p = torch.exp((qd @ ktd - qd.sum(-1, keepdim=True)) * 0.125)
         torch.testing.assert_close(out, (p @ vd).float(), rtol=1e-4, atol=1e-4)
 
+    @_full_threadgroup
     def test_dot_k_uniform_operands_tail(self) -> None:
         """Operands constant along K still add nothing past it: the last of 3
         lanes has 8 of 16 positions live, and an unmasked tail would sum
@@ -7298,6 +7337,7 @@ class TestMetalLaneFold(unittest.TestCase):
                 helion.Config(block_sizes=[16, 16])
             )
 
+    @_full_threadgroup
     def test_runtime_dot_k_rejects(self) -> None:
         """Lane counts and tail masks are compile-time."""
         q = torch.randn(32, 32, device=DEVICE)
@@ -7878,6 +7918,7 @@ class TestMetalPaddedTwin(unittest.TestCase):
         result, _, _ = self._run(kernel, default, args)
         self._assert_close(result, expected)
 
+    @_full_threadgroup
     def test_twin_folds_owner_lanes(self) -> None:
         """2560 elements on 1024 threads: the twin's reductions fold the
         owner's 3 lanes."""
@@ -8855,17 +8896,17 @@ class TestMetalAutotune(unittest.TestCase):
                 self.assertEqual(seen, [expected])
                 self.assertEqual(bound.settings.autotune_budget_seconds, budget)
 
-    def test_oversized_explicit_threadgroup_rejected_before_codegen(self) -> None:
-        """Explicit counts that cannot launch raise instead of compiling.
-
-        Metal refuses an oversized threadgroup only at pipeline-state build,
-        so without this pre-check the config would cost a full MSL compile
-        first.  64 * 64 explicit threads exceed the 1024-thread limit.
-        """
+    def test_oversized_explicit_threadgroup_is_capped(self) -> None:
+        """Explicit counts past the threadgroup budget are capped to it:
+        64 * 32 explicit threads launch as 32 * num_warps."""
 
         @helion.kernel(
             backend="metal",
-            configs=[helion.Config(block_sizes=[64, 64, 32], num_threads=[32, 64])],
+            configs=[
+                helion.Config(
+                    block_sizes=[64, 64, 32], num_threads=[32, 64], num_warps=4
+                )
+            ],
         )
         def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.size()
@@ -8880,10 +8921,9 @@ class TestMetalAutotune(unittest.TestCase):
 
         x = torch.randn(128, 128, device=DEVICE)
         y = torch.randn(128, 128, device=DEVICE)
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported, re.escape("thread block too large for metal kernel")
-        ):
-            matmul(x, y)
+        out, code, _ = _run_with_msl(matmul, (x, y))
+        self.assertEqual(math.prod(_launch(code)), 128)
+        torch.testing.assert_close(out, x @ y, rtol=1e-4, atol=1e-3)
 
 
 class TestMetalCodegen(unittest.TestCase):
@@ -8908,7 +8948,9 @@ class TestMetalLaneFoldRewrite(unittest.TestCase):
 
     def _unroll(self, source: str) -> str:
         body = ast.parse(textwrap.dedent(source)).body
-        return ast.unparse(ast.Module(body=unroll_lane_folds(body), type_ignores=[]))
+        return ast.unparse(
+            ast.Module(body=unroll_lane_folds(body, names_read), type_ignores=[])
+        )
 
     def test_lanes_jam_inside_loops(self) -> None:
         """Lane-dependent statements repeat per lane, renamed; a fold combines
@@ -8970,7 +9012,7 @@ class TestMetalLaneFoldRewrite(unittest.TestCase):
 
     def test_body_without_fold_is_unchanged(self) -> None:
         body = ast.parse("for slice_lane_0 in range(2):\n    store(out, x)").body
-        self.assertIs(unroll_lane_folds(body), body)
+        self.assertIs(unroll_lane_folds(body, names_read), body)
 
     def test_run_once_statements(self) -> None:
         """A statement the caller runs once stays whole between the lane
@@ -9066,7 +9108,7 @@ class TestMetalLaneFoldRewrite(unittest.TestCase):
                 self.subTest(name),
                 self.assertRaisesRegex(AssertionError, message),
             ):
-                unroll_lane_folds(ast.parse(source).body)
+                unroll_lane_folds(ast.parse(source).body, names_read)
 
 
 # ---------------------------------------------------------------------------
@@ -9973,6 +10015,7 @@ class TestMetalFreeArange(unittest.TestCase):
         expected = x * 2 + torch.arange(1000, device=DEVICE, dtype=torch.float32)
         torch.testing.assert_close(out, expected)
 
+    @_full_threadgroup
     def test_rows_and_columns(self) -> None:
         x = torch.randn(70, 90, device=DEVICE)
         out, _ = self._run(free2d, (x, 5, 3))
@@ -9980,6 +10023,7 @@ class TestMetalFreeArange(unittest.TestCase):
         cols = torch.arange(90, device=DEVICE, dtype=torch.float32)[None, :]
         torch.testing.assert_close(out, x + rows * 1000 + cols)
 
+    @_full_threadgroup
     def test_inner_tile_shares_the_budget(self) -> None:
         """The free rows reserve their threads before the inner tile takes
         its own: at the default config the tile gets 1024 / 32."""
@@ -10044,6 +10088,7 @@ class TestMetalFreeArange(unittest.TestCase):
         shifted = torch.arange(64, device=DEVICE, dtype=torch.int32) - 5
         torch.testing.assert_close(out, torch.where(shifted >= 0, shifted, -1))
 
+    @_full_threadgroup
     def test_sibling_tiles(self) -> None:
         """Both sibling tiles threaded on ``tid[0]``; the free rows go above
         every axis a strategy may read."""
@@ -10077,6 +10122,7 @@ class TestMetalFreeArange(unittest.TestCase):
         torch.testing.assert_close(out, x * 2)
         torch.testing.assert_close(out2, y * 3 + 1)
 
+    @_full_threadgroup
     def test_where_by_block(self) -> None:
         x = torch.randn(1000, device=DEVICE)
         out, _ = self._run(where_ok, (x,))
@@ -10141,16 +10187,24 @@ class TestMetalFreeArange(unittest.TestCase):
         b = torch.randn(48, 64, device=DEVICE)
         a50 = torch.randn(64, 50, device=DEVICE)
         b50 = torch.randn(50, 64, device=DEVICE)
-        k1 = helion.Config(block_sizes=[16, 16, 16], num_threads=[0, 0, 1])
+        k1 = helion.Config(
+            block_sizes=[16, 16, 16], num_threads=[0, 0, 1], num_warps=32
+        )
         cols = torch.arange(64, dtype=torch.float32)[None, :]
         cases = [
-            (dot_free_host, (a, b, 2, 2), helion.Config(block_sizes=[32, 32, 16])),
+            (
+                dot_free_host,
+                (a, b, 2, 2),
+                helion.Config(block_sizes=[32, 32, 16], num_warps=32),
+            ),
             (dot_free_host, (a, b, 4, 4), k1),
             (dot_free_tail, (a50, b50, 4, 4), k1),
             (
                 dot_rows_rootlanes,
-                (a50, b50, 8),
-                helion.Config(block_sizes=[16, 8, 16], num_threads=[2, 0, 1]),
+                (a50, b50, 4),
+                helion.Config(
+                    block_sizes=[16, 8, 16], num_threads=[0, 0, 1], num_warps=32
+                ),
             ),
         ]
         for kernel, args, config in cases:
@@ -10270,6 +10324,7 @@ class TestMetalFreeArange(unittest.TestCase):
             mm_k_free_acc, (a, b, 3), "is not the block of the device loop"
         )
 
+    @_full_threadgroup
     def test_matmul_k_on_threads_rejects(self) -> None:
         a = torch.randn(64, 48, device=DEVICE)
         b = torch.randn(48, 64, device=DEVICE)
@@ -10314,6 +10369,7 @@ class TestMetalFreeArange(unittest.TestCase):
             helion.Config(block_sizes=[32, 16], num_threads=[0, 2]),
         )
 
+    @_full_threadgroup
     def test_fourth_axis_rejects(self) -> None:
         self._assert_rejected(
             free_axis3,
@@ -10322,11 +10378,24 @@ class TestMetalFreeArange(unittest.TestCase):
         )
 
     def test_oversized_threadgroup_rejects(self) -> None:
+        """Each loop is budgeted on its own, so explicit counts that fit one
+        by one can still overflow together."""
         self._assert_rejected(
             free_threadgroup_overflow,
             (torch.randn(70, 90, device=DEVICE), 6),
             r"a threadgroup of \[\d+, \d+, \d+\] threads exceeds 1024",
+            helion.Config(
+                block_sizes=[16, 64, 64], num_threads=[0, 64, 64], num_warps=32
+            ),
         )
+
+    def test_free_axis_beside_a_root_and_an_inner_tile_fits_the_budget(self) -> None:
+        """At the default the root tile shrinks beside the free axis, which
+        the inner tile shares, to 8 x 16 threads."""
+        x = torch.randn(70, 90, device=DEVICE)
+        out, code = self._run(free_threadgroup_overflow, (x, 6))
+        self.assertIn("_block_dims=(8, 16, 1)", code)
+        torch.testing.assert_close(out, x + 1)
 
     def test_other_lengths_reject(self) -> None:
         message = "Metal lowers only a range over a block size that no loop owns"
@@ -10931,6 +11000,26 @@ class TestMetalRowReductionHeuristic(unittest.TestCase):
             [([128, 128, 4], [32, 32, 0]), ([256, 256, 1], [128, 128, 0])],
         )
 
+    def test_seeds_name_their_launch(self) -> None:
+        """Each seed's num_warps gives its own threadgroup, so a seed's layout
+        doesn't depend on the default num_warps."""
+        for fn, inputs, shape, launches in (
+            (softmax_two_pass.fn, 1, (37, 300), [(32, 4, 1), (128, 1, 1)]),
+            (kl_div_forward.fn, 2, (37, 300), [(512, 1, 1)]),
+            (kl_div_forward.fn, 2, (8, 4096), [(1024, 1, 1)]),
+        ):
+            args = tuple(torch.randn(*shape, device=DEVICE) for _ in range(inputs))
+            kernel = helion.kernel(fn, backend="metal", static_shapes=True)
+            bound, seeds = self._bound_seeds(kernel, args)
+            with self.subTest(kernel=fn.__name__, shape=shape):
+                self.assertEqual(
+                    [_launch(bound.to_code(seed)) for seed in seeds], launches
+                )
+                self.assertEqual(
+                    [seed.config["num_warps"] for seed in seeds],
+                    [math.prod(launch) // 32 for launch in launches],
+                )
+
     def test_long_rows_keep_one_vector_per_thread(self) -> None:
         self.assertEqual(
             self._seeds(sibling_mean_sub, (4, 32768)),
@@ -11164,13 +11253,16 @@ class TestMetalRowReductionHeuristic(unittest.TestCase):
             seeds = _heuristic_seeds(bound)
         self.assertTrue(seeds)
         for seed in seeds:
+            # At a full threadgroup the seed's 128 row threads stay threads
+            # beside the reduction dimension's 8, a layout codegen rejects.
+            full = helion.Config(**{**seed.config, "num_warps": 32})
             with (
                 self.subTest(config=seed),
                 self.assertRaisesRegex(
                     exc.BackendUnsupported, "no layout plan fixes the thread axis"
                 ),
             ):
-                bound.to_code(seed)
+                bound.to_code(full)
 
     def test_reduction_after_its_loop_beside_a_distinct_pass_block_gets_no_seed(
         self,
@@ -12669,6 +12761,7 @@ class TestMetalFactoredDims(unittest.TestCase):
             widened_in_inner_loop, (torch.randn(4, 16), torch.randn(4, 4)), message
         )
 
+    @_full_threadgroup
     def test_other_views_and_stacks_reject(self) -> None:
         x, y = torch.randn(4, 8), torch.randn(4, 8)
         self._assert_rejected(
@@ -12730,6 +12823,554 @@ class TestMetalFactoredDims(unittest.TestCase):
             "a store at a widened hl.arange\\(\\) index in a kernel that also has "
             "an MPP matmul",
         )
+
+
+# ---------------------------------------------------------------------------
+# Threadgroup budget: num_warps sizes the launch
+# ---------------------------------------------------------------------------
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def budget_add_2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.size()):
+        out[tm, tn] = x[tm, tn] + y[tm, tn]
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def budget_row_sum(x: torch.Tensor) -> torch.Tensor:
+    out = x.new_empty([x.size(0)])
+    for tm in hl.tile(x.size(0)):
+        out[tm] = x[tm, :].sum(-1)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def budget_row_argmax(x: torch.Tensor) -> torch.Tensor:
+    out = x.new_empty([x.size(0)], dtype=torch.int64)
+    for tm in hl.tile(x.size(0)):
+        out[tm] = x[tm, :].argmax(-1)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def budget_nested_pair(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        for tn in hl.tile(x.size(1)):
+            out[tm, tn] = x[tm, tn] * 2
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def budget_dot_k_tiles(
+    c: torch.Tensor, p: torch.Tensor, x: torch.Tensor
+) -> torch.Tensor:
+    m = c.size(0)
+    n = p.size(0)
+    out = torch.empty([m, n], dtype=torch.float32, device=c.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        acc = hl.dot(c[tm, :], p[tn, :].T, acc=acc)
+        for tj in hl.tile(x.size(1)):
+            acc = acc + x[tm, tj].sum(-1, keepdim=True)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def budget_dot_beside_row_sum(
+    c: torch.Tensor, p: torch.Tensor, r: torch.Tensor
+) -> torch.Tensor:
+    m = c.size(0)
+    n = p.size(0)
+    out = torch.empty([m, n], dtype=torch.float32, device=c.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        acc = hl.dot(c[tm, :], p[tn, :].T, acc=acc)
+        out[tm, tn] = acc + r[tm, :].sum(-1, keepdim=True)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def budget_bf16_round_trip_sum(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(x.size(0)):
+        v = x[tm, :].to(torch.float32) * 3.0
+        out[tm] = v.to(torch.bfloat16).to(torch.float32).sum(-1)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_tile_softmax_sum(x: torch.Tensor) -> torch.Tensor:
+    out = x.new_empty([x.size(0)])
+    for tm in hl.tile(x.size(0), block_size=8):
+        v = x[tm, :]
+        out[tm] = (v - v.amax(-1, keepdim=True)).exp().sum(-1)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_tile_scale(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0), block_size=8):
+        out[tm] = x[tm] * 2
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_tile_from_begin(x: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tm in hl.tile(8, x.size(0), block_size=8):
+        out[tm] = x[tm] * 2
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_tile_id(x: torch.Tensor) -> torch.Tensor:
+    out = x.new_zeros([(x.size(0) + 7) // 8])
+    for tm in hl.tile(x.size(0), block_size=8):
+        out[tm.id] = x[tm].sum()
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_tile_index(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0), block_size=8):
+        out[tm] = x[tm] + tm.index
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def registered_tile_scale(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    block = hl.register_block_size(x.size(0))
+    for tm in hl.tile(x.size(0), block_size=block):
+        out[tm] = x[tm] * 2
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def registered_tile_row_sum(x: torch.Tensor) -> torch.Tensor:
+    out = x.new_empty([x.size(0)])
+    block = hl.register_block_size(x.size(0))
+    for tm in hl.tile(x.size(0), block_size=block):
+        out[tm] = x[tm, :].sum(-1)
+    return out
+
+
+gdn_fwd_h_metal = helion.kernel(
+    helion_gdn_fwd_h.fn, backend="metal", static_shapes=True
+)
+
+_GDN_CHUNK = 64
+
+
+def _gdn_args(
+    t: int, k: int, v: int, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """gdn_fwd_h's inputs for one batch and head, with ``w`` orthonormal per
+    chunk (as the benchmark builds it) so the carried state stays bounded."""
+    gen = torch.Generator().manual_seed(0)
+    nt = t // _GDN_CHUNK
+    raw = torch.randn(1, nt, 1, _GDN_CHUNK, k, generator=gen)
+    wu, _, wv = torch.linalg.svd(raw, full_matrices=False)
+    w = (wu @ wv).permute(0, 1, 3, 2, 4).reshape(1, t, 1, k)
+    inc = 0.5 * math.log(1 / 256) * torch.rand(1, t, 1, generator=gen)
+    return (
+        torch.randn(1, t, 1, k, generator=gen).to(dtype),
+        w.to(dtype),
+        torch.randn(1, t, 1, v, generator=gen).to(dtype),
+        torch.cumsum(inc, dim=1),
+    )
+
+
+def _gdn_reference(
+    k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor
+) -> torch.Tensor:
+    """gdn_fwd_h in float64, rounding to ``k``'s dtype where the kernel does."""
+    t, dk, dv = k.size(1), k.size(-1), u.size(-1)
+    nt = t // _GDN_CHUNK
+
+    def rounded(x: torch.Tensor) -> torch.Tensor:
+        return x.to(k.dtype).double()
+
+    def chunk(x: torch.Tensor, i: int) -> torch.Tensor:
+        return x[0, i * _GDN_CHUNK : (i + 1) * _GDN_CHUNK, 0].double()
+
+    out = torch.empty(1, nt, 1, dk, dv, dtype=torch.float64)
+    state = torch.zeros(dk, dv, dtype=torch.float64)
+    for i in range(nt):
+        out[0, i, 0] = rounded(state)
+        gc = chunk(g, i)
+        new_v = (chunk(u, i) - chunk(w, i) @ rounded(state)) * torch.exp(gc[-1] - gc)[
+            :, None
+        ]
+        state = state * torch.exp(gc[-1]) + chunk(k, i).T @ rounded(new_v)
+    return out
+
+
+def _launch(code: str) -> tuple[int, ...]:
+    """The launch's threadgroup shape, from the host code's ``_block_dims``."""
+    dims = re.search(r"_block_dims=\((\d+), (\d+), (\d+)\)", code)
+    assert dims is not None, code
+    return tuple(int(d) for d in dims.groups())
+
+
+@_requires_darwin
+class TestMetalThreadgroupBudget(unittest.TestCase):
+    """A config's ``num_warps`` sizes the threadgroup: every block that takes
+    a thread axis gets its threads within ``32 * num_warps``, and lanes walk
+    the rest of its extent."""
+
+    def _run(
+        self,
+        kernel: helion.Kernel,
+        args: tuple[object, ...],
+        config: helion.Config | dict[str, object],
+    ) -> tuple[object, str, str]:
+        """Run *kernel* at *config*; a dict overrides its default config."""
+        if isinstance(config, dict):
+            default = kernel.bind(args).config_spec.default_config().config
+            config = helion.Config(**{**default, **config})
+        return _run_with_msl(kernel, args, config)
+
+    def test_num_warps_sizes_the_launch(self) -> None:
+        x = torch.randn(64, 64, device=DEVICE)
+        cases = (
+            (budget_add_2d, (x, x * 2), {}, x.cpu() * 3),
+            (
+                budget_row_sum,
+                (rows := torch.randn(16, 1000, device=DEVICE),),
+                {},
+                rows.cpu().double().sum(-1).float(),
+            ),
+            (
+                budget_row_sum,
+                (wide := torch.randn(16, 3000, device=DEVICE),),
+                {"reduction_loops": [1024]},
+                wide.cpu().double().sum(-1).float(),
+            ),
+            (budget_nested_pair, (x,), {}, x.cpu() * 2),
+        )
+        for kernel, args, config, expected in cases:
+            for num_warps in (1, 4, 8):
+                with self.subTest(
+                    kernel=kernel.name, config=config, num_warps=num_warps
+                ):
+                    out, code, _ = self._run(
+                        kernel, args, {**config, "num_warps": num_warps}
+                    )
+                    self.assertEqual(math.prod(_launch(code)), 32 * num_warps)
+                    torch.testing.assert_close(
+                        out.cpu(), expected, rtol=1e-4, atol=1e-3
+                    )
+
+    def test_rolled_chunk_steps_by_its_threads(self) -> None:
+        """A rolled chunk wider than the threads it gets steps by them: each
+        thread visits every span-th element of the chunk."""
+        for kernel, reference in (
+            (budget_row_sum, lambda x: x.double().sum(-1).float()),
+            (budget_row_argmax, lambda x: x.argmax(-1)),
+        ):
+            for n in (3000, 2049):
+                with self.subTest(kernel=kernel.name, n=n):
+                    x = torch.randn(8, n, device=DEVICE)
+                    out, code, _ = self._run(
+                        kernel, (x,), {"reduction_loops": [1024], "num_warps": 4}
+                    )
+                    self.assertEqual(_launch(code), (128, 1, 1))
+                    self.assertIn("_REDUCTION_BLOCK_1 = 128", code)
+                    torch.testing.assert_close(
+                        out.cpu(), reference(x.cpu()), rtol=1e-4, atol=1e-3
+                    )
+
+    def test_rolled_chunk_keeps_two_threads(self) -> None:
+        """A looped reduction needs two threads, so a chunk of 4 at
+        num_warps=1 steps by 2 beside a 16-thread tile."""
+        config = {"block_sizes": [32], "reduction_loops": [4], "num_warps": 1}
+        for n in (3000, 2049, 64):
+            with self.subTest(n=n):
+                x = torch.randn(40, n, device=DEVICE)
+                out, code, _ = self._run(budget_row_sum, (x,), config)
+                self.assertEqual(_launch(code), (2, 16, 1))
+                self.assertIn("_REDUCTION_BLOCK_1 = 2", code)
+                torch.testing.assert_close(
+                    out.cpu(), x.cpu().double().sum(-1).float(), rtol=1e-4, atol=1e-3
+                )
+
+    def test_combined_dims_reserve_their_share(self) -> None:
+        """A dimension Scalar code combines reserves its share of a full
+        threadgroup scaled to the budget: a 128-wide scalar-dot K takes 16 of
+        128 threads and leaves the tiles theirs, and all 128 of 1024."""
+        c = torch.randn(64, 128, device=DEVICE)
+        p = torch.randn(64, 128, device=DEVICE)
+        x = torch.randn(64, 32, device=DEVICE)
+        expected = (
+            c.cpu().double() @ p.cpu().double().T
+            + x.cpu().double().sum(-1, keepdim=True)
+        ).float()
+        for num_warps, launch, span in ((4, (16, 8, 1), 16), (32, (128, 8, 1), 128)):
+            with self.subTest(num_warps=num_warps):
+                out, code, msl = self._run(
+                    budget_dot_k_tiles, (c, p, x), {"num_warps": num_warps}
+                )
+                self.assertEqual(_launch(code), launch)
+                self.assertIn(f"tid, 0, {span}, _TG_SIZE_X", msl)
+                torch.testing.assert_close(out.cpu(), expected, rtol=1e-4, atol=1e-3)
+        # A 1024-wide row reserves the whole 128-thread budget, as at 1024.
+        x = torch.randn(4, 1024, device=DEVICE)
+        out, code, _ = self._run(
+            budget_row_sum, (x,), helion.Config(block_sizes=[1], num_warps=4)
+        )
+        self.assertEqual(_launch(code), (128, 1, 1))
+        torch.testing.assert_close(
+            out.cpu(), x.cpu().double().sum(-1).float(), rtol=1e-4, atol=1e-3
+        )
+
+    def test_nested_literal_tile_shrinks_to_the_budget(self) -> None:
+        """gdn_fwd_h's literal 64-row chunk tile, nested in the V tile, takes
+        only what K's reservation leaves, so K folds at most 64 lanes."""
+        args = (*_gdn_args(128, 256, 64, torch.float32), _GDN_CHUNK)
+        expected = _gdn_reference(*args[:4])
+        for config in (
+            helion.Config(block_sizes=[16], num_warps=4),
+            helion.Config(block_sizes=[32], num_threads=[1], num_warps=4),
+        ):
+            with self.subTest(config=config):
+                device_args = tuple(
+                    a.to(DEVICE) if isinstance(a, torch.Tensor) else a for a in args
+                )
+                out, code, msl = _run_with_msl(gdn_fwd_h_metal, device_args, config)
+                self.assertEqual(_launch(code), (32, 4, 1))
+                torch.testing.assert_close(
+                    out.cpu().double(), expected, rtol=1e-4, atol=1e-4
+                )
+
+    def test_explicit_nested_count_starving_the_fold_stays_rejected(self) -> None:
+        """An explicit count on a nested tile is charged in full, so at
+        num_warps=1 the scalar dot's 128-wide K is left one thread, past the
+        64-lane fold cap."""
+        args = (torch.randn(64, 128), torch.randn(64, 128), torch.randn(64, 32))
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported,
+            r"persistent reduction over 128 elements would need 128 lanes per "
+            r"thread on 1 thread \(max 64\)",
+        ):
+            budget_dot_k_tiles.bind(args).to_code(
+                helion.Config(
+                    block_sizes=[16, 16, 32], num_threads=[0, 0, 32], num_warps=1
+                )
+            )
+
+    def test_after_loop_reduction_tile_takes_one_thread(self) -> None:
+        """kl_div's pass, reduced after its loop, goes to one thread when the
+        tiles overflow the budget: it needs one element per thread or one
+        thread."""
+        y_pred = torch.randn(16, 512).log_softmax(-1)
+        y_true = torch.randn(16, 512).softmax(-1)
+        kernel = helion.kernel(kl_div_forward.fn, backend="metal", static_shapes=True)
+        out, code, _ = self._run(
+            kernel, (y_pred.to(DEVICE), y_true.to(DEVICE)), {"num_warps": 4}
+        )
+        self.assertEqual(_launch(code), (16, 1, 1))
+        expected = torch.nn.functional.kl_div(
+            y_pred.double(), y_true.double(), reduction="batchmean"
+        )
+        torch.testing.assert_close(out.cpu().double(), expected, rtol=1e-4, atol=1e-5)
+
+    def test_tile_reduced_after_its_loop_shrinks_to_one_thread(self) -> None:
+        """With no reduction dim to reserve for, the shrink to the budget
+        takes a tile reduced after its loop from one thread per element
+        straight to one thread; an explicit partial count stays rejected."""
+        x = torch.randn(8, 3000, device=DEVICE)
+        for num_warps in (1, 4, 32):
+            with self.subTest(num_warps=num_warps):
+                config = helion.Config(block_sizes=[4096, 1], num_warps=num_warps)
+                out, code, _ = _run_with_msl(sum_after_loop, (x,), config)
+                self.assertEqual(_launch(code), (1, 1, 1))
+                torch.testing.assert_close(
+                    out.cpu(), x.cpu().double().sum(-1).float(), rtol=1e-4, atol=1e-3
+                )
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported,
+            r"its block of 128 is spread over 16 threads, not one element per thread",
+        ):
+            sum_after_loop.bind((x.cpu(),)).to_code(
+                helion.Config(block_sizes=[128, 1], num_threads=[16, 1], num_warps=4)
+            )
+
+    def test_lane_floor(self) -> None:
+        """The launch grows past 32 * num_warps to the fewest threads at
+        which each reduction's lane form exists: layer_norm_bwd's persistent
+        9216-wide reduction folds at most 64 lanes, so 256 threads."""
+        x = torch.randn(4, 9216)
+        args = (
+            torch.randn(4, 9216),
+            x,
+            x.mean(-1),
+            torch.rsqrt(x.var(-1, unbiased=False) + 1e-5),
+            torch.randn(9216),
+        )
+        kernel = helion.kernel(layer_norm_bwd.fn, backend="metal", static_shapes=True)
+        device_args = tuple(a.to(DEVICE) for a in args)
+        (grad_x, grad_w, grad_b), code, _ = self._run(kernel, device_args, {})
+        self.assertEqual(math.prod(_launch(code)), 256)
+        dy, xd, _, _, w = (a.double() for a in args)
+        xd.requires_grad_(True)
+        w.requires_grad_(True)
+        bias = torch.zeros_like(w, requires_grad=True)
+        torch.nn.functional.layer_norm(xd, (9216,), w, bias, eps=1e-5).backward(dy)
+        for out, expected in ((grad_x, xd.grad), (grad_w, w.grad), (grad_b, bias.grad)):
+            torch.testing.assert_close(
+                out.cpu().double(), expected, rtol=1e-3, atol=1e-3
+            )
+
+    def test_argmax_keeps_a_thread_per_element(self) -> None:
+        """An argmax over a persistent row has no lane form, so its row keeps
+        a thread per element at num_warps=4: 1024 for a 1000-wide row, and
+        the whole 128-thread budget for a 100-wide one."""
+        for n, launch in ((1000, (1024, 1, 1)), (100, (128, 1, 1))):
+            with self.subTest(n=n):
+                x = torch.randn(16, n, device=DEVICE)
+                out, code, _ = self._run(budget_row_argmax, (x,), {"num_warps": 4})
+                self.assertEqual(_launch(code), launch)
+                torch.testing.assert_close(out.cpu(), x.cpu().argmax(-1))
+
+    def test_rejections_name_the_budget(self) -> None:
+        c = torch.randn(64, 128)
+        p = torch.randn(48, 128)
+        r = torch.randn(64, 512)
+        for config, note in (
+            (
+                helion.Config(block_sizes=[16, 16], reduction_loops=[8], num_warps=1),
+                (
+                    r"(?m)reduction loop over chunks of 8 elements needs 8 threads but "
+                    r"only 1 are available; .* \(threadgroup budget 32 threads "
+                    r"from num_warps=1\)$"
+                ),
+            ),
+            (
+                helion.Config(block_sizes=[16, 16], num_warps=4),
+                (
+                    r"(?m)in a lane loop beside other reduction dims \[\d+\] "
+                    r"\(threadgroup budget 128 threads from num_warps=4\)$"
+                ),
+            ),
+            (
+                helion.Config(block_sizes=[16, 16], num_warps=32),
+                r"(?m)in a lane loop beside other reduction dims \[\d+\]$",
+            ),
+        ):
+            with (
+                self.subTest(config=config),
+                self.assertRaisesRegex(exc.BackendUnsupported, note),
+            ):
+                budget_dot_beside_row_sum.bind((c, p, r)).to_code(config)
+
+    def test_lane_copied_bfloat_conversions_round_in_integers(self) -> None:
+        """Metal lowers a float -> bfloat cast that a lane copy repeats as a
+        float -> half cast: gdn_fwd_h at num_warps=1 folds K over 32 lanes,
+        and its bfloat state came back with half's bit patterns.  Lane copies
+        round in integer arithmetic instead."""
+        args = (*_gdn_args(256, 256, 32, torch.bfloat16), _GDN_CHUNK)
+        device_args = tuple(
+            a.to(DEVICE) if isinstance(a, torch.Tensor) else a for a in args
+        )
+        out, code, msl = _run_with_msl(
+            gdn_fwd_h_metal,
+            device_args,
+            helion.Config(block_sizes=[32], num_warps=1),
+        )
+        self.assertEqual(_launch(code), (8, 4, 1))
+        self.assertRegex(msl, r"helion_bf16_cast\([^;]*__lane\d+")
+        self.assertNotRegex(msl, r"static_cast<bfloat>\([^;]*__lane\d+")
+        torch.testing.assert_close(
+            out.cpu().double(), _gdn_reference(*args[:4]), rtol=2e-2, atol=2e-2
+        )
+
+    def test_lane_copied_bfloat_conversion_values(self) -> None:
+        """The integer rounding is torch's: a tie goes to even, a NaN stays a
+        NaN.  (A subnormal can't be observed here: the GPU returned 0 for
+        one, as float arithmetic around the cast may flush it.)"""
+        values = torch.tensor(
+            [1 + 2.0**-7, -(1 + 3 * 2.0**-7), float("nan"), 0.75, 70000.0]
+        ).to(torch.bfloat16)
+        x = torch.zeros(len(values), 256, dtype=torch.bfloat16)
+        for row, value in enumerate(values):
+            x[row, 17 * row] = value
+        out, _, msl = self._run(
+            budget_bf16_round_trip_sum, (x.to(DEVICE),), {"num_warps": 1}
+        )
+        self.assertRegex(msl, r"helion_bf16_cast\([^;]*__lane\d+")
+        expected = (values.float() * 3.0).to(torch.bfloat16).float()
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+
+    def test_root_tile_ignores_its_block_size_argument(self) -> None:
+        """A 1-D root ``hl.tile`` with a literal or registered block size is
+        indexed as a tunable tile is, not ``offsets * block_size``."""
+        rows = torch.randn(40, 1536, device=DEVICE)
+        for config in (
+            {"reduction_loops": [None], "num_warps": 4},
+            {"reduction_loops": [None], "num_warps": 32},
+            {"reduction_loops": [64], "num_warps": 4},
+            {"reduction_loops": [1024], "num_warps": 4},
+        ):
+            for m in (40, 37):
+                with self.subTest(kernel="softmax_sum", config=config, m=m):
+                    x = rows[:m].contiguous()
+                    out, code, _ = self._run(literal_tile_softmax_sum, (x,), config)
+                    self.assertIn("indices_0 = offsets_0", code)
+                    xd = x.cpu().double()
+                    expected = (xd - xd.amax(-1, keepdim=True)).exp().sum(-1)
+                    torch.testing.assert_close(
+                        out.cpu().double(), expected, rtol=1e-4, atol=1e-4
+                    )
+        values = torch.randn(43, device=DEVICE)
+        for m in (40, 37, 8, 1):
+            with self.subTest(kernel="literal_tile_scale", m=m):
+                x = values[:m].contiguous()
+                out, code, _ = self._run(literal_tile_scale, (x,), {})
+                self.assertNotIn("offsets_0 * 8", code)
+                torch.testing.assert_close(out.cpu(), x.cpu() * 2)
+        with self.subTest(kernel="from_begin"):
+            out, code, _ = self._run(literal_tile_from_begin, (values,), {})
+            self.assertIn("indices_0 = 8 + offsets_0", code)
+            expected = values.cpu().clone()
+            expected[:8] = 0
+            expected[8:] *= 2
+            torch.testing.assert_close(out.cpu(), expected)
+        x = values[:40].contiguous()
+        with self.subTest(kernel="tile_id"):
+            out, _, _ = self._run(literal_tile_id, (x,), {})
+            torch.testing.assert_close(
+                out.cpu(), x.cpu().view(5, 8).sum(-1), rtol=1e-5, atol=1e-5
+            )
+        with self.subTest(kernel="tile_index"):
+            out, _, _ = self._run(literal_tile_index, (x,), {})
+            torch.testing.assert_close(out.cpu(), x.cpu() + torch.arange(40))
+        table = torch.randn(40, 64, device=DEVICE)
+        for m in (40, 37):
+            for block in (8, 32):
+                for num_warps in (1, 4):
+                    config = helion.Config(block_sizes=[block], num_warps=num_warps)
+                    with self.subTest(kernel="registered_scale", m=m, config=config):
+                        x = values[:m].contiguous()
+                        out, code, _ = self._run(registered_tile_scale, (x,), config)
+                        self.assertNotIn("offsets_0 * _BLOCK_SIZE_0", code)
+                        torch.testing.assert_close(out.cpu(), x.cpu() * 2)
+                    with self.subTest(kernel="registered_row_sum", m=m, config=config):
+                        x = table[:m].contiguous()
+                        out, code, _ = self._run(registered_tile_row_sum, (x,), config)
+                        self.assertNotIn("offsets_0 * _BLOCK_SIZE_0", code)
+                        torch.testing.assert_close(
+                            out.cpu(),
+                            x.cpu().double().sum(-1).float(),
+                            rtol=1e-4,
+                            atol=1e-4,
+                        )
 
 
 if __name__ == "__main__":

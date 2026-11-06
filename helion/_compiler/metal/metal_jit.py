@@ -195,9 +195,12 @@ def _generate_msl(
     """
     from torch._inductor.codegen.mps import DTYPE_TO_METAL
 
+    from .lane_fold import BF16_CAST
+    from .mpp_matmul import BF16_CAST_PREAMBLE
     from .mpp_matmul import ROUND
     from .mpp_matmul import ROUND_PREAMBLE
     from .mpp_matmul import elementize
+    from .mpp_matmul import names_read
 
     tensor_dtypes = {
         name: arg.dtype
@@ -215,8 +218,9 @@ def _generate_msl(
             for k in fn_globals
             if k.startswith(TG_BUFFER_GLOBAL_PREFIX)
         ),
+        required_threads_per_threadgroup,
     )
-    body_stmts = unroll_lane_folds(body_stmts)
+    body_stmts = unroll_lane_folds(body_stmts, names_read)
     msl_parts: list[str] = [
         "#include <metal_stdlib>",
         "#include <c10/metal/utils.h>",
@@ -260,8 +264,10 @@ def _generate_msl(
                 "using namespace mpp::tensor_ops;",
             ]
         )
-        if ROUND in referenced:
-            msl_parts.append(ROUND_PREAMBLE)
+    if ROUND in referenced or BF16_CAST in referenced:
+        msl_parts.append(ROUND_PREAMBLE)
+    if BF16_CAST in referenced:
+        msl_parts.append(BF16_CAST_PREAMBLE)
     msl_parts.append("")
 
     params: list[str] = []

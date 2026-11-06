@@ -30,10 +30,13 @@ the matrices of its batch tile's one index:
 - a lane loop around a cooperative op is split at the op when only
   register and staging work sits beside it, and otherwise jammed across
   its lanes (``lane_fold.LaneJam``): Scalar work runs once per lane in body
-  order, each cooperative statement once;
+  order, each cooperative statement once; a lane loop of staging work that
+  only one thread of a row would run deals its lanes out over that row's
+  threads (:class:`_Replicas`);
 - an element-wise update of the K loop's carry before the op
   (``acc * alpha``) runs in place on the cooperative tensor in an element
-  loop (``_mpp_upd``); an operand of it that no element can recompute is
+  loop (``_mpp_upd``); an operand of it that no element can recompute, or
+  such a row or column vector read by a stored epilogue (``acc / l_i``), is
   staged into a threadgroup tile (``_mpp_vec``);
 - a staged operand its outermost loop doesn't change is staged once, before
   that loop (``_mpp_hoist``); a bfloat operand staged inside a loop from
@@ -95,6 +98,7 @@ from .factored_dims import FactoredValue
 from .factored_dims import factored_size
 from .factored_dims import widened_iota
 from .free_arange import live_graphs
+from .lane_fold import BF16_CAST
 from .lane_fold import LANE_FOLD
 from .lane_fold import MAX_LANE_COPIES
 from .lane_fold import LaneArrayBudget
@@ -142,6 +146,9 @@ ROUND_PREAMBLE = f"""inline float {ROUND}(float v) {{
     uint u = as_type<uint>(v);
     uint r = (u & 0x7FFFFFFFu) > 0x7F800000u ? (u | 0x00400000u) : u + 0x7FFFu + ((u >> 16) & 1u);
     return as_type<float>(r & 0xFFFF0000u);
+}}"""
+BF16_CAST_PREAMBLE = f"""inline bfloat {BF16_CAST}(float v) {{
+    return as_type<bfloat>(ushort(as_type<uint>({ROUND}(v)) >> 16));
 }}"""
 
 #: Each matmul's (acc, lhs, rhs) argument positions; None for no acc.  The
@@ -341,6 +348,8 @@ class MppGroup:
     upd: Node | None = None
     #: The ``_mpp_vec`` nodes that stage the update's Scalar operands.
     vecs: list[Node] = dataclasses.field(default_factory=list)
+    #: The ``_mpp_vec`` nodes that stage a stored epilogue's Scalar operands.
+    epilogue_vecs: set[Node] = dataclasses.field(default_factory=set)
 
 
 @dataclasses.dataclass
@@ -871,6 +880,7 @@ def plan_mpp_matmuls(graphs: list[GraphInfo]) -> MppPlan:
     if plan.by_matmul:
         _order_memory(plan, live, known)
         for group in plan.by_matmul.values():
+            _stage_epilogue_vecs(group, plan, known)
             _finalize(group, plan, known)
     return plan
 
@@ -1015,8 +1025,6 @@ def _plan_update(group: MppGroup, graphs: _Graphs) -> None:
     node stages for the element loop."""
     coop = set(group.update) | set(_aliases(group.levels[0].placeholder))
     recomputable = group.recomputable
-    blocks = {group.m_block, group.n_block, group.batch_block}
-    blocks.discard(None)
     staged: dict[Node, Node] = {}
     for node in group.update:
         for a in list(node.all_input_nodes):
@@ -1030,26 +1038,32 @@ def _plan_update(group: MppGroup, graphs: _Graphs) -> None:
                         f"an update of an MPP accumulator reads {a.name}, a scalar "
                         "that isn't a tensor, such as a float kernel argument"
                     )
-                dims = [_block(s) if s != 1 else None for s in val.size()]
-                if (
-                    any(
-                        d is None and s != 1
-                        for d, s in zip(dims, val.size(), strict=True)
-                    )
-                    or any(d is not None and d not in blocks for d in dims)
-                    or not ({group.m_block, group.n_block} & set(dims))
-                ):
+                if not _mn_dims(group, val):
                     raise _unsupported(
                         f"an update of an MPP accumulator reads {a.name}, which is "
                         "neither recomputable at any element nor a value over "
                         "the tile's M or N blocks"
                     )
-                positional_rebind.check_positional_merges(
-                    _producers(a, graphs), _STAGE_REBIND
-                )
-                vec = staged[a] = _insert(_mpp_vec, a, before=node)
+                vec = staged[a] = _stage_vec(a, node, graphs)
                 group.vecs.append(vec)
             node.replace_input_with(a, vec)
+
+
+def _mn_dims(group: MppGroup, val: torch.Tensor) -> set[int | None]:
+    """The group's M and N blocks among the dims of ``val``, or none when a
+    dim is neither 1 nor one of the group's M, N and batch blocks.  A
+    ``_mpp_vec`` tile can hold a value over one or both."""
+    blocks = {group.m_block, group.n_block, group.batch_block}
+    blocks.discard(None)
+    dims = {_block(s) for s in val.size() if s != 1}
+    if not dims <= blocks:
+        return set()
+    return dims & {group.m_block, group.n_block}
+
+
+def _stage_vec(value: Node, before: Node | None, graphs: _Graphs) -> Node:
+    positional_rebind.check_positional_merges(_producers(value, graphs), _STAGE_REBIND)
+    return _insert(_mpp_vec, value, before=before)
 
 
 def _mnk(matmul: Node, k_block: int) -> tuple[int, int, tuple[int, int], int | None]:
@@ -1797,16 +1811,36 @@ def _classify_uses(group: MppGroup, graphs: _Graphs) -> None:
                     group.stores.append(user)
                 continue
             if _pointwise(user) and _inputs_kept(
-                user, group.cur | group.derived, recomputable
+                user, group.cur | group.derived, group
             ):
                 group.derived.add(user)
                 work.append(user)
 
 
-def _inputs_kept(node: Node, coop: set[Node], recomputable: _Recomputable) -> bool:
-    """Whether an element loop can evaluate every input of ``node``: each is
-    cooperative or recomputable at any element."""
-    return all(a in coop or recomputable(a) for a in node.all_input_nodes)
+def _inputs_kept(node: Node, coop: set[Node], group: MppGroup) -> bool:
+    """Whether an element loop over the cooperative tensor can evaluate
+    ``node``: each input is cooperative, recomputable at any element or a
+    vector a tile can stage (:func:`_vec_input`)."""
+    return all(
+        a in coop or group.recomputable(a) or _vec_input(group, a)
+        for a in node.all_input_nodes
+    )
+
+
+def _vec_input(group: MppGroup, value: Node) -> bool:
+    """Whether a derived value's input that no element can recompute can be
+    staged into a ``_mpp_vec`` tile: a row or a column vector of the tile
+    (over one of its M and N blocks, and its batch block).  A value over both
+    M and N stays in the Scalar layout: staged, it would take as much
+    threadgroup memory as the materialization it avoids.  So does a value the
+    op updates in place, such as a ``:`` K op's constant seed over one block:
+    its readers read its materialization (:func:`_finalize`)."""
+    val = value.meta.get("val")
+    return (
+        value not in group.old
+        and isinstance(val, torch.Tensor)
+        and len(_mn_dims(group, val)) == 1
+    )
 
 
 def _prune_derived(group: MppGroup) -> None:
@@ -1827,7 +1861,7 @@ def _prune_derived(group: MppGroup) -> None:
                 u not in keep and u.target is not torch.ops.aten.sym_size.int
                 for u in d.users
             )
-            or not _inputs_kept(d, coop, group.recomputable)
+            or not _inputs_kept(d, coop, group)
         }
         if not drop and len(stores) == len(group.stores):
             return
@@ -1981,6 +2015,23 @@ def _finalize(group: MppGroup, plan: MppPlan, graphs: _Graphs) -> None:
     positional_rebind.check_positional_merges(
         _forward_slice(list(group.mats.values()), graphs), _MAT_REBIND
     )
+
+
+def _stage_epilogue_vecs(group: MppGroup, plan: MppPlan, graphs: _Graphs) -> None:
+    """Stage each input of a kept derived value that no element can
+    recompute (:func:`_vec_input`) into a ``_mpp_vec`` tile, right after the
+    input's definition, so ahead of every derived reader."""
+    staged: dict[Node, Node] = {}
+    for d in sorted(group.derived, key=lambda n: n.name):
+        for a in list(d.all_input_nodes):
+            if group.recomputable(a) or not _vec_input(group, a):
+                continue
+            vec = staged.get(a)
+            if vec is None:
+                vec = staged[a] = _stage_vec(a, None, graphs)
+                group.epilogue_vecs.add(vec)
+                plan.by_vec[vec] = group
+            d.replace_input_with(a, vec)
 
 
 def _update_reruns(group: MppGroup) -> list[Node]:
@@ -2227,7 +2278,18 @@ def _(state: CodegenState) -> ast.AST:
     buf = alloc_threadgroup_buffer(
         backend.dtype_str(tile_dtype), math.prod(sizes), prefix=VEC_TILE
     )
-    _stage_writes(cg, buf, [state.ast_arg(0)], tile_dtype, blocks, sizes[-1])
+    # Staged after its K loop, beside the lane loops the shared placement
+    # distributes, an epilogue vector's owner would count as a tensor access
+    # there (as a hoisted operand's would).
+    _stage_writes(
+        cg,
+        buf,
+        [state.ast_arg(0)],
+        tile_dtype,
+        blocks,
+        sizes[-1],
+        owner_in_preamble=node in group.epilogue_vecs,
+    )
     zero = "0.0" if tile_dtype.is_floating_point else "0"
     read = _tile_read(cg, buf, blocks, zero)
     if val.dtype != tile_dtype:
@@ -2375,7 +2437,12 @@ def _block_layout(cg: GenerateAST, block: int) -> _BlockLayout:
     assert isinstance(backend, MetalBackend)
     planned = backend.free_arange_plan.get(block)
     if planned is not None:
-        return _BlockLayout(f"tid[{planned[0]}]", planned[0])
+        from .free_arange import lane_name
+
+        axis, _threads, lanes = planned
+        if lanes == 1:
+            return _BlockLayout(f"tid[{axis}]", axis)
+        return _BlockLayout(f"tid[{axis}]", axis, lane_name(block), lanes=lanes)
     if env.block_sizes[block].reduction:
         strategy = cg.device_function.tile_strategy.block_id_to_strategy[(block,)]
         # The planner's block checks reject a padded twin (its fake size is
@@ -2447,8 +2514,8 @@ def _check_threads(cg: GenerateAST, group: MppGroup) -> None:
                         f"block {block} is spread over threads around a cooperative "
                         "MPP matmul; only its M, N and K blocks may hold threads"
                     )
-    for block, (_axis, size) in backend.free_arange_plan.items():
-        if block not in allowed and size > 1:
+    for block, (_axis, threads, _lanes) in backend.free_arange_plan.items():
+        if block not in allowed and threads > 1:
             raise _unsupported(
                 f"free block {block} is spread over threads around a cooperative "
                 "MPP matmul; only its M, N and K blocks may hold threads"
@@ -2605,11 +2672,22 @@ def fenced(node: Node | None) -> bool:
     return backend.mpp_plan is not None and node in backend.mpp_plan.fenced
 
 
-def _local(cg: GenerateAST, block: int) -> tuple[str, int | None]:
-    """The thread's index within the tile on *block*, and the thread axis
-    that holds the block (None when it is on lanes only)."""
-    layout = _block_layout(cg, block)
-    return layout.local, layout.axis
+def _in_tile(
+    cg: GenerateAST, blocks: Sequence[int]
+) -> tuple[list[_BlockLayout], list[str]]:
+    """Each block's layout, and the checks that this thread's index within
+    the tile lies inside it on the blocks where it may not: on every block
+    when a wider sibling can launch surplus threads (``force_tile_mask()``),
+    else only on ``:`` slices.  Under a uniform launch a tile loop's threads
+    times lanes are exactly its block, so its index is always inside."""
+    force = CompileEnvironment.current().backend.force_tile_mask()
+    layouts = [_block_layout(cg, b) for b in blocks]
+    checks = [
+        f"({layout.local}) < {n}"
+        for layout, n in zip(layouts, _tile(cg, blocks), strict=True)
+        if force or layout.strided
+    ]
+    return layouts, checks
 
 
 def _stage_writes(
@@ -2625,17 +2703,16 @@ def _stage_writes(
 ) -> None:
     """Write the elements this thread holds into the row-major tile ``buf``
     over one or two blocks at its index within the tile (part ``r`` of a
-    factored K at ``c * k + r``).  A thread whose index on a block lies past
-    the block writes nothing (a wider sibling's surplus threads), and of the
+    factored K at ``c * k + r``).  A thread whose index on a block may lie
+    past the block (:func:`_in_tile`) writes only inside it, and of the
     threads that hold the same element, because they differ only on another
-    block's axis, the one at 0 writes it."""
+    block's axis, the one at 0 writes it.  The write's last argument names
+    those pinned axes, and the owner test is its predicate's last term."""
     backend = CompileEnvironment.current().backend
-    locals_ = [_local(cg, b) for b in blocks]
-    pred = [
-        f"{loc} < {b}" for (loc, _), b in zip(locals_, _tile(cg, blocks), strict=True)
-    ]
-    owned = {axis for _, axis in locals_ if axis is not None}
-    owner = " and ".join(f"tid[{a}] == 0" for a in range(3) if a not in owned)
+    layouts, pred = _in_tile(cg, blocks)
+    owned = {layout.axis for layout in layouts if layout.axis is not None}
+    pinned = tuple(a for a in range(3) if a not in owned)
+    owner = " and ".join(f"tid[{a}] == 0" for a in pinned)
     if owner:
         # A name, not tid[...] in the write itself: the shared lane-loop
         # placement takes a subscripted name in a call for a tensor the call
@@ -2651,13 +2728,13 @@ def _stage_writes(
         else:
             pred.append(cg.lift(expr_from_string(owner), prefix="_mpp_owner").id)
     for r, part in enumerate(parts):
-        index = [loc for loc, _ in locals_]
+        index = [layout.local for layout in layouts]
         if k_pos is not None and k_factor != 1:
             index[k_pos] = f"{k_factor} * {index[k_pos]} + {r}"
         flat = _flat(index, cols)
         cg.add_statement(
             statement_from_string(
-                f"{STAGE}({buf}, {flat}, {{value}}, {' and '.join(pred)})",
+                f"{STAGE}({buf}, {flat}, {{value}}, {' and '.join(pred)}, {pinned!r})",
                 value=backend.cast_ast(part, dtype),
             )
         )
@@ -2672,14 +2749,15 @@ def _flat(index: Sequence[str], cols: int) -> str:
 
 def _tile_read(cg: GenerateAST, buf: str, blocks: Sequence[int], zero: str) -> ast.AST:
     """This thread's element of the row-major tile ``buf`` over ``blocks``.
-    A thread past a block on a wider sibling axis has no element; its read
-    stays inside the tile, and its value is masked off downstream."""
-    sizes = _tile(cg, blocks)
-    locs = [_local(cg, b)[0] for b in blocks]
-    inside = " and ".join(f"({loc}) < {n}" for loc, n in zip(locs, sizes, strict=True))
-    return expr_from_string(
-        f"({buf}[{_flat(locs, sizes[-1])}] if {inside} else {zero})"
-    )
+    A thread whose index on a block may lie past the block (:func:`_in_tile`)
+    reads ``zero`` there, so its read stays inside the tile; its value is
+    masked off downstream."""
+    layouts, inside = _in_tile(cg, blocks)
+    locs = [layout.local for layout in layouts]
+    read = f"{buf}[{_flat(locs, _tile(cg, blocks)[-1])}]"
+    if not inside:
+        return expr_from_string(read)
+    return expr_from_string(f"({read} if {' and '.join(inside)} else {zero})")
 
 
 def _stage(
@@ -2876,24 +2954,24 @@ def _call_name(node: ast.AST) -> str | None:
     return None
 
 
-def _reads(node: ast.AST) -> set[str]:
+def names_read(node: ast.AST) -> set[str]:
     """The names a statement or expression reads; an element loop's own
     definitions are not reads."""
     if isinstance(node, ast.For) and _call_name(node.iter) == ELEMENTS:
         inner: set[str] = set()
         defs: set[str] = set()
         for s in node.body:
-            inner |= _reads(s)
+            inner |= names_read(s)
             if (t := _target(s)) is not None:
                 defs.add(t)
             elif isinstance(s, ast.Expr) and isinstance(s.value, ast.Call):
                 if _call_name(s.value) == BIND:
                     defs.add(ast.literal_eval(s.value.args[0]))
-        return (inner - defs) | _reads(node.iter)
+        return (inner - defs) | names_read(node.iter)
     if isinstance(node, (ast.For, ast.If)):
-        out = _reads(node.iter if isinstance(node, ast.For) else node.test)
+        out = names_read(node.iter if isinstance(node, ast.For) else node.test)
         for s in (*node.body, *node.orelse):
-            out |= _reads(s)
+            out |= names_read(s)
         return out
     return {
         sub.id
@@ -3017,7 +3095,7 @@ class _Copies:
                 }
         self.reassigned = {n for n, c in writes.items() if c > 1}
         self.leaves = leaves
-        # A staged vector's read runs after the update loop's leading
+        # A staged vector's read runs after its element loop's leading
         # barrier, so the loop re-runs it, even where its index is the same
         # for every element (a block of one row).
         self.recomputed = bound | coop | vec_reads
@@ -3030,7 +3108,7 @@ class _Copies:
                     t is not None
                     and t not in self.recomputed
                     and t not in leaves
-                    and _reads(a.value) & self.recomputed
+                    and names_read(a.value) & self.recomputed
                 ):
                     self.recomputed.add(t)
                     changed = True
@@ -3050,7 +3128,7 @@ class _Copies:
             if n in self.reassigned or n in self.leaves:
                 continue
             for a in self.defs.get(n, ()):
-                work += _reads(a.value)
+                work += names_read(a.value)
         return out
 
     def take(self, s: ast.stmt) -> list[ast.stmt]:
@@ -3061,7 +3139,7 @@ class _Copies:
         assert isinstance(s, ast.Assign)
         names = sorted(
             r
-            for r in _reads(s.value)
+            for r in names_read(s.value)
             if r in self.reassigned and r not in self.recomputed
         )
         out: list[ast.stmt] = []
@@ -3086,7 +3164,7 @@ class _Copies:
         def reread(expr: ast.expr, anchor: str | None) -> ast.expr:
             reach = self._closure({anchor}) if anchor is not None else set()
             renames: dict[str, str] = {}
-            for r in _reads(expr) & self.reassigned:
+            for r in names_read(expr) & self.reassigned:
                 copies = {self.taken[(t, r)] for t in reach if (t, r) in self.taken}
                 if len(copies) != 1:
                     raise _unsupported(
@@ -3165,7 +3243,7 @@ def _materialized(body: list[ast.stmt], tg_buffers: frozenset[str]) -> set[str]:
             t = _target(a)
             if t is None or t in out:
                 continue
-            reads = _reads(a.value)
+            reads = names_read(a.value)
             if reads & tiles or (
                 reads & out and not _cross_thread(a.value, tg_buffers)
             ):
@@ -3178,10 +3256,12 @@ def elementize(
     body: list[ast.stmt],
     tensor_dtypes: Mapping[str, torch.dtype],
     tg_buffers: frozenset[str],
+    tg_size: Sequence[int] | None,
 ) -> list[ast.stmt]:
     """Move each store of a cooperative value into a loop over the
     cooperative tensor's elements; ``tensor_dtypes`` are the kernel's tensor
-    parameters' dtypes and ``tg_buffers`` its threadgroup buffer names.
+    parameters' dtypes, ``tg_buffers`` its threadgroup buffer names and
+    ``tg_size`` its threadgroup's threads per axis.
 
     The loop binds the Scalar layout's thread of each element and re-runs the
     recomputed statements the store reads, in body order.  A collective's
@@ -3210,13 +3290,16 @@ def elementize(
     scan(body)
     if not groups:
         return body
-    # A staged vector's tile is written before an update's element loop and
-    # read only inside it, with a barrier on each side (the loop's fence), so
-    # its reads exchange nothing at the loop and are re-run like any load.
+    # A staged vector's tile is written before the element loop that reads
+    # it (an update's or a store's) and read only inside it, with a barrier
+    # on each side, so its reads exchange nothing at the loop and are re-run
+    # like any load.
     vec_bufs = frozenset(b for b in tg_buffers if b.startswith(VEC_TILE))
     tg_buffers = tg_buffers - vec_bufs
     vec_reads = {
-        t for a in _assigns(body) if (t := _target(a)) and _reads(a.value) & vec_bufs
+        t
+        for a in _assigns(body)
+        if (t := _target(a)) and names_read(a.value) & vec_bufs
     }
     leaves = _collectives(body, tg_buffers) - set(alias)
     per_thread = _materialized(body, tg_buffers)
@@ -3262,7 +3345,9 @@ def elementize(
                 continue
             out += copies.take(s)
             roots = (
-                roots_of(_reads(s)) if not isinstance(s, (ast.For, ast.If)) else set()
+                roots_of(names_read(s))
+                if not isinstance(s, (ast.For, ast.If))
+                else set()
             )
             if len(roots) > 1:
                 raise _unsupported("an element-wise op on two cooperative MPP results")
@@ -3315,10 +3400,10 @@ def elementize(
                 )
             if id(s) not in chosen:
                 chosen[id(s)] = s
-                for r in _reads(s):
+                for r in names_read(s):
                     need(r)
 
-        for r in _reads(store_stmt):
+        for r in names_read(store_stmt):
             need(r)
         last: ast.AST = store_stmt
         if isinstance(store_stmt, ast.Expr) and _call_name(store_stmt.value) == PUT:
@@ -3345,7 +3430,7 @@ def elementize(
         ]
         loop_body.append(copy.deepcopy(store_stmt))
         iter_args: list[ast.expr] = [ast.Name(root, ast.Load())]
-        if any(_reads(s) & vec_bufs for s in chosen.values()):
+        if any(names_read(s) & vec_bufs for s in chosen.values()):
             # Barriers on each side: after the vector's staging writes, and
             # before the next writes to its tile.
             iter_args.append(ast.Constant(True))
@@ -3357,10 +3442,10 @@ def elementize(
         )
 
     result = _run_lane_loops_once(
-        process(body, []), set(alias), tensor_dtypes, tg_buffers
+        process(body, []), set(alias), tensor_dtypes, tg_buffers, tg_size
     )
-    # The planner gives a staged vector only update nodes as readers, which
-    # run in the update's element loop, between its barriers.
+    # The planner gives a staged vector only update and kept derived nodes
+    # as readers, which run in element loops, between their barriers.
     assert not _scalar_reads(result) & vec_bufs
     return result
 
@@ -3372,7 +3457,7 @@ def _scalar_reads(stmts: list[ast.stmt]) -> set[str]:
         if _is_elements(s):
             continue
         if isinstance(s, (ast.For, ast.If)):
-            out |= _reads(s.iter if isinstance(s, ast.For) else s.test)
+            out |= names_read(s.iter if isinstance(s, ast.For) else s.test)
             out |= _scalar_reads([*s.body, *s.orelse])
         elif (
             isinstance(s, ast.Expr)
@@ -3380,9 +3465,9 @@ def _scalar_reads(stmts: list[ast.stmt]) -> set[str]:
             and _call_name(s.value) == STAGE
         ):
             # A staging write names its tile; it doesn't read it.
-            out |= set().union(*map(_reads, s.value.args[1:]))
+            out |= set().union(*map(names_read, s.value.args[1:]))
         else:
-            out |= _reads(s)
+            out |= names_read(s)
     return out
 
 
@@ -3422,7 +3507,7 @@ def _dead_code(stmts: list[ast.stmt]) -> list[ast.stmt]:
     """Drop pure assignments nothing reads: the statements an element loop
     moved leave their originals' inputs dead."""
     while True:
-        live = set().union(*map(_reads, stmts))
+        live = set().union(*map(names_read, stmts))
         pruned = _prune(stmts, live)
         if pruned is None:
             return stmts
@@ -3470,7 +3555,7 @@ def _jam_lane_loop(loop: ast.For, coop: set[str]) -> LaneJam:
     def run_once(s: ast.stmt) -> set[str] | None:
         if isinstance(s, (ast.For, ast.If)) and not _is_elements(s):
             return None
-        return _reads(s) if _is_coop_stmt(s, coop) else None
+        return names_read(s) if _is_coop_stmt(s, coop) else None
 
     jam = LaneJam(loop, run_once)
     if carried := jam.carried():
@@ -3481,7 +3566,7 @@ def _jam_lane_loop(loop: ast.For, coop: set[str]) -> LaneJam:
     if reading := jam.lane_reading_units():
         raise _unsupported(
             "a cooperative MPP statement reads a lane-dependent name: "
-            f"{sorted(set().union(*map(_reads, reading)) & jam.dependent)}"
+            f"{sorted(set().union(*map(names_read, reading)) & jam.dependent)}"
         )
     return jam
 
@@ -3490,9 +3575,10 @@ def _split_schedulable(loop: ast.For, coop: set[str]) -> bool:
     """Whether ``_split_lane_loop`` takes the loop: one op directly in it,
     beside register statements, staging writes, fences and cooperative
     statements only, no accumulator seeded from a staged tile, which the
-    split would move ahead of the lanes that write the tile, and no lane fold
+    split would move ahead of the lanes that write the tile, no lane fold
     (``lane_reduction`` emits them directly in the loop), whose readers need
-    every lane of the same iteration folded first."""
+    every lane of the same iteration folded first, and no staged vector
+    written after the op (:func:`_vec_staged_after_op`)."""
     if sum(map(_is_run, loop.body)) != 1:
         return False
     for s in loop.body:
@@ -3513,7 +3599,25 @@ def _split_schedulable(loop: ast.For, coop: set[str]) -> bool:
             _is_run(s) or is_stage or _target(s) is not None or _is_coop_stmt(s, coop)
         ):
             return False
-    return True
+    return not _vec_staged_after_op(loop)
+
+
+def _is_vec_stage(s: ast.stmt) -> bool:
+    """Whether ``s`` writes a staged vector's tile."""
+    return (
+        isinstance(s, ast.Expr)
+        and isinstance(s.value, ast.Call)
+        and _call_name(s.value) == STAGE
+        and _node_name(s.value.args[0]).startswith(VEC_TILE)
+    )
+
+
+def _vec_staged_after_op(loop: ast.For) -> bool:
+    """Whether a staged vector's write follows the op: the split would move
+    it ahead of the op, before the lane-invariant statements after the op
+    that it may read, where the jam keeps body order."""
+    at = next(i for i, s in enumerate(loop.body) if _is_run(s))
+    return any(map(_is_vec_stage, loop.body[at + 1 :]))
 
 
 def _split_lane_loop(loop: ast.For, lane: str, coop: set[str]) -> list[ast.stmt]:
@@ -3548,7 +3652,7 @@ def _split_lane_loop(loop: ast.For, lane: str, coop: set[str]) -> list[ast.stmt]
     variant_names = {lane}
     read: set[str] = set()
     for s in others:
-        reads = _reads(s)
+        reads = names_read(s)
         read |= reads
         if (t := _target(s)) is not None and reads & variant_names:
             if t in read:
@@ -3563,23 +3667,186 @@ def _split_lane_loop(loop: ast.For, lane: str, coop: set[str]) -> list[ast.stmt]
     for i, s in enumerate(loop.body):
         if i == at:
             continue
-        if _reads(s) & variant_names:
+        if names_read(s) & variant_names:
             # The lane loop runs after every lane-invariant statement before
             # the op, an update's element loop among them, so a staged
-            # vector's writes must not vary per lane: its value is over M and
-            # N, and one that reads the K lane would be over K too.
-            assert not (
-                isinstance(s, ast.Expr)
-                and isinstance(s.value, ast.Call)
-                and _call_name(s.value) == STAGE
-                and _node_name(s.value.args[0]).startswith(VEC_TILE)
-            ), "a staged vector's tile written per lane of the op's K tile"
+            # vector's writes must not vary per lane: its value is over the
+            # tile's M or N blocks, not K, which it would be if it read the
+            # K lane.
+            assert not _is_vec_stage(s), (
+                "a staged vector's tile written per lane of the op's K tile"
+            )
             lanes.append(s)
         else:
             (before if i < at else after).append(s)
     if lanes:
         before.append(ast.For(loop.target, loop.iter, lanes, [], None))
     return [*before, loop.body[at], *after]
+
+
+def _defines(s: ast.AST) -> set[str]:
+    """The names a statement leaves assigned for the statements after it:
+    every name it assigns, nested bodies included, except inside an element
+    loop, whose definitions are private to it (as in :func:`names_read`)."""
+    if isinstance(s, ast.For) and _call_name(s.iter) == ELEMENTS:
+        return set()
+    if isinstance(s, ast.Name):
+        return {s.id} if isinstance(s.ctx, ast.Store) else set()
+    return set().union(*map(_defines, ast.iter_child_nodes(s)))
+
+
+def _loaded(s: ast.AST) -> set[str]:
+    """The names the pointers of a statement's ``tl.load`` calls read."""
+    return set().union(
+        *(names_read(load.args[0]) for node in ast.walk(s) if (load := _tl_load(node)))
+    )
+
+
+def _stmts(s: ast.stmt) -> list[ast.stmt]:
+    return [x for x in ast.walk(s) if isinstance(x, ast.stmt)]
+
+
+def _store_tensor(s: ast.stmt) -> str:
+    """The tensor a ``tl.store(tensor + offset, ...)`` writes."""
+    assert isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
+    ptr = s.value.args[0]
+    while isinstance(ptr, ast.BinOp):
+        ptr = ptr.left
+    return _node_name(ptr)
+
+
+def _distribute_lane_loop(
+    loop: ast.For, lane: str, coop: set[str]
+) -> list[ast.stmt] | None:
+    """Distribute a lane loop around a cooperative statement that reads no
+    lane-variant name (a ``:`` dim's lanes around the K loop that holds the
+    ops): each run of lane-variant statements between two cooperative
+    statements becomes a lane loop of its own, and every lane-invariant
+    statement runs once, in body order.  That is the jam's order
+    (:func:`_jam_lane_loop`) with each run's copies rolled back into a loop.
+
+    A statement is lane-variant if it reads or assigns a lane-dependent
+    name, and the lane-dependent names are the lane and, to a fixpoint,
+    every name a lane-variant statement assigns.  So ``s = 0.0`` starting a
+    per-row sum is lane-variant though it reads no lane; a device loop or an
+    ``if`` that assigns a per-lane name runs per lane, so every other name
+    it assigns is per lane too; and a lane fold's partial is lane-dependent,
+    so what reads it stays after the fold.  A lane-invariant statement then
+    reads and assigns no name a lane-variant one assigns, which is why it
+    may run once, ahead of a run's loop or between runs.  None
+    (the jam takes the loop) when a lane-variant statement holds a
+    cooperative op, assigns a name an earlier statement read (carried across
+    lanes), or a run reads a lane-variant name an earlier run assigned that
+    it can't recompute: only a name whose last assignment is call-free,
+    doesn't read its own target, and reads only such names that are
+    lane-variant is repeated.  Its inputs still hold the values it saw: a
+    lane-variant one reassigned later would be carried across lanes, and
+    the planner reads a lane-invariant name that a device loop reassigns
+    through an ``_mpp_snap`` copy.  Also None when a tensor the run stores
+    is touched by any other statement of the run, or is loaded by the
+    statement that stores it: the run's lanes go one after another, so one
+    lane's access would meet another lane's store in an order the jam,
+    which runs every lane's copy of a statement before the next, doesn't
+    have.  Within a run, a lane-invariant store of a tensor the run doesn't
+    touch moves after the run's loop, and a lane-invariant assignment moves
+    ahead of it when neither the run nor those deferred stores read the
+    name it assigns or store a tensor it reads."""
+    variant = {lane}
+    changed = True
+    while changed:
+        changed = False
+        for s in loop.body:
+            names = _defines(s)
+            if names - variant and (names_read(s) | names) & variant:
+                variant |= names
+                changed = True
+    flags = [bool((names_read(s) | _defines(s)) & variant) for s in loop.body]
+    read: set[str] = set()
+    for s, v in zip(loop.body, flags, strict=True):
+        if v and (_is_coop_stmt(s, coop) or _defines(s) & read):
+            return None
+        read |= names_read(s)
+    if not any(
+        not v and _is_coop_stmt(s, coop) for s, v in zip(loop.body, flags, strict=True)
+    ):
+        return None
+    pure: dict[str, ast.stmt] = {}
+    out: list[ast.stmt] = []
+    run: list[ast.stmt] = []
+    deferred: list[ast.stmt] = []
+
+    def repeat(names: set[str], have: set[str], prefix: list[ast.stmt]) -> bool:
+        for name in sorted(names - have - {lane}):
+            d = pure.get(name)
+            if d is None or not repeat(names_read(d) & variant, have, prefix):
+                return False
+            have.add(name)
+            prefix.append(copy.deepcopy(d))
+        return True
+
+    def stored(ss: list[ast.stmt]) -> set[str]:
+        return {_store_tensor(x) for s in ss for x in _stmts(s) if _is_store(x)}
+
+    def loaded(ss: list[ast.stmt]) -> set[str]:
+        return set().union(*map(_loaded, ss))
+
+    def close() -> bool:
+        nonlocal run, deferred
+        effects = [s for s in run if _target(s) not in pure]
+        if effects:
+            have = set().union(*map(_defines, run))
+            prefix: list[ast.stmt] = []
+            if not repeat(set().union(*map(names_read, run)) & variant, have, prefix):
+                return False
+            out.append(ast.For(loop.target, loop.iter, [*prefix, *run], [], None))
+        out.extend(deferred)
+        run, deferred = [], []
+        return True
+
+    for s, v in zip(loop.body, flags, strict=True):
+        written = _defines(s)
+        for name in written & pure.keys():
+            del pure[name]
+        if v:
+            if {_store_tensor(d) for d in deferred} & names_read(s):
+                return None  # a deferred store's tensor read later in the run
+            if stored([s]) & (_loaded(s) | loaded(run) | stored(run)) or (
+                _loaded(s) & stored(run)
+            ):
+                return None  # its lanes would see each other's stores
+            run.append(s)
+            assigned = _assigned(s)
+            if (
+                assigned is not None
+                and assigned[0] not in names_read(assigned[1])
+                and not any(isinstance(x, ast.Call) for x in ast.walk(assigned[1]))
+            ):
+                pure[assigned[0]] = s
+        elif (
+            run
+            and not _is_coop_stmt(s, coop)
+            and (assigned := _assigned(s)) is not None
+            and assigned[0] not in set().union(*map(names_read, [*run, *deferred]))
+            and not names_read(s) & stored([*run, *deferred])
+        ):
+            # Ahead of the run's loop and the stores deferred after it: none
+            # of them reads what it assigns or stores to a tensor it reads.
+            out.append(s)
+        elif (
+            run
+            and _is_store(s)
+            and _store_tensor(s) not in set().union(*map(names_read, run))
+        ):
+            # A store holds no load: Helion lifts each load into an assignment
+            # of its own, which the rule above checks.
+            deferred.append(s)
+        else:
+            if not close():
+                return None
+            out.append(s)
+    if not close():
+        return None
+    return out
 
 
 def _is_lane_loop(s: ast.stmt) -> TypeGuard[ast.For]:
@@ -3604,14 +3871,14 @@ def _tl_load(node: ast.AST) -> ast.Call | None:
     return None
 
 
-def _load_mask_other(load: ast.Call) -> tuple[ast.expr, ast.expr]:
-    """The mask and fill value of ``tl.load(ptr, mask, other=...)``.  Helion
-    masks every lane-loop load it emits, extents that divide their blocks
-    included."""
+def _load_mask_other(load: ast.Call) -> tuple[ast.expr, ast.expr] | None:
+    """The mask and fill value of ``tl.load(ptr, mask, other=...)``, or None
+    for an unmasked load."""
     mask = load.args[1]
+    if isinstance(mask, ast.Constant) and mask.value is None:
+        return None
     other = load.args[2] if len(load.args) > 2 else None
     other = next((k.value for k in load.keywords if k.arg == "other"), other)
-    assert not (isinstance(mask, ast.Constant) and mask.value is None)
     assert other is not None
     return mask, other
 
@@ -3643,8 +3910,8 @@ def _loads_first_all(
     def walk(ss: list[ast.stmt], in_lane: bool) -> list[ast.stmt]:
         out: list[ast.stmt] = []
         for s in ss:
-            if any(s is loop for loop in split):
-                assert isinstance(s, ast.For) and not in_lane
+            if not in_lane and any(s is loop for loop in split):
+                assert isinstance(s, ast.For)
                 out += _loads_first(s, coop, tensor_dtypes, tg_buffers, names)
                 continue
             if isinstance(s, (ast.For, ast.While, ast.If)) and not _is_elements(s):
@@ -3707,15 +3974,15 @@ def _loads_first(
         ptr = load.args[0]
         assert isinstance(ptr, ast.BinOp) and isinstance(ptr.left, ast.Name)
         tensor = ptr.left.id
-        assert not _reads(load) & tg_buffers
-        pending = sorted(_reads(load) & defs.keys())
+        assert not names_read(load) & tg_buffers
+        pending = sorted(names_read(load) & defs.keys())
         while pending:
             j = defs[pending.pop()]
             if j in slice_ or j in moved:
                 continue
-            assert j < i and not _reads(body[j]) & (coop | tg_buffers)
+            assert j < i and not names_read(body[j]) & (coop | tg_buffers)
             slice_.add(j)
-            pending += sorted(_reads(body[j]) & defs.keys())
+            pending += sorted(names_read(body[j]) & defs.keys())
         if budget.take(tensor_dtypes[tensor]):
             moved[i] = next(names)
             decls.append(
@@ -3742,12 +4009,17 @@ def _loads_first(
             s,
             statement_from_string(f"_metal_lane_put({array}, {lane}, {name})"),
         ]
-        mask, other = _load_mask_other(load)
+        read = f"_metal_lane_get({array}, {lane})"
+        masked = _load_mask_other(load)
+        if masked is None:
+            second.append(statement_from_string(f"{name} = {read}"))
+            continue
+        mask, other = masked
         # The array holds ``mask ? x : other``; the select keeps the load's
         # own MSL type.
         second.append(
             statement_from_string(
-                f"{name} = _metal_lane_get({array}, {lane}) if {{mask}} else {{other}}",
+                f"{name} = {read} if {{mask}} else {{other}}",
                 mask=copy.deepcopy(mask),
                 other=copy.deepcopy(other),
             )
@@ -3759,11 +4031,249 @@ def _loads_first(
     ]
 
 
+class _Replicas:
+    """The threads that hold the same staged elements, for dealing a staging
+    lane loop's lanes out over them.
+
+    A staged operand's dims are its group's blocks, so threads that differ
+    only on another block's thread axis compute the same elements, and the
+    owner test of :func:`_stage_writes` lets the one at 0 write them.  In a
+    lane loop over a ``:`` dim, which holds no threads, that one thread
+    walks every lane while the others wait at the op's barrier (attention's
+    ``q * qk_scale`` over the head dim, idle on every N thread).
+    :meth:`spread` gives each of them every n-th lane instead."""
+
+    def __init__(
+        self,
+        body: list[ast.stmt],
+        tg_size: Sequence[int] | None,
+        tg_buffers: frozenset[str],
+    ) -> None:
+        self.tg_size = tg_size
+        self.tg_buffers = tg_buffers
+        #: Each binding of a name: the value it reads (``None``: it may vary
+        #: on every axis) and the tests and loop ranges it runs under.
+        self.bindings: list[tuple[str, ast.expr | None, tuple[ast.expr, ...]]] = []
+        self._collect(body, ())
+        self.seen = {n.id for s in body for n in ast.walk(s) if isinstance(n, ast.Name)}
+        #: The thread axes each name's value may vary on, over every binding
+        #: of the name.  A name the body reads but never binds is a kernel
+        #: parameter, a launch constant, ``tgid``, a threadgroup buffer or a
+        #: helper (``metal_jit._generate_msl`` declares nothing else), each
+        #: the same on every thread of the threadgroup.  A name not in the
+        #: body at all was made after it, by splicing (a lane jam's
+        #: ``t_1__lane0``), and :meth:`reads_axes` lets it vary on every axis.
+        self.axes: dict[str, set[int]] = {}
+        changed = True
+        while changed:
+            changed = False
+            for name, value, control in self.bindings:
+                axes = {0, 1, 2} if value is None else self.value_axes(value)
+                for c in control:
+                    axes |= self.value_axes(c)
+                if not axes <= self.axes.get(name, set()):
+                    self.axes[name] = self.axes.get(name, set()) | axes
+                    changed = True
+
+    def _collect(self, stmts: list[ast.stmt], control: tuple[ast.expr, ...]) -> None:
+        for s in stmts:
+            if isinstance(s, ast.For) and _call_name(s.iter) == ELEMENTS:
+                # The walker emits an element loop as an isolated scope
+                # (``MslWalkerState.isolated_scope``): each of its bindings
+                # declares a new variable that nothing after the loop sees.
+                continue
+            if isinstance(s, (ast.If, ast.While, ast.For)):
+                header = s.iter if isinstance(s, ast.For) else s.test
+                if isinstance(s, ast.For):
+                    for t in ast.walk(s.target):
+                        if isinstance(t, ast.Name):
+                            self.bindings.append((t.id, s.iter, control))
+                self._bind_every_store(header, None, control)
+                self._collect([*s.body, *s.orelse], (*control, header))
+                continue
+            target: ast.expr | None = None
+            if (assigned := _assigned(s)) is not None:
+                target = cast("ast.Assign", s).targets[0]
+                self.bindings.append((*assigned, control))
+            elif isinstance(s, ast.AugAssign) and isinstance(s.target, ast.Name):
+                target = s.target
+                self.bindings.append((s.target.id, s.value, control))
+            self._bind_every_store(s, target, control)
+
+    def _bind_every_store(
+        self, node: ast.AST, modelled: ast.expr | None, control: tuple[ast.expr, ...]
+    ) -> None:
+        """Bind every name *node* stores other than *modelled*, and the base
+        name of every subscript or attribute it stores, to a value that may
+        vary on every axis."""
+        for t in ast.walk(node):
+            if isinstance(t, (ast.Subscript, ast.Attribute)) and isinstance(
+                t.ctx, ast.Store
+            ):
+                base = t.value
+                while isinstance(base, (ast.Subscript, ast.Attribute)):
+                    base = base.value
+                if isinstance(base, ast.Name):
+                    self.bindings.append((base.id, None, control))
+            elif isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store):
+                if t is not modelled:
+                    self.bindings.append((t.id, None, control))
+
+    def value_axes(self, node: ast.expr) -> set[int]:
+        """The thread axes the value of *node* may vary on: every axis for a
+        value that exchanges data between threads, else :meth:`reads_axes`."""
+        if _cross_thread(node, self.tg_buffers):
+            return {0, 1, 2}
+        return self.reads_axes(node)
+
+    def reads_axes(self, node: ast.AST) -> set[int]:
+        """The thread axes the values *node* reads may vary on: ``tid[a]``
+        varies on ``a``; a whole ``tid``, and a name not in the analysed
+        body, on every axis."""
+        axes: set[int] = set()
+        indexed: set[int] = set()
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Subscript)
+                and isinstance(sub.value, ast.Name)
+                and sub.value.id == "tid"
+                and isinstance(sub.slice, ast.Constant)
+            ):
+                axes.add(ast.literal_eval(sub.slice))
+                indexed.add(id(sub.value))
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                if sub.id == "tid":
+                    if id(sub) not in indexed:
+                        axes |= {0, 1, 2}
+                elif sub.id in self.seen:
+                    axes |= self.axes.get(sub.id, set())
+                else:
+                    axes |= {0, 1, 2}
+        return axes
+
+    def uniform(self, node: ast.AST) -> bool:
+        """Whether every thread computes the same *node*."""
+        return not self.reads_axes(node)
+
+    def owner_axes(self, name: str) -> tuple[int, ...] | None:
+        """The axes *name* pins to 0 when its only binding is an owner test
+        of :func:`_stage_writes`, ``tid[a] == 0 and ...``; else ``None``."""
+        values = [v for n, v, _ in self.bindings if n == name]
+        if len(values) != 1 or values[0] is None:
+            return None
+        axes: list[int] = []
+        for term in _conjuncts(values[0]):
+            if not (
+                isinstance(term, ast.Compare)
+                and len(term.ops) == 1
+                and isinstance(term.ops[0], ast.Eq)
+                and isinstance(term.left, ast.Subscript)
+                and isinstance(term.left.value, ast.Name)
+                and term.left.value.id == "tid"
+                and isinstance(term.left.slice, ast.Constant)
+                and isinstance(term.comparators[0], ast.Constant)
+                and term.comparators[0].value == 0
+            ):
+                return None
+            axes.append(ast.literal_eval(term.left.slice))
+        return tuple(axes)
+
+    def spread(self, loop: ast.For) -> ast.For:
+        """*loop*, a lane loop every thread reaches, with its lanes dealt out
+        over the threads of the one axis of more than one thread that its
+        staging writes pin to 0: thread ``t`` of that axis runs lanes ``t``,
+        ``t + n``, ..., so each lane still runs on exactly one thread and
+        each element is still written once.  Only when the body is register
+        work and such writes, all pinned to the same axes by an owner test
+        that is their predicate's last term, each at an index that reads the
+        lane (a flat tile index, distinct per lane), no lane reads a name an
+        earlier lane assigned (no name is read before or by its assignment),
+        and nothing in it but that test varies on that axis; else *loop*
+        itself."""
+        extent = loop.iter
+        assert isinstance(extent, ast.Call)
+        if self.tg_size is None or not (
+            len(extent.args) == 1 and isinstance(extent.args[0], ast.Constant)
+        ):
+            return loop
+        per_lane = {cast("ast.Name", loop.target).id}
+        pinned: set[tuple[int, ...]] = set()
+        read: set[str] = set()
+        for s in loop.body:
+            read |= names_read(s)
+            if (assigned := _assigned(s)) is not None:
+                if _cross_thread(assigned[1], self.tg_buffers) or assigned[0] in read:
+                    return loop
+                if names_read(assigned[1]) & per_lane:
+                    per_lane.add(assigned[0])
+                else:
+                    per_lane.discard(assigned[0])
+            elif isinstance(s, ast.Expr) and _call_name(s.value) == STAGE:
+                call = cast("ast.Call", s.value)
+                axes = ast.literal_eval(call.args[4])
+                owner = _conjuncts(call.args[3])[-1]
+                if not (
+                    isinstance(owner, ast.Name)
+                    and self.owner_axes(owner.id) == axes
+                    and names_read(call.args[1]) & per_lane
+                    and not any(
+                        _cross_thread(a, self.tg_buffers) for a in call.args[1:4]
+                    )
+                ):
+                    return loop
+                pinned.add(axes)
+            else:
+                return loop
+        if len(pinned) != 1:
+            return loop
+        axes = [a for a in pinned.pop() if self.tg_size[a] > 1]
+        if len(axes) != 1:
+            return loop
+        (axis,) = axes
+        body: list[ast.stmt] = []
+        for s in loop.body:
+            s = copy.deepcopy(s)
+            if isinstance(s, ast.Expr) and _call_name(s.value) == STAGE:
+                call = cast("ast.Call", s.value)
+                *terms, _owner = _conjuncts(call.args[3])
+                call.args[3] = (
+                    ast.BoolOp(ast.And(), terms)
+                    if len(terms) > 1
+                    else terms[0]
+                    if terms
+                    else ast.Constant(True)
+                )
+                call.args[4] = ast.Tuple([], ast.Load())
+            if axis in self.reads_axes(s):
+                return loop
+            body.append(s)
+        n = self.tg_size[axis]
+        return ast.For(
+            loop.target,
+            cast(
+                "ast.expr",
+                expr_from_string(f"range(tid[{axis}], {extent.args[0].value}, {n})"),
+            ),
+            body,
+            [],
+            None,
+        )
+
+
+def _conjuncts(test: ast.expr) -> list[ast.expr]:
+    """The terms of an ``and`` chain."""
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return [t for v in test.values for t in _conjuncts(v)]
+    return [test]
+
+
 def _run_lane_loops_once(
     stmts: list[ast.stmt],
     coop: set[str],
     tensor_dtypes: Mapping[str, torch.dtype],
     tg_buffers: frozenset[str],
+    tg_size: Sequence[int] | None,
 ) -> list[ast.stmt]:
     """Splice in the body of each lane loop that holds a cooperative
     statement: the op reads its whole tile from memory, so the loop's lanes
@@ -3771,9 +4281,12 @@ def _run_lane_loops_once(
     per iteration of the enclosing loop, as in Helion's semantics.  A lane
     loop holding the op directly beside lane-variant register and staging
     work only (the op's own K tile, whose lanes compute a staged operand) is
-    split at the op.  Any other loop that reads its lane is jammed across its
-    lanes (``_jam_lane_loop``), at most ``MAX_LANE_COPIES`` copies of a
-    statement deep."""
+    split at the op.  A loop distributed around the op
+    (``_distribute_lane_loop``) has each staging run's lanes dealt out over
+    the threads that hold the same elements (``_Replicas.spread``) where
+    every thread reaches it.  Any other loop that reads its lane is jammed
+    across its lanes (``_jam_lane_loop``), at most ``MAX_LANE_COPIES``
+    copies of a statement deep."""
 
     jammed: set[str] = set()
     copies_of: dict[int, int] = {}
@@ -3788,20 +4301,29 @@ def _run_lane_loops_once(
         return best
 
     split: list[ast.For] = []
+    replicas = _Replicas(stmts, tg_size, tg_buffers)
 
-    def splice(ss: list[ast.stmt]) -> list[ast.stmt]:
+    def splice(ss: list[ast.stmt], uniform: bool = True) -> list[ast.stmt]:
+        """*uniform*: every thread of the threadgroup runs ``ss``."""
         out: list[ast.stmt] = []
         for s in ss:
             if isinstance(s, ast.For) and _call_name(s.iter) != ELEMENTS:
-                s.body = splice(s.body)
+                s.body = splice(s.body, uniform and replicas.uniform(s.iter))
                 if _is_lane_loop(s) and any(_is_coop_stmt(x, coop) for x in s.body):
                     lane = cast("ast.Name", s.target).id
-                    if not any(lane in _reads(x) for x in s.body):
+                    if not any(lane in names_read(x) for x in s.body):
                         out.extend(s.body)
                     elif _split_schedulable(s, coop):
                         parts = _split_lane_loop(s, lane, coop)
                         split.extend(p for p in parts if _is_lane_loop(p))
                         out += parts
+                    elif (
+                        distributed := _distribute_lane_loop(s, lane, coop)
+                    ) is not None:
+                        out += [
+                            replicas.spread(x) if uniform and _is_lane_loop(x) else x
+                            for x in distributed
+                        ]
                     else:
                         n = const_extent(s) * copies(s.body)
                         if n > MAX_LANE_COPIES:
@@ -3816,14 +4338,15 @@ def _run_lane_loops_once(
                         out += body
                     continue
             elif isinstance(s, ast.If):
-                s.body = splice(s.body)
-                s.orelse = splice(s.orelse)
+                inner = uniform and replicas.uniform(s.test)
+                s.body = splice(s.body, inner)
+                s.orelse = splice(s.orelse, inner)
             out.append(s)
         return out
 
     result = _loads_first_all(
         splice(_dead_code(stmts)), split, coop, tensor_dtypes, tg_buffers
     )
-    leaked = jammed & set().union(*map(_reads, result))
+    leaked = jammed & set().union(*map(names_read, result))
     assert not leaked, f"lane-dependent names read outside their copies: {leaked}"
     return result

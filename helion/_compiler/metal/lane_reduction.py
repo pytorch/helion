@@ -70,6 +70,7 @@ from ..tile_strategy import _clone_lane_loop_with_body
 from ..tile_strategy import _current_rename_groups
 from ..tile_strategy import _merge_carried_names
 from . import mpp_matmul
+from .backend import budget_note
 from .lane_fold import LANE_FOLD
 from .lane_fold import LaneArrayBudget
 from .msl_reduction import SUPPORTED_REDUCTIONS
@@ -360,6 +361,7 @@ def _lane_body(
             raise _unsupported(
                 "lane reduction beside a statement the split cannot schedule: "
                 + ast.unparse(stmt).partition("\n")[0]
+                + budget_note()
             )
     stored: set[str] = set()
     loaded: set[str] = set()

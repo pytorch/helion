@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import textwrap
 from typing import TYPE_CHECKING
 import unittest
 from unittest.mock import patch
@@ -52,6 +53,13 @@ _requires_mps = unittest.skipUnless(
     sys.platform == "darwin" and torch.backends.mps.is_available(),
     "requires a Metal GPU",
 )
+
+
+def _full_threadgroup(test: Callable[..., None]) -> Callable[..., None]:
+    """For a test that pins the layout of a full 1024-thread threadgroup:
+    configs that leave ``num_warps`` unset take 32 instead of the default 4,
+    whose 128-thread budget walks more of each block in lanes."""
+    return patch("helion.autotuner.config_spec.DEFAULT_NUM_WARPS", 32)(test)
 
 
 def _run(
@@ -4065,6 +4073,7 @@ class TestMppMatmul(_MppCase):
             _close(out, ref)
             self._assert_mpp(code)
             self.assertNotIn("_mpp_mat", msl)
+            self.assertNotIn("_mpp_vec", msl)
 
     def test_transposed_operands(self) -> None:
         x = torch.randn(48, 72, device=DEVICE, dtype=torch.float16)
@@ -4300,6 +4309,7 @@ class TestMppMatmulRejects(_MppCase):
             batch_threaded, (self.x, self.y, tag), config, "is spread over threads"
         )
 
+    @_full_threadgroup
     def test_launch(self) -> None:
         message = "needs whole 32-thread SIMD groups and at most 1024 threads"
         self._rejects(sibling17, (self.x, self.y, self.bias), None, message)
@@ -4505,6 +4515,7 @@ class TestMppStaging(_MppCase):
                 _close(out, _mm(torch.where(rows, a, 0), rhs))
                 self._assert_staged(msl, "float", tiles=2)
 
+    @_full_threadgroup
     def test_staged_addmm_operands(self) -> None:
         """Computed, gathered and N-D operands of torch.addmm, beside views
         that are NaN past K (a K tail of 72 % 16 = 8), with K on threads and
@@ -4576,6 +4587,7 @@ class TestMppStaging(_MppCase):
         (write,) = [line for line in msl.splitlines() if "{ _mpp_tile[" in line]
         self.assertEqual(len(re.findall(r"- offset_\d+\) < 16\)", write)), 2)
 
+    @_full_threadgroup
     def test_non_view_operands(self) -> None:
         """Operands that are not device views are staged: masks
         that aren't ``index < bound`` on the load's own index, per-row or
@@ -4654,7 +4666,7 @@ class TestMppStaging(_MppCase):
         q = torch.randn(48, 128, device=DEVICE, dtype=bf)
         k = torch.randn(40, 128, device=DEVICE, dtype=bf)
         q0 = q.clone()
-        jam32 = helion.Config(block_sizes=[64, 16], num_threads=[2, 8])
+        jam32 = helion.Config(block_sizes=[64, 16], num_threads=[2, 8], num_warps=32)
         jams = (None, JAM64)
         for kernel, args, configs, expected in (
             (kloop_load_exp, (x, y), jams, ref(torch.exp(xf * 0.5))),
@@ -4666,10 +4678,20 @@ class TestMppStaging(_MppCase):
             (
                 kloop_block_size,
                 (x, y),
-                (helion.Config(block_sizes=[64, 16, 16]), JAM64),
+                (helion.Config(block_sizes=[64, 16, 16], num_warps=32), JAM64),
                 ref(xf + 16),
             ),
-            (dem_colon_inv, (q, k), (None, jam32), _mm(q0, k.T)),
+            (
+                dem_colon_inv,
+                (q, k),
+                (
+                    helion.Config(
+                        block_sizes=[32, 32], num_threads=[8, 8], num_warps=32
+                    ),
+                    jam32,
+                ),
+                _mm(q0, k.T),
+            ),
         ):
             for config in configs:
                 with self.subTest(kernel=kernel.name, config=config):
@@ -4905,20 +4927,23 @@ class TestMppFloatStaging(_FloatStagingCase):
         ):
             self._check(kernel, args, configs, expected)
 
+    @_full_threadgroup
     def test_colon_forms(self) -> None:
         """Ops over a ':' M, N or K: a staged rhs over the N loop's own tile
         from a column loaded or computed before the loop, a carry in an
         hl.grid loop, a row loaded before the K loop, and one loaded before
         the N loop, with no conversion."""
         bf = torch.bfloat16
+        # The tiles on 8 x 8 threads leave the ':' dim 16 of 1024.
+        tiles8 = helion.Config(block_sizes=[32, 32], num_threads=[8, 8], num_warps=32)
         q = torch.randn(48, 128, device=DEVICE, dtype=bf)
         k = torch.randn(40, 128, device=DEVICE, dtype=bf)
         self._check(
             nest_written,
             (q, k),
             (
-                helion.Config(block_sizes=[16, 16], num_threads=[16, 16]),
-                helion.Config(block_sizes=[32, 16], num_threads=[2, 16]),
+                helion.Config(block_sizes=[16, 16], num_threads=[16, 16], num_warps=32),
+                helion.Config(block_sizes=[32, 16], num_threads=[2, 16], num_warps=32),
             ),
             lambda _: 2 * (_d(q) @ _d(k).T),
         )
@@ -4928,7 +4953,7 @@ class TestMppFloatStaging(_FloatStagingCase):
             self._check(
                 kernel,
                 (q, c, cols),
-                (None,),
+                (tiles8,),
                 lambda _, s=scale: (_d(q) @ _bf(c * s))[:, None].expand(48, 40),
             )
         x64 = torch.randn(48, 64, device=DEVICE, dtype=bf)
@@ -4943,14 +4968,17 @@ class TestMppFloatStaging(_FloatStagingCase):
         self._check(
             kb_colon_n_lhs,
             (x, y, d),
-            (None, helion.Config(block_sizes=[128, 16], num_threads=[2, 2])),
+            (
+                None,
+                helion.Config(block_sizes=[128, 16], num_threads=[2, 2], num_warps=32),
+            ),
             lambda _: self._rows(d),
         )
         e = torch.randn(128, device=DEVICE)
         self._check(
             kb_colon_n_rhs,
             (x, e),
-            (None,),
+            (tiles8,),
             lambda _: _d(x).sum(1)[:, None] * _bf(e)[None, :],
         )
         xm = torch.randn(64, 72, device=DEVICE, dtype=bf)
@@ -4961,8 +4989,8 @@ class TestMppFloatStaging(_FloatStagingCase):
             (xm, ym, dm),
             (
                 None,
-                helion.Config(block_sizes=[128, 32], num_threads=[1, 2]),
-                helion.Config(block_sizes=[64, 32], num_threads=[1, 1]),
+                helion.Config(block_sizes=[128, 32], num_threads=[1, 2], num_warps=32),
+                helion.Config(block_sizes=[64, 32], num_threads=[1, 1], num_warps=32),
             ),
             lambda _: _bf(dm)[:, None] * _d(ym).sum(0),
         )
@@ -5053,6 +5081,7 @@ class TestMppFloatStaging(_FloatStagingCase):
                     equal_nan=True,
                 )
 
+    @_full_threadgroup
     def test_planned_nodes_on_the_path(self) -> None:
         """Nodes the plan holds by identity on the way from a conversion to
         the operand: the rewrite's copy of a fenced gather keeps its barrier,
@@ -5388,6 +5417,7 @@ class TestMppConversions(unittest.TestCase):
             if fenced is not None:
                 self.assertTrue(_fenced(msl, fenced), msl)
 
+    @_full_threadgroup
     def test_row_reductions(self) -> None:
         """Row reductions of the result, after the K loop and in it."""
         y = torch.randn(72, 64, device=DEVICE, dtype=torch.float16)
@@ -5424,6 +5454,7 @@ class TestMppConversions(unittest.TestCase):
                 layouts=(1, 1, 0),
             )
 
+    @_full_threadgroup
     def test_mixed_uses(self) -> None:
         """A value an element loop computes beside one in the Scalar layout:
         a use of a value that leaves the element loop leaves it too, and so
@@ -5483,6 +5514,7 @@ class TestMppConversions(unittest.TestCase):
                 layouts=(1, 1, 0),
             )
 
+    @_full_threadgroup
     def test_operands_no_thread_recomputes(self) -> None:
         """Epilogue operands that are per-element or per-row carries."""
         x, y, c, cd, rt = self.x, self.y, self.c, self.cd, self.rt
@@ -5656,6 +5688,7 @@ class TestMppConversions(unittest.TestCase):
                     _close(s, 2 * s_src.cpu().double())
                     self.assertNotIn("mem_flags::mem_device", msl)
 
+    @_full_threadgroup
     def test_scalar_seeds(self) -> None:
         """Seeds loaded or computed before the K loop, broadcast, read after
         it, shared by two loops, or another K loop's result."""
@@ -5736,11 +5769,13 @@ class TestMppConversions(unittest.TestCase):
         for config in (TILE16, TILE32):
             self._check(perm_store, (self.x, self.y), config, (None, self.rt.T))
 
+    @_full_threadgroup
     def test_store_under_tensor_if(self) -> None:
         """A store of a materialized value under a per-element if."""
         ref = torch.where(self.cd > 0, self.rt + 5 * self.cd, 0.0)
         self._check(tif_mat, (self.x, self.y, self.c), TILE16, (None, ref))
 
+    @_full_threadgroup
     def test_uses_at_reduced_values(self) -> None:
         """A store index or mask, or an epilogue load's index or mask, that a
         row reduction computes: an element loop at another thread's element
@@ -5761,6 +5796,7 @@ class TestMppConversions(unittest.TestCase):
             ):
                 self._check(kernel, args, config, (None, ref), layouts=(0, 1, 0))
 
+    @_full_threadgroup
     def test_surplus_threads(self) -> None:
         """A wider sibling's surplus threads have no element of the
         materialization: the read bounds N's local index by its block, 16,
@@ -5873,6 +5909,7 @@ class TestMppConversionRejects(_MppCase):
             "loop's body",
         )
 
+    @_full_threadgroup
     def test_backstop(self) -> None:
         """An element loop that would read a thread's own element of a
         materialization raises, here with each planner rule that prevents it
@@ -6447,14 +6484,16 @@ class TestMppRootAddmmRejects(_MppCase):
         self._rejects(
             root_plain,
             (x, y),
-            helion.Config(block_sizes=[32, 32, 16], num_threads=[1, 1, 0]),
+            helion.Config(
+                block_sizes=[32, 32, 16], num_threads=[1, 1, 0], num_warps=32
+            ),
             msg,
         )
         self._rejects(
             root_beside_sum,
             (x, y),
             helion.Config(
-                block_sizes=[16, 16, 16, 32], num_threads=[0, 1, 0, 0], num_warps=32
+                block_sizes=[16, 16, 16, 32], num_threads=[0, 1, 1, 1], num_warps=32
             ),
             msg,
         )
@@ -7799,8 +7838,10 @@ K_LANES = helion.Config(block_sizes=[16, 16, 32], num_threads=[16, 16, 4])
 class TestMppLaneJam(unittest.TestCase):
     """A lane loop that holds a cooperative op and Scalar work reading its
     lane, other than the op's own K tile beside register and staging work,
-    runs jammed across its lanes: each cooperative statement once where it
-    stands, the Scalar work once per lane, in body order."""
+    runs each cooperative statement once where it stands and the Scalar work
+    once per lane, in body order: jammed across its lanes, or distributed
+    into one rolled lane loop per run of that work
+    (``TestMppLaneDistribution``)."""
 
     def setUp(self) -> None:
         torch.manual_seed(0)
@@ -7819,15 +7860,19 @@ class TestMppLaneJam(unittest.TestCase):
         runs: int = 1,
     ) -> None:
         """Run ``kernel`` and compare each ``(got, ref)``: a tensor argument
-        the kernel writes, or the index of one of its outputs.  A jammed
-        kernel has lane copies and still one ``run`` per op."""
+        the kernel writes, or the index of one of its outputs.  The lanes
+        run as copies or rolled loops beside one ``run`` per op, which no
+        lane loop encloses."""
         with self.subTest(kernel=kernel.name, config=config):
             out, _, msl = _run(kernel, args, config)
             outs = out if isinstance(out, tuple) else (out,)
             for got, ref in refs:
                 _close(outs[got] if isinstance(got, int) else got, ref)
-            self.assertIn("__lane1", msl)
+            self.assertRegex(msl, r"__lane1|for \(int lane_\d+ = 0")
             self.assertEqual(msl.count(".run("), runs)
+            for match in re.finditer(r"\.run\(", msl):
+                loops = _open_loops(msl, match.start())
+                self.assertFalse([h for h in loops if "lane_" in h.split("=")[0]])
 
     def test_scalar_work_beside_the_op(self) -> None:
         """Side stores, materialized epilogues, Scalar seeds and per-row
@@ -7837,8 +7882,12 @@ class TestMppLaneJam(unittest.TestCase):
         bias = torch.randn(40, device=DEVICE)
         for config in (
             M_LANES,
-            helion.Config(block_sizes=[64, 32, 16], num_threads=[16, 8, 1]),
-            helion.Config(block_sizes=[64, 64, 16], num_threads=[16, 16, 1]),
+            helion.Config(
+                block_sizes=[64, 32, 16], num_threads=[16, 8, 1], num_warps=32
+            ),
+            helion.Config(
+                block_sizes=[64, 64, 16], num_threads=[16, 16, 1], num_warps=32
+            ),
         ):
             self._check(side_store, (x, y, z), config, (0, rt), (1, zd + 1))
         self._check(root_scaled, (x, y, 0.5), M_LANES, (0, rt * 0.5))
@@ -7859,7 +7908,9 @@ class TestMppLaneJam(unittest.TestCase):
         t = torch.zeros(49, 40, device=DEVICE)
         zd = self.z.cpu().double()
         ref = torch.cat([zd[1:] * 2, torch.zeros(1, 40, dtype=torch.float64)])
-        config = helion.Config(block_sizes=[64, 32, 16], num_threads=[1, 32, 1])
+        config = helion.Config(
+            block_sizes=[64, 32, 16], num_threads=[1, 32, 1], num_warps=32
+        )
         self._check(
             next_row, (self.x, self.y, self.z, t), config, (0, self.rt), (1, ref)
         )
@@ -7920,14 +7971,16 @@ class TestMppLaneJam(unittest.TestCase):
         x, y = self.x.half(), self.y.half()
         y64 = torch.randn(72, 64, device=DEVICE, dtype=torch.float16)
         for config in (
-            helion.Config(block_sizes=[16, 16], num_threads=[8, 1]),
-            helion.Config(block_sizes=[32, 16], num_threads=[16, 1]),
+            helion.Config(block_sizes=[16, 16], num_threads=[8, 1], num_warps=32),
+            helion.Config(block_sizes=[32, 16], num_threads=[16, 1], num_warps=32),
         ):
             self._check(row_sum_after, (x, y64), config, (0, _mm(x, y64).sum(-1)))
         self._check(
             root_scaled,
             (self.x, self.y, 0.5),
-            helion.Config(block_sizes=[32, 32, 32], num_threads=[1, 0, 1]),
+            helion.Config(
+                block_sizes=[32, 32, 32], num_threads=[1, 0, 1], num_warps=32
+            ),
             (0, self.rt * 0.5),
         )
         cp = torch.zeros(48, 72, device=DEVICE, dtype=torch.float16)
@@ -8046,25 +8099,19 @@ class TestMppLaneJamRejects(_MppCase):
         )
 
     def test_copies(self) -> None:
-        """Past 64 copies of a statement per thread, one jam's or nested
-        jams' product."""
-        xs, ys = self.xs, self.ys
-        args = (
-            xs,
-            ys,
-            torch.randn(64, 64, device=DEVICE),
-            torch.randn(64, device=DEVICE),
-        )
+        """Past 64 copies of a statement per thread: 128 row lanes around an
+        op whose readback a rolled run can't order."""
         self._rejects(
-            colon_seed_epi,
-            args,
-            helion.Config(block_sizes=[64, 64]),
-            "would run 256 copies of its Scalar work per thread (max 64)",
-        )
-        self._rejects(
-            two_ops_staged,
-            (self.x, self.y),
-            helion.Config(block_sizes=[64, 16, 32], num_threads=[16, 16, 1]),
+            readback,
+            (
+                self.x,
+                self.y,
+                torch.randn(40, device=DEVICE),
+                torch.zeros(48, 40, device=DEVICE),
+            ),
+            helion.Config(
+                block_sizes=[128, 32, 16], num_threads=[1, 32, 1], num_warps=32
+            ),
             "would run 128 copies of its Scalar work per thread (max 64)",
         )
 
@@ -8702,6 +8749,7 @@ class TestMppColonSlices(unittest.TestCase):
             for pattern in absent:
                 self.assertNotRegex(msl, pattern)
 
+    @_full_threadgroup
     def test_staged_colon_k(self) -> None:
         """Computed operands and seeds over a ':' K at the root or under an
         ``if``, with a K tail past a non-power-of-two K."""
@@ -8734,7 +8782,7 @@ class TestMppColonSlices(unittest.TestCase):
         self._check(
             colon_staged_both,
             (x, y, c),
-            helion.Config(block_sizes=[32, 16], num_threads=[16, 0], num_warps=2),
+            helion.Config(block_sizes=[32, 16], num_threads=[16, 0], num_warps=32),
             c.cpu().double() + _mm(ex, y * 2),
             *staged,
         )
@@ -8769,7 +8817,7 @@ class TestMppColonSlices(unittest.TestCase):
             self._check(
                 colon_n_kloop,
                 (p, v),
-                None,
+                helion.Config(block_sizes=[32, 32], num_threads=[8, 8], num_warps=32),
                 _mm(p, v),
                 re.escape("uint3((_e_n % 16)"),
                 r"slice_lane_\d+ = \(_e_n / 16\)",
@@ -8808,9 +8856,13 @@ class TestMppColonSlices(unittest.TestCase):
         s = torch.randn(40, device=DEVICE)
         pv = _mm(p, v)
         strided = re.escape("uint3((_e_n % 4), (_e_m / 2), 0)")
+        # Tiles on 16 x 16 threads leave N 4 of 1024.
+        tiles16 = helion.Config(
+            block_sizes=[32, 32], num_threads=[16, 16], num_warps=32
+        )
         materialized = r"_mpp_mat\[.*\(indices_\d+\w* - 0\)\)\]"
-        self._check(colon_n_seed, (p, v, c), None, c.cpu().double() + pv, strided)
-        self._check(colon_n_epi, (p, v, s), None, pv * s.cpu().double() + 1, strided)
+        self._check(colon_n_seed, (p, v, c), tiles16, c.cpu().double() + pv, strided)
+        self._check(colon_n_epi, (p, v, s), tiles16, pv * s.cpu().double() + 1, strided)
         self._check(colon_n_rowsum, (p, v), None, pv.sum(-1), materialized)
         pp = torch.rand(48, 72, device=DEVICE, dtype=torch.bfloat16)
         self._check(
@@ -8818,13 +8870,14 @@ class TestMppColonSlices(unittest.TestCase):
             (pp, v),
             None,
             _mm(pp, v) / pp.cpu().double().sum(-1)[:, None],
-            materialized,
+            _vec("float"),
+            absent=(materialized,),
         )
         x = torch.randn(3, 48, 72, device=DEVICE, dtype=torch.bfloat16)
         for config, pattern in (
-            (None, strided),
+            (tiles16, strided),
             (
-                helion.Config(block_sizes=[16, 16], num_threads=[2, 2]),
+                helion.Config(block_sizes=[16, 16], num_threads=[2, 2], num_warps=32),
                 re.escape("uint3(_e_n, (_e_m / 8), 0)"),
             ),
         ):
@@ -8839,7 +8892,7 @@ class TestMppColonSlices(unittest.TestCase):
         self._check(
             dem_kloop_store,
             (p, v),
-            None,
+            tiles16,
             pv,
             "__lane1",
             re.escape(_staged_tile(torch.bfloat16)),
@@ -8852,7 +8905,7 @@ class TestMppColonSlices(unittest.TestCase):
         y = torch.randn(64, 40, device=DEVICE, dtype=torch.float16)
         c = torch.randn(32, 40, device=DEVICE)
         one_thread = (re.escape("uint3(_e_n, 0, 0)"), re.escape("(_e_m / 1)"))
-        for config in (None, helion.Config(block_sizes=[32, 32])):
+        for config in (None, helion.Config(block_sizes=[32, 32], num_warps=32)):
             self._check(colon_m_kloop, (x, y), config, _mm(x, y), *one_thread)
         self._check(
             colon_m_seeded,
@@ -8867,7 +8920,7 @@ class TestMppColonSlices(unittest.TestCase):
             self._check(
                 colon_mn,
                 (xb, yb),
-                None,
+                helion.Config(block_sizes=[32], num_threads=[1], num_warps=32),
                 _mm(xb, yb),
                 r"uint3\(_e_m, \(_e_n % \d+\), 0\)",
                 m=m,
@@ -8882,21 +8935,23 @@ class TestMppColonSlices(unittest.TestCase):
         Staged inside the loop in bfloat, each ':' K lhs miscompiled at its
         second config, and ``hoist_rhs`` and ``if_late`` at theirs."""
         bf = torch.bfloat16
-        jam8 = helion.Config(block_sizes=[64, 32], num_threads=[8, 8])
-        jam32 = helion.Config(block_sizes=[64, 16], num_threads=[2, 8])
+        lanes8 = helion.Config(block_sizes=[64, 32], num_threads=[8, 8], num_warps=32)
+        lanes32 = helion.Config(block_sizes=[64, 16], num_threads=[2, 8], num_warps=32)
         for dtype, cases in (
-            (bf, ((colon_staged_inner, jam8), (inv_in_if, jam8))),
-            (torch.float16, ((colon_staged_inner, jam32),)),
-            (torch.float32, ((colon_staged_inner, jam32),)),
+            (bf, ((colon_staged_inner, lanes8), (inv_in_if, lanes8))),
+            (torch.float16, ((colon_staged_inner, lanes32),)),
+            (torch.float32, ((colon_staged_inner, lanes32),)),
         ):
             q = torch.randn(48, 128, device=DEVICE, dtype=dtype)
             k = torch.randn(40, 128, device=DEVICE, dtype=dtype)
             eq = torch.exp(q.cpu().float() * 0.25).to(dtype)
             for kernel, args, expected, config in (
                 *((kernel, (q, k), _mm(q * 0.125, k.T), c) for kernel, c in cases),
-                (colon_exp2_pre, (q * 0.25, k), _mm(eq, k.T), jam32),
+                (colon_exp2_pre, (q * 0.25, k), _mm(eq, k.T), lanes32),
             ):
-                for c in (None, config) if dtype != torch.float32 else (config,):
+                for c in dict.fromkeys(
+                    (lanes8, config) if dtype != torch.float32 else (config,)
+                ):
                     self._check(
                         kernel,
                         args,
@@ -8904,7 +8959,7 @@ class TestMppColonSlices(unittest.TestCase):
                         expected,
                         _STAGED_BEFORE,
                         re.escape(_staged_tile(dtype)),
-                        "__lane1",
+                        r"for \(int lane_0 = 0",
                         absent=(_STAGED_IN,),
                         dtype=dtype,
                     )
@@ -8919,13 +8974,23 @@ class TestMppColonSlices(unittest.TestCase):
             (
                 hoist_exp,
                 (q, k),
-                (None, helion.Config(block_sizes=[64, 16], num_threads=[4, 8])),
+                (
+                    None,
+                    helion.Config(
+                        block_sizes=[64, 16], num_threads=[4, 8], num_warps=32
+                    ),
+                ),
                 _mm(qe, k.T),
             ),
             (
                 hoist_rhs,
                 (q, kt),
-                (None, helion.Config(block_sizes=[64, 16], num_threads=[4, 16])),
+                (
+                    None,
+                    helion.Config(
+                        block_sizes=[64, 16], num_threads=[4, 16], num_warps=32
+                    ),
+                ),
                 _mm(q, kt * 0.5),
             ),
             (
@@ -8933,7 +8998,7 @@ class TestMppColonSlices(unittest.TestCase):
                 (q, k),
                 (
                     helion.Config(
-                        block_sizes=[64, 32], num_threads=[32, 32], num_warps=8
+                        block_sizes=[64, 32], num_threads=[32, 32], num_warps=32
                     ),
                 ),
                 late,
@@ -8964,9 +9029,11 @@ class TestMppColonSlices(unittest.TestCase):
         q = torch.randn(48, 128, device=DEVICE, dtype=bf)
         k = torch.randn(40, 128, device=DEVICE, dtype=bf)
         scaled = _mm(q * 0.125, k.T)
-        jam8 = helion.Config(block_sizes=[64, 32], num_threads=[8, 8])
+        # The tiles on 8 x 8 threads leave the ':' dim 16 of 1024.
+        tiles8 = helion.Config(block_sizes=[32, 32], num_threads=[8, 8], num_warps=32)
+        jam8 = helion.Config(block_sizes=[64, 32], num_threads=[8, 8], num_warps=32)
         for kernel in (inner_loadin, vary_in_if, load_in_if):
-            for config in (None, jam8):
+            for config in (tiles8, jam8):
                 self._check(
                     kernel,
                     (q, k),
@@ -8983,13 +9050,13 @@ class TestMppColonSlices(unittest.TestCase):
         self._check(
             colon_n_staged,
             (x, v),
-            None,
+            tiles8,
             _mm(ex, (v.cpu().double() * 2.0).to(bf)),
             re.escape(_staged_tile(bf)),
         )
-        jam32 = helion.Config(block_sizes=[64, 16], num_threads=[2, 8])
+        jam32 = helion.Config(block_sizes=[64, 16], num_threads=[2, 8], num_warps=32)
         for dtype, configs in (
-            (torch.float16, (None, jam32)),
+            (torch.float16, (tiles8, jam32)),
             (torch.float32, (jam32,)),
         ):
             q = torch.randn(48, 128, device=DEVICE, dtype=dtype)
@@ -9016,8 +9083,11 @@ class TestMppColonSlices(unittest.TestCase):
         d = torch.randn(64, device=DEVICE)
         bcast = d.cpu().to(torch.float16).double()[:, None] * y.cpu().double().sum(0)
         for config, patterns in (
-            (None, ("__lane1",)),
-            (helion.Config(block_sizes=[64, 32], num_threads=[1, 1]), ()),
+            (
+                helion.Config(block_sizes=[32, 32], num_threads=[16, 16], num_warps=32),
+                ("__lane1",),
+            ),
+            (helion.Config(block_sizes=[64, 32], num_threads=[1, 1], num_warps=32), ()),
         ):
             self._check(
                 kb_colon_m_lhs,
@@ -9638,6 +9708,7 @@ class TestMppBatched(unittest.TestCase):
             for pattern in absent:
                 self.assertNotRegex(msl, pattern)
 
+    @_full_threadgroup
     def test_batched(self) -> None:
         h, bf = torch.float16, torch.bfloat16
         x = torch.randn(3, 48, 72, device=DEVICE, dtype=h)
@@ -10806,9 +10877,12 @@ class TestMppCarryUpdate(unittest.TestCase):
         per K tile, read in the update's fenced loop."""
         p, v, a = self.p, self.v, self.a
         float_vec = (_vec("float"), _FENCED, _OWNED)
-        for config in (None, helion.Config(block_sizes=[16, 16])):
-            # The default puts M on lanes, so the jam runs the update once.
-            jam = ("__lane1",) if config is None else ()
+        m_lanes = helion.Config(
+            block_sizes=[32, 32], num_threads=[16, 16], num_warps=32
+        )
+        for config in (m_lanes, helion.Config(block_sizes=[16, 16], num_warps=32)):
+            # M on 2 lanes: the jam runs the update once.
+            jam = ("__lane1",) if config is m_lanes else ()
             self._check(
                 upd_carry,
                 (p, v, a),
@@ -10852,7 +10926,7 @@ class TestMppCarryUpdate(unittest.TestCase):
 
         for config in (TILE16, TILE32):
             self._check(upd_tilecarry, (p, v, c), config, tilecarry, *float_vec)
-        for config in (None, helion.Config(block_sizes=[16, 16])):
+        for config in (None, helion.Config(block_sizes=[16, 16], num_warps=32)):
             self._check(
                 upd_colon_tile,
                 (p, v, c),
@@ -10915,7 +10989,9 @@ class TestMppCarryUpdate(unittest.TestCase):
         self._check(
             upd_kred,
             (p, v, a),
-            helion.Config(block_sizes=[16, 32, 16], num_threads=[2, 2, 16]),
+            helion.Config(
+                block_sizes=[16, 32, 16], num_threads=[2, 2, 16], num_warps=32
+            ),
             kred,
             *float_vec,
         )
@@ -10982,6 +11058,7 @@ class TestMppCarryUpdate(unittest.TestCase):
         s = torch.full((48, 40), float("nan"), device=DEVICE)
         self._check(upd_written_vec, (p, v, a, s), TILE16, ref, _vec("float"), _FENCED)
 
+    @_full_threadgroup
     def test_cooperative_operand(self) -> None:
         """An update that reads another op's cooperative result
         materializes it and stages it as an [M, N] vector."""
@@ -11024,7 +11101,7 @@ class TestMppCarryUpdate(unittest.TestCase):
                 m_i = m_new
             return acc
 
-        for config in (TILE16, helion.Config(block_sizes=[32, 32, 16])):
+        for config in (TILE16, helion.Config(block_sizes=[32, 32, 16], num_warps=32)):
             self._check(upd_cast_vec, (p, v, a), config, cast_vec, _vec("float"))
         x = (torch.rand(48, 24, device=DEVICE) * 0.2 + 0.9).to(bf)
 
@@ -11039,7 +11116,10 @@ class TestMppCarryUpdate(unittest.TestCase):
             upd_prevec,
             (p, v, x),
             helion.Config(
-                block_sizes=[16, 16, 16], num_threads=[2, 16, 0], reduction_loops=[16]
+                block_sizes=[16, 16, 16],
+                num_threads=[2, 16, 1],
+                reduction_loops=[16],
+                num_warps=32,
             ),
             prevec,
             _vec("float"),
@@ -11341,6 +11421,482 @@ class TestMppCarryUpdateRejects(_MppCase):
             self._rejects_at(kernel, args, config, msg)
 
 
+# --- Epilogue vectors -------------------------------------------------------
+
+
+@helion.kernel(**S)
+def col_amax_add(x: torch.Tensor, y: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """A per-column epilogue operand: an ``amax`` over a ``:`` slice."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        c = torch.amax(w[:, tn].to(torch.float32), 0)
+        out[tm, tn] = acc * 0.5 + c[None, :]
+    return out
+
+
+@helion.kernel(**S)
+def row_col_sums(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A per-row and a per-column operand in one epilogue, the row one read
+    twice."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        r = torch.sum(x[tm, :].to(torch.float32), -1)[:, None]
+        c = torch.sum(y[:, tn].to(torch.float32), 0)[None, :]
+        out[tm, tn] = (acc - r) * c + r
+    return out
+
+
+@helion.kernel(**S)
+def row_sign(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A bool per-row operand of a ``where``."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        keep = torch.sum(x[tm, :].to(torch.float32), -1) > 0
+        out[tm, tn] = torch.where(keep[:, None], acc, -acc)
+    return out
+
+
+@helion.kernel(**S)
+def kloop_rowsum_store(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A store in the K loop, scaled by a row sum of the K tile."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            xt = x[tm, tk]
+            acc = torch.addmm(acc, xt, y[tk, tn])
+            s = torch.sum(xt.to(torch.float32), -1)
+            out[tm, tn] = acc * s[:, None]
+    return out
+
+
+@helion.kernel(**S)
+def colon_k_rownorm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A ``:`` K op scaled by the norms of its lhs's rows."""
+    m, _ = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        xt = x[tm, :]
+        acc = torch.addmm(hl.zeros([tm, tn], dtype=torch.float32), xt, y[:, tn])
+        s = torch.sum(xt.to(torch.float32) * xt.to(torch.float32), -1)
+        out[tm, tn] = acc * torch.rsqrt(s[:, None] + 1.0)
+    return out
+
+
+@helion.kernel(**S)
+def row_shared_groups(
+    x: torch.Tensor, y: torch.Tensor, w: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two ops in one body, each epilogue reading one row sum."""
+    m, _ = x.size()
+    _, n = y.size()
+    o1 = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    o2 = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        xt = x[tm, :]
+        r = torch.sum(xt.to(torch.float32), -1)
+        a = torch.addmm(hl.zeros([tm, tn], dtype=torch.float32), xt, y[:, tn])
+        o1[tm, tn] = a * r[:, None]
+        b = torch.addmm(hl.zeros([tm, tn], dtype=torch.float32), xt, w[:, tn])
+        o2[tm, tn] = b - r[:, None]
+    return o1, o2
+
+
+@helion.kernel(**S)
+def other_rownorm(x: torch.Tensor, y: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """The store's row operand sums another op's materialized result over
+    the N tile."""
+    m, _ = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        xt = x[tm, :]
+        a = torch.addmm(hl.zeros([tm, tn], dtype=torch.float32), xt, y[:, tn])
+        r = torch.sum(a.abs(), -1)
+        b = torch.addmm(hl.zeros([tm, tn], dtype=torch.float32), xt, w[:, tn])
+        out[tm, tn] = b / (r[:, None] + 1.0)
+    return out
+
+
+@helion.kernel(**S)
+def own_rownorm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """The store's row operand sums the result's own materialization."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm, n], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, :])
+        out[tm, :] = acc / (torch.sum(acc.abs(), -1, keepdim=True) + 1.0)
+    return out
+
+
+@helion.kernel(**S)
+def store_beside_rowsum(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """An element-loop store beside a row sum over a ``:`` N, which a lane
+    fold reduces."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    rs = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm, n], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, :])
+        out[tm, :] = acc * 2.0
+        rs[tm] = torch.sum(acc.abs(), -1)
+    return out, rs
+
+
+@helion.kernel(**S)
+def tile_sum_add(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """An [M, N] epilogue operand, a sum over a third dim."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tm, tn] = acc + torch.sum(z[tm, tn, :].to(torch.float32), -1)
+    return out
+
+
+@helion.kernel(**S)
+def fill_seed_cols(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A ``:`` K op seeded by a fill over N, which the epilogue reads too."""
+    m, _ = x.size()
+    n = y.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        z = hl.full([tn], 0.5, dtype=torch.float32)
+        r = torch.addmm(z, x[tm, :], y[:, tn])
+        out[tm, tn] = r * z
+    return out
+
+
+@helion.kernel(**S)
+def fill_seed_rows(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A ``:`` K op seeded by an [M, 1] fill, which the epilogue reads too."""
+    m, _ = x.size()
+    n = y.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        z = hl.full([tm, 1], 2.0, dtype=torch.float32)
+        r = torch.addmm(z, x[tm, :], y[:, tn])
+        out[tm, tn] = r - z
+    return out
+
+
+@helion.kernel(**S)
+def epi_vec_relabel(p: torch.Tensor, v: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """A row operand reduced from a square [N, M] load added to an [M, N]
+    value: its element (i, j) reads ``w[n0 + i, m0 + j]``."""
+    m, k = p.size()
+    n = v.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=p.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, p[tm, tk], v[tk, tn])
+        t = hl.zeros([tm, tn], dtype=torch.float32) + w[tn, tm]
+        s = torch.amax(t, 1)
+        out[tm, tn] = acc * s[:, None]
+    return out
+
+
+@helion.kernel(**S)
+def epi_row_as_col(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A row sum broadcast at the N position of a square tile."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        s = torch.sum(x[tm, :].to(torch.float32), -1)
+        out[tm, tn] = acc + s[None, :]
+    return out
+
+
+@helion.kernel(**S)
+def epi_col_as_row(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A column sum broadcast at the M position of a square tile."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        c = torch.sum(y[:, tn].to(torch.float32), 0)
+        out[tm, tn] = acc + c[:, None]
+    return out
+
+
+def _vec_stores(msl: str) -> int:
+    """How many element loops store a value read from a staged vector (an
+    update's loop writes its element back instead)."""
+    count = 0
+    for match in re.finditer(r"for \(auto _it = \w+\.begin\(\)[^{]*\{", msl):
+        depth, end = 1, match.end()
+        while depth:
+            depth += {"{": 1, "}": -1}.get(msl[end], 0)
+            end += 1
+        body = msl[match.end() : end]
+        count += "_mpp_vec" in body and "*_it = " not in body
+    return count
+
+
+def _attention_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """``attention``'s output: q * qk_scale rounded to bfloat, the rest in
+    float64."""
+    scale = 1.0 / math.sqrt(q.size(-1)) * 1.44269504
+    scores = _bf(_d(q) * scale) @ _d(k).transpose(-1, -2)
+    return _bf(torch.softmax(scores * math.log(2), -1) @ _d(v))
+
+
+#: M on 4 threads of 4 lanes, N on 16 threads; the ``:`` slice's reduction
+#: loops over chunks of 8.
+LOOPED_M_LANES = helion.Config(
+    block_sizes=[16, 16, 16], num_threads=[4, 16, 0], reduction_loops=[8], num_warps=2
+)
+#: N on 2 threads of 8 lanes, M on 16 threads.
+LOOPED_N_LANES = helion.Config(
+    block_sizes=[16, 16, 16], num_threads=[16, 2, 0], reduction_loops=[16], num_warps=2
+)
+
+
+@_requires_mps
+class TestMppEpilogueVectors(unittest.TestCase):
+    """A stored epilogue's row or column operand that no element can
+    recompute (a reduction, a loop carry) is staged into a threadgroup tile
+    over the group's M or N block, which the store's element loop reads;
+    the result itself is not materialized."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+        h = torch.float16
+        self.x = torch.randn(48, 72, device=DEVICE, dtype=h)
+        self.y = torch.randn(72, 40, device=DEVICE, dtype=h)
+        self.rt = _mm(self.x, self.y)
+
+    def _check(
+        self,
+        kernel: helion.Kernel,
+        args: tuple[object, ...],
+        config: helion.Config | None,
+        *refs: torch.Tensor,
+        vecs: tuple[str, ...] = ("float",),
+        mats: int = 0,
+        staged_in: str | None = None,
+    ) -> None:
+        """Run ``kernel``, compare its outputs with ``refs``, and check its
+        MSL stages vectors of the dtypes ``vecs`` that a store's element
+        loop reads, inside a loop whose header contains ``staged_in`` if
+        given, and holds ``mats`` materializations."""
+        with self.subTest(kernel=kernel.name, config=config):
+            out, _, msl = _run(kernel, args, config)
+            outs = out if isinstance(out, tuple) else (out,)
+            for o, ref in zip(outs, refs, strict=True):
+                _close(o, ref)
+            self.assertTrue(_tile_copies_ordered(msl), msl)
+            self.assertEqual(
+                re.findall(r"threadgroup (\w+) _mpp_vec\w*\[", msl), [*vecs]
+            )
+            self.assertEqual(_vec_stores(msl) > 0, bool(vecs))
+            self.assertEqual(_layouts(msl)[1], mats)
+            if staged_in is not None:
+                write = re.search(r"\{ _mpp_vec\w*\[", msl)
+                assert write is not None
+                loops = _open_loops(msl, write.start())
+                self.assertTrue([h for h in loops if staged_in in h], loops)
+
+    def test_row_and_column_vectors(self) -> None:
+        """A row carry of the K loop, over N tiles and over a ``:`` N; and
+        with M or N on lanes, a column ``amax`` over a ``:`` slice, a row
+        vector read twice beside a column vector, and a bool row vector."""
+        x, y, rt = self.x, self.y, self.rt
+        xd = _d(x)
+        rows = xd.sum(-1)[:, None]
+        for block, threads in ((16, [16, 16, 1]), (32, [32, 32, 1])):
+            config = helion.Config(
+                block_sizes=[block, block, 16], num_threads=threads, num_warps=32
+            )
+            self._check(mm_rowscale, (x, y), config, rt * rows)
+        pp = torch.rand(48, 72, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(72, 40, device=DEVICE, dtype=torch.bfloat16)
+        self._check(colon_n_div, (pp, v), None, _mm(pp, v) / _d(pp).sum(-1)[:, None])
+        w = torch.randn(24, 40, device=DEVICE, dtype=torch.float16)
+        for config in (LOOPED_M_LANES, LOOPED_N_LANES):
+            self._check(
+                col_amax_add, (x, y, w), config, rt * 0.5 + _d(w).amax(0)[None, :]
+            )
+            self._check(
+                row_col_sums,
+                (x, y),
+                config,
+                (rt - rows) * _d(y).sum(0)[None, :] + rows,
+                vecs=("float", "float"),
+            )
+            self._check(
+                row_sign,
+                (x, y),
+                config,
+                torch.where((xd.sum(-1) > 0)[:, None], rt, -rt),
+                vecs=("bool",),
+            )
+
+    def test_in_k_loop(self) -> None:
+        """A store in the K loop stages its row vector in the K loop, at
+        the default config and with every block on threads."""
+        x, y = self.x, self.y
+        for config in (
+            kloop_rowsum_store.bind((x, y)).config_spec.default_config(),
+            helion.Config(
+                block_sizes=[16, 16, 16], num_threads=[32, 32, 0], num_warps=1
+            ),
+        ):
+            last = _k_tiles(72, config.config["block_sizes"][-1])[-1]
+            self._check(
+                kloop_rowsum_store,
+                (x, y),
+                config,
+                self.rt * _d(x)[:, last].sum(-1)[:, None],
+                staged_in="offset_",
+            )
+
+    def test_groups(self) -> None:
+        """Two ops in one body, each staging the row vector they share, and a
+        row sum of another op's or the result's own materialization read by
+        the store."""
+        x = torch.randn(48, 64, device=DEVICE, dtype=torch.float16)
+        y, w = (
+            torch.randn(64, 40, device=DEVICE, dtype=torch.float16) for _ in range(2)
+        )
+        r = _d(x).sum(-1)[:, None]
+        self._check(
+            row_shared_groups,
+            (x, y, w),
+            None,
+            _mm(x, y) * r,
+            _mm(x, w) - r,
+            vecs=("float", "float"),
+        )
+        rt = _mm(x, y)
+        for bn in (16, 32):
+            config = helion.Config(block_sizes=[16, bn], num_threads=[128 // bn, bn])
+            self._check(
+                other_rownorm,
+                (x, y, w),
+                config,
+                _mm(x, w) / (_tile_row_sums(rt.abs(), bn) + 1),
+                mats=1,
+            )
+        self._check(
+            own_rownorm, (x, y), None, rt / (rt.abs().sum(-1, keepdim=True) + 1), mats=1
+        )
+
+    def test_attention(self) -> None:
+        """``examples/attention.py``'s ``acc / l_i`` divides in the store's
+        element loop, so only the scores are materialized, and an M tile of
+        32 rows over a head dim of 128 fits the threadgroup's memory."""
+        for shape, config in (
+            ((1, 3, 72, 64), None),
+            ((1, 3, 72, 64), helion.Config(block_sizes=[1, 32, 64], num_warps=4)),
+            ((1, 1, 128, 128), helion.Config(block_sizes=[1, 32, 64], num_warps=4)),
+        ):
+            q, k, v = (
+                torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
+                for _ in range(3)
+            )
+            with self.subTest(shape=shape, config=config):
+                (out, _), _, msl = _run(attention_metal, (q, k, v), config)
+                _close(out, _attention_ref(q, k, v))
+                self.assertEqual(_layouts(msl)[1], 1)
+                self.assertEqual(_vec_stores(msl), 1)
+
+    def test_split_keeps_vector_order(self) -> None:
+        """A ``:`` K op's lane loop holds the row vector's staging: split at
+        the op, the staging would move ahead of the lane-invariant
+        statements it reads, so the loop keeps body order."""
+        x = torch.randn(45, 64, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(64, 24, device=DEVICE, dtype=torch.float16)
+        xd = _d(x)
+        ref = _mm(x, y) * torch.rsqrt((xd * xd).sum(-1)[:, None] + 1)
+        for config in (
+            None,
+            helion.Config(block_sizes=[16, 16], num_threads=[4, 16], num_warps=2),
+        ):
+            self._check(colon_k_rownorm, (x, y), config, ref)
+
+    def test_store_beside_lane_fold(self) -> None:
+        """An element-loop store beside a row sum over a ``:`` N that a lane
+        fold reduces: the store's element loop binds its own lane names."""
+        x = torch.randn(48, 64, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(64, 40, device=DEVICE, dtype=torch.float16)
+        rt = _mm(x, y)
+        self._check(
+            store_beside_rowsum, (x, y), None, rt * 2, rt.abs().sum(-1), vecs=(), mats=1
+        )
+
+    def test_kept_materialized(self) -> None:
+        """An [M, N] operand stays in the Scalar layout: staged, it would
+        take as much threadgroup memory as the materialization.  So does a
+        ``:`` K op's seed over one block, which the op updates in place."""
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(64, 48, device=DEVICE, dtype=torch.float16)
+        z = torch.randn(32, 48, 8, device=DEVICE, dtype=torch.float16)
+        self._check(
+            tile_sum_add, (x, y, z), None, _mm(x, y) + _d(z).sum(-1), vecs=(), mats=1
+        )
+        x = torch.randn(37, 48, device=DEVICE)
+        y = torch.randn(48, 23, device=DEVICE)
+        rt = _mm(x, y)
+        self._check(fill_seed_cols, (x, y), None, (rt + 0.5) * 0.5, vecs=(), mats=2)
+        self._check(fill_seed_rows, (x, y), None, rt, vecs=(), mats=2)
+
+
+@_requires_mps
+class TestMppEpilogueVectorsRejects(_MppCase):
+    """Epilogue vectors that stay rejected, each with its reason."""
+
+    def test_positional(self) -> None:
+        """A row vector reduced from a square [N, M] load, and a row or a
+        column vector broadcast at the other position of a square tile:
+        staged by block, each element would read another's value."""
+        h = torch.float16
+        p = torch.randn(48, 72, device=DEVICE, dtype=h)
+        v = torch.randn(72, 48, device=DEVICE, dtype=h)
+        w = torch.randn(48, 48, device=DEVICE)
+        configs = (None, TILE16)
+        self._rejects_at(epi_vec_relabel, (p, v, w), configs, mpp_matmul._STAGE_REBIND)
+        for kernel in (epi_row_as_col, epi_col_as_row):
+            self._rejects_at(kernel, (p, v), configs, mpp_matmul._REBIND)
+
+
 # --- Lane reductions beside a cooperative op ------------------------------
 
 
@@ -11561,8 +12117,8 @@ class TestMppLaneFold(unittest.TestCase):
         walking every lane, with no combine."""
         lse = torch.logsumexp(self.s, -1)
         for config in (
-            None,
-            helion.Config(block_sizes=[32, 32], num_threads=[8, 16]),
+            helion.Config(block_sizes=[32, 32], num_threads=[16, 16], num_warps=32),
+            helion.Config(block_sizes=[32, 32], num_threads=[8, 16], num_warps=32),
         ):
             self._check(
                 nloop_lse,
@@ -11574,14 +12130,14 @@ class TestMppLaneFold(unittest.TestCase):
         self._check(
             nloop_lse,
             (self.q, self.kk),
-            helion.Config(block_sizes=[16, 16], num_threads=[16, 1]),
+            helion.Config(block_sizes=[16, 16], num_threads=[16, 1], num_warps=32),
             lambda bl: lse,
             combined=False,
         )
         self._check(
             nloop_offset,
             (self.q, self.kk),
-            helion.Config(block_sizes=[16, 64], num_threads=[4, 16]),
+            helion.Config(block_sizes=[16, 64], num_threads=[4, 16], num_warps=32),
             lambda bl: self.s[:, 5:].amax(-1).clamp(min=-3.5),
         )
 
@@ -11666,8 +12222,10 @@ class TestMppLaneFold(unittest.TestCase):
             return _bf(acc / l_i[:, None])
 
         for config in (
-            None,
-            helion.Config(block_sizes=[1, 16, 32], num_threads=[1, 16, 32]),
+            helion.Config(block_sizes=[1, 16, 16], num_threads=[1, 2, 4], num_warps=32),
+            helion.Config(
+                block_sizes=[1, 16, 32], num_threads=[1, 16, 16], num_warps=32
+            ),
         ):
             self._check(
                 attention_metal,
@@ -11681,6 +12239,7 @@ class TestMppLaneFold(unittest.TestCase):
                 "helion_red::group_sum",
             )
 
+    @_full_threadgroup
     def test_device_views_keep_split(self) -> None:
         """A lane body whose only MPP statement is an op over device views
         keeps the pass split."""
@@ -12217,8 +12776,10 @@ class TestMppOpDims(_MppCase):
         and row sums of a 1.0-seeded product (masked), of an mm under fast
         math (mask dropped), and products of the 1.0 seed itself (mask
         dropped, so a row past the op would read 0)."""
-        t16 = helion.Config(block_sizes=[16, 16, 16])
-        t32 = helion.Config(block_sizes=[32, 32, 16])
+        # Each config's num_warps launches its tile's threads whole: in a
+        # lane loop the column sums would reduce over a lane-strided axis.
+        t16 = helion.Config(block_sizes=[16, 16, 16], num_warps=8)
+        t32 = helion.Config(block_sizes=[32, 32, 16], num_warps=32)
 
         def plain_col_sums(p: torch.Tensor) -> torch.Tensor:
             return p.sum(0)
@@ -12236,7 +12797,12 @@ class TestMppOpDims(_MppCase):
             return torch.stack([torch.ones_like(p[:, 0]), row_sums(p)], 1)
 
         def nt(blocks: list[int], threads: list[int]) -> helion.Config:
-            return helion.Config(block_sizes=blocks, num_threads=threads)
+            launched = math.prod(t for t in threads if t)
+            return helion.Config(
+                block_sizes=blocks,
+                num_threads=threads,
+                num_warps=max(1, launched // 32),
+            )
 
         for kernel, (m, n), config, ref, op in (
             (colsum_seeded, (4, 40), t16, col_sums, (16, 16)),
@@ -12250,6 +12816,16 @@ class TestMppOpDims(_MppCase):
             x = torch.randn(m, 32, device=DEVICE)
             y = torch.randn(32, n, device=DEVICE)
             self._check(kernel, (x, y), config, ref(_mm(x, y)), op)
+        # At the default num_warps the 16 x 16 tile runs in a lane loop, and
+        # its column sum is rejected rather than miscompiled.
+        x = torch.randn(4, 32, device=DEVICE)
+        y = torch.randn(32, 40, device=DEVICE)
+        self._rejects(
+            colsum_seeded,
+            (x, y),
+            helion.Config(block_sizes=[16, 16, 16]),
+            "sum reduction over an axis strided by a tile lane loop",
+        )
 
     def test_unchanged_dims(self) -> None:
         """A block the extent fills, a loop of several tiles, symbolic
@@ -12335,6 +12911,1601 @@ class TestMppGraphPassSeed(unittest.TestCase):
                 with self.subTest(kernel=kernel.name, config=config):
                     out, _, _ = _run(kernel, args, config)
                     _close(out, ref)
+
+
+# --- Threadgroup budget: num_warps sizes the launch -----------------------
+
+
+@helion.kernel(**S)
+def free_rows_wide(
+    a: torch.Tensor, b: torch.Tensor, nbm: int, nbn: int
+) -> torch.Tensor:
+    """grouped_gemm's layout with its 32 to 128 row and column blocks."""
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.zeros([m, n], dtype=torch.float32, device=a.device)
+    bm = hl.register_block_size(32, 128)
+    bn = hl.register_block_size(32, 128)
+    for gm in hl.grid(nbm):
+        for gn in hl.grid(nbn):
+            rows = gm * bm + hl.arange(bm)
+            cols = gn * bn + hl.arange(bn)
+            rv = rows < m
+            cv = cols < n
+            acc = hl.zeros([bm, bn], dtype=torch.float32)
+            for tk in hl.tile(k):
+                a_blk = hl.load(a, [rows, tk.index], extra_mask=rv[:, None])
+                b_blk = hl.load(b, [tk.index, cols], extra_mask=cv[None, :])
+                acc = torch.addmm(acc, a_blk, b_blk)
+            hl.store(out, [rows, cols], acc, extra_mask=rv[:, None] & cv[None, :])
+    return out
+
+
+@helion.kernel(**S)
+def free_rows_wide_scalar_store(
+    a: torch.Tensor, b: torch.Tensor, nbm: int, nbn: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.zeros([m, n], dtype=torch.float32, device=a.device)
+    first = torch.zeros([m], dtype=torch.float32, device=a.device)
+    bm = hl.register_block_size(32, 128)
+    bn = hl.register_block_size(32, 128)
+    for gm in hl.grid(nbm):
+        for gn in hl.grid(nbn):
+            rows = gm * bm + hl.arange(bm)
+            cols = gn * bn + hl.arange(bn)
+            rv = rows < m
+            cv = cols < n
+            acc = hl.zeros([bm, bn], dtype=torch.float32)
+            for tk in hl.tile(k):
+                a_blk = hl.load(a, [rows, tk.index], extra_mask=rv[:, None])
+                b_blk = hl.load(b, [tk.index, cols], extra_mask=cv[None, :])
+                acc = torch.addmm(acc, a_blk, b_blk)
+            hl.store(out, [rows, cols], acc, extra_mask=rv[:, None] & cv[None, :])
+            hl.store(first, [rows], hl.load(a, [rows, 0], extra_mask=rv), extra_mask=rv)
+    return out, first
+
+
+@helion.kernel(**S)
+def free_rows_wide_staged(
+    a: torch.Tensor, b: torch.Tensor, nbm: int, nbn: int
+) -> torch.Tensor:
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.zeros([m, n], dtype=torch.float32, device=a.device)
+    bm = hl.register_block_size(32, 128)
+    bn = hl.register_block_size(32, 128)
+    for gm in hl.grid(nbm):
+        for gn in hl.grid(nbn):
+            rows = gm * bm + hl.arange(bm)
+            cols = gn * bn + hl.arange(bn)
+            rv = rows < m
+            cv = cols < n
+            acc = hl.zeros([bm, bn], dtype=torch.float32)
+            for tk in hl.tile(k):
+                a_blk = hl.load(a, [rows, tk.index], extra_mask=rv[:, None]) * 2
+                b_blk = hl.load(b, [tk.index, cols], extra_mask=cv[None, :])
+                acc = torch.addmm(acc, a_blk, b_blk)
+            hl.store(out, [rows, cols], acc, extra_mask=rv[:, None] & cv[None, :])
+    return out
+
+
+@helion.kernel(**S)
+def free_rows_wide_dead_carry(
+    a: torch.Tensor, b: torch.Tensor, nbm: int, nbn: int
+) -> torch.Tensor:
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.zeros([m, n], dtype=torch.float32, device=a.device)
+    bm = hl.register_block_size(32, 128)
+    bn = hl.register_block_size(32, 128)
+    for gm in hl.grid(nbm):
+        for gn in hl.grid(nbn):
+            rows = gm * bm + hl.arange(bm)
+            cols = gn * bn + hl.arange(bn)
+            rv = rows < m
+            cv = cols < n
+            acc = hl.zeros([bm, bn], dtype=torch.float32)
+            for tk in hl.tile(k):
+                a_blk = hl.load(a, [rows, tk.index], extra_mask=rv[:, None])
+                b_blk = hl.load(b, [tk.index, cols], extra_mask=cv[None, :])
+                acc = torch.addmm(acc, a_blk, b_blk)
+            hl.store(out, [rows, cols], acc, extra_mask=rv[:, None] & cv[None, :])
+            s = hl.zeros([bm], dtype=torch.float32)
+            for j in hl.grid(3):
+                s = s + hl.load(a, [rows, j], extra_mask=rv)
+    return out
+
+
+def _launch(code: str) -> tuple[int, ...]:
+    """The launch's threadgroup shape, from the host code's ``_block_dims``."""
+    dims = re.search(r"_block_dims=\((\d+), (\d+), (\d+)\)", code)
+    assert dims is not None, code
+    return tuple(int(d) for d in dims.groups())
+
+
+def _open_loops(msl: str, pos: int) -> list[str]:
+    """The headers of the MSL ``for`` blocks open at ``pos``."""
+    stack: list[str] = []
+    for match in re.finditer(r"for \(([^)]*)\) \{|\{|\}", msl[:pos]):
+        if match.group(0) == "}":
+            stack.pop()
+        else:
+            stack.append(match.group(1) or "")
+    return [header for header in stack if header]
+
+
+def _distribute(source: str) -> str | None:
+    """``_distribute_lane_loop`` of the lane loop *source*, unparsed."""
+    loop = ast.parse(textwrap.dedent(source)).body[0]
+    assert isinstance(loop, ast.For)
+    out = mpp_matmul._distribute_lane_loop(loop, "slice_lane_0", set())
+    if out is None:
+        return None
+    return ast.unparse(ast.fix_missing_locations(ast.Module(out, [])))
+
+
+@_requires_mps
+class TestMppThreadgroupBudget(unittest.TestCase):
+    """``num_warps`` sizes the threadgroup around an MPP op: blocks beyond it
+    walk lanes, and a lane loop around the op runs once per run of the
+    statements that depend on its lane."""
+
+    def _attention_args(self) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        torch.manual_seed(0)
+        bf = torch.bfloat16
+        q, k, v = (torch.randn(1, 2, 64, 64, dtype=bf) for _ in range(3))
+        scale = 1.0 / math.sqrt(64) * 1.44269504
+        scores = (q.double() * scale).to(bf).double() @ k.double().transpose(-1, -2)
+        expected = torch.softmax(scores * math.log(2), -1) @ v.double()
+        return (q.to(DEVICE), k.to(DEVICE), v.to(DEVICE)), _bf(expected)
+
+    def test_attention_head_dim_walks_lanes(self) -> None:
+        """At the default num_warps=4, attention's ``:`` head dim takes what
+        the tiles leave, one thread of 64 lanes, and its lane loop is split
+        around the K loop so no lane loop holds an MPP op."""
+        args, expected = self._attention_args()
+        (out, _), code, msl = _run(attention_metal, args, None)
+        _close(out, expected)
+        self.assertEqual(math.prod(_launch(code)), 128)
+        self.assertEqual(msl.count("for (int slice_lane_"), 1)
+        runs = [m.start() for m in re.finditer(r"_mpp_op_\d+\.run\(", msl)]
+        self.assertTrue(runs)
+        for pos in runs:
+            self.assertFalse(
+                [h for h in _open_loops(msl, pos) if "lane_" in h.split("=")[0]]
+            )
+
+    def test_attention_at_wider_budgets(self) -> None:
+        args, expected = self._attention_args()
+        default = attention_metal.bind(args).config_spec.default_config().config
+        for num_warps in (8, 32):
+            with self.subTest(num_warps=num_warps):
+                config = helion.Config(**{**default, "num_warps": num_warps})
+                (out, _), code, _ = _run(attention_metal, args, config)
+                _close(out, expected)
+                self.assertEqual(math.prod(_launch(code)), 32 * num_warps)
+
+    def test_k_loop_tile_shares_the_budget(self) -> None:
+        """int4_gemm at M = 1: the 16 x 16 output tile fits 128 threads by
+        giving the N tile 8 threads of 2 lanes."""
+        torch.manual_seed(0)
+        w = torch.randint(-8, 8, (128, 64))
+        a = torch.randn(1, 128).to(torch.bfloat16)
+        out, code, _ = _run(int4_gemm, (a.to(DEVICE), _pack_int4(w).to(DEVICE)), None)
+        _close(out, (a.double() @ w.double()).to(torch.bfloat16).double())
+        self.assertEqual(_launch(code), (16, 8, 1))
+
+    def test_free_blocks_walk_lanes(self) -> None:
+        """grouped_gemm's 128 x 128 tile fits any budget: each free block
+        takes threads within it and walks the rest in lanes, which only the
+        element loops bind.  Explicit counts are taken in block order, each
+        within what the earlier ones left."""
+        bf = torch.bfloat16
+        a = torch.randn(200, 64, dtype=bf)
+        b = torch.randn(64, 300, dtype=bf)
+        args = (a.to(DEVICE), b.to(DEVICE), 2, 3)
+        for num_warps, num_threads, launch, laned in (
+            (32, [], (32, 32, 1), "_free_lane_0"),
+            (8, [], (16, 16, 1), "_free_lane_0"),
+            (4, [128, 128, 0], (128, 1, 1), "_free_lane_1"),
+        ):
+            with self.subTest(num_warps=num_warps, num_threads=num_threads):
+                config = helion.Config(
+                    block_sizes=[128, 128, 32],
+                    num_threads=num_threads,
+                    num_warps=num_warps,
+                )
+                out, code, msl = _run(free_rows_wide, args, config)
+                _close(out, _mm(a, b))
+                self.assertEqual(_launch(code), launch)
+                self.assertIn(laned, msl)
+                self.assertNotIn("_free_lane_", msl[: msl.index("is_valid_element")])
+
+    def test_free_lanes_read_by_scalar_code_reject(self) -> None:
+        bf = torch.bfloat16
+        a = torch.randn(200, 64, dtype=bf)
+        b = torch.randn(64, 300, dtype=bf)
+        config = helion.Config(block_sizes=[128, 128, 32], num_warps=8)
+        for kernel, reader in (
+            (free_rows_wide_scalar_store, "store_1"),
+            (free_rows_wide_staged, "a staged MPP operand"),
+            (free_rows_wide_dead_carry, "s"),
+        ):
+            with (
+                self.subTest(kernel=kernel.name),
+                self.assertRaisesRegex(
+                    exc.BackendUnsupported,
+                    rf"block 0 on 16 threads x 8 lanes, but {reader} reads it in "
+                    r"Scalar code",
+                ),
+            ):
+                kernel.bind((a, b, 2, 3)).to_code(config)
+        # A ``_mpp_coop`` seed is staged from the Scalar layout, by thread.
+        a = torch.randn(45, 72, dtype=bf)
+        b = torch.randn(72, 40, dtype=bf)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported,
+            r"block 0 on 8 threads x 4 lanes, but _mpp_coop reads it in Scalar code",
+        ):
+            free_rows_seeded.bind((a, b, torch.randn(45, 40), 2, 2)).to_code(
+                helion.Config(block_sizes=[32, 32, 16], num_warps=4)
+            )
+
+    def test_former_jam_cap_rejections_compile(self) -> None:
+        """A ':' K that MPP contracts takes what the tiles leave, so 64 x 64
+        tiles run on 32 x 32 threads, not 4 x 4 threads around 256 jammed
+        lanes, past the 64-copy cap; two staged ops' 64-row tile likewise
+        fits without a jam."""
+        xs, ys = torch.randn(2, 64, 64, device=DEVICE)
+        c = torch.randn(64, 64, device=DEVICE)
+        w = torch.randn(64, device=DEVICE)
+        out, code, _ = _run(
+            colon_seed_epi,
+            (xs, ys, c, w),
+            helion.Config(block_sizes=[64, 64], num_warps=32),
+        )
+        self.assertEqual(_launch(code), (32, 32, 1))
+        _close(out, c.cpu().double() * 0.5 + _mm(xs, ys) + w.cpu().double()[:, None])
+        x = torch.randn(48, 72, device=DEVICE)
+        y = torch.randn(72, 40, device=DEVICE)
+        (out, out2), code, _ = _run(
+            two_ops_staged,
+            (x, y),
+            helion.Config(
+                block_sizes=[64, 16, 32], num_threads=[16, 16, 1], num_warps=32
+            ),
+        )
+        self.assertEqual(_launch(code), (16, 16, 1))
+        _close(out, _mm(x * 2, y))
+        _close(out2, _mm(x, y * 0.5))
+
+    def test_row_sum_tile_beside_the_k_loop_takes_threads(self) -> None:
+        """The row sum's nested tile takes threads beside a 16-thread M tile,
+        so the op gets two whole SIMD groups."""
+        x = torch.randn(48, 72, device=DEVICE)
+        y = torch.randn(72, 40, device=DEVICE)
+        out, code, _ = _run(
+            root_beside_sum,
+            (x, y),
+            helion.Config(
+                block_sizes=[16, 16, 16, 32], num_threads=[0, 1, 0, 0], num_warps=32
+            ),
+        )
+        self.assertEqual(_launch(code), (16, 4, 1))
+        _close(out, _mm(x, y) + x.cpu().double().sum(-1, keepdim=True))
+
+    def test_distribution_positions(self) -> None:
+        """Each run of lane-dependent statements becomes its own lane loop,
+        with the pure index it reads repeated; lane-invariant statements run
+        once, in order, a run's own invariant assignment ahead of its loop."""
+        self.assertEqual(
+            _distribute(
+                """
+                for slice_lane_0 in range(4):
+                    i = slice_lane_0 * 16
+                    t = n * 2
+                    tl.store(y + i, tl.load(x + i) * t)
+                    _mpp_acc_0 = _helion_mpp_acc(0, None)
+                    tl.store(w, t)
+                    tl.store(out + i, tl.load(z + i))
+                """
+            ),
+            textwrap.dedent(
+                """\
+                t = n * 2
+                for slice_lane_0 in range(4):
+                    i = slice_lane_0 * 16
+                    tl.store(y + i, tl.load(x + i) * t)
+                _mpp_acc_0 = _helion_mpp_acc(0, None)
+                tl.store(w, t)
+                for slice_lane_0 in range(4):
+                    i = slice_lane_0 * 16
+                    tl.store(out + i, tl.load(z + i))"""
+            ),
+        )
+        # ``t = n * 2`` can't move ahead of the store deferred before it,
+        # which reads ``t``.
+        self.assertEqual(
+            _distribute(
+                """
+                for slice_lane_0 in range(4):
+                    _mpp_acc_0 = _helion_mpp_acc(0, None)
+                    tl.store(y + slice_lane_0, 1.0)
+                    tl.store(w, t)
+                    t = n * 2
+                    tl.store(out + slice_lane_0, t)
+                """
+            ),
+            textwrap.dedent(
+                """\
+                _mpp_acc_0 = _helion_mpp_acc(0, None)
+                for slice_lane_0 in range(4):
+                    tl.store(y + slice_lane_0, 1.0)
+                tl.store(w, t)
+                t = n * 2
+                for slice_lane_0 in range(4):
+                    tl.store(out + slice_lane_0, t)"""
+            ),
+        )
+
+    def test_distribution_declines(self) -> None:
+        for name, source in (
+            (
+                "lane-dependent cooperative statement",
+                """
+                for slice_lane_0 in range(4):
+                    i = slice_lane_0 * 16
+                    _mpp_acc_0 = _helion_mpp_acc(0, None)
+                    _mpp_acc_1 = _helion_mpp_acc(i, None)
+                    tl.store(out + i, tl.load(z + i))
+                """,
+            ),
+            (
+                "deferred store's tensor read later in its run",
+                """
+                for slice_lane_0 in range(4):
+                    _mpp_acc_0 = _helion_mpp_acc(0, None)
+                    tl.store(y + slice_lane_0, 1.0)
+                    tl.store(w, 2.0)
+                    q = tl.load(w + slice_lane_0)
+                    tl.store(out + slice_lane_0, q)
+                """,
+            ),
+            (
+                "self-reading value read by a later run",
+                """
+                for slice_lane_0 in range(4):
+                    i = slice_lane_0 * 16
+                    i = i + 1
+                    tl.store(y + i, 1.0)
+                    _mpp_acc_0 = _helion_mpp_acc(0, None)
+                    tl.store(out + i, 2.0)
+                """,
+            ),
+            (
+                "value carried across lanes",
+                """
+                for slice_lane_0 in range(4):
+                    tl.store(y + c, tl.load(x + slice_lane_0))
+                    c = slice_lane_0 + 1
+                    _mpp_acc_0 = _helion_mpp_acc(0, None)
+                """,
+            ),
+            (
+                "loaded value read by a later run",
+                """
+                for slice_lane_0 in range(4):
+                    q = tl.load(x + slice_lane_0)
+                    _mpp_acc_0 = _helion_mpp_acc(0, None)
+                    tl.store(out + slice_lane_0, q)
+                """,
+            ),
+            (
+                "no cooperative statement",
+                """
+                for slice_lane_0 in range(4):
+                    tl.store(y + slice_lane_0, tl.load(x + slice_lane_0))
+                """,
+            ),
+        ):
+            with self.subTest(name):
+                self.assertIsNone(_distribute(source))
+
+    def test_lane_start_value_stays_in_its_lane_loop(self) -> None:
+        """A per-row sum's ``s = 0.0`` reads no lane but holds a value per
+        lane, so it stays in the lane loop that accumulates it."""
+        self.assertEqual(
+            _distribute(
+                """
+                for slice_lane_0 in range(2):
+                    tl.store(y + slice_lane_0, 1.0)
+                    _mpp_acc_0 = _helion_mpp_acc(0, None)
+                    s = 0.0
+                    for j in range(3):
+                        s = s + tl.load(x + slice_lane_0 * 3 + j)
+                    tl.store(out + slice_lane_0, s)
+                """
+            ),
+            textwrap.dedent(
+                """\
+                for slice_lane_0 in range(2):
+                    tl.store(y + slice_lane_0, 1.0)
+                _mpp_acc_0 = _helion_mpp_acc(0, None)
+                for slice_lane_0 in range(2):
+                    s = 0.0
+                    for j in range(3):
+                        s = s + tl.load(x + slice_lane_0 * 3 + j)
+                    tl.store(out + slice_lane_0, s)"""
+            ),
+        )
+        # root_beside_sum's row sum beside its K loop, its rows on 2 lanes.
+        x = torch.randn(48, 72, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(72, 40, device=DEVICE, dtype=torch.float16)
+        xf, yf = x.float(), y.float()
+        out, code, _ = _run(root_beside_sum, (xf, yf), None)
+        self.assertEqual(_launch(code), (8, 16, 1))
+        _close(out, _mm(xf, yf) + xf.cpu().double().sum(-1, keepdim=True))
+
+
+# --- Lane distribution around a cooperative statement ---------------------
+
+
+@helion.kernel(**S)
+def dist_loop_reset(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A device loop beside the K loop that resets a per-lane value and
+    accumulates one that depends on no lane."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        s = x[tm, tn] * 1.0
+        t = hl.zeros([tn], dtype=torch.float32)
+        for tj in hl.tile(k):
+            s = hl.zeros([tm, tn], dtype=torch.float32)
+            t = t + y[tj, tn].sum(0)
+        w = t * 2.0
+        out[tm, tn] = acc + s + w[None, :]
+    return out
+
+
+@helion.kernel(**S)
+def dist_if_reset(x: torch.Tensor, y: torch.Tensor, flag: torch.Tensor) -> torch.Tensor:
+    """The ``if`` form of dist_loop_reset."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for g in hl.grid(1):
+        f = flag[g]
+        for tm, tn in hl.tile([m, n]):
+            acc = hl.zeros([tm, tn], dtype=torch.float32)
+            for tk in hl.tile(k):
+                acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+            s = x[tm, tn] * 1.0
+            t = y[0, tn] * 1.0
+            if f > 0:
+                s = hl.zeros([tm, tn], dtype=torch.float32)
+                t = t + 1.0
+            w = t * 2.0
+            out[tm, tn] = acc + s + w[None, :]
+    return out
+
+
+@helion.kernel(**S)
+def dist_stale_index(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A call-free per-lane value that a device loop updates before the K
+    loop and that is read after it."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        s = tm.index * 2
+        for tj in hl.tile(k):
+            s = s + y[tj, 0].sum(0).to(torch.int32)
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tm, tn] = acc + s[:, None]
+    return out
+
+
+@helion.kernel(**S)
+def dist_rmw(x: torch.Tensor, y: torch.Tensor, cnt: torch.Tensor) -> torch.Tensor:
+    """A per-lane reset beside a read-modify-write of one row per tile."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        s = x[tm, tn] * 1.0
+        for _tj in hl.tile(k):
+            s = hl.zeros([tm, tn], dtype=torch.float32)
+            cnt[tm.id, tn] = cnt[tm.id, tn] + 1.0
+        out[tm, tn] = acc + s
+    return out
+
+
+@helion.kernel(**S)
+def dist_rb_loop(x: torch.Tensor, y: torch.Tensor, out2: torch.Tensor) -> torch.Tensor:
+    """Each iteration reads the tile's first row of ``out`` and stores every
+    row from it."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        s = x[tm, tn] * 1.0
+        for _tj in hl.tile(k):
+            s = hl.zeros([tm, tn], dtype=torch.float32)
+            a = out[tm.begin, tn]
+            out[tm, tn] = a[None, :] + s + 1.0
+        out2[tm, tn] = acc + s
+    return out
+
+
+@helion.kernel(**S)
+def dist_readback(x: torch.Tensor, y: torch.Tensor, out2: torch.Tensor) -> torch.Tensor:
+    """Store a row, then read back its pair row (2i <-> 2i + 1)."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tm, tn] = acc + x[tm, tn]
+        rows = tm.index + 1 - 2 * (tm.index % 2)
+        out2[tm, tn] = out[rows, tn]
+    return out
+
+
+@helion.kernel(**S)
+def dist_swap_load(x: torch.Tensor, y: torch.Tensor, buf: torch.Tensor) -> torch.Tensor:
+    """Load the pair row of ``buf``, then store this row: every load reads
+    the old values."""
+    m, k = x.size()
+    _, n = y.size()
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        rows = tm.index + 1 - 2 * (tm.index % 2)
+        b = buf[rows, tn]
+        buf[tm, tn] = b + acc
+    return buf
+
+
+@helion.kernel(**S)
+def dist_two_stores(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Store every row, then overwrite the pair rows: the second store
+    wins."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        v = acc + x[tm, tn]
+        rows = tm.index + 1 - 2 * (tm.index % 2)
+        out[tm, tn] = v
+        out[rows, tn] = v * 2.0
+    return out
+
+
+@helion.kernel(**S)
+def dist_store_then_load(
+    x: torch.Tensor, y: torch.Tensor, buf: torch.Tensor
+) -> torch.Tensor:
+    """A store and a load of ``buf`` that read no lane, after a per-lane
+    statement."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        v = x[tm, tn] * 2.0
+        buf[tm.id, tn] = y[0, tn] * 3.0
+        z = buf[tm.id, tn]
+        out[tm, tn] = acc + v + z[None, :]
+    return out
+
+
+@helion.kernel(**S)
+def dist_store_then_load_acc(
+    x: torch.Tensor, y: torch.Tensor, buf: torch.Tensor
+) -> torch.Tensor:
+    """dist_store_then_load whose per-lane statement reads the result."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        v = acc + x[tm, tn]
+        buf[tm.id, tn] = y[0, tn] * 3.0
+        z = buf[tm.id, tn]
+        out[tm, tn] = v + z[None, :]
+    return out
+
+
+def _lane_looped(msl: str, pattern: str) -> bool:
+    """Whether the first match of ``pattern`` in ``msl`` sits in a rolled
+    ``lane_`` loop."""
+    match = re.search(pattern, msl)
+    assert match is not None, pattern
+    return any(
+        re.match(r"int lane_\d+ = 0", header)
+        for header in _open_loops(msl, match.start())
+    )
+
+
+def _pair_rows(t: torch.Tensor) -> torch.Tensor:
+    """``t`` with rows 2i and 2i + 1 swapped."""
+    idx = torch.arange(t.size(0))
+    return t[idx + 1 - 2 * (idx % 2)]
+
+
+@_requires_mps
+class TestMppLaneDistribution(unittest.TestCase):
+    """A lane loop around a cooperative statement that reads no lane is
+    split into one rolled lane loop per run of the statements that depend on
+    its lane, and runs in the order the jam would give it; where a run's
+    lane-by-lane order could differ from the jam's, the jam takes the loop."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+        self.x = torch.randn(48, 72, device=DEVICE)
+        self.y = torch.randn(72, 40, device=DEVICE)
+        self.xy = _mm(self.x, self.y)
+        self.xd = self.x.cpu().double()[:, :40]
+
+    def _jammed(self, msl: str) -> None:
+        """The rows' lane loop (block 0's) is jammed, not rolled."""
+        self.assertIn("__lane1", msl)
+        self.assertNotIn("for (int lane_0 = 0", msl)
+
+    def test_per_lane_start_stays_in_its_lane_loop(self) -> None:
+        """``s = 0.0`` starting a per-row sum reads no lane but holds a value
+        per lane."""
+        _, _, msl = _run(root_beside_sum, (self.x, self.y), None)
+        self.assertTrue(_lane_looped(msl, re.escape("auto s = float(0.0);")))
+
+    def test_element_loop_definitions_stay_private(self) -> None:
+        """Names an element loop defines don't leave it, so upd_seed's seed
+        staging, 16 x 16 on 128 threads, keeps one rolled lane loop."""
+        h = torch.float16
+        p = torch.randn(48, 72, device=DEVICE, dtype=h)
+        v = torch.randn(72, 40, device=DEVICE, dtype=h)
+        c = torch.randn(48, 40, device=DEVICE)
+        a = torch.randn(48, 72, device=DEVICE) * 0.3
+        out, _, msl = _run(upd_seed, (p, v, c, a), TILE16)
+        expected = _d(c)
+        for ks in _k_tiles(72, 16):
+            expected = expected * _d(a)[:, ks.start, None] + _d(p)[:, ks] @ _d(v)[ks]
+        _close(out, expected)
+        self.assertEqual(len(re.findall(r"for \(int lane_\d+ = 0", msl)), 1)
+        self.assertNotIn("__lane1", msl)
+
+    def test_fold_combine_stays_after_its_fold(self) -> None:
+        """A lane fold's partial is lane-dependent, so the combine across
+        threads that reads it stays after the fold."""
+        q = torch.randn(48, 64, device=DEVICE)
+        kk = torch.randn(80, 64, device=DEVICE)
+        p = torch.randn(48, 72, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(72, 40, device=DEVICE, dtype=torch.bfloat16)
+        lse = torch.logsumexp(_d(q) @ _d(kk).T, -1)
+        for kernel, args, expected, config in (
+            (nloop_lse, (q, kk), lse, None),
+            (
+                nloop_lse,
+                (q, kk),
+                lse,
+                helion.Config(block_sizes=[16, 16], num_threads=[16, 1], num_warps=4),
+            ),
+            (
+                nloop_lse,
+                (q, kk),
+                lse,
+                helion.Config(block_sizes=[32, 32], num_threads=[8, 16], num_warps=4),
+            ),
+            (colon_n_rowsum, (p, v), _mm(p, v).sum(-1), None),
+        ):
+            with self.subTest(kernel=kernel.name, config=config):
+                out, _, msl = _run(kernel, args, config)
+                _close(out, expected)
+                for part in re.findall(r"auto (lane_\w*part\w*) =", msl):
+                    combine = re.search(rf"group_\w+\([^;]*\b{part}\b", msl)
+                    assert combine is not None
+                    self.assertLess(msl.index(f"auto {part} ="), combine.start())
+
+    def test_compound_assignments_follow_the_lane(self) -> None:
+        """A device loop or ``if`` that resets a per-lane value runs per lane,
+        so every other name it assigns is per lane too: its start and its
+        readers stay in the lane loop."""
+        ysum = self.y.cpu().double().sum(0)
+        for config in (
+            None,
+            helion.Config(block_sizes=[32, 16, 16, 16], num_warps=4),
+        ):
+            with self.subTest(kernel="loop", config=config):
+                out, _, msl = _run(dist_loop_reset, (self.x, self.y), config)
+                _close(out, self.xy + 2.0 * ysum[None, :])
+                self.assertTrue(_lane_looped(msl, re.escape("auto t = float(0.0);")))
+                self.assertTrue(_lane_looped(msl, r"\(t \* v_\d+\)"))
+        flag = torch.ones(1, dtype=torch.int32, device=DEVICE)
+        config = helion.Config(
+            block_sizes=[16, 16, 16], num_threads=[8, 16, 0], num_warps=4
+        )
+        with self.subTest(kernel="if"):
+            out, _, msl = _run(dist_if_reset, (self.x, self.y, flag), config)
+            y0 = self.y.cpu().double()[0]
+            _close(out, self.xy + 2.0 * (y0 + 1.0)[None, :])
+            self.assertTrue(_lane_looped(msl, r"if \(v_\d+\) \{"))
+
+    def test_updated_value_is_not_recomputed(self) -> None:
+        """A later run can't recompute a per-lane value from its first
+        definition once a device loop has updated it, so the jam takes the
+        loop."""
+        y = self.y.clone()
+        y[:, 0] = torch.randint(0, 4, (72,), device=DEVICE).float()
+        rows = 2.0 * torch.arange(48, dtype=torch.float64)[:, None]
+        expected = _mm(self.x, y) + rows + y.cpu().double()[:, 0].sum()
+        for config in (
+            None,
+            helion.Config(block_sizes=[32, 16, 16, 16], num_warps=4),
+            helion.Config(
+                block_sizes=[16, 16, 16, 16], num_threads=[8, 16, 0, 0], num_warps=4
+            ),
+        ):
+            with self.subTest(config=config):
+                out, _, msl = _run(dist_stale_index, (self.x, y), config)
+                _close(out, expected)
+                self._jammed(msl)
+
+    def test_runs_that_meet_their_own_stores_are_jammed(self) -> None:
+        """A run executes lane by lane where the jam runs every lane's copy
+        of a statement before the next: when a tensor the run stores is
+        touched by another of its statements, or loaded by the statement
+        that stores it, the jam takes the loop."""
+        x, y, xy, xd = self.x, self.y, self.xy, self.xd
+        lanes_32 = [
+            None,
+            helion.Config(block_sizes=[16, 32, 16, 16], num_threads=[1, 32, 0, 0]),
+        ]
+        for config in [
+            *lanes_32,
+            helion.Config(block_sizes=[16, 32, 16, 16], num_threads=[2, 32, 0, 0]),
+        ]:
+            with self.subTest(kernel="rmw", config=config):
+                cnt = torch.zeros(48, 40, device=DEVICE)
+                out, _, msl = _run(dist_rmw, (x, y, cnt), config)
+                bound = dist_rmw.bind((x, y, cnt))
+                blocks = (config or bound.config_spec.default_config()).block_sizes
+                expected = torch.zeros(48, 40, dtype=torch.float64)
+                expected[: math.ceil(48 / blocks[0])] = math.ceil(72 / blocks[3])
+                _close(out, xy)
+                _close(cnt, expected)
+                self._jammed(msl)
+        for config in lanes_32:
+            with self.subTest(kernel="rb_loop", config=config):
+                out2 = torch.zeros(48, 40, device=DEVICE)
+                out, _, msl = _run(dist_rb_loop, (x, y, out2), config)
+                blocks = (
+                    config
+                    or dist_rb_loop.bind((x, y, out2)).config_spec.default_config()
+                ).block_sizes
+                _close(
+                    out,
+                    torch.full(
+                        (48, 40), float(math.ceil(72 / blocks[3])), dtype=torch.float64
+                    ),
+                )
+                _close(out2, xy)
+                self._jammed(msl)
+        rows_16 = [
+            None,
+            helion.Config(block_sizes=[16, 16, 16], num_threads=[8, 16, 0]),
+        ]
+        two_warps = helion.Config(
+            block_sizes=[16, 16, 16], num_threads=[4, 16, 0], num_warps=2
+        )
+        for config in rows_16:
+            with self.subTest(kernel="swap_load", config=config):
+                buf = torch.randn(48, 40, device=DEVICE)
+                expected = _pair_rows(buf.cpu().double()) + xy
+                out, _, msl = _run(dist_swap_load, (x, y, buf), config)
+                _close(out, expected)
+                self._jammed(msl)
+        for config in [*rows_16, two_warps]:
+            with self.subTest(kernel="two_stores", config=config):
+                out, _, msl = _run(dist_two_stores, (x, y), config)
+                _close(out, 2.0 * _pair_rows(xy + xd))
+                self._jammed(msl)
+            with self.subTest(kernel="readback", config=config):
+                out2 = torch.zeros(48, 40, device=DEVICE)
+                out, _, msl = _run(dist_readback, (x, y, out2), config)
+                _close(out, xy + xd)
+                _close(out2, _pair_rows(xy + xd))
+                self._jammed(msl)
+
+    def test_run_storing_only_its_own_tensor_stays_distributed(self) -> None:
+        """A nested slice loop that stores ``out``, which nothing else in the
+        run touches, keeps its rolled lane loop."""
+        p = torch.randn(48, 72, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(72, 40, device=DEVICE, dtype=torch.bfloat16)
+        config = helion.Config(block_sizes=[32, 32], num_warps=4)
+        out, _, msl = _run(colon_n_rowsum, (p, v), config)
+        _close(out, _mm(p, v).sum(-1))
+        self.assertRegex(msl, r"for \(int lane_\d+ = 0")
+
+    def test_invariant_load_stays_after_the_store_it_reads(self) -> None:
+        """A store that reads no lane moves after its run's loop, so a load
+        of the same tensor that reads no lane can't move ahead of it."""
+        x, y = self.x, self.y
+        y0 = 3.0 * y.cpu().double()[0][None, :]
+        for kernel, expected, config in (
+            (dist_store_then_load, self.xy + 2.0 * self.xd + y0, None),
+            (
+                dist_store_then_load,
+                self.xy + 2.0 * self.xd + y0,
+                helion.Config(
+                    block_sizes=[16, 16, 16], num_threads=[1, 16, 0], num_warps=4
+                ),
+            ),
+            (dist_store_then_load_acc, self.xy + self.xd + y0, None),
+        ):
+            with self.subTest(kernel=kernel.name, config=config):
+                buf = torch.full((48, 40), -100.0, device=DEVICE)
+                out, _, msl = _run(kernel, (x, y, buf), config)
+                _close(out, expected)
+                self.assertLess(msl.index("buf[(("), msl.index("? buf[(("))
+
+    def test_staging_loop_inside_a_distributed_lane_loop(self) -> None:
+        """A staged ``:`` K splits its staging loop inside the row lane loop
+        that E then distributes; the staging keeps its split form there."""
+        h = torch.float16
+        x = torch.randn(48, 64, device=DEVICE, dtype=h)
+        y = torch.randn(64, 40, device=DEVICE, dtype=h)
+        xb = torch.randn(48, 72, device=DEVICE, dtype=torch.bfloat16)
+        yb = torch.randn(40, 72, device=DEVICE, dtype=torch.bfloat16)
+        x3 = torch.randn(3, 48, 64, device=DEVICE)
+        y3 = torch.randn(3, 64, 40, device=DEVICE)
+        for kernel, args, expected in (
+            (colon_k_staged, (x, y), _mm(x, y) * 2),
+            (colon_staged_lhs, (xb, yb), _mm(xb, yb.T) * 0.5),
+            (
+                bmm_staged,
+                (x3, y3),
+                torch.bmm(x3.cpu().double() * 0.5, y3.cpu().double()),
+            ),
+        ):
+            with self.subTest(kernel=kernel.name):
+                out, _, msl = _run(kernel, args, None)
+                _close(out, expected)
+                self.assertTrue(_lane_looped(msl, r"for \(int slice_lane_\d+"))
+                self.assertNotIn("_mpp_lanes_", msl)
+
+
+# --- Uniform launches: masks the shared per-tile rule proves true ----------
+
+
+@helion.kernel(**S)
+def bias_relu(x: torch.Tensor, y: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tm, tn] = torch.relu(acc + b[tn]).to(torch.float16)
+    return out
+
+
+@helion.kernel(**S)
+def add_into(x: torch.Tensor, y: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        o[tm, tn] = acc + o[tm, tn]
+    return o
+
+
+@helion.kernel(**S)
+def colsum_one_tile(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.zeros([n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n], block_size=[m, None]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tn] = acc.sum(0)
+    return out
+
+
+#: 256 threads as 16 x 16, every tile loop on 16 of them.
+_UNIFORM16 = helion.Config(
+    block_sizes=[16, 16, 16], num_threads=[16, 16, 1], num_warps=8
+)
+_INT4_UNIFORM = (
+    (
+        helion.Config(block_sizes=[32, 16, 64], num_threads=[0, 1, 0], num_warps=2),
+        (64, 1, 1),
+    ),
+    (helion.Config(block_sizes=[128, 16, 16], num_warps=8), (16, 16, 1)),
+)
+
+
+def _int4_args(m: int, k: int, n: int) -> tuple[torch.Tensor, ...]:
+    """int4_gemm's arguments (A a slice of a NaN buffer) and its result."""
+    w = torch.randint(-8, 8, (k, n))
+    a = torch.randn(m, k).to(torch.bfloat16)
+    ref = (a.double() @ w.double()).to(torch.bfloat16).double()
+    return _nan_padded(a.to(DEVICE)), _pack_int4(w).to(DEVICE), ref
+
+
+def _attention_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    scores = _d(q) @ _d(k).transpose(-1, -2) / math.sqrt(q.size(-1))
+    return torch.softmax(scores, -1) @ _d(v)
+
+
+@_requires_mps
+class TestMppUniformLaunch(_MppCase):
+    """When every strategy of a planner MPP kernel has one thread extent, the
+    launch has no surplus threads: a block whose extent divides it drops its
+    masks, and a tile loop's staging writes and materialized-tile reads
+    drop their in-tile checks.  Each config's launch is asserted, since only
+    a uniform one takes this path."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+
+    def _launches(self, code: str, launch: tuple[int, int, int]) -> None:
+        self.assertIn(f"_block_dims={launch}", code)
+
+    def test_int4_gemm(self) -> None:
+        """int4_gemm's staged B: no select on its load or on its lane
+        array's read-back, and an unguarded staging write."""
+        for m in (1, 16):
+            lhs, rhs, ref = _int4_args(m, 256, 128)
+            for config, launch in _INT4_UNIFORM:
+                with self.subTest(m=m, config=config):
+                    out, code, msl = _run(int4_gemm, (lhs, rhs), config)
+                    _close(out, ref)
+                    self._launches(code, launch)
+                    self.assertNotRegex(msl, r"\bmask_\d+")
+                    self.assertNotIn("? B[", msl)
+                    self.assertRegex(msl, r"if \(_mpp_owner_\d+\) \{ _mpp_tile\[")
+                    if launch == (64, 1, 1):
+                        self.assertRegex(
+                            msl, r"auto b_tile = _mpp_lanes_\d+\[lane_\d+\];"
+                        )
+
+    def test_epilogues(self) -> None:
+        """A bias, relu and f16 cast, and an epilogue that reads its own
+        destination through the materialized tile, 50 times with fresh
+        arguments: no mask and no select on the tile read."""
+        x = torch.randn(32, 128, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(128, 64, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(64, device=DEVICE)
+        with self.subTest(kernel="bias_relu"):
+            out, code, msl = _run(bias_relu, (x, y, b), _UNIFORM16)
+            _close(out, torch.relu(_mm(x, y) + _d(b)))
+            self._launches(code, (16, 16, 1))
+            self.assertNotRegex(msl, r"\bmask_\d+")
+        for _ in range(50):
+            o = torch.randn(32, 64, device=DEVICE)
+            ref = _mm(x, y) + _d(o)
+            with self.subTest(kernel="add_into"):
+                out, code, msl = _run(add_into, (x, y, o), _UNIFORM16)
+                _close(out, ref)
+                self._launches(code, (16, 16, 1))
+                self.assertNotRegex(msl, r"\bmask_\d+")
+                self.assertRegex(msl, r"= _mpp_mat\w*\[")
+                self.assertNotIn("? _mpp_mat", msl)
+
+    def test_reductions(self) -> None:
+        """Column sums of one M tile, and attention's row max and sum, read
+        the cooperative result unguarded and reduce it with no identity
+        fill.  Attention's ':' head dim keeps its in-tile checks, which
+        only a tile loop's layout proves true."""
+        x = torch.randn(32, 128, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(128, 64, device=DEVICE, dtype=torch.float16)
+        config = helion.Config(block_sizes=[32, 16], num_threads=[32, 0], num_warps=1)
+        with self.subTest(kernel="colsum_one_tile"):
+            out, code, msl = _run(colsum_one_tile, (x, y), config)
+            _close(out, _mm(x, y).sum(0))
+            self._launches(code, (32, 1, 1))
+            self.assertNotRegex(msl, r"\bmask_\d+")
+            self.assertNotIn("? _mpp_mat", msl)
+        q, k, v = (
+            torch.randn(1, 2, 64, 64, device=DEVICE, dtype=torch.float16)
+            for _ in range(3)
+        )
+        config = helion.Config(block_sizes=[1, 16, 16], num_threads=[1, 16, 16])
+        with self.subTest(kernel="attention"):
+            (out, _), code, msl = _run(attention_metal, (q, k, v), config)
+            _close(out, _attention_ref(q, k, v))
+            self._launches(code, (16, 16, 1))
+            self.assertNotRegex(msl, r"\bmask_\d+")
+            self.assertNotIn("_mask_to", msl)
+            self.assertRegex(msl, r"auto _mpp_v_\d+ = _mpp_mat\w*\[")
+            self.assertRegex(msl, r"if \(\(\(indices_\d+ - 0\) < 64\)\) \{ _mpp_tile\[")
+
+
+@_requires_mps
+class TestMppUniformLaunchKeepsMasks(_MppCase):
+    """What a uniform launch doesn't prove stays checked: an extent that
+    doesn't divide its block, a launch with two thread extents, and kernels
+    whose free ``hl.arange`` or MPP graph pass claims threads no strategy
+    owns."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+
+    def test_extent_not_dividing(self) -> None:
+        """N = 100 under 16-column tiles and int4_gemm at M = 3 keep those
+        masks."""
+        x = torch.randn(32, 128, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(128, 100, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(100, device=DEVICE)
+        with self.subTest(kernel="bias_relu"):
+            out, code, msl = _run(bias_relu, (x, y, b), _UNIFORM16)
+            _close(out, torch.relu(_mm(x, y) + _d(b)))
+            self.assertIn("_block_dims=(16, 16, 1)", code)
+            self.assertRegex(msl, r"\bindices_\d+ < 100\)")
+        lhs, rhs, ref = _int4_args(3, 256, 128)
+        for config, launch in _INT4_UNIFORM:
+            with self.subTest(kernel="int4_gemm", config=config):
+                out, code, msl = _run(int4_gemm, (lhs, rhs), config)
+                _close(out, ref)
+                self.assertIn(f"_block_dims={launch}", code)
+                self.assertRegex(msl, r"\bindices_\d+ < 3\)")
+
+    def test_two_thread_extents(self) -> None:
+        """int4_gemm launched as 16 x 8 or 8 x 16 keeps its tile masks and
+        its staging write's in-tile checks."""
+        config = helion.Config(block_sizes=[128, 16, 16], num_warps=4)
+        for m, launch in ((1, (16, 8, 1)), (16, (8, 16, 1))):
+            lhs, rhs, ref = _int4_args(m, 256, 128)
+            with self.subTest(m=m):
+                out, code, msl = _run(int4_gemm, (lhs, rhs), config)
+                _close(out, ref)
+                self.assertIn(f"_block_dims={launch}", code)
+                self.assertIn("? B[", msl)
+                self.assertRegex(msl, r"if \(\(\(\(indices_\d+ - offset_\d+\) < 128\)")
+
+    def test_threads_no_strategy_owns(self) -> None:
+        """Free ``hl.arange`` rows, and an ``hl.dot`` on the MPP graph pass
+        beside an ``addmm``, keep their masks at launches whose strategies
+        share one extent."""
+        a = torch.randn(64, 48, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(48, 64, device=DEVICE, dtype=torch.float16)
+        with self.subTest(kernel="free_rows"):
+            out, code, _ = _run(free_rows, (a, b, 4, 4), _UNIFORM16)
+            _close(out, _mm(a, b))
+            self.assertIn("_block_dims=(16, 16, 1)", code)
+        x = torch.randn(64, 64, device=DEVICE)
+        y = torch.randn(64, 64, device=DEVICE)
+        config = helion.Config(
+            block_sizes=[16, 16, 16, 16], num_threads=[4, 4, 0, 0], num_warps=4
+        )
+        with self.subTest(kernel="dot_then_addmm"):
+            (o1, o2), code, msl = _run(dot_then_addmm, (x, y), config)
+            _close(o1, _mm(x, y))
+            _close(o2, 2 * _mm(x, y))
+            self.assertIn("_metal_mpp_setup", code)
+            self.assertIn("_block_dims=(128, 4, 1)", code)
+            self.assertRegex(msl, r"\bmask_\d+")
+
+
+# --- Staging lane loops dealt out over the threads that share them ---------
+
+
+@helion.kernel(**S)
+def scaled_colon_lhs(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """A ':' K lhs computed once per M tile, before the N loop holding the
+    op."""
+    m, _ = x.size()
+    n = w.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        a = x[tm, :] * 0.5
+        for tn in hl.tile(n):
+            acc = hl.zeros([tm, tn], dtype=torch.float32)
+            out[tm, tn] = torch.addmm(acc, a, w[:, tn])
+    return out
+
+
+@helion.kernel(**S)
+def scaled_colon_rhs(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """A ':' K rhs computed once per N tile, before the M loop holding the
+    op."""
+    m, _ = x.size()
+    n = w.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tn in hl.tile(n):
+        b = w[:, tn] * 2.0
+        for tm in hl.tile(m):
+            acc = hl.zeros([tm, tn], dtype=torch.float32)
+            out[tm, tn] = torch.addmm(acc, x[tm, :], b)
+    return out
+
+
+@helion.kernel(**S)
+def gated_lhs(
+    x: torch.Tensor, g: torch.Tensor, bias: torch.Tensor, w: torch.Tensor
+) -> torch.Tensor:
+    """A lhs from a row gate and a column bias, before the N loop."""
+    m, _ = x.size()
+    n = w.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        a = (x[tm, :] * g[tm][:, None] + bias[None, :]).to(x.dtype)
+        for tn in hl.tile(n):
+            acc = hl.zeros([tm, tn], dtype=torch.float32)
+            out[tm, tn] = torch.addmm(acc, a, w[:, tn])
+    return out
+
+
+@helion.kernel(**S)
+def two_pins(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """A lhs that N's threads share and a rhs that M's threads share, staged
+    by one lane loop over the ':' K."""
+    m, _ = x.size()
+    n = w.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        a = x[tm, :] * 2.0
+        b = w[:, tn] * 0.5
+        for _k in hl.tile(1):
+            acc = hl.zeros([tm, tn], dtype=torch.float32)
+            out[tm, tn] = torch.addmm(acc, a, b)
+    return out
+
+
+def _spread_loops(msl: str) -> list[tuple[int, int, int, str]]:
+    """Each lane loop that starts at a thread index: its thread axis, extent,
+    step and body."""
+    loops = []
+    for match in re.finditer(
+        r"for \(int (\w*lane_\d+) = tid\[(\d)\]; \1 < (\d+); \1 \+= (\d+)\) \{", msl
+    ):
+        end, depth = match.end(), 1
+        while depth:
+            depth += {"{": 1, "}": -1}.get(msl[end], 0)
+            end += 1
+        axis, extent, step = (int(g) for g in match.groups()[1:])
+        loops.append((axis, extent, step, msl[match.end() : end]))
+    return loops
+
+
+#: A staging write that an owner test pins, in a lane loop from 0.
+_OWNED_LANES = (
+    r"for \(int \w*lane_\d+ = 0;[^{]*\{[^}]*_mpp_owner\w*\)\) \{ _mpp_(tile|seed)"
+)
+
+
+@_requires_mps
+class TestMppStagingSpread(_MppCase):
+    """A lane loop staging an operand that the threads of another block's
+    axis all hold, whose writes an owner test gives the thread at 0 of that
+    axis, deals its lanes out over the axis instead: thread ``t`` runs lanes
+    ``t``, ``t + n``, ... and writes them without the owner test."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+
+    def _spreads(self, code: str, msl: str, axis: int, extent: int) -> str:
+        """The one dealt lane loop runs over ``extent`` lanes from
+        ``tid[axis]`` by the launch's threads on that axis and stages
+        without an owner test; return its MSL position."""
+        (loop,) = _spread_loops(msl)
+        self.assertEqual(loop[:3], (axis, extent, _launch(code)[axis]))
+        self.assertRegex(loop[3], r"\{ _mpp_(tile|seed)\w*\[")
+        self.assertNotIn("_mpp_owner", loop[3])
+        return msl.index(loop[3])
+
+    def test_attention(self) -> None:
+        """attention's ``q * qk_scale`` over the ':' head dim, dealt out over
+        the N threads, at a sequence length no block divides."""
+        bf = torch.bfloat16
+        q, k, v = (torch.randn(2, 3, 72, 64, dtype=bf) for _ in range(3))
+        scale = 1.0 / math.sqrt(64) * 1.44269504
+        scores = (q.double() * scale).to(bf).double() @ k.double().transpose(-1, -2)
+        expected = _bf(torch.softmax(scores * math.log(2), -1) @ v.double())
+        args = (q.to(DEVICE), k.to(DEVICE), v.to(DEVICE))
+        for config in (
+            None,
+            helion.Config(block_sizes=[1, 32, 64], num_threads=[1, 0, 0], num_warps=8),
+            helion.Config(block_sizes=[1, 16, 64], num_threads=[1, 0, 0], num_warps=4),
+        ):
+            with self.subTest(config=config):
+                (out, _), code, msl = _run(attention_metal, args, config)
+                _close(out, expected)
+                self._spreads(code, msl, 0, 64)
+
+    def test_hoisted_operands(self) -> None:
+        """A lhs over 40 lanes, which 16 N threads don't divide, a rhs
+        dealt out over the M threads, and a lhs computed from a row gate and
+        a column bias, run 20 times."""
+        h = torch.float16
+        x, w = torch.randn(48, 40, dtype=h), torch.randn(40, 48, dtype=h)
+        for config in (
+            None,
+            helion.Config(block_sizes=[16, 16], num_threads=[0, 16], num_warps=1),
+        ):
+            with self.subTest(kernel="scaled_colon_lhs", config=config):
+                out, code, msl = _run(
+                    scaled_colon_lhs, (x.to(DEVICE), w.to(DEVICE)), config
+                )
+                _close(out, _mm(x * 0.5, w))
+                self._spreads(code, msl, 1, 40)
+        x, w = torch.randn(40, 64, dtype=h), torch.randn(64, 48, dtype=h)
+        for config in (
+            None,
+            helion.Config(block_sizes=[16, 16], num_threads=[16, 0], num_warps=1),
+        ):
+            with self.subTest(kernel="scaled_colon_rhs", config=config):
+                out, code, msl = _run(
+                    scaled_colon_rhs, (x.to(DEVICE), w.to(DEVICE)), config
+                )
+                _close(out, _mm(x, w * 2.0))
+                self._spreads(code, msl, 1, 64)
+        x, g, bias = (
+            torch.randn(37, 72, dtype=h),
+            torch.randn(37, dtype=h),
+            torch.randn(72, dtype=h),
+        )
+        w = torch.randn(72, 40, dtype=h)
+        a = (x * g[:, None] + bias[None, :]).to(h)
+        config = helion.Config(block_sizes=[32, 32], num_warps=4)
+        for _ in range(20):
+            with self.subTest(kernel="gated_lhs"):
+                args = tuple(t.to(DEVICE) for t in (x, g, bias, w))
+                out, code, msl = _run(gated_lhs, args, config)
+                _close(out, _mm(a, w))
+                self._spreads(code, msl, 1, 72)
+
+    def test_inside_a_lane_loop(self) -> None:
+        """A staging loop nested in the M tile's lane loop: ``if_late``'s 64
+        lanes over 32 threads, and ``hoist_exp``'s 2 lanes over 8 threads,
+        where the threads past the extent run none."""
+        bf = torch.bfloat16
+        q = torch.randn(48, 64, dtype=bf) * 0.5
+        k = torch.randn(40, 64, dtype=bf)
+        late = _mm(q * 0.125, k.T)
+        late[:, :32] = 0
+        for kernel, config, expected, axis, extent in (
+            (
+                if_late,
+                helion.Config(block_sizes=[64, 32], num_threads=[32, 32], num_warps=32),
+                late,
+                1,
+                64,
+            ),
+            (
+                hoist_exp,
+                helion.Config(block_sizes=[64, 16], num_threads=[4, 8], num_warps=32),
+                _mm(torch.exp(q) * q, k.T),
+                2,
+                2,
+            ),
+        ):
+            with self.subTest(kernel=kernel.name):
+                out, code, msl = _run(kernel, (q.to(DEVICE), k.to(DEVICE)), config)
+                _close(out, expected)
+                pos = self._spreads(code, msl, axis, extent)
+                self.assertTrue(
+                    [h for h in _open_loops(msl, pos) if h.startswith("int lane_")]
+                )
+
+    def test_keeps_the_owner(self) -> None:
+        """Kept on the owner path: a lane loop staging a lhs that N's threads
+        share beside a rhs that M's share, which no one axis deals out, and
+        attention at a config whose N axis has one thread."""
+        h = torch.float16
+        x, w = torch.randn(48, 64, dtype=h), torch.randn(64, 40, dtype=h)
+        with self.subTest(kernel="two_pins"):
+            out, _, msl = _run(two_pins, (x.to(DEVICE), w.to(DEVICE)), None)
+            _close(out, _mm(x * 2.0, w * 0.5))
+            self.assertRegex(msl, _OWNED_LANES)
+            self.assertFalse(_spread_loops(msl))
+        q, k, v = (torch.randn(1, 2, 64, 64, device=DEVICE, dtype=h) for _ in range(3))
+        config = helion.Config(
+            block_sizes=[1, 32, 16], num_threads=[1, 32, 1], num_warps=1
+        )
+        with self.subTest(kernel="attention"):
+            (out, _), code, msl = _run(attention_metal, (q, k, v), config)
+            _close(out, _attention_ref(q, k, v))
+            self.assertIn("_block_dims=(32, 1, 1)", code)
+            self.assertRegex(msl, _OWNED_LANES)
+            self.assertFalse(_spread_loops(msl))
+
+
+_SPREAD_OWNER = "_mpp_owner = tid[0] == 0 and tid[2] == 0\n"
+_SPREAD_VALUE = "v_1 = float(slice_lane_0) * 2.0"
+_SPREAD_STAGE = (
+    "_helion_mpp_stage(_mpp_tile, tid[1] * 16 + slice_lane_0, v_1,"
+    " slice_lane_0 < 16 and _mpp_owner, (0, 2))"
+)
+
+
+def _spread_body(
+    pre: str = "",
+    run: tuple[str, ...] = (_SPREAD_VALUE, _SPREAD_STAGE),
+    extent: str = "16",
+    wrap: str | None = None,
+) -> str:
+    """A kernel body whose lane loop holds the staging statements ``run``
+    beside a K loop holding an op, after ``pre``, under ``wrap``."""
+    loop = "\n".join(
+        [
+            f"for slice_lane_0 in range({extent}):",
+            *(f"    {s}" for s in run),
+            "    for offset_3 in tl.range(0, 64, 16):",
+            "        acc = _helion_mpp_run(0)",
+        ]
+    )
+    if wrap is not None:
+        loop = f"{wrap}\n{textwrap.indent(loop, '    ')}"
+    return f"{_SPREAD_OWNER}{pre}{loop}\n"
+
+
+def _spread_value(scale: str) -> tuple[str, str]:
+    return (f"v_1 = float(slice_lane_0) * {scale}", _SPREAD_STAGE)
+
+
+def _spread_owner(test: str) -> str:
+    """A body whose staging write's last term is a name bound to ``test``."""
+    stage = _SPREAD_STAGE.replace("_mpp_owner,", "_mpp_owner_9,")
+    return _spread_body(f"_mpp_owner_9 = {test}\n", (_SPREAD_VALUE, stage))
+
+
+class TestMppStagingSpreadRule(unittest.TestCase):
+    """``_run_lane_loops_once`` on hand-built bodies at threadgroup
+    (8, 32, 1), where the staging writes pin ``tid[0]`` (8 threads) and
+    ``tid[2]``: which lane loops are dealt out over ``tid[0]``."""
+
+    def _rewrite(
+        self, source: str, tg_size: tuple[int, int, int] = (8, 32, 1)
+    ) -> list[ast.stmt]:
+        return mpp_matmul._run_lane_loops_once(
+            ast.parse(source).body,
+            set(),
+            {},
+            frozenset({"_mpp_tile", "_mpp_tile_1"}),
+            tg_size,
+        )
+
+    def _lanes(self, source: str, tg_size: tuple[int, int, int] = (8, 32, 1)) -> str:
+        """The header of the staging lane loop after the rewrite."""
+        out = self._rewrite(source, tg_size)
+        text = ast.unparse(ast.fix_missing_locations(ast.Module(out, [])))
+        (header,) = re.findall(r"for slice_lane_0 in range\(.*\):", text)
+        return header
+
+    def test_deals_lanes(self) -> None:
+        loop = self._rewrite(_spread_body())[1]
+        self.assertEqual(
+            ast.unparse(ast.fix_missing_locations(loop)).splitlines(),
+            [
+                "for slice_lane_0 in range(tid[0], 16, 8):",
+                "    v_1 = float(slice_lane_0) * 2.0",
+                (
+                    "    _helion_mpp_stage(_mpp_tile, tid[1] * 16 + slice_lane_0, v_1,"
+                    " slice_lane_0 < 16, ())"
+                ),
+            ],
+        )
+        self.assertEqual(
+            self._lanes(_spread_body(), (2, 32, 1)),
+            "for slice_lane_0 in range(tid[0], 16, 2):",
+        )
+
+    def test_uniform_inputs_deal_lanes(self) -> None:
+        """Names and control every thread of the threadgroup computes alike,
+        a write index through a name, and a per-element name of an element
+        loop, which declares its own variable."""
+        for name, source in {
+            "uniform_if_assign": _spread_body(
+                "s = 1.0\nif tgid[0] < 4:\n    s = 2.0\n", _spread_value("s")
+            ),
+            "uniform_augassign": _spread_body(
+                "s = 1.0\ns += 2.0\n", _spread_value("s")
+            ),
+            "under_uniform_if": _spread_body(wrap="if tgid[0] < 4:"),
+            "under_uniform_for": _spread_body(wrap="for i in tl.range(0, 4):"),
+            "index_through_a_name": _spread_body(
+                run=(
+                    "i_1 = tid[1] * 16 + slice_lane_0",
+                    _SPREAD_VALUE,
+                    _SPREAD_STAGE.replace("tid[1] * 16 + slice_lane_0,", "i_1,"),
+                )
+            ),
+            "element_loop_bind": _spread_body(
+                "s = 2.0\nfor _e in _helion_mpp_elements(acc):\n    s = float(tid[0])\n",
+                _spread_value("s"),
+            ),
+        }.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self._lanes(source), "for slice_lane_0 in range(tid[0], 16, 8):"
+                )
+
+    def _spread_alone(self, *run: str) -> None:
+        """Assert ``_Replicas.spread`` keeps a lane loop holding ``run``."""
+        body = ast.parse(
+            _SPREAD_OWNER
+            + "for slice_lane_0 in range(16):\n"
+            + "".join(f"    {s}\n" for s in run)
+        ).body
+        loop = body[1]
+        assert isinstance(loop, ast.For)
+        replicas = mpp_matmul._Replicas(body, (8, 32, 1), frozenset({"_mpp_tile"}))
+        self.assertIs(replicas.spread(loop), loop)
+
+    def test_keeps_a_collective(self) -> None:
+        """A collective in the run must run as often on every thread, even
+        one whose result no write reads."""
+        self._spread_alone(
+            "s_1 = helion_red.simd_sum(float(slice_lane_0))",
+            _SPREAD_VALUE,
+            _SPREAD_STAGE,
+        )
+
+    def test_keeps_a_carry_to_a_later_lane(self) -> None:
+        """A name a lane reads before a statement assigns it holds the
+        previous lane's value.  ``_distribute_lane_loop`` hands such a loop
+        to the jam, so only a direct call reaches ``spread`` with it."""
+        self._spread_alone(*_spread_value("s"), "s = float(slice_lane_0)")
+
+    def test_keeps(self) -> None:
+        """Kept: one case per condition of the rule, per form that binds a
+        name the run reads, per owner check and per kind of thread-varying
+        control around the loop."""
+        stage = _SPREAD_STAGE
+        tile_1 = stage.replace("_mpp_tile,", "_mpp_tile_1,")
+        cases = {
+            "range_not_constant": _spread_body(extent="n"),
+            "range_with_start": _spread_body(extent="0, 16"),
+            "reduction_in_run": _spread_body(
+                run=(
+                    "s_1 = helion_red.simd_sum(float(slice_lane_0))",
+                    "v_1 = s_1 * 2.0",
+                    stage,
+                )
+            ),
+            "threadgroup_read_in_run": _spread_body(
+                run=("v_1 = _mpp_tile_1[slice_lane_0] * 2.0", stage)
+            ),
+            "device_store_in_run": _spread_body(
+                run=(_SPREAD_VALUE, "tl.store(out + slice_lane_0, v_1, None)", stage)
+            ),
+            **{
+                f"reduction_in_write_{arg}": _spread_body(
+                    run=(_SPREAD_VALUE, stage.replace(old, new))
+                )
+                for arg, old, new in (
+                    (
+                        "index",
+                        "slice_lane_0,",
+                        "slice_lane_0 + helion_red.simd_max(0),",
+                    ),
+                    ("value", " v_1,", " helion_red.simd_max(v_1),"),
+                    ("predicate", " < 16 ", " < helion_red.simd_max(16) "),
+                )
+            },
+            "lane_jammed_name": _SPREAD_OWNER
+            + "for slice_lane_0 in range(16):\n"
+            + "    for lane_1 in range(2):\n"
+            + "        t_1 = foo(tid[0], lane_1)\n"
+            + "        for offset_3 in tl.range(0, 64, 16):\n"
+            + "            acc = _helion_mpp_run(0)\n"
+            + "        v_1 = float(slice_lane_0) * t_1\n"
+            + f"        {stage}\n",
+            "different_pins": _spread_body(
+                "_mpp_owner_1 = tid[0] == 0\n",
+                (
+                    _SPREAD_VALUE,
+                    stage,
+                    tile_1.replace("_mpp_owner, (0, 2)", "_mpp_owner_1, (0,)"),
+                ),
+            ),
+            "reads_tid": _spread_body(
+                run=("v_1 = float(slice_lane_0 + tid[0])", stage)
+            ),
+            "index_without_lane": _spread_body(
+                run=(_SPREAD_VALUE, stage.replace(" + slice_lane_0,", ","))
+            ),
+            "index_rebound": _spread_body(
+                run=(
+                    "i_1 = tid[1] * 16 + slice_lane_0",
+                    "i_1 = tid[1] * 16",
+                    _SPREAD_VALUE,
+                    stage.replace("tid[1] * 16 + slice_lane_0,", "i_1,"),
+                )
+            ),
+            "self_carry": _spread_body(
+                "s = 0.0\n",
+                ("s = s + float(slice_lane_0)", stage.replace(" v_1,", " s,")),
+            ),
+            "self_carry_two": _spread_body(
+                "s = 0.0\n",
+                (
+                    "v_1 = float(slice_lane_0)",
+                    "s = s + v_1",
+                    stage.replace(" v_1,", " s,"),
+                ),
+            ),
+            **{
+                name: _spread_body(pre, _spread_value(scale))
+                for name, pre, scale in (
+                    ("if_tid", "s = 1.0\nif tid[0] < 4:\n    s = 2.0\n", "s"),
+                    ("for_tid", "s = 1.0\nfor i in range(tid[0]):\n    s = 2.0\n", "s"),
+                    ("while_tid", "s = 1.0\nwhile tid[0] < 4:\n    s = 2.0\n", "s"),
+                    ("walrus_in_test", "if (s := float(tid[0])) > 0:\n    pass\n", "s"),
+                    ("augassign", "s = 1.0\ns += float(tid[0])\n", "s"),
+                    ("tuple_target", "s, t = (float(tid[0]), 1.0)\n", "s"),
+                    ("annassign", "s: float = float(tid[0])\n", "s"),
+                    (
+                        "for_target",
+                        "for j in range(tid[0], tid[0] + 1):\n    pass\n",
+                        "float(j)",
+                    ),
+                    ("whole_tid", "s = helper(tid)\n", "s"),
+                    ("coop_value", "s = _helion_mpp_acc(0)\n", "s"),
+                    ("subscript_store", "arr[0] = float(tid[0])\n", "arr[0]"),
+                    ("attribute_store", "o.x = float(tid[0])\n", "o.x"),
+                    ("nested_store", "o.x[0][0] = float(tid[0])\n", "o.x[0][0]"),
+                    (
+                        "bound_later_in_a_loop",
+                        "s = 1.0\nfor i in tl.range(0, 4):\n    u = s\n    s = float(tid[0])\n",
+                        "u",
+                    ),
+                    ("tid_named_axis", "j = 0\n", "tid[j]"),
+                )
+            },
+            "last_term_not_a_name": _spread_body(
+                run=(_SPREAD_VALUE, stage.replace("_mpp_owner,", "tgid[0] < 12,"))
+            ),
+            "owner_axes_mismatch": _spread_owner("tid[0] == 0"),
+            "owner_tests_tgid": _spread_owner("tgid[0] == 0 and tid[2] == 0"),
+            "owner_nonzero": _spread_owner("tid[0] == 1 and tid[2] == 0"),
+            "owner_not_equality": _spread_owner("tid[0] <= 0 and tid[2] == 0"),
+            "owner_chained": _spread_owner("tid[0] == 0 == tgid[0] and tid[2] == 0"),
+            "owner_named_axis": _spread_owner("tid[j] == 0 and tid[2] == 0"),
+            "owner_named_value": _spread_owner("tid[0] == k and tid[2] == 0"),
+            "owner_rebound": _spread_body(
+                "if tgid[0] < 1:\n    _mpp_owner = tid[0] == 0 and tid[2] == 0\n"
+            ),
+            "under_tid_if": _spread_body(wrap="if tid[0] < 4:"),
+            "under_tid1_if": _spread_body(wrap="if tid[1] < 4:"),
+            "under_tid1_else": _spread_body(wrap="if tid[1] < 4:\n    pass\nelse:"),
+            "under_tid_for": _spread_body(wrap="for i in range(tid[1]):"),
+        }
+        for name, source in cases.items():
+            with self.subTest(name=name):
+                self.assertNotIn("tid[", self._lanes(source))
+        for name, tg_size in (("two_threaded_pins", (8, 32, 4)), ("none", (1, 32, 1))):
+            with self.subTest(name=name):
+                self.assertNotIn("tid[", self._lanes(_spread_body(), tg_size))
 
 
 if __name__ == "__main__":
