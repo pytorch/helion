@@ -53,6 +53,8 @@ _EXPECTED_ALL = [
     "IfGraphInfo",
     "InductorOpOverrides",
     "LoopedReductionStrategy",
+    "list_backends",
+    "load_backend_plugins",
     "Lowering",
     "PersistentReductionStrategy",
     "ReductionLoopGraphInfo",
@@ -319,6 +321,8 @@ class TestBackendApiSurface(unittest.TestCase):
             return False
 
         for token in set(re.findall(r"`([A-Za-z_][A-Za-z0-9_.]*)`", section)):
+            if token.startswith("__") and token.endswith("__"):
+                continue  # dunders in prose (e.g. `__init__`) are not coverage claims
             if is_member(token):
                 name = token.removeprefix("Backend.")
                 self.assertIn(name, covered, f"{token} is documented but not pinned")

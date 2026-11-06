@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
 import threading
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Generic
 from typing import Literal
 from typing import Protocol
@@ -22,6 +24,7 @@ from .. import exc
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
 
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.type_info import TypeInfo
@@ -39,6 +42,41 @@ if TYPE_CHECKING:
 
 _CodegenT = TypeVar("_CodegenT")
 _CODEGEN_REPAIR_STATE = threading.local()
+_CODEGEN_RECORDING = threading.local()
+_NO_PREVIOUS_HANDLER = object()
+
+
+@contextlib.contextmanager
+def _record_codegen_registrations() -> Iterator[
+    list[tuple[dict[str, Any], str, object, object]]
+]:
+    """Collect ``(implementations, backend, previous, handler)`` per registration.
+
+    Nests: a registration is recorded by every active recorder on this thread.
+    Recording is thread-local: a plugin that spawns threads during import has
+    their registrations recorded nowhere, so they survive a rollback of the
+    plugin's load.
+    """
+    stack: list[list[tuple[dict[str, Any], str, object, object]]] | None = getattr(
+        _CODEGEN_RECORDING, "stack", None
+    )
+    if stack is None:
+        stack = _CODEGEN_RECORDING.stack = []
+    recorded: list[tuple[dict[str, Any], str, object, object]] = []
+    stack.append(recorded)
+    try:
+        yield recorded
+    finally:
+        stack.pop()
+
+
+def _forget_recorded_registrations(
+    entries: list[tuple[dict[str, Any], str, object, object]],
+) -> None:
+    """Drop ``entries`` from every enclosing recorder (a nested load succeeded)."""
+    ids = {id(entry) for entry in entries}
+    for recorded in getattr(_CODEGEN_RECORDING, "stack", None) or []:
+        recorded[:] = [entry for entry in recorded if id(entry) not in ids]
 
 
 def _codegen_repair_in_progress() -> bool:
@@ -62,19 +100,27 @@ def _register_codegen_handler(
     codegen_names: frozenset[str] | None = getattr(
         _CODEGEN_REPAIR_STATE, "codegen_names", None
     )
+    # Explicit raises (not asserts) so -O cannot let a handler be overwritten.
     if codegen_names is None:
-        assert backend not in implementations, (
-            f"codegen already registered for backend {backend!r}"
-        )
+        if backend in implementations:
+            raise AssertionError(f"codegen already registered for backend {backend!r}")
     else:
         if backend not in codegen_names:
             return
         key = (id(implementations), backend)
         registrations: set[tuple[int, str]] = _CODEGEN_REPAIR_STATE.registrations
-        assert key not in registrations, (
-            f"codegen already registered for backend {backend!r}"
-        )
+        if key in registrations:
+            raise AssertionError(f"codegen already registered for backend {backend!r}")
         registrations.add(key)
+    stack = getattr(_CODEGEN_RECORDING, "stack", None)
+    if stack:
+        previous = dict.get(implementations, backend, _NO_PREVIOUS_HANDLER)
+        # The *same* tuple object is appended to every active recorder;
+        # _forget_recorded_registrations matches entries by id(), so do not
+        # copy the tuple per list (a copy would break nested-load rollback).
+        entry = (implementations, backend, previous, handler)
+        for recorded in stack:
+            recorded.append(entry)
     implementations[backend] = handler
 
 
