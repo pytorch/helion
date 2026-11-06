@@ -3523,6 +3523,16 @@ def _install_dependency_phases(
             graph_info.phase_index = phase_index
 
 
+# Whether the native dot can also consume FP8 on each validated NVIDIA target.
+_TRITON_NARROW_DOT_TARGETS = {
+    (8, 0): False,
+    (8, 6): False,
+    (9, 0): True,
+    (10, 3): True,
+    (12, 0): True,
+}
+
+
 # Operations whose lowering has a faster approximate form under the fast_math
 # setting on the Triton and CuTe backends (``inductor_lowering`` and the cute
 # ``exp2_fastmath`` / ``exact_division`` / gelu templates), by the name the
@@ -3659,15 +3669,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 rewrite_cute_half_atomic_output_allocations(host_fn, promotions)
                 promote_cute_root_graph_host_tensors(device_ir.graphs, promotions)
         env = CompileEnvironment.current()
+        capability = env.ptx_capability
         if (
             env.backend.name == "triton"
-            and env.ptx_capability in ((8, 0), (8, 6), (9, 0), (10, 3), (12, 0))
+            and capability is not None
+            and capability in _TRITON_NARROW_DOT_TARGETS
             and env.settings.fast_math
             and env.backend.map_dot_precision(env.settings.dot_precision) == "tf32"
         ):
             from .triton.narrow_dot_operands import narrow_dot_operands
 
-            allow_fp8 = env.ptx_capability in ((9, 0), (10, 3), (12, 0))
+            allow_fp8 = _TRITON_NARROW_DOT_TARGETS[capability]
             for graph in device_ir.graphs:
                 narrow_dot_operands(
                     graph.graph, env.config_spec.matmul_facts, allow_fp8=allow_fp8
