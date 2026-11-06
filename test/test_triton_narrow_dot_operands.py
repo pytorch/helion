@@ -134,8 +134,8 @@ CUDA_CAPABILITY = (
     if torch.cuda.is_available() and torch.version.hip is None
     else None
 )
-SUPPORTED = CUDA_CAPABILITY in ((8, 0), (8, 6), (9, 0), (10, 0), (10, 3), (12, 0))
-FP8_SUPPORTED = CUDA_CAPABILITY in ((9, 0), (10, 0), (10, 3), (12, 0))
+SUPPORTED = CUDA_CAPABILITY in ((8, 0), (8, 6), (9, 0), (10, 3), (12, 0))
+FP8_SUPPORTED = CUDA_CAPABILITY in ((9, 0), (10, 3), (12, 0))
 
 
 @skipUnlessBackends(["triton"])
