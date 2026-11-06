@@ -55,6 +55,12 @@ for tile in hl.tile(0, 1000, block_size=64):
 
 The `grid()` function iterates over individual indices rather than tiles. It's equivalent to `tile(size, block_size=1)` but returns scalar indices instead of tile objects.
 
+### persistent_num_workers()
+
+```{eval-rst}
+.. autofunction:: persistent_num_workers
+```
+
 ### jagged_tile()
 
 ```{eval-rst}

@@ -59,6 +59,9 @@ from .settings import is_pallas_interpret as _module_is_pallas_interpret
 from .triton.launcher import default_launcher as _triton_default_launcher
 from .triton.launcher import get_num_sm as _triton_get_num_sm
 from .triton.launcher import get_num_xcd as get_num_xcd
+from .triton.launcher import get_xpu_grf_modes as get_xpu_grf_modes
+from .triton.launcher import get_xpu_kernel_shared as get_xpu_kernel_shared
+from .triton.launcher import get_xpu_programs_per_xecore as get_xpu_programs_per_xecore
 from .triton.launcher import set_triton_allocator as set_triton_allocator
 
 log: logging.Logger = logging.getLogger(__name__)
