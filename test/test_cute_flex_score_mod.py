@@ -475,7 +475,7 @@ def _emulate_tiles(
 
     def stream_fill(ns: dict[str, object], tile: int) -> None:
         """The emitter's stream fill: chunks ``0 .. slots - 1`` of ``tile``."""
-        ns["flash_flex_pkv"] = tile
+        ns["flash_flex_ikv"] = tile
         for slot in range(slots):
             ns["flash_flex_pc"] = slot
             ns["flash_flex_ps"] = slot
@@ -518,6 +518,8 @@ def _emulate_tiles(
             ns["flash_kv_peek"] = next_tile
             exec(prologue, ns)
             if index not in absent:
+                # Bound once ahead of the chunk loop, as the emitter does:
+                # the stream's issues below must not move it.
                 ns["flash_flex_pkv"] = kv_tile
                 result = results[index]
                 for ci in range(chunks):
@@ -528,7 +530,6 @@ def _emulate_tiles(
                         ns["flash_flex_pc"] = (ci + depth) % chunks
                         ns["flash_flex_ps"] = (ci + depth) % (depth + 1)
                         ns["flash_flex_pf_init"] = False
-                        ns["flash_flex_pkv"] = kv_tile
                         exec(prefetch, ns)
                     ns["flash_ci"] = ci
                     if slots:
@@ -538,7 +539,7 @@ def _emulate_tiles(
                         exec(consume, ns)
                         ns["flash_flex_pc"] = (ci + slots) % chunks
                         ns["flash_flex_ps"] = ci % slots
-                        ns["flash_flex_pkv"] = (
+                        ns["flash_flex_ikv"] = (
                             kv_tile if ci + slots < chunks else next_tile
                         )
                         exec(issue, ns)
@@ -1573,7 +1574,7 @@ class TestCuteFlexScoreMod(TestCase):
         each run's copy row base (the owner's leading offsets plus the
         lane's row delta times the row step: 1024 / 3072 elements per query
         row); the issue block copies 1 / 3 pieces of 128 bytes per row of
-        chunk ``flash_flex_pc`` of tile ``flash_flex_pkv`` into slot
+        chunk ``flash_flex_pc`` of tile ``flash_flex_ikv`` into slot
         ``flash_flex_ps`` and commits; the consume block waits for the
         chunk's group, reads the whole-chunk runs from slot ``flash_ci %
         2`` between warp syncs; the element block indexes the chunk run;
@@ -1633,7 +1634,7 @@ class TestCuteFlexScoreMod(TestCase):
         )
         issue = code.chunk_issue
         self.assertIn(
-            "flash_flex1_ikvbase = cutlass.Int32(flash_flex_pkv) * cutlass.Int32(128)",
+            "flash_flex1_ikvbase = cutlass.Int32(flash_flex_ikv) * cutlass.Int32(128)",
             issue,
         )
         self.assertIn(
