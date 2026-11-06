@@ -39,6 +39,7 @@ from helion._testing import skipIfNotCUDA
 if TYPE_CHECKING:
     from collections.abc import Callable
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_dense_tcgen05 import plain_mm
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
 
@@ -368,6 +369,48 @@ def test_model_needs_a_recorded_budget() -> None:
     )
 
 
+def test_output_edge_tma_store_admission_charges_the_ring_once() -> None:
+    """The edge plan's (128, 64) C ring next to a 256x256x64 ab=6 ring fits."""
+    config = _config(2, NO_ROWS)
+    tile = {"bm": 256, "bn": 256, "bk": 64, "cluster_m": 2}
+    assert smem.output_edge_tma_store_smem_fits(
+        config, {}, ab_stages=6, c_stages=2, **tile
+    )
+    assert not smem.output_edge_tma_store_smem_fits(
+        config, {}, ab_stages=7, c_stages=2, **tile
+    )
+    assert not smem.output_edge_tma_store_smem_fits(
+        config, {}, ab_stages=6, c_stages=4, **tile
+    )
+    # A configured explicit subtile wider than the plan's (128, 32) on a
+    # 128-wide tile is charged at its width: 192 KiB AB + 2 x 16 KiB fits, a
+    # 4-deep ring of the wider subtile does not.
+    narrow = {"bm": 256, "bn": 128, "bk": 64, "cluster_m": 2}
+    explicit = {"tcgen05_layout_overrides_epi_tile_n": 64}
+    assert smem.output_edge_tma_store_smem_fits(
+        config, explicit, ab_stages=8, c_stages=2, **narrow
+    )
+    assert smem.output_edge_tma_store_smem_fits(
+        config, {}, ab_stages=8, c_stages=4, **narrow
+    )
+    assert not smem.output_edge_tma_store_smem_fits(
+        config, explicit, ab_stages=8, c_stages=4, **narrow
+    )
+    # Staged ``pre_acc_wait`` rows keep the SIMT epilogue on edge shapes.
+    staged = _config(2, F32_ROW)
+    assert not smem.output_edge_tma_store_smem_fits(
+        staged,
+        {"tcgen05_aux_load_placement": "pre_acc_wait"},
+        ab_stages=6,
+        c_stages=2,
+        **tile,
+    )
+    # Without store facts the ring cannot be sized; the admission fails closed.
+    assert not smem.output_edge_tma_store_smem_fits(
+        _config(2, None), {}, ab_stages=6, c_stages=2, **tile
+    )
+
+
 # Compile checks for the fp32-row geometries the SMEM model admits (sm_100 GPU).
 #
 # Each case is a ``pre_acc_wait`` row-vector GEMM whose 192 KiB AB ring, 32 KiB
@@ -544,3 +587,32 @@ def test_admitted_fp32_row_geometry_compiles_and_runs(case: str) -> None:
     torch.cuda.synchronize()
     for out in outputs:
         torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=1e-1)
+
+
+@_sm100_gpu
+def test_output_edge_tma_store_beside_six_ab_stages_compiles_and_runs() -> None:
+    """bf16 1000x4096x2880 (a ragged M) at 2x1 256x256x64 and six AB stages:
+    the arena model fits the TMA store's (128, 64) C ring beside them
+    (229 548 of 232 448 B); the kernel compiles and matches torch."""
+    torch.manual_seed(0)
+    x = torch.randn(1000, 2880, device=DEVICE, dtype=torch.bfloat16)
+    y = torch.randn(2880, 4096, device=DEVICE, dtype=torch.bfloat16)
+    bound = plain_mm.bind((x, y))
+    values = {
+        "block_sizes": [256, 256, 64],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_ab_stages": 6,
+        "tcgen05_c_stages": 2,
+        "tcgen05_acc_stages": 2,
+        "l2_groupings": [1],
+    }
+    projected = dict(values)
+    bound.config_spec.normalize(projected, _fix_invalid=True)
+    assert projected["tcgen05_ab_stages"] == 6
+    assert "tcgen05_tma_store_atom" in bound.to_code(helion.Config(**projected))
+    bound.set_config(helion.Config(**projected))
+    out = bound(x, y)
+    torch.testing.assert_close(
+        out, (x.float() @ y.float()).to(out.dtype), rtol=2e-2, atol=1e-1
+    )

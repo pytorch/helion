@@ -98,8 +98,6 @@ from ..strategies import tcgen05_explicit_epilogue_tile_supported
 from ..strategies import validate_tcgen05_strategy_invariants
 from ..strategies import warp_spec_from_config
 from ..tcgen05.knobs import acc_stages_knob
-from ..tcgen05.knobs import aux_load_mode_knob
-from ..tcgen05.knobs import aux_stages_knob
 from ..tcgen05.knobs import epi_subtile_n_knob
 from ..tcgen05.knobs import epi_warp_groups_knob
 from ..tcgen05.knobs import epi_warps_knob
@@ -3265,26 +3263,18 @@ def _normalize_multi_output_rings(
         for value in (bm, bn, bk, cluster_m, ab_stages, c_stages)
     ) or cluster_m not in (1, 2):
         return
-    stage_rows = smem._store_lowering_stages_rows(config)
-    epi_warps = epi_warps_knob(config)
-    acc_stages = acc_stages_knob(config)
 
     def fits(ab: int, c: int) -> bool:
-        return smem.default_layout_smem_fits(
+        return smem._config_arena_fits(
             state,
+            config,
             bm=cast("int", bm),
             bn=cast("int", bn),
             bk=cast("int", bk),
             cluster_m=cast("int", cluster_m),
             ab_stages=ab,
             c_stages=c,
-            stage_rows=stage_rows,
-            epi_warps=epi_warps,
-            acc_stages=acc_stages,
-            aux_load_mode=aux_load_mode_knob(config),
-            aux_stages=aux_stages_knob(config),
             epi_subtile_n=epi_subtile_n_knob(config),
-            epi_warp_groups=epi_warp_groups_knob(config),
         )
 
     if fits(cast("int", ab_stages), cast("int", c_stages)):
