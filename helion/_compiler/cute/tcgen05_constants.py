@@ -38,6 +38,9 @@ TCGEN05_TWO_CTA_MAX_K_TILES = 256
 # quarter of the SMs even with those pairs; the floor only needs to exclude
 # the launch-bound regime.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 256
+# Smallest K tile the planner caps a K-tail shape to so that whole K tiles
+# keep the persistent and CtaGroup.TWO schedules (``enable_cute_tcgen05_search``).
+TCGEN05_WHOLE_K_TILE_MIN = 64
 # The tile of the edge family's 128-row CTA pair (each CTA owns 64 rows of a
 # 128 x 128 pair tile); the planner counts a 16-bit edge grid in these.
 TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK = 128
@@ -117,6 +120,9 @@ TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M = 128
 TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N = 128
 # Best measured seed L2 grouping for the full-tile CtaGroup.TWO row.
 TCGEN05_TWO_CTA_SEED_L2_GROUPING = 4
+# Grouped raster for the resident-cluster 2x2 twin seeds: the co-resident
+# wave walks this many pair rows per group across the cluster-N columns.
+TCGEN05_CLUSTER_N2_SEED_L2_GROUPING = 8
 # This pid order stays slightly ahead of persistent_blocked in the validated
 # CtaGroup.TWO envelope.
 TCGEN05_TWO_CTA_SEED_PID_TYPE = "persistent_interleaved"

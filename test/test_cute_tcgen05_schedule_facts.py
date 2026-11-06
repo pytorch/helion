@@ -32,6 +32,7 @@ from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_dense_tcgen05 import blackwell_capability
 from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
 from helion._testing.cute_dense_tcgen05 import extra_store_mm
+from helion._testing.cute_dense_tcgen05 import plain_mm
 from helion._testing.cute_dense_tcgen05 import scaled_args
 from helion._testing.cute_dense_tcgen05 import scaled_mm
 from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
@@ -371,3 +372,73 @@ def test_k_tail_does_not_widen_other_instruction_families() -> None:
         assert not native_tma_schedule_supported(
             replace(facts, dtype=dtype), (128, 128, 128), cluster_m=2, cluster_n=1
         )
+
+
+def _plain_bind(
+    m: int, n: int, k: int, dtype: torch.dtype = torch.bfloat16
+) -> BoundKernel:
+    return plain_mm._bind_isolated(
+        (torch.empty((m, k), dtype=dtype), torch.empty((n, k), dtype=dtype).T)
+    )
+
+
+def _k_block_max(bound: BoundKernel) -> int:
+    fragments = bound.config_spec._cute_tcgen05_config._matmul_block_fragments()
+    assert fragments is not None
+    return fragments[2].high
+
+
+def test_output_edge_admits_two_cta_pairs_and_flattens_one_cta_partial_tiles() -> None:
+    """Ragged M, whole K: persistent and CtaGroup.TWO search on 64-deep K tiles.
+
+    One-CTA persistent kernels run whole tiles only (the host multi-tile
+    guard), so the search flattens their partial-tile samples while the
+    two-CTA pairs keep their persistent schedule.
+    """
+    bound = _plain_bind(1000, 4096, 2880)
+    state = bound.config_spec._cute_tcgen05_config
+    assert "persistent_interleaved" in bound.config_spec.allowed_pid_types
+    constraints = state.cluster_m2_search_constraints
+    assert constraints is not None and not constraints.allow_edge_k_tail_family
+    assert state.output_edge_persistent_admitted
+    assert _k_block_max(bound) == 64
+    one_cta = {
+        "block_sizes": [128, 256, 64],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 1,
+    }
+    state._fix_cluster_m1_persistent_search_config(one_cta)
+    assert one_cta["pid_type"] == "flat"
+    pair = {
+        "block_sizes": [256, 256, 64],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 2,
+    }
+    state._fix_cluster_m1_persistent_search_config(pair)
+    assert pair["pid_type"] == "persistent_interleaved"
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype"),
+    (
+        # Ragged M below the 256-row pair tile.
+        ((16, 14336, 4096), torch.bfloat16),
+        # Ragged in both M and N.
+        ((3000, 3000, 3072), torch.bfloat16),
+        # FP8 keeps its exact-tile restoration.
+        ((1000, 4096, 2880), torch.float8_e4m3fn),
+    ),
+)
+def test_output_edge_admission_excludes_unpaired_and_double_edge_shapes(
+    shape: tuple[int, int, int], dtype: torch.dtype
+) -> None:
+    bound = _plain_bind(*shape, dtype=dtype)
+    assert not bound.config_spec._cute_tcgen05_config.output_edge_persistent_admitted
+
+
+def test_k_cap_applies_only_where_whole_k_tiles_admit_persistence() -> None:
+    """200x1000x2880 is ragged in both M and N: no persistent schedule, no cap."""
+    capped = _plain_bind(1000, 4096, 2880)
+    uncapped = _plain_bind(200, 1000, 2880)
+    assert _k_block_max(capped) == 64
+    assert _k_block_max(uncapped) > 64
