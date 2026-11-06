@@ -49,6 +49,7 @@ from .reduction import RED_SITE_GLOBAL_PREFIX
 from .reduction import TG_BUFFER_GLOBAL_PREFIX
 from .reduction import group_path
 from .reduction import group_scratch_slots
+from .tile_sharing import share_tiles
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -195,17 +196,32 @@ def _generate_msl(
     """
     from torch._inductor.codegen.mps import DTYPE_TO_METAL
 
+    from .lane_fold import BF16_CAST
+    from .mpp_matmul import BF16_CAST_PREAMBLE
+    from .mpp_matmul import ROUND
+    from .mpp_matmul import ROUND_PREAMBLE
     from .mpp_matmul import elementize
+    from .mpp_matmul import names_read
 
+    tensor_dtypes = {
+        name: arg.dtype
+        for name, arg in zip(param_names, args, strict=True)
+        if isinstance(arg, torch.Tensor)
+    }
+    for dtype in tensor_dtypes.values():
+        if dtype not in DTYPE_TO_METAL:
+            raise ValueError(f"Unsupported Metal dtype: {dtype}")
     body_stmts = elementize(
         body_stmts,
+        tensor_dtypes,
         frozenset(
             k[len(TG_BUFFER_GLOBAL_PREFIX) :]
             for k in fn_globals
             if k.startswith(TG_BUFFER_GLOBAL_PREFIX)
         ),
+        required_threads_per_threadgroup,
     )
-    body_stmts = unroll_lane_folds(body_stmts)
+    body_stmts = unroll_lane_folds(body_stmts, names_read)
     msl_parts: list[str] = [
         "#include <metal_stdlib>",
         "#include <c10/metal/utils.h>",
@@ -221,8 +237,12 @@ def _generate_msl(
     reduction_sites = _reduction_sites(
         fn_globals, referenced, required_threads_per_threadgroup
     )
-    threadgroup_buffers = _threadgroup_buffers(
-        fn_globals, referenced, reduction_sites, required_threads_per_threadgroup
+    body_stmts, threadgroup_buffers = _threadgroup_buffers(
+        body_stmts,
+        fn_globals,
+        referenced,
+        reduction_sites,
+        required_threads_per_threadgroup,
     )
     uses_reductions = _uses_reductions(body_stmts)
     if uses_reductions:
@@ -249,6 +269,10 @@ def _generate_msl(
                 "using namespace mpp::tensor_ops;",
             ]
         )
+    if ROUND in referenced or BF16_CAST in referenced:
+        msl_parts.append(ROUND_PREAMBLE)
+    if BF16_CAST in referenced:
+        msl_parts.append(BF16_CAST_PREAMBLE)
     msl_parts.append("")
 
     params: list[str] = []
@@ -267,8 +291,6 @@ def _generate_msl(
             # one recompiles rather than reusing a stale shader.
             scalar_preamble.append(f"    {_constexpr_decl(name, arg)}")
             continue
-        if arg.dtype not in DTYPE_TO_METAL:
-            raise ValueError(f"Unsupported Metal dtype: {arg.dtype}")
         metal_dtype = DTYPE_TO_METAL[arg.dtype]
         is_scalar = arg.ndim == 0
         if is_scalar:
@@ -341,6 +363,10 @@ def _constexpr_decl(name: str, value: object) -> str:
     if isinstance(value, bool):
         return f"constexpr bool {name} = {'true' if value else 'false'};"
     if isinstance(value, int):
+        if not -(2**31) <= value < 2**31:
+            raise exc.BackendUnsupported(
+                "metal", f"kernel argument {name} = {value} does not fit an int"
+            )
         return f"constexpr int {name} = {value};"
     if isinstance(value, float):
         return f"constexpr float {name} = {value!r};"
@@ -415,12 +441,16 @@ _MSL_SCALAR_BYTES = {
 
 
 def _threadgroup_buffers(
+    body_stmts: list[ast.stmt],
     fn_globals: dict[str, object],
     referenced: set[str],
     reduction_sites: dict[str, tuple[str, int]],
     threads_per_threadgroup: tuple[int, int, int] | None,
-) -> list[tuple[str, str, int]]:
-    """Collect ``(name, metal_dtype, slots)`` scratch declarations to hoist.
+) -> tuple[list[ast.stmt], list[tuple[str, str, int]]]:
+    """Collect ``(name, metal_dtype, slots)`` scratch declarations to hoist,
+    with MPP tiles that are never live together sharing one
+    (:func:`tile_sharing.share_tiles`, which edits the body in place and
+    returns it).
 
     Written by ``metal/reduction.py::alloc_threadgroup_buffer`` as generated
     module-level globals, the same transport ``_BLOCK_SIZE_*`` uses.  Only
@@ -440,6 +470,7 @@ def _threadgroup_buffers(
         buf_name, buf_dtype, buf_slots = fn_globals[name]  # type: ignore[misc]
         if buf_name in referenced:
             declared.append((str(buf_name), str(buf_dtype), buf_slots))  # type: ignore[arg-type]
+    body_stmts, declared = share_tiles(body_stmts, declared)
 
     def slots(buf_slots: int | str) -> int:
         if isinstance(buf_slots, int):
@@ -472,7 +503,7 @@ def _threadgroup_buffers(
             f"reduction scratch and MPP staging need {used()} bytes of "
             f"threadgroup memory (max {MAX_THREADGROUP_MEMORY_BYTES})",
         )
-    return buffers()
+    return body_stmts, buffers()
 
 
 def _raise_if_mpp_unsupported_device() -> None:

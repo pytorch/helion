@@ -17,6 +17,8 @@ from helion._compiler.ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from helion._compiler.cute.resident_sequence import SequenceRegion
 from helion._compiler.cute.resident_sequence import materialize_resident_sequences
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _source(threads: int = 32, slots: int = 2) -> str:
     prefix = """row = cutlass.Int32(cute.arch.thread_idx()[1])

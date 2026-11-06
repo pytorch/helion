@@ -23,6 +23,8 @@ from helion._compiler.cute.row_fragment import RowFragment
 from helion._compiler.cute.row_fragment import RowFragmentLayout
 from helion._compiler.cute.row_fragment import row_fragment_tensor_inputs
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 

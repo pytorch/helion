@@ -10,7 +10,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 from test.test_cute_scaled_contraction import _config
 from test.test_cute_scaled_contraction import _inputs
 
@@ -30,6 +29,7 @@ from helion._compiler.cute.block_scaled_provenance import integer_recipe
 from helion._compiler.cute.block_scaled_provenance import operand_fingerprint
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 from helion.language import creation_ops
@@ -37,7 +37,7 @@ from helion.language import memory_ops
 
 _nvfp4_w4a4_matmul_kernel = import_example("nvfp4_gemm")._nvfp4_w4a4_matmul_kernel
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -106,7 +106,7 @@ def _bind_native(
         )
     else:
         args = (*args[:4], torch.empty((m, n), dtype=dtype), args[5])
-    with _cpu_target():
+    with cpu_target():
         kernel = helion.kernel(
             _plain_scales.fn if generic else _nvfp4_w4a4_matmul_kernel.fn,
             backend="cute",
@@ -141,7 +141,7 @@ def test_original_and_dynamic_metadata_are_proved(
     shape: tuple[int, int, int], static: bool
 ) -> None:
     bound, _ = _bind_native(shape, static=static)
-    with _cpu_target():
+    with cpu_target():
         plan = _wrapper_plan(bound.to_code(_native_config()))
     assert (plan["m"], plan["k"], plan["n"]) == (shape[0], shape[1] * 16, shape[2])
     assert plan["lhs_row_fast"] is False and plan["rhs_row_fast"] is True
@@ -152,7 +152,7 @@ def test_original_and_dynamic_metadata_are_proved(
 @skipUnlessBackends(["cute"])
 def test_generic_scale_layout_and_output_dtype(dtype: torch.dtype) -> None:
     bound, _ = _bind_native(generic=True, static=False, dtype=dtype)
-    with _cpu_target():
+    with cpu_target():
         plan = _wrapper_plan(
             bound.to_code(
                 _native_config(
@@ -172,7 +172,7 @@ def test_generic_scale_layout_and_output_dtype(dtype: torch.dtype) -> None:
 @skipUnlessBackends(["cute"])
 def test_explicit_intermediate_rounding_is_retained(dtype: torch.dtype) -> None:
     bound, _ = _bind_native(dtype=dtype)
-    with _cpu_target():
+    with cpu_target():
         plan = _wrapper_plan(bound.to_code(_native_config()))
     assert plan["round_dtypes"] == ("torch.bfloat16", str(dtype))
 
@@ -193,7 +193,7 @@ def test_output_aliasing_an_input_declines_native_reordering() -> None:
     args = list(_inputs(4, 3, 4))
     packed = cast("torch.Tensor", args[0])
     args[4] = packed.view(torch.bfloat16).reshape(-1)[:16].view(4, 4)
-    with _cpu_target():
+    with cpu_target():
         kernel = helion.kernel(
             _nvfp4_w4a4_matmul_kernel.fn,
             backend="cute",
@@ -214,7 +214,7 @@ def test_overlapping_output_elements_decline_native_reordering(
 ) -> None:
     args = list(_inputs(4, 3, 4))
     args[4] = torch.empty_strided((4, 4), strides, dtype=torch.bfloat16)
-    with _cpu_target():
+    with cpu_target():
         kernel = helion.kernel(
             _nvfp4_w4a4_matmul_kernel.fn,
             backend="cute",
@@ -235,7 +235,7 @@ def test_noncontiguous_disjoint_output_layout_is_supported(
 ) -> None:
     args = list(_inputs(4, 3, 4))
     args[4] = torch.empty_strided((4, 4), strides, dtype=torch.bfloat16)
-    with _cpu_target():
+    with cpu_target():
         kernel = helion.kernel(
             _nvfp4_w4a4_matmul_kernel.fn,
             backend="cute",
@@ -250,7 +250,7 @@ def test_noncontiguous_disjoint_output_layout_is_supported(
 def test_all_native_seeds_round_trip_and_emit() -> None:
     bound, _ = _bind_native()
     assert bound.host_function is not None
-    with bound.env, _cpu_target():
+    with bound.env, cpu_target():
         seeds = CuteBlockScaledMmaHeuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
         )
@@ -260,7 +260,7 @@ def test_all_native_seeds_round_trip_and_emit() -> None:
             bound.config_spec.normalize(seed)
             restored = generation.unflatten(generation.flatten(seed))
             assert all(restored[key] == value for key, value in seed.items())
-    with _cpu_target():
+    with cpu_target():
         for seed in seeds:
             assert _wrapper_plan(bound.to_code(seed))["kind"] == "block_scaled_mma"
 
@@ -394,7 +394,7 @@ def test_native_region_proof_rejects_changed_semantics(change: str) -> None:
         raise _StoppedProof
 
     with (
-        _cpu_target(),
+        cpu_target(),
         patch(
             "helion._compiler.cute.block_scaled_mma.plan_block_scaled",
             side_effect=probe,

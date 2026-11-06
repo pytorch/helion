@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import math
+import sys
 import unittest
 
+import pytest
 import torch
 
 from helion._compiler.metal.msl_reduction import REDUCTION_PREAMBLE
 from helion._compiler.metal.reduction import group_path
 from helion._compiler.metal.reduction import group_scratch_slots
+
+# Metal runs on macOS only: CI's Linux jobs skip the whole file.
+pytestmark = pytest.mark.skipif(
+    sys.platform != "darwin", reason="Metal tests require macOS"
+)
 
 DEVICE = "mps"
 

@@ -13,12 +13,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-from test.test_cute_fuse_mm_accumulation import _cpu_target
-
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 
@@ -47,7 +46,7 @@ def test_role_coordinates_follow_the_launch_axes(loop_order: list[int]) -> None:
         torch.empty((96, 136), dtype=torch.float16),
         torch.empty((136,), dtype=torch.float32),
     )
-    with _mock_cuda_unavailable(), _cpu_target():
+    with mock_cuda_unavailable(), cpu_target():
         bound = _matmul_bias._bind_isolated(args)
         with bound.env:
             config = dict(bound.config_spec.default_config().config)

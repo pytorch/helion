@@ -254,6 +254,8 @@ def test_nested_runtime_scalar(tmp_path: Path, named_tuple: bool) -> None:
     torch.testing.assert_close(exported._nested(pair(x, 3.0)), x * 3.0)
 
 
+# The smoke test of the Helion-free interpreter; the flash attention exports
+# below run the same check on far larger kernels and are the slow tier.
 def test_native_source_edit_without_helion(tmp_path: Path) -> None:
     x = torch.randn(128, device=DEVICE)
     bound = _pointwise.bind((x, 2.0))
@@ -316,6 +318,7 @@ def test_current_stream_and_cuda_graph(tmp_path: Path) -> None:
     torch.testing.assert_close(captured, x * 3.0 + 1.0)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(("family", "head_dim"), [("fa4", 64), ("fa4_alt", 128)])
 def test_flash_attention(tmp_path: Path, family: str, head_dim: int) -> None:
     if torch.cuda.get_device_capability()[0] < 10:

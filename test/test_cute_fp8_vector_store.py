@@ -7,13 +7,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 # CuTe's generated launcher resolves kernel annotations and DSL primitives in
@@ -69,8 +68,8 @@ def test_persistent_row_store_is_one_fp8_packet(
 ) -> None:
     # A partial outer row tile must predicate the packet as a whole.
     args = (torch.empty((37, 32), dtype=torch.bfloat16), dtype, hl.constexpr(32))
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(_quantize_rows, args)
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(_quantize_rows, args)
         code = bound.to_code(_config(bound, vec_width))
     helper = (
         "_cute_store_fp8e4m3fn_vec"
@@ -91,8 +90,8 @@ def test_lane_mask_keeps_partial_packet_stores(limit: int) -> None:
         torch.float8_e4m3fn,
         hl.constexpr(limit),
     )
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(_quantize_rows, args)
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(_quantize_rows, args)
         code = bound.to_code(_config(bound, 8))
     assert "_helion_persistent_branch_vec_store" not in code, code
     # An explicit lane mask retains scalar stores, even at a packet boundary.

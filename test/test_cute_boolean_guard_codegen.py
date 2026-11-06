@@ -13,7 +13,7 @@ from .test_cute_bounded_cache_codegen import _config
 from .test_cute_bounded_cache_codegen import _cpu_target
 from helion._testing import skipUnlessBackends
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 class _FlattenConjunctions(ast.NodeTransformer):

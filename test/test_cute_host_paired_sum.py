@@ -8,18 +8,17 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.cute.host_paired_sum import PAIRED_SUM_KEY
 from helion._compiler.cute.host_paired_sum import lower_host_sum_pairs
 from helion._compiler.cute.host_paired_sum import prove_host_sum_pairs
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import InvalidConfig
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -30,7 +29,7 @@ if TYPE_CHECKING:
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
@@ -78,7 +77,7 @@ def _args(
 
 @pytest.fixture(scope="module")
 def pair_bound() -> BoundKernel:
-    return _cpu_bind(_paired, _args())
+    return cpu_bind(_paired, _args())
 
 
 def _config(bound: BoundKernel, layout: object) -> helion.Config:
@@ -155,7 +154,7 @@ def test_original_typed_proof_and_final_host_pair_preserve_producer(
 def test_missing_or_wrong_typed_pair_declines(
     enabled: bool, dtype: torch.dtype
 ) -> None:
-    bound = _cpu_bind(_paired, _args(dtype, enabled))
+    bound = cpu_bind(_paired, _args(dtype, enabled))
     assert not bound.env.config_spec.cute_host_paired_sum_available
     assert "_cute_try_paired_sum_cast" not in bound.to_code(_config(bound, "off"))
     with pytest.raises(InvalidConfig, match="typed independent pair"):
@@ -163,7 +162,7 @@ def test_missing_or_wrong_typed_pair_declines(
 
 
 def test_literal_dtype_and_argument_source_are_typed() -> None:
-    bound = _cpu_bind(_literal, _args()[:2])
+    bound = cpu_bind(_literal, _args()[:2])
     assert bound.env.config_spec.cute_host_paired_sum_available
     assert "dtype_is_tensor=False" in bound.to_code(_config(bound, "mapped"))
 
@@ -307,7 +306,7 @@ def test_disabled_heuristics_keep_explicit_proof_but_no_seeds() -> None:
         autotune_effort="none",
         disable_autotuner_heuristics=True,
     )
-    bound = _cpu_bind(kernel, _args())
+    bound = cpu_bind(kernel, _args())
     assert bound.env.config_spec.cute_host_paired_sum_available
     assert not bound.env.config_spec.compiler_seed_configs
     assert "_cute_try_paired_sum_cast" in bound.to_code(_config(bound, "narrow"))

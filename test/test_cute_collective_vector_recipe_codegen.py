@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.test_cute_collective_native_seeded import _config
 from test.test_cute_collective_native_seeded import _inputs
 from test.test_cute_collective_native_seeded import _mamba_kernel
@@ -14,6 +13,7 @@ from test.test_cute_collective_native_seeded import _seeded_contraction
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
@@ -36,7 +36,7 @@ def test_original_mamba_vector_recipe_codegen(
     recipe: str, compute: str, static_shapes: bool
 ) -> None:
     inputs = tuple(torch.empty(size, dtype=torch.bfloat16) for size in _mamba_sizes(2))
-    bound = _cpu_bind(_mamba_kernel(static_shapes=static_shapes), inputs)
+    bound = cpu_bind(_mamba_kernel(static_shapes=static_shapes), inputs)
     config = helion.Config(
         block_sizes=[64, 64, 64],
         num_threads=[2, 64, 1, 1],
@@ -60,7 +60,7 @@ def test_original_mamba_vector_recipe_codegen(
 
 
 def test_vector_recipe_seeds_and_config_roundtrip() -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
+    bound = cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
     assert bound.host_function is not None
     with bound.env:
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
@@ -79,7 +79,7 @@ def test_vector_recipe_seeds_and_config_roundtrip() -> None:
 
 @pytest.mark.parametrize("recipe", [None, True, 8, "automatic"])
 def test_vector_recipe_config_rejects_unknown_strategies(recipe: object) -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(torch.float16))
+    bound = cpu_bind(_seeded_contraction, _inputs(torch.float16))
     config = helion.Config.from_dict(
         _config().config | {"cute_collective_recipe": recipe}
     )
@@ -90,7 +90,7 @@ def test_vector_recipe_config_rejects_unknown_strategies(recipe: object) -> None
 @pytest.mark.parametrize("recipe", ["vector", "vector_unrolled"])
 def test_vector_recipe_keeps_existing_alias_rejection(recipe: str) -> None:
     a, b, seed, limit = _inputs(torch.bfloat16)
-    bound = _cpu_bind(_seed_written_in_place, (a, b, seed))
+    bound = cpu_bind(_seed_written_in_place, (a, b, seed))
     with pytest.raises(
         helion.exc.BackendUnsupported, match="operand loads may alias row-loop writes"
     ):

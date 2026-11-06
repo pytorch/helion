@@ -9,6 +9,8 @@ import pytest
 from helion._compiler.cute.thread_block_projection import flatten_thread_coordinates
 from helion._compiler.cute.thread_block_projection import update_launch_block
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize(
     "dimensions",

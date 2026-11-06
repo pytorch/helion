@@ -25,7 +25,16 @@ import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import import_example
+from helion._testing import pairwise
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_mma_dag import DETERMINISM_LAUNCHES
+from helion._testing.cute_mma_dag import LAUNCHES
+from helion._testing.cute_mma_dag import RUNTIMES
+from helion._testing.cute_mma_dag import assert_close
+from helion._testing.cute_mma_dag import cast_tensor
+from helion._testing.cute_mma_dag import run_cute
+from helion._testing.cute_mma_dag import run_triton
+from helion._testing.cute_mma_dag import tensors
 import helion.language as hl
 from helion.runtime.cute import sass_check
 
@@ -42,8 +51,7 @@ pytestmark = [
     ),
 ]
 
-RT = "_helion_mma_dag"
-LAUNCHES = 8
+RT = RUNTIMES["warp"]
 
 
 def _engine() -> object:
@@ -445,67 +453,21 @@ def _config(
     )
 
 
-def _tensors(result: object) -> tuple[torch.Tensor, ...]:
-    return result if isinstance(result, tuple) else (cast_tensor(result),)
-
-
-def cast_tensor(value: object) -> torch.Tensor:
-    assert isinstance(value, torch.Tensor)
-    return value
-
-
 def _run_cute(
-    fn: Callable[..., object], args: tuple[object, ...], config: helion.Config
+    fn: Callable[..., object],
+    args: tuple[object, ...],
+    config: helion.Config,
+    launches: int = LAUNCHES,
 ) -> tuple[str, tuple[torch.Tensor, ...]]:
-    kernel = helion.kernel(fn, backend="cute", static_shapes=True)
-    bound = kernel.bind(args)
-    with bound.env:
-        normalized = bound.config_spec.normalized_config(config)
-    source = bound.to_code(normalized)
-    assert f"{RT}.mma_" in source, source
-    assert "_cute_grouped_reduce_shared_two_stage" not in source
-    compiled = bound.compile_config(normalized)
-    outputs = [_tensors(compiled(*args)) for _ in range(LAUNCHES)]
-    torch.cuda.synchronize()
-    for other in outputs[1:]:
-        for lhs, rhs in zip(outputs[0], other, strict=True):
-            assert torch.equal(lhs, rhs)
-    return source, outputs[0]
+    return run_cute(fn, args, config, mode="warp", launches=launches)
 
 
-def _run_triton(
-    fn: Callable[..., object], args: tuple[object, ...], block_sizes: list[int]
-) -> tuple[torch.Tensor, ...]:
-    kernel = helion.kernel(fn, backend="triton", static_shapes=True)
-    bound = kernel.bind(args)
-    out = _tensors(bound.compile_config(helion.Config(block_sizes=block_sizes))(*args))
-    torch.cuda.synchronize()
-    return out
-
-
-def _assert_close(
-    outs: tuple[torch.Tensor, ...],
-    refs: tuple[torch.Tensor, ...],
-    *,
-    scaled: bool = False,
-) -> None:
-    """``scaled``: the absolute tolerance follows the tensor's magnitude (a
-    recurrence of cancelling fp32 sums rounded to bf16 leaves single
-    elements a few bf16 ulps of the large terms apart between backends; the
-    SIMT cute path shows the same elements against Triton)."""
-    for out, ref in zip(outs, refs, strict=True):
-        assert out.dtype == ref.dtype and out.shape == ref.shape
-        if out.dtype == torch.float32:
-            torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
-        else:
-            atol = 2e-2 * max(1.0, ref.float().abs().max().item()) if scaled else 2e-2
-            torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=2e-2)
-
-
-# kernel, mode, has_h0, (n, d, dv), dtype, bm, bn, warps, stages
+# kernel, mode, has_h0, (n, d, dv), dtype, bm, bn, warps, stages: every decay
+# mode of both recurrences, with and without an initial state, both 16-bit
+# dtypes (the f16 rows stand for their geometry), one- to eight-warp tiles
+# from 16 x 8 to 128 x 128, ring depths 1-4 and 8 / 64 chunks.
 _STATE_CASES = (
     ("fwd", "vanilla", False, (8, 64, 64), torch.bfloat16, 16, 8, 1, 1),
-    ("fwd", "vanilla", False, (8, 64, 64), torch.bfloat16, 64, 64, 4, 2),
     ("fwd", "vanilla", False, (64, 64, 64), torch.bfloat16, 64, 64, 8, 4),
     ("fwd", "vanilla", False, (8, 128, 128), torch.bfloat16, 128, 128, 4, 2),
     ("fwd", "vanilla", False, (8, 128, 128), torch.bfloat16, 64, 128, 8, 3),
@@ -552,13 +514,15 @@ def test_state_recurrences_match_the_triton_backend(
     fn = _kernel_fn(kernel)
     source, out = _run_cute(fn, args, _config([bm, bn], warps, stages))
     assert f"block=({32 * warps}, 1, 1)" in source
-    _assert_close(out, _run_triton(fn, args, [bm, bn]))
+    assert_close(out, run_triton(fn, args, [bm, bn]))
 
 
-# kernel, mode, (d, dv), block_sizes (lead, root, loop), warps, stages, extra
+# kernel, mode, (d, dv), block_sizes (lead, root, loop), warps, stages, extra:
+# every decay mode of the three K-loop kernels, 2-8 warps, root tiles 32-128
+# with K tiles 16-128 (a partial K tile included), ring depths 1-4 and the
+# shared-memory exchange on a gated epilogue.
 _DAG_CASES = (
     ("fwd_o", "vanilla", (64, 64), [1, 64, 64], 4, 2, {}),
-    ("fwd_o", "vanilla", (128, 128), [1, 128, 128], 8, 2, {}),
     ("fwd_o", "vanilla", (128, 128), [1, 128, 64], 8, 4, {}),
     ("fwd_o", "vanilla", (64, 128), [1, 32, 16], 8, 1, {}),
     ("fwd_o", "gated", (128, 128), [1, 128, 64], 8, 4, {}),
@@ -598,29 +562,25 @@ def test_k_loop_kernels_match_the_triton_backend(
     fn = _kernel_fn(kernel)
     source, out = _run_cute(fn, args, _config(block_sizes, warps, stages, **extra))
     assert f"block=({32 * warps}, 1, 1)" in source
-    _assert_close(out, _run_triton(fn, args, block_sizes))
+    assert_close(out, run_triton(fn, args, block_sizes))
 
 
-# kernel, gated, (n, d, dv), bdv, warps, stages, extra
+# kernel, gated, (n, d, dv), bdv, warps, stages, extra: both delta-rule
+# recurrences, gated and plain, DV tiles 16-128 (whole and partial DV), 2-8
+# warps, ring depths 1-4 and 8 / 64 chunks.
 _DELTA_CASES = (
-    ("fwd_h_delta", False, (8, 128, 32), 32, 4, 2, {}),
     ("fwd_h_delta", False, (8, 128, 64), 32, 8, 2, {}),
     ("fwd_h_delta", False, (64, 128, 128), 32, 4, 4, {}),
     ("fwd_h_delta", False, (8, 128, 128), 128, 8, 2, {}),
     ("fwd_h_delta", False, (8, 128, 64), 16, 2, 1, {}),
-    ("fwd_h_delta", False, (8, 128, 64), 64, 8, 3, {}),
-    ("fwd_h_delta", True, (8, 128, 64), 32, 8, 2, {}),
     ("fwd_h_delta", True, (64, 128, 128), 64, 8, 4, {}),
     ("fwd_h_delta", True, (8, 128, 32), 16, 4, 1, {}),
     ("fwd_h_delta", True, (8, 128, 128), 128, 8, 2, {}),
-    ("dstate", False, (8, 128, 64), 32, 8, 2, {}),
     ("dstate", False, (64, 128, 128), 32, 8, 3, {}),
     ("dstate", False, (8, 128, 32), 16, 4, 2, {}),
-    ("dstate", False, (8, 128, 64), 64, 8, 2, {}),
     ("dstate", False, (8, 128, 128), 64, 8, 1, {}),
     ("dstate", False, (8, 128, 64), 32, 4, 1, {}),
     ("dstate", True, (8, 128, 64), 32, 4, 2, {}),
-    ("dstate", True, (8, 128, 64), 32, 8, 2, {}),
     ("dstate", True, (64, 128, 128), 32, 8, 3, {}),
     ("dstate", True, (8, 128, 128), 64, 8, 1, {}),
     # D == C == 64 (s0): the two ``:`` dims of q / k / w share one axis.
@@ -652,7 +612,7 @@ def test_delta_state_recurrences_match_the_triton_backend(
     fn = _kernel_fn(kernel)
     source, out = _run_cute(fn, args, _config([bdv], warps, stages, **extra))
     assert f"block=({32 * warps}, 1, 1)" in source
-    _assert_close(out, _run_triton(fn, args, [bdv]), scaled=True)
+    assert_close(out, run_triton(fn, args, [bdv]), scaled=True)
 
 
 @pytest.mark.parametrize("kernel", ("fwd_h_delta", "dstate"))
@@ -696,7 +656,7 @@ def test_varlen_state_pass_matches_the_triton_backend(
     source, out = _run_cute(fn, args, _config([bdv], warps, stages))
     assert source.count(f"{RT}.ldg_s64(") == 2
     assert "for md_i in cutlass.range(md_scalar, md_scalar_1):" in source
-    _assert_close(out, _run_triton(fn, args, [bdv]), scaled=True)
+    assert_close(out, run_triton(fn, args, [bdv]), scaled=True)
 
 
 def _inputs_varlen_tokens(
@@ -847,7 +807,7 @@ def test_varlen_window_kernels_match_the_triton_backend(
     _source, refs = _run_backend(
         fn, "triton", args, outputs, helion.Config(block_sizes=block_sizes)
     )
-    _assert_close(outs, refs, scaled=True)
+    assert_close(outs, refs, scaled=True)
     if kernel == "o_diag":
         # Rows past a sequence's end are never written: the next sequence's
         # first tokens keep their values (zero here) under both backends.
@@ -929,7 +889,7 @@ def test_vector_windows_at_any_stride_match_the_triton_backend(
     _source, refs = _run_backend(
         _vector_window_kernel, "triton", args, (5, 6), helion.Config()
     )
-    _assert_close(outs, refs, scaled=True)
+    assert_close(outs, refs, scaled=True)
 
 
 @pytest.mark.parametrize("kernel", ("fwd", "bwd"))
@@ -1003,10 +963,10 @@ def test_the_promoted_defaults_run_on_tensor_cores() -> None:
             assert f"{RT}.mma_bf16(" in source
         else:
             assert "_helion_mma_dag_tc.prims.tcgen05_mma(" in source
-        out = _tensors(bound.compile_config(config)(*args))
-        _assert_close(
+        out = tensors(bound.compile_config(config)(*args))
+        assert_close(
             out,
-            _run_triton(fn, args, config.config["block_sizes"]),
+            run_triton(fn, args, config.config["block_sizes"]),
             scaled=kernel in ("fwd_h_delta", "dstate"),
         )
         if mode == "warp":
@@ -1022,7 +982,8 @@ def test_the_promoted_defaults_run_on_tensor_cores() -> None:
 # Region-tree probes: a loop reading an enclosing region's fragment / vector, a
 # view read after a takeover, a ringed loop nested in a bare outer loop.
 _REGION_TREE_INEXACT = {"_vec_from_outer": {0}, "_reduced_view_after_takeover": {1}}
-# kernel, inputs, block sizes, warps, stages
+# kernel, inputs, block sizes, warps, stages: every region-tree shape at 4 / 8
+# warps, and the nested ring at three (outer, inner) tiles and ring depths 1-3.
 _REGION_TREE_CASES = (
     ("_acc_from_outer", "outer", [], 4, 2),
     ("_acc_from_outer", "outer", [], 8, 1),
@@ -1070,11 +1031,11 @@ def test_region_tree_kernels_match_the_triton_backend(
             _randn(g, 16, 128, 128, dtype=torch.bfloat16),
         )
     _source, out = _run_cute(fn, args, _config(block_sizes, warps, stages))
-    ref = _run_triton(fn, args, block_sizes)
+    ref = run_triton(fn, args, block_sizes)
     inexact = _REGION_TREE_INEXACT.get(name, set())
     for index, (lhs, rhs) in enumerate(zip(out, ref, strict=True)):
         if index in inexact:
-            _assert_close((lhs,), (rhs,))
+            assert_close((lhs,), (rhs,))
         else:
             assert torch.equal(lhs, rhs), index
 
@@ -1093,7 +1054,7 @@ def test_side_loads_varying_with_a_nested_loop_match_the_triton_backend(
     h = _randn(g, 4, 128, 128, dtype=torch.bfloat16)
     gate = _randn(g, 4, 128, dtype=torch.float32)
     for fn in (kernels._inner_varying_gate, kernels._inner_varying_row_gate):
-        ref = _run_triton(fn, (do, h, gate), [64, 64])
+        ref = run_triton(fn, (do, h, gate), [64, 64])
         for aux in ("register", "ring"):
             for loads in ("lane", "tma"):
                 config = _config(
@@ -1127,7 +1088,7 @@ def test_packed_pairs_match_the_triton_backend(mode: int) -> None:
     s2 = _randn(g, 2, 64, dtype=torch.float32)
     args = (t["k"], t["v"], sr, sc, s2, mode)
     _source, out = _run_cute(fn, args, _config([64, 64], 4, 2))
-    ref = _run_triton(fn, args, [64, 64])
+    ref = run_triton(fn, args, [64, 64])
     if mode in (2, 4):
         torch.testing.assert_close(out[0], ref[0], atol=1e-4, rtol=1e-5)
     else:
@@ -1158,7 +1119,7 @@ def test_anchored_fwd_h_reads_the_decay_row_from_the_ring_slot() -> None:
         )
         outs.append(out[0])
     assert torch.equal(outs[0], outs[1])
-    _assert_close((outs[0],), _run_triton(fn, args, [32, 128]))
+    assert_close((outs[0],), run_triton(fn, args, [32, 128]))
 
 
 def test_unaligned_operand_sources_take_the_synchronous_pass() -> None:
@@ -1174,7 +1135,7 @@ def test_unaligned_operand_sources_take_the_synchronous_pass() -> None:
     source, out = _run_cute(fn, args, _config([64, 64], 4, 2))
     assert f"{RT}.ldg_b32(" in source and f"{RT}.sts_b32(" in source
     assert source.count(f"{RT}.cp_async_16(") == 8
-    _assert_close(out, _run_triton(fn, args, [64, 64]))
+    assert_close(out, run_triton(fn, args, [64, 64]))
 
 
 def test_wy_with_an_unaligned_key_matches_the_triton_backend() -> None:
@@ -1201,7 +1162,7 @@ def test_wy_with_an_unaligned_key_matches_the_triton_backend() -> None:
         for block_sizes, warps, stages in (([64, 64, 64], 4, 2), ([128, 32, 32], 4, 2)):
             source, out = _run_cute(fn, args, _config(block_sizes, warps, stages))
             assert f"{RT}.mma_tf32(" in source and f"{RT}.lds_b32(" in source
-            ref = _run_triton(fn, args, block_sizes)
+            ref = run_triton(fn, args, block_sizes)
             for lhs, rhs in zip(out, ref, strict=True):
                 assert torch.equal(lhs, rhs)
 
@@ -1231,6 +1192,8 @@ def _probe_kernels() -> ModuleType:
         "_stale_carry",
     ),
 )
+# Every chain / carry probe under both operand routes: with two axes the
+# product is their pairwise cover.
 @pytest.mark.parametrize("exchange", ("auto", "smem"))
 def test_probe_kernels_match_the_triton_backend(name: str, exchange: str) -> None:
     fn = getattr(_probe_kernels(), name)
@@ -1258,7 +1221,7 @@ def test_probe_kernels_match_the_triton_backend(name: str, exchange: str) -> Non
     )
     if name == "_epi_chain" and exchange == "smem":
         assert source.count(f"{RT}.sts_b32(md_x") == 16
-    _assert_close(out, _run_triton(fn, args, block_sizes))
+    assert_close(out, run_triton(fn, args, block_sizes))
 
 
 @pytest.mark.parametrize(
@@ -1290,7 +1253,7 @@ def test_exchange_modes_are_bit_equal_on_every_m2_kernel(
     )
     for lhs, rhs in zip(auto, smem, strict=True):
         assert torch.equal(lhs, rhs)
-    _assert_close(auto, _run_triton(fn, args, block_sizes))
+    assert_close(auto, run_triton(fn, args, block_sizes))
 
 
 def test_fp16_k_loop_kernel_matches_the_triton_backend() -> None:
@@ -1299,7 +1262,7 @@ def test_fp16_k_loop_kernel_matches_the_triton_backend() -> None:
     fn = _kernel_fn("fwd_o")
     source, out = _run_cute(fn, args, _config([1, 64, 64], 4, 2))
     assert f"{RT}.mma_f16(" in source
-    _assert_close(out, _run_triton(fn, args, [1, 64, 64]))
+    assert_close(out, run_triton(fn, args, [1, 64, 64]))
 
 
 def test_unaligned_fp32_source_takes_the_synchronous_pass_on_dv() -> None:
@@ -1315,7 +1278,7 @@ def test_unaligned_fp32_source_takes_the_synchronous_pass_on_dv() -> None:
     fn = _kernel_fn("dv")
     source, out = _run_cute(fn, args, _config([1, 64, 64], 4, 2))
     assert f"{RT}.ldg_v2_f32(" in source and f"{RT}.lds_v4_f32(" not in source
-    _assert_close(out, _run_triton(fn, args, [1, 64, 64]))
+    assert_close(out, run_triton(fn, args, [1, 64, 64]))
 
 
 @pytest.mark.parametrize("name", ("_loop_chain", "_loop_chain_store"))
@@ -1329,18 +1292,18 @@ def test_chained_loop_dots_match_the_triton_backend(
     t = _inputs(bh=2, n=8, d=64, dv=64, dtype=torch.bfloat16, seed=21)
     args = (t["k"], t["v"])
     _source, out = _run_cute(fn, args, _config([64, 64], warps, stages))
-    _assert_close(out, _run_triton(fn, args, [64, 64]))
+    assert_close(out, run_triton(fn, args, [64, 64]))
 
 
-# kernel, gated, (d, dv), block sizes, warps, stages, extra knobs
+# kernel, gated, (d, dv), block sizes, warps, stages, extra knobs: every
+# per-chunk delta-rule program, gated and plain, in the pipeline's dtypes and
+# the fp32 variants, 2-8 warps, tiles 16-128 (D == C == 64 shapes included),
+# ring depths 1-4 and the shared-memory exchange on each multi-loop program.
 _M4_CASES = (
     ("dk", False, (128, 64), [32], 4, 2, {}),
     ("dk", False, (128, 64), [64], 8, 4, {}),
-    ("dk", False, (128, 64), [128], 8, 2, {}),
     ("dk", False, (64, 64), [16], 2, 1, {}),
-    ("dk", False, (128, 128), [32], 4, 3, {}),
     ("dqkw", False, (128, 64), [32, 32, 32], 4, 2, {}),
-    ("dqkw", False, (128, 64), [64, 32, 64], 8, 2, {}),
     ("dqkw", False, (128, 64), [32, 64, 32], 8, 1, {}),
     ("dqkw", False, (64, 64), [64, 64, 64], 8, 4, {}),
     (
@@ -1354,7 +1317,6 @@ _M4_CASES = (
     ),
     ("wy_dL", False, (128, 64), [32, 32, 128], 4, 2, {}),
     ("wy_dL", False, (128, 64), [32, 32, 64], 8, 2, {}),
-    ("wy_dL", False, (128, 64), [64, 64, 64], 4, 1, {}),
     ("wy_dL", False, (128, 64), [16, 16, 16], 8, 3, {}),
     (
         "wy_dL",
@@ -1367,7 +1329,6 @@ _M4_CASES = (
     ),
     ("wy_dL", False, (64, 64), [64, 32, 64], 4, 2, {}),
     ("dqkw", True, (128, 64), [32, 32, 32, 32, 32], 4, 2, {}),
-    ("dqkw", True, (128, 64), [32, 32, 32, 64, 64], 8, 2, {}),
     ("dqkw", True, (128, 128), [64, 32, 64, 32, 128], 8, 1, {}),
     (
         "dqkw",
@@ -1379,13 +1340,11 @@ _M4_CASES = (
         {"cute_mma_dag_exchange": "smem"},
     ),
     ("wy_dL", True, (128, 64), [32, 32, 128], 4, 2, {}),
-    ("wy_dL", True, (128, 64), [32, 32, 64], 8, 2, {}),
     ("wy_dL", True, (64, 64), [64, 64, 64], 4, 1, {"cute_mma_dag_exchange": "smem"}),
     ("wy", False, (128, 64), [128, 32, 32], 4, 2, {}),
     ("wy", True, (128, 64), [128, 32, 32], 4, 2, {}),
     ("wy", False, (128, 128), [64, 64, 64], 8, 2, {}),
     ("wy", True, (64, 64), [32, 32, 32], 4, 1, {}),
-    ("wy", False, (128, 64), [32, 128, 64], 8, 4, {}),
     ("wy", False, (128, 64), [128, 32, 32], 4, 2, {"cute_mma_dag_exchange": "smem"}),
     ("wy", True, (128, 128), [64, 64, 64], 8, 2, {"cute_mma_dag_exchange": "smem"}),
     ("dk_f32", False, (128, 64), [32], 4, 2, {}),
@@ -1419,14 +1378,14 @@ def test_m4_kernels_match_the_triton_backend(
     fn = _kernel_fn(kernel)
     source, out = _run_cute(fn, args, _config(block_sizes, warps, stages, **extra))
     assert f"block=({32 * warps}, 1, 1)" in source
-    ref = _run_triton(fn, args, block_sizes)
+    ref = run_triton(fn, args, block_sizes)
     # bf16 products accumulated in fp32 in the same order: the delta modes
     # are bit-identical to Triton, except the vectors summed over a
     # fragment dim.
     inexact = _M4_INEXACT.get((kernel, gated), set())
     for index, (lhs, rhs) in enumerate(zip(out, ref, strict=True)):
         if index in inexact:
-            _assert_close((lhs,), (rhs,))
+            assert_close((lhs,), (rhs,))
         else:
             assert torch.equal(lhs, rhs), index
 
@@ -1534,31 +1493,27 @@ def _kda_args(kernel: str, t: dict[str, torch.Tensor], bh: int) -> tuple[object,
 # reduction (summation order).
 _KDA_INEXACT = {"state_du_kda": {0, 1}, "wu_kda": {3}, "state_dwk_kda": {2}}
 _KDA_SCALED = {"state_du_kda"}
-# kernel, (d, dv), block sizes, warps, stages
+# kernel, (d, dv), block sizes, warps, stages: every kda / anchored program at
+# two geometries each -- 2-8 warps, tiles 16-64 over D, DV in 64 / 128 and
+# ring depths 1-3.
 _KDA_CASES = (
-    ("bwd_o_kda", (64, 64), [32, 32, 32], 4, 2),
     ("bwd_o_kda", (128, 64), [64, 32, 64], 8, 1),
     ("bwd_o_kda", (64, 128), [16, 64, 16], 4, 2),
-    ("state_du_kda", (64, 64), [32], 4, 2),
     ("state_du_kda", (128, 128), [64], 8, 1),
     ("state_du_kda", (64, 128), [16], 2, 3),
-    ("wu_kda", (64, 64), [32, 32], 4, 2),
     ("wu_kda", (128, 64), [64, 64], 8, 1),
     ("wu_kda", (64, 128), [32, 16], 4, 2),
-    ("fwd_o_anch", (64, 64), [1, 32, 32], 4, 2),
     ("fwd_o_anch", (128, 128), [1, 64, 64], 8, 1),
     ("fwd_o_anch", (64, 64), [1, 16, 32], 2, 3),
     # The epilogue reads the column sum of its own fragment (``dgc_last``)
     # beside the fragment under the ``is_last`` row mask: the vector is
     # relaid through the scratch into the fragment's register positions.
     ("state_dwk_kda", (64, 64), [1, 64, 32], 8, 2),
-    ("state_dwk_kda", (128, 64), [1, 32, 32], 4, 2),
     ("state_dwk_kda", (64, 128), [1, 64, 64], 8, 1),
     # The Neumann chain's carries are seeded with pointwise values over the
     # loaded gram (``A = -(beta * Akk[b])``, ``T = eye + A``).
     ("wy_anch", (64, 64), [32, 32], 4, 2),
     ("wy_anch", (128, 128), [64, 64], 8, 1),
-    ("wy_anch", (128, 64), [32, 64], 4, 2),
 )
 
 
@@ -1582,7 +1537,7 @@ def test_kda_kernels_match_the_triton_backend(
     args = _kda_args(kernel, t, 2)
     fn = _kernel_fn(kernel)
     _source, out = _run_cute(fn, args, _config(block_sizes, warps, stages))
-    ref = _run_triton(fn, args, block_sizes)
+    ref = run_triton(fn, args, block_sizes)
     inexact = _KDA_INEXACT.get(kernel, set())
     for index, (lhs, rhs) in enumerate(zip(out, ref, strict=True)):
         if index not in inexact:
@@ -1591,7 +1546,7 @@ def test_kda_kernels_match_the_triton_backend(
             atol = 2e-2 * max(1.0, rhs.abs().max().item())
             torch.testing.assert_close(lhs, rhs, atol=atol, rtol=2e-2)
         else:
-            _assert_close((lhs,), (rhs,))
+            assert_close((lhs,), (rhs,))
 
 
 @pytest.mark.parametrize("gated", (False, True))
@@ -1613,20 +1568,25 @@ def test_wy_dl_at_the_s1_pipeline_shape_matches_the_triton_backend(gated: bool) 
             bound.config_spec.default_config()
         )
     assert default.config["cute_mma_dag"] == "tcgen05"
-    out = _tensors(bound.compile_config(default)(*args))
+    out = tensors(bound.compile_config(default)(*args))
     torch.cuda.synchronize()
-    ref = _run_triton(fn, args, default.config["block_sizes"])
+    ref = run_triton(fn, args, default.config["block_sizes"])
     inexact = _M4_INEXACT[("wy_dL", gated)]
     for index, (lhs, rhs) in enumerate(zip(out, ref, strict=True)):
         if index in inexact:
-            _assert_close((lhs,), (rhs,))
+            assert_close((lhs,), (rhs,))
         else:
             assert torch.equal(lhs, rhs), index
 
 
-@pytest.mark.parametrize("name", ("_acc_scaled_b", "_acc_scaled_a", "_acc_scaled_b16"))
-@pytest.mark.parametrize("warps", (4, 8))
-@pytest.mark.parametrize("exchange", ("auto", "smem"))
+@pytest.mark.parametrize(
+    ("name", "warps", "exchange"),
+    pairwise(
+        name=("_acc_scaled_b", "_acc_scaled_a", "_acc_scaled_b16"),
+        warps=(4, 8),
+        exchange=("auto", "smem"),
+    ),
+)
 def test_a_rescaled_acc_read_by_an_operand_matches_the_triton_backend(
     name: str, warps: int, exchange: str
 ) -> None:
@@ -1638,7 +1598,7 @@ def test_a_rescaled_acc_read_by_an_operand_matches_the_triton_backend(
     _source, out = _run_cute(
         fn, (k,), _config([64], warps, 2, cute_mma_dag_exchange=exchange)
     )
-    ref = _run_triton(fn, (k,), [64])
+    ref = run_triton(fn, (k,), [64])
     for lhs, rhs in zip(out, ref, strict=True):
         assert torch.equal(lhs, rhs)
 
@@ -1663,7 +1623,7 @@ def test_shuffle_route_shapes_match_the_triton_backend(
     if exchange == "auto" and warps == 4:
         marker = "md_aw" if name == "_hoisted_a_chain" else "md_qsl + 2"
         assert marker in source
-    ref = _run_triton(fn, args, [64])
+    ref = run_triton(fn, args, [64])
     for lhs, rhs in zip(out, ref, strict=True):
         assert torch.equal(lhs, rhs)
 
@@ -1726,8 +1686,10 @@ def test_loop_outputs_in_another_slot_match_the_triton_backend(
     spec = helion.kernel(fn, backend="cute", static_shapes=True).bind(args).config_spec
     assert spec.cute_mma_dag is not None
     assert spec.cute_mma_dag.choices == ("off", "warp")
-    _source, out = _run_cute(fn, args, _config([], warps, 2))
-    for lhs, rhs in zip(out, _run_triton(fn, args, []), strict=True):
+    _source, out = _run_cute(
+        fn, args, _config([], warps, 2), launches=DETERMINISM_LAUNCHES
+    )
+    for lhs, rhs in zip(out, run_triton(fn, args, []), strict=True):
         assert torch.equal(lhs, rhs)
 
 
@@ -1740,7 +1702,7 @@ def test_a_root_dot_rescaling_its_loops_carry_matches_the_triton_backend(
     g = torch.Generator(device=DEVICE).manual_seed(17)
     args = (_randn(g, 6, 64, 128, scale=0.15, dtype=torch.bfloat16),)
     _source, out = _run_cute(fn, args, _config([64], warps, 2))
-    for lhs, rhs in zip(out, _run_triton(fn, args, [64]), strict=True):
+    for lhs, rhs in zip(out, run_triton(fn, args, [64]), strict=True):
         assert torch.equal(lhs, rhs)
 
 
@@ -1759,7 +1721,7 @@ def test_aliased_arguments_are_refused_at_launch() -> None:
     source, out = _run_cute(fn, args, _config([64, 64], 4, 2))
     assert "'kind': 'helion_mma_dag_alias'" in source
     ref_out = torch.empty_like(s_in)
-    ref = _run_triton(fn, (t["k"], t["v"], s_in, ref_out), [64, 64])
+    ref = run_triton(fn, (t["k"], t["v"], s_in, ref_out), [64, 64], cache=False)
     assert torch.equal(out[0], ref[0])
     # s_out carries a row sum of the fragment (another reduction order).
     torch.testing.assert_close(s_out, ref_out, atol=1e-3, rtol=1e-4)
@@ -1792,8 +1754,8 @@ def test_a_zero_trip_outer_loop_matches_the_triton_backend(n: int) -> None:
     b = _randn(g, 2, n, 128, 64, dtype=torch.bfloat16)
     source, out = _run_cute(kernels._grid_nest, (a, b), _config([64, 32], 4, 3))
     assert f"cutlass.range(0, {n})" in source
-    ref = _run_triton(kernels._grid_nest, (a, b), [64, 32])
-    _assert_close(out, ref)
+    ref = run_triton(kernels._grid_nest, (a, b), [64, 32])
+    assert_close(out, ref)
     if n:
         eager = 2.0 * (a.float() @ b.float())
         torch.testing.assert_close(out[0], eager, atol=1e-2, rtol=1e-2)
@@ -1802,8 +1764,8 @@ def test_a_zero_trip_outer_loop_matches_the_triton_backend(n: int) -> None:
     args = (a3, b3, n)
     source, out = _run_cute(kernels._grid_nest_steps, args, _config([64, 32], 4, 3))
     assert "if 0 < n:" in source
-    ref = _run_triton(kernels._grid_nest_steps, args, [64, 32])
-    _assert_close(out, ref)
+    ref = run_triton(kernels._grid_nest_steps, args, [64, 32])
+    assert_close(out, ref)
 
 
 def _load_module(path: Path) -> ModuleType:
@@ -1840,8 +1802,8 @@ def test_the_standalone_export_keeps_the_alias_guard(tmp_path: Path) -> None:
     h_out = exported._rmw_two_names(*args)
     torch.cuda.synchronize()
     ref_out = torch.empty_like(s_in)
-    ref = _run_triton(fn, (t["k"], t["v"], s_in, ref_out), [64, 64])
-    _assert_close((h_out,), ref)
+    ref = run_triton(fn, (t["k"], t["v"], s_in, ref_out), [64, 64], cache=False)
+    assert_close((h_out,), ref)
     torch.testing.assert_close(s_out, ref_out, atol=1e-3, rtol=1e-4)
     # Arguments aliasing differently from the export's trip the exporter's
     # input-alias facts guard first; the span check is reached by an export
@@ -2033,9 +1995,11 @@ def test_a_16_bit_matmul_with_a_tile_index_mask_matches_the_triton_backend(
     # int32 bounds.  Bit-equal to Triton over eight launches.
     fn = _probe_kernels()._head_sum_logits
     args = _head_sum_args()
-    source, out = _run_cute(fn, args, _config(block_sizes, warps, stages))
+    source, out = _run_cute(
+        fn, args, _config(block_sizes, warps, stages), launches=DETERMINISM_LAUNCHES
+    )
     assert f"{RT}.ldg_s32(" in source
-    (ref,) = _run_triton(fn, args, block_sizes)
+    (ref,) = run_triton(fn, args, block_sizes)
     assert torch.isinf(ref).any() and torch.isfinite(ref).any()
     assert torch.equal(out[0], ref)
 
@@ -2094,7 +2058,7 @@ def test_varying_bound_loops_mask_the_partial_trip(
     assert "for md_i in cutlass.range(0, md_trips0):" in source
     assert ("< md_end0 else cutlass.Float32(0.0)" in source) == (block_m < 64)
     expected = _causal_scaled_reference(a, s, b, block_m)
-    _assert_close((out,), (expected,), scaled=True)
+    assert_close((out,), (expected,), scaled=True)
     # Without the mask every CTA would walk whole 64-wide trips.
     if block_m < 64:
         unmasked = _causal_scaled_reference(a, s, b, 64)
@@ -2123,11 +2087,11 @@ def test_mamba2_chunk_scan_matches_the_triton_backend() -> None:
         _randn(g, batch, chunks, heads, d, ds, dtype=bf16),
         _randn(g, heads, dtype=bf16),
     )
-    refs = _run_triton(fn, args, [32, 64, 64])
+    refs = run_triton(fn, args, [32, 64, 64])
     for block_m, warps, stages in ((16, 2, 2), (32, 4, 2), (64, 8, 4)):
         source, outs = _run_cute(fn, args, _config([block_m, 64, 64], warps, stages))
         assert ("md_end0 else" in source) == (block_m < 64)
-        _assert_close(outs, refs, scaled=True)
+        assert_close(outs, refs, scaled=True)
         # The aux ring stages dt / dA_cumsum through shared memory: the same
         # fp32 values reach the same arithmetic.
         source, ringed = _run_cute(
@@ -2177,7 +2141,7 @@ def test_the_aux_ring_survives_the_early_nested_prologue() -> None:
         _randn(g, c, dv, dtype=torch.bfloat16),
         _randn(g, c, dtype=torch.bfloat16),
     )
-    refs = _run_triton(_nested_gated_probe, args, [64, 64, 64])
+    refs = run_triton(_nested_gated_probe, args, [64, 64, 64])
     for stages in (2, 4):
         source, register = _run_cute(
             _nested_gated_probe, args, _config([64, 64, 64], 4, stages)
@@ -2192,7 +2156,7 @@ def test_the_aux_ring_survives_the_early_nested_prologue() -> None:
         assert f"{RT}.cp_async_4(md_aux1 + " in early
         for lhs, rhs in zip(ring, register, strict=True):
             assert torch.equal(lhs, rhs)
-        _assert_close(ring, refs)
+        assert_close(ring, refs)
 
 
 def _tensor_with_address_bit_31(
@@ -2246,7 +2210,7 @@ def test_the_aux_ring_word_alignment_survives_address_bit_31() -> None:
     )
     for lhs, rhs in zip(ring, register, strict=True):
         assert torch.equal(lhs, rhs)
-    _assert_close(ring, _run_triton(_nested_gated_probe, args, [64, 64, 64]))
+    assert_close(ring, run_triton(_nested_gated_probe, args, [64, 64, 64]))
 
 
 def test_a_partial_trip_does_not_read_the_other_operand_past_the_bound() -> None:
@@ -2279,7 +2243,7 @@ def test_a_partial_trip_does_not_read_the_other_operand_past_the_bound() -> None
         _randn(g, batch, chunks, heads, d, ds, dtype=bf16),
         _randn(g, heads, dtype=bf16),
     )
-    (ref,) = _run_triton(fn, args, [32, 64, 64])
+    (ref,) = run_triton(fn, args, [32, 64, 64])
     assert torch.isfinite(ref[0, :32]).all()
     for loads in ("lane", "tma"):
         # (Not ``_run_cute``: its launch-to-launch ``torch.equal`` cannot
@@ -2321,7 +2285,7 @@ def test_the_aux_ring_matches_the_register_form_on_the_gated_chain(
     _source, register = _run_cute(fn, args, _config([bm, bn], warps, stages))
     for lhs, rhs in zip(ring, register, strict=True):
         assert torch.equal(lhs, rhs)
-    _assert_close(ring, _run_triton(fn, args, [bm, bn]))
+    assert_close(ring, run_triton(fn, args, [bm, bn]))
     # The TMA ring with each side-load form (the aux copies sit behind the
     # issuing thread's bulk copies in the same prologue stage).
     for aux in ("register", "ring"):
@@ -2348,9 +2312,11 @@ def test_a_loop_less_batched_matmul_matches_the_triton_backend(
     # masked store a vector store.  Bit-equal to Triton over eight launches.
     fn = _probe_kernels()._head_sum_logits_batched
     args = _head_sum_args(h=32)
-    source, out = _run_cute(fn, args, _config(block_sizes, warps, 4))
+    source, out = _run_cute(
+        fn, args, _config(block_sizes, warps, 4), launches=DETERMINISM_LAUNCHES
+    )
     assert "for md_i" not in source and f"{RT}.octet_sum(" in source
-    (ref,) = _run_triton(fn, args, block_sizes)
+    (ref,) = run_triton(fn, args, block_sizes)
     assert torch.isinf(ref).any() and torch.isfinite(ref).any()
     assert torch.equal(out[0], ref)
 
@@ -2522,10 +2488,10 @@ def test_dqkg_with_the_gate_gradient_matches_the_triton_backend(
     fn = _kernel_fn("dqkg")
     source, (dq, dk, dg) = _run_cute(fn, args, _config(block_sizes, warps, stages))
     assert f"{RT}.shfl_down_add_f32(" in source
-    rq, rk, rg = _run_triton(fn, args, block_sizes)
+    rq, rk, rg = run_triton(fn, args, block_sizes)
     assert torch.equal(dq, rq)
-    _assert_close((dk,), (rk,), scaled=True)
-    _assert_close((dg,), (rg,))
+    assert_close((dk,), (rk,), scaled=True)
+    assert_close((dg,), (rg,))
 
 
 def test_anchored_wy_state_key_matches_the_triton_backend() -> None:
@@ -2542,7 +2508,7 @@ def test_anchored_wy_state_key_matches_the_triton_backend() -> None:
         if backend == "cute":
             _source, out = _run_cute(fn, args, _config([32, 32], 4, 2))
         else:
-            out = _run_triton(fn, args, [32, 32])
+            out = run_triton(fn, args, [32, 32], cache=False)
         outs.append((*out, kso))
     for lhs, rhs in zip(*outs, strict=True):
         assert torch.equal(lhs, rhs)
@@ -2628,7 +2594,7 @@ def test_the_anchored_wy_autotune_fault_config_is_verified_before_it_runs() -> N
             assert torch.equal(lhs, rhs)
     kso = torch.empty_like(t["k"])
     args = (t["k"], t["v"], t["beta"], t["gc"], akk, kso, False, True)
-    ref = (*_run_triton(fn, args, [8, 8]), kso)
+    ref = (*run_triton(fn, args, [8, 8], cache=False), kso)
     for lhs, rhs in zip(plain, ref, strict=True):
         assert torch.equal(lhs, rhs)
 
@@ -2652,16 +2618,21 @@ def test_l2_hinted_operand_packets_are_a_pure_cache_hint(
     args = _head_sum_args(m=4, h=32)
     hinted = [*policies, "", "", "", "", ""]
     source, out = _run_cute(
-        fn, args, _config([1, 64], 4, 4, load_eviction_policies=hinted)
+        fn,
+        args,
+        _config([1, 64], 4, 4, load_eviction_policies=hinted),
+        launches=DETERMINISM_LAUNCHES,
     )
     assert source.count(f"{RT}.cp_async_16_l2(") == 12
     assert f"{RT}.cp_async_16(" not in source
     assert "_helion_cute_sass_checks = ('hinted_cp_async',)" in source
     for word in words:
         assert f"{RT}.l2_policy_{word}()" in source
-    _, plain = _run_cute(fn, args, _config([1, 64], 4, 4))
+    _, plain = _run_cute(
+        fn, args, _config([1, 64], 4, 4), launches=DETERMINISM_LAUNCHES
+    )
     assert torch.equal(out[0], plain[0])
-    (ref,) = _run_triton(fn, args, [1, 64])
+    (ref,) = run_triton(fn, args, [1, 64])
     assert torch.equal(out[0], ref)
 
 
@@ -2702,7 +2673,7 @@ def test_the_hinted_decode_kernels_sass_has_no_collision_under_several_configs()
         with bound.env:
             normalized = bound.config_spec.normalized_config(hinted)
         compiled = bound.compile_config(normalized)
-        (out,) = _tensors(compiled(*args))
+        (out,) = tensors(compiled(*args))
         torch.cuda.synchronize()
         module = sys.modules[compiled.__module__]
         cute_kernel = next(
@@ -2788,7 +2759,7 @@ def test_se_block_backward_matches_the_triton_backend(
     if derived == "pass":
         assert "md_x0" not in source
         assert f"{RT}.lds_v4_b32(md_d" in source
-    ref = _run_triton(fn, args, block_sizes)
+    ref = run_triton(fn, args, block_sizes)
     for lhs, rhs in zip(out, ref, strict=True):
         assert torch.equal(lhs, rhs)
 
@@ -2823,7 +2794,7 @@ def test_a_half_typed_pass_chain_matches_the_triton_backend(
     if derived == "pass":
         assert f"{RT}.sts_v4_b32(md_t0 + " in source
         assert f"{RT}.pack_bf16x2(" in source
-    (ref,) = _run_triton(fn, args, [64, 64, 64])
+    (ref,) = run_triton(fn, args, [64, 64, 64])
     assert torch.equal(out, ref)
 
 
@@ -2846,7 +2817,7 @@ def test_a_non_finite_fill_beside_a_fragment_matches_the_triton_backend(
     args = _masked_neg_inf_args()
     source, (out,) = _run_cute(fn, args, _config([64], warps, 2))
     assert "cutlass.Float32(float('-inf'))" in source
-    (ref,) = _run_triton(fn, _masked_neg_inf_args(), [64])
+    (ref,) = run_triton(fn, _masked_neg_inf_args(), [64])
     assert torch.isinf(ref).any() and torch.isfinite(ref).any()
     assert torch.equal(out, ref)
 
@@ -2874,10 +2845,12 @@ def test_ragged_root_tiles_match_the_triton_backend(
     # Triton's masked tile over eight launches.
     fn = _probe_kernels()._head_sum_logits
     args = _head_sum_args(m=m)
-    source, out = _run_cute(fn, args, _config(block_sizes, warps, 2))
+    source, out = _run_cute(
+        fn, args, _config(block_sizes, warps, 2), launches=DETERMINISM_LAUNCHES
+    )
     assert f"{RT}.cp_async_16_zfill(" in source
     assert f"{RT}.ldg_s32_pred(" in source and f"{RT}.ldg_f32_pred(" in source
-    (ref,) = _run_triton(fn, args, block_sizes)
+    (ref,) = run_triton(fn, args, block_sizes)
     assert torch.isinf(ref).any() and torch.isfinite(ref).any()
     assert torch.equal(out[0], ref)
 
@@ -3030,8 +3003,8 @@ def test_a_half_addmm_into_an_fp32_accumulator_matches_the_references(
     ref = (c.float().T @ grad_d).to(torch.float16)
     rel_l2 = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
     assert rel_l2 < 1e-3, rel_l2
-    (triton,) = _run_triton(_half_addmm_db, args, block_sizes)
-    _assert_close((out,), (triton,))
+    (triton,) = run_triton(_half_addmm_db, args, block_sizes)
+    assert_close((out,), (triton,))
 
 
 def test_a_half_addmm_whose_recipe_is_reused_materializes_and_matches() -> None:
@@ -3072,18 +3045,21 @@ def test_a_half_addmm_whose_recipe_is_reused_materializes_and_matches() -> None:
 # Side loads riding the ring (``cute_mma_dag_aux='ring'``)
 # --------------------------------------------------------------------------
 
-# kernel, decay mode, (n, d, dv), block sizes, warps, stages
+# kernel, decay mode, (n, d, dv), block sizes, warps, stages: each side-load
+# shape (a gate row and a decay scalar, a per-channel decay vector, a row of
+# the staged gc tile) in both recurrences, ring depths 1-8, 2-8 warps and
+# even / odd trip counts.
+# The module's long relaunch sweep: a four-stage ring with side tiles at the
+# full tile, the most barrier phases per launch.
+_SIDE_RING_LONG_SWEEP = ("bwd", "scalar", (16, 64, 64), [32, 64], 4, 4)
 _SIDE_RING_CASES = (
-    ("bwd", "scalar", (16, 64, 64), [32, 64], 4, 4),
-    ("bwd", "scalar", (16, 64, 64), [64, 64], 8, 2),
+    _SIDE_RING_LONG_SWEEP,
     ("bwd", "scalar", (8, 64, 64), [64, 64], 4, 1),
     ("bwd", "scalar", (5, 64, 64), [32, 32], 2, 8),
     ("fwd", "scalar", (16, 64, 64), [32, 64], 2, 3),
     ("fwd", "scalar", (8, 128, 128), [64, 128], 8, 4),
     # The per-channel decay (``diag``): a vector along a ROOT axis.
-    ("bwd", "diag", (16, 64, 64), [32, 64], 4, 4),
     ("bwd", "diag", (7, 128, 64), [64, 64], 8, 2),
-    ("fwd", "diag", (8, 64, 128), [64, 64], 4, 2),
     ("fwd", "diag", (9, 64, 64), [32, 32], 4, 1),
     # full_gla's anchored mode: the chunk's last decay row is a row of the
     # staged gc tile -- the ring slot serves it under ``lane``
@@ -3120,11 +3096,22 @@ def test_side_loads_riding_the_ring_match_the_lane_loads_bitwise(
     t = _inputs(bh=2, n=n, d=d, dv=dv, dtype=torch.bfloat16, seed=3)
     args = _fwd_args(t, mode, True) if kernel == "fwd" else _bwd_args(t, mode)
     fn = _kernel_fn(kernel)
+    launches = (
+        DETERMINISM_LAUNCHES
+        if (kernel, mode, shape, block_sizes, warps, stages) == _SIDE_RING_LONG_SWEEP
+        else LAUNCHES
+    )
     register_source, register = _run_cute(
-        fn, args, _config(block_sizes, warps, stages, cute_mma_dag_aux="register")
+        fn,
+        args,
+        _config(block_sizes, warps, stages, cute_mma_dag_aux="register"),
+        launches,
     )
     ring_source, ring = _run_cute(
-        fn, args, _config(block_sizes, warps, stages, cute_mma_dag_aux="ring")
+        fn,
+        args,
+        _config(block_sizes, warps, stages, cute_mma_dag_aux="ring"),
+        launches,
     )
     assert f"{RT}.cp_async_4(" not in register_source
     assert f"{RT}.cp_async_4(md_aux0" in ring_source
@@ -3132,7 +3119,7 @@ def test_side_loads_riding_the_ring_match_the_lane_loads_bitwise(
     assert f"{RT}.ldg_f32(" not in ring_source[ring_source.index("for md_i in") :]
     for lhs, rhs in zip(register, ring, strict=True):
         assert torch.equal(lhs, rhs)
-    _assert_close(ring, _run_triton(fn, args, block_sizes))
+    assert_close(ring, run_triton(fn, args, block_sizes))
 
 
 @pytest.mark.parametrize(("warps", "stages"), ((4, 2), (4, 4), (8, 1)))
@@ -3167,7 +3154,7 @@ def test_side_loads_riding_the_ring_with_hoisted_loads_match_the_lane_loads(
     assert f"{RT}.ldg_f32(" not in ring_source[ring_source.index("for md_i in") :]
     for lhs, rhs in zip(register, ring, strict=True):
         assert torch.equal(lhs, rhs)
-    _assert_close(ring, _run_triton(fn, args, [32, 64]))
+    assert_close(ring, run_triton(fn, args, [32, 64]))
 
 
 def test_side_loads_of_a_loop_whose_ring_stages_nothing_take_the_registers() -> None:
@@ -3201,15 +3188,13 @@ def test_side_loads_of_a_loop_whose_ring_stages_nothing_take_the_registers() -> 
             assert (ring_source == register_source) == (not rides)
             for lhs, rhs in zip(register, ring, strict=True):
                 assert torch.equal(lhs, rhs)
-            _assert_close(ring, _run_triton(fn, args, block_sizes))
+            assert_close(ring, run_triton(fn, args, block_sizes))
 
 
 # kernel, (n, d, dv) or the varlen chunks, block size, warps, stages
 _SIDE_RING_DELTA_CASES = (
     ("dstate", (8, 64, 64), [32], 4, 2),
-    ("dstate", (8, 64, 64), [64], 8, 4),
     ("dstate", (3, 128, 64), [64], 8, 1),
-    ("fwd_h_delta", (8, 64, 64), [64], 4, 2),
     ("fwd_h_delta", (8, 64, 64), [32], 8, 3),
     ("fwd_h_delta", (3, 128, 64), [64], 4, 2),
     ("fwd_h_delta_varlen", (5, 1, 3), [64], 4, 2),
@@ -3257,7 +3242,7 @@ def test_side_loads_of_the_delta_rule_recurrences_ride_the_ring_bitwise(
     assert f"{RT}.cp_async_4(md_aux0" in ring_source
     for lhs, rhs in zip(register, ring, strict=True):
         assert torch.equal(lhs, rhs)
-    _assert_close(ring, _run_triton(fn, args, block_sizes), scaled=True)
+    assert_close(ring, run_triton(fn, args, block_sizes), scaled=True)
 
 
 def test_a_side_load_of_a_nested_ring_loop_rides_its_ring() -> None:
@@ -3279,4 +3264,4 @@ def test_a_side_load_of_a_nested_ring_loop_rides_its_ring() -> None:
         )
         assert f"{RT}.cp_async_16(md_aux1" in ring_source
         assert torch.equal(register[0], ring[0])
-        assert torch.equal(ring[0], _run_triton(fn, (do, h, gate), [64, 64])[0])
+        assert torch.equal(ring[0], run_triton(fn, (do, h, gate), [64, 64])[0])

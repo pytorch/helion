@@ -21,6 +21,8 @@ from helion._compiler.cute.bounded_loop_cache import specialize_single_tile_swee
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _admit(function: ast.FunctionDef):
     arguments = {argument.arg for argument in function.args.args}

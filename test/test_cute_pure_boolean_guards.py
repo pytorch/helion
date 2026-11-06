@@ -13,6 +13,8 @@ from helion._compiler.cute.affine_vector_io import _conjunction
 from helion._compiler.cute.affine_vector_io import _pure_boolean_guard
 from helion._compiler.cute.boolean_guards import reassociate_boolean_guards
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _expression(source: str) -> ast.expr:
     return ast.parse(source, mode="eval").body

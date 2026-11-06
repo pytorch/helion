@@ -17,11 +17,10 @@ import logging
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 
 _examples_attention = import_example("attention")
 attention = _examples_attention.attention
@@ -52,7 +51,7 @@ def _bind(fn, config: helion.Config, args: tuple[object, ...], *, backend: str):
         autotune_accuracy_check=False,
         force_autotune=False,
     )
-    return _cpu_bind(kernel, args)
+    return cpu_bind(kernel, args)
 
 
 @skipUnlessBackends(["cute"])

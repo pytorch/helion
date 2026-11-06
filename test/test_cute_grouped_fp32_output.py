@@ -5,14 +5,16 @@ import ast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -51,8 +53,8 @@ def test_grouped_fp32_output_uses_worklist_and_charges_wider_ring(
         torch.empty((4, 256, 128), dtype=dtype),
         torch.tensor([0, 0, 1, 129, 640], dtype=torch.int32),
     )
-    with _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped_fp32_output, args)
+    with _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped_fp32_output, args)
         facts = bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts
         assert facts is not None and facts.output_dtype_bytes == 4
         config = helion.Config(

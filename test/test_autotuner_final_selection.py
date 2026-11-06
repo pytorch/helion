@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -2547,6 +2548,7 @@ class TestFinalSelectionOnDevice(TestCase):
     alike; the selection itself is backend independent and the CPU tests cover
     it."""
 
+    @pytest.mark.slow
     @skipIfRefEager("compiles and times configs on the device")
     def test_full_effort_selection_runs(self) -> None:
         args = (

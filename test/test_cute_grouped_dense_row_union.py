@@ -14,7 +14,6 @@ import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_grouped_coverage_search import _bound
 from test.test_cute_grouped_coverage_search import _search
 from test.test_cute_grouped_full_coverage import _config as _old_config
@@ -37,10 +36,13 @@ from helion._compiler.program_id import ProgramIDs
 from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
+
+pytestmark = pytest.mark.cpu_only
 
 grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
@@ -58,7 +60,7 @@ def _cpu_only() -> Generator[None, None, None]:
     old_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         _target(),
     ):

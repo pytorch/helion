@@ -11,7 +11,6 @@ import torch
 from test.test_cute_block_scaled_mma import _bind_native
 from test.test_cute_block_scaled_mma import _native_config
 from test.test_cute_block_scaled_mma import _wrapper_plan
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
 from helion._compiler.cute.block_scaled_config import normalize_block_scaled_config
@@ -20,6 +19,7 @@ from helion._compiler.cute.block_scaled_prepare import preparation_source
 from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 
@@ -44,7 +44,7 @@ def _fused_plan(shape: tuple[int, int, int], **config: object) -> dict[str, obje
         "cute_scaled_prepare": "fused",
         **config,
     }
-    with _cpu_target():
+    with cpu_target():
         return _wrapper_plan(bound.to_code(_native_config(**settings)))
 
 
@@ -284,7 +284,7 @@ def test_epilogue_width_prices_the_shared_memory_estimate() -> None:
         "cute_scaled_stages": 4,
         "cute_scaled_prepare": "fused",
     }
-    with _cpu_target():
+    with cpu_target():
         with pytest.raises(BackendUnsupported):
             bound.to_code(_native_config(**settings, cute_scaled_epilogue_n=64))
         plan = _wrapper_plan(

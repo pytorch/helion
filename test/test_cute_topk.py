@@ -25,9 +25,6 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.cute_register_model import execute_register_plan_events
 from test.cute_register_model import gather_registers
@@ -53,8 +50,12 @@ from helion._compiler.runtime_tensor_guards import (
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import pairwise
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -62,6 +63,7 @@ from helion.language._tracing_ops import _get_symnode
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from collections.abc import Sequence
 
 
 from helion._compiler.cute.sorting_networks import COMPACT_SORT_LAYERS
@@ -173,10 +175,23 @@ def _assert_register_selection(source: str) -> None:
     )
 
 
+def _pairwise_cases(
+    cases: Sequence[tuple[object, ...]], **axes: Sequence[object]
+) -> list[tuple[object, ...]]:
+    """All-pairs rows over ``axes`` and the explicit geometry ``cases``.
+
+    Each row is ``(*axis values, *case fields)``, so a parametrize call keeps
+    one name per field. Every case meets every value of every axis, and every
+    pair of axis values appears, without the full product.
+    """
+    return [(*row[:-1], *row[-1]) for row in pairwise(**axes, cases=cases)]
+
+
 def test_topk_collection_without_cute(tmp_path: Path) -> None:
-    """A Triton-only installation keeps portable tests and skips CuTe tests."""
+    """A Triton-only installation keeps portable tests and leaves out CuTe tests."""
     script = textwrap.dedent(
         """
+        import os
         import sys
         sys.modules["cutlass"] = None
         sys.modules["cutlass.cute"] = None
@@ -205,12 +220,20 @@ def test_topk_collection_without_cute(tmp_path: Path) -> None:
             "test_torch_topk_in_kernel", "test_torch_topk_smallest"
         }
 
-        executed = Results()
-        assert pytest.main([
+        cute_tests = [
             "test/test_cute_topk.py::test_topk_numeric_float_key_exactness_boundary",
             "test/test_cute_topk.py::test_compact_network_bounds_and_operation_count",
-            "-q"
-        ], plugins=[executed]) == 0
+        ]
+        # Under HELION_BACKEND=triton the conftest deselects every
+        # test_cute_*.py module before any test runs (exit code 5: no tests).
+        deselected = Results()
+        assert pytest.main([*cute_tests, "-q"], plugins=[deselected]) == 5
+        assert deselected.nodes == [] and deselected.reports == []
+        # The CuTe lane keeps the portable test and skips the one that needs
+        # the DSL.
+        os.environ["HELION_BACKEND"] = "cute"
+        executed = Results()
+        assert pytest.main([*cute_tests, "-q"], plugins=[executed]) == 0
         assert [outcome for outcome, _ in executed.reports] == ["passed", "skipped"]
         assert "CuTe DSL" in executed.reports[1][1]
         """
@@ -259,15 +282,15 @@ def test_ordering_axis_keeps_complete_reduction_input(backend, operation):
         else (torch.ones(3, 8192), True)
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
         kernel = helion.kernel(
             function, backend=backend, static_shapes=True, autotune_effort="none"
         )
-        bound = _cpu_bind(kernel, inputs)
+        bound = cpu_bind(kernel, inputs)
         assert not bound.config_spec.reduction_loops.valid_block_ids()
         source = bound.to_code(bound.config_spec.default_config())
     if backend == "triton":
@@ -292,12 +315,12 @@ def _topk_with_independent_sum(x: torch.Tensor, y: torch.Tensor):
 @skipIfRefEager("requires compiler IR and explicit configurations")
 def test_ordering_does_not_disable_independent_reduction_rolling():
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
-        bound = _cpu_bind(
+        bound = cpu_bind(
             _topk_with_independent_sum, (torch.ones(3, 64), torch.ones(3, 8192))
         )
         blocks = bound.config_spec.reduction_loops.valid_block_ids()
@@ -397,6 +420,9 @@ def _inputs(width: int, dtype: torch.dtype) -> torch.Tensor:
 @onlyBackends(["cute"])
 @pytest.mark.parametrize(
     "dtype,width,k,largest,lanes",
+    # Hand-picked cover of the register path's fragment sizes (width / lanes),
+    # k classes (1, odd, 32) and both directions on the special-value rows
+    # of ``_inputs``; a full product would need 72 rows for the same pairs.
     [
         (torch.bfloat16, 16, 1, True, 1),
         (torch.float16, 16, 3, False, 4),
@@ -597,6 +623,9 @@ def _assert_topk_output(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "rows,width,k,dtype,lanes,block_rows,vector,padding,offset,output_vector",
+    # Each id names the geometry it covers: CTA extremes, input and output
+    # vector widths with their tails, row-count tails, and strided or
+    # offset storage. No two rows share an (vector, output_vector, tail) path.
     [
         pytest.param(3, 1, 1, torch.bfloat16, 1, 1, 1, 0, 0, 1, id="singleton-min-cta"),
         pytest.param(
@@ -667,17 +696,19 @@ def test_direct_topk_layout_and_geometry(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("value_mode", ["gather", "decode"])
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(
-    "selection_layout,key_dtype,k,lanes",
-    [
-        ("replicated", "int32", 32, 4),
-        ("distributed", "int32", 32, 4),
-        ("distributed", "float32_bits", 6, 2),
-        ("distributed", "float32_bits", 8, 32),
-    ],
+    "dtype,value_mode,index_dtype,selection_layout,key_dtype,k,lanes",
+    _pairwise_cases(
+        [
+            ("replicated", "int32", 32, 4),
+            ("distributed", "int32", 32, 4),
+            ("distributed", "float32_bits", 6, 2),
+            ("distributed", "float32_bits", 8, 32),
+        ],
+        dtype=(torch.bfloat16, torch.float16),
+        value_mode=("gather", "decode"),
+        index_dtype=(torch.int32, torch.int64),
+    ),
 )
 def test_topk_output_alignment_changes_on_same_bound_kernel(
     dtype: torch.dtype,
@@ -727,20 +758,26 @@ def test_topk_output_alignment_changes_on_same_bound_kernel(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("largest", [False, True])
 @pytest.mark.parametrize(
+    "index_dtype,dtype,largest,"
     "width,k,lanes,output_vector,key_dtype,rank_mode,value_mode,layout,padding,offset",
-    [
-        (1, 1, 1, 1, "int32", "signed", "gather", "replicated", 0, 0),
-        (64, 32, 4, 2, "float32_bits", "ordinal", "decode", "replicated", 0, 0),
-        (65, 65, 8, 8, "float32", "signed", "decode", "distributed", 2, 1),
-        (128, 24, 8, 8, "float32_native", "ordinal", "decode", "distributed", 2, 1),
-        (128, 8, 32, 8, "float32_native", "signed", "gather", "distributed", 0, 0),
-        (64, 6, 2, 2, "int32", "ordinal", "decode", "distributed", 0, 0),
-        (128, 32, 8, 4, "float32_native", "ordinal", "decode", "replicated", 0, 0),
-    ],
+    # Each row is a distinct (key dtype, rank mode, value mode, layout,
+    # vector, alignment) path; the index/input dtypes and direction only need
+    # to meet every row and each other once.
+    _pairwise_cases(
+        [
+            (1, 1, 1, 1, "int32", "signed", "gather", "replicated", 0, 0),
+            (64, 32, 4, 2, "float32_bits", "ordinal", "decode", "replicated", 0, 0),
+            (65, 65, 8, 8, "float32", "signed", "decode", "distributed", 2, 1),
+            (128, 24, 8, 8, "float32_native", "ordinal", "decode", "distributed", 2, 1),
+            (128, 8, 32, 8, "float32_native", "signed", "gather", "distributed", 0, 0),
+            (64, 6, 2, 2, "int32", "ordinal", "decode", "distributed", 0, 0),
+            (128, 32, 8, 4, "float32_native", "ordinal", "decode", "replicated", 0, 0),
+        ],
+        index_dtype=(torch.int32, torch.int64),
+        dtype=(torch.bfloat16, torch.float16),
+        largest=(False, True),
+    ),
 )
 def test_topk_index_output_dtype_preserves_selected_bits(
     index_dtype: torch.dtype,
@@ -810,12 +847,14 @@ def test_topk_narrow_indices_preserve_wide_address_math(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("largest", [False, True])
-@pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
 @pytest.mark.parametrize(
-    "width,k,output_vector,padding,offset",
-    [(64, 64, 8, 0, 0), (65, 65, 1, 2, 1), (64, 17, 4, 2, 1)],
+    "dtype,largest,rank_mode,width,k,output_vector,padding,offset",
+    _pairwise_cases(
+        [(64, 64, 8, 0, 0), (65, 65, 1, 2, 1), (64, 17, 4, 2, 1)],
+        dtype=(torch.bfloat16, torch.float16),
+        largest=(False, True),
+        rank_mode=("signed", "ordinal"),
+    ),
 )
 def test_topk_decode_preserves_selected_bits(
     dtype: torch.dtype,
@@ -848,19 +887,24 @@ def test_topk_decode_preserves_selected_bits(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("largest", [False, True])
-@pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
 @pytest.mark.parametrize(
-    "key_dtype,width,k,output_vector,padding,offset,value_mode",
-    [
-        ("float32", 512, 32, 8, 0, 0, "decode"),
-        ("float32", 65, 65, 1, 2, 1, "gather"),
-        ("float32", 1024, 32, 4, 0, 1, "decode"),
-        ("float32_bits", 1024, 32, 8, 0, 0, "decode"),
-        ("float32_bits", 65, 65, 1, 2, 1, "gather"),
-        ("float32_bits", 1, 1, 1, 0, 0, "decode"),
-    ],
+    "dtype,largest,rank_mode,key_dtype,width,k,output_vector,padding,offset,value_mode",
+    # Rows pair each float key encoding with the widths at its precision
+    # boundary and both value modes; dtype, direction and rank mode are
+    # independent knobs that only need all-pairs coverage.
+    _pairwise_cases(
+        [
+            ("float32", 512, 32, 8, 0, 0, "decode"),
+            ("float32", 65, 65, 1, 2, 1, "gather"),
+            ("float32", 1024, 32, 4, 0, 1, "decode"),
+            ("float32_bits", 1024, 32, 8, 0, 0, "decode"),
+            ("float32_bits", 65, 65, 1, 2, 1, "gather"),
+            ("float32_bits", 1, 1, 1, 0, 0, "decode"),
+        ],
+        dtype=(torch.bfloat16, torch.float16),
+        largest=(False, True),
+        rank_mode=("signed", "ordinal"),
+    ),
 )
 def test_topk_float_keys_preserve_selected_bits(
     dtype: torch.dtype,
@@ -896,27 +940,33 @@ def test_topk_float_keys_preserve_selected_bits(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("largest", [False, True])
 @pytest.mark.parametrize(
+    "dtype,largest,"
     "width,k,lanes,block_rows,padding,offset,key_dtype,rank_mode,value_mode",
-    [
-        (1, 1, 1, 1, 0, 0, "int32", "ordinal", "decode"),
-        (65, 33, 1, 8, 2, 1, "int32", "ordinal", "decode"),
-        (65, 6, 2, 8, 2, 1, "int32", "ordinal", "decode"),
-        (128, 32, 2, 64, 0, 0, "float32_bits", "ordinal", "decode"),
-        (128, 32, 4, 32, 0, 0, "float32", "signed", "decode"),
-        (128, 64, 8, 16, 0, 0, "int32", "ordinal", "gather"),
-        (128, 24, 8, 16, 2, 1, "float32_bits", "ordinal", "decode"),
-        (128, 12, 8, 16, 0, 0, "int32", "signed", "decode"),
-        (256, 128, 16, 8, 0, 0, "float32_bits", "ordinal", "decode"),
-        (128, 64, 32, 4, 0, 0, "float32", "signed", "decode"),
-        (65, 65, 4, 32, 2, 1, "float32", "signed", "gather"),
-        (64, 7, 8, 4, 0, 0, "int32", "ordinal", "decode"),
-        (128, 17, 16, 4, 0, 0, "float32_bits", "ordinal", "decode"),
-        (65, 31, 32, 1, 2, 1, "float32", "signed", "decode"),
-        (64, 3, 32, 1, 0, 0, "int32", "ordinal", "gather"),
-    ],
+    # Every row is a distinct (lanes, k / lanes output vector, block rows, key
+    # dtype, rank mode, value mode) geometry of the distributed layout; each
+    # meets both input dtypes and both directions through the pairwise cover.
+    _pairwise_cases(
+        [
+            (1, 1, 1, 1, 0, 0, "int32", "ordinal", "decode"),
+            (65, 33, 1, 8, 2, 1, "int32", "ordinal", "decode"),
+            (65, 6, 2, 8, 2, 1, "int32", "ordinal", "decode"),
+            (128, 32, 2, 64, 0, 0, "float32_bits", "ordinal", "decode"),
+            (128, 32, 4, 32, 0, 0, "float32", "signed", "decode"),
+            (128, 64, 8, 16, 0, 0, "int32", "ordinal", "gather"),
+            (128, 24, 8, 16, 2, 1, "float32_bits", "ordinal", "decode"),
+            (128, 12, 8, 16, 0, 0, "int32", "signed", "decode"),
+            (256, 128, 16, 8, 0, 0, "float32_bits", "ordinal", "decode"),
+            (128, 64, 32, 4, 0, 0, "float32", "signed", "decode"),
+            (65, 65, 4, 32, 2, 1, "float32", "signed", "gather"),
+            (64, 7, 8, 4, 0, 0, "int32", "ordinal", "decode"),
+            (128, 17, 16, 4, 0, 0, "float32_bits", "ordinal", "decode"),
+            (65, 31, 32, 1, 2, 1, "float32", "signed", "decode"),
+            (64, 3, 32, 1, 0, 0, "int32", "ordinal", "gather"),
+        ],
+        dtype=(torch.bfloat16, torch.float16),
+        largest=(False, True),
+    ),
 )
 def test_topk_distributed_selection(
     dtype: torch.dtype,
@@ -956,18 +1006,22 @@ def test_topk_distributed_selection(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("largest", [False, True])
 @pytest.mark.parametrize(
-    "width,k,lanes,input_vector,key_dtype,rank_mode,value_mode",
-    [
-        (8, 8, 8, 1, "int32", "ordinal", "decode"),
-        (13, 9, 16, 1, "float32_bits", "signed", "decode"),
-        (64, 32, 32, 2, "float32", "ordinal", "gather"),
-        (128, 32, 16, 8, "int32", "ordinal", "decode"),
-        (128, 32, 32, 4, "float32_bits", "ordinal", "decode"),
-        (65, 33, 32, 4, "float32", "signed", "decode"),
-    ],
+    "dtype,largest,width,k,lanes,input_vector,key_dtype,rank_mode,value_mode",
+    # Rows cover the growing-subgroup stages (lanes vs. k) with each key dtype
+    # and input vector; dtype and direction only need the pairwise cover.
+    _pairwise_cases(
+        [
+            (8, 8, 8, 1, "int32", "ordinal", "decode"),
+            (13, 9, 16, 1, "float32_bits", "signed", "decode"),
+            (64, 32, 32, 2, "float32", "ordinal", "gather"),
+            (128, 32, 16, 8, "int32", "ordinal", "decode"),
+            (128, 32, 32, 4, "float32_bits", "ordinal", "decode"),
+            (65, 33, 32, 4, "float32", "signed", "decode"),
+        ],
+        dtype=(torch.bfloat16, torch.float16),
+        largest=(False, True),
+    ),
 )
 def test_topk_distributed_growing_selection(
     dtype: torch.dtype,
@@ -1004,18 +1058,22 @@ def test_topk_distributed_growing_selection(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("largest", [False, True])
 @pytest.mark.parametrize(
-    "width,k,lanes,input_vector,key_dtype,network",
-    [
-        (256, 8, 16, 8, "int32", "batcher"),
-        (256, 8, 32, 8, "float32", "compact"),
-        (512, 8, 32, 8, "float32_bits", "compact_pruned"),
-        (128, 3, 16, 8, "int32", "compact_pruned"),
-        (33, 1, 32, 4, "float32", "batcher"),
-        (3, 3, 32, 1, "float32_bits", "compact"),
-    ],
+    "dtype,largest,width,k,lanes,input_vector,key_dtype,network",
+    # Rows pair each sort network and key dtype with a lanes > k geometry;
+    # dtype and direction only need the pairwise cover.
+    _pairwise_cases(
+        [
+            (256, 8, 16, 8, "int32", "batcher"),
+            (256, 8, 32, 8, "float32", "compact"),
+            (512, 8, 32, 8, "float32_bits", "compact_pruned"),
+            (128, 3, 16, 8, "int32", "compact_pruned"),
+            (33, 1, 32, 4, "float32", "batcher"),
+            (3, 3, 32, 1, "float32_bits", "compact"),
+        ],
+        dtype=(torch.bfloat16, torch.float16),
+        largest=(False, True),
+    ),
 )
 def test_topk_distributed_more_lanes_than_outputs(
     dtype: torch.dtype,
@@ -1061,18 +1119,22 @@ def topk_spec(monkeypatch: pytest.MonkeyPatch) -> ConfigSpec:
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("network", ["compact", "compact_pruned"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("largest", [False, True])
 @pytest.mark.parametrize(
-    "width,k,lanes,layout,key_dtype,rank_mode,value_mode",
-    [
-        (64, 32, 1, "replicated", "float32_bits", "ordinal", "decode"),
-        (128, 32, 2, "replicated", "float32", "signed", "decode"),
-        (128, 32, 16, "distributed", "int32", "ordinal", "decode"),
-        (65, 33, 2, "replicated", "int32", "signed", "gather"),
-        (512, 8, 2, "replicated", "float32_bits", "ordinal", "decode"),
-    ],
+    "network,dtype,largest,width,k,lanes,layout,key_dtype,rank_mode,value_mode",
+    # Rows are the compact-table sizes (k, width / lanes) with each layout and
+    # key dtype; both networks, dtypes and directions meet every row pairwise.
+    _pairwise_cases(
+        [
+            (64, 32, 1, "replicated", "float32_bits", "ordinal", "decode"),
+            (128, 32, 2, "replicated", "float32", "signed", "decode"),
+            (128, 32, 16, "distributed", "int32", "ordinal", "decode"),
+            (65, 33, 2, "replicated", "int32", "signed", "gather"),
+            (512, 8, 2, "replicated", "float32_bits", "ordinal", "decode"),
+        ],
+        network=("compact", "compact_pruned"),
+        dtype=(torch.bfloat16, torch.float16),
+        largest=(False, True),
+    ),
 )
 def test_topk_compact_selection_networks(
     network: str,
@@ -1115,6 +1177,8 @@ def test_topk_compact_selection_networks(
 
 @pytest.mark.parametrize(
     "key,value",
+    # One row per (knob, rejected kind): booleans, wrong-typed numbers,
+    # out-of-domain integers and unknown strings each take a distinct check.
     [
         ("cute_topk_lanes_per_row", True),
         ("cute_topk_rows_per_block", False),
@@ -1294,18 +1358,23 @@ def test_topk_config_limits_threads_per_block(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("largest", [False, True])
-@pytest.mark.parametrize("selection_layout", ["replicated", "distributed"])
-@pytest.mark.parametrize("sort_network", ["batcher", "compact_pruned"])
 @pytest.mark.parametrize(
+    "dtype,largest,selection_layout,sort_network,"
     "width,k,lanes,output_vector,padding,offset,value_mode",
-    [
-        (64, 64, 4, 8, 0, 0, "decode"),
-        (65, 65, 4, 1, 2, 1, "gather"),
-        (128, 32, 16, 4, 0, 0, "decode"),
-        (128, 8, 32, 4, 0, 0, "decode"),
-    ],
+    # Rows span the native-key geometries (full-row k, odd strided row, k <
+    # lanes); dtype, direction, layout and network are independent knobs.
+    _pairwise_cases(
+        [
+            (64, 64, 4, 8, 0, 0, "decode"),
+            (65, 65, 4, 1, 2, 1, "gather"),
+            (128, 32, 16, 4, 0, 0, "decode"),
+            (128, 8, 32, 4, 0, 0, "decode"),
+        ],
+        dtype=(torch.bfloat16, torch.float16),
+        largest=(False, True),
+        selection_layout=("replicated", "distributed"),
+        sort_network=("batcher", "compact_pruned"),
+    ),
 )
 def test_topk_native_float_preserves_all_bits(
     dtype: torch.dtype,
@@ -1439,9 +1508,14 @@ def _code(
 
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("vector", [1, 2, 4, 8])
-@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+@pytest.mark.parametrize(
+    "index_dtype,vector,layout",
+    pairwise(
+        index_dtype=(torch.int32, torch.int64),
+        vector=(1, 2, 4, 8),
+        layout=("replicated", "distributed"),
+    ),
+)
 def test_topk_index_output_dtype_codegen(
     index_dtype: torch.dtype, vector: int, layout: str
 ) -> None:
@@ -1580,10 +1654,15 @@ def test_topk_odd_output_stride_uses_scalar_stores() -> None:
 
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("largest", [False, True])
-@pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
-@pytest.mark.parametrize("key_encoder", ["dsl", "asm"])
+@pytest.mark.parametrize(
+    "dtype,largest,rank_mode,key_encoder",
+    pairwise(
+        dtype=(torch.bfloat16, torch.float16),
+        largest=(False, True),
+        rank_mode=("signed", "ordinal"),
+        key_encoder=("dsl", "asm"),
+    ),
+)
 def test_topk_decode_all_16bit_inputs(
     dtype: torch.dtype, largest: bool, rank_mode: str, key_encoder: str
 ) -> None:
@@ -1728,6 +1807,8 @@ def test_topk_decode_keeps_wide_vector_output_addresses() -> None:
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "cols,key_dtype,selected_dtype",
+    # Each float key encoding at both sides of its exactness boundary (512
+    # and 16384 columns) plus the integer baseline.
     [
         (512, "int32", "Int32"),
         (512, "float32", "Float32"),
@@ -2056,6 +2137,8 @@ def test_topk_cache_hash_includes_compact_tables() -> None:
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "k,lanes",
+    # Each (k, lanes) row is a different output vector / padded-k guard
+    # combination; every key dtype renders its own key path for each.
     [(3, 8), (3, 4), (6, 2), (33, 1), (32, 16), (1, 32), (8, 32)],
 )
 @pytest.mark.parametrize("key_dtype", ["int32", "float32", "float32_bits"])
@@ -2105,6 +2188,9 @@ def test_topk_distributed_keeps_wide_addresses(rows: int, stride: int) -> None:
     assert "cute.assume(topk_output_offset, divby=2)" in code
 
 
+# Pure-Python permutation model: every supported lane count against every
+# requested vector width, since the clamp ``min(vector, lanes, size)`` differs
+# per pair.
 @pytest.mark.parametrize("lanes", [1, 2, 4, 8, 16, 32])
 @pytest.mark.parametrize("requested_vector", [1, 2, 4, 8])
 def test_distributed_output_transpose_rank_mapping(
@@ -2152,6 +2238,8 @@ def test_distributed_output_transpose_rank_mapping(
 @pytest.mark.parametrize("key_dtype", ["int32", "float32", "float32_bits"])
 @pytest.mark.parametrize(
     "k,lanes,requested,effective",
+    # Each row is a distinct effective output vector (clamped by k, lanes and
+    # the request); every key dtype converts the vector keys differently.
     [
         (32, 1, 8, 8),
         (32, 32, 8, 1),
@@ -2214,9 +2302,14 @@ def _out_topk(x: torch.Tensor, values: torch.Tensor, indices: torch.Tensor) -> N
 
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
-@pytest.mark.parametrize("alias_kind", ["separate", "view", "dlpack"])
-@pytest.mark.parametrize("alias_target", ["values", "indices"])
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "alias_kind,alias_target,index_dtype",
+    pairwise(
+        alias_kind=("separate", "view", "dlpack"),
+        alias_target=("values", "indices"),
+        index_dtype=(torch.int32, torch.int64),
+    ),
+)
 def test_matcher_uses_runtime_span_alias_proof(
     alias_kind: str, alias_target: str, index_dtype: torch.dtype
 ) -> None:
@@ -2292,6 +2385,8 @@ def test_native_float_key_range_and_roundtrip(dtype: torch.dtype, width: int) ->
     assert bool(values[-int((~nonnan).sum()) :].isnan().all())
 
 
+# Cheap exhaustive bit check: every payload width the encoder supports, in
+# both directions, over all 65536 input words.
 @pytest.mark.parametrize("index_bits", range(15))
 @pytest.mark.parametrize("largest", [False, True])
 def test_native_bfloat_bias_exhaustive(index_bits: int, largest: bool) -> None:
@@ -2448,6 +2543,8 @@ def _evaluate(values: np.ndarray, size: int, k: int, network: str) -> np.ndarray
     ).numpy()
 
 
+# Cheap zero-one proof: every table size of every network has its own
+# comparator layers, so no pair can stand in for another.
 @pytest.mark.parametrize("size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("network", ["batcher", "compact", "compact_pruned"])
 def test_selection_network_exhaustive_binary(size: int, network: str) -> None:
@@ -2464,9 +2561,14 @@ def test_selection_network_exhaustive_binary(size: int, network: str) -> None:
         )
 
 
-@pytest.mark.parametrize("size", [32, 64, 128, 256])
-@pytest.mark.parametrize("network", ["batcher", "compact", "compact_pruned"])
-@pytest.mark.parametrize("floating", [False, True])
+@pytest.mark.parametrize(
+    "size,network,floating",
+    pairwise(
+        size=(32, 64, 128, 256),
+        network=("batcher", "compact", "compact_pruned"),
+        floating=(False, True),
+    ),
+)
 def test_selection_network_random_duplicates_and_padding(
     size: int, network: str, floating: bool
 ) -> None:
@@ -2511,6 +2613,7 @@ def test_compact_network_bounds_and_operation_count() -> None:
     )
 
 
+# Every power-of-two size up to the dispatch fallback boundary (cheap, CPU).
 @pytest.mark.parametrize("size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 def test_network_dispatch_and_power_two_fallback(size: int) -> None:
     generator = np.random.default_rng(619)
@@ -2534,6 +2637,8 @@ def test_selection_network_rejects_invalid_sizes(size: int, k: int) -> None:
 # Ordered asm top-k tests.
 
 
+# Cheap exhaustive bit check of the PTX encoder model over all 65536 words:
+# both NaN boundaries (dtype), rank modes, directions and payload widths.
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
 @pytest.mark.parametrize("largest", [False, True])
@@ -2583,20 +2688,24 @@ def test_ordered_key_asm_exhaustive(
 
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
-    "width,key_dtype,ordered",
-    [
-        (128, "int32", True),
-        (512, "float32", True),
-        (1024, "float32", True),
-        (16384, "float32_bits", True),
-        (32768, "float32_bits", True),
-        (128, "float32_native", False),
-        (32768, "float32_native", True),
-    ],
+    "dtype,key_encoder,width,key_dtype,ordered",
+    # Rows put each key dtype at its precision boundary widths; the dtype only
+    # changes the encoder's infinity constant, so it needs the pairwise cover.
+    _pairwise_cases(
+        [
+            (128, "int32", True),
+            (512, "float32", True),
+            (1024, "float32", True),
+            (16384, "float32_bits", True),
+            (32768, "float32_bits", True),
+            (128, "float32_native", False),
+            (32768, "float32_native", True),
+        ],
+        dtype=(torch.bfloat16, torch.float16),
+        key_encoder=("dsl", "asm"),
+    ),
 )
-@pytest.mark.parametrize("key_encoder", ["dsl", "asm"])
 def test_ordered_key_asm_codegen_scope(
     dtype: torch.dtype, width: int, key_dtype: str, ordered: bool, key_encoder: str
 ) -> None:
@@ -2625,6 +2734,8 @@ def test_ordered_key_asm_codegen_scope(
 # Packed rare top-k tests.
 
 
+# Cheap exhaustive bit check of the packed-rare model over all 65536 words:
+# both NaN boundaries (dtype), payload widths and directions.
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("index_bits", range(16))
 @pytest.mark.parametrize("largest", [False, True])
@@ -2708,22 +2819,38 @@ def test_packed_rare_config(
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("selection_codegen_stub")
 @pytest.mark.parametrize(
+    "key_encoder,largest,"
     "width,k,lanes,vector,layout,key_dtype,rank_mode,value_mode,active",
-    [
-        (128, 32, 2, 4, "replicated", "int32", "ordinal", "decode", True),
-        (128, 24, 2, 4, "replicated", "float32_bits", "ordinal", "decode", True),
-        (128, 32, 4, 4, "distributed", "float32", "ordinal", "decode", True),
-        (128, 12, 2, 4, "replicated", "int32", "ordinal", "decode", False),
-        (64, 6, 2, 2, "distributed", "int32", "ordinal", "decode", False),
-        (128, 32, 2, 1, "replicated", "int32", "ordinal", "decode", False),
-        (128, 32, 2, 4, "replicated", "float32_native", "ordinal", "decode", False),
-        (128, 32, 2, 4, "replicated", "int32", "ordinal", "gather", False),
-        (128, 32, 2, 4, "replicated", "int32", "signed", "decode", False),
-        (32768, 32, 2, 4, "replicated", "float32_native", "ordinal", "decode", True),
-    ],
+    # Rows toggle one admission condition each (vector, k, key dtype, rank
+    # mode, value mode, width); the encoder and direction only change the
+    # rendered branch, so they need the pairwise cover.
+    _pairwise_cases(
+        [
+            (128, 32, 2, 4, "replicated", "int32", "ordinal", "decode", True),
+            (128, 24, 2, 4, "replicated", "float32_bits", "ordinal", "decode", True),
+            (128, 32, 4, 4, "distributed", "float32", "ordinal", "decode", True),
+            (128, 12, 2, 4, "replicated", "int32", "ordinal", "decode", False),
+            (64, 6, 2, 2, "distributed", "int32", "ordinal", "decode", False),
+            (128, 32, 2, 1, "replicated", "int32", "ordinal", "decode", False),
+            (128, 32, 2, 4, "replicated", "float32_native", "ordinal", "decode", False),
+            (128, 32, 2, 4, "replicated", "int32", "ordinal", "gather", False),
+            (128, 32, 2, 4, "replicated", "int32", "signed", "decode", False),
+            (
+                32768,
+                32,
+                2,
+                4,
+                "replicated",
+                "float32_native",
+                "ordinal",
+                "decode",
+                True,
+            ),
+        ],
+        key_encoder=("dsl", "asm"),
+        largest=(False, True),
+    ),
 )
-@pytest.mark.parametrize("key_encoder", ["dsl", "asm"])
-@pytest.mark.parametrize("largest", [False, True])
 def test_packed_rare_codegen_guard(
     width: int,
     k: int,
@@ -2798,18 +2925,24 @@ def test_packed_rare_wide_addresses(index_dtype: torch.dtype) -> None:
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("largest", [False, True])
-@pytest.mark.parametrize("key_encoder", ["dsl", "asm"])
 @pytest.mark.parametrize(
+    "dtype,index_dtype,largest,key_encoder,"
     "width,k,lanes,vector,layout,key_dtype,offset",
-    [
-        (128, 32, 2, 4, "replicated", "int32", 0),
-        (128, 128, 4, 8, "distributed", "float32_bits", 0),
-        (65, 8, 2, 2, "distributed", "float32", 0),
-        (64, 6, 2, 2, "distributed", "int32", 1),
-    ],
+    # Rows are the packed-rare geometries (every-word k=128, odd width, the
+    # k=6 row that declines the fast path, an offset output); dtype, index
+    # dtype, direction and encoder are independent knobs.
+    _pairwise_cases(
+        [
+            (128, 32, 2, 4, "replicated", "int32", 0),
+            (128, 128, 4, 8, "distributed", "float32_bits", 0),
+            (65, 8, 2, 2, "distributed", "float32", 0),
+            (64, 6, 2, 2, "distributed", "int32", 1),
+        ],
+        dtype=(torch.bfloat16, torch.float16),
+        index_dtype=(torch.int32, torch.int64),
+        largest=(False, True),
+        key_encoder=("dsl", "asm"),
+    ),
 )
 def test_packed_rare_exact_bits(
     dtype: torch.dtype,
@@ -2877,9 +3010,14 @@ def test_packed_rare_exact_bits(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("layout", ["replicated", "distributed"])
-@pytest.mark.parametrize("key_encoder", ["dsl", "asm"])
+@pytest.mark.parametrize(
+    "index_dtype,layout,key_encoder",
+    pairwise(
+        index_dtype=(torch.int32, torch.int64),
+        layout=("replicated", "distributed"),
+        key_encoder=("dsl", "asm"),
+    ),
+)
 def test_packed_rare_alignment_transition(
     index_dtype: torch.dtype, layout: str, key_encoder: str
 ) -> None:
@@ -2925,16 +3063,20 @@ def test_packed_rare_alignment_transition(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
-    "k,lanes,requested,layout,last",
-    [
-        (24, 2, 4, "replicated", 11),
-        (32, 4, 4, "distributed", 7),
-        (8, 2, 8, "distributed", 3),
-    ],
+    "largest,key_dtype,encoder,k,lanes,requested,layout,last",
+    # Rows are the endpoint geometries (odd k, distributed k and k < vector);
+    # direction, key dtype and encoder each pick the endpoint expression.
+    _pairwise_cases(
+        [
+            (24, 2, 4, "replicated", 11),
+            (32, 4, 4, "distributed", 7),
+            (8, 2, 8, "distributed", 3),
+        ],
+        largest=(False, True),
+        key_dtype=("int32", "float32", "float32_bits"),
+        encoder=("dsl", "asm"),
+    ),
 )
-@pytest.mark.parametrize("largest", [False, True])
-@pytest.mark.parametrize("key_dtype", ["int32", "float32", "float32_bits"])
-@pytest.mark.parametrize("encoder", ["dsl", "asm"])
 def test_packed_endpoint_codegen(
     k: int,
     lanes: int,
@@ -2995,11 +3137,16 @@ def test_packed_endpoint_codegen(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("largest", [False, True])
-@pytest.mark.parametrize("encoder", ["dsl", "asm"])
-@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize(
+    "dtype,index_dtype,largest,encoder,offset",
+    pairwise(
+        dtype=(torch.bfloat16, torch.float16),
+        index_dtype=(torch.int32, torch.int64),
+        largest=(False, True),
+        encoder=("dsl", "asm"),
+        offset=(0, 1),
+    ),
+)
 def test_packed_endpoint_non_power_two_k(
     dtype: torch.dtype,
     index_dtype: torch.dtype,
@@ -3161,9 +3308,14 @@ def test_cached_topk_alias_binding_stays_rejected_after_release(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize(
+    "dtype,index_dtype,largest",
+    pairwise(
+        dtype=(torch.bfloat16, torch.float16),
+        index_dtype=(torch.int32, torch.int64),
+        largest=(False, True),
+    ),
+)
 def test_singleton_topk_search_and_recompile_after_input_release(
     dtype: torch.dtype, index_dtype: torch.dtype, largest: bool
 ) -> None:
@@ -3295,9 +3447,14 @@ def test_search_alias_proof_requires_registered_live_facts(damage: str) -> None:
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize(
+    "dtype,index_dtype,largest",
+    pairwise(
+        dtype=(torch.bfloat16, torch.float16),
+        index_dtype=(torch.int32, torch.int64),
+        largest=(False, True),
+    ),
+)
 def test_cached_topk_recompiles_exact_values_after_input_release(
     dtype: torch.dtype, index_dtype: torch.dtype, largest: bool
 ) -> None:
@@ -3330,6 +3487,8 @@ def _select(values: np.ndarray, k: int, network: str) -> np.ndarray:
     ).numpy()
 
 
+# Cheap zero-one proof of the balanced schedule for every table size of both
+# networks that support it.
 @pytest.mark.parametrize("size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("network", ["batcher", "compact"])
 def test_balanced_exhaustive_binary(size: int, network: str) -> None:
@@ -3342,9 +3501,14 @@ def test_balanced_exhaustive_binary(size: int, network: str) -> None:
         np.testing.assert_array_equal(_select(values, k, network), expected[:, :k])
 
 
-@pytest.mark.parametrize("size", [32, 64, 128, 256])
-@pytest.mark.parametrize("network", ["batcher", "compact"])
-@pytest.mark.parametrize("floating", [False, True])
+@pytest.mark.parametrize(
+    "size,network,floating",
+    pairwise(
+        size=(32, 64, 128, 256),
+        network=("batcher", "compact"),
+        floating=(False, True),
+    ),
+)
 def test_balanced_random_duplicates_padding(
     size: int, network: str, floating: bool
 ) -> None:
@@ -3451,40 +3615,68 @@ def test_balanced_schedule_reaches_codegen(layout: str, network: str) -> None:
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("largest", [False, True])
 @pytest.mark.parametrize(
+    "dtype,index_dtype,largest,"
     "width,k,lanes,network,key_dtype,layout,rank_mode,value_mode,padding,offset",
-    [
-        (128, 8, 4, "batcher", "float32_bits", "distributed", "signed", "gather", 0, 0),
-        (1024, 8, 8, "batcher", "float32", "distributed", "ordinal", "decode", 2, 1),
-        (
-            65,
-            6,
-            2,
-            "compact",
-            "float32_native",
-            "replicated",
-            "ordinal",
-            "decode",
-            2,
-            1,
-        ),
-        (
-            128,
-            32,
-            4,
-            "compact_pruned",
-            "int32",
-            "distributed",
-            "signed",
-            "gather",
-            0,
-            0,
-        ),
-        (33, 8, 16, "batcher", "int32", "distributed", "ordinal", "decode", 0, 0),
-    ],
+    # Rows pair every network and key dtype with a balanced-merge geometry
+    # (k / lanes group count, layout, odd or offset storage); dtype, index
+    # dtype and direction are independent knobs.
+    _pairwise_cases(
+        [
+            (
+                128,
+                8,
+                4,
+                "batcher",
+                "float32_bits",
+                "distributed",
+                "signed",
+                "gather",
+                0,
+                0,
+            ),
+            (
+                1024,
+                8,
+                8,
+                "batcher",
+                "float32",
+                "distributed",
+                "ordinal",
+                "decode",
+                2,
+                1,
+            ),
+            (
+                65,
+                6,
+                2,
+                "compact",
+                "float32_native",
+                "replicated",
+                "ordinal",
+                "decode",
+                2,
+                1,
+            ),
+            (
+                128,
+                32,
+                4,
+                "compact_pruned",
+                "int32",
+                "distributed",
+                "signed",
+                "gather",
+                0,
+                0,
+            ),
+            (33, 8, 16, "batcher", "int32", "distributed", "ordinal", "decode", 0, 0),
+        ],
+        dtype=(torch.bfloat16, torch.float16),
+        index_dtype=(torch.int32, torch.int64),
+        largest=(False, True),
+    ),
 )
 def test_balanced_gpu_exact_selected_bits(
     dtype: torch.dtype,
@@ -3948,6 +4140,8 @@ def test_topk_integer_seeds_cover_scalar_and_paired_store_blocks(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "cols,k,geometry",
+    # Cheap CPU binds: each row is a width class with its own expected seed
+    # geometry list, checked for both 16-bit input dtypes.
     [
         (1, 1, [(1, 128)]),
         (17, 3, [(1, 128)]),
@@ -4061,6 +4255,8 @@ def test_topk_scalar_store_integer_seeds_are_initial_pinned_hints(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
     "cols,k,geometry",
+    # Cheap CPU binds: each row is a width class with its expected large
+    # fragment geometry (or none); float32 must decline every row.
     [
         (1, 1, None),
         (64, 8, None),
@@ -4182,6 +4378,8 @@ def test_topk_large_fragment_integer_seed_respects_row_choices() -> None:
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "cols,k,distributed_lanes,native_lanes",
+    # Cheap CPU binds: each row is a width class with its own expected lane
+    # lists, checked for both 16-bit input dtypes.
     [
         (3, 1, [1], [1]),
         (64, 32, [8, 4], [2, 1]),
@@ -4245,6 +4443,8 @@ def test_topk_new_seeds_cover_growing_and_native_fragments(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "cols,k,geometry",
+    # Cheap CPU binds: each row is a width class with its own expected seed
+    # geometry list, checked for both 16-bit input dtypes.
     [
         (1, 1, [(1, 128)]),
         (17, 3, [(1, 128)]),
@@ -4465,9 +4665,14 @@ def test_topk_seeds_require_final_runtime_alias_proof(alias_kind: str) -> None:
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("_cpu_compile_environment")
-@pytest.mark.parametrize("alias_kind", ["separate", "view", "dlpack"])
-@pytest.mark.parametrize("disable_heuristics", [False, True])
-@pytest.mark.parametrize("width", [1, 32])
+@pytest.mark.parametrize(
+    "alias_kind,disable_heuristics,width",
+    pairwise(
+        alias_kind=("separate", "view", "dlpack"),
+        disable_heuristics=(False, True),
+        width=(1, 32),
+    ),
+)
 def test_topk_alias_fallback_retains_generic_search(
     alias_kind: str, disable_heuristics: bool, width: int
 ) -> None:
@@ -4537,6 +4742,8 @@ def test_topk_seeds_registry_cache_and_disable_integration() -> None:
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "cols,k,expected_lanes",
+    # Cheap CPU binds: each row is a width class with its own expected
+    # endpoint lane list, checked for both 16-bit input dtypes.
     [
         (1, 1, [1]),
         (17, 3, [1]),
@@ -4627,6 +4834,8 @@ def _lop3(a: np.ndarray, b: np.ndarray, c: int, table: int) -> np.ndarray:
     return result
 
 
+# Cheap exhaustive bit check of the paired PTX encoder model over all 65536
+# words: both NaN boundaries, every payload width, both directions.
 @pytest.mark.parametrize("infinity", [0x7C00, 0x7F80])
 @pytest.mark.parametrize("bits", range(1, 16))
 @pytest.mark.parametrize("largest", [False, True])
@@ -4685,6 +4894,8 @@ def test_paired_ordinal_exhaustive(infinity: int, bits: int, largest: bool) -> N
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "cols,stride,vector,rank,key,active",
+    # Each row toggles one admission condition of the paired encoder (vector
+    # width, stride alignment, odd width, rank mode, key dtype, singleton).
     [
         (128, 128, 8, "ordinal", "int32", True),
         (128, 130, 2, "ordinal", "int32", True),
@@ -4747,20 +4958,25 @@ def test_paired_encoder_keeps_wide_address_math() -> None:
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("largest", [False, True])
 @pytest.mark.parametrize(
-    "width,k,padding,offset,vector,key,layout",
-    [
-        (128, 32, 0, 0, 8, "int32", "replicated"),
-        (128, 24, 2, 0, 2, "int32", "distributed"),
-        (128, 24, 2, 0, 2, "float32_bits", "distributed"),
-        (130, 24, 2, 0, 2, "int32", "distributed"),
-        (130, 24, 2, 0, 2, "float32_bits", "distributed"),
-        (65, 6, 1, 1, 4, "float32", "replicated"),
-        (128, 32, 0, 1, 8, "int32", "replicated"),
-    ],
+    "dtype,index_dtype,largest,width,k,padding,offset,vector,key,layout",
+    # Rows are the paired-encoder geometries (input vector width, odd width
+    # or stride, key dtype, layout, offset output); dtype, index dtype and
+    # direction are independent knobs.
+    _pairwise_cases(
+        [
+            (128, 32, 0, 0, 8, "int32", "replicated"),
+            (128, 24, 2, 0, 2, "int32", "distributed"),
+            (128, 24, 2, 0, 2, "float32_bits", "distributed"),
+            (130, 24, 2, 0, 2, "int32", "distributed"),
+            (130, 24, 2, 0, 2, "float32_bits", "distributed"),
+            (65, 6, 1, 1, 4, "float32", "replicated"),
+            (128, 32, 0, 1, 8, "int32", "replicated"),
+        ],
+        dtype=(torch.bfloat16, torch.float16),
+        index_dtype=(torch.int32, torch.int64),
+        largest=(False, True),
+    ),
 )
 def test_paired_encoder_exact_selected_bits(
     dtype: torch.dtype,
@@ -4847,20 +5063,25 @@ def test_paired_encoder_same_bound_alignment_transition(
 
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("largest", [True, False])
 @pytest.mark.parametrize(
-    "k,lanes,requested,effective,wide",
-    [
-        (32, 1, 8, 8, True),
-        (32, 2, 4, 4, True),
-        (32, 2, 8, 8, True),
-        (32, 4, 8, 8, True),
-        (24, 2, 8, 8, True),
-        (12, 2, 8, 4, True),
-        (6, 2, 8, 2, False),
-        (32, 32, 8, 1, False),
-    ],
+    "index_dtype,largest,k,lanes,requested,effective,wide",
+    # Rows are the effective wide-output vectors (clamped by k, lanes and the
+    # request); the direction picks the endpoint and the index dtype the
+    # address math, so both only need the pairwise cover.
+    _pairwise_cases(
+        [
+            (32, 1, 8, 8, True),
+            (32, 2, 4, 4, True),
+            (32, 2, 8, 8, True),
+            (32, 4, 8, 8, True),
+            (24, 2, 8, 8, True),
+            (12, 2, 8, 4, True),
+            (6, 2, 8, 2, False),
+            (32, 32, 8, 1, False),
+        ],
+        index_dtype=(torch.int32, torch.int64),
+        largest=(True, False),
+    ),
 )
 def test_distributed_wide_output_codegen(
     index_dtype: torch.dtype,
@@ -4907,19 +5128,24 @@ def test_distributed_wide_output_codegen(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("largest", [False, True])
 @pytest.mark.parametrize(
-    "k,lanes,vector,offset,key_dtype,defer",
-    [
-        (32, 1, 8, 0, "int32", True),
-        (32, 2, 4, 0, "int32", False),
-        (32, 2, 8, 0, "float32_bits", True),
-        (24, 2, 4, 1, "int32", True),
-        (24, 4, 8, 0, "float32_native", True),
-        (6, 2, 8, 0, "int32", False),
-    ],
+    "dtype,index_dtype,largest,k,lanes,vector,offset,key_dtype,defer",
+    # Rows are the wide-output geometries (vector per lane, odd k tail, offset
+    # output, each key dtype, deferred or direct gathers); dtype, index dtype
+    # and direction are independent knobs.
+    _pairwise_cases(
+        [
+            (32, 1, 8, 0, "int32", True),
+            (32, 2, 4, 0, "int32", False),
+            (32, 2, 8, 0, "float32_bits", True),
+            (24, 2, 4, 1, "int32", True),
+            (24, 4, 8, 0, "float32_native", True),
+            (6, 2, 8, 0, "int32", False),
+        ],
+        dtype=(torch.bfloat16, torch.float16),
+        index_dtype=(torch.int32, torch.int64),
+        largest=(False, True),
+    ),
 )
 def test_distributed_wide_output_exact_bits_and_tails(
     dtype: torch.dtype,
@@ -5044,11 +5270,14 @@ def test_topk_softmax_uses_row_local_epilogue(damage: str) -> None:
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("largest", [True, False])
-@pytest.mark.parametrize("layout", ["replicated", "distributed"])
 @pytest.mark.parametrize(
-    "n,k,lanes,vector", [(65, 3, 8, 1), (64, 8, 16, 4), (128, 32, 2, 8)]
+    "dtype,largest,layout,n,k,lanes,vector",
+    _pairwise_cases(
+        [(65, 3, 8, 1), (64, 8, 16, 4), (128, 32, 2, 8)],
+        dtype=(torch.bfloat16, torch.float16),
+        largest=(True, False),
+        layout=("replicated", "distributed"),
+    ),
 )
 def test_topk_softmax_fused_values(
     dtype: torch.dtype,
@@ -5294,7 +5523,10 @@ def _assert_composed_register_selection(code: str, layout: str) -> None:
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
 @pytest.mark.parametrize(
-    "kind", ["pointwise", "temperature", "preprocess", "broadcast", "broadcast_store"]
+    # Each composition kind is its own matcher path and both layouts render
+    # it differently (cheap CPU codegen).
+    "kind",
+    ["pointwise", "temperature", "preprocess", "broadcast", "broadcast_store"],
 )
 def test_topk_composition_codegen(kind: str, layout: str) -> None:
     x = torch.empty((5, 65), dtype=torch.bfloat16)
@@ -5848,9 +6080,14 @@ def test_sort_uses_register_selection_network(descending: bool) -> None:
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("descending", [False, True])
-@pytest.mark.parametrize("width,layout", [(16, "replicated"), (65, "distributed")])
+@pytest.mark.parametrize(
+    "dtype,descending,width,layout",
+    _pairwise_cases(
+        [(16, "replicated"), (65, "distributed")],
+        dtype=(torch.bfloat16, torch.float16),
+        descending=(False, True),
+    ),
+)
 def test_sort_network_preserves_values_indices_and_ties(
     dtype: torch.dtype, descending: bool, width: int, layout: str
 ) -> None:
@@ -5911,9 +6148,14 @@ def test_topk_composition_reduces_input_and_vectorizes(mode: str, width: int) ->
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("mode", ["rms", "softmax"])
-@pytest.mark.parametrize("layout", ["replicated", "distributed"])
-@pytest.mark.parametrize("width", [64, 65])
+@pytest.mark.parametrize(
+    "mode,layout,width",
+    pairwise(
+        mode=("rms", "softmax"),
+        layout=("replicated", "distributed"),
+        width=(64, 65),
+    ),
+)
 def test_topk_composition_normalizes_before_selection(
     mode: str, layout: str, width: int
 ) -> None:
@@ -6083,7 +6325,10 @@ def test_topk_composition_indices_only_avoids_value_recovery() -> None:
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "mode", ["softmax", "logsumexp", "reciprocal", "zero_sign", "predicate", "raw"]
+    # Each mode observes the selected values through a different epilogue
+    # expression, and the two layouts recover those values differently.
+    "mode",
+    ["softmax", "logsumexp", "reciprocal", "zero_sign", "predicate", "raw"],
 )
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
 def test_topk_composition_value_observability(mode: str, layout: str) -> None:
@@ -6128,7 +6373,10 @@ def test_topk_composition_value_observability(mode: str, layout: str) -> None:
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "dtype", [torch.int32, torch.float32, torch.float16, torch.bfloat16, torch.int64]
+    # Every element width the helper vectorizes (2, 4 and 8 bytes, with the
+    # 16-bit NaN payload words) against each lanes / vector shape.
+    "dtype",
+    [torch.int32, torch.float32, torch.float16, torch.bfloat16, torch.int64],
 )
 @pytest.mark.parametrize("lanes,vector", [(2, 8), (4, 2), (32, 4)])
 def test_subgroup_vector_layout_preserves_bits(
@@ -6189,10 +6437,13 @@ def test_subgroup_vector_layout_preserves_bits(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("largest", [False, True])
-@pytest.mark.parametrize("layout", ["replicated", "distributed"])
 @pytest.mark.parametrize(
-    "value_mode,rank_mode", [("gather", "signed"), ("decode", "ordinal")]
+    "largest,layout,value_mode,rank_mode",
+    _pairwise_cases(
+        [("gather", "signed"), ("decode", "ordinal")],
+        largest=(False, True),
+        layout=("replicated", "distributed"),
+    ),
 )
 def test_fp32_ordered_selection_preserves_full_precision(
     largest: bool, layout: str, value_mode: str, rank_mode: str
@@ -6348,20 +6599,26 @@ def _mixed_dtype_row_topk(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
-    "layout,value_mode", [("distributed", "decode"), ("replicated", "gather")]
-)
-@pytest.mark.parametrize(
-    "producer,largest,normalize_selected",
+    "dtype,layout,value_mode,producer,largest,normalize_selected",
+    # Rows are the FP32 producers (each a different rounding boundary) plus
+    # the smallest-k and normalized-output variants; the input dtype and the
+    # (layout, value mode) pair only need the pairwise cover.
     [
-        ("affine", True, False),
-        ("affine", False, False),
-        ("rounded", True, False),
-        ("sigmoid", True, False),
-        ("softmax", True, False),
-        ("affine", True, True),
-        ("cast", True, False),
+        (dtype, *layout_value_mode, *case)
+        for dtype, layout_value_mode, case in pairwise(
+            dtype=(torch.float16, torch.bfloat16),
+            layout_value_mode=(("distributed", "decode"), ("replicated", "gather")),
+            case=(
+                ("affine", True, False),
+                ("affine", False, False),
+                ("rounded", True, False),
+                ("sigmoid", True, False),
+                ("softmax", True, False),
+                ("affine", True, True),
+                ("cast", True, False),
+            ),
+        )
     ],
 )
 def test_mixed_dtype_selection_preserves_producer_boundaries(
@@ -6571,9 +6828,14 @@ def _coarse_rank_tensor_model(
     return events, actual
 
 
-@pytest.mark.parametrize("rank_only", [False, True])
-@pytest.mark.parametrize("recovery", ["direct", "packed"])
-@pytest.mark.parametrize("payload_only", [False, True])
+@pytest.mark.parametrize(
+    "rank_only,recovery,payload_only",
+    pairwise(
+        rank_only=(False, True),
+        recovery=("direct", "packed"),
+        payload_only=(False, True),
+    ),
+)
 def test_coarse_rank_tensor_graph_matches_eager(rank_only, recovery, payload_only):
     for cause in ("unique", "tie", "below", "other_row"):
         rows = [[0x3E800000 + i * 8192 for i in range(16)] for _ in range(8)]
@@ -6695,9 +6957,9 @@ def test_coarse_rank_topk_old_population_prefix_and_rng(seed):
     results = []
     states = []
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch(
             "helion._compiler.autotuner_heuristics.register_topk_key_recovery_coverage"
         ),
@@ -6711,9 +6973,9 @@ def test_coarse_rank_topk_old_population_prefix_and_rng(seed):
             )
             if not enabled:
                 with context:
-                    bound = _cpu_bind(kernel, args)
+                    bound = cpu_bind(kernel, args)
             else:
-                bound = _cpu_bind(kernel, args)
+                bound = cpu_bind(kernel, args)
             spec = bound.config_spec
             assert "cute_topk_coarse_keys" not in spec.default_config()
             assert all(
@@ -7040,18 +7302,18 @@ def test_coarse_rank_topk_key_recovery_population(seed):
 
     args = (torch.empty((5, 256), dtype=torch.float32), 8, True)
     results, states = [], []
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         for enabled in (False, True):
             kernel = helion.kernel(
                 _row_topk.fn, backend="cute", static_shapes=True, autotune_effort="full"
             )
             if enabled:
-                bound = _cpu_bind(kernel, args)
+                bound = cpu_bind(kernel, args)
             else:
                 with patch(
                     "helion._compiler.autotuner_heuristics.register_topk_key_recovery_coverage"
                 ):
-                    bound = _cpu_bind(kernel, args)
+                    bound = cpu_bind(kernel, args)
             spec = bound.config_spec
             assert "cute_topk_key_recovery" not in spec.default_config()
             assert all(
@@ -7841,9 +8103,16 @@ def _simulate_topk_fragment(source, inputs, outputs, blocks):
     namespace["_simulate_independent_fragment"](modeled, inputs, outputs, blocks)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.int64])
-@pytest.mark.parametrize("largest", [False, True])
-@pytest.mark.parametrize("width,k", [(17, 3), (7, 7), (1, 1)])
+@pytest.mark.parametrize(
+    "dtype,largest,width,k",
+    # Rows are the fragment shapes (partial, full and singleton rows); each
+    # dtype has its own special values and both directions reverse the rank.
+    _pairwise_cases(
+        [(17, 3), (7, 7), (1, 1)],
+        dtype=(torch.float16, torch.float32, torch.int64),
+        largest=(False, True),
+    ),
+)
 def test_fragment_leading_axes_topk_generated_values(dtype, largest, width, k):
     rows, groups = 5, 3
     x = (
@@ -7865,8 +8134,8 @@ def test_fragment_leading_axes_topk_generated_values(dtype, largest, width, k):
         x[:, :, 0] = torch.iinfo(torch.int64).min
         x[:, :, 1] = torch.iinfo(torch.int64).max
     snapshot = x.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
         cfg = bound.config_spec.default_config()
         source = bound.to_code(cfg)
     values = torch.empty((rows, groups, k), dtype=dtype)
@@ -7891,8 +8160,8 @@ def test_fragment_leading_axes_topk_generated_values(dtype, largest, width, k):
 
 def test_fragment_composed_topk_gather_generated_values():
     x = ((torch.arange(5 * 17).reshape(5, 17) * 3) % 11).float()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_composed_topk_gather, (x, 3))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_composed_topk_gather, (x, 3))
         cfg = bound.config_spec.default_config()
         source = bound.to_code(cfg)
     values, gathered = torch.empty((5, 3)), torch.empty((5, 3))
@@ -7933,8 +8202,8 @@ def test_fragment_leading_axes_topk_strided_generated_values(dtype):
     storage = torch.arange(3 * 17 * 10).reshape(3, 17, 10).to(dtype)
     x = storage[:, :, ::2].permute(2, 0, 1)
     before = storage.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_leading_axes_topk, (x, 3, True))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_leading_axes_topk, (x, 3, True))
         cfg = bound.config_spec.default_config()
         source = bound.to_code(cfg)
     values = torch.empty((5, 3, 3), dtype=dtype)
@@ -7999,16 +8268,21 @@ def _topk_padded_producer_reference(x, largest, mode):
     return computed.gather(-1, indices), indices
 
 
-@pytest.mark.parametrize("width,rows", [(17, 5), (33, 1)])
-@pytest.mark.parametrize("largest", [False, True])
-@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize(
+    "largest,mode,width,rows",
+    _pairwise_cases(
+        [(17, 5), (33, 1)],
+        largest=(False, True),
+        mode=(0, 1, 2),
+    ),
+)
 def test_fragment_topk_computed_logical_tail(width, rows, largest, mode):
     x = (torch.arange(rows * 3 * width).reshape(rows, 3, width) % 11 + 2).float()
     if largest:
         x = -x
     before = x.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_topk_padded_producer, (x, largest, mode))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_topk_padded_producer, (x, largest, mode))
         cfg = bound.config_spec.default_config()
         source = bound.to_code(cfg)
     values, indices = torch.empty_like(x), torch.full(x.shape, -99, dtype=torch.int64)
@@ -8049,8 +8323,8 @@ def _fragment_topk_ambiguous_padded_reshape(x):
 
 def test_fragment_topk_padded_reshape_without_coordinate_proof_declines():
     x = torch.ones((5, 3, 17))
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_topk_ambiguous_padded_reshape, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_topk_ambiguous_padded_reshape, (x,))
         with pytest.raises(helion.exc.BackendUnsupported):
             bound.to_code(bound.config_spec.default_config())
 
@@ -8090,8 +8364,8 @@ def test_fragment_topk_tiled_selected_axis_declines(middle):
     from helion._compiler.cute.computed_fragment import computed_fragment_supported
 
     x = torch.ones((5, middle, 17))
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_topk_tiled_selected_axis, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_topk_tiled_selected_axis, (x,))
         with bound.env, bound.host_function:
             assert not computed_fragment_supported(
                 bound.env, bound.host_function.device_ir.graphs
@@ -8137,8 +8411,8 @@ def test_fragment_single_computed_topk_fallback_values(width, k, largest, tile):
     x[2, :4] = torch.tensor([float("inf"), -float("inf"), 0.0, -0.0])
     bias = torch.zeros(width)
     before = storage.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_masked_computed_row_topk, (x, bias, k, largest))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_masked_computed_row_topk, (x, bias, k, largest))
         config = bound.config_spec.default_config()
         config.config["block_sizes"] = [tile]
         source = bound.to_code(config)
@@ -8173,8 +8447,8 @@ def test_fragment_single_topk_preserves_optimized_owner(kind):
         "prologue": (_preprocessed_row_topk, (x, 8, True)),
         "softmax": (_temperature_row_topk, (x, 8)),
     }[kind]
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, args)
         with bound.env, bound.host_function:
             ir = bound.host_function.device_ir
             assert (
@@ -8355,11 +8629,15 @@ def _simulate_network_topk_fragment(source, inputs, outputs, blocks, threads=128
 
 
 @pytest.mark.parametrize(
-    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.int32]
-)
-@pytest.mark.parametrize("largest", [False, True])
-@pytest.mark.parametrize(
-    "width,k,threads", [(1, 1, 32), (17, 3, 128), (65, 33, 256), (129, 129, 64)]
+    "dtype,largest,width,k,threads",
+    # Rows are the network shapes (singleton, partial and full rows at each
+    # thread count); each dtype has its own special values and both
+    # directions reverse the rank, so they need the pairwise cover.
+    _pairwise_cases(
+        [(1, 1, 32), (17, 3, 128), (65, 33, 256), (129, 129, 64)],
+        dtype=(torch.float16, torch.bfloat16, torch.float32, torch.int32),
+        largest=(False, True),
+    ),
 )
 def test_fragment_network_topk_values(
     dtype, largest, width, k, threads, block_rows=None
@@ -8382,8 +8660,8 @@ def test_fragment_network_topk_values(
         if width > 1:
             x[:, :, 1] = torch.iinfo(dtype).max
     original = x.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
         c = b.config_spec.default_config()
         c.config.update(cute_fragment_topk_network=True, cute_fragment_threads=threads)
         if block_rows is not None:
@@ -8410,8 +8688,8 @@ def test_fragment_network_topk_values(
 @pytest.mark.parametrize("largest", [False, True])
 def test_fragment_network_topk_masked_producer(mode, largest):
     x = ((torch.arange(5 * 3 * 17).reshape(5, 3, 17) * 7) % 13 - 20).float()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_topk_padded_producer, (x, largest, mode))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_topk_padded_producer, (x, largest, mode))
         c = b.config_spec.default_config()
         before = b.to_code(c)
         c.config["cute_fragment_topk_network"] = True
@@ -8434,8 +8712,8 @@ def test_fragment_network_topk_masked_producer(mode, largest):
 
 def test_fragment_network_topk_composed_gather():
     x = ((torch.arange(5 * 17).reshape(5, 17) * 3) % 11).float()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_composed_topk_gather, (x, 3))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_composed_topk_gather, (x, 3))
         c = b.config_spec.default_config()
         c.config["cute_fragment_topk_network"] = True
         source = b.to_code(c)
@@ -8461,8 +8739,8 @@ def test_fragment_network_topk_strides(layout):
         if layout == "transposed"
         else storage[1:6, :, 1:18]
     )
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_leading_axes_topk, (x, 3, True))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_leading_axes_topk, (x, 3, True))
         c = b.config_spec.default_config()
         c.config["cute_fragment_topk_network"] = True
         source = b.to_code(c)
@@ -8500,8 +8778,8 @@ def test_fragment_network_topk_sdk(tmp_path, dtype, width, k, largest, block_row
 
     cuda_initialized = torch.cuda.is_initialized()
     x = torch.empty((5, 3, width), dtype=dtype)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
         config = bound.config_spec.default_config()
         config.config["cute_fragment_topk_network"] = True
         if block_rows is not None:
@@ -8599,7 +8877,7 @@ def test_fragment_network_topk_population_prefix(seed):
     args = (torch.empty((5, 3, 65)), 7, True)
     results = []
     states = []
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         for enabled in (False, True):
             kernel = helion.kernel(
                 _fragment_leading_axes_topk.fn,
@@ -8611,9 +8889,9 @@ def test_fragment_network_topk_population_prefix(seed):
                 with patch(
                     "helion._compiler.autotuner_heuristics.register_fragment_topk_network_coverage"
                 ):
-                    bound = _cpu_bind(kernel, args)
+                    bound = cpu_bind(kernel, args)
             else:
-                bound = _cpu_bind(kernel, args)
+                bound = cpu_bind(kernel, args)
             spec = bound.config_spec
             assert "cute_fragment_topk_network" not in spec.default_config()
             with bound.env:
@@ -8649,8 +8927,8 @@ def test_fragment_network_topk_unsupported_request(kind):
             dtype=torch.int64 if kind == "dtype" else torch.float32,
         )
     )
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, (x, 3, True))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, (x, 3, True))
         c = bound.config_spec.default_config()
         before = bound.to_code(c)
         c.config["cute_fragment_topk_network"] = False
@@ -8681,8 +8959,8 @@ def test_fragment_network_topk_mixed_fallback(wide):
     )
     if not wide:
         y[:, :, 0] = torch.iinfo(torch.int64).min
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_mixed_network_topk, (x, y))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_mixed_network_topk, (x, y))
         c = b.config_spec.default_config()
         c.config["cute_fragment_topk_network"] = True
         source = b.to_code(c)
@@ -8718,8 +8996,8 @@ def _fragment_network_topk_reshaped(x):
 
 def test_fragment_network_topk_resident_reshape():
     x = ((torch.arange(5 * 4 * 16).reshape(5, 64) * 7) % 31).float()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_network_topk_reshaped, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_network_topk_reshaped, (x,))
         c = b.config_spec.default_config()
         before = b.to_code(c)
         c.config["cute_fragment_topk_network"] = True
@@ -8739,8 +9017,8 @@ def test_fragment_network_topk_resident_reshape():
 @pytest.mark.parametrize("mutation", ["padding", "slots", "barrier", "comparisons"])
 def test_fragment_network_topk_generated_mutations(mutation):
     x = -torch.arange(1, 5 * 3 * 17 + 1).reshape(5, 3, 17).float()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_leading_axes_topk, (x, 17, True))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_leading_axes_topk, (x, 17, True))
         c = b.config_spec.default_config()
         c.config["cute_fragment_topk_network"] = True
         source = b.to_code(c)
@@ -8856,8 +9134,8 @@ def test_fragment_network_topk_capacity_boundary():
 def test_fragment_network_topk_strict_boolean(value):
     from helion.exc import InvalidConfig
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_leading_axes_topk, (torch.empty(5, 3, 17), 3, True))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_leading_axes_topk, (torch.empty(5, 3, 17), 3, True))
         c = b.config_spec.default_config()
         c.config["cute_fragment_topk_network"] = value
         with pytest.raises(InvalidConfig, match="complete fragment top-k"):
@@ -8881,8 +9159,8 @@ def test_fragment_network_full_population_keeps_later_coverage(seed):
     from helion.autotuner.pattern_search import PatternSearch
 
     args = (torch.empty((5, 3, 65)), 7, True)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_leading_axes_topk, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_leading_axes_topk, args)
         keys = [group.key for group in bound.config_spec.compiler_coverage_groups]
         assert keys.index("cute_fragment_topk_network") < keys.index(
             "cute_fragment_packet_loads"

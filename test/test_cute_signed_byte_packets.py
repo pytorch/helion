@@ -10,9 +10,6 @@ import pytest
 import torch
 from torch._dynamo.source import LocalSource
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.cute.memory_ops import (
     _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
@@ -22,9 +19,13 @@ from helion._compiler.cute.memory_ops import (
     register_persistent_vec_alignment_specializations,
 )
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.language.memory_ops import _cute_unroll_vec_extract
 from helion.language.memory_ops import _cute_unroll_vec_load_expr
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _Int8(int):
@@ -282,8 +283,8 @@ def test_grid_lane_flush_uses_packet_from_deferred_hoist(enabled: bool) -> None:
         cute_lane_layouts=["blocked"],
         cute_signed_bitfield_bf16=enabled,
     )
-    with _mock_cuda_unavailable():
-        code = _cpu_bind(
+    with mock_cuda_unavailable():
+        code = cpu_bind(
             _high_nibble_to_bf16, (torch.empty(4096, dtype=torch.int8),)
         ).to_code(config)
     assert ("_cute_signed_bitfield_to_bf16_packed(" in code) is enabled

@@ -7,17 +7,18 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics.cute import (
     CutePersistentSubwarpRowsHeuristic,
 )
 from helion._compiler.cute.proven_loop_bounds import simplify_proven_loop_bounds
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import BooleanFragment
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
@@ -74,8 +75,8 @@ def _comparisons(source: str) -> list[str]:
 def test_seeded_persistent_reduction_exposes_bounds_without_autotuner_seeds(
     width: int, dtype: torch.dtype
 ) -> None:
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(_center_rows, (torch.empty(4096, width, dtype=dtype),))
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(_center_rows, (torch.empty(4096, width, dtype=dtype),))
         spec = bound.config_spec
         assert spec.cute_proven_bounds_enabled
         assert spec.autotuner_heuristics == []
@@ -116,8 +117,8 @@ def test_seeded_persistent_reduction_exposes_bounds_without_autotuner_seeds(
     ("width", "dtype"), [(32, torch.bfloat16), (64, torch.bfloat16)]
 )
 def test_bounds_keep_partial_outer_row_guards(width: int, dtype: torch.dtype) -> None:
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(_center_rows, (torch.empty(137, width, dtype=dtype),))
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(_center_rows, (torch.empty(137, width, dtype=dtype),))
         enabled = bound.to_code(_config(bound, width, enabled=True))
         control = bound.to_code(_config(bound, width, enabled=False))
     enabled_comparisons = _comparisons(enabled)
@@ -141,8 +142,8 @@ def test_bounds_admission_follows_the_short_row_seed_plan(
 ) -> None:
     # Reductions without a seed plan (too short for a vector group, or wider
     # than one warp of packets) keep the knob out of their search space.
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(_center_rows, (torch.empty(4096, width, dtype=dtype),))
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(_center_rows, (torch.empty(4096, width, dtype=dtype),))
         assert bound.host_function is not None
         eligible = CutePersistentSubwarpRowsHeuristic.is_eligible(
             bound.env, bound.host_function.device_ir

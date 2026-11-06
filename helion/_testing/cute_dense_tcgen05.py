@@ -10,10 +10,9 @@ from unittest.mock import patch
 
 import torch
 
-from test._cute_binding import _forbid_native_compile
-from test.test_cute_fuse_mm_accumulation import _cpu_target
-from test.test_cute_tcgen05_ordinary_exploration import _cuda_fake
-
+from .cute_codegen import cpu_target
+from .cute_codegen import cuda_fake
+from .cute_codegen import forbid_native_compile
 import helion
 from helion._compiler import compile_environment
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
@@ -21,7 +20,7 @@ from helion._hardware import HardwareInfo
 import helion.language as hl
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
 # ``cpu_codegen_target`` reports the full opt-in capacity as the AB budget.
 # ``gb300_target`` restores the production descriptors, including the 28 KiB
@@ -39,7 +38,7 @@ _GB300_PROPERTIES = SimpleNamespace(
 
 
 @contextmanager
-def blackwell_capability(capability: tuple[int, int]) -> Iterator[None]:
+def blackwell_capability(capability: tuple[int, int]) -> Generator[None, None, None]:
     """Report ``capability`` to helion, torch and inductor device queries."""
     with (
         patch(
@@ -67,9 +66,11 @@ def blackwell_capability(capability: tuple[int, int]) -> Iterator[None]:
 def _cpu_hardware_info(device: torch.device | None = None) -> HardwareInfo:
     # Promotion cache keys include product identity. Derive it from the
     # patched capability so nested GB300 targets stay consistent.
-    major, minor = compile_environment.target_device_capability(
+    capability = compile_environment.target_device_capability(
         device if device is not None else torch.device("cuda:0")
     )
+    assert capability is not None
+    major, minor = capability
     return HardwareInfo(
         device_kind="cuda",
         hardware_name="NVIDIA GB300" if (major, minor) == (10, 3) else "NVIDIA B200",
@@ -79,11 +80,13 @@ def _cpu_hardware_info(device: torch.device | None = None) -> HardwareInfo:
 
 
 @contextmanager
-def cpu_codegen_target(capability: tuple[int, int] = (10, 0)) -> Iterator[None]:
+def cpu_codegen_target(
+    capability: tuple[int, int] = (10, 0),
+) -> Generator[None, None, None]:
     """Generate CuTe source for a 152-SM Blackwell device without CUDA work."""
     with (
-        _cpu_target(),
-        _forbid_native_compile(),
+        cpu_target(),
+        forbid_native_compile(),
         patch("helion._hardware.get_hardware_info", new=_cpu_hardware_info),
         patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=152),
         patch.object(
@@ -95,7 +98,7 @@ def cpu_codegen_target(capability: tuple[int, int] = (10, 0)) -> Iterator[None]:
         ),
         patch(
             "helion._compiler.cute.backend.CuteBackend.normalize_input_fake_tensor",
-            new=_cuda_fake,
+            new=cuda_fake,
         ),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -107,7 +110,7 @@ def cpu_codegen_target(capability: tuple[int, int] = (10, 0)) -> Iterator[None]:
 
 
 @contextmanager
-def gb300_target() -> Iterator[None]:
+def gb300_target() -> Generator[None, None, None]:
     """CPU codegen against the production GB300 SMEM capacity and AB reserve."""
     with (
         cpu_codegen_target((10, 3)),

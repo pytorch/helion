@@ -8,8 +8,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
@@ -22,10 +20,14 @@ from helion._compiler.cute.tensor_layout_relations import TensorLayoutRelation
 from helion._compiler.device_function import DeviceFunction
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 vector_scale = import_example("aot_example").vector_scale
 
@@ -34,7 +36,7 @@ vector_scale = import_example("aot_example").vector_scale
 def _cpu_only():
     with (
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
@@ -47,7 +49,7 @@ def _bound(dtype=torch.bfloat16, *, length=8192, function=None, args=None):
         static_shapes=False,
         autotune_effort="full",
     )
-    return _cpu_bind(
+    return cpu_bind(
         kernel, (torch.empty(length, dtype=dtype), 2.0) if args is None else args
     )
 

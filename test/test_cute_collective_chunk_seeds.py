@@ -5,11 +5,10 @@ import operator
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -74,7 +73,7 @@ def test_config_owned_chunks_keep_collective_geometry_through_seed_transfer(
     )
     kernel = _direct_chunk_matmul if direct_chunk else _partitioned_matmul
     parameter = "tile_extent" if direct_chunk else "partitions"
-    bound = _cpu_bind(kernel, inputs)
+    bound = cpu_bind(kernel, inputs)
     with bound.env:
         generation = ConfigGeneration(bound.config_spec)
         transferred = [config for _flat, config in generation.seed_flat_config_pairs()]
@@ -109,7 +108,7 @@ def test_unrelated_user_parameter_does_not_multiply_collective_seeds() -> None:
         torch.empty((64, 256), dtype=torch.float16),
         torch.empty((256, 128), dtype=torch.float16),
     )
-    bound = _cpu_bind(_matmul_with_unrelated_knob, inputs)
+    bound = cpu_bind(_matmul_with_unrelated_knob, inputs)
     assert bound.host_function is not None
     with bound.env:
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(

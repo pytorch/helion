@@ -10,6 +10,8 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_fake_tensor_mode_supports_cond() -> None:
     with create_fake_tensor_mode(ShapeEnv()):

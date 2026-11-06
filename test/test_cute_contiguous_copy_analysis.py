@@ -14,7 +14,6 @@ import torch
 
 from test.test_cute_collective_vector_recipe import _RECIPE
 from test.test_cute_collective_vector_recipe import _run_recipe
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
 from helion._compiler.cute.collective_vector_recipe import emit_vector_recipe
@@ -22,6 +21,7 @@ from helion._compiler.cute.contiguous_copy import CopyTensorFacts
 from helion._compiler.cute.contiguous_copy import _Analysis
 from helion._compiler.cute.contiguous_copy import plan_contiguous_copy
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
 
@@ -236,7 +236,7 @@ def test_float_shifted_matmul_keeps_only_aligned_operand_vectorized(
         torch.empty((64, 48), dtype=dtype)[:, :37],
         torch.tensor([0.125], dtype=torch.float32),
     )
-    with _cpu_target():
+    with cpu_target():
         bound = _float_shift_matmul._bind_isolated(inputs)
         source = bound.to_code(_shift_config(recipe, compute))
     assert "cute.gemm(" in source

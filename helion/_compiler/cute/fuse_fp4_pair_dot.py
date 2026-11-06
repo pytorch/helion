@@ -356,6 +356,13 @@ def _fuse_block(
 def fuse_fp4_pair_dot(body: list[ast.stmt]) -> list[ast.stmt]:
     """Apply the fusion to every block of ``body`` (mutates in place)."""
     module = ast.Module(body=body, type_ignores=[])
+    if not any(
+        isinstance(node, ast.Name) and node.id == DECODE_FN for node in ast.walk(module)
+    ):
+        # Every matched product reads two decoded halves, so a body without
+        # a decode call has nothing to fuse; skip the name counts and the
+        # per-block fact tables.
+        return body
     reads: Counter[str] = Counter()
     defs: Counter[str] = Counter()
     for node in ast.walk(module):

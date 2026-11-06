@@ -7,9 +7,13 @@ from typing import TYPE_CHECKING
 from typing import cast
 import unittest
 
+import pytest
+
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.generate_ast import GenerateAST
 from helion.runtime.config import Config
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from helion._compiler.cute.collective_matmul import CollectiveMmaSite

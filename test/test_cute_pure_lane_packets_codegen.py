@@ -12,15 +12,14 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
 from helion._compiler.cute import affine_vector_io
 from helion._compiler.rng_utils import philox_rand_ref
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
@@ -28,13 +27,13 @@ _examples_low_mem_dropout = import_example("low_mem_dropout")
 low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
 low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.fixture(autouse=True)
 def _cpu_only():
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
@@ -69,7 +68,7 @@ def _capture(width: int):
         autotune_effort="none",
         cute_rng_stream="word0",
     )
-    bound = _cpu_bind(kernel, (0.25, torch.empty(513), 123))
+    bound = cpu_bind(kernel, (0.25, torch.empty(513), 123))
     assert bound.config_spec.pointwise_facts
     with patch.object(affine_vector_io, "vectorize_affine_tile_lanes", record):
         source = bound.to_code(_config(width))
@@ -247,7 +246,7 @@ def test_packet_seeds_survive_config_generation(function):
         autotune_effort="none",
         cute_rng_stream="word0",
     )
-    bound = _cpu_bind(kernel, (0.25, torch.empty(33554432), 123))
+    bound = cpu_bind(kernel, (0.25, torch.empty(33554432), 123))
     configs = []
     with bound.env:
         seeds = CutePointwiseVecHeuristic.get_seed_configs(
@@ -292,7 +291,7 @@ def test_only_proved_scalar_assembly_receives_pointwise_facts(
             )
         return out
 
-    bound = _cpu_bind(kernel, (torch.empty(1024), assembly, pure))
+    bound = cpu_bind(kernel, (torch.empty(1024), assembly, pure))
     assert bool(bound.config_spec.pointwise_facts) is (
         backend == "cute" and pure and assembly.startswith("add.")
     )

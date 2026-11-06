@@ -12,6 +12,8 @@ import pytest
 
 from helion._compiler.cute.standalone import _Helpers
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path

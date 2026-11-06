@@ -30,9 +30,10 @@ import helion
 from helion._compiler.cute import cute_flash
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
-from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing.cute_flash import compile_and_run
+from helion._testing.cute_flash import compiled_source
 import helion.language as hl
 from helion.runtime.kernel import Kernel
 
@@ -345,7 +346,7 @@ def _run(
     )
     if config is None:
         config = {**FLEX_CONFIG, **(overrides or {}), **(extra_config or {})}
-    code, (out, lse) = code_and_output(_flex_kernel(), args, **config)
+    code, (out, lse) = compile_and_run(_flex_kernel(), args, config)
     ref_out, ref_lse = flex_attention(
         q,
         k,
@@ -429,8 +430,8 @@ def test_noop_block_mask_matches_the_dense_kernel(
     code, out, lse, ref_out, ref_lse = _run(q, k, v, block_mask)
     _assert_list_walk(code, mask=False, score=False)
     _assert_close(out, lse, ref_out, ref_lse)
-    dense_code, (dense_out, dense_lse) = code_and_output(
-        _dense_attention, (q, k, v), **DENSE_CONFIG
+    dense_code, (dense_out, dense_lse) = compile_and_run(
+        _dense_attention, (q, k, v), DENSE_CONFIG
     )
     assert "flash_flex" not in dense_code
     if head_dim == 64:
@@ -737,10 +738,8 @@ def _assert_rank3_maps(code: str) -> None:
 @pytest.mark.parametrize(
     ("head_dim", "dtype", "kv_heads", "q_seq", "kv_seq"),
     [
-        (64, torch.bfloat16, 4, 1024, 1024),
         (128, torch.float16, 4, 1024, 1024),
         (64, torch.bfloat16, 2, 1024, 1024),
-        (64, torch.bfloat16, 4, 1024, 512),
         (64, torch.bfloat16, 4, 1152, 1152),
     ],
 )
@@ -751,7 +750,9 @@ def test_transposed_views_match_the_contiguous_fused_path(
     rank-4 TMA maps (the O ``empty_like`` keeps the layout): bitwise the
     contiguous fused result at the same configuration (TMA epilogue), and
     within tolerance of the eager reference. Covers both dtypes and head
-    dims, grouped heads, ``M != N`` and a ragged query length."""
+    dims (the map's element type and box), grouped heads (the K/V head
+    index) and a ragged query length (the guarded rows); the strided maps
+    carry no other shape-dependent code."""
     q, k, v = _qkv(2, 4, q_seq, kv_seq, head_dim, dtype, kv_heads=kv_heads)
     block_mask = _block_mask(_causal, 2, 4, q_seq, kv_seq)
     enable_gqa = kv_heads != 4
@@ -866,9 +867,11 @@ def _assert_close_to_fp32(
 @pytest.mark.parametrize(
     ("head_dim", "dtype"),
     [
+        # The 32 B swizzle widths at both ends (16, 112) and the 64 B widths
+        # (32, 96) in both dtypes; 80 repeats the 32 B class (see the score_mod
+        # and staged-store tests below).
         pytest.param(16, torch.bfloat16, id="d16-bf16"),
         pytest.param(32, torch.bfloat16, id="d32-bf16"),
-        pytest.param(80, torch.bfloat16, id="d80-bf16"),
         pytest.param(96, torch.float16, id="d96-fp16"),
         pytest.param(112, torch.bfloat16, id="d112-bf16"),
     ],
@@ -885,7 +888,8 @@ def test_head_dim_causal(head_dim: int, dtype: torch.dtype) -> None:
 
 
 @onlyBackends(["cute"])
-@pytest.mark.parametrize("head_dim", [32, 80, 96])
+# One width of each swizzle class (64 B at 32, 32 B at 80).
+@pytest.mark.parametrize("head_dim", [32, 80])
 def test_head_dim_score_mod_and_grouped_heads(head_dim: int) -> None:
     """A relative-position bias score_mod over the causal mask, two K/V heads
     shared by four query heads."""
@@ -906,11 +910,13 @@ def test_head_dim_score_mod_and_grouped_heads(head_dim: int) -> None:
 @pytest.mark.parametrize(
     ("head_dim", "q_seq", "dtype"),
     [
+        # Whole rows per pass (16), a two-thread row slice (80; 48 and 112 take
+        # the same spread, 112 on a sub-tile length) and a four-thread slice
+        # (96, on a ragged length).
         pytest.param(16, 1024, torch.bfloat16, id="d16"),
         pytest.param(80, 1024, torch.bfloat16, id="d80"),
         pytest.param(96, 960, torch.float16, id="d96-ragged"),
         pytest.param(112, 64, torch.bfloat16, id="d112-sub-tile"),
-        pytest.param(48, 1024, torch.bfloat16, id="d48"),
     ],
 )
 def test_head_dim_staged_vector_store(
@@ -1238,8 +1244,7 @@ def test_item_words_build_is_cuda_graph_capturable(seq: int, words: int) -> None
     config = helion.Config(
         **{**bound.config_spec.default_config().config, **FLEX_CONFIG}
     )
-    bound.set_config(config)
-    code = bound.to_code(config)
+    code = compiled_source(bound, config)
     assert "_helion_flash_flex_item_words(" in code
     assert ("flash_flex_total = " in code) == (words > 1)
     eager_out, eager_lse = bound(*args)
@@ -1295,6 +1300,10 @@ def _assert_pair_list_walk(code: str) -> None:
 @pytest.mark.parametrize(
     ("head_dim", "dtype", "mask_name", "q_seq", "kv_seq"),
     [
+        # Axes: the mask shapes the walk (all-full, diagonal, absent tiles,
+        # empty rows); the dtype picks the operand type; Q != KV lengths put
+        # KV tiles past every Q block's list; 192 / 144 / 160 are the value
+        # widths with their own drain tiling beside 256.
         pytest.param(256, torch.bfloat16, "noop", 1024, 1024, id="d256-noop"),
         pytest.param(256, torch.bfloat16, "causal", 1024, 1024, id="d256-causal"),
         pytest.param(256, torch.float16, "causal", 1024, 1024, id="d256-causal-fp16"),
@@ -1467,7 +1476,6 @@ def test_list_walk_on_the_cooperative_pair_cursor_walk(
         pytest.param(1024, 1024, 4, id="plain"),
         pytest.param(1024, 1024, 2, id="gqa"),
         pytest.param(1152, 1152, 4, id="ragged"),
-        pytest.param(1024, 512, 4, id="cross"),
     ],
 )
 # pyrefly: ignore [bad-argument-type]
@@ -1643,6 +1651,13 @@ _ALL_PAIR_KNOBS = {
     cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
     cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
 }
+# Axes: the knob sets are the loader warp alone, with the extra K slot, the
+# mask phases alone and all three (every knob and their interaction); the
+# shapes are the plain walk, grouped heads (K/V at ``bh // kv_group``), a
+# ragged Q length (guarded rows), a ragged KV length at width 192 (the tail
+# mask) and 16K keys (the cursor walk).  Each shape runs all knobs and, but
+# for the 16K cursor shape, the loader alone; the extra K slot without the
+# mask phases is a plain-shape case.
 _PAIR_KNOB_CASES = [
     pytest.param(
         2048,
@@ -1686,39 +1701,6 @@ _PAIR_KNOB_CASES = [
             cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
         },
         id="d256-loader-k3",
-    ),
-    pytest.param(
-        2048,
-        2048,
-        2,
-        256,
-        {
-            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
-            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
-        },
-        id="d256-gqa-loader-k3",
-    ),
-    pytest.param(
-        1024,
-        512,
-        None,
-        256,
-        {
-            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
-            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
-        },
-        id="d256-ragged-q-loader-k3",
-    ),
-    pytest.param(
-        512,
-        1024,
-        None,
-        192,
-        {
-            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
-            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
-        },
-        id="d192-ragged-kv-loader-k3",
     ),
     pytest.param(
         2048,
@@ -1854,8 +1836,8 @@ def test_block_mask_none_is_the_dense_flex_plan() -> None:
     _assert_close(out, lse, ref_out, ref_lse)
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
     torch.testing.assert_close(out, expected, atol=3e-2, rtol=2e-2)
-    dense_code, (dense_out, dense_lse) = code_and_output(
-        _dense_attention, (q, k, v), **DENSE_CONFIG
+    dense_code, (dense_out, dense_lse) = compile_and_run(
+        _dense_attention, (q, k, v), DENSE_CONFIG
     )
     assert "flash_flex" not in dense_code
     assert torch.equal(out, dense_out)

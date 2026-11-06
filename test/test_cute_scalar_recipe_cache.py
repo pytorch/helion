@@ -16,6 +16,8 @@ from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.cute.scalar_recipe_cache import plan_scalar_recipe_cache
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 

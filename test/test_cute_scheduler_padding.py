@@ -9,7 +9,6 @@ import pytest
 import sympy
 import torch
 
-from ._cute_aux import _cpu_codegen
 from .test_cute_scheduler_mailbox import _plain_matmul
 import helion
 from helion import exc
@@ -19,6 +18,7 @@ from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -77,7 +77,7 @@ def test_padding_guards_actual_role_and_mailbox_codegen(
         torch.empty(shape, dtype=torch.bfloat16)
         for shape in ((7, 128, 64), (7, 64, 320), (7, 128, 320))
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = _batched_product._bind_isolated(args)
         code = bound.to_code(_config(order, swizzle, mailbox))
         with patch.object(
@@ -247,7 +247,7 @@ def test_clustered_static_scheduler_guards_logical_clusters_codegen(
             "tcgen05_cluster_n": cluster_n,
         }
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         if cluster_m == 1 and cluster_n == 2:
             with pytest.raises(exc.InvalidConfig, match="cluster_n=2 requires"):
                 _plain_matmul._bind_isolated(args).to_code(config)
@@ -270,7 +270,7 @@ def test_batched_plain_cold_search_does_not_expose_clc() -> None:
         torch.empty(shape, dtype=torch.bfloat16)
         for shape in ((7, 128, 128), (7, 128, 4096), (7, 128, 4096))
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = _batched_product._bind_isolated(args)
         config = bound.config_spec._cute_tcgen05_config
         assert config.matmul_has_leading_passthrough
@@ -291,7 +291,7 @@ def test_clc_source_is_outside_static_padding_change(swizzle: int) -> None:
             "tcgen05_persistence_model": "clc_persistent",
         }
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = _plain_matmul._bind_isolated(args)
         code = bound.to_code(config)
         with patch.object(

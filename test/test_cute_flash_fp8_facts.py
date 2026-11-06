@@ -28,8 +28,6 @@ import torch
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
-from test._cute_aux import _cpu_codegen
-
 import helion
 from helion._compiler import backend as _compiler_backend
 from helion._compiler.cute import cute_flash
@@ -38,6 +36,7 @@ from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import cpu_codegen
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -49,7 +48,7 @@ if TYPE_CHECKING:
 
     from helion.runtime.kernel import BoundKernel
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 LOG2E = math.log2(math.e)
 
@@ -361,7 +360,7 @@ def bmm_attention_post_dot_scale(
 def _as_sm100() -> Iterator[None]:
     """CPU codegen with the flash gate forced on (as the flex matcher tests)."""
     with (
-        _cpu_codegen(),
+        cpu_codegen(),
         patch("helion._compiler.backend._attention_flash_supported", return_value=True),
         patch(
             "helion._compiler.backend._attention_flash_gate_enabled", return_value=True

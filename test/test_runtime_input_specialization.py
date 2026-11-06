@@ -1527,8 +1527,9 @@ class TestDerivedInputStorageProvenance(unittest.TestCase):
                     )
 
     def test_derived_storage_dispatch_rejects_later_aliasing_inputs(self) -> None:
-        from test._cute_binding import _mock_cuda_unavailable
         from test.cute_population_contracts import _target
+
+        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
         def viewed_scan(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
@@ -1539,7 +1540,7 @@ class TestDerivedInputStorageProvenance(unittest.TestCase):
 
         x, out = torch.empty(4, 8), torch.empty(32)
         with (
-            _mock_cuda_unavailable(),
+            mock_cuda_unavailable(),
             _target(),
             patch(
                 "torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")

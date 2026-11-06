@@ -37,6 +37,7 @@ from ..reduction_strategy import reduction_acc_dtype
 from ..tile_strategy import LoopDimInfo
 from ..tile_strategy import PersistentReductionState
 from .backend import MetalBackend
+from .backend import budget_note
 from .lane_fold import LANE_FOLD
 from .lane_fold import MAX_LANE_COPIES
 from .lane_reduction import lane_split_for
@@ -118,7 +119,7 @@ class MetalPersistentReductionStrategy(PersistentReductionStrategy):
             raise exc.BackendUnsupported(
                 "metal",
                 f"reduction over persistent dim {block_id} in a lane loop beside "
-                f"other reduction dims {others}",
+                f"other reduction dims {others}{budget_note()}",
             )
         if self._lane_extent > MAX_LANE_COPIES:
             span = self._lane_span
@@ -127,7 +128,7 @@ class MetalPersistentReductionStrategy(PersistentReductionStrategy):
                 "metal",
                 f"persistent reduction over {self._serialized_extent} elements "
                 f"would need {self._lane_extent} lanes per thread on {threads} "
-                f"(max {MAX_LANE_COPIES})",
+                f"(max {MAX_LANE_COPIES}){budget_note()}",
             )
         self._folds = True
 
@@ -147,7 +148,9 @@ class MetalPersistentReductionStrategy(PersistentReductionStrategy):
         backend = CompileEnvironment.current().backend
         if backend.is_indexed_reduction(reduction_type):
             raise exc.BackendUnsupported(
-                "metal", f"{reduction_type} over a persistent dim walked in a lane loop"
+                "metal",
+                f"{reduction_type} over a persistent dim walked in a lane loop"
+                f"{budget_note()}",
             )
         # Checked here rather than left to the cross-thread combine, which a
         # single-thread dimension never emits.

@@ -56,6 +56,8 @@ from helion._compiler.cute.tcgen05_tma_rn import TMA_RN
 from helion._compiler.cute.tcgen05_tma_rn import WARP_RAW
 from helion.autotuner.config_generation import ConfigGeneration
 
+pytestmark = pytest.mark.cpu_only
+
 
 def low_config(bound, ctas=1, wrapped=True):
     return helion.Config.from_dict(

@@ -20,9 +20,6 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion import exc
 from helion._compiler.cute.thread_budget import checked_thread_block_dims
@@ -30,6 +27,8 @@ from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -268,8 +267,8 @@ def _one_thread_config(bound: BoundKernel) -> helion.Config:
 
 
 def _render(fn: Callable[..., torch.Tensor], *args: object, **overrides: object) -> str:
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(fn), args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(fn), args)
         return bound.to_code(_config(bound, **overrides))
 
 
@@ -286,8 +285,8 @@ _CHECKED_IMPORT = (
 
 
 def test_an_argument_sized_launch_shape_is_checked_at_launch() -> None:
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(), (torch.randn(40, 100), 8))
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), (torch.randn(40, 100), 8))
         code = bound.to_code(_one_thread_config(bound))
     assert "block=_cute_checked_block_dims((_BLOCK_SIZE_0, 1, 1))" in code, code
     assert _CHECKED_IMPORT in code, code
@@ -493,8 +492,8 @@ def test_the_aot_example_reductions_render_under_the_default_config(
 ) -> None:
     """The shipped ``static_shapes=False`` kernels of examples/aot_example.py write ``m, n = x.size()`` and reduce along ``n``: they declined for a round."""
     module = import_path(EXAMPLES_DIR / "aot_example.py")
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(getattr(module, kernel_name), args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(getattr(module, kernel_name), args)
         code = bound.to_code(bound.config_spec.default_config())
     assert "_RDIM_SIZE_" in code, code
     assert "_launcher(" in code, code

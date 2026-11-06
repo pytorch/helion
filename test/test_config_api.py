@@ -16,6 +16,7 @@ from unittest.mock import patch
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
+import pytest
 import torch
 
 import helion
@@ -93,6 +94,8 @@ from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import MatmulFact
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

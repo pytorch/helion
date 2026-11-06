@@ -10,9 +10,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_fp8_vector_store import _config
 from test.test_cute_fp8_vector_store import _quantize_rows
 
@@ -27,8 +24,13 @@ from helion._compiler.cute.masked_packet_load_names import (
 from helion._compiler.cute.packet_store_policy import _STORE_HELPERS
 from helion._compiler.cute.packet_store_policy import lower_packet_store_policy
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from helion.autotuner.config_fragment import EnumFragment
@@ -289,11 +291,11 @@ def test_fp8_codegen_selects_policy_after_packing(
 ) -> None:
     args = (torch.empty((37, 32), dtype=torch.bfloat16), dtype, hl.constexpr(32))
     with (
-        _mock_cuda_unavailable(),
-        _forbid_native_compile(),
+        mock_cuda_unavailable(),
+        forbid_native_compile(),
         patch("helion.autotuner.config_spec.torch.version.cuda", "13.0"),
     ):
-        bound = _cpu_bind(_quantize_rows, args)
+        bound = cpu_bind(_quantize_rows, args)
         bound.config_spec.target_device_capability = (10, 3)
         config = _config(bound, vec_width)
         config.config["cute_store_policy"] = "l2_evict_last"
@@ -318,11 +320,11 @@ def test_misaligned_fp8_output_keeps_scalar_fallback() -> None:
     storage = torch.empty((37, 33), dtype=torch.float8_e4m3fn)
     out = storage[:, 1:]
     with (
-        _mock_cuda_unavailable(),
-        _forbid_native_compile(),
+        mock_cuda_unavailable(),
+        forbid_native_compile(),
         patch("helion.autotuner.config_spec.torch.version.cuda", "13.0"),
     ):
-        bound = _cpu_bind(_convert_into, (x, out))
+        bound = cpu_bind(_convert_into, (x, out))
         bound.config_spec.target_device_capability = (10, 3)
         config = _config(bound, 16)
         config.config["cute_store_policy"] = "l2_evict_last"

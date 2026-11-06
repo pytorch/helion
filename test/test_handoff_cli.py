@@ -24,6 +24,8 @@ from helion.autotuner.handoff_cli import CLISourceAgent
 from helion.autotuner.handoff_submit import _atomic_json
 from helion.autotuner.logger import AutotuningLogger
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def bundle(tmp_path):

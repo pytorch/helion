@@ -21,6 +21,8 @@ from helion.autotuner.config_spec import CuteVectorWidthSpec
 from helion.autotuner.config_spec import NumThreadsSpec
 from helion.autotuner.config_spec import ReductionLoopSpec
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(

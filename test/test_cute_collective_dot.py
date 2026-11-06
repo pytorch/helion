@@ -9,8 +9,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 
 if TYPE_CHECKING:
     from helion._compiler.device_function import DeviceFunction
@@ -94,7 +94,7 @@ def _seed_inputs(dtype: torch.dtype, device: str = "cpu") -> tuple[torch.Tensor,
 @skipUnlessBackends(["cute"])
 def test_explicit_dot_stages_original_fp32_seed(dtype: torch.dtype) -> None:
     inputs = _seed_inputs(dtype)
-    source = _cpu_bind(_seeded_dot, inputs).to_code(_config())
+    source = cpu_bind(_seeded_dot, inputs).to_code(_config())
     ast.parse(source)
     assert source.count("cute.gemm(") == 1
     assert "_acc.fill(0.0)" not in source
@@ -108,7 +108,7 @@ def test_explicit_dot_stages_original_fp32_seed(dtype: torch.dtype) -> None:
 @skipUnlessBackends(["cute"])
 def test_invariant_seed_is_not_a_loop_carry() -> None:
     inputs = _seed_inputs(torch.float16)
-    source = _cpu_bind(_invariant_seed_dot, inputs).to_code(_config())
+    source = cpu_bind(_invariant_seed_dot, inputs).to_code(_config())
     assert "cute.gemm(" not in source
     assert "_helion_pending_collective_mma" not in source
 
@@ -121,7 +121,7 @@ def test_full_slice_dot_owns_entire_synthetic_k(dtype: torch.dtype, k: int) -> N
         torch.empty((130, k), dtype=dtype),
         torch.empty((k, 70), dtype=dtype),
     )
-    source = _cpu_bind(_full_slice_dot, inputs).to_code(_config(full_slice=True))
+    source = cpu_bind(_full_slice_dot, inputs).to_code(_config(full_slice=True))
     assert source.count("cute.gemm(") == 1
     assert "synthetic_lane_" not in source
     assert "_helion_pending_collective_mma" not in source
@@ -147,7 +147,7 @@ def _partial_synthetic_k_render(
         # path as a configuration that disables it explicitly.
         config["cute_vector_widths"] = [2, 1, 1]
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         kernel = helion.kernel(
@@ -156,7 +156,7 @@ def _partial_synthetic_k_render(
             static_shapes=static_shapes,
             autotune_effort="none",
         )
-        bound = _cpu_bind(kernel, inputs)
+        bound = cpu_bind(kernel, inputs)
         return bound.to_code(helion.Config.from_dict(config))
 
 
@@ -206,7 +206,7 @@ def test_full_thread_k_keeps_the_complete_scalar_dot(
         cute_collective_mma=False,
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         kernel = helion.kernel(
@@ -215,7 +215,7 @@ def test_full_thread_k_keeps_the_complete_scalar_dot(
             static_shapes=static_shapes,
             autotune_effort="none",
         )
-        source = _cpu_bind(kernel, inputs).to_code(config)
+        source = cpu_bind(kernel, inputs).to_code(config)
     assert "synthetic_lane_" not in source
     assert "cute.gemm(" not in source
     assert "group_span=64" in source
@@ -280,7 +280,7 @@ def test_mamba_contractions_receive_complete_ordinary_seeds(
         static_shapes=static_shapes,
         autotune_effort="none",
     )
-    bound = _cpu_bind(kernel, inputs)
+    bound = cpu_bind(kernel, inputs)
     assert bound.host_function is not None
     with bound.env:
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(

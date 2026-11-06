@@ -11,14 +11,15 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.rng_utils import philox_rand_ref
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -38,11 +39,11 @@ def cpu_only(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
             ("helion._compat._is_hip", False),
         ):
             stack.enter_context(patch(name, return_value=value))
-        stack.enter_context(_mock_cuda_unavailable())
+        stack.enter_context(mock_cuda_unavailable())
         stack.enter_context(
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden"))
         )
-        stack.enter_context(_forbid_native_compile())
+        stack.enter_context(forbid_native_compile())
         yield
     torch.set_num_threads(previous_threads)
     assert torch.cuda.is_initialized() == initialized

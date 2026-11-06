@@ -16,6 +16,10 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -1354,21 +1358,19 @@ def _serial_scan_fallback(monkeypatch):
     )
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("kind", ["sum", "prod", "min", "max"])
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int32])
 @pytest.mark.usefixtures("_serial_scan_fallback")
 def test_ordinary_tiled_scan_generated_values(kind, reverse, dtype):
-    from test._cute_binding import _cpu_bind
-    from test._cute_binding import _forbid_native_compile
-    from test._cute_binding import _mock_cuda_unavailable
     from test.cute_population_contracts import _target
 
     backing = ((torch.arange(3 * 34).reshape(3, 34) % 3) + 1).to(dtype)
     x = backing[:, ::2]
     snapshot = backing.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_ordinary_tiled_scan, (x, kind, reverse))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_ordinary_tiled_scan, (x, kind, reverse))
         source = bound.to_code(bound.config_spec.default_config())
     assert "fragment_smem" not in source
     actual = _execute_direct_scan_program(source, (x, kind, reverse))
@@ -1378,20 +1380,18 @@ def test_ordinary_tiled_scan_generated_values(kind, reverse, dtype):
     torch.testing.assert_close(backing, snapshot, rtol=0, atol=0)
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.usefixtures("_serial_scan_fallback")
 def test_ordinary_scan_host_fixed_chunk_generated_values():
     from unittest.mock import patch
 
-    from test._cute_binding import _cpu_bind
-    from test._cute_binding import _forbid_native_compile
-    from test._cute_binding import _mock_cuda_unavailable
     from test.cute_population_contracts import _target
     import test.test_cute_computed_fragment as fragment_tests
     from test.test_cute_computed_fragment import _fragment_host_fixed_chunk_scan
 
     x = (torch.arange(3 * 17).reshape(3, 17) % 7).float()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_host_fixed_chunk_scan, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_host_fixed_chunk_scan, (x,))
         source = bound.to_code(bound.config_spec.default_config())
     for chunk_size in (4, 8, 16):
         with patch.object(fragment_tests, "_FRAGMENT_FIXED_CHUNK", chunk_size):
@@ -1433,17 +1433,15 @@ def _ordinary_tiled_tuple_scan(x: torch.Tensor, reverse: hl.constexpr):
     return out
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.usefixtures("_serial_scan_fallback")
 def test_ordinary_tiled_tuple_scan_generated_values(reverse):
-    from test._cute_binding import _cpu_bind
-    from test._cute_binding import _forbid_native_compile
-    from test._cute_binding import _mock_cuda_unavailable
     from test.cute_population_contracts import _target
 
     x = ((torch.arange(3 * 17).reshape(3, 17) % 3) + 1).float()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_ordinary_tiled_tuple_scan, (x, reverse))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_ordinary_tiled_tuple_scan, (x, reverse))
         source = bound.to_code(bound.config_spec.default_config())
     actual = _execute_direct_scan_program(source, (x, reverse))
     expected = _ordinary_scan_expected(x, "prod", reverse) + _ordinary_scan_expected(
@@ -1465,20 +1463,18 @@ def _ordinary_bounded_scan(
     return out
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     "begin,end,width", [(3, 20, 25), (3, 19, 25), (0, 17, 25), (3, 20, 20)]
 )
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.usefixtures("_serial_scan_fallback")
 def test_ordinary_bounded_scan_generated_values(begin, end, width, reverse):
-    from test._cute_binding import _cpu_bind
-    from test._cute_binding import _forbid_native_compile
-    from test._cute_binding import _mock_cuda_unavailable
     from test.cute_population_contracts import _target
 
     x = ((torch.arange(3 * width).reshape(3, width) % 3) + 1).float()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_ordinary_bounded_scan, (x, begin, end, reverse))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_ordinary_bounded_scan, (x, begin, end, reverse))
         source = bound.to_code(bound.config_spec.default_config())
     actual = _execute_direct_scan_program(source, (x, begin, end, reverse))
     expected = _ordinary_scan_expected(x[:, begin:end], "prod", reverse)
@@ -1528,25 +1524,23 @@ def _ordinary_first_axis_bounded_scan(
     return out
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("first_axis", [False, True])
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.usefixtures("_serial_scan_fallback")
 def test_ordinary_grid_scan_generated_values(first_axis, reverse):
-    from test._cute_binding import _cpu_bind
-    from test._cute_binding import _forbid_native_compile
-    from test._cute_binding import _mock_cuda_unavailable
     from test.cute_population_contracts import _target
 
     x = ((torch.arange(3 * 25).reshape(3, 25) % 3) + 1).float()
     if first_axis:
         x = x.t().contiguous()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         kernel = (
             _ordinary_first_axis_bounded_scan
             if first_axis
             else _ordinary_grid_bounded_scan
         )
-        bound = _cpu_bind(kernel, (x, 3, 20, reverse))
+        bound = cpu_bind(kernel, (x, 3, 20, reverse))
         source = bound.to_code(bound.config_spec.default_config())
     # Reuse the exact generated host wrapper with different runtime bounds.
     for begin, end in [(3, 20), (1, 18), (2, 21)]:
@@ -1581,12 +1575,10 @@ def test_ordinary_grid_scan_native(first_axis, reverse):
         torch.testing.assert_close(x, before, rtol=0, atol=0)
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("missing", ["owner", "end"])
 @pytest.mark.usefixtures("_serial_scan_fallback")
 def test_ordinary_grid_scan_requires_logical_owner(monkeypatch, missing):
-    from test._cute_binding import _cpu_bind
-    from test._cute_binding import _forbid_native_compile
-    from test._cute_binding import _mock_cuda_unavailable
     from test.cute_population_contracts import _target
 
     from helion._compiler.cute.cute_reshape import _resolve_dim_block_id
@@ -1610,8 +1602,8 @@ def test_ordinary_grid_scan_requires_logical_owner(monkeypatch, missing):
         return original(state, helper, inputs, dim, reverse, **kwargs)
 
     x = torch.ones(3, 25)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_ordinary_grid_bounded_scan, (x, 3, 20, True))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_ordinary_grid_bounded_scan, (x, 3, 20, True))
         # Initialize lazy backend registration before replacing its emitter.
         bound.to_code(bound.config_spec.default_config())
         original = scan_ops._cute_codegen_serial_scan
@@ -1622,10 +1614,8 @@ def test_ordinary_grid_scan_requires_logical_owner(monkeypatch, missing):
             bound.to_code(bound.config_spec.default_config())
 
 
+@skipUnlessBackends(["cute"])
 def test_ordinary_default_scan_keeps_parallel_dispatch(monkeypatch):
-    from test._cute_binding import _cpu_bind
-    from test._cute_binding import _forbid_native_compile
-    from test._cute_binding import _mock_cuda_unavailable
     from test.cute_population_contracts import _target
 
     from helion._compiler.backend_registry import repair_backend_codegen
@@ -1641,12 +1631,13 @@ def test_ordinary_default_scan_keeps_parallel_dispatch(monkeypatch):
         return result
 
     monkeypatch.setattr(scan_ops, "_cute_try_parallel_scan", observe)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_ordinary_tiled_scan, (torch.ones(3, 17), "sum", False))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_ordinary_tiled_scan, (torch.ones(3, 17), "sum", False))
         bound.to_code(bound.config_spec.default_config())
     assert results and all(results)
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("extent", [17, "chunk_size"])
 @pytest.mark.parametrize("reverse", [False, True])
 def test_serial_scan_position_handles_symbolic_extent(extent, reverse):
@@ -1773,21 +1764,19 @@ def _singleton_scan_data(dim, device="cpu"):
     return x, y
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("dim", [0, -1])
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("tuple_input", [False, True])
 @pytest.mark.parametrize("masked", [False, True])
 def test_singleton_scan_generated_identity(dim, reverse, tuple_input, masked):
-    from test._cute_binding import _cpu_bind
-    from test._cute_binding import _forbid_native_compile
-    from test._cute_binding import _mock_cuda_unavailable
     from test.cute_population_contracts import _target
 
     x, y = _singleton_scan_data(dim)
     before = (x.contiguous().view(torch.int32).clone(), y.clone())
     args = (x, y, dim, reverse, tuple_input, masked, True)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_singleton_inclusive_scan, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_singleton_inclusive_scan, args)
         source = bound.to_code(bound.config_spec.default_config())
     actual = _execute_singleton_scan_program(source, args)
     expected_x, expected_y = x.clone(), y.clone()
@@ -1837,12 +1826,11 @@ def test_singleton_scan_native_identity(dim, reverse, tuple_input, masked):
     torch.testing.assert_close(y, y_before, rtol=0, atol=0)
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.usefixtures("_serial_scan_fallback")
 def test_singleton_scan_rebind_does_not_specialize_shape_hints():
     from unittest.mock import patch
 
-    from test._cute_binding import _forbid_native_compile
-    from test._cute_binding import _mock_cuda_unavailable
     from test.cute_population_contracts import _target
 
     kernel = helion.kernel(
@@ -1855,9 +1843,9 @@ def test_singleton_scan_rebind_does_not_specialize_shape_hints():
     integer = (torch.arange(17 * 16, dtype=torch.int64) + (1 << 60)).reshape(17, 16)
     bindings = {}
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
         for width in (1, 4, 1):

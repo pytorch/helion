@@ -36,6 +36,8 @@ from helion.autotuner.config_spec import ReductionLoopSpec
 from helion.language import _tracing_ops
 from helion.runtime.config import Config
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 

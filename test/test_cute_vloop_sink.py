@@ -26,8 +26,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test._cute_vloop_sink_kernels import FRAGMENT_REDUCE
 from test._cute_vloop_sink_kernels import TWO_STAGE_REDUCE
 from test._cute_vloop_sink_kernels import _sink_config
@@ -50,7 +48,11 @@ from helion._compiler.autotuner_heuristics.cute import CuteColumnReductionHeuris
 from helion._compiler.cute import sink_vector_loops
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
 softmax = import_example("softmax").softmax
@@ -64,7 +66,7 @@ cutlass = pytest.importorskip("cutlass")
 @pytest.fixture
 def cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -77,7 +79,7 @@ def cpu_only() -> Iterator[None]:
 def _cpu_code(
     kernel: helion.Kernel, args: tuple[torch.Tensor, ...], **config: object
 ) -> str:
-    bound = _cpu_bind(kernel, args)
+    bound = cpu_bind(kernel, args)
     return bound.to_code(
         bound.config_spec.normalized_config(helion.Config.from_dict(dict(config)))
     )
@@ -801,7 +803,7 @@ def test_kernels_without_the_pattern_generate_identical_code(cpu_only: None) -> 
     ) -> dict[str, object]:
         """One 1024-wide row per CTA on 128 threads with V=8 (the persistent
         one-vector-per-thread layout of a row reduction)."""
-        bound = _cpu_bind(kernel, args)
+        bound = cpu_bind(kernel, args)
         spec = bound.config_spec
         (reduction,) = [
             block.block_id for block in bound.env.block_sizes if block.reduction
@@ -848,7 +850,7 @@ def test_kernels_without_the_pattern_generate_identical_code(cpu_only: None) -> 
 @skipUnlessBackends(["cute"])
 def test_lane_unroll_requires_sinking_or_a_grid_lane_loop(cpu_only: None) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_static, (x,))
+    bound = cpu_bind(col_reduce_sum_static, (x,))
 
     def normalized_unroll(block_sizes: list[int], num_threads: list[int]) -> int:
         config = bound.config_spec.normalized_config(
@@ -887,7 +889,7 @@ def test_column_reduction_heuristic_seeds_the_coalesced_layout(
     cpu_only: None,
 ) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_dynamic, (x,))
+    bound = cpu_bind(col_reduce_sum_dynamic, (x,))
     spec = bound.config_spec
     assert "cute_column_reduction" in spec.autotuner_heuristics
     seeds = [
@@ -928,7 +930,7 @@ def test_column_reduction_heuristic_seeds_the_coalesced_layout(
     assert CuteColumnReductionHeuristic.register_facts(
         bound.env, bound.host_function.device_ir
     ) == {"input_tensor_metadata"}
-    static_bound = _cpu_bind(col_reduce_sum_static, (x,))
+    static_bound = cpu_bind(col_reduce_sum_static, (x,))
     assert "cute_column_reduction" in static_bound.config_spec.autotuner_heuristics
     assert (
         CuteColumnReductionHeuristic.register_facts(
@@ -943,7 +945,7 @@ def test_column_reduction_heuristic_seeds_the_coalesced_layout(
         (col_reduce_sum_from8_static, (1000, 1008)),
         (col_reduce_sum_from8_dynamic, (1000, 1008)),
     ):
-        declined = _cpu_bind(kernel, (torch.empty(*shape, dtype=torch.bfloat16),))
+        declined = cpu_bind(kernel, (torch.empty(*shape, dtype=torch.bfloat16),))
         assert "cute_column_reduction" not in declined.config_spec.autotuner_heuristics
         assert not any(
             seed.config.get("cute_vloop_sink")
@@ -956,7 +958,7 @@ def test_column_reduction_heuristic_seeds_the_coalesced_layout(
         (col_reduce_sum_from8_dynamic, torch.empty(1000, 1008, dtype=torch.bfloat16)),
         (col_reduce_sum_dynamic, torch.empty(4096, 4096, dtype=torch.bfloat16).t()),
     ):
-        declined = _cpu_bind(kernel, (x,))
+        declined = cpu_bind(kernel, (x,))
         assert (
             CuteColumnReductionHeuristic.register_facts(
                 declined.env, declined.host_function.device_ir
@@ -964,7 +966,7 @@ def test_column_reduction_heuristic_seeds_the_coalesced_layout(
             == frozenset()
         )
     # Row reductions are not column reductions.
-    rows_bound = _cpu_bind(
+    rows_bound = cpu_bind(
         helion.kernel(
             rms_norm_fwd.fn,
             backend="cute",

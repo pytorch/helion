@@ -58,6 +58,7 @@ def _timeout_default() -> float:
 
 
 SUBPROCESS_TIMEOUT_SECONDS = _timeout_default()
+SESSION_MARKER = "HELION_AUTOREVIEW_SESSION"
 
 
 PROMPT_DIFF_PREFIX = (
@@ -74,9 +75,10 @@ PROMPT_HEAD_PREFIX = (
 PROMPT_ARGS_PREFIX = """\
 Review only the thing described by these command-line arguments. Treat them as
 the user's description of what to review, and resolve any referenced commits,
-URLs, diffs, files, issues, or pull requests as needed. Do not review
-staged/uncommitted changes or the last commit unless the arguments explicitly
-ask for that.
+URLs, diffs, files, issues, or pull requests as needed. Inspect commits with
+`git show` or `git diff`; never check out, reset, stash, rebase or otherwise
+move HEAD or change the working tree. Do not review staged/uncommitted changes
+or the last commit unless the arguments explicitly ask for that.
 
 Review target:
 {review_target}\
@@ -140,12 +142,19 @@ def build_review_prompt(head: bool, review_args: list[str] | None = None) -> str
 
 
 def subprocess_env() -> dict[str, str]:
-    """Return env stripped of vars that prevent the installed launcher binaries
-    from running. The Meta launcher passes META_DANGEROUSLY_DISABLE_LINUX_SANDBOX
-    through to the inner binary, which then refuses to start."""
+    """Return the environment for the inner reviewer and fixer sessions.
+
+    It drops the vars that prevent the installed launcher binaries from running
+    (the Meta launcher passes META_DANGEROUSLY_DISABLE_LINUX_SANDBOX through to
+    the inner binary, which then refuses to start) and marks the session as an
+    autoreview session."""
     env = os.environ.copy()
     env.pop("META_CLAUDE_DANGEROUSLY_DISABLE_LINUX_SANDBOX", None)
     env.pop("META_DANGEROUSLY_DISABLE_LINUX_SANDBOX", None)
+    # The inner sessions read AGENTS.md, which asks agents to run this script
+    # on finished work; the marker keeps a --fix session from nesting another
+    # review (see main()).
+    env[SESSION_MARKER] = "1"
     return env
 
 
@@ -536,6 +545,13 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    if os.environ.get(SESSION_MARKER):
+        print(
+            "autoreview.py: already running inside an autoreview session; "
+            "the outer run reviews the result",
+            file=sys.stderr,
+        )
+        return 0
 
     if args.add and not args.fix:
         parser.error("--add requires --fix")

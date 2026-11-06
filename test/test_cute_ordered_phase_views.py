@@ -7,15 +7,15 @@ import sys
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 
@@ -77,12 +77,12 @@ def _detach_phases(x: torch.Tensor) -> torch.Tensor:
 
 @pytest.fixture
 def cpu_only():
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         yield
 
 
 def _code(kernel, x):
-    bound = _cpu_bind(kernel, (x,))
+    bound = cpu_bind(kernel, (x,))
     config = bound.config_spec.default_config()
     config.config["pid_type"] = "flat"
     return bound.to_code(config)
@@ -147,7 +147,7 @@ def test_ordered_writable_input_view_is_not_fresh():
     eager = helion.kernel(
         _write_view_phases.fn, backend="cute", static_shapes=True, ref_mode="eager"
     )
-    actual = _cpu_bind(eager, (x,)).run_ref(x)
+    actual = cpu_bind(eager, (x,)).run_ref(x)
     assert torch.equal(actual, expected)
     assert torch.equal(x.flatten(), expected / 2)
 

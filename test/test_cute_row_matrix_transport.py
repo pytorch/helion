@@ -25,6 +25,8 @@ from helion._testing import skipUnlessBackends
 from helion.exc import InvalidConfig
 import helion.language as hl
 
+pytestmark = pytest.mark.cpu_only
+
 
 def materialized_pair(left, hidden, expansion, auxiliary):
     rows, inner = left.size()

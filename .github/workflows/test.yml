@@ -25,8 +25,12 @@ env:
 jobs:
   load-matrix:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      run-tests: ${{ steps.changes.outputs.run-tests }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -34,17 +38,50 @@ jobs:
       - name: Load matrix from file
         id: set-matrix
         run: |
-          matrix=$(cat .github/matrix.json | jq -c .)
+          # Entries with "pr": false in matrix.json run on pushes to main only:
+          # near-duplicates of the A10G and H100 jobs that change only the
+          # interpreter (3.14t), the dtype asserts, the reference-eager mode or
+          # the Triton build (fbtriton).
+          # An entry with "shards": n expands into n jobs that set
+          # shard-index/shard-count (HELION_TEST_SHARD=i/n in test/conftest.py).
+          PR="${{ github.event_name == 'pull_request' }}"
+          matrix=$(jq -c --argjson pr "$PR" '{include: [
+              .include[]
+              | select(($pr | not) or .pr != false)
+              | if .shards then . as $job | range(.shards) as $i
+                  | ($job + {"shard-index": $i, "shard-count": $job.shards} | del(.shards))
+                else . end
+            ]}' .github/matrix.json)
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+      - name: Skip the test jobs for docs-only pull requests
+        id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_tests=true
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # An API failure leaves $files empty, which runs the tests. A
+            # renamed file counts under both of its names, so moving code into
+            # docs/ still runs them.
+            files=$(gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.number }}/files" --jq '.[] | .filename, (.previous_filename // empty)') \
+              || { echo "::warning::Could not list the pull request's files; running every test job."; files=""; }
+            if [[ -n "$files" ]] && ! grep -vE '^(docs/|[^/]*\.(md|rst)$|LICENSE$)' <<<"$files" >/dev/null; then
+              echo "Only documentation changed; skipping the test jobs."
+              run_tests=false
+            fi
+          fi
+          echo "run-tests=$run_tests" >> $GITHUB_OUTPUT
 
   test:
     needs: load-matrix
+    if: needs.load-matrix.outputs.run-tests == 'true'
 
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.load-matrix.outputs.matrix) }}
 
-    name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.pytorch-version }}-${{ matrix.triton-package || matrix.backend }}-${{ matrix.alias }}
+    name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.pytorch-version }}-${{ matrix.triton-package || matrix.backend }}-${{ matrix.alias }}${{ matrix.shard-count && format('-shard{0}of{1}', matrix.shard-index, matrix.shard-count) || '' }}
 
     container: ${{ matrix.image != '' && fromJSON(format('{{"image":"{0}","options":"{1}"}}', matrix.image, matrix.container-options)) || '' }}
 
@@ -361,8 +398,17 @@ jobs:
           # -rf: print failed tests
           # --timeout: max allowed time for each test
           # -n: xdist workers (test/conftest.py defaults the scheduler to worksteal).
-          # Without -n, conftest sizes the workers to the GPU, so always pass it.
+          # Without -n, conftest sizes the workers to the GPU (or, for the CPU
+          # lane, to the CPUs), so pass it explicitly except as "-n auto" there.
+          # Lanes: the CuTe modules marked cpu_only (source generation only,
+          # about 80 worker-minutes) run on a CPU runner (matrix "lane": "cpu";
+          # it installs the cu130 torch wheel because Helion's CuTe codegen
+          # reads torch.version.cuda and the Linux cpu wheel ships no Triton;
+          # no driver is needed), and the CuTe B200 shards deselect them. The
+          # Triton backend's cpu_only tests are about five worker-minutes, less
+          # than a runner's setup, so every other job keeps the whole suite.
           PARALLEL="-n4"
+          MARK=""
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             TEST_PATH="test/test_examples_dist.py"
             EXTRA_FLAGS="-rs"
@@ -374,9 +420,29 @@ jobs:
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
             PARALLEL="-n0"
+          elif [[ "${{ matrix.lane }}" == "cpu" ]]; then
+            TEST_PATH="."
+            EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
+            MARK="cpu_only"
+            # test/conftest.py sizes the workers to the CPUs for this lane.
+            export HELION_TEST_LANE=cpu
+            PARALLEL="-n auto"
           else
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
+            if [[ "$HELION_BACKEND" == "cute" ]]; then MARK="not cpu_only"; fi
+          fi
+          # Pull requests skip the slow tier (fresh-interpreter replays, real
+          # autotune searches); pushes to main run it.
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            MARK="${MARK:+($MARK) and }not slow"
+          fi
+          MARK_FLAGS=()
+          if [[ -n "$MARK" ]]; then MARK_FLAGS=(-m "$MARK"); fi
+          # HELION_TEST_SHARD=i/n makes test/conftest.py keep shard i of the n
+          # duration-balanced module groups (test/shard_durations.json).
+          if [[ -n "${{ matrix.shard-count }}" ]]; then
+            export HELION_TEST_SHARD="${{ matrix.shard-index }}/${{ matrix.shard-count }}"
           fi
           # A10G runners expose one 22 GiB GPU. Four xdist workers can collectively
           # exhaust VRAM with CUDA/Triton/Inductor state even when an individual test
@@ -432,12 +498,13 @@ jobs:
             # no traceback. Give it the same headroom as A10G.
             TIMEOUT=180
           elif [[ "$HELION_BACKEND" == "cute" ]]; then
-            # The CuTe suite runs eight xdist workers on one B200. Tests that
-            # take ~25s alone (the mamba2 chunk-scan backend comparison, the
-            # flat-gather-sink codegen checks) run past 60s under that
-            # contention and lose their worker the same way. Give it the same
-            # headroom, dump stacks before the limit, and list the slowest
-            # tests so near-timeouts show up in the log.
+            # The CuTe shards run eight xdist workers on one B200 and the CuTe
+            # CPU lanes one worker per CPU. Tests that take ~25s alone (the
+            # mamba2 chunk-scan backend comparison, the flat-gather-sink
+            # codegen checks) run past 60s under that contention and lose
+            # their worker the same way. Give it the same headroom, dump
+            # stacks before the limit, and list the slowest tests so
+            # near-timeouts show up in the log.
             TIMEOUT=180
             EXTRA_FLAGS="$EXTRA_FLAGS -o faulthandler_timeout=120 --durations=20"
           fi
@@ -450,20 +517,22 @@ jobs:
             # timeout report can be lost with xdist's captured worker output.
             EXTRA_FLAGS="$EXTRA_FLAGS -o faulthandler_timeout=120 --durations=20"
           fi
-          pytest $PARALLEL -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          pytest $PARALLEL -rf --timeout=$TIMEOUT --timeout-method=thread "${MARK_FLAGS[@]}" $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
           # JAX and TorchTPU initialize the TPU runtime differently. Run the
           # physical remote-copy suites in fresh, sequential pytest processes.
           if [[ "${{ matrix.alias }}" == "tpu" ]]; then
-            pytest -n0 -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyJaxRuntime
-            HELION_TEST_TORCH_TPU_MULTIPROCESS=1 pytest -n0 -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyTorchTpuRuntime
+            pytest -n0 -rf --timeout=$TIMEOUT --timeout-method=thread "${MARK_FLAGS[@]}" test/test_remote_copy.py::TestRemoteCopyJaxRuntime
+            HELION_TEST_TORCH_TPU_MULTIPROCESS=1 pytest -n0 -rf --timeout=$TIMEOUT --timeout-method=thread "${MARK_FLAGS[@]}" test/test_remote_copy.py::TestRemoteCopyTorchTpuRuntime
           fi
           # Each remote-copy test launches one process per GPU, so run this class
           # serially rather than assigning its tests to concurrent xdist workers.
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
-            pytest -n0 -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS test/test_remote_copy.py::TestRemoteCopyGPU | tee >(eval $SKIP_CHECK)
+            pytest -n0 -rf --timeout=$TIMEOUT --timeout-method=thread "${MARK_FLAGS[@]}" $EXTRA_FLAGS test/test_remote_copy.py::TestRemoteCopyGPU | tee >(eval $SKIP_CHECK)
           fi
 
   test-notebooks:
+    needs: load-matrix
+    if: needs.load-matrix.outputs.run-tests == 'true'
     name: test-notebooks-cu130-py3.12-pytorch-2.13-a10g
 
     container:

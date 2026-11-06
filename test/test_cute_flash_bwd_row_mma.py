@@ -32,7 +32,6 @@ from helion.autotuner.config_generation import ConfigGeneration
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_pdl import _assert_only_the_dependent_launch_differs
 from test.test_cute_pdl import _last_wave_guard
@@ -40,6 +39,7 @@ from test.test_cute_pdl import _on_and_off
 
 from helion._compiler.cute import cute_flash_bwd_row_mma as row
 from helion._testing import import_example
+from helion._testing.cute_codegen import mock_cuda_unavailable
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -453,7 +453,7 @@ def test_row_dk_dv_are_deterministic() -> None:
 @pytest.fixture
 def cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(

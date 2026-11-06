@@ -17,6 +17,8 @@ from helion._compiler.cute.collective_tcgen05 import CollectiveTcgen05Plan
 from helion._compiler.cute.collective_tcgen05 import CollectiveTmemResource
 from helion._compiler.cute.collective_tmem_operand import CollectiveTmemOperand
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _expr(source: str) -> ast.expr:
     return ast.parse(source, mode="eval").body

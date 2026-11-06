@@ -8,8 +8,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_host_paired_sum_seeds import _population
 from test.test_cute_host_single_sum import _arguments
 from test.test_cute_host_single_sum import _single
@@ -18,11 +16,13 @@ import helion
 from helion._compiler.cute.host_paired_sum import PAIRED_SUM_KEY
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 
 rms_norm_bwd = import_example("rms_norm").rms_norm_bwd
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -61,7 +61,7 @@ def _original(static: bool) -> tuple[BoundKernel, tuple[torch.Tensor, ...]]:
         torch.empty(1024, dtype=torch.float16, requires_grad=True),
         torch.empty((256, 1), dtype=torch.float32),
     )
-    return _cpu_bind(kernel, arguments), arguments
+    return cpu_bind(kernel, arguments), arguments
 
 
 @pytest.mark.parametrize("static", (True, False))
@@ -107,7 +107,7 @@ def test_original_single_return_actual_initial100_reaches_both_layouts(
 
 def test_generic_single_seeds_have_independent_nested_configs() -> None:
     arguments = _arguments()
-    bound = _cpu_bind(_single, arguments)
+    bound = cpu_bind(_single, arguments)
     assert {config[PAIRED_SUM_KEY] for config in _population(bound, arguments)[:5]} == {
         "off",
         "mapped",
@@ -139,7 +139,7 @@ def test_disabling_heuristics_preserves_explicit_single_choice() -> None:
         autotune_effort="none",
         disable_autotuner_heuristics=True,
     )
-    bound = _cpu_bind(kernel, _arguments())
+    bound = cpu_bind(kernel, _arguments())
     assert bound.config_spec.cute_host_paired_sum_available
     assert not bound.config_spec.compiler_seed_configs
     with bound.env:

@@ -102,6 +102,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 from ... import exc
+from ..ast_extension import iter_statements
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import ReadWrites
 from ._ast_pass_utils import _names_read
@@ -1342,16 +1343,17 @@ def lanes_with_sites(
     the fold rejects a reduce that is not one of its recorded sites.
     """
     found: set[str] = set()
-    for stmt in body:
-        for node in ast.walk(stmt):
-            if (
-                isinstance(node, ast.For)
-                and isinstance(node.target, ast.Name)
-                and node.target.id in sites
-                and node.target.id not in found
-                and _reduce_calls(node)
-            ):
-                found.add(node.target.id)
+    if not sites:
+        return frozenset(found)
+    for stmt in iter_statements(body):
+        if (
+            isinstance(stmt, ast.For)
+            and isinstance(stmt.target, ast.Name)
+            and stmt.target.id in sites
+            and stmt.target.id not in found
+            and _reduce_calls(stmt)
+        ):
+            found.add(stmt.target.id)
     return frozenset(found)
 
 

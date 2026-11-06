@@ -24,7 +24,7 @@ from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 FINALIZER_KEY = "cute_split_k_finalizer_warps"
 FINALIZER_MECHANISM = "cute.split_k_finalizer"

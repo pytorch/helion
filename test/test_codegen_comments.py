@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import ast
 
+import pytest
+
 from helion._compiler.ast_extension import create
 from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.ast_extension import unparse
 from helion._compiler.source_location import SourceLocation
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_unparse_inserts_source_location_comments(tmp_path) -> None:

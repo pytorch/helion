@@ -40,6 +40,7 @@ import unittest
 from unittest.mock import patch
 import weakref
 
+import pytest
 import sympy
 import torch
 from torch._dynamo.source import LocalSource
@@ -60,6 +61,8 @@ from helion.runtime.kernel import _PreparedMetadataSpecializationExtractor
 from helion.runtime.kernel import _RuntimeInputSpecializationExtractor
 from helion.runtime.kernel import _SpecializationAlias
 from helion.runtime.kernel import _TensorDescriptorAlignmentExtractor
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Callable

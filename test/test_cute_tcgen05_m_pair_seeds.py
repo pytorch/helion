@@ -9,9 +9,9 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 
-from ._cute_binding import _cpu_bind
 import helion
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
@@ -19,7 +19,10 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 PAIR_BM = 2 * TCGEN05_TWO_CTA_BLOCK_M
 
@@ -87,7 +90,7 @@ def _bind(kernel: helion.Kernel, args: tuple[torch.Tensor, ...]) -> object:
             CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
         ),
     ):
-        return _cpu_bind(kernel, args)
+        return cpu_bind(kernel, args)
 
 
 def _m_pair_seeds(spec: object) -> list[dict[str, object]]:

@@ -47,6 +47,8 @@ from helion.autotuner.heuristic_generator import compute_validity_partitions
 from helion.autotuner.heuristic_generator import select_config_subset
 from helion.runtime.config import Config
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from pathlib import Path
 

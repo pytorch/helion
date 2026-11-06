@@ -13,6 +13,7 @@ from typing import cast
 
 import sympy
 from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.functions import IntTrueDiv
 from torch.utils._sympy.functions import PythonMod
 
 from ..device_function import DeviceFunction
@@ -47,7 +48,20 @@ def _needs_helper(node: sympy.Basic) -> bool:
     )
 
 
-class _SignedIndexPrinter(HelionTritonPrinter):
+class _MetalPrinter(HelionTritonPrinter):
+    """Prints ``IntTrueDiv`` (Python's ``/`` on integers) as a float division:
+    ``texpr`` prints it as a bare ``/``, which MSL evaluates as an integer
+    division."""
+
+    def _print_IntTrueDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = _operands(expr)
+        # The device-code walker reads ``static_cast<float>(a) / b`` as a
+        # comparison chain whose cast spans the quotient; the parentheses keep
+        # it on ``a``.
+        return f"((static_cast<float>({self.doprint(lhs)})) / ({self.doprint(rhs)}))"
+
+
+class _SignedIndexPrinter(_MetalPrinter):
     """Prints an expression in 64-bit signed arithmetic.
 
     Metal's index values (offsets, ``tid``, ``tgid``) are ``uint``, so a
@@ -76,4 +90,6 @@ def metal_texpr(expr: sympy.Expr) -> str:
     # wrong.
     if any(_needs_helper(node) for node in expr.atoms(FloorDiv, PythonMod)):
         return _SignedIndexPrinter().doprint(expr)
+    if expr.atoms(IntTrueDiv):
+        return _MetalPrinter().doprint(expr)
     return texpr(expr)

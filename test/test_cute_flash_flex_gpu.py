@@ -19,6 +19,7 @@ matcher, the hook renderer and the list-walk emitter. Expectations:
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 from pathlib import Path
@@ -44,11 +45,14 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_flash import compile_and_source
 import helion.language as hl
 from helion.runtime.kernel import Kernel
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from helion.runtime.kernel import BoundKernel
 
 # The pruned-interval campaign structure the flex seeds carry.
 PAIR_BODY: dict[str, object] = {
@@ -89,9 +93,19 @@ def _cute_kernel(kernel: Kernel) -> Kernel:
     )
 
 
-def _flex_kernel() -> Kernel:
+def _fresh_flex_kernel() -> Kernel:
+    """A flex example kernel with empty bind and compile caches."""
     module = import_path(EXAMPLES_DIR / "flex_attention.py")
     return _cute_kernel(module.helion_flex_attention_kernel)
+
+
+@functools.cache
+def _flex_kernel() -> Kernel:
+    """The module's one flex kernel: its bound kernels are keyed by the
+    arguments' specialization (shapes, dtypes, the hooks' code and closure
+    layout), so tests sharing a shape and a hook share one bind, and
+    ``_compile_flex`` compiles each (bind, config) once per process."""
+    return _fresh_flex_kernel()
 
 
 def _flex_args(
@@ -127,37 +141,58 @@ def _flex_args(
     )
 
 
+def _bind_flex(
+    args: tuple[Any, ...],
+    overrides: dict[str, object] | None,
+    *,
+    kernel: Kernel | None = None,
+) -> tuple[BoundKernel, helion.Config, cute_flash.FlashAttentionConfig]:
+    """Bind the flex kernel and resolve the default config plus ``overrides``,
+    asserting the surface is the flex plan category and the body the walk.
+    ``kernel`` (a fresh one) bypasses the module's shared kernel for a render
+    that depends on more than the arguments and the config (the environment)."""
+    bound = (_flex_kernel() if kernel is None else kernel).bind(args)
+    spec = bound.config_spec
+    assert spec.cute_flash_search_enabled
+    assert spec._cute_flash_score_modifier_kinds == ("flex",)
+    requested = {**spec.default_config().config, **(overrides or {})}
+    normalized = bound._normalized_config_copy(helion.Config(**requested))
+    resolved = spec._resolve_cute_flash_config(normalized.config)
+    assert resolved.pipeline_family == "fa4"
+    # (The list walk is persistent by default; an override pins either way.)
+    assert resolved.persistent == bool(requested[cute_flash.FLASH_PERSISTENT_KEY])
+    return bound, normalized, resolved
+
+
+def _render_flex(
+    args: tuple[Any, ...], overrides: dict[str, object] | None
+) -> tuple[cute_flash.FlashAttentionConfig, str]:
+    """The resolved config and the source of the flex kernel at the default
+    config plus ``overrides``, without compiling it."""
+    bound, normalized, resolved = _bind_flex(args, overrides)
+    code = bound.to_code(normalized)
+    assert "flash_flex_status" in code
+    return resolved, code
+
+
 def _compile_flex(
     args: tuple[Any, ...],
     overrides: dict[str, object] | None,
     *,
     expect_in_code: str | None = None,
-    code_sink: list[str] | None = None,
+    kernel: Kernel | None = None,
 ) -> tuple[Any, cute_flash.FlashAttentionConfig]:
-    """Compile the flex kernel at the default config plus ``overrides``,
-    asserting the surface is the flex plan category and the body the walk
-    (``code_sink`` receives the rendered source)."""
-    bound = _flex_kernel().bind(args)
-    spec = bound.config_spec
-    assert spec.cute_flash_search_enabled
-    assert spec._cute_flash_score_modifier_kinds == ("flex",)
-    base = spec.default_config().config
-    normalized = bound._normalized_config_copy(
-        helion.Config(**{**base, **(overrides or {})})
-    )
-    resolved = spec._resolve_cute_flash_config(normalized.config)
-    assert resolved.pipeline_family == "fa4"
-    # (The list walk is persistent by default; an override pins either way.)
-    assert resolved.persistent == bool(
-        {**base, **(overrides or {})}[cute_flash.FLASH_PERSISTENT_KEY]
-    )
-    code = bound.to_code(normalized)
+    """Compile the flex kernel at the default config plus ``overrides`` (see
+    ``_bind_flex``). ``BoundKernel.compile_config`` memoizes per normalized
+    config, so a second request for the same (bind, config) returns the first
+    compile; its source is read back from the compile's own render
+    (``get_cached_path``) rather than rendered again."""
+    bound, normalized, resolved = _bind_flex(args, overrides, kernel=kernel)
+    fn, code = compile_and_source(bound, normalized)
     assert "flash_flex_status" in code
     if expect_in_code is not None:
         assert expect_in_code in code
-    if code_sink is not None:
-        code_sink.append(code)
-    return bound.compile_config(normalized), resolved
+    return fn, resolved
 
 
 def _run_flex(
@@ -322,19 +357,39 @@ _REFERENCE_CASES = {
     "gqa": (2048, 2048, _causal, 8, 2, (128, 128)),
     "q256": (2048 + 128, 2048 + 128, _causal, 4, None, (256, 128)),
 }
+_REFERENCE_BODIES: dict[str, dict[str, object] | None] = {
+    "default": None,
+    "pair_desc": PAIR_DESC,
+    "staged_asc": STAGED_ASC,
+}
+# Every table geometry on the seeded (persistent, split-KV) walk; the pinned
+# bodies (the descending TMA-epilogue pair body at 16 columns, the ascending
+# staged-store body at 32) on the geometries that reach into the body: a
+# ragged query length (the epilogue's live-row guard), a half KV tile (the
+# chunk-level column mask), one KV block (the trivial walk in each order),
+# empty rows (zeros and -inf through each epilogue); the 256-row tables on
+# the TMA body and grouped heads on the staged body as one more check of
+# the walk-level features on a pinned body.  M != N is table geometry alone.
+_REFERENCE_GRID = [
+    *(("default", case) for case in sorted(_REFERENCE_CASES)),
+    *(
+        ("pair_desc", case)
+        for case in ("empty_rows", "one_kv_block", "q256", "ragged_m", "ragged_n")
+    ),
+    *(
+        ("staged_asc", case)
+        for case in ("empty_rows", "gqa", "one_kv_block", "ragged_m", "ragged_n")
+    ),
+]
 
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
-@pytest.mark.parametrize("case", sorted(_REFERENCE_CASES))
 @pytest.mark.parametrize(
-    "overrides",
-    [None, PAIR_DESC, STAGED_ASC],
-    ids=["default", "pair_desc", "staged_asc"],
+    ("body", "case"), _REFERENCE_GRID, ids=["-".join(row) for row in _REFERENCE_GRID]
 )
-def test_flex_matches_torch_flex_attention(
-    case: str, overrides: dict[str, object] | None
-) -> None:
+def test_flex_matches_torch_flex_attention(body: str, case: str) -> None:
+    overrides = _REFERENCE_BODIES[body]
     q_seq, kv_seq, mask, heads, kv_heads, block_sizes = _REFERENCE_CASES[case]
     batch = 2
     enable_gqa = kv_heads is not None
@@ -468,13 +523,17 @@ def test_strided_table_runs_match_torch(overrides: dict[str, object]) -> None:
     _assert_close_to_reference(out, lse, out_ref, lse_ref)
 
 
-def _edge_like_score_args(seed: int) -> tuple[Any, ...]:
+@functools.cache
+def _edge_like_score_args() -> tuple[Any, ...]:
     """Flex arguments with the graphormer-edge shape of score_mod over the band
     mask: a strided int32 row-table run (``types``, three reads per element),
-    a row-table vector (``lengths``) and a gathered bias table."""
+    a row-table vector (``lengths``) and a gathered bias table.  One instance
+    per process: the tests of this hook's prefetch and cooperative loads
+    compare against the same per-lane in-chunk kernel, which they then share
+    through ``_compile_flex``."""
     batch, heads, seq = 2, 4, 1024
     q, k, v = _qkv(batch, heads, seq, seq)
-    torch.manual_seed(seed)
+    torch.manual_seed(4)
     types = torch.randint(0, 8, (batch, seq, seq, 3), device=DEVICE, dtype=torch.int32)
     lengths = torch.randint(0, 4, (batch, seq, seq), device=DEVICE, dtype=torch.int32)
     table = torch.randn(heads, 24, device=DEVICE)
@@ -494,12 +553,14 @@ def _edge_like_score_args(seed: int) -> tuple[Any, ...]:
     return _flex_args(q, k, v, score_mod, block_mask)
 
 
-def _spatial_score_args(seed: int) -> tuple[Any, ...]:
+@functools.cache
+def _spatial_score_args() -> tuple[Any, ...]:
     """Flex arguments with the graphormer-spatial shape of score_mod over the
-    band mask: one int32 row-table vector feeding a gathered bias table."""
+    band mask: one int32 row-table vector feeding a gathered bias table (one
+    instance per process, as ``_edge_like_score_args``)."""
     batch, heads, seq = 2, 4, 1024
     q, k, v = _qkv(batch, heads, seq, seq)
-    torch.manual_seed(seed)
+    torch.manual_seed(4)
     dist = torch.randint(0, 7, (batch, seq, seq), device=DEVICE, dtype=torch.int32)
     bias = torch.randn(heads, 7, device=DEVICE)
 
@@ -522,33 +583,64 @@ _MULTI_COMPILE_TIMEOUT = pytest.mark.timeout(300)
 UNROLLED: dict[str, object] = {cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY: False}
 
 
+def _edge_like_per_lane_reference(
+    overrides: dict[str, object],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The output and LSE of the graphormer-edge hook's unrolled per-lane
+    in-chunk kernel (no prefetch, no cooperative load) on ``overrides``.
+    Each edge-like kernel takes ~20 s to compile, so the prefetch and
+    cooperative cases compare against this one kernel, compiled once per
+    process by ``_compile_flex``."""
+    args = _edge_like_score_args()
+    fn, resolved = _compile_flex(
+        args,
+        {
+            **overrides,
+            **UNROLLED,
+            cute_flash.FLASH_FLEX_PREFETCH_KEY: 0,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: 0,
+        },
+    )
+    assert resolved.flex_prefetch == 0 and resolved.flex_coalesce == 0
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    return out, lse
+
+
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
+@pytest.mark.slow  # two ~20 s compiles of the edge-like hook per case
 @_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize("budget", [32, 128])
 @pytest.mark.parametrize(
     "overrides", [PAIR_DESC, STAGED_ASC], ids=["pair_desc", "staged_asc"]
 )
 def test_next_chunk_table_prefetch_is_bitwise_the_in_chunk_loads(
-    overrides: dict[str, object],
+    overrides: dict[str, object], budget: int
 ) -> None:
     """``cute_flash_flex_prefetch``: the row-table vector and the shared
     strided run issued ahead (budgets 32: the vector one chunk ahead, and
     128: both one ahead at 32 columns, two ahead at 16) give the same
     output and LSE as the in-chunk loads, on partial and full tiles; the
     body is pinned unrolled (``UNROLLED``)."""
-    args = _edge_like_score_args(4)
-    results: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-    for budget in (0, 32, 128):
-        fn, resolved = _compile_flex(
-            args, {**overrides, **UNROLLED, cute_flash.FLASH_FLEX_PREFETCH_KEY: budget}
-        )
-        assert resolved.flex_prefetch == budget
-        out, lse = fn(*args)
-        torch.cuda.synchronize()
-        results[budget] = (out, lse)
-    for budget in (32, 128):
-        assert torch.equal(results[budget][0], results[0][0])
-        assert torch.equal(results[budget][1], results[0][1])
+    args = _edge_like_score_args()
+    out_ref, lse_ref = _edge_like_per_lane_reference(overrides)
+    # Coalescing off, as on the reference: a coalesced run is streamed, not
+    # prefetched, so the budget would otherwise be inert.
+    fn, resolved = _compile_flex(
+        args,
+        {
+            **overrides,
+            **UNROLLED,
+            cute_flash.FLASH_FLEX_PREFETCH_KEY: budget,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: 0,
+        },
+    )
+    assert resolved.flex_prefetch == budget and resolved.flex_coalesce == 0
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
 
 
 @skipIfNotCUDA()
@@ -563,11 +655,17 @@ def test_deep_table_prefetch_lead_is_bitwise_the_in_chunk_loads(
     """A single-vector score_mod at budget 128 runs three (32 columns) /
     seven (16 columns) chunks ahead and gives the same output and LSE as
     the in-chunk loads."""
-    args = _spatial_score_args(4)
+    args = _spatial_score_args()
     deep: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     for budget in (0, 128):
         fn, resolved = _compile_flex(
-            args, {**overrides, **UNROLLED, cute_flash.FLASH_FLEX_PREFETCH_KEY: budget}
+            args,
+            {
+                **overrides,
+                **UNROLLED,
+                cute_flash.FLASH_FLEX_PREFETCH_KEY: budget,
+                cute_flash.FLASH_FLEX_COALESCE_KEY: 0,
+            },
         )
         assert resolved.flex_prefetch == budget
         out, lse = fn(*args)
@@ -589,6 +687,7 @@ WIDE_OVER_Q: dict[str, object] = {
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
+@pytest.mark.slow  # two ~20 s compiles of the edge-like hook per case
 @_MULTI_COMPILE_TIMEOUT
 @pytest.mark.parametrize(
     ("overrides", "width"),
@@ -613,34 +712,23 @@ def test_cooperative_table_loads_are_bitwise_the_per_lane_vectors(
     """``cute_flash_flex_coalesce``: the row-table runs fetched
     warp-cooperatively (whole lines of 4 / 8 / 16 rows per request at 128 /
     64 / 32 bytes per row) and staged through the warp's shared-memory
-    buffer give the same output and LSE as the per-lane vectors, with and
-    without the ring prefetch, on partial and full tiles; at 16-column
-    chunks the 64-byte spans cap the request at 64, so the pair_desc body
-    offers no 128.  The body is pinned unrolled (``UNROLLED``) so the ring
-    prefetch cases exist."""
-    args = _edge_like_score_args(5)
+    buffer give the same output and LSE as the per-lane vectors, on partial
+    and full tiles; at 16-column chunks the 64-byte spans cap the request at
+    64, so the pair_desc body offers no 128.  The body is pinned unrolled
+    (``UNROLLED``, the loop the cooperative stream runs in).  The ring
+    prefetch is not a second axis here: runs the cooperative stream carries
+    are not register-prefetched (``_prefetch_plan``), so every load of this
+    hook being such a run, a prefetch budget renders the same source."""
+    args = _edge_like_score_args()
+    out_ref, lse_ref = _edge_like_per_lane_reference(overrides)
     fn, resolved = _compile_flex(
-        args, {**overrides, **UNROLLED, cute_flash.FLASH_FLEX_COALESCE_KEY: 0}
+        args, {**overrides, **UNROLLED, cute_flash.FLASH_FLEX_COALESCE_KEY: width}
     )
-    assert resolved.flex_coalesce == 0
-    out_ref, lse_ref = fn(*args)
+    assert resolved.flex_coalesce == width, (width, resolved.flex_coalesce)
+    out, lse = fn(*args)
     torch.cuda.synchronize()
-    for prefetch in (0, 128):
-        fn, resolved = _compile_flex(
-            args,
-            {
-                **overrides,
-                **UNROLLED,
-                cute_flash.FLASH_FLEX_COALESCE_KEY: width,
-                cute_flash.FLASH_FLEX_PREFETCH_KEY: prefetch,
-            },
-        )
-        assert resolved.flex_coalesce == width, (width, resolved.flex_coalesce)
-        assert resolved.flex_prefetch == prefetch
-        out, lse = fn(*args)
-        torch.cuda.synchronize()
-        assert torch.equal(out, out_ref), (width, prefetch)
-        assert torch.equal(lse, lse_ref), (width, prefetch)
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
 
 
 @skipIfNotCUDA()
@@ -657,7 +745,7 @@ def test_cooperative_loads_of_the_spatial_vector_table_are_bitwise(
     """The spatial shape (one int32 vector table, a 36 KB staging at 32
     columns): a 128-byte request resolves to the widest width the body
     offers and gives the same output and LSE as the per-lane vectors."""
-    args = _spatial_score_args(5)
+    args = _spatial_score_args()
     fn, resolved = _compile_flex(
         args, {**overrides, **UNROLLED, cute_flash.FLASH_FLEX_COALESCE_KEY: 0}
     )
@@ -688,7 +776,7 @@ def test_rolled_chunk_loop_is_bitwise_the_unrolled_kernel(
     """The rolled PASS1 chunk loop (``cute_flash_flex_rolled_chunks``), with
     and without the cp.async stream, gives the same output and LSE as the
     unrolled per-lane kernel."""
-    args = _spatial_score_args(5)
+    args = _spatial_score_args()
     fn, resolved = _compile_flex(
         args, {**overrides, **UNROLLED, cute_flash.FLASH_FLEX_COALESCE_KEY: 0}
     )
@@ -1110,22 +1198,12 @@ def test_tmem_rowmax_is_bitwise_the_software_rowmax_on_the_list_walk(
     )
     args = _flex_args(q, k, v, _identity, block_mask)
     base = {**RESIDENT_REP32, cute_flash.FLASH_S_RESIDENT_KEY: resident}
-    fn, resolved = _compile_flex(args, base)
-    assert resolved.rowmax == "software" and resolved.s_resident is resident
-    bound = _flex_kernel().bind(args)
-    probe = bound.config_spec._resolve_cute_flash_config(
-        bound._normalized_config_copy(
-            helion.Config(
-                **{
-                    **bound.config_spec.default_config().config,
-                    **base,
-                    cute_flash.FLASH_ROWMAX_KEY: "tmem",
-                }
-            )
-        ).config
-    )
+    # Resolve before compiling anything: most devices skip here.
+    _, _, probe = _bind_flex(args, {**base, cute_flash.FLASH_ROWMAX_KEY: "tmem"})
     if probe.rowmax != "tmem":
         pytest.skip("this device's policy has no TMEM row reduction (GB300 only)")
+    fn, resolved = _compile_flex(args, base)
+    assert resolved.rowmax == "software" and resolved.s_resident is resident
     out_ref, lse_ref = fn(*args)
     torch.cuda.synchronize()
     fn, resolved = _compile_flex(
@@ -1241,7 +1319,9 @@ def test_absent_stage_mma_skip_is_bitwise_the_unskipped_kernel(
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
-@pytest.mark.parametrize("q_seq", [64, 128, 384, 1152])
+# One half-live tile; one full tile with a dead second stage; a full pair
+# ahead of that tile (longer lengths repeat the same last pair).
+@pytest.mark.parametrize("q_seq", [64, 128, 384])
 def test_ragged_query_tma_epilogue_is_bitwise_the_staged_store(q_seq: int) -> None:
     """The TMA output store of a ragged query length (``M % 256 != 0``) stores
     only the live rows of the last pair: a full tile through TMA, a half-live
@@ -1363,6 +1443,11 @@ def test_dead_stage_split_merges_both_softmax_warpgroups(
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
+# kv_seq: the one-word register walk (16 KV tiles) and the cursor walk over
+# the words table (34, 64 tiles); kv_order: the slice comes off either end
+# of the walk word; epilogue: the staged store, the TMA store on an even
+# length, the shared softmax region's merge, grouped heads, the two-word
+# register walk; tail_split: the split widths 2, 4 and 8 across those.
 @pytest.mark.parametrize(
     ("tail_split", "kv_order", "kv_seq", "epilogue"),
     [
@@ -1575,10 +1660,13 @@ def test_tail_split_forced_timeout_leaves_the_merge_to_the_last_arriver() -> Non
         expect_in_code="flash_split_polls < cutlass.Int32(1024)",
     )
     with patch.dict(os.environ, {"HELION_CUTE_FLASH_FLEX_TAIL_SPIN_POLLS": "0"}):
+        # The same config renders differently under the patched environment:
+        # a fresh kernel keeps it out of the shared compile cache.
         timeout_fn, _ = _compile_flex(
             args,
             {**base, cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: 4},
             expect_in_code="flash_split_polls < cutlass.Int32(0)",
+            kernel=_fresh_flex_kernel(),
         )
     out_free, lse_free = free_fn(*args)
     out_timeout, lse_timeout = timeout_fn(*args)
@@ -1669,7 +1757,7 @@ def test_tail_split_gqa_grid_replays_under_a_cuda_graph() -> None:
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
-@pytest.mark.parametrize("kv_split", [2, 4])
+@_MULTI_COMPILE_TIMEOUT
 @pytest.mark.parametrize(
     ("q_seq", "kv_seq", "body", "dead_split"),
     [
@@ -1688,7 +1776,7 @@ def test_tail_split_gqa_grid_replays_under_a_cuda_graph() -> None:
     ],
 )
 def test_split_kv_walk_matches_the_unsplit_kernel(
-    kv_split: int, q_seq: int, kv_seq: int, body: dict[str, object], dead_split: bool
+    q_seq: int, kv_seq: int, body: dict[str, object], dead_split: bool
 ) -> None:
     """``cute_flash_kv_split``: every work item's KV walk over two or four
     CTAs, each walking a contiguous slice of the union walk and the last
@@ -1698,7 +1786,8 @@ def test_split_kv_walk_matches_the_unsplit_kernel(
     dead-stage split on and off and the persistent item loop: within the
     merge's rounding of the unsplit kernel (another summation order, LSE
     within 1e-3; the empty rows bitwise) and close to torch; repeated
-    launches agree bitwise (the arrival counters reset themselves)."""
+    launches agree bitwise (the arrival counters reset themselves).  Both
+    split counts run against one compile of the unsplit kernel."""
     batch, heads = 4, 8
     torch.manual_seed(5)
     table = (
@@ -1733,27 +1822,34 @@ def test_split_kv_walk_matches_the_unsplit_kernel(
         cute_flash.FLASH_FLEX_DEAD_STAGE_SPLIT_KEY: dead_split,
     }
     one_fn, one_cfg = _compile_flex(args, {**base, cute_flash.FLASH_KV_SPLIT_KEY: 1})
-    split_fn, split_cfg = _compile_flex(
-        args, {**base, cute_flash.FLASH_KV_SPLIT_KEY: kv_split}
-    )
-    assert one_cfg.kv_split == 1 and split_cfg.kv_split == kv_split
-    assert split_cfg.flex_dead_stage_split is dead_split
+    assert one_cfg.kv_split == 1
     out_one, lse_one = one_fn(*args)
-    out_split, lse_split = split_fn(*args)
     torch.cuda.synchronize()
     out_ref, lse_ref = _reference(q, k, v, None, block_mask)
-    _assert_close_to_reference(out_split, lse_split, out_ref, lse_ref)
-    torch.testing.assert_close(out_split.float(), out_one.float(), atol=1e-2, rtol=1e-2)
     finite = torch.isfinite(lse_one)
-    assert torch.equal(finite, torch.isfinite(lse_split))
-    torch.testing.assert_close(lse_split[finite], lse_one[finite], atol=1e-3, rtol=0)
-    assert torch.equal(lse_split[~finite], lse_one[~finite])
-    assert torch.all(out_split[~finite] == 0)
-    for _ in range(3):
-        out_again, lse_again = split_fn(*args)
+    for kv_split in (2, 4):
+        split_fn, split_cfg = _compile_flex(
+            args, {**base, cute_flash.FLASH_KV_SPLIT_KEY: kv_split}
+        )
+        assert split_cfg.kv_split == kv_split
+        assert split_cfg.flex_dead_stage_split is dead_split
+        out_split, lse_split = split_fn(*args)
         torch.cuda.synchronize()
-        assert torch.equal(out_again, out_split)
-        assert torch.equal(lse_again, lse_split)
+        _assert_close_to_reference(out_split, lse_split, out_ref, lse_ref)
+        torch.testing.assert_close(
+            out_split.float(), out_one.float(), atol=1e-2, rtol=1e-2
+        )
+        assert torch.equal(finite, torch.isfinite(lse_split))
+        torch.testing.assert_close(
+            lse_split[finite], lse_one[finite], atol=1e-3, rtol=0
+        )
+        assert torch.equal(lse_split[~finite], lse_one[~finite])
+        assert torch.all(out_split[~finite] == 0)
+        for _ in range(3):
+            out_again, lse_again = split_fn(*args)
+            torch.cuda.synchronize()
+            assert torch.equal(out_again, out_split), kv_split
+            assert torch.equal(lse_again, lse_split), kv_split
 
 
 def _copy_tables(args: tuple[Any, ...], block_mask: Any) -> None:
@@ -2289,8 +2385,9 @@ def _documents_320(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
 # dtype, whether the knob renders the plain hook: a table gather or a
 # predicate the keep-word peephole does not fold (``// 320``), or no mask).
 _FAST_FULL_CASES: dict[str, tuple[Any, ...]] = {
+    # 2000 (even, both stages of the last pair partly live) and 3001 (odd:
+    # the unaligned epilogue); longer even lengths repeat 2000's last pair.
     "ragged_causal_2000": (2, 2, 2, 2000, 2000, _causal, {}, torch.bfloat16, False),
-    "ragged_causal_4000": (1, 2, 2, 4000, 4000, _causal, {}, torch.bfloat16, False),
     "ragged_causal_3001": (1, 2, 2, 3001, 3001, _causal, {}, torch.bfloat16, False),
     "ragged_causal_fp16": (2, 2, 2, 2000, 2000, _causal, {}, torch.float16, False),
     "ragged_causal_resident": (
@@ -2316,8 +2413,9 @@ _FAST_FULL_CASES: dict[str, tuple[Any, ...]] = {
         False,
     ),
     "causal_diagonal": (2, 2, 2, 2048, 2048, _causal, {}, torch.bfloat16, False),
+    # A window inside one pair (its two partial edges meet) and one wider
+    # than a pair (full tiles between them); 512 falls between the two.
     "window_256": (2, 2, 2, 2048, 2048, _window(256), {}, torch.bfloat16, False),
-    "window_512": (2, 2, 2, 2048, 2048, _window(512), {}, torch.bfloat16, False),
     "window_1024": (2, 2, 2, 2048, 2048, _window(1024), {}, torch.bfloat16, False),
     "band": (2, 4, 4, 2048, 2048, _band, {}, torch.bfloat16, False),
     "band_gqa_persistent": (
@@ -2384,24 +2482,26 @@ def test_flex_hook_fast_full_is_bitwise_the_plain_hook(case: str) -> None:
         q, k, v, _identity, block_mask, mask_mod=mask_arg, enable_gqa=kv_heads != heads
     )
     base = {**base, cute_flash.FLASH_KV_SPLIT_KEY: 1}
-    plain_code: list[str] = []
-    fn, resolved = _compile_flex(args, base, code_sink=plain_code)
+    fast = {**base, cute_flash.FLASH_FLEX_HOOK_FAST_FULL_KEY: True}
+    if plain:
+        # The knob renders the same source: compare the renders, compile nothing.
+        resolved, plain_code = _render_flex(args, base)
+        assert resolved.flex_hook_fast_full is False and not resolved.s_resident
+        resolved, fast_code = _render_flex(args, fast)
+        assert resolved.flex_hook_fast_full is True
+        assert fast_code == plain_code
+        return
+    fn, resolved = _compile_flex(args, base)
     assert resolved.flex_hook_fast_full is False
     assert resolved.s_resident is (case == "ragged_causal_resident")
     out_ref, lse_ref = fn(*args)
     torch.cuda.synchronize()
-    fast_code: list[str] = []
     fn, resolved = _compile_flex(
         args,
-        {**base, cute_flash.FLASH_FLEX_HOOK_FAST_FULL_KEY: True},
-        code_sink=fast_code,
+        fast,
+        expect_in_code="flash_flex_needs_mask = cutlass.Boolean(cute.arch.vote_any_sync(flash_flex_masked))",
     )
     assert resolved.flex_hook_fast_full is True
-    vote = "flash_flex_needs_mask = cutlass.Boolean(cute.arch.vote_any_sync(flash_flex_masked))"
-    if plain:
-        assert fast_code == plain_code
-        return
-    assert vote in fast_code[0]
     out, lse = fn(*args)
     torch.cuda.synchronize()
     assert torch.equal(out, out_ref)

@@ -1860,6 +1860,15 @@ def vectorize_branch_local_persistent_fragments(
     proven_tensor_stride_values: Mapping[tuple[str, int], int] | None = None,
 ) -> list[ast.stmt]:
     """Vectorize marked exact fragments and erase every unhandled marker."""
+    if not any(
+        isinstance(node, ast.Name) and node.id in (_LOAD_MARKER, _STORE_MARKER)
+        for stmt in body
+        for node in ast.walk(stmt)
+    ):
+        # Without a load or store marker the walk below restores nothing and
+        # vectorizes nothing. Keep the location fix-up the full path applies,
+        # since later passes unparse statements created without locations.
+        return ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])).body
     vectorizer = _BranchLocalPersistentVectorizer(
         body,
         proven_disjoint_tensor_pairs or set(),

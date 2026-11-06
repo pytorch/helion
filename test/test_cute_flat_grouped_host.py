@@ -24,6 +24,8 @@ from helion._compiler.cute.tcgen05_flat_grouped_ir import prove_flat_grouped_rna
 from helion._compiler.type_info import LiteralType
 from helion._testing import import_example
 
+pytestmark = pytest.mark.cpu_only
+
 jagged_dense_bmm = import_example("jagged_dense_bmm").jagged_dense_bmm
 
 if TYPE_CHECKING:

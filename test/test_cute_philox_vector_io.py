@@ -30,6 +30,8 @@ from helion._compiler.cute.philox_stream import SCALAR_CONSTRAINTS
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _source(width=4, predicate="index < length", extra=""):
     return f"""def kernel(src, out, seed, start, length, p, scale, other):

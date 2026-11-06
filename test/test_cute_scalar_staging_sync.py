@@ -8,7 +8,6 @@ import pytest
 import torch
 
 from test import test_cute_lowerings
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_consumer_if
@@ -16,7 +15,10 @@ from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_if
 from helion._compiler.cute.cute_mma import _Tcgen05ScalarSmemSync
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 matmul_custom_key = import_example("aot_example").matmul_custom_key
 
@@ -42,7 +44,7 @@ def _native_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 @pytest.fixture(autouse=True)
 def _target(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("HELION_CUTE_MMA_IMPL", "auto")
-    with _cpu_target():
+    with cpu_target():
         yield
 
 

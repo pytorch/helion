@@ -25,6 +25,8 @@ from helion.language import _tracing_ops
 from helion.language import creation_ops
 from helion.language import memory_ops
 
+pytestmark = pytest.mark.cpu_only
+
 squeeze_and_excitation_net_fwd = import_example(
     "squeeze_and_excitation_net"
 ).squeeze_and_excitation_net_fwd

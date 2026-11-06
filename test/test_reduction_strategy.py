@@ -16,6 +16,8 @@ from helion._compiler.flydsl.backend import FlyDSLBackend
 from helion._compiler.metal.backend import MetalBackend
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion._compiler.backend import Backend
 

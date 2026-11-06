@@ -17,8 +17,12 @@ from __future__ import annotations
 import ast
 import textwrap
 
+import pytest
+
 from helion._compiler.cute.fuse_fp8_pair_decode import fuse_fp8_pair_decode
 from helion._testing import TestCase
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _run(src: str) -> str:

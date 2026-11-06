@@ -8,18 +8,20 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
 from test.cute_population_contracts import with_flat_min_blocks_default
 
 import helion
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner import LFBOTreeSearch
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
@@ -43,14 +45,14 @@ def test_compound_small_row_seed_reaches_full_random_population(dtype, renorm):
     cuda_initialized_before = torch.cuda.is_initialized()
     args = (torch.empty((4, 512), dtype=dtype), 10, renorm)
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile() as forbidden,
+        forbid_native_compile() as forbidden,
         patch(
             "torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")
         ) as lazy_init,
     ):
-        bound = _cpu_bind(_generic_weights, args)
+        bound = cpu_bind(_generic_weights, args)
         spec = bound.config_spec
         assert spec.cute_topk_search_enabled
         assert spec.compiler_default_config is None

@@ -18,6 +18,8 @@ from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 
+pytestmark = pytest.mark.cpu_only
+
 KEY = "cute_reduction_local_tree"
 
 

@@ -29,6 +29,8 @@ from helion._testing import skipUnlessBackends
 from helion.autotuner.compiler_coverage import append_compiler_coverage
 from helion.autotuner.config_generation import ConfigGeneration
 
+pytestmark = pytest.mark.cpu_only
+
 ROW = "cute_reduction_row_schedule"
 PACK = "cute_reduction_pack_output"
 

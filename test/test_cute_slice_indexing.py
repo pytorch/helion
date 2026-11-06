@@ -118,10 +118,10 @@ def test_concatenate_serial_slice_coordinates(
 def test_concatenate_separates_grid_and_full_slice_thread_axes(
     proven_bounds: bool,
 ) -> None:
-    from test._cute_binding import _cpu_bind
+    from helion._testing.cute_codegen import cpu_bind
 
     kernel = helion.kernel(concat2d_dim1_simple.fn, backend="cute", static_shapes=True)
-    bound = _cpu_bind(kernel, (torch.empty(256, 128), torch.empty(256, 256)))
+    bound = cpu_bind(kernel, (torch.empty(256, 128), torch.empty(256, 256)))
     # This candidate used to put the row and the second input's full slice
     # on the same axis. The serial first slice must not reserve a thread axis.
     code = bound.to_code(_concatenate_parallel_config(proven_bounds))
@@ -140,7 +140,7 @@ def test_concatenate_separates_grid_and_full_slice_thread_axes(
 
 @skipUnlessBackends(["cute"])
 def test_atomic_slice_rejects_distinct_update_coordinate_axis() -> None:
-    from test._cute_binding import _cpu_bind
+    from helion._testing.cute_codegen import cpu_bind
 
     @helion.kernel(backend="cute", static_shapes=True)
     def atomic_slice(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
@@ -148,7 +148,7 @@ def test_atomic_slice_rejects_distinct_update_coordinate_axis() -> None:
             hl.atomic_add(out, [row.index + 1, slice(None)], x[row, col])
         return out
 
-    bound = _cpu_bind(atomic_slice, (torch.empty((8, 8)), torch.empty((9, 8))))
+    bound = cpu_bind(atomic_slice, (torch.empty((8, 8)), torch.empty((9, 8))))
     with pytest.raises(BackendUnsupported, match="distinct tile axes"):
         bound.to_code(helion.Config())
 
@@ -177,7 +177,7 @@ def test_atomic_cas_slice_masks_tail_and_returns_previous_values() -> None:
 @pytest.mark.parametrize("partial", [False, True])
 @skipUnlessBackends(["cute"])
 def test_atomic_slice_rejects_flattened_distinct_update_axes(partial: bool) -> None:
-    from test._cute_binding import _cpu_bind
+    from helion._testing.cute_codegen import cpu_bind
 
     @helion.kernel(backend="cute", static_shapes=True)
     def atomic_slice(
@@ -190,7 +190,7 @@ def test_atomic_slice_rejects_flattened_distinct_update_axes(partial: bool) -> N
                 hl.atomic_add(out, [slice(None)], x[row, col].reshape(-1))
         return out
 
-    bound = _cpu_bind(
+    bound = cpu_bind(
         atomic_slice, (torch.empty((8, 8)), torch.empty(66 if partial else 64), partial)
     )
     # The flattening reshape is refused before the atomic sees its value: an

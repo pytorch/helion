@@ -12,8 +12,6 @@ import numpy as np
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion import exc
 from helion._compiler.ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
@@ -23,6 +21,9 @@ from helion._compiler.cute.resident_sequence import materialize_resident_sequenc
 from helion._compiler.tile_strategy import _lane_reduce_marker_expr
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -589,7 +590,7 @@ def test_unchanged_examples_emit_logical_reduction_phases(
     row_softmax = import_example("aot_example").row_softmax
     welford = import_example("welford").welford
 
-    from test._cute_binding import _cpu_bind
+    from helion._testing.cute_codegen import cpu_bind
 
     monkeypatch.setenv("HELION_DISABLE_ONLINE_TO_3PASS", "0" if online_rewrite else "1")
     function = welford.fn if kind == "welford" else row_softmax.fn
@@ -612,14 +613,14 @@ def test_unchanged_examples_emit_logical_reduction_phases(
         cute_cluster_n=1,
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(kernel, arguments)
+        bound = cpu_bind(kernel, arguments)
         code = bound.to_code(config)
     assert "_helion_sequence_reduce" not in code
     assert "sequence_acc" in code

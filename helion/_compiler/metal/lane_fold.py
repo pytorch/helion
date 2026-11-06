@@ -43,6 +43,8 @@ from .reduction import combine_expr
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    import torch
+
 _Node = TypeVar("_Node", bound=ast.AST)
 
 #: The marker ``MetalPersistentReductionStrategy.codegen_reduction`` emits.
@@ -54,22 +56,42 @@ LANE_FOLD = "_metal_lane_fold"
 #: (``CUTE_REGISTER_TILE_MAX_ELEMENTS``).
 MAX_LANE_COPIES = 64
 
+#: Most bytes of lane arrays one split keeps per thread.  Measured on Apple
+#: GPUs: arrays of 16-bit loads up to 64 bytes were neutral or faster than
+#: reloading, 128 bytes mixed and 256 bytes up to 2.3x slower; 32-bit arrays
+#: were neutral to 5% slower at any size, so only narrower loads are kept.
+MAX_LANE_ARRAY_BYTES = 64
 
-def unroll_lane_folds(body: list[ast.stmt]) -> list[ast.stmt]:
+
+class LaneArrayBudget:
+    """The per-thread lane arrays of one split, ``lanes`` elements each."""
+
+    def __init__(self, lanes: int) -> None:
+        self.lanes = lanes
+        self.left = MAX_LANE_ARRAY_BYTES
+
+    def take(self, dtype: torch.dtype) -> bool:
+        """Whether a load of ``dtype`` gets an array, charging it if so."""
+        size = self.lanes * dtype.itemsize
+        if dtype.itemsize >= 4 or size > self.left:
+            return False
+        self.left -= size
+        return True
+
+
+def unroll_lane_folds(
+    body: list[ast.stmt], reads: Callable[[ast.stmt], set[str]]
+) -> list[ast.stmt]:
     """Unroll and jam every lane loop that carries a fold; *body* itself when
-    it has none."""
-    lanes = _fold_lanes(body)
+    it has none.  *reads* gives the names a statement reads, which for an
+    MPP element loop excludes the names it binds and defines itself."""
+    lanes = folded_lanes(body)
     if not lanes:
         return body
     lane_names: set[str] = set()
     result = _unroll(body, lanes, lane_names)
-    assert not _fold_lanes(result), "a lane fold outside its lane loop"
-    leaked = lane_names & {
-        node.id
-        for stmt in result
-        for node in ast.walk(stmt)
-        if isinstance(node, ast.Name)
-    }
+    assert not folded_lanes(result), "a lane fold outside its lane loop"
+    leaked = lane_names & set().union(*map(reads, result))
     assert not leaked, f"lane-dependent names used outside their lane loop: {leaked}"
     return result
 
@@ -98,7 +120,7 @@ def _is_fold_stmt(stmt: ast.stmt) -> bool:
     return isinstance(stmt, ast.Assign) and _is_fold(stmt.value)
 
 
-def _fold_lanes(stmts: list[ast.stmt]) -> set[str]:
+def folded_lanes(stmts: list[ast.stmt]) -> set[str]:
     lanes: set[str] = set()
     for stmt in stmts:
         for node in ast.walk(stmt):
@@ -136,11 +158,40 @@ def _writes(tree: ast.AST) -> set[str]:
     }
 
 
+#: The integer-rounded float -> bfloat conversion every lane copy uses
+#: (``metal_jit`` emits its definition when it is referenced).
+BF16_CAST = "helion_bf16_cast"
+
+
 class _RenameLane(ast.NodeTransformer):
     def __init__(self, dependent: set[str], lane: str, index: int) -> None:
         self.dependent = dependent
         self.lane = lane
         self.index = index
+
+    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+        # Metal miscompiles float -> bfloat conversions that lane copies
+        # multiply (exact in float16 and float32 at the same MSL); round
+        # them in integer arithmetic, as the MPP path's float tiles do.
+        self.generic_visit(node)
+        if (
+            isinstance(node.left, ast.Name)
+            and node.left.id == "static_cast"
+            and len(node.ops) == 2
+            and isinstance(node.ops[0], ast.Lt)
+            and isinstance(node.ops[1], ast.Gt)
+            and isinstance(node.comparators[0], ast.Name)
+            and node.comparators[0].id == "bfloat"
+        ):
+            return ast.copy_location(
+                ast.Call(
+                    func=ast.Name(id=BF16_CAST, ctx=ast.Load()),
+                    args=[node.comparators[1]],
+                    keywords=[],
+                ),
+                node,
+            )
+        return node
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         if node.id == self.lane:

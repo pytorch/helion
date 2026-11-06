@@ -9,9 +9,6 @@ from packaging.version import Version
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
 from test.test_autotuner_heuristics import _grouped_worklist_kernel_body
@@ -32,6 +29,10 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_flash import seeds_per_codegen_branch
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.runtime.cute.launcher import _tcgen05_grouped_device_source_m_tile_supported
@@ -99,8 +100,8 @@ def test_source128_codegen_retains_live_offsets_and_feature_tail(
         torch.empty((8, 160, 256), dtype=torch.bfloat16),
         torch.tensor([0, 0, 1, 129, 257, 512, 639, 640, 640], dtype=offset_dtype),
     )
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped_fp32_output, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped_fp32_output, args)
         config = bound.config_spec.normalized_config(_config(cluster_m, block_k))
         source = bound.to_code(config)
     plan = next(
@@ -173,16 +174,16 @@ def test_typed_device_seeds_and_promotion_survive_newer_dsl(
         metadata,
     )
     with (
-        _forbid_cuda_work(),
+        forbid_cuda_work(),
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch(
             "helion._compiler.cute.cutedsl_compat._installed_cute_dsl_version",
             return_value=_CuteDSLVersionProbe(version=Version("4.8.0")),
         ),
     ):
         assert not tcgen05_runtime_n_ptx_compatible()
-        bound = _cpu_bind(kernel, args)
+        bound = cpu_bind(kernel, args)
         seeds = bound.config_spec.compiler_seed_configs
         assert seeds
         assert CuteTcgen05GroupedWorklistHeuristic.should_promote(bound.env)
@@ -198,6 +199,21 @@ def test_typed_device_seeds_and_promotion_survive_newer_dsl(
         assert "worklist_nm" in fields[MODE].search_choices
         assert 128 in fields[SOURCE].search_choices
         for seed in source128:
+            assert seed[MODE] == "worklist_nm"
+        # The source128 codegen branches on the CTA group, the cluster N, the
+        # bounded D shift, the orientation and the MMA N; the other seed axes
+        # (stage depths, L2 swizzle) re-parameterize the same text.  Render
+        # the first seed of each branch and the last seed instead of all.
+        for seed in seeds_per_codegen_branch(
+            source128,
+            lambda seed: (
+                seed["tcgen05_cluster_m"],
+                seed.get("tcgen05_cluster_n"),
+                seed.get(SHIFTED),
+                seed.get("tcgen05_grouped_worklist_orientation"),
+                seed.get("tcgen05_grouped_worklist_mma_n"),
+            ),
+        ):
             ast.parse(bound.to_code(seed))
 
 
@@ -207,8 +223,8 @@ def test_source128_seeds_reach_a_cold_full_initial_population() -> None:
         torch.empty((8, 256, 512), dtype=torch.bfloat16),
         torch.arange(9, dtype=torch.int32) * 256,
     )
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped_fp32_output, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped_fp32_output, args)
         state = random.getstate()
         try:
             random.seed(281)
@@ -244,15 +260,15 @@ def test_external_worklist_retains_the_runtime_n_dsl_gate() -> None:
         torch.tensor([[0, 0, 128, 256], [1, 256, 128, 256]], dtype=torch.int32),
     )
     with (
-        _forbid_cuda_work(),
+        forbid_cuda_work(),
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch(
             "helion._compiler.cute.cutedsl_compat._installed_cute_dsl_version",
             return_value=_CuteDSLVersionProbe(version=Version("4.8.0")),
         ),
     ):
-        bound = _cpu_bind(kernel, args)
+        bound = cpu_bind(kernel, args)
         assert bound.host_function is not None
         assert not tcgen05_runtime_n_ptx_compatible()
         assert (
@@ -286,9 +302,9 @@ def test_source128_seed_depths_use_physical_smem_and_preserve_old_prefix() -> No
         return device_tiles(*arguments, **keywords)
 
     with (
-        _forbid_cuda_work(),
+        forbid_cuda_work(),
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch(
             "helion._compiler.autotuner_heuristics.cute._tcgen05_grouped_physical_k_seeds",
             return_value=[],
@@ -303,7 +319,7 @@ def test_source128_seed_depths_use_physical_smem_and_preserve_old_prefix() -> No
             "helion._compiler.autotuner_heuristics.cute._tcgen05_grouped_source128_seeds",
             return_value=[],
         ):
-            previous = _cpu_bind(_grouped_fp32_output, args)
+            previous = cpu_bind(_grouped_fp32_output, args)
             old_seeds = deepcopy(
                 [
                     seed
@@ -312,7 +328,7 @@ def test_source128_seed_depths_use_physical_smem_and_preserve_old_prefix() -> No
                 ]
             )
             old_default = deepcopy(previous.config_spec.compiler_default_config)
-        bound = _cpu_bind(_grouped_fp32_output, args)
+        bound = cpu_bind(_grouped_fp32_output, args)
         all_seeds = bound.config_spec.compiler_seed_configs
         seeds = [seed for seed in all_seeds if seed.get(SHIFTED) is not True]
         shifted = [seed for seed in all_seeds if seed.get(SHIFTED) is True]
@@ -340,6 +356,9 @@ def test_source128_seed_depths_use_physical_smem_and_preserve_old_prefix() -> No
             assert seed.get("num_sm_multiplier", 1) * required < 232448
 
 
+# 16 cases: each metadata kind is a different kernel and device layout, each
+# metadata dtype a different device bounds load, each cluster_m a CTA group
+# (ONE/TWO) and each block_k a different operand smem layout and stage shape.
 @pytest.mark.cuda
 @pytest.mark.parametrize("metadata_kind", ["offsets", "split_sizes"])
 @pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])

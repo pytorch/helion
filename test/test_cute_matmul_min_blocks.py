@@ -10,7 +10,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
 from test.test_cute_flash_exp2 import _dense_attention_output
@@ -21,6 +20,7 @@ from helion._compiler.autotuner_heuristics.cute_launch_bounds import (
     register_matmul_min_blocks_coverage,
 )
 from helion._testing import import_example
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner import LFBOTreeSearch
 from helion.autotuner.compiler_coverage import CoverageDependency
 from helion.autotuner.config_generation import ConfigGeneration
@@ -29,6 +29,8 @@ from helion.autotuner.metrics import AutotuneMetrics
 from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.runtime.settings import default_autotuner_fn
+
+pytestmark = pytest.mark.cpu_only
 
 matmul = import_example("matmul").matmul
 matmul_split_k = import_example("matmul_split_k").matmul_split_k
@@ -136,7 +138,7 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     torch.set_num_threads(1)
     with (
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield

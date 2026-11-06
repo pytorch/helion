@@ -2841,19 +2841,20 @@ def _integer_loop_kernel():
 
 
 def _integer_loop_code(x, *, minimum=False, threads=128, enabled=True, **kw):
-    from test._cute_binding import _cpu_bind
-    from test._cute_binding import _forbid_native_compile
-    from test._cute_binding import _mock_cuda_unavailable
     from test.cute_population_contracts import _target
+
+    from helion._testing.cute_codegen import cpu_bind
+    from helion._testing.cute_codegen import forbid_native_compile
+    from helion._testing.cute_codegen import mock_cuda_unavailable
 
     kernel = _integer_loop_kernel()
     from types import SimpleNamespace
     from unittest.mock import patch
 
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         patch("torch.cuda.current_device", return_value=0),
         patch(
@@ -2863,7 +2864,7 @@ def _integer_loop_code(x, *, minimum=False, threads=128, enabled=True, **kw):
             ),
         ),
     ):
-        bound = _cpu_bind(
+        bound = cpu_bind(
             kernel,
             (
                 x,
@@ -2890,6 +2891,7 @@ def _integer_loop_code(x, *, minimum=False, threads=128, enabled=True, **kw):
 instantiate_parametrized_tests(TestReductions)
 
 
+@onlyBackends(["cute"])
 class TestIntegerLoopReductionCPU(unittest.TestCase):
     def test_integer_loop_collective_placement(self):
         import ast
@@ -3072,6 +3074,7 @@ def _integer_loop_model(source, x, *, return_scratch=False):
     return torch.from_numpy(out), events
 
 
+@onlyBackends(["cute"])
 class TestIntegerLoopReductionValuesCPU(unittest.TestCase):
     def test_exact_tails_extrema_and_duplicate_stores(self):
         for dtype in (torch.int32, torch.int64):
@@ -3114,6 +3117,7 @@ class TestIntegerLoopReductionValuesCPU(unittest.TestCase):
                 self.assertEqual(old, new)
 
 
+@onlyBackends(["cute"])
 class TestIntegerLoopReductionProofCPU(unittest.TestCase):
     def test_physical_subgroups_and_serial_lanes_keep_old_schedule(self):
         x = torch.zeros((5, 1025), dtype=torch.int64)
@@ -3179,11 +3183,11 @@ class TestIntegerLoopReductionProofCPU(unittest.TestCase):
         import random
         from unittest.mock import patch
 
-        from test._cute_binding import _forbid_native_compile
-        from test._cute_binding import _mock_cuda_unavailable
         from test.cute_population_contracts import _target
         from test.cute_population_contracts import checked_initial_population
 
+        from helion._testing.cute_codegen import forbid_native_compile
+        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.autotuner.pattern_search import InitialPopulationStrategy
         from helion.autotuner.pattern_search import PatternSearch
 
@@ -3206,7 +3210,7 @@ class TestIntegerLoopReductionProofCPU(unittest.TestCase):
         self.assertNotIn(key, spec.default_config().config)
         self.assertTrue(spec.compiler_coverage_groups[-1].deferred)
         self.assertEqual(spec.compiler_coverage_groups[-1].key, key)
-        with bound.env, _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        with bound.env, mock_cuda_unavailable(), _target(), forbid_native_compile():
             config = dict(spec.default_config().config)
             for bad in (1, "true", None):
                 with self.subTest(bad=bad), self.assertRaises(helion.exc.InvalidConfig):

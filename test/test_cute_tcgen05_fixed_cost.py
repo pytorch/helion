@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_dense_tcgen05 import wrapper_plans
 from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
 from test.test_cute_tcgen05_fixed_chain import PUBLICATION_HOISTED
 from test.test_cute_tcgen05_fixed_chain import _bind_bias_gemm
@@ -34,11 +33,12 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONF
 from helion._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
 from helion._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUTS
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_dense_tcgen05 import wrapper_plans
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Callable

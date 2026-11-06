@@ -9,19 +9,21 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_shared_rhs_grouped import _target
 from test.test_cute_structural_compatibility import _pointwise
 
 import helion
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.runtime.cute_structural_config import CuteStructuralConfig
 from helion.runtime.cute_structural_config import StructuralPolicyError
 from helion.runtime.cute_structural_policy import CUTE_STRUCTURAL_SETTINGS
 from helion.runtime.cute_structural_policy import CuteStructuralPolicy
 from helion.runtime.kernel import Kernel
 from helion.runtime.settings import Settings
+
+pytestmark = pytest.mark.cpu_only
 
 ALL_PASSES = CuteStructuralPolicy(**dict.fromkeys(CUTE_STRUCTURAL_SETTINGS, True))
 
@@ -36,7 +38,7 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     torch.set_num_threads(1)
     with (
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield

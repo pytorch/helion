@@ -16,9 +16,6 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._sympy.functions import FloorDiv
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
@@ -33,6 +30,9 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.runtime.ref_mode import RefMode
 
@@ -680,15 +680,16 @@ def test_fragment_fp8_typed_storage_and_conversions(dtype):
 def test_fragment_logical_storage_cpu_codegen(dtype):
     import ast
 
-    from test._cute_binding import _cpu_bind
-    from test._cute_binding import _forbid_native_compile
-    from test._cute_binding import _mock_cuda_unavailable
     from test.cute_population_contracts import _target
 
+    from helion._testing.cute_codegen import cpu_bind
+    from helion._testing.cute_codegen import forbid_native_compile
+    from helion._testing.cute_codegen import mock_cuda_unavailable
+
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
         if dtype is torch.uint8:
@@ -704,7 +705,7 @@ def test_fragment_logical_storage_cpu_codegen(dtype):
             inputs = (torch.ones(3, 65).to(dtype),)
             kernel = _fragment_fp8_storage
             types = {"Float8E4M3FN" if dtype is torch.float8_e4m3fn else "Float8E5M2"}
-        bound = _cpu_bind(kernel, inputs)
+        bound = cpu_bind(kernel, inputs)
         tree = ast.parse(bound.to_code(bound.config_spec.default_config()))
     loads = [
         node
@@ -753,9 +754,9 @@ def test_fragment_dynamic_capacity_codegen_and_rebinding(kind):
         for shape in shapes
     ]
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch("helion.runtime.kernel.target_device_capability", return_value=(10, 0)),
         patch(
@@ -964,16 +965,16 @@ def _fragment_grid_origin_scan(x: torch.Tensor, begin: hl.constexpr):
 @pytest.mark.parametrize("mode", ["serial", "cooperative"])
 def test_fragment_grid_origins_cover_each_output_once(block_rows, begin, mode):
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(_fragment_grid_origin_scan, (torch.ones(37, 5), begin))
+        bound = cpu_bind(_fragment_grid_origin_scan, (torch.ones(37, 5), begin))
         config = bound.config_spec.default_config()
         config.config["block_sizes"][0] = block_rows
         config.config["cute_fragment_scan"] = mode
@@ -1231,16 +1232,16 @@ def test_independent_full_reduction_fragment_codegen_and_values(
         autotune_effort="none",
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(kernel, inputs)
+        bound = cpu_bind(kernel, inputs)
         config = bound.config_spec.default_config()
         config.config["block_sizes"][:] = [block_columns, block_rows]
         config.config["reduction_loops"] = [None]
@@ -1279,16 +1280,16 @@ def test_existing_tile_or_row_reduction_keeps_native_path(tiled):
         autotune_effort="none",
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(kernel, (torch.ones(5, 17),))
+        bound = cpu_bind(kernel, (torch.ones(5, 17),))
         source = bound.to_code(bound.config_spec.default_config())
     assert "fragment_smem" not in source
 
@@ -1310,16 +1311,16 @@ def test_same_axis_statistic_broadcast_from_another_lane_owner_is_refused():
     # lane loop that consumes the broadcast statistic; lowering it there gave
     # wrong values (17 and 1000 columns).
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(
+        bound = cpu_bind(
             _native_same_axis_statistic, (torch.ones(17), torch.ones(5, 17))
         )
         config = bound.config_spec.default_config()
@@ -1336,9 +1337,9 @@ def test_independent_full_reduction_records_dynamic_metadata_before_projection()
     )
 
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -1351,7 +1352,7 @@ def test_independent_full_reduction_records_dynamic_metadata_before_projection()
             static_shapes=False,
             autotune_effort="none",
         )
-        bound = _cpu_bind(kernel, (torch.ones(5, 17), torch.ones(5, 65), 0.5))
+        bound = cpu_bind(kernel, (torch.ones(5, 17), torch.ones(5, 65), 0.5))
         facts = computed_fragment_specialization_facts(
             bound._env, bound.host_function.device_ir
         )
@@ -1442,16 +1443,16 @@ def test_fragment_owned_reduction_tiles_preserve_full_producer_and_carry(
     x[0, 1] = x[0, columns - 2] = 0.75
     x[1, 3] = x[1, columns - 3] = 0.25
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(_fragment_factored_tiled_reduction, (x, kind))
+        bound = cpu_bind(_fragment_factored_tiled_reduction, (x, kind))
         config = _factored_tiled_config(bound, tile)
         with bound.env:
             effective_tiles = bound._normalized_config_copy(config).reduction_loops
@@ -1606,9 +1607,9 @@ def test_fragment_singleton_scan_codegen_and_rebind(static_shapes, steps):
         for shape in shapes
     ]
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         patch("helion.runtime.kernel.target_device_capability", return_value=(10, 0)),
         patch(
@@ -1644,8 +1645,8 @@ def test_fragment_singleton_scan_codegen_and_rebind(static_shapes, steps):
 
 
 def test_fragment_singleton_views_alone_preserve_native_codegen():
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_singleton_native_path, (torch.ones(3, 7),))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_singleton_native_path, (torch.ones(3, 7),))
         code = bound.to_code(bound.config_spec.default_config())
     assert "fragment_index" not in code and "SmemAllocator" not in code
 
@@ -1668,7 +1669,7 @@ def test_fragment_singleton_scan_eager_contract(steps, width):
         autotune_effort="none",
         ref_mode=RefMode.EAGER,
     )
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         actual = kernel(x, steps)
     torch.testing.assert_close(actual, expected.transpose(-2, -1), rtol=0, atol=0)
 
@@ -2028,15 +2029,15 @@ def test_fragment_warp_reduction_cpu_mixed_argmax_and_logical_tail(kind, dtype):
     x = _fragment_warp_reduction_inputs(3, 65, dtype, kind)
     expected = _fragment_warp_reduction_reference(x, kind)
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(_fragment_warp_reduction_mixed, (x, kind))
+        bound = cpu_bind(_fragment_warp_reduction_mixed, (x, kind))
         for mode in ("serial", "warp"):
             config = _fragment_warp_reduction_config(bound, mode, 16)
             source = bound.to_code(config)
@@ -2057,15 +2058,15 @@ def test_fragment_warp_reduction_cpu_nan_across_tiles(kind):
     x[1, 33] = float("nan")
     x[2, 127] = float("nan")
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(_fragment_factored_tiled_reduction, (x, kind))
+        bound = cpu_bind(_fragment_factored_tiled_reduction, (x, kind))
         config = _fragment_warp_reduction_config(bound, "warp", 16)
         source = bound.to_code(config)
     assert "fragment_reduce_tile" in source
@@ -2333,9 +2334,9 @@ def _fragment_expression_diamond_scan(x: torch.Tensor, depth: int):
 @pytest.mark.parametrize("row_tile", [1, 4])
 def test_fragment_expression_real_graph_codegen_growth(row_tile):
     counts = []
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         for depth in (2, 4, 8):
-            bound = _cpu_bind(
+            bound = cpu_bind(
                 _fragment_expression_diamond_scan, (torch.ones(3, 31), depth)
             )
             config = bound.config_spec.default_config()
@@ -2404,8 +2405,8 @@ def test_captured_full_reduction_loop_generated_values(
     width, row_tile, reduction_tile, steps
 ):
     x = (torch.arange(3 * width).reshape(3, width) % 9).float() - 2
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_captured_reduction, (x, steps))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_captured_reduction, (x, steps))
         source = bound.to_code(
             _captured_reduction_config(bound, row_tile, reduction_tile)
         )
@@ -2423,8 +2424,8 @@ def test_captured_full_reduction_loop_generated_values(
 
 def test_captured_full_reduction_loop_default_values():
     x = torch.ones(3, 1025)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_captured_reduction, (x, 3))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_captured_reduction, (x, 3))
         source = bound.to_code(bound.config_spec.default_config())
     actual = torch.full((3,), -1, dtype=torch.int32)
     _simulate_independent_fragment(source, {"x": x, "steps": 3}, {"out": actual}, 3)
@@ -2434,8 +2435,8 @@ def test_captured_full_reduction_loop_default_values():
 @pytest.mark.parametrize("failure", ["capacity", "admission"])
 def test_captured_full_reduction_loop_rejects_unsafe_fallback(failure):
     x = torch.ones(3, 131072 if failure == "capacity" else 17)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_captured_reduction, (x, 3))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_captured_reduction, (x, 3))
         config = _captured_reduction_config(bound, 1, None)
         with ExitStack() as stack:
             if failure == "admission":
@@ -2468,8 +2469,8 @@ def _fragment_tiled_capture_control(x: torch.Tensor, steps: int):
 def test_captured_explicit_tile_reduction_keeps_native_owner():
     from helion._compiler.cute.captured_reduction import captured_reduction_coordinates
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_tiled_capture_control, (torch.ones(3, 17), 3))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_tiled_capture_control, (torch.ones(3, 17), 3))
         with bound.env, bound.host_function:
             assert not captured_reduction_coordinates(
                 bound.env, bound.host_function.device_ir.graphs
@@ -2528,8 +2529,8 @@ def _fragment_captured_conditional_missing(x: torch.Tensor, steps: int):
 @pytest.mark.parametrize("steps", [3, 4])
 def test_captured_conditional_other_branch_supplies_unchanged_output(steps):
     x = torch.ones(3, 17)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_captured_conditional_missing, (x, steps))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_captured_conditional_missing, (x, steps))
         source = bound.to_code(_captured_reduction_config(bound, 1, 16))
     actual = torch.full((3,), -1, dtype=torch.int32)
     _simulate_independent_fragment(source, {"x": x, "steps": steps}, {"out": actual}, 3)
@@ -2539,8 +2540,8 @@ def test_captured_conditional_other_branch_supplies_unchanged_output(steps):
 @pytest.mark.parametrize("steps", [1, 3])
 def test_captured_conditional_explicit_outputs_keep_generated_values(steps):
     x = torch.ones(3, 17)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_captured_conditional, (x, steps, False))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_captured_conditional, (x, steps, False))
         source = bound.to_code(_captured_reduction_config(bound, 1, 16))
     actual = torch.full((3,), -1, dtype=torch.int32)
     _simulate_independent_fragment(source, {"x": x, "steps": steps}, {"out": actual}, 3)
@@ -2553,8 +2554,8 @@ def test_captured_conditional_explicit_outputs_keep_generated_values(steps):
 def test_fragment_threads_mixed_warp_reduction_cpu(threads, dtype):
     x = _fragment_warp_reduction_inputs(3, 65, dtype, "max")
     expected = _fragment_warp_reduction_reference(x, "max")
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_warp_reduction_mixed, (x, "max"))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_warp_reduction_mixed, (x, "max"))
         config = _fragment_warp_reduction_config(bound, "warp", 16)
         config.config["cute_fragment_threads"] = threads
         source = bound.to_code(config)
@@ -2588,8 +2589,8 @@ def test_fragment_threads_nan_order_cpu(threads, kind):
     x[0, 0] = float("nan")
     x[1, 33] = float("nan")
     x[2, 127] = float("nan")
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_factored_tiled_reduction, (x, kind))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_factored_tiled_reduction, (x, kind))
         config = _fragment_warp_reduction_config(bound, "warp", 16)
         config.config["cute_fragment_threads"] = threads
         source = bound.to_code(config)
@@ -2632,8 +2633,8 @@ def _physical_vector_capture(x: torch.Tensor, rows: int, steps: int):
 )
 def test_captured_vector_uses_complete_physical_lanes(width, threads, native):
     x = torch.arange(width, dtype=torch.float32)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_physical_vector_capture, (x, 3, 3))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_physical_vector_capture, (x, 3, 3))
         config = bound.config_spec.default_config()
         config.config["block_sizes"] = [1]
         config.config["num_threads"] = [1, threads]
@@ -2664,8 +2665,8 @@ def test_captured_vector_physical_or_fragment_native(width, threads):
     "options", [{"cute_fragment_reduction": "warp"}, {"cute_fragment_threads": 64}]
 )
 def test_physical_capture_preserves_explicit_fragment_modes(options):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_physical_vector_capture, (torch.ones(16), 3, 3))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_physical_vector_capture, (torch.ones(16), 3, 3))
         config = bound.config_spec.default_config()
         config.config.update(block_sizes=[1], num_threads=[1, 16], **options)
         source = bound.to_code(config)
@@ -2673,8 +2674,8 @@ def test_physical_capture_preserves_explicit_fragment_modes(options):
 
 
 def test_physical_capture_vector_packets_keep_fragment_owner():
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_physical_vector_capture, (torch.ones(16), 3, 3))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_physical_vector_capture, (torch.ones(16), 3, 3))
         config = bound.config_spec.default_config()
         config.config.update(
             block_sizes=[1],
@@ -2732,8 +2733,8 @@ def _fragment_scalar_tensor_index_scan(x: torch.Tensor):
 
 
 def _tensor_index_source(kernel, args):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, args)
         return bound.to_code(bound.config_spec.default_config())
 
 
@@ -2836,8 +2837,8 @@ def test_fragment_tensor_index_native_rank3(scalar):
 def test_fragment_tensor_index_mapping_rejects_unowned_axes():
     from helion._compiler.cute.fragment_indexing import memory_index_coordinates
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_tensor_index_scan, (torch.ones(3, 5), "broadcast"))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_tensor_index_scan, (torch.ones(3, 5), "broadcast"))
         with bound.env:
             index = torch.ones(2, 3, dtype=torch.int64)
             for shape in ((4,), (1, 2)):
@@ -2971,8 +2972,8 @@ def _fragment_host_fixed_chunk_scan(x: torch.Tensor):
 def test_fragment_unresolved_fixed_extent_preserves_ordinary_owner():
     from helion._compiler import generate_ast as generate_module
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_host_fixed_chunk_scan, (torch.ones(3, 17),))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_host_fixed_chunk_scan, (torch.ones(3, 17),))
         config = bound.config_spec.default_config()
         source = bound.to_code(config)
         with patch.object(
@@ -2989,8 +2990,8 @@ def test_fragment_unresolved_fixed_extent_preserves_ordinary_owner():
 
 @pytest.mark.parametrize("option", ["cute_fragment_scan", "cute_fragment_threads"])
 def test_fragment_unresolved_fixed_extent_rejects_explicit_owner(option):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_host_fixed_computed_scan, (torch.ones(3, 17),))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_host_fixed_computed_scan, (torch.ones(3, 17),))
         config = bound.config_spec.default_config()
         config.config[option] = "cooperative" if option == "cute_fragment_scan" else 32
         with pytest.raises(exc.InvalidConfig, match="computed fragment root"):
@@ -3078,8 +3079,8 @@ def test_free_iota_reduction_complete_producer_values(chunk, reduction, kind):
     x = (torch.arange(3 * (4 * chunk + 6), dtype=torch.int32) % 13).reshape(3, -1)[
         :, ::2
     ]
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_free_iota_vector_reduction, (x, chunk, kind))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_free_iota_vector_reduction, (x, chunk, kind))
         source = bound.to_code(_free_iota_config(bound, reduction))
     assert "arange_lane" not in source
     assert "fragment_reduce_tile" in source
@@ -3096,15 +3097,15 @@ def test_free_iota_reduction_complete_producer_values(chunk, reduction, kind):
 def test_free_iota_large_default_reduction_values():
     x = (torch.arange(2 * 8195).reshape(2, 8195) % 7).int()
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(_free_iota_vector_reduction, (x, 8192, "count"))
+        bound = cpu_bind(_free_iota_vector_reduction, (x, 8192, "count"))
         source = bound.to_code(bound.config_spec.default_config())
     expected = _free_iota_reference(x, 8192, "count")
     actual = torch.full_like(expected, -999)
@@ -3115,8 +3116,8 @@ def test_free_iota_large_default_reduction_values():
 
 def test_free_iota_existing_complete_axis_keeps_native_program():
     # The persistent 64-element axis already owns the ordinary iota coordinate.
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(
             _free_iota_vector_reduction, (torch.ones(3, 129).int(), 64, "sum")
         )
         config = _free_iota_config(bound, None)
@@ -3131,8 +3132,8 @@ def test_free_iota_existing_complete_axis_keeps_native_program():
 
 
 def test_free_iota_declines_incompatible_collective_config():
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(
             _free_iota_vector_reduction, (torch.ones(3, 129).int(), 64, "count")
         )
         config = _free_iota_config(bound, 16)
@@ -3194,8 +3195,8 @@ def _fragment_int32_extrema_reference(x):
 @pytest.mark.parametrize("columns", [17, 65])
 def test_fragment_int32_negated_extrema_generated_boundaries(mode, columns):
     x = _fragment_int32_extrema_inputs(columns)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_int32_negated_extrema, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_int32_negated_extrema, (x,))
         config = bound.config_spec.default_config()
         config.config["cute_fragment_reduction"] = mode
         code = bound.to_code(config)
@@ -3265,8 +3266,8 @@ def _fragment_dynamic_host_strides(x, out):
 def test_fragment_host_stride_arguments_preserve_views_and_rebinds():
     inputs = torch.arange(3 * 18).reshape(3, 18).float()[:, 1::2]
     outputs = torch.full((3, 27), -999.0)[:, 2::3]
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_dynamic_host_strides, (inputs, outputs))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_dynamic_host_strides, (inputs, outputs))
         config = bound.config_spec.default_config()
         source = bound.to_code(config)
     tree = ast.parse(source)
@@ -3322,8 +3323,8 @@ def test_free_iota_store_ownership_keeps_alias_guards(mode):
         if mode == "same_target"
         else storage[:, 1:]
     )
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(
             _free_iota_two_destinations,
             (x, left, right, 64, mode == "same_target"),
         )
@@ -3397,8 +3398,8 @@ def _fragment_uncached_cheap(x: torch.Tensor):
 
 def test_fragment_producer_cache_cost_and_unsupported_configs():
     x = torch.arange(3 * 65, dtype=torch.float32).reshape(3, 65) * 0.01
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_uncached_cheap, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_uncached_cheap, (x,))
         assert not bound.config_spec.cute_fragment_producer_cache_root_ids
         config = bound.config_spec.default_config()
         original = bound.to_code(config)
@@ -3414,8 +3415,8 @@ def test_fragment_producer_cache_cost_and_unsupported_configs():
 def test_fragment_producer_cache_generated_values_and_roundtrip(columns):
     x = torch.linspace(-3, 3, 3 * columns).reshape(3, columns)
     before = x.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_cached_transcendental, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_cached_transcendental, (x,))
         assert bound.config_spec.cute_fragment_producer_cache_root_ids
         config = bound.config_spec.default_config()
         config.config["block_sizes"][:] = [2] * len(config.block_sizes)
@@ -3502,9 +3503,9 @@ def test_fragment_producer_cache_preserves_prefix_and_rng(strategy_name):
     x = torch.ones((3, 65))
     # Later independent coverage groups are tested in their own appended order.
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch(
             "helion._compiler.autotuner_heuristics.register_fragment_warp_scan_coverage"
         ),
@@ -3518,7 +3519,7 @@ def test_fragment_producer_cache_preserves_prefix_and_rng(strategy_name):
         with patch(
             "helion._compiler.autotuner_heuristics.register_fragment_producer_cache_coverage"
         ):
-            previous = _cpu_bind(
+            previous = cpu_bind(
                 helion.kernel(
                     _fragment_cached_transcendental.fn,
                     backend="cute",
@@ -3526,7 +3527,7 @@ def test_fragment_producer_cache_preserves_prefix_and_rng(strategy_name):
                 ),
                 (x,),
             )
-        current = _cpu_bind(
+        current = cpu_bind(
             helion.kernel(
                 _fragment_cached_transcendental.fn, backend="cute", static_shapes=True
             ),
@@ -3569,8 +3570,8 @@ def test_fragment_producer_cache_preserves_prefix_and_rng(strategy_name):
 
 def test_fragment_producer_cache_capacity_is_not_bypassed():
     x = torch.ones((3, 65))
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_cached_transcendental, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_cached_transcendental, (x,))
         config = bound.config_spec.default_config()
         config.config["cute_fragment_producer_cache"] = True
         for capacity in (0, 16):
@@ -3589,8 +3590,8 @@ def test_fragment_producer_cache_preserves_special_value_bits():
     x[0, 0] = float("nan")
     x[1, :2] = torch.tensor([float("inf"), -float("inf")])
     x[2, ::2] = -0.0
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_cached_transcendental, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_cached_transcendental, (x,))
         config = bound.config_spec.default_config()
         config.config["block_sizes"][:] = [2] * len(config.block_sizes)
         outputs = []
@@ -3627,8 +3628,8 @@ def test_fragment_warp_scan_cpu_typed_axes_tail_and_input_reuse(
         if reverse
         else torch.cumsum(x + 1, axis, dtype=dtype)
     )
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_computed_scan, (x, axis, reverse))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_computed_scan, (x, axis, reverse))
         config = helion.Config.from_dict(
             dict(bound.config_spec.default_config())
             | {
@@ -3713,8 +3714,8 @@ def test_fragment_warp_scan_cpu_exact_tree_boundaries(dtype, width, reverse):
     else:
         x[:, width // 2] = torch.iinfo(dtype).max
     expected = _warp_scan_tree_reference(x, reverse)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_warp_scan_special, (x, reverse))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_warp_scan_special, (x, reverse))
         config = helion.Config.from_dict(
             dict(bound.config_spec.default_config())
             | {
@@ -3848,8 +3849,8 @@ def test_fragment_warp_scan_cpu_exclusive_producer_and_tiled_extent(kernel, reve
                 values.flip((1,)).cumsum(1).flip((1,)) if reverse else values.cumsum(1)
             )
         blocks = 6
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, (x, reverse))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, (x, reverse))
         config = bound.config_spec.default_config()
         if kernel is _fragment_warp_scan_exclusive:
             config.config["block_sizes"] = [2]
@@ -3932,8 +3933,8 @@ def test_fragment_warp_scan_cpu_empty_logical_extent(reverse):
     # nonzero physical tile: every slot must be initialized and reverse source
     # positions must never be read. Only the bound expression is substituted.
     x = torch.full((3, 65), float("nan"))
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_warp_scan_special, (x, reverse))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_warp_scan_special, (x, reverse))
         config = helion.Config.from_dict(
             dict(bound.config_spec.default_config())
             | {"block_sizes": [2], "cute_fragment_warp_scan": True}
@@ -3964,8 +3965,8 @@ def test_fragment_warp_scan_sdk_staged_values_and_guarded_load(
 
     from test.test_cute_fragment_scan_config import _computed_scan
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_computed_scan, (torch.ones(3, 5, 65, dtype=dtype), 2, False))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_computed_scan, (torch.ones(3, 5, 65, dtype=dtype), 2, False))
         config = helion.Config.from_dict(
             dict(bound.config_spec.default_config())
             | {
@@ -4148,8 +4149,8 @@ def test_fragment_mixed_warp_scans_cpu(mode, dtype, fallback_dtype, width, rever
     x, y = _mixed_warp_scan_inputs(dtype, fallback_dtype, width)
     before = (x.clone(), y.clone())
     expected = _mixed_warp_scan_reference(x, y, reverse)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_mixed_warp_scans, (x, y, reverse))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_mixed_warp_scans, (x, y, reverse))
         config = helion.Config.from_dict(
             dict(bound.config_spec.default_config())
             | {
@@ -4232,8 +4233,8 @@ def _fragment_readonly_snapshots(
 
 
 def _snapshot_codegen(kernel, args, threads=128, enabled=True):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, args)
         config = bound.config_spec.default_config()
         config.config.update(
             cute_fragment_threads=threads, cute_fragment_register_snapshots=enabled
@@ -4386,8 +4387,8 @@ def test_snapshot_budget_and_boolean_config():
     with pytest.raises(exc.InvalidConfig):
         _snapshot_codegen(_fragment_readonly_snapshots, (x, "sum"), 32)
     x = torch.ones(2, 65)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_readonly_snapshots, (x, "sum"))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_readonly_snapshots, (x, "sum"))
         config = bound.config_spec.default_config()
         original = bound.to_code(config)
         config.config["cute_fragment_register_snapshots"] = False
@@ -4512,8 +4513,8 @@ def _fragment_sliced_integer_extrema(x):
 
 def test_snapshot_sliced_row_reduction_binds():
     # A sliced row reduces over a symbolic rdim extent, not an int.
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(
             _fragment_sliced_integer_extrema, (torch.ones(2, 65, dtype=torch.int32),)
         )
         assert "@cute.kernel" in bound.to_code(bound.config_spec.default_config())
@@ -4553,8 +4554,8 @@ def test_fragment_packet_loads_generated_masks_layouts(width, layout):
         x = torch.arange(3 * width, dtype=torch.float32).reshape(width, 3).T
     before = x.clone()
     codes = []
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_packet_masked_scan, (x, 13))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_packet_masked_scan, (x, 13))
         config = bound.config_spec.default_config()
         config.config["block_sizes"] = [2]
         for enabled in (False, True):
@@ -4593,17 +4594,17 @@ def test_fragment_packet_loads_preserves_old_population_rng(strategy_name):
 
     from helion.autotuner.pattern_search import InitialPopulationStrategy
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         with patch(
             "helion._compiler.autotuner_heuristics.register_fragment_packet_loads_coverage"
         ):
-            old = _cpu_bind(
+            old = cpu_bind(
                 helion.kernel(
                     _fragment_uncached_cheap.fn, backend="cute", static_shapes=True
                 ),
                 (torch.ones(3, 65),),
             )
-        new = _cpu_bind(
+        new = cpu_bind(
             helion.kernel(
                 _fragment_uncached_cheap.fn, backend="cute", static_shapes=True
             ),
@@ -4642,8 +4643,8 @@ def test_fragment_packet_loads_half_types_take_eight_byte_packets(dtype):
     # Four 16-bit scalars per packet: the same loop body as the fp32 packet
     # (the DSL's AST preprocessing of its conditionals stays bounded) over an
     # 8-byte vector copy.
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_uncached_cheap, (torch.ones(3, 17, dtype=dtype),))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_uncached_cheap, (torch.ones(3, 17, dtype=dtype),))
         assert bound.config_spec.cute_fragment_packet_load_root_ids
         config = bound.config_spec.default_config()
         config.config["cute_fragment_packet_loads"] = True
@@ -4660,8 +4661,8 @@ def test_fragment_packet_loads_half_types_take_eight_byte_packets(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float64, torch.int32])
 def test_fragment_packet_loads_unsupported_dtype_default_parity(dtype):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_uncached_cheap, (torch.ones(3, 17, dtype=dtype),))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_uncached_cheap, (torch.ones(3, 17, dtype=dtype),))
         assert not bound.config_spec.cute_fragment_packet_load_root_ids
         config = bound.config_spec.default_config()
         before = bound.to_code(config)
@@ -4742,8 +4743,8 @@ def test_fragment_packet_loads_preserves_special_bits():
     )
     x = bits.view(torch.float32).repeat(3, 1)
     codes = []
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_packet_masked_scan, (x, 1000))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_packet_masked_scan, (x, 1000))
         config = bound.config_spec.default_config()
         config.config["block_sizes"] = [2]
         for enabled in (False, True):
@@ -4766,8 +4767,8 @@ def test_fragment_packet_loads_preserves_special_bits():
 
 def test_fragment_packet_loads_declines_aliasing_host_mutation():
     x = torch.arange(3 * 17, dtype=torch.float32).reshape(3, 17)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_dynamic_host_strides, (x, x))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_dynamic_host_strides, (x, x))
         assert not bound.config_spec.cute_fragment_packet_load_root_ids
         config = bound.config_spec.default_config()
         config.config["cute_fragment_packet_loads"] = True
@@ -4793,8 +4794,8 @@ def test_fragment_packet_loads_admit_loads_beside_fresh_outputs():
     # ``torch.zeros_like`` is not a layout-exact factory, but it is a fresh
     # allocation on every call: the loads beside its stores are readonly.
     x = torch.arange(3 * 64, dtype=torch.float32).reshape(3, 64)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_packet_zero_filled_outputs, (x, 13))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_packet_zero_filled_outputs, (x, 13))
         assert bound.config_spec.cute_fragment_packet_load_root_ids
         config = bound.config_spec.default_config()
         config.config["block_sizes"] = [2]
@@ -4805,8 +4806,8 @@ def test_fragment_packet_loads_admit_loads_beside_fresh_outputs():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_fragment_packet_loads_zero_extent_does_not_issue_packets(dtype):
     x = torch.empty((3, 0), dtype=dtype)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_uncached_cheap, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_uncached_cheap, (x,))
         config = bound.config_spec.default_config()
         before = bound.to_code(config)
         assert "num_bits_per_copy=" not in before
@@ -4855,8 +4856,8 @@ def test_fragment_packet_shared_address_generated(width, layout, offset):
     offsets = torch.zeros((2, 4), dtype=torch.float32)
     offsets[:, 0] = offset
     codes = []
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_packet_shared_address, (x, offsets, width, 13))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_packet_shared_address, (x, offsets, width, 13))
         config = bound.config_spec.default_config()
         config.config["block_sizes"] = [1]
         for enabled in (False, True):
@@ -5046,8 +5047,8 @@ def test_fragment_hierarchical_integer_scan_cpu(dtype, width, reverse, threads):
     expected = ordered.cumsum(-1, dtype=dtype)
     if reverse:
         expected = expected.flip((-1,))
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_warp_scan_special, (x, reverse))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_warp_scan_special, (x, reverse))
         config = helion.Config.from_dict(
             dict(bound.config_spec.default_config())
             | {
@@ -5112,8 +5113,8 @@ def test_fragment_hierarchical_integer_scan_cpu_strides_and_input_reuse(axis, re
     expected = ordered.cumsum(axis, dtype=x.dtype)
     if reverse:
         expected = expected.flip((axis,))
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_computed_scan, (x, axis, reverse))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_computed_scan, (x, axis, reverse))
         config = helion.Config.from_dict(
             dict(bound.config_spec.default_config())
             | {
@@ -5142,8 +5143,8 @@ def test_fragment_hierarchical_integer_scan_cpu_strides_and_input_reuse(axis, re
 
 def test_fragment_hierarchical_integer_scan_resource_limit():
     x = torch.ones((1, 16385), dtype=torch.int64)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_warp_scan_special, (x, False))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_warp_scan_special, (x, False))
         config = helion.Config.from_dict(
             dict(bound.config_spec.default_config())
             | {
@@ -5213,8 +5214,8 @@ def _resident_while_plan_recipe(x, limits, swap: hl.constexpr, steps: hl.constex
 def _resident_while_bound(swap=False, steps=2):
     from helion.language import _tracing_ops
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(
             _resident_while_plan_recipe,
             (
                 torch.arange(48).reshape(3, 16).float(),
@@ -5254,7 +5255,7 @@ def test_resident_while_plan_actual_current_edges(steps):
     assert tuple(str(graph.graph) for graph in graphs) == before
     # Stage 2 requires the explicit gather capability; the structural plan is
     # still insufficient without logical domains and the shared emitter.
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         config = bound.config_spec.default_config()
         config.config["cute_fragment_bounded_gather"] = True
         code = bound.to_code(config)
@@ -5511,8 +5512,8 @@ def _resident_while_recurrence(x, limits, steps: hl.constexpr, capacity: hl.cons
 
 
 def _resident_while_codegen(x, limits, steps, threads):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(
             _resident_while_recurrence,
             (x, limits, steps, 1 << (x.size(1) - 1).bit_length()),
         )
@@ -5601,7 +5602,7 @@ def test_resident_while_predicate_publication_and_reader_barriers():
 def test_resident_while_existing_thread_and_cache_config_rejections():
     x = torch.ones((3, 16))
     limits = torch.tensor([0, 1, 3], dtype=torch.int32)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, config, _code = _resident_while_codegen(x, limits, 2, 128)
         for key, value, message in (
             ("cute_fragment_threads", 32, "supported computed fragment root"),
@@ -5656,8 +5657,8 @@ def _resident_while_index_drift(x, limits, bounded: hl.constexpr):
 def test_resident_while_mutable_index_requires_current_bounds(bounded):
     from helion._compiler.cute.gather_domains import loop_domain_facts
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(
             _resident_while_index_drift,
             (torch.ones((3, 16)), torch.tensor([0, 1, 3], dtype=torch.int32), bounded),
         )
@@ -5718,8 +5719,8 @@ def test_resident_while_invariant_index_bounds(width, nested):
     for row in range(3):
         for _iteration in range(limits[row].item() * (4 if nested else 1)):
             expected[row] = (expected[row] + 1)[torch.arange(width) ^ 1]
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_resident_while_invariant_index, (x, limits, nested))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_resident_while_invariant_index, (x, limits, nested))
         with bound.env, bound.host_function:
             facts = loop_domain_facts(bound.env, bound.host_function.device_ir.graphs)
             assert (0, width - 1) in facts.readonly_ranges.values()
@@ -5770,7 +5771,7 @@ def _resident_while_readonly_program(
 
 
 def _resident_while_readonly_bound(x, limits, out, steps):
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _resident_while_readonly_program,
         (x, limits, out, steps, 1 << (x.size(1) - 1).bit_length()),
     )
@@ -5794,7 +5795,7 @@ def test_resident_while_readonly_load_assembly_and_sum(width, steps):
                 fresh = x[row, (lane + iteration + packet) % width]
                 expected[row] = (expected[row] + fresh)[(lane * 3 + 1) % width]
     before = x.clone(), limits.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, config = _resident_while_readonly_bound(
             x, limits, torch.empty_like(x), steps
         )
@@ -5822,7 +5823,7 @@ def test_resident_while_readonly_rejects_aliased_output(alias):
         out = x.view_as(x)
     elif alias == "dlpack":
         out = torch.utils.dlpack.from_dlpack(x)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, config = _resident_while_readonly_bound(
             x, torch.tensor([0, 1, 4], dtype=torch.int32), out, 2
         )
@@ -5845,7 +5846,7 @@ def test_resident_while_readonly_discovery_live_facts_before_snapshot():
 
     x = torch.ones((3, 1), dtype=torch.int32)
     limits = torch.tensor([0, 1, 4], dtype=torch.int32)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         with patch.object(
             cute_fragment_bounded_gather, "bounded_gather_roots", discover
         ):
@@ -5869,7 +5870,7 @@ def test_resident_while_readonly_discovery_does_not_weaken_codegen_facts():
     limits = torch.tensor([0, 1, 4], dtype=torch.int32)
     out = torch.empty_like(x)
     live = {"x": x, "limits": limits, "out": out, "steps": 2, "capacity": 1}
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, config = _resident_while_readonly_bound(x, limits, out, 2)
         env = bound.env
         graphs = bound.host_function.device_ir.graphs
@@ -5920,7 +5921,7 @@ def test_resident_while_readonly_discovery_rejects_contradictory_live_alias():
     x = torch.ones((3, 1), dtype=torch.int32)
     limits = torch.tensor([0, 1, 4], dtype=torch.int32)
     out = torch.empty_like(x)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, _config = _resident_while_readonly_bound(x, limits, out, 2)
         env = bound.env
         roots = bound.config_spec.cute_fragment_bounded_gather_root_ids
@@ -6030,8 +6031,8 @@ def _pure_region_model_source(code):
 
 
 def _pure_region_codes(kernel, args, cache):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, args)
         assert bound.config_spec.cute_fragment_pure_producer_regions_root_ids
         config = bound.config_spec.default_config()
         config.config["cute_fragment_producer_cache"] = cache
@@ -6375,14 +6376,14 @@ def test_fragment_pure_producer_regions_prefix_and_rng(strategy_name):
     from helion.autotuner.pattern_search import InitialPopulationStrategy
 
     def bind():
-        return _cpu_bind(
+        return cpu_bind(
             helion.kernel(
                 _fragment_pure_region_diamond.fn, backend="cute", static_shapes=True
             ),
             (torch.ones((2, 65), dtype=torch.int32), 4),
         )
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         with patch(
             "helion._compiler.autotuner_heuristics.register_fragment_pure_producer_regions_coverage"
         ):
@@ -6411,8 +6412,8 @@ def test_fragment_pure_producer_regions_prefix_and_rng(strategy_name):
 
 
 def test_fragment_pure_producer_regions_strict_config():
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_uncached_cheap, (torch.ones((3, 65)),))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_uncached_cheap, (torch.ones((3, 65)),))
         original = bound.to_code(bound.config_spec.default_config())
         for value in (True, 1, None, "region"):
             config = bound.config_spec.default_config()
@@ -6427,7 +6428,7 @@ def test_fragment_pure_producer_regions_strict_config():
 
 
 def test_fragment_pure_producer_regions_nested_root_declines():
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         x = torch.ones((3, 16), dtype=torch.int32)
         bound, config = _resident_while_readonly_bound(
             x, torch.tensor([0, 1, 3], dtype=torch.int32), torch.empty_like(x), 2
@@ -6573,7 +6574,7 @@ def _where_tail_config(bound, mode):
 )
 def test_fragment_where_implicit_tail_cpu(width, form):
     x, idx = _where_tail_inputs(width)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         for kind in ("sum", "min", "max"):
             args = (x, idx, form, kind)
             expected = _where_tail_reference(*args)
@@ -6584,9 +6585,9 @@ def test_fragment_where_implicit_tail_cpu(width, form):
                 static_shapes=True,
             )
             torch.testing.assert_close(
-                _cpu_bind(eager, args).run_ref(*args), expected, rtol=0, atol=0
+                cpu_bind(eager, args).run_ref(*args), expected, rtol=0, atol=0
             )
-            bound = _cpu_bind(_fragment_where_logical_tail, args)
+            bound = cpu_bind(_fragment_where_logical_tail, args)
             for mode in ("serial", "warp"):
                 code = bound.to_code(_where_tail_config(bound, mode))
                 actual = torch.full_like(expected, -999)
@@ -6601,7 +6602,7 @@ def test_fragment_where_explicit_padding_cpu(width):
     x = torch.zeros((3, width))
     extent = 1 << (width - 1).bit_length()
     expected = torch.full((3,), 1.5 * extent)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         eager = helion.kernel(
             _fragment_where_explicit_padding.fn,
             ref_mode="eager",
@@ -6609,9 +6610,9 @@ def test_fragment_where_explicit_padding_cpu(width):
             static_shapes=True,
         )
         torch.testing.assert_close(
-            _cpu_bind(eager, (x, extent)).run_ref(x, extent), expected, rtol=0, atol=0
+            cpu_bind(eager, (x, extent)).run_ref(x, extent), expected, rtol=0, atol=0
         )
-        bound = _cpu_bind(_fragment_where_explicit_padding, (x, extent))
+        bound = cpu_bind(_fragment_where_explicit_padding, (x, extent))
         for mode in ("serial", "warp"):
             code = bound.to_code(_where_tail_config(bound, mode))
             actual = torch.full_like(expected, -999)
@@ -6686,7 +6687,7 @@ def test_fragment_where_adversarial_tail_cpu(form, kind, value, expected_value):
     x.fill_(value)
     args = (x, idx, form, kind)
     expected = torch.full((3,), expected_value)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         eager = helion.kernel(
             _fragment_where_adversarial_tail.fn,
             ref_mode="eager",
@@ -6694,9 +6695,9 @@ def test_fragment_where_adversarial_tail_cpu(form, kind, value, expected_value):
             static_shapes=True,
         )
         torch.testing.assert_close(
-            _cpu_bind(eager, args).run_ref(*args), expected, rtol=0, atol=0
+            cpu_bind(eager, args).run_ref(*args), expected, rtol=0, atol=0
         )
-        bound = _cpu_bind(_fragment_where_adversarial_tail, args)
+        bound = cpu_bind(_fragment_where_adversarial_tail, args)
         for mode in ("serial", "warp"):
             code = bound.to_code(_where_tail_config(bound, mode))
             actual = torch.full_like(expected, -999)
@@ -6724,7 +6725,7 @@ def test_fragment_where_explicit_padding_min_cpu():
     x = torch.full((3, 17), 10.0)
     args = (x, 32)
     expected = torch.ones(3)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         eager = helion.kernel(
             _fragment_where_explicit_padding_min.fn,
             ref_mode="eager",
@@ -6732,9 +6733,9 @@ def test_fragment_where_explicit_padding_min_cpu():
             static_shapes=True,
         )
         torch.testing.assert_close(
-            _cpu_bind(eager, args).run_ref(*args), expected, rtol=0, atol=0
+            cpu_bind(eager, args).run_ref(*args), expected, rtol=0, atol=0
         )
-        bound = _cpu_bind(_fragment_where_explicit_padding_min, args)
+        bound = cpu_bind(_fragment_where_explicit_padding_min, args)
         for mode in ("serial", "warp"):
             code = bound.to_code(_where_tail_config(bound, mode))
             actual = torch.full_like(expected, -999)
@@ -6774,8 +6775,8 @@ def _fragment_completed_scan_exports(x, threshold, kind: hl.constexpr):
 
 
 def _completed_scan_source(x, threshold, kind="paired", threads=128, enabled=True):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_completed_scan_exports, (x, threshold, kind))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_completed_scan_exports, (x, threshold, kind))
         config = bound.config_spec.default_config()
         config.config.update(
             cute_fragment_threads=threads, cute_fragment_warp_scan=True
@@ -6860,8 +6861,8 @@ def test_completed_scan_exports_declines(kind, width):
 
 def test_completed_scan_exports_off_and_request_controls():
     x, threshold = torch.ones((2, 33)), torch.zeros(2)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_completed_scan_exports, (x, threshold, "paired"))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_completed_scan_exports, (x, threshold, "paired"))
         config = bound.config_spec.default_config()
         config.config["cute_fragment_warp_scan"] = True
         original = bound.to_code(config)
@@ -6991,8 +6992,8 @@ def _immutable_while_snapshot(x, limits, capacity: hl.constexpr):
 def _immutable_while_snapshot_codegen(
     x, limits, threads, snapshots, kernel=_immutable_while_snapshot
 ):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, (x, limits, 1 << (x.size(1) - 1).bit_length()))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, (x, limits, 1 << (x.size(1) - 1).bit_length()))
         config = bound.config_spec.default_config()
         config.config.update(
             cute_fragment_bounded_gather=True,
@@ -7093,10 +7094,10 @@ def _immutable_while_snapshot_decline(
 def test_immutable_while_snapshot_declines(mode):
     from helion._compiler.cute.register_snapshots import snapshot_chains
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         x = torch.ones(3, 17, dtype=torch.int32)
         limits = torch.tensor([0, 1, 4], dtype=torch.int32)
-        bound = _cpu_bind(_immutable_while_snapshot_decline, (x, limits, 32, mode))
+        bound = cpu_bind(_immutable_while_snapshot_decline, (x, limits, 32, mode))
         with bound.env, bound.host_function:
             chains = snapshot_chains(bound.host_function.device_ir.graphs, bound.env)
         assert not chains
@@ -7264,8 +7265,8 @@ class TestImmutableWhileSnapshotsNative(TestCase):
 # A complete producer prefix changes ownership; its scalar publications and
 # every later allocation/consumer retain the ordinary shared lifetime.
 def _warp_producer_source(x, threshold, *, threads=128, enabled=True, kind="paired"):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_completed_scan_exports, (x, threshold, kind))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_completed_scan_exports, (x, threshold, kind))
         config = bound.config_spec.default_config()
         config.config.update(
             cute_fragment_threads=threads,
@@ -7341,14 +7342,14 @@ def test_warp_producer_regions_prefix_and_rng(strategy_name):
     from helion.autotuner.pattern_search import InitialPopulationStrategy
 
     def bind():
-        return _cpu_bind(
+        return cpu_bind(
             helion.kernel(
                 _fragment_completed_scan_exports.fn, backend="cute", static_shapes=True
             ),
             (torch.ones((2, 65)), torch.zeros(2), "paired"),
         )
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         with patch(
             "helion._compiler.autotuner_heuristics.register_fragment_warp_producer_regions_coverage"
         ):
@@ -7438,7 +7439,7 @@ def test_warp_producer_regions_transactional_decline(mutation):
 
 
 def test_warp_producer_regions_strict_option_and_nested_decline():
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         x = torch.ones((3, 16), dtype=torch.int32)
         bound, config = _resident_while_readonly_bound(
             x, torch.tensor([0, 1, 3], dtype=torch.int32), torch.empty_like(x), 2
@@ -7451,7 +7452,7 @@ def test_warp_producer_regions_strict_option_and_nested_decline():
         with pytest.raises(exc.InvalidConfig):
             bound.to_code(config)
         x = torch.ones((1, 17))
-        bound = _cpu_bind(
+        bound = cpu_bind(
             _fragment_completed_scan_exports, (x, torch.zeros(1), "paired")
         )
         original = bound.to_code(bound.config_spec.default_config())
@@ -7500,8 +7501,8 @@ def test_warp_producer_regions_scalar_bits_and_suffix(dtype, valid):
     x[2, 9] = float("nan")
     results = []
     codes = []
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(
             helion.kernel(
                 _fragment_warp_prefix_frontiers.fn, backend="cute", static_shapes=True
             ),
@@ -7551,8 +7552,8 @@ def _fragment_warp_prefix_cooperative_suffix(x: torch.Tensor, y: torch.Tensor):
 
 
 def _warp_prefix_cooperative_source(x, y, *, enabled):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_warp_prefix_cooperative_suffix, (x, y))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_warp_prefix_cooperative_suffix, (x, y))
         config = bound.config_spec.default_config()
         config.config.update(
             cute_fragment_threads=128,
@@ -7701,16 +7702,16 @@ def test_grid_row_loop_carries_keep_native_path():
     # coordinate, not a resident matrix: several rows per CTA must keep the
     # ordinary lowering instead of the shared-memory fragment owner.
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(_grid_row_online_logsumexp, (torch.ones(4, 16, 256),))
+        bound = cpu_bind(_grid_row_online_logsumexp, (torch.ones(4, 16, 256),))
         assert not bound.config_spec.cute_fragment_thread_root_ids
         source = bound.to_code(_grid_row_config(bound, [1, 2, 64]))
     assert "fragment_smem" not in source

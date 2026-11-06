@@ -41,6 +41,8 @@ from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     import helion
 

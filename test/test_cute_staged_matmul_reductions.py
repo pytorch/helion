@@ -16,6 +16,8 @@ from helion._compiler.ast_read_writes import ast_rename
 from helion._compiler.cute import matmul_fallback
 from helion._compiler.cute.scalar_recipe import PURE_DECODE_HELPERS
 
+pytestmark = pytest.mark.cpu_only
+
 _RENAMES = {"next_high": "high", "next_mass": "mass", "next_total": "total"}
 
 

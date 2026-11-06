@@ -13,7 +13,6 @@ import numpy as np
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_iota_symbolic_hints import _copy
 
 import helion
@@ -24,6 +23,7 @@ from helion._compiler.cute.cute_reshape import _resolve_tile_extent
 from helion._compiler.cute.cute_reshape import codegen_cute_virtual_clone
 from helion._compiler.cute.indexing import CuteShapeChainView
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 CUDA_DEVICE = "cuda"
@@ -37,7 +37,7 @@ def _cpu_codegen_target() -> Generator[None, None, None]:
     """Keep CPU bindings independent of visible or already-initialized CUDA."""
     initialized = torch.cuda.is_initialized()
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch.object(
             torch.cuda, "current_device", side_effect=AssertionError("CPU only")
         ) as current_device,

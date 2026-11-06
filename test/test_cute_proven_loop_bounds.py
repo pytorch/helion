@@ -10,6 +10,8 @@ from helion._compiler.cute.proven_loop_bounds import exact_static_grid
 from helion._compiler.cute.proven_loop_bounds import simplify_proven_loop_bounds
 from helion._compiler.cute.simplify_proven_bounds import simplify_proven_bounds
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _rewrite(source: str, *, threads: tuple[int, int, int] | None = (1, 2, 64)) -> str:
     return ast.unparse(

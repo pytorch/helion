@@ -33,9 +33,6 @@ from unittest.mock import patch
 
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion import exc
 from helion._compiler.cute.backend import launch_drops_root_threads
@@ -49,6 +46,8 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 
@@ -310,14 +309,14 @@ def _cpu_render(
 ) -> str:
     """Render a kernel without a GPU, from the default config plus ``overrides``."""
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(kernel, args)
+        bound = cpu_bind(kernel, args)
         settings = dict(bound.config_spec.default_config().config)
         settings.update(overrides)
         return bound.to_code(helion.Config.from_dict(settings))

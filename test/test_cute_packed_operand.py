@@ -17,7 +17,7 @@ from helion.autotuner.compiler_coverage import append_compiler_coverage
 
 matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.mark.parametrize("reduction", (64, 128, 256))

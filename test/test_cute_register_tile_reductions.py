@@ -31,8 +31,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test._cute_register_tile_kernels import col_scale
 from test._cute_register_tile_kernels import col_scale_into
 from test._cute_register_tile_kernels import col_scale_three
@@ -62,9 +60,13 @@ from helion._compiler.cute.register_tile_admission import (
 from helion._compiler.cute.register_tile_admission import RegisterTileUnsupported
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.experimental.linear_attention import recurrent_step_fused
 import helion.language as hl
 from helion.language import _tracing_ops
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -81,7 +83,7 @@ LOOPED_RETRY_LOG = "the retry loops the reduction"
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -123,7 +125,7 @@ def _bind(
     """
     if arguments is None:
         arguments = _arguments()
-    return _cpu_bind(_kernel(), arguments), arguments
+    return cpu_bind(_kernel(), arguments), arguments
 
 
 def _config(
@@ -340,7 +342,7 @@ def test_aliasing_inputs_reject_the_split(caplog: pytest.LogCaptureFixture) -> N
     state = torch.empty((BH, D, DV), dtype=torch.float32)
     q, k, v, _state, alpha = _arguments(state)
     arguments = (state[:, :, 0], k, v, state, alpha)
-    bound = _cpu_bind(recurrent_step_in_place, arguments)
+    bound = cpu_bind(recurrent_step_in_place, arguments)
     with (
         caplog.at_level(logging.DEBUG, logger="helion._compiler.cute.memory_ops"),
         caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"),
@@ -378,7 +380,7 @@ def test_flattened_column_tile_forms_a_register_tile() -> None:
     # thread_idx[0], one packet load per lane, one column reduce, and the
     # reduced columns stored once by the reduction-coordinate-zero threads.
     arguments = (torch.empty((128, 1024), dtype=torch.float32),)
-    bound = _cpu_bind(col_sum, arguments)
+    bound = cpu_bind(col_sum, arguments)
     config = column_config(bound, block=32, tile_threads=8, reduction_threads=8)
     assert config.reduction_loops == [None]
     code = bound.to_code(config)
@@ -402,7 +404,7 @@ def test_reduction_derived_scale_is_emitted_in_the_consume_nest() -> None:
     # store of every row, so the consume nest must define it before the
     # products.
     arguments = (torch.empty((128, 1024), dtype=torch.float32),)
-    bound = _cpu_bind(col_scale, arguments)
+    bound = cpu_bind(col_scale, arguments)
     code = bound.to_code(
         column_config(bound, block=32, tile_threads=8, reduction_threads=8)
     )
@@ -428,7 +430,7 @@ def test_eviction_policy_loads_form_a_register_tile(policy: str, helper: str) ->
     # The L2-policy packet helpers are loads like ``cute.arch.load``: the
     # register tile schedules them in its accumulate nest.
     arguments = (torch.empty((128, 1024), dtype=torch.float32),)
-    bound = _cpu_bind(col_sum, arguments)
+    bound = cpu_bind(col_sum, arguments)
     code = bound.to_code(
         column_config(
             bound,
@@ -454,7 +456,7 @@ def test_nested_device_loop_keeps_the_rolled_lane() -> None:
         torch.empty((128, 1024), dtype=torch.float32),
         torch.empty((4, 1024), dtype=torch.float32),
     )
-    bound = _cpu_bind(col_sum_nested, arguments)
+    bound = cpu_bind(col_sum_nested, arguments)
     code = bound.to_code(
         column_config(bound, block=32, tile_threads=8, reduction_threads=8)
     )
@@ -466,7 +468,7 @@ def test_nested_device_loop_keeps_the_rolled_lane() -> None:
 @skipUnlessBackends(["cute"])
 def test_two_reductions_share_one_register_tile() -> None:
     arguments = (torch.empty((128, 1024), dtype=torch.float32),)
-    bound = _cpu_bind(col_stats, arguments)
+    bound = cpu_bind(col_stats, arguments)
     code = bound.to_code(
         column_config(bound, block=32, tile_threads=8, reduction_threads=8)
     )
@@ -485,7 +487,7 @@ def test_single_vector_thread_uses_the_warp_column_path() -> None:
     # One vector thread under 64 consecutive reduction threads: the column
     # reduce folds each warp with a shuffle before the shared-memory exchange.
     arguments = (torch.empty((128, 1024), dtype=torch.float32),)
-    bound = _cpu_bind(col_sum, arguments)
+    bound = cpu_bind(col_sum, arguments)
     code = bound.to_code(
         column_config(bound, block=4, tile_threads=1, reduction_threads=64)
     )
@@ -554,7 +556,7 @@ def test_chained_reductions_run_one_accumulate_nest_per_level(
     # schedule runs a second accumulate nest between the two combines, reading
     # the stashed tile instead of loading it again.
     arguments = make_arguments()
-    bound = _cpu_bind(kernel, arguments)
+    bound = cpu_bind(kernel, arguments)
     config = column_config(bound, block=32, tile_threads=8, reduction_threads=8)
     with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
         code = bound.to_code(config)
@@ -640,7 +642,7 @@ def test_unschedulable_bodies_fall_back_to_the_rolled_lane(
     # rolled lane nesting and compiles exactly as it did before register tiles
     # existed.
     arguments = make_arguments()
-    bound = _cpu_bind(kernel, arguments)
+    bound = cpu_bind(kernel, arguments)
     bound.config_spec.target_device_capability = capability
     config = column_config(
         bound,
@@ -668,7 +670,7 @@ def test_bf16_register_tile_flushes_fp32_results_on_sm100(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     arguments = (torch.empty((128, 1024), dtype=torch.bfloat16),)
-    bound = _cpu_bind(col_sum_f32_out, arguments)
+    bound = cpu_bind(col_sum_f32_out, arguments)
     bound.config_spec.target_device_capability = (10, 0)
     config = column_config(bound, block=64, tile_threads=8, reduction_threads=16, vec=8)
     with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
@@ -710,7 +712,7 @@ def test_rejected_register_tiles_retry_as_the_looped_reduction(
     # (reduction_loops=[128], 64 reduction threads), not a 32-thread lane
     # over 32 scalar rows each.
     arguments = make_arguments()
-    bound = _cpu_bind(kernel, arguments)
+    bound = cpu_bind(kernel, arguments)
     config = column_config(bound, block=32, tile_threads=8, reduction_threads=64)
     assert config.reduction_loops == [None]
     with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
@@ -781,7 +783,7 @@ def test_the_looped_retry_keeps_the_sink_knob() -> None:
     # grid records no V-loop wrapper, so it leaves the body untouched).  The
     # knob-on code is the knob-off looped code.
     arguments = (_f32(1024, 1024), 1)
-    bound = _cpu_bind(col_sum_guarded, arguments)
+    bound = cpu_bind(col_sum_guarded, arguments)
     config = column_config(bound, block=32, tile_threads=8, reduction_threads=64)
     code, passes = _passes(bound, _sinking(bound, config))
     assert [attempt.reduction_loops for attempt in passes] == [[None], [128]]
@@ -808,7 +810,7 @@ def test_the_retry_starts_the_memory_transforms_afresh() -> None:
     # must emit every placeholder again.  The record lives on the pass's
     # ``GenerateAST``, which the retry creates anew.
     arguments = (_f32(64, 64), _f32(64, 64))
-    bound = _cpu_bind(add_rows, arguments)
+    bound = cpu_bind(add_rows, arguments)
     host = bound.host_function
     assert host is not None
     passes: list[list[dict[str, str]]] = []
@@ -859,7 +861,7 @@ def test_register_budget_keeps_wide_stashes_rolled(
     # elements) plus the accumulators exceed the live-value budget; half the
     # lanes per thread fit.
     arguments = (_f32(128, 1024), _f32(128, 1024), _f32(128, 1024))
-    bound = _cpu_bind(col_scale_three, arguments)
+    bound = cpu_bind(col_scale_three, arguments)
     with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
         code = bound.to_code(
             column_config(bound, block=32, tile_threads=8, reduction_threads=8)
@@ -883,7 +885,7 @@ def test_eight_byte_policy_loads_are_stashed() -> None:
     # It is a load like the 16-byte form: the loaded tile is stashed for the
     # consume nest instead of being re-loaded behind the barrier.
     arguments = (_f32(128, 1024), _f32(128, 1024))
-    bound = _cpu_bind(col_scale_into, arguments)
+    bound = cpu_bind(col_scale_into, arguments)
     code = bound.to_code(
         column_config(
             bound,
@@ -916,7 +918,7 @@ def test_aliasing_views_reject_every_load_form(
     # whichever helper the load goes through.
     base = _f32(129, 1024)
     arguments = (base[:128], base[1:])
-    bound = _cpu_bind(col_scale_into, arguments)
+    bound = cpu_bind(col_scale_into, arguments)
     extra: dict[str, Any] = (
         {} if policy is None else {"load_eviction_policies": [policy]}
     )
@@ -1006,7 +1008,7 @@ def test_register_tile_blocks_follow_the_body_and_the_extent() -> None:
         (col_sum_dynamic, (_f32(1024, 1024),), False),
         (rms_norm_bwd, rms_norm_bwd_arguments(), False),
     ):
-        bound = _cpu_bind(kernel, arguments)
+        bound = cpu_bind(kernel, arguments)
         (reduction,) = [
             block.block_id for block in bound.env.block_sizes if block.reduction
         ]
@@ -1025,7 +1027,7 @@ def test_tile_axis_reductions_keep_the_rolled_nesting(
     # register-tile seed is promoted and the autotune-off default renders the
     # warp-reduction layout it had before chained bodies were admitted.
     arguments = rms_norm_bwd_arguments()
-    bound = _cpu_bind(rms_norm_bwd, arguments)
+    bound = cpu_bind(rms_norm_bwd, arguments)
     spec = bound.config_spec
     assert not spec.cute_register_tile_reduction_blocks
     assert "cute_register_tile" not in spec.autotuner_heuristics
@@ -1058,7 +1060,7 @@ def test_tile_axis_reduction_under_a_register_tile_falls_back(
     with patch(
         "helion._compiler.device_ir.register_tile_body_admitted", return_value=True
     ):
-        bound = _cpu_bind(rms_norm_bwd, arguments)
+        bound = cpu_bind(rms_norm_bwd, arguments)
     spec = bound.config_spec
     (reduction,) = [
         block.block_id for block in bound.env.block_sizes if block.reduction
@@ -1087,7 +1089,7 @@ def test_dynamic_extent_forces_the_looped_reduction() -> None:
     # shrunk thread count is forced looped, with the trip count computed from
     # the runtime extent on the host.
     arguments = (_f32(1024, 1024),)
-    bound = _cpu_bind(col_sum_dynamic, arguments)
+    bound = cpu_bind(col_sum_dynamic, arguments)
     config = column_config(bound, block=32, tile_threads=8, reduction_threads=64)
     assert config.reduction_loops == [128]
     code = bound.to_code(config)

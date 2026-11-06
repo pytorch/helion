@@ -7,9 +7,6 @@ from typing import cast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.autotuner_heuristics.cute import _seq_config_list
@@ -24,6 +21,8 @@ from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.language import _tracing_ops
 
@@ -85,8 +84,8 @@ def test_unrelated_root_retains_its_default_tile(first: bool) -> None:
         torch.empty(128, 64, dtype=torch.float16),
         torch.empty(257),
     )
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(_pointwise_first if first else _pointwise_last, args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_pointwise_first if first else _pointwise_last, args)
         assert bound.host_function is not None
         spec = bound.config_spec
         other = _pointwise_block_id(bound)
@@ -204,8 +203,8 @@ def test_non_matmul_axis_in_matmul_tree_is_not_admitted(nested: bool) -> None:
         kernel, backend="cute", static_shapes=True, autotune_effort="none"
     )
 
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable():
+        bound = cpu_bind(
             variant,
             (
                 torch.empty(64, 128, dtype=torch.float16),
@@ -289,8 +288,8 @@ def test_sibling_reduction_does_not_receive_unlaunchable_seeds() -> None:
             reduced[row] = x[row, :].sum(-1)
         return out, reduced
 
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable():
+        bound = cpu_bind(
             mixed,
             (
                 torch.empty(64, 128, dtype=torch.float16),
@@ -358,8 +357,8 @@ def test_epilogue_reduction_keeps_its_existing_seed_admission() -> None:
                 out[m, n] = acc.to(out.dtype)
         return out
 
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable():
+        bound = cpu_bind(
             mixed,
             (
                 torch.empty(64, 128, dtype=torch.float16),

@@ -51,6 +51,8 @@ from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _block_config(bound, ctas=2, wrapped=True):
     return helion.Config.from_dict(

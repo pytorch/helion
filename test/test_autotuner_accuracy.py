@@ -165,7 +165,13 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         search._prepare()
         self.assertLessEqual(torch.cuda.memory_reserved(DEVICE), reserved - (256 << 20))
 
+    # The accuracy checks through the benchmark worker spawn a worker each
+    # (seconds of startup): the slow tier, except the smoke tests
+    # test_accuracy_check_filters_bad_config_wrong_output,
+    # test_autotune_noncontiguous_arg and test_autotune_broadcast_arg, which
+    # test_autotuner_search relies on for the worker path.
     @skipIfNotCUDA()
+    @pytest.mark.slow
     def test_accuracy_check_runs_candidates_on_poisoned_memory(self) -> None:
         # ``out`` is read before it is written: the kernel is only "correct"
         # when its fresh buffer already holds the right numbers.  The autotuner
@@ -276,6 +282,7 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(x, b), x + b)
 
+    @pytest.mark.slow
     def test_accuracy_check_filters_bad_config_wrong_arg_mutation(self) -> None:
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
         good_config = helion.Config(block_sizes=[1], num_warps=4)
@@ -858,6 +865,7 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         self.assertIn(winner, (cfg1, cfg2))
         self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
+    @pytest.mark.slow
     def test_autotune_configuration_cloning(self) -> None:
         """Tests base_search._clone_args function."""
 
@@ -2169,6 +2177,8 @@ class TestAutotuneIgnoreErrors(TestCase):
             started_count, completed_count, "Each started should have completion"
         )
 
+    # Four real searches (finite, random, pattern, differential evolution).
+    @pytest.mark.slow
     @skipIfRefEager("Autotuning not supported in ref eager mode")
     @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_log_started_completed(self):

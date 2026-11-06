@@ -14,6 +14,8 @@ from helion._compiler.cute.collective_matmul import CollectiveMmaSite
 from helion._compiler.cute.collective_matmul import _lower_site
 from helion._compiler.cute.collective_matmul import _region_write_roots
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion._compiler.device_function import DeviceFunction
 

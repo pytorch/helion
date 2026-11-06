@@ -8,12 +8,6 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _forbid_cuda_work
-from test._cute_dense_tcgen05 import cpu_codegen_target
-from test._cute_dense_tcgen05 import extra_store_mm
-from test._cute_dense_tcgen05 import scaled_args
-from test._cute_dense_tcgen05 import vector_scaled_mm
-
 import helion
 from helion._compiler.cute.aux_tensor import _tcgen05_aux_detector_mma_nodes
 from helion._compiler.cute.cute_mma import analyze_cute_mma_node
@@ -23,17 +17,22 @@ from helion._compiler.cute.pipeline_smem import max_pipeline_ab_stages
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.tcgen05_constants import Tcgen05RowvecAuxRow
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
+from helion._testing.cute_dense_tcgen05 import extra_store_mm
+from helion._testing.cute_dense_tcgen05 import scaled_args
+from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
 from helion.autotuner.config_generation import ConfigGeneration
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.fixture(autouse=True)
 def _cpu_codegen() -> Iterator[None]:
-    with cpu_codegen_target(), _forbid_cuda_work():
+    with cpu_codegen_target(), forbid_cuda_work():
         yield
 
 

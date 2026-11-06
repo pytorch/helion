@@ -11,6 +11,8 @@ import pytest
 
 from helion._testing import skipUnlessCuteAvailable
 
+pytestmark = pytest.mark.cpu_only
+
 
 @skipUnlessCuteAvailable("CuTe disk-cache loading requires the supported CuTe DSL")
 @pytest.mark.parametrize("mode", ("ffi", "plain", "miss", "corrupt"))

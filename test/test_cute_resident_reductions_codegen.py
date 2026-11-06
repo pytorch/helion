@@ -7,9 +7,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics import get_heuristics
 from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
@@ -21,7 +18,11 @@ from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_function import TensorArg
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
+
+pytestmark = pytest.mark.cpu_only
 
 layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
 rms_norm_bwd = import_example("rms_norm").rms_norm_bwd
@@ -57,14 +58,14 @@ def test_original_normalization_seeds_survive_search_and_emit_resident_pipeline(
 ) -> None:
     kernel, args = _kernel_and_arguments(kind, dtype, static_shapes=static_shapes)
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(kernel, args)
+        bound = cpu_bind(kernel, args)
         host = bound.host_function
         assert host is not None
         spec = bound.config_spec
@@ -134,7 +135,7 @@ def test_original_normalization_seeds_survive_search_and_emit_resident_pipeline(
 @skipUnlessBackends(["cute"])
 def test_resident_knobs_reject_unproved_config_values() -> None:
     kernel, args = _kernel_and_arguments("layer_norm", torch.bfloat16)
-    bound = _cpu_bind(kernel, args)
+    bound = cpu_bind(kernel, args)
     host = bound.host_function
     assert host is not None
     seeds = CuteResidentReductionHeuristic.get_seed_configs(bound.env, host.device_ir)

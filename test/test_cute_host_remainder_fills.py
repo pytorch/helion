@@ -9,14 +9,13 @@ from typing import Any
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.cute.host_remainder_fills import prove_host_remainder_fills
 from helion._testing import DEVICE
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -107,7 +106,7 @@ def _kernel(fn: Callable[..., Any], **settings: Any) -> Kernel:
 
 
 def _code(fn: Callable[..., Any], *args: torch.Tensor) -> tuple[BoundKernel, str]:
-    bound = _cpu_bind(_kernel(fn, autotune_effort="full"), args)
+    bound = cpu_bind(_kernel(fn, autotune_effort="full"), args)
     return bound, bound.to_code(bound.config_spec.default_config())
 
 
@@ -148,7 +147,7 @@ def _host(code: str) -> str:
 def test_fill_moves_into_the_kernel(
     fn: Callable[..., Any], fill: str, call: str
 ) -> None:
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         shape = (2, 16, 64) if fn is _three_dim_tail else (64, 128)
         bound, code = _code(fn, torch.empty(shape))
         assert bound.host_function is not None
@@ -179,7 +178,7 @@ def test_fill_moves_into_the_kernel(
 
 @skipIfRefEager("generates code")
 def test_zero_factory_and_remainder_fill_both_leave_the_host() -> None:
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         _bound, code = _code(_rows_plus_one_zeros, torch.empty((64, 128)))
         host = _host(code)
         assert "torch.empty(" in host and "torch.zeros(" not in host
@@ -207,7 +206,7 @@ def test_zero_factory_and_remainder_fill_both_leave_the_host() -> None:
     ],
 )
 def test_unproven_fills_stay_on_the_host(fn: Callable[..., Any], fill: str) -> None:
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         bound, code = _code(fn, torch.empty((64, 128)))
         assert bound.host_function is not None
         with bound.env:

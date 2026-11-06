@@ -27,6 +27,7 @@ from typing import Iterator
 
 from ... import exc
 from .mpp_graph_codegen import MPPSetupParams
+from .mpp_matmul import ACC_SEED
 from .msl_reduction import REDUCTION_NAMESPACE
 
 
@@ -51,8 +52,10 @@ class EmitState:
     _enclosing: list[set[str]] = dataclasses.field(default_factory=list)
     #: Each MPP cooperative tensor's name, or a reference alias's, to its root.
     coop: dict[str, str] = dataclasses.field(default_factory=dict)
-    #: Each cooperative root's MPP group id and operand dtype.
-    coop_group: dict[str, tuple[int, str]] = dataclasses.field(default_factory=dict)
+    #: Each cooperative root's MPP group id and its lhs and rhs element types.
+    coop_group: dict[str, tuple[int, tuple[str, str]]] = dataclasses.field(
+        default_factory=dict
+    )
     #: Each cooperative root's M and N blocks.
     coop_tile: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
     #: The cooperative roots whose descriptor rounds a size-1 dim up.
@@ -208,13 +211,24 @@ def _emit_stmts(
                 parts.append(f"{pad}{array}[{lane}] = {value};")
             elif _is_call_to(call, "_helion_mpp_stage"):
                 assert isinstance(call, ast.Call)
-                buf, index, value, pred = (_ast_expr_to_msl(a) for a in call.args)
+                buf, index, value, pred = (
+                    _ast_expr_to_msl(a, subs=subs) for a in call.args[:4]
+                )
                 parts.append(f"{pad}if ({pred}) {{ {buf}[{index}] = {value}; }}")
+            elif _is_call_to(call, "_helion_mpp_put"):
+                # An element loop's write of the updated element (mpp_matmul's
+                # _helion_mpp_update).
+                assert isinstance(call, ast.Call)
+                parts.append(
+                    f"{pad}*_it = {_ast_expr_to_msl(call.args[0], subs=subs)};"
+                )
             elif _is_call_to(call, "_helion_mpp_fence"):
                 parts.append(
                     f"{pad}threadgroup_barrier(mem_flags::mem_device | "
                     "mem_flags::mem_threadgroup);"
                 )
+            elif _is_call_to(call, "_helion_mpp_barrier"):
+                parts.append(f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);")
             elif _is_call_to(call, "_helion_mpp_materialize"):
                 assert isinstance(call, ast.Call)
                 _emit_coop_materialize(call, parts, pad, state)
@@ -320,12 +334,13 @@ def _emit_coop_acc(
     launch's own constants; ``check_mpp_launch`` rejects launches that are not
     whole SIMD groups.
     """
-    gid, tm, tn, tk, dtype, lhs_t, rhs_t, fill = (
+    gid, tm, tn, tk, dtypes, lhs_t, rhs_t, fill = (
         ast.literal_eval(a) for a in call.args[:8]
     )
-    lhs_staged, rhs_staged, block_m, block_n, seed = (
-        ast.literal_eval(a) for a in call.args[9:14]
+    lhs_staged, rhs_staged, block_m, block_n = (
+        ast.literal_eval(a) for a in call.args[9:ACC_SEED]
     )
+    seed = ast.literal_eval(call.args[ACC_SEED])
     if (block_m, block_n) != (tm, tn):
         state.coop_rounded.add(name)
     state.coop_tile[name] = (block_m, block_n)
@@ -336,8 +351,9 @@ def _emit_coop_acc(
     desc = f"_mpp_desc_{gid}"
     lhs_space = "threadgroup" if lhs_staged else "device"
     rhs_space = "threadgroup" if rhs_staged else "device"
-    lhs = f"tensor<{lhs_space} {dtype}, extents<int32_t, {lhs_extents}>, tensor_inline>"
-    rhs = f"tensor<{rhs_space} {dtype}, extents<int32_t, {rhs_extents}>, tensor_inline>"
+    lhs_dtype, rhs_dtype = dtypes
+    lhs = f"tensor<{lhs_space} {lhs_dtype}, extents<int32_t, {lhs_extents}>, tensor_inline>"
+    rhs = f"tensor<{rhs_space} {rhs_dtype}, extents<int32_t, {rhs_extents}>, tensor_inline>"
     parts.extend(
         [
             (
@@ -373,7 +389,7 @@ def _emit_coop_acc(
         )
     state.declare(name)
     state.coop[name] = name
-    state.coop_group[name] = (gid, dtype)
+    state.coop_group[name] = (gid, dtypes)
 
 
 def _coop_elements(coop: str, pad: str, block_m: int, block_n: int) -> list[str]:
@@ -518,7 +534,7 @@ def _emit_coop_run(
     src = call.args[0]
     assert isinstance(src, ast.Name) and src.id in state.coop
     root = state.coop[src.id]
-    gid, dtype = state.coop_group[root]
+    gid, dtypes = state.coop_group[root]
     # _helion_mpp_run's arguments: acc, gid, the lhs and rhs views (nine each), four
     # tile-dim flags, four block sizes.
     tile_dims = [bool(ast.literal_eval(a)) for a in call.args[20:24]]
@@ -530,6 +546,7 @@ def _emit_coop_run(
     for i, var in enumerate(("_mpp_a", "_mpp_b")):
         args = call.args[2 + 9 * i : 11 + 9 * i]
         dims = (blocks[2 * i], blocks[2 * i + 1])
+        dtype = dtypes[i]
         if spaces[i]:
             handles.append(([], [], _staged_view(args, dtype, var, dims)))
         else:
@@ -598,6 +615,10 @@ def _emit_for(
             **(subs or {}),
             **{name: "(*_it)" for name, r in state.coop.items() if r == root},
         }
+        fenced = len(it.args) > 1 and ast.literal_eval(it.args[1])
+        if fenced:
+            # The loop reads a staged vector's tile: after its staging writes.
+            parts.append(f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);")
         # A cooperative tensor's multidimensional index is (column, row).
         parts.extend(
             (
@@ -618,6 +639,9 @@ def _emit_for(
                 stmt.body, parts, indent=indent + 4, state=state, subs=element_subs
             )
         parts.append(f"{pad}}}")
+        if fenced:
+            # Every element has read the tile before its next writes.
+            parts.append(f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);")
         return
 
     # --- MPP cooperative iterator (synthesized by the pass) ---

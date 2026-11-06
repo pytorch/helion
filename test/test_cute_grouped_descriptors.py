@@ -39,6 +39,8 @@ from helion.autotuner.config_generation import ConfigGeneration
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.cute.launcher import _create_cute_wrapper
 
+pytestmark = pytest.mark.cpu_only
+
 
 def signed(value: int, bits: int) -> int:
     return (value + (1 << (bits - 1))) % (1 << bits) - (1 << (bits - 1))

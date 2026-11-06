@@ -22,7 +22,7 @@ from helion._compiler.cute.materialize_operand import _additive_seed
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from typing import Any

@@ -8,14 +8,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -25,7 +24,7 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Generator[None, None, None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
@@ -56,7 +55,7 @@ def test_underscore_device_binding_preserves_host_argument(
     x = torch.empty(19)
     inputs = (x,) if tensor_argument else (x, torch.empty(dimension))
     kernel = _underscore_tensor if tensor_argument else _underscore_dimension
-    bound = _cpu_bind(kernel, inputs)
+    bound = cpu_bind(kernel, inputs)
     source = bound.to_code(helion.Config(block_sizes=[32], num_threads=[32]))
     module = ast.parse(source)
     device = next(

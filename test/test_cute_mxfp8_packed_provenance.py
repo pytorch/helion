@@ -8,15 +8,17 @@ import pytest
 import torch
 
 from test.test_cute_mxfp8_mma import _config
-from test.test_cute_mxfp8_mma import _cpu_target
 from test.test_cute_mxfp8_mma import _wrapper_plan
 
 import helion
 from helion._compiler.cute.mxfp8_mma import _scale
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language import memory_ops
+
+pytestmark = pytest.mark.cpu_only
 
 
 def example(
@@ -202,7 +204,7 @@ def test_cpu_packed_source_admits_and_preserves_native_geometry(
         ),
         torch.empty((m, n), dtype=torch.bfloat16),
     )
-    with _cpu_target():
+    with cpu_target():
         bound = _packed_mxfp8._bind_isolated(values)
         assert bound.config_spec.cute_mxfp8_mma_available
         assert bound.config_spec.cute_mxfp8_fused_scales_available

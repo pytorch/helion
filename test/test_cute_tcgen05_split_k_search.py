@@ -32,7 +32,7 @@ import helion.language as hl
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @contextmanager
@@ -203,7 +203,7 @@ def test_a_tile_body_with_another_side_effect_cannot_split() -> None:
 def test_sampled_splits_render() -> None:
     # The envelope predicate above mirrors the fixer; rendering closes the
     # loop with codegen's own envelope check.
-    from test._cute_dense_tcgen05 import cpu_codegen_target
+    from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
 
     with cpu_codegen_target():
         bound = _bind(512, 512, 65536)

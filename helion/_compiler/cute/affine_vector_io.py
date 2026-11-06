@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch.fx.experimental.symbolic_shapes import statically_known_true
 
+from ..ast_extension import iter_statements
 from ..ast_read_writes import ReadWrites
 from ..compile_environment import CompileEnvironment
 from .memory_ops import tensor_has_specialized_base_alignment
@@ -1448,6 +1449,15 @@ def vectorize_affine_tile_lanes(
             constexpr=constexpr_values,
         )
         body = packetizer.body(body)
+    if not any(
+        isinstance(stmt, ast.For) and _affine_loop_candidate(stmt)
+        for stmt in iter_statements(body)
+    ):
+        # ``_Vectorizer.body`` rewrites only such loops; without one, skip the
+        # binding, register-read and integer-fact analyses it would consume.
+        # Keep the location fix-up the full path applies: later passes unparse
+        # statements the packetizer created without locations.
+        return ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])).body
     private_accesses: frozenset[str] = frozenset()
     renames = {
         name: aliases[0] for name, aliases in device_function._variable_renames.items()

@@ -11,11 +11,10 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import skipIfRefEager
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.local_cache import _search_policy_json_value
 from helion.autotuner.local_cache import _UncacheableSearchPolicy
 import helion.language as hl
@@ -23,6 +22,8 @@ from helion.runtime.cute_structural_policy import CUTE_STRUCTURAL_SETTINGS
 from helion.runtime.cute_structural_policy import CuteStructuralOrigins
 from helion.runtime.cute_structural_policy import CuteStructuralPolicy
 from helion.runtime.settings import Settings
+
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(autouse=True)
@@ -32,7 +33,7 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("HELION_BACKEND", raising=False)
     monkeypatch.setenv("HELION_AUTOTUNE_RANDOM_SEED", "0")
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield

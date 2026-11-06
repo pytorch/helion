@@ -33,6 +33,8 @@ from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(scope="module")
 def case():

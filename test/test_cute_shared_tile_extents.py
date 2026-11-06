@@ -9,8 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_sibling_loop_threads import _context
 from test.test_cute_sibling_loop_threads import _row_ir
 
@@ -19,6 +17,10 @@ from helion._compiler.tile_dispatch import TileStrategyDispatch
 from helion._compiler.tile_strategy import PerThreadNDTileStrategy
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
+
+pytestmark = pytest.mark.cpu_only
 
 jagged_layer_norm_kernel = import_example("jagged_layer_norm").jagged_layer_norm_kernel
 
@@ -32,10 +34,10 @@ def _code(blocks: list[int], threads: list[int], vec: int = 4) -> str:
         cute_flatten_nested_reductions=True,
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
-        bound = _cpu_bind(
+        bound = cpu_bind(
             kernel,
             (torch.empty((32641, 128)), torch.empty(257, dtype=torch.int64), 1e-6),
         )

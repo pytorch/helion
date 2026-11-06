@@ -18,6 +18,8 @@ from helion._compiler.cute.philox_packets import lower_philox_packets
 from helion._compiler.cute.philox_stream import SCALAR_ASM
 from helion._compiler.cute.philox_stream import SCALAR_CONSTRAINTS
 
+pytestmark = pytest.mark.cpu_only
+
 CORE = "cutlass.Int64(base + cutlass.Int32(lane))"
 PROVED = (
     CORE,

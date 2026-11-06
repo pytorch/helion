@@ -6,16 +6,16 @@ from unittest.mock import patch
 
 import pytest
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_collective_tf32 import _jagged_inputs
 from test.test_cute_collective_tf32 import _kernel
 from test.test_cute_collective_tmem_seed_order import _initial_population
 
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 @pytest.fixture(scope="module", autouse=True)
 def _forbid_cuda_init() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
@@ -38,7 +38,7 @@ def test_full_population_reaches_native_register_vector_loads(
 ) -> None:
     batch, rows, reduction, columns = shape
     args = _jagged_inputs(batch=batch, rows=rows, k=reduction, n=columns)
-    bound = _cpu_bind(_kernel(), args)
+    bound = cpu_bind(_kernel(), args)
     population = _initial_population(bound, args)
     assert len(population) == len(set(population))
     assert population == _initial_population(bound, args)
@@ -83,7 +83,7 @@ def test_dynamic_batch_metadata_keeps_existing_seed_admission(
     # requests are not evidence that a native compiler seed was reached.
     batch, rows, reduction, columns = shape
     args = _jagged_inputs(batch=batch, rows=rows, k=reduction, n=columns)
-    bound = _cpu_bind(_kernel(static_shapes=False), args)
+    bound = cpu_bind(_kernel(static_shapes=False), args)
     assert bound.host_function is not None
     with bound.env:
         assert not CuteCollectiveMatmulHeuristic.get_seed_configs(
@@ -94,7 +94,7 @@ def test_dynamic_batch_metadata_keeps_existing_seed_admission(
 @pytest.mark.parametrize("count", [2, 7, 100])
 def test_register_recipe_seeds_preserve_explicit_user_priority(count: int) -> None:
     args = _jagged_inputs(batch=256, rows=30856, k=128, n=128)
-    bound = _cpu_bind(_kernel(), args)
+    bound = cpu_bind(_kernel(), args)
     explicit = next(
         config
         for config in reversed(bound.config_spec.compiler_seed_configs)

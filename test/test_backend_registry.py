@@ -5,6 +5,7 @@ from typing import cast
 import unittest
 from unittest import mock
 
+import pytest
 import torch
 
 from helion import exc
@@ -23,6 +24,8 @@ import helion.language as hl
 from helion.language._decorators import APIFunc
 from helion.language._decorators import api
 from helion.language._decorators import codegen
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestBackendRegistry(unittest.TestCase):

@@ -42,6 +42,8 @@ from helion._compiler.cute.attention_plan import dense_score_plan
 from helion.exc import InvalidConfig
 from helion.runtime.cute import flash_flex
 
+pytestmark = pytest.mark.cpu_only
+
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 

@@ -26,8 +26,6 @@ from torch.nn.attention.flex_attention import noop_mask
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
-from test._cute_aux import _cpu_codegen
-
 import helion
 from helion._compiler.cute import flex_bwd_match as flex_bwd_match_module
 from helion._compiler.cute import flex_match
@@ -44,6 +42,7 @@ from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
 from helion.runtime.kernel import Kernel
 
@@ -135,7 +134,7 @@ def _args(
 @contextlib.contextmanager
 def _as_sm100() -> Iterator[None]:
     with (
-        _cpu_codegen(),
+        cpu_codegen(),
         patch("helion._compiler.backend._attention_flash_supported", return_value=True),
         patch(
             "helion._compiler.backend._attention_flash_gate_enabled", return_value=True

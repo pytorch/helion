@@ -24,7 +24,7 @@ from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.mark.parametrize("shape", ((1000, 1000, 1000), (777, 999, 555)))

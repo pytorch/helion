@@ -5,13 +5,13 @@ import ast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.test_cute_collective_native_seeded import _mamba_kernel
 from test.test_cute_collective_native_seeded import _mamba_sizes
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
@@ -46,7 +46,7 @@ def test_mamba_epilogue_removes_dead_seed_replay(
     arguments = tuple(
         torch.empty(size, dtype=torch.bfloat16) for size in _mamba_sizes(2)
     )
-    bound = _cpu_bind(_mamba_kernel(static_shapes=static_shapes), arguments)
+    bound = cpu_bind(_mamba_kernel(static_shapes=static_shapes), arguments)
     source = bound.to_code(_mamba_config(strategy, compute))
     loops = [
         node
@@ -131,7 +131,7 @@ def test_residual_epilogue_codegen(
     n_first: bool,
 ) -> None:
     arguments = _residual_inputs(dtype, out_dtype, unaligned)
-    bound = _cpu_bind(_residual_matmul, arguments)
+    bound = cpu_bind(_residual_matmul, arguments)
     source = bound.to_code(_residual_config(strategy, compute, n_first))
     assert "epilogue_vector_values" in source
     assert "epilogue_store_lane" in source
@@ -144,7 +144,7 @@ def test_residual_epilogue_codegen(
 def test_residual_epilogue_rejects_aliased_output() -> None:
     a, b, residual, _out = _residual_inputs(torch.float16, torch.float16, False)
     arguments = (a, b, residual, a[:, :70])
-    bound = _cpu_bind(_residual_matmul, arguments)
+    bound = cpu_bind(_residual_matmul, arguments)
     # The output store races the aliased operand loads: the thread-race check
     # refuses the body before the collective lowering sees the aliasing.
     with pytest.raises(
@@ -156,7 +156,7 @@ def test_residual_epilogue_rejects_aliased_output() -> None:
 @pytest.mark.parametrize("strategy", [None, True, 8, "automatic"])
 def test_invalid_epilogue_strategy_rejected(strategy: object) -> None:
     arguments = _residual_inputs(torch.float16, torch.float16, False)
-    bound = _cpu_bind(_residual_matmul, arguments)
+    bound = cpu_bind(_residual_matmul, arguments)
     config = _residual_config("scalar", "warp", False).config | {
         "cute_collective_epilogue": strategy
     }
@@ -166,7 +166,7 @@ def test_invalid_epilogue_strategy_rejected(strategy: object) -> None:
 
 def test_epilogue_search_and_roundtrip() -> None:
     arguments = _residual_inputs(torch.float16, torch.float16, False)
-    bound = _cpu_bind(_residual_matmul, arguments)
+    bound = cpu_bind(_residual_matmul, arguments)
     assert bound.host_function is not None
     with bound.env:
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(

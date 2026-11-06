@@ -7,11 +7,10 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner import PowerOfTwoFragment
 import helion.language as hl
 
@@ -24,7 +23,7 @@ pytestmark = skipUnlessBackends("cute")
 
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         yield
 
 
@@ -41,7 +40,7 @@ def _host_code(
         autotune_effort="full",
         ignore_warnings=[helion.exc.TensorOperationInWrapper],
     )
-    bound = _cpu_bind(kernel, args)
+    bound = cpu_bind(kernel, args)
     config = bound.config_spec.default_config()
     if overrides:
         config = helion.Config(**{**config.config, **overrides})
@@ -720,7 +719,7 @@ def test_chained_ranges_drop_the_fill_under_dynamic_shapes() -> None:
         autotune_effort="full",
         ignore_warnings=[helion.exc.TensorOperationInWrapper],
     )
-    bound = _cpu_bind(kernel, _jagged_args())
+    bound = cpu_bind(kernel, _jagged_args())
     code = bound.to_code(bound.config_spec.default_config())
     assert "out = torch.empty_like(y)" in code
 

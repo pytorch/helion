@@ -126,7 +126,12 @@ def _process_list(
     to_delete: list[int] = []
 
     def _drop_for_subtree_writes(node: ast.AST) -> None:
+        if not muls:
+            # Nothing pending to invalidate: skip walking the nested body.
+            return
         for sub in ast.walk(node):
+            if not muls:
+                return
             if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
                 _drop_stale_muls(muls, sub.id, canon)
 

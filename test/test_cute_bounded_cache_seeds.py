@@ -22,7 +22,7 @@ from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def _seeds(bound):

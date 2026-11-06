@@ -6,7 +6,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.test_cute_collective_native_seeded import _mamba_kernel
 from test.test_cute_collective_native_seeded import _mamba_sizes
 from test.test_cute_collective_seeds import _independent_matmuls
@@ -15,6 +14,7 @@ from test.test_cute_collective_tf32 import _round_tf32
 import helion
 from helion._compiler.cute.collective_tcgen05 import CollectiveOperandSmem
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 
 CUDA_DEVICE = "cuda"
@@ -51,7 +51,7 @@ def test_pool_preserves_mamba_arithmetic_and_every_synchronization(
     arguments = tuple(
         torch.empty(size, dtype=torch.bfloat16) for size in _mamba_sizes(2)
     )
-    bound = _cpu_bind(_mamba_kernel(static_shapes=False), arguments)
+    bound = cpu_bind(_mamba_kernel(static_shapes=False), arguments)
     config = helion.Config(
         block_sizes=[64, 64, 64],
         num_threads=[2, 64, 1, 1],

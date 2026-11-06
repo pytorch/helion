@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-from itertools import product
 import operator
 import random
 from typing import TYPE_CHECKING
@@ -12,9 +11,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
 
@@ -29,9 +25,15 @@ from helion._compiler.cute.radix_selection import radix_schedule
 from helion._compiler.cute.radix_selection_config import BOOLEAN_KEYS
 from helion._compiler.cute.radix_selection_config import CONFIG_KEYS
 from helion._compiler.cute.radix_selection_config import PIPELINE_CHOICES
+from helion._testing import pairwise
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
 from helion.runtime.ref_mode import RefMode
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -40,9 +42,9 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
         yield
@@ -276,7 +278,7 @@ def test_unordered_parser_requires_literal_false(sorted_value) -> None:
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("largest", [True, False])
 def test_actual_rank_recipe_generates_bounded_cluster_source(dtype, largest) -> None:
-    bound = _cpu_bind(_payload_selection, (*_args(dtype), largest, False))
+    bound = cpu_bind(_payload_selection, (*_args(dtype), largest, False))
     graph = bound.config_spec.cute_radix_selection_graph
     assert graph is not None
     assert graph.logical_cols == 64 and graph.cols == 33 and graph.k == 17
@@ -313,7 +315,7 @@ def test_actual_rank_recipe_generates_bounded_cluster_source(dtype, largest) -> 
 
 
 def test_live_key_values_keep_f32_int32_rank_and_int64_original_indices() -> None:
-    bound = _cpu_bind(_observed_keys, (*_args(), False))
+    bound = cpu_bind(_observed_keys, (*_args(), False))
     graph = bound.config_spec.cute_radix_selection_graph
     assert graph is not None and graph.value_getters and graph.index_getters
     source = bound.to_code(_radix_config(bound))
@@ -326,9 +328,9 @@ def test_live_key_values_keep_f32_int32_rank_and_int64_original_indices() -> Non
 
 
 def test_cross_slot_consumer_and_sorted_selection_decline() -> None:
-    flipped = _cpu_bind(_observed_keys, (*_args(), True))
+    flipped = cpu_bind(_observed_keys, (*_args(), True))
     assert flipped.config_spec.cute_radix_selection_graph is None
-    ordered = _cpu_bind(_payload_selection, (*_args(), True, True))
+    ordered = cpu_bind(_payload_selection, (*_args(), True, True))
     assert ordered.config_spec.cute_radix_selection_graph is None
     with pytest.raises(exc.InvalidConfig):
         ordered.to_code(_radix_config(ordered))
@@ -336,7 +338,7 @@ def test_cross_slot_consumer_and_sorted_selection_decline() -> None:
 
 @pytest.mark.parametrize("bad_getter", [True, 2, -1])
 def test_original_tuple_getter_proof_is_typed_and_bounded(bad_getter) -> None:
-    bound = _cpu_bind(_payload_selection, _args())
+    bound = cpu_bind(_payload_selection, _args())
     info = bound.host_function.device_ir.graphs[0]
     selection = next(
         node for node in info.graph.nodes if node.target is torch.ops.aten.topk.default
@@ -349,7 +351,7 @@ def test_original_tuple_getter_proof_is_typed_and_bounded(bad_getter) -> None:
 
 
 def test_final_codegen_rechecks_the_current_recipe() -> None:
-    bound = _cpu_bind(_payload_selection, _args())
+    bound = cpu_bind(_payload_selection, _args())
     info = bound.host_function.device_ir.graphs[0]
     comparison = next(
         node for node in info.graph.nodes if node.target is torch.ops.aten.gt.Scalar
@@ -360,7 +362,7 @@ def test_final_codegen_rechecks_the_current_recipe() -> None:
 
 
 def test_rank_recipe_requires_integer_comparison_constants() -> None:
-    bound = _cpu_bind(_payload_selection, _args())
+    bound = cpu_bind(_payload_selection, _args())
     info = bound.host_function.device_ir.graphs[0]
     comparison = next(
         node for node in info.graph.nodes if node.target is torch.ops.aten.gt.Scalar
@@ -374,24 +376,24 @@ def test_rank_recipe_requires_integer_comparison_constants() -> None:
 def test_readonly_proof_rejects_storage_aliases(wrapper) -> None:
     x, lengths, k = _args(cols=32)
     out = x if wrapper == "same_tensor" else torch.utils.dlpack.from_dlpack(x)
-    bound = _cpu_bind(_external_output, (x, lengths, out))
+    bound = cpu_bind(_external_output, (x, lengths, out))
     assert bound.config_spec.cute_radix_selection_graph is None
-    independent = _cpu_bind(_external_output, (x, lengths, torch.empty_like(x)))
+    independent = cpu_bind(_external_output, (x, lengths, torch.empty_like(x)))
     assert independent.config_spec.cute_radix_selection_graph is not None
 
 
 def test_packet_alignment_is_bound_cache_specialized() -> None:
     x, lengths, k = _args()
-    aligned = _cpu_bind(_payload_selection, (x, lengths, k))
+    aligned = cpu_bind(_payload_selection, (x, lengths, k))
     unaligned_x = torch.empty((3, 34), dtype=x.dtype)[:, 1:]
     assert unaligned_x.data_ptr() % 16 == 2
-    unaligned = _cpu_bind(_payload_selection, (unaligned_x, lengths, k))
+    unaligned = cpu_bind(_payload_selection, (unaligned_x, lengths, k))
     assert "num_bits_per_copy=128" in aligned.to_code(_radix_config(aligned))
     assert "num_bits_per_copy=128" not in unaligned.to_code(_radix_config(unaligned))
 
 
 def test_literal_resource_budget_and_mode_validation() -> None:
-    bound = _cpu_bind(_payload_selection, _args())
+    bound = cpu_bind(_payload_selection, _args())
     graph = bound.config_spec.cute_radix_selection_graph
     assert graph is not None
     config = _radix_config(bound)
@@ -420,7 +422,7 @@ def test_literal_resource_budget_and_mode_validation() -> None:
 
 
 def test_direct_and_match_are_independent_histogram_modes() -> None:
-    bound = _cpu_bind(_payload_selection, _args())
+    bound = cpu_bind(_payload_selection, _args())
     direct = bound.to_code(_radix_config(bound))
     matched = bound.to_code(_radix_config(bound, cute_radix_histogram_mode="match"))
     assert "cute.arch.match_sync" not in direct
@@ -439,7 +441,7 @@ def test_direct_and_match_are_independent_histogram_modes() -> None:
 
 def test_argument_names_do_not_collide_with_generated_locals() -> None:
     x, lengths, k = _args(cols=32)
-    bound = _cpu_bind(_colliding_names, (x, lengths))
+    bound = cpu_bind(_colliding_names, (x, lengths))
     assert bound.config_spec.cute_radix_selection_graph is not None
     source = bound.to_code(_radix_config(bound))
     kernel = next(
@@ -479,8 +481,8 @@ def test_legacy_defaults_and_initial_random_prefix_are_unchanged(largest) -> Non
     with patch.object(
         CuteRadixSelectionHeuristic, "register_facts", return_value=frozenset()
     ):
-        before = _cpu_bind(_payload_selection, args)
-    after = _cpu_bind(_payload_selection, args)
+        before = cpu_bind(_payload_selection, args)
+    after = cpu_bind(_payload_selection, args)
     assert before.config_spec.default_config() == after.config_spec.default_config()
     assert (
         before.config_spec.compiler_seed_configs
@@ -512,7 +514,7 @@ def test_legacy_defaults_and_initial_random_prefix_are_unchanged(largest) -> Non
 
 
 def test_flags_require_typed_booleans_and_radix_and_trim_requires_largest() -> None:
-    bound = _cpu_bind(_payload_selection, _args())
+    bound = cpu_bind(_payload_selection, _args())
     for key in BOOLEAN_KEYS:
         for value in (0, 1, None, "true"):
             with pytest.raises(exc.InvalidConfig, match="Boolean"):
@@ -523,7 +525,7 @@ def test_flags_require_typed_booleans_and_radix_and_trim_requires_largest() -> N
         config.config[key] = True
         with pytest.raises(exc.InvalidConfig, match="requires the radix"):
             bound.config_spec.normalized_config(config)
-    smallest = _cpu_bind(_payload_selection, (*_args(), False, False))
+    smallest = cpu_bind(_payload_selection, (*_args(), False, False))
     with pytest.raises(exc.InvalidConfig, match="largest=True"):
         smallest.to_code(_radix_config(smallest, cute_radix_valid_domain=True))
 
@@ -531,16 +533,33 @@ def test_flags_require_typed_booleans_and_radix_and_trim_requires_largest() -> N
 _RADIX_SOURCE_FLAGS = tuple(
     key for key in BOOLEAN_KEYS if key != "cute_radix_cached_payload_inverse"
 )
+_RADIX_KEY_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize(
-    "modes", tuple(product((False, True), repeat=len(_RADIX_SOURCE_FLAGS)))
-)
+def _radix_flag_rows() -> list[tuple[tuple[bool, ...], torch.dtype]]:
+    # Each flag selects its own source branch and the dtype picks the key
+    # width, so every pair of settings appears together, plus the all-off and
+    # all-on corners of every dtype; the full product is 768 rows.
+    rows = [
+        (tuple(row[:-1]), row[-1])
+        for row in pairwise(
+            **dict.fromkeys(_RADIX_SOURCE_FLAGS, (False, True)),
+            dtype=_RADIX_KEY_DTYPES,
+        )
+    ]
+    for dtype in _RADIX_KEY_DTYPES:
+        for mode in (False, True):
+            corner = ((mode,) * len(_RADIX_SOURCE_FLAGS), dtype)
+            if corner not in rows:
+                rows.append(corner)
+    return rows
+
+
+@pytest.mark.parametrize(("modes", "dtype"), _radix_flag_rows())
 def test_all_flag_combinations_keep_typed_bounded_source_and_allocations(
-    dtype: torch.dtype, modes: tuple[bool, ...]
+    modes: tuple[bool, ...], dtype: torch.dtype
 ) -> None:
-    bound = _cpu_bind(_payload_selection, _args(dtype))
+    bound = cpu_bind(_payload_selection, _args(dtype))
     graph = bound.config_spec.cute_radix_selection_graph
     assert graph is not None
     config = _radix_config(
@@ -584,7 +603,7 @@ def test_all_flag_combinations_keep_typed_bounded_source_and_allocations(
 
 
 def test_zero_capacity_bypasses_key_and_scalar_cache_and_c1_avoids_dsm() -> None:
-    bound = _cpu_bind(_payload_selection, _args())
+    bound = cpu_bind(_payload_selection, _args())
     source = bound.to_code(
         _radix_config(
             bound,
@@ -602,7 +621,7 @@ def test_zero_capacity_bypasses_key_and_scalar_cache_and_c1_avoids_dsm() -> None
 
 
 def test_resident_input_register_budget_preserves_reload_path() -> None:
-    bound = _cpu_bind(_payload_selection, _args(cols=65537))
+    bound = cpu_bind(_payload_selection, _args(cols=65537))
     reload = _radix_config(bound, cute_radix_threads=256, cute_radix_cluster_ctas=1)
     bound.config_spec.normalized_config(reload)
     resident = _radix_config(
@@ -619,7 +638,7 @@ def test_int64_length_clamps_before_narrowing_and_raw_suffix_is_preserved() -> N
     x = torch.randn(3, 33, dtype=torch.bfloat16)
     lengths = torch.tensor([-(1 << 40), 1 << 40, (1 << 32) + 7], dtype=torch.int64)
     args = (x, lengths, 17)
-    bound = _cpu_bind(_raw_length_and_keys, args)
+    bound = cpu_bind(_raw_length_and_keys, args)
     config = _radix_config(bound, **dict.fromkeys(BOOLEAN_KEYS, True))
     source = bound.to_code(config)
     assert any(
@@ -662,7 +681,7 @@ def test_int64_length_clamps_before_narrowing_and_raw_suffix_is_preserved() -> N
 
 def test_trim_respects_the_declared_logical_domain() -> None:
     args = (torch.empty(3, 128), torch.empty(3, dtype=torch.int64))
-    bound = _cpu_bind(_partial_logical_row, args)
+    bound = cpu_bind(_partial_logical_row, args)
     graph = bound.config_spec.cute_radix_selection_graph
     assert graph is not None and graph.logical_cols == 64 and graph.cols == 128
     config = _radix_config(bound, cute_radix_valid_domain=True)
@@ -675,7 +694,7 @@ def test_trim_respects_the_declared_logical_domain() -> None:
 
 def test_forwarded_raw_keeps_identity_prefix_masks_and_unmasked_loads_reread() -> None:
     args = _args()
-    masked = _cpu_bind(_payload_selection, args)
+    masked = cpu_bind(_payload_selection, args)
     masked_source = masked.to_code(
         _radix_config(
             masked, cute_radix_ticket_stores=True, cute_radix_candidate_capacity=0
@@ -683,7 +702,7 @@ def test_forwarded_raw_keeps_identity_prefix_masks_and_unmasked_loads_reread() -
     )
     unmasked_args = _args(cols=32)
     output = torch.empty_like(unmasked_args[0])
-    unmasked = _cpu_bind(_external_output, (unmasked_args[0], unmasked_args[1], output))
+    unmasked = cpu_bind(_external_output, (unmasked_args[0], unmasked_args[1], output))
     unmasked_source = unmasked.to_code(
         _radix_config(
             unmasked, cute_radix_ticket_stores=True, cute_radix_candidate_capacity=0
@@ -708,7 +727,7 @@ def test_forwarded_raw_keeps_identity_prefix_masks_and_unmasked_loads_reread() -
 
     assert suffix_loads(masked_source) == 0
     assert suffix_loads(unmasked_source) > 0
-    fanout = _cpu_bind(
+    fanout = cpu_bind(
         _source_fanout,
         (torch.empty(3, 16, dtype=torch.bfloat16), torch.empty(3, dtype=torch.int64)),
     )
@@ -719,16 +738,24 @@ def test_forwarded_raw_keeps_identity_prefix_masks_and_unmasked_loads_reread() -
         fanout.to_code(_radix_config(fanout, cute_radix_ticket_stores=True))
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("packet_bits", [128, 256])
-@pytest.mark.parametrize("unroll", [1, 2, 4])
-@pytest.mark.parametrize("resident_input", [False, True])
-@pytest.mark.parametrize("payload_inverse", [False, True])
+# The dtype sets the elements per packet, packet_bits the copy width, unroll
+# the scan rounds, and the two resident flags the cached-source branches; the
+# assertions below check pairs of them, which all-pairs rows cover.
+@pytest.mark.parametrize(
+    ("dtype", "packet_bits", "unroll", "resident_input", "payload_inverse"),
+    pairwise(
+        dtype=(torch.bfloat16, torch.float32),
+        packet_bits=(128, 256),
+        unroll=(1, 2, 4),
+        resident_input=(False, True),
+        payload_inverse=(False, True),
+    ),
+)
 def test_packet_width_and_source_unroll_keep_uniform_candidate_loops(
     dtype, packet_bits, unroll, resident_input, payload_inverse
 ) -> None:
     args = _args(dtype, cols=35)
-    bound = _cpu_bind(_payload_selection, args)
+    bound = cpu_bind(_payload_selection, args)
     config = _radix_config(
         bound,
         **{
@@ -775,8 +802,8 @@ def test_wide_packet_has_separate_cache_alignment_fact_and_scalar_fallback() -> 
     assert x.data_ptr() % 32 == 0
     assert shifted.data_ptr() % 16 == 0 and shifted.data_ptr() % 32 == 16
     lengths = torch.empty(3, dtype=torch.int32)
-    aligned = _cpu_bind(_payload_selection, (x, lengths, 17))
-    unaligned = _cpu_bind(_payload_selection, (shifted, lengths, 17))
+    aligned = cpu_bind(_payload_selection, (x, lengths, 17))
+    unaligned = cpu_bind(_payload_selection, (shifted, lengths, 17))
     key = "cute_radix_packet_alignment_32_v1"
     assert aligned.env.bound_runtime_input_specialization_results[key] == 0
     assert unaligned.env.bound_runtime_input_specialization_results[key] == 16
@@ -795,7 +822,7 @@ def test_wide_packet_has_separate_cache_alignment_fact_and_scalar_fallback() -> 
 
 
 def test_pipeline_coordinates_reject_untyped_or_unbounded_choices() -> None:
-    bound = _cpu_bind(_payload_selection, _args())
+    bound = cpu_bind(_payload_selection, _args())
     for key, choices in PIPELINE_CHOICES.items():
         for value in (True, None, "256", -1, 512):
             with pytest.raises(exc.InvalidConfig):
@@ -832,7 +859,7 @@ def test_first_histogram_publishes_counters_and_all_row_branches_keep_final_wait
 ) -> None:
     x = torch.randn(3, 33, dtype=dtype)
     lengths = torch.tensor([16, 17, 18], dtype=length_dtype)
-    bound = _cpu_bind(_payload_selection, (x, lengths, 17))
+    bound = cpu_bind(_payload_selection, (x, lengths, 17))
     config = _radix_config(
         bound,
         **dict.fromkeys(BOOLEAN_KEYS, True),
@@ -893,7 +920,7 @@ def test_exact_long_read_bounds_and_full_store_guards_are_elided_only_when_prove
         ("masked", (False, True, False)),
         ("smaller", (False, False, True)),
     ):
-        bound = _cpu_bind(_custom_payload, (*arguments, *modes))
+        bound = cpu_bind(_custom_payload, (*arguments, *modes))
         source = bound.to_code(
             _radix_config(
                 bound,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import operator
+import sys
 import unittest
 
+import pytest
 import torch
 from torch.fx import Graph
 
@@ -17,6 +19,13 @@ from helion._compiler.metal.mpp_graph_transform import rewrite_mpp_graphs
 import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language import memory_ops
+
+# Metal runs on macOS only: CI's Linux jobs skip the whole file. It needs no
+# GPU where it does run, so it belongs to the cpu_only lane.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.skipif(sys.platform != "darwin", reason="Metal tests require macOS"),
+]
 
 
 def _target_names(graph: Graph) -> list[str]:
@@ -38,8 +47,13 @@ class TestMetalMPPGraphTransform(unittest.TestCase):
         lhs_indices: tuple[int, int] = (0, 1),
         rhs_indices: tuple[int, int] = (1, 2),
         store_indices: tuple[int, int] = (0, 2),
+        seed: float | None = 0.0,
     ) -> DeviceIR:
+        """``seed`` is the acc's fill value, or None for an acc loaded from a
+        tensor."""
         body_graph = Graph()
+        acc = body_graph.placeholder("acc")
+        acc.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
         lhs = body_graph.placeholder("lhs")
         lhs.meta["val"] = torch.empty(4, 64, dtype=torch.float32)
         rhs = body_graph.placeholder("rhs")
@@ -52,14 +66,22 @@ class TestMetalMPPGraphTransform(unittest.TestCase):
             memory_ops.load, args=(rhs, list(rhs_indices), None, None)
         )
         rhs_load.meta["val"] = torch.empty(64, 4, dtype=torch.float32)
-        acc = body_graph.placeholder("acc")
-        acc.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
         mma = body_graph.call_function(hl.dot, args=(lhs_load, rhs_load, acc, None))
         mma.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
         body_graph.output((mma,))
 
         root_graph = Graph()
-        acc_init = root_graph.call_function(_tracing_ops._new_var, args=())
+        if seed is None:
+            c = root_graph.call_function(_tracing_ops._new_var, args=())
+            c.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+            acc_init = root_graph.call_function(
+                memory_ops.load, args=(c, list(store_indices), None, None)
+            )
+        else:
+            acc_init = root_graph.call_function(
+                hl.full, args=([4, 4], seed, torch.float32, None)
+            )
+        acc_init.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
         for_loop = root_graph.call_function(
             _tracing_ops._for_loop,
             args=(0, [0], [64], [acc_init]),
@@ -234,6 +256,19 @@ class TestMetalMPPGraphTransform(unittest.TestCase):
         assert isinstance(root, RootGraphInfo)
         self.assertIn("_for_loop", _target_names(root.graph))
         self.assertNotIn("_mpp_graph", _target_names(root.graph))
+
+    def test_seed_other_than_zero_is_not_rewritten(self) -> None:
+        """The region starts its cooperative tensor at zero, so a nonzero
+        fill or a loaded seed would be dropped."""
+        for seed in (1.5, None):
+            with self.subTest(seed=seed):
+                device_ir = self._build_matmul_ir(epilogue=None, seed=seed)
+
+                rewrite_mpp_graphs(device_ir)
+                root = device_ir.graphs[1]
+                assert isinstance(root, RootGraphInfo)
+                self.assertIn("_for_loop", _target_names(root.graph))
+                self.assertNotIn("_mpp_graph", _target_names(root.graph))
 
     def test_mpp_marker_preserves_loop_args(self) -> None:
         device_ir = self._build_matmul_ir(epilogue="relu")

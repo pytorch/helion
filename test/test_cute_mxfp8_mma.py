@@ -12,13 +12,13 @@ import pytest
 import torch
 
 from test.test_cute_block_scaled_mma import _wrapper_plan
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
 from helion._compiler.cute.block_scaled_config import block_scaled_workspace_shape
 from helion._compiler.cute.mxfp8_mma import _match_mxfp8
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language.matmul_ops import dot_scaled
@@ -229,7 +229,7 @@ def test_cpu_native_mxfp8_admission_and_workspace(
 ) -> None:
     initialized = torch.cuda.is_initialized()
     inputs = _cpu_inputs(shape, typed=typed, transposed=transposed)
-    with _cpu_target():
+    with cpu_target():
         kernel = _mxfp8_transposed if transposed else _mxfp8
         bound = kernel._bind_isolated(inputs)
         assert bound.config_spec.cute_mxfp8_mma_available
@@ -252,7 +252,7 @@ def test_cpu_native_mxfp8_admission_and_workspace(
 def test_cpu_native_mxfp8_operand_masks(
     operand: str, fill: float, admitted: bool
 ) -> None:
-    with _cpu_target():
+    with cpu_target():
         bound = _mxfp8._bind_isolated(_cpu_inputs((73, 129, 160)))
         with bound.env, bound.host_function:
             ir = bound.host_function.device_ir
@@ -299,7 +299,7 @@ def test_cpu_native_mxfp8_operand_masks(
 )
 def test_cpu_native_mxfp8_rejects_unsafe_programs(change: str) -> None:
     inputs = _cpu_inputs((128, 128, 128))
-    with _cpu_target():
+    with cpu_target():
         if change == "nonzero_acc":
             bound = _nonzero_acc._bind_isolated(inputs)
         elif change in ("wrong_operand_row", "wrong_scale_row"):
@@ -361,7 +361,7 @@ def test_cpu_native_mxfp8_stages_only_under_aligned_raw_operands() -> None:
 def test_cpu_native_mxfp8_rejects_unsupported_geometry(
     changes: dict[str, object],
 ) -> None:
-    with _cpu_target():
+    with cpu_target():
         bound = _mxfp8._bind_isolated(_cpu_inputs((73, 129, 160)))
         with pytest.raises((helion.exc.InvalidConfig, helion.exc.BackendUnsupported)):
             bound.to_code(_config(bound, **changes))

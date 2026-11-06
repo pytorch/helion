@@ -7,14 +7,14 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from ._cute_binding import _cpu_bind
-from ._cute_binding import _mock_cuda_unavailable
 from .cute_population_contracts import _target
 from .test_cute_grouped_fp32_output import _grouped_fp32_output
 import helion
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.cute.launcher import _tcgen05_grouped_dynamic_tensormap_workspace
 
@@ -44,8 +44,8 @@ def test_grouped_multiplier_owns_actual_grid_workspace(
         torch.empty((4, 256, 128), dtype=torch.bfloat16),
         torch.tensor([0, 0, 1, 129, 640], dtype=offset_dtype),
     )
-    with _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped_fp32_output, args)
+    with _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped_fp32_output, args)
         config = bound.config_spec.normalized_config(_config(2))
         assert config["num_sm_multiplier"] == 2
         code = bound.to_code(config)

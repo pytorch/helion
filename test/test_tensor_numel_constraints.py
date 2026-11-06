@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import cast
 import unittest
 
+import pytest
 import sympy
 
 from helion._compiler.backend import TileIRBackend
@@ -18,6 +19,8 @@ from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import ReductionLoopSpec
 from helion.autotuner.config_spec import TensorNumelConstraint
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _make_constraint(

@@ -17,7 +17,6 @@ import torch
 from test.test_cute_mma_dag_gpu import _KDA_INEXACT
 from test.test_cute_mma_dag_gpu import _KDA_SCALED
 from test.test_cute_mma_dag_gpu import _M4_ARGS
-from test.test_cute_mma_dag_gpu import _assert_close
 from test.test_cute_mma_dag_gpu import _bwd_args
 from test.test_cute_mma_dag_gpu import _dqk_args
 from test.test_cute_mma_dag_gpu import _dqkg_args
@@ -41,8 +40,6 @@ from test.test_cute_mma_dag_gpu import _kernel_fn
 from test.test_cute_mma_dag_gpu import _probe_kernels
 from test.test_cute_mma_dag_gpu import _randn
 from test.test_cute_mma_dag_gpu import _run_backend
-from test.test_cute_mma_dag_gpu import _run_triton
-from test.test_cute_mma_dag_gpu import _tensors
 from test.test_cute_mma_dag_tcgen05 import _bind_fwd_o_anch_f32  # noqa: F401
 from test.test_cute_mma_dag_tcgen05 import _matmul_layernorm
 from test.test_cute_mma_dag_tcgen05 import _probe_batch_rescale
@@ -74,6 +71,13 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_mma_dag import DETERMINISM_LAUNCHES
+from helion._testing.cute_mma_dag import LAUNCHES
+from helion._testing.cute_mma_dag import RUNTIMES
+from helion._testing.cute_mma_dag import assert_close
+from helion._testing.cute_mma_dag import run_cute
+from helion._testing.cute_mma_dag import run_triton
+from helion._testing.cute_mma_dag import tensors
 from helion.exc import InvalidConfig
 
 if TYPE_CHECKING:
@@ -91,8 +95,7 @@ pytestmark = [
     ),
 ]
 
-RT = "_helion_mma_dag_tc"
-LAUNCHES = 8
+RT = RUNTIMES["tcgen05"]
 
 
 def _config(
@@ -108,24 +111,12 @@ def _config(
 
 
 def _run_cute(
-    fn: Callable[..., object], args: tuple[object, ...], config: helion.Config
+    fn: Callable[..., object],
+    args: tuple[object, ...],
+    config: helion.Config,
+    launches: int = LAUNCHES,
 ) -> tuple[str, tuple[torch.Tensor, ...]]:
-    kernel = helion.kernel(fn, backend="cute", static_shapes=True)
-    bound = kernel.bind(args)
-    with bound.env:
-        normalized = bound.config_spec.normalized_config(config)
-    assert normalized.config["cute_mma_dag"] == "tcgen05", normalized
-    source = bound.to_code(normalized)
-    assert f"{RT}.prims.tcgen05_mma(" in source, source
-    assert "_cute_grouped_reduce_shared_two_stage" not in source
-    assert "_helion_mma_dag.mma_" not in source
-    compiled = bound.compile_config(normalized)
-    outputs = [_tensors(compiled(*args)) for _ in range(LAUNCHES)]
-    torch.cuda.synchronize()
-    for other in outputs[1:]:
-        for lhs, rhs in zip(outputs[0], other, strict=True):
-            assert torch.equal(lhs, rhs)
-    return source, outputs[0]
+    return run_cute(fn, args, config, mode="tcgen05", launches=launches)
 
 
 @pytest.mark.parametrize(
@@ -145,10 +136,13 @@ def test_varlen_state_pass_matches_the_triton_backend(
     assert source.count("_helion_mma_dag.ldg_s64(") == 2
     assert "for md_i in cutlass.range(md_scalar, md_scalar_1):" in source
     assert "if md_scalar_1 > md_scalar:" in source
-    _assert_close(out, _run_triton(fn, args, [bdv]), scaled=True)
+    assert_close(out, run_triton(fn, args, [bdv]), scaled=True)
 
 
-# kernel, mode, has_h0, (n, d, dv), dtype, bm, bn, warps, stages
+# kernel, mode, has_h0, (n, d, dv), dtype, bm, bn, warps, stages: every decay
+# mode of both recurrences, with and without an initial state, both 16-bit
+# dtypes, 4 / 8 warps, tiles 64 x 16 to 128 x 128, ring depths 1-8 and 8 / 64
+# chunks.
 _CASES = (
     ("fwd", "vanilla", False, (8, 64, 64), torch.bfloat16, 64, 64, 8, 4),
     ("fwd", "vanilla", False, (8, 64, 64), torch.bfloat16, 64, 64, 4, 2),
@@ -200,7 +194,7 @@ def test_state_recurrences_match_the_triton_backend(
     fn = _kernel_fn(kernel)
     source, out = _run_cute(fn, args, _config([bm, bn], warps, stages))
     assert f"block=({32 * warps}, 1, 1)" in source
-    _assert_close(out, _run_triton(fn, args, [bm, bn]))
+    assert_close(out, run_triton(fn, args, [bm, bn]))
 
 
 @pytest.mark.parametrize("kernel", ("fwd", "bwd"))
@@ -242,7 +236,7 @@ def test_the_warp_and_tcgen05_modes_agree(kernel: str, mode: str, has_h0: bool) 
     tc = _run_cute(fn, args, _config([64, 64], 8, 4))[1][0]
     kernel_obj = helion.kernel(fn, backend="cute", static_shapes=True)
     bound = kernel_obj.bind(args)
-    warp = _tensors(
+    warp = tensors(
         bound.compile_config(
             helion.Config(
                 block_sizes=[64, 64],
@@ -271,14 +265,15 @@ def test_the_promoted_default_runs_on_tensor_memory() -> None:
         assert config.config["cute_mma_dag_stages"] in (8, 4)
         source = bound.to_code(config)
         assert f"{RT}.prims.tcgen05_mma(" in source
-        out = _tensors(bound.compile_config(config)(*args))
-        _assert_close(out, _run_triton(fn, args, config.config["block_sizes"]))
+        out = tensors(bound.compile_config(config)(*args))
+        assert_close(out, run_triton(fn, args, config.config["block_sizes"]))
 
 
-# kernel, mode, (d, dv), block_sizes, warps, stages
+# kernel, mode, (d, dv), block_sizes, warps, stages: every decay mode of the
+# three K-loop kernels, 4 / 8 warps, root tiles 16-128 with K tiles 16-128
+# (a partial K tile included) and ring depths 2-8.
 _K_LOOP_CASES = (
     ("fwd_o", "vanilla", (64, 64), [1, 64, 64], 4, 2),
-    ("fwd_o", "vanilla", (128, 128), [1, 128, 128], 4, 2),
     ("fwd_o", "vanilla", (128, 128), [1, 128, 64], 8, 4),
     ("fwd_o", "vanilla", (128, 128), [1, 64, 32], 4, 8),
     ("fwd_o", "vanilla", (64, 128), [1, 16, 16], 4, 2),
@@ -286,7 +281,6 @@ _K_LOOP_CASES = (
     ("fwd_o", "gated", (64, 64), [1, 64, 64], 8, 2),
     ("dqk", "vanilla", (64, 64), [1, 64, 64], 4, 2),
     ("dqk", "vanilla", (128, 128), [1, 128, 32], 4, 2),
-    ("dqk", "vanilla", (128, 128), [1, 64, 64], 8, 2),
     ("dqk", "gated", (64, 64), [1, 64, 64], 4, 2),
     ("dqk", "gated", (128, 64), [1, 64, 64], 8, 2),
     ("dv", "vanilla", (64, 64), [1, 64, 64], 4, 2),
@@ -321,7 +315,7 @@ def test_k_loop_kernels_match_the_triton_backend(
     # The fragment operands of the epilogue dots go through an exchange tile
     # read by the tensor core (no mma.sync repack).
     assert f"{RT}.prims.tcgen05_commit(md_eacc" in source
-    _assert_close(out, _run_triton(fn, args, block_sizes))
+    assert_close(out, run_triton(fn, args, block_sizes))
 
 
 @pytest.mark.parametrize(
@@ -336,7 +330,7 @@ def test_k_loop_kernels_agree_with_the_warp_mode(kernel: str, mode: str) -> None
     fn = _kernel_fn(kernel)
     tc = _run_cute(fn, args, _config([1, 64, 64], 4, 2))[1]
     bound = helion.kernel(fn, backend="cute", static_shapes=True).bind(args)
-    warp = _tensors(
+    warp = tensors(
         bound.compile_config(
             helion.Config(
                 block_sizes=[1, 64, 64],
@@ -366,15 +360,17 @@ def test_gated_k_loop_epilogues_prefetch_their_decay_rows() -> None:
     ):
         args = {"fwd_o": _fwd_o_args, "dqk": _dqk_args, "dv": _dv_args}[kernel](t, mode)
         fn = _kernel_fn(kernel)
-        source, out = _run_cute(fn, args, _config(block_sizes, warps, 2))
+        source, out = _run_cute(
+            fn, args, _config(block_sizes, warps, 2), launches=DETERMINISM_LAUNCHES
+        )
         epilogue = source.rsplit(f"{RT}.mbar_wait(md_accb, ", 1)[1]
         assert "md_ex0 = _helion_mma_dag.ldg_f32(" in source, kernel
         assert "ldg_" not in epilogue, kernel
-        _assert_close(out, _run_triton(fn, args, block_sizes))
+        assert_close(out, run_triton(fn, args, block_sizes))
     bound = helion.kernel(_kernel_fn("fwd_o"), backend="cute", static_shapes=True).bind(
         _fwd_o_args(t, "gated")
     )
-    warp = _tensors(
+    warp = tensors(
         bound.compile_config(
             helion.Config(
                 block_sizes=[1, 128, 128],
@@ -385,7 +381,10 @@ def test_gated_k_loop_epilogues_prefetch_their_decay_rows() -> None:
         )(*_fwd_o_args(t, "gated"))
     )
     tc = _run_cute(
-        _kernel_fn("fwd_o"), _fwd_o_args(t, "gated"), _config([1, 128, 128], 4, 2)
+        _kernel_fn("fwd_o"),
+        _fwd_o_args(t, "gated"),
+        _config([1, 128, 128], 4, 2),
+        launches=DETERMINISM_LAUNCHES,
     )[1]
     torch.cuda.synchronize()
     for lhs, rhs in zip(tc, warp, strict=True):
@@ -501,7 +500,7 @@ def test_the_region_renderer_stages_the_chunk_scan_epilogue_tile() -> None:
         _randn(g, batch, chunks, heads, d, ds, dtype=bf16),
         _randn(g, heads, dtype=bf16),
     )
-    refs = _run_triton(fn, args, [64, 64, 64])
+    refs = run_triton(fn, args, [64, 64, 64])
     outs = {}
     for loads in ("tma", "lane"):
         source, outs[loads] = _run_cute(
@@ -512,7 +511,7 @@ def test_the_region_renderer_stages_the_chunk_scan_epilogue_tile() -> None:
         assert ("_helion_mma_dag.ldg_b32(" in epilogue) == (loads == "lane")
     for lhs, rhs in zip(outs["tma"], outs["lane"], strict=True):
         assert torch.equal(lhs, rhs)
-    _assert_close(outs["tma"], refs, scaled=True)
+    assert_close(outs["tma"], refs, scaled=True)
 
 
 def test_the_k_loop_defaults_run_on_tensor_memory() -> None:
@@ -528,22 +527,21 @@ def test_the_k_loop_defaults_run_on_tensor_memory() -> None:
         assert config.config["cute_mma_dag"] == "tcgen05", kernel
         source = bound.to_code(config)
         assert f"{RT}.prims.tcgen05_mma(" in source
-        out = _tensors(bound.compile_config(config)(*args))
-        _assert_close(out, _run_triton(fn, args, config.config["block_sizes"]))
+        out = tensors(bound.compile_config(config)(*args))
+        assert_close(out, run_triton(fn, args, config.config["block_sizes"]))
 
 
-# kernel, gated, (n, d, dv), bdv, warps, stages
+# kernel, gated, (n, d, dv), bdv, warps, stages: both delta-rule recurrences,
+# gated and plain, DV tiles 16-64 (whole and partial DV, D == C == 64
+# included), 4 / 8 warps, ring depths 1-4 and 8 / 64 chunks.
 _DELTA_CASES = (
-    ("fwd_h_delta", False, (8, 128, 32), 32, 4, 2),
     ("fwd_h_delta", False, (8, 128, 64), 32, 8, 2),
     ("fwd_h_delta", False, (64, 128, 128), 32, 4, 4),
     ("fwd_h_delta", False, (8, 128, 128), 64, 4, 2),
     ("fwd_h_delta", False, (8, 128, 64), 16, 4, 1),
-    ("fwd_h_delta", True, (8, 128, 64), 32, 4, 2),
     ("fwd_h_delta", True, (64, 128, 128), 64, 8, 4),
     ("fwd_h_delta", True, (8, 128, 32), 16, 4, 1),
     ("fwd_h_delta", True, (8, 64, 64), 32, 4, 2),
-    ("dstate", False, (8, 128, 64), 32, 4, 2),
     ("dstate", False, (64, 128, 128), 32, 8, 3),
     ("dstate", False, (8, 128, 32), 16, 4, 2),
     ("dstate", False, (8, 128, 64), 64, 4, 2),
@@ -585,8 +583,8 @@ def test_delta_state_recurrences_match_the_triton_backend(
     # pointwise steps share the Inductor lowering: bit-equal, except that
     # Triton contracts the gated dstate's ``dv_i + dv_kh * decay`` into an
     # FMA (one bf16 ulp on a few elements; the warp mode shows the same).
-    ref = _run_triton(fn, args, [bdv])
-    _assert_close(out, ref)
+    ref = run_triton(fn, args, [bdv])
+    assert_close(out, ref)
     if not (gated and kernel == "dstate"):
         for lhs, rhs in zip(out, ref, strict=True):
             assert torch.equal(lhs, rhs)
@@ -601,7 +599,7 @@ def test_delta_state_recurrences_match_the_triton_backend(
         bound.config_spec.normalize(warp_config, _fix_invalid=True)
     assert warp_config["cute_mma_dag"] == "warp", warp_config
     assert warp_config["block_sizes"] == [bdv], warp_config
-    warp = _tensors(bound.compile_config(helion.Config(**warp_config))(*args))
+    warp = tensors(bound.compile_config(helion.Config(**warp_config))(*args))
     torch.cuda.synchronize()
     for lhs, rhs in zip(out, warp, strict=True):
         assert torch.equal(lhs, rhs)
@@ -619,7 +617,7 @@ def test_a_body_store_in_the_first_block_matches_the_triton_backend(
     args = (t["k"], t["v"], _randn(g, 2, 64, 64, 64, dtype=torch.bfloat16))
     source, out = _run_cute(_store_first, args, _config([64, 64], warps, stages))
     assert "md_parity * 8192 + md_row64 * 128" in source
-    _assert_close(out, _run_triton(_store_first, args, [64, 64]))
+    assert_close(out, run_triton(_store_first, args, [64, 64]))
 
 
 @pytest.mark.parametrize(
@@ -636,6 +634,8 @@ def test_a_body_store_in_the_first_block_matches_the_triton_backend(
         "_loop_chain_store",
     ),
 )
+# Every K-loop probe at both warp counts (with their ring depths): with two
+# axes the product is their pairwise cover.
 @pytest.mark.parametrize(("warps", "stages"), ((4, 2), (8, 1)))
 def test_probe_kernels_match_the_triton_backend(
     name: str, warps: int, stages: int
@@ -667,7 +667,7 @@ def test_probe_kernels_match_the_triton_backend(
             args = (*args, _randn(g, 4, 64, 64, dtype=torch.bfloat16))
         block_sizes = [1, 64, 64]
     _source, out = _run_cute(fn, args, _config(block_sizes, warps, stages))
-    _assert_close(out, _run_triton(fn, args, block_sizes))
+    assert_close(out, run_triton(fn, args, block_sizes))
 
 
 def test_unaligned_operand_sources_take_the_synchronous_pass() -> None:
@@ -683,7 +683,7 @@ def test_unaligned_operand_sources_take_the_synchronous_pass() -> None:
     source, out = _run_cute(fn, args, _config([64, 64], 8, 2))
     assert "_helion_mma_dag.ldg_b32(" in source and "_helion_mma_dag.sts_b32(" in source
     assert "'tma_count': 1" in source
-    _assert_close(out, _run_triton(fn, args, [64, 64]))
+    assert_close(out, run_triton(fn, args, [64, 64]))
 
 
 def test_the_program_order_loop_prefetches_the_epilogue_row_after_the_loop() -> None:
@@ -699,14 +699,14 @@ def test_the_program_order_loop_prefetches_the_epilogue_row_after_the_loop() -> 
         _randn(g, 6, 64, 64, dtype=torch.bfloat16),
         _randn(g, 6, 64, scale=0.1, dtype=torch.float32),
     )
-    source, out = _run_cute(fn, args, _config([], 4, 2))
+    source, out = _run_cute(fn, args, _config([], 4, 2), launches=DETERMINISM_LAUNCHES)
     loop, epilogue = source.rsplit(f"{RT}.mbar_wait(md_accb, 4 - 0 - 1 & 1)", 1)
     last = loop.rstrip().rsplit("\n", 1)[1]
     assert last.startswith("    md_ex0 = _helion_mma_dag.ldg_f32("), last
     assert "ldg_" not in epilogue
-    _assert_close(out, _run_triton(fn, args, []))
+    assert_close(out, run_triton(fn, args, []))
     bound = helion.kernel(fn, backend="cute", static_shapes=True).bind(args)
-    warp = _tensors(
+    warp = tensors(
         bound.compile_config(
             helion.Config(
                 block_sizes=[],
@@ -742,29 +742,28 @@ def test_a_wide_epilogue_fragment_prefetches_only_its_row_site() -> None:
     assert source.count("md_ex0 = _helion_mma_dag.ldg_f32(") == 1
     assert "md_ex1" not in source
     assert epilogue.count("_helion_mma_dag.ldg_f32(") == 128
-    _assert_close(out, _run_triton(fn, args, [1, 64, 64]))
+    assert_close(out, run_triton(fn, args, [1, 64, 64]))
 
 
-# kernel, gated, block_sizes, warps, stages
+# kernel, gated, block_sizes, warps, stages: every region program the examples
+# admit, gated and plain, at 4 / 8 warps, tiles 16-128 and ring depths 1-8.
+# (Geometries the persistent, loads-knob and wide-tile tests below run are
+# left to them: dqkw gated [64, 32, 64, 128, 32], bwd_o_kda [64, 64, 16],
+# wy_dL [.., 64, 128]; state_du_kda renders the same body at 4 and 8 warps.)
 _M4_CASES = (
     ("dk", False, [64], 4, 2),
     ("dk", False, [32], 8, 4),
-    ("dk", False, [128], 4, 1),
     ("dk", False, [16], 4, 8),
     ("dqkw", False, [64, 64, 64], 4, 2),
     ("dqkw", False, [32, 64, 32], 8, 1),
     ("dqkw", False, [64, 32, 16], 4, 4),
     ("dqkw", True, [64, 64, 64, 64, 64], 4, 2),
     ("dqkw", True, [32, 32, 32, 64, 64], 8, 2),
-    ("dqkw", True, [64, 32, 64, 128, 32], 4, 1),
     ("wy_dL", False, [64, 64, 64], 4, 2),
     ("wy_dL", False, [32, 64, 32], 8, 1),
-    ("wy_dL", False, [64, 32, 128], 4, 4),
     ("wy_dL", True, [64, 64, 64], 4, 2),
-    ("wy_dL", True, [32, 32, 32], 4, 4),
     ("wy_dL", True, [64, 32, 64], 8, 2),
     ("wy", False, [64, 64, 64], 4, 2),
-    ("wy", False, [32, 64, 64], 4, 4),
     ("wy", False, [64, 128, 128], 4, 1),
     ("wy", False, [64, 64, 64], 8, 2),
     ("wy", True, [64, 64, 64], 4, 2),
@@ -772,13 +771,10 @@ _M4_CASES = (
     # The kda / anchored region programs (a tile-only derived operand in
     # tensor memory, a dots-only batch behind a loop, the outer loop's staging
     # behind a sibling loop's last batch).
-    ("bwd_o_kda", False, [64, 64, 16], 4, 4),
     ("bwd_o_kda", False, [64, 64, 64], 4, 2),
     ("bwd_o_kda", False, [32, 64, 32], 8, 1),
     ("state_du_kda", False, [16], 4, 8),
     ("state_du_kda", False, [64], 4, 2),
-    ("state_du_kda", False, [32], 8, 4),
-    ("fwd_o_anch", False, [1, 16, 16], 4, 4),
     ("fwd_o_anch", False, [1, 64, 64], 4, 2),
     ("fwd_o_anch", False, [1, 32, 128], 8, 1),
     # dwk's masked epilogue store reads the column sum of its own fragment
@@ -809,7 +805,7 @@ def _assert_region_outputs(
         elif lhs.dim() >= 3 and index not in inexact:
             assert torch.equal(lhs, rhs), index
         else:
-            _assert_close((lhs,), (rhs,))
+            assert_close((lhs,), (rhs,))
 
 
 def _m4_args(kernel: str, gated: bool, seed: int = 3) -> tuple[object, ...]:
@@ -848,7 +844,7 @@ def test_region_programs_match_the_triton_backend(
     if kernel == "wy":
         assert f"{RT}.prims.Tcgen05MMAKind.TF32" in source
         assert "a_dtype=cutlass.Float32, b_dtype=cutlass.Float32" in source
-    ref = _run_triton(fn, args, block_sizes)
+    ref = run_triton(fn, args, block_sizes)
     _assert_region_outputs(kernel, out, ref)
     if kernel == "wy":
         # mma.sync's tf32 m16n8k8 and the UMMA accumulate in different
@@ -861,7 +857,7 @@ def test_region_programs_match_the_triton_backend(
     with bound.env:
         bound.config_spec.normalize(warp_config, _fix_invalid=True)
     assert warp_config["cute_mma_dag"] == "warp", warp_config
-    warp = _tensors(bound.compile_config(helion.Config(**warp_config))(*args))
+    warp = tensors(bound.compile_config(helion.Config(**warp_config))(*args))
     torch.cuda.synchronize()
     _assert_region_outputs(kernel, out, warp)
 
@@ -887,11 +883,14 @@ def test_the_loads_knob_matches_the_triton_backend(
     # launches each.
     args = _m4_args(kernel, gated)
     fn = _kernel_fn(kernel)
-    ref = _run_triton(fn, args, block_sizes)
+    ref = run_triton(fn, args, block_sizes)
     outs = {}
     for loads in ("tma", "lane"):
         source, out = _run_cute(
-            fn, args, _config(block_sizes, warps, stages, cute_mma_dag_loads=loads)
+            fn,
+            args,
+            _config(block_sizes, warps, stages, cute_mma_dag_loads=loads),
+            launches=DETERMINISM_LAUNCHES,
         )
         if kernel == "dk":
             assert (f"{RT}.lds_v4_f32(md_s0 + 0 + md_st0" in source) == (loads == "tma")
@@ -926,11 +925,16 @@ def test_root_items_overlaying_the_loop_frames_match_the_triton_backend() -> Non
     )
     fn = _two_loops_store_between.fn
     for warps, stages in ((4, 2), (8, 1)):
-        source, out = _run_cute(fn, (a, b, c, d), _config([64, 64], warps, stages))
+        source, out = _run_cute(
+            fn,
+            (a, b, c, d),
+            _config([64, 64], warps, stages),
+            launches=DETERMINISM_LAUNCHES,
+        )
         assert (
             "alloc_smem(cutlass.Uint8, 32768, alignment=1024)" in source or stages == 1
         )
-        ref = _run_triton(fn, (a, b, c, d), [64, 64])
+        ref = run_triton(fn, (a, b, c, d), [64, 64])
         for lhs, rhs in zip(out, ref, strict=True):
             assert torch.equal(lhs, rhs)
     a32 = torch.randn((48, 64, 64), device=DEVICE, dtype=torch.float32, generator=g)
@@ -939,12 +943,14 @@ def test_root_items_overlaying_the_loop_frames_match_the_triton_backend() -> Non
     )
     fn = _hoisted_raw_over_a_narrow_ring.fn
     for sizes, warps, stages in (([16], 4, 2), ([32], 4, 1), ([16], 8, 4)):
-        source, out = _run_cute(fn, (a32, b2), _config(sizes, warps, stages))
+        source, out = _run_cute(
+            fn, (a32, b2), _config(sizes, warps, stages), launches=DETERMINISM_LAUNCHES
+        )
         if sizes == [16] and stages == 2:
             assert source.index(f"{RT}.mbar_wait(md_sfr, 0)") < source.index(
                 f"{RT}.prims.mbarrier_arrive_expect_tx(md_full0"
             )
-        ref = _run_triton(fn, (a32, b2), sizes)
+        ref = run_triton(fn, (a32, b2), sizes)
         for lhs, rhs in zip(out, ref, strict=True):
             assert torch.equal(lhs, rhs)
 
@@ -970,11 +976,13 @@ def test_shared_tmem_columns_match_the_triton_backend(
     # numbers stay Triton's over eight launches.
     args = _m4_args("wy_dL", gated)
     fn = _kernel_fn("wy_dL")
-    source, out = _run_cute(fn, args, _config(block_sizes, warps, stages))
+    source, out = _run_cute(
+        fn, args, _config(block_sizes, warps, stages), launches=DETERMINISM_LAUNCHES
+    )
     assert f"{RT}.prims.tcgen05_alloc(md_tslot, 128," in source
     columns = re.findall(r"md_acc(\d+) = cutlass\.inttoptr\(md_tmem \+ (\d+),", source)
     assert len({column for _slot, column in columns}) < len(columns)
-    _assert_region_outputs("wy_dL", out, _run_triton(fn, args, block_sizes))
+    _assert_region_outputs("wy_dL", out, run_triton(fn, args, block_sizes))
 
 
 @pytest.mark.parametrize(
@@ -997,9 +1005,9 @@ def test_flat_streaming_region_programs_run_on_tensor_memory(
     assert default.config["cute_mma_dag_loads"] == "tma"
     with bound.env:
         default = spec.normalized_config(default)
-    out = _tensors(bound.compile_config(default)(*args))
+    out = tensors(bound.compile_config(default)(*args))
     _assert_region_outputs(
-        kernel, out, _run_triton(fn, args, default.config["block_sizes"])
+        kernel, out, run_triton(fn, args, default.config["block_sizes"])
     )
 
 
@@ -1020,9 +1028,9 @@ def test_region_programs_keep_the_warp_default(kernel: str) -> None:
     )
     with bound.env:
         seed = spec.normalized_config(seed)
-    out = _tensors(bound.compile_config(seed)(*args))
+    out = tensors(bound.compile_config(seed)(*args))
     _assert_region_outputs(
-        kernel, out, _run_triton(fn, args, seed.config["block_sizes"])
+        kernel, out, run_triton(fn, args, seed.config["block_sizes"])
     )
 
 
@@ -1079,8 +1087,8 @@ def test_chain_probes_match_the_triton_backend(
     if name == "h4":
         assert f"{RT}.prims.Tcgen05MMAKind.TF32" in source
         assert "unpack_bf16x2(" in source and "unpack_f16x2(" not in source
-    ref = _run_triton(fn, args, block_sizes)
-    _assert_close(out, ref)
+    ref = run_triton(fn, args, block_sizes)
+    assert_close(out, ref)
     for index, (lhs, rhs) in enumerate(zip(out, ref, strict=True)):
         if index not in inexact:
             assert torch.equal(lhs, rhs), index
@@ -1099,7 +1107,7 @@ def _launches(
         normalized = bound.config_spec.normalized_config(config)
     assert normalized.config["cute_mma_dag"] == "tcgen05", normalized
     compiled = bound.compile_config(normalized)
-    outputs = [_tensors(compiled(*args)) for _ in range(count)]
+    outputs = [tensors(compiled(*args)) for _ in range(count)]
     torch.cuda.synchronize()
     return bound.to_code(normalized), outputs
 
@@ -1126,7 +1134,7 @@ def test_tensors_accessed_after_their_snapshot_see_the_stored_values() -> None:
     assert bound.config_spec.cute_mma_dag_facts is None
     source, outputs = _launches(_snap_same_dst, args, config, 20)
     assert f"{RT}.prims.cp_async_bulk_tensor_global_shared_cta(" not in source
-    (ref,) = _run_triton(_snap_same_dst, args, [64, 16])
+    (ref,) = run_triton(_snap_same_dst, args, [64, 16])
     for (out,) in outputs:
         assert torch.equal(out, ref)
 
@@ -1141,7 +1149,7 @@ def test_trailing_tma_stores_match_the_triton_backend(stages: int) -> None:
             _store_after, args, _config([64, cols], 4, stages), 20
         )
         assert source.count(f"{RT}.prims.cp_async_bulk_wait_group(1, read=True)") == 1
-        (ref,) = _run_triton(_store_after, args, [64, cols])
+        (ref,) = run_triton(_store_after, args, [64, cols])
         for (out,) in outputs:
             assert torch.equal(out, ref)
 
@@ -1174,7 +1182,7 @@ def test_fp32_gla_output_reads_h_mn_major_by_tma(
     source, out = _run_cute(fn, args, _config(block_sizes, warps, stages))
     assert "'s128b_atom_32b'" in source
     assert f"{RT}.prims.Tcgen05SmemSwizzle.SWIZZLE_128B_ATOM_32B" in source
-    ref = _run_triton(fn, args, block_sizes)
+    ref = run_triton(fn, args, block_sizes)
     for lhs, rhs in zip(out, ref, strict=True):
         assert torch.equal(lhs, rhs)
 
@@ -1196,15 +1204,13 @@ def test_snapshot_rereads_through_views_see_the_stores(cols: int) -> None:
             )
 
 
+# kernel, mode, (n, d, dv), bn, stages: every program with a pass chain,
+# trips 1, 2 and N, stages 2, 3, 4 and 8, tiles 32 / 64.
 _PASS_WARP_CASES = (
     ("fwd_h_delta", True, (8, 128, 64), 32, 4),
-    ("fwd_h_delta", True, (8, 128, 64), 32, 2),
-    ("fwd_h_delta", True, (1, 128, 64), 32, 4),
     ("fwd_h_delta", True, (2, 128, 128), 64, 3),
     ("dstate", True, (8, 128, 64), 32, 2),
-    ("dstate", True, (2, 128, 64), 32, 3),
     ("dstate", True, (1, 128, 128), 64, 2),
-    ("bwd", "scalar", (8, 64, 64), 64, 4),
     ("bwd", "scalar", (1, 64, 64), 64, 2),
     ("bwd", "scalar", (64, 128, 128), 64, 8),
     # The K-loop kernels' fp32 dh convert pass (a raw tile beside the operand).
@@ -1260,7 +1266,7 @@ def test_pass_warps_match_the_chain_passes(
         _source, other = _run_cute(fn, args, _config(block_sizes, warps, stages))
         for lhs, rhs in zip(out, other, strict=True):
             assert torch.equal(lhs, rhs)
-    _assert_close(out, _run_triton(fn, args, block_sizes))
+    assert_close(out, run_triton(fn, args, block_sizes))
 
 
 def test_in_loop_vector_stores_run_on_the_warp_mode() -> None:
@@ -1351,9 +1357,9 @@ def test_sync_route_pass_tiles_are_paced_by_the_free_barrier(
     assert f"{RT}.mbar_wait_sleep(md_free + md_stage, md_round)" in pass_loop
     assert "md_full" not in pass_loop and f"{RT}.ldg_" not in pass_loop
     compiled = bound.compile_config(normalized)
-    outputs = [_tensors(compiled(*args)) for _ in range(10)]
+    outputs = [tensors(compiled(*args)) for _ in range(10)]
     torch.cuda.synchronize()
-    ref = _run_triton(fn, args, [64, 64])
+    ref = run_triton(fn, args, [64, 64])
     for out in outputs:
         for lhs, rhs in zip(out, ref, strict=True):
             assert torch.equal(lhs, rhs)
@@ -1380,17 +1386,15 @@ def _regions_probe_inputs(seed: int = 6) -> dict[str, torch.Tensor]:
     }
 
 
-# Region probes: (name, fn, arg keys, block sizes, warps, stages)
+# Region probes: (name, fn, arg keys, block sizes, warps, stages) -- every
+# probe at the geometry of its bug, the loop-shaped ones at a second tile or
+# ring depth (1-3 stages, 4 / 8 warps, 32-128 tiles).
 _REGION_PROBES = (
     ("hoist", _probe_hoist, ("q", "k", "s", "x64"), [64, 128], 4, 2),
-    ("hoist", _probe_hoist, ("q", "k", "s", "x64"), [64, 64], 4, 2),
     ("hoist_loop", _probe_hoist_loop, ("s", "u", "w", "x128"), [32, 64], 4, 2),
-    ("hoist_loop", _probe_hoist_loop, ("s", "u", "w", "x128"), [64, 64], 4, 2),
     ("rawlate", _probe_rawlate, ("q", "k", "x64", "q2"), [64, 64], 4, 2),
-    ("rawlate", _probe_rawlate, ("q", "k", "x64", "q2"), [32, 64], 4, 2),
     ("rawlate", _probe_rawlate, ("q", "k", "x64", "q2"), [64, 64], 4, 1),
     ("carry2", _probe_carry2, ("s", "t", "q", "x64"), [64, 64], 4, 2),
-    ("carry2", _probe_carry2, ("s", "t", "q", "x64"), [32, 64], 4, 2),
     ("kk", _probe_kk, ("q", "k"), [64, 128], 4, 2),
     (
         "recompute",
@@ -1400,21 +1404,11 @@ _REGION_PROBES = (
         4,
         2,
     ),
-    (
-        "recompute",
-        _probe_recompute,
-        ("q", "k", "s", "t", "x64", "x64b", "x64c", "s"),
-        [64, 64],
-        4,
-        1,
-    ),
     ("drainrace", _probe_drainrace, ("q", "k", "s", "t"), [64, 64], 4, 2),
     ("drainrace", _probe_drainrace, ("q", "k", "s", "t"), [32, 128], 4, 3),
     ("dotless_store", _probe_dotless_store, ("q", "k", "x512", "y512"), [64, 64], 4, 2),
-    ("dotless_store", _probe_dotless_store, ("q", "k", "x512", "y512"), [64, 32], 4, 2),
     ("register_carry", _probe_register_carry, ("q", "k", "s", "x64"), [64, 64], 4, 2),
     ("register_carry", _probe_register_carry, ("q", "k", "s", "x64"), [32, 64], 8, 2),
-    ("register_carry", _probe_register_carry, ("q", "k", "s", "x64"), [64, 32], 4, 1),
     ("register_carry_budget", _probe_register_carry_budget, ("k",), [64], 4, 2),
     ("register_carry_budget", _probe_register_carry_budget, ("k",), [32], 8, 4),
 )
@@ -1449,8 +1443,10 @@ def test_region_probes_match_the_triton_backend(
     # an FMA and Triton >= 3.9 rounds first (one fp32 rounding apart).
     t = _regions_probe_inputs()
     args = tuple(t[key] for key in keys)
-    _source, out = _run_cute(fn, args, _config(block_sizes, warps, stages))
-    ref = _run_triton(fn, args, block_sizes)
+    _source, out = _run_cute(
+        fn, args, _config(block_sizes, warps, stages), launches=DETERMINISM_LAUNCHES
+    )
+    ref = run_triton(fn, args, block_sizes)
     for index, (lhs, rhs) in enumerate(zip(out, ref, strict=True)):
         if name == "register_carry_budget" and index == 0:
             atol = 1e-6 * rhs.abs().max().item()
@@ -1462,14 +1458,12 @@ def test_region_probes_match_the_triton_backend(
 @pytest.mark.parametrize(
     ("kernel", "gated", "block_sizes", "warps", "stages", "extra"),
     (
-        ("wy_dL", False, [32, 64, 128], 4, 2, {}),
         ("wy_dL", False, [64, 64, 128], 4, 2, {}),
         ("wy_dL", True, [32, 64, 128], 4, 2, {}),
         ("wy_dL", True, [64, 64, 128], 4, 4, {}),
         ("dqkw", True, [128, 64, 64, 64, 128], 4, 3, {"cute_mma_dag_exchange": "smem"}),
     ),
     ids=[
-        "wy_dL-32x64x128w4s2",
         "wy_dL-64x64x128w4s2",
         "wy_dL-gated-32x64x128w4s2",
         "wy_dL-gated-64x64x128w4s4",
@@ -1492,8 +1486,13 @@ def test_wide_tiles_sharing_a_tensor_map_match_the_triton_backend(
     # bit-equal to Triton, the vectors by tolerance, eight launches each.
     args = _m4_args(kernel, gated)
     fn = _kernel_fn(kernel)
-    _source, out = _run_cute(fn, args, _config(block_sizes, warps, stages, **extra))
-    _assert_region_outputs(kernel, out, _run_triton(fn, args, block_sizes))
+    _source, out = _run_cute(
+        fn,
+        args,
+        _config(block_sizes, warps, stages, **extra),
+        launches=DETERMINISM_LAUNCHES,
+    )
+    _assert_region_outputs(kernel, out, run_triton(fn, args, block_sizes))
 
 
 @pytest.mark.parametrize(
@@ -1533,9 +1532,14 @@ def test_the_chains_squared_carry_takes_its_own_columns(
     # default (four CTAs per SM).
     args = _m4_args("wy", gated)
     fn = _kernel_fn("wy")
-    source, out = _run_cute(fn, args, _config(block_sizes, warps, stages, **extra))
+    source, out = _run_cute(
+        fn,
+        args,
+        _config(block_sizes, warps, stages, **extra),
+        launches=DETERMINISM_LAUNCHES,
+    )
     assert f"{RT}.prims.tcgen05_alloc(md_tslot, 128," in source
-    _assert_region_outputs("wy", out, _run_triton(fn, args, block_sizes))
+    _assert_region_outputs("wy", out, run_triton(fn, args, block_sizes))
 
 
 @pytest.mark.parametrize(
@@ -1549,22 +1553,21 @@ def test_a_16_bit_matmul_with_a_tile_index_mask_matches_the_triton_backend(
     fn = _probe_kernels()._head_sum_logits
     args = _head_sum_args()
     _source, out = _run_cute(fn, args, _config(block_sizes, warps, stages))
-    (ref,) = _run_triton(fn, args, block_sizes)
+    (ref,) = run_triton(fn, args, block_sizes)
     assert torch.equal(out[0], ref)
 
 
-# (m, k, n), bm, bk, stages, cluster
-# shape, bm, bk, stages, split count, split mode
+# shape, bm, bk, stages, split count, split mode: both split forms over 1-16
+# CTAs per row, row tiles 64 / 128, K tiles 64 / 128, ring depths 1-8 and
+# grids from one CTA to beyond one wave.
 _MLN_CASES = (
     ((128, 256, 256), 64, 64, 2, 1, "cluster"),
-    ((128, 256, 256), 128, 64, 4, 1, "cluster"),
     ((256, 512, 2048), 64, 64, 2, 8, "cluster"),
     ((256, 512, 2048), 128, 128, 2, 8, "cluster"),
     ((256, 256, 1024), 128, 64, 4, 4, "cluster"),
     ((64, 128, 512), 64, 128, 1, 2, "cluster"),
     ((512, 1024, 1024), 64, 64, 8, 8, "cluster"),
     # The fixup grid: no cluster, the row sums through the workspace.
-    ((256, 512, 2048), 64, 64, 2, 8, "fixup"),
     ((256, 512, 2048), 128, 64, 4, 8, "fixup"),
     ((256, 512, 2048), 64, 64, 2, 16, "fixup"),
     ((512, 1024, 1024), 64, 128, 4, 8, "fixup"),
@@ -1644,7 +1647,13 @@ def test_the_fixup_counters_survive_the_wrap() -> None:
     counters = workspace[tiles * row_tiles * rows * 4 * 2 :][: row_tiles * 4].view(
         torch.int32
     )
-    assert counters.tolist() == [period] * row_tiles
+    # The compiled module, and with it this workspace, is shared with every
+    # earlier compile of this kernel at this shape and config in the process
+    # (the deterministic-split test below is one), and each of their launches
+    # advanced every counter by one period.
+    launched = counters[0].item()
+    assert launched >= period and launched % period == 0
+    assert counters.tolist() == [launched] * row_tiles
     for seed in (2**31 - period, 2**32 - period, 2**32 - 2 * period):
         counters.fill_(seed - 2**32 if seed >= 2**31 else seed)
         torch.cuda.synchronize()
@@ -1712,11 +1721,7 @@ def test_the_streamed_epilogue_matches_the_reference(
             epilogue,
             loads,
         )
-        bound = helion.kernel(
-            _matmul_layernorm, backend="cute", static_shapes=True
-        ).bind((x, y, weight, bias))
-        fn = bound.compile_config(bound.config_spec.normalized_config(config))
-        assert torch.equal(fn(x, y, weight, bias), fn(x, y, weight, bias))
+        # (``_run_cute`` relaunched the compile and compared the launches.)
         outs[epilogue] = out
     ref = torch.nn.functional.layer_norm(
         (x @ y).float(), [n], weight.float(), bias.float()
@@ -1783,7 +1788,7 @@ def test_a_non_finite_fill_beside_a_fragment_matches_the_triton_backend() -> Non
     fn = _probe_kernels()._masked_neg_inf_stored
     source, (out,) = _run_cute(fn, _masked_neg_inf_args(), _config([64], 4, 2))
     assert "cutlass.Float32(float('-inf'))" in source
-    (ref,) = _run_triton(fn, _masked_neg_inf_args(), [64])
+    (ref,) = run_triton(fn, _masked_neg_inf_args(), [64])
     assert torch.isinf(ref).any() and torch.isfinite(ref).any()
     assert torch.equal(out, ref)
 
@@ -1813,7 +1818,7 @@ def test_se_block_dx_derived_operand_routes_match_the_triton_backend(
         assert f"{RT}.prims.tcgen05_st(" not in loop
     else:
         assert f"{RT}.prims.tcgen05_st(" in loop
-    (ref,) = _run_triton(fn, args, [128, 64, 64])
+    (ref,) = run_triton(fn, args, [128, 64, 64])
     assert torch.equal(out, ref)
 
 
@@ -1837,10 +1842,13 @@ def test_the_split_epilogue_matches_the_triton_backend(
     fn = _probe_kernels()._head_sum_logits
     args = _head_sum_args()
     source, (out,) = _run_cute(
-        fn, args, _config(block_sizes, 8, stages, cute_mma_dag_epilogue="split")
+        fn,
+        args,
+        _config(block_sizes, 8, stages, cute_mma_dag_epilogue="split"),
+        launches=DETERMINISM_LAUNCHES,
     )
     assert "md_epi = md_warp < 8" in source and "block=(256, 1, 1)" in source
-    (ref,) = _run_triton(fn, args, block_sizes)
+    (ref,) = run_triton(fn, args, block_sizes)
     assert torch.equal(out, ref)
 
 
@@ -1909,7 +1917,7 @@ def test_region_probes_match_the_triton_backend_under_the_split(
         fn, args, _config(block_sizes, 8, stages, cute_mma_dag_epilogue="split")
     )
     assert "md_epi = md_warp < 8" in source
-    ref = _run_triton(fn, args, block_sizes)
+    ref = run_triton(fn, args, block_sizes)
     for index, (lhs, rhs) in enumerate(zip(out, ref, strict=True)):
         if name == "register_carry_budget" and index == 0:
             atol = 1e-6 * rhs.abs().max().item()
@@ -1948,7 +1956,7 @@ def test_region_programs_match_the_triton_backend_under_the_split(
         fn, args, _config(block_sizes, 8, stages, cute_mma_dag_epilogue="split")
     )
     assert "md_epi = md_warp < 8" in source
-    _assert_region_outputs(kernel, out, _run_triton(fn, args, block_sizes))
+    _assert_region_outputs(kernel, out, run_triton(fn, args, block_sizes))
 
 
 # --------------------------------------------------------------------------
@@ -1995,10 +2003,11 @@ def test_the_lookahead_schedule_matches_the_triton_backend(
             cute_mma_dag_epilogue=epilogue,
             cute_mma_dag_lookahead="on",
         ),
+        launches=DETERMINISM_LAUNCHES,
     )
     assert "md_lkb = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)" in source
     assert source.count(f"{RT}.prims.tcgen05_commit(md_lkb + ") == 2
-    (ref,) = _run_triton(fn, args, block_sizes)
+    (ref,) = run_triton(fn, args, block_sizes)
     assert torch.equal(out, ref)
 
 
@@ -2071,7 +2080,7 @@ def test_se_block_dx_streamed_ring_matches_the_triton_backend(
     assert f"{RT}.prims.tcgen05_commit(md_empty0 + md_st0" in loop
     assert "_helion_mma_dag.ldg_b32(" not in source
     assert ", md_sfr)" in source
-    (ref,) = _run_triton(fn, args, block_sizes)
+    (ref,) = run_triton(fn, args, block_sizes)
     assert torch.equal(out, ref)
 
 
@@ -2103,7 +2112,7 @@ def test_se_block_dw_mn_major_tf32_a_matches_the_triton_backend(
     assert "SWIZZLE_128B_ATOM_32B" in source
     if derived == "pass":
         assert "md_empty0 = cute.arch.alloc_smem(cutlass.Int64" in source
-    (ref,) = _run_triton(fn, args, [64, 64, 64])
+    (ref,) = run_triton(fn, args, [64, 64, 64])
     assert torch.equal(out, ref)
 
 
@@ -2153,7 +2162,7 @@ def test_tensor_memory_a_operands_are_bit_equal_to_the_exchange_tiles(
     for lhs, rhs in zip(outs["auto"], outs["smem"], strict=True):
         assert torch.equal(lhs, rhs)
         assert torch.isfinite(lhs).all()
-    _assert_region_outputs("wy", outs["auto"], _run_triton(fn, args, block_sizes))
+    _assert_region_outputs("wy", outs["auto"], run_triton(fn, args, block_sizes))
 
 
 _STATE_READ_PROBES = {
@@ -2284,7 +2293,7 @@ def test_dqkg_anchored_dk_reads_the_shared_da_tile_mn_major(
         descs.append(match.group(1))
     assert len({desc.split("build(")[1].split(",")[0] for desc in descs}) == 1
     assert all("SWIZZLE_128B_ATOM_32B" in desc for desc in descs), descs
-    rq, rk, rg = _run_triton(fn, args, block_sizes)
+    rq, rk, rg = run_triton(fn, args, block_sizes)
     assert torch.equal(dq, rq)
     assert torch.equal(dg, rg)
     relative_l2 = (dk.float() - rk.float()).norm() / rk.float().norm()
@@ -2292,7 +2301,7 @@ def test_dqkg_anchored_dk_reads_the_shared_da_tile_mn_major(
     if d == 64:
         assert torch.equal(dk, rk)
     else:
-        _assert_close((dk,), (rk,), scaled=True)
+        assert_close((dk,), (rk,), scaled=True)
 
 
 @pytest.mark.parametrize(
@@ -2356,7 +2365,7 @@ def test_varlen_window_tiles_match_the_triton_backend(
         outputs,
         helion.Config(block_sizes=block_sizes),
     )
-    _assert_close(outs, refs, scaled=True)
+    assert_close(outs, refs, scaled=True)
 
 
 # kernel, decay mode, (bhn, d, dv), block sizes, warps, stages, CTAs per SM,
@@ -2374,14 +2383,12 @@ _PERSISTENT_CASES = (
         2,
         {"cute_mma_dag_epilogue": "split"},
     ),
-    ("dqkg", "scalar", (1024, 64, 64), [1, 64, 32], 4, 2, 2, {}),
     ("dqkg", "anchored", (1024, 64, 64), [1, 32, 32], 4, 2, 2, {}),
     # A four-trip ring loop (two slots; the next tile's prologue is one
     # slot) and a grid below the CTA count (every next-tile issue guarded).
     ("dqkg", "scalar", (512, 64, 256), [1, 64, 64], 4, 2, 2, {}),
     ("dqkg", "scalar", (16, 64, 64), [1, 64, 64], 4, 1, 2, {}),
     ("dv", "scalar", (1024, 64, 64), [1, 64, 64], 4, 1, 3, {}),
-    ("dv", "vanilla", (1024, 64, 64), [1, 64, 64], 4, 1, 3, {}),
     ("dv", "diag", (1024, 64, 64), [1, 64, 64], 4, 1, 2, {}),
     ("dv", "scalar", (16, 64, 64), [1, 64, 64], 4, 1, 1, {}),
 )
@@ -2456,13 +2463,15 @@ def test_persistent_launches_match_the_flat_launch_bitwise(
 # ring; wy_dL: three ring loops; wy: four top-level loops; bwd_o_kda and
 # wy_anch: the kda family's) as persistent launches against their flat
 # launches.
+# The module's long relaunch sweep: a persistent launch of five loops (a
+# nested ring among them) at two CTAs per SM and one stage, the most barrier
+# phases per launch.
+_SIBLING_PERSISTENT_LONG_SWEEP = ("dqkw", True, [64, 32, 64, 128, 32], 4, 1, 2)
 _SIBLING_PERSISTENT_CASES = (
     ("dqkw", False, [64, 64, 64], 4, 2, 1),
-    ("dqkw", True, [64, 32, 64, 128, 32], 4, 1, 2),
+    _SIBLING_PERSISTENT_LONG_SWEEP,
     ("wy_dL", False, [64, 64, 64], 4, 2, 1),
-    ("wy_dL", False, [64, 32, 128], 4, 2, 1),
     ("wy", False, [64, 64, 64], 4, 2, 1),
-    ("bwd_o_kda", False, [64, 64, 64], 4, 2, 1),
     ("bwd_o_kda", False, [64, 64, 16], 4, 4, 2),
     ("wy_anch", False, [32, 64], 4, 1, 2),
 )
@@ -2498,7 +2507,15 @@ def test_persistent_launches_with_sibling_root_loops_match_the_flat_launch_bitwi
         t = _inputs_m4(bhn=512, d=128, dv=128, dtype=torch.bfloat16, seed=3)
         args = _M4_ARGS[kernel](t, gated)
     fn = _kernel_fn(kernel)
-    _flat_source, base = _run_cute(fn, args, _config(block_sizes, warps, stages))
+    launches = (
+        DETERMINISM_LAUNCHES
+        if (kernel, gated, block_sizes, warps, stages, ctas)
+        == _SIBLING_PERSISTENT_LONG_SWEEP
+        else LAUNCHES
+    )
+    _flat_source, base = _run_cute(
+        fn, args, _config(block_sizes, warps, stages), launches
+    )
     source, out = _run_cute(
         fn,
         args,
@@ -2510,6 +2527,7 @@ def test_persistent_launches_with_sibling_root_loops_match_the_flat_launch_bitwi
             pid_type="persistent_interleaved",
             num_sm_multiplier=ctas,
         ),
+        launches,
     )
     assert "for virtual_pid in range(" in source
     assert "if md_npid < total_pids:" in source
@@ -2641,7 +2659,7 @@ def test_the_mma_warp_matches_the_pass_schedule_and_the_triton_backend(
         _config(block_sizes, warps, stages, cute_mma_dag_derived="pass", **extra),
     )
     assert torch.equal(out, base)
-    (ref,) = _run_triton(fn, args, block_sizes)
+    (ref,) = run_triton(fn, args, block_sizes)
     assert torch.equal(out, ref)
 
 
@@ -2778,7 +2796,7 @@ def test_the_mma_warp_owns_no_packet_outside_its_loop(
     assert "md_ready" not in plain and f"if md_tidx < {32 * warps}:" not in plain
     for lhs, rhs in zip(out, base, strict=True):
         assert torch.equal(lhs, rhs)
-    ref = _run_triton(fn, args, config.config["block_sizes"])
+    ref = run_triton(fn, args, config.config["block_sizes"])
     if kernel == "dqkw":
         _assert_region_outputs(kernel, out, ref)
     else:

@@ -23,6 +23,7 @@ from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessBlockPtr
+from helion._testing import slowIfBackends
 from helion.autotuner.benchmark_provider import _searching_candidates
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
@@ -714,6 +715,8 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             # Otherwise the bound kernel is keyed on the exact input metadata.
             self.assertIs(row_sum.bind((y,)), bound)
 
+    # A real search at four extents (CuTe compiles each candidate cold).
+    @slowIfBackends(["cute"])
     def test_looped_winner_autotunes_once_across_extent_buckets(self):
         """The autotuner's reference baseline at n=1024 is a persistent row
         reduction; compiling it must not key the extent bucket, so the looped
