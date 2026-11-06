@@ -14,6 +14,7 @@ from typing import Callable
 from typing import Sequence
 
 import torch
+from torch._inductor.ops_handler import OpsHandler
 
 from .. import exc
 from .ast_extension import expr_from_string
@@ -25,7 +26,6 @@ if TYPE_CHECKING:
     import contextlib
 
     import sympy
-    from torch._inductor.ops_handler import OpsHandler
 
     from ..autotuner.config_fragment import ConfigSpecFragment
     from ..autotuner.config_priors import ValuePrior
@@ -71,7 +71,8 @@ if TYPE_CHECKING:
     from .tile_strategy import TileStrategy
     from .tile_strategy import VecLaneWrapper
 
-    InductorOpOverrides = OpsHandler[Any]
+# Defined at runtime so ``helion.backend_api`` can re-export it.
+InductorOpOverrides = OpsHandler[Any]
 
 log: logging.Logger = logging.getLogger(__name__)
 
