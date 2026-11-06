@@ -1697,61 +1697,64 @@ def test_several_rows_per_thread_renders_roll_back_the_lane_accumulators() -> No
             assert all(name.endswith("_acc") for name in saves), saves
 
 
-def test_ragged_shapes_render_the_plain_kernel() -> None:
+# The several-rows and the one-row packet configs on this shape are rendered
+# (and pinned to the plain render, with its ``if mask else`` selects) by the
+# GPU tests test_several_rows_per_thread_configs_on_a_ragged_shape and
+# test_one_row_packet_configs_on_a_ragged_axis_render_the_plain_kernel, which
+# compile the plain kernel anyway; the pins here cover the remaining configs.
+@pytest.mark.parametrize(
+    ("kernel", "plain_kernel"),
+    ROWS_KERNELS,
+    ids=[kernel.fn.__name__ for kernel, _ in ROWS_KERNELS],
+)
+def test_ragged_shapes_render_the_plain_rows_kernel(
+    kernel: helion.Kernel, plain_kernel: helion.Kernel
+) -> None:
     """Ragged shapes (a partial row block, a reduction axis the lane sweeps
     do not divide) put ``if mask else`` selects into the sweeps: every
     packet load and register-cache reload is one, and every operand of
-    every division descends from one (the rows kernels' loads directly,
-    JSD's and softmax's exponentials and row sums through the arithmetic).
+    every division descends from one (the rows kernels' loads directly).
     The pass fails closed on every such operand, whatever the spelling, so
-    the render IS the plain render: no helper, no hoisted reciprocal, for
-    every rows kernel, JSD and softmax under every config -- the
-    several-rows configs, the one-row configs and the one-row packet family
-    (corpus-4 config 43).  The same packet configs on an exact axis take
-    the redo form: the pin is about the masked tail, not the config."""
+    the render IS the plain render: no helper, no hoisted reciprocal, under
+    the one-row configs.  The same one-row packet configs on an exact axis
+    take the redo form: the pin is about the masked tail, not the config."""
     x = torch.empty(RAGGED_ROWS, RAGGED_COLS, dtype=torch.float32)
     s = torch.empty(RAGGED_ROWS, dtype=torch.float32)
-    configs = (
-        *SEVERAL_ROWS_CONFIGS,
-        ROWS_CONFIG,
-        INDEPENDENT_ROWS_CONFIG,
-        *ONE_ROW_PACKET_CONFIGS,
-    )
-    for kernel, plain_kernel in ROWS_KERNELS:
-        for config in configs:
-            plain = _render(plain_kernel, (x, s), **config)
-            assert " else " in plain, (kernel.fn.__name__, config)
-            assert _render(kernel, (x, s), **config) == plain, (
-                kernel.fn.__name__,
-                config,
-            )
+    for config in (ROWS_CONFIG, INDEPENDENT_ROWS_CONFIG):
+        plain = _render(plain_kernel, (x, s), **config)
+        assert " else " in plain, config
+        assert _render(kernel, (x, s), **config) == plain, config
+    # The control: on an exact axis the one-row packet configs take the
+    # redo form, rolling the sweep accumulators back.
+    x = torch.empty(64, 4096, dtype=torch.float32)
+    s = torch.empty(64, dtype=torch.float32)
+    for config in map(_on_exact_axis, ONE_ROW_PACKET_CONFIGS):
+        plain = _render(plain_kernel, (x, s), **config)
+        assert " else " not in plain, config
+        exact = _render(kernel, (x, s), **config)
+        assert REDO in exact, config
+        assert _without_exact_additions(exact) == plain, config
+        _exact_names_defined_before_use(exact)
+        saves, restores = _saved_names(exact)
+        assert saves and saves == restores, config
+
+
+def test_ragged_shapes_render_the_plain_softmax_and_jsd() -> None:
+    """The same pin for softmax (its exponentials and row sums descend from
+    the masked loads through the arithmetic) under its pinned config and the
+    one-row packet family, and for JSD under its pinned config; JSD's
+    independent-reduction and ragged configs on this shape are pinned by
+    test_jsd_configs_with_independent_reductions_match_the_plain_render."""
     xh = torch.empty(RAGGED_ROWS, RAGGED_COLS, dtype=torch.float16)
     for config in (SOFTMAX_CONFIG, *ONE_ROW_PACKET_CONFIGS):
         plain = _render(softmax_plain, (xh,), **config)
         assert " else " in plain, config
         assert _render(softmax, (xh,), **config) == plain, config
+    x = torch.empty(RAGGED_ROWS, RAGGED_COLS, dtype=torch.float32)
     args = (0.3, 2.0, x, x.clone())
-    for config in (JSD_CONFIG, INDEPENDENT_JSD_CONFIG, *JSD_RAGGED_CONFIGS):
-        plain = _render(jsd_plain, args, **config)
-        assert " else " in plain, config
-        assert _render(jsd, args, **config) == plain, config
-    # The control: on an exact axis the one-row packet configs take the
-    # redo form in every rows kernel, rolling the sweep accumulators back.
-    x = torch.empty(64, 4096, dtype=torch.float32)
-    s = torch.empty(64, dtype=torch.float32)
-    for kernel, plain_kernel in ROWS_KERNELS:
-        for config in map(_on_exact_axis, ONE_ROW_PACKET_CONFIGS):
-            plain = _render(plain_kernel, (x, s), **config)
-            assert " else " not in plain, (kernel.fn.__name__, config)
-            exact = _render(kernel, (x, s), **config)
-            assert REDO in exact, (kernel.fn.__name__, config)
-            assert _without_exact_additions(exact) == plain, (
-                kernel.fn.__name__,
-                config,
-            )
-            _exact_names_defined_before_use(exact)
-            saves, restores = _saved_names(exact)
-            assert saves and saves == restores, (kernel.fn.__name__, config)
+    plain = _render(jsd_plain, args, **JSD_CONFIG)
+    assert " else " in plain
+    assert _render(jsd, args, **JSD_CONFIG) == plain
 
 
 # --------------------------------------------------------------------------
@@ -1768,6 +1771,10 @@ def _float_from_parts(
         | significand.to(torch.int32)
     )
     return bits.view(torch.float32)
+
+
+def _shape_id(shape: tuple[int, int]) -> str:
+    return f"{shape[0]}x{shape[1]}"
 
 
 @skipIfNotCUDA()
@@ -2054,9 +2061,15 @@ class TestExactDivisionCuda(TestCase):
         configs: list[dict[str, Any]],
         *,
         redo_markers: tuple[str, ...] = (),
+        plain_markers: tuple[str, ...] = (),
+        plain_marker_count: int | None = None,
     ) -> list[int]:
         """The redo form equals the plain render bit for bit on every
-        config; ``redo_markers`` must appear in every redo render.  A config
+        config; ``redo_markers`` must appear in every redo render and
+        ``plain_markers`` in the plain renders of the first
+        ``plain_marker_count`` configs (all by default): the ragged shapes'
+        ``if mask else`` selects, which make the pinned configs' fail-closed
+        pins meaningful (a random config's lane sweep may divide the axis).  A config
         the backend rejects for this shape (``BackendUnsupported``, a
         structural refusal) must be rejected identically with the exact
         hoist on.  A config on which the pass fails closed (no loop it can
@@ -2092,6 +2105,9 @@ class TestExactDivisionCuda(TestCase):
             ran += 1
             body0 = _kernel_body(code0)
             assert ANY_EXACT not in body0
+            if plain_marker_count is None or index < plain_marker_count:
+                for marker in plain_markers:
+                    assert marker in body0, (marker, plain_config)
             rendered = _kernel_body(
                 kernel.bind(args).to_code(helion.Config(**plain_config))
             )
@@ -2136,41 +2152,43 @@ class TestExactDivisionCuda(TestCase):
         assert len(buckets[False]) == count, buckets
         return [*buckets[False], *buckets[True]]
 
+    @parametrize("shape", [(96, 4096), (RAGGED_ROWS, RAGGED_COLS)], name_fn=_shape_id)
     def test_softmax_configs_with_independent_reductions_match_the_plain_render(
-        self,
+        self, shape: tuple[int, int]
     ) -> None:
         """The independent partial accumulators and random configs: the
         redo form equals the plain render on the adversarial fp16 rows, on
         an exact and on a ragged shape.  A config whose consume sweep the
         redo cannot take (its store packet list is bound outside the lane
         loop; every config with a masked tail) renders the plain render."""
-        for rows, cols in ((96, 4096), (RAGGED_ROWS, RAGGED_COLS)):
-            g = torch.Generator().manual_seed(0)
-            x = torch.randn(rows, cols, generator=g)
-            x[0, ::3] = float("-inf")
-            x[1, :] = float("-inf")
-            x[2, 7] = float("nan")
-            x[3, :] = 0.0
-            x[4, :] += 6e4
-            x[5, :] *= 1e4
-            x[6, :] = -65504.0
-            x[6, 1] = 65504.0
-            x[rows - 1, ::2] = float("-inf")
-            args = (x.to(torch.float16).to(DEVICE),)
-            configs = [
-                INDEPENDENT_SOFTMAX_CONFIG,
-                *self._random_configs(softmax, args, 2),
-            ]
-            with self.subTest(shape=(rows, cols)):
-                fired = self._forms_match_the_plain_render(
-                    softmax, softmax_plain, args, configs
-                )
-                if cols == 4096:
-                    # The campaign's pinned config takes the redo form.
-                    assert 0 in fired, fired
+        rows, cols = shape
+        g = torch.Generator().manual_seed(0)
+        x = torch.randn(rows, cols, generator=g)
+        x[0, ::3] = float("-inf")
+        x[1, :] = float("-inf")
+        x[2, 7] = float("nan")
+        x[3, :] = 0.0
+        x[4, :] += 6e4
+        x[5, :] *= 1e4
+        x[6, :] = -65504.0
+        x[6, 1] = 65504.0
+        x[rows - 1, ::2] = float("-inf")
+        args = (x.to(torch.float16).to(DEVICE),)
+        configs = [
+            INDEPENDENT_SOFTMAX_CONFIG,
+            *self._random_configs(softmax, args, 2),
+        ]
+        fired = self._forms_match_the_plain_render(
+            softmax, softmax_plain, args, configs
+        )
+        if cols == 4096:
+            # The campaign's pinned config takes the redo form.
+            assert 0 in fired, fired
 
+    @parametrize("cols", [4096, RAGGED_COLS])
+    @parametrize("pinned", [True, False], name_fn=lambda p: "pinned" if p else "random")
     def test_jsd_configs_with_independent_reductions_match_the_plain_render(
-        self,
+        self, cols: int, pinned: bool
     ) -> None:
         """JSD under the pinned configs, the configs whose masked tails the
         retired guard form perturbed by 1-2 ulp, and random configs.  On an
@@ -2178,34 +2196,41 @@ class TestExactDivisionCuda(TestCase):
         configs take the redo form and equal the plain render bit for bit;
         the several-rows configs (row-masked loads) and every config on a
         vocabulary the lane sweeps do not divide (50 x 4000: the masked
-        packet loads reach every operand) render the plain kernel."""
-        for cols in (4096, RAGGED_COLS):
-            g = torch.Generator().manual_seed(0)
-            student = torch.randn(RAGGED_ROWS, cols, generator=g)
-            teacher = torch.randn(RAGGED_ROWS, cols, generator=g)
-            student[0, :] = -1e30
-            student[1, 5] = float("nan")
-            student[2, ::7] = float("-inf")
-            student[3, :] *= 1e30
-            teacher[RAGGED_ROWS - 1, :] = -1e30
-            args = (0.3, 2.0, student.to(DEVICE), teacher.to(DEVICE))
-            configs = [
-                INDEPENDENT_JSD_CONFIG,
-                *JSD_RAGGED_CONFIGS,
-                *self._random_configs(jsd, args, 1),
-            ]
-            with self.subTest(cols=cols):
-                fired = self._forms_match_the_plain_render(
-                    jsd, jsd_plain, args, configs
-                )
-                if cols == 4096:
-                    assert set(fired) >= {0, 1}, fired
-                    assert not set(fired) & {2, 3}, fired
-                else:
-                    assert fired == [], fired
+        packet loads reach every operand) render the plain kernel.  Each
+        config compiles its own kernels, so the pinned and the random
+        configs are separate cases."""
+        g = torch.Generator().manual_seed(0)
+        student = torch.randn(RAGGED_ROWS, cols, generator=g)
+        teacher = torch.randn(RAGGED_ROWS, cols, generator=g)
+        student[0, :] = -1e30
+        student[1, 5] = float("nan")
+        student[2, ::7] = float("-inf")
+        student[3, :] *= 1e30
+        teacher[RAGGED_ROWS - 1, :] = -1e30
+        args = (0.3, 2.0, student.to(DEVICE), teacher.to(DEVICE))
+        configs = (
+            [INDEPENDENT_JSD_CONFIG, *JSD_RAGGED_CONFIGS]
+            if pinned
+            else self._random_configs(jsd, args, 1)
+        )
+        fired = self._forms_match_the_plain_render(
+            jsd,
+            jsd_plain,
+            args,
+            configs,
+            plain_markers=() if cols == 4096 else (" else ",),
+        )
+        if cols != 4096:
+            assert fired == [], fired
+        elif pinned:
+            assert set(fired) >= {0, 1}, fired
+            assert not set(fired) & {2, 3}, fired
 
+    @parametrize(
+        "kernel,plain", ROWS_KERNELS, name_fn=lambda kernel, plain: kernel.fn.__name__
+    )
     def test_one_row_packet_configs_on_a_ragged_axis_render_the_plain_kernel(
-        self,
+        self, kernel: helion.Kernel, plain: helion.Kernel
     ) -> None:
         """Every rows kernel on the hard rows of 53 x 4000 under the one-row
         packet family (corpus-4 config 43, whose redo render differed from
@@ -2215,38 +2240,42 @@ class TestExactDivisionCuda(TestCase):
         the redo form (a lane sweep that divides 4000 has no masked tail)
         must equal the plain render bit for bit."""
         args = _hard_rows(DEVICE, RAGGED_ROWS, RAGGED_COLS)
-        for kernel, plain in ROWS_KERNELS:
-            random_configs = [
-                config
-                for config in self._random_configs(kernel, args, 3)
-                if not _several_rows_per_thread(config)
-            ]
-            assert len(random_configs) == 3, random_configs
-            configs = [*ONE_ROW_PACKET_CONFIGS, *random_configs]
-            with self.subTest(kernel=kernel.fn.__name__):
-                fired = self._forms_match_the_plain_render(kernel, plain, args, configs)
-                assert not set(fired) & set(range(len(ONE_ROW_PACKET_CONFIGS))), fired
+        random_configs = [
+            config
+            for config in self._random_configs(kernel, args, 3)
+            if not _several_rows_per_thread(config)
+        ]
+        assert len(random_configs) == 3, random_configs
+        configs = [*ONE_ROW_PACKET_CONFIGS, *random_configs]
+        fired = self._forms_match_the_plain_render(
+            kernel,
+            plain,
+            args,
+            configs,
+            plain_markers=(" else ",),
+            plain_marker_count=len(ONE_ROW_PACKET_CONFIGS),
+        )
+        assert not set(fired) & set(range(len(ONE_ROW_PACKET_CONFIGS))), fired
 
+    @parametrize("shape", [(64, 4096), (RAGGED_ROWS, RAGGED_COLS)], name_fn=_shape_id)
     def test_reduction_configs_with_independent_reductions_match_the_plain_render(
-        self,
+        self, shape: tuple[int, int]
     ) -> None:
         """A rolled row kernel with a store sweep and a reduction sweep:
         one-row and several-rows random configs on the hard rows, on an
         exact shape (every config takes the redo form) and on a ragged
         shape (the masked operand loads keep the plain division)."""
-        for shape in ((64, 4096), (RAGGED_ROWS, RAGGED_COLS)):
-            args = _hard_rows(DEVICE, *shape)
-            configs = [
-                INDEPENDENT_ROWS_CONFIG,
-                *self._random_configs(normalize_and_sum, args, 2),
-            ]
-            assert sum(map(_several_rows_per_thread, configs)) == 2, configs
-            with self.subTest(shape=shape):
-                fired = self._forms_match_the_plain_render(
-                    normalize_and_sum, normalize_and_sum_plain, args, configs
-                )
-                if shape == (64, 4096):
-                    assert fired == list(range(len(configs))), fired
+        args = _hard_rows(DEVICE, *shape)
+        configs = [
+            INDEPENDENT_ROWS_CONFIG,
+            *self._random_configs(normalize_and_sum, args, 2),
+        ]
+        assert sum(map(_several_rows_per_thread, configs)) == 2, configs
+        fired = self._forms_match_the_plain_render(
+            normalize_and_sum, normalize_and_sum_plain, args, configs
+        )
+        if shape == (64, 4096):
+            assert fired == list(range(len(configs))), fired
 
     def _several_rows_configs_match_the_plain_render(
         self,
@@ -2256,15 +2285,18 @@ class TestExactDivisionCuda(TestCase):
         config: dict[str, Any],
     ) -> None:
         args = _hard_rows(DEVICE, *shape)
+        exact_shape = shape == (64, 4096)
         fired = self._forms_match_the_plain_render(
             kernel,
             plain,
             args,
             [config],
             redo_markers=("cutlass.range_constexpr", "_helion_exdiv_save_"),
+            plain_markers=() if exact_shape else (" else ",),
         )
-        if shape == (64, 4096):
-            assert fired == [0], fired
+        # On the exact shape the redo form fires; on the ragged shape the
+        # masked operand loads make the pass fail closed (the plain render).
+        assert fired == ([0] if exact_shape else []), fired
 
     # Each case compiles both the plain and redo kernels. Give every pair its
     # own test timeout instead of sharing one across all 24 compilations.
@@ -2293,8 +2325,8 @@ class TestExactDivisionCuda(TestCase):
     ) -> None:
         """The same on a ragged shape (a partial row block, a reduction axis
         the lanes do not divide): the masked operand loads keep the plain
-        division (the render is the plain render; were a sweep to take the
-        redo form it would have to equal the plain render bit for bit)."""
+        division, so the render is the plain render with its ``if mask
+        else`` selects."""
         self._several_rows_configs_match_the_plain_render(
             (RAGGED_ROWS, RAGGED_COLS), kernel, plain, config
         )

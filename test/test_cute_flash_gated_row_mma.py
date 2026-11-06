@@ -40,12 +40,13 @@ from helion._compiler.cute import cute_flash_gated
 from helion._compiler.cute import cute_flash_gated_row_mma as row_mma
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_flash import compiled_source
 from helion.exc import InvalidConfig
-
-pytestmark = skipUnlessBackends(["cute"])
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+pytestmark = skipUnlessBackends(["cute"])
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
@@ -488,14 +489,12 @@ def test_row_seed_configs(head_dim: int) -> None:
             }
 
 
+# The configurations the numerics test below launches are compiled there; this
+# keeps the one row program (two m-tiles and a two-way key split behind the
+# ring at head dim 64) that no numerics case runs.
 @pytest.mark.parametrize(
     ("head_dim", "q_tile", "kv_tile", "kv_stage", "warps", "fast_math"),
-    [
-        (32, 16, 16, 2, 4, True),
-        (32, 16, 32, 4, 2, False),
-        (64, 32, 64, 2, 4, True),
-        (128, 16, 64, 2, 2, True),
-    ],
+    [(64, 32, 64, 2, 4, True)],
 )
 def test_row_kernel_compiles_without_gpu(
     head_dim: int,
@@ -534,14 +533,18 @@ def test_row_kernel_compiles_without_gpu(
 # ---------------------------------------------------------------------------
 
 
-def _run_row(kernel: Any, args: tuple[Any, ...], config: helion.Config) -> torch.Tensor:
+def _run_row(
+    kernel: Any, args: tuple[Any, ...], config: helion.Config
+) -> tuple[torch.Tensor, str]:
+    """Compile and launch ``config``; returns the output and the compiled source
+    (read back from the compiled module rather than rendered a second time)."""
     kernel.reset()
     bound = kernel.bind(args)
-    bound.set_config(config)
-    assert ROW_KIND in bound.to_code(config)
+    code = compiled_source(bound, config)
+    assert ROW_KIND in code
     out = bound(*args)
     torch.cuda.synchronize()
-    return out
+    return out, code
 
 
 # The head-dim 64/128 row programs at 64- and 128-wide KV tiles take about a
@@ -551,24 +554,38 @@ def _run_row(kernel: Any, args: tuple[Any, ...], config: helion.Config) -> torch
 # pyrefly: ignore [bad-argument-type]
 @onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+# Every row is a distinct kernel: the head dim sets the fragment counts; the
+# query tile one or two m-tiles per warp (``grm_ms``); the KV tile the 4- or
+# 8-element gate passes; ``kv_stage`` no ring (1) or a two- or four-slot
+# cp.async ring; ``warps`` a single warp (no combine), a key split with the
+# shared-memory combine (``grm_ks``), or both splits at once. ``fast_math``
+# swaps the one gate-division line, so a single exact-division row covers it.
 @pytest.mark.parametrize(
-    ("head_dim", "q_tile", "kv_tile", "kv_stage", "warps"),
+    ("head_dim", "q_tile", "kv_tile", "kv_stage", "warps", "fast_math"),
     [
-        (32, 16, 16, 2, 4),
-        (32, 16, 32, 4, 2),
-        (32, 16, 128, 1, 1),
-        (64, 16, 64, 2, 1),
-        (64, 16, 16, 4, 8),
-        (64, 32, 32, 4, 2),
-        (64, 32, 16, 2, 8),
-        (64, 16, 128, 1, 1),
-        (128, 16, 64, 2, 2),
-        (128, 32, 64, 1, 4),
+        (32, 16, 16, 2, 4, True),
+        (32, 16, 32, 4, 2, False),
+        (64, 16, 64, 2, 1, True),
+        (64, 16, 16, 4, 8, True),
+        (64, 32, 32, 4, 2, True),
+        (64, 32, 16, 2, 8, True),
+        (64, 16, 128, 1, 1, True),
+        (128, 16, 64, 2, 2, True),
+        (128, 32, 64, 1, 4, True),
     ],
 )
 def test_row_program_matches_reference_at_jagged_lengths(
-    head_dim: int, q_tile: int, kv_tile: int, kv_stage: int, warps: int
+    head_dim: int,
+    q_tile: int,
+    kv_tile: int,
+    kv_stage: int,
+    warps: int,
+    fast_math: bool,
 ) -> None:
+    """Lengths 300 (the maximum, not a tile multiple: its last tile's tail
+    rows alias the next sequence), 173, an empty sequence, 261, 5 and a last
+    sequence of one row, shorter than the maximum, so the tail rows of its
+    last tile lie past the tensor end (zero-filled loads, no store)."""
     torch.manual_seed(2026)
     max_seq_len = 300
     q, k, v, seq_offsets = _jagged_inputs([300, 173, 0, 261, 5, 1], 2, head_dim)
@@ -583,9 +600,10 @@ def test_row_program_matches_reference_at_jagged_lengths(
         keep=_causal_keep,
         kv_end="tile_end",
     )
-    kernel = _hstu_module()._helion_jagged_attention_kernel
+    kernel = _with_fast_math(_hstu_module()._helion_jagged_attention_kernel, fast_math)
     config = _row_config(q_tile, kv_tile, kv_stage, warps)
-    out = _run_row(kernel, args, config)
+    out, code = _run_row(kernel, args, config)
+    assert ("approx=True" in code) is fast_math
     _assert_matches(out, expected, 2e-2)
     # The warp combine runs in fixed order: repeated launches of the compiled
     # kernel (``bind`` returns the bound kernel ``_run_row`` compiled) are
@@ -593,32 +611,3 @@ def test_row_program_matches_reference_at_jagged_lengths(
     again = kernel.bind(args)(*args)
     torch.cuda.synchronize()
     assert torch.equal(out, again)
-
-
-# pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("fast_math", [True, False])
-def test_row_program_last_sequence_shorter_than_max(fast_math: bool) -> None:
-    """The last sequence is shorter than ``max_seq_len``: its last query
-    tile's tail rows lie past the tensor end (zero-filled loads, no store),
-    and the first sequence's tail rows alias the second sequence's rows."""
-    torch.manual_seed(11)
-    max_seq_len = 128
-    q, k, v, seq_offsets = _jagged_inputs([128, 86], 4, 32)
-    args = (max_seq_len, 0.05, q, k, v, seq_offsets)
-    expected = _gated_reference(
-        q,
-        k,
-        v,
-        seq_offsets,
-        alpha=0.05,
-        max_seq_len=max_seq_len,
-        keep=_causal_keep,
-        kv_end="tile_end",
-    )
-    kernel = _with_fast_math(_hstu_module()._helion_jagged_attention_kernel, fast_math)
-    out = _run_row(kernel, args, _row_config(16, 32, 2, 4))
-    _assert_matches(out, expected, 2e-2)
-    code = kernel.bind(args).to_code(_row_config(16, 32, 2, 4))
-    assert ("approx=True" in code) is fast_math

@@ -22,8 +22,10 @@ from helion._compiler.cute.collective_tmem_seed import _same_cell
 from helion._compiler.cute.collective_tmem_seed import _seed_recipe
 from helion._compiler.cute.collective_tmem_seed import bridge_collective_tmem_seeds
 from helion._compiler.cute.collective_tmem_seed import prune_pure_scalar_statements
+from helion._testing import pairwise
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_flash import compiled_source
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
@@ -87,6 +89,19 @@ def _pair() -> tuple[
 def _fresh() -> Callable[[str], str]:
     counter = count()
     return lambda name: f"{name}_{next(counter)}"
+
+
+# ``block_m`` picks the TMEM store atom (St16x128bOp at 64 rows, St32x32bOp
+# at 128) and ``block_n`` the thread layout; the element type only renames the
+# MMA operands and ``static_shapes`` only bakes the extents into the source.
+# All pairs of these independent knobs keep every (block_m, block_n) tile with
+# both element types / shape modes in four cases instead of eight.
+_MAMBA_SEED_TILE_CASES = pairwise(
+    block_m=(64, 128), block_n=(32, 64), static_shapes=(False, True)
+)
+_MAMBA_SEED_CUDA_CASES = pairwise(
+    block_m=(64, 128), block_n=(32, 64), dtype=(torch.float16, torch.bfloat16)
+)
 
 
 @pytest.mark.parametrize("index", ["row", "(m0 + row) - m0"])
@@ -224,11 +239,12 @@ else:
     assert "old" not in ast.unparse(ast.fix_missing_locations(ast.Module(pruned, [])))
 
 
-@pytest.mark.parametrize("static_shapes", [False, True])
-@pytest.mark.parametrize("block_m,block_n", [(64, 32), (64, 64), (128, 32), (128, 64)])
+@pytest.mark.parametrize(
+    ("block_m", "block_n", "static_shapes"), _MAMBA_SEED_TILE_CASES
+)
 @skipUnlessBackends(["cute"])
 def test_generated_mamba_has_direct_seed_and_live_final_drain(
-    static_shapes: bool, block_m: int, block_n: int
+    block_m: int, block_n: int, static_shapes: bool
 ) -> None:
     args = tuple(torch.empty(size, dtype=torch.bfloat16) for size in _mamba_sizes(2))
     bound = cpu_bind(_mamba_kernel(static_shapes=static_shapes), args)
@@ -354,8 +370,7 @@ def test_dependent_contractions_cuda_tail_empty_k_and_graph_reset(
     lengths.fill_(78)
     bound = _dependent_contractions._bind_isolated(args)
     config = _dependent_config(block_m, block_n, True)
-    assert "collective_tmem_seed_values" in bound.to_code(config)
-    bound.set_config(config)
+    assert "collective_tmem_seed_values" in compiled_source(bound, config)
     control = _dependent_contractions._bind_isolated(args)
     control.set_config(_dependent_config(block_m, block_n, False))
     replay = _make_cudagraph_replay(lambda: bound(*args))
@@ -384,8 +399,7 @@ def test_dependent_contractions_cuda_tail_empty_k_and_graph_reset(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("block_m,block_n", [(64, 32), (64, 64), (128, 32), (128, 64)])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(("block_m", "block_n", "dtype"), _MAMBA_SEED_CUDA_CASES)
 @skipUnlessBackends(["cute"])
 def test_mamba_cuda_tmem_seed_matches_existing_exactly(
     block_m: int, block_n: int, dtype: torch.dtype
@@ -407,8 +421,7 @@ def test_mamba_cuda_tmem_seed_matches_existing_exactly(
         }
     )
     bound = kernel._bind_isolated(args)
-    assert "collective_tmem_seed_values" in bound.to_code(config)
-    bound.set_config(config)
+    assert "collective_tmem_seed_values" in compiled_source(bound, config)
     control = kernel._bind_isolated(args)
     control.set_config(
         helion.Config.from_dict(config.config | {"cute_collective_tmem_seed": False})

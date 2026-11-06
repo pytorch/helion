@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 from contextlib import ExitStack
 from contextlib import contextmanager
 import dataclasses
@@ -12,7 +11,6 @@ from pathlib import Path
 import random
 import subprocess
 import sys
-from typing import TYPE_CHECKING
 from typing import Any
 from typing import Iterator
 from typing import cast
@@ -292,12 +290,12 @@ from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_flash import memoized_flash_fragments
 from helion.autotuner import IntegerFragment
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
 from helion.autotuner.base_cache import StrictAutotuneCacheKey
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
-from helion.autotuner.config_fragment import ConfigSpecFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
@@ -325,9 +323,6 @@ from helion.runtime.kernel import _find_device as runtime_find_device
 from helion.runtime.kernel import _input_tensor_metadata
 from helion.runtime.settings import Settings
 from helion.runtime.settings import _get_backend
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 HOPPER_HARDWARE = HardwareInfo(
     device_kind="cuda",
@@ -574,40 +569,6 @@ def _grouped_worklist_bind_patches(
                     return_value=True,
                 )
             )
-        yield
-
-
-@contextlib.contextmanager
-def _memoized_flash_fragments() -> Iterator[None]:
-    """Memoize ``flash_autotune_fragments`` for the duration of one test.
-
-    The structural coverage design calls it thousands of times per
-    ``ConfigGeneration`` with only a handful of distinct argument tuples (one
-    per pipeline-family override), and it is deterministic for fixed arguments
-    and environment. The first repeat of each key is re-verified against the
-    real function so a nondeterministic surface would still fail. Do not use
-    under a patched flash target policy or HELION_CUTE_FLASH_* environment.
-    """
-    real = cast(
-        "Callable[..., dict[str, ConfigSpecFragment]]",
-        cute_flash.flash_autotune_fragments,
-    )
-    surfaces: dict[tuple[object, ...], dict[str, ConfigSpecFragment]] = {}
-    verified: set[tuple[object, ...]] = set()
-
-    def wrapper(
-        head_dim: int, num_kv: int, **kwargs: object
-    ) -> dict[str, ConfigSpecFragment]:
-        key = (head_dim, num_kv, tuple(sorted(kwargs.items())))
-        cached = surfaces.get(key)
-        if cached is None:
-            cached = surfaces[key] = real(head_dim, num_kv, **kwargs)
-        elif key not in verified:
-            verified.add(key)
-            assert real(head_dim, num_kv, **kwargs) == cached
-        return dict(cached)
-
-    with patch.object(cute_flash, "flash_autotune_fragments", wrapper):
         yield
 
 
@@ -942,7 +903,7 @@ class TestAutotunerHeuristic(TestCase):
         self.assertGreaterEqual(len(population), 100)
         self.assertLessEqual(set(coverage), set(population))
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_heuristic_returns_all_legal_seeds(self) -> None:
         spec = ConfigSpec(backend=CuteBackend())
         for block_id, size_hint in enumerate((1, 128, 128)):
@@ -6380,7 +6341,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     self.assertEqual(canonical, seed)
                     self.assertEqual(config_gen.unflatten(canonical_flat), seed)
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_full_population_covers_compound_schedule_dependencies(
         self,
     ) -> None:
@@ -6451,7 +6412,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             [],
         )
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_full_population_reserves_random_exploration(self) -> None:
         config_gen = _dense_fp16_hd64_bh64_flash_generation()
         spec = config_gen.config_spec
@@ -6674,7 +6635,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             set(coverage[: search.initial_population]), partial_population
         )
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_large_bh_population_covers_structural_axes_and_random(
         self,
     ) -> None:
@@ -7488,7 +7449,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     )
                 )
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_compound_families_reachable_without_compiler_seeds(
         self,
     ) -> None:
@@ -7652,7 +7613,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                         "descending",
                     )
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_clc_head_search_uses_work_grid_divisors(self) -> None:
         fragments = flash_autotune_fragments(64, 1024, num_bh=6)
         heads = fragments[FLASH_CLC_HEADS_PER_BATCH_KEY]
@@ -7703,7 +7664,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         }
         self.assertEqual(structural_groups, {1, 2, 3, 6})
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_clc_head_search_preserves_tensor_head_geometry(
         self,
     ) -> None:
@@ -8036,7 +7997,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             configs.append(anchors[0].config)
         self.assertTrue(all(config == configs[0] for config in configs[1:]))
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_bf16_hd64_2cta_seed_transfers_to_2048(self) -> None:
         spec = ConfigSpec(backend=CuteBackend())
         for block_id, target in enumerate((1, 128, 128)):
@@ -8376,7 +8337,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     1,
                 )
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_dense_degree2_seed_is_in_full_initial_population(
         self,
     ) -> None:
@@ -8638,7 +8599,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         self.assertIn("deg2_16x6", packet.search_choices or ())
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_causal_degree2_seed_is_in_full_initial_population(
         self,
     ) -> None:

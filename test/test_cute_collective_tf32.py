@@ -11,6 +11,7 @@ from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuri
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_flash import seeds_per_codegen_branch
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
 
@@ -81,10 +82,6 @@ def _jagged_inputs(
     )
 
 
-# Every collective seed (about two hundred per shape) is generated on the
-# host; that CPU-bound codegen legitimately runs past the default per-test CI
-# timeout for the two larger shapes.
-@pytest.mark.timeout(300)
 @pytest.mark.parametrize(
     "shape", [(16, 319, 32, 32), (64, 4674, 64, 64), (256, 30856, 128, 128)]
 )
@@ -107,6 +104,25 @@ def test_original_jagged_shapes_have_native_and_warp_fp32_seeds(
         "tcgen05",
     }
     for seed in seeds:
+        # Every seed is a collective MMA over one batch element per tile.
+        assert seed.config["cute_collective_mma"] is True
+        assert seed.block_sizes[0] == 1
+        assert seed.get("cute_collective_compute", "warp") in {"warp", "tcgen05"}
+    # The collective codegen branches on the compute unit, operand copy,
+    # operand recipe and epilogue; the other seed axes (tile shape, thread
+    # layout, stage count) re-parameterize the same text, so render the first
+    # seed of each branch and the last seed of each compute unit instead of
+    # all (about two hundred per shape).
+    for seed in seeds_per_codegen_branch(
+        seeds,
+        lambda seed: (
+            seed.get("cute_collective_compute", "warp"),
+            seed.get("cute_collective_copy"),
+            seed.get("cute_collective_recipe"),
+            seed.get("cute_collective_epilogue"),
+        ),
+        last_per=lambda seed: seed.get("cute_collective_compute", "warp"),
+    ):
         source = bound.to_code(seed)
         ast.parse(source)
         if seed.get("cute_collective_compute", "warp") == "tcgen05":
@@ -185,6 +201,9 @@ def _require_sm100() -> None:
         pytest.skip("requires SM100-family")
 
 
+# 18 cases: the shapes put K below, at and above the 64-wide K tile (a masked
+# K tail, one exact tile, two tiles) and N on both collective N tiles; each
+# copy/compute/recipe triple is its own operand-staging and MMA code path.
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "shape", [(16, 319, 32, 32), (64, 4674, 64, 64), (256, 30856, 128, 128)]

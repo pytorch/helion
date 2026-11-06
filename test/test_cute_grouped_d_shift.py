@@ -22,6 +22,7 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_codegen import require_cute_codegen
+from helion._testing.cute_flash import seeds_per_codegen_branch
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -124,6 +125,9 @@ def _value(expression: ast.expr, values):
     )
 
 
+# 12 cases: each worklist orientation emits its own TMA store atom and
+# coordinate order, each metadata kind is a different kernel (offsets, split
+# sizes, fp32 output), and each metadata dtype loads the row bounds differently.
 @pytest.mark.parametrize("orientation", ["mn", "nm"])
 @pytest.mark.parametrize("kind", ["offsets", "sizes", "fp32"])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -342,9 +346,6 @@ def test_signed_pointer_and_virtual_coordinate_bounds_fail_closed(
     assert not bounded_d_shift_index_domain(m, n, row_tile)
 
 
-# Renders every shifted seed of a grouped tcgen05 kernel: ~55 s alone, so the
-# 60 s per-test CI limit trips under xdist contention.
-@pytest.mark.timeout(180)
 def test_shifted_compiler_seeds_keep_the_old_prefix_and_logical_cap() -> None:
     args = (
         torch.empty((2048, 512), dtype=torch.bfloat16),
@@ -362,6 +363,22 @@ def test_shifted_compiler_seeds_keep_the_old_prefix_and_logical_cap() -> None:
         for seed in shifted:
             assert seed.block_sizes[2] == 64
             assert seed["tcgen05_grouped_full_allocation_a"] is True
+            assert seed["tcgen05_grouped_mode"] == "worklist_nm"
+        # The shifted codegen branches on the worklist orientation, the CTA
+        # group, the cluster N, the source M tile and the MMA N; the other
+        # seed axes (stage depths, L2 swizzle) re-parameterize the same text.
+        # Render the first seed of each branch and the last seed instead of
+        # all ~150.
+        for seed in seeds_per_codegen_branch(
+            shifted,
+            lambda seed: (
+                seed.get("tcgen05_grouped_worklist_orientation"),
+                seed["tcgen05_cluster_m"],
+                seed.get("tcgen05_cluster_n"),
+                seed.get("tcgen05_grouped_worklist_source_m_tile"),
+                seed.get("tcgen05_grouped_worklist_mma_n"),
+            ),
+        ):
             ast.parse(bound.to_code(seed))
 
 

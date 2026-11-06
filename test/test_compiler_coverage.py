@@ -15,12 +15,12 @@ import torch
 
 from test.cute_population_contracts import _pointwise
 from test.cute_population_contracts import _target
-from test.test_cute_flash_length_invariance import _flash_config_spec
 
 import helion
 from helion._compiler.cute.backend import CuteBackend
 from helion._dist_utils import sync_seed
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_flash import flash_config_spec
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.compiler_coverage import CompilerCoverageGroup
 from helion.autotuner.compiler_coverage import CoverageWitness
@@ -705,7 +705,7 @@ def test_coverage_is_after_every_flash_best_available_return(
 ) -> None:
     # Real full ConfigGeneration and PatternSearch; only the expensive flash
     # structural design is held at a small deterministic set for branch testing.
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64, num_kv=48, dtype=torch.float16, is_causal=False
     )
     spec.user_defined_tunables.update(

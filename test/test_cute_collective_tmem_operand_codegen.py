@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-from functools import partial
 from unittest.mock import patch
 
 import pytest
@@ -30,9 +29,11 @@ from helion._compiler.cute.collective_matmul import (
     has_collective_tmem_operand_candidate,
 )
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._testing import pairwise
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_flash import compiled_source
 from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
@@ -40,6 +41,19 @@ from helion.autotuner.config_generation import ConfigGeneration
 pytestmark = skipUnlessBackends(["cute"])
 
 CUDA_DEVICE = "cuda"
+
+
+# Shape 0 is the small synthetic tiling (32-wide N and K tiles); shapes 1 and 2
+# are the two mamba2 sizes, whose state widths give one or two K steps of the
+# same 64-wide tiles. The element type only renames the MMA operands and
+# ``static_shapes`` only bakes the extents into the source, so all pairs of
+# the three knobs keep every shape with both element types and shape modes in
+# six cases instead of twelve.
+_MAMBA_TMEM_A_CASES = pairwise(
+    shape=(0, 1, 2),
+    dtype=(torch.float16, torch.bfloat16),
+    static_shapes=(False, True),
+)
 
 
 def _sizes(shape: int) -> tuple[tuple[int, ...], ...]:
@@ -83,9 +97,7 @@ def _loop(source: str, name: str) -> str:
     return ast.unparse(node)
 
 
-@pytest.mark.parametrize("shape", [0, 1, 2])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("static_shapes", [False, True])
+@pytest.mark.parametrize(("shape", "dtype", "static_shapes"), _MAMBA_TMEM_A_CASES)
 def test_original_three_mamba_sizes_keep_b_staging_and_seed_arithmetic(
     shape: int, dtype: torch.dtype, static_shapes: bool
 ) -> None:
@@ -329,9 +341,7 @@ def test_tmem_a_preserves_operand_alias_rejection() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("shape", [0, 1, 2])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("static_shapes", [False, True])
+@pytest.mark.parametrize(("shape", "dtype", "static_shapes"), _MAMBA_TMEM_A_CASES)
 def test_original_mamba_tmem_a_cuda(
     shape: int, dtype: torch.dtype, static_shapes: bool
 ) -> None:
@@ -347,8 +357,7 @@ def test_original_mamba_tmem_a_cuda(
     kernel = _mamba_kernel(static_shapes=static_shapes)
     bound = kernel._bind_isolated(args)
     config = _mamba_tmem_config(shape)
-    assert "OperandSource.TMEM" in bound.to_code(config)
-    bound.set_config(config)
+    assert "OperandSource.TMEM" in compiled_source(bound, config)
     control = kernel._bind_isolated(args)
     control.set_config(
         helion.Config.from_dict(config.config | {"cute_collective_tmem_a": False})
@@ -387,8 +396,7 @@ def test_tmem_a_partial_synthetic_k_cuda(dtype: torch.dtype) -> None:
     )
     bound = _full_slice_dot._bind_isolated(args)
     config = _full_slice_tmem_config()
-    assert "OperandSource.TMEM" in bound.to_code(config)
-    bound.set_config(config)
+    assert "OperandSource.TMEM" in compiled_source(bound, config)
     control = _full_slice_dot._bind_isolated(args)
     control.set_config(
         helion.Config.from_dict(config.config | {"cute_collective_tmem_a": False})
@@ -425,16 +433,18 @@ def test_tmem_a_runtime_k_tails_unaligned_and_empty_cuda(
         _seeded_config(bm, bn, bk).config
         | {"cute_collective_recipe": recipe, "cute_collective_tmem_a": True}
     )
+    # ``limit`` is a dynamic extent (ints specialize by type only), so one
+    # compile of each kernel serves every length; only the graph capture,
+    # which bakes the scalar argument, is per length.
+    bound = _seeded_contraction._bind_isolated((a, b, seed, 78))
+    assert "OperandSource.TMEM" in compiled_source(bound, config)
+    control = _seeded_contraction._bind_isolated((a, b, seed, 78))
+    control.set_config(
+        helion.Config.from_dict(config.config | {"cute_collective_tmem_a": False})
+    )
     for limit in (78, 0, 33, 78):
         args = (a, b, seed, limit)
-        bound = _seeded_contraction._bind_isolated(args)
-        assert "OperandSource.TMEM" in bound.to_code(config)
-        bound.set_config(config)
-        control = _seeded_contraction._bind_isolated(args)
-        control.set_config(
-            helion.Config.from_dict(config.config | {"cute_collective_tmem_a": False})
-        )
-        replay = _make_cudagraph_replay(partial(bound, *args))
+        replay = _make_cudagraph_replay(lambda args=args: bound(*args))
         for factor in (1.0, -0.5, 0.75):
             a.mul_(factor)
             seed.mul_(0.5)
@@ -461,9 +471,9 @@ def test_tmem_a_dynamic_empty_seed_bridge_cuda(
         _dependent_config(bm, bn, True).config | {"cute_collective_tmem_a": True}
     )
     bound = _dependent_contractions._bind_isolated(args)
-    assert "OperandSource.TMEM" in bound.to_code(config)
-    assert "collective_tmem_seed_values" in bound.to_code(config)
-    bound.set_config(config)
+    source = compiled_source(bound, config)
+    assert "OperandSource.TMEM" in source
+    assert "collective_tmem_seed_values" in source
     control = _dependent_contractions._bind_isolated(args)
     control.set_config(_dependent_config(bm, bn, False))
     replay = _make_cudagraph_replay(lambda: bound(*args))

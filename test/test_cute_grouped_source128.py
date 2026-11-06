@@ -32,6 +32,7 @@ from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_flash import seeds_per_codegen_branch
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.runtime.cute.launcher import _tcgen05_grouped_device_source_m_tile_supported
@@ -198,6 +199,21 @@ def test_typed_device_seeds_and_promotion_survive_newer_dsl(
         assert "worklist_nm" in fields[MODE].search_choices
         assert 128 in fields[SOURCE].search_choices
         for seed in source128:
+            assert seed[MODE] == "worklist_nm"
+        # The source128 codegen branches on the CTA group, the cluster N, the
+        # bounded D shift, the orientation and the MMA N; the other seed axes
+        # (stage depths, L2 swizzle) re-parameterize the same text.  Render
+        # the first seed of each branch and the last seed instead of all.
+        for seed in seeds_per_codegen_branch(
+            source128,
+            lambda seed: (
+                seed["tcgen05_cluster_m"],
+                seed.get("tcgen05_cluster_n"),
+                seed.get(SHIFTED),
+                seed.get("tcgen05_grouped_worklist_orientation"),
+                seed.get("tcgen05_grouped_worklist_mma_n"),
+            ),
+        ):
             ast.parse(bound.to_code(seed))
 
 
@@ -340,6 +356,9 @@ def test_source128_seed_depths_use_physical_smem_and_preserve_old_prefix() -> No
             assert seed.get("num_sm_multiplier", 1) * required < 232448
 
 
+# 16 cases: each metadata kind is a different kernel and device layout, each
+# metadata dtype a different device bounds load, each cluster_m a CTA group
+# (ONE/TWO) and each block_k a different operand smem layout and stage shape.
 @pytest.mark.cuda
 @pytest.mark.parametrize("metadata_kind", ["offsets", "split_sizes"])
 @pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
