@@ -992,7 +992,13 @@ def _bind_kernel_for_lowering(kernel: Kernel, args: tuple[object, ...]) -> Bound
         )
         return kernel._bind_isolated(args)
     try:
-        return kernel._bind(args)
+        bound = kernel._bind(args)
+        if bound._is_disk_runner:
+            # Keep lowering's frontend private. Materializing the runner would
+            # publish shared state whose later code generation can need
+            # _bind_lock while Inductor still owns Dynamo's compile lock.
+            return kernel._bind_isolated(args)
+        return bound
     finally:
         kernel._bind_lock.release()
 
