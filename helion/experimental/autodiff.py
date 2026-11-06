@@ -3501,7 +3501,7 @@ class FXToHelionConverter:
                     # non-tangent inputs (primals or intermediates) the tile
                     # variable has the same ndim as the original tensor and the
                     # unsqueeze must be emitted explicitly.
-                    is_tangent_input = input_node.name.startswith("tangents_")
+                    is_tangent_input = _is_tangent_shaped(input_node)
                     if self._use_reduction_kernel_path or not is_tangent_input:
                         result_var = f"{node.name}_val"
                         node_to_var[node.name] = result_var
@@ -4866,6 +4866,25 @@ def _numel(shape: tuple[int, ...]) -> int:
     for s in shape:
         n *= s
     return n
+
+
+def _is_tangent_shaped(node: Node) -> bool:
+    """Whether ``node`` is a tangent or a same-rank op computed only from tangents.
+
+    E.g. ``mean_backward`` scales the tangent before unsqueezing it, so the
+    unsqueeze input is ``div(tangents_1, n)`` rather than ``tangents_1``.
+    """
+    if node.op == "placeholder":
+        return node.name.startswith("tangents_")
+    if node.op != "call_function" or "val" not in node.meta:
+        return False
+    inputs = node.all_input_nodes
+    return bool(inputs) and all(
+        "val" in inp.meta
+        and inp.meta["val"].ndim == node.meta["val"].ndim
+        and _is_tangent_shaped(inp)
+        for inp in inputs
+    )
 
 
 def _diff_squeezed_dims(
