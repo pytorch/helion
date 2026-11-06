@@ -14,6 +14,8 @@ from helion._compiler.device_ir import RootGraphInfo
 from helion.language import _tracing_ops
 from helion.language import creation_ops
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from torch.fx import Node
 

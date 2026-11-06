@@ -9,8 +9,6 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_matmul import _tensor_roots
@@ -19,10 +17,13 @@ from helion._compiler.cute.packed_matmul import packed_matmul_axis
 from helion._compiler.tile_strategy import PerThreadNDTileStrategy
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import BackendUnsupported
 import helion.language as hl
 from helion.language.matmul_ops import dot
+
+pytestmark = pytest.mark.cpu_only
 
 _examples_int4_gemm = import_example("int4_gemm")
 _unpack_int4_matrix = _examples_int4_gemm._unpack_int4_matrix
@@ -91,7 +92,7 @@ def _original_bound(
         autotune_effort="none",
         **settings,
     )
-    return _cpu_bind(
+    return cpu_bind(
         kernel,
         (torch.empty((m, k), dtype=dtype), torch.empty((k // 2, n), dtype=torch.int8)),
     )
@@ -167,7 +168,7 @@ def test_packed_collective_is_not_specific_to_int4(
         factor,
         use_addmm,
     )
-    source = _cpu_bind(_expanded_matmul, inputs).to_code(_config(factor=factor))
+    source = cpu_bind(_expanded_matmul, inputs).to_code(_config(factor=factor))
     assert "tcgen05.CtaGroup.ONE" in source
     assert "cute.gemm(" in source
     for lane in range(factor):
@@ -182,7 +183,7 @@ def test_packed_collective_preserves_input_alias_rejection(
 ) -> None:
     a = torch.empty((73, 78), dtype=dtype)
     inputs = (a, torch.empty((39, 41), dtype=torch.int8), a[:, :41], 2, False)
-    bound = _cpu_bind(_expanded_matmul, inputs)
+    bound = cpu_bind(_expanded_matmul, inputs)
     # The output aliases an operand: the thread-race check sees the store race
     # the operand loads before the collective lowering sees the aliasing.
     with pytest.raises(BackendUnsupported, match="a body a later pass rewrites"):
@@ -239,7 +240,7 @@ def test_nonintegral_mma_expansion_has_no_collective_seed() -> None:
         3,
         False,
     )
-    bound = _cpu_bind(_expanded_matmul, inputs)
+    bound = cpu_bind(_expanded_matmul, inputs)
     assert bound.host_function is not None
     with bound.env:
         assert not CuteCollectiveMatmulHeuristic.get_seed_configs(

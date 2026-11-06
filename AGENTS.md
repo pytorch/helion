@@ -38,6 +38,32 @@ This document explains how to work effectively in this repository.
   - Warning: Do not run the full test suite with `HELION_AUTOTUNE_EFFORT=none` — it can change execution paths and break tests. Only use this env var for targeted local iteration on specific tests.
 - Helpful env vars: `HELION_LOGS=all|+all`, `HELION_PRINT_OUTPUT_CODE=1`, `HELION_AUTOTUNE_EFFORT=none`.
 
+### Test Budget Rules
+
+The suite has tens of thousands of tests; CI time is dominated by compile-heavy
+tests and parametrization grids, so new tests must follow these rules:
+
+- New shared test helpers go in `helion/_testing/` (e.g. `helion._testing.cute_codegen`
+  for `cpu_bind`, `mock_cuda_unavailable`, `cpu_target`), not in a test module that
+  other test modules import; move existing cross-module helpers there when touching them.
+- Tests that only inspect generated source must bind on CPU (`cpu_bind` /
+  `cpu_target`) and go in a module marked `pytestmark = pytest.mark.cpu_only`,
+  which the CPU lane runs without a GPU. A `cpu_only` module must pass with
+  `CUDA_VISIBLE_DEVICES=""`.
+- `test/test_cute_*.py` modules only run under `HELION_BACKEND=cute`
+  (`test/conftest.py` skips them at collection otherwise). Gate cute-only tests elsewhere
+  with `@onlyBackends(["cute"])` or `skipUnlessBackends(["cute"])`.
+- Parametrization grids above 8 cases need a comment saying why each axis is
+  needed; use `helion._testing.pairwise` for all-pairs coverage of
+  independent knobs instead of a full product.
+- Compile and launch each kernel configuration once per module: share
+  references through module-level caches instead of recompiling per case,
+  prefer small problem sizes, and render one representative seed rather than
+  every seed in a search space.
+- Mark tests that spawn interpreters, run a real autotune search, or need more
+  than ~20s with `@pytest.mark.slow`; pull requests skip them.
+- Check `pytest --durations=20 <file>` before landing a new test file.
+
 ### PyTest Debugging Tips
 
 - Prefer `pytest -x -vv -s` while iterating: stops on first failure, prints full logs and stderr (needed to see generated code from failures that write to stderr).
@@ -45,7 +71,7 @@ This document explains how to work effectively in this repository.
 - For long outputs, pipe to a file: `... -s 2>&1 | tee /tmp/pytest.out`.
 - Enable dtype/codegen checks when chasing codegen bugs: set `HELION_DEBUG_DTYPE_ASSERTS=1` and/or `HELION_PRINT_OUTPUT_CODE=1`.
 - Show skip reasons with `pytest -ra`; narrow with `-k <pattern>` for fast cycles.
-- pytest runs in parallel by default: `test/conftest.py` sizes the pytest-xdist worker count to the free memory of the first visible GPU (NVIDIA, ROCm, or XPU) and the CPU count, running serially without a GPU and uses `--dist worksteal`. `-s`, `--pdb`, and `-n0` run in a single process; `-n N` picks the count.
+- pytest runs in parallel by default: `test/conftest.py` sizes the pytest-xdist worker count to the free memory of the first visible GPU (NVIDIA, ROCm, or XPU) and the CPU count, or to the CPU count without a GPU, and uses `--dist worksteal`. `-s`, `--pdb`, and `-n0` run in a single process; `-n N` picks the count.
 
 ## GPU Usage
 

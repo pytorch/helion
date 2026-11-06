@@ -23,7 +23,7 @@ from helion.runtime.kernel import BoundKernel
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 CPU_DEVICE = torch.device("cpu")
 
 

@@ -6,6 +6,7 @@ from typing import Any
 from typing import cast
 from unittest.mock import patch
 
+import pytest
 import sympy
 import torch
 
@@ -40,6 +41,8 @@ from helion.autotuner.config_spec import MatmulFact
 from helion.autotuner.config_spec import PipelinedRegion
 from helion.autotuner.config_spec import RootGridFact
 from helion.autotuner.config_spec import SymbolicLoopBound
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _matmul_fact(

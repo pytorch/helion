@@ -1644,7 +1644,13 @@ def test_the_fixup_counters_survive_the_wrap() -> None:
     counters = workspace[tiles * row_tiles * rows * 4 * 2 :][: row_tiles * 4].view(
         torch.int32
     )
-    assert counters.tolist() == [period] * row_tiles
+    # The compiled module, and with it this workspace, is shared with every
+    # earlier compile of this kernel at this shape and config in the process
+    # (the deterministic-split test below is one), and each of their launches
+    # advanced every counter by one period.
+    launched = counters[0].item()
+    assert launched >= period and launched % period == 0
+    assert counters.tolist() == [launched] * row_tiles
     for seed in (2**31 - period, 2**32 - period, 2**32 - 2 * period):
         counters.fill_(seed - 2**32 if seed >= 2**31 else seed)
         torch.cuda.synchronize()

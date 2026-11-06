@@ -9,15 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_cuda_work
-from test._cute_dense_tcgen05 import atomic_output_mm
-from test._cute_dense_tcgen05 import column_major_args
-from test._cute_dense_tcgen05 import cpu_codegen_target
-from test._cute_dense_tcgen05 import gb300_target
-from test._cute_dense_tcgen05 import scaled_args
-from test._cute_dense_tcgen05 import scaled_mm_column_major
-from test._cute_dense_tcgen05 import wrapper_plans
-
 import helion
 from helion._compiler.cute import cute_mma
 from helion._compiler.cute.dense_gemm import prove_dense_gemm_facts
@@ -26,6 +17,14 @@ from helion._compiler.cute.pipeline_smem import max_pipeline_ab_stages
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.tcgen05_schedule_facts import analyze_native_gemm
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import atomic_output_mm
+from helion._testing.cute_dense_tcgen05 import column_major_args
+from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
+from helion._testing.cute_dense_tcgen05 import gb300_target
+from helion._testing.cute_dense_tcgen05 import scaled_args
+from helion._testing.cute_dense_tcgen05 import scaled_mm_column_major
+from helion._testing.cute_dense_tcgen05 import wrapper_plans
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
@@ -33,7 +32,7 @@ from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 # These are physical M/N/K tiles of the frontend's B.T @ A.T expression.
 # They are not compiler geometry requests or logical-axis projections.
@@ -43,7 +42,7 @@ _DEPTHS = (10, 8)
 
 @pytest.fixture(autouse=True)
 def _cpu_codegen() -> Iterator[None]:
-    with cpu_codegen_target(), _forbid_cuda_work():
+    with cpu_codegen_target(), forbid_cuda_work():
         yield
 
 

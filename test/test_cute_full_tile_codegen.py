@@ -9,8 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_pure_lane_packets_codegen import _capture
 from test.test_cute_pure_lane_packets_codegen import _execute
@@ -23,6 +21,8 @@ from helion._compiler.cute.tensor_layout_relations import TensorLayoutRelation
 from helion._compiler.rng_utils import philox_rand_ref
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
@@ -33,14 +33,14 @@ _examples_low_mem_dropout = import_example("low_mem_dropout")
 low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
 low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.fixture(autouse=True)
 def _cpu_only():
     with (
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -81,7 +81,7 @@ def _bound(
         autotune_effort=effort,
         cute_rng_stream="word0",
     )
-    return _cpu_bind(
+    return cpu_bind(
         kernel,
         (0.25, torch.empty(33554432, dtype=dtype) if tensor is None else tensor, 123),
     )
@@ -208,14 +208,14 @@ def _metadata_length(values: torch.Tensor) -> torch.Tensor:
 
 
 def test_general_pointwise_metadata_extent_admits_without_rng_or_flatten():
-    bound = _cpu_bind(_metadata_length, (torch.empty(1024),))
+    bound = cpu_bind(_metadata_length, (torch.empty(1024),))
     source = bound.to_code(_config(enabled=True))
     assert "cute.is_static(" in source
     assert "cutlass.Int64(cute.size(" in source
 
 
 def test_equal_example_length_is_not_a_metadata_relation():
-    bound = _cpu_bind(_independent_length, (torch.empty(1024), 1024))
+    bound = cpu_bind(_independent_length, (torch.empty(1024), 1024))
     source = bound.to_code(_config(enabled=True))
     assert "cute.is_static(" not in source
 

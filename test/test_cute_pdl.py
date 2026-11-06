@@ -35,8 +35,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test._cute_vloop_sink_kernels import col_reduce_max_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_from8_static
@@ -55,7 +53,11 @@ from helion._compiler.cute.host_zero_fill_launches import MAX_FILL_NUMEL
 from helion._compiler.cute.pdl_release import ZERO_FILL_KERNEL_PREFIX
 from helion._compiler.cute.pdl_release import resident_ctas_per_sm
 from helion._testing import import_example
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 rms_norm_batched = import_example("aot_example").rms_norm_batched
 
@@ -68,7 +70,7 @@ cutlass = pytest.importorskip("cutlass")
 @pytest.fixture
 def cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -184,7 +186,7 @@ def _on_and_off(bound: Any, config: dict[str, object]) -> tuple[str, str]:
 
 
 def _codes(kernel: helion.Kernel, args: tuple, **config: object) -> tuple[str, str]:
-    return _on_and_off(_cpu_bind(kernel, args), config)
+    return _on_and_off(cpu_bind(kernel, args), config)
 
 
 def _release_block(kernel: ast.FunctionDef, start: int) -> int:
@@ -428,7 +430,7 @@ def test_column_reductions_take_the_knob_under_their_default_config(
     cpu_only: None, kernel: helion.Kernel, shapes: list[tuple[int, ...]]
 ) -> None:
     args = tuple(torch.empty(*shape, dtype=torch.bfloat16) for shape in shapes)
-    bound = _cpu_bind(kernel, args)
+    bound = cpu_bind(kernel, args)
     on, off = _on_and_off(bound, dict(bound.config_spec.default_config().config))
     ahead = _assert_only_the_dependent_launch_differs(on, off)
     # A zero-filled accumulator launches as a fill kernel and the wait moves
@@ -447,7 +449,7 @@ def test_hoisted_register_allocations_may_precede_the_wait(
     fn = rms_norm_batched.fn if static_shapes else _rms_norm_specialized_n
     x = torch.empty((13, 4096), dtype=torch.bfloat16)
     args = (x, 1e-5)
-    bound = _cpu_bind(_dynamic_kernel(fn, static_shapes=static_shapes), args)
+    bound = cpu_bind(_dynamic_kernel(fn, static_shapes=static_shapes), args)
     config = _rolled_config(bound, rows=4, threads=64, vec=8, chunk=1024)
     on, off = _on_and_off(bound, dict(config.config))
     assert _assert_only_the_dependent_launch_differs(on, off) == [
@@ -457,7 +459,7 @@ def test_hoisted_register_allocations_may_precede_the_wait(
 
 def test_the_knob_is_a_searchable_boolean(cpu_only: None) -> None:
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_static, (x,))
+    bound = cpu_bind(col_reduce_sum_static, (x,))
     spec = bound.config_spec
     assert spec.default_config().config.get("cute_pdl", False) is False
     with pytest.raises(exc.InvalidConfig, match="cute_pdl must be a boolean"):
@@ -491,7 +493,7 @@ def test_pre_hopper_targets_neither_search_nor_apply_the_knob(
     # ``griddepcontrol`` needs sm_90: below it the fragment offers only the
     # off value and an explicit ``cute_pdl=True`` generates the knob-off code.
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_static, (x,))
+    bound = cpu_bind(col_reduce_sum_static, (x,))
     spec = bound.config_spec
     with patch.object(spec, "target_device_capability", (8, 0)):
         assert spec._flat_fields()["cute_pdl"].search_choices == (False,)
@@ -520,7 +522,7 @@ def test_the_release_placements_add_one_line_in_the_named_spot(
     cpu_only: None,
 ) -> None:
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_static, (x,))
+    bound = cpu_bind(col_reduce_sum_static, (x,))
     on, _off = _on_and_off(bound, _COLUMN_SUM)
     # ``entry`` is the knob-on code of the tests above; ``none`` is that code
     # without the release.
@@ -549,7 +551,7 @@ def test_the_release_placements_add_one_line_in_the_named_spot(
 
 def test_the_release_knob_rides_on_cute_pdl(cpu_only: None) -> None:
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_static, (x,))
+    bound = cpu_bind(col_reduce_sum_static, (x,))
     spec = bound.config_spec
     assert "cute_pdl_release" not in spec.default_config().config
     # Without the knob the placement has nothing to act on: the default one
@@ -602,7 +604,7 @@ def test_the_release_knob_rides_on_cute_pdl(cpu_only: None) -> None:
 
     assert _dependent_launch(spec) == {"cute_pdl": True, "cute_pdl_spread": True}
     # Pre-Hopper targets search neither the knob nor the placement.
-    below = _cpu_bind(col_reduce_sum_static, (x,)).config_spec
+    below = cpu_bind(col_reduce_sum_static, (x,)).config_spec
     with patch.object(below, "target_device_capability", (8, 0)):
         assert below._flat_fields()["cute_pdl_release"].search_choices == ("auto",)
         assert _dependent_launch(below) == {}
@@ -619,7 +621,7 @@ def test_the_flat_round_trip_keeps_the_grid_rule(cpu_only: None) -> None:
 
     x = torch.empty(1000, 1008, dtype=torch.bfloat16)
     w = torch.empty(1008, dtype=torch.bfloat16)
-    bound = _cpu_bind(scale_rows, (x, w))
+    bound = cpu_bind(scale_rows, (x, w))
     spec = bound.config_spec
     generation = ConfigGeneration(spec)
     pointwise = {"block_sizes": [16, 64], "num_threads": [4, 64], "cute_pdl": True}
@@ -652,7 +654,7 @@ def test_the_implicit_release_follows_the_grid(cpu_only: None) -> None:
     # from the CTAs of its last wave once it needs more; an explicit
     # placement is taken as given.
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_static, (x,))
+    bound = cpu_bind(col_reduce_sum_static, (x,))
     spec = bound.config_spec
     implicit = spec.normalized_config(helion.Config(**_COLUMN_SUM, cute_pdl=True))
     entry = _release_code(bound, _COLUMN_SUM, "entry")
@@ -712,7 +714,7 @@ def test_the_implicit_release_counts_the_launch_grid(cpu_only: None) -> None:
     pointwise = {"block_sizes": [16, 64], "num_threads": [4, 64]}
     # Two top-level loops launch the sum of their grids: 2 x 1008 CTAs need
     # two waves; 2 x 256 fit one.
-    bound = _cpu_bind(two_roots, (x, x.clone()))
+    bound = cpu_bind(two_roots, (x, x.clone()))
     code = _implicit_code(
         bound, block_sizes=[16, 64, 16, 64], num_threads=[4, 64, 4, 64]
     )
@@ -726,7 +728,7 @@ def test_the_implicit_release_counts_the_launch_grid(cpu_only: None) -> None:
     assert _last_wave_guard(code) is None
     # L2 grouping reorders the parent grid without resizing it: 1008 CTAs
     # fit at 8 per SM, not at the 4 the hint asks for.
-    bound = _cpu_bind(scale_rows, (x, w))
+    bound = cpu_bind(scale_rows, (x, w))
     code = _implicit_code(bound, **pointwise, l2_groupings=[4])
     assert _launch(code) == ("(1008,)", 256)
     assert _last_wave_guard(code) is None
@@ -828,7 +830,7 @@ def test_the_last_wave_release_is_plain_entry_for_a_one_wave_grid(
     # 64 CTAs of 512 threads on 148 SMs (592 slots): one wave, so the last
     # wave is the whole grid and the placement renders the entry code.
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_static, (x,))
+    bound = cpu_bind(col_reduce_sum_static, (x,))
     assert _release_code(bound, _COLUMN_SUM, "last_wave") == _release_code(
         bound, _COLUMN_SUM, "entry"
     )
@@ -843,7 +845,7 @@ def test_the_last_wave_release_guards_the_entry_release_past_one_wave(
     # CTA 4, the first of the last wave, starts.  Nothing else changes: the
     # code without the index and the guarded release is the ``none`` code.
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_static, (x,))
+    bound = cpu_bind(col_reduce_sum_static, (x,))
     spec = bound.config_spec
     with patch.object(spec, "num_sm", 15):
         code = _release_code(bound, _COLUMN_SUM, "last_wave")
@@ -868,7 +870,7 @@ def test_the_last_wave_release_sizes_a_dynamic_grid_at_runtime(
     # capacity (148 SMs x 4 CTAs of 512 threads = 592), a compile-time
     # constant.
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_dynamic, (x,))
+    bound = cpu_bind(col_reduce_sum_dynamic, (x,))
     code = _release_code(bound, _COLUMN_SUM, "last_wave")
     assert _launch(code)[0] == "((n + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1,)"
     assert _last_wave_guard(code) == f"if pdl_cta >= {_GRID_CTAS} - 592:"
@@ -905,7 +907,7 @@ def test_the_last_wave_release_counts_the_launch_grid(cpu_only: None) -> None:
     # entry.
     x = torch.empty(1000, 1008, dtype=torch.bfloat16)
     w = torch.empty(1008, dtype=torch.bfloat16)
-    bound = _cpu_bind(two_roots, (x, x.clone()))
+    bound = cpu_bind(two_roots, (x, x.clone()))
     code = _last_wave_code(
         bound, block_sizes=[16, 64, 16, 64], num_threads=[4, 64, 4, 64]
     )
@@ -919,7 +921,7 @@ def test_the_last_wave_release_counts_the_launch_grid(cpu_only: None) -> None:
     # A persistent launch is ``_NUM_SM * num_sm_multiplier`` CTAs: one wave
     # at a multiplier the occupancy covers (plain entry), guarded past it
     # (16 x 148 = 2368 CTAs, the last 1184 release).
-    bound = _cpu_bind(scale_rows, (x, w))
+    bound = cpu_bind(scale_rows, (x, w))
     pointwise = {"block_sizes": [16, 64], "num_threads": [4, 64]}
     code = _last_wave_code(bound, **pointwise, pid_type="persistent_blocked")
     assert _launch(code) == ("(_NUM_SM,)", 256)
@@ -1065,7 +1067,7 @@ def test_the_spread_knob_pads_the_kernel_after_its_release(cpu_only: None) -> No
     # placed right after the wait and the release and kept live by the
     # helper the module imports; everything else is the knob-on code.
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_static, (x,))
+    bound = cpu_bind(col_reduce_sum_static, (x,))
     spec = bound.config_spec
     on = bound.to_code(
         spec.normalized_config(helion.Config(**_COLUMN_SUM, cute_pdl=True))
@@ -1124,7 +1126,7 @@ def test_the_spread_pad_follows_the_launch_grid(cpu_only: None) -> None:
     x = torch.empty(1000, 1008, dtype=torch.bfloat16)
     w = torch.empty(1008, dtype=torch.bfloat16)
     pointwise = {"block_sizes": [16, 64], "num_threads": [4, 64]}
-    bound = _cpu_bind(scale_rows, (x, w))
+    bound = cpu_bind(scale_rows, (x, w))
     spec = bound.config_spec
     code = bound.to_code(
         spec.normalized_config(
@@ -1134,7 +1136,7 @@ def test_the_spread_pad_follows_the_launch_grid(cpu_only: None) -> None:
     assert _launch(code) == ("(1008,)", 256)
     assert _PAD.format(28161) in code and _KEEP in code
     # A grid the host sizes at runtime gets no pad: its density is unknown.
-    bound = _cpu_bind(col_reduce_sum_dynamic, (x,))
+    bound = cpu_bind(col_reduce_sum_dynamic, (x,))
     spec = bound.config_spec
     on = bound.to_code(
         spec.normalized_config(helion.Config(**_COLUMN_SUM, cute_pdl=True))
@@ -1149,7 +1151,7 @@ def test_the_spread_pad_follows_the_launch_grid(cpu_only: None) -> None:
 
 def test_the_spread_knob_rides_on_cute_pdl(cpu_only: None) -> None:
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_static, (x,))
+    bound = cpu_bind(col_reduce_sum_static, (x,))
     spec = bound.config_spec
     assert "cute_pdl_spread" not in spec.default_config().config
     plain = bound.to_code(spec.normalized_config(helion.Config(**_COLUMN_SUM)))

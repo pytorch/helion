@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from typing import cast
 
+import pytest
 import torch
 
 from helion.autotuner.benchmark_provider import _clone_args
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _storage_id(tensor: torch.Tensor) -> int:

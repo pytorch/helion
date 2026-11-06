@@ -9,18 +9,17 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.cute.flatten_nested_reductions import flatten_nested_reductions
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 jagged_layer_norm_kernel = import_example("jagged_layer_norm").jagged_layer_norm_kernel
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -69,8 +68,8 @@ def test_joint_reductions_compile_as_flat_jagged_passes(
         cute_flatten_nested_reductions=True,
         autotune_effort="none",
     )
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable():
+        bound = cpu_bind(
             kernel, (torch.empty((731, columns)), torch.empty(18, dtype=torch.int64))
         )
     host = bound.host_function
@@ -122,8 +121,8 @@ def test_host_loop_storage_rebinding_preserves_original_loops(
             cute_flatten_nested_reductions=enabled,
             autotune_effort="none",
         )
-        with _mock_cuda_unavailable():
-            bound = _cpu_bind(
+        with mock_cuda_unavailable():
+            bound = cpu_bind(
                 kernel,
                 (torch.empty((731, 69)), torch.empty(18, dtype=torch.int64)),
             )
@@ -189,14 +188,14 @@ def test_rewrite_declines_unproved_reduction_and_memory_contracts(
         namespace["_joint_sum"], backend="cute", cute_flatten_nested_reductions=True
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch(
             "helion._compiler.cute.flatten_nested_reductions.flatten_nested_reductions",
             decide,
         ),
         pytest.raises(_Decision) as result,
     ):
-        _cpu_bind(kernel, (torch.empty((731, 69)), torch.empty(18, dtype=torch.int64)))
+        cpu_bind(kernel, (torch.empty((731, 69)), torch.empty(18, dtype=torch.int64)))
     assert result.value.changed == 0
 
 
@@ -209,14 +208,14 @@ def test_original_reduction_precision_is_required(dtype: torch.dtype) -> None:
         jagged_layer_norm_kernel.fn, backend="cute", cute_flatten_nested_reductions=True
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch(
             "helion._compiler.cute.flatten_nested_reductions.flatten_nested_reductions",
             decide,
         ),
         pytest.raises(_Decision) as result,
     ):
-        _cpu_bind(
+        cpu_bind(
             kernel,
             (torch.empty((731, 69), dtype=dtype), torch.empty(18, dtype=torch.int64)),
         )

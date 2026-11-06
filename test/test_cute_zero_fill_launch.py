@@ -20,9 +20,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.cute.host_zero_fill_launches import MAX_FILL_NUMEL
 from helion._compiler.cute.pdl_release import ZERO_FILL_KERNEL_PREFIX
@@ -31,6 +28,8 @@ from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import import_example
 from helion._testing import onlyBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -45,7 +44,7 @@ _RELEASE = "cute.arch.griddepcontrol_launch_dependents()"
 @pytest.fixture
 def cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -99,7 +98,7 @@ def _host_lines(code: str, name: str) -> list[str]:
 
 
 def _codes(kernel: helion.Kernel, args: tuple, **config: object) -> tuple[str, str]:
-    bound = _cpu_bind(kernel, args)
+    bound = cpu_bind(kernel, args)
     spec = bound.config_spec
     on = bound.to_code(
         spec.normalized_config(helion.Config.from_dict({**config, "cute_pdl": True}))
@@ -162,7 +161,7 @@ def test_the_accumulator_fill_launches_as_a_dependent_kernel(cpu_only: None) -> 
     assert touches_out(body[wait + 1])
     # The fill kernel never stands in for the kernel's own early release.
     assert generic_release_rendered(on)
-    bound = _cpu_bind(atomic_column_sum, (x,))
+    bound = cpu_bind(atomic_column_sum, (x,))
     late = bound.to_code(
         bound.config_spec.normalized_config(
             helion.Config.from_dict(

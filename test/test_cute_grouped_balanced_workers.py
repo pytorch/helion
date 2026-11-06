@@ -8,9 +8,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_grouped_ab_k import _unsupported_k_loop
 from test.test_cute_grouped_d_shift import _args
@@ -22,10 +19,15 @@ from test.test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 
 from helion._compiler.cute.grouped_balanced_workers import GroupedBalancedWorkersPlan
 from helion._compiler.cute.grouped_balanced_workers import balanced_workers_index_domain
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.cute.launcher import _validate_tcgen05_grouped_device_split_sizes
+
+pytestmark = pytest.mark.cpu_only
 
 KEY = "tcgen05_grouped_balanced_workers"
 
@@ -46,8 +48,8 @@ def _source(kind="offsets", dtype=torch.int32, source_m=128, *, shifted=True):
     args = _args(kind, dtype)
     config = _config(source_m)
     config.config["tcgen05_grouped_d_shift"] = shifted
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(kernel, args)
         assert bound.config_spec._cute_tcgen05_config.grouped_balanced_workers_supported
         normalized = bound.config_spec.normalized_config(config)
         assert normalized.block_sizes[2] == 64
@@ -334,8 +336,8 @@ def test_balancing_preserves_every_tile_with_the_minimum_number_of_waves(
 @pytest.mark.parametrize("value", [False, None])
 def test_default_off_is_canonical_and_keeps_source_unchanged(value) -> None:
     args = _args("offsets", torch.int32)
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_device_offsets_kernel, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_device_offsets_kernel, args)
         control = _d_shift_config("mn")
         source = bound.to_code(bound.config_spec.normalized_config(control))
         control.config[KEY] = value
@@ -357,8 +359,8 @@ def test_default_off_is_canonical_and_keeps_source_unchanged(value) -> None:
     ],
 )
 def test_unsupported_profiles_and_config_values_fail_closed(updates) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_device_offsets_kernel, _args("offsets", torch.int32))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_device_offsets_kernel, _args("offsets", torch.int32))
         config = _config()
         config.config.update(updates)
         with pytest.raises(InvalidConfig):
@@ -368,8 +370,8 @@ def test_unsupported_profiles_and_config_values_fail_closed(updates) -> None:
 @pytest.mark.parametrize("variant", range(4))
 def test_noncanonical_k_effects_do_not_gain_a_worker_balance_domain(variant) -> None:
     args = (*_args("offsets", torch.int32), variant)
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_unsupported_k_loop, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_unsupported_k_loop, args)
         assert not bound.config_spec._cute_tcgen05_config.grouped_balanced_workers_supported
         config = _config()
         config.config["tcgen05_grouped_d_shift"] = False
@@ -383,8 +385,8 @@ def test_alias_or_strided_output_cannot_reassign_persistent_workers(variant) -> 
     a, b, offsets = _args("offsets", torch.int64)
     b = torch.empty((8, 256, 256), dtype=a.dtype)
     args = (a, b, offsets, variant)
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_unsafe_output, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_unsafe_output, args)
         assert not bound.config_spec._cute_tcgen05_config.grouped_balanced_workers_supported
         config = _config()
         config.config["tcgen05_grouped_d_shift"] = False
@@ -422,8 +424,8 @@ def _quad_source(kind="offsets", dtype=torch.int32, source_m=128, n_size=768):
     config.config["tcgen05_cluster_n"] = 2
     config.config["tcgen05_grouped_worklist_mma_n"] = 192
     kernel = _device_offsets_kernel if kind == "offsets" else _device_split_sizes_kernel
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(kernel, args)
         source = bound.to_code(bound.config_spec.normalized_config(config))
     return source, args
 

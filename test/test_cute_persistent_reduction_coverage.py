@@ -14,7 +14,7 @@ import helion
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.mark.parametrize("name", ["rms_norm", "layer_norm"])
@@ -406,9 +406,10 @@ def _assert_fragment_norm_coverage(source: str, rows: int, width: int):
 def _partial_fragment_norm_source():
     layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
 
-    from test._cute_binding import _forbid_native_compile
-    from test._cute_binding import _mock_cuda_unavailable
     from test.cute_population_contracts import _target
+
+    from helion._testing.cute_codegen import forbid_native_compile
+    from helion._testing.cute_codegen import mock_cuda_unavailable
 
     x = torch.empty(35, 64, dtype=torch.float16)
     inputs = (
@@ -420,9 +421,9 @@ def _partial_fragment_norm_source():
         True,
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
         kernel = helion.kernel(

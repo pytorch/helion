@@ -9,13 +9,13 @@ import torch
 
 from test.test_cute_mxfp8_mma import _config
 from test.test_cute_mxfp8_mma import _cpu_inputs
-from test.test_cute_mxfp8_mma import _cpu_target
 from test.test_cute_mxfp8_mma import _mxfp8
 from test.test_cute_mxfp8_mma import _wrapper_plan
 
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 from helion.autotuner import EnumFragment
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -33,7 +33,7 @@ def test_cpu_source_only_choices_share_native_source(
     changes: dict[str, object],
 ) -> None:
     initialized = torch.cuda.is_initialized()
-    with _cpu_target():
+    with cpu_target():
         bound = _mxfp8._bind_isolated(_cpu_inputs((137, 273, 288)))
         base = _config(bound)
         varied = _config(bound, **changes)
@@ -62,7 +62,7 @@ def test_cpu_native_geometry_is_independent_and_complete() -> None:
     geometries = tuple(
         product((64, 128, 256), (128, 256), (2, 3, 4, 5), (1, 2), (False, True))
     )
-    with _cpu_target():
+    with cpu_target():
         bound = _mxfp8._bind_isolated(_cpu_inputs((137, 273, 288)))
         normalized_geometries = set()
         for geometry in geometries:
@@ -75,7 +75,7 @@ def test_cpu_native_geometry_is_independent_and_complete() -> None:
 
 
 def test_cpu_scalar_choices_are_not_canonicalized() -> None:
-    with _cpu_target():
+    with cpu_target():
         bound = _mxfp8._bind_isolated(_cpu_inputs((137, 273, 288)))
         baseline = _config(bound, cute_scaled_mma=False)
         changed = _config(
@@ -89,7 +89,7 @@ def test_cpu_scalar_choices_are_not_canonicalized() -> None:
 
 
 def test_cpu_native_root_preserves_user_tunables() -> None:
-    with _cpu_target():
+    with cpu_target():
         bound = _mxfp8._bind_isolated(_cpu_inputs((137, 273, 288)))
         bound.config_spec.user_defined_tunables["application_choice"] = EnumFragment(
             choices=(0, 1)
@@ -106,7 +106,7 @@ def test_cpu_native_root_preserves_user_tunables() -> None:
 
 
 def test_cpu_nonflat_native_config_still_declines() -> None:
-    with _cpu_target():
+    with cpu_target():
         bound = _mxfp8._bind_isolated(_cpu_inputs((137, 273, 288)))
         config = _config(bound, pid_type="persistent_interleaved", block_sizes=[16, 64])
         with pytest.raises((helion.exc.InvalidConfig, helion.exc.BackendUnsupported)):

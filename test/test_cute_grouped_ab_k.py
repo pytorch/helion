@@ -10,10 +10,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
-from test._cute_binding import _require_cute_codegen
 from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
 
@@ -24,6 +20,10 @@ from helion._compiler.cute.grouped_ab_k import prove_grouped_ab_k_loop
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from helion._testing import DEVICE
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import require_cute_codegen
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.exc import BackendUnsupported
@@ -151,8 +151,8 @@ def test_physical128_keeps_observed_logical64_and_both_loop_steps(
     cluster_m: int, dtype: torch.dtype, offset_dtype: torch.dtype
 ) -> None:
     args = _args(n=160, dtype=dtype, offset_dtype=offset_dtype)
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_observed_logical_k, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_observed_logical_k, args)
         block = bound.config_spec.block_sizes[2]
         assert block.max_size == block.declared_max_size == 64
         requested = _config(cluster_m)
@@ -198,7 +198,7 @@ def test_physical128_cuda_live_offsets_and_graph_replay(
         pytest.skip("requires CUDA")
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family grouped MMA")
-    _require_cute_codegen()
+    require_cute_codegen()
     generator = torch.Generator(device=DEVICE).manual_seed(972)
     n = 256 if immutable else 160
     a = torch.randn((640, 256), device=DEVICE, generator=generator).bfloat16()
@@ -239,8 +239,8 @@ def test_physical128_cuda_live_offsets_and_graph_replay(
 
 @pytest.mark.parametrize("variant", [1, 2, 3, 5])
 def test_noncanonical_k_loops_cannot_request_physical128(variant: int) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_unsupported_k_loop, (*_args(), variant))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_unsupported_k_loop, (*_args(), variant))
         assert not bound.config_spec._cute_tcgen05_config.grouped_ab_k_fusion_supported
         with pytest.raises((InvalidConfig, BackendUnsupported)):
             bound.to_code(_config(2))
@@ -253,8 +253,8 @@ def test_nonunit_addmm_arguments_fail_the_closed_loop_proof(
     # The frontend currently rejects nondefault kwargs itself. Exercise the
     # backend guard against a future lowering supplying an otherwise valid FX
     # contraction with those kwargs.
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_observed_logical_k, _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_observed_logical_k, _args())
         graphs = bound.host_function.device_ir.graphs
         mma = next(
             node
@@ -284,8 +284,8 @@ def test_nonunit_addmm_arguments_fail_the_closed_loop_proof(
     "mutation", ["load", "store", "output", "carry", "rhs", "begin", "end", "k_mask"]
 )
 def test_unmatched_k_dataflow_and_effects_fail_closed(mutation: str) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_observed_logical_k, _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_observed_logical_k, _args())
         graphs = bound.host_function.device_ir.graphs
         mma = next(
             node
@@ -353,8 +353,8 @@ def test_unmatched_k_dataflow_and_effects_fail_closed(mutation: str) -> None:
 
 
 def test_partial_physical_k_tail_fails_closed() -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_observed_logical_k, _args(k=192))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_observed_logical_k, _args(k=192))
         assert not bound.config_spec._cute_tcgen05_config.grouped_ab_k_fusion_supported
         with pytest.raises((InvalidConfig, BackendUnsupported)):
             bound.to_code(_config(2))
@@ -366,8 +366,8 @@ def test_partial_physical_k_tail_fails_closed() -> None:
 def test_physical_k_requires_an_existing_native_worklist_profile(
     invalid_geometry: str,
 ) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_observed_logical_k, _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_observed_logical_k, _args())
         config = _config(2)
         if invalid_geometry == "rows":
             config.block_sizes[0] = 128
@@ -388,8 +388,8 @@ def test_physical_k_requires_an_existing_native_worklist_profile(
 
 @pytest.mark.parametrize("cluster_m,stages", [(1, 6), (2, 7)])
 def test_physical_k_uses_its_own_smem_footprint(cluster_m: int, stages: int) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_observed_logical_k, _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_observed_logical_k, _args())
         config = _config(cluster_m, stages=stages)
         legacy = deepcopy(config)
         legacy.config.pop(KEY)
@@ -431,9 +431,9 @@ def test_none_keeps_legacy_source_and_fused_seeds_keep_logical_cap() -> None:
         return device_tiles(*arguments, **keywords)
 
     with (
-        _forbid_cuda_work(),
+        forbid_cuda_work(),
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch.object(
             heuristics,
             "_tcgen05_grouped_device_tile_seeds",
@@ -444,7 +444,7 @@ def test_none_keeps_legacy_source_and_fused_seeds_keep_logical_cap() -> None:
             "helion._compiler.autotuner_heuristics.cute._tcgen05_grouped_physical_k_seeds",
             return_value=[],
         ):
-            old = _cpu_bind(_observed_logical_k, args)
+            old = cpu_bind(_observed_logical_k, args)
             old_seeds = deepcopy(
                 [
                     seed
@@ -453,7 +453,7 @@ def test_none_keeps_legacy_source_and_fused_seeds_keep_logical_cap() -> None:
                 ]
             )
             old_default = deepcopy(old.config_spec.compiler_default_config)
-        bound = _cpu_bind(_observed_logical_k, args)
+        bound = cpu_bind(_observed_logical_k, args)
         all_seeds = bound.config_spec.compiler_seed_configs
         seeds = [seed for seed in all_seeds if seed.get(SHIFTED) is not True]
         shifted = [seed for seed in all_seeds if seed.get(SHIFTED) is True]
@@ -475,8 +475,8 @@ def test_none_keeps_legacy_source_and_fused_seeds_keep_logical_cap() -> None:
 
 def test_physical_k_seeds_reach_cold_full_population() -> None:
     args = _args(m=2048, k=512)
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_observed_logical_k, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_observed_logical_k, args)
         state = random.getstate()
         try:
             random.seed(188)

@@ -8,9 +8,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_grouped_d_shift import _plans
 from test.test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
@@ -20,9 +17,14 @@ from test.test_cute_grouped_mn_224 import _profile
 
 from helion._compiler.cute import cute_mma
 from helion._compiler.cute.grouped_panel_raster import grouped_device_panel_index_domain
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 from helion.runtime.cute.launcher import _validate_tcgen05_grouped_device_split_sizes
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _config(swizzle=8, cluster_n=1):
@@ -35,7 +37,7 @@ def _config(swizzle=8, cluster_n=1):
 
 
 def _emit(config, args=None):
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
         if args is None:
             args = _args()
             if config.get("tcgen05_cluster_n", 1) == 2:
@@ -44,7 +46,7 @@ def _emit(config, args=None):
                     args[1],
                     torch.arange(9, dtype=torch.int64) * 96,
                 )
-        bound = _cpu_bind(_grouped, args)
+        bound = cpu_bind(_grouped, args)
         assert (
             bound.config_spec._cute_tcgen05_config.grouped_device_mn_swizzle_supported
         )
@@ -187,7 +189,7 @@ def test_live_offset_metadata_remains_device_read_and_runtime_plan_is_checked(dt
     assert output["bounded_output_shift"] is True
     assert "StaticPersistentGroupTileScheduler.create" in source
     assert "tcgen05_grouped_problem_sizes_smem_ptr" in source
-    with _forbid_cuda_work():
+    with forbid_cuda_work():
         _validate_tcgen05_grouped_device_split_sizes(plan, args[2])
         for bad in (
             {"device_panel_swizzle": False},
@@ -202,8 +204,8 @@ def test_default_swizzle_one_preserves_the_original_emission():
     config = _config(swizzle=1)
     explicit = _emit(config)
     config.config.pop("tcgen05_l2_swizzle_size")
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped, _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped, _args())
         omitted = bound.to_code(config)
     assert omitted == explicit
     assert "tcgen05_grouped_panel_local_index" not in omitted
@@ -222,16 +224,16 @@ def test_empty_and_skewed_offsets_remain_live_inputs_to_the_same_generated_code(
 
 
 def test_quad_global_m_edge_keeps_the_existing_split_scheduler_guard():
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped, _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped, _args())
         with pytest.raises(BackendUnsupported, match="split full/fringe scheduler"):
             bound.to_code(_config(cluster_n=2))
 
 
 @pytest.mark.parametrize("variant", [1, 2, 3])
 def test_noncanonical_loop_cannot_claim_device_swizzle(variant):
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped, (*_args(), variant))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped, (*_args(), variant))
         assert not bound.config_spec._cute_tcgen05_config.grouped_device_mn_swizzle_supported
         with pytest.raises((InvalidConfig, BackendUnsupported)):
             bound.to_code(_config())
@@ -240,12 +242,12 @@ def test_noncanonical_loop_cannot_claim_device_swizzle(variant):
 def test_split_sizes_and_nm_stay_on_their_existing_raster_routes():
     args = list(_args())
     args[2] = torch.full((8,), 80, dtype=torch.int32)
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_device_split_sizes_kernel, tuple(args))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_device_split_sizes_kernel, tuple(args))
         assert not bound.config_spec._cute_tcgen05_config.grouped_device_mn_swizzle_supported
         with pytest.raises(InvalidConfig):
             bound.to_code(_config())
-        bound = _cpu_bind(_grouped, _args())
+        bound = cpu_bind(_grouped, _args())
         config = _config()
         config.config["tcgen05_grouped_worklist_orientation"] = "nm"
         with pytest.raises(InvalidConfig):
@@ -253,8 +255,8 @@ def test_split_sizes_and_nm_stay_on_their_existing_raster_routes():
 
 
 def test_incomplete_cluster_n_and_invalid_index_domains_are_rejected():
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(
             _grouped,
             (
                 torch.empty((768, 256), dtype=torch.bfloat16),
@@ -264,7 +266,7 @@ def test_incomplete_cluster_n_and_invalid_index_domains_are_rejected():
         )
         with pytest.raises(BackendUnsupported, match="mn_complete_n_clusters"):
             bound.to_code(_config(cluster_n=2))
-        bound = _cpu_bind(_grouped, _args())
+        bound = cpu_bind(_grouped, _args())
         with (
             patch.object(
                 cute_mma, "grouped_device_panel_index_domain", return_value=False

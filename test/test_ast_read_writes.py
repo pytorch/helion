@@ -3,9 +3,13 @@ from __future__ import annotations
 import ast
 import unittest
 
+import pytest
+
 from helion._compiler.ast_read_writes import ReadWrites
 from helion._compiler.ast_read_writes import dead_assignment_elimination
 from helion._compiler.ast_read_writes import definitely_does_not_have_side_effects
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestAstReadWrites(unittest.TestCase):

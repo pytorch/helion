@@ -15,6 +15,8 @@ from helion._compiler.cute.interchanged_store_dce import eliminate_interchanged_
 from helion._compiler.cute.persistent_branch_vec import _definition_snapshots
 from helion._compiler.cute.persistent_branch_vec import _freeze_definition
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _doubling_assignments(depth):
     source = ["budget_0 = base"]

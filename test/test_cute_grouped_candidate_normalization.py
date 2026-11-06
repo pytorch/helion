@@ -17,13 +17,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_grouped_coverage_search import _target
 
 import helion
 from helion import exc
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
 
 grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
     from helion.runtime.kernel import BoundKernel
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 ROW_UNION_KEY = "tcgen05_grouped_dense_row_union"
 SCHEDULE_KEY = "tcgen05_grouped_row_union_schedule"
@@ -44,7 +44,7 @@ def _cpu_only() -> Generator[None, None, None]:
     old_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         _target(),
     ):

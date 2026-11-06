@@ -22,6 +22,8 @@ from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
+pytestmark = pytest.mark.cpu_only
+
 cpu_only = test_cute_philox_policy.cpu_only
 
 SEEDS = (

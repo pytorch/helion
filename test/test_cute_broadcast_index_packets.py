@@ -8,14 +8,15 @@ import operator
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.cute.memory_ops import _cute_lane_uniform_predicate
 from helion._compiler.cute.memory_ops import _CuteLaneIndexFacts
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -58,8 +59,8 @@ def _generate(dtype: torch.dtype, width: int, limit: int, stride: int = 1) -> st
         limit,
         stride,
     )
-    with _forbid_cuda_work(), _mock_cuda_unavailable():
-        return _cpu_bind(gathered_sum, args).to_code(packet_config(width))
+    with forbid_cuda_work(), mock_cuda_unavailable():
+        return cpu_bind(gathered_sum, args).to_code(packet_config(width))
 
 
 @pytest.mark.parametrize(("dtype", "width"), [(torch.float32, 4), (torch.bfloat16, 4)])

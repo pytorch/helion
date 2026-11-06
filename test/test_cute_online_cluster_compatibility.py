@@ -16,7 +16,6 @@ import numpy as np
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_cluster_online_pair import softmax_two_pass_kernel
 
 import helion
@@ -26,8 +25,11 @@ from helion._compiler.cute.duplicate_reduction_carries import (
 )
 from helion._compiler.cute.hoist_warp_reduce import validate_cluster_reduce_placement
 from helion._compiler.tile_strategy import NDTileStrategy
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.language._decorators import is_api_func
 from helion.language.tile_ops import tile_begin
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -39,7 +41,7 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",

@@ -17,10 +17,8 @@ import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import checked_initial_population
 from test.test_cute_full_slice_matmul import _matmul
-from test.test_cute_fuse_mm_accumulation import _cpu_target as _split_k_target
 from test.test_cute_repro_settings import _case
 from test.test_cute_repro_settings import _host
 from test.test_cute_repro_settings import _replay
@@ -33,6 +31,8 @@ from test.test_cute_split_k_workspace import _fp32_bias
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target as _split_k_target
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.base_search import normalize_autotune_seed_configs
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
@@ -42,6 +42,8 @@ from helion.runtime.cute_structural_config import resolve_cute_structural_policy
 from helion.runtime.cute_structural_policy import CUTE_STRUCTURAL_SETTINGS
 from helion.runtime.cute_structural_policy import CuteStructuralPolicy
 from helion.runtime.settings import Settings
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -59,7 +61,7 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     torch.set_num_threads(1)
     with (
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",

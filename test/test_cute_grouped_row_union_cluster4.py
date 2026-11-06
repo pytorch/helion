@@ -12,8 +12,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_grouped_coverage_search import _bound
 from test.test_cute_grouped_coverage_search import _search
 from test.test_cute_grouped_k128_full_coverage import _bound as _generic_bound
@@ -34,9 +32,13 @@ from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.program_id import ProgramIDs
 from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
+
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -46,7 +48,7 @@ def cpu_only():
     torch.set_num_threads(1)
     try:
         with (
-            _mock_cuda_unavailable(),
+            mock_cuda_unavailable(),
             patch(
                 "torch.cuda.current_device", side_effect=AssertionError("CPU only")
             ) as current_device,
@@ -64,7 +66,7 @@ def cpu_only():
             patch(
                 "torch.cuda.synchronize", side_effect=AssertionError("GPU forbidden")
             ) as synchronize,
-            _forbid_native_compile() as native_compilation,
+            forbid_native_compile() as native_compilation,
             _target(),
         ):
             yield

@@ -49,6 +49,8 @@ from helion._testing import TestCase
 from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     import ast
     from collections.abc import Iterator

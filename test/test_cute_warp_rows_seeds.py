@@ -8,22 +8,22 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteReductionTileHeuristic
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.fixture(autouse=True)
 def _cpu_only():
-    with _target(), _mock_cuda_unavailable():
+    with _target(), mock_cuda_unavailable():
         yield
 
 
@@ -42,7 +42,7 @@ def _seeds(fn, args):
     kernel = helion.kernel(
         fn, backend="cute", static_shapes=True, autotune_effort="full"
     )
-    bound = _cpu_bind(kernel, args)
+    bound = cpu_bind(kernel, args)
     assert CuteReductionTileHeuristic.is_eligible(
         bound.env, bound.host_function.device_ir
     )

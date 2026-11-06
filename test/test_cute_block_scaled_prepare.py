@@ -15,12 +15,12 @@ from torch._inductor.codecache import PyCodeCache
 from test.test_cute_block_scaled_mma import _bind_native
 from test.test_cute_block_scaled_mma import _native_config
 from test.test_cute_block_scaled_mma import _wrapper_plan
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 from helion._compiler.cute.block_scaled_prepare import preparation_source
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -186,7 +186,7 @@ def test_exact_preparation_covers_every_byte_once_and_zeroes_physical_padding(
                 torch.uint8
             )
         )
-    with _cpu_target():
+    with cpu_target():
         plan = _wrapper_plan(
             bound.to_code(
                 _native_config(
@@ -247,7 +247,7 @@ def test_exact_preparation_covers_every_byte_once_and_zeroes_physical_padding(
 
 def test_preparation_reloads_mutated_contents() -> None:
     bound, inputs = _bind_native((7, 3, 9))
-    with _cpu_target():
+    with cpu_target():
         plan = _wrapper_plan(bound.to_code(_native_config()))
     for tensor in inputs[:4]:
         assert isinstance(tensor, torch.Tensor)
@@ -263,7 +263,7 @@ def test_preparation_reloads_mutated_contents() -> None:
 @pytest.mark.parametrize("scale_bits", [128, 184, 255])
 def test_byte_packing_ignores_sign_extension_of_narrow_loads(scale_bits: int) -> None:
     bound, inputs = _bind_native((7, 3, 9))
-    with _cpu_target():
+    with cpu_target():
         plan = _wrapper_plan(bound.to_code(_native_config()))
     for tensor in inputs[:2]:
         assert isinstance(tensor, torch.Tensor)
@@ -286,7 +286,7 @@ def test_host_workspace_is_fresh_per_invocation_and_replacement_inputs_are_forwa
     def capture(kernel: object, grid: object, *args: object, **kwargs: object) -> None:
         calls.append(args)
 
-    with _cpu_target():
+    with cpu_target():
         source = bound.to_code(_native_config())
         plan = _wrapper_plan(source)
         module = PyCodeCache.load(source)

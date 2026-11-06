@@ -35,9 +35,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion import exc
 from helion._compiler.ast_read_writes import HELION_ATOMIC_UNIFORM_LANES_ATTR
@@ -46,14 +43,16 @@ from helion._compiler.cute.lane_loop_distribution import check_full_nest
 from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
 
 
 def _generate(kernel: object, args: tuple[torch.Tensor, ...], **config: object) -> str:
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, args)
         return bound.to_code(helion.Config.from_dict(config))
 
 

@@ -13,8 +13,6 @@ import torch
 from torch._inductor import config as inductor_config
 from torch._inductor.virtualized import V
 
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_register_region import _conditional_permutation
 from test.test_cute_register_region import _plan
@@ -23,7 +21,11 @@ import helion
 from helion._compiler.cute.row_fragment import RowFragmentEmitter
 from helion._compiler.cute.scalar_lowering import ScalarLoweringContextCache
 from helion._compiler.inductor_lowering import GenerateASTFromInductor
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from helion._compiler.generate_ast import GenerateAST
@@ -64,7 +66,7 @@ def _mixed_integer(x: torch.Tensor) -> torch.Tensor:
 
 
 def _code(kernel, args):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, config, plan = _plan(kernel, args)
         assert plan is not None
         source = bound.to_code(config)
@@ -101,7 +103,7 @@ def test_scalar_context_preserves_branch_source():
 
 
 def test_scalar_context_isolates_programs_branches_and_arguments():
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, _, _ = _plan(_mixed_integer, (torch.zeros(3, 32, 8, dtype=torch.int32),))
     cg = cast("GenerateAST", SimpleNamespace())
     cache = ScalarLoweringContextCache(cg)

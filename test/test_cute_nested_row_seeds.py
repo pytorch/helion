@@ -5,9 +5,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics import get_heuristics
 from helion._compiler.autotuner_heuristics.cute import CuteNestedRowHeuristic
@@ -17,6 +14,8 @@ from helion._compiler.cute.thread_budget import tile_loop_thread_count
 from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 _examples_jagged_layer_norm = import_example("jagged_layer_norm")
@@ -42,7 +41,7 @@ def test_nested_jagged_passes_receive_reachable_coherent_seeds(
         static_shapes=static_shapes,
         autotune_effort="none",
     )
-    bound = _cpu_bind(
+    bound = cpu_bind(
         kernel,
         (torch.empty((731, columns)), torch.empty(18, dtype=torch.int64), 1e-6),
     )
@@ -119,7 +118,7 @@ def test_nested_jagged_default_is_the_primary_seed(
         static_shapes=static_shapes,
         autotune_effort="none",
     )
-    bound = _cpu_bind(
+    bound = cpu_bind(
         kernel,
         (torch.empty((731, columns)), torch.empty(18, dtype=torch.int64), 1e-6),
     )
@@ -200,7 +199,7 @@ def test_nested_jagged_vectorized_default_matches_reference() -> None:
 
 def test_nested_seeds_respect_config_sequence_registration_order() -> None:
     kernel = helion.kernel(jagged_layer_norm_kernel.fn, backend="cute")
-    bound = _cpu_bind(
+    bound = cpu_bind(
         kernel,
         (torch.empty((731, 128)), torch.empty(18, dtype=torch.int64), 1e-6),
     )
@@ -225,7 +224,7 @@ def test_nested_seeds_do_not_claim_a_plain_row_kernel() -> None:
             out[row] = x[row, :].sum(dim=-1)
         return out
 
-    bound = _cpu_bind(row_sum, (torch.empty((17, 128)),))
+    bound = cpu_bind(row_sum, (torch.empty((17, 128)),))
     host = bound.host_function
     assert host is not None
     assert not CuteNestedRowHeuristic.get_seed_configs(bound.env, host.device_ir)
@@ -242,8 +241,8 @@ def test_flat_jagged_search_reaches_wide_coherent_vector_sweeps(
         cute_flatten_nested_reductions=True,
         autotune_effort="none",
     )
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable():
+        bound = cpu_bind(
             kernel, (torch.empty((731, 128)), torch.empty(18, dtype=torch.int64))
         )
     host = bound.host_function

@@ -14,6 +14,8 @@ from helion.autotuner.config_spec import CUTE_AFFINE_SCAN_SCHEDULE_KEY
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.search_space_logger import canonical_config_id
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _enabled_spec(*, step_count: int | None = 4) -> ConfigSpec:
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 0))

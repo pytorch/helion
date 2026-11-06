@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
 
 pytestmark = [
+    pytest.mark.cpu_only,
     skipUnlessBackends(["cute"]),
     pytest.mark.skipif(
         os.environ.get("HELION_INTERPRET") == "1",

@@ -14,6 +14,8 @@ from helion._compiler.cute.bounded_loop_cache import cache_single_tile_loads
 from helion._compiler.cute.bounded_loop_cache import private_fragment_accesses
 from helion._compiler.cute.bounded_loop_cache import specialize_single_tile_sweeps
 
+pytestmark = pytest.mark.cpu_only
+
 SOURCE = """
 def kernel(x, out, n, row):
     acc = cutlass.Float32(0)

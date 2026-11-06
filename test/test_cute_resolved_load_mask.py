@@ -12,7 +12,6 @@ import pytest
 import torch
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from test._cute_binding import _cpu_bind
 from test.test_cute_collective_b_major import _b_copy
 from test.test_cute_collective_dot import _full_slice_dot
 from test.test_cute_collective_native_seeded import _mamba_kernel
@@ -23,6 +22,7 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.memory_ops import _cute_resolved_load_mask
 from helion._compiler.host_function import HostFunction
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 
 CUDA_DEVICE = "cuda"
@@ -168,7 +168,7 @@ def test_full_slice_equal_extents_do_not_capture_another_output_axis(
         static_shapes=True,
         autotune_effort="none",
     )
-    source = _cpu_bind(kernel, inputs).to_code(_config(compute=compute, copy=copy))
+    source = cpu_bind(kernel, inputs).to_code(_config(compute=compute, copy=copy))
     assert source.count("cute.gemm(") == 1
     _assert_operand_coordinates_are_local(source)
     # N=70/21 still needs a real RHS/output bound after its unrelated M mask
@@ -196,7 +196,7 @@ def test_original_seeded_mamba_oversized_m_tile_has_no_escaped_row_mask(
             "cute_collective_native_seeded": True,
         }
     )
-    source = _cpu_bind(_mamba_kernel(static_shapes=static_shapes), inputs).to_code(
+    source = cpu_bind(_mamba_kernel(static_shapes=static_shapes), inputs).to_code(
         config
     )
     assert source.count("tcgen05.CtaGroup.ONE") == 2

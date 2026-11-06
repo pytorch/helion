@@ -9,14 +9,13 @@ from typing import cast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics.cute import _FALLBACK_L2_BYTES
 from helion._compiler.autotuner_heuristics.cute import _resident_input_eviction_policies
 from helion._compiler.autotuner_heuristics.cute import _reversed_root_loop_orders
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -25,12 +24,12 @@ if TYPE_CHECKING:
 
     from helion.runtime.kernel import BoundKernel
 
-pytestmark = skipUnlessBackends("cute")
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends("cute")]
 
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         yield
 
 
@@ -67,7 +66,7 @@ def _bind(fn: Callable[..., Any], *args: torch.Tensor) -> BoundKernel:
         autotune_effort="full",
         ignore_warnings=[helion.exc.TensorOperationInWrapper],
     )
-    return _cpu_bind(kernel, args)
+    return cpu_bind(kernel, args)
 
 
 def _rope_args(k_heads: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

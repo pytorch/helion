@@ -7,9 +7,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
 from test.test_cute_grouped_ab_k import _unsupported_k_loop
@@ -18,8 +15,13 @@ from test.test_cute_grouped_large_device_seeds import _grouped_offsets_k64
 import helion
 from helion._compiler.autotuner_heuristics import cute as heuristics
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _kernel():
@@ -48,9 +50,9 @@ def test_mn_seeds_preserve_old_prefix_normalize_and_reach_native_source(
 ) -> None:
     args = _args(m, groups, n, k)
     with (
-        _forbid_cuda_work(),
+        forbid_cuda_work(),
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch.object(
             heuristics, "_tcgen05_grouped_prefix_adaptive_n_seeds", return_value=[]
         ),
@@ -58,10 +60,10 @@ def test_mn_seeds_preserve_old_prefix_normalize_and_reach_native_source(
         with patch.object(
             heuristics, "_tcgen05_grouped_mn_device_tile_seeds", return_value=[]
         ):
-            previous = _cpu_bind(_kernel(), args)
+            previous = cpu_bind(_kernel(), args)
             old_seeds = list(previous.config_spec.compiler_seed_configs)
             old_default = previous.config_spec.compiler_default_config
-        bound = _cpu_bind(_kernel(), args)
+        bound = cpu_bind(_kernel(), args)
         spec = bound.config_spec
         seeds = spec.compiler_seed_configs
         assert seeds[: len(old_seeds)] == old_seeds
@@ -118,8 +120,8 @@ def test_mn_seeds_preserve_old_prefix_normalize_and_reach_native_source(
 
 
 def test_resource_and_complete_cluster_bounds_apply_to_each_proposal() -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(), _args(512, 4, 256, 256))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), _args(512, 4, 256, 256))
         seeds = heuristics._tcgen05_grouped_mn_device_tile_seeds(
             bound.config_spec,
             groups=4,
@@ -168,8 +170,8 @@ def test_resource_and_complete_cluster_bounds_apply_to_each_proposal() -> None:
     ],
 )
 def test_seed_helper_rejects_unproved_or_out_of_domain_inputs(updates) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(), _args(512, 4, 256, 256))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), _args(512, 4, 256, 256))
         values = {
             "groups": 4,
             "n": 256,
@@ -187,8 +189,8 @@ def test_seed_helper_rejects_unproved_or_out_of_domain_inputs(updates) -> None:
 
 def test_mn_seed_configs_are_in_a_fresh_full_search_population() -> None:
     args = _args(2048, 16, 1536, 2048)
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(), args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), args)
         assert bound.config_spec.compiler_seed_overflow_requested
         rng_state = random.getstate()
         try:
@@ -261,8 +263,8 @@ def test_mn_seed_configs_are_in_a_fresh_full_search_population() -> None:
 
 
 def test_noncanonical_reduction_does_not_receive_immutable_mn_proposals() -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_unsupported_k_loop, (*_args(512, 4, 256, 256), 1))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_unsupported_k_loop, (*_args(512, 4, 256, 256), 1))
         assert not bound.config_spec._cute_tcgen05_config.grouped_d_shift_supported
         assert not any(
             seed.get("tcgen05_grouped_worklist_orientation") == "mn"
@@ -274,10 +276,10 @@ def test_mn_descriptor_discount_requires_aligned_tma_inputs() -> None:
     rows, groups, columns, reduction = 512, 4, 512, 256
     storage = torch.empty(rows * reduction + 1, dtype=torch.bfloat16)
     other = _args(rows, groups, columns, reduction)[1:]
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
         for offset in (0, 1):
             a = storage[offset : offset + rows * reduction].view(rows, reduction)
-            bound = _cpu_bind(_kernel(), (a, *other))
+            bound = cpu_bind(_kernel(), (a, *other))
             facts = bound.config_spec._cute_tcgen05_config
             assert facts.grouped_d_shift_supported
             assert facts.matmul_operands_tma_provable is (offset == 0)

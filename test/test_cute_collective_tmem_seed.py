@@ -9,7 +9,6 @@ from typing import cast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.test_cute_collective_native_seeded import _mamba_kernel
 from test.test_cute_collective_native_seeded import _mamba_sizes
 from test.test_cute_collective_vector_epilogue_codegen import _mamba_config
@@ -24,6 +23,7 @@ from helion._compiler.cute.collective_tmem_seed import _seed_recipe
 from helion._compiler.cute.collective_tmem_seed import bridge_collective_tmem_seeds
 from helion._compiler.cute.collective_tmem_seed import prune_pure_scalar_statements
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
@@ -231,7 +231,7 @@ def test_generated_mamba_has_direct_seed_and_live_final_drain(
     static_shapes: bool, block_m: int, block_n: int
 ) -> None:
     args = tuple(torch.empty(size, dtype=torch.bfloat16) for size in _mamba_sizes(2))
-    bound = _cpu_bind(_mamba_kernel(static_shapes=static_shapes), args)
+    bound = cpu_bind(_mamba_kernel(static_shapes=static_shapes), args)
     config = helion.Config.from_dict(
         _mamba_config("vector_unrolled").config
         | {
@@ -254,7 +254,7 @@ def test_generated_mamba_has_direct_seed_and_live_final_drain(
 @skipUnlessBackends(["cute"])
 def test_tmem_seed_search_and_config_roundtrip() -> None:
     args = tuple(torch.empty(size, dtype=torch.bfloat16) for size in _mamba_sizes(2))
-    bound = _cpu_bind(_mamba_kernel(static_shapes=False), args)
+    bound = cpu_bind(_mamba_kernel(static_shapes=False), args)
     assert bound.host_function is not None
     with bound.env:
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
@@ -275,7 +275,7 @@ def test_tmem_seed_search_and_config_roundtrip() -> None:
 @skipUnlessBackends(["cute"])
 def test_invalid_tmem_seed_flag_is_rejected(value: object) -> None:
     args = tuple(torch.empty(size, dtype=torch.bfloat16) for size in _mamba_sizes(0))
-    bound = _cpu_bind(_mamba_kernel(static_shapes=False), args)
+    bound = cpu_bind(_mamba_kernel(static_shapes=False), args)
     config = helion.Config.from_dict(
         _mamba_config("scalar").config | {"cute_collective_tmem_seed": value}
     )
@@ -330,7 +330,7 @@ def _dependent_inputs(dtype: torch.dtype, device: str) -> tuple[torch.Tensor, ..
 @pytest.mark.parametrize("block_m,block_n", [(64, 32), (128, 64)])
 @skipUnlessBackends(["cute"])
 def test_dynamic_empty_reduction_codegen(block_m: int, block_n: int) -> None:
-    bound = _cpu_bind(_dependent_contractions, _dependent_inputs(torch.float16, "cpu"))
+    bound = cpu_bind(_dependent_contractions, _dependent_inputs(torch.float16, "cpu"))
     source = bound.to_code(_dependent_config(block_m, block_n, True))
     assert "collective_tmem_seed_values" in source
     assert "collective_tmem_seed_initialized" in source

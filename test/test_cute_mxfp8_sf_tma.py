@@ -9,7 +9,6 @@ import torch
 
 from test.test_cute_mxfp8_mma import _config
 from test.test_cute_mxfp8_mma import _cpu_inputs
-from test.test_cute_mxfp8_mma import _cpu_target
 from test.test_cute_mxfp8_mma import _mxfp8
 from test.test_cute_mxfp8_mma import _wrapper_plan
 from test.test_cute_mxfp8_packed_provenance import _packed_mxfp8
@@ -22,9 +21,10 @@ from helion._compiler.cute.block_scaled_config import BLOCK_SCALED_CHOICES
 from helion._compiler.cute.block_scaled_config import block_scaled_choices
 from helion._compiler.cute.block_scaled_config import normalize_block_scaled_config
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 from helion.runtime.cute.launcher import _cute_stage_under_aligned_operands
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def _packed_inputs(
@@ -77,7 +77,7 @@ def test_sf_tma_requires_a_boolean(sf_tma: object) -> None:
 def test_unit_word_tensor_map_axes_keep_global_scale_loading(
     shape: tuple[int, int, int],
 ) -> None:
-    with _cpu_target():
+    with cpu_target():
         bound = _packed_mxfp8._bind_isolated(_packed_inputs(*shape))
         assert bound.config_spec.cute_mxfp8_fused_scales_available
         assert not bound.config_spec.cute_mxfp8_sf_tma_available
@@ -91,7 +91,7 @@ def test_unit_word_tensor_map_axes_keep_global_scale_loading(
 def test_unit_row_tensor_map_axes_preserve_descriptor_bounds(
     shape: tuple[int, int, int],
 ) -> None:
-    with _cpu_target():
+    with cpu_target():
         bound = _packed_mxfp8._bind_isolated(_packed_inputs(*shape))
         assert bound.config_spec.cute_mxfp8_sf_tma_available
         config = _config(
@@ -110,7 +110,7 @@ def test_unit_row_tensor_map_axes_preserve_descriptor_bounds(
 
 
 def test_byte_scales_cannot_select_the_packed_scale_tma() -> None:
-    with _cpu_target():
+    with cpu_target():
         bound = _mxfp8._bind_isolated(_cpu_inputs((73, 273, 288)))
         assert not bound.config_spec.cute_mxfp8_sf_tma_available
         with pytest.raises(helion.exc.InvalidConfig, match="SF TMA"):
@@ -119,7 +119,7 @@ def test_byte_scales_cannot_select_the_packed_scale_tma() -> None:
 
 def test_native_tma_config_preserves_json_flattening_and_source_identity() -> None:
     initialized = torch.cuda.is_initialized()
-    with _cpu_target():
+    with cpu_target():
         bound = _packed_mxfp8._bind_isolated(_packed_inputs())
         assert bound.config_spec.cute_mxfp8_sf_tma_available
         base = _config(
@@ -150,7 +150,7 @@ def test_native_tma_config_preserves_json_flattening_and_source_identity() -> No
 
 
 def test_raw_sf_buffers_are_included_in_the_native_shared_memory_limit() -> None:
-    with _cpu_target():
+    with cpu_target():
         bound = _packed_mxfp8._bind_isolated(_packed_inputs())
         geometry = {
             "cute_scaled_fused_scales": True,
@@ -193,7 +193,7 @@ def test_inplace_requires_the_scale_tma_path() -> None:
 
 
 def test_joint_native_inplace_profile_preserves_both_persistent_choices() -> None:
-    with _cpu_target():
+    with cpu_target():
         bound = _packed_mxfp8._bind_isolated(_packed_inputs())
         with bound.env:
             seeds = CuteBlockScaledMmaHeuristic.get_seed_configs(
@@ -221,7 +221,7 @@ def test_joint_native_inplace_profile_preserves_both_persistent_choices() -> Non
 
 
 def test_legal_old_seeds_remain_and_the_proved_sf_pipeline_is_discoverable() -> None:
-    with _cpu_target():
+    with cpu_target():
         bound = _packed_mxfp8._bind_isolated(_packed_inputs())
         with bound.env:
             seeds = CuteBlockScaledMmaHeuristic.get_seed_configs(

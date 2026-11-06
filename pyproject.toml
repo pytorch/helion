@@ -179,7 +179,16 @@ allow-direct-references = true
 source = "vcs"
 
 [tool.pytest.ini_options]
-markers = ["cuda: requires an explicitly assigned CUDA device"]
+markers = [
+  "cuda: requires an explicitly assigned CUDA device",
+  # Selected by the CPU lane (`-m cpu_only`, no accelerator) and deselected by
+  # the GPU jobs. Apply at module level only when every test in the module
+  # passes with CUDA_VISIBLE_DEVICES="".
+  "cpu_only: passes without an accelerator",
+  # Fresh-interpreter replays, real autotune searches, and stress tests.
+  # Pull requests run `-m 'not slow'`; pushes to main run everything.
+  "slow: spawns interpreters or runs a real autotune search",
+]
 # artifacts/ holds gitignored benchmark and probe outputs, some of them named
 # test_*.py with import-time side effects; pytest must never collect them
 # (pytest's built-in defaults plus artifacts and the docs build).

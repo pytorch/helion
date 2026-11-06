@@ -9,6 +9,7 @@ from typing import Any
 from typing import cast
 import unittest
 
+import pytest
 import torch
 from torch.fx import Graph
 
@@ -35,6 +36,8 @@ from helion._compiler.generate_ast import GenerateAST
 from helion._compiler.tile_strategy import DeviceLoopState
 from helion._testing import onlyBackends
 from helion.language.memory_ops import _codegen_cute_store_tcgen05_tile
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from torch.fx.node import Node

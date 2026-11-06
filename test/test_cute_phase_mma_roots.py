@@ -26,7 +26,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test._cute_se_bwd_chains import se_bwd_da_chain
 from test._cute_se_bwd_chains import se_bwd_dx_chain
 from test.cute_population_contracts import with_flat_min_blocks_default
@@ -47,6 +46,7 @@ from helion._compiler.cute.aux_tensor import analyze_tcgen05_matmul_store_chains
 from helion._compiler.cute.mma_support import CuteMmaSupport
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
@@ -61,7 +61,7 @@ squeeze_and_excitation_net_fwd = (
     _examples_squeeze_and_excitation_net.squeeze_and_excitation_net_fwd
 )
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -77,7 +77,7 @@ def _native_cpu_target() -> Generator[None, None, None]:
     )
     with (
         _cpu_target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "helion._compiler.cute.mma_support.get_cute_mma_support",

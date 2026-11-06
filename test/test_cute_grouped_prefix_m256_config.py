@@ -7,18 +7,20 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from ._cute_binding import _cpu_bind
-from ._cute_binding import _forbid_cuda_work
-from ._cute_binding import _mock_cuda_unavailable
 from .cute_population_contracts import _target
 from .cute_population_contracts import checked_initial_population
 from .test_cute_grouped_large_device_seeds import _kernel
 from .test_cute_grouped_prefix_adaptive_config import _args
 from .test_cute_grouped_prefix_adaptive_config import _recipes
 from helion._compiler.autotuner_heuristics import cute as heuristics
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.exc import InvalidConfig
+
+pytestmark = pytest.mark.cpu_only
 
 KEY = "tcgen05_grouped_prefix_adaptive_n"
 SOURCE = "tcgen05_grouped_worklist_source_m_tile"
@@ -30,8 +32,8 @@ RESERVED = "tcgen05_grouped_static_reserved_sms"
 @pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("balanced", [False, True])
 def test_m256_pair_survives_strict_transfer(dtype, offset_dtype, balanced):
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(
             _kernel(), _args(m=8192, dtype=dtype, offset_dtype=offset_dtype)
         )
         spec = bound.config_spec
@@ -107,8 +109,8 @@ def test_m256_pair_survives_strict_transfer(dtype, offset_dtype, balanced):
     ],
 )
 def test_incoherent_m256_recipe_is_rejected(change):
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        spec = _cpu_bind(_kernel(), _args(m=8192)).config_spec
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        spec = cpu_bind(_kernel(), _args(m=8192)).config_spec
         raw = deepcopy(_recipes(spec, 256)[0])
         raw.config.update(change)
         with pytest.raises(InvalidConfig):
@@ -122,8 +124,8 @@ def test_incoherent_m256_recipe_is_rejected(change):
 def test_m256_domain_uses_real_metadata_and_supports_complete_box_tails(
     groups, m, n, k
 ):
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        spec = _cpu_bind(_kernel(), _args(groups=groups, m=m, n=n, k=k)).config_spec
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        spec = cpu_bind(_kernel(), _args(groups=groups, m=m, n=n, k=k)).config_spec
         assert (
             spec._cute_tcgen05_config.get_grouped_prefix_adaptive_n_profile(
                 {SOURCE: 256}
@@ -137,8 +139,8 @@ def test_m256_domain_uses_real_metadata_and_supports_complete_box_tails(
     "groups,n,k", [(33, 1536, 2048), (16, 2048, 2048), (16, 1544, 2048), (16, 1536, 96)]
 )
 def test_m256_outside_domain_has_no_profile(groups, n, k):
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        spec = _cpu_bind(_kernel(), _args(groups=groups, m=8192, n=n, k=k)).config_spec
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        spec = cpu_bind(_kernel(), _args(groups=groups, m=8192, n=n, k=k)).config_spec
         assert (
             spec._cute_tcgen05_config.get_grouped_prefix_adaptive_n_profile(
                 {SOURCE: 256}
@@ -150,14 +152,14 @@ def test_m256_outside_domain_has_no_profile(groups, n, k):
 
 def test_all_old_seeds_and_default_precede_m256_append():
     args = _args(m=8192)
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
         with patch.object(
             heuristics, "_tcgen05_grouped_prefix_adaptive_n_m256_seeds", return_value=[]
         ):
-            before = _cpu_bind(_kernel(), args).config_spec
+            before = cpu_bind(_kernel(), args).config_spec
             old = deepcopy(before.compiler_seed_configs)
             default = deepcopy(before.compiler_default_config)
-        spec = _cpu_bind(_kernel(), args).config_spec
+        spec = cpu_bind(_kernel(), args).config_spec
         assert spec.compiler_seed_configs[: len(old)] == old
         assert spec.compiler_default_config == default
         assert spec.compiler_seed_configs[len(old) :] == _recipes(spec, 256)
@@ -181,7 +183,7 @@ def test_full_population_preserves_prefix_rng_and_appends_all_effective_m256_see
     args = _args(m=8192)
     saved = random.getstate()
     try:
-        with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
+        with forbid_cuda_work(), _target(), mock_cuda_unavailable():
             old_kernel = _kernel()
             old_kernel.settings.autotune_effort = "full"
             with patch.object(
@@ -189,10 +191,10 @@ def test_full_population_preserves_prefix_rng_and_appends_all_effective_m256_see
                 "_tcgen05_grouped_prefix_adaptive_n_m256_seeds",
                 return_value=[],
             ):
-                before = _cpu_bind(old_kernel, args)
+                before = cpu_bind(old_kernel, args)
             kernel = _kernel()
             kernel.settings.autotune_effort = "full"
-            after = _cpu_bind(kernel, args)
+            after = cpu_bind(kernel, args)
             kwargs = LFBOTreeSearch.get_kwargs_from_profile(
                 get_effort_profile("full"), after.settings
             )
@@ -220,8 +222,8 @@ def test_full_population_preserves_prefix_rng_and_appends_all_effective_m256_see
 
 
 def test_m256_disabled_key_uses_exact_native_source():
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(), _args(m=8192))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), _args(m=8192))
         raw = deepcopy(_recipes(bound.config_spec, 256)[0])
         raw.config.pop(KEY)
         disabled = deepcopy(raw)

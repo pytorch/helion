@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from typing import cast
 
+import pytest
 import torch
 
 from helion._compiler.ast_extension import ExtendedAST
@@ -22,6 +23,8 @@ from helion._compiler.cute.factor_affine_reductions import (
 from helion._compiler.cute.factor_affine_reductions import pack_fp32_constexpr_loops
 from helion.language import _tracing_ops
 from helion.language import view_ops
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _add_node(

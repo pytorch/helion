@@ -3,11 +3,14 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 
 import helion
 from helion.autotuner.benchmark_provider import _MAX_REFERENCE_BASELINE_ATTEMPTS
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _Spec:

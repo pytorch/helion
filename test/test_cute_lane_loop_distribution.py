@@ -37,8 +37,6 @@ import pytest
 import sympy
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_scan_lowering import _segment_args
 from test.test_cute_scan_lowering import _segment_scan
 from test.test_cute_scan_lowering import _segment_scan_reverse
@@ -51,6 +49,8 @@ from helion._compiler.cute.block_uniform import block_uniform
 from helion._compiler.device_ir import ReductionLoopGraphInfo
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.language import _tracing_ops
 
@@ -59,12 +59,12 @@ concat2d_dim1_simple = import_example("concatenate").concat2d_dim1_simple
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def _generate(kernel: object, args: tuple[torch.Tensor, ...], **config: object) -> str:
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, args)
         return bound.to_code(helion.Config.from_dict(config))
 
 
@@ -1851,8 +1851,8 @@ def test_argument_flag_proof_survives_the_bind_tensors_being_freed() -> None:
         _ELEMENTWISE_THREADS_CONFIG,
         {**_ELEMENTWISE_THREADS_CONFIG, "block_sizes": [2, 64], "num_threads": [2, 64]},
     )
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(_flagged_first_column_then_update_all, (x, flags))
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_flagged_first_column_then_update_all, (x, flags))
         first = bound.to_code(helion.Config.from_dict(configs[0]))
         del x, flags
         gc.collect()
@@ -2132,8 +2132,8 @@ def test_block_uniform_proves_only_cta_uniform_conditions(
     # cache-keyed disjointness fact) keep apart from ``flags``.  Passed as a
     # view of ``x`` the flag may change under the threads; a device loop's
     # tile is outside the proof (it fails closed).
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, args)
     host_function = bound.host_function
     assert host_function is not None
     (condition,) = {
@@ -5970,8 +5970,8 @@ def _row_sum_render(
     pid_type: str | None = None,
 ) -> str:
     args = _row_sum_store_args(variant, d, dv, shape=shape)
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(_row_sum_store_kernel(variant), args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_row_sum_store_kernel(variant), args)
         config = _row_sum_store_config(bound, rolled=rolled, pid_type=pid_type)
         return bound.to_code(helion.Config(**config))
 
@@ -6196,8 +6196,8 @@ def test_a_definition_the_placement_would_move_into_a_lane_loop_keeps_its_outsid
         static_shapes=True,
         autotune_effort="none",
     )
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, _segment_args())
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, _segment_args())
         config = {
             **bound.config_spec.default_config().config,
             **_SCAN_THREAD_SPLITS[split],
@@ -6294,8 +6294,8 @@ def test_masked_full_slice_store_whose_mask_the_body_reads_or_rewrites_after_it_
         static_shapes=True,
         autotune_effort="none",
     )
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, args)
         config = _row_sum_store_config(bound, rolled=64)
         with pytest.raises(exc.BackendUnsupported, match="not the tile program"):
             bound.to_code(helion.Config(**config))
@@ -6359,8 +6359,8 @@ def test_full_slice_stores_in_two_root_loops_take_a_replica_each(
     root loop sharing the rolled block registers its own.  Keyed per device
     function, the second root reused the first's ``rindex_lane`` with no lane
     loop of its own: a ``NameError`` in the DSL."""
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(_two_root_kernel(), _two_root_args(d))
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_two_root_kernel(), _two_root_args(d))
         config = _row_sum_store_config(bound, rolled=chunk)
         code = bound.to_code(helion.Config(**config))
     function = _kernel_function(code)

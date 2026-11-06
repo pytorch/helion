@@ -27,7 +27,7 @@ import helion.language as hl
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 KEY = family.KEY
 WARPS = family.WARPS_KEY

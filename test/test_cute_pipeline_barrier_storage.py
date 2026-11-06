@@ -7,18 +7,18 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from ._cute_aux import _config
-from ._cute_aux import _cpu_codegen
-from ._cute_aux import _rank_two_code
-from ._cute_aux import _rank_two_inputs
 from .test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from .test_cute_grouped_gemm_split_sizes import _selected_config
 from .test_cute_scheduler_mailbox import _plain_matmul
 from helion import exc
 from helion._compiler.cute import tcgen05_constants
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import aux_config as _config
+from helion._testing.cute_aux import cpu_codegen
+from helion._testing.cute_aux import rank_two_code
+from helion._testing.cute_aux import rank_two_inputs
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def _literal_int(node: ast.expr) -> int:
@@ -127,7 +127,7 @@ def test_ab_full_empty_allocation_all_stages_and_cta_groups(
         tcgen05_aux_load_mode="simt",
         tcgen05_warp_spec_c_input_warps=0,
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _plain_matmul._bind_isolated(args).to_code(config)
     pipelines = _assert_full_empty_storage(code)
     assert pipelines["tcgen05_ab_pipeline_mbars"] == stages
@@ -149,7 +149,7 @@ def test_clc_full_empty_allocations(wait_mode: str, sched_stages: int) -> None:
         tcgen05_sched_stage_count=sched_stages,
         tcgen05_sched_consumer_wait_mode=wait_mode,
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _plain_matmul._bind_isolated(args).to_code(config)
     pipelines = _assert_full_empty_storage(code)
     assert pipelines["tcgen05_sched_pipeline_mbars"] == sched_stages
@@ -162,13 +162,13 @@ def test_auxiliary_full_empty_allocations(stages: int) -> None:
         # Productive AUX currently excludes this depth independently of the
         # AB storage correction. Preserve that public admission restriction.
         with pytest.raises(exc.BackendUnsupported, match="incompatible"):
-            _rank_two_code(
-                _rank_two_inputs(),
+            rank_two_code(
+                rank_two_inputs(),
                 _config(block_sizes=[128, 128, 64], tcgen05_ab_stages=stages),
             )
         return
-    code = _rank_two_code(
-        _rank_two_inputs(),
+    code = rank_two_code(
+        rank_two_inputs(),
         _config(block_sizes=[128, 128, 64], tcgen05_ab_stages=stages),
     )
     pipelines = _assert_full_empty_storage(code)
@@ -183,7 +183,7 @@ def test_grouped_full_empty_allocations(block_k: int) -> None:
         torch.empty((8, 224, 128), dtype=torch.bfloat16),
         torch.tensor((0, 1, 127, 224, 256, 449, 0, 991), dtype=torch.int32),
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _device_split_sizes_kernel._bind_isolated(args).to_code(
             _selected_config(block_k)
         )

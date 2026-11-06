@@ -13,14 +13,15 @@ from typing import Any
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.cute.cache_policy_loads import _CUTE_NC_L2_FIRST_HELPERS
 from helion._compiler.cute.cutedsl_compat import readonly_packet_load_supported
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 _NC_16B = _CUTE_NC_L2_FIRST_HELPERS[16]
 _NC_32B = _CUTE_NC_L2_FIRST_HELPERS[32]
@@ -104,8 +105,8 @@ def _generate(
     config: helion.Config,
     capability: tuple[int, int] | None = None,
 ) -> str:
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(kernel, args)
         if capability is not None:
             bound.config_spec.target_device_capability = capability
         return bound.to_code(config)
@@ -148,8 +149,8 @@ def test_scalar_word_load_drops_the_readonly_hint() -> None:
     # The policy applies to every load site; only packets have the helper.
     x = torch.empty((37, 64), dtype=torch.bfloat16)
     scale = torch.empty((37,), dtype=torch.float32)
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(_scaled_rows, (x, scale))
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(_scaled_rows, (x, scale))
         (reduction,) = [
             block.block_id for block in bound.env.block_sizes if block.reduction
         ]

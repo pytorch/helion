@@ -10,6 +10,8 @@ import torch
 
 from test import test_cute_epilogue_fanout as fanout
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("initialized", [False, True])
 @pytest.mark.parametrize("body_fails", [False, True])

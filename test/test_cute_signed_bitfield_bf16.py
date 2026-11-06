@@ -23,6 +23,8 @@ from helion.exc import InvalidConfig
 from helion.language import memory_ops
 from helion.runtime.config import Config
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _node(graph, target, args, dtype, kwargs=None):
     node = graph.call_function(target, args, kwargs or {})

@@ -13,15 +13,16 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.memory_ops import _cute_stack_tensor_mask_expr
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.language.memory_ops import _cute_combined_mask
+
+pytestmark = pytest.mark.cpu_only
 
 jagged_dense_bmm = import_example("jagged_dense_bmm").jagged_dense_bmm
 
@@ -172,7 +173,7 @@ def test_index_axes_follow_provenance_and_active_overrides(routing: str) -> None
 def test_flattened_jagged_load_keeps_its_k_tail_mask() -> None:
     # Fixed CPU capabilities must not fill process-wide hardware caches.
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch("helion._compat._supports_maxnreg", return_value=False),
         patch("helion._compat._supports_tensor_descriptor", return_value=False),
@@ -192,7 +193,7 @@ def test_flattened_jagged_load_keeps_its_k_tail_mask() -> None:
             torch.empty((16, 32, 32)),
             torch.empty((16, 32)),
         )
-        source = _cpu_bind(kernel, arguments).to_code(
+        source = cpu_bind(kernel, arguments).to_code(
             helion.Config(
                 block_sizes=[1, 32, 32, 64],
                 num_threads=[0, 4, 32, 1],

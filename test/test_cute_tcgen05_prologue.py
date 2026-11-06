@@ -9,7 +9,7 @@ from helion._compiler.cute.tcgen05_prologue import inline_mod_nonneg_expr
 from helion._compiler.cute.tcgen05_prologue import masked_cluster_rank_expr
 from helion._testing import skipUnlessBackends
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def test_inline_division_forms():

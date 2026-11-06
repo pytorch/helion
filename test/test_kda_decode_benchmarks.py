@@ -11,6 +11,8 @@ from benchmarks.cute import compare_kda_recurrent_backends as recurrent
 from benchmarks.cute import kda_benchmark_utils as benchmark_utils
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 

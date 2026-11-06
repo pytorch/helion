@@ -10,7 +10,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from ._cute_binding import _mock_cuda_unavailable
 import helion
 from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
@@ -21,8 +20,11 @@ from helion._compiler.cute.flash_schedule import FlashScheduleSpec
 from helion._compiler.cute.flash_schedule import build_fa4_schedule
 from helion._compiler.cute.flash_schedule import max_fa4_kv_depth
 from helion._compiler.cute.flash_schedule import verify_flash_schedule
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -38,7 +40,7 @@ pytest.importorskip("cutlass.cute")
 def _cpu_only() -> Iterator[None]:
     with (
         patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}, clear=True),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch.object(
             torch.cuda, "_lazy_init", side_effect=AssertionError("CPU-only test")
         ),

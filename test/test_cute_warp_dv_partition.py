@@ -9,7 +9,7 @@ from helion._testing import skipUnlessBackends
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 decomp = importlib.import_module("helion._compiler.cute.chunk_recurrence_dv4_sm100")
 primitives = importlib.import_module("helion._compiler.cute.kda_device_primitives")
 

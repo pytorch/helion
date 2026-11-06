@@ -16,15 +16,15 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import BooleanFragment
 import helion.language as hl
 
@@ -137,9 +137,9 @@ def _sliced_gram_adjoint_reference(
 @pytest.fixture
 def _cpu_only():
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
         yield
@@ -158,7 +158,7 @@ def _config(bound: object, **overrides: object) -> helion.Config:
 
 
 def test_staging_knobs_join_the_search_surface(_cpu_only: None) -> None:
-    bound = _cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(_anchored_gram, _gram_inputs())
     spec = bound.config_spec
     assert spec.cute_fragment_padded_rows_root_ids
     assert spec.cute_fragment_unrolled_loops_root_ids
@@ -186,7 +186,7 @@ def test_loads_beside_a_fresh_zero_filled_output_are_readonly(
     # The gram's outputs are ``torch.zeros`` the host function allocates on
     # every call: a storage no input can alias, so the loads beside its
     # stores are readonly and the packet-load knob is offered.
-    bound = _cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(_anchored_gram, _gram_inputs())
     assert bound.config_spec.cute_fragment_packet_load_root_ids
     assert PACKETS in bound.config_spec._flat_fields()
     code = bound.to_code(_config(bound, **{PACKETS: True}))
@@ -194,7 +194,7 @@ def test_loads_beside_a_fresh_zero_filled_output_are_readonly(
 
 
 def test_padded_rows_stride_every_staged_tile(_cpu_only: None) -> None:
-    bound = _cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(_anchored_gram, _gram_inputs())
     dense = bound.to_code(_config(bound))
     padded = bound.to_code(_config(bound, **{PAD: True}))
     # [rows, 128] fp32 tiles stride 132 words, [rows, 128] bf16 tiles 136
@@ -212,7 +212,7 @@ def test_padded_rows_stride_every_staged_tile(_cpu_only: None) -> None:
 
 
 def test_unrolled_loops_walk_slots_as_constexpr(_cpu_only: None) -> None:
-    bound = _cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(_anchored_gram, _gram_inputs())
     rolled = bound.to_code(_config(bound))
     unrolled = bound.to_code(_config(bound, **{UNROLL: True}))
     assert "fragment_slot in cutlass.range_constexpr(" not in rolled
@@ -234,7 +234,7 @@ def test_unrolled_loops_walk_slots_as_constexpr(_cpu_only: None) -> None:
 
 
 def test_whole_tile_transposed_operand_is_read_in_place(_cpu_only: None) -> None:
-    bound = _cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(_anchored_gram, _gram_inputs())
     simt = bound.to_code(_config(bound))
     tf32 = bound.to_code(_config(bound, **{DOT: "tf32_mma", PAD: True}))
     assert tf32.count(MMA) == 2
@@ -259,7 +259,7 @@ def test_a_partial_tile_keeps_the_staged_operands(_cpu_only: None) -> None:
     z = torch.ones(2, 24, 12)
     from test.test_cute_fp32_dot import _batched_dot
 
-    bound = _cpu_bind(_batched_dot, (x, y, z))
+    bound = cpu_bind(_batched_dot, (x, y, z))
     simt = bound.to_code(_config(bound))
     tf32 = bound.to_code(_config(bound, **{DOT: "tf32_mma"}))
     # Both operands keep their staged (padded) copies, one barrier each

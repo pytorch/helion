@@ -12,6 +12,8 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.host_function import HostFunction
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize(
     "extent,chunk,cluster,expected_cluster",

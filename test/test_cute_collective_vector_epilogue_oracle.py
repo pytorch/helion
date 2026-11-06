@@ -26,6 +26,8 @@ from helion._compiler.cute.collective_vector_epilogue import (
 from helion._compiler.cute.contiguous_copy import CopyTensorFacts
 from helion._compiler.device_function import TensorArg
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion._compiler.cute.collective_matmul import CollectiveMmaSite
     from helion._compiler.device_function import DeviceFunction

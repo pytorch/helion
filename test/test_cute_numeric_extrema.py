@@ -6,9 +6,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_register_region import _float32_extrema_input_bits
 from test.test_cute_register_region import _plan
@@ -16,6 +13,9 @@ from test.test_cute_register_region import _plan
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 
@@ -53,7 +53,7 @@ def _numeric_broadcast(left: torch.Tensor, right: torch.Tensor):
 def test_numeric_extrema_preserved_in_register_region(dtype):
     left = torch.arange(96, dtype=dtype).reshape(3, 4, 8)
     right = left + 1
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, config, plan = _plan(_numeric_register_extrema, (left, right))
         assert plan is not None
         source = bound.to_code(config)
@@ -66,8 +66,8 @@ def test_numeric_extrema_preserved_in_register_region(dtype):
 def test_numeric_extrema_pointwise_promotion():
     left = torch.arange(256, dtype=torch.bfloat16)
     right = torch.arange(256, dtype=torch.float32) - 1
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_numeric_pointwise, (left, right))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_numeric_pointwise, (left, right))
         source = bound.to_code(helion.Config(block_sizes=[128]))
     assert "_cute_numeric_extremum" in source
     assert "minimum=" in source
@@ -76,8 +76,8 @@ def test_numeric_extrema_pointwise_promotion():
 def test_numeric_extrema_broadcast_promotion():
     left = torch.ones((31, 33), dtype=torch.bfloat16)
     right = torch.ones(33, dtype=torch.float32)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_numeric_broadcast, (left, right))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_numeric_broadcast, (left, right))
         source = bound.to_code(helion.Config(block_sizes=[8, 32]))
     assert "_cute_numeric_extremum" in source
     assert "minimum=" in source

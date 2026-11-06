@@ -11,6 +11,8 @@ from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.cute.vector_reduction_packets import optimize_vector_reductions
 from helion.language.memory_ops import _cute_unroll_vec_load_expr
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _transform(source: str, *, unroll_packets: bool = False) -> ast.Module:
     tree = ast.parse(source)

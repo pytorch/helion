@@ -7,12 +7,11 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _forbid_cuda_work
-from test._cute_dense_tcgen05 import cpu_codegen_target
-
 import helion
 from helion._compiler.cute.strategies import TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
@@ -20,12 +19,12 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.fixture(autouse=True)
 def _cpu_codegen() -> Iterator[None]:
-    with cpu_codegen_target(), _forbid_cuda_work():
+    with cpu_codegen_target(), forbid_cuda_work():
         yield
 
 

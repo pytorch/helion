@@ -3,17 +3,12 @@
 from __future__ import annotations
 
 import ast
-from contextlib import ExitStack
-from contextlib import contextmanager
 import operator
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 import torch
-
-from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
@@ -21,43 +16,17 @@ from helion._compiler.cute.cute_mma import analyze_cute_mma_node
 from helion._compiler.cute.fuse_mm_accumulation import fuse_mm_accumulation
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import import_example
-from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language import memory_ops
 from helion.language.matmul_ops import MATMUL_DIM_BLOCK_IDS_META
 from helion.language.matmul_ops import MATMUL_FACT_ID_META
 
+pytestmark = pytest.mark.cpu_only
+
 matmul_custom_key = import_example("aot_example").matmul_custom_key
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-
-@contextmanager
-def _cpu_target() -> Iterator[None]:
-    with ExitStack() as stack:
-        stack.enter_context(patch_cute_mma_support())
-        stack.enter_context(_mock_cuda_unavailable())
-        stack.enter_context(
-            patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU test"))
-        )
-        for name, value in (
-            ("helion.runtime.kernel.target_device_capability", (10, 0)),
-            ("helion._compiler.compile_environment.target_device_capability", (10, 0)),
-            ("helion.runtime.get_num_sm", 148),
-            ("helion._compat._is_hip", False),
-            (
-                (
-                    "helion._compiler.cute.tcgen05_config."
-                    "CuteTcgen05Config.per_cta_smem_budget_bytes"
-                ),
-                232448,
-            ),
-        ):
-            stack.enter_context(patch(name, return_value=value))
-        yield
 
 
 def _program(
@@ -259,7 +228,7 @@ def test_aot_source_uses_half_mma_with_fp32_accumulator(
         autotune_effort="none",
         dot_precision="ieee",
     )
-    with _cpu_target():
+    with cpu_target():
         bound = kernel._bind_isolated(
             (torch.empty((m, k), dtype=dtype), torch.empty((k, n), dtype=dtype))
         )
@@ -294,7 +263,7 @@ def test_true_fp32_inputs_keep_ieee_precision() -> None:
         autotune_effort="none",
         dot_precision="ieee",
     )
-    with _cpu_target():
+    with cpu_target():
         bound = kernel._bind_isolated((torch.empty((64, 64)), torch.empty((64, 32))))
         assert not bound.env.config_spec.cute_tcgen05_search_enabled
         assert bound.host_function is not None
@@ -332,7 +301,7 @@ def test_dynamic_inputs_key_both_k_sizes_and_output_extents(
         shapes.reverse()
     shapes.extend([(128, 80, 80, 128), (73, 64, 64, 41), (128, 64, 48, 128)])
     bounds = []
-    with _cpu_target():
+    with cpu_target():
         for m, left_k, right_k, n in shapes:
             args = (
                 torch.empty((m, left_k), dtype=dtype),
@@ -360,7 +329,7 @@ def test_mma_proof_keeps_cast_and_mask_semantics(change: str) -> None:
         static_shapes=True,
         autotune_effort="none",
     )
-    with _cpu_target():
+    with cpu_target():
         bound = kernel._bind_isolated(
             (
                 torch.empty((64, 64), dtype=torch.bfloat16),
@@ -414,7 +383,7 @@ def test_computed_fp32_inputs_are_not_specialized_or_narrowed() -> None:
             out[tile_m, tile_n] = acc.to(out.dtype)
         return out
 
-    with _cpu_target():
+    with cpu_target():
         bound = computed._bind_isolated(
             (
                 torch.empty((64, 64), dtype=torch.bfloat16),
@@ -437,7 +406,7 @@ def test_zero_k_keeps_zero_accumulator(dtype: torch.dtype) -> None:
         static_shapes=False,
         autotune_effort="none",
     )
-    with _cpu_target():
+    with cpu_target():
         bound = kernel._bind_isolated(
             (torch.empty((64, 0), dtype=dtype), torch.empty((0, 32), dtype=dtype))
         )
@@ -473,7 +442,7 @@ def test_role_lifecycle_owns_absorbed_cast_scaffolding() -> None:
         tcgen05_num_epi_warps=4,
         tcgen05_strategy="pure_matmul_role_lifecycle",
     )
-    with _cpu_target():
+    with cpu_target():
         bound = kernel._bind_isolated(
             (
                 torch.empty((128, 384), dtype=torch.bfloat16),

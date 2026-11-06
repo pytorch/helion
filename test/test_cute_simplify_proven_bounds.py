@@ -8,6 +8,8 @@ import pytest
 from helion._compiler.ast_extension import convert
 from helion._compiler.cute.simplify_proven_bounds import simplify_proven_bounds
 
+pytestmark = pytest.mark.cpu_only
+
 SOURCE = """
 pid_0 = cutlass.Int32(cute.arch.block_idx()[0])
 pid_1 = cutlass.Int32(cute.arch.block_idx()[1])

@@ -11,15 +11,14 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.cute.scalar_recipe_rounding import (
     NARROW_MULTIPLY_ROUNDING_META_KEY,
 )
 from helion._compiler.cute.scalar_recipe_rounding import preserve_fp32_multiply_rounding
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -136,10 +135,10 @@ def _render(
         fast_math=fast_math,
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
-        bound = _cpu_bind(bound_kernel, args, capability=capability)
+        bound = cpu_bind(bound_kernel, args, capability=capability)
         return bound.to_code(
             bound.config_spec.autotune_reference_config() if config is None else config
         )
@@ -545,10 +544,10 @@ def test_collective_rounding_boundary_respects_fast_math(
         cute_collective_mma=True,
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
-        source = _cpu_bind(kernel, args).to_code(config)
+        source = cpu_bind(kernel, args).to_code(config)
     assert "cute.gemm(" in source
     assert ("mul.rn.f32" in source) is not fast_math
     if not fast_math:

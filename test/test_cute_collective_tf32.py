@@ -6,12 +6,11 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
 
@@ -94,7 +93,7 @@ def test_original_jagged_shapes_have_native_and_warp_fp32_seeds(
 ) -> None:
     batch, rows, k, n = shape
     arguments = _jagged_inputs(batch=batch, rows=rows, k=k, n=n)
-    bound = _cpu_bind(_kernel(), arguments)
+    bound = cpu_bind(_kernel(), arguments)
     assert bound.host_function is not None
     assert bound.host_function.device_ir.grid_block_ids == [[0, 2]]
     assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
@@ -123,7 +122,7 @@ def test_original_jagged_shapes_have_native_and_warp_fp32_seeds(
 
 @pytest.mark.parametrize("precision", ["ieee", "tf32x3"])
 def test_exact_fp32_precision_keeps_scalar_fallback(precision: str) -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _kernel(precision=precision), _jagged_inputs(batch=3, rows=137, k=78, n=128)
     )
     assert bound.host_function is not None
@@ -138,7 +137,7 @@ def test_exact_fp32_precision_keeps_scalar_fallback(precision: str) -> None:
 
 
 def test_fp32_does_not_fall_through_to_half_warp_mma() -> None:
-    bound = _cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=137, k=78, n=128))
+    bound = cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=137, k=78, n=128))
     source = bound.to_code(_config(compute="warp"))
     assert "warp.MmaTF32Op((16, 8, 8))" in source
     assert "cute.gemm(" in source
@@ -151,7 +150,7 @@ def test_fp32_does_not_fall_through_to_half_warp_mma() -> None:
 def test_computed_batched_fp32_tail_uses_native_collective(
     tile: tuple[int, int, int], static_shapes: bool
 ) -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _kernel(batched=True, static_shapes=static_shapes),
         (torch.empty((3, 130, 78)), torch.empty((3, 78, 70))),
     )
@@ -164,7 +163,7 @@ def test_computed_batched_fp32_tail_uses_native_collective(
 
 
 def test_multiple_batch_elements_cannot_share_one_collective_tile() -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _kernel(batched=True), (torch.empty((3, 130, 78)), torch.empty((3, 78, 70)))
     )
     config = _config()

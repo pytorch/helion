@@ -20,8 +20,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
@@ -34,6 +32,8 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 REDUCE = "_cute_grouped_reduce_shared_two_stage("
@@ -225,7 +225,7 @@ def _device_loop_body(code: str) -> str:
 def _cpu_only():
     with (
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
@@ -238,7 +238,7 @@ def _bind(fn, n: int = 16384, dtype: torch.dtype = torch.bfloat16):
     kernel = helion.kernel(
         fn, backend="cute", static_shapes=True, autotune_effort="full"
     )
-    return _cpu_bind(kernel, (torch.empty((8, n), dtype=dtype),))
+    return cpu_bind(kernel, (torch.empty((8, n), dtype=dtype),))
 
 
 @skipIfRefEager("generates code")
@@ -285,7 +285,7 @@ def test_online_softmax_lanes_fuse_into_one_pass(_cpu_only, fast_math: bool) -> 
         autotune_effort="full",
         fast_math=fast_math,
     )
-    bound = _cpu_bind(kernel, (torch.empty((8, 16384), dtype=torch.bfloat16),))
+    bound = cpu_bind(kernel, (torch.empty((8, 16384), dtype=torch.bfloat16),))
     loop = _device_loop_body(bound.to_code(_config(16384, 128, 16)))
     compute_loops = [
         line
@@ -317,7 +317,7 @@ def test_other_minuend_or_weighted_exponential_keeps_two_folds(_cpu_only, fn) ->
     kernel = helion.kernel(
         fn, backend="cute", static_shapes=True, autotune_effort="full"
     )
-    bound = _cpu_bind(
+    bound = cpu_bind(
         kernel,
         (
             torch.empty((8, 16384), dtype=torch.bfloat16),
@@ -392,7 +392,7 @@ def test_lane_loop_already_reduced_after_it_keeps_its_form(
     kernel = helion.kernel(
         shifted_sum_rows, backend="cute", static_shapes=True, autotune_effort="full"
     )
-    bound = _cpu_bind(kernel, (torch.empty((4, 32768)), torch.empty((4, 32768))))
+    bound = cpu_bind(kernel, (torch.empty((4, 32768)), torch.empty((4, 32768))))
     code = bound.to_code(
         helion.Config(
             block_sizes=[1, 32768],
@@ -479,7 +479,7 @@ def test_register_cache_fill_runs_once_per_lane_after_the_folds(
     kernel = helion.kernel(
         two_pass_softmax, backend="cute", static_shapes=True, autotune_effort="full"
     )
-    bound = _cpu_bind(kernel, (torch.empty((64, 2048), dtype=torch.float16),))
+    bound = cpu_bind(kernel, (torch.empty((64, 2048), dtype=torch.float16),))
     code = bound.to_code(
         helion.Config(
             block_sizes=[1, 256],

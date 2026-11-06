@@ -22,13 +22,12 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -211,8 +210,8 @@ def _config(bound: BoundKernel, **overrides: object) -> helion.Config:
 
 
 def _render(fn: Callable[..., torch.Tensor], *args: object, **overrides: object) -> str:
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(fn), args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(fn), args)
         return bound.to_code(_config(bound, **overrides))
 
 
@@ -289,8 +288,8 @@ def test_a_one_entry_host_value_is_read_once_for_every_entry() -> None:
         static_shapes=True,
         autotune_effort="none",
     )
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(static, (torch.randn(40, 100), torch.tensor([3.0]), 8))
+    with mock_cuda_unavailable():
+        bound = cpu_bind(static, (torch.randn(40, 100), torch.tensor([3.0]), 8))
         code = bound.to_code(bound.config_spec.default_config())
     assert "w[0]" in code, code
 
@@ -325,10 +324,10 @@ def test_a_host_value_of_another_static_length_is_declined() -> None:
         autotune_effort="none",
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         pytest.raises(exc.BackendUnsupported, match="value of length 3"),
     ):
-        bound = _cpu_bind(
+        bound = cpu_bind(
             static, (torch.randn(40, 100), torch.tensor([1.0, 2.0, 3.0]), 8)
         )
         bound.to_code(bound.config_spec.default_config())

@@ -53,7 +53,7 @@ squeeze_and_excitation_net_fwd = (
     _examples_squeeze_and_excitation_net.squeeze_and_excitation_net_fwd
 )
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from typing import Any

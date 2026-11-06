@@ -16,6 +16,8 @@ from benchmarks.cute.example_report import report_results
 import pytest
 import torch
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_catalog_covers_example_kernel_modules():
     root = Path(__file__).resolve().parents[1] / "examples"

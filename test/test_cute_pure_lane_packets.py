@@ -19,6 +19,8 @@ from test.test_cute_affine_vector_io import _vector_store
 from helion._compiler.cute.pure_lane_packets import _PacketVectorizer
 from helion._compiler.cute.pure_lane_packets import _pure_packet_call
 
+pytestmark = pytest.mark.cpu_only
+
 _SOURCE = """
 def kernel(src, out, start: cutlass.Int32, length: cutlass.Int32):
     for tile_offset_0 in range(0, length, 8 * WIDTH):

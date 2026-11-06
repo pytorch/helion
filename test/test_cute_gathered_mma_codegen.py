@@ -5,18 +5,17 @@ import ast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.cute.launcher import _cute_wrapper_plan_bakes_tensor_shapes
 
 moe_matmul_ogs = import_example("moe_matmul_ogs").moe_matmul_ogs
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def _bound(
@@ -42,7 +41,7 @@ def _bound(
         static_shapes=static,
         autotune_effort="none",
     )
-    return _cpu_bind(kernel, inputs)
+    return cpu_bind(kernel, inputs)
 
 
 @pytest.mark.parametrize(

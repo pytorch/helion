@@ -9,21 +9,21 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_native_compile
 from test.test_cute_philox_stream import cpu_only  # noqa: F401
 
 import helion
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_native_compile
 import helion.language as hl
 
-pytestmark = pytest.mark.usefixtures("cpu_only", "no_native")
+pytestmark = [pytest.mark.cpu_only, pytest.mark.usefixtures("cpu_only", "no_native")]
 
 
 @pytest.fixture
 def no_native(monkeypatch):
     monkeypatch.delenv("HELION_CUTE_RNG_STREAM", raising=False)
     initialized_before = torch.cuda.is_initialized()
-    with _forbid_native_compile():
+    with forbid_native_compile():
         yield
     assert torch.cuda.is_initialized() == initialized_before
 

@@ -21,8 +21,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test._cute_register_tile_kernels import col_scale
 from test._cute_register_tile_kernels import col_sum
 from test._cute_register_tile_kernels import column_config
@@ -32,13 +30,15 @@ from helion._compiler.autotuner_heuristics.cute import CuteRegisterTileHeuristic
 from helion._compiler.cute.register_tile_admission import RegisterTileUnsupported
 from helion._compiler.generate_ast import GenerateAST
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.experimental.linear_attention import recurrent_step_correction_fused
 from helion.experimental.linear_attention import recurrent_step_fused
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 BH, D, DV = 8, 128, 128
 COLUMN_REDUCE = "_cute_grouped_reduce_shared_columns("
@@ -53,7 +53,7 @@ KNOBS: dict[str, Any] = {
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -80,7 +80,7 @@ def _bind() -> tuple[Any, tuple[torch.Tensor, ...]]:
         torch.empty((BH, D, DV), dtype=torch.float32),
         torch.empty((BH,), dtype=torch.float32),
     )
-    return _cpu_bind(kernel, arguments), arguments
+    return cpu_bind(kernel, arguments), arguments
 
 
 def _config(
@@ -220,7 +220,7 @@ def test_store_first_keeps_the_combine_first_when_a_store_needs_the_result() -> 
     # reduction result, so the consume nest cannot move ahead of the combine
     # and the knob renders the knob-free schedule.
     arguments = (torch.empty((128, 1024), dtype=torch.float32),)
-    bound = _cpu_bind(col_scale, arguments)
+    bound = cpu_bind(col_scale, arguments)
     knob_free = bound.to_code(
         column_config(bound, block=32, tile_threads=8, reduction_threads=8)
     )
@@ -245,7 +245,7 @@ def test_warp_fold_is_ignored_by_the_consecutive_lane_column_reduce() -> None:
     # that branch of the helper already folds each warp with a shuffle, so the
     # knob adds nothing and the render is the knob-free one.
     arguments = (torch.empty((128, 1024), dtype=torch.float32),)
-    bound = _cpu_bind(col_sum, arguments)
+    bound = cpu_bind(col_sum, arguments)
     knob_free = bound.to_code(
         column_config(bound, block=4, tile_threads=1, reduction_threads=64)
     )
@@ -341,7 +341,7 @@ def _bind_correction(*, diagonal: bool = True) -> tuple[Any, tuple[torch.Tensor,
         torch.empty((BH, D) if diagonal else (BH,), dtype=torch.float32),
         torch.empty((BH,), dtype=torch.float32),
     )
-    return _cpu_bind(kernel, arguments), arguments
+    return cpu_bind(kernel, arguments), arguments
 
 
 def _combines(statements: list[str]) -> list[int]:

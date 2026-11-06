@@ -11,15 +11,16 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion import _compat
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner import config_spec
 import helion.language as hl
 from helion.language import loops
+
+pytestmark = pytest.mark.cpu_only
 
 pytest.importorskip("triton")
 
@@ -45,10 +46,10 @@ def test_cpu_capabilities_preserve_process_caches(nested: bool, raises: bool) ->
     with (
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         expected,
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
     ):
         outer = _cached_capabilities()
-        with _mock_cuda_unavailable() if nested else nullcontext():
+        with mock_cuda_unavailable() if nested else nullcontext():
             assert torch.cuda.is_available() is False
             assert [function() for function in _cached_capabilities()] == [
                 False,
@@ -103,9 +104,9 @@ def _check_codegen_cache_isolation(warm: bool) -> None:
             ]
         before = [function.cache_info() for function in original]
         args = (torch.empty(64), torch.empty(64))
-        with _mock_cuda_unavailable():
+        with mock_cuda_unavailable():
             kernel = helion.kernel(_pointwise, backend="cute", autotune_effort="none")
-            code = _cpu_bind(kernel, args).to_code(helion.Config(block_sizes=[32]))
+            code = cpu_bind(kernel, args).to_code(helion.Config(block_sizes=[32]))
             assert "@cute.kernel" in code
         assert all(
             a is b for a, b in zip(original, _cached_capabilities(), strict=True)
@@ -122,7 +123,7 @@ def _check_codegen_cache_isolation(warm: bool) -> None:
             patch("helion.runtime.get_num_sm", return_value=148),
         ):
             kernel = helion.kernel(_pointwise, backend="triton", autotune_effort="none")
-            code = _cpu_bind(kernel, args).to_code(
+            code = cpu_bind(kernel, args).to_code(
                 helion.Config(
                     block_sizes=[32],
                     num_warps=4,

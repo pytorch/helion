@@ -7,9 +7,6 @@ from typing import Any
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
@@ -21,6 +18,9 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -118,8 +118,8 @@ ROLLED: dict[str, Any] = {
 
 
 def _bind(kernel: helion.Kernel, args: tuple[object, ...]) -> BoundKernel:
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        return _cpu_bind(kernel, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        return cpu_bind(kernel, args)
 
 
 def _device_ir(bound: BoundKernel) -> DeviceIR:
@@ -148,7 +148,7 @@ def test_softmax_and_log_softmax_share_their_reductions() -> None:
     assert _count_targets(root, torch.ops.aten.amax.default) == 2
     assert _count_targets(root, torch.ops.aten.exp.default) == 2
     assert _count_targets(root, torch.ops.aten.sum.dim_IntList) == 4
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         code = bound.to_code(helion.Config(**ROLLED))
     assert code.count(BLOCK_REDUCE) == 6
     assert code.count("for roffset_") == 5
@@ -162,7 +162,7 @@ def test_the_setting_keeps_the_traced_graph(monkeypatch: pytest.MonkeyPatch) -> 
     assert _count_targets(root, torch.ops.aten.amax.default) == 4
     assert _count_targets(root, torch.ops.aten.exp.default) == 4
     assert _count_targets(root, torch.ops.aten.sum.dim_IntList) == 6
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         code = bound.to_code(helion.Config(**ROLLED))
     assert code.count(BLOCK_REDUCE) == 10
     assert code.count("for roffset_") == 9
@@ -198,7 +198,7 @@ def test_subgraph_arguments_follow_the_surviving_node() -> None:
     for info in device_ir.graphs:
         if isinstance(info, NodeArgsGraphInfo):
             assert all(node in live for node in info.node_args)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         code = bound.to_code(
             helion.Config(
                 block_sizes=[1, 256],

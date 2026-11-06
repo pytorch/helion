@@ -14,6 +14,8 @@ from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.search_space_logger import canonical_config_id
 from helion.exc import InvalidConfig
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _Fragment:
     def __init__(self, values):

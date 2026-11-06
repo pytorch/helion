@@ -13,14 +13,13 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -81,8 +80,8 @@ def _flat(offset: int, device: torch.device | str | None = None) -> torch.Tensor
 def test_store_through_input_view_requires_an_aligned_input_base(offset: int) -> None:
     x = torch.empty((37, 32), dtype=torch.bfloat16)
     destination = _flat(offset)
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(_center_into_view, (x, destination))
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(_center_into_view, (x, destination))
         code = bound.to_code(_config(bound))
     assert ("_cute_store_u16_vec(" in code) is (offset == 0), code
 
@@ -90,8 +89,8 @@ def test_store_through_input_view_requires_an_aligned_input_base(offset: int) ->
 @pytest.mark.parametrize("offset", [0, 1])
 def test_load_through_input_view_requires_an_aligned_input_base(offset: int) -> None:
     flat = _flat(offset)
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(_center_view, (flat, 32))
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(_center_view, (flat, 32))
         code = bound.to_code(_config(bound))
     packet_loads = [
         line

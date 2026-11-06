@@ -5,17 +5,16 @@ import ast
 import pytest
 import torch
 
-from test._cute_aux import _batched_aux
-from test._cute_aux import _config
-from test._cute_aux import _cpu_codegen
-from test._cute_aux import _inputs
-from test._cute_aux import _rank_two_aux
-
 import helion
 from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_aux import aux_config as _config
+from helion._testing.cute_aux import aux_inputs as _inputs
+from helion._testing.cute_aux import batched_aux
+from helion._testing.cute_aux import cpu_codegen
+from helion._testing.cute_aux import rank_two_aux
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -39,7 +38,7 @@ def _rank_two_multi_aux(
     return out
 
 
-def _rank_two_inputs(
+def rank_two_inputs(
     count: int,
     *,
     m: int = 256,
@@ -110,14 +109,14 @@ def test_staged_aux_read_completion_codegen(
     kind: str, mode: str, dtype: torch.dtype
 ) -> None:
     if kind == "batched":
-        kernel = _batched_aux
+        kernel = batched_aux
         args = _inputs(dtype=dtype)
     else:
         multi = kind == "rank_two_multi"
-        kernel = _rank_two_multi_aux if multi else _rank_two_aux
-        args = _rank_two_inputs(2 if multi else 1, dtype=dtype)
+        kernel = _rank_two_multi_aux if multi else rank_two_aux
+        args = rank_two_inputs(2 if multi else 1, dtype=dtype)
     config = _config(block_sizes=[128, 128, 64], tcgen05_aux_load_mode=mode)
-    with _cpu_codegen():
+    with cpu_codegen():
         code = kernel._bind_isolated(args).to_code(config)
     count = _assert_aux_read_fence_order(code, use_tma_load=mode == "tma")
     if kind == "batched" and mode == "simt":
@@ -135,13 +134,13 @@ def test_staged_aux_read_completion_codegen(
 def test_direct_aux_loads_do_not_gain_ring_fence(tails: bool) -> None:
     # One output fringe is supported by this role-local one-CTA strategy;
     # its unrelated double-edge geometry is intentionally not requested.
-    args = _rank_two_inputs(2, m=257 if tails else 256, n=512)
+    args = rank_two_inputs(2, m=257 if tails else 256, n=512)
     config = _config(
         block_sizes=[128, 128, 64],
         tcgen05_aux_load_mode="simt",
         tcgen05_warp_spec_c_input_warps=0,
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _rank_two_multi_aux._bind_isolated(args).to_code(config)
     assert _assert_aux_read_fence_order(code) == 0
     assert "tcgen05_aux_pipeline.consumer_release" not in code
@@ -160,7 +159,7 @@ def test_rank_two_aux_ring_repeatability(mode: str, dtype: torch.dtype) -> None:
         torch.manual_seed(seed)
         args = tuple(
             torch.randn_like(value, device=DEVICE) * 0.1
-            for value in _rank_two_inputs(2, m=512, n=8192, dtype=dtype)
+            for value in rank_two_inputs(2, m=512, n=8192, dtype=dtype)
         )
         before = tuple(value.clone() for value in args)
         lhs, rhs, bias, scale = args

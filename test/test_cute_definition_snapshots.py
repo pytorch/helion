@@ -12,6 +12,8 @@ from helion._compiler.cute.persistent_branch_vec import (
 from helion._compiler.tile_strategy import _lane_split_reorders_aliasing_memory
 from helion._compiler.tile_strategy import _LaneReduceMarker
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _repeated_expression(count: int) -> list[ast.stmt]:
     return ast.parse(

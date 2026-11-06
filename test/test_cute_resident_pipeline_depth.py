@@ -32,6 +32,8 @@ from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
 

@@ -30,6 +30,8 @@ from helion._compiler.cute.contiguous_copy import CopyTensorFacts
 from helion._compiler.cute.scalar_recipe import ScalarRecipe
 from helion._compiler.cute.scalar_recipe import build_recipe
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 

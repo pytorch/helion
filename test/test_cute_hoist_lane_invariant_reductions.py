@@ -6,6 +6,8 @@ import ast
 import textwrap
 from typing import cast
 
+import pytest
+
 from helion._compiler.ast_extension import ExtendedAST
 from helion._compiler.ast_extension import convert
 from helion._compiler.ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
@@ -14,6 +16,8 @@ from helion._compiler.cute.hoist_lane_invariant_reductions import (
     hoist_lane_invariant_reductions,
 )
 from helion._compiler.cute.vector_reduction_packets import optimize_vector_reductions
+
+pytestmark = pytest.mark.cpu_only
 
 _TENSORS = {"bias", "gate", "head", "indices", "key", "out", "state"}
 _TENSOR_DTYPES = {

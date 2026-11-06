@@ -5,17 +5,16 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 
 jagged_layer_norm_kernel = import_example("jagged_layer_norm").jagged_layer_norm_kernel
 jagged_mean_kernel = import_example("jagged_mean").jagged_mean_kernel
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 CPU_DEVICE = "cpu"
 
@@ -29,7 +28,7 @@ def test_dynamic_jagged_row_masks_keep_affine_vector_loads(
     # last two-row tile predicates the Int64 offset load before the vector loops.
     rows = sum((0, 1, 2, 9, 257, 0, 513, 7, 65))
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -45,7 +44,7 @@ def test_dynamic_jagged_row_masks_keep_affine_vector_loads(
         )
         values = torch.empty(rows * columns, device=CPU_DEVICE).view(rows, columns)
         offsets = torch.empty(10, dtype=torch.int64, device=CPU_DEVICE)
-        bound = _cpu_bind(kernel, (values, offsets, 1e-6))
+        bound = cpu_bind(kernel, (values, offsets, 1e-6))
         assert len(bound.config_spec.block_sizes) == 4
         code = bound.to_code(
             helion.Config(
@@ -66,7 +65,7 @@ def test_vector_width_on_a_jagged_feature_axis_stays_scalar(
     # extent to prove a whole number of packets, so its loads stay scalar.
     # The packet check used to read the jagged block's numel and assert.
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -85,7 +84,7 @@ def test_vector_width_on_a_jagged_feature_axis_stays_scalar(
             torch.empty(17, dtype=torch.int32, device=CPU_DEVICE),
             128,
         )
-        bound = _cpu_bind(kernel, args)
+        bound = cpu_bind(kernel, args)
         code = bound.to_code(
             helion.Config(
                 block_sizes=[1, 128, 64],

@@ -12,9 +12,6 @@ import numpy as np
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_interchanged_store_dce import _PAIRS
 from test.test_cute_interchanged_store_dce import _execute as _execute_interchange
@@ -33,6 +30,9 @@ from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
@@ -53,8 +53,8 @@ def _tile_id_reduced_store(x: torch.Tensor, out: torch.Tensor, masked: hl.conste
 def _tile_id_program(rows: int, columns: int, masked: bool, threads=32):
     x = torch.arange(rows * columns, dtype=torch.float32).reshape(rows, columns)
     out = torch.full((rows, (columns + 127) // 128), -1.0)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_tile_id_reduced_store, (x, out, masked))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_tile_id_reduced_store, (x, out, masked))
         config = bound.config_spec.default_config()
         config.config.update(
             block_sizes=[4, 128], num_threads=[1, 1 if columns == 1 else threads]
@@ -852,14 +852,14 @@ def test_exact_rejected_backward_config_declines_before_emission() -> None:
         }
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(kernel, args)
+        bound = cpu_bind(kernel, args)
         with pytest.raises(helion.exc.BackendUnsupported, match="different lane owner"):
             bound.to_code(config)
 
@@ -1617,14 +1617,14 @@ def _emitted_tile_reduction_markers(
     )
     q = torch.empty((4, 256, 64), dtype=torch.bfloat16)
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(_online_softmax_kernel(), (q, q, q))
+        bound = cpu_bind(_online_softmax_kernel(), (q, q, q))
         code = bound.to_code(config)
     markers = []
     for expression in captured:
@@ -2161,8 +2161,8 @@ def _tile_id_multi_axis_store(x: torch.Tensor, out: torch.Tensor):
 def test_tile_id_multi_axis_keeps_nested_reduction_rejection(shape):
     x = torch.ones(shape)
     out = torch.empty((shape[0], (shape[1] + 7) // 8, (shape[2] + 127) // 128))
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_tile_id_multi_axis_store, (x, out))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_tile_id_multi_axis_store, (x, out))
         config = bound.config_spec.default_config()
         config.config.update(block_sizes=[4, 8, 128], num_threads=[1, 1, 32])
         with pytest.raises(helion.exc.BackendUnsupported, match="nested reduction"):
@@ -2264,8 +2264,8 @@ def test_tile_id_serial_tail_preserves_element_mask(begin, end, masked):
     # of one lane's partial sum in place of the complete first tile's reduction.
     x = torch.arange(3 * 513, dtype=torch.float32).reshape(3, 513) % 17 + 1
     out = torch.full((3, 5), -1.0)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_tile_id_serial_store, (x, out, begin, end, masked))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_tile_id_serial_store, (x, out, begin, end, masked))
         config = bound.config_spec.default_config()
         config.config.update(block_sizes=[4, 128], num_threads=[1, 32])
         code = bound.to_code(config)
@@ -2536,16 +2536,16 @@ def test_tile_id_source_load_keeps_uniform_value_with_store_owner_masks(complete
         return result
 
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch.object(memory_ops, "_cute_combined_mask", observe),
         patch.object(cute_memory_ops, "_cute_combined_mask", observe),
         patch.object(
             memory_ops, "_cute_tile_id_thread_extent_is_complete", return_value=complete
         ),
     ):
-        bound = _cpu_bind(_tile_id_scalar_copy, (x, weights))
+        bound = cpu_bind(_tile_id_scalar_copy, (x, weights))
         config = bound.config_spec.default_config()
         config.config.update(block_sizes=[4, 128], num_threads=[1, 32])
         source = bound.to_code(config)

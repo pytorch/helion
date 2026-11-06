@@ -8,17 +8,19 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.cute_population_contracts import checked_initial_population
 
 import helion
 from helion._compiler.generate_ast import GenerateAST
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 from helion.exc import InvalidConfig
+
+pytestmark = pytest.mark.cpu_only
 
 matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
@@ -47,7 +49,7 @@ def _bound(m=32, k=4096, n=64, **settings):
         torch.empty((m, k), dtype=torch.float16),
         torch.empty((k, n), dtype=torch.float16),
     )
-    return _cpu_bind(kernel, args)
+    return cpu_bind(kernel, args)
 
 
 def _config():

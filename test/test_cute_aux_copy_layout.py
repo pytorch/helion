@@ -9,16 +9,16 @@ import torch
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
-from test._cute_aux import _config
-from test._cute_aux import _cpu_codegen
-from test.test_cute_aux_read_fence import _rank_two_inputs
 from test.test_cute_aux_read_fence import _rank_two_multi_aux
+from test.test_cute_aux_read_fence import rank_two_inputs
 
 from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout
 from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_aux import aux_config as _config
+from helion._testing.cute_aux import cpu_codegen
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -93,10 +93,10 @@ def test_aux_copy_layout_last_row_last_subtile_bounds() -> None:
 
 @pytest.mark.parametrize("mixed", [False, True])
 def test_aux_copy_codegen_uses_actual_subtile_per_descriptor(mixed: bool) -> None:
-    args = list(_rank_two_inputs(2))
+    args = list(rank_two_inputs(2))
     if mixed:
         args[-1] = torch.empty_like(args[-1], dtype=torch.float32)
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _rank_two_multi_aux._bind_isolated(tuple(args)).to_code(
             _config(block_sizes=[128, 128, 64], tcgen05_aux_load_mode="simt")
         )
@@ -118,8 +118,8 @@ def test_aux_copy_codegen_uses_actual_subtile_per_descriptor(mixed: bool) -> Non
 
 
 def test_aux_copy_layout_not_imported_in_tma_codegen() -> None:
-    with _cpu_codegen():
-        code = _rank_two_multi_aux._bind_isolated(_rank_two_inputs(2)).to_code(
+    with cpu_codegen():
+        code = _rank_two_multi_aux._bind_isolated(rank_two_inputs(2)).to_code(
             _config(block_sizes=[128, 128, 64], tcgen05_aux_load_mode="tma")
         )
     assert "_cute_aux_copy_layout" not in code
@@ -129,9 +129,9 @@ def test_aux_copy_layout_not_imported_in_tma_codegen() -> None:
 
 @pytest.mark.parametrize("m", [512, 513])
 def test_aux_copy_persistent_fringe_host_admission(m: int) -> None:
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _rank_two_multi_aux._bind_isolated(
-            _rank_two_inputs(2, m=m, n=8192)
+            rank_two_inputs(2, m=m, n=8192)
         ).to_code(_config(block_sizes=[128, 128, 64], tcgen05_aux_load_mode="simt"))
     host = next(
         node

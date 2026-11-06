@@ -25,9 +25,6 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.cute_register_model import execute_register_plan_events
 from test.cute_register_model import gather_registers
@@ -55,6 +52,9 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -174,9 +174,10 @@ def _assert_register_selection(source: str) -> None:
 
 
 def test_topk_collection_without_cute(tmp_path: Path) -> None:
-    """A Triton-only installation keeps portable tests and skips CuTe tests."""
+    """A Triton-only installation keeps portable tests and leaves out CuTe tests."""
     script = textwrap.dedent(
         """
+        import os
         import sys
         sys.modules["cutlass"] = None
         sys.modules["cutlass.cute"] = None
@@ -205,12 +206,20 @@ def test_topk_collection_without_cute(tmp_path: Path) -> None:
             "test_torch_topk_in_kernel", "test_torch_topk_smallest"
         }
 
-        executed = Results()
-        assert pytest.main([
+        cute_tests = [
             "test/test_cute_topk.py::test_topk_numeric_float_key_exactness_boundary",
             "test/test_cute_topk.py::test_compact_network_bounds_and_operation_count",
-            "-q"
-        ], plugins=[executed]) == 0
+        ]
+        # Under HELION_BACKEND=triton the conftest deselects every
+        # test_cute_*.py module before any test runs (exit code 5: no tests).
+        deselected = Results()
+        assert pytest.main([*cute_tests, "-q"], plugins=[deselected]) == 5
+        assert deselected.nodes == [] and deselected.reports == []
+        # The CuTe lane keeps the portable test and skips the one that needs
+        # the DSL.
+        os.environ["HELION_BACKEND"] = "cute"
+        executed = Results()
+        assert pytest.main([*cute_tests, "-q"], plugins=[executed]) == 0
         assert [outcome for outcome, _ in executed.reports] == ["passed", "skipped"]
         assert "CuTe DSL" in executed.reports[1][1]
         """
@@ -259,15 +268,15 @@ def test_ordering_axis_keeps_complete_reduction_input(backend, operation):
         else (torch.ones(3, 8192), True)
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
         kernel = helion.kernel(
             function, backend=backend, static_shapes=True, autotune_effort="none"
         )
-        bound = _cpu_bind(kernel, inputs)
+        bound = cpu_bind(kernel, inputs)
         assert not bound.config_spec.reduction_loops.valid_block_ids()
         source = bound.to_code(bound.config_spec.default_config())
     if backend == "triton":
@@ -292,12 +301,12 @@ def _topk_with_independent_sum(x: torch.Tensor, y: torch.Tensor):
 @skipIfRefEager("requires compiler IR and explicit configurations")
 def test_ordering_does_not_disable_independent_reduction_rolling():
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
-        bound = _cpu_bind(
+        bound = cpu_bind(
             _topk_with_independent_sum, (torch.ones(3, 64), torch.ones(3, 8192))
         )
         blocks = bound.config_spec.reduction_loops.valid_block_ids()
@@ -6695,9 +6704,9 @@ def test_coarse_rank_topk_old_population_prefix_and_rng(seed):
     results = []
     states = []
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch(
             "helion._compiler.autotuner_heuristics.register_topk_key_recovery_coverage"
         ),
@@ -6711,9 +6720,9 @@ def test_coarse_rank_topk_old_population_prefix_and_rng(seed):
             )
             if not enabled:
                 with context:
-                    bound = _cpu_bind(kernel, args)
+                    bound = cpu_bind(kernel, args)
             else:
-                bound = _cpu_bind(kernel, args)
+                bound = cpu_bind(kernel, args)
             spec = bound.config_spec
             assert "cute_topk_coarse_keys" not in spec.default_config()
             assert all(
@@ -7040,18 +7049,18 @@ def test_coarse_rank_topk_key_recovery_population(seed):
 
     args = (torch.empty((5, 256), dtype=torch.float32), 8, True)
     results, states = [], []
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         for enabled in (False, True):
             kernel = helion.kernel(
                 _row_topk.fn, backend="cute", static_shapes=True, autotune_effort="full"
             )
             if enabled:
-                bound = _cpu_bind(kernel, args)
+                bound = cpu_bind(kernel, args)
             else:
                 with patch(
                     "helion._compiler.autotuner_heuristics.register_topk_key_recovery_coverage"
                 ):
-                    bound = _cpu_bind(kernel, args)
+                    bound = cpu_bind(kernel, args)
             spec = bound.config_spec
             assert "cute_topk_key_recovery" not in spec.default_config()
             assert all(
@@ -7865,8 +7874,8 @@ def test_fragment_leading_axes_topk_generated_values(dtype, largest, width, k):
         x[:, :, 0] = torch.iinfo(torch.int64).min
         x[:, :, 1] = torch.iinfo(torch.int64).max
     snapshot = x.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
         cfg = bound.config_spec.default_config()
         source = bound.to_code(cfg)
     values = torch.empty((rows, groups, k), dtype=dtype)
@@ -7891,8 +7900,8 @@ def test_fragment_leading_axes_topk_generated_values(dtype, largest, width, k):
 
 def test_fragment_composed_topk_gather_generated_values():
     x = ((torch.arange(5 * 17).reshape(5, 17) * 3) % 11).float()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_composed_topk_gather, (x, 3))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_composed_topk_gather, (x, 3))
         cfg = bound.config_spec.default_config()
         source = bound.to_code(cfg)
     values, gathered = torch.empty((5, 3)), torch.empty((5, 3))
@@ -7933,8 +7942,8 @@ def test_fragment_leading_axes_topk_strided_generated_values(dtype):
     storage = torch.arange(3 * 17 * 10).reshape(3, 17, 10).to(dtype)
     x = storage[:, :, ::2].permute(2, 0, 1)
     before = storage.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_leading_axes_topk, (x, 3, True))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_leading_axes_topk, (x, 3, True))
         cfg = bound.config_spec.default_config()
         source = bound.to_code(cfg)
     values = torch.empty((5, 3, 3), dtype=dtype)
@@ -8007,8 +8016,8 @@ def test_fragment_topk_computed_logical_tail(width, rows, largest, mode):
     if largest:
         x = -x
     before = x.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_topk_padded_producer, (x, largest, mode))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_topk_padded_producer, (x, largest, mode))
         cfg = bound.config_spec.default_config()
         source = bound.to_code(cfg)
     values, indices = torch.empty_like(x), torch.full(x.shape, -99, dtype=torch.int64)
@@ -8049,8 +8058,8 @@ def _fragment_topk_ambiguous_padded_reshape(x):
 
 def test_fragment_topk_padded_reshape_without_coordinate_proof_declines():
     x = torch.ones((5, 3, 17))
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_topk_ambiguous_padded_reshape, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_topk_ambiguous_padded_reshape, (x,))
         with pytest.raises(helion.exc.BackendUnsupported):
             bound.to_code(bound.config_spec.default_config())
 
@@ -8090,8 +8099,8 @@ def test_fragment_topk_tiled_selected_axis_declines(middle):
     from helion._compiler.cute.computed_fragment import computed_fragment_supported
 
     x = torch.ones((5, middle, 17))
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_topk_tiled_selected_axis, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_topk_tiled_selected_axis, (x,))
         with bound.env, bound.host_function:
             assert not computed_fragment_supported(
                 bound.env, bound.host_function.device_ir.graphs
@@ -8137,8 +8146,8 @@ def test_fragment_single_computed_topk_fallback_values(width, k, largest, tile):
     x[2, :4] = torch.tensor([float("inf"), -float("inf"), 0.0, -0.0])
     bias = torch.zeros(width)
     before = storage.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_masked_computed_row_topk, (x, bias, k, largest))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_masked_computed_row_topk, (x, bias, k, largest))
         config = bound.config_spec.default_config()
         config.config["block_sizes"] = [tile]
         source = bound.to_code(config)
@@ -8173,8 +8182,8 @@ def test_fragment_single_topk_preserves_optimized_owner(kind):
         "prologue": (_preprocessed_row_topk, (x, 8, True)),
         "softmax": (_temperature_row_topk, (x, 8)),
     }[kind]
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, args)
         with bound.env, bound.host_function:
             ir = bound.host_function.device_ir
             assert (
@@ -8382,8 +8391,8 @@ def test_fragment_network_topk_values(
         if width > 1:
             x[:, :, 1] = torch.iinfo(dtype).max
     original = x.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
         c = b.config_spec.default_config()
         c.config.update(cute_fragment_topk_network=True, cute_fragment_threads=threads)
         if block_rows is not None:
@@ -8410,8 +8419,8 @@ def test_fragment_network_topk_values(
 @pytest.mark.parametrize("largest", [False, True])
 def test_fragment_network_topk_masked_producer(mode, largest):
     x = ((torch.arange(5 * 3 * 17).reshape(5, 3, 17) * 7) % 13 - 20).float()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_topk_padded_producer, (x, largest, mode))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_topk_padded_producer, (x, largest, mode))
         c = b.config_spec.default_config()
         before = b.to_code(c)
         c.config["cute_fragment_topk_network"] = True
@@ -8434,8 +8443,8 @@ def test_fragment_network_topk_masked_producer(mode, largest):
 
 def test_fragment_network_topk_composed_gather():
     x = ((torch.arange(5 * 17).reshape(5, 17) * 3) % 11).float()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_composed_topk_gather, (x, 3))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_composed_topk_gather, (x, 3))
         c = b.config_spec.default_config()
         c.config["cute_fragment_topk_network"] = True
         source = b.to_code(c)
@@ -8461,8 +8470,8 @@ def test_fragment_network_topk_strides(layout):
         if layout == "transposed"
         else storage[1:6, :, 1:18]
     )
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_leading_axes_topk, (x, 3, True))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_leading_axes_topk, (x, 3, True))
         c = b.config_spec.default_config()
         c.config["cute_fragment_topk_network"] = True
         source = b.to_code(c)
@@ -8500,8 +8509,8 @@ def test_fragment_network_topk_sdk(tmp_path, dtype, width, k, largest, block_row
 
     cuda_initialized = torch.cuda.is_initialized()
     x = torch.empty((5, 3, width), dtype=dtype)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
         config = bound.config_spec.default_config()
         config.config["cute_fragment_topk_network"] = True
         if block_rows is not None:
@@ -8599,7 +8608,7 @@ def test_fragment_network_topk_population_prefix(seed):
     args = (torch.empty((5, 3, 65)), 7, True)
     results = []
     states = []
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         for enabled in (False, True):
             kernel = helion.kernel(
                 _fragment_leading_axes_topk.fn,
@@ -8611,9 +8620,9 @@ def test_fragment_network_topk_population_prefix(seed):
                 with patch(
                     "helion._compiler.autotuner_heuristics.register_fragment_topk_network_coverage"
                 ):
-                    bound = _cpu_bind(kernel, args)
+                    bound = cpu_bind(kernel, args)
             else:
-                bound = _cpu_bind(kernel, args)
+                bound = cpu_bind(kernel, args)
             spec = bound.config_spec
             assert "cute_fragment_topk_network" not in spec.default_config()
             with bound.env:
@@ -8649,8 +8658,8 @@ def test_fragment_network_topk_unsupported_request(kind):
             dtype=torch.int64 if kind == "dtype" else torch.float32,
         )
     )
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, (x, 3, True))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, (x, 3, True))
         c = bound.config_spec.default_config()
         before = bound.to_code(c)
         c.config["cute_fragment_topk_network"] = False
@@ -8681,8 +8690,8 @@ def test_fragment_network_topk_mixed_fallback(wide):
     )
     if not wide:
         y[:, :, 0] = torch.iinfo(torch.int64).min
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_mixed_network_topk, (x, y))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_mixed_network_topk, (x, y))
         c = b.config_spec.default_config()
         c.config["cute_fragment_topk_network"] = True
         source = b.to_code(c)
@@ -8718,8 +8727,8 @@ def _fragment_network_topk_reshaped(x):
 
 def test_fragment_network_topk_resident_reshape():
     x = ((torch.arange(5 * 4 * 16).reshape(5, 64) * 7) % 31).float()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_network_topk_reshaped, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_network_topk_reshaped, (x,))
         c = b.config_spec.default_config()
         before = b.to_code(c)
         c.config["cute_fragment_topk_network"] = True
@@ -8739,8 +8748,8 @@ def test_fragment_network_topk_resident_reshape():
 @pytest.mark.parametrize("mutation", ["padding", "slots", "barrier", "comparisons"])
 def test_fragment_network_topk_generated_mutations(mutation):
     x = -torch.arange(1, 5 * 3 * 17 + 1).reshape(5, 3, 17).float()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_leading_axes_topk, (x, 17, True))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_leading_axes_topk, (x, 17, True))
         c = b.config_spec.default_config()
         c.config["cute_fragment_topk_network"] = True
         source = b.to_code(c)
@@ -8856,8 +8865,8 @@ def test_fragment_network_topk_capacity_boundary():
 def test_fragment_network_topk_strict_boolean(value):
     from helion.exc import InvalidConfig
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        b = _cpu_bind(_fragment_leading_axes_topk, (torch.empty(5, 3, 17), 3, True))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        b = cpu_bind(_fragment_leading_axes_topk, (torch.empty(5, 3, 17), 3, True))
         c = b.config_spec.default_config()
         c.config["cute_fragment_topk_network"] = value
         with pytest.raises(InvalidConfig, match="complete fragment top-k"):
@@ -8881,8 +8890,8 @@ def test_fragment_network_full_population_keeps_later_coverage(seed):
     from helion.autotuner.pattern_search import PatternSearch
 
     args = (torch.empty((5, 3, 65)), 7, True)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_leading_axes_topk, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_leading_axes_topk, args)
         keys = [group.key for group in bound.config_spec.compiler_coverage_groups]
         assert keys.index("cute_fragment_topk_network") < keys.index(
             "cute_fragment_packet_loads"

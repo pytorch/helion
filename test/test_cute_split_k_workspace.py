@@ -19,7 +19,6 @@ from test.cute_population_contracts import checked_initial_population
 from test.test_cute_collective_chunk_seeds import _direct_chunk_matmul
 from test.test_cute_collective_chunk_seeds import _matmul_with_unrelated_knob
 from test.test_cute_collective_chunk_seeds import _partitioned_matmul
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
 from helion._compiler.autotuner_heuristics.cute_split_k_workspace import (
@@ -36,6 +35,7 @@ from helion._compiler.cute.split_k_workspace_codegen import (
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
@@ -46,7 +46,7 @@ import helion.language as hl
 
 matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -85,7 +85,7 @@ def _promotion_on(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _cpu_target(),
+        cpu_target(),
         patch.object(
             CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
         ),

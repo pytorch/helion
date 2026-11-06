@@ -8,8 +8,6 @@ from unittest.mock import patch
 
 import pytest
 
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_compiler_coverage import make_search
 from test.test_cute_mxfp8_mma import _cpu_inputs
 from test.test_cute_mxfp8_mma import _mxfp8
@@ -24,14 +22,18 @@ from helion._compiler.autotuner_heuristics.cute_mxfp8_epilogue_coverage import (
 from helion._compiler.cute.block_scaled_config import MXFP8_EPILOGUE_MODES
 from helion._compiler.cute.block_scaled_config import mxfp8_shared_memory_bytes
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.metrics import AutotuneMetrics
+
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(autouse=True)
 def _cpu_only():
     with (
-        _forbid_cuda_work(),
-        _mock_cuda_unavailable(),
+        forbid_cuda_work(),
+        mock_cuda_unavailable(),
         patch.object(
             CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=228 * 1024
         ),
@@ -125,9 +127,9 @@ def test_unsupported_metadata_has_no_output_coverage(m: int, n: int, k: int) -> 
 
 
 def test_unpacked_scale_family_has_no_output_coverage() -> None:
-    from test._cute_binding import _cpu_bind
+    from helion._testing.cute_codegen import cpu_bind
 
-    bound = _cpu_bind(_mxfp8, _cpu_inputs((8, 264, 256)))
+    bound = cpu_bind(_mxfp8, _cpu_inputs((8, 264, 256)))
     assert bound.config_spec.cute_mxfp8_mma_available
     assert not bound.config_spec.cute_mxfp8_tma_output_available
     assert not any(

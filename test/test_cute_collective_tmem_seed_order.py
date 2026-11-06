@@ -7,8 +7,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import checked_initial_population
 from test.test_cute_collective_tmem_operand_codegen import _mamba_kernel
 from test.test_cute_collective_tmem_operand_codegen import _sizes
@@ -17,11 +15,13 @@ from test.test_cute_collective_tmem_seed import _dependent_inputs
 
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 @pytest.fixture(scope="module", autouse=True)
 def _forbid_cuda_init() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
@@ -138,7 +138,7 @@ def test_full_initial_population_reaches_complete_tmem_operand_schedule(
     shape: int, dtype: torch.dtype, static_shapes: bool
 ) -> None:
     args = tuple(torch.empty(size, dtype=dtype) for size in _sizes(shape))
-    bound = _cpu_bind(_mamba_kernel(static_shapes=static_shapes), args)
+    bound = cpu_bind(_mamba_kernel(static_shapes=static_shapes), args)
     old_seeds = _legacy_registered_seeds(bound)
     new_seeds = bound.config_spec.compiler_seed_configs
     assert old_seeds[0] == new_seeds[0]
@@ -166,7 +166,7 @@ def test_full_initial_population_reaches_complete_tmem_operand_schedule(
 @pytest.fixture(scope="module")
 def dependent_case() -> tuple[BoundKernel, tuple[torch.Tensor, ...]]:
     args = _dependent_inputs(torch.bfloat16, "cpu")
-    return _cpu_bind(_dependent_contractions, args), args
+    return cpu_bind(_dependent_contractions, args), args
 
 
 @pytest.mark.parametrize("count", [2, 7, 30, 100])

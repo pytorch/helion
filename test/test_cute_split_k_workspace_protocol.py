@@ -15,7 +15,6 @@ import torch
 from torch._inductor.codecache import PyCodeCache
 
 from test.test_cute_collective_chunk_seeds import _direct_chunk_matmul
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 from test.test_cute_split_k_workspace import _args
 from test.test_cute_split_k_workspace import _embedded_sources
 from test.test_cute_split_k_workspace import _fp32_bias
@@ -26,6 +25,7 @@ from helion._compiler.cute.split_k_workspace import workspace_schedule
 from helion._compiler.cute.split_k_workspace_codegen import _reducer_source
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 import helion.language as hl
 
@@ -35,7 +35,7 @@ pytestmark = skipUnlessBackends(["cute"])
 @pytest.fixture(autouse=True)
 def _cpu_protocol():
     with (
-        _cpu_target(),
+        cpu_target(),
         patch.object(
             CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
         ),

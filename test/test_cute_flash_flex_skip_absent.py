@@ -29,6 +29,8 @@ from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import FlexKvWalk
 from helion._compiler.cute.attention_plan import dense_score_plan
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion._compiler.device_function import DeviceFunction
     from helion.autotuner.config_fragment import ConfigSpecFragment

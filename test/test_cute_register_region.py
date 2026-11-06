@@ -12,9 +12,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_register_program import _run
 
@@ -27,6 +24,9 @@ from helion._compiler.cute.selection_coarse import coarse_rank_recover
 from helion._compiler.cute.selection_network import selection_network
 from helion._testing import DEVICE
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -148,7 +148,7 @@ def _coarse_selection(x: torch.Tensor, recovery: str) -> torch.Tensor:
 
 
 def _plan(kernel, args, threads=0):
-    bound = _cpu_bind(kernel, args)
+    bound = cpu_bind(kernel, args)
     config = bound.config_spec.default_config()
     config.config["num_threads"] = [threads]
     tile_strategy = SimpleNamespace(
@@ -164,7 +164,7 @@ def _plan(kernel, args, threads=0):
 
 def test_generic_permutation_register_codegen():
     x = torch.arange(7 * 4 * 8, dtype=torch.int64).reshape(7, 4, 8)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, config, plan = _plan(_permutation, (x,))
         assert plan is not None
         assert plan.groups == 4
@@ -187,7 +187,7 @@ def test_generic_permutation_register_codegen():
 @pytest.mark.parametrize("threads", [1, 32, 128])
 def test_register_region_does_not_ignore_inner_axis_thread_requests(threads):
     x = torch.empty((7, 4, 8), dtype=torch.int64)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, _, plan = _plan(_permutation, (x,), threads)
         assert 0 not in bound.config_spec.num_threads.valid_block_ids()
         assert plan is None
@@ -195,7 +195,7 @@ def test_register_region_does_not_ignore_inner_axis_thread_requests(threads):
 
 def test_selection_helper_is_an_ordinary_register_graph():
     x = torch.randperm(3 * 4 * 8).reshape(3, 4, 8)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, config, plan = _plan(_selection, (x,))
         assert plan is not None
         assert all("topk" not in str(node.target) for node in plan.module.graph.nodes)
@@ -218,7 +218,7 @@ def test_register_region_rejects_output_alias_or_internal_overlap(alias):
         "dlpack": lambda: torch.from_dlpack(x),
         "overlap": lambda: torch.empty((1, 4, 8), dtype=x.dtype).expand(3, -1, -1),
     }[alias]()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         _, _, plan = _plan(_with_output, (x, out))
     assert plan is None
 
@@ -226,7 +226,7 @@ def test_register_region_rejects_output_alias_or_internal_overlap(alias):
 def test_register_region_rejects_data_dependent_gather():
     x = torch.zeros((3, 4, 8), dtype=torch.int64)
     indices = torch.zeros_like(x)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         _, _, plan = _plan(_dynamic_gather, (x, indices))
     assert plan is None
 
@@ -234,7 +234,7 @@ def test_register_region_rejects_data_dependent_gather():
 def test_register_region_admits_proven_bounded_runtime_gather():
     x = torch.arange(3 * 4 * 8, dtype=torch.int64).reshape(3, 4, 8)
     indices = torch.randint(-100, 100, x.shape)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         _, _, plan = _plan(_bounded_gather, (x, indices))
     assert plan is not None
     outputs, _source = _run(plan.module, x[0], indices[0])
@@ -246,7 +246,7 @@ def test_register_region_admits_proven_bounded_runtime_gather():
 def test_native_helion_if_lowers_to_uniform_register_cond(positive, preserved):
     x = torch.full((3, 32, 4), 2 if positive else -2, dtype=torch.int32)
     kernel = _conditional_preserved_values if preserved else _conditional_permutation
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, config, plan = _plan(kernel, (x,))
         assert plan is not None
         code = bound.to_code(config)
@@ -264,7 +264,7 @@ def test_native_helion_if_lowers_to_uniform_register_cond(positive, preserved):
 
 
 def test_register_conditional_rejects_partial_warp_or_memory_effects():
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         _, _, partial = _plan(
             _conditional_permutation, (torch.ones((3, 4, 8), dtype=torch.int32),)
         )
@@ -287,7 +287,7 @@ def test_full_coarse_algorithm_is_a_native_helion_register_program(recovery, cas
     coarse = coarse_rank_keys(x[0], 4, 1, 4)
     selected = selection_network(coarse, 4, "compact", "balanced", groups_per_result=4)
     assert bool(coarse_rank_guard(x[0], selected, 4, 4, 4)) == (case != "ordinary")
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, config, plan = _plan(_coarse_selection, (x, recovery))
         assert plan is not None
         code = bound.to_code(config)
@@ -311,7 +311,7 @@ def test_generic_register_coarse_sdk(tmp_path, recovery):
 
     cuda_initialized = torch.cuda.is_initialized()
     x = torch.ones((7, 32, 4), dtype=torch.int32)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, config, plan = _plan(_coarse_selection, (x, recovery))
         assert plan is not None
         source = bound.to_code(config)
@@ -373,7 +373,7 @@ def test_generic_register_coarse_sdk(tmp_path, recovery):
 def test_register_region_uses_bound_runtime_disjointness():
     x = torch.zeros((3, 4, 8), dtype=torch.int64)
     out = torch.empty_like(x)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         _, _, plan = _plan(_with_output, (x, out))
         assert plan is not None
         with patch(
@@ -490,7 +490,7 @@ def test_float32_extrema_use_generic_register_region():
         bits.to(torch.int32).view(torch.float32)
         for bits in _float32_extrema_input_bits()
     )
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound, config, plan = _plan(_float32_extrema, (left, right))
         assert plan is not None
         source = bound.to_code(config)

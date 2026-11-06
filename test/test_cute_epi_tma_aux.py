@@ -16,8 +16,6 @@ import torch
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
-from test._cute_aux import _cpu_codegen
-
 import helion
 from helion import exc
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
@@ -29,6 +27,7 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -170,7 +169,7 @@ def _illegal_aux_views(
 def _render(
     kernel: object, args: tuple[torch.Tensor, ...], config: dict[str, object]
 ) -> str:
-    with _cpu_codegen():
+    with cpu_codegen():
         return kernel._bind_isolated(args).to_code(helion.Config.from_dict(config))  # type: ignore[attr-defined]
 
 
@@ -182,7 +181,7 @@ def _normalize(
     fix: bool,
 ) -> dict[str, object]:
     normalized = dict(config)
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = kernel._bind_isolated(args)  # type: ignore[attr-defined]
         with bound.env:
             bound.config_spec.normalize(normalized, _fix_invalid=fix)
@@ -390,7 +389,7 @@ def test_normalizer_refuses_the_ring_without_an_exact_shape_operand() -> None:
 
 
 def test_search_surface_and_seeds() -> None:
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = _gated_gemm._bind_isolated(_gated_args())
         state = bound.config_spec._cute_tcgen05_config
         facts = state.pipeline_smem_facts
@@ -433,7 +432,7 @@ def test_tma_illegal_aux_views_keep_the_staged_modes_off(view: str) -> None:
     a, b, _g, d = _gated_args()
     g = _illegal_aux_views(4096, 1024)[view]
     args = (a, b, g, d)
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = _gated_gemm._bind_isolated(args)
         state = bound.config_spec._cute_tcgen05_config
         assert state.exact_shape_aux_kernel_detected
@@ -455,7 +454,7 @@ def test_tma_illegal_aux_views_keep_the_staged_modes_off(view: str) -> None:
     # bind-time fact were wrong), on the epilogue-issued and the
     # producer-warp ring alike.
     for config in (_one_cta(), _producer_warp_tma()):
-        with _cpu_codegen():
+        with cpu_codegen():
             bound = _gated_gemm._bind_isolated(args)
             bound.config_spec._cute_tcgen05_config.exact_aux_tma_provable = True
             with pytest.raises(

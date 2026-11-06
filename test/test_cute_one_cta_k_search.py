@@ -13,12 +13,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_cuda_work
-from test._cute_dense_tcgen05 import blackwell_capability
-from test._cute_dense_tcgen05 import cpu_codegen_target
-from test._cute_dense_tcgen05 import scaled_args
-from test._cute_dense_tcgen05 import scaled_mm
-from test._cute_dense_tcgen05 import user_bound_mm
 import test.test_cute_backend as backend_tests
 
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2FfiHeuristic
@@ -26,6 +20,12 @@ from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuri
 from helion._compiler.compile_environment import FixedBlockSizeSource
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import blackwell_capability
+from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
+from helion._testing.cute_dense_tcgen05 import scaled_args
+from helion._testing.cute_dense_tcgen05 import scaled_mm
+from helion._testing.cute_dense_tcgen05 import user_bound_mm
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 
@@ -34,12 +34,12 @@ if TYPE_CHECKING:
 
     from helion.runtime.kernel import BoundKernel
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.fixture(autouse=True)
 def _cpu_codegen() -> Iterator[None]:
-    with cpu_codegen_target(), _forbid_cuda_work():
+    with cpu_codegen_target(), forbid_cuda_work():
         yield
 
 

@@ -11,7 +11,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 from test.test_cute_materialized_fission import _CpuRefMode
 
 import helion
@@ -19,6 +18,7 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -27,7 +27,7 @@ from helion.runtime.ref_mode import RefModeContext
 
 matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -58,7 +58,7 @@ class _OperandCpuRefMode(_CpuRefMode):
 @pytest.fixture(autouse=True)
 def _cpu_b200() -> Iterator[None]:
     with (
-        _cpu_target(),
+        cpu_target(),
         patch.object(
             CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
         ),

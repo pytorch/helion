@@ -3,13 +3,13 @@ from __future__ import annotations
 import ast
 import re
 
+import pytest
 import torch
-
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
 
 _examples_nvfp4_gemv = import_example("nvfp4_gemv")
@@ -17,7 +17,7 @@ _nvfp4_gemv_bf16in_body = _examples_nvfp4_gemv._nvfp4_gemv_bf16in_body
 _nvfp4_gemv_fp4in_body = _examples_nvfp4_gemv._nvfp4_gemv_fp4in_body
 swizzled_scale_numel = _examples_nvfp4_gemv.swizzled_scale_numel
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 _CONFIG = helion.Config(
     block_sizes=[1, 256],
@@ -51,7 +51,7 @@ def _render(fn: object, inputs: tuple[object, ...], config: helion.Config) -> st
         static_shapes=True,
         autotune_effort="none",
     )
-    with _cpu_target():
+    with cpu_target():
         bound = kernel._bind_isolated(inputs)
         return bound.to_code(config)
 

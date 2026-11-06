@@ -9,9 +9,6 @@ import pytest
 import sympy
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteReductionTileHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteReductionWideChunkHeuristic
@@ -28,6 +25,8 @@ from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 from helion.language._tracing_ops import _host_tensor
@@ -117,14 +116,14 @@ def test_cute_dynamic_reduction_seeds_vector_memory(
     softmax = helion.kernel(
         fn, backend="cute", static_shapes=False, autotune_effort="none"
     )
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         x = torch.empty(64, 4096, dtype=dtype)
         args = (
             (x, torch.ones_like(x, dtype=torch.bool))
             if fn is _memory_masked_softmax
             else (x,)
         )
-        bound = _cpu_bind(softmax, args)
+        bound = cpu_bind(softmax, args)
         assert bound.host_function is not None
         spec = bound.config_spec
         seed = CuteRolledRowLadderHeuristic.get_seed_config(
@@ -205,8 +204,8 @@ def test_dynamic_tile_heuristics_keep_their_existing_static_gate(
     kernel = helion.kernel(
         softmax_two_pass.fn, backend="cute", static_shapes=False, autotune_effort="none"
     )
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, (torch.empty(5, 4100, dtype=dtype),))
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, (torch.empty(5, 4100, dtype=dtype),))
         assert bound.host_function is not None
         for heuristic in (
             CuteTileVecHeuristic,
@@ -229,8 +228,8 @@ def test_dynamic_persistent_seed_keeps_scalar_memory(dtype: torch.dtype) -> None
     kernel = helion.kernel(
         _softmax, backend="cute", static_shapes=False, autotune_effort="none"
     )
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, (torch.empty(5, 1024, dtype=dtype),))
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, (torch.empty(5, 1024, dtype=dtype),))
         assert bound.host_function is not None
         seed = CuteReductionTileHeuristic.get_seed_config(
             bound.env, bound.host_function.device_ir
@@ -453,8 +452,8 @@ def test_square_row_bias_does_not_override_reduction_payload(
         static_shapes=True,
         autotune_effort="none",
     )
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable():
+        bound = cpu_bind(
             kernel,
             (
                 torch.empty(4096, 4096, dtype=dtype),
@@ -475,8 +474,8 @@ def test_square_row_bias_does_not_override_reduction_payload(
 @skipIfRefEager("checks vector slots for a jagged axis")
 def test_jagged_tile_vector_seed_admission_is_preserved() -> None:
     kernel = helion.kernel(_jagged_sum, backend="cute", autotune_effort="none")
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable():
+        bound = cpu_bind(
             kernel,
             (
                 torch.empty(731),

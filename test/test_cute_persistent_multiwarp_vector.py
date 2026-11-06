@@ -21,17 +21,18 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics import get_heuristics
 from helion._compiler.autotuner_heuristics.cute import CuteReductionTileHeuristic
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
 softmax = import_example("softmax").softmax
@@ -62,7 +63,7 @@ RUNTIME_LANE = (
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -108,7 +109,7 @@ def _bind(
     holds weak references), and a collected tensor silently leaves the loads
     scalar.
     """
-    return _cpu_bind(kernel, arguments), arguments
+    return cpu_bind(kernel, arguments), arguments
 
 
 def _bind_rms_norm(
@@ -301,7 +302,7 @@ def test_whole_warp_thread_request_covers_the_full_row(
         bound.config_spec.num_threads.config_get(config.num_threads, reduction, 0)
         == threads
     )
-    with _forbid_native_compile():
+    with forbid_native_compile():
         source = ast.parse(bound.to_code(config))
     lane_extents = {
         ast.literal_eval(node.iter.args[0])

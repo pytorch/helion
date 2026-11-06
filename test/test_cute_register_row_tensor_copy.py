@@ -9,9 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from ._cute_binding import _cpu_bind
-from ._cute_binding import _forbid_native_compile
-from ._cute_binding import _mock_cuda_unavailable
 from .cute_population_contracts import _target
 from .test_cute_rolled_online_epilogue import row_logsumexp
 from .test_cute_rolled_online_epilogue import row_shifted_other
@@ -24,6 +21,11 @@ from helion._compiler.cute.register_row_tensor_copy import _original_vector_elem
 from helion._compiler.cute.register_row_tensor_copy import prove_tensor_copy
 from helion._compiler.cute.rolled_cluster_online_pair import _prove
 from helion._compiler.cute.rolled_cluster_online_pair import _wrap_sites
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _config(
@@ -57,8 +59,8 @@ def _generate(
 ) -> str:
     x = torch.empty((3, 32000), dtype=dtype)
     args = (x, torch.empty_like(x)) if kernel is row_shifted_other else (x,)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, args)
         assert not bound.settings.fast_math
         return bound.to_code(_config(threads, tensor_copy, vector_width))
 
@@ -271,8 +273,8 @@ def test_default_and_false_keep_original_loader() -> None:
 
 def test_tensor_copy_requires_register_row() -> None:
     x = torch.empty((3, 32000), dtype=torch.bfloat16)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(row_logsumexp, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(row_logsumexp, (x,))
         config = _config()
         config.config["cute_register_row"] = False
         with pytest.raises(exc.InvalidConfig, match="requires cute_register_row"):
@@ -285,8 +287,8 @@ def test_tensor_copy_requires_register_row() -> None:
 @pytest.mark.parametrize("value", [0, 1, "true", None])
 def test_tensor_copy_requires_boolean(value) -> None:
     x = torch.empty((3, 32000), dtype=torch.bfloat16)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(row_logsumexp, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(row_logsumexp, (x,))
         config = _config()
         config.config["cute_register_row_tensor_copy"] = value
         with pytest.raises(exc.InvalidConfig, match="must be a boolean"):
