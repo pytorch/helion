@@ -258,7 +258,7 @@ class FlyDSLBackend(Backend):
             "helion": "import helion",
             "hl": "import helion.language as hl",
             "_default_flydsl_launcher": (
-                "from helion.runtime import default_flydsl_launcher"
+                "from helion._compiler.flydsl.launcher import default_flydsl_launcher"
                 " as _default_flydsl_launcher"
             ),
         }

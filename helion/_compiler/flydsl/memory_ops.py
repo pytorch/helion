@@ -257,7 +257,12 @@ def _flydsl_buffer_setup(
 
     device_fn = state.device_function
     setup_key = (tensor_name, is_vec, is_rolled_col)
-    setup = device_fn._flydsl_setup.get(setup_key)
+    # (tensor, is_vec, is_rolled_col) -> loop-invariant buffer/div/copy-atom
+    # setup, memoized so load and store reuse the same lifted AST vars.
+    setups: dict[tuple[object, ...], dict[str, int | str]] = (
+        device_fn.backend_codegen_state.setdefault("flydsl", {})
+    )
+    setup = setups.get(setup_key)
     if setup is None:
         _hoist = None
         # A rolled ``:`` column that fits in one wavefront (N <= 64) has a loop
@@ -332,7 +337,7 @@ def _flydsl_buffer_setup(
             )
 
         setup = {"div": div.id, "atom": atom.id, "vec": vec_width, "row": row.id}
-        device_fn._flydsl_setup[setup_key] = setup
+        setups[setup_key] = setup
 
     return {
         "setup": setup,

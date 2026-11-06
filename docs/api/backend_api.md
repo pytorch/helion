@@ -34,9 +34,9 @@ other attributes of the classes listed here, may change without notice.
    `scalar_arg_preamble`, `kernel_prologue` (called once per `generate_ast`
    pass, after body codegen; its statements go after the scalar-argument
    preamble and before the kernel preamble and body; its `fn` argument is
-   passed only so the backend can tell which device function this is, none of
-   its attributes are covered by `BACKEND_API_VERSION`, and the backend must
-   not modify it);
+   passed only so the backend can tell which device function this is; none of
+   its attributes except `backend_codegen_state` (see below) are covered by
+   `BACKEND_API_VERSION`, and the backend must not otherwise modify it);
    `cast_expr`, `cast_scalar_ast`;
    `where_expr`, `minimum_expr`, `zeros_expr`, `full_expr`, `reshape_expr`,
    `broadcast_to_expr`, `expands_broadcast_dims`;
@@ -84,6 +84,10 @@ other attributes of the classes listed here, may change without notice.
 5. **Sympy helper.** `symint_sympy_expr(x)` returns the `sympy.Expr` behind a
    `torch.SymInt`; its signature (takes a SymInt, returns `sympy.Expr`) is
    covered, which is all codegen sites rely on.
+6. **Per-function state.** `DeviceFunction.backend_codegen_state`, a dict for
+   codegen state shared across a backend's op handlers while one device
+   function is generated. Use your backend's name as the key; the value is
+   yours.
 
 ## What is not covered
 
@@ -99,6 +103,7 @@ rule 1 above.
 | Change | Action |
 |---|---|
 | Add an optional hook with a safe default | No bump |
+| Add a covered attribute or exported name | No bump |
 | Make a hook required | Bump |
 | Remove, rename, or change the signature of a covered member | Bump |
 | Change the documented call order of a covered hook | Bump |
