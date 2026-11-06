@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import ast
 import os
 import unittest
 
+import pytest
 import torch
 from torch.testing._internal.common_device_type import largeTensorTest
 
 import helion
 from helion import exc
+from helion._compiler.loop_dependency_checker import _holds_no_storage
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -504,6 +507,384 @@ def kernel_list_no_cache_layernorm(
             normalized = (val.to(torch.float32) - mean[:, None]) * rstd[:, None]
             output[tile_m, tile_d + i * D] = normalized.to(output.dtype)
     return output
+
+
+@helion.kernel(autotune_effort="none")
+def filtered_values(x: torch.Tensor, limit: hl.constexpr) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [i + 1 for i in (0, 1, 2, 3) if i < limit if i % 2 == 0]
+        acc = torch.zeros([tile], dtype=x.dtype, device=x.device)
+        for value in values:
+            acc = acc + x[tile] * value
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def constant_filters(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [8 // i for i in (0, 1, 2, 4) if i != 0 and 8 // i >= 4]
+        chained = [i + 1 for i in (0, 1, 2) if 0 < i <= 8 // i]
+        members = [i + 1 for i in hl.static_range(4) if i in (0, 2)]
+        nested = [i + 1 for i in (0, 1, 2) if (i != 0 and 8 // i >= 4) == 1]
+        truth = [i for i in (1, 2) if (i,) if not ()]
+        out[tile] = (
+            x[tile] * sum(values)
+            + x[tile] * sum(chained)
+            + x[tile] * sum(members)
+            + x[tile] * sum(nested)
+            + x[tile] * sum(truth)
+        )
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def filtered_generator(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = tuple(i + 1 for i in (0, 1, 2, 3) if i % 2 == 0)
+        out[tile] = x[tile] * (values[0] + values[1])
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def none_values(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [None for i in (0, 1, 2) if i > 0]
+        if values[1] is None:
+            out[tile] = x[tile]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def dynamic_filter(x: torch.Tensor, limit: int) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [i for i in (0, 1, 2) if i < limit]
+        out[tile] = x[tile] * values[0]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def dynamic_membership(x: torch.Tensor, limit: int) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [i for i in (0, 1, 2) if i in (limit, 5)]
+        for value in values:
+            out[tile] = x[tile] * value
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def tensor_filter(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [i for i in (0, 1, 2) if x[tile] > 0]
+        for value in values:
+            out[tile] = x[tile] * value
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def identity_filter(x: torch.Tensor, limit: hl.constexpr) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [i for i in (10000, 20000) if i is limit]
+        for value in values:
+            out[tile] = x[tile] * value
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def shadowed_target(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    i = 7
+    for tile in hl.tile(x.numel()):
+        values = [i + 1 for i in (0, 1, 2) if i > 0]
+        out[tile] = x[tile] * (values[0] + values[1] + i)
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def filtered_tensors(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        pairs = ((0, 1), (1, 2), (2, 3))
+        values = [x[tile] * factor for index, factor in pairs if index != 1]
+        out[tile] = values[0] + values[1]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def computed_literal_filter(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        acc = torch.zeros([tile], dtype=x.dtype, device=x.device)
+        for j in (0, 1):
+            n = j + 1
+            values = [i for i in (1, 2) if i == n]
+            acc = acc + x[tile] * values[0]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def computed_static_range_filter(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        acc = torch.zeros([tile], dtype=x.dtype, device=x.device)
+        for j in hl.static_range(2):
+            n = j + 1
+            values = [i for i in (1, 2) if i == n]
+            acc = acc + x[tile] * values[0]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def iteration_dependent_iterable(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        acc = torch.zeros([tile], dtype=x.dtype, device=x.device)
+        for j in (1, 2):
+            values = [i for i in (j,) if i > 0]
+            acc = acc + x[tile] * values[0]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def heterogeneous_filter(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [v for v in (1, None, 2) if v is not None]
+        mixed = [v for v in (1, "keep", 2) if v != 2]
+        if mixed[1] == "keep":
+            out[tile] = x[tile] * (values[0] + values[1])
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def tensor_and_scalar_result(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [v for v in (x, 1) if v is not None]
+        out[tile] = values[0][tile] * values[1]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def changing_comprehension_length(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        acc = torch.zeros([tile], dtype=x.dtype, device=x.device)
+        for limit in hl.static_range(1, 4):
+            values = [i for i in (0, 1, 2) if i < limit]
+            for value in values:
+                acc = acc + x[tile] * value
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def filtered_multidimensional_tensor(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        values = [x[tile] * i for i in (1, 2, 3) if i != 2]
+        out[tile] = values[0] + values[1]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def generator_enclosing_filtered_dict(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        generator = (j + 0 for j in (1, 2))
+        first = {0: len([i for i in (1, 2) if i > 0]) for _ in generator}  # noqa: B035
+        second = {0: len([i for i in (1, 2) if i > 0]) for _ in generator}  # noqa: B035
+        out[tile] = x[tile] * (len(first) + len(second))
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def generator_enclosing_nested_filtered_list(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        generator = (j + 0 for j in (1, 1))
+        first = [len([i for i in (1, 2) if value]) for value in generator]
+        second = [len([i for i in (1, 2) if value]) for value in generator]
+        out[tile] = x[tile] * (len(first) + len(second))
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def generator_enclosing_filtered_list(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        generator = (j + 0 for j in (1, 1))
+        acc = x[tile] * 0
+        for value in generator:
+            selected = [i for i in (1, 2) if value]
+            acc = acc + len(selected)
+        for value in generator:
+            selected = [i for i in (1, 2) if value]
+            acc = acc + len(selected)
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def consumed_generator_enclosing_filtered_list(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        generator = (j + 0 for j in (1, 1))
+        acc = x[tile] * 0
+        for value in tuple(generator):
+            selected = [i for i in (1, 2) if value]
+            acc = acc + len(selected)
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def consumed_generator_in_iterable(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        generator = (j + 0 for j in (3, 4))
+        first = [0 for _ in tuple(generator) if 1]
+        second = [0 for _ in tuple(generator) if 1]
+        out[tile] = x[tile] * (len(first) + len(second))
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def consumed_generator_in_element(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        generator = (j + 0 for j in (3, 4))
+        values = [len(tuple(generator)) for i in (1, 2) if i]
+        out[tile] = x[tile] * (values[0] + 10 * values[1])
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def host_generator_as_filtered_iterable(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    generator = (j + 0 for j in (3, 4))
+    for tile in hl.tile(x.numel()):
+        first = [0 for _ in generator if 1]
+        second = [0 for _ in generator if 1]
+        out[tile] = x[tile] * (len(first) + len(second))
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def generator_as_filtered_iterable(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        generator = (j + 0 for j in (3, 4))
+        first = [0 for _ in generator if 1]
+        second = [0 for _ in generator if 1]
+        out[tile] = x[tile] * (len(first) + len(second))
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def nested_generator_in_filter(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        generator = (j + 0 for j in (3, 4))
+        values = [i for i in (1, 2) if [generator] == [(3, 4)]]
+        out[tile] = x[tile] * len(values)
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def mutate_comprehension_list(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        cached = [x[tile] * 0 for _ in (0, 1)]
+        cached[0] = x[tile]
+        cached[1] = x[tile] * 2
+        out[tile] = cached[0] + cached[1]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def unpack_list_comprehensions(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        a, b = [i + 0 for i in (1, 2)]
+        c, d = [i for i in (0, 3, 4) if i > 0]
+        out[tile] = x[tile] * (a + b + c + d)
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def mixed_sequence_tuple_comparison(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        acc = x[tile] * 0
+        for values in ([1, 2], (1, 2)):
+            if values == (1, 2):
+                acc = acc + x[tile]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def mixed_sequence_list_comparison(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        acc = x[tile] * 0
+        for values in ((1, 2), [1, 2]):
+            if values == [1, 2]:
+                acc = acc + x[tile]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def generator_tuple_comparison(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        generator = (i + 0 for i in (1, 2))
+        if generator == (1, 2):
+            out[tile] = x[tile] * 7
+        else:
+            out[tile] = x[tile] * 3
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def filtered_list_tuple_comparison(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        values = [i for i in (1, 2) if i > 0]
+        if values == (1, 2):
+            out[tile] = x[tile] * 7
+        else:
+            out[tile] = x[tile] * 3
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def filtered_list_comparisons(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        first = [i for i in (1, 2) if i > 0]
+        selected = [i for i in (1, 2) if first == [1, 2]]
+        different_type = [i for i in (3, 4) if first == (1, 2)]
+        acc = x[tile] * 0
+        for value in selected:
+            acc = acc + x[tile] * value
+        for value in different_type:
+            acc = acc + x[tile] * value
+        out[tile] = acc
+    return out
 
 
 @onlyBackends(["triton", "cute"])
@@ -1069,6 +1450,210 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         assert speedup > 1.0, (
             f"Expected register cache to be faster, got speedup={speedup:.2f}x"
         )
+
+
+@pytest.mark.skipif(
+    os.environ.get("HELION_INTERPRET") == "1", reason="Requires compiled mode"
+)
+class TestFilteredComprehensions:
+    @pytest.mark.parametrize("limit, factors", [(0, ()), (1, (1,)), (4, (1, 3))])
+    def test_filtered_values_bind(self, limit: int, factors: tuple[int, ...]) -> None:
+        bound = filtered_values.bind((torch.ones(32), limit))
+        graph = str(bound.host_function.device_ir.graphs[0].graph)
+        for factor in factors:
+            assert f", {factor})" in graph
+        assert graph.count("aten.mul.Tensor") == len(factors)
+
+    def test_constant_filters(self) -> None:
+        bound = constant_filters.bind((torch.ones(32),))
+        graph = bound.host_function.device_ir.graphs[0].graph
+        factors = [
+            node.args[1]
+            for node in graph.nodes
+            if node.target is torch.ops.aten.mul.Tensor
+        ]
+        assert factors == [12, 5, 4, 5, 3]
+
+    def test_none_is_an_element(self) -> None:
+        bound = none_values.bind((torch.ones(32),))
+        assert any(
+            node.target is hl.store
+            for node in bound.host_function.device_ir.graphs[0].graph.nodes
+        )
+
+    def test_runtime_filter_is_rejected(self) -> None:
+        with pytest.raises(exc.StatementNotSupported, match="compile-time constant"):
+            dynamic_filter.bind((torch.ones(32), 2))
+
+    def test_runtime_membership_is_rejected(self) -> None:
+        with pytest.raises(exc.StatementNotSupported, match="compile-time constant"):
+            dynamic_membership.bind((torch.ones(32), 2))
+
+    def test_tensor_filter_is_rejected(self) -> None:
+        with pytest.raises(exc.StatementNotSupported, match="compile-time constant"):
+            tensor_filter.bind((torch.ones(32),))
+
+    def test_identity_filter_is_rejected(self) -> None:
+        with pytest.raises(exc.StatementNotSupported, match="Identity comparisons"):
+            identity_filter.bind((torch.ones(32), 10000))
+
+    def test_comprehension_target_does_not_shadow_outer_value(self) -> None:
+        bound = shadowed_target.bind((torch.ones(32),))
+        graph = str(bound.host_function.device_ir.graphs[0].graph)
+        assert ", 12)" in graph
+
+    def test_filtered_tensor_bodies_are_traced_only_for_selected_elements(self) -> None:
+        bound = filtered_tensors.bind((torch.ones(32),))
+        graph = str(bound.host_function.device_ir.graphs[0].graph)
+        assert graph.count("aten.mul.Tensor") == 2
+        assert ", 1)" in graph
+        assert ", 3)" in graph
+
+    @pytest.mark.parametrize(
+        "kernel", [computed_literal_filter, computed_static_range_filter]
+    )
+    def test_computed_filter_per_iteration(self, kernel: helion.Kernel) -> None:
+        bound = kernel.bind((torch.ones(32),))
+        graph = str(bound.host_function.device_ir.graphs[0].graph)
+        assert graph.count("aten.mul.Tensor") == 2
+        assert all(f", {factor})" in graph for factor in (1, 2))
+
+    @pytest.mark.parametrize(
+        "kernel", [iteration_dependent_iterable, heterogeneous_filter]
+    )
+    def test_filtered_sequence_types_per_iteration(self, kernel: helion.Kernel) -> None:
+        bound = kernel.bind((torch.ones(32),))
+        graph = str(bound.host_function.device_ir.graphs[0].graph)
+        if kernel is iteration_dependent_iterable:
+            assert graph.count("aten.mul.Tensor") == 2
+            assert all(f", {factor})" in graph for factor in (1, 2))
+        else:
+            assert ", 3)" in graph
+
+    def test_filtered_mixed_result_preserves_tensor_alias_information(self) -> None:
+        bound = tensor_and_scalar_result.bind((torch.ones(32),))
+        comprehension = next(
+            node
+            for stmt in bound.host_function.body
+            for node in ast.walk(stmt)
+            if isinstance(node, ast.ListComp)
+        )
+        assert isinstance(comprehension.elt, ast.Name)
+        assert not _holds_no_storage(comprehension.elt)
+
+    def test_changing_comprehension_length_is_rejected(self) -> None:
+        with pytest.raises(exc.StatementNotSupported, match="changing lengths"):
+            changing_comprehension_length.bind((torch.ones(32),))
+
+    @pytest.mark.parametrize(
+        ("kernel", "message"),
+        [
+            (filtered_generator, "Filtered generator expressions"),
+            (
+                host_generator_as_filtered_iterable,
+                "Generator values in filtered comprehensions",
+            ),
+            (
+                generator_as_filtered_iterable,
+                "Generator values in filtered comprehensions",
+            ),
+            (
+                consumed_generator_in_iterable,
+                "Generator values in filtered comprehensions",
+            ),
+            (
+                consumed_generator_in_element,
+                "Generator values in filtered comprehensions",
+            ),
+            (nested_generator_in_filter, "Generator values in filtered comprehensions"),
+        ],
+    )
+    def test_generator_restrictions(self, kernel: helion.Kernel, message: str) -> None:
+        with pytest.raises(exc.StatementNotSupported, match=message):
+            kernel.bind((torch.ones(32),))
+
+    @pytest.mark.parametrize(
+        ("kernel", "message"),
+        [
+            (
+                generator_enclosing_filtered_list,
+                "Generator values in loops containing filtered comprehensions",
+            ),
+            (
+                consumed_generator_enclosing_filtered_list,
+                "Generator values in loops containing filtered comprehensions",
+            ),
+            (
+                generator_enclosing_nested_filtered_list,
+                "Generator values in comprehensions containing filtered lists",
+            ),
+            (
+                generator_enclosing_filtered_dict,
+                "Generator values in comprehensions containing filtered lists",
+            ),
+            (generator_tuple_comparison, "Generator equality comparisons"),
+        ],
+    )
+    def test_generator_enclosing_filtered_lists(
+        self, kernel: helion.Kernel, message: str
+    ) -> None:
+        with pytest.raises(exc.StatementNotSupported, match=message):
+            kernel.bind((torch.ones(32),))
+
+    @pytest.mark.parametrize(
+        "kernel", [mixed_sequence_tuple_comparison, mixed_sequence_list_comparison]
+    )
+    def test_mixed_sequence_comparisons(self, kernel: helion.Kernel) -> None:
+        bound = kernel.bind((torch.ones(32),))
+        assert bound.host_function is not None
+        graph = bound.host_function.device_ir.graphs[0].graph
+        assert (
+            sum(node.target is torch.ops.aten.add.Tensor for node in graph.nodes) == 1
+        )
+
+    def test_filtered_list_comparisons(self) -> None:
+        bound = filtered_list_comparisons.bind((torch.ones(32),))
+        assert bound.host_function is not None
+        graph = bound.host_function.device_ir.graphs[0].graph
+        factors = [
+            node.args[1]
+            for node in graph.nodes
+            if node.target is torch.ops.aten.mul.Tensor
+        ]
+        assert factors == [0, 1, 2]
+
+    @pytest.mark.cuda
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+    @pytest.mark.parametrize("limit, multiplier", [(0, 0), (4, 4)])
+    def test_filtered_values_cuda(self, limit: int, multiplier: int) -> None:
+        x = torch.randn(128, device=DEVICE)
+        torch.testing.assert_close(filtered_values(x, limit), x * multiplier)
+
+    @pytest.mark.cuda
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+    def test_filtered_multidimensional_tensor_cuda(self) -> None:
+        x = torch.randn(16, 4, device=DEVICE)
+        torch.testing.assert_close(filtered_multidimensional_tensor(x), x * 4)
+
+    @pytest.mark.cuda
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+    @pytest.mark.parametrize(
+        ("kernel", "factor"),
+        [
+            (filtered_tensors, 4),
+            (mutate_comprehension_list, 3),
+            (unpack_list_comprehensions, 10),
+            (mixed_sequence_tuple_comparison, 1),
+            (filtered_list_tuple_comparison, 3),
+            (computed_static_range_filter, 3),
+            (computed_literal_filter, 3),
+        ],
+    )
+    def test_comprehension_results_cuda(
+        self, kernel: helion.Kernel, factor: int
+    ) -> None:
+        x = torch.randn(128, device=DEVICE)
+        torch.testing.assert_close(kernel(x), x * factor)
 
 
 if __name__ == "__main__":
