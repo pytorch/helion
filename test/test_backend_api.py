@@ -101,6 +101,7 @@ _BACKEND_HOOKS = {
     "scalar_load_expr": "(self, tensor_name: 'str', index_expr: 'str | None' = None) -> 'str'",
     "inline_constexpr": "(self, name: 'str', value: 'str') -> 'str'",
     "scalar_arg_preamble": "(self, arg: 'Argument') -> 'list[ast.AST]'",
+    "kernel_prologue": "(self, fn: 'DeviceFunction') -> 'list[ast.stmt]'",
     "cast_expr": "(self, expr_str: 'str', dtype_str: 'str') -> 'str'",
     "cast_scalar_ast": "(self, x: 'ast.AST', target_dtype: 'torch.dtype') -> 'ast.AST'",
     "where_expr": "(self, mask: 'str', true_val: 'str', false_val: 'str') -> 'str'",

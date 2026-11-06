@@ -1344,6 +1344,7 @@ class DeviceFunction:
         scalar_preamble: list[ast.AST] = []
         for arg in param_args:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
+        kernel_prologue = backend.kernel_prologue(self)
 
         function_decorator = backend.function_decorator_for_args(param_args)
         decorators = (
@@ -1367,6 +1368,7 @@ class DeviceFunction:
             [
                 *[statement_from_string(pdl[op]) for op in env.pdl_entry],
                 *scalar_preamble,
+                *kernel_prologue,
                 *self.preamble,
                 *self.body,
                 *[statement_from_string(pdl[op]) for op in env.pdl_exit],
@@ -1380,7 +1382,10 @@ class DeviceFunction:
             constexpr_to_inline=constexpr_to_inline,
             wrapper_only_params=wrapper_only_params,
             bounded_cache_request=bounded_cache_request,
-            body_start=len(env.pdl_entry) + len(scalar_preamble) + len(self.preamble),
+            body_start=len(env.pdl_entry)
+            + len(scalar_preamble)
+            + len(kernel_prologue)
+            + len(self.preamble),
         )
         kernel_body, extra_args = backend.finalize_device_body(
             kernel_body, body_context

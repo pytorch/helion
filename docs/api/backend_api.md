@@ -31,7 +31,12 @@ other attributes of the classes listed here, may change without notice.
    `program_id_expr`, `grid_index_expr`, `loop_index_expr`, `arange_expr`,
    `range_str`, `lane_index_expr`, `lane_offset_expr`,
    `thread_in_tile_mask_expr`, `scalar_load_expr`, `inline_constexpr`,
-   `scalar_arg_preamble`;
+   `scalar_arg_preamble`, `kernel_prologue` (called once per `generate_ast`
+   pass, after body codegen; its statements go after the scalar-argument
+   preamble and before the kernel preamble and body; its `fn` argument is
+   passed only so the backend can tell which device function this is, none of
+   its attributes are covered by `BACKEND_API_VERSION`, and the backend must
+   not modify it);
    `cast_expr`, `cast_scalar_ast`;
    `where_expr`, `minimum_expr`, `zeros_expr`, `full_expr`, `reshape_expr`,
    `broadcast_to_expr`, `expands_broadcast_dims`;
