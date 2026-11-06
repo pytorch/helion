@@ -289,6 +289,15 @@ class TestPluginLoadFailures(unittest.TestCase):
             self._assert_fails("_hplug_cgimp", "already registered to")
             self.assertIs(_REGISTRY["triton"], TritonBackend)
 
+    def test_clashing_config_key(self) -> None:
+        src = _backend("_hplug_keys") + (
+            "\n    @classmethod\n"
+            "    def plugin_config_keys(cls):\n"
+            "        return frozenset({'num_warps'})\n"
+        )
+        with _plugins(("_hplug_keys", "_hplug_keys", src, None)):
+            self._assert_fails("_hplug_keys", "config keys that already exist")
+
 
 class TestNestedPluginLoads(unittest.TestCase):
     def test_plugin_importing_another_plugin(self) -> None:

@@ -621,10 +621,42 @@ class Backend(abc.ABC):
         """Validate implicit RNG support under the selected semantic policy."""
         return None
 
-    def supports_config_key(self, key: str) -> bool:
-        from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
+    @classmethod
+    def plugin_config_keys(cls) -> frozenset[str]:
+        """Autotuner config keys this backend adds beyond Helion's built-in keys.
 
-        return key not in BACKEND_SPECIFIC_KEYS
+        They become valid config keys while the backend is registered, are
+        supported by this backend (and its subclasses), and are rejected by
+        every other backend.  Return a fragment for every declared key from
+        :meth:`tunable_fragments`; a declared key without one is never
+        searched (warned at bind).
+
+        The result must be a constant frozenset for the process lifetime
+        (compute it at class-definition time): ``ConfigSpec`` samples it at
+        bind time and ``config_spec`` caches it per registry contents.  For a
+        hardware-conditional knob, declare the key unconditionally and, on
+        hardware where it does not apply, return a single-choice fragment
+        (one fixed value).
+        Two registered backends may declare the same key only if one
+        subclasses the other (e.g. ``super().plugin_config_keys() | {"k"}``);
+        siblings of one base clash at registration
+        (``backend_registry._check_plugin_config_keys``).
+        """
+        return frozenset()
+
+    def supports_config_key(self, key: str) -> bool:
+        from ..autotuner import config_spec
+
+        if key in config_spec.BACKEND_SPECIFIC_KEYS:
+            return False
+        # Built-in keys can never be plugin keys (enforced at registration by
+        # backend_registry._check_plugin_config_keys), so skip the registry
+        # lookup.
+        if key in config_spec.VALID_KEYS:
+            return True
+        if key in config_spec.registered_plugin_config_keys():
+            return key in type(self).plugin_config_keys()
+        return True
 
     def default_num_sm_multiplier(self) -> int:
         """``num_sm_multiplier`` of a persistent config that names none, and

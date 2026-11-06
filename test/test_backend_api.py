@@ -123,6 +123,7 @@ _BACKEND_HOOKS = {
     "launches_surplus_tile_threads": "(self) -> 'bool'",
     "launcher_keyword_args": "(self, config: 'Config', *, has_barrier: 'bool') -> 'list[str]'",
     "supports_config_key": "(self, key: 'str') -> 'bool'",
+    "plugin_config_keys": "(cls) -> 'frozenset[str]'",
     "tunable_fragments": "(self) -> 'dict[str, ConfigSpecFragment]'",
     "supports_precompile": "(self) -> 'bool'",
     "adjust_block_size_constraints": "(self, block_specs: 'list[object]', ndim: 'int', block_sizes: 'list[object] | None' = None, kernel_tensor_sizes: 'dict[tuple[object, ...], int] | None' = None, min_element_bits: 'int' = 32) -> 'None'",

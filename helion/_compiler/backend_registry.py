@@ -117,6 +117,10 @@ def register_compiler_backend(backend_class: type[Backend]) -> None:
 
     Args:
         backend_class: A :class:`Backend` subclass.
+
+    Raises:
+        ValueError: if ``backend_class.plugin_config_keys()`` reuses a built-in
+            config key or a key declared by an unrelated registered backend.
     """
     global _REPAIRED_CODEGEN_NAMES
 
@@ -133,11 +137,36 @@ def register_compiler_backend(backend_class: type[Backend]) -> None:
                 f"refusing to overwrite it with "
                 f"{backend_class.__module__}.{backend_class.__qualname__}"
             )
+        _check_plugin_config_keys(backend.name, backend_class)
         for recorded in getattr(_BACKEND_RECORDING, "stack", None) or []:
             recorded.append((backend.name, backend_class))
         _REGISTRY[backend.name] = backend_class
         codegen_names, _ = _codegen_repair_scope(backend.codegen_name)
         _REPAIRED_CODEGEN_NAMES = _REPAIRED_CODEGEN_NAMES.difference(codegen_names)
+
+
+def _check_plugin_config_keys(name: str, backend_class: type[Backend]) -> None:
+    keys = backend_class.plugin_config_keys()
+    if not keys:
+        return
+    from ..autotuner.config_spec import VALID_KEYS
+
+    clashes = keys & VALID_KEYS
+    for other_name, other in _REGISTRY.items():
+        if other_name == name:
+            continue
+        # Only a subclass and its base may share keys; siblings of one base
+        # and backends sharing a mixin's keys clash.
+        if other is backend_class:
+            continue
+        if issubclass(backend_class, other) or issubclass(other, backend_class):
+            continue
+        clashes |= keys & other.plugin_config_keys()
+    if clashes:
+        raise ValueError(
+            f"Backend {name!r} declares config keys that already exist: "
+            f"{sorted(clashes)}"
+        )
 
 
 def get_backend_class(name: str) -> type[Backend]:

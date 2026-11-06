@@ -104,8 +104,17 @@ other attributes of the classes listed here, may change without notice.
    `reduction_block_size_is_inlined_constexpr`,
    `launches_surplus_tile_threads`;
    `launcher_keyword_args`;
-   `supports_config_key`, `tunable_fragments`, `supports_precompile`,
-   `adjust_block_size_constraints`, `autotune`,
+   `supports_config_key`, `plugin_config_keys` (a classmethod adding backend-
+   specific autotuner config keys: the result must be a constant frozenset;
+   the keys are accepted for this backend and its subclasses even if
+   `supports_config_key` is an allowlist, rejected by other backends as
+   backend-specific keys, and each needs a search fragment from
+   `tunable_fragments` (where a knob does not apply on the current
+   hardware, return a single-choice fragment); registering a backend raises `ValueError` if it
+   reuses a built-in key or a key of a registered backend that is neither
+   its subclass nor its base, so sibling subclasses of one base clash),
+   `tunable_fragments`,
+   `supports_precompile`, `adjust_block_size_constraints`, `autotune`,
    `get_do_bench`, `get_interleaved_bench`.
    The autotuner times candidates with `get_do_bench()` (single config) and
    `get_interleaved_bench()` (candidates compared side by side); returning

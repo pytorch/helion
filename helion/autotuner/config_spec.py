@@ -14,6 +14,7 @@ from typing import Callable
 from typing import Iterator
 from typing import NamedTuple
 from typing import cast
+import warnings
 
 import torch
 from torch._inductor.runtime.runtime_utils import next_power_of_2
@@ -1484,6 +1485,50 @@ VALID_KEYS: frozenset[str] = frozenset(
         *GROUPED_RNA_CONFIG_KEYS,
     ]
 )
+
+
+# (registered backend classes, (plugin, specific, valid) key sets).
+_PLUGIN_KEY_SETS: tuple[tuple[type, ...], tuple[frozenset[str], ...]] | None = None
+# Backend classes already warned about declared keys without a fragment.
+_WARNED_FRAGMENTLESS_KEYS: set[type] = set()
+
+
+def _plugin_key_sets() -> tuple[frozenset[str], ...]:
+    # Rebuilt only when the registry changes; normalize() calls these per key.
+    global _PLUGIN_KEY_SETS
+    from .._compiler.backend_registry import _REGISTRY
+
+    classes = tuple(_REGISTRY.values())
+    cached = _PLUGIN_KEY_SETS
+    if cached is None or cached[0] != classes:
+        plugin = frozenset().union(*(cls.plugin_config_keys() for cls in classes))
+        cached = (
+            classes,
+            (
+                plugin,
+                BACKEND_SPECIFIC_KEYS | plugin,
+                VALID_KEYS | plugin,
+            ),
+        )
+        _PLUGIN_KEY_SETS = cached
+    return cached[1]
+
+
+def registered_plugin_config_keys() -> frozenset[str]:
+    """Config keys declared by registered backends' ``plugin_config_keys()``."""
+    return _plugin_key_sets()[0]
+
+
+def backend_specific_keys() -> frozenset[str]:
+    """``BACKEND_SPECIFIC_KEYS`` plus keys declared by registered backends."""
+    return _plugin_key_sets()[1]
+
+
+def valid_keys() -> frozenset[str]:
+    """``VALID_KEYS`` plus keys declared by registered backends."""
+    return _plugin_key_sets()[2]
+
+
 # Loop types the autotuner searches by default for every Pallas inner loop.
 AUTOTUNED_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
 VALID_PALLAS_LOOP_TYPES = AUTOTUNED_PALLAS_LOOP_TYPES
@@ -1748,6 +1793,7 @@ class ConfigSpec:
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
+        self._backend_plugin_keys = type(backend).plugin_config_keys()
         self.device = device
         # ``VALID_KEYS`` split into (supported, unsupported), keyed on the
         # backend and target it was computed for; see ``_config_key_support``.
@@ -2278,10 +2324,26 @@ class ConfigSpec:
         # kernels on cute once device-IR analysis proves the fact.
         self.cute_reflatten_candidates: list[FlattenLoopSpec] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
-        unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
+        # Validate against THIS backend's own key space, not the global union
+        # of every registered plugin's keys: a stray/typo'd fragment key must
+        # fail deterministically at bind time instead of passing whenever some
+        # unrelated lazily loaded plugin happens to declare the same key.
+        own_tunable_keys = BACKEND_TUNABLE_KEYS | self._backend_plugin_keys
+        unknown_tunables = set(self.backend_tunable_fragments) - own_tunable_keys
         if unknown_tunables:
             raise RuntimeError(
                 f"Backend {self.backend_name!r} returned unknown tunables: {sorted(unknown_tunables)!r}"
+            )
+        backend_class = type(self.backend)
+        missing = self._backend_plugin_keys - set(self.backend_tunable_fragments)
+        if missing and backend_class not in _WARNED_FRAGMENTLESS_KEYS:
+            _WARNED_FRAGMENTLESS_KEYS.add(backend_class)
+            warnings.warn(
+                f"Backend {backend_class.__module__}.{backend_class.__qualname__} "
+                f"declares config keys {sorted(missing)!r} in plugin_config_keys() "
+                "but returns no fragment for them from tunable_fragments(); they "
+                "are never searched and user-set values are accepted untested.",
+                stacklevel=1,
             )
 
     @property
@@ -5198,6 +5260,10 @@ class ConfigSpec:
         return cached[1], cached[2]
 
     def supports_config_key(self, key: str) -> bool:
+        # The backend's own plugin keys (snapshotted at bind) are accepted even
+        # when its supports_config_key is an allowlist.
+        if key in self._backend_plugin_keys:
+            return True
         if key in VALID_KEYS:
             return key in self._config_key_support()[0]
         return self._supports_config_key_uncached(key)
@@ -6888,7 +6954,10 @@ class ConfigSpec:
                 )
 
     def supported_config_keys(self) -> frozenset[str]:
-        return self._config_key_support()[0]
+        plugin_keys = (valid_keys() - VALID_KEYS) | self._backend_plugin_keys
+        return self._config_key_support()[0] | frozenset(
+            key for key in plugin_keys if self.supports_config_key(key)
+        )
 
     def _default_num_stages(self) -> int:
         return DEFAULT_NUM_STAGES
@@ -6948,7 +7017,13 @@ class ConfigSpec:
         self._cute_tcgen05_config._clamp_l2_swizzle_size_to_shape(config)
 
     def unsupported_config_keys(self, config: Mapping[str, object]) -> list[str]:
-        return sorted(self._config_key_support()[1].intersection(config))
+        plugin_keys = valid_keys() - VALID_KEYS
+        unsupported = self._config_key_support()[1].intersection(config) | {
+            key
+            for key in config
+            if key in plugin_keys and not self.supports_config_key(key)
+        }
+        return sorted(unsupported - set(self.user_defined_tunables))
 
     def is_supported_config(self, config: Mapping[str, object]) -> bool:
         return not self.unsupported_config_keys(config)
@@ -7284,8 +7359,9 @@ class ConfigSpec:
             # from common keys (e.g. num_warps, num_stages, indexing).
             # Backend-specific keys should raise errors; common keys are
             # silently stripped so configs are portable across backends.
-            backend_specific = [k for k in unsupported if k in BACKEND_SPECIFIC_KEYS]
-            common = [k for k in unsupported if k not in BACKEND_SPECIFIC_KEYS]
+            specific_keys = backend_specific_keys()
+            backend_specific = [k for k in unsupported if k in specific_keys]
+            common = [k for k in unsupported if k not in specific_keys]
             for key in common:
                 config.pop(key, None)
             if backend_specific:
@@ -8513,7 +8589,10 @@ class ConfigSpec:
             )
 
         # Allow tunable parameter keys in addition to backend-supported keys.
-        unknown_keys = {*config} - VALID_KEYS
+        # Snapshot keys are never "unknown" to this spec even if the
+        # backend's been unregistered since bind (failed-plugin rollback,
+        # tests), so normalize() agrees with supports_config_key() there.
+        unknown_keys = {*config} - valid_keys() - self._backend_plugin_keys
         invalid_keys = (unknown_keys | {*self.unsupported_config_keys(config)}) - {
             *self.user_defined_tunables.keys()
         }
