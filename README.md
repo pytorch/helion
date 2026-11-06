@@ -15,14 +15,22 @@ as PyTorch operations over tiles; the compiler derives a configuration
 space for each kernel and hardware target and autotunes it, so the same
 kernel adapts across input shapes and hardware targets.
 
-Helion generates kernels through one of several backends, selected with the
-`HELION_BACKEND` environment variable:
+Helion generates kernels through one of several backends. Select one with
+the `HELION_BACKEND` environment variable or the `backend=` argument of
+`@helion.kernel`:
 
-* [Triton] (default)
-* [TileIR](#tileir-backend), for NVIDIA Blackwell GPUs
-* [CuTe DSL](#cute-backend-cuda-13), for NVIDIA Blackwell GPUs
-* [Pallas], for Google TPUs
-* Metal (Apple GPUs) and FlyDSL (AMD GPUs), both experimental
+* [Triton] (default): `HELION_BACKEND=triton`
+* [TileIR](#tileir-backend), for NVIDIA Blackwell GPUs: `HELION_BACKEND=tileir` (also set `ENABLE_TILE=1`)
+* [CuTe DSL](#cute-backend-cuda-13), for NVIDIA Blackwell GPUs: `HELION_BACKEND=cute`
+* [Pallas], for Google TPUs: `HELION_BACKEND=pallas`
+* Metal, for Apple GPUs (experimental): `HELION_BACKEND=metal`
+* FlyDSL, for AMD GPUs (experimental): `HELION_BACKEND=flydsl`
+
+```python
+@helion.kernel(backend="cute")
+def my_kernel(x: torch.Tensor) -> torch.Tensor:
+    ...
+```
 
 [Triton]: https://github.com/triton-lang/triton
 [Pallas]: https://docs.jax.dev/en/latest/pallas/index.html
