@@ -24,18 +24,20 @@ def _registered_backend(name: str) -> Backend | None:
     Synthetic backend names (tests) own no hooks.
     """
     from ..backend_registry import get_backend
-    from ..backend_registry import list_backends
+    from ..backend_registry import registered_backends
 
-    if name not in list_backends():
+    if name not in registered_backends():
         return None
     return get_backend(name)
 
 
 def _builtin_heuristics() -> dict[str, tuple[AutotunerHeuristicType, ...]]:
     from ..backend_registry import get_backend
-    from ..backend_registry import list_backends
+    from ..backend_registry import registered_backends
 
-    return {name: get_backend(name).autotuner_heuristics() for name in list_backends()}
+    return {
+        name: get_backend(name).autotuner_heuristics() for name in registered_backends()
+    }
 
 
 def _current_registry_generation() -> int:

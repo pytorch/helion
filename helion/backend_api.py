@@ -25,6 +25,8 @@ from ._compiler.backend import Backend as Backend
 from ._compiler.backend import BackendState as BackendState
 from ._compiler.backend import InductorOpOverrides as InductorOpOverrides
 from ._compiler.backend_registry import BACKEND_API_VERSION as BACKEND_API_VERSION
+from ._compiler.backend_registry import list_backends as list_backends
+from ._compiler.backend_registry import load_backend_plugins as load_backend_plugins
 from ._compiler.backend_registry import (
     register_compiler_backend as register_compiler_backend,
 )
@@ -100,6 +102,8 @@ __all__ = [
     "codegen",
     "exc",
     "expr_from_string",
+    "list_backends",
+    "load_backend_plugins",
     "mask_to_op",
     "reduce_op",
     "register_compiler_backend",
