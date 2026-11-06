@@ -400,8 +400,8 @@ def analyze_search_space(
     Returns:
         A SearchSpaceReport describing the valid search space
     """
-    from ..autotuner.config_spec import VALID_KEYS
     from ..autotuner.config_spec import VALID_PID_TYPES
+    from ..autotuner.config_spec import valid_keys
 
     overrides = dict(config_overrides or {})
     dimensions: list[DimensionStats] = []
@@ -426,7 +426,7 @@ def analyze_search_space(
             _apply_override(acf_dim, overrides["advanced_controls_file"])
         dimensions.append(acf_dim)
 
-    for key in sorted(VALID_KEYS):
+    for key in sorted(valid_keys()):
         if key in flat_fields:
             continue
         if config_spec.supports_config_key(key):
@@ -605,12 +605,6 @@ def _get_disable_reason(config_spec: ConfigSpec, key: str) -> str:
     if key == "pallas_loop_type":
         if not config_spec.has_pallas_inner_loops:
             return "No Pallas inner loops in kernel"
-
-    # Check if it's a backend-specific key
-    from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
-
-    if key in BACKEND_SPECIFIC_KEYS:
-        return f"Not supported by {backend_name} backend"
 
     return f"Not supported by {backend_name} backend"
 

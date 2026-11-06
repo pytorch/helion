@@ -17,6 +17,7 @@ from typing import Sequence
 
 import sympy
 import torch
+from torch._inductor.ops_handler import OpsHandler
 
 from .. import exc
 from .ast_extension import expr_from_string
@@ -41,8 +42,6 @@ if TYPE_CHECKING:
     from collections.abc import Collection
     import contextlib
 
-    from torch._inductor.ops_handler import OpsHandler
-
     from ..autotuner.config_fragment import ConfigSpecFragment
     from ..autotuner.config_priors import ValuePrior
     from ..autotuner.config_spec import ConfigSpec
@@ -65,7 +64,8 @@ if TYPE_CHECKING:
     from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
 
-    InductorOpOverrides = OpsHandler[Any]
+# Defined at runtime so ``helion.backend_api`` can re-export it.
+InductorOpOverrides = OpsHandler[Any]
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -621,10 +621,42 @@ class Backend(abc.ABC):
         """Validate implicit RNG support under the selected semantic policy."""
         return None
 
-    def supports_config_key(self, key: str) -> bool:
-        from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
+    @classmethod
+    def plugin_config_keys(cls) -> frozenset[str]:
+        """Autotuner config keys this backend adds beyond Helion's built-in keys.
 
-        return key not in BACKEND_SPECIFIC_KEYS
+        They become valid config keys while the backend is registered, are
+        supported by this backend (and its subclasses), and are rejected by
+        every other backend.  Return a fragment for every declared key from
+        :meth:`tunable_fragments`; a declared key without one is never
+        searched (warned at bind).
+
+        The result must be a constant frozenset for the process lifetime
+        (compute it at class-definition time): ``ConfigSpec`` samples it at
+        bind time and ``config_spec`` caches it per registry contents.  For a
+        hardware-conditional knob, declare the key unconditionally and, on
+        hardware where it does not apply, return a single-choice fragment
+        (one fixed value).
+        Two registered backends may declare the same key only if one
+        subclasses the other (e.g. ``super().plugin_config_keys() | {"k"}``);
+        siblings of one base clash at registration
+        (``backend_registry._check_plugin_config_keys``).
+        """
+        return frozenset()
+
+    def supports_config_key(self, key: str) -> bool:
+        from ..autotuner import config_spec
+
+        if key in config_spec.BACKEND_SPECIFIC_KEYS:
+            return False
+        # Built-in keys can never be plugin keys (enforced at registration by
+        # backend_registry._check_plugin_config_keys), so skip the registry
+        # lookup.
+        if key in config_spec.VALID_KEYS:
+            return True
+        if key in config_spec.registered_plugin_config_keys():
+            return key in type(self).plugin_config_keys()
+        return True
 
     def default_num_sm_multiplier(self) -> int:
         """``num_sm_multiplier`` of a persistent config that names none, and
@@ -1359,6 +1391,27 @@ class Backend(abc.ABC):
         """Generate preamble statements for scalar arguments in the device function.
 
         Backends can override to dereference scalar refs, etc.
+        """
+        return []
+
+    def kernel_prologue(self, fn: DeviceFunction) -> list[ast.stmt]:
+        """Statements to splice into a device function after body codegen.
+
+        Called once per ``DeviceFunction.codegen_function_def``, after the body
+        has been generated and dead-code eliminated, so a backend can emit
+        helpers (e.g. shared-memory declarations) only when body codegen
+        recorded that it needs them.  The statements go after the PDL wait and
+        the scalar-argument preamble and before ``fn.preamble`` and the body;
+        they are not dead-code eliminated but do go through variable renaming.
+
+        Called once per ``generate_ast`` pass, for the one device function that
+        pass emits.  ``pre_codegen`` runs earlier in the same pass, so reset
+        any per-pass state there; a backend instance may serve several passes.
+
+        ``fn`` is passed only so the backend can tell which device function
+        this is.  None of its attributes are covered by
+        ``BACKEND_API_VERSION``, and the backend must not modify it; contribute
+        only through the returned statements.
         """
         return []
 

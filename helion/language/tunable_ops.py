@@ -174,7 +174,9 @@ def _register_tunable_type(
     if not (isinstance(name_val, str) and isinstance(fragment_val, ConfigSpecFragment)):
         raise exc.RegisterTunableArgTypes(name, fragment)
 
-    if name_val in VALID_KEYS or f"{name_val}s" in VALID_KEYS:
+    # The bound kernel's own key space, so a later plugin's keys can't conflict.
+    valid = VALID_KEYS | env.config_spec._backend_plugin_keys
+    if name_val in valid or f"{name_val}s" in valid:
         raise exc.TunableNameConflict(name_val)
     if (
         name_val in env.config_spec.user_defined_tunables
