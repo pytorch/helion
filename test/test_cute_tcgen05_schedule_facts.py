@@ -448,6 +448,38 @@ def test_k_cap_applies_only_where_whole_k_tiles_admit_persistence() -> None:
     assert _k_block_max(uncapped) > 64
 
 
+def test_m_edge_two_cta_ab6_keeps_tma_store_and_drains_after_dealloc() -> None:
+    """1000x4096x2880 bf16 at 2x1 256x256x64 ab=6 keeps the TMA-store epilogue.
+
+    The arena (192 KiB AB ring, 32 KiB (128, 64) C ring and the barriers) fits
+    the opt-in capacity, which the AB-gate-budget check refused, and the two-CTA
+    teardown frees TMEM before draining the bulk stores.
+    """
+    bound = plain_mm._bind_isolated(
+        (
+            torch.empty((1000, 2880), dtype=torch.bfloat16),
+            torch.empty((4096, 2880), dtype=torch.bfloat16).T,
+        )
+    )
+    source = bound.to_code(
+        helion.Config(
+            block_sizes=[256, 256, 64],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=6,
+            tcgen05_c_stages=2,
+        )
+    )
+    assert "'kind': 'tcgen05_d_tma'" in source
+    assert "'ab_stage_count': 6" in source
+    assert "cute.copy(tcgen05_tma_store_atom" in source
+    assert source.count("tcgen05_c_pipeline.producer_tail()") == 1
+    assert source.rindex("tcgen05_tmem_allocator.free(") < source.index(
+        "tcgen05_c_pipeline.producer_tail()"
+    )
+
+
 def _default_with_sms(shape: tuple[int, int, int], num_sms: int) -> helion.Config:
     with patch(
         "helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=num_sms

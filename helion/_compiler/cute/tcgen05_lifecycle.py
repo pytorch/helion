@@ -56,14 +56,6 @@ class Tcgen05LifecycleContext:
     # MMA warp has issued its last MMA (the two-CTA path always does), so
     # the next kernel's launch and prologue overlap this kernel's drain.
     pdl_release: bool = False
-    # Two-CTA row-union kernels (one tile per CTA at the catalogue shapes, so
-    # the whole teardown is exposed): the store warp's ``cp.async.bulk.wait_group
-    # 0`` is independent of the TMEM handshake, and ``free`` is a cross-CTA
-    # rendezvous on the pair's dealloc mbarrier, so the drain is issued after
-    # the dealloc and the two overlap (grouped_gemm s1: 3.58 -> 3.54 us per
-    # call).  The dense two-CTA persistent kernels keep their validated order
-    # (drain, then dealloc).
-    drain_after_dealloc: bool = False
     # Two-CTA row-union kernels: the MMA warp owns the TMEM allocation
     # (``tcgen05.alloc``, relinquish, ``free``; ``tmem_allocator_warp`` is its
     # warp) and frees it right after its accumulator ``producer_tail``: that
@@ -115,13 +107,17 @@ class Tcgen05LifecycleContext:
         post_loop_lines: list[str] = []
         short_teardown = self.use_merged_pipeline_init and not self.is_two_cta
         # The store warp's ``cp.async.bulk.wait_group 0`` is independent of
-        # the TMEM handshake, so the merged-init one-CTA teardown and the
-        # two-CTA row-union teardown (``drain_after_dealloc``) issue it after
-        # the dealloc and overlap the two drains; every other teardown keeps
-        # its long-validated order (drain, then dealloc).
-        drain_after_dealloc = short_teardown or (
-            self.is_two_cta and self.drain_after_dealloc
-        )
+        # the TMEM handshake, and on a CTA pair ``free`` is a cross-CTA
+        # rendezvous on the dealloc mbarrier, so the merged-init one-CTA
+        # teardown and every two-CTA teardown issue the drain after the
+        # dealloc and overlap the two instead of holding warp 0 (and with it
+        # the epilogue's ``tmem_alloc_barrier`` meet and the peer's dealloc)
+        # behind the last bulk stores. Row-union grouped_gemm s1: 3.58 ->
+        # 3.54 us per call; dense persistent 2x1 bf16 under flushed graph
+        # replay (device time, same process): 1000x4096x2880 21.16 -> 20.92
+        # us, 16384x384x768 14.00 -> 13.89 us. The remaining one-CTA
+        # teardowns keep their long-validated order (drain, then dealloc).
+        drain_after_dealloc = short_teardown or self.is_two_cta
         if (
             tma_store_pipeline_tail
             and not drain_after_dealloc
@@ -162,7 +158,7 @@ class Tcgen05LifecycleContext:
                 ]
             )
             # The store drain was issued at the top unless it follows the
-            # dealloc (``drain_after_dealloc``); never both.
+            # dealloc (always, on a CTA pair); never both.
             if tma_store_pipeline_tail and drain_after_dealloc:
                 post_loop_lines.append(tma_store_pipeline_tail)
             return post_loop_lines
