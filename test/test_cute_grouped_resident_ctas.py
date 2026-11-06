@@ -16,7 +16,6 @@ import cutlass
 from cutlass._mlir import ir
 import cutlass.cute as cute
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_grouped_coverage_search import _bound
 from test.test_cute_grouped_coverage_search import _search
 from test.test_cute_grouped_dense_row_union import _selected
@@ -29,8 +28,11 @@ from helion._compiler.cute.grouped_row_union import ROW_UNION_TMEM_COLUMNS
 from helion._compiler.cute.grouped_row_union import GroupedRowUnionPlan
 from helion._compiler.cute.grouped_row_union import resident_ctas_supported
 from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
+
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -38,7 +40,7 @@ def cpu_only():
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch("cutlass.cute.compile", side_effect=AssertionError("native forbidden")),
         _target(),

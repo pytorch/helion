@@ -10,6 +10,8 @@ from helion._compiler.cute.materialized_fission import MaterializedFissionPlan
 from helion._compiler.cute.materialized_fission_codegen import _stage_config
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _plan(pointwise: tuple[int, ...]) -> MaterializedFissionPlan:
     return MaterializedFissionPlan(

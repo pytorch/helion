@@ -14,14 +14,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 PACKET = "ir.VectorType.get([8], cutlass.Uint16.mlir_type)"
 STORE = "_cute_store_u16_vec("
@@ -127,8 +126,8 @@ def _code(dtype: torch.dtype, view: str) -> str:
     config = helion.Config(
         block_sizes=[8, 128], num_threads=[8, 16], cute_vector_widths=[1, 8]
     )
-    with _mock_cuda_unavailable():
-        return _cpu_bind(kernel, (_view(dtype, view),)).to_code(config)
+    with mock_cuda_unavailable():
+        return cpu_bind(kernel, (_view(dtype, view),)).to_code(config)
 
 
 @pytest.mark.parametrize("dtype", [torch.int16, torch.bfloat16], ids=["int16", "bf16"])
@@ -172,8 +171,8 @@ def _column_code(reshape: str, view: str) -> str:
         assert view == "offset_4"
         # Eight bytes into an aligned allocation.
         x = torch.empty(4104, dtype=torch.bfloat16)[4:4100]
-    with _mock_cuda_unavailable():
-        return _cpu_bind(kernel, (x,)).to_code(config)
+    with mock_cuda_unavailable():
+        return cpu_bind(kernel, (x,)).to_code(config)
 
 
 @pytest.mark.parametrize("reshape", ["view", "unsqueeze"])
@@ -204,8 +203,8 @@ def _wrapper_view_code(fn: object, dtype: torch.dtype) -> str:
     config = helion.Config(
         block_sizes=[8, 128], num_threads=[8, 16], cute_vector_widths=[1, 8]
     )
-    with _mock_cuda_unavailable():
-        return _cpu_bind(kernel, (torch.empty((64, 136), dtype=dtype),)).to_code(config)
+    with mock_cuda_unavailable():
+        return cpu_bind(kernel, (torch.empty((64, 136), dtype=dtype),)).to_code(config)
 
 
 def test_a_wrapper_view_at_a_packet_multiple_offset_keeps_its_packet() -> None:

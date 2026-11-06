@@ -25,6 +25,8 @@ from helion.autotuner.llm.workload import compute_workload_hints
 from helion.runtime.config import Config
 from helion.runtime.settings import Settings
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _config_spec(backend: str) -> ConfigSpec:
     return ConfigSpec(

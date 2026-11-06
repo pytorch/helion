@@ -8,6 +8,8 @@ import pytest
 
 from helion._compiler.cute.cluster_online_pair import fuse_cluster_online_pair
 
+pytestmark = pytest.mark.cpu_only
+
 _SOURCE = """
 cache = cute.make_rmem_tensor(8, cutlass.Float32)
 max_buffer = cute.arch.alloc_smem(cutlass.Float32, 2)

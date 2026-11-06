@@ -14,7 +14,9 @@ follow the example's V-width generalization).
 from __future__ import annotations
 
 import ast
+import collections
 import dataclasses
+import functools
 import importlib
 import math
 import os
@@ -25,8 +27,6 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
-
-from test._cute_aux import _cpu_codegen
 
 import helion
 from helion._compiler.cute import cute_flash
@@ -43,8 +43,14 @@ from helion._compiler.cute.flash_schedule import verify_flash_schedule
 from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import pairwise
+from helion._testing.cute_aux import cpu_codegen
+from helion._testing.cute_flash import bind_flash_kernel
+from helion._testing.cute_flash import render_flash_config
 import helion.language as hl
 from helion.runtime.kernel import Kernel
+
+pytestmark = pytest.mark.cpu_only
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
@@ -410,20 +416,16 @@ def _causal(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
     return q_idx >= kv_idx
 
 
-def _render_flex(
-    head_dim: int,
-    *,
-    dtype: torch.dtype = torch.bfloat16,
-    seq: int = 1024,
-    config: dict[str, object] | None = None,
-) -> str:
-    """The flex example kernel at ``FLEX_CONFIG`` on CPU tensors and a real
-    causal BlockMask."""
+@functools.cache
+def _flex_kernel() -> Kernel[Any]:
     module = import_path(EXAMPLES_DIR / "flex_attention.py")
-    kernel = Kernel(
+    return Kernel(
         module.helion_flex_attention_kernel.fn,
         settings=module.helion_flex_attention_kernel.settings.copy(backend="cute"),
     )
+
+
+def _flex_args(head_dim: int, dtype: torch.dtype, seq: int) -> tuple[object, ...]:
     torch.manual_seed(0)
     q, k, v = (torch.randn(2, 4, seq, head_dim, dtype=dtype) for _ in range(3))
     # A CPU render: the BlockMask tables live beside the CPU tensors.
@@ -431,7 +433,7 @@ def _render_flex(
     full_num = block_mask.full_kv_num_blocks
     full_idx = block_mask.full_kv_indices
     assert full_num is not None and full_idx is not None
-    args = (
+    return (
         q,
         k,
         v,
@@ -446,12 +448,27 @@ def _render_flex(
         1.0 / math.sqrt(head_dim),
         False,
     )
+
+
+def _render_flex(
+    head_dim: int,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    seq: int = 1024,
+    config: dict[str, object] | None = None,
+) -> str:
+    """The flex example kernel at ``FLEX_CONFIG`` on CPU tensors and a real
+    causal BlockMask (one bind per shape and one render per normalized
+    config, shared across the module's tests)."""
     values = dict(FLEX_CONFIG)
     if config:
         values.update(config)
-    with _cpu_codegen():
-        bound = kernel.bind(args)
-        return bound.to_code(bound._normalized_config_copy(helion.Config(**values)))
+    return render_flash_config(
+        _flex_kernel(),
+        ("flex", head_dim, dtype, seq),
+        functools.partial(_flex_args, head_dim, dtype, seq),
+        values,
+    )
 
 
 @pytest.mark.parametrize(
@@ -701,6 +718,13 @@ def _dense_attention(
     return out.view(q_in.size())
 
 
+def _dense_args(batch: int, heads: int, seq: int, head_dim: int) -> tuple[object, ...]:
+    torch.manual_seed(0)
+    return tuple(
+        torch.randn(batch, heads, seq, head_dim, dtype=torch.bfloat16) for _ in range(3)
+    )
+
+
 def _render_dense(
     head_dim: int,
     *,
@@ -711,19 +735,16 @@ def _render_dense(
     config: dict[str, object] | None = None,
 ) -> str:
     """The dense (causal or plain) kernel's render at its default config plus
-    ``config`` on CPU tensors."""
-    torch.manual_seed(0)
-    q, k, v = (
-        torch.randn(batch, heads, seq, head_dim, dtype=torch.bfloat16) for _ in range(3)
-    )
+    ``config`` on CPU tensors (one bind per shape and one render per
+    normalized config, shared across the module's tests)."""
     kernel = _dense_causal_attention if causal else _dense_attention
-    kernel.reset()
-    with _cpu_codegen():
-        bound = kernel.bind((q, k, v))
-        values = dict(bound.config_spec.default_config().config)
-        if config:
-            values.update(config)
-        return bound.to_code(bound._normalized_config_copy(helion.Config(**values)))
+    arg_key = (batch, heads, seq, head_dim, torch.bfloat16)
+    make_args = functools.partial(_dense_args, batch, heads, seq, head_dim)
+    bound = bind_flash_kernel(kernel, arg_key, make_args)
+    values = dict(bound.config_spec.default_config().config)
+    if config:
+        values.update(config)
+    return render_flash_config(kernel, arg_key, make_args, values)
 
 
 def _render_dense_causal(
@@ -752,7 +773,7 @@ def test_dense_surface_opens_at_the_new_widths(head_dim: int) -> None:
         torch.randn(2, 4, 2048, head_dim, dtype=torch.bfloat16) for _ in range(3)
     )
     _dense_causal_attention.reset()
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = _dense_causal_attention.bind((q, k, v))
         spec = bound.config_spec
         assert spec.cute_flash_search_enabled
@@ -795,10 +816,26 @@ def test_header_bytes_follow_the_ring_depth() -> None:
     assert max_fa4_kv_depth(FlashScheduleSpec(32, 2, stage_output=True)) == 24
 
 
-@pytest.mark.parametrize("separate", (False, True), ids=("aliased", "separate"))
-@pytest.mark.parametrize("stage_output", (False, True), ids=("direct", "staged"))
-@pytest.mark.parametrize("head_dim", tuple(range(16, 129, 16)))
-def test_byte_model_matches_the_runtime_storage_at_the_cap(
+# All pairs of the three knobs: every fused width meets both the staged and the
+# direct store and both ring layouts, which exercises every term of the byte
+# model (the width scales the tiles, the flags add the output tile and the
+# second ring) without the full 8 x 2 x 2 product.
+@pytest.mark.parametrize(
+    ("head_dim", "stage_output", "separate"),
+    [
+        pytest.param(
+            *row,
+            id=f"d{row[0]}-{'staged' if row[1] else 'direct'}-"
+            f"{'separate' if row[2] else 'aliased'}",
+        )
+        for row in pairwise(
+            head_dim=tuple(range(16, 129, 16)),
+            stage_output=(False, True),
+            separate=(False, True),
+        )
+    ],
+)
+def test_fa4_byte_model_matches_the_runtime_storage_at_the_cap(
     head_dim: int, stage_output: bool, separate: bool
 ) -> None:
     cutlass = importlib.import_module("cutlass")
@@ -978,31 +1015,84 @@ def test_pair_list_walk_searches_the_staged_epilogue() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_single_tile_byte_model_matches_the_runtime_storage() -> None:
+# The single-tile bodies' storage layouts: (s_stage, q_rows, two_cta,
+# k_stage_extra). The single CTA takes one or two score stages and 128 or 64
+# query rows; the cooperative pair halves the KV rows beside two score stages;
+# the extra K ring slot deepens K alone on either body.
+_WS_STORAGE_LAYOUTS: dict[str, tuple[int, int, bool, int]] = {
+    "single": (2, 128, False, 0),
+    "single-s1": (1, 128, False, 0),
+    "single-q64": (2, 64, False, 0),
+    "single-s1-q64": (1, 64, False, 0),
+    "pair": (2, 128, True, 0),
+    "single-extra-k": (2, 128, False, 1),
+    "pair-extra-k": (2, 128, True, 1),
+}
+
+
+@pytest.mark.parametrize("layout", tuple(_WS_STORAGE_LAYOUTS))
+def test_ws_byte_model_matches_the_runtime_storage(layout: str) -> None:
+    """The single-tile bodies' byte model is the runtime ``SharedStorage``
+    size at every fused width above 64, ring depth and store mode."""
     cutlass = importlib.import_module("cutlass")
     flash_shared_storage = importlib.import_module(
         "helion._compiler.cute._flash_runtime"
     ).flash_shared_storage
+    s_stage, q_rows, two_cta, k_stage_extra = _WS_STORAGE_LAYOUTS[layout]
+    kv_rows = 64 if two_cta else 128
     for head_dim in (64, 128, 144, 192, 256):
         for kv_stage in (1, 2, 3, 4):
-            for s_stage in (1, 2):
-                for staged in (False, True):
-                    for q_rows in (128, 64):
-                        runtime = flash_shared_storage(
-                            head_dim,
-                            kv_stage,
-                            s_stage,
-                            cutlass.BFloat16,
-                            o_stage=1 if staged else 0,
-                            q_rows=q_rows,
-                        ).size_in_bytes()
-                        assert runtime == cute_flash._flash_ws_storage_bytes(
-                            head_dim,
-                            kv_stage,
-                            q_tile_m=q_rows,
-                            s_stage=s_stage,
-                            epi_stg=staged,
-                        )
+            for staged in (False, True):
+                runtime = flash_shared_storage(
+                    head_dim,
+                    kv_stage,
+                    s_stage,
+                    cutlass.BFloat16,
+                    o_stage=1 if staged else 0,
+                    q_rows=q_rows,
+                    kv_rows=kv_rows,
+                    two_cta=two_cta,
+                    k_stage=kv_stage + k_stage_extra,
+                ).size_in_bytes()
+                assert runtime == cute_flash._flash_ws_storage_bytes(
+                    head_dim,
+                    kv_stage,
+                    q_tile_m=q_rows,
+                    s_stage=s_stage,
+                    epi_stg=staged,
+                    kv_rows=kv_rows,
+                    two_cta=two_cta,
+                    k_stage_extra=k_stage_extra,
+                ), (head_dim, kv_stage, staged)
+
+
+def test_ws_pair_storage_caps_and_extra_slot_limit() -> None:
+    # The pair's dealloc mbarrier rides in the header's alignment padding.
+    assert cute_flash._flash_ws_storage_bytes(
+        256, 2, q_tile_m=128, s_stage=2, epi_stg=False, kv_rows=64, two_cta=True
+    ) == cute_flash._flash_ws_storage_bytes(
+        256, 2, q_tile_m=128, s_stage=2, epi_stg=False, kv_rows=64
+    )
+    cap = cute_flash._flash_ws_kv_stage_cap
+    assert (
+        cap(256, q_tile_m=128, s_stage=2, epi_stg=False, kv_rows=64, two_cta=True) == 2
+    )
+    assert (
+        cap(192, q_tile_m=128, s_stage=2, epi_stg=False, kv_rows=64, two_cta=True) == 3
+    )
+    assert (
+        cap(256, q_tile_m=128, s_stage=2, epi_stg=True, kv_rows=64, two_cta=True) == 1
+    )
+    limit = cute_flash.FlashScheduleLimits().shared_memory_bytes
+    pair = {
+        "q_tile_m": 128,
+        "s_stage": 2,
+        "epi_stg": False,
+        "kv_rows": 64,
+        "two_cta": True,
+    }
+    assert cute_flash._flash_ws_storage_bytes(256, 2, k_stage_extra=1, **pair) <= limit
+    assert cute_flash._flash_ws_storage_bytes(256, 2, k_stage_extra=2, **pair) > limit
 
 
 def test_single_tile_ring_caps() -> None:
@@ -1106,7 +1196,7 @@ def test_dense_surface_opens_above_128_on_the_single_tile_body(
         torch.randn(2, 4, 2048, head_dim, dtype=torch.bfloat16) for _ in range(3)
     )
     _dense_causal_attention.reset()
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = _dense_causal_attention.bind((q, k, v))
         spec = bound.config_spec
         assert spec.cute_flash_search_enabled
@@ -1223,7 +1313,7 @@ def test_flex_list_walk_runs_on_the_cooperative_pair_above_128() -> None:
         1.0 / math.sqrt(256),
         False,
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = kernel.bind(args)
         spec = bound.config_spec
         assert spec.cute_flash_search_enabled
@@ -1356,7 +1446,7 @@ def test_flex_list_walk_above_128_declines_what_the_pair_cannot_host() -> None:
             False,
         )
         kernel.reset()
-        with _cpu_codegen():
+        with cpu_codegen():
             bound = kernel.bind(args)
             return not bound.config_spec.cute_flash_search_enabled
 
@@ -1475,51 +1565,6 @@ def test_cooperative_pair_falls_back_to_the_single_cta_body() -> None:
             cute_flash.FLASH_PIPELINE_FAMILY_KEY
         ]
         assert "ws_2cta" not in _active(family)
-
-
-def test_cooperative_pair_byte_model_matches_the_runtime_storage() -> None:
-    cutlass = importlib.import_module("cutlass")
-    flash_shared_storage = importlib.import_module(
-        "helion._compiler.cute._flash_runtime"
-    ).flash_shared_storage
-    for head_dim in (128, 192, 256):
-        for kv_stage in (1, 2, 3, 4):
-            for staged in (False, True):
-                runtime = flash_shared_storage(
-                    head_dim,
-                    kv_stage,
-                    2,
-                    cutlass.BFloat16,
-                    o_stage=1 if staged else 0,
-                    q_rows=128,
-                    kv_rows=64,
-                    two_cta=True,
-                ).size_in_bytes()
-                assert runtime == cute_flash._flash_ws_storage_bytes(
-                    head_dim,
-                    kv_stage,
-                    q_tile_m=128,
-                    s_stage=2,
-                    epi_stg=staged,
-                    kv_rows=64,
-                    two_cta=True,
-                )
-    # The pair's dealloc mbarrier rides in the header's alignment padding.
-    assert cute_flash._flash_ws_storage_bytes(
-        256, 2, q_tile_m=128, s_stage=2, epi_stg=False, kv_rows=64, two_cta=True
-    ) == cute_flash._flash_ws_storage_bytes(
-        256, 2, q_tile_m=128, s_stage=2, epi_stg=False, kv_rows=64
-    )
-    cap = cute_flash._flash_ws_kv_stage_cap
-    assert (
-        cap(256, q_tile_m=128, s_stage=2, epi_stg=False, kv_rows=64, two_cta=True) == 2
-    )
-    assert (
-        cap(192, q_tile_m=128, s_stage=2, epi_stg=False, kv_rows=64, two_cta=True) == 3
-    )
-    assert (
-        cap(256, q_tile_m=128, s_stage=2, epi_stg=True, kv_rows=64, two_cta=True) == 1
-    )
 
 
 def test_cooperative_pair_render_structure() -> None:
@@ -1733,7 +1778,7 @@ def test_cooperative_pair_cell_space_enumerates_under_the_qualification_floor() 
     torch.manual_seed(0)
     q, k, v = (torch.randn(4, 8, 4096, 256, dtype=torch.bfloat16) for _ in range(3))
     _dense_causal_attention.reset()
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = _dense_causal_attention.bind((q, k, v))
         gen = ConfigGeneration(bound.config_spec)
         assert gen.flash_structural_coverage_uncovered_values() == []
@@ -1869,8 +1914,51 @@ def test_direct_store_pins_re_canonicalize_the_staged_store_children() -> None:
 
 # Rendering the entire normalized space takes nearly a minute even without
 # other xdist workers contending for the CPU.
-@pytest.mark.timeout(180)
-def test_d256_causal_pair_cell_identities_render_distinct_texts() -> None:
+# The d256 causal cell's exact space, partitioned by knobs the host code echoes
+# verbatim (``_d256_chunk_markers``): every render of a chunk carries its own
+# markers and none of the other values', so two rows of different chunks render
+# distinct texts by construction and only the rows of one chunk need the
+# exhaustive comparison. One case per chunk keeps each under a few seconds
+# where the whole space is some 260 renders.
+_D256_PAIR_CELL_CHUNKS: dict[str, dict[str, object]] = {
+    "ws_overlap": {cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"},
+    **{
+        f"ws_2cta-{'persistent' if persistent else 'grid'}-cluster{cluster}-k{extra}": {
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+            cute_flash.FLASH_PERSISTENT_KEY: persistent,
+            cute_flash.FLASH_PAIR_CLUSTER_KEY: cluster,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: extra,
+        }
+        for persistent in (False, True)
+        for cluster in (1, 2)
+        for extra in (0, 1)
+    },
+}
+
+
+def _d256_chunk_markers(pins: dict[str, object]) -> tuple[list[str], list[str]]:
+    """Host-code substrings every render at ``pins`` carries, and the ones
+    the other values of the same knobs would carry instead."""
+    two_cta = pins[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "ws_2cta"
+    present = [f"'use_2cta_instrs': {two_cta}"]
+    absent = [f"'use_2cta_instrs': {not two_cta}"]
+    if two_cta:
+        persistent = pins[cute_flash.FLASH_PERSISTENT_KEY]
+        present.append(f"'persistent': {persistent},")
+        absent.append(f"'persistent': {not persistent},")
+        cluster = pins[cute_flash.FLASH_PAIR_CLUSTER_KEY]
+        assert cluster in (1, 2)
+        present.append(f"_helion_cute_cluster_shape = ({2 * cluster}, 1, 1)")
+        absent.append(f"_helion_cute_cluster_shape = ({2 * (3 - cluster)}, 1, 1)")
+        if pins[cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY]:
+            present.append("k_stage=3)")
+        else:
+            absent.append("k_stage=")
+    return present, absent
+
+
+@pytest.mark.parametrize("chunk", tuple(_D256_PAIR_CELL_CHUNKS))
+def test_d256_causal_pair_cell_identities_render_distinct_texts(chunk: str) -> None:
     """Every normalized config of the d256 causal cell's exact space renders a
     distinct text: no two identities are one measurement. (Before the
     direct-store pins re-canonicalized the staged store's children, the
@@ -1878,17 +1966,15 @@ def test_d256_causal_pair_cell_identities_render_distinct_texts() -> None:
     of the cell's measured pair configs were duplicates.) At b4 h8 s4096 the
     L2-sized launch group is eight heads, apart from the serial and
     whole-grid groups, so the documented ``0`` / ``num_bh`` alias of the
-    group's strategy names does not occur."""
-    import collections
-
+    group's strategy names does not occur. Each case renders one chunk of
+    the space (``_D256_PAIR_CELL_CHUNKS``) and checks the chunk's markers."""
     from helion.autotuner.config_generation import ConfigGeneration
     from helion.autotuner.surrogate_pattern_search import _FLASH_EXACT_SPACE_RAW_FLOOR
 
-    torch.manual_seed(0)
-    q, k, v = (torch.randn(4, 8, 4096, 256, dtype=torch.bfloat16) for _ in range(3))
-    _dense_causal_attention.reset()
-    with _cpu_codegen():
-        bound = _dense_causal_attention.bind((q, k, v))
+    arg_key = (4, 8, 4096, 256, torch.bfloat16)
+    make_args = functools.partial(_dense_args, 4, 8, 4096, 256)
+    bound = bind_flash_kernel(_dense_causal_attention, arg_key, make_args)
+    with cpu_codegen():
         gen = ConfigGeneration(bound.config_spec)
         space = gen.flash_exact_effective_search_space_configs(
             _FLASH_EXACT_SPACE_RAW_FLOOR
@@ -1899,22 +1985,9 @@ def test_d256_causal_pair_cell_identities_render_distinct_texts() -> None:
             normalized = bound._normalized_config_copy(config)
             key = tuple(sorted((k, repr(v)) for k, v in normalized.config.items()))
             identities.setdefault(key, normalized)
-        texts = {key: bound.to_code(config) for key, config in identities.items()}
     # The exact space is the normalized space: no two of its rows share an
-    # identity, and no two identities share a render.
+    # identity.
     assert len(identities) == len(space)
-    by_text: dict[str, list[dict[str, str]]] = collections.defaultdict(list)
-    for key, text in texts.items():
-        by_text[text].append(dict(key))
-    duplicates = [group for group in by_text.values() if len(group) > 1]
-    assert duplicates == [], [
-        {
-            field: sorted({row[field] for row in group})
-            for field in group[0]
-            if any(row[field] != group[0][field] for row in group)
-        }
-        for group in duplicates
-    ]
     families = collections.Counter(
         dict(key)[cute_flash.FLASH_PIPELINE_FAMILY_KEY] for key in identities
     )
@@ -1927,6 +2000,42 @@ def test_d256_causal_pair_cell_identities_render_distinct_texts() -> None:
             assert row[cute_flash.FLASH_S_STAGE_KEY] == "2"
             assert row[cute_flash.FLASH_EPI_STG_STORE_KEY] == "'slice'"
             assert row[cute_flash.FLASH_EPI_STG_KEY] == "False"
+    # The chunks partition the space: every identity matches exactly one, and
+    # every chunk has rows.
+    by_chunk: dict[str, dict[tuple[tuple[str, str], ...], helion.Config]] = (
+        collections.defaultdict(dict)
+    )
+    for key, config in identities.items():
+        (name,) = [
+            name
+            for name, pins in _D256_PAIR_CELL_CHUNKS.items()
+            if all(config.config[k] == v for k, v in pins.items())
+        ]
+        by_chunk[name][key] = config
+    assert set(by_chunk) == set(_D256_PAIR_CELL_CHUNKS)
+    # This chunk's renders all carry its markers (and none of the other
+    # chunks' values), so they differ from every other chunk's render; among
+    # themselves no two identities share a render.
+    present, absent = _d256_chunk_markers(_D256_PAIR_CELL_CHUNKS[chunk])
+    texts = {
+        key: render_flash_config(_dense_causal_attention, arg_key, make_args, config)
+        for key, config in by_chunk[chunk].items()
+    }
+    for text in texts.values():
+        assert all(marker in text for marker in present), present
+        assert not any(marker in text for marker in absent), absent
+    by_text: dict[str, list[dict[str, str]]] = collections.defaultdict(list)
+    for key, text in texts.items():
+        by_text[text].append(dict(key))
+    duplicates = [group for group in by_text.values() if len(group) > 1]
+    assert duplicates == [], [
+        {
+            field: sorted({row[field] for row in group})
+            for field in group[0]
+            if any(row[field] != group[0][field] for row in group)
+        }
+        for group in duplicates
+    ]
 
 
 # -- (y) the single-tile bodies' issue-stream knobs: the pair's load warp -----------
@@ -2207,49 +2316,6 @@ def test_extra_k_slot_resolves_where_it_fits() -> None:
     resolved = _resolve(256, pair)
     again = _resolve(256, dict(cute_flash.flash_effective_config_values(resolved)))
     assert again.ws_k_stage_extra == 1
-
-
-def test_extra_k_slot_byte_model_matches_the_runtime_storage() -> None:
-    cutlass = importlib.import_module("cutlass")
-    flash_shared_storage = importlib.import_module(
-        "helion._compiler.cute._flash_runtime"
-    ).flash_shared_storage
-    for head_dim in (64, 128, 192, 256):
-        for kv_stage in (1, 2, 3):
-            for two_cta in (False, True):
-                for staged in (False, True):
-                    kv_rows = 64 if two_cta else 128
-                    runtime = flash_shared_storage(
-                        head_dim,
-                        kv_stage,
-                        2,
-                        cutlass.BFloat16,
-                        o_stage=1 if staged else 0,
-                        q_rows=128,
-                        kv_rows=kv_rows,
-                        two_cta=two_cta,
-                        k_stage=kv_stage + 1,
-                    ).size_in_bytes()
-                    assert runtime == cute_flash._flash_ws_storage_bytes(
-                        head_dim,
-                        kv_stage,
-                        q_tile_m=128,
-                        s_stage=2,
-                        epi_stg=staged,
-                        kv_rows=kv_rows,
-                        two_cta=two_cta,
-                        k_stage_extra=1,
-                    ), (head_dim, kv_stage, two_cta, staged)
-    limit = cute_flash.FlashScheduleLimits().shared_memory_bytes
-    pair = {
-        "q_tile_m": 128,
-        "s_stage": 2,
-        "epi_stg": False,
-        "kv_rows": 64,
-        "two_cta": True,
-    }
-    assert cute_flash._flash_ws_storage_bytes(256, 2, k_stage_extra=1, **pair) <= limit
-    assert cute_flash._flash_ws_storage_bytes(256, 2, k_stage_extra=2, **pair) > limit
 
 
 def test_extra_k_slot_is_searched_where_every_row_fits_it() -> None:

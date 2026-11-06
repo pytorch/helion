@@ -5,14 +5,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -106,7 +105,7 @@ def _assert_staged_gemm(code: str, *, root_lane: str = "lane_0") -> None:
 
 def test_simt_gemm_plain_matmul_codegen() -> None:
     kernel = _kernel(_mm_ieee)
-    bound = _cpu_bind(kernel, (torch.ones(64, 256), torch.ones(256, 64)))
+    bound = cpu_bind(kernel, (torch.ones(64, 256), torch.ones(256, 64)))
     config = _simt_config(
         bound,
         block_sizes=[64, 64, 8],
@@ -162,7 +161,7 @@ def test_simt_gemm_knob_requires_fp32_contraction() -> None:
     kernel = helion.kernel(
         _mm_bf16, backend="cute", static_shapes=True, autotune_effort="none"
     )
-    bound = _cpu_bind(
+    bound = cpu_bind(
         kernel,
         (
             torch.ones(64, 256, dtype=torch.bfloat16),
@@ -179,7 +178,7 @@ def test_split_k_barrier_ordered_phases_and_seeds() -> None:
     split_k_matmul = import_example("split_k_barrier").split_k_matmul
 
     kernel = _kernel(split_k_matmul.fn)
-    bound = _cpu_bind(kernel, (torch.ones(128, 4096), torch.ones(4096, 128)))
+    bound = cpu_bind(kernel, (torch.ones(128, 4096), torch.ones(4096, 128)))
     spec = bound.config_spec
     # ``hl.register_tunable`` and the ``cdiv`` / ``next_power_of_2`` prelude
     # are pure metadata: the barrier phases may launch in order.
@@ -312,7 +311,7 @@ def test_universal_path_refuses_subrange_k_with_seeded_accumulator() -> None:
     # does not apply; the universal MmaUniversalOp staging masks against the
     # operand's full K and must not take the sub-range loop either.
     kernel = _kernel(_mm_seeded_split_k)
-    bound = _cpu_bind(
+    bound = cpu_bind(
         kernel, (torch.ones(32, 256), torch.ones(256, 32), torch.ones(32, 32))
     )
     code = bound.to_code(_tile_config(bound, cute_simt_mma=True))
@@ -323,7 +322,7 @@ def test_universal_path_refuses_subrange_k_under_a_device_loop() -> None:
     # Review case (b): the knob off, a sub-range K loop under a device loop;
     # the operand analysis now admits the block, the lowering must not.
     kernel = _kernel(_mm_nested_k)
-    bound = _cpu_bind(kernel, (torch.ones(32, 256), torch.ones(256, 32)))
+    bound = cpu_bind(kernel, (torch.ones(32, 256), torch.ones(256, 32)))
     _assert_scalar_dot(bound.to_code(_tile_config(bound)))
     # Nor the SIMT GEMM: its accumulator lives ahead of the K loop, so the
     # sub-range must subdivide a root tile, not a loop that re-enters it.
@@ -336,14 +335,14 @@ def test_simt_knob_unavailable_for_tf32_contractions() -> None:
     kernel = helion.kernel(
         _mm_ieee, backend="cute", static_shapes=True, autotune_effort="none"
     )
-    bound = _cpu_bind(kernel, (torch.ones(64, 256), torch.ones(256, 64)))
+    bound = cpu_bind(kernel, (torch.ones(64, 256), torch.ones(256, 64)))
     spec = bound.config_spec
     assert not spec.cute_fp32_dot_exact
     assert not spec.cute_simt_mma_enabled
     assert "cute_simt_mma" not in spec._flat_fields()
     with pytest.raises(exc.InvalidConfig, match="cute_simt_mma"):
         spec.normalize(_simt_config(bound, cute_simt_mma=True))
-    exact = _cpu_bind(_kernel(_mm_ieee), (torch.ones(64, 256), torch.ones(256, 64)))
+    exact = cpu_bind(_kernel(_mm_ieee), (torch.ones(64, 256), torch.ones(256, 64)))
     assert (
         exact.config_spec.cute_fp32_dot_exact
         and exact.config_spec.cute_simt_mma_enabled

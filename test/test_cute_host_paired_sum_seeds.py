@@ -9,8 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import checked_initial_population
 from test.test_cute_host_paired_sum import _args
 from test.test_cute_host_paired_sum import _config
@@ -23,6 +21,8 @@ from helion._compiler.autotuner_heuristics.cute_host_paired_sum import (
 from helion._compiler.cute.host_paired_sum import PAIRED_SUM_KEY
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
@@ -31,7 +31,7 @@ import helion.language as hl
 
 layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -72,7 +72,7 @@ def _original(static: bool) -> tuple[BoundKernel, tuple[object, ...]]:
         torch.empty(1024, dtype=torch.bfloat16, requires_grad=True),
         True,
     )
-    return _cpu_bind(kernel, arguments), arguments
+    return cpu_bind(kernel, arguments), arguments
 
 
 def _population(
@@ -150,7 +150,7 @@ def test_ordinary_pair_gets_valid_reachable_seeds_with_independent_nested_lists(
     None
 ):
     arguments = _args()
-    bound = _cpu_bind(_paired, arguments)
+    bound = cpu_bind(_paired, arguments)
     population = _population(bound, arguments)
     assert {config[PAIRED_SUM_KEY] for config in population[:5]} == {
         "off",
@@ -176,7 +176,7 @@ def test_ordinary_pair_gets_valid_reachable_seeds_with_independent_nested_lists(
 
 
 def test_seed_overlay_retains_every_existing_producer_in_order() -> None:
-    bound = _cpu_bind(_paired, _args())
+    bound = cpu_bind(_paired, _args())
     producers = [
         helion.Config(
             block_sizes=[4, 32],
@@ -209,7 +209,7 @@ def test_no_pair_does_not_add_a_host_choice_to_matmul_population() -> None:
         torch.empty((128, 128), dtype=torch.float16),
         torch.empty((128, 128), dtype=torch.float16),
     )
-    bound = _cpu_bind(_ordinary_matmul, arguments)
+    bound = cpu_bind(_ordinary_matmul, arguments)
     assert not bound.config_spec.cute_host_paired_sum_available
     assert all(
         PAIRED_SUM_KEY not in config.config for config in _population(bound, arguments)
@@ -217,7 +217,7 @@ def test_no_pair_does_not_add_a_host_choice_to_matmul_population() -> None:
 
 
 def test_config_roundtrip_and_search_identity() -> None:
-    bound = _cpu_bind(_paired, _args())
+    bound = cpu_bind(_paired, _args())
     choices = ("off", "mapped", "narrow")
     configs = [_config(bound, layout) for layout in choices]
     with bound.env:

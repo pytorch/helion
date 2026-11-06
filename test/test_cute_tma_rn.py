@@ -43,6 +43,8 @@ from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 
+pytestmark = pytest.mark.cpu_only
+
 
 def rn_config(bound, bk=32, wrapped=True):
     values = bound.config_spec._base_default_config().config | {

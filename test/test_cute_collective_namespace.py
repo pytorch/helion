@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.test_cute_collective_register_chain import _chain
 from test.test_cute_collective_register_chain import _fresh
 
@@ -17,7 +16,10 @@ from helion._compiler.cute.collective_epilogue import _scalar_epilogue
 from helion._compiler.cute.collective_register_chain import emit_register_chain
 from helion._compiler.cute.collective_register_chain import plan_register_chain
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -89,7 +91,7 @@ def test_collective_template_names_preserve_tensor_arguments(
         torch.empty((64, 32), dtype=torch.bfloat16, device=CPU_DEVICE),
         torch.empty((32, 32), dtype=torch.bfloat16, device=CPU_DEVICE),
     )
-    bound = _cpu_bind(kernel, inputs)
+    bound = cpu_bind(kernel, inputs)
     config = helion.Config(
         block_sizes=[64, 32, 32, 32],
         num_threads=[4, 32, 1, 1],
@@ -137,7 +139,7 @@ def test_register_chain_epilogue_keeps_scalar_argument_values(
         torch.empty((32, 32), dtype=torch.bfloat16, device=CPU_DEVICE),
         value,
     )
-    bound = _cpu_bind(kernel, inputs)
+    bound = cpu_bind(kernel, inputs)
     config = helion.Config(
         block_sizes=[16, 16, 32, 32],
         num_threads=[4, 16, 1, 1],

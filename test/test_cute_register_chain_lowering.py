@@ -28,6 +28,8 @@ from helion._compiler.cute.collective_register_chain_lowering import (
 )
 from helion._compiler.cute.scalar_recipe import build_recipe
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion._compiler.device_function import DeviceFunction
 

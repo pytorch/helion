@@ -10,8 +10,6 @@ import numpy as np
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_persistent_reduction_coverage import _assert_fragment_norm_coverage
 
 import helion
@@ -20,7 +18,11 @@ from helion._compiler import tile_strategy
 from helion._compiler.cute.interchanged_store_dce import eliminate_interchanged_stores
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 _PAIRS = {
     frozenset(pair)
@@ -545,8 +547,8 @@ def test_column_sums_over_a_lane_looped_row_tile_are_added_once() -> None:
     """Eight rows of a tile on one thread walk a lane loop around the column
     loop; the interchange puts the column loop outside and the kernel holds
     one atomic of the full column sum, with no first pass left."""
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable():
+        bound = cpu_bind(
             helion.kernel(_column_sums_added, backend="cute", autotune_effort="none"),
             (torch.randn(37, 100),),
         )

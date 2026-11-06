@@ -7,15 +7,6 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _forbid_cuda_work
-from test._cute_dense_tcgen05 import atomic_output_mm
-from test._cute_dense_tcgen05 import blackwell_capability
-from test._cute_dense_tcgen05 import cpu_codegen_target
-from test._cute_dense_tcgen05 import extra_store_mm
-from test._cute_dense_tcgen05 import scaled_args
-from test._cute_dense_tcgen05 import scaled_mm
-from test._cute_dense_tcgen05 import scaled_mm_fp32
-
 import helion
 from helion._compiler.autotuner_heuristics.cute_tcgen05_schedule import (
     CuteTcgen05ScheduleHeuristic,
@@ -24,17 +15,25 @@ from helion._compiler.cute.one_cta_pipeline import max_one_cta_pipeline_ab_stage
 from helion._compiler.cute.one_cta_pipeline import one_cta_pipeline_smem_bytes
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import atomic_output_mm
+from helion._testing.cute_dense_tcgen05 import blackwell_capability
+from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
+from helion._testing.cute_dense_tcgen05 import extra_store_mm
+from helion._testing.cute_dense_tcgen05 import scaled_args
+from helion._testing.cute_dense_tcgen05 import scaled_mm
+from helion._testing.cute_dense_tcgen05 import scaled_mm_fp32
 from helion.autotuner.config_generation import ConfigGeneration
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.fixture(autouse=True)
 def _cpu_codegen() -> Iterator[None]:
-    with cpu_codegen_target(), _forbid_cuda_work():
+    with cpu_codegen_target(), forbid_cuda_work():
         yield
 
 

@@ -5,6 +5,7 @@ import contextlib
 import functools
 import importlib
 import importlib.machinery
+import importlib.metadata
 import importlib.util
 import inspect
 import io
@@ -327,6 +328,18 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.version.hip is not None, reason)
 
 
+@functools.cache
+def _has_fbtriton() -> bool:
+    # Meta's fbtriton distribution owns the triton package.
+    return "fbtriton" in importlib.metadata.packages_distributions().get("triton", ())
+
+
+def skipIfFbTriton(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if the Triton backend runs on Meta's fbtriton build."""
+    # Deferred to test time like skipIfTileIR: no CUDA init at collection.
+    return skipIfFn(lambda: _get_backend() == "triton" and _has_fbtriton(), reason)
+
+
 def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with tileir"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
@@ -464,6 +477,63 @@ def matchesBackends(backends: Sequence[str]) -> bool:
     return backend in backends or (backend == "tileir" and "triton" in backends)
 
 
+def _axis_pair(i: int, a: int, j: int, b: int) -> tuple[int, int, int, int]:
+    return (i, a, j, b) if i < j else (j, b, i, a)
+
+
+def pairwise(**axes: Sequence[object]) -> list[tuple[object, ...]]:
+    """Return an all-pairs covering array over ``axes``, in axis order.
+
+    Every value of every axis appears together with every value of every other
+    axis in at least one row, which catches the interactions a full product
+    would while growing with the two largest axes instead of their product
+    (eight boolean flags need 9 rows, not 256). The greedy construction is
+    deterministic, so pytest ids are stable. Use the result as the parameter
+    list of ``pytest.mark.parametrize``.
+    """
+    names = list(axes)
+    values = [list(axes[name]) for name in names]
+    for name, options in zip(names, values, strict=True):
+        if not options:
+            raise ValueError(f"pairwise axis {name!r} has no values")
+    if len(names) == 1:
+        return [(value,) for value in values[0]]
+    uncovered = {
+        (i, a, j, b)
+        for i in range(len(names))
+        for j in range(i + 1, len(names))
+        for a in range(len(values[i]))
+        for b in range(len(values[j]))
+    }
+    rows: list[tuple[int, ...]] = []
+    while uncovered:
+        # Seed the row with the first uncovered pair, then give every other
+        # axis the value that covers the most pairs with the values chosen so
+        # far (lowest index on ties).
+        i, a, j, b = min(uncovered)
+        row = {i: a, j: b}
+        for axis in range(len(names)):
+            if axis in row:
+                continue
+
+            def gain(value: int, axis: int = axis, chosen: dict[int, int] = row) -> int:
+                return sum(
+                    _axis_pair(axis, value, other, index) in uncovered
+                    for other, index in chosen.items()
+                )
+
+            row[axis] = max(range(len(values[axis])), key=lambda v: (gain(v), -v))
+        choice = tuple(row[axis] for axis in range(len(names)))
+        rows.append(choice)
+        for i in range(len(names)):
+            uncovered.difference_update(
+                (i, choice[i], j, choice[j]) for j in range(i + 1, len(names))
+            )
+    return [
+        tuple(values[axis][index] for axis, index in enumerate(row)) for row in rows
+    ]
+
+
 def skipUnlessBackends(backends: Sequence[str]) -> pytest.MarkDecorator:
     """Return a pytest mark that skips unless `_get_backend() in backends`."""
     backend = _get_backend()
@@ -540,6 +610,18 @@ def get_test_float32_matmul_precision() -> str:
 def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
     """Skip test when backend is not Triton (e.g. cute, pallas)."""
     return skipIfFn(lambda: _get_backend() != "triton", reason)
+
+
+def slowIfBackends(backends: Sequence[str]) -> Callable[[Callable], Callable]:
+    """Mark a test ``slow`` only under one of ``backends``.
+
+    For tests whose cost comes from one backend (a CuTe cold compile of
+    every candidate) while the others run them as cheap correctness checks
+    that pull requests should keep.
+    """
+    if matchesBackends(backends):
+        return pytest.mark.slow
+    return lambda test_item: test_item
 
 
 def onlyBackends(

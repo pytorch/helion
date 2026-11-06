@@ -8,16 +8,16 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 from test.test_cute_scalar_staging_sync import _native_matmul
 
 import helion
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 
 matmul_custom_key = import_example("aot_example").matmul_custom_key
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _target(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("HELION_CUTE_MMA_IMPL", "auto")
-    with _cpu_target():
+    with cpu_target():
         yield
 
 

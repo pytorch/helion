@@ -6,12 +6,12 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_flash import seeds_per_codegen_branch
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
 
@@ -82,10 +82,6 @@ def _jagged_inputs(
     )
 
 
-# Every collective seed (about two hundred per shape) is generated on the
-# host; that CPU-bound codegen legitimately runs past the default per-test CI
-# timeout for the two larger shapes.
-@pytest.mark.timeout(300)
 @pytest.mark.parametrize(
     "shape", [(16, 319, 32, 32), (64, 4674, 64, 64), (256, 30856, 128, 128)]
 )
@@ -94,7 +90,7 @@ def test_original_jagged_shapes_have_native_and_warp_fp32_seeds(
 ) -> None:
     batch, rows, k, n = shape
     arguments = _jagged_inputs(batch=batch, rows=rows, k=k, n=n)
-    bound = _cpu_bind(_kernel(), arguments)
+    bound = cpu_bind(_kernel(), arguments)
     assert bound.host_function is not None
     assert bound.host_function.device_ir.grid_block_ids == [[0, 2]]
     assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
@@ -108,6 +104,25 @@ def test_original_jagged_shapes_have_native_and_warp_fp32_seeds(
         "tcgen05",
     }
     for seed in seeds:
+        # Every seed is a collective MMA over one batch element per tile.
+        assert seed.config["cute_collective_mma"] is True
+        assert seed.block_sizes[0] == 1
+        assert seed.get("cute_collective_compute", "warp") in {"warp", "tcgen05"}
+    # The collective codegen branches on the compute unit, operand copy,
+    # operand recipe and epilogue; the other seed axes (tile shape, thread
+    # layout, stage count) re-parameterize the same text, so render the first
+    # seed of each branch and the last seed of each compute unit instead of
+    # all (about two hundred per shape).
+    for seed in seeds_per_codegen_branch(
+        seeds,
+        lambda seed: (
+            seed.get("cute_collective_compute", "warp"),
+            seed.get("cute_collective_copy"),
+            seed.get("cute_collective_recipe"),
+            seed.get("cute_collective_epilogue"),
+        ),
+        last_per=lambda seed: seed.get("cute_collective_compute", "warp"),
+    ):
         source = bound.to_code(seed)
         ast.parse(source)
         if seed.get("cute_collective_compute", "warp") == "tcgen05":
@@ -123,7 +138,7 @@ def test_original_jagged_shapes_have_native_and_warp_fp32_seeds(
 
 @pytest.mark.parametrize("precision", ["ieee", "tf32x3"])
 def test_exact_fp32_precision_keeps_scalar_fallback(precision: str) -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _kernel(precision=precision), _jagged_inputs(batch=3, rows=137, k=78, n=128)
     )
     assert bound.host_function is not None
@@ -138,7 +153,7 @@ def test_exact_fp32_precision_keeps_scalar_fallback(precision: str) -> None:
 
 
 def test_fp32_does_not_fall_through_to_half_warp_mma() -> None:
-    bound = _cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=137, k=78, n=128))
+    bound = cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=137, k=78, n=128))
     source = bound.to_code(_config(compute="warp"))
     assert "warp.MmaTF32Op((16, 8, 8))" in source
     assert "cute.gemm(" in source
@@ -151,7 +166,7 @@ def test_fp32_does_not_fall_through_to_half_warp_mma() -> None:
 def test_computed_batched_fp32_tail_uses_native_collective(
     tile: tuple[int, int, int], static_shapes: bool
 ) -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _kernel(batched=True, static_shapes=static_shapes),
         (torch.empty((3, 130, 78)), torch.empty((3, 78, 70))),
     )
@@ -164,7 +179,7 @@ def test_computed_batched_fp32_tail_uses_native_collective(
 
 
 def test_multiple_batch_elements_cannot_share_one_collective_tile() -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _kernel(batched=True), (torch.empty((3, 130, 78)), torch.empty((3, 78, 70)))
     )
     config = _config()
@@ -186,6 +201,9 @@ def _require_sm100() -> None:
         pytest.skip("requires SM100-family")
 
 
+# 18 cases: the shapes put K below, at and above the 64-wide K tile (a masked
+# K tail, one exact tile, two tiles) and N on both collective N tiles; each
+# copy/compute/recipe triple is its own operand-staging and MMA code path.
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "shape", [(16, 319, 32, 32), (64, 4674, 64, 64), (256, 30856, 128, 128)]

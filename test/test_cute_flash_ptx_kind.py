@@ -22,7 +22,7 @@ import cutlass
 from helion._compiler.cute import _flash_gemm_ptx as flash_ptx
 from helion._testing import skipUnlessBackends
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def test_mma_kind_for_dtype() -> None:

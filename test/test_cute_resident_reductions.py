@@ -14,7 +14,7 @@ from helion._compiler.cute.resident_reductions import feature_index_expression
 from helion._compiler.cute.resident_reductions import materialize_resident_reductions
 from helion._testing import skipUnlessBackends
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 _FEATURES = 16
 _TENSORS = ("x", "dy", "weight", "mean", "scale", "out", "partial")

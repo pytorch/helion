@@ -9,7 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from ._cute_aux import _cpu_codegen
 from .test_cute_tile_loop_vec_hoist import _reduction_kernel
 import helion
 from helion._compiler.tile_strategy import DeviceGridState
@@ -17,6 +16,7 @@ from helion._compiler.tile_strategy import PerThreadNDTileStrategy
 from helion._compiler.tile_strategy import VecLaneWrapper
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
 from helion.language.memory_ops import _cute_register_tile_unroll_vec_store
 
@@ -133,7 +133,7 @@ def _config() -> helion.Config:
 
 
 def _code(args: tuple[Any, ...], kernel: Any) -> str:
-    with _cpu_codegen():
+    with cpu_codegen():
         return kernel._bind_isolated(args).to_code(_config())
 
 
@@ -171,7 +171,7 @@ def test_horizontal_tile_index_aliases_do_not_disable_vectorization() -> None:
         torch.empty((2, 2048), dtype=torch.bfloat16),
         torch.empty((512,), dtype=torch.bfloat16),
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _horizontal_tile_indices._bind_isolated(args).to_code(
             _horizontal_config()
         )
@@ -321,7 +321,7 @@ def test_two_pass_reduction_still_vectorizes(monkeypatch: pytest.MonkeyPatch) ->
         num_threads=[0, 32],
         cute_vector_widths=[1, 8],
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _reduction_kernel._bind_isolated(
             (torch.empty((2, 2048), dtype=torch.float16),)
         ).to_code(config)

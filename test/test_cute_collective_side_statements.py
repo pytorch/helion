@@ -16,13 +16,12 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-from test.test_cute_fuse_mm_accumulation import _cpu_target
-
 import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -190,8 +189,8 @@ def test_per_element_statements_beside_collective_matmul_are_refused(
         torch.empty((256, 256), dtype=torch.float32),
     )
     with (
-        _mock_cuda_unavailable(),
-        _cpu_target(),
+        mock_cuda_unavailable(),
+        cpu_target(),
         pytest.raises(exc.BackendUnsupported, match="beside a collective matmul"),
     ):
         bound = kernel._bind_isolated(args)  # pyrefly: ignore [missing-attribute]

@@ -15,6 +15,8 @@ from helion._compiler.cute.grouped_row_union import PAIRED_CLC
 from helion._compiler.cute.grouped_row_union import GroupedRowUnionPlan
 from helion._testing import skipUnlessBackends
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 

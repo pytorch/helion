@@ -25,7 +25,7 @@ from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.language import memory_ops
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from typing import Any

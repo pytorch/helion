@@ -1,3 +1,5 @@
+"""CPU-only CuTe code generation helpers shared by the test suite."""
+
 from __future__ import annotations
 
 from contextlib import ExitStack
@@ -14,22 +16,27 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
 from torch.utils._pytree import tree_leaves
 
-from helion._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
-from helion._utils import triton_is_available
+from .._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
+from .._utils import triton_is_available
+from . import patch_cute_mma_support
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable
+    from collections.abc import Generator
     from unittest.mock import MagicMock
 
+    from ..runtime.kernel import BoundKernel
+    from ..runtime.kernel import Kernel
 
-def _require_cute_codegen() -> None:
+
+def require_cute_codegen() -> None:
     # Source generation imports SDK types even when native compilation is
     # forbidden. Keep these tests runnable in Triton-only installations.
     if reason := _cute_backend_requirement_error():
         raise SkipTest(reason)
 
 
-def _codegen_skip_reason(backend: str) -> str | None:
+def codegen_skip_reason(backend: str) -> str | None:
     """Report why ``backend`` cannot generate source, without raising."""
     if backend == "cute":
         return _cute_backend_requirement_error()
@@ -38,13 +45,18 @@ def _codegen_skip_reason(backend: str) -> str | None:
     return None
 
 
-def _cpu_bind(kernel, args, *, capability: tuple[int, int] | None = (10, 0)):
+def cpu_bind(
+    kernel: Kernel[object],
+    args: tuple[object, ...],
+    *,
+    capability: tuple[int, int] | None = (10, 0),
+) -> BoundKernel[object]:
     """Bind ``kernel`` for code generation on a CPU-only process.
 
     ``capability`` is the compute capability the bound kernel targets; ``None``
     models an unknown target (``target_device_capability`` without CUDA).
     """
-    if reason := _codegen_skip_reason(kernel.settings.backend):
+    if reason := codegen_skip_reason(kernel.settings.backend):
         raise SkipTest(reason)
     with ExitStack() as stack:
         for name, value in (
@@ -61,12 +73,12 @@ def _cpu_bind(kernel, args, *, capability: tuple[int, int] | None = (10, 0)):
 
 
 @contextmanager
-def _mock_cuda_unavailable() -> Iterator[None]:
+def mock_cuda_unavailable() -> Generator[None, None, None]:
     """Model CPU code generation without filling process-wide device caches."""
     with (
         patch(
             "helion._compiler.cute.backend.CuteBackend.validate_environment",
-            side_effect=_require_cute_codegen,
+            side_effect=require_cute_codegen,
         ),
         patch("torch.cuda.is_available", return_value=False),
         patch("helion._compat._supports_maxnreg", return_value=False),
@@ -79,7 +91,7 @@ def _mock_cuda_unavailable() -> Iterator[None]:
 
 
 @contextmanager
-def _forbid_native_compile() -> Iterator[list[MagicMock]]:
+def forbid_native_compile() -> Generator[list[MagicMock], None, None]:
     """Fail if CuTe DSL compilation runs; a no-op when cutlass is not installed."""
     with ExitStack() as stack:
         mocks: list[MagicMock] = []
@@ -94,12 +106,12 @@ def _forbid_native_compile() -> Iterator[list[MagicMock]]:
 
 
 @contextmanager
-def _forbid_cuda_work() -> Iterator[None]:
+def forbid_cuda_work() -> Generator[None, None, None]:
     """Guard this test even when an earlier test initialized the CUDA context."""
     initialized = torch.cuda.is_initialized()
     with ExitStack() as stack:
-        stack.enter_context(_RejectNativeCuda())
-        guards = stack.enter_context(_forbid_native_compile())
+        stack.enter_context(RejectNativeCuda())
+        guards = stack.enter_context(forbid_native_compile())
         guards.extend(
             stack.enter_context(
                 patch(target, side_effect=AssertionError("CUDA work forbidden"))
@@ -121,10 +133,16 @@ def _forbid_cuda_work() -> Iterator[None]:
         assert torch.cuda.is_initialized() == initialized
 
 
-class _RejectNativeCuda(TorchDispatchMode):
+class RejectNativeCuda(TorchDispatchMode):
     """Stop direct ATen dispatch before it can reach a live CUDA context."""
 
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+    def __torch_dispatch__(
+        self,
+        func: Callable[..., object],
+        types: object,
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
         kwargs = {} if kwargs is None else kwargs
         inputs = tree_leaves((args, kwargs))
         fake_modes = [
@@ -162,3 +180,52 @@ class _RejectNativeCuda(TorchDispatchMode):
             ):
                 raise AssertionError("CUDA result forbidden by dispatch guard")
         return result
+
+
+@contextmanager
+def cpu_target() -> Generator[None, None, None]:
+    """Generate tcgen05 CuTe source for a 148-SM sm100 target without CUDA.
+
+    Extends ``mock_cuda_unavailable`` with the compute capability, SM count and
+    tcgen05 shared-memory budget the schedule heuristics read, and fails the
+    test if anything initializes CUDA.
+    """
+    with ExitStack() as stack:
+        stack.enter_context(patch_cute_mma_support())
+        stack.enter_context(mock_cuda_unavailable())
+        stack.enter_context(
+            patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU test"))
+        )
+        for name, value in (
+            ("helion.runtime.kernel.target_device_capability", (10, 0)),
+            ("helion._compiler.compile_environment.target_device_capability", (10, 0)),
+            ("helion.runtime.get_num_sm", 148),
+            ("helion._compat._is_hip", False),
+            (
+                (
+                    "helion._compiler.cute.tcgen05_config."
+                    "CuteTcgen05Config.per_cta_smem_budget_bytes"
+                ),
+                232448,
+            ),
+        ):
+            stack.enter_context(patch(name, return_value=value))
+        yield
+
+
+def cuda_fake(backend: object, tensor: torch.Tensor) -> torch.Tensor:
+    """Stand-in for ``CuteBackend.normalize_input_fake_tensor`` on a CPU process.
+
+    Re-homes a CPU fake tensor on ``cuda:0`` so CuTe code generation sees device
+    inputs without a CUDA context.
+    """
+    assert isinstance(tensor, FakeTensor)
+    with torch._C._DisableTorchDispatch():
+        meta = torch.empty_strided(
+            tensor.shape,
+            tensor.stride(),
+            dtype=tensor.dtype,
+            device=torch.device("meta"),
+            requires_grad=tensor.requires_grad,
+        )
+    return FakeTensor(tensor.fake_mode, meta, torch.device("cuda:0"))

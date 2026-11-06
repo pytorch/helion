@@ -9,7 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_full_slice_matmul import _bind
 from test.test_cute_materialized_fission import _se_args
@@ -21,8 +20,11 @@ from helion._compiler.cute.mma_support import CuteMmaSupport
 from helion._compiler.generate_ast import GenerateAST
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.language import memory_ops
+
+pytestmark = pytest.mark.cpu_only
 
 squeeze_and_excitation_net_fwd = import_example(
     "squeeze_and_excitation_net"
@@ -41,7 +43,7 @@ def _native_cpu_target() -> Generator[None, None, None]:
     )
     with (
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "helion._compiler.cute.mma_support.get_cute_mma_support",

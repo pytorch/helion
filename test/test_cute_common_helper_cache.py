@@ -10,6 +10,8 @@ import pytest
 from helion.runtime.cute import launcher
 from helion.runtime.cute import source_dependencies
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from pathlib import Path
 

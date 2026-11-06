@@ -20,7 +20,7 @@ from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.language import tile_ops
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel

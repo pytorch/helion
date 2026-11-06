@@ -21,6 +21,8 @@ from helion._compiler.cute import pipeline_state_loads
 from helion._compiler.cute.scalar_recipe import PURE_HELPERS
 from helion._compiler.cute.scalar_recipe import build_recipe
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Mapping

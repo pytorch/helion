@@ -22,7 +22,7 @@ import helion.language as hl
 from helion.language import register_block_size as choose_block
 from helion.language import specialize as specialize_shape
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Callable

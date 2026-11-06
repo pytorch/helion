@@ -9,6 +9,7 @@ from unittest.mock import Mock
 from unittest.mock import patch
 
 from packaging.version import Version
+import pytest
 import torch
 
 from helion._argument_device import _find_argument_device
@@ -16,6 +17,8 @@ from helion._utils import triton_is_available
 from helion.runtime.config import Config
 from helion.runtime.precompile_shim import _device_probe_values
 from helion.runtime.precompile_shim import make_precompiler
+
+pytestmark = pytest.mark.cpu_only
 
 
 @unittest.skipUnless(triton_is_available(), "requires Triton")

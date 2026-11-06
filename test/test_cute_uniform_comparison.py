@@ -12,9 +12,6 @@ import pytest
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
 from helion._compiler.compile_environment import CompileEnvironment
@@ -25,8 +22,12 @@ from helion._compiler.cute.uniform_comparison import lower_uniform_comparisons
 from helion._compiler.cute.uniform_comparison import match_uniform_float_gt
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.language.random_ops import _uint32_to_uniform_float
+
+pytestmark = pytest.mark.cpu_only
 
 _examples_low_mem_dropout = import_example("low_mem_dropout")
 low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
@@ -36,7 +37,7 @@ low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 @pytest.fixture(autouse=True)
 def _cpu_only():
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
@@ -355,7 +356,7 @@ def test_original_dropout_hoists_one_cutoff_and_preserves_host_and_philox(
             autotune_effort="none",
             cute_rng_stream="word0",
         )
-        bound = _cpu_bind(kernel, (0.25, torch.empty(513), 123))
+        bound = cpu_bind(kernel, (0.25, torch.empty(513), 123))
         return bound.to_code(_config(width))
 
     actual = ast.parse(code())
@@ -398,7 +399,7 @@ def test_original_dropout_hoists_one_cutoff_and_preserves_host_and_philox(
 
 @skipUnlessBackends(["cute"])
 def test_observable_uniform_keeps_original_cast_scale_and_store():
-    bound = _cpu_bind(_observe_uniform, (torch.empty(513), 0.25, 123))
+    bound = cpu_bind(_observe_uniform, (torch.empty(513), 0.25, 123))
     source = bound.to_code(_config(1))
     assert "uniform_cutoff(p)" in source
     assert "4.6566127342e-10" in source
@@ -425,7 +426,7 @@ def test_pointwise_seed_discovery_is_unchanged():
             autotune_effort="none",
             cute_rng_stream="word0",
         )
-        bound = _cpu_bind(kernel, (0.25, torch.empty(262144), 123))
+        bound = cpu_bind(kernel, (0.25, torch.empty(262144), 123))
         assert bound.config_spec.pointwise_facts
         with bound.env:
             return CutePointwiseVecHeuristic.get_seed_configs(

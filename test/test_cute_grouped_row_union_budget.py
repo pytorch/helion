@@ -8,8 +8,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_grouped_coverage_search import _bound
 from test.test_cute_grouped_row_union_cluster4 import selected
 from test.test_cute_grouped_row_union_cluster4 import wrapper
@@ -22,7 +20,11 @@ from helion._compiler.cute.grouped_row_union import TRANSPOSED
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import BackendUnsupported
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -37,7 +39,7 @@ def cpu_only() -> Generator[None, None, None]:
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")),
         patch("torch.cuda.current_device", side_effect=AssertionError("CUDA metadata")),
         patch(
@@ -48,7 +50,7 @@ def cpu_only() -> Generator[None, None, None]:
             "torch.cuda.get_device_capability",
             side_effect=AssertionError("CUDA metadata"),
         ),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         _target(),
     ):
         yield

@@ -7,13 +7,13 @@ import numpy as np
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.test_cute_collective_chunk_seeds import _partitioned_matmul
 
 import helion
 from helion._compiler.cute.collective_warp_pipeline import pipeline_collective_loop
 from helion._compiler.cute.collective_warp_pipeline import signed_int32_bound
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
@@ -249,7 +249,7 @@ def test_pipeline_codegen_and_config_transfer(stages: int) -> None:
         torch.empty((64, 16384), dtype=torch.float16),
         torch.empty((16384, 128), dtype=torch.float16),
     )
-    bound = _cpu_bind(_partitioned_matmul, inputs)
+    bound = cpu_bind(_partitioned_matmul, inputs)
     config = _config(stages, partitions=64)
     with bound.env:
         normalized = bound.config_spec.normalized_config(config)
@@ -272,7 +272,7 @@ def test_pipeline_seed_survives_chunk_seed_transfer() -> None:
         torch.empty((64, 16384), dtype=torch.float16),
         torch.empty((16384, 128), dtype=torch.float16),
     )
-    bound = _cpu_bind(_partitioned_matmul, inputs)
+    bound = cpu_bind(_partitioned_matmul, inputs)
     with bound.env:
         generation = ConfigGeneration(bound.config_spec)
         seeds = [config for _flat, config in generation.seed_flat_config_pairs()]

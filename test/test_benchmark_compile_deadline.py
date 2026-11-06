@@ -18,6 +18,7 @@ import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -36,6 +37,8 @@ from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.runtime.config import Config
 from helion.runtime.settings import Settings
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from helion.autotuner.precompile_future import SerializedCompiledFunction
@@ -89,6 +92,10 @@ class _CountCalls:
 
 
 class TestWorkerCompileDeadline(unittest.TestCase):
+    """Real spawn workers: the slow tier, except the watchdog test, which kills
+    its worker at the half-second compile deadline and is the smoke test."""
+
+    @pytest.mark.slow
     def test_compile_deadline_kills_a_worker_stuck_in_compile(self) -> None:
         worker = BenchmarkWorker()
         try:
@@ -108,6 +115,7 @@ class TestWorkerCompileDeadline(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    @pytest.mark.slow
     def test_benchmark_timeout_counts_from_the_compiled_report(self) -> None:
         worker = BenchmarkWorker()
         try:
@@ -133,6 +141,7 @@ class TestWorkerCompileDeadline(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    @pytest.mark.slow
     def test_a_job_without_phases_keeps_the_whole_job_timeout(self) -> None:
         worker = BenchmarkWorker()
         try:
@@ -146,6 +155,7 @@ class TestWorkerCompileDeadline(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    @pytest.mark.slow
     def test_phase_reports_are_ignored_without_a_compile_deadline(self) -> None:
         worker = BenchmarkWorker()
         try:

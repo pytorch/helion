@@ -292,18 +292,19 @@ def _interpret_triton_selection(source, inputs, path, monkeypatch, selected_ops=
     return vars(module)[function](*inputs, _launcher=launch)
 
 
-@pytest.mark.parametrize("largest", [False, True])
+# The automatic dispatch sorts only one block row of four warps at k >= 32
+# over the 769-wide input; the rows sit on each side of those boundaries,
+# with each direction seen at every k.
 @pytest.mark.parametrize(
-    ("k", "warps", "rows_per_program"),
+    ("k", "warps", "rows_per_program", "largest"),
     [
-        (16, 4, 1),
-        (16, 8, 1),
-        (32, 4, 1),
-        (32, 8, 1),
-        (64, 4, 1),
-        (64, 8, 1),
-        (64, 4, 2),
-        (64, 4, 4),
+        (16, 4, 1, False),  # k below the sort threshold
+        (16, 8, 1, True),
+        (32, 4, 1, False),  # the smallest sorted k
+        (32, 8, 1, True),  # eight warps keep top-k
+        (64, 4, 1, True),  # the largest k
+        (64, 8, 1, False),
+        (64, 4, 4, True),  # several rows per program keep top-k
     ],
 )
 @skipIfRefEager("executes generated automatic dispatch through the CPU interpreter")

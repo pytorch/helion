@@ -10,7 +10,7 @@ import torch
 from torch.overrides import TorchFunctionMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from test._cute_binding import _mock_cuda_unavailable
+from helion._testing.cute_codegen import mock_cuda_unavailable
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
@@ -22,6 +22,8 @@ from helion.runtime.cute import paired_sum
 from helion.runtime.cute.paired_sum import plan_for_pair
 from helion.runtime.cute.paired_sum import sum_plan
 from helion.runtime.cute.paired_sum import try_paired_sum_cast
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -38,7 +40,7 @@ _requires_pinned_aten_build = pytest.mark.skipif(
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield

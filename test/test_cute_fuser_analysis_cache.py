@@ -11,6 +11,8 @@ from helion._compiler.ast_read_writes import ReadWrites
 from helion._compiler.cute.fuse_two_pass_loads import _AnalysisCache
 from helion._compiler.cute.fuse_two_pass_loads import _CuteFuseTwoPassLoads
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _definitions(values: dict[str, ast.expr]) -> dict[str, str]:
     return {name: ast.dump(value) for name, value in values.items()}

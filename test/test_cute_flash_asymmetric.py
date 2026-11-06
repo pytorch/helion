@@ -27,6 +27,8 @@ from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion.autotuner.config_fragment import ConfigSpecFragment
 

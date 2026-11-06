@@ -6,11 +6,15 @@ from typing import cast
 import unittest
 from unittest import mock
 
+import pytest
+
 from helion._compiler import backend_registry
 from helion.language._decorators import APIFunc
 from helion.language._decorators import CodegenDict
 from helion.language._decorators import api
 from helion.language._decorators import codegen
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _stub_common(state: object) -> str:

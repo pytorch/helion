@@ -15,6 +15,8 @@ from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def phase():

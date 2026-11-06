@@ -8,9 +8,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.ast_extension import ExtendedAST
 from helion._compiler.cute.promote_output_axis import _fresh_tensors
@@ -22,13 +19,15 @@ from helion._compiler.type_info import SequenceType
 from helion._compiler.type_info import TileIndexType
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 jagged_dense_bmm = import_example("jagged_dense_bmm").jagged_dense_bmm
 moe_matmul_ogs = import_example("moe_matmul_ogs").moe_matmul_ogs
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 CPU_DEVICE = "cpu"
 
@@ -265,14 +264,14 @@ def _dynamic_columns(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
 def _bind(kernel: Kernel[torch.Tensor], *args: object) -> BoundKernel[torch.Tensor]:
     """Trace and generate source on CPU; no CUDA allocation or launch occurs.
 
-    ``_mock_cuda_unavailable`` models one target whatever the host holds: the
+    ``mock_cuda_unavailable`` models one target whatever the host holds: the
     structural detectors read the process's device (``get_cute_mma_support``
     behind the flash search surface), so on a Blackwell host the fp8 attention
     kernel below would otherwise bind to the fused flash surface, whose
     normalization pins the block sizes these renders assert.
     """
-    with _mock_cuda_unavailable():
-        return _cpu_bind(kernel, tuple(args))
+    with mock_cuda_unavailable():
+        return cpu_bind(kernel, tuple(args))
 
 
 def _input() -> torch.Tensor:

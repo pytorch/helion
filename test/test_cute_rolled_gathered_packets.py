@@ -12,6 +12,8 @@ import pytest
 from helion._compiler.cute.memory_ops import _cute_looped_unroll_uniform_definitions
 from helion._compiler.cute.memory_ops import _cute_relocate_above_vloop
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion._compiler.inductor_lowering import CodegenState
     from helion._compiler.reduction_strategy import LoopedReductionStrategy

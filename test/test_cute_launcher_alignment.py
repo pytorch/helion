@@ -18,6 +18,10 @@ import torch
 from helion._testing import skipUnlessCuteAvailable
 from helion.runtime.cute import launcher
 
+# Not a cpu_only module: test_fast_relaunch_capi_executor_raises_cuda_errors
+# raises the DSL's real CUDA error, whose name lookup loads libcuda, and the
+# CPU-lane runners have no driver library.
+
 
 @dataclasses.dataclass
 class _Pointer:

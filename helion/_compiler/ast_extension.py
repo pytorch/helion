@@ -20,6 +20,8 @@ from .source_location import UnknownLocation
 from .source_location import current_location
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from collections.abc import Iterator
     from collections.abc import Sequence
     import types
 
@@ -156,6 +158,26 @@ def clone_ast(value: object) -> object:
             return value.copy(**fields)
         return ast.copy_location(type(value)(**fields), value)
     return value
+
+
+# In source order: a try statement's handlers and else come before its finally.
+_STATEMENT_LIST_FIELDS = ("body", "handlers", "orelse", "finalbody", "cases")
+
+
+def iter_statements(body: Iterable[ast.AST]) -> Iterator[ast.stmt]:
+    """Yield every statement of ``body`` and of the blocks nested in it.
+
+    A statement-only walk: the expressions of each statement are skipped, so
+    a pass whose trigger is a statement shape (a lane loop, an assignment) can
+    scan a kernel body for it at a fraction of ``ast.walk``'s cost.
+    """
+    for stmt in body:
+        if isinstance(stmt, ast.stmt):
+            yield stmt
+        for field in _STATEMENT_LIST_FIELDS:
+            child = getattr(stmt, field, None)
+            if isinstance(child, list):
+                yield from iter_statements(child)
 
 
 def create(cls: type[_T], **fields: object) -> _T:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.metadata
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import TYPE_CHECKING
@@ -10,6 +11,7 @@ from typing import Any
 import warnings
 
 from _pytest._io.saferepr import saferepr
+from _pytest.mark.expression import Expression
 import psutil
 import pytest
 
@@ -150,27 +152,60 @@ def _free_device_memory_gib() -> float | None:
     return None
 
 
-def _gpu_num_workers() -> int | None:
-    """Workers that fit the GPU: 0 (serial) below two, None without a GPU."""
+def _cpu_lane(config: pytest.Config) -> bool:
+    """Whether this run is the CPU lane: ``HELION_TEST_LANE=cpu`` (set by CI)
+    or an ``-m`` expression that selects only ``cpu_only`` items.
+
+    ``-m "not cpu_only"`` is the GPU lane and ``-m "not slow"`` selects
+    everything, so neither counts.
+    """
+    if os.environ.get("HELION_TEST_LANE") == "cpu":
+        return True
+    markexpr = config.getoption("markexpr", None) or ""
+    if not markexpr:
+        return False
+    try:
+        expression = Expression.compile(markexpr)
+    except SyntaxError:
+        # What pytest >= 9 raises for a malformed expression (8 had its own
+        # ParseError); pytest reports it itself.
+        return False
+    return expression.evaluate(
+        lambda name, **kwargs: name == "cpu_only"
+    ) and not expression.evaluate(lambda name, **kwargs: False)
+
+
+def _default_num_workers(config: pytest.Config) -> int | None:
+    """Workers that fit the GPU: 0 (serial) below two, None without a GPU.
+
+    The CPU lane only generates source, so without a GPU it gets one
+    single-threaded worker per CPU (under the GPU cap, for memory). Other runs
+    without an NVIDIA, ROCm, or XPU device (Metal, TPU, plain CPU) stay serial,
+    as their device runtimes expect.
+    """
     free_gib = _free_device_memory_gib()
     if free_gib is None:
-        return None
-    workers = min(
-        int(free_gib // _GPU_GIB_PER_WORKER),
-        _num_cpus() // _CPUS_PER_WORKER,
-        _MAX_WORKERS,
-    )
+        if not _cpu_lane(config):
+            return None
+        workers = min(_num_cpus(), _MAX_WORKERS)
+    else:
+        workers = min(
+            int(free_gib // _GPU_GIB_PER_WORKER),
+            _num_cpus() // _CPUS_PER_WORKER,
+            _MAX_WORKERS,
+        )
     # A single worker only adds xdist's startup cost to a serial run.
     return workers if workers >= 2 else 0
 
 
 @pytest.hookimpl(optionalhook=True)
 def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
-    # Size ``-n auto`` to the GPU rather than xdist's default of one worker per
-    # CPU, unless PYTEST_XDIST_AUTO_NUM_WORKERS (read by xdist) overrides it.
+    # Size ``-n auto`` to the GPU (or the CPUs without one) rather than xdist's
+    # default of one worker per CPU, unless PYTEST_XDIST_AUTO_NUM_WORKERS (read
+    # by xdist) overrides it.
     if os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS"):
         return None
-    return _gpu_num_workers()
+    return _default_num_workers(config)
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -180,10 +215,10 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
     if not config.pluginmanager.hasplugin("xdist") or hasattr(config, "workerinput"):
         return
     option = config.option
-    # Without -n, run in parallel on a GPU, except where one process is
-    # expected: -s, --pdb, --trace, --collect-only, and a pytest run started
-    # from inside a test (PYTEST_CURRENT_TEST is set while one runs), which
-    # observes its own reports in order.  -n0 runs serially.
+    # Without -n, run in parallel, except where one process is expected: -s,
+    # --pdb, --trace, --collect-only, and a pytest run started from inside a
+    # test (PYTEST_CURRENT_TEST is set while one runs), which observes its own
+    # reports in order.  -n0 runs serially.
     if (
         option.numprocesses is None
         and not option.tx
@@ -191,12 +226,124 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
         and not (option.usepdb or option.trace or option.collectonly)
         and "PYTEST_CURRENT_TEST" not in os.environ
     ):
-        option.numprocesses = _gpu_num_workers()
+        option.numprocesses = _default_num_workers(config)
     # worksteal lets idle workers take tests queued behind a long-running one;
     # xdist's default "load" scheduler leaves them stuck on a single worker
     # (e.g. the FLA-backed linear examples serialized into a ~16 min tail).
     if option.numprocesses and option.dist == "no":
         option.dist = "worksteal"
+
+
+def _active_backend() -> str:
+    # Mirrors helion.runtime.settings._get_backend without importing torch into
+    # the xdist controller; tileir shares the Triton tests (matchesBackends).
+    backend = os.environ.get("HELION_BACKEND", "triton").strip().lower()
+    return "triton" if backend == "tileir" else backend
+
+
+def _module_of(item: pytest.Item) -> str:
+    # The rootdir-relative module path, the key of test/shard_durations.json.
+    return item.nodeid.split("::", 1)[0]
+
+
+def _cute_module(path: Path) -> bool:
+    # test_cute_*.py modules hard-code backend="cute" on their kernels, so they
+    # test the same code under every HELION_BACKEND; only the CuTe lane
+    # collects them. Other modules gate CuTe-only tests with onlyBackends and
+    # friends.
+    return path.name.startswith("test_cute_") and path.suffix == ".py"
+
+
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+    # Skipped before import: the 600+ CuTe modules otherwise cost every
+    # non-CuTe run their import and collection.
+    if _active_backend() != "cute" and _cute_module(collection_path):
+        return True
+    return None
+
+
+def pytest_report_header(config: pytest.Config) -> list[str]:
+    backend = _active_backend()
+    lines = [f"helion backend: {backend}"]
+    if backend != "cute":
+        lines.append(
+            "test_cute_*.py modules are not collected (set HELION_BACKEND=cute)"
+        )
+    if shard := os.environ.get("HELION_TEST_SHARD"):
+        lines.append(
+            f"helion test shard: {shard} (modules balanced by "
+            "test/shard_durations.json)"
+        )
+    return lines
+
+
+def _shard() -> tuple[int, int]:
+    """The ``HELION_TEST_SHARD=i/n`` split of this run, ``(0, 1)`` without one.
+
+    A pytest run started from inside a test (PYTEST_CURRENT_TEST is set while
+    one runs) inherits the variable but collects its own few modules, which
+    would all land on shard 0; it runs unsharded.
+    """
+    spec = os.environ.get("HELION_TEST_SHARD")
+    if not spec or "PYTEST_CURRENT_TEST" in os.environ:
+        return 0, 1
+    match = re.fullmatch(r"(\d+)/(\d+)", spec)
+    if match is None or not 0 <= int(match[1]) < int(match[2]):
+        raise pytest.UsageError(
+            f"HELION_TEST_SHARD={spec!r} is not of the form i/n with 0 <= i < n"
+        )
+    return int(match[1]), int(match[2])
+
+
+def _deselect(
+    config: pytest.Config, items: list[pytest.Item], kept: list[pytest.Item]
+) -> None:
+    if len(kept) != len(items):
+        keep = {id(item) for item in kept}
+        config.hook.pytest_deselected(
+            items=[item for item in items if id(item) not in keep]
+        )
+        items[:] = kept
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> Generator[None, None, None]:
+    # Before the other plugins' hooks: a test_cute_*.py module named on the
+    # command line is collected despite pytest_ignore_collect; it stays in the
+    # CuTe lane all the same, and nothing else gets to observe it.
+    cute_lane = _active_backend() == "cute"
+    _deselect(
+        config,
+        items,
+        [item for item in items if cute_lane or not _cute_module(item.path)],
+    )
+    yield
+    # After them, so pytest's own -m/-k deselection has run and the shards are
+    # balanced over the modules this lane actually runs. HELION_TEST_SHARD=i/n
+    # splits one lane across n CI runners. Whole modules stay in one shard so
+    # module-level kernels, fixtures and reference compiles are built once per
+    # lane, and the modules are assigned by their recorded durations
+    # (test/shard_durations.json) so the shards finish together.
+    index, shards = _shard()
+    if shards > 1:
+        # Imported in the hook: only the processes that collect run it, which
+        # keeps helion (and torch) out of the xdist controller like the rest
+        # of this file.
+        from helion._testing.sharding import assign_shards
+        from helion._testing.sharding import load_durations
+
+        shard_of = assign_shards(
+            {_module_of(item) for item in items},
+            shards,
+            load_durations(config.rootpath / "test" / "shard_durations.json"),
+        )
+        _deselect(
+            config,
+            items,
+            [item for item in items if shard_of[_module_of(item)] == index],
+        )
 
 
 def _worker_status_dir(config: pytest.Config) -> Path | None:

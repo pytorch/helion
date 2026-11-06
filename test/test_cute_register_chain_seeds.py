@@ -10,15 +10,15 @@ from typing import cast
 import unittest
 from unittest.mock import patch
 
+import pytest
 import sympy
 import torch
-
-from test._cute_binding import _mock_cuda_unavailable
 
 from helion._compiler.autotuner_heuristics.register_chain import (
     CuteRegisterChainHeuristic,
 )
 from helion._compiler.backend import CuteBackend
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -33,6 +33,8 @@ from helion.autotuner.config_spec import MatmulFact
 from helion.autotuner.config_spec import NumThreadsSpec
 from helion.autotuner.config_spec import ResolvedMatmulFact
 from helion.autotuner.config_spec import RootGridFact
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     import helion
@@ -149,7 +151,7 @@ class TestCuteRegisterChainSeeds(unittest.TestCase):
         super().setUp()
         stack = ExitStack()
         self.addCleanup(stack.close)
-        stack.enter_context(_mock_cuda_unavailable())
+        stack.enter_context(mock_cuda_unavailable())
         for name in (
             "_lazy_init",
             "current_device",

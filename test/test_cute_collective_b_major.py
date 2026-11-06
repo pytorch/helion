@@ -6,12 +6,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
@@ -81,10 +80,10 @@ def _source(
         cute_collective_compute=compute,
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
-        return _cpu_bind(kernel, (*inputs, computed_b)).to_code(config)
+        return cpu_bind(kernel, (*inputs, computed_b)).to_code(config)
 
 
 def _b_copy(source: str) -> ast.For:
@@ -228,10 +227,10 @@ def test_mamba_transposed_state_uses_k_copy(shape: int, static_shapes: bool) -> 
         autotune_effort="none",
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
-        bound = _cpu_bind(kernel, inputs)
+        bound = cpu_bind(kernel, inputs)
         config = helion.Config.from_dict(
             bound.config_spec.default_config().config
             | {

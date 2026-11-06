@@ -14,9 +14,6 @@ from torch.fx import Graph
 from torch.fx import GraphModule
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_register_program import _run as run_scalar_program
 
@@ -31,6 +28,9 @@ from helion._compiler.cute.register_tensor import plan_register_tensor
 from helion._compiler.cute.row_fragment import RowFragment
 from helion._compiler.cute.row_fragment import RowFragmentLayout
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -235,8 +235,8 @@ def _sort_rows(value: torch.Tensor):
 
 @pytest.mark.parametrize("width", [512, 8192])
 def test_wide_sort_has_compact_caller_ast(width):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_sort_rows, (torch.empty((3, width), dtype=torch.float32),))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_sort_rows, (torch.empty((3, width), dtype=torch.float32),))
         config = bound.config_spec.default_config()
         config.config.update(
             cute_topk_lanes_per_row=16,

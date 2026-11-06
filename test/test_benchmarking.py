@@ -28,6 +28,8 @@ import helion.autotuner.benchmarking as benchmarking
 import helion.autotuner.metrics as autotune_metrics
 from helion.runtime.settings import default_autotuner_fn
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(autouse=True)
 def _clear_process_local_cute_library_override(monkeypatch):

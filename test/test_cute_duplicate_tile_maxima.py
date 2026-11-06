@@ -14,6 +14,8 @@ from helion._compiler.cute.bounded_loop_cache import cache_single_tile_loads
 from helion._compiler.cute.bounded_loop_cache import specialize_single_tile_sweeps
 from helion._compiler.cute.duplicate_tile_maxima import deduplicate_bounded_maxima
 
+pytestmark = pytest.mark.cpu_only
+
 SOURCE = """
 def kernel(x, out, n, reset):
     for tile in range(cutlass.Int32(0), cutlass.Int32(n), cutlass.Int32(8)):

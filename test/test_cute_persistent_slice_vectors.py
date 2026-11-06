@@ -25,14 +25,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -46,7 +45,7 @@ pytestmark = skipUnlessBackends(["cute"])
 @pytest.fixture
 def cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
     ):
         yield
@@ -151,7 +150,7 @@ def _config(**overrides: object) -> helion.Config:
 def _cpu_code(
     kernel: helion.Kernel, args: tuple[torch.Tensor, ...], **cfg: object
 ) -> str:
-    bound = _cpu_bind(kernel, args)
+    bound = cpu_bind(kernel, args)
     return bound.to_code(bound.config_spec.normalized_config(_config(**cfg)))
 
 
@@ -253,7 +252,7 @@ def test_without_the_sink_the_nested_slice_loads_stay_scalar(cpu_only: None) -> 
 
 def test_values_holding_both_axes_do_not_share_a_thread_axis(cpu_only: None) -> None:
     x = torch.empty(32, 8, 64, dtype=torch.bfloat16)
-    bound = _cpu_bind(scale_rows, (x,))
+    bound = cpu_bind(scale_rows, (x,))
     spec = bound.config_spec
     # Block 1 is the 8-wide axis, block 2 the 64-wide (stride-1) axis.
     num_threads = [0] * len(spec.num_threads)
@@ -280,7 +279,7 @@ def test_values_holding_both_axes_do_not_share_a_thread_axis(cpu_only: None) -> 
 
 
 def test_pointwise_seeds_cover_the_persistent_slice(cpu_only: None) -> None:
-    bound = _cpu_bind(rope_like, _rope_args())
+    bound = cpu_bind(rope_like, _rope_args())
     spec = bound.env.config_spec
     # The live-ins of the compiler's rolled lane-loop graphs are not loop
     # carried accumulators: the kernel stays in the pointwise family.
@@ -308,7 +307,7 @@ def test_pointwise_seeds_cover_the_persistent_slice(cpu_only: None) -> None:
 
 
 def test_one_vector_lane_stays_persistent_beside_wide_tiles(cpu_only: None) -> None:
-    bound = _cpu_bind(rope_like, _rope_args())
+    bound = cpu_bind(rope_like, _rope_args())
     spec = bound.config_spec
     # 32 seq threads leave 32 of the 1024-thread budget for the 64-wide slice;
     # the one-vector lane only needs 8 of them and stays persistent.
@@ -342,7 +341,7 @@ def test_rope_like_matches_the_reference_on_the_gpu() -> None:
 def test_row_reduction_over_two_tile_axes_gets_the_reduction_tile_seeds(
     cpu_only: None,
 ) -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         batched_row_softmax, (torch.empty(8, 256, 1024, dtype=torch.float16),)
     )
     spec = bound.env.config_spec

@@ -3,20 +3,22 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
-
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._compiler.cute.backend import CuteBackend
 from helion._testing import skipIfRefEager
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import KernelGridFact
 from helion.autotuner.config_spec import ReductionLoopSpec
 from helion.autotuner.config_spec import RootGridFact
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestCuteRegionGridFloors(unittest.TestCase):
@@ -179,10 +181,10 @@ class TestGridFloorsThroughDeviceIR(unittest.TestCase):
             return a, b
 
         with (
-            _mock_cuda_unavailable(),
+            mock_cuda_unavailable(),
             patch("helion.autotuner.config_spec.num_compute_units", return_value=148),
         ):
-            bound = _cpu_bind(two_roots, (torch.empty(65536), torch.empty(65536)))
+            bound = cpu_bind(two_roots, (torch.empty(65536), torch.empty(65536)))
         spec = bound.config_spec
         assert spec.kernel_grid_fact is not None
         self.assertEqual(len(spec.kernel_grid_fact.grid_groups), 2)

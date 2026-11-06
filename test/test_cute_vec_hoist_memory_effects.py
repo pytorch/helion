@@ -23,11 +23,11 @@ from typing import Any
 import pytest
 import torch
 
-from ._cute_aux import _cpu_codegen
 import helion
 from helion._compiler.cute.memory_ops import _cute_statement_written_tensors
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
 from helion.language.memory_ops import CuteTileVecStoreSite
 
@@ -262,7 +262,7 @@ def _two_axis_args() -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _code(kernel: Any, args: tuple[Any, ...], config: helion.Config) -> str:
-    with _cpu_codegen():
+    with cpu_codegen():
         return kernel._bind_isolated(args).to_code(config)
 
 

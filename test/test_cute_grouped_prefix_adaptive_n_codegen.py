@@ -13,10 +13,6 @@ from typing import Any
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
-from test._cute_binding import _require_cute_codegen
 from test.cute_population_contracts import _target
 from test.test_cute_grouped_d_shift import _config as _ordinary_config
 from test.test_cute_grouped_large_device_seeds import _kernel
@@ -28,6 +24,10 @@ import helion
 from helion._compiler.cute.grouped_prefix_adaptive_n_codegen import _is_role
 from helion._compiler.cute.grouped_prefix_adaptive_n_codegen import _role_payload
 from helion._testing import DEVICE
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import require_cute_codegen
 from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.runtime.cute.launcher import _create_cute_wrapper
@@ -101,8 +101,8 @@ def _decoder(tree: ast.Module) -> ast.FunctionDef:
 @pytest.fixture(scope="module")
 def sources() -> dict[str, str]:
     result = {}
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(), _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), _args())
         spec = bound.config_spec
         profile = spec._cute_tcgen05_config.grouped_prefix_adaptive_n_profile
         assert profile is not None
@@ -213,8 +213,8 @@ def test_general_tensor_extents_dtypes_and_live_metadata_emit_native_pair(
     dtype: torch.dtype,
     offset_dtype: torch.dtype,
 ) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(
             _kernel(),
             _args(groups=groups, m=m, n=n, k=k, dtype=dtype, offset_dtype=offset_dtype),
         )
@@ -253,10 +253,10 @@ def test_unregistered_native_axes_reject_an_explicit_recipe(
     sources: dict[str, str],
 ) -> None:
     del sources
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        supported = _cpu_bind(_kernel(), _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        supported = cpu_bind(_kernel(), _args())
         config = _recipe(supported.config_spec)
-        unregistered = _cpu_bind(
+        unregistered = cpu_bind(
             _kernel(),
             _args(groups=4, m=257, n=768, k=256, dtype=torch.float16),
         )
@@ -369,7 +369,7 @@ def test_actual_host_wrapper_has_two_ab_descriptors_one_bounded_d_and_one_launch
         ("tensor", "torch.bfloat16", 2, (2048, 1536), (1536, 1), 16),
         ("wrapper_host_scalar", "tcgen05_grouped_total_clusters", "int"),
     )
-    with _forbid_cuda_work():
+    with forbid_cuda_work():
         wrapper = _create_cute_wrapper(kernel, schema, (32, 8, 1), num_sm=152)
         host = inspect.getsource(wrapper)
     assert host.count(").launch(") == 1
@@ -385,8 +385,8 @@ def test_real_sdk_publication_scan_and_decoder_ir_remain_int32(
     offset_dtype: torch.dtype,
     tmp_path: Path,
 ) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(), _args(offset_dtype=offset_dtype))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), _args(offset_dtype=offset_dtype))
         source = bound.to_code(
             bound.config_spec.normalized_config(_recipe(bound.config_spec))
         )
@@ -434,7 +434,7 @@ def test_real_sdk_publication_scan_and_decoder_ir_remain_int32(
         )
         + "\n"
     )
-    with _forbid_cuda_work(), _sdk() as sdk:
+    with forbid_cuda_work(), _sdk() as sdk:
         spec = importlib.util.spec_from_file_location(
             "typed_prefix_publisher", module_path
         )
@@ -528,12 +528,12 @@ def _impure_grouped_loop(
 
 @pytest.mark.parametrize("variant", range(1, 8))
 def test_impure_or_transformed_reductions_cannot_enter_the_recipe(variant: int) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
         args = _args(groups=4, m=640, n=768, k=256)
-        pure = _cpu_bind(_kernel(), args)
+        pure = cpu_bind(_kernel(), args)
         config = _recipe(pure.config_spec)
         try:
-            impure = _cpu_bind(_impure_grouped_loop, (*args, variant))
+            impure = cpu_bind(_impure_grouped_loop, (*args, variant))
         except AssertionError as failure:
             # The existing frontend rejects nondefault dot kwargs before the
             # native purity proof can run. It still cannot enter this recipe.
@@ -612,7 +612,7 @@ def test_general_prefix_recipe_live_branch_changes_and_graph_input_preservation(
         pytest.skip("requires CUDA")
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family tcgen05")
-    _require_cute_codegen()
+    require_cute_codegen()
     groups, rows, columns, reduction = 16, 2048, 1536, 256
     generator = torch.Generator().manual_seed(953)
 

@@ -10,9 +10,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_topk import _simulate_network_topk_fragment
 
@@ -21,7 +18,12 @@ from helion._compiler.autotuner_heuristics.cute_fragment_topk_network import (
     network_topk_supported,
 )
 from helion._compiler.cute.ordered_selection import selection_values_only
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -29,7 +31,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with _mock_cuda_unavailable(), _forbid_native_compile():
+    with mock_cuda_unavailable(), forbid_native_compile():
         yield
 
 
@@ -85,7 +87,7 @@ def _integer_data(n: int) -> torch.Tensor:
 
 def _source(x: torch.Tensor, k: int, largest: bool, kind: str, enabled: bool):
     with _target():
-        bound = _cpu_bind(_value_selection, (x, k, largest, kind))
+        bound = cpu_bind(_value_selection, (x, k, largest, kind))
         config = bound.config_spec.default_config()
         config.config.update(cute_fragment_threads=32)
         config.config["cute_fragment_topk_network"] = enabled
@@ -198,7 +200,7 @@ def test_int64_observed_indices_keep_serial_lowering() -> None:
     x = torch.arange(2 * 3 * 17).reshape(2, 3, 17).float()
     y = _integer_data(17)
     with _target():
-        bound = _cpu_bind(_mixed_indexed, (x, y))
+        bound = cpu_bind(_mixed_indexed, (x, y))
         config = bound.config_spec.default_config()
         config.config.update(cute_fragment_topk_network=True, cute_fragment_threads=32)
         code = bound.to_code(config)
@@ -259,7 +261,7 @@ def test_int64_network_preserves_encoded_probability_and_id_fields() -> None:
     probabilities[..., 0] = -0.0
     original_ids = torch.arange(17, dtype=torch.int32).flip(0).repeat(2, 3, 1)
     with _target():
-        bound = _cpu_bind(_encoded_probability_sort, (probabilities, original_ids))
+        bound = cpu_bind(_encoded_probability_sort, (probabilities, original_ids))
         config = bound.config_spec.default_config()
         config.config.update(cute_fragment_topk_network=True, cute_fragment_threads=32)
         code = bound.to_code(config)
@@ -304,8 +306,8 @@ def test_int64_network_default_and_population_prefix_stay_legacy() -> None:
         with patch.object(
             cute_fragment_topk_network, "network_topk_supported", old_support
         ):
-            before = _cpu_bind(_value_selection, args)
-        after = _cpu_bind(_value_selection, args)
+            before = cpu_bind(_value_selection, args)
+        after = cpu_bind(_value_selection, args)
     assert before.config_spec.default_config() == after.config_spec.default_config()
     assert (
         before.config_spec.compiler_seed_configs

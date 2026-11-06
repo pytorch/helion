@@ -3,9 +3,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_rolled_cluster import _rms_ref
 from test.test_cute_rolled_cluster import rms_norm_rolled_kernel
@@ -16,6 +13,9 @@ from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 
 
 def _kernel() -> helion.Kernel:
@@ -33,8 +33,8 @@ def test_static_cluster_tail_keeps_the_original_bound(columns: int) -> None:
         torch.empty((3, columns), dtype=torch.bfloat16),
         torch.empty((columns,), dtype=torch.bfloat16),
     )
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_kernel(), args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_kernel(), args)
         config = helion.Config(
             block_sizes=[1],
             num_threads=[1, 128],
@@ -57,8 +57,8 @@ def test_masked_cluster_seed_has_a_vectorized_register_slice(columns: int) -> No
         torch.empty((3, columns), dtype=torch.bfloat16),
         torch.empty((columns,), dtype=torch.bfloat16),
     )
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_kernel(), args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_kernel(), args)
         host = bound.host_function
         assert host is not None
         seeds = CuteMaskedRolledClusterHeuristic.get_seed_configs(

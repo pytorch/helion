@@ -8,8 +8,6 @@ from unittest.mock import patch
 
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-from test._cute_dense_tcgen05 import wrapper_plans
 from test.test_cute_shared_rhs_grouped import _bind as _bind_shared_rhs_grouped
 from test.test_cute_shared_rhs_grouped import _inputs as _shared_rhs_grouped_inputs
 
@@ -26,6 +24,8 @@ from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_dense_tcgen05 import wrapper_plans
 import helion.language as hl
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 
@@ -431,7 +431,7 @@ class TestCuteTcgen05DirectEntryTmaOutputProof(unittest.TestCase):
         rank-3 N,K-major form, so codegen proves its destination like a plain
         GEMM's; the bind-time proof must not exempt it.
         """
-        with _mock_cuda_unavailable():
+        with mock_cuda_unavailable():
             bound = _bind_shared_rhs_grouped(
                 grouped_gemm_jagged.fn, _shared_rhs_grouped_inputs()
             )

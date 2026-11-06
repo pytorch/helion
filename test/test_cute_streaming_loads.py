@@ -282,12 +282,12 @@ for i in range(8):
 
 
 def test_scalar_policy_codegen_retains_fusion():
-    from test._cute_binding import _cpu_bind
-    from test._cute_binding import _forbid_native_compile
-    from test._cute_binding import _mock_cuda_unavailable
+    from helion._testing.cute_codegen import cpu_bind
+    from helion._testing.cute_codegen import forbid_native_compile
+    from helion._testing.cute_codegen import mock_cuda_unavailable
 
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(_logsumexp_scalar_kernel, (torch.zeros(64, 2048),))
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(_logsumexp_scalar_kernel, (torch.zeros(64, 2048),))
         code = bound.to_code(bound.configs[0])
     assert "_cute_scalar_policy_load(" in code
     assert "_fuse_cache_0" in code

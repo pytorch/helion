@@ -7,9 +7,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_grouped_d_shift import _plans
 from test.test_cute_grouped_device_panel import _config
@@ -23,9 +20,14 @@ from helion._compiler.cute.grouped_panel_raster import (
 )
 from helion._compiler.cute.grouped_panel_raster import GROUPED_PANEL_RATIO_KEY as RATIO
 from helion._compiler.cute.grouped_panel_raster import grouped_panel_ratio_index_domain
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 from helion.runtime.cute.launcher import _validate_tcgen05_grouped_device_split_sizes
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _adaptive(ratio=1, *, primary=8, alternate=4, cluster_n=1):
@@ -135,8 +137,8 @@ def test_actual_adaptive_decoder_matches_each_selected_order_and_peer_bijection(
 
 
 def test_absent_and_explicit_none_keep_static_source_and_remove_optional_keys():
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped, _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped, _args())
         original = _config()
         config = _config()
         config.config.update({ALT: None, RATIO: None})
@@ -160,8 +162,8 @@ def test_absent_and_explicit_none_keep_static_source_and_remove_optional_keys():
     ],
 )
 def test_invalid_or_partial_adaptation_fails_closed(alternate, ratio):
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped, _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped, _args())
         with pytest.raises(InvalidConfig):
             bound.config_spec.normalized_config(_adaptive(ratio, alternate=alternate))
 
@@ -183,8 +185,8 @@ def test_adaptive_metadata_is_live_and_runtime_threshold_is_checked():
 
 
 def test_threshold_guard_is_repeated_at_codegen():
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped, _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped, _args())
         with (
             patch.object(
                 cute_mma, "grouped_panel_ratio_index_domain", return_value=False
@@ -199,7 +201,7 @@ def test_legacy_width_can_be_selected_without_relaxing_quad_edge_guard():
     assert "tcgen05_grouped_panel_choice_m_clusters" in source
     source = _emit(_adaptive(primary=1))
     assert _plans(source)[0]["l2_swizzle_size"] == 1
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped, _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped, _args())
         with pytest.raises(BackendUnsupported, match="split full/fringe scheduler"):
             bound.to_code(_adaptive(primary=1, cluster_n=2))

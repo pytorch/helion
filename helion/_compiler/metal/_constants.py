@@ -18,10 +18,9 @@ SIMD_WIDTH = 32
 #: uses the CuTe name; everything else on this backend uses this one.
 MAX_THREADS_PER_THREADGROUP = 1024
 
-#: Maximum number of SIMD groups in a threadgroup, hence the slot count of
-#: every ``threadgroup`` scratch buffer (one slot per SIMD group; see
-#: ``reduction.alloc_threadgroup_buffer``).
-MAX_SIMD_GROUPS = MAX_THREADS_PER_THREADGROUP // SIMD_WIDTH
+#: Threadgroup memory available to one threadgroup
+#: (``maxThreadgroupMemoryLength`` on Apple-silicon GPUs).
+MAX_THREADGROUP_MEMORY_BYTES = 32768
 
 #: A Metal threadgroup is three-dimensional:
 #: ``thread_position_in_threadgroup`` is a ``uint3``.  A kernel needing a

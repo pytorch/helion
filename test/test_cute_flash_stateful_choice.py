@@ -14,8 +14,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from ._cute_binding import _forbid_native_compile
-from ._cute_binding import _mock_cuda_unavailable
 from .test_cute_flash_exp2 import _emit_causal_resident_native_source
 from .test_cute_flash_exp2 import _flash_runtime
 from .test_cute_flash_resident_choice import _emit as _emit_explicit_dense
@@ -29,10 +27,14 @@ from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.flash_tuning import FlashTuningPolicy
 from helion._compiler.cute.mma_support import CuteMmaSupport
 from helion._testing import import_example
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
+
+pytestmark = pytest.mark.cpu_only
 
 causal_attention_output = import_example("attention").causal_attention_output
 
@@ -47,8 +49,8 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
-        _forbid_native_compile(),
+        mock_cuda_unavailable(),
+        forbid_native_compile(),
         patch.dict(os.environ, {}, clear=True),
     ):
         yield

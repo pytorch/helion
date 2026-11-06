@@ -7,9 +7,6 @@ import copy
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_topk import _allocating_topk
 from test.test_cute_topk import _has_register_selection
@@ -19,7 +16,12 @@ import helion
 from helion._compiler.cute.ordered_selection import ordered_selection_args
 from helion._compiler.cute.ordered_selection import selection_args
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -80,8 +82,8 @@ def test_stable_sort_argument_schema(stable: bool | None, dim: int) -> None:
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("descending", [False, True])
 def test_stable_sort_row_owner(descending: bool) -> None:
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(
             _row_stable_sort, (torch.empty((3, 17), dtype=torch.bfloat16), descending)
         )
         assert bound.config_spec.cute_topk_search_enabled
@@ -109,8 +111,8 @@ def test_stable_sort_fragment_values(dtype, descending, network):
         x[:, :, 0] = torch.iinfo(torch.int32).min
         x[:, :, 1] = torch.iinfo(torch.int32).max
     original = x.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_fragment_stable_sort, (x, descending))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_fragment_stable_sort, (x, descending))
         config = bound.config_spec.default_config()
         config.config.update(
             cute_fragment_topk_network=network, cute_fragment_threads=32
@@ -140,8 +142,8 @@ def test_canonical_probability_sort_retains_original_id_ties(network: bool) -> N
     ids = ((torch.arange(17) * 7) % 17).to(torch.int32).expand(2, 3, 17).clone()
     probabilities = (ids % 5).float()
     original_probabilities, original_ids = probabilities.clone(), ids.clone()
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_canonical_stable_sort, (probabilities, ids))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_canonical_stable_sort, (probabilities, ids))
         config = bound.config_spec.default_config()
         config.config.update(
             cute_fragment_topk_network=network, cute_fragment_threads=32
@@ -172,8 +174,8 @@ def test_canonical_probability_sort_retains_original_id_ties(network: bool) -> N
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("rows", [4, 17])
 def test_small_row_topk_seed_remains_a_hint(dtype, rows):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(
             _allocating_topk, (torch.empty((rows, 512), dtype=dtype), 10, True)
         )
     spec = bound.config_spec

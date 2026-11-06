@@ -9,9 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from ._cute_binding import _cpu_bind
-from ._cute_binding import _forbid_cuda_work
-from ._cute_binding import _mock_cuda_unavailable
 from .cute_population_contracts import _target
 from .cute_population_contracts import checked_initial_population
 from .test_cute_grouped_fp32_output import _grouped_fp32_output
@@ -20,10 +17,15 @@ from .test_cute_grouped_large_device_seeds import _kernel
 import helion
 from helion._compiler.autotuner_heuristics import cute as heuristics
 from helion._compiler.cute import cute_mma
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.exc import InvalidConfig
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 KEY = "tcgen05_grouped_prefix_adaptive_n"
 BALANCED = "tcgen05_grouped_balanced_workers"
@@ -97,8 +99,8 @@ def _recipes(spec, source_m_tile: int | None = 128) -> list[helion.Config]:
 def test_both_worker_policies_and_existing_reservations_survive_strict_transfer(
     dtype: torch.dtype, offset_dtype: torch.dtype, balanced: bool, reserved: int
 ) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(), _args(dtype=dtype, offset_dtype=offset_dtype))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), _args(dtype=dtype, offset_dtype=offset_dtype))
         spec = bound.config_spec
         recipes = _recipes(spec)
         assert len(recipes) == 3
@@ -168,8 +170,8 @@ def test_both_worker_policies_and_existing_reservations_survive_strict_transfer(
 def test_incompatible_explicit_recipes_fail_instead_of_measuring_a_default(
     change: dict,
 ) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(), _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), _args())
         spec = bound.config_spec
         recipe = deepcopy(_recipes(spec)[0])
         recipe.config.update(change)
@@ -179,8 +181,8 @@ def test_incompatible_explicit_recipes_fail_instead_of_measuring_a_default(
 
 @pytest.mark.parametrize("value", [None, 0, 1, "true"])
 def test_prefix_key_is_an_actual_boolean(value) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(), _args())
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), _args())
         recipe = deepcopy(_recipes(bound.config_spec)[0])
         recipe.config[KEY] = value
         with pytest.raises(InvalidConfig):
@@ -191,8 +193,8 @@ def test_prefix_key_is_an_actual_boolean(value) -> None:
 def test_recipe_domain_is_resource_and_tensor_metadata_based(
     groups: int, n: int, k: int
 ) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        spec = _cpu_bind(_kernel(), _args(groups=groups, n=n, k=k)).config_spec
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        spec = cpu_bind(_kernel(), _args(groups=groups, n=n, k=k)).config_spec
         assert spec._cute_tcgen05_config.grouped_prefix_adaptive_n_supported
         assert len(_recipes(spec)) == 3
 
@@ -203,8 +205,8 @@ def test_recipe_domain_is_resource_and_tensor_metadata_based(
 def test_outside_one_panel_or_prefix_domain_has_no_recipe(
     groups: int, n: int, k: int
 ) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        spec = _cpu_bind(_kernel(), _args(groups=groups, n=n, k=k)).config_spec
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        spec = cpu_bind(_kernel(), _args(groups=groups, n=n, k=k)).config_spec
         assert spec._cute_tcgen05_config.grouped_prefix_adaptive_n_profile is None
         assert not _recipes(spec)
         if not spec._cute_tcgen05_config.grouped_prefix_adaptive_n_supported:
@@ -214,8 +216,8 @@ def test_outside_one_panel_or_prefix_domain_has_no_recipe(
 def test_unaligned_operands_cannot_claim_the_native_input_proof() -> None:
     args = list(_args())
     args[0] = torch.empty(2048 * 2048 + 1, dtype=torch.bfloat16)[1:].view(2048, 2048)
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        spec = _cpu_bind(_kernel(), tuple(args)).config_spec
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        spec = cpu_bind(_kernel(), tuple(args)).config_spec
         assert not spec._cute_tcgen05_config.grouped_prefix_adaptive_n_supported
         assert not _recipes(spec)
 
@@ -224,8 +226,8 @@ def test_unaligned_operands_cannot_claim_the_native_input_proof() -> None:
 def test_nonzero_accumulator_and_output_alias_do_not_claim_pure_fresh_output(
     variant: int,
 ) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        spec = _cpu_bind(_not_pure_fresh, (*_args(), variant)).config_spec
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        spec = cpu_bind(_not_pure_fresh, (*_args(), variant)).config_spec
         assert not spec._cute_tcgen05_config.grouped_prefix_adaptive_n_supported
         assert not _recipes(spec)
 
@@ -236,9 +238,9 @@ def test_split_sizes_and_different_output_atom_do_not_enter_prefix_recipe() -> N
         torch.empty((8, 768, 768), dtype=torch.bfloat16),
         torch.full((8,), 256, dtype=torch.int64),
     )
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        split = _cpu_bind(_device_split_sizes_kernel, split_args).config_spec
-        output32 = _cpu_bind(_grouped_fp32_output, _args()).config_spec
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        split = cpu_bind(_device_split_sizes_kernel, split_args).config_spec
+        output32 = cpu_bind(_grouped_fp32_output, _args()).config_spec
         for spec in (split, output32):
             assert not spec._cute_tcgen05_config.grouped_prefix_adaptive_n_supported
             assert not _recipes(spec)
@@ -248,8 +250,8 @@ def test_split_sizes_and_different_output_atom_do_not_enter_prefix_recipe() -> N
 def test_one_sixteenth_reservation_uses_the_compile_architecture(
     num_sm: int, expected: int
 ) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        spec = _cpu_bind(_kernel(), _args()).config_spec
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        spec = cpu_bind(_kernel(), _args()).config_spec
         with patch.object(spec, "num_sm", num_sm):
             recipes = heuristics._tcgen05_grouped_prefix_adaptive_n_m128_seeds(spec)
         assert [
@@ -274,21 +276,21 @@ def test_seed_integer_hints_do_not_override_the_actual_tensor_domain() -> None:
         )
 
     with (
-        _forbid_cuda_work(),
+        forbid_cuda_work(),
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch.object(
             cute_mma, "analyze_tcgen05_grouped_worklist", side_effect=invented_hints
         ),
     ):
-        spec = _cpu_bind(_kernel(), _args(n=2304)).config_spec
+        spec = cpu_bind(_kernel(), _args(n=2304)).config_spec
         assert not spec._cute_tcgen05_config.grouped_prefix_adaptive_n_supported
         assert not _recipes(spec)
 
 
 def test_unregistered_native_matmul_axes_do_not_claim_a_recipe() -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        spec = _cpu_bind(
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        spec = cpu_bind(
             _kernel(), _args(groups=4, m=257, n=768, k=256, dtype=torch.float16)
         ).config_spec
         assert not spec.cute_tcgen05_search_enabled
@@ -300,8 +302,8 @@ def test_unregistered_native_matmul_axes_do_not_claim_a_recipe() -> None:
 def test_optional_recipes_survive_legacy_empty_palette_without_default_promotion() -> (
     None
 ):
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        spec = _cpu_bind(_kernel(), _args()).config_spec
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        spec = cpu_bind(_kernel(), _args()).config_spec
         env = SimpleNamespace(config_spec=spec)
         cls = heuristics.CuteTcgen05GroupedWorklistHeuristic
         with patch.object(cls, "_eligible_inputs", return_value=None):
@@ -312,14 +314,14 @@ def test_optional_recipes_survive_legacy_empty_palette_without_default_promotion
 
 def test_existing_default_and_entire_v6_seed_prefix_are_unchanged() -> None:
     args = _args()
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
         with patch.object(
             heuristics, "_tcgen05_grouped_prefix_adaptive_n_seeds", return_value=[]
         ):
-            previous = _cpu_bind(_kernel(), args)
+            previous = cpu_bind(_kernel(), args)
             old_seeds = deepcopy(previous.config_spec.compiler_seed_configs)
             old_default = deepcopy(previous.config_spec.compiler_default_config)
-        bound = _cpu_bind(_kernel(), args)
+        bound = cpu_bind(_kernel(), args)
         spec = bound.config_spec
         assert spec.compiler_seed_configs[: len(old_seeds)] == old_seeds
         assert spec.compiler_default_config == old_default
@@ -336,10 +338,10 @@ def test_existing_default_and_entire_v6_seed_prefix_are_unchanged() -> None:
 def test_native_full_population_contains_and_pins_both_effective_recipes() -> None:
     args = _args()
     saved = random.getstate()
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
         kernel = _kernel()
         kernel.settings.autotune_effort = "full"
-        bound = _cpu_bind(kernel, args)
+        bound = cpu_bind(kernel, args)
         try:
             random.seed(309)
             kwargs = LFBOTreeSearch.get_kwargs_from_profile(

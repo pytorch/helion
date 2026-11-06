@@ -747,12 +747,12 @@ def _simulate_merged_sum(source: str, x: torch.Tensor) -> np.ndarray:
 @pytest.mark.parametrize("blocks", [(4, 4, 8), (1, 4, 8), (1, 1, 8), (1, 1, 1)])
 @pytest.mark.parametrize("shape", [(3, 4, 5), (5, 9, 13)])
 def test_merged_reduction_physical_codegen_values(blocks, shape) -> None:
-    from ._cute_binding import _cpu_bind
     from .cute_population_contracts import _target
+    from helion._testing.cute_codegen import cpu_bind
 
     x = (torch.arange(np.prod(shape), dtype=torch.float32) % 17 - 8).reshape(shape)
     with _target():
-        bound = _cpu_bind(_merged_sum_kernel, (x,))
+        bound = cpu_bind(_merged_sum_kernel, (x,))
         config = bound.config_spec.default_config()
         config.config["block_sizes"] = list(blocks)
         source = bound.to_code(config)
@@ -763,11 +763,11 @@ def test_merged_reduction_physical_codegen_values(blocks, shape) -> None:
 
 
 def test_merged_reduction_multiple_serial_sources_stay_rejected() -> None:
-    from ._cute_binding import _cpu_bind
     from .cute_population_contracts import _target
+    from helion._testing.cute_codegen import cpu_bind
 
     with _target():
-        bound = _cpu_bind(_merged_sum_kernel, (torch.ones(3, 4, 5),))
+        bound = cpu_bind(_merged_sum_kernel, (torch.ones(3, 4, 5),))
         config = bound.config_spec.default_config()
         config.config.update(block_sizes=[1, 4, 8], num_threads=[1, 1, 1])
         with pytest.raises(exc.BackendUnsupported, match="lane owner"):
@@ -775,9 +775,9 @@ def test_merged_reduction_multiple_serial_sources_stay_rejected() -> None:
 
 
 def test_merged_reduction_generated_live_coordinate_stays_rejected() -> None:
-    from ._cute_binding import _cpu_bind
     from .cute_population_contracts import _target
     from helion._compiler.cute import nested_lane_reductions
+    from helion._testing.cute_codegen import cpu_bind
 
     original = nested_lane_reductions.resolve_pruned_lane_owners
 
@@ -789,7 +789,7 @@ def test_merged_reduction_generated_live_coordinate_stays_rejected() -> None:
         return original(body, fallbacks, **kwargs)
 
     with _target():
-        bound = _cpu_bind(_merged_sum_kernel, (torch.ones(3, 4, 5),))
+        bound = cpu_bind(_merged_sum_kernel, (torch.ones(3, 4, 5),))
         config = bound.config_spec.default_config()
         config.config["block_sizes"] = [1, 4, 8]
         with (

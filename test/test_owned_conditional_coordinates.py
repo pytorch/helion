@@ -6,28 +6,30 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from ._cute_binding import _forbid_native_compile
-from ._cute_binding import _mock_cuda_unavailable
 from .test_cute_flash_resident_choice import _spec as _dense_spec
 from .test_cute_flash_stateful_choice import _spec as _causal_spec
 import helion
 from helion._compiler.cute.cute_flash import _flash_resident_softmax_overrides
 from helion._compiler.cute.cute_flash import flash_structural_leaf_from_config
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.search_space_logger import canonical_config_id
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(autouse=True)
 def _no_native_compile():
-    with _forbid_native_compile():
+    with forbid_native_compile():
         yield
 
 
 @pytest.fixture
 def protected_cpu():
     # Keep local coordinate legality independent of the host GPU visibility.
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         yield
 
 

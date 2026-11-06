@@ -13,8 +13,6 @@ import numpy as np
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_resident_sequence import _indent
 from test.test_cute_resident_sequence import _Tensor
 from test.test_cute_resident_sequence import _YieldCollectives
@@ -32,7 +30,11 @@ from helion._compiler.cute.resident_sequence import materialize_resident_sequenc
 from helion._compiler.tile_strategy import _lane_reduce_marker_expr
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
+
+pytestmark = pytest.mark.cpu_only
 
 softmax_bwd = import_example("softmax").softmax_bwd
 
@@ -359,14 +361,14 @@ def test_original_backward_single_reduction_seeds_roundtrip(
     with (
         # Binding specializes hardware facts even for CPU tensors. The imported
         # helper's target mocks must not fall through to the visible CUDA device.
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(kernel, inputs)
+        bound = cpu_bind(kernel, inputs)
         host = bound.host_function
         assert host is not None
         with bound.env:

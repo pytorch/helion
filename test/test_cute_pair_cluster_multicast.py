@@ -17,13 +17,13 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
 from helion._compiler.cute.epilogue_fanout import FANOUT_CONFIG_KEY
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -152,7 +152,7 @@ def test_plain_2x2_cluster_caps_at_the_co_resident_cluster_count() -> None:
     cap ``_NUM_SM // 2`` (two hardware waves: 14.43 vs 11.90 us on the
     4096x1024x1024 256x128 pair tile).
     """
-    with _target(), _mock_cuda_unavailable():
+    with _target(), mock_cuda_unavailable():
         bound = _bind(gemm, 4096, 1024, 1024)
         config = helion.Config(
             block_sizes=[256, 128, 128],
@@ -173,7 +173,7 @@ def test_plain_2x2_cluster_caps_at_the_co_resident_cluster_count() -> None:
 def test_pair_fanout_admits_the_2x2_cluster() -> None:
     """The shared fanout keeps the CTA pair's N-pair multicast: same epilogue,
     a 2x2 cluster layout and the two-producer empty barrier."""
-    with _target(), _mock_cuda_unavailable():
+    with _target(), mock_cuda_unavailable():
         bound = _bind(two_outputs, 4096, 1024, 1024)
         codes = {}
         for cluster_n in (1, 2):
@@ -199,7 +199,7 @@ def test_pair_fanout_admits_the_2x2_cluster() -> None:
 
 
 def test_pair_fanout_refuses_the_2x2_cluster_on_an_odd_n_tile_count() -> None:
-    with _target(), _mock_cuda_unavailable():
+    with _target(), mock_cuda_unavailable():
         bound = _bind(two_outputs, 4096, 640, 1024)
         config = helion.Config(
             block_sizes=[256, 128, 128],
@@ -224,7 +224,7 @@ def test_plain_2x2_cluster_refuses_an_odd_n_tile_count_before_render() -> None:
     pass normalization and fail at render (``cute_mma``'s BackendUnsupported)
     after the search had spent a compile; now it fails closed with the reason
     and the search repairs the cluster."""
-    with _target(), _mock_cuda_unavailable():
+    with _target(), mock_cuda_unavailable():
         bound = _bind(gemm, 4096, 1280, 1280)
         odd = helion.Config(
             block_sizes=[256, 256, 64],
@@ -256,7 +256,7 @@ def test_paired_pipeline_admits_the_2x2_cluster_and_renders_the_auto_pair() -> N
     """``tcgen05_cta_group='two'`` admits ``tcgen05_cluster_n=2`` on the
     256-row pair tile with whole N-tile pairs; its render is byte-identical
     to the ``'auto'`` pair's 2x2 (the pin had no codegen behind it)."""
-    with _target(), _mock_cuda_unavailable():
+    with _target(), mock_cuda_unavailable():
         bound = _bind(gemm, 4096, 1024, 1024)
         codes = {}
         for cta_group in ("two", "auto"):
@@ -293,7 +293,7 @@ def test_paired_pipeline_refuses_the_2x2_cluster_outside_its_envelope(
 ) -> None:
     """Outside the envelope the strict refusal names the rule and the repair
     drops the cluster, not the family (the search keeps its pair sample)."""
-    with _target(), _mock_cuda_unavailable():
+    with _target(), mock_cuda_unavailable():
         bound = _bind(gemm, *shape)
         config = helion.Config(
             block_sizes=block_sizes,
@@ -324,7 +324,7 @@ def test_paired_seeds_carry_2x2_twins_of_the_deep_rings() -> None:
     """nvjet stages its 2x2 clusters 64 deep in K: the deepest bk=64 ring of
     every 256-row pair tile with whole N-tile pairs gets a cluster_n=2 twin
     (and nothing else does); each twin is a strict fixed point."""
-    with _target(), _mock_cuda_unavailable():
+    with _target(), mock_cuda_unavailable():
         bound = _bind(gemm, 4096, 1024, 1024)
         seeds = _paired_seeds(bound)
         twins = [seed for seed in seeds if seed.config["tcgen05_cluster_n"] == 2]

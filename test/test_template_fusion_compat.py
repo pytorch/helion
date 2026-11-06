@@ -10,6 +10,8 @@ from torch.utils._ordered_set import OrderedSet
 
 from helion import _compat
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(autouse=True)
 def clear_version_caches():

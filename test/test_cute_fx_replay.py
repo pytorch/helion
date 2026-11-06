@@ -15,6 +15,8 @@ from helion._compiler.ast_extension import create
 from helion._compiler.generate_ast import GenerateAST
 from helion._compiler.inductor_lowering import GraphInterpreter
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _Lowering:
     def __init__(self, result: ast.expr) -> None:

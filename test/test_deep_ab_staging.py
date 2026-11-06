@@ -7,7 +7,11 @@ deep staging logic for FP8 dtypes.
 
 from __future__ import annotations
 
+import pytest
+
 from helion._testing import TestCase
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestDeepABStagingHelpers(TestCase):

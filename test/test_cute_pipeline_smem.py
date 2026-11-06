@@ -9,9 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_cuda_work
-from test.test_cute_fuse_mm_accumulation import _cpu_target
-
 import helion
 from helion._compiler.cute.cute_mma import _tcgen05_use_2cta_instrs
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
@@ -19,10 +16,12 @@ from helion._compiler.cute.pipeline_smem import max_pipeline_ab_stages
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_codegen import forbid_cuda_work
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -31,7 +30,7 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _cpu_b200() -> Iterator[None]:
     with (
-        _cpu_target(),
+        cpu_target(),
         patch.object(
             CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
         ),
@@ -316,7 +315,7 @@ def test_column_major_output_prices_its_actual_store_ring() -> None:
 
     a, b, out = _args()
     out = out.t().contiguous().t()
-    with _forbid_cuda_work():
+    with forbid_cuda_work():
         bound = _gemm._bind_isolated((a, b, out))
         facts = bound.config_spec._cute_tcgen05_config.pipeline_smem_facts
         assert facts is not None and facts.output_column_major

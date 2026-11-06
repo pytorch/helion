@@ -28,6 +28,8 @@ from helion.autotuner.metrics import KernelMetadata
 from helion.runtime.config import Config
 from helion.runtime.settings import Settings
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from pathlib import Path
 

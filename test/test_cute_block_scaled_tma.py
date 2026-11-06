@@ -48,10 +48,13 @@ def _inspect_padded_scale_map(
     _record_copy_ranks(atom, coordinates)
 
 
+# The layouts fix the asserted ranks, so one (n, k) per tile shape suffices;
+# the extents still take sub-tile, exact and padded values of each.
 @skipUnlessCuteAvailable("requires the supported CuTe DSL")
-@pytest.mark.parametrize("n", [1, 128, 129, 257])
-@pytest.mark.parametrize("k", [16, 80, 272])
-@pytest.mark.parametrize("bn,bk", [(128, 64), (256, 64), (256, 128), (256, 256)])
+@pytest.mark.parametrize(
+    ("n", "k", "bn", "bk"),
+    [(1, 16, 128, 64), (129, 80, 256, 64), (257, 272, 256, 128), (256, 256, 256, 256)],
+)
 def test_scale_descriptor_and_device_coordinate_ranks_agree(
     n: int, k: int, bn: int, bk: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:

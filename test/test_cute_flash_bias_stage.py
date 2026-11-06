@@ -18,8 +18,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
@@ -27,6 +25,7 @@ from helion._testing import import_example
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.exc import InvalidConfig
 
 _examples_attention = import_example("attention")
@@ -74,7 +73,7 @@ def _bias_stage_fragment(spec):
 
 @skipUnlessBackends(["cute"])
 def test_biased_plan_stages_the_bias_by_default() -> None:
-    bound = _cpu_bind(_kernel(biased_attention.fn), _cpu_args((2, 8, 1024, 64)))
+    bound = cpu_bind(_kernel(biased_attention.fn), _cpu_args((2, 8, 1024, 64)))
     spec = bound.config_spec
     assert spec.cute_flash_search_enabled
     cfg = spec.default_config()
@@ -110,7 +109,7 @@ def test_head_dim_128_keeps_a_two_deep_kv_ring() -> None:
     two K/V stages, so the default reads ``direct`` (fail closed) while the
     knob stays searchable; without the staged output the resolver takes the
     one-stage ring and keeps a two-deep K/V ring."""
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _kernel(biased_attention_output.fn), _cpu_args((1, 2, 256, 128), torch.float16)
     )
     spec = bound.config_spec
@@ -147,7 +146,7 @@ def test_head_dim_128_keeps_a_two_deep_kv_ring() -> None:
 
 @skipUnlessBackends(["cute"])
 def test_plans_without_a_tensor_bias_pin_direct() -> None:
-    bound = _cpu_bind(_kernel(attention.fn), _cpu_args((2, 8, 1024, 64), bias=False))
+    bound = cpu_bind(_kernel(attention.fn), _cpu_args((2, 8, 1024, 64), bias=False))
     spec = bound.config_spec
     cfg = spec.default_config()
     assert cfg.config["cute_flash_bias_stage"] == "direct"

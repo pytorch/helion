@@ -9,7 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 from test.test_cute_packed_collective_matmul import _ScalarTensor
 
 import helion
@@ -19,6 +18,7 @@ from helion._compiler.cute.packed_matmul import interleaved_matrix_terms
 from helion._compiler.cute.scaled_contraction import expose_scaled_contractions
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 from helion.language import creation_ops
@@ -28,7 +28,7 @@ from helion.language.quantized_ops import float4_e2m1fn_x2_to_float32
 
 _nvfp4_w4a4_matmul_kernel = import_example("nvfp4_gemm")._nvfp4_w4a4_matmul_kernel
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from helion._compiler.device_ir import DeviceIR
@@ -62,7 +62,7 @@ def _bind(
         static_shapes=_nvfp4_w4a4_matmul_kernel.settings.static_shapes,
         autotune_effort="none",
     )
-    with _cpu_target():
+    with cpu_target():
         return kernel._bind_isolated(inputs), inputs
 
 
@@ -101,7 +101,7 @@ def test_original_nvfp4_has_ordinary_mma_seeds(shape: tuple[int, int, int]) -> N
             bound.config_spec.normalize(seed)
             restored = generation.unflatten(generation.flatten(seed))
             assert all(restored[key] == value for key, value in seed.items())
-    with _cpu_target():
+    with cpu_target():
         source = bound.to_code(_config())
     assert "cute.gemm(" in source
     assert "tcgen05.CtaGroup.ONE" in source
@@ -149,7 +149,7 @@ def test_pair_count_and_scale_layout_are_not_fixed(pairs: int) -> None:
         torch.empty((7, 41), dtype=torch.float8_e4m3fn),
         torch.empty((73, 41), dtype=torch.float32),
     )
-    with _cpu_target():
+    with cpu_target():
         bound = _scaled_pairs._bind_isolated(args)
         source = bound.to_code(_config("scalar"))
     assert bound.host_function is not None
@@ -318,7 +318,7 @@ def test_actual_packed_staging_preserves_scales_and_nan_padding(
     compute: str, bk: int
 ) -> None:
     bound, inputs = _bind()
-    with _cpu_target():
+    with cpu_target():
         source = bound.to_code(_config(compute, bk=bk))
     tree = ast.parse(source)
     loops = [
@@ -546,7 +546,7 @@ def test_one_scale_narrow_operand_is_exposed(dtype: torch.dtype) -> None:
         torch.empty((7, 41), dtype=torch.float8_e4m3fn),
         torch.empty((73, 41), dtype=torch.float32),
     )
-    with _cpu_target():
+    with cpu_target():
         bound = _one_scale_pairs._bind_isolated(args)
         source = bound.to_code(_config("scalar"))
     (node,) = _dot_nodes(bound)
@@ -582,7 +582,7 @@ def test_w4a16_example_exposes_a_bf16_contraction() -> None:
         static_shapes=True,
         autotune_effort="none",
     )
-    with _cpu_target():
+    with cpu_target():
         bound = kernel._bind_isolated(inputs)
         source = bound.to_code(_config())
     assert len(_dot_nodes(bound)) == 1
@@ -618,7 +618,7 @@ def test_refuses_scale_on_narrow_operand(kernel: object) -> None:
             sb,
             torch.empty((73, 41), dtype=torch.float32),
         )
-    with _cpu_target():
+    with cpu_target():
         bound = kernel._bind_isolated(args)  # pyrefly: ignore[missing-attribute]
     assert _dot_nodes(bound) == []
     assert bound.config_spec.matmul_facts == []

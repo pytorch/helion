@@ -9,9 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from ._cute_binding import _cpu_bind
-from ._cute_binding import _forbid_cuda_work
-from ._cute_binding import _mock_cuda_unavailable
 from .cute_population_contracts import _target
 from .test_cute_grouped_fp32_output import _grouped_fp32_output
 from .test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
@@ -22,6 +19,9 @@ import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 
 
@@ -36,8 +36,8 @@ def test_global_weights_host_descriptor_matches_device_coordinates(
     )
     config = dict(_config(1).config)
     config["tcgen05_grouped_full_allocation_a"] = True
-    with _target(), _mock_cuda_unavailable():
-        code = _cpu_bind(_grouped_fp32_output, args).to_code(
+    with _target(), mock_cuda_unavailable():
+        code = cpu_bind(_grouped_fp32_output, args).to_code(
             helion.Config.from_dict(config)
         )
     parsed = ast.parse(code)
@@ -78,8 +78,8 @@ def test_global_weights_keeps_feature_tail_on_dynamic_path(cluster_m: int) -> No
         torch.empty((4, 192, 128), dtype=torch.bfloat16),
         torch.tensor([0, 0, 1, 129, 640], dtype=torch.int32),
     )
-    with _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped_fp32_output, args)
+    with _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped_fp32_output, args)
         config = dict((_config(1) if cluster_m == 1 else _selected_config(128)).config)
         bound.to_code(helion.Config.from_dict(config))
         config["tcgen05_grouped_full_allocation_a"] = True
@@ -137,8 +137,8 @@ def test_two_immutable_descriptors_address_each_expert_and_live_interval(
         torch.empty((groups, columns, reduction), dtype=torch.bfloat16),
         torch.tensor([0, 0, 1, 129, rows], dtype=offset_dtype),
     )
-    with _target(), _mock_cuda_unavailable(), _forbid_cuda_work():
-        source = _cpu_bind(_grouped_fp32_output, args).to_code(
+    with _target(), mock_cuda_unavailable(), forbid_cuda_work():
+        source = cpu_bind(_grouped_fp32_output, args).to_code(
             _two_config(source_m_tile)
         )
     tree = ast.parse(source)
@@ -259,8 +259,8 @@ def test_two_ordinary_inputs_keep_the_original_dynamic_descriptors(
         torch.empty((4, 512, 128), dtype=torch.bfloat16),
         torch.tensor([0, 0, 1, 129, 640], dtype=torch.int32),
     )
-    with _target(), _mock_cuda_unavailable(), _forbid_cuda_work():
-        source = _cpu_bind(_grouped_fp32_output, args).to_code(
+    with _target(), mock_cuda_unavailable(), forbid_cuda_work():
+        source = cpu_bind(_grouped_fp32_output, args).to_code(
             _two_config(source_m_tile, immutable=False)
         )
     ab = next(
@@ -285,8 +285,8 @@ def test_two_immutable_inputs_require_index_and_ownership_proofs(
         torch.empty((4, 512, 128), dtype=torch.bfloat16),
         torch.tensor([0, 0, 1, 129, 640], dtype=torch.int32),
     )
-    with _target(), _mock_cuda_unavailable(), _forbid_cuda_work():
-        bound = _cpu_bind(_grouped_fp32_output, args)
+    with _target(), mock_cuda_unavailable(), forbid_cuda_work():
+        bound = cpu_bind(_grouped_fp32_output, args)
         with (
             patch(f"helion._compiler.cute.cute_mma.{proof}", return_value=False),
             pytest.raises(exc.BackendUnsupported),

@@ -9,9 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_shared_rhs_grouped import _target as _cpu_codegen_target
 
 import helion
@@ -53,6 +50,9 @@ from helion._testing import matchesBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessTcgen05RuntimeNPtx
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.cute.launcher import _tcgen05_grouped_runtime_nm_tile_records
@@ -1067,8 +1067,8 @@ def test_grouped_worklist_nm_codegen_backstop_rejects_generated_smem() -> None:
         ab_stages=7,
     )
     with (
-        _forbid_cuda_work(),
-        _mock_cuda_unavailable(),
+        forbid_cuda_work(),
+        mock_cuda_unavailable(),
         _cpu_codegen_target(),
         patch(f"{__name__}.DEVICE", torch.device("cpu")),
     ):
@@ -1079,7 +1079,7 @@ def test_grouped_worklist_nm_codegen_backstop_rejects_generated_smem() -> None:
             source_m_tile=TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
         )
         _selected_kernel.reset()
-        bound = _cpu_bind(_selected_kernel, args)
+        bound = cpu_bind(_selected_kernel, args)
         bound.env.config_spec.cute_tcgen05_search_enabled = True
         bound.env.config_spec._tcgen05_ab_stages_three_search_constraints = None
         with (

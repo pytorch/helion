@@ -17,6 +17,8 @@ from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import MemoryOpFact
 from helion.runtime.kernel import _input_tensor_metadata
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.device_ir import DeviceIR

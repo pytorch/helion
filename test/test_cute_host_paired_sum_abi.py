@@ -19,11 +19,11 @@ pytest.importorskip("cutlass.cute")
 
 from cuda.bindings.driver import CUstream
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_host_paired_sum_seeds import _original
 
 import helion
 from helion._compiler.cute.paired_sum_runtime import paired_sum_cast_kernel
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.runtime.cute import launcher
 from helion.runtime.cute import paired_sum
 
@@ -43,7 +43,7 @@ _requires_pinned_aten_build = pytest.mark.skipif(
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "torch.cuda._exchange_device", side_effect=AssertionError("GPU forbidden")

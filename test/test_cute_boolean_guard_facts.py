@@ -13,6 +13,8 @@ from helion._compiler.ast_read_writes import ast_rename
 from helion._compiler.cute import boolean_guards
 from helion._compiler.cute.boolean_guards import reassociate_boolean_guards
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _pair(source: str) -> tuple[list[ast.stmt], list[ast.stmt]]:
     before = ast.parse(textwrap.dedent(source)).body

@@ -6,7 +6,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_affine_vector_io import _SOURCE
 from test.test_cute_affine_vector_io import _execute
@@ -18,7 +17,10 @@ from helion._compiler.runtime_tensor_guards import (
 )
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 add_2d = import_example("aot_compile_example").add_2d
 
@@ -156,7 +158,7 @@ def test_original_dynamic_aot_add_uses_vector_memory(
     try:
         with (
             _target(),
-            _mock_cuda_unavailable(),
+            mock_cuda_unavailable(),
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         ):
             kernel = helion.kernel(
@@ -203,7 +205,7 @@ def test_external_output_registers_alias_facts_for_vector_memory(
     try:
         with (
             _target(),
-            _mock_cuda_unavailable(),
+            mock_cuda_unavailable(),
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         ):
             kernel = helion.kernel(

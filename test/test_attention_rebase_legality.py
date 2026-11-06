@@ -8,18 +8,20 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from ._cute_binding import _forbid_native_compile
-from ._cute_binding import _mock_cuda_unavailable
 from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
 from helion._compiler.backend import CuteBackend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute import cute_flash as flash
 from helion._compiler.device_ir import DeviceIR
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -27,7 +29,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with _mock_cuda_unavailable(), _forbid_native_compile():
+    with mock_cuda_unavailable(), forbid_native_compile():
         yield
 
 

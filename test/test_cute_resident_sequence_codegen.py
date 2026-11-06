@@ -8,21 +8,20 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics.cute_resident_sequence import (
     CuteResidentSequenceHeuristic,
 )
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 
 row_softmax = import_example("aot_example").row_softmax
 welford = import_example("welford").welford
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def _arguments(kind: str, columns: int, dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
@@ -36,20 +35,25 @@ def _arguments(kind: str, columns: int, dtype: torch.dtype) -> tuple[torch.Tenso
     return (matrix,)
 
 
+# The column extents pick the seed geometries of each kernel and static shapes
+# change the generated source; only softmax has an online sweep to rewrite,
+# so the welford rows run with the rewrite disabled alone.
 @pytest.mark.parametrize(
-    "kind,columns,dtype",
+    "kind,columns,dtype,online_rewrite",
     [
-        ("welford", 512, torch.float32),
-        ("welford", 1024, torch.float32),
-        ("welford", 1536, torch.float32),
-        ("welford", 2048, torch.float32),
-        ("softmax", 256, torch.bfloat16),
-        ("softmax", 1024, torch.bfloat16),
-        ("softmax", 4096, torch.bfloat16),
+        ("welford", 512, torch.float32, False),
+        ("welford", 1024, torch.float32, False),
+        ("welford", 1536, torch.float32, False),
+        ("welford", 2048, torch.float32, False),
+        ("softmax", 256, torch.bfloat16, False),
+        ("softmax", 256, torch.bfloat16, True),
+        ("softmax", 1024, torch.bfloat16, False),
+        ("softmax", 1024, torch.bfloat16, True),
+        ("softmax", 4096, torch.bfloat16, False),
+        ("softmax", 4096, torch.bfloat16, True),
     ],
 )
 @pytest.mark.parametrize("static", [False, True])
-@pytest.mark.parametrize("online_rewrite", [False, True])
 def test_original_sequence_seeds_roundtrip_and_emit(
     kind: str,
     columns: int,
@@ -66,14 +70,14 @@ def test_original_sequence_seeds_roundtrip_and_emit(
         autotune_effort="none",
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(kernel, _arguments(kind, columns, dtype))
+        bound = cpu_bind(kernel, _arguments(kind, columns, dtype))
         host = bound.host_function
         assert host is not None
         with bound.env:
@@ -85,6 +89,7 @@ def test_original_sequence_seeds_roundtrip_and_emit(
             surviving = [
                 config for _flat, config in generation.seed_flat_config_pairs()
             ]
+        rendered: set[tuple[object, ...]] = set()
         for seed in seeds:
             assert (
                 seed.block_sizes[1]
@@ -104,6 +109,20 @@ def test_original_sequence_seeds_roundtrip_and_emit(
                 "cute_cluster_n",
             ):
                 assert roundtrip.config[key] == normalized.config[key]
+            # Render one seed per sequence lowering (the thread count picks
+            # the register-tile or looped reduction form): the row tile only
+            # resizes the loops of the source checked below.
+            family = (
+                roundtrip.config["cute_reduction_sequence"],
+                roundtrip.config["cute_cluster_n"],
+                tuple(cast("list[str]", roundtrip.config["cute_lane_layouts"])),
+                tuple(cast("list[int]", roundtrip.config["cute_vector_widths"])),
+                tuple(cast("list[int]", roundtrip.config["num_threads"])),
+                roundtrip.block_sizes[0],
+            )
+            if family in rendered:
+                continue
+            rendered.add(family)
             source = bound.to_code(roundtrip)
             assert "sequence_acc" in source
             assert "_helion_sequence_reduce" not in source
@@ -147,7 +166,7 @@ def test_original_sequence_seeds_roundtrip_and_emit(
 @pytest.mark.parametrize("value", ["other", 0, True, ["resident"]])
 def test_sequence_config_rejects_unknown_schedule(value: object) -> None:
     kernel = helion.kernel(welford.fn, backend="cute", autotune_effort="none")
-    bound = _cpu_bind(kernel, _arguments("welford", 2048, torch.float32))
+    bound = cpu_bind(kernel, _arguments("welford", 2048, torch.float32))
     with pytest.raises(helion.exc.InvalidConfig):
         bound.config_spec.normalized_config(
             helion.Config(cute_reduction_sequence=value)
@@ -158,7 +177,7 @@ def test_sequence_uses_realized_shared_sibling_thread_extent() -> None:
     kernel = helion.kernel(
         welford.fn, backend="cute", static_shapes=True, autotune_effort="none"
     )
-    bound = _cpu_bind(kernel, _arguments("welford", 2048, torch.float32))
+    bound = cpu_bind(kernel, _arguments("welford", 2048, torch.float32))
     config = helion.Config(
         block_sizes=[1, 2048, 2048],
         num_threads=[1, 32, 128],
@@ -183,7 +202,7 @@ def test_sequence_vector_cache_policies_remain_eligible(
     kernel = helion.kernel(
         welford.fn, backend="cute", static_shapes=True, autotune_effort="none"
     )
-    bound = _cpu_bind(kernel, _arguments("welford", 2048, torch.float32))
+    bound = cpu_bind(kernel, _arguments("welford", 2048, torch.float32))
     config = helion.Config(
         block_sizes=[4, 2048, 2048],
         num_threads=[4, 32, 32],

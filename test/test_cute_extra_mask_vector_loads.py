@@ -16,22 +16,21 @@ import ast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 concat2d_dim1 = import_example("concatenate").concat2d_dim1
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def _generate(kernel: object, args: tuple[torch.Tensor, ...], **config: object) -> str:
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, args)
         return bound.to_code(helion.Config.from_dict(config))
 
 

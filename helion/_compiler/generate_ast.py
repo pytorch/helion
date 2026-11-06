@@ -5,7 +5,6 @@ import collections
 import contextlib
 import dataclasses
 import logging
-import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import cast
@@ -36,7 +35,7 @@ from .cute.fragment_mma_dot import fragment_mma_off_config
 from .cute.register_tile_admission import RegisterTileUnsupported
 from .cute.ring_mma_dot import RingMmaNotApplied
 from .cute.ring_mma_dot import ring_mma_off_config
-from .cute.thread_budget import thread_idx_axis
+from .cute.thread_budget import referenced_thread_axes
 from .cute.unroll_lane_loads import LaneUnrollNotApplied
 from .cute.unroll_lane_loads import lane_unroll_off_config
 from .device_function import ConstExprArg
@@ -1698,14 +1697,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             for loop_state in loops:
                 statement_groups.append(loop_state.lane_index_definitions()[0])
         for statements in statement_groups:
-            for stmt in statements:
-                axes.update(
-                    int(axis_text)
-                    for axis_text in re.findall(
-                        r"cute\.arch\.thread_idx\(\)\[(\d+)\]",
-                        ast.unparse(stmt),
-                    )
-                )
+            axes.update(referenced_thread_axes(statements))
         return axes
 
     def _record_root_read_axes(
@@ -1722,12 +1714,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             *body,
             *grid_state.outer_suffix,
         ]
-        read_axes = {
-            axis
-            for stmt in statements
-            for node in ast.walk(stmt)
-            if (axis := thread_idx_axis(node)) is not None
-        }
+        read_axes = set(referenced_thread_axes(statements))
         self.root_read_axis_sizes.append(
             {
                 axis: size
@@ -1743,18 +1730,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     ) -> None:
         if axis_sizes is None:
             axis_sizes = self._current_active_thread_axis_sizes()
-        for stmt in statements:
-            text = ast.unparse(stmt)
-            for axis_text in re.findall(
-                r"cute\.arch\.thread_idx\(\)\[(\d+)\]",
-                text,
-            ):
-                axis = int(axis_text)
-                if 0 <= axis < 3:
-                    self.referenced_thread_block_dims[axis] = max(
-                        self.referenced_thread_block_dims[axis],
-                        axis_sizes.get(axis, 1),
-                    )
+        for axis in referenced_thread_axes(statements):
+            self.referenced_thread_block_dims[axis] = max(
+                self.referenced_thread_block_dims[axis],
+                axis_sizes.get(axis, 1),
+            )
 
     @contextlib.contextmanager
     def set_statements(self, new_statements: list[ast.AST] | None) -> Iterator[None]:
@@ -2129,6 +2109,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 for param in self._extra_params:
                     self.device_function.placeholder_args.add(param)
                 if CompileEnvironment.current().backend.name == "cute":
+                    from .tile_strategy import has_lane_reduce_markers
                     from .tile_strategy import hoist_lane_invariant_chunk_recurrence
                     from .tile_strategy import (
                         interchange_lane_outside_serial_reductions,
@@ -2259,25 +2240,32 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         name: aliases[0]
                         for name, aliases in self.device_function._variable_renames.items()
                     }
-                    resolve_pruned_lane_owners(
-                        list(self.device_function.body),
-                        self.device_function.cute_state.reshape_lane_fallbacks,
-                        physical_fallbacks=self.device_function.cute_state.reshape_physical_fallbacks,
-                        uniform_names=lane_uniform_names,
-                    )
-                    self.device_function.body = sink_lane_loops_into_uniform_branches(
-                        list(self.device_function.body),
-                        uniform_names=lane_uniform_names,
-                        rename_groups=lane_rename_groups,
-                    )
-                    self.device_function.body = normalize_nested_lane_reductions(
-                        list(self.device_function.body),
-                        uniform_names=lane_uniform_names,
-                        proven_disjoint_tensor_pairs=proven_disjoint_pairs,
-                        proven_tensor_stride_values=self.device_function.proven_tensor_stride_values(),
-                        rename_groups=lane_rename_groups,
-                    )
-                    validate_lane_reduce_owners(list(self.device_function.body))
+                    # The passes below rewrite, validate or restore
+                    # ``_helion_lane_reduce`` markers and leave a body without
+                    # any unchanged: scan for them once instead of in each.
+                    lane_markers = has_lane_reduce_markers(self.device_function.body)
+                    if lane_markers:
+                        resolve_pruned_lane_owners(
+                            list(self.device_function.body),
+                            self.device_function.cute_state.reshape_lane_fallbacks,
+                            physical_fallbacks=self.device_function.cute_state.reshape_physical_fallbacks,
+                            uniform_names=lane_uniform_names,
+                        )
+                        self.device_function.body = (
+                            sink_lane_loops_into_uniform_branches(
+                                list(self.device_function.body),
+                                uniform_names=lane_uniform_names,
+                                rename_groups=lane_rename_groups,
+                            )
+                        )
+                        self.device_function.body = normalize_nested_lane_reductions(
+                            list(self.device_function.body),
+                            uniform_names=lane_uniform_names,
+                            proven_disjoint_tensor_pairs=proven_disjoint_pairs,
+                            proven_tensor_stride_values=self.device_function.proven_tensor_stride_values(),
+                            rename_groups=lane_rename_groups,
+                        )
+                        validate_lane_reduce_owners(list(self.device_function.body))
                     self.device_function.body = interchange_lane_outside_serial_reductions(
                         list(self.device_function.body),
                         proven_disjoint_tensor_pairs=proven_disjoint_pairs,
@@ -2288,33 +2276,40 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             for alias in (name, *aliases)
                         },
                     )
-                    validate_lane_reduce_owners(list(self.device_function.body))
-                    from .cute.register_tile_admission import RegisterTileOptions
+                    # The interchange only moves markers that already exist
+                    # (``_interchange_one_lane_loop`` keeps a nest without
+                    # one as is), so the scan above still decides.
+                    if lane_markers:
+                        validate_lane_reduce_owners(list(self.device_function.body))
+                        from .cute.register_tile_admission import RegisterTileOptions
 
-                    knobs = self.device_function.config.config
-                    self.device_function.body = split_lane_loop_reductions(
-                        list(self.device_function.body),
-                        uniform_names=lane_uniform_names,
-                        proven_disjoint_tensor_pairs=proven_disjoint_pairs,
-                        proven_tensor_stride_values=(
-                            self.device_function.proven_tensor_stride_values()
-                        ),
-                        rename_groups={
-                            name: aliases[0]
-                            for name, aliases in self.device_function._variable_renames.items()
-                        },
-                        running_sums=self.device_function.cute_matmul_running_sums,
-                        register_tile_options=RegisterTileOptions(
-                            warp_fold=knobs.get("cute_register_tile_warp_fold") is True,
-                            store_first=knobs.get("cute_register_tile_store_first")
-                            is True,
-                        ),
-                    )
-                    # Reject any owned marker without a proved lowering, so an
-                    # incomplete per-lane input cannot stand in for a reduction.
-                    self.device_function.body = restore_unprocessed_lane_reduce_markers(
-                        list(self.device_function.body)
-                    )
+                        knobs = self.device_function.config.config
+                        self.device_function.body = split_lane_loop_reductions(
+                            list(self.device_function.body),
+                            uniform_names=lane_uniform_names,
+                            proven_disjoint_tensor_pairs=proven_disjoint_pairs,
+                            proven_tensor_stride_values=(
+                                self.device_function.proven_tensor_stride_values()
+                            ),
+                            rename_groups={
+                                name: aliases[0]
+                                for name, aliases in self.device_function._variable_renames.items()
+                            },
+                            running_sums=self.device_function.cute_matmul_running_sums,
+                            register_tile_options=RegisterTileOptions(
+                                warp_fold=knobs.get("cute_register_tile_warp_fold")
+                                is True,
+                                store_first=knobs.get("cute_register_tile_store_first")
+                                is True,
+                            ),
+                        )
+                        # Reject any owned marker without a proved lowering, so an
+                        # incomplete per-lane input cannot stand in for a reduction.
+                        self.device_function.body = (
+                            restore_unprocessed_lane_reduce_markers(
+                                list(self.device_function.body)
+                            )
+                        )
                     # Restructure chunked-recurrence ``for chunk: for lane:``
                     # nests whose matmul ``dot_acc`` running-sum needs the
                     # lane-invariant rescale / chunk-entry stores / final combine

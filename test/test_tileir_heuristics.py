@@ -6,10 +6,6 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
 from helion._compiler.autotuner_heuristics import get_heuristics
@@ -19,6 +15,9 @@ from helion._compiler.autotuner_heuristics.tileir import TileIRRowReductionHeuri
 from helion._compiler.autotuner_heuristics.tileir import TileIRSmallReductionHeuristic
 from helion._compiler.backend import TileIRBackend
 from helion._testing import skipIfRefEager
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import MatmulFact
@@ -32,6 +31,8 @@ from helion.autotuner.llm_search import LLMGuidedSearch
 import helion.language as hl
 from helion.runtime.settings import Settings
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("ENABLE_TILE", "1")
-    with _mock_cuda_unavailable(), _forbid_cuda_work():
+    with mock_cuda_unavailable(), forbid_cuda_work():
         yield
 
 
@@ -289,7 +290,7 @@ def test_live_cpu_binding_recognizes_registered_matmul_tiles() -> None:
             )
         return out
 
-    bound = _cpu_bind(
+    bound = cpu_bind(
         matmul,
         (
             torch.empty((256, 512), dtype=torch.bfloat16),
@@ -318,7 +319,7 @@ def test_live_cpu_binding_recognizes_declined_but_bounded_chunk() -> None:
             out[row, part] = value.amax()
         return out
 
-    bound = _cpu_bind(chunk_max, (torch.empty((64, 32000)),))
+    bound = cpu_bind(chunk_max, (torch.empty((64, 32000)),))
     spec = bound.config_spec
     assert (
         spec.reduction_kernel_fact.reductions[0].category == ReductionCategory.DECLINED
@@ -341,7 +342,7 @@ def test_live_cpu_binding_recognizes_fixed_width_group_reduction() -> None:
             out[group, column] = (value / maximum[:, None]).to(x.dtype)
         return out
 
-    bound = _cpu_bind(group_norm, (torch.empty((4096, 32), dtype=torch.bfloat16),))
+    bound = cpu_bind(group_norm, (torch.empty((4096, 32), dtype=torch.bfloat16),))
     spec = bound.config_spec
     assert (
         spec.reduction_kernel_fact.reductions[0].category
@@ -363,7 +364,7 @@ def test_live_cpu_binding_recognizes_canonical_row_reduction() -> None:
             out[row, :] = (value * inv[:, None]).to(x.dtype)
         return out
 
-    bound = _cpu_bind(row_norm, (torch.empty((16, 7168), dtype=torch.float16),))
+    bound = cpu_bind(row_norm, (torch.empty((16, 7168), dtype=torch.float16),))
     spec = bound.config_spec
     assert spec.autotuner_heuristics == ["tileir_row_reduction"]
     seeds = spec.compiler_seed_configs

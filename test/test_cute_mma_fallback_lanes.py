@@ -5,12 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-from test.test_cute_fuse_mm_accumulation import _cpu_target
-
 import helion
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_codegen import mock_cuda_unavailable
 
 matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
@@ -35,7 +34,7 @@ def test_split_reduction_keeps_scalar_operand_loads(dtype: torch.dtype) -> None:
         static_shapes=True,
         autotune_effort="none",
     )
-    with _mock_cuda_unavailable(), _cpu_target():
+    with mock_cuda_unavailable(), cpu_target():
         bound = kernel._bind_isolated(
             (
                 torch.empty((64, 1024), dtype=dtype),

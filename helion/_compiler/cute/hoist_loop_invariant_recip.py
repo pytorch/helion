@@ -1259,17 +1259,18 @@ def _collect_all_name_reads(body: list[ast.stmt]) -> set[str]:
 
 def _dce_pure_assigns(body: list[ast.stmt]) -> list[ast.stmt]:
     """Remove ``NAME = pure-expr`` statements where NAME is never read
-    afterwards, and ``pure-expr`` has no side effects.
+    anywhere in the kernel, and ``pure-expr`` has no side effects.
 
     A pure-expr is conservatively any expression with no Call nodes.
-    The pass iterates until fixed point so cascaded dead chains
-    (``v_10 = v_9 - mi; v_X = v_10 + 1``) DCE together — if the second
-    is removed, the first becomes dead too.
 
-    Reads are collected across the ENTIRE body before any DCE so an
-    assignment inside an ``if`` branch is never removed when the name
-    is read in an enclosing scope (the previous per-scope read set
-    would miss those outer reads and silently drop the assignment).
+    Reads are collected ONCE across the ENTIRE body before any DCE so an
+    assignment inside an ``if`` branch is never removed when the name is
+    read in an enclosing scope (a per-scope read set would miss those outer
+    reads and silently drop the assignment).  That whole-body read set also
+    counts the reads of the statements removed here, so the head of a dead
+    chain (``v_10 = v_9 - mi; v_X = v_10 + 1``) stays when only its tail is
+    dead: every removal is decided against the same set, which makes one
+    pass over each scope complete.
 
     Mutates ``body`` in place.
     """
@@ -1301,42 +1302,29 @@ def _dce_pure_assigns(body: list[ast.stmt]) -> list[ast.stmt]:
             return None
         return name
 
-    def _walk(stmts: list[ast.stmt], outer_reads: set[str]) -> list[ast.stmt]:
+    # The full body's reads: every scope decides against this one set, so a
+    # name assigned in an ``if`` branch and read after it is never removed.
+    reads = _collect_all_name_reads(body)
+
+    def _walk(stmts: list[ast.stmt]) -> list[ast.stmt]:
         if _is_placeholder_body(stmts):
             return stmts
-        # Recurse into children first so DCE at the leaves can propagate
-        # upward via fixed-point iteration.  ``outer_reads`` carries reads
-        # from enclosing scopes so a name assigned in an ``if`` branch is
-        # preserved if it is read after the if/else.
+        new_stmts = []
         for stmt in stmts:
             if isinstance(
                 stmt, (ast.For, ast.While, ast.If, ast.With, ast.FunctionDef)
             ):
-                stmt.body = _walk(stmt.body, outer_reads)
+                stmt.body = _walk(stmt.body)
             if isinstance(stmt, (ast.For, ast.While, ast.If)):
-                stmt.orelse = _walk(stmt.orelse, outer_reads)
+                stmt.orelse = _walk(stmt.orelse)
+            if isinstance(stmt, ast.Assign):
+                name = _eligible_target(stmt)
+                if name is not None and name not in reads and _is_pure(stmt.value):
+                    continue
+            new_stmts.append(stmt)
+        return new_stmts
 
-        # Iterate to fixed point.
-        while True:
-            reads = _collect_all_name_reads(stmts) | outer_reads
-            new_stmts = []
-            removed = False
-            for stmt in stmts:
-                if isinstance(stmt, ast.Assign):
-                    name = _eligible_target(stmt)
-                    if name is not None and name not in reads and _is_pure(stmt.value):
-                        removed = True
-                        continue
-                new_stmts.append(stmt)
-            stmts = new_stmts
-            if not removed:
-                break
-        return stmts
-
-    # Seed with the full body's reads so the inner ``_walk`` calls see
-    # every read across the entire kernel, not just reads local to their
-    # own scope.
-    body[:] = _walk(body, _collect_all_name_reads(body))
+    body[:] = _walk(body)
     return body
 
 

@@ -1,26 +1,37 @@
 from __future__ import annotations
 
-import dataclasses
 import random
 
 import pytest
 import torch
 
-from .test_cute_flash_length_invariance import _memoized_flash_fragments
 from .test_cute_flash_resident_choice import _spec as _dense_spec
 from .test_cute_flash_stateful_choice import _spec as _causal_spec
 from helion._compiler.cute import cute_flash as flash
+from helion._testing.cute_flash import memoized_flash_fragments
+from helion._testing.cute_flash import shared_flash_generation
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 
+pytestmark = pytest.mark.cpu_only
 
+
+# The pinned-packet domains' two coverage designs take about a minute each:
+# the design normalizes some 100k candidate configs (twice each under
+# overrides) in ``ConfigGeneration._flash_deterministic_coverage_flats``.
+# Pull requests skip them; the pinned-rep domains stay under 20 s.
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 @pytest.mark.timeout(240)
 @pytest.mark.parametrize(
     ("causal", "key", "value"),
     (
-        (False, flash.FLASH_EXP2_PACKET_KEY, "deg2_16x6"),
+        pytest.param(
+            False,
+            flash.FLASH_EXP2_PACKET_KEY,
+            "deg2_16x6",
+            marks=pytest.mark.slow,
+        ),
         (False, flash.FLASH_P_STORE_REP_KEY, 32),
         (True, flash.FLASH_P_STORE_REP_KEY, 32),
     ),
@@ -28,17 +39,10 @@ from helion.exc import InvalidConfig
 def test_fixed_controls_remove_only_incompatible_resident_search_choices(
     causal: bool, key: str, value: object, dtype: torch.dtype
 ) -> None:
-    # The expanded domain requires two independent complete coverage designs.
-    # Keep all 100 configs and allow both designs to finish under a bounded timeout.
     head_dim = 64 if dtype is torch.float16 else 128
     # A pinned polynomial packet needs the fast_math surface, the only one
     # that offers it.
     fast_math = value in flash._FLASH_FAST_MATH_EXP2_PACKETS
-    spec = (
-        _causal_spec(head_dim, 32, dtype)
-        if causal
-        else _dense_spec(head_dim, 48, dtype, fast_math=fast_math)
-    )
     overrides = {key: value}
     if not causal and key == flash.FLASH_P_STORE_REP_KEY:
         # Rep32 P stores require Rep32 S loads and cannot use the upstream
@@ -48,12 +52,32 @@ def test_fixed_controls_remove_only_incompatible_resident_search_choices(
         overrides[flash.FLASH_S_LOAD_REP_KEY] = 32
         overrides[flash.FLASH_P_CHUNK_ARRIVE_KEY] = False
         overrides[flash.FLASH_SOFTMAX_SETUP_KEY] = "shared"
-    generation = spec.create_config_generation(overrides=overrides)
     resident = "resident_stateful" if causal else "resident_value_graph"
+    # The pinned generation and its explicit resident-free reference (the same
+    # surface with the resident choice taken out of the search) are the shared
+    # warmed instances: their coverage designs are built once per process.
+    spec_args: tuple[object, ...] = (
+        (head_dim, 32, dtype) if causal else (head_dim, 48, dtype)
+    )
+    spec_kwargs: dict[str, object] = {} if causal else {"fast_math": fast_math}
+    build_spec = _causal_spec if causal else _dense_spec
+    generation = shared_flash_generation(
+        build_spec, *spec_args, overrides=overrides, **spec_kwargs
+    )
+    reference = shared_flash_generation(
+        build_spec,
+        *spec_args,
+        overrides=overrides,
+        excluded_search_choices={flash.FLASH_SOFTMAX_LOWERING_KEY: resident},
+        **spec_kwargs,
+    )
+    # 100 rows: the complete coverage design plus a random tail, so both the
+    # design's witnesses and the random fill are checked for the resident
+    # choice (the fill is cheap; the design dominates and is already built).
     saved = random.getstate()
     try:
         random.seed(20261003)
-        with _memoized_flash_fragments():
+        with memoized_flash_fragments():
             population = generation.random_population(100)
     finally:
         random.setstate(saved)
@@ -62,35 +86,11 @@ def test_fixed_controls_remove_only_incompatible_resident_search_choices(
         config.config[flash.FLASH_SOFTMAX_LOWERING_KEY] != resident
         for config in population
     )
-    family = generation._flash_pipeline_family_override
-    fields = (
-        spec._flat_fields()
-        if family is None
-        else spec._flat_fields_with_flash_family(family)
-    )
-    fragment = fields[flash.FLASH_SOFTMAX_LOWERING_KEY]
-    assert isinstance(fragment, EnumFragment)
-    reference = ConfigGeneration(
-        spec,
-        overrides=generation._override_values,
-        _flash_pipeline_family_override=generation._flash_pipeline_family_override,
-        _field_view={
-            **fields,
-            flash.FLASH_SOFTMAX_LOWERING_KEY: dataclasses.replace(
-                fragment,
-                search_choices=tuple(
-                    choice
-                    for choice in fragment._active_choices()
-                    if choice != resident
-                ),
-            ),
-        },
-    )
     if key == flash.FLASH_EXP2_PACKET_KEY:
         assert all(config.config[key] == value for config in population)
         # Packet-owned parents already leave some ordinary child axes
         # unreachable. Preserve that telemetry against the resident-free domain.
-        with _memoized_flash_fragments():
+        with memoized_flash_fragments():
             assert (
                 generation.flash_structural_coverage_uncovered_values()
                 == reference.flash_structural_coverage_uncovered_values()
@@ -107,7 +107,7 @@ def test_fixed_controls_remove_only_incompatible_resident_search_choices(
         saved = random.getstate()
         try:
             random.seed(20261003)
-            with _memoized_flash_fragments():
+            with memoized_flash_fragments():
                 assert population == reference.random_population(100)
         finally:
             random.setstate(saved)
@@ -171,16 +171,24 @@ def test_direct_generation_preserves_its_subset_view_and_explicit_errors() -> No
 
 
 # This builds a complete coverage design, including probes for unreachable
-# override values. Allow the same shared-CI headroom as the population test above.
+# override values; the FP16 hd64 domain's probes take about a minute (the
+# design searches witnesses for the children the override pins away), so
+# pull requests skip that case. Allow the same shared-CI headroom as the
+# population test above.
 @pytest.mark.timeout(240)
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize(
+    "dtype",
+    (
+        pytest.param(torch.float16, marks=pytest.mark.slow),
+        torch.bfloat16,
+    ),
+)
 def test_unpaired_store_override_retains_unrelated_coverage_gap(
     dtype: torch.dtype,
 ) -> None:
     head_dim = 64 if dtype is torch.float16 else 128
-    spec = _dense_spec(head_dim, 48, dtype)
-    generation = spec.create_config_generation(
-        overrides={flash.FLASH_P_STORE_REP_KEY: 32}
+    generation = shared_flash_generation(
+        _dense_spec, head_dim, 48, dtype, overrides={flash.FLASH_P_STORE_REP_KEY: 32}
     )
     expected = [(flash.FLASH_S_LOAD_REP_KEY, 16)]
     if dtype is torch.float16:
@@ -191,5 +199,5 @@ def test_unpaired_store_override_retains_unrelated_coverage_gap(
     # The dense domains advertise per-chunk P release, whose P16 layout
     # cannot survive this P32 override. Keep that gap visible too.
     expected.append((flash.FLASH_P_CHUNK_ARRIVE_KEY, True))
-    with _memoized_flash_fragments():
+    with memoized_flash_fragments():
         assert generation.flash_structural_coverage_uncovered_values() == expected

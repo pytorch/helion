@@ -5,9 +5,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics import get_heuristics
 from helion._compiler.autotuner_heuristics.cute import CuteNestedRowHeuristic
@@ -17,6 +14,8 @@ from helion._compiler.cute.thread_budget import tile_loop_thread_count
 from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 _examples_jagged_layer_norm = import_example("jagged_layer_norm")
@@ -27,14 +26,11 @@ reference_jagged_layer_norm_pytorch = (
 
 pytestmark = skipUnlessBackends(["cute"])
 
-_SEED_CODEGEN_SHARDS = 4
-
 
 @pytest.mark.parametrize("columns", [32, 69, 128, 512])
 @pytest.mark.parametrize("static_shapes", [False, True])
-@pytest.mark.parametrize("seed_shard", range(_SEED_CODEGEN_SHARDS))
 def test_nested_jagged_passes_receive_reachable_coherent_seeds(
-    columns: int, static_shapes: bool, seed_shard: int
+    columns: int, static_shapes: bool
 ) -> None:
     kernel = helion.kernel(
         jagged_layer_norm_kernel.fn,
@@ -42,7 +38,7 @@ def test_nested_jagged_passes_receive_reachable_coherent_seeds(
         static_shapes=static_shapes,
         autotune_effort="none",
     )
-    bound = _cpu_bind(
+    bound = cpu_bind(
         kernel,
         (torch.empty((731, columns)), torch.empty(18, dtype=torch.int64), 1e-6),
     )
@@ -61,9 +57,8 @@ def test_nested_jagged_passes_receive_reachable_coherent_seeds(
     # view carries a symbolic storage offset, which no bound residue covers.
     sunk = [seed for seed in seeds if seed.config.get("cute_vloop_sink")]
     assert bool(sunk) == (columns % 4 == 0 and static_shapes)
-    # The largest case generates 111 sources; split that work across test cases
-    # so CI's per-test timeout does not terminate a worker mid-codegen.
-    for seed in seeds[seed_shard::_SEED_CODEGEN_SHARDS]:
+    rendered: set[tuple[object, ...]] = set()
+    for seed in seeds:
         normalized = seed.config.copy()
         spec.normalize(normalized)
         assert normalized["num_threads"] == seed.config["num_threads"]
@@ -92,6 +87,13 @@ def test_nested_jagged_passes_receive_reachable_coherent_seeds(
             else:
                 assert reduction_threads == 1
                 assert feature_threads > 1
+        # Render one seed per thread split: the row tile and lane unroll only
+        # resize the loops of the same lowering, which the checks above cover
+        # for every seed.
+        family = (vectorized, tuple(seed.num_threads))
+        if family in rendered:
+            continue
+        rendered.add(family)
         with patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
@@ -119,7 +121,7 @@ def test_nested_jagged_default_is_the_primary_seed(
         static_shapes=static_shapes,
         autotune_effort="none",
     )
-    bound = _cpu_bind(
+    bound = cpu_bind(
         kernel,
         (torch.empty((731, columns)), torch.empty(18, dtype=torch.int64), 1e-6),
     )
@@ -200,7 +202,7 @@ def test_nested_jagged_vectorized_default_matches_reference() -> None:
 
 def test_nested_seeds_respect_config_sequence_registration_order() -> None:
     kernel = helion.kernel(jagged_layer_norm_kernel.fn, backend="cute")
-    bound = _cpu_bind(
+    bound = cpu_bind(
         kernel,
         (torch.empty((731, 128)), torch.empty(18, dtype=torch.int64), 1e-6),
     )
@@ -225,7 +227,7 @@ def test_nested_seeds_do_not_claim_a_plain_row_kernel() -> None:
             out[row] = x[row, :].sum(dim=-1)
         return out
 
-    bound = _cpu_bind(row_sum, (torch.empty((17, 128)),))
+    bound = cpu_bind(row_sum, (torch.empty((17, 128)),))
     host = bound.host_function
     assert host is not None
     assert not CuteNestedRowHeuristic.get_seed_configs(bound.env, host.device_ir)
@@ -242,8 +244,8 @@ def test_flat_jagged_search_reaches_wide_coherent_vector_sweeps(
         cute_flatten_nested_reductions=True,
         autotune_effort="none",
     )
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable():
+        bound = cpu_bind(
             kernel, (torch.empty((731, 128)), torch.empty(18, dtype=torch.int64))
         )
     host = bound.host_function

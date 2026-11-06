@@ -5,8 +5,6 @@ import ast
 import pytest
 import torch
 
-from ._cute_binding import _cpu_bind
-from ._cute_binding import _mock_cuda_unavailable
 from .cute_population_contracts import _target
 from .test_cute_grouped_fp32_output import _grouped_fp32_output
 from .test_cute_grouped_grid_multiplier import _config
@@ -16,7 +14,11 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_store_shape
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.runtime.cute.launcher import _tcgen05_grouped_device_source_m_tile_supported
+
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("source_rows", [8, 16])
@@ -34,8 +36,8 @@ def test_narrow_grouped_source_keeps_its_extent_through_store(
     config["tcgen05_ab_stages"] = 3
     config["tcgen05_grouped_worklist_source_m_tile"] = source_rows
     config["tcgen05_warp_register_reallocation"] = False
-    with _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_grouped_fp32_output, args)
+    with _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_grouped_fp32_output, args)
         normalized = bound.config_spec.normalized_config(
             helion.Config.from_dict(config)
         )

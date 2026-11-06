@@ -7,17 +7,19 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_compiler_coverage import make_search
 
 import helion
 from helion import exc
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 KEY = "cute_fragment_scan"
 
@@ -73,9 +75,9 @@ def _tiled_scan(x: torch.Tensor):
 @pytest.fixture(autouse=True)
 def _cpu_only():
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
         yield
@@ -114,7 +116,7 @@ def _without_later_fragment_coverage():
 
 
 def _bind():
-    return _cpu_bind(_computed_scan, (torch.ones(3, 5, 65), 2, False))
+    return cpu_bind(_computed_scan, (torch.ones(3, 5, 65), 2, False))
 
 
 def _config(bound, mode):
@@ -150,7 +152,7 @@ def test_strict_scan_enum_and_legacy_serial_config():
 
 @pytest.mark.parametrize("kernel", [_direct_scan, _computed_product])
 def test_ineligible_scan_never_exposes_cooperative(kernel):
-    bound = _cpu_bind(kernel, (torch.ones(3, 65),))
+    bound = cpu_bind(kernel, (torch.ones(3, 65),))
     assert not bound.config_spec.cute_fragment_scan_root_ids
     assert KEY not in bound.config_spec._flat_fields()
     with pytest.raises(exc.InvalidConfig, match="computed additive scan"):
@@ -171,9 +173,7 @@ def test_ineligible_scan_never_exposes_cooperative(kernel):
 )
 @pytest.mark.parametrize("axis,reverse", [(1, False), (2, True)])
 def test_both_scan_strategies_codegen_numeric_axes(dtype, axis, reverse):
-    bound = _cpu_bind(
-        _computed_scan, (torch.ones(3, 5, 65, dtype=dtype), axis, reverse)
-    )
+    bound = cpu_bind(_computed_scan, (torch.ones(3, 5, 65, dtype=dtype), axis, reverse))
     serial = bound.to_code(_config(bound, "serial"))
     cooperative = bound.to_code(_config(bound, "cooperative"))
     assert "fragment_scan_initialized" in serial
@@ -183,7 +183,7 @@ def test_both_scan_strategies_codegen_numeric_axes(dtype, axis, reverse):
 
 
 def test_partial_tile_bitcast_capability_is_independent_of_scan_strategy():
-    bound = _cpu_bind(_tiled_scan, (torch.randn(5, 65),))
+    bound = cpu_bind(_tiled_scan, (torch.randn(5, 65),))
     for mode in ("serial", "cooperative"):
         code = bound.to_code(_config(bound, mode))
         assert "fragment_smem" in code
@@ -191,7 +191,7 @@ def test_partial_tile_bitcast_capability_is_independent_of_scan_strategy():
 
 
 def test_phase_bundle_inherits_scan_strategy():
-    bound = _cpu_bind(_barrier_scan, (torch.ones(3, 65),))
+    bound = cpu_bind(_barrier_scan, (torch.ones(3, 65),))
     assert len(bound.config_spec.cute_fragment_scan_root_ids) == 2
     # Flat scheduling selects ordered launches instead of one persistent grid.
     serial_config = _config(bound, "serial")
@@ -348,7 +348,7 @@ def test_scan_fact_registration_remains_available_when_heuristics_disabled():
         autotune_effort="none",
         disable_autotuner_heuristics=True,
     )
-    bound = _cpu_bind(kernel, (torch.ones(3, 5, 65), 2, False))
+    bound = cpu_bind(kernel, (torch.ones(3, 5, 65), 2, False))
     assert KEY in bound.config_spec._flat_fields()
     assert any(group.key == KEY for group in bound.config_spec.compiler_coverage_groups)
     assert bound.config_spec.compiler_seed_configs == []
@@ -408,9 +408,7 @@ def _phase_fragment_reductions(x: torch.Tensor):
 
 
 def _bind_reduction(kind="sum", dtype=torch.float32):
-    return _cpu_bind(
-        _factored_scalar_reduction, (torch.ones(3, 128, dtype=dtype), kind)
-    )
+    return cpu_bind(_factored_scalar_reduction, (torch.ones(3, 128, dtype=dtype), kind))
 
 
 def _reduction_config(bound, mode):
@@ -479,7 +477,7 @@ def test_fragment_reduction_unsupported_combine_or_dtype_has_no_warp(kind, dtype
 
 
 def test_fragment_reduction_ordinary_native_root_has_no_warp():
-    bound = _cpu_bind(_ordinary_scalar_reduction, (torch.ones(3, 128),))
+    bound = cpu_bind(_ordinary_scalar_reduction, (torch.ones(3, 128),))
     assert not bound.config_spec.cute_fragment_reduction_root_ids
     assert REDUCTION_KEY not in bound.config_spec._flat_fields()
     with pytest.raises(exc.InvalidConfig, match="computed scalar reduction"):
@@ -487,7 +485,7 @@ def test_fragment_reduction_ordinary_native_root_has_no_warp():
 
 
 def test_fragment_reduction_explicit_phase_roots_share_capability():
-    bound = _cpu_bind(_phase_fragment_reductions, (torch.ones(3, 128),))
+    bound = cpu_bind(_phase_fragment_reductions, (torch.ones(3, 128),))
     assert len(bound.config_spec.cute_fragment_reduction_root_ids) == 2
     assert REDUCTION_KEY in bound.config_spec._flat_fields()
 
@@ -578,7 +576,7 @@ def test_fragment_reduction_facts_survive_disabled_heuristics():
         autotune_effort="none",
         disable_autotuner_heuristics=True,
     )
-    bound = _cpu_bind(kernel, (torch.ones(3, 128), "sum"))
+    bound = cpu_bind(kernel, (torch.ones(3, 128), "sum"))
     assert bound.config_spec.cute_fragment_reduction_root_ids
     assert REDUCTION_KEY in bound.config_spec._flat_fields()
     assert any(
@@ -608,8 +606,8 @@ def test_fragment_reduction_coverage_composes_with_existing_scan_coverage():
     with patch(
         "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
     ):
-        old_bound = _cpu_bind(_scan_and_fragment_reduction, (torch.ones(3, 128),))
-    bound = _cpu_bind(_scan_and_fragment_reduction, (torch.ones(3, 128),))
+        old_bound = cpu_bind(_scan_and_fragment_reduction, (torch.ones(3, 128),))
+    bound = cpu_bind(_scan_and_fragment_reduction, (torch.ones(3, 128),))
     assert {group.key for group in bound.config_spec.compiler_coverage_groups} >= {
         KEY,
         REDUCTION_KEY,
@@ -748,14 +746,14 @@ def test_fragment_resource_supplements_preserve_full_cold_prefix_and_rng(width):
         "helion._compiler.autotuner_heuristics.fragment_resource_carrier",
         return_value=None,
     ):
-        old_bound = _cpu_bind(_resource_fullrow_scan, inputs)
+        old_bound = cpu_bind(_resource_fullrow_scan, inputs)
     kernel = helion.kernel(
         _resource_fullrow_scan.fn,
         backend="cute",
         static_shapes=True,
         autotune_effort="none",
     )
-    bound = _cpu_bind(kernel, inputs)
+    bound = cpu_bind(kernel, inputs)
     old = make_search(old_bound.config_spec, count=20)
     full = make_search(bound.config_spec, count=20)
     seeds = deepcopy(bound.config_spec.compiler_seed_configs)
@@ -785,7 +783,7 @@ def test_fragment_resource_supplements_preserve_full_cold_prefix_and_rng(width):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("width", [5, 17])
 def test_fragment_resource_bound_covers_scan_aliases_dot_and_tails(dtype, width):
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _resource_repeated_scan_dot, (torch.ones(3, width, width, dtype=dtype),)
     )
     for mode in ("serial", "cooperative"):
@@ -804,7 +802,7 @@ def test_fragment_resource_catalog_declines_nested_and_unproved_runtime_extents(
         FragmentStorageTerm,
     )
 
-    bound = _cpu_bind(_fragment_captured_reduction, (torch.ones(3, 17), 3))
+    bound = cpu_bind(_fragment_captured_reduction, (torch.ones(3, 17), 3))
     with bound.env, bound.host_function:
         config = bound.config_spec.default_config()
         assert (
@@ -839,7 +837,7 @@ def test_fragment_resource_carrier_builds_catalog_only_once():
             static_shapes=True,
             autotune_effort="none",
         )
-        bound = _cpu_bind(kernel, (torch.ones(3, 8193),))
+        bound = cpu_bind(kernel, (torch.ones(3, 8193),))
     assert create.call_count == 1
     assert all(
         group.supplemental_witnesses
@@ -866,14 +864,14 @@ def test_fragment_resource_hard_minima_preserve_prefix_and_rng(rows):
         "helion._compiler.autotuner_heuristics.fragment_resource_carrier",
         return_value=None,
     ):
-        old_bound = _cpu_bind(_resource_fullrow_scan, inputs)
+        old_bound = cpu_bind(_resource_fullrow_scan, inputs)
     kernel = helion.kernel(
         _resource_fullrow_scan.fn,
         backend="cute",
         static_shapes=True,
         autotune_effort="none",
     )
-    bound = _cpu_bind(kernel, inputs)
+    bound = cpu_bind(kernel, inputs)
     spec = bound.config_spec
     block = spec.block_sizes[0]
     assert block.min_size < block.autotuner_min
@@ -917,7 +915,7 @@ def test_fragment_resource_hard_minima_keep_legal_bounds_and_scheduling():
 
     with FakeTensorMode():
         inputs = (torch.empty(131072, 4097),)
-    bound = _cpu_bind(_resource_fullrow_scan, inputs)
+    bound = cpu_bind(_resource_fullrow_scan, inputs)
     spec = bound.config_spec
     original_default = spec.default_config()
     # A non-unit hard minimum is legal but must never be crossed. Raising it
@@ -957,7 +955,7 @@ def test_fragment_resource_hard_minima_never_codegen_neighbors():
 
     with FakeTensorMode():
         inputs = (torch.empty(65536, 4097),)
-    bound = _cpu_bind(_resource_fullrow_scan, inputs)
+    bound = cpu_bind(_resource_fullrow_scan, inputs)
     with (
         bound.env,
         bound.host_function,
@@ -1016,7 +1014,7 @@ def test_fragment_threads_strict_domain_and_roundtrip():
 
 @pytest.mark.parametrize("kernel", [_direct_scan, _computed_product])
 def test_fragment_threads_unsupported_root_rejected(kernel):
-    bound = _cpu_bind(kernel, (torch.ones(3, 65),))
+    bound = cpu_bind(kernel, (torch.ones(3, 65),))
     assert not bound.config_spec.cute_fragment_thread_root_ids
     assert THREAD_KEY not in bound.config_spec._flat_fields()
     with pytest.raises(exc.InvalidConfig, match="computed fragment root"):
@@ -1031,7 +1029,7 @@ def test_fragment_threads_scan_loop_and_launch_ownership(count, mode):
     from test.test_cute_computed_fragment import _simulate_independent_fragment
 
     x = torch.arange(3 * 5 * 65, dtype=torch.float32).reshape(3, 5, 65) % 8
-    bound = _cpu_bind(_computed_scan, (x, 2, False))
+    bound = cpu_bind(_computed_scan, (x, 2, False))
     config = _thread_config(bound, count)
     config.config[KEY] = mode
     code = bound.to_code(config)
@@ -1095,8 +1093,8 @@ def test_fragment_threads_complete_prior_population_and_rng(strategy, resource):
     with patch(
         "helion._compiler.autotuner_heuristics.register_fragment_threads_coverage"
     ):
-        old_bound = _cpu_bind(kernel, (x,))
-    bound = _cpu_bind(kernel, (x,))
+        old_bound = cpu_bind(kernel, (x,))
+    bound = cpu_bind(kernel, (x,))
     old = make_search(old_bound.config_spec, count=20, strategy=strategy)
     full = make_search(bound.config_spec, count=20, strategy=strategy)
     random.seed(91234)
@@ -1130,7 +1128,7 @@ def test_fragment_threads_disabled_seeds_neighbors_and_override():
         autotune_effort="none",
         disable_autotuner_heuristics=True,
     )
-    bound = _cpu_bind(kernel, (torch.ones(3, 5, 65), 2, False))
+    bound = cpu_bind(kernel, (torch.ones(3, 5, 65), 2, False))
     assert bound.config_spec.cute_fragment_thread_root_ids
     assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
     generation = bound.config_spec.create_config_generation()
@@ -1152,7 +1150,7 @@ def test_fragment_threads_disabled_seeds_neighbors_and_override():
 
 def test_fragment_threads_both_ordered_phases_and_dynamic_rebind():
     for shape in ((3, 65), (5, 129)):
-        bound = _cpu_bind(_barrier_scan, (torch.ones(shape),))
+        bound = cpu_bind(_barrier_scan, (torch.ones(shape),))
         assert len(bound.config_spec.cute_fragment_thread_root_ids) == 2
         for threads in (512, 1024):
             config = _thread_config(bound, threads)
@@ -1209,7 +1207,7 @@ REGISTER_LOADS_KEY = "cute_fragment_register_loads"
 def _register_load_bound():
     from test.test_atomic_ops import _register_load_histogram
 
-    return _cpu_bind(_register_load_histogram, (torch.ones(2, 65), 3, 128))
+    return cpu_bind(_register_load_histogram, (torch.ones(2, 65), 3, 128))
 
 
 def test_register_loads_strict_bool_roundtrip_and_neighbors():
@@ -1297,7 +1295,7 @@ def test_register_loads_ineligible_scan_and_backend():
     from helion._compiler.cute.backend import CuteBackend
     from helion._compiler.triton.backend import TritonBackend
 
-    bound = _cpu_bind(_direct_scan, (torch.ones(2, 65),))
+    bound = cpu_bind(_direct_scan, (torch.ones(2, 65),))
     assert not bound.config_spec.cute_fragment_register_load_root_ids
     assert REGISTER_LOADS_KEY not in bound.config_spec._flat_fields()
     config = bound.config_spec.default_config()
@@ -1366,7 +1364,7 @@ def test_register_loads_proof_rejects_remapping_reduction_carry_branch_and_mutat
 def test_register_loads_preloop_capture_remains_shared():
     from test.test_atomic_ops import _local_atomic_histogram
 
-    bound = _cpu_bind(_local_atomic_histogram, (torch.ones(2, 32), 17, 3, "plain"))
+    bound = cpu_bind(_local_atomic_histogram, (torch.ones(2, 32), 17, 3, "plain"))
     assert not bound.config_spec.cute_fragment_register_load_root_ids
     config = bound.config_spec.default_config()
     config.config[REGISTER_LOADS_KEY] = True
@@ -1473,7 +1471,7 @@ def test_warp_scan_complete_prior_prefix_rng_seeds_and_overrides(strategy):
 
 @pytest.mark.parametrize("kernel", [_direct_scan, _computed_product])
 def test_warp_scan_unsupported_owner_rejects(kernel):
-    bound = _cpu_bind(kernel, (torch.ones(3, 65),))
+    bound = cpu_bind(kernel, (torch.ones(3, 65),))
     assert not bound.config_spec.cute_fragment_warp_scan_root_ids
     with pytest.raises(exc.InvalidConfig, match="bounded warp-prefix"):
         bound.to_code(_warp_scan_config(bound))
@@ -1483,9 +1481,7 @@ def test_warp_scan_unsupported_owner_rejects(kernel):
     "dtype,columns", [(torch.float16, 65), (torch.bfloat16, 65), (torch.float32, 1025)]
 )
 def test_warp_scan_dtype_and_capacity_rejection(dtype, columns):
-    bound = _cpu_bind(
-        _computed_scan, (torch.ones(1, 2, columns, dtype=dtype), 2, False)
-    )
+    bound = cpu_bind(_computed_scan, (torch.ones(1, 2, columns, dtype=dtype), 2, False))
     with pytest.raises(exc.InvalidConfig, match="(warp-prefix|axis capacity)"):
         bound.to_code(_warp_scan_config(bound))
 
@@ -1523,7 +1519,7 @@ def _mixed_dtype_phase_scans(x: torch.Tensor, y: torch.Tensor):
 
 
 def test_warp_scan_mixed_phase_roots_keep_ineligible_serial_emitter():
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _mixed_dtype_phase_scans,
         (torch.ones(3, 33, dtype=torch.float16), torch.ones(3, 65)),
     )
@@ -1537,7 +1533,7 @@ def test_warp_scan_mixed_phase_roots_keep_ineligible_serial_emitter():
 
 @pytest.mark.parametrize("reverse", [False, True])
 def test_warp_scan_zero_physical_capacity_rejects(reverse):
-    bound = _cpu_bind(_computed_scan, (torch.empty(3, 5, 0), 2, reverse))
+    bound = cpu_bind(_computed_scan, (torch.empty(3, 5, 0), 2, reverse))
     with pytest.raises(exc.InvalidConfig, match="axis capacity"):
         bound.to_code(_warp_scan_config(bound))
 
@@ -1604,7 +1600,7 @@ def test_fragment_extensions_complete_legacy_prefix_rng_and_final_coverage(
                     patch("helion._compiler.autotuner_heuristics." + registration)
                 )
             specs.append(
-                _cpu_bind(
+                cpu_bind(
                     helion.kernel(fn, backend="cute", static_shapes=True), args
                 ).config_spec
             )
@@ -1647,7 +1643,7 @@ ATOMIC_AGGREGATION_KEY = "cute_fragment_atomic_aggregation"
 def _atomic_aggregation_bind():
     from test.test_atomic_ops import _fragment_aggregated_histogram
 
-    return _cpu_bind(
+    return cpu_bind(
         _fragment_aggregated_histogram,
         (
             torch.ones((2, 65), dtype=torch.int32),
@@ -1750,7 +1746,7 @@ def test_mixed_warp_scan_phase_capacity_and_default_parity(mode, reverse):
     args = (torch.ones(3, 1057), torch.ones(3, 65))
     if reverse:
         args = args[::-1]
-    bound = _cpu_bind(_mixed_dtype_phase_scans, args)
+    bound = cpu_bind(_mixed_dtype_phase_scans, args)
     default = _config(bound, mode)
     default.config["pid_type"] = "flat"
     assert bound.to_code(default) == bound.to_code(
@@ -1762,7 +1758,7 @@ def test_mixed_warp_scan_phase_capacity_and_default_parity(mode, reverse):
 
 
 def test_mixed_warp_scan_all_ineligible_phases_reject():
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _mixed_dtype_phase_scans, (torch.ones(3, 1057), torch.ones(3, 2049))
     )
     with pytest.raises(exc.InvalidConfig, match="at least one supported operation"):
@@ -1778,7 +1774,7 @@ def _mixed_warp_scan_dynamic(x: torch.Tensor):
 
 
 def test_mixed_warp_scan_configured_capacity_changes_on_same_binding():
-    bound = _cpu_bind(_mixed_warp_scan_dynamic, (torch.ones(3, 2053),))
+    bound = cpu_bind(_mixed_warp_scan_dynamic, (torch.ones(3, 2053),))
     for width in (32, 1024, 2048, 256):
         config = helion.Config.from_dict(
             dict(bound.config_spec.default_config())

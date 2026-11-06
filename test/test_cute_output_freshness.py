@@ -10,14 +10,13 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _forbid_cuda_work
-from test._cute_dense_tcgen05 import cpu_codegen_target
-from test._cute_dense_tcgen05 import scaled_args
-from test._cute_dense_tcgen05 import vector_scaled_mm
-
 import helion
 from helion._compiler.cute.promote_output_axis import _fresh_tensors
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
+from helion._testing.cute_dense_tcgen05 import scaled_args
+from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
 import helion.language as hl
 from helion.language.constexpr import ConstExpr as literal_metadata
 
@@ -26,12 +25,12 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.fixture(autouse=True)
 def _cpu_codegen() -> Iterator[None]:
-    with cpu_codegen_target(), _forbid_cuda_work():
+    with cpu_codegen_target(), forbid_cuda_work():
         yield
 
 

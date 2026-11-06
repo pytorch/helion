@@ -5,11 +5,6 @@ import ast
 import pytest
 import torch
 
-from ._cute_aux import _config
-from ._cute_aux import _cpu_codegen
-from ._cute_aux import _rank_two_aux
-from ._cute_aux import _rank_two_code
-from ._cute_aux import _rank_two_inputs
 from .test_cute_grouped_gemm_split_sizes import _assert_device_offsets_output
 from .test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
 from .test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
@@ -21,6 +16,11 @@ from helion._compiler.program_id import _build_sched_pipeline_consumer_release_b
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_aux import aux_config as _config
+from helion._testing.cute_aux import cpu_codegen
+from helion._testing.cute_aux import rank_two_aux
+from helion._testing.cute_aux import rank_two_code
+from helion._testing.cute_aux import rank_two_inputs
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -89,8 +89,8 @@ def test_scheduler_release_helper_orders_every_reading_lane() -> None:
 def test_scheduler_aux_consumers_release_all_lanes(
     wait_mode: str, load_mode: str, tile: list[int]
 ) -> None:
-    code = _rank_two_code(
-        _rank_two_inputs(),
+    code = rank_two_code(
+        rank_two_inputs(),
         _config(
             block_sizes=tile,
             tcgen05_aux_load_mode=load_mode,
@@ -123,7 +123,7 @@ def test_scheduler_thread_count_preserves_cluster_routing(
     )
     if clc:
         config.config["tcgen05_persistence_model"] = "clc_persistent"
-    with _cpu_codegen():
+    with cpu_codegen():
         _plain_matmul.reset()
         code = _plain_matmul.bind(args).to_code(config)
     _assert_all_lane_releases(code, arrivals=6 * 32 * (2 * cluster_n if clc else 1))
@@ -148,7 +148,7 @@ def test_scheduler_staged_mailbox_releases_all_lanes(wait_mode: str) -> None:
         tcgen05_sched_stage_count=2,
         tcgen05_sched_consumer_wait_mode=wait_mode,
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         _plain_matmul.reset()
         code = _plain_matmul.bind(args).to_code(config)
     _assert_all_lane_releases(code, arrivals=6 * 32 * 2)
@@ -158,9 +158,9 @@ def test_scheduler_staged_mailbox_releases_all_lanes(wait_mode: str) -> None:
 @pytest.mark.parametrize("wait_mode", ["normal", "warp_leader"])
 def test_scheduler_simt_aux_producer_participates(wait_mode: str) -> None:
     args = tuple(torch.empty((256, 256), dtype=torch.bfloat16) for _ in range(3))
-    with _cpu_codegen():
-        _rank_two_aux.reset()
-        code = _rank_two_aux.bind(args).to_code(
+    with cpu_codegen():
+        rank_two_aux.reset()
+        code = rank_two_aux.bind(args).to_code(
             _config(
                 block_sizes=[128, 128, 64],
                 tcgen05_aux_load_mode="simt",
@@ -180,7 +180,7 @@ def test_grouped_worklist_mailbox_releases_all_lanes() -> None:
         split_sizes,
     )
     config = _selected_config(128)
-    with _cpu_codegen():
+    with cpu_codegen():
         _device_split_sizes_kernel.reset()
         code = _device_split_sizes_kernel.bind(args).to_code(config)
     _assert_all_lane_releases(code, arrivals=6 * 32)
@@ -203,7 +203,7 @@ def test_grouped_worklist_staged_mailbox_releases_all_lanes() -> None:
         torch.empty((8, 224, 128), dtype=torch.bfloat16),
         split_sizes,
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         _device_split_sizes_kernel.reset()
         code = _device_split_sizes_kernel.bind(args).to_code(
             _one_cta_worklist_config(2)
@@ -224,7 +224,7 @@ def test_grouped_worklist_staged_mailbox_requires_one_cta() -> None:
     )
     config = _selected_config(64)
     config.config["tcgen05_sched_stage_count"] = 2
-    with _cpu_codegen():
+    with cpu_codegen():
         _device_split_sizes_kernel.reset()
         bound = _device_split_sizes_kernel.bind(args)
         with pytest.raises(InvalidConfig, match="tcgen05_sched_stage_count=2"):

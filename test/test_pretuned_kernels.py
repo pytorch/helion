@@ -36,6 +36,7 @@ from helion._testing import skipIfCute
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
+from helion._testing import slowIfBackends
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -555,6 +556,7 @@ def test_muse_spark_moe_ep4_compiles() -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.slow
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 @pytest.mark.parametrize(
     "name", ["deepseek_v3_moe_nvfp4_tp", "deepseek_v3_attention_nvfp4_tp"]
@@ -582,6 +584,7 @@ def test_deepseek_v3_tp_megakernels_run_on_four_ranks(name: str) -> None:
     )
 
 
+@pytest.mark.slow
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 @pytest.mark.timeout(1800)
 @pytest.mark.parametrize(
@@ -1107,11 +1110,13 @@ class TestPretunedKernelsCorrectness(TestCase):
         self._run_vllm_ported_correctness("per_token_group_fp8_quant")
 
     # CuTe compiles these kernels cold in ~40-50s on B200.
+    @slowIfBackends(["cute"])
     @pytest.mark.timeout(300)
     def test_rms_norm_dynamic_per_token_quant(self):
         self._run_vllm_ported_correctness("rms_norm_dynamic_per_token_quant")
 
     # CuTe compiles these kernels cold in ~40-50s on B200.
+    @slowIfBackends(["cute"])
     @pytest.mark.timeout(300)
     def test_rms_norm_per_block_quant(self):
         self._run_vllm_ported_correctness("rms_norm_per_block_quant")
@@ -1590,6 +1595,7 @@ class TestPretunedCuteCodegen(TestCase):
 
 # The perf targets were measured with the Triton backend running the checked-in
 # Triton-tuned heuristics; a cute run of those configs has no calibrated target.
+@pytest.mark.slow
 @onlyBackends(["triton"])
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 class TestPretunedKernelsPerformance(TestCase):

@@ -15,12 +15,13 @@ from torch._inductor.codecache import PyCodeCache
 from test.test_cute_block_scaled_mma import _bind_native
 from test.test_cute_block_scaled_mma import _native_config
 from test.test_cute_block_scaled_mma import _wrapper_plan
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 from helion._compiler.cute.block_scaled_prepare import preparation_source
+from helion._testing import pairwise
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -170,13 +171,26 @@ def _unpack_scales(raw: torch.Tensor, rows: int, groups: int) -> torch.Tensor:
     )
 
 
-@pytest.mark.parametrize("prepare,rows", [("tiled", 32), ("tiled", 16), ("linear", 32)])
-@pytest.mark.parametrize("generic", [False, True])
-@pytest.mark.parametrize("bn", [128, 256])
-@pytest.mark.parametrize("groups,bk", [(1, 64), (3, 64), (5, 64), (5, 256), (17, 256)])
+# The kernel kind and its row block, the scale-input layout, the rhs tile
+# padding and the k padding with its partial-tile tails each take their own
+# branch of the preparation; all-pairs rows cover every interaction of them.
+@pytest.mark.parametrize(
+    ("prepare_rows", "generic", "bn", "groups_bk"),
+    pairwise(
+        prepare_rows=(("tiled", 32), ("tiled", 16), ("linear", 32)),
+        generic=(False, True),
+        bn=(128, 256),
+        groups_bk=((1, 64), (3, 64), (5, 64), (5, 256), (17, 256)),
+    ),
+)
 def test_exact_preparation_covers_every_byte_once_and_zeroes_physical_padding(
-    generic: bool, groups: int, bk: int, bn: int, prepare: str, rows: int
+    prepare_rows: tuple[str, int],
+    generic: bool,
+    bn: int,
+    groups_bk: tuple[int, int],
 ) -> None:
+    prepare, rows = prepare_rows
+    groups, bk = groups_bk
     m, n = 7, 9
     bound, inputs = _bind_native((m, groups, n), generic=generic, static=False)
     for index, tensor in enumerate(inputs[:4]):
@@ -186,7 +200,7 @@ def test_exact_preparation_covers_every_byte_once_and_zeroes_physical_padding(
                 torch.uint8
             )
         )
-    with _cpu_target():
+    with cpu_target():
         plan = _wrapper_plan(
             bound.to_code(
                 _native_config(
@@ -247,7 +261,7 @@ def test_exact_preparation_covers_every_byte_once_and_zeroes_physical_padding(
 
 def test_preparation_reloads_mutated_contents() -> None:
     bound, inputs = _bind_native((7, 3, 9))
-    with _cpu_target():
+    with cpu_target():
         plan = _wrapper_plan(bound.to_code(_native_config()))
     for tensor in inputs[:4]:
         assert isinstance(tensor, torch.Tensor)
@@ -263,7 +277,7 @@ def test_preparation_reloads_mutated_contents() -> None:
 @pytest.mark.parametrize("scale_bits", [128, 184, 255])
 def test_byte_packing_ignores_sign_extension_of_narrow_loads(scale_bits: int) -> None:
     bound, inputs = _bind_native((7, 3, 9))
-    with _cpu_target():
+    with cpu_target():
         plan = _wrapper_plan(bound.to_code(_native_config()))
     for tensor in inputs[:2]:
         assert isinstance(tensor, torch.Tensor)
@@ -286,7 +300,7 @@ def test_host_workspace_is_fresh_per_invocation_and_replacement_inputs_are_forwa
     def capture(kernel: object, grid: object, *args: object, **kwargs: object) -> None:
         calls.append(args)
 
-    with _cpu_target():
+    with cpu_target():
         source = bound.to_code(_native_config())
         plan = _wrapper_plan(source)
         module = PyCodeCache.load(source)

@@ -10,14 +10,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.cute.host_full_sum import prove_host_full_sum
 from helion._testing import DEVICE
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.runtime.cute.full_sum import full_sum_plan
 from helion.runtime.cute.paired_sum import _compatible_aten_sum
@@ -149,7 +148,7 @@ def _kernel(fn: Callable[..., Any], **settings: Any) -> Kernel:
 
 
 def _bind(fn: Callable[..., object], *args: object) -> BoundKernel:
-    return _cpu_bind(_kernel(fn, autotune_effort="full"), args)
+    return cpu_bind(_kernel(fn, autotune_effort="full"), args)
 
 
 def _host_code(bound: BoundKernel, layout: str) -> str:
@@ -192,7 +191,7 @@ def test_plan_mirrors_aten_vectorized_block_width() -> None:
 def test_assigned_sum_and_mean_call_the_helper_with_the_original_fallback(
     layout: str,
 ) -> None:
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         for fn, mean, original in (
             (_row_sum_total, False, "total = torch.sum(out)"),
             (_row_sum_mean, True, "average = out.mean()"),
@@ -215,7 +214,7 @@ def test_assigned_sum_and_mean_call_the_helper_with_the_original_fallback(
 @_requires_pinned_aten_build
 @skipIfRefEager("generates code")
 def test_returned_sum_and_tuple_are_rewritten() -> None:
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         bound = _bind(_row_sum_returned_mean, torch.empty((256, 32)))
         code = _host_code(bound, "mapped")
         assert "_helion_full_sum = _cute_try_full_sum(out, mean=True" in code
@@ -233,7 +232,7 @@ def test_returned_sum_and_tuple_are_rewritten() -> None:
 @_requires_pinned_aten_build
 @skipIfRefEager("generates code")
 def test_kernel_inputs_are_admitted() -> None:
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         bound = _bind(_row_sum_input, torch.empty((256, 32)), torch.empty((256,)))
         code = _host_code(bound, "mapped")
         assert "offset = _cute_try_full_sum(bias, mean=False" in code
@@ -245,7 +244,7 @@ def test_kernel_inputs_are_admitted() -> None:
 def test_knob_off_keeps_the_host_call_and_is_seeded() -> None:
     from helion._compiler.autotuner_heuristics import compiler_seed_configs
 
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         bound = _bind(_row_sum_total, torch.empty((256, 32), dtype=torch.bfloat16))
         code = _host_code(bound, "off")
         assert "_cute_try_full_sum" not in code and "total = torch.sum(out)" in code
@@ -261,7 +260,7 @@ def test_knob_off_keeps_the_host_call_and_is_seeded() -> None:
 @_requires_pinned_aten_build
 @skipIfRefEager("generates code")
 def test_sum_divided_by_a_host_scalar_passes_the_divisor() -> None:
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         bound = _bind(_row_sum_scaled, torch.empty((256, 32)))
         assert bound.host_function is not None
         proof = prove_host_full_sum(bound.host_function)
@@ -313,7 +312,7 @@ def test_sum_divided_by_a_host_scalar_passes_the_divisor() -> None:
 def test_unproven_sites_keep_the_host_call(
     fn: Callable[..., object], args: tuple[object, ...]
 ) -> None:
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         bound = _bind(fn, torch.empty((256, 32)), *args)
         assert bound.host_function is not None
         assert not prove_host_full_sum(bound.host_function).sites

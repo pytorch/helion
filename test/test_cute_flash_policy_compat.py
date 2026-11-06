@@ -13,6 +13,8 @@ from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion.autotuner.config_fragment import EnumFragment
 

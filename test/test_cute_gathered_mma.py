@@ -12,6 +12,8 @@ from helion._compiler.cute.gathered_mma import GatherTensorFacts
 from helion._compiler.cute.gathered_mma import _expanded
 from helion._compiler.cute.gathered_mma import analyze_gathered_mma_region
 
+pytestmark = pytest.mark.cpu_only
+
 SOURCE = """
 group = cutlass.Int32(cute.arch.block_idx()[0]) % groups
 column_offset = cutlass.Int32(cute.arch.block_idx()[0]) // groups * BN

@@ -18,6 +18,8 @@ from helion._compiler.cute import cutedsl_compat
 from helion._compiler.cute.cute_mma_dag import MMA_DAG_HINTED_CP_ASYNC_CHECK
 from helion.runtime.cute import sass_check
 
+pytestmark = pytest.mark.cpu_only
+
 # The kda WY transform's autotune-fault config (``_WY_FAULT_CONFIG`` of the
 # GPU tests), its one PTX assembled twice and disassembled with the same
 # ``nvdisasm -c``; each excerpt is the first staging region's fourteen

@@ -28,6 +28,8 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_round_up_smem_bytes
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_spec import ConfigSpec
 
+pytestmark = pytest.mark.cpu_only
+
 # The arena model sizes the epilogue stage through CUTLASS's own helper, so it
 # needs the CuTe DSL like the kernels it describes; most CI runners lack it.
 pytest.importorskip("cutlass")

@@ -20,7 +20,6 @@ import torch
 from torch._inductor.runtime.hints import DeviceProperties
 from torch._subclasses.fake_tensor import FakeTensor
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
@@ -48,6 +47,7 @@ from helion._compiler.cute.tcgen05_constants import (
     tcgen05_aux_fragment_bytes_per_thread,
 )
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -57,7 +57,7 @@ if TYPE_CHECKING:
 
     from helion.runtime.kernel import BoundKernel
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 PLACEMENT = TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 HOIST = TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
@@ -150,7 +150,7 @@ def cuda_trace() -> Generator[None, None, None]:
             stack.enter_context(
                 patch.object(CompileEnvironment, "_to_fake_tensor", convert)
             )
-            stack.enter_context(_mock_cuda_unavailable())
+            stack.enter_context(mock_cuda_unavailable())
             stack.enter_context(
                 patch(
                     "torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")

@@ -4,17 +4,19 @@ from contextlib import ExitStack
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
-
-from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion import exc
 from helion._compiler.backend import CuteBackend
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import MatmulFact
+
+pytestmark = pytest.mark.cpu_only
 
 _KEY = "cute_register_chain"
 
@@ -44,7 +46,7 @@ class TestCuteRegisterChainConfig(unittest.TestCase):
         super().setUp()
         stack = ExitStack()
         self.addCleanup(stack.close)
-        stack.enter_context(_mock_cuda_unavailable())
+        stack.enter_context(mock_cuda_unavailable())
         for name in (
             "_lazy_init",
             "current_device",

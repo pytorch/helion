@@ -27,6 +27,8 @@ from test.test_cute_flash_flex_skip_absent import _resolve
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute.attention_plan import dense_score_plan
 
+pytestmark = pytest.mark.cpu_only
+
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 

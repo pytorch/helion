@@ -31,14 +31,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion import exc
 from helion._compiler import tile_strategy
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -140,7 +139,7 @@ def _sibling_config(bound: BoundKernel, pid_type: str) -> helion.Config:
 @contextmanager
 def _cpu_codegen() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -190,7 +189,7 @@ def test_a_reduction_over_a_one_row_tile_passes_the_element_through(
 ) -> None:
     """``block_sizes=[1, 128]``: the row block holds one element per thread and no thread axis, so there is nothing to combine; the 128 column threads were folded into one total (every column got the row's sum, 130 times too large over 32 rows)."""
     with _cpu_codegen():
-        bound = _cpu_bind(_kernel(_column_sums_added), (torch.randn(32, 128),))
+        bound = cpu_bind(_kernel(_column_sums_added), (torch.randn(32, 128),))
         code = bound.to_code(_config(bound, [1, 128], num_threads))
     body = _kernel_body(code)
     assert "sum_1 = cutlass.Float32(load)" in body, code
@@ -214,7 +213,7 @@ def test_a_reduction_after_the_blocks_loop_combines_its_threads(
 ) -> None:
     """One row per CTA on ``bs`` column threads: ``acc.mean(dim=1)`` after the column loop combines the threads' columns (one warp per CTA took the direct shortcut into the loop-carried passthrough and kept each thread's own column)."""
     with _cpu_codegen():
-        bound = _cpu_bind(
+        bound = cpu_bind(
             _kernel(_row_means_after_the_column_loop), (torch.randn(37, 100),)
         )
         code = bound.to_code(_config(bound, [num_threads[0], 1], num_threads))
@@ -270,7 +269,7 @@ def test_a_tile_reduction_beside_a_wider_sibling_defines_its_indices(
 ) -> None:
     """The 128-thread column tile runs on the sibling's 512-thread launch, so its load is masked to the tile's threads and the combine spans the launch; the index and mask definitions were parked in the grid's prefix and never emitted (``NameError: name 'mask_1' is not defined``)."""
     with _cpu_codegen():
-        bound = _cpu_bind(
+        bound = cpu_bind(
             _kernel(_row_sums_beside_a_wider_tile),
             (torch.randn(64, 128), torch.randn(64, 1024)),
         )
@@ -301,14 +300,14 @@ def test_a_tile_reduction_beside_a_wider_sibling_matches_reference(
 def test_a_mean_in_a_masked_loop_without_an_end_variable_is_declined() -> None:
     """The row tile of 37 rows in blocks of 8 is masked, so ``mean(dim=0)`` divides by the tile's extent off the loop's end variable; without one the mean is declined instead of dividing by the block."""
     with _cpu_codegen():
-        bound = _cpu_bind(
+        bound = cpu_bind(
             _kernel(_column_means_added, static_shapes=False), (torch.randn(37, 100),)
         )
         config = _config(bound, [8, 32], [1, 32])
         body = _kernel_body(bound.to_code(config))
         assert "- tile_offset_0" in body, body
         assert "_helion_inv_div" not in body, body
-        bound = _cpu_bind(
+        bound = cpu_bind(
             _kernel(_column_means_added, static_shapes=False), (torch.randn(37, 100),)
         )
         with (

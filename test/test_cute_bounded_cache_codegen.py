@@ -9,26 +9,25 @@ import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
 
-from test._cute_binding import _mock_cuda_unavailable
-
 from .cute_population_contracts import _target
 import helion
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.precompile_future import _load_compiled_fn
 from helion.autotuner.precompile_future import _serialize_compiled_fn
 from helion.autotuner.precompile_future import _unload_compiled_fn
 
 row_softmax = import_example("aot_example").row_softmax
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @contextmanager
 def _cpu_target():
     with (
         _target(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",

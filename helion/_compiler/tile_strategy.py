@@ -457,6 +457,21 @@ def _find_lane_reduce_call(node: ast.AST) -> ast.Call | None:
     return None
 
 
+def has_lane_reduce_markers(body: Sequence[ast.AST]) -> bool:
+    """Whether any statement of ``body`` may hold a ``_helion_lane_reduce``
+    marker: a reference to the marker name anywhere in it.
+
+    The lane-reduction passes rewrite, validate and restore only these
+    markers (and never create one), so a body without any is left as is by
+    every one of them; each still checks the exact call shape itself.
+    """
+    return any(
+        isinstance(node, ast.Name) and node.id == _HELION_LANE_REDUCE_MARKER
+        for statement in body
+        for node in ast.walk(statement)
+    )
+
+
 class _ReplaceLaneReduceCall(ast.NodeTransformer):
     def visit_Call(self, node: ast.Call) -> ast.AST:
         self.generic_visit(node)
@@ -553,6 +568,12 @@ def validate_lane_reduce_owners(body: list[ast.AST]) -> None:
     existing interchange proof. Residual owned markers must not be restored to
     incomplete scalar inputs by the final safety net.
     """
+    if not any(_find_lane_reduce_call(statement) for statement in body):
+        # Without a marker there is no owner to validate; skip the per-node
+        # marker parse of the whole body. (The codegen skips the whole
+        # lane-reduction pass group without markers; this keeps direct
+        # callers cheap too.)
+        return
 
     def visit(node: ast.AST, lanes: tuple[tuple[str, bool], ...]) -> None:
         lane = getattr(node, HELION_LANE_LOOP_VAR_ATTR, None)

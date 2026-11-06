@@ -21,13 +21,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 jagged_mean_kernel = import_example("jagged_mean").jagged_mean_kernel
@@ -45,7 +44,7 @@ cutlass = pytest.importorskip("cutlass")
 @pytest.fixture
 def cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -56,7 +55,7 @@ def cpu_only() -> Iterator[None]:
 
 
 def _code(kernel: helion.Kernel, args: tuple[object, ...], config: dict) -> str:
-    bound = _cpu_bind(kernel, args)
+    bound = cpu_bind(kernel, args)
     normalized = bound.config_spec.normalized_config(helion.Config.from_dict(config))
     with patch(
         "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
@@ -170,7 +169,7 @@ def test_a_jagged_feature_tile_loads_straddling_chunks_at_the_chunk_mask(
     kernel = helion.kernel(jagged_mean_kernel.fn, backend="cute", fast_math=True)
     x, offsets = _jagged_args()
     counts = torch.empty(17, dtype=torch.int32)
-    bound = _cpu_bind(kernel, (x, offsets, counts, 128))
+    bound = cpu_bind(kernel, (x, offsets, counts, 128))
     assert (
         "cute_flat_gather_int_factor_residue_v1"
         in bound.env.runtime_input_specializations

@@ -17,9 +17,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_fp32_dot import _chunk_cumsum
 from test.test_cute_fragment_tile_staging import _anchored_gram
@@ -30,6 +27,9 @@ import helion
 from helion import exc
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import BooleanFragment
 import helion.language as hl
 
@@ -66,9 +66,9 @@ def _odd_width_gram(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
 @pytest.fixture
 def _cpu_only():
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
         yield
@@ -80,7 +80,7 @@ def _config(bound: object, **overrides: object) -> helion.Config:
 
 
 def test_transport_knobs_join_the_search_surface(_cpu_only: None) -> None:
-    bound = _cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(_anchored_gram, _gram_inputs())
     spec = bound.config_spec
     assert spec.cute_fragment_vector_io_root_ids
     assert spec.cute_fragment_batched_loads_root_ids
@@ -117,7 +117,7 @@ def test_transport_knobs_join_the_search_surface(_cpu_only: None) -> None:
 
 def test_a_root_without_a_second_load_has_no_batching(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = _cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(_chunk_cumsum, (g,))
     spec = bound.config_spec
     assert not spec.cute_fragment_batched_loads_root_ids
     assert BATCH not in spec._flat_fields()
@@ -127,7 +127,7 @@ def test_a_root_without_a_second_load_has_no_batching(_cpu_only: None) -> None:
 
 def test_odd_rows_decline_the_packets(_cpu_only: None) -> None:
     q = torch.ones(4, 32, 100, dtype=torch.bfloat16)
-    bound = _cpu_bind(_odd_width_gram, (q, q))
+    bound = cpu_bind(_odd_width_gram, (q, q))
     # The heuristic offers the knob (the 32-column output store qualifies);
     # the emitter proves 100 % 8 != 0 for the q / k windows and keeps their
     # scalar loads, while the iota-window store into the zero-filled output
@@ -142,7 +142,7 @@ def test_odd_rows_decline_the_packets(_cpu_only: None) -> None:
 
 
 def test_row_packets_replace_every_scalar_access(_cpu_only: None) -> None:
-    bound = _cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(_anchored_gram, _gram_inputs())
     scalar = bound.to_code(_config(bound))
     vec = bound.to_code(_config(bound, **{VEC: True}))
     # Ten window loads and two iota-window stores: every one of them moves
@@ -166,7 +166,7 @@ def test_row_packets_replace_every_scalar_access(_cpu_only: None) -> None:
 
 
 def test_batched_loads_share_one_barrier_per_run(_cpu_only: None) -> None:
-    bound = _cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(_anchored_gram, _gram_inputs())
     serial = bound.to_code(_config(bound))
     batched = bound.to_code(_config(bound, **{BATCH: True}))
     # Each tier stages five windows (the anchor row, two row windows, two
@@ -184,7 +184,7 @@ def test_batched_loads_share_one_barrier_per_run(_cpu_only: None) -> None:
 
 def test_coordinate_only_operands_are_read_in_place(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = _cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(_chunk_cumsum, (g,))
     simt = bound.to_code(_config(bound))
     tf32 = bound.to_code(_config(bound, **{DOT: "tf32_mma"}))
     # The lower-triangular mask is a pure function of its coordinates: the
@@ -205,7 +205,7 @@ def test_coordinate_only_operands_are_read_in_place(_cpu_only: None) -> None:
 def test_direct_coordinates_keep_the_fallback_for_non_affine_indices(
     _cpu_only: None,
 ) -> None:
-    bound = _cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(_anchored_gram, _gram_inputs())
     code = bound.to_code(_config(bound, **{DOT: "tf32_mma", PAD: True}))
     # The staged q window feeds the operand through its layout's affine
     # index, read with its own coordinates (the 136-stride bf16 rows)...
@@ -215,7 +215,7 @@ def test_direct_coordinates_keep_the_fallback_for_non_affine_indices(
 
 
 def test_split_k_shares_a_tile_between_idle_warps(_cpu_only: None) -> None:
-    bound = _cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(_anchored_gram, _gram_inputs())
     whole = bound.to_code(_config(bound, **{DOT: "tf32_mma", PAD: True}))
     split = bound.to_code(_config(bound, **{DOT: "tf32_mma", PAD: True, SPLIT: True}))
     assert "fragment_mma_split" not in whole and "fragment_mma_unit" not in whole
@@ -238,7 +238,7 @@ def test_split_k_shares_a_tile_between_idle_warps(_cpu_only: None) -> None:
 
 
 def test_slab_loads_stage_each_tensor_once(_cpu_only: None) -> None:
-    bound = _cpu_bind(_anchored_gram, _gram_inputs())
+    bound = cpu_bind(_anchored_gram, _gram_inputs())
     spec = bound.config_spec
     assert spec.cute_fragment_slab_loads_root_ids
     assert isinstance(spec._flat_fields()[SLAB], BooleanFragment)
@@ -272,14 +272,14 @@ def test_slab_loads_stage_each_tensor_once(_cpu_only: None) -> None:
 
 def test_slab_plan_declines_a_single_window_root(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = _cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(_chunk_cumsum, (g,))
     assert not bound.config_spec.cute_fragment_slab_loads_root_ids
     assert SLAB not in bound.config_spec._flat_fields()
 
 
 def test_a_cast_of_a_conflict_free_tile_is_read_in_place(_cpu_only: None) -> None:
     g = torch.ones(4, 64, 128, dtype=torch.bfloat16)
-    bound = _cpu_bind(_chunk_cumsum, (g,))
+    bound = cpu_bind(_chunk_cumsum, (g,))
     # A 64-column bf16 chunk tile has 128-byte rows: padded rows stride
     # 72 elements, which spreads the B lanes' reads over the banks, so the
     # ``.to(float32)`` operand is read (and converted) in place: no padded
@@ -687,7 +687,7 @@ def _varlen_anchored_gram_reference(
 def test_varlen_windows_at_one_runtime_offset_share_a_slab(_cpu_only: None) -> None:
     from helion._compiler.cute.fragment_slab_loads import plan_slab_loads
 
-    bound = _cpu_bind(_varlen_anchored_gram, _varlen_gram_inputs())
+    bound = cpu_bind(_varlen_anchored_gram, _varlen_gram_inputs())
     spec = bound.config_spec
     # q (two row tiers) and k (rows, then columns) are read at the runtime
     # offset token_base[j] under the valid_len[j] limit; gc's windows are
@@ -741,7 +741,7 @@ def test_varlen_windows_under_another_mask_keep_their_walk(_cpu_only: None) -> N
 
     token_base, valid_len, nt = _varlen_tables((37, 64, 27), 48)
     x = torch.ones(128, 2, 64, dtype=torch.bfloat16)
-    bound = _cpu_bind(_mismatched_varlen_windows, (x, token_base, valid_len))
+    bound = cpu_bind(_mismatched_varlen_windows, (x, token_base, valid_len))
     # A mask over another window than the rows it guards, or no mask at
     # all beside a masked member, is not the slab's row predicate: no group.
     assert not bound.config_spec.cute_fragment_slab_loads_root_ids
@@ -752,7 +752,7 @@ def test_varlen_windows_under_another_mask_keep_their_walk(_cpu_only: None) -> N
 def test_a_slab_along_the_contiguous_dim_is_walked(_cpu_only: None) -> None:
     from helion._compiler.cute.fragment_slab_loads import plan_slab_loads
 
-    bound = _cpu_bind(_contiguous_dim_windows, (torch.ones(4, 32, 128),))
+    bound = cpu_bind(_contiguous_dim_windows, (torch.ones(4, 32, 128),))
     spec = bound.config_spec
     assert spec.cute_fragment_slab_loads_root_ids
     with bound.env, bound.host_function:
@@ -784,7 +784,7 @@ def test_varlen_windows_along_the_contiguous_dim_share_a_slab(
 ) -> None:
     from helion._compiler.cute.fragment_slab_loads import plan_slab_loads
 
-    bound = _cpu_bind(_varlen_contiguous_dim_windows, _varlen_contiguous_inputs())
+    bound = cpu_bind(_varlen_contiguous_dim_windows, _varlen_contiguous_inputs())
     spec = bound.config_spec
     assert spec.cute_fragment_slab_loads_root_ids
     with bound.env, bound.host_function:
@@ -848,7 +848,7 @@ def test_engine_varlen_gram_plans_three_slabs(_cpu_only: None) -> None:
         0.125,
         True,
     )
-    bound = _cpu_bind(kernel, args)
+    bound = cpu_bind(kernel, args)
     # The engine's varlen anchored gram: four q tiers, seven k windows and
     # eleven gc windows (four of them under the chunk-size tiers' ``if``)
     # are three slabs; the tiers' captured ``base`` / ``vlen`` / ``dcols``

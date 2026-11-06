@@ -9,10 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
-from test._cute_binding import _require_cute_codegen
 from test.cute_population_contracts import _target
 from test.test_cute_grouped_ab_k import _observed_logical_k
 from test.test_cute_grouped_ab_k import _unsupported_k_loop
@@ -22,6 +18,11 @@ from test.test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 import helion
 from helion._compiler.cute.grouped_d_shift import bounded_d_shift_index_domain
 from helion._testing import DEVICE
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import require_cute_codegen
+from helion._testing.cute_flash import seeds_per_codegen_branch
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -124,6 +125,9 @@ def _value(expression: ast.expr, values):
     )
 
 
+# 12 cases: each worklist orientation emits its own TMA store atom and
+# coordinate order, each metadata kind is a different kernel (offsets, split
+# sizes, fp32 output), and each metadata dtype loads the row bounds differently.
 @pytest.mark.parametrize("orientation", ["mn", "nm"])
 @pytest.mark.parametrize("kind", ["offsets", "sizes", "fp32"])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -136,8 +140,8 @@ def test_fixed_bounded_d_view_and_live_coordinates_mask_exact_rows(
         "fp32": _observed_logical_k,
     }[kind]
     args = _args(kind, dtype)
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(kernel, args)
         assert bound.config_spec._cute_tcgen05_config.grouped_d_shift_supported
         config = bound.config_spec.normalized_config(_config(orientation))
         source = bound.to_code(config)
@@ -263,8 +267,8 @@ def test_fixed_bounded_d_view_and_live_coordinates_mask_exact_rows(
 
 @pytest.mark.parametrize("orientation", ["mn", "nm"])
 def test_default_off_matches_the_original_source(orientation: str) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_observed_logical_k, _args("fp32", torch.int32))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_observed_logical_k, _args("fp32", torch.int32))
         config = _config(orientation)
         config.config.pop(KEY)
         explicit_off = deepcopy(config)
@@ -277,8 +281,8 @@ def test_default_off_matches_the_original_source(orientation: str) -> None:
 
 @pytest.mark.parametrize("variant", [1, 2, 3, 5])
 def test_noncanonical_reductions_cannot_request_bounded_d_shift(variant: int) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_unsupported_k_loop, (*_args("fp32", torch.int32), variant))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_unsupported_k_loop, (*_args("fp32", torch.int32), variant))
         assert not bound.config_spec._cute_tcgen05_config.grouped_d_shift_supported
         with pytest.raises((InvalidConfig, BackendUnsupported)):
             bound.to_code(_config("mn"))
@@ -292,8 +296,8 @@ def test_owned_contiguous_output_is_required(variant: int) -> None:
         torch.tensor([0, 0, 1, 129, 257, 385, 513, 639, 640], dtype=torch.int32),
         variant,
     )
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_unsafe_output, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_unsafe_output, args)
         assert not bound.config_spec._cute_tcgen05_config.grouped_d_shift_supported
         with pytest.raises((InvalidConfig, BackendUnsupported)):
             bound.to_code(_config("mn"))
@@ -303,8 +307,8 @@ def test_owned_contiguous_output_is_required(variant: int) -> None:
 def test_feature_tail_requires_exact_grouped_input_extents(orientation: str):
     args = list(_args("fp32", torch.int32))
     args[1] = torch.empty((8, 160, 256), dtype=torch.bfloat16)
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_observed_logical_k, tuple(args))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_observed_logical_k, tuple(args))
         if orientation == "mn":
             source = bound.to_code(_config(orientation))
             _, ab, output = _plans(source)
@@ -317,8 +321,8 @@ def test_feature_tail_requires_exact_grouped_input_extents(orientation: str):
 
 @pytest.mark.parametrize("bad", [1, "true", "ptr_shift"])
 def test_invalid_config_values_are_rejected(bad) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_observed_logical_k, _args("fp32", torch.int32))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_observed_logical_k, _args("fp32", torch.int32))
         config = _config("mn")
         config.config[KEY] = bad
         with pytest.raises(InvalidConfig):
@@ -342,17 +346,14 @@ def test_signed_pointer_and_virtual_coordinate_bounds_fail_closed(
     assert not bounded_d_shift_index_domain(m, n, row_tile)
 
 
-# Renders every shifted seed of a grouped tcgen05 kernel: ~55 s alone, so the
-# 60 s per-test CI limit trips under xdist contention.
-@pytest.mark.timeout(180)
 def test_shifted_compiler_seeds_keep_the_old_prefix_and_logical_cap() -> None:
     args = (
         torch.empty((2048, 512), dtype=torch.bfloat16),
         torch.empty((4, 512, 512), dtype=torch.bfloat16),
         torch.tensor([0, 0, 1, 129, 2048], dtype=torch.int32),
     )
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_observed_logical_k, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_observed_logical_k, args)
         seeds = bound.config_spec.compiler_seed_configs
         original = [seed for seed in seeds if not seed.get(KEY)]
         shifted = [seed for seed in seeds if seed.get(KEY)]
@@ -362,6 +363,22 @@ def test_shifted_compiler_seeds_keep_the_old_prefix_and_logical_cap() -> None:
         for seed in shifted:
             assert seed.block_sizes[2] == 64
             assert seed["tcgen05_grouped_full_allocation_a"] is True
+            assert seed["tcgen05_grouped_mode"] == "worklist_nm"
+        # The shifted codegen branches on the worklist orientation, the CTA
+        # group, the cluster N, the source M tile and the MMA N; the other
+        # seed axes (stage depths, L2 swizzle) re-parameterize the same text.
+        # Render the first seed of each branch and the last seed instead of
+        # all ~150.
+        for seed in seeds_per_codegen_branch(
+            shifted,
+            lambda seed: (
+                seed.get("tcgen05_grouped_worklist_orientation"),
+                seed["tcgen05_cluster_m"],
+                seed.get("tcgen05_cluster_n"),
+                seed.get("tcgen05_grouped_worklist_source_m_tile"),
+                seed.get("tcgen05_grouped_worklist_mma_n"),
+            ),
+        ):
             ast.parse(bound.to_code(seed))
 
 
@@ -375,7 +392,7 @@ def test_bounded_output_shift_live_empty_tail_rows_and_graph_replay(
         pytest.skip("requires CUDA")
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family tcgen05")
-    _require_cute_codegen()
+    require_cute_codegen()
     generator = torch.Generator(device=DEVICE).manual_seed(691)
     a = torch.randn((640, 256), generator=generator, device=DEVICE).bfloat16()
     b = torch.randn((8, 512, 256), generator=generator, device=DEVICE).bfloat16()

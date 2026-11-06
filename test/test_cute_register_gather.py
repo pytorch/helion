@@ -18,6 +18,8 @@ from helion._compiler.cute.row_fragment import RowFragment
 from helion._compiler.cute.row_fragment import RowFragmentLayout
 from helion._compiler.cute.row_fragment import emit_replicated_register_gather
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("dtype", [np.int32, np.int64, np.float32, np.bool_])
 @pytest.mark.parametrize(

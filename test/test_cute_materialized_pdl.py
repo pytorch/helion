@@ -42,7 +42,7 @@ from helion.exc import InvalidConfig
 
 matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from typing import Any

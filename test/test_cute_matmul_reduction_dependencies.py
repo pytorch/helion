@@ -19,6 +19,8 @@ from helion._compiler import tile_strategy as lanes
 from helion._compiler.cute import matmul_fallback
 from helion._compiler.generate_ast import GenerateAST
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _bare_body() -> str:
     return (

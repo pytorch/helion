@@ -15,17 +15,17 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_shared_rhs_grouped import _target
-from test.test_cute_tcgen05_ordinary_exploration import _cuda_fake
 from test.test_cute_tcgen05_ordinary_exploration import _ordinary_gemm
 
 import helion
 from helion._compiler.cute.tcgen05_lifecycle import Tcgen05LifecycleContext
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cuda_fake
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 CPU_DEVICE = "cpu"
 
@@ -119,7 +119,7 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     with (
         _target(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda.current_device", return_value=0),
         patch("torch.cuda.get_device_capability", return_value=(10, 0)),
         patch(
@@ -127,7 +127,7 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
         ),
         patch(
             "helion._compiler.cute.backend.CuteBackend.normalize_input_fake_tensor",
-            new=_cuda_fake,
+            new=cuda_fake,
         ),
         patch(
             "torch._inductor.runtime.hints.DeviceProperties.create",

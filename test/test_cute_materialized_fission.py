@@ -16,7 +16,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import with_flat_min_blocks_default
 
 import helion
@@ -27,6 +26,7 @@ from helion._compiler.cute.promote_output_axis import _access_tensor
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.precompile_future import SerializedCompiledFunction
 from helion.autotuner.precompile_future import _load_compiled_fn
@@ -38,6 +38,8 @@ from helion.runtime.ref_mode import RefMode
 from helion.runtime.ref_mode import RefModeContext
 from helion.runtime.ref_mode import RefModeTorchFunctionMode
 from helion.runtime.settings import Settings
+
+pytestmark = pytest.mark.cpu_only
 
 squeeze_and_excitation_net_fwd = import_example(
     "squeeze_and_excitation_net"
@@ -423,7 +425,7 @@ def _cpu_only() -> Generator[None, None, None]:
     # Hardware specialization also runs for CPU arguments. Keep these target
     # mocks independent of whether this pytest worker can see a real GPU.
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU use forbidden")),
     ):
         yield

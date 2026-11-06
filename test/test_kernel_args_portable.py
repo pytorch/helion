@@ -37,6 +37,8 @@ from helion.autotuner.kernel_args import make_portable_args
 from helion.autotuner.kernel_args import resolve_portable_args
 from helion.runtime.settings import Settings
 
+pytestmark = pytest.mark.cpu_only
+
 ALPHA = 2.0
 
 
