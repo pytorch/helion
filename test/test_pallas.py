@@ -1528,6 +1528,31 @@ class TestPallas(TestCase):
                 pallas_load_buffer_count=[2, 2],
             )
 
+    def test_vmem_check_counts_emit_pipeline_buffers(self) -> None:
+        """emit_pipeline allocates its block buffers in-kernel; they must count."""
+        # x, y and out each get two 2048x2048 fp32 pipeline buffers = 96MB.
+        args = (
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+        )
+        code, _ = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[256, 256],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn(f"_pipeline_vmem_bytes={3 * 2 * 256 * 256 * 4}", code)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Ran out of memory in memory space vmem.*Estimated [0-9.]+MB exceeds",
+        ):
+            code_and_output(
+                pallas_inner_loop_add,
+                args,
+                block_sizes=[2048, 2048],
+                pallas_loop_type="emit_pipeline",
+            )
+
     @xfailIfPallasInterpret(
         "torch.float8_e4m3fn has no JAX dtype mapping in interpret mode; "
         "conversion errors before the VMEM check fires"

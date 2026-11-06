@@ -1632,9 +1632,14 @@ def _pallas_check_vmem_or_raise(
     tensor_arg_indices: list[int],
     output_indices: list[int],
     pallas_aliases: dict[int, int] | None,
+    pipeline_vmem_bytes: int = 0,
 ) -> None:
-    """Estimate the kernel's VMEM footprint and raise if it exceeds the limit."""
-    estimated_vmem = _estimate_pallas_vmem_bytes(
+    """Estimate the kernel's VMEM footprint and raise if it exceeds the limit.
+
+    ``pipeline_vmem_bytes`` covers emit_pipeline block buffers, which the
+    kernel allocates itself and so appear in no spec or scratch shape.
+    """
+    estimated_vmem = pipeline_vmem_bytes + _estimate_pallas_vmem_bytes(
         pl,
         pltpu,
         in_specs,
@@ -2055,6 +2060,7 @@ def _pallas_compile_jit_fn(
     _grid_scalar_prefetch_arg_indices: list[int] | None,
     interpret: bool,
     placeholder_fn: Callable[[object], object] | None = None,
+    _pipeline_vmem_bytes: int = 0,
 ) -> _PallasCompileResult:
     """Build the ``pl.kernel`` jit_fn used by the Pallas launcher.
 
@@ -2196,6 +2202,7 @@ def _pallas_compile_jit_fn(
             tensor_arg_indices,
             _output_indices,
             pallas_aliases,
+            _pipeline_vmem_bytes,
         )
 
     if scalar_prefetch_args:
@@ -2410,6 +2417,7 @@ def _pallas_install_launcher_cache(
     _grid_scalar_prefetch_arg_indices: list[int] | None,
     _uses_remote_copy: bool = False,
     _matmul_dot_general: dict[str, object] | None = None,
+    _pipeline_vmem_bytes: int = 0,
 ) -> tuple[object, ...]:
     """Cache-miss path shared by all Pallas launchers.
 
@@ -2454,6 +2462,7 @@ def _pallas_install_launcher_cache(
         placeholder_fn=functools.partial(
             _pallas_torch_placeholder, interpret=interpret
         ),
+        _pipeline_vmem_bytes=_pipeline_vmem_bytes,
     )
 
     jax_callable = _pallas_build_callable(
@@ -2562,6 +2571,7 @@ def default_pallas_launcher(
     _compact_ordered_offset_arg_index: int = -1,
     _compact_active_mask_arg_index: int = -1,
     _compact_ordered_window: int = 0,
+    _pipeline_vmem_bytes: int = 0,
     **kwargs: object,
 ) -> object:
     """Unified Pallas kernel launcher for TPU (or CPU with interpret=True).
@@ -2655,6 +2665,7 @@ def default_pallas_launcher(
                 _grid_scalar_prefetch_arg_indices=_grid_scalar_prefetch_arg_indices,
                 _uses_remote_copy=_uses_remote_copy,
                 _matmul_dot_general=_matmul_dot_general,
+                _pipeline_vmem_bytes=_pipeline_vmem_bytes,
             )
         setattr(pallas_kernel, _PALLAS_SCRATCH_KEY_ATTR, scratch_key)
 

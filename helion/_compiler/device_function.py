@@ -619,6 +619,10 @@ class DeviceFunction:
         # Root-grid memory operations routed through explicit DMA resources.
         # Inner-loop schedulers keep iteration-specific bindings on loop state.
         self.pallas_grid_dma_bindings: dict[torch.fx.Node, DmaResources] = {}
+        # Pallas: VMEM bytes of the largest emit_pipeline's own block buffers.
+        # emit_pipeline allocates them inside the kernel, so the launcher's
+        # VMEM estimate cannot see them unless codegen passes them along.
+        self.pallas_pipeline_vmem_bytes: int = 0
         # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
         # using pl.ds() that may need host-side padding.
         self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
