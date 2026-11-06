@@ -26,7 +26,7 @@ Helion generates kernels through one of several backends, selected with the
 
 * [Triton] (default)
 * [TileIR](tileir_backend.md), for NVIDIA Blackwell GPUs
-* [CuTe DSL], for NVIDIA GPUs
+* [CuTe DSL], for NVIDIA Blackwell GPUs
 * [Pallas], for Google TPUs
 * Metal (Apple GPUs) and FlyDSL (AMD GPUs), both experimental
 
