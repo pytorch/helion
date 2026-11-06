@@ -209,7 +209,6 @@ def test_strict_settings_do_not_rewrite(fast_math, precision):
 
 
 @skipUnlessBackends(["triton"])
-@pytest.mark.skipif(not SUPPORTED, reason="requires a supported NVIDIA GPU")
 @pytest.mark.skipif(not FP8_SUPPORTED, reason="requires Hopper or Blackwell FP8")
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("upcast", [False, True])
