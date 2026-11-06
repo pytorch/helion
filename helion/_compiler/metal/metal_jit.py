@@ -49,6 +49,7 @@ from .reduction import RED_SITE_GLOBAL_PREFIX
 from .reduction import TG_BUFFER_GLOBAL_PREFIX
 from .reduction import group_path
 from .reduction import group_scratch_slots
+from .tile_sharing import share_tiles
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -236,8 +237,12 @@ def _generate_msl(
     reduction_sites = _reduction_sites(
         fn_globals, referenced, required_threads_per_threadgroup
     )
-    threadgroup_buffers = _threadgroup_buffers(
-        fn_globals, referenced, reduction_sites, required_threads_per_threadgroup
+    body_stmts, threadgroup_buffers = _threadgroup_buffers(
+        body_stmts,
+        fn_globals,
+        referenced,
+        reduction_sites,
+        required_threads_per_threadgroup,
     )
     uses_reductions = _uses_reductions(body_stmts)
     if uses_reductions:
@@ -436,12 +441,16 @@ _MSL_SCALAR_BYTES = {
 
 
 def _threadgroup_buffers(
+    body_stmts: list[ast.stmt],
     fn_globals: dict[str, object],
     referenced: set[str],
     reduction_sites: dict[str, tuple[str, int]],
     threads_per_threadgroup: tuple[int, int, int] | None,
-) -> list[tuple[str, str, int]]:
-    """Collect ``(name, metal_dtype, slots)`` scratch declarations to hoist.
+) -> tuple[list[ast.stmt], list[tuple[str, str, int]]]:
+    """Collect ``(name, metal_dtype, slots)`` scratch declarations to hoist,
+    with MPP tiles that are never live together sharing one
+    (:func:`tile_sharing.share_tiles`, which edits the body in place and
+    returns it).
 
     Written by ``metal/reduction.py::alloc_threadgroup_buffer`` as generated
     module-level globals, the same transport ``_BLOCK_SIZE_*`` uses.  Only
@@ -461,6 +470,7 @@ def _threadgroup_buffers(
         buf_name, buf_dtype, buf_slots = fn_globals[name]  # type: ignore[misc]
         if buf_name in referenced:
             declared.append((str(buf_name), str(buf_dtype), buf_slots))  # type: ignore[arg-type]
+    body_stmts, declared = share_tiles(body_stmts, declared)
 
     def slots(buf_slots: int | str) -> int:
         if isinstance(buf_slots, int):
@@ -493,7 +503,7 @@ def _threadgroup_buffers(
             f"reduction scratch and MPP staging need {used()} bytes of "
             f"threadgroup memory (max {MAX_THREADGROUP_MEMORY_BYTES})",
         )
-    return buffers()
+    return body_stmts, buffers()
 
 
 def _raise_if_mpp_unsupported_device() -> None:

@@ -27,6 +27,7 @@ from typing import Iterator
 
 from ... import exc
 from .mpp_graph_codegen import MPPSetupParams
+from .mpp_matmul import ACC_SEED
 from .msl_reduction import REDUCTION_NAMESPACE
 
 
@@ -210,7 +211,9 @@ def _emit_stmts(
                 parts.append(f"{pad}{array}[{lane}] = {value};")
             elif _is_call_to(call, "_helion_mpp_stage"):
                 assert isinstance(call, ast.Call)
-                buf, index, value, pred = (_ast_expr_to_msl(a) for a in call.args[:4])
+                buf, index, value, pred = (
+                    _ast_expr_to_msl(a, subs=subs) for a in call.args[:4]
+                )
                 parts.append(f"{pad}if ({pred}) {{ {buf}[{index}] = {value}; }}")
             elif _is_call_to(call, "_helion_mpp_put"):
                 # An element loop's write of the updated element (mpp_matmul's
@@ -224,6 +227,8 @@ def _emit_stmts(
                     f"{pad}threadgroup_barrier(mem_flags::mem_device | "
                     "mem_flags::mem_threadgroup);"
                 )
+            elif _is_call_to(call, "_helion_mpp_barrier"):
+                parts.append(f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);")
             elif _is_call_to(call, "_helion_mpp_materialize"):
                 assert isinstance(call, ast.Call)
                 _emit_coop_materialize(call, parts, pad, state)
@@ -332,9 +337,10 @@ def _emit_coop_acc(
     gid, tm, tn, tk, dtypes, lhs_t, rhs_t, fill = (
         ast.literal_eval(a) for a in call.args[:8]
     )
-    lhs_staged, rhs_staged, block_m, block_n, seed = (
-        ast.literal_eval(a) for a in call.args[9:14]
+    lhs_staged, rhs_staged, block_m, block_n = (
+        ast.literal_eval(a) for a in call.args[9:ACC_SEED]
     )
+    seed = ast.literal_eval(call.args[ACC_SEED])
     if (block_m, block_n) != (tm, tn):
         state.coop_rounded.add(name)
     state.coop_tile[name] = (block_m, block_n)

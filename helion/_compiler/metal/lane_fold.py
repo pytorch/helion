@@ -85,12 +85,12 @@ def unroll_lane_folds(
     """Unroll and jam every lane loop that carries a fold; *body* itself when
     it has none.  *reads* gives the names a statement reads, which for an
     MPP element loop excludes the names it binds and defines itself."""
-    lanes = _fold_lanes(body)
+    lanes = folded_lanes(body)
     if not lanes:
         return body
     lane_names: set[str] = set()
     result = _unroll(body, lanes, lane_names)
-    assert not _fold_lanes(result), "a lane fold outside its lane loop"
+    assert not folded_lanes(result), "a lane fold outside its lane loop"
     leaked = lane_names & set().union(*map(reads, result))
     assert not leaked, f"lane-dependent names used outside their lane loop: {leaked}"
     return result
@@ -120,7 +120,7 @@ def _is_fold_stmt(stmt: ast.stmt) -> bool:
     return isinstance(stmt, ast.Assign) and _is_fold(stmt.value)
 
 
-def _fold_lanes(stmts: list[ast.stmt]) -> set[str]:
+def folded_lanes(stmts: list[ast.stmt]) -> set[str]:
     lanes: set[str] = set()
     for stmt in stmts:
         for node in ast.walk(stmt):
