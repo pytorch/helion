@@ -256,6 +256,8 @@ class FlyDSLBackend(Backend):
             "helion": "import helion",
             "hl": "import helion.language as hl",
             "_default_flydsl_launcher": (
+                # The stable public name (v1.5.0 on), not the module path,
+                # so saved code keeps loading when the launcher moves.
                 "from helion.runtime import default_flydsl_launcher"
                 " as _default_flydsl_launcher"
             ),
