@@ -8,6 +8,8 @@ import re
 import subprocess
 import sys
 import tempfile
+from typing import TYPE_CHECKING
+from typing import ClassVar
 import unittest
 
 import torch
@@ -25,6 +27,9 @@ from helion.backend_api import TritonBackend
 import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language import reduce_ops
+
+if TYPE_CHECKING:
+    import ast
 
 _REPO_ROOT = Path(helion.__file__).resolve().parent.parent
 _DOCS_PATH = Path(__file__).resolve().parents[1] / "docs" / "api" / "backend_api.md"
@@ -178,6 +183,8 @@ def _signature(cls: type, name: str) -> str:
 class _ApiOnlyBackend(backend_api.TritonBackend):
     # A backend written only against helion.backend_api, reusing Triton
     # codegen under a new name (the TileIRBackend pattern).
+    states: ClassVar[list[object]] = []
+
     @property
     def name(self) -> str:
         return "_test_api_only"
@@ -185,6 +192,12 @@ class _ApiOnlyBackend(backend_api.TritonBackend):
     @property
     def codegen_name(self) -> str:
         return "triton"
+
+    def kernel_prologue(self, fn: backend_api.DeviceFunction) -> list[ast.stmt]:
+        # The covered per-function state: a dict a backend may write to.
+        fn.backend_codegen_state.setdefault("_test_api_only", {})["seen"] = True
+        type(self).states.append(fn.backend_codegen_state)
+        return []
 
 
 class TestBackendApiSurface(unittest.TestCase):
@@ -377,6 +390,7 @@ class TestBackendApiSurface(unittest.TestCase):
 class TestBackendApiCompile(TestCase):
     def test_api_only_backend_compiles_and_runs(self) -> None:
         repaired_before = backend_registry._REPAIRED_CODEGEN_NAMES
+        _ApiOnlyBackend.states = []
         backend_api.register_compiler_backend(_ApiOnlyBackend)
         try:
 
@@ -395,6 +409,9 @@ class TestBackendApiCompile(TestCase):
             unregister_compiler_backend("_test_api_only")
             backend_registry._REPAIRED_CODEGEN_NAMES = repaired_before
         torch.testing.assert_close(out, x + y)
+        self.assertTrue(_ApiOnlyBackend.states)
+        for state in _ApiOnlyBackend.states:
+            self.assertEqual(state, {"_test_api_only": {"seen": True}})
 
 
 if __name__ == "__main__":
