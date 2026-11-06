@@ -43,6 +43,7 @@ def _graph(dtype: torch.dtype, *, shared_mask: bool = False):
     return graph, product, values, facts
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]
 )
@@ -57,6 +58,7 @@ def test_masked_rewrite_updates_facts_and_preserves_shared_cast(dtype):
     graph.lint()
 
 
+@pytest.mark.cpu_only
 def test_shared_mask_and_mismatched_dtype_do_not_rewrite():
     graph, _, _, facts = _graph(torch.bfloat16, shared_mask=True)
     assert narrow_dot_operands(graph, facts) == 0
@@ -65,6 +67,7 @@ def test_shared_mask_and_mismatched_dtype_do_not_rewrite():
     assert narrow_dot_operands(graph, facts) == 0
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("case", ["native", "mask_value", "output_dtype", "acc_dtype"])
 def test_other_dots_do_not_rewrite(case):
     graph, product, values, facts = _graph(torch.bfloat16)
@@ -161,6 +164,17 @@ def test_small_dot_padding(dtype):
     cfg = helion.Config(block_sizes=[16, 16], indexing="pointer", num_warps=4)
     result = bound.compile_config(cfg)(a, b)
     torch.testing.assert_close(result, a.float() @ b.float(), rtol=0.01, atol=0.02)
+
+
+@skipUnlessBackends(["triton"])
+@pytest.mark.skipif(not HOPPER, reason="requires NVIDIA Hopper")
+def test_default_precision_rewrites():
+    a = torch.randn((32, 64), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((64, 32), device="cuda", dtype=torch.bfloat16)
+    bound = helion.kernel(
+        _matmul, fast_math=True, dot_precision="default"
+    )._bind_isolated((a, b))
+    assert bound.config_spec.matmul_facts[0].lhs_dtype == torch.bfloat16
 
 
 @skipUnlessBackends(["triton"])

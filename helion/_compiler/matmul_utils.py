@@ -487,7 +487,6 @@ def emit_tl_dot_with_padding(
                     else None,
                     input_precision=input_precision,
                     out_dtype=dot_out_dtype,
-                    precise_fp8=precise_fp8,
                 )
             )
         # pyrefly: ignore [bad-argument-type]
