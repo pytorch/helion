@@ -1002,6 +1002,90 @@ def test_full_and_masked_hooks_give_their_shared_rings_one_shape(
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("score", "order", "rolled"),
+    [
+        ("bias", "ascending", False),
+        ("bias", "descending", False),
+        ("bias", "descending", True),
+        ("identity", "ascending", False),
+    ],
+    ids=["bias_asc", "bias_desc", "bias_desc_rolled", "identity_asc"],
+)
+def test_partial_tile_after_a_full_tile_restages_the_mask_rows(
+    score: str, order: str, rolled: bool
+) -> None:
+    """The cooperative stream issues the walk's next tile's first chunks
+    during the current tile's PASS1, with the current tile's hook: a full
+    tile copies the score's runs only (``bias``: the full hook) or nothing
+    (``identity``: the dense PASS1).  An int32 ``keep[b, h, q, kv]`` table
+    streamed by a causal mask_mod, with KV tile 1 fully kept, makes the last
+    query tile of a 512-long sequence walk partial / full / partial tiles,
+    so in either walk order a partial tile follows a full one and read its
+    first chunks' keep rows from an older tile (max error ~0.8 against
+    torch, no error).  It re-stages them with the masked hook's block: the
+    same output and LSE as the kernel without the stream, and torch's
+    within bf16 tolerance, unrolled and rolled."""
+    batch, heads, seq = 2, 4, 512
+    q, k, v = _qkv(batch, heads, seq, seq)
+    torch.manual_seed(3)
+    bias = torch.randn(batch, heads, seq, seq, device=DEVICE)
+    keep = torch.rand(batch, heads, seq, seq, device=DEVICE) > 0.3
+    keep[..., 128:256] = True
+    keep_i32 = keep.to(torch.int32)
+
+    def bias_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + hl.load(bias, [b, h, q_idx, kv_idx])
+
+    def bias_mod_ref(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + bias[b, h, q_idx, kv_idx]
+
+    def keep_table(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (hl.load(keep_i32, [b, h, q_idx, kv_idx]) != 0) & (q_idx >= kv_idx)
+
+    def keep_table_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (keep_i32[b, h, q_idx, kv_idx] != 0) & (q_idx >= kv_idx)
+
+    score_mod, score_ref = {
+        "bias": (bias_mod, bias_mod_ref),
+        "identity": (_identity, None),
+    }[score]
+    block_mask = create_block_mask(
+        keep_table_ref, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    # The last query tile's walk holds a full tile between partial ones.
+    assert block_mask.full_kv_num_blocks is not None
+    assert block_mask.full_kv_num_blocks[..., 3].min().item() == 1
+    args = _flex_args(q, k, v, score_mod, block_mask, mask_mod=keep_table)
+    base = {
+        cute_flash.FLASH_S_LOAD_REP_KEY: 16,
+        cute_flash.FLASH_KV_SPLIT_KEY: 1,
+        cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: order,
+        cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY: rolled,
+        cute_flash.FLASH_FLEX_PREFETCH_KEY: 0,
+    }
+    fn, resolved = _compile_flex(args, {**base, cute_flash.FLASH_FLEX_COALESCE_KEY: 0})
+    assert resolved.flex_coalesce == 0
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    bound, normalized, resolved = _bind_flex(
+        args, {**base, cute_flash.FLASH_FLEX_COALESCE_KEY: 64}
+    )
+    assert resolved.flex_coalesce == 64 and resolved.flex_rolled_chunks == rolled
+    fn, code = compile_and_source(bound, normalized)
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+    _assert_close_to_reference(out, lse, *_reference(q, k, v, score_ref, block_mask))
+    # The partial steps' re-stage is rendered (the two hooks' issue blocks
+    # differ).
+    assert "(flash_flex_mstaged == cutlass.Int32(0))" in code
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
 def test_item_words_are_bitwise_the_device_list_walk() -> None:
     """The host-built per-item bitmask words (``cute_flash_flex_item_words``,
     the default) give the same output and LSE as the device walk over the

@@ -24089,6 +24089,9 @@ if warp_idx == 15:
         # in flight through the previous step's PASS2, its prologue and the
         # S wait instead of heading the tile.
         cross_tile = cfg.flex_prefetch > 0
+        # The stream's issue blocks of a full / partial step (``restage``).
+        full_issue = ""
+        masked_issue = ""
         if with_score:
             full_hook = render_flex_hook(
                 score_plan,
@@ -24098,6 +24101,7 @@ if warp_idx == 15:
                 **hook_kwargs,  # pyrefly: ignore[bad-argument-type]
             )
             hooks.append(full_hook)
+            full_issue = full_hook.chunk_issue
             full_rowmax_block = modifier_rowmax_block(
                 "\n" + _flash_flex_hook_lines(full_hook.chunk_body, " " * 16).rstrip(),
                 full_hook.chunk_prefetch,
@@ -24132,6 +24136,7 @@ if warp_idx == 15:
                 **hook_kwargs,  # pyrefly: ignore[bad-argument-type]
             )
             hooks.append(masked_hook)
+            masked_issue = masked_hook.chunk_issue
             masked_rowmax_block = modifier_rowmax_block(
                 "\n"
                 + _flash_flex_hook_lines(masked_hook.chunk_body, " " * 16).rstrip(),
@@ -24233,6 +24238,21 @@ if warp_idx == 15:
         issue_blocks = list(
             dict.fromkeys(hook.chunk_issue for hook in hooks if hook.chunk_issue)
         )
+        # A step issues the next tile's first chunks by its own kind, not
+        # the next tile's: a full step copies the full hook's runs (the
+        # score's) or nothing (the dense PASS1, or a full hook the stream
+        # does not serve), while a partial tile also reads the mask's runs
+        # of those chunks.  Where the masked hook's issue block carries
+        # more than the full step's, ``flash_flex_mstaged`` records whether
+        # the staged chunks of the upcoming tile hold the masked hook's
+        # runs (set by the fills, which run every block, and by a masked
+        # PASS1; cleared by a full one), and a partial step that finds it
+        # clear re-stages its first chunks with the masked hook's block in
+        # its prologue, ahead of the S wait.  The cost lands on the full ->
+        # partial steps only: a full step after a full one reads what the
+        # previous step issued, and a partial step after a partial or an
+        # absent one finds its chunks staged.
+        restage = bool(coop_slots and masked_issue) and masked_issue != full_issue
         peek_lines: list[str] = []
         first_tile = "0"
         needs_peek = prefetch_depth or coop_slots
@@ -24328,6 +24348,16 @@ if warp_idx == 15:
         )
         if hook_prologue:
             tile_prologue += "\n" + hook_prologue.rstrip("\n")
+        if restage:
+            # A partial tile after a full one: its first chunks were staged
+            # without the mask's runs (see ``restage``).
+            tile_prologue += (
+                "\n            if (flash_flex_status != 0) & flash_flex_needs_mask & "
+                "(flash_flex_mstaged == cutlass.Int32(0)):\n"
+                + _flash_flex_stream_fill(
+                    [masked_issue], coop_slots, "flash_kv", indent=" " * 16
+                )
+            )
         segment = _FlashSoftmaxLoopSegment(
             loop_var="flash_kv_iter", loop_bound=kv_loop_bound
         )
@@ -24385,6 +24415,15 @@ if warp_idx == 15:
                     issue_blocks, coop_slots, "flash_kv_peek", indent=" " * 16
                 )
             )
+            if restage:
+                # Whether the next tile's staged chunks hold the masked
+                # hook's runs: issued by a masked PASS1 or the absent fill.
+                pre_loop_parts.append("        flash_flex_mstaged = cutlass.Int32(1)")
+                epilogue_parts.append(
+                    "            flash_flex_mstaged = cutlass.Int32(cutlass.select_("
+                    "flash_flex_needs_mask | (flash_flex_status == 0), "
+                    "cutlass.Int32(1), cutlass.Int32(0)))"
+                )
         if pre_loop_parts:
             pre_loop_fill = "\n".join([*first_peek, *pre_loop_parts])
             tile_epilogue = "\n".join(epilogue_parts)
