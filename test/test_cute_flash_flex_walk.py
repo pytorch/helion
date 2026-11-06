@@ -1054,7 +1054,7 @@ def test_flex_rolled_chunks_knob_rolls_pass1_and_pins_the_register_ring() -> Non
     assert src.count("for flash_ci in cutlass.range(flash_LD_CHUNKS):") == 2
     assert "for flash_ci in cutlass.range_constexpr(flash_LD_CHUNKS):" not in src
     assert (
-        "flash_flex_pkv = cutlass.Int32(cutlass.select_(flash_ci + 4 < flash_LD_CHUNKS, "
+        "flash_flex_ikv = cutlass.Int32(cutlass.select_(flash_ci + 4 < flash_LD_CHUNKS, "
         "flash_kv, flash_kv_peek))"
     ) in src
     assert "flash_flex_ps = flash_ci % 4" in src
@@ -1132,7 +1132,7 @@ def test_codegen_splices_the_cooperative_stream() -> None:
         assert at < body.index("flash_flex_pc = (flash_ci + 4) % flash_LD_CHUNKS")
         assert "flash_flex_ps = flash_ci % 4" in body
         assert (
-            "flash_flex_pkv = flash_kv if flash_ci + 4 < flash_LD_CHUNKS else flash_kv_peek"
+            "flash_flex_ikv = flash_kv if flash_ci + 4 < flash_LD_CHUNKS else flash_kv_peek"
             in body
         )
         assert at < body.index(issue) < body.index("cute.copy(")
@@ -1145,7 +1145,7 @@ def test_codegen_splices_the_cooperative_stream() -> None:
         pre = stage_src[:loop_at]
         assert "flash_kv_peek = cutlass.Int32(0)" in pre
         assert pre.index("cute.arch.cp_async_wait_group(0)") < pre.index(
-            "flash_flex_pkv = flash_kv_peek"
+            "flash_flex_ikv = flash_kv_peek"
         )
         assert pre.count(issue) == 4
         assert "flash_flex_ps = 3" in pre
@@ -1157,7 +1157,7 @@ def test_codegen_splices_the_cooperative_stream() -> None:
     for text in (
         "flash_flex_pc",
         "flash_kv_peek",
-        "flash_flex_pkv",
+        "flash_flex_ikv",
         "cute.arch.cp_async_wait_group",
         "cute.arch.cp_async_commit_group",
     ):

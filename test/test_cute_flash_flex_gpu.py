@@ -795,6 +795,76 @@ def test_rolled_chunk_loop_is_bitwise_the_unrolled_kernel(
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
 @_MULTI_COMPILE_TIMEOUT
+def test_cooperative_stream_lead_keeps_the_mask_prefetch_on_its_tile() -> None:
+    """A score_mod streaming a per-column row table (``bias[b, h, q, kv]``
+    through the cooperative ring) beside a mask_mod whose per-column table
+    (``doc[kv_idx]``) rides the register prefetch ring: at 16-column chunks
+    the stream runs four chunks ahead and the register ring two, so the
+    stream moves to the walk's next tile while the ring still fetches
+    in-tile chunks.  Each lead keeps its own tile: the same output and LSE
+    as the in-chunk per-lane loads, and torch's within bf16 tolerance (one
+    shared tile pointed the last chunk's mask at the next tile)."""
+    batch, heads, seq = 2, 4, 256
+    q, k, v = _qkv(batch, heads, seq, seq)
+    torch.manual_seed(3)
+    bias = torch.randn(batch, heads, seq, seq, device=DEVICE)
+    doc = torch.repeat_interleave(torch.arange(4, device=DEVICE), seq // 4)
+
+    def bias_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + hl.load(bias, [b, h, q_idx, kv_idx])
+
+    def bias_mod_ref(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + bias[b, h, q_idx, kv_idx]
+
+    def documents(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (hl.load(doc, [q_idx]) == hl.load(doc, [kv_idx])) & (q_idx >= kv_idx)
+
+    def documents_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (doc[q_idx] == doc[kv_idx]) & (q_idx >= kv_idx)
+
+    block_mask = create_block_mask(
+        documents_ref, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, bias_mod, block_mask, mask_mod=documents)
+    base = {
+        cute_flash.FLASH_S_LOAD_REP_KEY: 16,
+        cute_flash.FLASH_KV_SPLIT_KEY: 1,
+        **UNROLLED,
+    }
+    fn, resolved = _compile_flex(
+        args,
+        {
+            **base,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: 0,
+            cute_flash.FLASH_FLEX_PREFETCH_KEY: 0,
+        },
+    )
+    assert (resolved.flex_coalesce, resolved.flex_prefetch) == (0, 0)
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    bound, normalized, resolved = _bind_flex(
+        args,
+        {
+            **base,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: 64,
+            cute_flash.FLASH_FLEX_PREFETCH_KEY: 64,
+        },
+    )
+    assert (resolved.flex_coalesce, resolved.flex_coalesce_slots) == (64, 4)
+    fn, code = compile_and_source(bound, normalized)
+    # The leads: the register ring two chunks ahead, the stream four.
+    assert "flash_flex_ps = (flash_ci + 2) % 3" in code
+    assert "flash_flex_ps = flash_ci % 4" in code
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+    _assert_close_to_reference(out, lse, *_reference(q, k, v, bias_mod_ref, block_mask))
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
 def test_item_words_are_bitwise_the_device_list_walk() -> None:
     """The host-built per-item bitmask words (``cute_flash_flex_item_words``,
     the default) give the same output and LSE as the device walk over the

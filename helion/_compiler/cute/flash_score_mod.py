@@ -118,7 +118,7 @@ class FlexHookCode(NamedTuple):
     prefetch_depth: int = 0
     # The warp-cooperative table stream (``render_flex_hook(coalesce=...,
     # coop_slots=S)``): ``chunk_issue`` copies chunk ``flash_flex_pc`` of
-    # KV tile ``flash_flex_pkv`` into staging slot ``flash_flex_ps`` (Python
+    # KV tile ``flash_flex_ikv`` into staging slot ``flash_flex_ps`` (Python
     # ints the emitter binds) with ``cp.async`` and commits the group;
     # ``chunk_consume`` waits for chunk ``flash_ci``'s group (``S - 1``
     # newer groups may stay in flight), reads the lane's staged rows of
@@ -156,7 +156,7 @@ _ELEMENT = 4
 _PCHUNK = 5
 _PGROUP = 6
 # The cooperative stream's issue block (chunk ``flash_flex_pc`` of tile
-# ``flash_flex_pkv`` into slot ``flash_flex_ps``) and its consume block (the
+# ``flash_flex_ikv`` into slot ``flash_flex_ps``) and its consume block (the
 # staged rows of chunk ``flash_ci``).
 _PISSUE = 7
 _PCONSUME = 8
@@ -170,6 +170,12 @@ _PREFETCH_INIT = "flash_flex_pf_init"
 # The KV tile the prefetch block loads from (the current tile for the
 # in-tile chunks, the walk's next tile for the cross-tile fill).
 _PREFETCH_TILE = "flash_flex_pkv"
+# The KV tile the cooperative issue block copies from.  A name apart from
+# the prefetch's: the emitter binds the prefetch's tile once ahead of
+# PASS1's chunk loop, while the stream rebinds its own per chunk (the walk's
+# next tile for its last ``coop_slots`` issues), ahead of prefetches that
+# may still load the current tile.
+_ISSUE_TILE = "flash_flex_ikv"
 
 # Dependence tokens.
 _T_B = "b"
@@ -1256,7 +1262,7 @@ class _HookEmitter:
             # The issued tile's first column (the emitter binds the tile).
             self.emit(
                 _PISSUE,
-                f"{var} = cutlass.Int32({_PREFETCH_TILE}) * cutlass.Int32(128)",
+                f"{var} = cutlass.Int32({_ISSUE_TILE}) * cutlass.Int32(128)",
             )
         elif name == "icbase":
             # The issued chunk's first column.
