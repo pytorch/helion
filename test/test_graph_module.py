@@ -5,6 +5,7 @@ import unittest
 import torch
 
 import helion
+from helion._compiler._dynamo.variables import infer_output_spec
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -90,6 +91,17 @@ class TestGraphModule(RefEagerTestBase, TestCase):
             apply_graph_module(gm, x)
 
         self.assertIn("call_module", str(cm.exception))
+
+    @skipIfRefEager("binds the kernel without running it")
+    def test_graph_module_host_semantic_fingerprint(self):
+        """The torch.compile output spec fingerprints the bound host code,
+        whose type annotations print a GraphModule argument on one line."""
+        x = torch.randn(128, device=DEVICE)
+        gm = torch.fx.symbolic_trace(lambda x: torch.sin(x + 1))
+
+        spec = infer_output_spec(apply_graph_module, (gm, x))
+
+        self.assertEqual(spec["leaf_specs"][0]["shape"], [128])
 
     def test_graph_module_caching(self):
         """Test that GraphModule hash caching works correctly."""
