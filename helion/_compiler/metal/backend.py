@@ -173,8 +173,7 @@ def scalar_contraction_blocks(graphs: list[GraphInfo], live: bool = True) -> set
     parts: those the scalar contraction lowers (``matmul_ops``) and the
     whole-K ones ``plan_mpp_matmuls`` takes, whose ``:`` M or N admission
     counts on the lane floor's threads for these blocks.  An aten matmul
-    lowers through MPP or is rejected, and the graph pass's K loops are not
-    live (``live_graphs`` skips them).  ``live=False`` scans every graph (no
+    lowers through MPP or is rejected.  ``live=False`` scans every graph (no
     compiling function to tell live ones), which can only add blocks."""
     from ...language.matmul_ops import dot
     from ..compile_environment import CompileEnvironment
@@ -432,8 +431,9 @@ class MetalBackend(Backend):
         return self._uniform_extent is None
 
     def launches_surplus_tile_threads(self) -> bool:
-        # MPP requires num_warps * 32 threads on tid[0], which is independent
-        # of the row block size; see the base docstring.
+        # Each launch axis takes the largest extent among the strategies that
+        # emit it, so a smaller tile on that axis has surplus threads; see the
+        # base docstring.
         return True
 
     def inductor_op_overrides(self) -> InductorOpOverrides:
@@ -524,29 +524,23 @@ class MetalBackend(Backend):
         }
         self.mpp_plan = plan_mpp_matmuls(graphs, threaded)
         check_free_lanes(self.free_arange_plan, self.mpp_plan, graphs)
-        self._uniform_extent = self._uniform_thread_extent(graphs, tile_strategy)
+        self._uniform_extent = self._uniform_thread_extent(tile_strategy)
 
-    def _uniform_thread_extent(
-        self, graphs: list[GraphInfo], tile_strategy: TileStrategyDispatch
-    ) -> int | None:
+    def _uniform_thread_extent(self, tile_strategy: TileStrategyDispatch) -> int | None:
         """The one thread extent E of every strategy's thread axes, or
         ``None`` if their extents differ, or the kernel has a free
-        ``hl.arange`` or goes through the MPP graph pass.
+        ``hl.arange``.
 
         The launch is the largest extent of each emitted thread axis, so with
         a single E every launch axis is 1 or E (``launcher_keyword_args``
         asserts it), and no tile runs surplus threads on whichever axis the
-        emitted code gives it.  Free aranges and the MPP graph pass claim
-        threads that no strategy owns.  The MPP planner launches only the
-        strategies' threads, and an element of a cooperative result is
-        visited at its row and column, which lie inside the op's tile and so
-        inside each block: the shared rule's masks hold there too.
+        emitted code gives it.  Free aranges claim threads that no strategy
+        owns.  The MPP planner launches only the strategies' threads, and an
+        element of a cooperative result is visited at its row and column,
+        which lie inside the op's tile and so inside each block: the shared
+        rule's masks hold there too.
         """
-        from .mpp_graph_codegen import MPPGraphInfo
-
-        if self.free_arange_plan or any(
-            isinstance(graph, MPPGraphInfo) for graph in graphs
-        ):
+        if self.free_arange_plan:
             return None
         extents = {
             extent
@@ -1000,8 +994,6 @@ class MetalBackend(Backend):
         )
         self._thread_budget = threadgroup_budget(config)
         self._num_warps = int(config.num_warps)
-        # Claim the MPP matmul's threads before the tiles take the whole budget.
-        config = self._config_with_mpp_thread_budget(fn, block_ids, config)
         # Cap tile thread counts so the reduction axes and free hl.arange axes
         # still fit alongside them.
         config = self._config_with_reduction_thread_budget(fn, block_ids, config)
@@ -1369,99 +1361,4 @@ class MetalBackend(Backend):
         changed |= self._serialize_nested_auto_tiles(
             fn, block_ids, config, num_threads, budget
         )
-        return self._finalize_thread_config(config, num_threads, changed)
-
-    def _config_with_mpp_thread_budget(
-        self, fn: DeviceFunction, block_ids: list[int], config: Config
-    ) -> Config:
-        """Reserve root-grid thread budget for MPPGraph cooperative work.
-
-        MPP matmul and ordinary scalar Metal code run inside one Metal
-        threadgroup.  MPP needs ``num_warps * 32`` threads participating on
-        ``tid[0]`` for its cooperative operation, while scalar code in the
-        surrounding root graph may still use ``tid[0]``, ``tid[1]``, and
-        ``tid[2]`` for normal tile indexing.  This method keeps the root graph
-        scalar-lowered, but caps auto ``num_threads`` on later root-grid axes
-        so the combined threadgroup stays within Metal's 1024-thread limit.
-        """
-        if not any(
-            type(graph_info).__name__ == "MPPGraphInfo"
-            for graph_info in fn.codegen.codegen_graphs
-        ):
-            return config
-
-        from ..host_function import HostFunction
-
-        device_ir = HostFunction.current().device_ir
-        # Only adjust the loop strategy for the root grid.  MPPGraphInfo emits
-        # the cooperative K-loop internally; nested/device loops should keep
-        # their normal Metal/CuTe strategy.
-        # Any root grid, not just the first: rewrite_mpp_graphs scans every
-        # RootGraphInfo, so a matmul in a later top-level hl.tile still gets
-        # MPP lowering and still needs its thread budget reserved.
-        if block_ids not in device_ir.grid_block_ids:
-            return config
-        if len(block_ids) < 2:
-            return config
-
-        from ..compile_environment import CompileEnvironment
-        from ..cute.thread_budget import MAX_THREADS_PER_BLOCK
-
-        env = CompileEnvironment.current()
-        num_threads = self._mutable_num_threads(config)
-
-        first_block_id = block_ids[0]
-        first_axis_size = env.block_sizes[first_block_id].from_config(config)
-        if not isinstance(first_axis_size, int):
-            return config
-        first_axis_configured = int(
-            env.config_spec.num_threads.config_get(
-                config.num_threads, first_block_id, 0
-            )
-        )
-        first_axis_threads = (
-            first_axis_configured if first_axis_configured > 0 else first_axis_size
-        )
-
-        # MPP's execution_simdgroups<N> uses N simdgroups, and each Metal
-        # simdgroup has 32 threads.  tid[0] must be large enough for both
-        # MPP's cooperative operation and any scalar indexing on the first
-        # root axis.
-        mpp_threads = config.num_warps * 32
-        used_threads = max(mpp_threads, first_axis_threads)
-        changed = False
-
-        # Walk the remaining axes in launch order.  Auto axes are reduced to the
-        # largest divisor that keeps the total threadgroup size under Metal's
-        # limit; an explicit count is taken as given, but is rejected if the
-        # product cannot launch.  Metal only refuses an oversized threadgroup
-        # when it builds the pipeline state, so without this the config costs a
-        # full MSL compile before failing -- 15-45% of a sampled matmul search
-        # space, depending on seed.
-        for block_id in block_ids[1:]:
-            configured = int(
-                env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
-            )
-            if configured > 0:
-                used_threads *= configured
-                if used_threads > MAX_THREADS_PER_BLOCK:
-                    raise exc.BackendUnsupported(
-                        self.name,
-                        f"threadgroup of {used_threads} threads "
-                        f"(max {MAX_THREADS_PER_BLOCK}); MPP claims "
-                        f"{mpp_threads} on tid[0] and the explicit num_threads "
-                        "on the remaining axes do not fit alongside it",
-                    )
-                continue
-
-            axis_size = env.block_sizes[block_id].from_config(config)
-            if not isinstance(axis_size, int):
-                continue
-
-            budget = max(1, MAX_THREADS_PER_BLOCK // max(1, used_threads))
-            chosen = _largest_divisor_at_most(axis_size, budget)
-            if self._record_thread_count(env, num_threads, block_id, chosen):
-                changed = True
-            used_threads *= chosen
-
         return self._finalize_thread_config(config, num_threads, changed)

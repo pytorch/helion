@@ -15,8 +15,7 @@ Every statement then runs on every thread of a free axis, and a Metal thread
 holds each value by block where Helion's values are positional arrays.  The
 plan rejects every layout where those differ:
 
-- an MPP region or a reduction, whose cross-thread combines don't know the
-  free axis;
+- a reduction, whose cross-thread combine doesn't know the free axis;
 - two values meeting position by position with a free block's dim facing a
   different block (:func:`_check_positional_merges`);
 - a matmul other than one accumulating a carry of its own single-thread K
@@ -174,10 +173,7 @@ def plan_free_aranges(
     if not free:
         return {}
     from ..inductor_lowering import ReductionLowering
-    from .mpp_graph_codegen import MPPGraphInfo
 
-    if any(isinstance(graph, MPPGraphInfo) for graph in graphs):
-        raise _unsupported("an MPP matmul claims tid[0] cooperatively")
     live = live_graphs(graphs)
     if any(
         isinstance(node.meta.get("lowering"), ReductionLowering)

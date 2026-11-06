@@ -101,6 +101,20 @@ def _get_msl(kernel: helion.Kernel, args: tuple[object, ...]) -> str:
     return _run_with_msl(kernel, args)[2]
 
 
+def _element_loops(msl: str) -> list[str]:
+    """The text of each MPP element loop: ``for (auto _it = c.begin(); ...) {``
+    through its closing brace."""
+    loops = []
+    header = r"for \(auto _it = (\w+)\.begin\(\); _it != \1\.end\(\); _it\+\+\) \{"
+    for match in re.finditer(header, msl):
+        depth, end = 1, match.end()
+        while depth:
+            depth += {"{": 1, "}": -1}.get(msl[end], 0)
+            end += 1
+        loops.append(msl[match.start() : end])
+    return loops
+
+
 def _group_reductions(msl: str) -> list[tuple[str, str, str, int, int]]:
     """``(op, path, partials, axis, span)`` of each ``helion_red::group_*`` call.
 
@@ -1382,10 +1396,7 @@ class TestMetalMatmul(unittest.TestCase):
                 torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
         msl = _get_msl(dot_fp32_out, (x, y))
-        self.assertIn(
-            "decltype(_mpp_setup_lhs_slice), decltype(_mpp_setup_rhs_slice), float",
-            msl,
-        )
+        self.assertRegex(msl, r"get_destination_cooperative_tensor<.*, float>\(\)")
         self.assertIn("tensor<device half", msl)
 
     def test_matmul_bfloat16(self) -> None:
@@ -1429,12 +1440,12 @@ class TestMetalMatmul(unittest.TestCase):
         y = torch.randn(64, 64, device=DEVICE)
         self.assertIn("matmul2d", _get_msl(matmul_kernel, (x, y)))
         msl = _get_msl(dot_kernel, (x, y))
-        self.assertIn(
-            "[[required_threads_per_threadgroup(128, 8, 1)]] kernel void",
-            msl,
-        )
         self.assertIn("matmul2d", msl, "MPP matmul2d not found in MSL")
-        self.assertIn("_op.run", msl, "MPP run call not found in MSL")
+        self.assertRegex(msl, r"_mpp_op_\d+\.run\(", "MPP run call not found in MSL")
+        # The op runs on every SIMD group of the kernel's own threadgroup.
+        self.assertIn(
+            "execution_simdgroups<(_TG_SIZE_X * _TG_SIZE_Y * _TG_SIZE_Z) / 32>", msl
+        )
         self.assertNotIn("auto acc = float(0.0)", msl)
 
     def test_matmul_with_relu(self) -> None:
@@ -1460,8 +1471,8 @@ class TestMetalMatmul(unittest.TestCase):
         torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
 
     def test_matmul_supported_epilogues(self) -> None:
-        """Each epilogue runs on the cooperative tensor, through the planner
-        for ``torch.addmm`` and through the graph pass for ``hl.dot``."""
+        """Each epilogue runs on the cooperative tensor, for ``torch.addmm``
+        and ``hl.dot`` alike."""
         cfg = [helion.Config(block_sizes=[32, 32, 32], num_warps=4)]
 
         @helion.kernel(backend="metal", configs=cfg)
@@ -1517,14 +1528,14 @@ class TestMetalMatmul(unittest.TestCase):
                         result, epilogue(mm), atol=1e-4, rtol=1e-4
                     )
             msl = _get_msl(dot_epilogue, (x, y, epilogue))
-            self.assertIn("_coop.begin()", msl)
-            self.assertIn("_coop.store", msl)
+            self.assertTrue(any("out[" in loop for loop in _element_loops(msl)))
 
     @unittest.skip(
         "Flaky numerical mismatch on the metal-m2 CI runner (fixed-config "
         "matmul+aux epilogue); skip on metal pending investigation."
     )
-    def test_matmul_aux_tensor_epilogue_materializes(self) -> None:
+    def test_matmul_aux_tensor_epilogue(self) -> None:
+        """An epilogue that reads another tensor runs in the element loop."""
         cfg = [helion.Config(block_sizes=[32, 32, 32], num_warps=4)]
 
         @helion.kernel(backend="metal", configs=cfg)
@@ -1570,9 +1581,7 @@ class TestMetalMatmul(unittest.TestCase):
 
         msl = _get_msl(dot_add_aux, (x, y, z))
         self.assertIn("matmul2d", msl)
-        self.assertIn("_coop.store", msl)
-        self.assertIn("threadgroup_barrier(mem_flags::mem_device)", msl)
-        self.assertNotIn("_coop_writeback", msl)
+        self.assertTrue(any("z[" in loop for loop in _element_loops(msl)))
 
     def test_matmul_epilogue_codegen(self) -> None:
         """ReLU epilogue must appear inside cooperative_tensor iteration."""
@@ -1593,14 +1602,16 @@ class TestMetalMatmul(unittest.TestCase):
         x = torch.randn(64, 64, device=DEVICE)
         y = torch.randn(64, 64, device=DEVICE)
         msl = _get_msl(dot_relu, (x, y))
-        self.assertIn("_coop.begin()", msl, "Epilogue loop not found in MSL")
-        self.assertIn("_coop.store", msl, "Cooperative store not found in MSL")
+        self.assertTrue(
+            any("c10::metal::max(" in loop for loop in _element_loops(msl)),
+            "ReLU not found in the element loop",
+        )
         self.assertNotIn("auto acc = float(0.0)", msl)
 
-    def test_mpp_graph_followed_by_scalar_outer_work(self) -> None:
-        """MPPGraph lowering must not consume later scalar work in the root
-        graph.  The same kernel with ``torch.addmm`` takes the planner, which
-        jams the 4-warp config's M/N lane loop around the op."""
+    def test_mpp_matmul_followed_by_scalar_outer_work(self) -> None:
+        """Scalar work after a K loop in the root graph stays out of the
+        matmul's element loop, for ``hl.dot`` and ``torch.addmm`` alike: the
+        planner jams the 4-warp config's M/N lane loop around the op."""
         cfg = helion.Config(block_sizes=[32, 32, 32], num_warps=4)
 
         @helion.kernel(backend="metal", configs=[cfg])
@@ -1643,7 +1654,7 @@ class TestMetalMatmul(unittest.TestCase):
         y = torch.randn(64, 64, device=DEVICE)
         z = torch.randn(64, 64, device=DEVICE)
         code = dot_then_scalar.bind((x, y, z)).to_code()
-        self.assertIn("_block_dims=(128, 8, 1)", code)
+        self.assertIn("_helion_mpp_acc(", code)
 
         out, side = dot_then_scalar(x, y, z)
         torch.testing.assert_close(out, torch.mm(x, y), atol=1e-4, rtol=1e-4)
@@ -1651,11 +1662,10 @@ class TestMetalMatmul(unittest.TestCase):
 
         msl = _get_msl(dot_then_scalar, (x, y, z))
         self.assertIn("matmul2d", msl)
-        self.assertIn("_coop.store", msl)
-        self.assertLess(msl.index("_coop.store"), msl.index("side["))
-        self.assertNotIn("if ((tid[1] == 0))", msl)
-        self.assertIn("z[", msl)
-        self.assertIn("tid[1]", msl)
+        loops = _element_loops(msl)
+        self.assertTrue(any("out[" in loop for loop in loops))
+        self.assertFalse(any("side[" in loop for loop in loops))
+        self.assertIn("side[", msl)
 
         bound = matmul_then_scalar.bind((x, y, z))
         out, side = bound.compile_config(bound.config_spec.default_config())(x, y, z)
@@ -1665,59 +1675,8 @@ class TestMetalMatmul(unittest.TestCase):
         torch.testing.assert_close(out, torch.mm(x, y), atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(side, z + 1.0)
 
-    def test_mpp_setup_marker_rejects_stale_arity(self) -> None:
-        import ast as pyast
-
-        from helion._compiler.metal.msl_ast_walker import _extract_mpp_setup_params
-
-        # The original 14-arg marker shape is stale once tile-offset names,
-        # transpose flags, and leading extents are added.
-        expr = pyast.parse(
-            '_metal_mpp_setup("x", "y", 64, 64, 64, 32, 32, 32, 4, '
-            '"float", "float", "", "", "acc")'
-        )
-        stmt = expr.body[0]
-        self.assertIsInstance(stmt, pyast.Expr)
-        call = stmt.value
-        self.assertIsInstance(call, pyast.Call)
-        with self.assertRaisesRegex(AssertionError, "expects 18 positional args"):
-            _extract_mpp_setup_params(call)
-
-    def test_mpp_emission_scopes_symbols_by_setup_name(self) -> None:
-        import ast as pyast
-
-        from helion._compiler.metal.msl_ast_walker import EmitState
-        from helion._compiler.metal.msl_ast_walker import _emit_stmts
-
-        code = (
-            '_mpp_setup = _metal_mpp_setup("x", "y", 64, 64, 64, 32, 32, 32, 4, '
-            '"float", "float", "acc", 0, 0, 64, 64, '
-            "offset_0, offset_1)\n"
-            "_metal_mpp_k_step(_mpp_setup, 0)\n"
-            '_metal_mpp_coop_store(_mpp_setup, "out0", "float")\n'
-            '_mpp_setup_1 = _metal_mpp_setup("a", "b", 64, 64, 64, 32, 32, 32, 4, '
-            '"float", "float", "acc_1", 0, 0, 64, 64, '
-            "offset_0, offset_1)\n"
-            "_metal_mpp_k_step(_mpp_setup_1, 0)\n"
-            '_metal_mpp_coop_store(_mpp_setup_1, "out1", "float")\n'
-        )
-        state = EmitState()
-        parts: list[str] = []
-        _emit_stmts(pyast.parse(code).body, parts, indent=4, state=state)
-        msl = "\n".join(parts)
-
-        self.assertIn("_mpp_setup_lhs", msl)
-        self.assertIn("_mpp_setup_1_lhs", msl)
-        self.assertIn("_mpp_setup_C", msl)
-        self.assertIn("_mpp_setup_1_C", msl)
-        self.assertIn("_mpp_setup_op.run", msl)
-        self.assertIn("_mpp_setup_1_op.run", msl)
-        self.assertNotIn("auto _lhs =", msl)
-        self.assertNotIn("auto _C =", msl)
-        self.assertNotIn("matmul2d<_desc", msl)
-
     def test_matmul_via_hl_dot(self) -> None:
-        """``hl.dot`` reaches the same MPPGraph pipeline as ``torch.addmm``."""
+        """``hl.dot`` reaches the same MPP planner as ``torch.addmm``."""
         cfg = [helion.Config(block_sizes=[32, 32, 32], num_warps=4)]
 
         @helion.kernel(backend="metal", configs=cfg)
@@ -1736,10 +1695,17 @@ class TestMetalMatmul(unittest.TestCase):
         y = torch.randn(64, 64, device=DEVICE)
         result = matmul_dot(x, y)
         torch.testing.assert_close(result, torch.mm(x, y), atol=1e-4, rtol=1e-4)
+        # A column-strided lhs is not a view MPP can read; it is staged.
+        strided = torch.randn(64, 128, device=DEVICE)[:, ::2]
+        torch.testing.assert_close(
+            matmul_dot(strided, y), torch.mm(strided, y), atol=1e-4, rtol=1e-4
+        )
 
         msl = _get_msl(matmul_dot, (x, y))
         self.assertIn("matmul2d", msl, "MPP matmul2d not found in MSL (hl.dot)")
-        self.assertIn("_op.run", msl, "MPP run call not found in MSL (hl.dot)")
+        self.assertRegex(
+            msl, r"_mpp_op_\d+\.run\(", "MPP run call not found in MSL (hl.dot)"
+        )
 
     def test_matmul_via_hl_dot_with_relu(self) -> None:
         cfg = [helion.Config(block_sizes=[32, 32, 32], num_warps=4)]
@@ -1763,10 +1729,13 @@ class TestMetalMatmul(unittest.TestCase):
 
         msl = _get_msl(matmul_dot_relu, (x, y))
         self.assertIn("matmul2d", msl, "MPP matmul2d not found in MSL (hl.dot)")
-        self.assertIn("_coop.begin()", msl, "Epilogue loop not found in MSL (hl.dot)")
+        self.assertTrue(
+            any("c10::metal::max(" in loop for loop in _element_loops(msl)),
+            "ReLU not found in the element loop (hl.dot)",
+        )
 
     def test_matmul_bias_epilogue_is_correct(self) -> None:
-        """Surplus MPP threads must not race with the scalar bias epilogue."""
+        """A bias epilogue over every launch shape the configs give."""
 
         def matmul_bias(
             x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
@@ -1848,8 +1817,7 @@ def dot_full_k_bf16_out(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 @helion.kernel(backend="metal")
 def dot_tile_k_shifted(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """A K loop over computed operands, which the MPP graph pass doesn't
-    take."""
+    """A K loop over computed operands."""
     out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
     for tile_m, tile_n in hl.tile([x.size(0), y.size(1)]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
@@ -1873,7 +1841,7 @@ def dot_tile_k_shifted_f16(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 @helion.kernel(backend="metal")
 def dot_tile_k_f16_acc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """A computed lhs keeps the K loop out of the MPP region."""
+    """A computed lhs with a float16 acc, which keeps it scalar."""
     out = torch.empty([x.size(0), y.size(1)], dtype=torch.float16, device=x.device)
     for tile_m, tile_n in hl.tile([x.size(0), y.size(1)]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float16)
@@ -5592,7 +5560,6 @@ class TestMetalPermute(unittest.TestCase):
         out, code = self._run(mpp_result_permuted_twice, (a, b), config)
         self.assertNotIn("dot_product", code)
         torch.testing.assert_close(out, a @ b, rtol=1e-2, atol=1e-2)
-        # Unequal M and N keep the K loop off the graph pass.
         a = torch.randn(48, 64, device=DEVICE)
         b = torch.randn(64, 80, device=DEVICE)
         out, code = self._run(mpp_result_transposed, (a, b), config)
@@ -5674,20 +5641,16 @@ class TestMetalPermute(unittest.TestCase):
                     kernel, args, config, "support: a control-flow carry"
                 )
 
-    def test_transposed_mpp_reload_is_rejected(self) -> None:
-        """MPP stores the K loop's result as ``[M, N]`` and reloads it through
-        the ``[tn, tm]`` store's index, a load whose value is not its access."""
+    def test_transposed_mpp_result_store(self) -> None:
+        """A K loop's result stored through the ``[tn, tm]`` index of its
+        transpose: the element loop stores each element at its own index."""
         a = torch.randn(64, 64, device=DEVICE)
         b = torch.randn(64, 64, device=DEVICE)
-        bound = mpp_result_transposed.bind((a, b))
-        for config in (
-            bound.config_spec.default_config(),
-            helion.Config(block_sizes=[16, 16, 16]),
-        ):
+        for config in (None, helion.Config(block_sizes=[16, 16, 16])):
             with self.subTest(config=config):
-                self._assert_rejected(
-                    mpp_result_transposed, (a, b), config, "support: a load result"
-                )
+                out, code = self._run(mpp_result_transposed, (a, b), config)
+                self.assertIn("_helion_mpp_acc(", code)
+                torch.testing.assert_close(out, (a @ b).T, rtol=1e-2, atol=1e-2)
 
     def test_rebinding_index_tensors_are_rejected(self) -> None:
         config = helion.Config(block_sizes=[16, 16])
@@ -12835,7 +12798,6 @@ class TestMetalFactoredDims(unittest.TestCase):
         )
         self.assertIn("iota_part_1", code)
         self.assertIn("load_part_1", code)
-        self.assertNotIn("_metal_mpp_setup", code)
 
     def test_matmul_over_parts_rejects(self) -> None:
         """A matmul over parts that the MPP planner doesn't lower (a
@@ -13064,14 +13026,19 @@ class TestMetalFactoredDims(unittest.TestCase):
             helion.Config(block_sizes=[16, 16], num_threads=[4, 0]),
         )
 
-    def test_mpp_region_rejects(self) -> None:
-        x = torch.randn(32, 32, dtype=torch.float16)
-        self._assert_rejected(
-            mpp_beside_widened,
-            (x, x.clone(), torch.randn(4, 16)),
-            "a store at a widened hl.arange\\(\\) index in a kernel that also has "
-            "an MPP matmul",
+    def test_widened_store_beside_an_mpp_matmul(self) -> None:
+        """A store at a widened index in a kernel whose K loop is an MPP op."""
+        x = torch.randn(32, 32, device=DEVICE, dtype=torch.float16)
+        a = torch.randn(4, 16, device=DEVICE)
+        bound = mpp_beside_widened.bind((x, x.clone(), a))
+        code = bound.to_code(bound.config_spec.default_config())
+        self.assertIn("_helion_mpp_acc(", code)
+        self.assertIn("load_part_1", code)
+        out, copy = bound.compile_config(bound.config_spec.default_config())(
+            x, x.clone(), a
         )
+        torch.testing.assert_close(out, x.float() @ x.float(), rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(copy, a)
 
 
 # ---------------------------------------------------------------------------

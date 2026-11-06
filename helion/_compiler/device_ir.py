@@ -1796,10 +1796,6 @@ class DeviceIR:
             temp._apply_rolling(config)
         temp._apply_epilogue_subtiling(config)
         temp._hoist_inband_polls()
-        if CompileEnvironment.current().backend_name == "metal":
-            from .metal.mpp_graph_transform import rewrite_mpp_graphs
-
-            rewrite_mpp_graphs(temp)
         return temp.graphs
 
     def _hoist_inband_polls(self) -> None:

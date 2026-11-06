@@ -184,9 +184,6 @@ def plan_reduced_tile_axes(
     another loop launches the axis wider.  The plan is skipped:
 
     - while a reduction strategy reserves the leading axes (those keep them);
-    - with an MPP graph: ``MetalBackend._config_with_mpp_thread_budget``
-      sizes the root grid's axes around the cooperative matmul's ``tid[0]``
-      in the grid's own block order;
     - when two threaded tile loops are siblings (``for tile_n ...`` next to
       ``for tile_k ...`` with different block ids): the body lets siblings
       share their nesting level's axes, but a plan ranks every block-id set
@@ -204,15 +201,10 @@ def plan_reduced_tile_axes(
     from ..host_function import HostFunction
     from ..inductor_lowering import ReductionLowering
     from ..reduction_strategy import ReductionStrategy
-    from .mpp_graph_codegen import MPPGraphInfo
 
     device_ir = HostFunction.current().device_ir
-    if (
-        tile_strategy.reserved_reduction_axes()
-        or any(isinstance(graph, MPPGraphInfo) for graph in graphs)
-        or _has_threaded_sibling_loops(
-            tile_loop_paths(device_ir, graphs), tile_strategy
-        )
+    if tile_strategy.reserved_reduction_axes() or _has_threaded_sibling_loops(
+        tile_loop_paths(device_ir, graphs), tile_strategy
     ):
         return
     tile_blocks = [

@@ -847,8 +847,7 @@ def plan_mpp_matmuls(graphs: list[GraphInfo], threaded: set[int]) -> MppPlan:
     seed that is not a constant fill reaches the K loop through a
     ``_mpp_coop`` node, which stages it into the cooperative tensor.
 
-    The graph pass leaves the K-loop graph it replaced in ``graphs``, so only
-    the graphs the kernel runs are scanned.
+    Only the graphs the kernel runs (``live_graphs``) are scanned.
     """
     from .backend import scalar_contraction_blocks
 
@@ -3601,7 +3600,7 @@ class _Copies:
 _CROSS_THREAD_CALLS = ("simd_", "quad_", "threadgroup_barrier", "simdgroup_barrier")
 #: Helion's markers for MPP ops and regions, and for lane folds and lane
 #: reductions, which combine the iterations of a lane loop.
-_CROSS_THREAD_MARKERS = ("_helion_mpp_", "_metal_mpp_", "_metal_lane_")
+_CROSS_THREAD_MARKERS = ("_helion_mpp_", "_metal_lane_")
 
 
 def _cross_thread(node: ast.AST, tg_buffers: frozenset[str]) -> bool:

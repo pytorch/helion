@@ -720,7 +720,6 @@
  "test/test_merge_reduction_dims.py": 0.0,
  "test/test_metal.py": 0.5,
  "test/test_metal_collectives.py": 0.0,
- "test/test_metal_mpp_graph_transform.py": 0.0,
  "test/test_misc.py": 48.1,
  "test/test_multi_shape_autotune.py": 5.8,
  "test/test_owned_conditional_coordinates.py": 0.8,

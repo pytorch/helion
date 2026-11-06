@@ -378,9 +378,7 @@ def _uses_mpp_markers(body_stmts: list[ast.stmt]) -> bool:
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if isinstance(func, ast.Name) and func.id.startswith(
-            ("_metal_mpp_", "_helion_mpp_")
-        ):
+        if isinstance(func, ast.Name) and func.id.startswith("_helion_mpp_"):
             return True
     return False
 
