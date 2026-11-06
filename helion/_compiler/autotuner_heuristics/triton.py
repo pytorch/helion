@@ -2760,6 +2760,16 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         return bm, bn, bk, num_warps, num_stages, l2
 
     @classmethod
+    def _promote_aspect_seed(
+        cls,
+        env: CompileEnvironment,
+        fact: MatmulFact,
+        primary: MatmulSeedDraft,
+        aspect: MatmulSeedDraft,
+    ) -> bool:
+        return False
+
+    @classmethod
     def _ranked_configs(cls, env: CompileEnvironment, fact: MatmulFact) -> list[Config]:
         """Ranked seed list: the budget primary (rank-0, Product A) + a couple of diverse alternates
         (transposed aspect, shallower num_stages) to seed the autotuner search. Deduped by the loader."""
@@ -2888,6 +2898,13 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                     if block_id is not None
                 }
             )
+            aspects = cls._aspect_seed_drafts(
+                env,
+                mm,
+                primary,
+                num_sm=num_sm,
+                axis_ids=axis_ids,
+            )
             corrected = [
                 *cls._register_mma_seed_drafts(
                     env,
@@ -2896,13 +2913,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                     num_sm=num_sm,
                     axis_ids=axis_ids,
                 ),
-                *cls._aspect_seed_drafts(
-                    env,
-                    mm,
-                    primary,
-                    num_sm=num_sm,
-                    axis_ids=axis_ids,
-                ),
+                *aspects,
                 *cls._bk_stage_seed_drafts(
                     env,
                     mm,
@@ -2911,6 +2922,9 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                     axis_ids=axis_ids,
                 ),
             ]
+            if cls._promote_aspect_seed(env, fact, primary, aspects[0]):
+                # The first aspect grows M; emit it identically to its seed for deduplication.
+                ranked.insert(0, emit(aspects[0], (bm, bn, bk)))
             ranked.extend(emit(draft, (bm, bn, bk)) for draft in corrected)
             return dedupe_configs(ranked)
 
@@ -3266,6 +3280,67 @@ class TritonH100FormulaMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
     HARD_SMEM_16BIT_STORE_STAGE_OFFSET = 1
     SAT_NUM_WARPS = None
     WARPGROUP_DOT_WORK = 1 << 19
+
+    @classmethod
+    def _promote_aspect_seed(
+        cls,
+        env: CompileEnvironment,
+        fact: MatmulFact,
+        primary: MatmulSeedDraft,
+        aspect: MatmulSeedDraft,
+    ) -> bool:
+        spec = env.config_spec
+        mm = spec.kernel_matmul_fact
+        grid = spec.kernel_grid_fact
+        if (
+            fact.lhs_dtype != torch.bfloat16
+            or fact.rhs_dtype != torch.bfloat16
+            or fact.lhs_ndim != 2
+            or fact.rhs_ndim != 2
+            or fact.static_m is None
+            or not 32 < fact.static_m <= 64
+            or len(spec.block_sizes) != 3
+            or mm is None
+            or not mm.attribution_complete
+            or len(mm.matmuls) != 1
+            or grid is None
+            or len(grid.roots) != 1
+        ):
+            return False
+        resolved = mm.matmuls[0]
+        site = resolved.site
+        if (
+            set(grid.group_for_graph(site.graph_id))
+            != {fact.m_block_id, fact.n_block_id}
+            or not site.updates_carry
+            or len(site.loop_axes) != 1
+            or site.loop_axes[0].block_id != fact.k_block_id
+            or site.loop_axes[0].bounded_by_block_id is not None
+            or len(mm.pipelined_regions) != 1
+            or any(
+                resolved.axes.kind(axis) != DotAxisKind.TUNABLE_TILED
+                for axis in ("m", "n", "k")
+            )
+        ):
+            return False
+
+        slots = {
+            cast("BlockSizeSpec", spec.block_sizes[i]).block_id: i
+            for i in range(len(spec.block_sizes))
+        }
+        m_slot, n_slot, k_slot = (
+            slots[cast("int", block_id)]
+            for block_id in (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+        )
+        # Keep the same tile area while using the 64-row WGMMA path, which
+        # requires a warpgroup. The aspect draft has passed resource checks.
+        return (
+            primary.block_sizes[m_slot] == 32
+            and aspect.block_sizes[m_slot] == 64
+            and aspect.block_sizes[n_slot] * 2 == primary.block_sizes[n_slot]
+            and aspect.block_sizes[k_slot] == primary.block_sizes[k_slot]
+            and aspect.num_warps == cls.WARPGROUP_WARPS
+        )
 
     @classmethod
     def _pipeline_stage_cap(
