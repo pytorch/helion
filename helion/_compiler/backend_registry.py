@@ -18,7 +18,6 @@ import warnings
 
 from .backend import Backend
 from .cute.backend import CuteBackend
-from .flydsl.backend import FlyDSLBackend
 from .metal.backend import MetalBackend
 from .pallas.backend import PallasBackend
 from .triton.backend import TileIRBackend
@@ -61,13 +60,17 @@ _LOADED_PLUGINS: set[str] = set()
 # being imported directly on another thread); raises instead of hanging.
 _PLUGIN_LOAD_TIMEOUT_S = 60.0
 
+# Backends that moved out of tree: name -> pip package providing it. An entry
+# only improves the "unknown backend" error; remove it once users have had
+# time to migrate.
+_KNOWN_EXTERNAL_BACKENDS: dict[str, str] = {"flydsl": "helion-flydsl"}
+
 _BUILTIN_BACKENDS: list[type[Backend]] = [
     TritonBackend,
     PallasBackend,
     CuteBackend,
     TileIRBackend,
     MetalBackend,
-    FlyDSLBackend,
 ]
 
 _REGISTRY: dict[str, type[Backend]] = {}
@@ -199,6 +202,7 @@ def get_backend_class(name: str) -> type[Backend]:
     if name not in _REGISTRY:
         raise ValueError(
             f"Unknown backend: {name!r}. Available backends: {list_backends()}"
+            f"{install_hint(name)}"
         )
     return _REGISTRY[name]
 
@@ -208,10 +212,38 @@ def get_backend(name: str) -> Backend:
 
     Callers that only read a hook (a capability predicate, the heuristics
     tuple, the structural policy type) get their own instance: backends are
-    cheap to construct and several (Metal, Pallas, FlyDSL) keep per-compile
+    cheap to construct and several (Metal, Pallas, out-of-tree ones) keep per-compile
     state on the instance, so instances are never shared.
     """
     return get_backend_class(name)()
+
+
+def install_hint(name: str) -> str:
+    """Suffix for "unknown backend" errors when ``name`` moved out of tree."""
+    package = _KNOWN_EXTERNAL_BACKENDS.get(name)
+    if package is None:
+        return ""
+    if not _entry_point_installed(name):
+        return f". The {name!r} backend is provided by `pip install {package}`"
+    if _parse_plugins_disabled() is True:
+        return (
+            f". The {name!r} plugin is ignored because "
+            "HELION_DISABLE_BACKEND_PLUGINS is set"
+        )
+    cached = _PLUGIN_ENTRY_POINTS
+    if cached is not None and name not in cached:
+        # Discovery ran while plugins were disabled (or before the install).
+        return (
+            f". The {name!r} plugin is installed but was not discovered when "
+            "plugins were first looked up; restart the process to load it"
+        )
+    return ""
+
+
+def _entry_point_installed(name: str) -> bool:
+    # A fresh look, not the cached discovery, so the hint reflects now.
+    entry_points = importlib.metadata.entry_points(group=PLUGIN_ENTRY_POINT_GROUP)
+    return any(ep.name == name for ep in entry_points)
 
 
 def list_backends() -> list[str]:
@@ -316,6 +348,14 @@ def _plugins_disabled() -> bool:
 
     var = "HELION_DISABLE_BACKEND_PLUGINS"
     return _parse_env_bool(var, os.environ.get(var), False)
+
+
+def _parse_plugins_disabled() -> bool | None:
+    """HELION_DISABLE_BACKEND_PLUGINS as a bool, or None if invalid."""
+    try:
+        return _plugins_disabled()
+    except ValueError:
+        return None
 
 
 def _plugin_entry_points() -> dict[str, EntryPoint]:

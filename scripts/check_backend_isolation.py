@@ -3,7 +3,7 @@
 
 Core is ``helion/_compiler/*.py``, ``helion/_compiler/autotuner_heuristics/**``,
 ``helion/autotuner/**``, ``helion/language/**`` and ``helion/runtime/*.py``; the
-sibling backend packages ``helion/_compiler/{flydsl,metal,pallas,triton}/**`` are
+sibling backend packages ``helion/_compiler/{metal,pallas,triton}/**`` are
 scanned by the same rules so a backend never reaches into another backend's
 folder.  A violation is a ``== "cute"`` / ``!= "cute"`` comparison or an
 ``in ("cute", ...)`` membership test, a literal ``BackendUnsupported("cute", ...)``
@@ -40,7 +40,6 @@ CORE_GLOBS = (
     "helion/runtime/*.py",
 )
 SIBLING_BACKEND_GLOBS = (
-    "helion/_compiler/flydsl/**/*.py",
     "helion/_compiler/metal/**/*.py",
     "helion/_compiler/pallas/**/*.py",
     "helion/_compiler/triton/**/*.py",

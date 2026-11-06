@@ -23,6 +23,7 @@ from .. import exc
 from .._compat import is_hip
 from .._compat import supports_tf32_precision_on_amd
 from .._compiler.backend_registry import get_backend
+from .._compiler.backend_registry import install_hint
 from .._compiler.backend_registry import list_backends
 from .._compiler.backend_registry import registered_backends
 from ..autotuner.effort_profile import AutotuneEffort
@@ -378,9 +379,17 @@ def _get_dot_precision() -> DotPrecision:
 
 def _get_backend() -> str:
     names = registered_backends()
-    if os.environ.get("HELION_BACKEND", "").strip() not in ("", *names):
+    value = os.environ.get("HELION_BACKEND", "").strip()
+    if value not in ("", *names):
         names = list_backends()  # scan installed plugins only when needed
-    return _env_get_literal("HELION_BACKEND", "triton", mapping={n: n for n in names})
+    try:
+        return _env_get_literal(
+            "HELION_BACKEND", "triton", mapping={n: n for n in names}
+        )
+    except ValueError as e:
+        if hint := install_hint(value):
+            raise ValueError(f"{e}{hint}") from None
+        raise
 
 
 def is_pallas_interpret() -> bool:

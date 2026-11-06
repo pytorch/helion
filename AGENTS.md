@@ -130,7 +130,7 @@ runtime uses Triton's launcher. The paths you changed say which lanes matter:
 | one `test/test_*.py` | that module, on the backends it targets |
 | `helion/_compiler/cute/**`, `helion/runtime/cute/**` | the CuTe CPU lane first (no GPU; catches most codegen regressions), then the CuTe GPU lane |
 | `helion/_compiler/triton/**`, `helion/runtime/triton/**` | the Triton and CuTe lanes (CuTe builds on them; Pallas and Metal run only in CI) |
-| `helion/_compiler/{pallas,metal,flydsl}/**`, `helion/runtime/pallas/**` | that backend's suite (`pallas-interpret` locally; the rest in CI) |
+| `helion/_compiler/{pallas,metal}/**`, `helion/runtime/pallas/**` | that backend's suite (`pallas-interpret` locally; the rest in CI) |
 | core: `helion/_compiler/*.py`, `helion/language/**`, `helion/autotuner/**`, `helion/runtime/*.py`, `helion/_testing/**`, `test/conftest.py` | the Triton and CuTe lanes |
 | `examples/**` | `test/test_examples.py` under the affected backends |
 | `scripts/*.py` | the test modules that name the script (`--changed` finds them) |

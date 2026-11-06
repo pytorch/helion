@@ -30,7 +30,7 @@ the `HELION_BACKEND` environment variable or the `backend=` argument of
 * [CuTe DSL], for NVIDIA Blackwell GPUs: `HELION_BACKEND=cute`
 * [Pallas], for Google TPUs: `HELION_BACKEND=pallas`
 * Metal, for Apple GPUs (experimental): `HELION_BACKEND=metal`
-* FlyDSL, for AMD GPUs (experimental): `HELION_BACKEND=flydsl`
+* FlyDSL, for AMD GPUs (experimental), as the separate `helion-flydsl` package: `pip install helion-flydsl`, then `HELION_BACKEND=flydsl`
 
 ```python
 @helion.kernel(backend="cute")

@@ -48,7 +48,8 @@ class _PrologueBackend(backend_api.TritonBackend):
 
 
 class _FlagBackend(backend_api.TritonBackend):
-    # Mirrors FlyDSL: body codegen sets a flag that kernel_prologue reads.
+    # Mirrors out-of-tree helion-flydsl: body codegen sets a flag that
+    # kernel_prologue reads.
     calls: ClassVar[list[tuple[str, int]]] = []
 
     def __init__(self) -> None:
@@ -141,7 +142,7 @@ class TestKernelPrologue(TestCase):
 
     def test_recompile_reemits_prologue(self) -> None:
         # One backend instance serves every pass of a bound kernel, so a flag
-        # kept on the instance must be reset in pre_codegen (FlyDSL pattern).
+        # kept on the instance must be reset in pre_codegen (helion-flydsl's pattern).
         _FlagBackend.calls = []
         repaired_before = backend_registry._REPAIRED_CODEGEN_NAMES
         backend_api.register_compiler_backend(_FlagBackend)

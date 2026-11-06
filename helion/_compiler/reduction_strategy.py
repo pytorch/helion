@@ -1106,7 +1106,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             )
         self._thread_count = thread_count
         if thread_count > 0:
-            # Thread-level backends (e.g. FlyDSL) may override the per-block thread
+            # Thread-level backends may override the per-block thread
             # count of a looped whole-row reduction; tile-level backends return
             # None here and keep the default.
             _override = env.backend.looped_reduction_thread_count(
@@ -1173,8 +1173,8 @@ class LoopedReductionStrategy(ReductionStrategy):
     ) -> None:
         # Register the loop block size as a constexpr kernel param, defined host-side.
         if CompileEnvironment.current().backend.reduction_block_size_is_inlined_constexpr():
-            # FlyDSL's scf.for step must be a value inside the loop, not an
-            # external constexpr param, so inline the block size as a literal.
+            # Some backends need the loop step as a value inside the loop, not
+            # an external constexpr param, so inline the block size as a literal.
             state.device_function.constexpr_arg(block_size_var, self._loop_block_size)
             return
         if state.device_function.constexpr_arg(block_size_var):

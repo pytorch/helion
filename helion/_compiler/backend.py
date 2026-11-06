@@ -762,9 +762,10 @@ class Backend(abc.ABC):
         """Whether the reduction-loop block size is inlined as a module-level
         literal instead of a constexpr kernel param.
 
-        FlyDSL's scf.for step must be a value produced inside the loop, not an
-        external constexpr param, so it inlines the block size as a literal.
-        Other backends return False and use a constexpr kernel param.
+        Backends whose loops lower to an MLIR ``scf.for`` (e.g. the out-of-tree
+        helion-flydsl) need the step to be a value produced inside the loop, not
+        an external constexpr param, so they inline the block size as a
+        literal.  Other backends return False and use a constexpr kernel param.
         """
         return False
 
@@ -1248,9 +1249,8 @@ class Backend(abc.ABC):
 
         Called once per rollable rdim during device_ir analysis, after the shared
         ``ReductionLoopSpec`` has been appended. Default: no-op. Backends that need
-        additional tuning knobs per reduction block (e.g. flydsl's
-        ``cute_vector_widths``) override this instead of adding a name-check in
-        device_ir.
+        additional tuning knobs per reduction block (e.g. a vector width per
+        reduction) override this instead of adding a name-check in device_ir.
         """
         return
 
@@ -1264,9 +1264,10 @@ class Backend(abc.ABC):
     ) -> str:
         """Wrap the looped-reduction accumulator init expression, if needed.
 
-        FlyDSL's runtime scf.for carries the accumulator as an iter_arg whose init
-        type must match the per-thread vector the loop body yields, so it wraps
-        the scalar seed in ``fx.Vector.filled(...)``. Identity by default.
+        A backend whose runtime loop carries the accumulator as a loop-carried
+        value (e.g. an MLIR ``scf.for`` iter_arg) may need its init type to match
+        the per-thread vector the loop body yields, and wraps the scalar seed
+        accordingly. Identity by default.
         """
         return acc_full
 
@@ -1467,7 +1468,7 @@ class Backend(abc.ABC):
 
         Defaults to ``cast_ast``. Backends that write casts as ``value.to(dtype)``
         must override this, because a bare number has no ``.to()`` method --
-        FlyDSL, for example, uses ``fx.Float16(5)`` instead.
+        such a backend constructs the typed scalar directly instead.
         """
         return self.cast_ast(x, target_dtype)
 
@@ -1477,7 +1478,7 @@ class Backend(abc.ABC):
 
         Tile-level backends (Triton, etc.) broadcast-expand a sub-rank operand up
         to the output rank. Backends whose per-thread vectors carry the tile/row
-        axis implicitly (e.g. FlyDSL) return False to skip the expansion.
+        axis implicitly return False to skip the expansion.
         """
         return True
 

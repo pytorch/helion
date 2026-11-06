@@ -105,16 +105,28 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
 if not TYPE_CHECKING:  # keep type checkers flagging typos in helion.runtime
 
     def __getattr__(name: str) -> object:
-        # Saved FlyDSL code from v1.5.0-v1.5.2 imports the launcher from here.
-        # Goes away with helion/_compiler/flydsl/ (or forwards to the plugin).
+        # Saved FlyDSL code from v1.5.0-v1.5.2 imports the launcher from here;
+        # it now lives in the helion-flydsl plugin.
         if name == "default_flydsl_launcher":
+            try:
+                from helion_flydsl.launcher import (  # pyrefly: ignore[missing-import]
+                    default_flydsl_launcher,
+                )
+            except ModuleNotFoundError as e:
+                if e.name != "helion_flydsl":
+                    raise  # installed, but it or one of its imports is broken
+                # Not an AttributeError: ``from helion.runtime import ...`` would
+                # replace that with a generic ImportError.
+                raise ModuleNotFoundError(
+                    "default_flydsl_launcher moved to the helion-flydsl "
+                    "package: pip install helion-flydsl",
+                    name="helion_flydsl",
+                ) from None
             warnings.warn(
                 "helion.runtime.default_flydsl_launcher moved to "
-                "helion._compiler.flydsl.launcher; regenerate saved FlyDSL code",
+                "helion_flydsl.launcher; regenerate saved FlyDSL code",
                 DeprecationWarning,
                 stacklevel=2,
             )
-            from .._compiler.flydsl.launcher import default_flydsl_launcher
-
             return default_flydsl_launcher
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
