@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ..compile_environment import CompileEnvironment
-    from ..device_function import Argument
+    from ..device_function import DeviceFunction
     from ..device_ir import GraphInfo
     from ..tile_dispatch import TileStrategyDispatch
 
@@ -108,13 +108,12 @@ class FlyDSLBackend(Backend):
         # cross-wave smem block reduce. Set per-compile by pre_codegen.
         self._flydsl_warps_per_row: int = 1
         self._tensor_use_buffer: dict[int, bool] = {}
-        # Both reset each compile by pre_codegen. ``_needs_warp_helpers`` is set
-        # by reduction_expr when a reduction is generated, so the warp-reduce
-        # helper defs are emitted (from scalar_arg_preamble, which runs after the
-        # body) only for kernels that actually reduce -- not every kernel.
-        # ``_helpers_emitted`` then guards against emitting them more than once.
+        # Reset each compile by pre_codegen and set by reduction_expr, so the
+        # warp-reduce helper defs are emitted (from kernel_prologue, which runs
+        # after the body) only for kernels that actually reduce.
         self._flydsl_needs_warp_helpers: bool = False
-        self._flydsl_helpers_emitted: bool = False
+        # kernel_prologue calls this pass; reset by pre_codegen.
+        self._flydsl_prologue_calls: int = 0
 
     @property
     def name(self) -> str:
@@ -255,8 +254,7 @@ class FlyDSLBackend(Backend):
             "arith": "from flydsl.expr import arith",
             "rocdl": "from flydsl.expr import rocdl",
             "gpu": "from flydsl.expr import gpu",
-            "full": "from flydsl.expr.vector import full",
-            "ReductionOp": "from flydsl.expr.vector import ReductionOp",
+            "ReductionOp": "from flydsl.expr import ReductionOp",
             "helion": "import helion",
             "hl": "import helion.language as hl",
             "_default_flydsl_launcher": (
@@ -358,6 +356,9 @@ class FlyDSLBackend(Backend):
 
         spec = bound_kernel.config_spec
         default = spec.default_config()
+        # Surface unsupported kernels (e.g. grid-tiled columns) with their own
+        # error instead of the search's generic "baseline config failed".
+        bound_kernel.to_triton_code(default)
         default_bs = default.config.get("block_sizes")
         if not isinstance(default_bs, list) or not default_bs:
             return default
@@ -502,7 +503,18 @@ class FlyDSLBackend(Backend):
 
         # Reset per-compilation state so helpers are re-emitted on each compile.
         self._flydsl_needs_warp_helpers = False
-        self._flydsl_helpers_emitted = False
+        self._flydsl_prologue_calls = 0
+        from ..host_function import HostFunction
+        from .memory_ops import ROWS_ONLY_HINT
+
+        # Only rows are mapped to the grid; a second grid-tiled dimension would
+        # silently compute wrong results (see _reject_unsupported_subscript).
+        for grid_ids in HostFunction.current().device_ir.grid_block_ids:
+            if len(grid_ids) > 1:
+                raise exc.BackendUnsupported(
+                    self.name,
+                    f"a top-level hl.tile over more than one dimension; {ROWS_ONLY_HINT}",
+                )
         # Two regimes, encoded in block_sizes:
         #   W=1 (small-N): [bm, 256] -> bm rows/block, 1 warp/row, block = 64*bm.
         #   W>1 (large-N): [1, ...]  -> 1 row/block, W warps cooperate, 64*W,
@@ -816,17 +828,21 @@ class FlyDSLBackend(Backend):
 
         return FlyDSLOpOverrides()
 
-    def scalar_arg_preamble(self, arg: Argument) -> list[ast.AST]:
+    def kernel_prologue(self, fn: DeviceFunction) -> list[ast.stmt]:
         from ..ast_extension import statement_from_string
 
-        # Emit the warp-reduce helper defs once, and only for kernels that
-        # actually reduce (reduction_expr sets _needs_warp_helpers). This hook
-        # runs per scalar arg after the kernel body is generated, so the flag is
-        # already set by the time we get here; a pure-elementwise kernel leaves
-        # it False and emits nothing.
-        if self._flydsl_helpers_emitted or not self._flydsl_needs_warp_helpers:
+        # Emit the warp-reduce helper defs only for kernels that actually
+        # reduce. This hook runs after the kernel body is generated, so
+        # reduction_expr has already set the flag; a pure-elementwise kernel
+        # leaves it False and emits nothing.
+        self._flydsl_prologue_calls += 1
+        if self._flydsl_prologue_calls > 1:
+            raise AssertionError(
+                "flydsl: kernel_prologue called twice in one codegen pass; the "
+                "per-pass warp-helper flag assumes one device function per pass"
+            )
+        if not self._flydsl_needs_warp_helpers:
             return []
-        self._flydsl_helpers_emitted = True
 
         # Intra-warp fold: one warp per row -> warp shuffle covers 64 lanes, no
         # smem. The 6 XOR-shuffle folds (log2 64) are unrolled here rather than
@@ -842,7 +858,7 @@ class FlyDSLBackend(Backend):
         _wsum_body = _fold(
             "w.addf(w.shuffle_xor({off}, 64), fastmath=arith.FastMathFlags.fast)"
         )
-        stmts: list[ast.AST] = [
+        stmts: list[ast.stmt] = [
             statement_from_string(h)
             for h in [
                 f"def _flydsl_wmax(w):\n{_wmax_body}\n    return w",
@@ -957,9 +973,9 @@ class _FlyDSLRedBuf:
         dtype: torch.dtype | None = None,
     ) -> str:
         # The _flydsl_{w,b}{sum,max,min} helper defs these calls reference are
-        # emitted by scalar_arg_preamble (which runs after this body is
-        # generated); flag that they are needed so they are emitted only for
-        # reducing kernels.
+        # emitted by kernel_prologue (which runs after this body is generated);
+        # flag that they are needed so they are emitted only for reducing
+        # kernels.
         if reduction_type not in ("sum", "max", "min"):
             raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
         self._flydsl_needs_warp_helpers = True

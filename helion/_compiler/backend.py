@@ -17,6 +17,7 @@ from typing import Sequence
 
 import sympy
 import torch
+from torch._inductor.ops_handler import OpsHandler
 
 from .. import exc
 from .ast_extension import expr_from_string
@@ -41,8 +42,6 @@ if TYPE_CHECKING:
     from collections.abc import Collection
     import contextlib
 
-    from torch._inductor.ops_handler import OpsHandler
-
     from ..autotuner.config_fragment import ConfigSpecFragment
     from ..autotuner.config_priors import ValuePrior
     from ..autotuner.config_spec import ConfigSpec
@@ -65,7 +64,8 @@ if TYPE_CHECKING:
     from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
 
-    InductorOpOverrides = OpsHandler[Any]
+# Defined at runtime so ``helion.backend_api`` can re-export it.
+InductorOpOverrides = OpsHandler[Any]
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -1359,6 +1359,27 @@ class Backend(abc.ABC):
         """Generate preamble statements for scalar arguments in the device function.
 
         Backends can override to dereference scalar refs, etc.
+        """
+        return []
+
+    def kernel_prologue(self, fn: DeviceFunction) -> list[ast.stmt]:
+        """Statements to splice into a device function after body codegen.
+
+        Called once per ``DeviceFunction.codegen_function_def``, after the body
+        has been generated and dead-code eliminated, so a backend can emit
+        helpers (e.g. shared-memory declarations) only when body codegen
+        recorded that it needs them.  The statements go after the PDL wait and
+        the scalar-argument preamble and before ``fn.preamble`` and the body;
+        they are not dead-code eliminated but do go through variable renaming.
+
+        Called once per ``generate_ast`` pass, for the one device function that
+        pass emits.  ``pre_codegen`` runs earlier in the same pass, so reset
+        any per-pass state there; a backend instance may serve several passes.
+
+        ``fn`` is passed only so the backend can tell which device function
+        this is.  None of its attributes are covered by
+        ``BACKEND_API_VERSION``, and the backend must not modify it; contribute
+        only through the returned statements.
         """
         return []
 
