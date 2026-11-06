@@ -67,6 +67,7 @@ from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
+from .inductor_lowering import reduction_block_id
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
 from .merge_reduction_dims import _MERGE_OPS
@@ -1131,9 +1132,8 @@ class DeviceIR:
         (``DeviceFunction.evaluate_constexpr_condition``) is no decision: only
         its taken side runs, and it is walked without extending the path.
         """
-        from .inductor_lowering import ReductionLowering
-
         result: dict[int, list[list[tuple[int, int]]]] = {}
+        cached_reduction_block_id = functools.cache(reduction_block_id)
 
         def walk(graph_id: int, path: list[tuple[int, int]]) -> None:
             if not 0 <= graph_id < len(self.graphs):
@@ -1142,13 +1142,11 @@ class DeviceIR:
             for node in graph.nodes:
                 if node.op != "call_function":
                     continue
-                lowering = node.meta.get("lowering")
-                if isinstance(lowering, ReductionLowering) and isinstance(
-                    lowering.block_index, int
-                ):
-                    result.setdefault(lowering.block_index, [])
-                    if path not in result[lowering.block_index]:
-                        result[lowering.block_index].append(list(path))
+                block_id = cached_reduction_block_id(node)
+                if block_id is not None:
+                    result.setdefault(block_id, [])
+                    if path not in result[block_id]:
+                        result[block_id].append(list(path))
                 if node.target is _tracing_ops._if and len(node.args) >= 3:
                     live_graph_id = fn.constexpr_taken_graph_id(node)
                     if live_graph_id is not None:
@@ -1256,7 +1254,6 @@ class DeviceIR:
                 register_tensor_alias_specializations(env)
         if not rdims:
             return
-        from .inductor_lowering import ReductionLowering
 
         num_original_graphs = len(self.graphs)
 
@@ -1271,8 +1268,10 @@ class DeviceIR:
             # stacking with rdim, or reduces over rdim along a non-tile
             # (hl.arange) axis that cannot be sliced inside the reduction loop.
             can_roll_graphs = True
+            rollers: dict[int, ReductionRoller] = {}
             for graph_info in self.graphs[:num_original_graphs]:
-                roller = ReductionRoller(self, rdim, {})
+                roller = ReductionRoller(self, rdim, graph_to_info)
+                rollers[graph_info.graph_id] = roller
                 if (
                     roller.has_matmul_with_rdim(graph_info.graph)
                     or roller.has_gather_along_rdim(graph_info.graph)
@@ -1294,7 +1293,7 @@ class DeviceIR:
             for graph_id in range(num_original_graphs):
                 graph_info = self.graphs[graph_id]
                 assert graph_id == graph_info.graph_id
-                roller = ReductionRoller(self, rdim, graph_to_info)
+                roller = rollers[graph_id]
                 try:
                     roller.process(graph_info.graph)
                 except NotImplementedError:
@@ -1311,11 +1310,7 @@ class DeviceIR:
                 if reduction_info.used_rdim:
                     used_graphs.add(graph_id)
                     reduction_count = sum(
-                        1
-                        for n in graph_info.graph.nodes
-                        if n.op == "call_function"
-                        and isinstance(n.meta.get("lowering"), ReductionLowering)
-                        and n.meta["lowering"].block_index == rdim.block_id
+                        roller.is_reduction(n) for n in graph_info.graph.nodes
                     )
                     if reduction_count >= 2 and env.config_spec.supports_config_key(
                         "reduction_fusion"
@@ -1588,6 +1583,7 @@ class DeviceIR:
                     row_reread=per["row_reread"],
                     reread_eviction_index=per["reread_eviction_index"],
                     fixed_tile_size_hint=fixed_tile_size_hint,
+                    is_custom=bid in analysis.by_id[gid].custom_reduction_block_ids,
                 )
             )
 

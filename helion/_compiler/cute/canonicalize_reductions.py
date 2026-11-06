@@ -11,6 +11,7 @@ from torch._inductor.ir import Reduction
 
 from ...language._tracing_ops import _mask_to
 from ...language.reduce_ops import _reduce
+from ..inductor_lowering import custom_reduction_sources
 
 if TYPE_CHECKING:
     from torch.fx.node import Argument
@@ -85,10 +86,10 @@ def canonicalize_reductions(ir: DeviceIR) -> None:
         for node in list(graph.nodes):
             if node.op != "call_function" or node.target is not _reduce:
                 continue
-            combine_id, inputs, dim, keep_dims, is_tuple = node.args
+            combine_id, _inputs, dim, keep_dims, is_tuple = node.args
             if not isinstance(combine_id, int) or not isinstance(dim, int):
                 continue
-            values = list(inputs) if isinstance(inputs, (tuple, list)) else [inputs]
+            values = custom_reduction_sources(node)
             if any(not isinstance(value, torch.fx.Node) for value in values):
                 continue
             combines = _independent_combines(ir.graphs[combine_id].graph, len(values))

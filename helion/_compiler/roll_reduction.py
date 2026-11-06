@@ -34,7 +34,8 @@ from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
-from .inductor_lowering import ReductionLowering
+from .inductor_lowering import custom_reduction_sources
+from .inductor_lowering import reduction_block_id
 
 if TYPE_CHECKING:
     from .compile_environment import BlockSizeInfo
@@ -95,14 +96,20 @@ class ReductionRoller:
         self.available: set[torch.fx.Node] = set()
         self.graphs_added: list[int] = []
         self._size_node: torch.fx.Node | None = None
+        # This roller copies source nodes into new graphs without rewriting
+        # their payloads. Drop classification results with this one pass.
+        self._reduction_block_ids: dict[torch.fx.Node, int | None] = {}
+
+    def _cached_reduction_block_id(self, node: torch.fx.Node) -> int | None:
+        if node.target is not _reduce:
+            return reduction_block_id(node)
+        if node not in self._reduction_block_ids:
+            self._reduction_block_ids[node] = reduction_block_id(node)
+        return self._reduction_block_ids[node]
 
     def is_reduction(self, node: torch.fx.Node) -> bool:
-        """Check if a node is a reduction"""
-        return (
-            node.op == "call_function"
-            and isinstance(lowering := node.meta["lowering"], ReductionLowering)
-            and lowering.block_index == self.rdim.block_id
-        )
+        """Whether the node reduces the dimension being rolled."""
+        return self._cached_reduction_block_id(node) == self.rdim.block_id
 
     def should_go_in_inner_graph(self, node: torch.fx.Node) -> bool:
         """Nodes go in the inner graph if they use the reduction dimension"""
@@ -110,10 +117,9 @@ class ReductionRoller:
             return False
         assert node.op == "call_function", f"Unsupported node type {node.op}"
 
-        if node.target is _reduce:
-            # TODO(jansel): support rolling user-defined reductions
+        if node.target is _reduce and self._cached_reduction_block_id(node) is None:
             raise NotImplementedError(
-                "hl._reduce operations are not compatible with reduction rolling"
+                "custom reduction rolling requires Triton and matching single-axis payloads"
             )
 
         if node.target is _associative_scan:
@@ -250,7 +256,16 @@ class ReductionRoller:
             num_rdims = self._count_rdim_axes_in_subscript(target, index_arg)
         else:
             val = node.meta.get("val", None)
-            num_rdims = self._count_rdim_axes_in_val(val)
+            # Custom tuple outputs share one chunk coordinate. Other tuple
+            # operations keep their existing conservative rolling guard.
+            values = (
+                val
+                if node.target is _reduce and isinstance(val, (tuple, list))
+                else (val,)
+            )
+            num_rdims = max(
+                (self._count_rdim_axes_in_val(value) for value in values), default=0
+            )
 
         if num_rdims > 1:
             raise NotImplementedError(
@@ -579,8 +594,15 @@ class ReductionRoller:
                     continue
                 seen.add(node)
                 if self.is_reduction(node):
-                    source = node.args[0]
-                    if isinstance(source, torch.fx.Node) and inside_loop(source):
+                    sources = (
+                        custom_reduction_sources(node)
+                        if node.target is _reduce
+                        else (node.args[0],)
+                    )
+                    if any(
+                        isinstance(source, torch.fx.Node) and inside_loop(source)
+                        for source in sources
+                    ):
                         return True
                     continue
                 if inside_loop(node):
@@ -589,6 +611,14 @@ class ReductionRoller:
             return False
 
         def unrollable(reduction: torch.fx.Node) -> bool:
+            # Custom helpers preserve their input dtypes. Sequential low-precision
+            # carries can stagnate, and widening arbitrary helpers changes semantics.
+            if reduction.target is _reduce and any(
+                source.meta["val"].dtype.is_floating_point
+                and source.meta["val"].dtype.itemsize < 4
+                for source in custom_reduction_sources(reduction)
+            ):
+                return True
             free_iota = False
             seen: set[torch.fx.Node] = set()
             stack = list(reduction.all_input_nodes)

@@ -432,9 +432,12 @@ class LLMGuidedSearch(PopulationBasedSearch):
         # Start from default and add only distinct random configs that unflatten cleanly.
         seed_configs: list[Config] = [self.config_spec.autotune_reference_config()]
         seen_config_keys = {self._config_key(seed_configs[0])}
+        default_flat = self.config_gen.default_flat()
         for flat in self.config_gen.random_population_flat(
             self.initial_random_configs + 1
-        )[1:]:
+        ):
+            if flat == default_flat:
+                continue
             try:
                 cfg = self.config_gen.unflatten(flat)
             except Exception:
@@ -444,7 +447,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
                 continue
             seen_config_keys.add(key)
             seed_configs.append(cfg)
-        return seed_configs
+        return seed_configs[: max(1, self.initial_random_configs + 1)]
 
     def _dedupe_new_configs(
         self, configs: list[Config], seen_config_keys: set[str]

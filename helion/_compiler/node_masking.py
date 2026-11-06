@@ -107,7 +107,7 @@ def apply_masking(
 
 def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
     """Remove unnecessary _mask_to nodes from the graph."""
-    from .inductor_lowering import ReductionLowering
+    from .inductor_lowering import is_reduction_node
 
     upstream_reduction_cache: dict[torch.fx.Node, bool] = {}
     downstream_reduction_cache: dict[torch.fx.Node, bool] = {}
@@ -125,8 +125,7 @@ def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
             if current in visited:
                 continue
             visited.add(current)
-            lowering = current.meta.get("lowering")
-            if isinstance(lowering, ReductionLowering):
+            if is_reduction_node(current):
                 result = True
                 break
             stack.extend(current.all_input_nodes)
@@ -141,8 +140,7 @@ def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
 
         result = False
         for user in node.users:
-            lowering = user.meta.get("lowering")
-            if isinstance(lowering, ReductionLowering):
+            if is_reduction_node(user):
                 result = True
                 break
             if user.op == "call_function" and feeds_reduction_input(user):

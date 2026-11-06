@@ -57,9 +57,18 @@ def _population(bound, count=None, explicit=None):
             configs = [search.config_gen.unflatten(item) for item in flat]
             assert len(configs) == len(set(configs)) == (count or 100)
             assert [search.config_gen.flatten(config) for config in configs] == flat
-            assert configs[0] == search.config_gen.unflatten(
-                search.config_gen.default_flat()
+            pairs = (
+                search.config_gen.user_seed_flat_config_pairs(
+                    search._autotune_seed_configs()
+                )
+                + search.config_gen.seed_flat_config_pairs()
             )
+            expected_first = (
+                pairs[0][1]
+                if pairs
+                else search.config_gen.unflatten(search.config_gen.default_flat())
+            )
+            assert configs[0] == expected_first
     return configs
 
 
@@ -138,7 +147,7 @@ def test_bounded_family_preserves_budget_and_explicit_seed_priority(count):
         with bound.env:
             generation = ConfigGeneration(bound.config_spec)
             expected = generation.canonicalize_flat(generation.flatten(explicit))[1]
-    assert population[1] == expected
+    assert population[0] == expected
 
 
 def row_energy(x: torch.Tensor) -> torch.Tensor:

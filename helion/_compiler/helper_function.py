@@ -172,13 +172,18 @@ class HelperFunctionManager:
     def __init__(self) -> None:
         self.helper_functions: dict[str, HelperFunctionGraphInfo] = {}
         self._final_names: dict[str, str] = {}
+        self.custom_reduction_combiners: dict[tuple[str, int, bool, bool], str] = {}
 
     def register_helper_function(
         self, helper_graph_info: HelperFunctionGraphInfo, final_name: str
-    ) -> None:
-        """Register a helper function to be generated at global scope."""
+    ) -> str:
+        """Record a new global helper under its assigned name."""
         self.helper_functions[helper_graph_info.name] = helper_graph_info
         self._final_names[helper_graph_info.name] = final_name
+        return final_name
+
+    def registered_name(self, helper_graph_info: HelperFunctionGraphInfo) -> str | None:
+        return self._final_names.get(helper_graph_info.name)
 
     def codegen_helper_functions(self) -> list[ast.stmt]:
         """Generate helper function definitions at global scope."""
@@ -217,10 +222,6 @@ class HelperFunctionManager:
             helper_defs.append(func_def)
 
         return helper_defs  # pyrefly: ignore[bad-return]
-
-    def get_final_name(self, helper_graph_info: HelperFunctionGraphInfo) -> str:
-        """Get the final generated name for a helper function."""
-        return self._final_names.get(helper_graph_info.name, helper_graph_info.name)
 
     def _codegen_helper_function_body(
         self, helper_graph_info: HelperFunctionGraphInfo

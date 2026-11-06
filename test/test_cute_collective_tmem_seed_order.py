@@ -106,8 +106,9 @@ def _initial_population(
             )
             flat = checked_initial_population(search)
             result = [search.config_gen.unflatten(value) for value in flat]
+            first = (user_seeds or bound.config_spec.compiler_seed_configs)[0]
             assert result[0] == search.config_gen.unflatten(
-                search.config_gen.default_flat()
+                search.config_gen.flatten(first)
             )
             return result
     finally:
@@ -184,7 +185,7 @@ def test_tmem_schedule_order_preserves_budget_and_explicit_user_priority(
     with bound.env:
         generation = bound.config_spec.create_config_generation()
         _flat, normalized = generation.canonicalize_flat(generation.flatten(explicit))
-    assert population[1] == normalized
+    assert population[0] == normalized
 
 
 def test_unrelated_seed_configs_retain_their_exact_order(

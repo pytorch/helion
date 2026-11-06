@@ -112,9 +112,10 @@ class AutotunerHeuristic:
         heuristic plants only its single ``get_seed_config``. A heuristic that
         overrides this returns ``[primary, *alternates]`` — the loader plants the
         whole list as compiler seeds (``compiler_seed_configs`` is a list); the
-        primary (``[0]``, the no-autotune Product-A config) must equal
-        ``get_seed_config``. Alternates earn their slot only by covering the
-        region's variance or speeding Product-B search convergence.
+        primary (``[0]``, the no-autotune Product-A config) must match
+        ``get_seed_config`` if both hooks are implemented. Alternates earn their
+        slot only by covering the region's variance or speeding Product-B search
+        convergence.
         """
         return None
 

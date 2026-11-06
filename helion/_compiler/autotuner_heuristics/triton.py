@@ -4435,6 +4435,71 @@ class _LivenessTileAllocation(NamedTuple):
     num_warps: int
 
 
+def _custom_reduction_roots(spec: ConfigSpec) -> set[int]:
+    """Roots whose custom schedules do not share a native reduction."""
+    fact, grid = spec.reduction_kernel_fact, spec.kernel_grid_fact
+    if fact is None or grid is None:
+        return set()
+    root_of = dict(grid.graph_to_root)
+    custom = {
+        root_of[r.graph_id]
+        for r in fact.reductions
+        if r.is_custom and r.graph_id in root_of
+    }
+    native = {
+        root_of[r.graph_id]
+        for r in fact.reductions
+        if not r.is_custom and r.graph_id in root_of
+    }
+    return custom - native
+
+
+def _custom_reduction_grid_ids(spec: ConfigSpec) -> set[int]:
+    grid = spec.kernel_grid_fact
+    if grid is None:
+        return set()
+    custom_roots = _custom_reduction_roots(spec)
+    owned = {
+        block_id
+        for root in grid.roots
+        if root.root_graph_id in custom_roots
+        for block_id in root.block_ids
+    }
+    shared = {
+        block_id
+        for root in grid.roots
+        if root.root_graph_id not in custom_roots
+        for block_id in root.block_ids
+    }
+    return owned - shared
+
+
+def _custom_persistent_block_sizes(
+    spec: ConfigSpec, base_sizes: Sequence[int]
+) -> list[int]:
+    """Floor custom-only roots while preserving native-root launch geometry."""
+    custom_grid_ids = _custom_reduction_grid_ids(spec)
+    return [
+        TritonReductionHeuristic._block_floor(block)
+        if block.block_id in custom_grid_ids
+        else value
+        for block, value in zip(spec.block_sizes, base_sizes, strict=True)
+    ]
+
+
+def _custom_persistent_reduction_loops(
+    spec: ConfigSpec, config: Config
+) -> list[int | None]:
+    """Keep native loop widths while making custom-only axes persistent."""
+    custom_ids = spec.custom_only_reduction_block_ids
+    return [
+        None if loop.block_id in custom_ids else width
+        for loop, width in zip(
+            spec.reduction_loops, config.reduction_loops, strict=True
+        )
+    ]
+
+
 class TritonReductionHeuristic(AutotunerHeuristic):
     """Candidate-resolved Triton reduction seed for H100 and B200.
 
@@ -4455,7 +4520,7 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         ("cuda", "sm100"),
     )
     # Promote the tuned reduction seed to the compiler default (autotune off) on H100 and B200.
-    # The narrow fallback is a separate class and stays unpromoted.
+    # The separate narrow fallback stays unpromoted for native reductions.
     # This is safe because the seed only emits valid configs: it materializes through
     # ``_materialize_config`` (an illegal ``pid_type`` is repaired to a legal persistent type),
     # ``ReductionLoopSpec._normalize`` floors a degenerate looped chunk of 1, and the reduction
@@ -4581,11 +4646,19 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         kf = env.config_spec.reduction_kernel_fact
         assert kf is not None
         block_of = cls._reduction_candidate_block_map(env, candidate)
+        persistent_ids = {
+            reduction.block_id
+            for reduction in kf.reductions
+            if block_of[reduction.block_id] >= reduction.size_hint
+        }
         peak_bytes = 0
         for step in kf.live_tile_steps:
             step_bytes = 0
             for tile in step:
-                if tile.kind == "global":
+                if (
+                    tile.kind == "global"
+                    or tile.carried_reduction_block_id in persistent_ids
+                ):
                     continue
                 tile_bytes = TritonH100MatmulHeuristic._resolve_tile_bytes(
                     tile,
@@ -5189,10 +5262,22 @@ class TritonReductionHeuristic(AutotunerHeuristic):
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        """Seed custom reductions with a persistent baseline and a liveness proposal.
+
+        Without native reductions, the persistent baseline is the untuned default.
+        Mixed kernels keep the native liveness proposal primary.
+        """
         spec = env.config_spec
         pd = _primary_descriptor_selected(env)
         if pd is None:
-            return None
+            return []
         kf = spec.reduction_kernel_fact
         assert kf is not None
         alloc = cls.size_reduction_tiles_liveness(env, spec, pd)
@@ -5237,7 +5322,35 @@ class TritonReductionHeuristic(AutotunerHeuristic):
             if evict is not None:
                 seed["load_eviction_policies"] = evict
 
-        return _materialize_config(seed, config_spec=spec)
+        config = _materialize_config(seed, config_spec=spec)
+        if not spec.custom_only_reduction_block_ids.intersection(
+            spec.reduction_loops.valid_block_ids()
+        ):
+            return [config]
+
+        persistent = dict(config.config)
+        persistent["reduction_loops"] = _custom_persistent_reduction_loops(spec, config)
+        mixed = spec.has_native_reductions
+        base_sizes = config.block_sizes
+        if not mixed:
+            default_sizes = spec._base_default_config().block_sizes
+            grid_ids = set(spec.grid_block_ids)
+            base_sizes = [
+                default if block.block_id in grid_ids else value
+                for block, value, default in zip(
+                    spec.block_sizes, config.block_sizes, default_sizes, strict=True
+                )
+            ]
+        persistent_sizes = _custom_persistent_block_sizes(spec, base_sizes)
+        persistent["block_sizes"] = persistent_sizes
+        # Every root shares the launch warp count; preserve the native choice.
+        if not mixed:
+            width = max(loop.size_hint for loop in spec.reduction_loops)
+            persistent["num_warps"] = cls._num_warps_for_reduction_width(width)
+        baseline = _materialize_config(persistent, config_spec=spec)
+        # Keep the native liveness proposal primary when unrelated native
+        # reductions share the kernel; only the custom axes need a baseline.
+        return dedupe_configs([config, baseline] if mixed else [baseline, config])
 
 
 # Hardware the tuned reduction seeds own; the narrow fallback yields to these targets.
@@ -5245,16 +5358,23 @@ _TUNED_REDUCTION_TARGETS = TritonReductionHeuristic.HARDWARE_TARGETS
 
 
 class TritonNarrowReductionHeuristic(AutotunerHeuristic):
-    """Conservative upstream reduction fallback for hardware WITHOUT a tuned track (anything
-    other than sm90/sm100): one row/program, single persistent pass, ``['last']`` eviction where
-    supported. Fires only for a STANDARD (Helion-rolled) reduction — the user-tiled track had no
-    upstream seed, so it stays unclaimed on non-sm90/sm100. Not promoted (the un-tuned baseline
-    should not override the compiler default). This is the verbatim pre-sm100 behavior, now its own
-    class rather than an off-target branch inside the sm90 heuristic.
+    """Reduction fallback for hardware without a tuned track (outside sm90/sm100).
+
+    Kernels without custom reduction loops keep the legacy native proposal: one
+    row per program, persistent reductions, and supported ``['last']`` eviction.
+    User-tiled reductions remain unclaimed. When custom loops are present, the
+    persistent custom seed starts from default coordinates and changes only
+    custom-only axes and loads. Mixed kernels keep native/default scheduling
+    and eviction, and this fallback is promoted only for custom-only kernels.
     """
 
     name = "triton_reduction_narrow"
     backend = "triton"
+
+    @classmethod
+    def should_promote(cls, env: CompileEnvironment) -> bool:
+        spec = env.config_spec
+        return spec.has_custom_reduction_loops and not spec.has_native_reductions
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -5271,19 +5391,42 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         spec = env.config_spec
-        seed: dict[str, Any] = {
-            "block_sizes": [1],
-            "reduction_loops": [None],
-        }
-        # Emit 'last' only where the backend supports it; backends that restrict
-        # eviction to ("",) keep the spec default so the seed stays valid.
+        seed: dict[str, Any]
+        custom_loops = spec.has_custom_reduction_loops
+        if custom_loops:
+            default = spec._base_default_config()
+            seed = dict(default.config)
+            seed["block_sizes"] = _custom_persistent_block_sizes(
+                spec, default.block_sizes
+            )
+        else:
+            seed = {"block_sizes": [1], "reduction_loops": [None]}
+        # Emit 'last' only where the backend supports it. A promoted custom
+        # seed must also preserve loads in any unrelated grid roots.
         eviction = spec.load_eviction_policies
         if (
             eviction.length
             and isinstance(eviction.inner, EnumFragment)
             and "last" in eviction.inner.choices
         ):
-            seed["load_eviction_policies"] = ["last"] * eviction.length
+            if custom_loops:
+                custom_ids = spec.custom_only_reduction_block_ids
+                policies = eviction.default()
+                for memory in spec.memory_op_facts:
+                    if (
+                        memory.eviction_index is not None
+                        and memory.reductions_fed
+                        and all(
+                            block_id in custom_ids
+                            for block_id, _ in memory.reductions_fed
+                        )
+                    ):
+                        policies[memory.eviction_index] = "last"
+                seed["load_eviction_policies"] = policies
+            else:
+                seed["load_eviction_policies"] = ["last"] * eviction.length
+        if custom_loops:
+            return _materialize_config(seed, config_spec=spec)
         return Config(**seed)
 
 

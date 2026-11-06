@@ -62,8 +62,9 @@ def _population(
                 search.config_gen.unflatten(flat)
                 for flat in checked_initial_population(search)
             ]
+            first = bound.config_spec.compiler_seed_configs[0]
             assert result[0] == search.config_gen.unflatten(
-                search.config_gen.default_flat()
+                search.config_gen.flatten(first)
             )
             assert len(result) == len(set(result))
             return result
