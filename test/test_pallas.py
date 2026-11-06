@@ -4474,6 +4474,38 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(out, a @ b, rtol=1e-2, atol=1e-2)
 
+    @parametrize("loop_type", ("fori_loop", "unroll", "emit_pipeline"))
+    def test_two_loops_tiling_same_dim_pad_to_both_blocks(self, loop_type: str) -> None:
+        """Two inner loops tile N with different block sizes; pad covers both.
+
+        N = 1536 is a multiple of 256 but not of 1024.  Padding x only for
+        the second loop's 256 block lets the first loop's last 1024 tile read
+        past the end of x.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def row_center(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n):
+                    acc = acc + torch.sum(x[tile_m, tile_n], dim=-1)
+                mean = acc / n
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] - mean[:, None]
+            return out
+
+        x = torch.randn(16, 1536, device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(
+            row_center,
+            (x,),
+            block_sizes=[8, 1024, 256],
+            pallas_loop_type=loop_type,
+        )
+        self.assertIn("(0, 1, 1024, 0), (0, 1, 256, 0)", code)
+        torch.testing.assert_close(out, x - x.mean(dim=-1, keepdim=True))
+
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:
         """BMM with K reduction starting at non-zero offset, across all loop types."""
