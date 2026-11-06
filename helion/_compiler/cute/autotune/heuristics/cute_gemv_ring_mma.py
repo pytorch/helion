@@ -55,7 +55,7 @@ class CuteGemvRingMmaHeuristic(AutotunerHeuristic):
     """Rolled rows, whole-warp K threads, the dot through the cp.async ring on MMA fragments."""
 
     name = "cute_gemv_ring_mma"
-    priority = 44
+    priority = 45
     backend = "cute"
 
     @classmethod

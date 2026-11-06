@@ -80,7 +80,7 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
 
     name = "cute_resident_reduction"
     backend = "cute"
-    priority = 31
+    priority = 32
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
 
     @staticmethod

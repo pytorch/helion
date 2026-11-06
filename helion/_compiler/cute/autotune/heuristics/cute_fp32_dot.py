@@ -97,7 +97,7 @@ class CuteFp32DotHeuristic(AutotunerHeuristic):
 
     name = KEY
     backend = "cute"
-    priority = 60
+    priority = 61
 
     @classmethod
     def register_facts(
