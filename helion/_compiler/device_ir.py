@@ -3661,14 +3661,19 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         env = CompileEnvironment.current()
         if (
             env.backend.name == "triton"
-            and env.ptx_capability == (9, 0)
+            and env.ptx_capability
+            in ((8, 0), (8, 6), (9, 0), (10, 0), (10, 3), (12, 0))
             and env.settings.fast_math
             and env.backend.map_dot_precision(env.settings.dot_precision) == "tf32"
         ):
             from .triton.narrow_dot_operands import narrow_dot_operands
 
             for graph in device_ir.graphs:
-                narrow_dot_operands(graph.graph, env.config_spec.matmul_facts)
+                narrow_dot_operands(
+                    graph.graph,
+                    env.config_spec.matmul_facts,
+                    allow_fp8=env.ptx_capability not in ((8, 0), (8, 6)),
+                )
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         dot_scaled_changed = False

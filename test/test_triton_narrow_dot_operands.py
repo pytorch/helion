@@ -49,7 +49,7 @@ def _graph(dtype: torch.dtype, *, shared_mask: bool = False):
 )
 def test_masked_rewrite_updates_facts_and_preserves_shared_cast(dtype):
     graph, product, values, facts = _graph(dtype)
-    assert narrow_dot_operands(graph, facts) == 1
+    assert narrow_dot_operands(graph, facts, allow_fp8=True) == 1
     assert values[0][1] in graph.nodes
     assert values[0][2].args[0] is values[0][0]
     assert values[0][2].meta["val"].dtype == dtype
@@ -59,12 +59,19 @@ def test_masked_rewrite_updates_facts_and_preserves_shared_cast(dtype):
 
 
 @pytest.mark.cpu_only
+def test_rewrite_can_disable_fp8():
+    graph, _, _, facts = _graph(torch.float8_e4m3fn)
+    assert narrow_dot_operands(graph, facts, allow_fp8=False) == 0
+    assert facts[0].lhs_dtype == torch.float32
+
+
+@pytest.mark.cpu_only
 def test_shared_mask_and_mismatched_dtype_do_not_rewrite():
     graph, _, _, facts = _graph(torch.bfloat16, shared_mask=True)
-    assert narrow_dot_operands(graph, facts) == 0
+    assert narrow_dot_operands(graph, facts, allow_fp8=True) == 0
     graph, _, values, facts = _graph(torch.bfloat16)
     values[1][0].meta["val"] = torch.empty((32, 32), dtype=torch.float16)
-    assert narrow_dot_operands(graph, facts) == 0
+    assert narrow_dot_operands(graph, facts, allow_fp8=True) == 0
 
 
 @pytest.mark.cpu_only
@@ -82,7 +89,7 @@ def test_other_dots_do_not_rewrite(case):
             acc = graph.placeholder("acc")
         acc.meta["val"] = torch.empty((32, 32), dtype=torch.float16)
         product.args = (*product.args[:2], acc, None)
-    assert narrow_dot_operands(graph, facts) == 0
+    assert narrow_dot_operands(graph, facts, allow_fp8=True) == 0
     assert facts[0].lhs_dtype == torch.float32
     graph.lint()
 
@@ -122,20 +129,24 @@ def _native(a, b):
     return out
 
 
-HOPPER = (
-    torch.cuda.is_available()
-    and torch.version.hip is None
-    and torch.cuda.get_device_capability() == (9, 0)
+CUDA_CAPABILITY = (
+    torch.cuda.get_device_capability()
+    if torch.cuda.is_available() and torch.version.hip is None
+    else None
 )
+SUPPORTED = CUDA_CAPABILITY in ((8, 0), (8, 6), (9, 0), (10, 0), (10, 3), (12, 0))
+FP8_SUPPORTED = CUDA_CAPABILITY in ((9, 0), (10, 0), (10, 3), (12, 0))
 
 
 @skipUnlessBackends(["triton"])
-@pytest.mark.skipif(not HOPPER, reason="requires NVIDIA Hopper")
+@pytest.mark.skipif(not SUPPORTED, reason="requires a supported NVIDIA GPU")
 @pytest.mark.parametrize(
     "dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]
 )
 @pytest.mark.parametrize("static_shapes", [False, True])
 def test_ragged_strided_upcast_dot(dtype, static_shapes):
+    if dtype.itemsize == 1 and not FP8_SUPPORTED:
+        pytest.skip("native FP8 dot is not enabled on Ampere")
     torch.manual_seed(11)
     a = torch.randn((37, 260), device="cuda").to(dtype)[:, ::2]
     b = torch.randn((130, 106), device="cuda").to(dtype)[:, ::2]
@@ -151,11 +162,13 @@ def test_ragged_strided_upcast_dot(dtype, static_shapes):
 
 
 @skipUnlessBackends(["triton"])
-@pytest.mark.skipif(not HOPPER, reason="requires NVIDIA Hopper")
+@pytest.mark.skipif(not SUPPORTED, reason="requires a supported NVIDIA GPU")
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]
 )
 def test_small_dot_padding(dtype):
+    if dtype.itemsize == 1 and not FP8_SUPPORTED:
+        pytest.skip("native FP8 dot is not enabled on Ampere")
     a = torch.randn((7, 8), device="cuda").to(dtype)
     b = torch.randn((8, 9), device="cuda").to(dtype)
     bound = helion.kernel(
@@ -167,7 +180,7 @@ def test_small_dot_padding(dtype):
 
 
 @skipUnlessBackends(["triton"])
-@pytest.mark.skipif(not HOPPER, reason="requires NVIDIA Hopper")
+@pytest.mark.skipif(not SUPPORTED, reason="requires a supported NVIDIA GPU")
 def test_default_precision_rewrites():
     a = torch.randn((32, 64), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((64, 32), device="cuda", dtype=torch.bfloat16)
@@ -178,7 +191,7 @@ def test_default_precision_rewrites():
 
 
 @skipUnlessBackends(["triton"])
-@pytest.mark.skipif(not HOPPER, reason="requires NVIDIA Hopper")
+@pytest.mark.skipif(not SUPPORTED, reason="requires a supported NVIDIA GPU")
 @pytest.mark.parametrize(
     ("fast_math", "precision"), [(False, "tf32"), (True, "ieee"), (True, "tf32x3")]
 )
@@ -196,7 +209,8 @@ def test_strict_settings_do_not_rewrite(fast_math, precision):
 
 
 @skipUnlessBackends(["triton"])
-@pytest.mark.skipif(not HOPPER, reason="requires NVIDIA Hopper")
+@pytest.mark.skipif(not SUPPORTED, reason="requires a supported NVIDIA GPU")
+@pytest.mark.skipif(not FP8_SUPPORTED, reason="requires Hopper or Blackwell FP8")
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("upcast", [False, True])
 def test_fp8_accumulates_accurately(dtype, upcast):
@@ -210,6 +224,8 @@ def test_fp8_accumulates_accurately(dtype, upcast):
     )
     bound = kernel._bind_isolated((a, b))
     cfg = helion.Config(block_sizes=[64, 32, 64], indexing="pointer", num_warps=4)
-    assert "max_num_imprecise_acc=0" in bound.to_code(cfg)
+    assert ("max_num_imprecise_acc=0" in bound.to_code(cfg)) == (
+        CUDA_CAPABILITY == (9, 0)
+    )
     result = bound.compile_config(cfg)(a, b)
     torch.testing.assert_close(result, a.float() @ b.float(), rtol=0.001, atol=0.01)

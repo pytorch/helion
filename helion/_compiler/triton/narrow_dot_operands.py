@@ -1,4 +1,4 @@
-"""Remove lossless operand conversions before fast-math dots on Hopper."""
+"""Remove lossless operand conversions before fast-math Triton dots."""
 
 from __future__ import annotations
 
@@ -60,7 +60,9 @@ def _source(
     return None
 
 
-def narrow_dot_operands(graph: torch.fx.Graph, facts: list[MatmulFact]) -> int:
+def narrow_dot_operands(
+    graph: torch.fx.Graph, facts: list[MatmulFact], *, allow_fp8: bool
+) -> int:
     """Use the original dtype for paired FP32 upcasts, retaining FP32 output."""
     changed = 0
     for node in list(graph.nodes):
@@ -83,6 +85,8 @@ def narrow_dot_operands(graph: torch.fx.Graph, facts: list[MatmulFact]) -> int:
             continue
         dtype = _dtype(lhs[0])
         assert dtype is not None
+        if dtype.itemsize == 1 and not allow_fp8:
+            continue
         operands = []
         for source, _, mask in (lhs, rhs):
             if mask is not None:

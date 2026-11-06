@@ -738,7 +738,7 @@ class Settings(_Settings):
         "fast_math": (
             "If True, enable fast math approximations (Helion-level, including the CuTe "
             "flash-attention polynomial exp2 packets, and Inductor-level). "
-            "On Hopper Triton, paired FP32 upcasts before a dot may be removed "
+            "On supported NVIDIA Triton targets, paired FP32 upcasts before a dot may be removed "
             "when dot precision resolves to TF32 (including the default), changing "
             "accumulation order. "
             "May reduce numerical precision and change NaN/Inf behavior. "
