@@ -24,6 +24,7 @@ from .._compat import is_hip
 from .._compat import supports_tf32_precision_on_amd
 from .._compiler.backend_registry import get_backend
 from .._compiler.backend_registry import list_backends
+from .._compiler.backend_registry import registered_backends
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import InitialPopulation
 from ..autotuner.effort_profile import get_effort_profile
@@ -376,11 +377,10 @@ def _get_dot_precision() -> DotPrecision:
 
 
 def _get_backend() -> str:
-    return _env_get_literal(
-        "HELION_BACKEND",
-        "triton",
-        mapping={name: name for name in list_backends()},
-    )
+    names = registered_backends()
+    if os.environ.get("HELION_BACKEND", "").strip() not in ("", *names):
+        names = list_backends()  # scan installed plugins only when needed
+    return _env_get_literal("HELION_BACKEND", "triton", mapping={n: n for n in names})
 
 
 def is_pallas_interpret() -> bool:
@@ -722,8 +722,8 @@ class Settings(_Settings):
     __slots__ = {
         "backend": (
             "Code generation backend. One of 'triton' (default), 'pallas' (JAX/Pallas), "
-            "'cute' (CUTLASS CuTe DSL), or 'metal' (Apple Metal MSL). "
-            "Set HELION_BACKEND=<backend> to override."
+            "'cute' (CUTLASS CuTe DSL), 'metal' (Apple Metal MSL), or an installed "
+            "backend plugin's name. Set HELION_BACKEND=<backend> to override."
         ),
         "ignore_warnings": (
             "Subtypes of exc.BaseWarning to ignore when compiling. "

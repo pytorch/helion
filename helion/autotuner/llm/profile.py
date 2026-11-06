@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ..._compiler.backend_registry import get_backend
-from ..._compiler.backend_registry import list_backends
+from ..._compiler.backend_registry import registered_backends
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -30,7 +30,7 @@ STREAMING_REDUCTION_HINT = (
 def prompt_profile(backend: str) -> LlmPromptProfile:
     """The prose of the prompts for the backend named ``backend``; a name no
     registered backend answers to gets this default profile under that name."""
-    if backend not in list_backends():
+    if backend not in registered_backends():
         return LlmPromptProfile(backend)
     return get_backend(backend).llm_prompt_profile()
 
