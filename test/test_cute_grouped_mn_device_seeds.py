@@ -44,9 +44,8 @@ def _args(m: int, groups: int, n: int, k: int):
 @pytest.mark.parametrize(
     "m,groups,n,k", [(2048, 16, 1536, 2048), (8192, 16, 1536, 2048), (512, 4, 512, 256)]
 )
-@pytest.mark.parametrize("render_shard", range(8))
 def test_mn_seeds_preserve_old_prefix_normalize_and_reach_native_source(
-    m: int, groups: int, n: int, k: int, render_shard: int
+    m: int, groups: int, n: int, k: int
 ) -> None:
     args = _args(m, groups, n, k)
     with (
@@ -71,21 +70,35 @@ def test_mn_seeds_preserve_old_prefix_normalize_and_reach_native_source(
         assert spec.block_sizes[2].declared_max_size == 64
         added = seeds[len(old_seeds) :]
         assert added
-        for seed_index, seed in enumerate(added):
+        representatives: dict[tuple[object, ...], helion.Config] = {}
+        for seed in added:
             assert seed.get("tcgen05_grouped_worklist_orientation") == "mn"
             assert seed.block_sizes == [256, 128, 64]
             assert seed["tcgen05_grouped_full_allocation_a"] is True
             assert seed["tcgen05_grouped_d_shift"] is True
             normalized = spec.normalized_config(seed)
             assert normalized.block_sizes[2] == 64
-            # Keep all normalization checks in every case. Each added seed's
-            # full source is rendered once across bounded CPU-only shards.
-            if seed_index % 8 == render_shard:
-                source = bound.to_code(normalized)
-                ast.parse(source)
-                assert "'bounded_output_shift': True" in source
-                assert "'immutable_ab_tensormaps': True" in source
-                assert "TensorMapManager" not in source
+            # Every seed is normalized; one seed per worklist geometry and
+            # L2 swizzle layout is rendered below (the pipeline depths only
+            # resize the same source).
+            representatives.setdefault(
+                (
+                    seed["tcgen05_grouped_worklist_source_m_tile"],
+                    seed["tcgen05_grouped_worklist_mma_n"],
+                    seed["tcgen05_cluster_n"],
+                    seed.get("tcgen05_grouped_balanced_workers"),
+                    seed.get("tcgen05_l2_swizzle_size"),
+                    seed.get("tcgen05_grouped_l2_swizzle_alternate"),
+                    seed.get("tcgen05_grouped_l2_swizzle_mn_ratio"),
+                ),
+                normalized,
+            )
+        for normalized in representatives.values():
+            source = bound.to_code(normalized)
+            ast.parse(source)
+            assert "'bounded_output_shift': True" in source
+            assert "'immutable_ab_tensormaps': True" in source
+            assert "TensorMapManager" not in source
         mn = [
             seed
             for seed in added

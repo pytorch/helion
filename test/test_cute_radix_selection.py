@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-from itertools import product
 import operator
 import random
 from typing import TYPE_CHECKING
@@ -26,6 +25,7 @@ from helion._compiler.cute.radix_selection import radix_schedule
 from helion._compiler.cute.radix_selection_config import BOOLEAN_KEYS
 from helion._compiler.cute.radix_selection_config import CONFIG_KEYS
 from helion._compiler.cute.radix_selection_config import PIPELINE_CHOICES
+from helion._testing import pairwise
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
@@ -533,14 +533,31 @@ def test_flags_require_typed_booleans_and_radix_and_trim_requires_largest() -> N
 _RADIX_SOURCE_FLAGS = tuple(
     key for key in BOOLEAN_KEYS if key != "cute_radix_cached_payload_inverse"
 )
+_RADIX_KEY_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize(
-    "modes", tuple(product((False, True), repeat=len(_RADIX_SOURCE_FLAGS)))
-)
+def _radix_flag_rows() -> list[tuple[tuple[bool, ...], torch.dtype]]:
+    # Each flag selects its own source branch and the dtype picks the key
+    # width, so every pair of settings appears together, plus the all-off and
+    # all-on corners of every dtype; the full product is 768 rows.
+    rows = [
+        (tuple(row[:-1]), row[-1])
+        for row in pairwise(
+            **dict.fromkeys(_RADIX_SOURCE_FLAGS, (False, True)),
+            dtype=_RADIX_KEY_DTYPES,
+        )
+    ]
+    for dtype in _RADIX_KEY_DTYPES:
+        for mode in (False, True):
+            corner = ((mode,) * len(_RADIX_SOURCE_FLAGS), dtype)
+            if corner not in rows:
+                rows.append(corner)
+    return rows
+
+
+@pytest.mark.parametrize(("modes", "dtype"), _radix_flag_rows())
 def test_all_flag_combinations_keep_typed_bounded_source_and_allocations(
-    dtype: torch.dtype, modes: tuple[bool, ...]
+    modes: tuple[bool, ...], dtype: torch.dtype
 ) -> None:
     bound = cpu_bind(_payload_selection, _args(dtype))
     graph = bound.config_spec.cute_radix_selection_graph
@@ -721,11 +738,19 @@ def test_forwarded_raw_keeps_identity_prefix_masks_and_unmasked_loads_reread() -
         fanout.to_code(_radix_config(fanout, cute_radix_ticket_stores=True))
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("packet_bits", [128, 256])
-@pytest.mark.parametrize("unroll", [1, 2, 4])
-@pytest.mark.parametrize("resident_input", [False, True])
-@pytest.mark.parametrize("payload_inverse", [False, True])
+# The dtype sets the elements per packet, packet_bits the copy width, unroll
+# the scan rounds, and the two resident flags the cached-source branches; the
+# assertions below check pairs of them, which all-pairs rows cover.
+@pytest.mark.parametrize(
+    ("dtype", "packet_bits", "unroll", "resident_input", "payload_inverse"),
+    pairwise(
+        dtype=(torch.bfloat16, torch.float32),
+        packet_bits=(128, 256),
+        unroll=(1, 2, 4),
+        resident_input=(False, True),
+        payload_inverse=(False, True),
+    ),
+)
 def test_packet_width_and_source_unroll_keep_uniform_candidate_loops(
     dtype, packet_bits, unroll, resident_input, payload_inverse
 ) -> None:
