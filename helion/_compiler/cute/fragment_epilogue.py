@@ -25,7 +25,6 @@ from typing import cast
 import sympy
 import torch
 from torch.fx.node import Node
-from torch.fx.node import map_arg
 
 from ...language import _tracing_ops
 from ...language import memory_ops
@@ -454,14 +453,11 @@ def _pointwise_inputs(node: Node) -> tuple[Node, ...] | None:
     lowering = node.meta.get("lowering")
     if not isinstance(lowering, PointwiseLowering):
         return None
-    inputs: list[Node] = []
-
-    def visit(value: Node) -> Node:
-        if isinstance(value.meta.get("val"), torch.Tensor):
-            inputs.append(value)
-        return value
-
-    map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
+    inputs = [
+        value
+        for value in lowering.input_nodes(node)
+        if isinstance(value.meta.get("val"), torch.Tensor)
+    ]
     if not inputs or len(inputs) != len(lowering.input_names):
         return None
     return tuple(inputs)

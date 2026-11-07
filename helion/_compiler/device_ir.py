@@ -68,12 +68,14 @@ from .container_identity import compare_container_identity
 from .container_identity import record_opaque_container_result
 from .fragment_call import guard_fragment_call_input
 from .fragment_comparison import guard_fragment_comparison
+from .fx_side_effects import is_impure_node
 from .host_function import HostFunction
 from .host_function import SymbolOrigin
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
+from .logical_reduction_dims import install_logical_reduction_decompositions
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
 from .merge_reduction_dims import _MERGE_OPS
@@ -81,6 +83,7 @@ from .merge_reduction_dims import chain_reduction_dims
 from .merge_reduction_dims import merge_reduction_dims
 from .node_masking import defer_pallas_load_masks
 from .node_masking import remove_unnecessary_masking
+from .roll_reduction import EffectfulReductionReplay
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
 from .tuple_constants import TupleConstants
@@ -197,6 +200,7 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # node so the cute epilogue chain analyzer can fuse it; the inductor
     # default decomp expands the polynomial form and breaks the chain.
     install_gelu_decomp(decomp_table)
+    install_logical_reduction_decompositions(decomp_table)
     for op in _MERGE_OPS.values():
         decomp_table[op] = chain_reduction_dims(op, decomp_table.get(op))
     return decomp_table
@@ -385,7 +389,8 @@ class NodeArgsGraphInfo(GraphInfo):
         raise KeyError("Placeholder not found in node_args")
 
     def kwargs(self) -> dict[str, object]:
-        # TODO(jansel): do we need to map these to the new graph in the case of a copy?
+        # A single graph copy cannot remap its external captures. Collection
+        # copies rebind these once all parent and child graphs exist.
         return {
             "node_args": [*self.node_args],
         }
@@ -620,7 +625,7 @@ class ReductionLoopGraphInfo(ForLoopGraphInfo):
 @dataclasses.dataclass
 class IfGraphInfo(NodeArgsGraphInfo):
     predicate_is_tensor: bool = False
-    else_branch: ElseGraphInfo | None = None
+    else_branch: int | None = None
 
     if_arg_names: list[str] | None = None
     else_arg_names: list[str] | None = None
@@ -1029,7 +1034,7 @@ class DeviceIR:
         graph_info_cls: type[GraphInfo] = GraphInfo,
         **kwargs: object,
     ) -> int:
-        graph.eliminate_dead_code()
+        graph.eliminate_dead_code(is_impure_node=is_impure_node)
         graph_id = len(self.graphs)
         self.graphs.append(graph_info_cls(graph_id=graph_id, graph=graph, **kwargs))
         return graph_id
@@ -1175,7 +1180,7 @@ class DeviceIR:
             # (hl.arange) axis that cannot be sliced inside the reduction loop.
             can_roll_graphs = True
             for graph_info in self.graphs[:num_original_graphs]:
-                roller = ReductionRoller(self, rdim, {})
+                roller = ReductionRoller(self, rdim, {}, allow_unbound_alias_facts=True)
                 if (
                     roller.has_matmul_with_rdim(graph_info.graph)
                     or roller.has_gather_along_rdim(graph_info.graph)
@@ -1185,7 +1190,7 @@ class DeviceIR:
                     can_roll_graphs = False
                     break
 
-            roller = ReductionRoller(self, rdim, {})
+            roller = ReductionRoller(self, rdim, {}, allow_unbound_alias_facts=True)
             # Registered aliases still load through their owner's symbol.
             # Rolling just the alias would leave full-domain loads unsliced.
             if roller.has_pinned_rdim() or (
@@ -1195,19 +1200,49 @@ class DeviceIR:
                 can_roll_graphs = False
 
             if not can_roll_graphs:
-                rdim_results.append((rdim, False, set()))
+                rdim_results.append((rdim, False, set(), None))
                 continue
 
             used_graphs: set[int] = set()
             all_graphs_processed = True
+            persistent_reason = None
             for graph_id in range(num_original_graphs):
                 graph_info = self.graphs[graph_id]
                 assert graph_id == graph_info.graph_id
-                roller = ReductionRoller(self, rdim, graph_to_info)
+                roller = ReductionRoller(
+                    self, rdim, graph_to_info, allow_unbound_alias_facts=True
+                )
                 try:
                     roller.process(graph_info.graph)
-                except NotImplementedError:
+                except NotImplementedError as error:
                     all_graphs_processed = False
+                    if isinstance(error, EffectfulReductionReplay):
+                        reason = str(error)
+                        persistent_reason = (
+                            reason
+                            if persistent_reason is None
+                            else min(persistent_reason, reason)
+                        )
+                        # Keep this child persistent while analyzing later
+                        # graphs, including its callers. The axis cannot roll,
+                        # but a plain refusal elsewhere must still veto its
+                        # compatibility slot regardless of graph order.
+                        reduction_info = RolledReductionInfo(
+                            rolled_block_ids=[rdim.block_id],
+                            original_graph_id=graph_id,
+                            used_rdim=len(roller.graphs_added) > 0,
+                            can_be_rolled_by_caller=roller.outer_count == 0
+                            and len(roller.graphs_added) == 1,
+                        )
+                        graph_to_info[graph_id] = reduction_info
+                        self.rolled_reductions.append(reduction_info)
+                        # The failed replay follows an already emitted sweep.
+                        # Retiring it must not give a later overlapping axis
+                        # the slot this graph occupied in saved configs.
+                        if reduction_info.used_rdim:
+                            used_graphs.add(graph_id)
+                        continue
+                    persistent_reason = None
                     break
                 reduction_info = RolledReductionInfo(
                     rolled_block_ids=[rdim.block_id],
@@ -1234,7 +1269,7 @@ class DeviceIR:
                 graph_to_info[graph_id] = reduction_info
             if not all_graphs_processed:
                 allow_loop = False
-            rdim_results.append((rdim, allow_loop, used_graphs))
+            rdim_results.append((rdim, allow_loop, used_graphs, persistent_reason))
 
         env.backend.rewrite_device_ir(
             DeviceIRStage.REDUCTION_ROLLING_ANALYZED, self.host_function, self
@@ -1243,8 +1278,8 @@ class DeviceIR:
         # Second pass: register reduction loop specs, ensuring that each
         # original graph is only rolled for one reduction dim at a time.
         graphs_with_rolled_rdim: set[int] = set()
-        for rdim, allow_loop, used_graphs in rdim_results:
-            if not allow_loop:
+        for rdim, allow_loop, used_graphs, persistent_reason in rdim_results:
+            if not allow_loop and persistent_reason is None:
                 continue
             if used_graphs & graphs_with_rolled_rdim:
                 continue
@@ -1257,11 +1292,13 @@ class DeviceIR:
                             env.backend.reduction_loops_allow_non_power_of_two
                         ),
                         allow_full_extent=env.backend.reduction_loops_allow_full_extent,
+                        persistent_reason=persistent_reason,
                     )
                 )
-                env.backend.register_reduction_loop_config_slots(
-                    env, rdim.block_id, rdim.size_hint()
-                )
+                if allow_loop:
+                    env.backend.register_reduction_loop_config_slots(
+                        env, rdim.block_id, rdim.size_hint()
+                    )
             graphs_with_rolled_rdim |= used_graphs
 
         env.backend.rewrite_device_ir(
@@ -1567,6 +1604,7 @@ class DeviceIR:
 
         temp = copy.copy(self)
         temp.graphs = [g.copy() for g in self.graphs]
+        temp._rebind_control_flow_captures()
         if self.host_function is not None:
             from .selected_tunable_types import specialize_selected_tunable_types
 
@@ -1575,7 +1613,38 @@ class DeviceIR:
             temp._apply_rolling(config)
         temp._apply_epilogue_subtiling(config)
         temp._hoist_inband_polls()
+        temp._rebind_control_flow_captures()
         return temp.graphs
+
+    def _rebind_control_flow_captures(self) -> None:
+        # The current call operands are authoritative. Earlier graph rewrites
+        # may already have removed the nodes recorded in node_args, and copies
+        # retain those old references. Helper graphs without a control-flow
+        # capture slot keep their separate argument convention unchanged.
+        parents: dict[int, tuple[torch.fx.Node, int]] = {}
+        graphs = {info.graph_id: info.graph for info in self.graphs}
+        pending = list(reversed(self.root_ids))
+        visited: set[int] = set()
+        while pending:
+            graph_id = pending.pop()
+            if graph_id in visited:
+                continue
+            visited.add(graph_id)
+            for node in graphs[graph_id].nodes:
+                for child_id, slot in _control_flow_graph_entries(node):
+                    # While arguments are mutable state, not invariant
+                    # captures, but still need the copied initial operands.
+                    capture_slot = 2 if slot is None else slot
+                    parents.setdefault(child_id, (node, capture_slot))
+                    pending.append(child_id)
+        # Reduction analysis appends unreachable copies of parent graphs.
+        # They must not replace the operands of a root-reachable call.
+        for info in self.graphs:
+            if isinstance(info, NodeArgsGraphInfo) and info.graph_id in parents:
+                parent, slot = parents[info.graph_id]
+                info.node_args = list(
+                    cast("Sequence[torch.fx.Node]", parent.args[slot])
+                )
 
     def _hoist_inband_polls(self) -> None:
         """Move each inband peer load, with its pure inputs, up to the previous
@@ -1600,7 +1669,7 @@ class DeviceIR:
             )
 
         def reorderable(node: torch.fx.Node) -> bool:
-            # Impure asm (e.g. clock reads) is not marked side effecting.
+            # Poll hoisting conservatively leaves all inline assembly in place.
             return (
                 node.op == "call_function"
                 and node.target not in (memory_ops.load, inline_asm_elementwise)
@@ -1654,6 +1723,15 @@ class DeviceIR:
                 if info.rolled_block_ids == [block_id]:
                     graph_to_info[info.original_graph_id] = info
 
+            # A child that fits entirely in one sweep can run in its caller's
+            # sweep. Keep its original body for that context: the standalone
+            # entry below still needs its own reduction loop.
+            caller_bodies = {
+                graph_id: self.graphs[graph_id].copy()
+                for graph_id, info in graph_to_info.items()
+                if info.used_rdim and info.can_be_rolled_by_caller
+            }
+            inner_graph_ids: list[int] = []
             for graph_id in range(num_original_graphs):
                 info = graph_to_info.get(graph_id)
                 if info is None or not info.used_rdim:
@@ -1666,12 +1744,71 @@ class DeviceIR:
                     self, rdim, graph_to_info, enable_fusion=enable_fusion
                 )
                 new_graph = roller.process(graph_info.graph)
+                inner_graph_ids.extend(roller.graphs_added)
                 new_graph_id = self.add_graph(
                     new_graph, type(graph_info), **graph_info.kwargs()
                 )
                 # Replace only the graph payload to preserve root metadata
                 # (e.g., phase_index used for barrier phase splitting).
                 graph_info.graph = self.graphs[new_graph_id].graph
+
+            self._bind_caller_rolled_graphs(caller_bodies, inner_graph_ids)
+
+    def _bind_caller_rolled_graphs(
+        self, caller_bodies: dict[int, GraphInfo], inner_graph_ids: list[int]
+    ) -> None:
+        """Bind nested calls to bodies owned by this reduction sweep."""
+        caller_entries: dict[int, int] = {}
+
+        def caller_entry(graph_id: int, *, copy_branch_descriptor: bool = False) -> int:
+            if graph_id in caller_entries:
+                return caller_entries[graph_id]
+            if graph_id in caller_bodies:
+                body = caller_bodies[graph_id]
+            elif copy_branch_descriptor:
+                # Even an unchanged then body owns the paired else edge in
+                # IfGraphInfo. Give this caller its own descriptor when only
+                # the else body changes; standalone users keep the old pair.
+                assert isinstance(self.graphs[graph_id], IfGraphInfo)
+                body = self.graphs[graph_id].copy()
+            else:
+                return graph_id
+            new_id = self.add_graph(body.graph, type(body), **body.kwargs())
+            caller_entries[graph_id] = new_id
+            rebind_calls(body.graph)
+            entry = self.graphs[new_id]
+            if isinstance(entry, IfGraphInfo) and entry.else_branch is not None:
+                # If codegen also follows this edge through GraphInfo.
+                entry.else_branch = caller_entry(entry.else_branch)
+            return new_id
+
+        def rebind_calls(graph: torch.fx.Graph) -> None:
+            for node in graph.nodes:
+                if _tracing_ops.is_for_loop_target(node.target):
+                    slots = (0,)
+                elif node.target is _tracing_ops._if:
+                    slots = (1, 2)
+                else:
+                    continue
+                args = list(node.args)
+                for slot in slots:
+                    child_id = args[slot]
+                    assert isinstance(child_id, int)
+                    args[slot] = caller_entry(child_id)
+                if node.target is _tracing_ops._if:
+                    branch = self.graphs[args[1]]
+                    assert isinstance(branch, IfGraphInfo)
+                    if branch.else_branch != args[2]:
+                        original_if = node.args[1]
+                        assert isinstance(original_if, int)
+                        args[1] = caller_entry(original_if, copy_branch_descriptor=True)
+                node.args = tuple(args)
+
+        # Only calls already inside a sweep use these entries. Calls from
+        # outside it retain their independently rolled graph, including
+        # when the same child is reached in both contexts.
+        for graph_id in inner_graph_ids:
+            rebind_calls(self.graphs[graph_id].graph)
 
     def _apply_epilogue_subtiling(self, config: Config) -> None:
         """Apply epilogue subtiling on the graph copies if enabled."""

@@ -4,7 +4,7 @@ Every test binds ``examples/flex_attention.py::helion_flex_attention_backward_ke
 on the CPU with real ``create_block_mask`` BlockMasks and asserts the plan the
 matcher produces, the regions it captures (score / mask / Jacobian, in the
 renderer's transposed frame), the autotune surface it feeds and the loops it
-claims. Nothing here compiles or launches CuTe.
+claims. No test launches CuTe; one separately opted-in test assembles offline.
 """
 
 from __future__ import annotations
@@ -57,6 +57,7 @@ if TYPE_CHECKING:
 
 _aten = torch.ops.aten
 _CPU = torch.device("cpu")
+pytestmark = pytest.mark.cpu_only
 
 
 @functools.cache
@@ -422,6 +423,47 @@ def test_softcap_jacobian_region_with_gradient_arithmetic(
     plan = _match_or_fail(bound).plan
     assert plan.grad_region is not None
     assert "fbwd_mul_pairs_packed" in _render(bound)
+
+
+def test_transformed_gradient_operands_keep_tensor_slots() -> None:
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return score * 5.0
+
+    def score_mod_bwd(grad, score, b, h, q_idx, kv_idx):
+        return grad * 2.0 + grad * 3.0
+
+    bound = _bind(_args(_tensors(), None, score_mod, score_mod_bwd))
+    match = _match_or_fail(bound)
+    assert match.plan.grad_region is not None
+    add = next(
+        n for n in match.plan.grad_region.graph.nodes if n.target is _aten.add.Tensor
+    )
+    for operand, expected in zip(add.args, (2.0, 3.0), strict=True):
+        assert isinstance(operand, torch.fx.Node)
+        assert operand.target is _aten.full.default
+        assert operand.args == ([], expected)
+        assert operand.kwargs["dtype"] == add.meta["val"].dtype == torch.float32
+        assert operand.meta["val"].dtype == torch.float32
+    # Typed constant nodes preserve the recipe's tensor operand slots.
+    _render(bound)
+
+
+def test_bare_constant_gradient_region() -> None:
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return score * 5.0
+
+    def score_mod_bwd(grad, score, b, h, q_idx, kv_idx):
+        return grad * 5.0
+
+    bound = _bind(_args(_tensors(), None, score_mod, score_mod_bwd))
+    match = _match_or_fail(bound)
+    region = match.plan.grad_region
+    assert region is not None
+    assert region.output.target is _aten.full.default
+    assert region.output.args == ([], 5.0)
+    assert region.output.kwargs["dtype"] == torch.float32
+    assert region.output.meta["val"].dtype == torch.float32
+    _render(bound)
 
 
 def test_ragged_lengths_match() -> None:

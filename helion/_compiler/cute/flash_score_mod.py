@@ -69,7 +69,6 @@ from unittest.mock import patch
 
 import torch
 from torch.fx import Node
-from torch.fx import map_arg
 from torch.fx.experimental import proxy_tensor
 from torch.fx.traceback import preserve_node_meta
 
@@ -579,19 +578,6 @@ def _floordiv_operands(node: Node) -> tuple[Node, object] | None:
     return x, node.args[1]
 
 
-def _lowering_inputs(node: Node) -> list[Node]:
-    """The node's lowering inputs in ``InductorLowering.input_asts`` order."""
-    inputs: list[Node] = []
-
-    def visit(value: Node) -> Node:
-        if value not in inputs:
-            inputs.append(value)
-        return value
-
-    map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
-    return inputs
-
-
 class _Analyzer:
     """Dependence / affine analysis of one region."""
 
@@ -654,8 +640,11 @@ class _Analyzer:
         return _NodeInfo("hs", frozenset(), None, scalar_index=slot - 5 - self.num_aux)
 
     def _input_deps(self, node: Node, nodes: dict[Node, _NodeInfo]) -> frozenset[str]:
+        # This module is also imported during ConfigSpec bootstrap.
+        from ..inductor_lowering import lowering_input_nodes
+
         deps: set[str] = set()
-        for value in _lowering_inputs(node):
+        for value in lowering_input_nodes(node):
             info = nodes.get(value)
             if info is None:
                 raise _unsupported(
@@ -1953,6 +1942,7 @@ class _HookEmitter:
         self, info: _RegionInfo, node: Node, meta: _NodeInfo, name: str
     ) -> None:
         from ..inductor_lowering import PointwiseLowering
+        from ..inductor_lowering import lowering_input_nodes
         from .scalar_lowering import lower_pointwise_scalar
 
         lowering = node.meta.get("lowering")
@@ -1969,12 +1959,7 @@ class _HookEmitter:
                 f"{node.name} ({node.target}) has no pointwise lowering "
                 f"({type(lowering).__name__})"
             )
-        inputs = _lowering_inputs(node)
-        if len(inputs) != len(lowering.input_names):
-            raise _unsupported(
-                f"{node.name}: {len(inputs)} inputs for lowering names "
-                f"{lowering.input_names}"
-            )
+        inputs = lowering_input_nodes(node)
         input_asts = [expr_from_string(self.value(info, value)) for value in inputs]
         statements: list[ast.AST] = []
         result = lower_pointwise_scalar(

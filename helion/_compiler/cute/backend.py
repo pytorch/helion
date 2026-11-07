@@ -3070,6 +3070,13 @@ class CuteBackend(Backend):
 
         class HelionCuteDSLOpOverrides(CuteDSLOpOverrides):
             @staticmethod
+            # pyrefly: ignore [bad-override]
+            def isnan(x: CuteDSLArg) -> CuteDSLArg:
+                # Ordered values, including infinities and signed zeros, equal
+                # themselves. Reuse the typed unordered comparison for NaNs.
+                return CuteDSLOpOverrides.ne(x, x)
+
+            @staticmethod
             def _ftz_safe_current_node() -> bool:
                 from torch._inductor.virtualized import V
 

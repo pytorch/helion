@@ -1505,10 +1505,7 @@ def _validate_prepare_semantics(
     def normalized(raw: torch.fx.Node) -> torch.fx.Node | None:
         square = _single_user(
             raw,
-            lambda node: (
-                _binary_args(node, (torch.ops.aten.mul.Tensor,))
-                in ((raw, raw), (raw, None))
-            ),
+            lambda node: _binary_args(node, (torch.ops.aten.mul.Tensor,)) == (raw, raw),
         )
         if square is None:
             return None

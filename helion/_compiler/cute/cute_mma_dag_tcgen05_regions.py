@@ -3489,12 +3489,10 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         ):
             return None
         value = program.resolve(second.value)
-        # The Inductor lowering masks a repeated input to None (``x * x``
-        # arrives as ``mul(x, None)``).
         if (
             _is_call(value, torch.ops.aten.mul.Tensor)
             and len(value.args) == 2
-            and value.args[1] in (None, value.args[0])
+            and value.args[1] is value.args[0]
         ) or (
             _is_call(value, torch.ops.aten.pow.Tensor_Scalar)
             and len(value.args) == 2

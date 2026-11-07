@@ -650,6 +650,12 @@ input types. You can pre-compile as many configs as you need using
 `BoundKernel.compile_config`.  **Warning:** `kernel.bind()` specializes,
 and the result will only work with the same input types you passed.
 
+The callable returned by `compile_config` does not rebind its arguments. Manual
+routing must preserve all specialization facts, including storage-disjointness
+predicates when the compiler reorders input loads around output stores. Call the
+`Kernel` or configured `BoundKernel` when these relationships can change: their
+dispatch guards select a separately compiled binding for overlapping inputs.
+
 - With `static_shapes=True` (default) the bound kernel only works for the
 exact shape/stride signature of the example inputs.  The generated code
 has shapes baked in, which often provides a performance boost.

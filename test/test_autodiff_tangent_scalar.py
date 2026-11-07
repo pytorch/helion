@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -12,6 +13,8 @@ from torch._inductor.codecache import PyCodeCache
 from torch.fx.experimental.proxy_tensor import make_fx
 
 import helion
+from helion._compiler.compile_environment import FixedBlockSizeSource
+from helion._compiler.device_ir import RootGraphInfo
 from helion._testing import cpu_render_target
 from helion._testing import matchesBackends
 from helion._testing import skipUnlessBackends
@@ -20,11 +23,13 @@ from helion._testing.autodiff_shapes import alias_shape_backward
 from helion._testing.autodiff_shapes import alias_shape_case
 from helion._testing.cute_codegen import cpu_bind
 from helion.experimental.autodiff import FXToHelionConverter
+from helion.experimental.autodiff import GraphAnalyzer
 from helion.experimental.autodiff import InputMapping
 from helion.experimental.autodiff import _collect_reduce_dims
 from helion.experimental.autodiff import _collect_store_reduce_dims
 from helion.experimental.autodiff import _reduction_dims_and_keepdim
 from helion.experimental.autodiff import differentiate_graph
+import helion.language as hl
 from helion.runtime.ref_mode import RefMode
 
 if TYPE_CHECKING:
@@ -821,3 +826,121 @@ def test_reduction_argument_parsing_preserves_collector_defaults() -> None:
     source = graph.placeholder("scalar")
     graph.call_function(torch.ops.aten.sum.dim_IntList, (source, [0], True))
     assert _collect_reduce_dims(graph, iter_ndim=0, skip_keepdim=True) == set()
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def _autodiff_semantic_operands(x: torch.Tensor, y: torch.Tensor, pruned: hl.constexpr):
+    out = torch.empty_like(x)
+    for rows in hl.tile(8, block_size=8):
+        if pruned:
+            out[rows] = torch.pow(1.0, x[rows]) + y[rows]
+        else:
+            out[rows] = torch.ops.aten.clamp.Tensor(x[rows], y[rows], None)
+    return out
+
+
+def test_autodiff_refuses_pruned_required_tensor():
+    with cpu_render_target():
+        bound = cpu_bind(
+            _autodiff_semantic_operands, (torch.empty(8), torch.empty(8), True)
+        )
+        ir = bound.host_function.device_ir
+        root = next(info for info in ir.graphs if isinstance(info, RootGraphInfo))
+        before = str(root.graph)
+        power = next(
+            n for n in root.graph.nodes if n.target is torch.ops.aten.pow.Scalar
+        )
+        assert power.args == (1.0, None)
+        assert not power.meta["lowering"].input_names
+        analyzer = GraphAnalyzer(copy.deepcopy(root.graph), all_graphs=ir.graphs)
+        # This was already unsupported: the extractor emitted pow(1,None)
+        # and failed only when the extracted module executed.
+        with pytest.raises(
+            helion.exc.AutodiffNotSupported,
+            match="required Tensor argument exponent was pruned",
+        ):
+            analyzer.extract_computation_graph()
+        assert str(root.graph) == before
+
+
+def test_autodiff_preserves_optional_tensor_none():
+    with cpu_render_target():
+        bound = cpu_bind(
+            _autodiff_semantic_operands, (torch.empty(8), torch.empty(8), False)
+        )
+        ir = bound.host_function.device_ir
+        root = next(info for info in ir.graphs if isinstance(info, RootGraphInfo))
+        before = str(root.graph)
+        # Helion canonicalizes optional-Tensor clamp to maximum. Restore its
+        # equivalent legal ATen spelling on a copy at the extractor API.
+        extraction_graph = copy.deepcopy(root.graph)
+        clamp = next(
+            n
+            for n in extraction_graph.nodes
+            if n.target
+            in (
+                torch.ops.aten.maximum.default,
+                torch.ops.aten.clamp_min.Tensor,
+                torch.ops.aten.clamp.Tensor,
+            )
+        )
+        clamp.target = torch.ops.aten.clamp.Tensor
+        clamp.args = (*clamp.args[:2], None)
+        clamp.kwargs = {}
+        analyzer = GraphAnalyzer(extraction_graph, all_graphs=ir.graphs)
+        graph, mappings, _, _ = analyzer.extract_computation_graph()
+        clamp = next(n for n in graph.nodes if n.target is torch.ops.aten.clamp.Tensor)
+        assert clamp.args[2] is None
+        values = {
+            "x": torch.linspace(-2, 2, 8).requires_grad_(),
+            "y": torch.zeros(8, requires_grad=True),
+        }
+        actual = torch.fx.GraphModule({}, graph)(
+            *(values[m.tensor_name] for m in mappings)
+        )[0]
+        expected = torch.clamp(values["x"], min=values["y"])
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        actual_grad = torch.autograd.grad(actual.sum(), tuple(values.values()))
+        expected_grad = torch.autograd.grad(expected.sum(), tuple(values.values()))
+        for a, b in zip(actual_grad, expected_grad, strict=True):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        assert str(root.graph) == before
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def _scan_pruned_tensor(x: torch.Tensor):
+    out = torch.empty((x.size(0),), dtype=x.dtype, device=x.device)
+    for rows in hl.tile(x.size(0), block_size=8):
+        total = hl.zeros([rows], dtype=x.dtype)
+        for columns in hl.tile(x.size(1), block_size=4):
+            total = total + torch.sum(torch.pow(1.0, x[rows, columns]), dim=1)
+        out[rows] = total
+    return out
+
+
+def test_scan_combine_refuses_pruned_required_tensor():
+    with cpu_render_target():
+        bound = cpu_bind(_scan_pruned_tensor, (torch.empty(8, 16),))
+        ir = bound.host_function.device_ir
+        power = next(
+            node
+            for info in ir.graphs
+            for node in info.graph.nodes
+            if node.target is torch.ops.aten.pow.Scalar
+        )
+        assert power.args == (1.0, None)
+        root = next(info for info in ir.graphs if isinstance(info, RootGraphInfo))
+        analyzer = GraphAnalyzer(
+            root.graph,
+            all_graphs=ir.graphs,
+            config_block_sizes={
+                block.block_id: int(block.block_size_source.value)
+                for block in bound.env.block_sizes
+                if isinstance(block.block_size_source, FixedBlockSizeSource)
+            },
+        )
+        with pytest.raises(
+            helion.exc.AutodiffNotSupported,
+            match="required Tensor argument exponent was pruned",
+        ):
+            analyzer.extract_computation_graph()

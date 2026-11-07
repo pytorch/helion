@@ -520,6 +520,9 @@ def _split_feature_reduction_loop(
             [ast.fix_missing_locations(loop)],
             proven_disjoint_tensor_pairs=disjoint_pairs,
             thread_axis_names={lane_name: frozenset((0,))},
+            # Each materialization is later placed under a single-warp
+            # condition. It cannot use the CTA-wide opaque-input snapshot.
+            cta_uniform=False,
         )
     except exc.BackendUnsupported:
         return None

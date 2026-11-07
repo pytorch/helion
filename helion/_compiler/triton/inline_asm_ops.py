@@ -35,20 +35,24 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     # Convert the list of tensor args to AST
     # We need to create a proper list AST with the tensor elements
     raw_args = state.ast_args[2]
-    if isinstance(raw_args, list):
-        # Create AST List node with the tensor elements
-        args_ast = create(ast.List, elts=raw_args, ctx=ast.Load())
+    if isinstance(raw_args, (list, tuple)):
+        # FX containers are immutable; AST transforms mutate their list fields.
+        args_ast = create(ast.List, elts=list(raw_args), ctx=ast.Load())
     else:
-        # If it's not a list, wrap it in a list (shouldn't normally happen)
+        # Preserve an argument that is already represented by an AST expression.
         args_ast = raw_args
 
     # Convert dtype to Triton type string(s)
     if isinstance(dtype, (tuple, list)):
         dtype_strs = [triton_type(dt) for dt in dtype if isinstance(dt, torch.dtype)]
-        dtype_arg = f"({', '.join(dtype_strs)})"  # Use tuple syntax for multiple dtypes
+        dtype_arg = create(
+            ast.Tuple,
+            elts=[expr_from_string(value) for value in dtype_strs],
+            ctx=ast.Load(),
+        )
         has_multiple_outputs = True
     else:
-        dtype_arg = (
+        dtype_arg = expr_from_string(
             triton_type(dtype) if isinstance(dtype, torch.dtype) else "tl.float32"
         )
         has_multiple_outputs = False
@@ -61,7 +65,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
             create(ast.Constant, value=asm_str),
             create(ast.Constant, value=constraints_str),
             args_ast,
-            expr_from_string(dtype_arg),
+            dtype_arg,
             create(ast.Constant, value=is_pure),
             create(ast.Constant, value=pack),
         ],
@@ -72,9 +76,12 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     if has_multiple_outputs:
         assert isinstance(dtype, (tuple, list))  # Type guard for len()
         num_outputs = len(dtype)
+        inline_asm_result = state.codegen.lift(
+            inline_asm_call, dce=is_pure is True, prefix="inline_asm_result"
+        )
         return [
             expr_from_string(
-                f"{{inline_asm_result}}[{i}]", inline_asm_result=inline_asm_call
+                f"{{inline_asm_result}}[{i}]", inline_asm_result=inline_asm_result
             )
             for i in range(num_outputs)
         ]
