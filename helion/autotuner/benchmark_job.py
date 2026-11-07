@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 from typing import TYPE_CHECKING
@@ -18,6 +19,7 @@ from .benchmarking import _resolve_l2_flush_mode
 from .benchmarking import do_bench
 from .benchmarking import do_bench_cuda_graph
 from .benchmarking import do_bench_generic
+from .benchmarking import kernel_timer_unready_reason
 from .benchmarking import steady_graph_dispatch
 from .benchmarking import synchronize_device
 from .input_banks import InputBankMemoryError
@@ -79,9 +81,9 @@ class BenchmarkJob(PhasedJob):
     # their original values for every later job (an accuracy check among
     # them). Private finalist copies are already the finalist's own.
     mutated_arg_indices: tuple[int, ...] = ()
-    # L2 regime of the timed calls (``call``, ``off`` or ``replay``); None
-    # reads HELION_AUTOTUNE_L2_FLUSH in the worker. The final selection names
-    # its own regime (``final_selection_l2_flush_mode``).
+    # L2 regime of the timed calls (``call``, ``off``, ``replay`` or
+    # ``kernel``); None reads HELION_AUTOTUNE_L2_FLUSH in the worker. The
+    # final selection names its own regime (``final_selection_l2_flush_mode``).
     l2_flush_mode: str | None = None
     input_banks: int = 1
 
@@ -116,52 +118,93 @@ class BenchmarkJob(PhasedJob):
                         ) from error
                 bench = do_bench_generic if self.use_wall_clock else do_bench
                 # The worker warmed the current device before this job; the
-                # kernel's graphs run on its arguments' device.
-                steady_graph_dispatch(device=_cuda_device_of(args))
+                # kernel's graphs, its warm call (or bank warm-up), the
+                # synchronization after it and the timers (which flush, mark
+                # and trace the current device) run on its arguments' device.
+                device = _cuda_device_of(args)
                 benchmark_fn: Callable[[], object] = functools.partial(fn, *args)
-                bank_flush_mode = "replay"
-                pre_timing: Callable[[], object] | None = None
-                if self.input_banks > 1:
-                    cycle = make_input_bank_cycle(fn, args, self.input_banks)
-                    benchmark_fn = cycle
-                    bank_flush_mode = _resolve_l2_flush_mode(self.l2_flush_mode)
-                    if bank_flush_mode == "off":
-                        pre_timing = cycle
-                    cycle.warm(retained_cycles=2 if pre_timing is not None else 1)
-                else:
-                    benchmark_fn()
-                # Compile and run once; the timers then skip their setup call.
-                synchronize_device()
-                if report_phase is not None:
-                    report_phase(PHASE_COMPILED)
-                # return_mode="median" guarantees a float return.
-                if self.input_banks > 1:
-                    # Event nodes time exactly one complete bank cycle inside
-                    # the graph, excluding host dispatch and any flush/primer.
-                    result = do_bench_cuda_graph(
-                        benchmark_fn,
-                        return_mode="median",
-                        warmup=self.warmup,
-                        rep=self.rep,
-                        fixed_repetitions=self.fixed_repetitions,
-                        pre_warmed=True,
-                        l2_flush_mode=bank_flush_mode,
-                        pre_timing=pre_timing,
-                    )
-                else:
-                    result = bench(
-                        benchmark_fn,
-                        return_mode="median",
-                        warmup=self.warmup,
-                        rep=self.rep,
-                        fixed_repetitions=self.fixed_repetitions,
-                        probe_long_kernel=self.probe_long_kernel,
-                        l2_flush_mode=self.l2_flush_mode,
-                        pre_warmed=True,
-                    )
+                with (
+                    torch.cuda.device(device)
+                    if device is not None
+                    else contextlib.nullcontext()
+                ):
+                    steady_graph_dispatch(device=device)
+                    bank_flush_mode = "replay"
+                    pre_timing: Callable[[], object] | None = None
+                    if self.input_banks > 1:
+                        cycle = make_input_bank_cycle(fn, args, self.input_banks)
+                        benchmark_fn = cycle
+                        bank_flush_mode = _resolve_l2_flush_mode(self.l2_flush_mode)
+                        if bank_flush_mode == "off":
+                            pre_timing = cycle
+                        cycle.warm(retained_cycles=2 if pre_timing is not None else 1)
+                    else:
+                        benchmark_fn()
+                    # Compile and run once; the timers then skip their setup
+                    # call.
+                    synchronize_device()
+                    if report_phase is not None:
+                        report_phase(PHASE_COMPILED)
+                    # return_mode="median" guarantees a float return.
+                    if self.input_banks > 1:
+                        # Event nodes time exactly one complete bank cycle
+                        # inside the graph, excluding host dispatch and any
+                        # flush/primer. (check_input_bank_mode admits only the
+                        # replay and off regimes here, never ``kernel``.)
+                        result = do_bench_cuda_graph(
+                            benchmark_fn,
+                            return_mode="median",
+                            warmup=self.warmup,
+                            rep=self.rep,
+                            fixed_repetitions=self.fixed_repetitions,
+                            pre_warmed=True,
+                            l2_flush_mode=bank_flush_mode,
+                            pre_timing=pre_timing,
+                        )
+                    else:
+                        if self.l2_flush_mode == "kernel" and not self.use_wall_clock:
+                            reason = kernel_timer_unready_reason()
+                            if reason is not None:
+                                # The parent labelled this window ``kernel``
+                                # (``LocalBenchmarkProvider.worker_kernel_timer_available``):
+                                # a reading timed with CUDA events instead
+                                # must not pass as one.
+                                raise RuntimeError(
+                                    f"the kernel trace timer is unavailable in "
+                                    f"the benchmark worker: {reason}"
+                                )
+                        result = bench(
+                            benchmark_fn,
+                            return_mode="median",
+                            warmup=self.warmup,
+                            rep=self.rep,
+                            fixed_repetitions=self.fixed_repetitions,
+                            probe_long_kernel=self.probe_long_kernel,
+                            l2_flush_mode=self.l2_flush_mode,
+                            pre_warmed=True,
+                        )
                 return cast("float", result) / self.input_banks
             finally:
                 _unload_compiled_fn(fn)
+
+
+@dataclasses.dataclass(frozen=True)
+class KernelTimerProbeJob:
+    """Why the benchmark worker cannot time ``kernel`` windows from the trace
+    on ``device``, ``None`` when it can: the profiling session runs in the
+    worker, which keeps the learned footprint for the windows that follow."""
+
+    device: int | None = None
+
+    def __call__(self) -> str | None:
+        """``kernel_timer_unready_reason``: ``None`` when the worker traces."""
+        with (
+            capture_output(),
+            torch.cuda.device(self.device)
+            if self.device is not None
+            else contextlib.nullcontext(),
+        ):
+            return kernel_timer_unready_reason()
 
 
 @functools.cache

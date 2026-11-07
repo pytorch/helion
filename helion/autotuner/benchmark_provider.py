@@ -50,6 +50,8 @@ from .benchmark_job import AccuracyCheckJob
 from .benchmark_job import AccuracyCheckResult
 from .benchmark_job import BenchmarkJob
 from .benchmark_job import CompiledFunctionLoadError
+from .benchmark_job import KernelTimerProbeJob
+from .benchmark_job import _cuda_device_of
 from .benchmark_worker import BenchmarkCompileTimeout
 from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkTimeout
@@ -795,6 +797,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_baseline_post_args_path: str | None = None
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
+        # ``worker_kernel_timer_available``'s answer, once asked.
+        self._worker_kernel_timer: bool | None = None
         self._last_benchmark_failure_status: Literal["error", "timeout"] | None = None
         self._no_viable_config_error: Exception | None = None
         # Configs of the batch in progress whose compile has started; read by
@@ -3203,6 +3207,43 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self._subprocess_benchmark_enabled()
             and self.settings.autotune_benchmark_fn is None
         )
+
+    def worker_kernel_timer_available(self) -> bool:
+        """Whether the benchmark worker times ``kernel`` windows from the
+        CUDA activity trace on the arguments' device (``KernelTimerProbeJob``),
+        asked once: the profiling session runs in the worker, never in this
+        process."""
+        if self._worker_kernel_timer is None:
+            available = False
+            if self.steady_window_benchmark_available():
+                device = _cuda_device_of(self.args)
+                try:
+                    reason = self._get_benchmark_worker().run(
+                        KernelTimerProbeJob(None if device is None else device.index),
+                        timeout=float(self.settings.autotune_benchmark_timeout),
+                    )
+                except BenchmarkWorkerUnkillable:
+                    raise
+                except Exception as error:
+                    # A capability probe: any failure of the trace path (a
+                    # torch nightly renaming the private profiler APIs it
+                    # reads raises AttributeError or TypeError in the
+                    # worker) falls back to the ``call`` regime. A raising
+                    # probe is a bug, unlike a reason it returns (another
+                    # tool holding the activity API): say so.
+                    reason = f"the probe failed: {type(error).__name__}: {error}"
+                    self.log.warning(
+                        f"The benchmark worker's kernel trace probe failed: {reason}"
+                    )
+                available = reason is None
+                if not available:
+                    # debug: ``_traceable`` says it loudly where ``kernel``
+                    # was asked for, not where it is only the default
+                    self.log.debug(
+                        f"The benchmark worker cannot time kernel windows: {reason}"
+                    )
+            self._worker_kernel_timer = available
+        return self._worker_kernel_timer
 
     def private_argument_copies_affordable(self, count: int) -> bool:
         """Whether ``count`` private copies of the kernel arguments fit on the
