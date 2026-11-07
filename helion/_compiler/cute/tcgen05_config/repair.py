@@ -39,9 +39,9 @@ from ..cute_warp_mma_gemm import warp_mma_max_legal_warps
 from ..cute_warp_mma_gemm import warp_mma_tile_reason
 from ..cute_warp_mma_gemm import warp_mma_warp_layout
 from ..dense_aligned_n import ALIGNED_N_CHOICES
+from ..dense_aligned_n import DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K
 from ..dense_aligned_n import TILE_N_KEY
 from ..dense_aligned_n import carrier_n
-from ..dense_aligned_n import dense_aligned_n_defaults
 from ..epilogue_fanout import FANOUT_CONFIG_KEY
 from ..epilogue_fanout import FANOUT_MODES
 from ..epilogue_fanout import schedule_supported as fanout_schedule_supported
@@ -2127,10 +2127,15 @@ def _normalize_dense_aligned_n(
         )
     if fix_invalid:
         view = facts._matmul_config_view(state, config)
-        if view is not None:
-            blocks, mi, ni, _ki = view
+        block_m = facts._dense_aligned_n_block_m(state)
+        if view is not None and block_m is not None:
+            blocks, mi, ni, ki = view
             blocks = list(blocks)
-            blocks[mi], blocks[ni] = 128, carrier_n(width)
+            blocks[mi], blocks[ni] = block_m, carrier_n(width)
+            if facts._dense_aligned_n_sixteen_bit(state):
+                blocks[ki] = DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K
+            elif blocks[ki] not in (64, 128):
+                blocks[ki] = 64
             config["block_sizes"] = blocks
         acc_stages = config.get("tcgen05_acc_stages", 2)
         if type(acc_stages) is not int or acc_stages not in (1, 2):
@@ -2138,21 +2143,43 @@ def _normalize_dense_aligned_n(
         store_mode = config.get("tcgen05_c_store_mode", "normal")
         if store_mode not in ("normal", "direct"):
             store_mode = "normal"
-        config.update(
-            dense_aligned_n_defaults(
-                acc_stages=acc_stages, store_mode=cast("str", store_mode)
-            )
+        # The 16-bit pair admits its own L2 grouping and N pairing; keep a
+        # sampled value the plan accepts instead of the family default.
+        sampled = {
+            key: config[key]
+            for key in ("l2_groupings", "tcgen05_cluster_n")
+            if key in config
+        }
+        surface = facts._dense_aligned_n_surface(
+            state, acc_stages=acc_stages, store_mode=cast("str", store_mode)
         )
+        config.update(surface)
+        facts._drop_inactive_direct_entry_controls(state, config)
         if config.get("pid_type") not in state.allowed_pid_types or config.get(
             "pid_type"
         ) not in ("persistent_interleaved", "persistent_blocked"):
             config["pid_type"] = facts._preferred_persistent_pid_type(state)
+        if facts._dense_aligned_n_sixteen_bit(state):
+            # A configured subtile that does not partition the physical
+            # width is dropped rather than leaving the family.
+            subtile = config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY)
+            if type(subtile) is int and subtile > 0 and width % subtile:
+                config[TCGEN05_EPI_SUBTILE_N_CONFIG_KEY] = None
+            for key, value in sampled.items():
+                trial = {**config, key: value}
+                if facts._dense_aligned_n_plan(state, trial) is not None:
+                    config[key] = value
     plan = facts._dense_aligned_n_plan(state, config)
     if plan is None:
         raise InvalidConfig(
-            "tcgen05_tile_n requires its proved full-M/N dense FP8 paired static schedule and unchanged tile bounds"
+            "tcgen05_tile_n requires a proved dense paired GEMM (dense_aligned_n_plan): "
+            "whole N tiles of the physical width, unchanged tile bounds, "
+            "whole M tiles for FP8 or whole K tiles under a 16-bit M tail, "
+            "and for 16-bit a row-major output, a width that is a multiple "
+            "of 32 and an epilogue subtile that divides it"
         )
-    for key, value in dense_aligned_n_defaults(
+    for key, value in facts._dense_aligned_n_surface(
+        state,
         acc_stages=cast("int", config.get("tcgen05_acc_stages", 2)),
         store_mode=cast("str", config.get("tcgen05_c_store_mode", "normal")),
     ).items():

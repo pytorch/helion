@@ -285,14 +285,15 @@ def pipeline_smem_bytes(
     ``tcgen05_epi_warp_groups``) and ``epi_subtile_n`` pins the 256-row
     pair's C subtile to ``(128, epi_subtile_n)``: a configured
     ``tcgen05_epi_subtile_n`` (the explicit-tile path), or the plan's own
-    (128, 32) subtile of a plain 16-bit store on static full tiles, which
-    the paired caller resolves (the staged aux rings keep the plan's
+    (128, 32) subtile of a plain 16-bit store on static full tiles (or the
+    aligned-N physical tile with a partial last M tile), which the paired
+    caller resolves (the staged aux rings keep the plan's
     with-source subtile, as ``cute_mma`` sizes them).
     """
     from cutlass.utils.blackwell_helpers import compute_epilogue_tile_size
 
-    # Non-power-of-two N widths are proved only for the M128 instruction.
-    assert bn in (64, 128, 256) or (bm == 128 and bn % 16 == 0 and 64 < bn < 256)
+    # Non-power-of-two N widths are the aligned-N family's physical tiles.
+    assert bn in (64, 128, 256) or (bn % 16 == 0 and 64 < bn < 256)
     assert bm in (128, 256) and bk in (64, 128, 256)
     assert facts.input_dtype_bytes in (1, 2)
     assert facts.output_dtype_bytes in (2, 4)

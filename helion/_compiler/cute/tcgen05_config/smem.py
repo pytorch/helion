@@ -762,10 +762,11 @@ def output_edge_tma_store_smem_fits(
     232 448 B opt-in) fell back to the SIMT epilogue and lost to ab=5,
     while the hand-kept TMA store at ab=6 compiled and ran 2.8% faster.
     This judges the measured arena model (``default_layout_smem_fits``)
-    at the C subtile the output-edge plan renders: edge tiles never take
-    the plain (128, 32) narrow subtile (it needs static full tiles), so
-    the ring is charged at CuTe's with-source subtile, or at a configured
-    explicit tile when that is wider. Fails closed like the model.
+    at the C subtile the output-edge plan renders: power-of-two edge tiles
+    never take the plain (128, 32) narrow subtile (it needs static full
+    tiles; the aligned-N family prices its own M-edge ring), so the ring
+    is charged at CuTe's with-source subtile, or at a configured explicit
+    tile when that is wider. Fails closed like the model.
     """
     facts = state.rowvec_aux_facts
     if facts is None or cluster_m not in (1, 2):
@@ -1080,8 +1081,8 @@ def epilogue_subtile(
     The matmul plan's choice (``cute_mma``): a configured subtile
     (``tcgen05_epi_subtile_n``, the explicit-tile path: ``(per-CTA M,
     n)``) wins; then the plan's (128, 32) for promoted 16-bit rows that
-    are staged, or for a plain 16-bit store on the 256-wide two-CTA tile
-    (``tcgen05_plain_narrow_subtile``: one output store and no auxiliary
+    are staged, or for a plain 16-bit store on the 192- or 256-wide
+    two-CTA tile (``tcgen05_plain_narrow_subtile``: one output store and no auxiliary
     operand -- a two-output or aux epilogue keeps CuTe's with-source
     (128, 64) subtile there, 64 KiB of C rings for two outputs; the plan
     also asks for a single static-full-tile store, which every plain

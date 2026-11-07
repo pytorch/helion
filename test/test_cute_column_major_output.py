@@ -237,7 +237,8 @@ def test_column_major_budget_rejects_output_edges_and_partial_first_k_tile(
         bound.to_code(_config())
 
 
-def test_dense_allocation_proof_requires_fresh_output_and_one_function() -> None:
+def test_dense_allocation_proof_requires_owned_output_and_one_function() -> None:
+    # A view of an argument output is not owned (an argument itself is).
     args = column_major_args()
     borrowed = _borrowed_column_major_output._bind_isolated(
         (*args[:2], torch.empty((256, 2048), dtype=torch.bfloat16))

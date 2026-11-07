@@ -35,6 +35,10 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_round_up_smem_bytes
 from helion._testing import DEVICE
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_dense_tcgen05 import aligned_n_bf16_config
+from helion._testing.cute_dense_tcgen05 import bf16_mm_args
+from helion._testing.cute_dense_tcgen05 import column_scale_mm_into
+from helion._testing.cute_dense_tcgen05 import plain_mm_into
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -422,10 +426,13 @@ def test_output_edge_tma_store_admission_charges_the_ring_once() -> None:
 
 
 def _sm100_gpu(test: Callable[..., object]) -> Callable[..., object]:
-    """Skip ``test`` without a CUDA GPU of capability 10.0 or newer."""
-    return skipIfNotCUDA()(
-        skipIfCudaCapabilityLessThan((10, 0), reason="tcgen05 requires an sm_100 GPU")(
-            test
+    """Skip ``test`` without a CUDA GPU of capability 10.0 or newer; the
+    ``cuda`` mark sends it to the GPU lane out of this ``cpu_only`` module."""
+    return pytest.mark.cuda(
+        skipIfNotCUDA()(
+            skipIfCudaCapabilityLessThan(
+                (10, 0), reason="tcgen05 requires an sm_100 GPU"
+            )(test)
         )
     )
 
@@ -616,3 +623,66 @@ def test_output_edge_tma_store_beside_six_ab_stages_compiles_and_runs() -> None:
     torch.testing.assert_close(
         out, (x.float() @ y.float()).to(out.dtype), rtol=2e-2, atol=1e-1
     )
+
+
+@_sm100_gpu
+def test_sixteen_bit_aligned_n_pair_scales_columns() -> None:
+    """A per-column FP32 scale on the 192-wide pair behind the 256 carrier
+    reads the physical columns' scale (8192x768x768)."""
+    torch.manual_seed(0)
+    x, y, out = bf16_mm_args(8192, 768, 768, device=DEVICE)
+    scale = torch.randn((768,), dtype=torch.float32, device=DEVICE)
+    bound = column_scale_mm_into.bind((x, y, scale, out))
+    config = aligned_n_bf16_config(tcgen05_ab_stages=6)
+    assert "_BLOCK_SIZE_1 = 192" in bound.to_code(config)
+    bound.set_config(config)
+    bound(x, y, scale, out)
+    torch.testing.assert_close(
+        out, (x.float() @ y.float() * scale).to(out.dtype), rtol=2e-2, atol=1e-1
+    )
+
+
+@_sm100_gpu
+@pytest.mark.parametrize(
+    ("m", "rhs_k_major", "dtype", "changes"),
+    (
+        (1024, True, torch.bfloat16, {}),
+        (1024, False, torch.bfloat16, {}),
+        (1152, True, torch.bfloat16, {}),
+        (1024, True, torch.float16, {}),
+        # The seeded grouped raster with N tiles paired (A multicast).
+        (
+            1024,
+            True,
+            torch.bfloat16,
+            {
+                "tcgen05_cluster_n": 2,
+                "pid_type": "persistent_interleaved",
+                "l2_groupings": [8],
+            },
+        ),
+    ),
+    ids=("nt", "nn", "nt_m_tail", "nt_fp16", "nt_2x2_grouped"),
+)
+def test_sixteen_bit_aligned_n_pair_compiles_and_runs(
+    m: int, rhs_k_major: bool, dtype: torch.dtype, changes: dict[str, object]
+) -> None:
+    """The 192-wide paired M256 tile behind the 256 carrier: seven 28 KiB AB
+    stages beside a (128, 32) C ring fill the opt-in, writing an argument
+    output (the Inductor calling convention); a partial last M tile is
+    clipped by the TMA store, and an fp16 GEMM keeps its dtype."""
+    torch.manual_seed(0)
+    x, y, out = (
+        t.to(dtype)
+        for t in bf16_mm_args(m, 768, 512, rhs_k_major=rhs_k_major, device=DEVICE)
+    )
+    bound = plain_mm_into.bind((x, y, out))
+    config = aligned_n_bf16_config(**changes)
+    assert "_BLOCK_SIZE_1 = 192" in bound.to_code(config)
+    bound.set_config(config)
+    expected = (x.float() @ y.float()).to(dtype)
+    for _ in range(LAUNCHES):
+        out.zero_()
+        bound(x, y, out)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected, rtol=2e-2, atol=1e-1)

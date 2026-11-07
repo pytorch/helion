@@ -24,11 +24,14 @@ from ..cute_warp_mma_gemm import WARP_MMA_MIN_BM
 from ..cute_warp_mma_gemm import WARP_MMA_MIN_BN
 from ..cute_warp_mma_gemm import warp_mma_admission_reason
 from ..dense_aligned_n import ALIGNED_N_CHOICES
+from ..dense_aligned_n import DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K
 from ..dense_aligned_n import TILE_N_KEY
 from ..dense_aligned_n import DenseAlignedNPlan
 from ..dense_aligned_n import carrier_n
+from ..dense_aligned_n import dense_aligned_n_block_m
 from ..dense_aligned_n import dense_aligned_n_defaults
 from ..dense_aligned_n import dense_aligned_n_plan
+from ..dense_aligned_n import dense_aligned_n_sixteen_bit
 from ..epilogue_fanout import FANOUT_CONFIG_KEY
 from ..grouped_row_union import CONFIG_KEY as GROUPED_ROW_UNION_KEY
 from ..grouped_row_union import PAIRED_CLC_SCHEDULE
@@ -60,12 +63,13 @@ from ..tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
-from ..tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+from ..tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
 from ..tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_CHOICES
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION
+from ..tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
@@ -859,17 +863,62 @@ def _dense_aligned_n_plan(
     )
 
 
+def _dense_aligned_n_block_m(state: CuteTcgen05Config) -> int | None:
+    """Pair M of the aligned-N family for this kernel's input dtype."""
+    facts = state.dense_gemm_facts
+    return None if facts is None else dense_aligned_n_block_m(facts.input_dtype)
+
+
+def _dense_aligned_n_surface(
+    state: CuteTcgen05Config, *, acc_stages: int = 2, store_mode: str = "normal"
+) -> dict[str, object]:
+    """The family's pinned values in the search schema's representation:
+    an inactive direct-entry control is absent rather than pinned off
+    (``_apply_paired_pipeline_surface``)."""
+    values = dense_aligned_n_defaults(acc_stages=acc_stages, store_mode=store_mode)
+    _drop_inactive_direct_entry_controls(state, values)
+    return values
+
+
+def _drop_inactive_direct_entry_controls(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> None:
+    """Remove the two direct-entry controls where the search schema does
+    not carry them.  ``optional_fragments`` adds them exactly when the
+    direct-entry seed is eligible; asking it directly would recurse
+    through the aligned-N width fragment into the seeds."""
+    if not seeds.full_tile_direct_entry_seed_eligible(state):
+        config.pop(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY, None)
+        config.pop(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, None)
+
+
+def _dense_aligned_n_sixteen_bit(state: CuteTcgen05Config) -> bool:
+    """Whether the aligned-N family runs the 16-bit paired M256 instruction."""
+    facts = state.dense_gemm_facts
+    return facts is not None and dense_aligned_n_sixteen_bit(facts.input_dtype)
+
+
 def _dense_aligned_n_width_plans(
     state: CuteTcgen05Config, width: int
 ) -> Iterator[tuple[dict[str, Any], DenseAlignedNPlan]]:
     """Normal-store seed values (in seed order) proved for one physical N."""
     facts = state.dense_gemm_facts
+    block_m = _dense_aligned_n_block_m(state)
+    sixteen_bit = _dense_aligned_n_sixteen_bit(state)
     if (
         not state.search_enabled
         or facts is None
-        # dense_aligned_n_plan needs 128-row tiles that divide M and a
-        # physical width that divides N; skip widths that cannot qualify.
-        or facts.shape[0] % 128
+        or block_m is None
+        # dense_aligned_n_plan needs a physical width that divides N and
+        # pair-M tiles that divide M (the 16-bit pair: or whole K tiles);
+        # skip widths that cannot qualify.
+        or (
+            facts.shape[0] % block_m
+            and not (
+                sixteen_bit
+                and facts.shape[2] % DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K == 0
+            )
+        )
         or facts.shape[1] % width
         or not _tcgen05_mma_impl_allowed()
     ):
@@ -877,13 +926,15 @@ def _dense_aligned_n_width_plans(
     pid = _preferred_persistent_pid_type(state)
     if pid is None:
         return
-    for bk in (64, 128):
-        for acc_stages in (2, 1):
+    # The 16-bit pair's short-K families want the deep 64-wide ring with
+    # both accumulators: one seed per width.
+    for bk in (DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K,) if sixteen_bit else (64, 128):
+        for acc_stages in (2,) if sixteen_bit else (2, 1):
             values: dict[str, Any] = {
-                **dense_aligned_n_defaults(acc_stages=acc_stages),
+                **_dense_aligned_n_surface(state, acc_stages=acc_stages),
                 TILE_N_KEY: width,
                 "block_sizes": _matmul_seed_block_sizes(
-                    state, bm=128, bn=carrier_n(width), bk=bk
+                    state, bm=block_m, bn=carrier_n(width), bk=bk
                 ),
                 "pid_type": pid,
                 "tcgen05_c_stages": 2,
@@ -1007,12 +1058,14 @@ def _plain_narrow_subtile_facts(
 ) -> bool:
     """The epilogue facts of ``cute_mma``'s plain narrow-subtile rule.
 
-    A plain 16-bit store on the 256-wide two-CTA tile -- one output, no
-    broadcast rows, no auxiliary operand (an exact-shape one keeps the
-    plan's with-source subtile) -- renders ``(128,
+    A plain 16-bit store on the 192- or 256-wide two-CTA tile (the
+    aligned-N family's physical width, or the ordinary 256-wide tile) --
+    one output, no broadcast rows, no auxiliary operand (an exact-shape
+    one keeps the plan's with-source subtile) -- renders ``(128,
     TCGEN05_PLAIN_NARROW_SUBTILE_N)`` subtiles.  The plan also asks for
-    static full tiles, a row-major output and a TMA-store epilogue; the
-    callers that know those facts check them.
+    static full tiles (the aligned-N physical tile: whole N and K tiles),
+    a row-major output and a TMA-store epilogue; the callers that know
+    those facts check them.
     """
     facts = state.rowvec_aux_facts
     constraints = state.ab_stages_three_search_constraints
@@ -1025,7 +1078,7 @@ def _plain_narrow_subtile_facts(
         and not state.aux_kernel_detected
         and constraints.dtype_bytes == 2
         and cluster_m == 2
-        and bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+        and bn in TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
         and facts.exact_aux_count == 0
         and tcgen05_explicit_epilogue_tile_supported(
             is_two_cta=True,

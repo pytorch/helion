@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import torch
 
+from .._compiler.cute.dense_aligned_n import dense_aligned_n_defaults
 from . import cpu_render_target
 from . import default_cute_mma_support
 from . import patch_target_facts
@@ -170,6 +171,27 @@ def scaled_mm(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def scaled_mm_into(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """``scaled_mm`` (vector scales) writing an argument output."""
+    m, k = a.shape
+    n = b.shape[1]
+    row_scale = scale_a.reshape(-1, 1).expand(m, n)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = hl.dot(a[rows, inner], b[inner, cols], acc=acc)
+        out[rows, cols] = (acc * row_scale[rows, cols] * scale_b[cols]).to(
+            torch.bfloat16
+        )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def scaled_mm_column_major(
     b_t: torch.Tensor,
     a_t: torch.Tensor,
@@ -276,6 +298,92 @@ def plain_mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             acc = hl.dot(a[rows, inner], b[inner, cols], acc=acc)
         out[rows, cols] = acc.to(torch.bfloat16)
     return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def plain_mm_into(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    """``plain_mm`` with Inductor's calling convention: an argument output."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = acc.to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def output_reading_mm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    """An argument output that the epilogue also reads."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = (acc * out[rows, cols].to(torch.float32)).to(torch.bfloat16)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def output_alias_reading_mm(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
+) -> None:
+    """``output_reading_mm`` reading the output through a host-side view."""
+    m, k = a.shape
+    n = b.shape[1]
+    alias = out.view(m, n)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = (acc * alias[rows, cols].to(torch.float32)).to(torch.bfloat16)
+
+
+def bf16_mm_args(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    rhs_k_major: bool = True,
+    device: torch.device | str = "cpu",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Random 16-bit operands and an argument output for ``plain_mm_into``."""
+    a = torch.randn((m, k), dtype=torch.bfloat16, device=device)
+    b = (
+        torch.randn((n, k), dtype=torch.bfloat16, device=device).T
+        if rhs_k_major
+        else torch.randn((k, n), dtype=torch.bfloat16, device=device)
+    )
+    return a, b, torch.empty((m, n), dtype=torch.bfloat16, device=device)
+
+
+def aligned_n_bf16_config(**changes: object) -> helion.Config:
+    """The 16-bit aligned-N pair: a 192-wide physical N behind the 256 carrier."""
+    return helion.Config.from_dict(
+        {
+            **dense_aligned_n_defaults(),
+            "tcgen05_tile_n": 192,
+            "block_sizes": [256, 256, 64],
+            "pid_type": "persistent_blocked",
+            "tcgen05_ab_stages": 7,
+            "tcgen05_c_stages": 2,
+        }
+        | changes
+    )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def column_scale_mm_into(
+    a: torch.Tensor, b: torch.Tensor, scale: torch.Tensor, out: torch.Tensor
+) -> None:
+    """A per-column FP32 scale of the accumulator into ``out``."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = (acc * scale[cols]).to(out.dtype)
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

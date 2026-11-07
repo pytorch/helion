@@ -49,6 +49,8 @@ from ..strategies import Tcgen05LayoutStrategy
 from ..strategies import Tcgen05PersistenceModel
 from ..strategies import Tcgen05Strategy
 from ..tcgen05.knobs import epi_subtile_n_knob
+from ..tcgen05_constants import TCGEN05_ALIGNED_N_TALL_L2_GROUPINGS
+from ..tcgen05_constants import TCGEN05_ALIGNED_N_TALL_PAIR_ROWS
 from ..tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
@@ -2702,12 +2704,41 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
 
 
 def dense_aligned_n_seed_configs(state: CuteTcgen05Config) -> list[Config]:
+    dense_facts = state.dense_gemm_facts
+    sixteen_bit = facts._dense_aligned_n_sixteen_bit(state)
     seeds: list[Config] = [
         Config.from_dict(values | {"tcgen05_ab_stages": depth})
         for width in ALIGNED_N_CHOICES
         for values, plan in facts._dense_aligned_n_width_plans(state, width)
-        for depth in dict.fromkeys((min(2, plan.max_ab_stages), plan.max_ab_stages))
+        for depth in dict.fromkeys(
+            (plan.max_ab_stages,)
+            if sixteen_bit
+            else (min(2, plan.max_ab_stages), plan.max_ab_stages)
+        )
     ]
+    if sixteen_bit:
+        # Tall 16-bit GEMMs read every A row block once per N tile; the
+        # grouped persistent raster keeps a band of them L2-resident.
+        # 25216x768x768 at width 192: grouping 2 0.93, 8 0.96, 16 1.00 of
+        # cuBLAS; 32768x768x768: 8 0.98, 16 0.96.
+        assert dense_facts is not None
+        if (
+            dense_facts.shape[0]
+            >= TCGEN05_ALIGNED_N_TALL_PAIR_ROWS * TCGEN05_TWO_CTA_BLOCK_M
+            and "persistent_interleaved" in state.allowed_pid_types
+        ):
+            seeds.extend(
+                Config.from_dict(
+                    seed.config
+                    | {
+                        "pid_type": "persistent_interleaved",
+                        "l2_groupings": [group],
+                    }
+                )
+                for seed in tuple(seeds)
+                for group in TCGEN05_ALIGNED_N_TALL_L2_GROUPINGS
+            )
+        return seeds
     # Preserve the ranked normal-store prefix exactly. Direct stores use
     # the same conservative allocation bound and append only after their
     # complete graph/geometry proof succeeds.
