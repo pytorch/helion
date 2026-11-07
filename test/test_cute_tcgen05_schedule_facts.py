@@ -13,12 +13,16 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.autotuner_heuristics.cute_tcgen05_default import (
+    CuteTcgen05DefaultTileHeuristic,
+)
 from helion._compiler.autotuner_heuristics.cute_tcgen05_schedule import (
     CuteTcgen05ScheduleHeuristic,
 )
 from helion._compiler.cute.dense_gemm import prove_dense_gemm_facts
 from helion._compiler.cute.one_cta_pipeline import prove_one_cta_pipeline_facts
 from helion._compiler.cute.tcgen05_config import _TWO_CTA_PERSISTENT_PID_VETO
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from helion._compiler.cute.tcgen05_schedule_facts import Tcgen05FullTileScheduleFacts
 from helion._compiler.cute.tcgen05_schedule_facts import analyze_native_gemm
 from helion._compiler.cute.tcgen05_schedule_facts import full_tile_schedule_supported
@@ -442,3 +446,51 @@ def test_k_cap_applies_only_where_whole_k_tiles_admit_persistence() -> None:
     uncapped = _plain_bind(200, 1000, 2880)
     assert _k_block_max(capped) == 64
     assert _k_block_max(uncapped) > 64
+
+
+def _default_with_sms(shape: tuple[int, int, int], num_sms: int) -> helion.Config:
+    with patch(
+        "helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=num_sms
+    ):
+        return _plain_bind(*shape).config_spec.default_config()
+
+
+def test_default_tile_one_cta_tile_quantizes_m_into_whole_waves() -> None:
+    """25216 rows: 197 one-CTA 128x256 rows of tiles fill 4 waves of 148 SMs;
+    the 256-row pair tile leaves a fifth, nearly empty wave."""
+    config = _default_with_sms((25216, 768, 3072), 148)
+    assert config.block_sizes == [128, 256, 64]
+    assert config.config["tcgen05_cluster_m"] == 1
+    assert config.config["pid_type"] == "persistent_interleaved"
+
+
+def test_default_tile_pair_replaces_ffi_on_a_partial_wave() -> None:
+    """8192x768x3072: 96 FFI pair tiles are 1.3 waves; the 256x128 pair wins,
+    with the FFI controls off and the grouped raster for its several waves."""
+    config = _default_with_sms((8192, 768, 3072), 148)
+    assert config.block_sizes == [256, 128, 64]
+    assert config.config["tcgen05_cluster_m"] == 2
+    assert not config.config.get("tcgen05_tvm_ffi_launch")
+    assert config.config.get("tcgen05_layout_strategy") == "default"
+    assert config.config["l2_groupings"] == [TCGEN05_TWO_CTA_SEED_L2_GROUPING]
+
+
+def test_default_tile_keeps_ffi_on_whole_waves() -> None:
+    config = _default_with_sms((4096, 4096, 4096), 148)
+    assert config.config.get("tcgen05_tvm_ffi_launch") is True
+    assert config.block_sizes[:2] == [256, 256]
+
+
+def test_default_tile_promotion_survives_ffi_normalization() -> None:
+    """A one-CTA pick over an FFI-eligible shape keeps its tile: the promoted
+    values turn the FFI controls off instead of relying on the winning seed."""
+    config = _default_with_sms((5376, 1792, 4096), 147)
+    assert config.block_sizes == [128, 256, 64]
+    assert not config.config.get("tcgen05_tvm_ffi_launch")
+
+
+def test_default_tile_leaves_small_grids_to_their_seeds() -> None:
+    """Fewer 128x128 tiles than SMs: per-CTA latency decides, no promotion."""
+    bound = _plain_bind(1024, 1024, 4096)
+    with bound.env:
+        assert CuteTcgen05DefaultTileHeuristic._pick(bound.env) is None
