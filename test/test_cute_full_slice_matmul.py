@@ -19,6 +19,7 @@ from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import patch_target_facts
+from helion._testing.cute_structural_kernels import _matmul
 import helion.language as hl
 from helion.runtime.ref_mode import RefMode
 from helion.runtime.ref_mode import RefModeContext
@@ -37,14 +38,6 @@ if TYPE_CHECKING:
 
     from helion._compiler.host_function import HostFunction
     from helion.runtime.kernel import BoundKernel
-
-
-def _matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    out = torch.empty([a.size(0), b.size(1)], dtype=torch.float32, device=a.device)
-    for row, column in hl.tile([a.size(0), b.size(1)]):
-        product = a[row, :] @ b[:, column]
-        out[row, column] = product.float() * 1.003
-    return out
 
 
 def _partial(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

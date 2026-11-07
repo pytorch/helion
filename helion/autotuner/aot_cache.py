@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from typing import Callable
 
     from ..runtime.structural_policy import StructuralPolicy
+    from .aot_structural_export import GuardedCallKey
     from .base_search import BaseSearch
     from .config_fragment import ConfigSpecFragment
 
@@ -1141,7 +1142,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
             policy.identity(),
             source_digest,
             hashlib.sha256(heuristic_file.read_bytes()).hexdigest(),
-            repr(guards),
         )
         # Structural rewrites can specialize dimensions even with static_shapes
         # disabled (e.g. operand materialization's hl.specialize(shape)). These
@@ -1158,11 +1158,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
             )
         )
         group = (
-            ("exact", (_export_call_key(tuple(self.args)), guard_key))
+            ("exact", (guards, _export_call_key(tuple(self.args)), guard_key))
             if requires_bound
             else (
                 "dynamic",
-                (_export_call_key(tuple(self.args), dynamic=True), guard_key),
+                (guards, _export_call_key(tuple(self.args), dynamic=True), guard_key),
             )
         )
         with self._compiled_kernel_variants_lock:
@@ -1191,7 +1191,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 kernel_source_file=source_file,
                 structural_policy=policy,
                 dynamic_groups=groups,
-                runtime_guards=guards,
+                runtime_guard_plans=tuple(
+                    cast("GuardedCallKey", signature[1])[0] for signature in updated
+                ),
                 user_key=getattr(self.kernel.kernel, "_aot_user_key", None),
             )
             variants[group] = tuple(codes)
@@ -1273,9 +1275,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
             from .aot_structural_export import export_runtime_guards
 
             guards, guard_key = export_runtime_guards(self.kernel, normalized_args)
-            call_key = (_export_call_key(normalized_args), guard_key)
-            variants_key = (*variants_key, repr(guards))
-            export_options = {"structural_policy": policy, "runtime_guards": guards}
+            call_key = (guards, _export_call_key(normalized_args), guard_key)
+            export_options = {"structural_policy": policy}
 
         # The compile workflow runs in one process. Serialize concurrent calls
         # in that process so two newly observed signatures cannot each rewrite
@@ -1298,6 +1299,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
             updated = {**variants, call_key: (config_fingerprint, code)}
             ordered = sorted(updated.items(), key=lambda item: repr(item[0]))
+            if policy is not None:
+                export_options["runtime_guard_plans"] = tuple(
+                    cast("GuardedCallKey", key)[0] for key in updated
+                )
             out_path = generate_standalone_file(
                 kernel_name=kernel_name,
                 triton_codes=[variant[1][1] for variant in ordered],

@@ -86,6 +86,7 @@ from .source_location import current_location
 from .tuple_constants import TupleConstants
 from .type_info import CallableType
 from .type_info import ClassType
+from .type_info import CollectionType
 from .type_info import ConfigFragmentType
 from .type_info import DictType
 from .type_info import GridIndexType
@@ -106,8 +107,10 @@ from .type_info import _eval_unary
 from .type_info import tensor_may_have_many_elements
 from .type_info import tile_spanned_by_slice
 from .variable_origin import AttributeOrigin
+from .variable_origin import CollectionLengthOrigin
 from .variable_origin import DeviceOrigin
 from .variable_origin import GetItemOrigin
+from .variable_origin import NameOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorStrideOrigin
 
@@ -1956,7 +1959,12 @@ class WalkDeviceAST(NodeVisitor):
         return _eval_binary(node.op, left, right)
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> object:
-        operand = self.visit(node.operand)
+        length = (
+            self._host_collection_length(node.operand)
+            if isinstance(node.op, ast.Not)
+            else None
+        )
+        operand = length if length is not None else self.visit(node.operand)
         if isinstance(node.op, ast.Not):
             return self._trace_not(operand)
         return _eval_unary(node.op, operand)
@@ -1978,10 +1986,18 @@ class WalkDeviceAST(NodeVisitor):
 
     def visit_Compare(self, node: ast.Compare) -> object:
         lhs_node = node.left
-        lhs = self.visit(lhs_node)
+        # Identity classification uses the existing input/capture provenance
+        # guards, including unproved origins. It does not interpret contents.
+        # Keep that path separate from equality or other value operations.
+        visit_operand = (
+            self._identity_operand
+            if all(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops)
+            else self.visit
+        )
+        lhs = visit_operand(lhs_node)
         results = []
         for op, rhs_node in zip(node.ops, node.comparators, strict=True):
-            rhs = self.visit(rhs_node)
+            rhs = visit_operand(rhs_node)
             if isinstance(op, (ast.Is, ast.IsNot)) and (
                 type(lhs) in (tuple, list, dict) or type(rhs) in (tuple, list, dict)
             ):
@@ -2439,7 +2455,8 @@ class WalkDeviceAST(NodeVisitor):
     def visit_If(self, node: ast.If) -> object:
         test = node.test
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-            operand = self.visit(test.operand)
+            length = self._host_collection_length(test.operand)
+            operand = length if length is not None else self.visit(test.operand)
             if isinstance(operand, torch.Tensor) and tensor_may_have_many_elements(
                 operand
             ):
@@ -2449,7 +2466,8 @@ class WalkDeviceAST(NodeVisitor):
                 return
             test_proxy = self._trace_not(operand)
         else:
-            test_proxy = self.visit(test)
+            length = self._host_collection_length(test)
+            test_proxy = length if length is not None else self.visit(test)
         if not isinstance(test_proxy, _tracing_ops._symbolic_types):
             body = node.body if test_proxy else node.orelse
             if body:
@@ -2458,7 +2476,8 @@ class WalkDeviceAST(NodeVisitor):
         self._create_if_subgraph(test_proxy, node.body, node.orelse)
 
     def visit_IfExp(self, node: ast.IfExp) -> object:
-        test_proxy = self.visit(node.test)
+        length = self._host_collection_length(node.test)
+        test_proxy = length if length is not None else self.visit(node.test)
         if isinstance(test_proxy, _tracing_ops._symbolic_types):
             raise exc.StatementNotSupported("dynamic conditional expression")
         return self.visit(node.body if test_proxy else node.orelse)
@@ -2618,6 +2637,44 @@ class WalkDeviceAST(NodeVisitor):
             if_graph.branches_outputs.append((name, else_output_index))
 
         return if_graph_idx
+
+    def _identity_operand(self, node: ast.AST) -> object:
+        if isinstance(node, ast.Name) and node.id not in self.scope:
+            assert isinstance(node, ExtendedAST)
+            info = node._type_info
+            if (
+                type(info) in (SequenceType, DictType)
+                and isinstance(info, CollectionType)
+                and info.origin.is_host()
+            ):
+                return info.tree_map(lambda item: item.proxy())
+        return self.visit(node)
+
+    def _host_collection_length(self, node: ast.AST) -> int | torch.SymInt | None:
+        if not isinstance(node, ast.Name) or node.id in self.scope:
+            return None
+        assert isinstance(node, ExtendedAST)
+        info = node._type_info
+        if (
+            type(info) not in (SequenceType, DictType)
+            or not isinstance(info, CollectionType)
+            or not info.contains_approximate_contents()
+            or not info.length_projection_safe
+            or not info.origin.is_host()
+        ):
+            return None
+        if info.contents_exact:
+            # Type propagation folds truth from the outer collection alone;
+            # approximate children must not turn that into a dynamic branch.
+            assert isinstance(info.element_types, (list, tuple, dict))
+            return len(info.element_types)
+        # Read the named host value already produced by the original code.
+        # Do not rerun its comprehension or an arbitrary producing helper.
+        value = CompileEnvironment.current().create_unbacked_symint()
+        HostFunction.current().expr_to_origin[value._sympy_()] = SymbolOrigin(
+            CollectionLengthOrigin(NameOrigin(node.id))
+        )
+        return value
 
     def visit_Name(self, node: ast.Name) -> object:
         if node.id in self.scope:
@@ -2963,6 +3020,14 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(node, ExtendedAST)
         # pyrefly: ignore [missing-attribute]
         func_type_info = node.func._type_info
+        if (
+            isinstance(func_type_info, CallableType)
+            and any(func_type_info.value is builtin for builtin in (len, bool))
+            and len(node.args) == 1
+            and not node.keywords
+            and (length := self._host_collection_length(node.args[0])) is not None
+        ):
+            return length if func_type_info.value is len else length != 0
         builtin_fragment_constructor = isinstance(func_type_info, CallableType) and any(
             func_type_info.value is cls for cls in _BUILTIN_TUNABLE_FRAGMENTS
         )

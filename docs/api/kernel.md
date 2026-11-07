@@ -28,6 +28,30 @@ runtime values: simplifying them algebraically can change ordered IEEE rounding.
 Their conversion to dynamic integer extents may therefore still be unsupported;
 use equivalent integer shape arithmetic when its rounding semantics are intended.
 
+### Host tensor indexing
+
+Host tensor subscripts may contain at most one ellipsis. For example,
+`view = x[..., :4]` selects up to four elements along the last dimension before
+entering a device loop. A repeated ellipsis such as `x[..., ..., :]` raises
+`helion.exc.TypeInferenceError` during binding, before invoking PyTorch indexing.
+
+### Host collection predicates
+
+A named builtin list, tuple, or dictionary created on the host may be tested
+with `if values`, `if not values`, `bool(values)`, or `len(values)` inside a
+device loop. When filtering makes its contents dynamic, Helion passes the actual
+host length to the device; representative elements used during type inference
+do not determine the predicate. The collection is evaluated once by the original
+host code.
+
+Collection values or lengths returned by opaque helpers are rejected when the
+compiler cannot prove their runtime semantics. A filtered generator or a custom
+collection with overridden truth/length methods cannot use this device
+projection. Evaluate its scalar predicate explicitly in supported host code
+instead. Dynamic device conditional expressions (`a if values else b`) remain
+unsupported; use an `if` statement. These cases previously could compile using
+representative contents and produce an incorrect result.
+
 ## Creation and Usage
 
 ### Basic Kernel Creation

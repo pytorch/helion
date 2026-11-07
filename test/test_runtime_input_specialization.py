@@ -1215,7 +1215,7 @@ class TestLayoutProvenance(unittest.TestCase):
         real_input = torch.empty_strided((2, 3), (1, 2))
         origin = NameOrigin("allocation")
 
-        with env:
+        with env, env.use_runtime_arg_values({"x": real_input}):
             fake_input = env.to_fake(real_input, ArgumentOrigin("x"))
             assert isinstance(fake_input, torch.Tensor)
             input_type = TensorType(ArgumentOrigin("x"), fake_input)
@@ -1273,7 +1273,7 @@ class TestLayoutProvenance(unittest.TestCase):
         )
         real_input = torch.empty_strided((2, 3, 4), (12, 4, 1))
 
-        with env:
+        with env, env.use_runtime_arg_values({"x": real_input}):
             fake_input = env.to_fake(real_input, ArgumentOrigin("x"))
             assert isinstance(fake_input, torch.Tensor)
             flattened = fake_input.view(6, 4)

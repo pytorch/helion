@@ -229,6 +229,19 @@ class GetItemOrigin(WrappedOrigin):
 
 
 @dataclasses.dataclass
+class CollectionLengthOrigin(WrappedOrigin):
+    """Length of an already evaluated host collection, not its type examples."""
+
+    def host_str(self) -> str:
+        # The projection is limited to built-in collections. A direct method
+        # call also remains correct when the user has a local named ``len``.
+        return f"({self.value.host_str()}).__len__()"
+
+    def suggest_var_name(self) -> str:
+        return f"{self.value.suggest_var_name()}_length"
+
+
+@dataclasses.dataclass
 class TensorSizeOrigin(WrappedOrigin):
     key: int
 

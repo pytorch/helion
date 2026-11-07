@@ -15,7 +15,7 @@ from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
-import helion.language as hl
+from helion._testing.cute_structural_kernels import _joint_sum
 
 jagged_layer_norm_kernel = import_example("jagged_layer_norm").jagged_layer_norm_kernel
 reference_jagged_layer_norm_pytorch = import_example(
@@ -27,35 +27,6 @@ pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 if TYPE_CHECKING:
     from pathlib import Path
     from types import FunctionType
-
-
-def _joint_sum(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-    rows, columns = x.shape
-    batches = offsets.size(0) - 1
-    out = torch.empty_like(x)
-    source = x.view(-1)
-    dest = out.view(-1)
-    for row in hl.tile(batches):
-        starts = offsets[row]
-        ends = offsets[row.index + 1]
-        lengths = ends - starts
-        total = hl.zeros([row], dtype=torch.float32)
-        for column in hl.tile(columns):
-            partial = hl.zeros([row, column], dtype=torch.float32)
-            for jagged in hl.jagged_tile(lengths):
-                index = (starts[:, None] + jagged.index[None, :])[:, :, None] * columns
-                index = index + column.index[None, None, :]
-                value = hl.load(source, [index])
-                partial = partial + (value * 1.25 + 2).sum(dim=1)
-            total = total + partial.sum(dim=1)
-        scale = total / (lengths.to(torch.float32) * columns)
-        for column in hl.tile(columns):
-            for jagged in hl.jagged_tile(lengths):
-                index = (starts[:, None] + jagged.index[None, :])[:, :, None] * columns
-                index = index + column.index[None, None, :]
-                value = hl.load(source, [index])
-                hl.store(dest, [index], value + scale[:, None, None])
-    return out
 
 
 @pytest.mark.parametrize("columns", [32, 69, 128, 512])
@@ -113,7 +84,7 @@ def test_host_loop_storage_rebinding_preserves_original_loops(
     )
     path = tmp_path / "host_storage_rebinding.py"
     path.write_text(source)
-    namespace = dict(globals())
+    namespace = dict(_joint_sum.__globals__)
     exec(compile(source, str(path), "exec"), namespace)
 
     bodies = []
@@ -181,7 +152,7 @@ def test_rewrite_declines_unproved_reduction_and_memory_contracts(
     source = source.replace(old, new)
     path = tmp_path / "joint_variant.py"
     path.write_text(source)
-    namespace = dict(globals())
+    namespace = dict(_joint_sum.__globals__)
     exec(compile(source, str(path), "exec"), namespace)
 
     def decide(host):

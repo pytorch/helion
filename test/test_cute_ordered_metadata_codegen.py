@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import helion
+from helion._testing.constant_membership import ordered_membership_phases
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_codegen import load_generated_module
@@ -402,3 +403,19 @@ def test_mutable_module_flags_are_not_folded(alias, monkeypatch):
         config = dict(bound.config_spec.default_config()) | {"pid_type": "flat"}
         with pytest.raises(helion.exc.BackendUnsupported, match="pure|shape-only"):
             bound.to_code(helion.Config.from_dict(config))
+
+
+@pytest.mark.parametrize("mode,bias", [("fast", 3), ("missing", 7)])
+def test_ordered_membership_selects_the_actual_branch(mode, bias):
+    with cpu_target():
+        bound = cpu_bind(
+            helion.kernel(
+                ordered_membership_phases, backend="cute", static_shapes=True
+            ),
+            (torch.ones(7), mode),
+        )
+        config = dict(bound.config_spec.default_config()) | {"pid_type": "flat"}
+        source = bound.to_code(helion.Config.from_dict(config))
+    assert f"bias = {bias}" in source
+    assert f"bias = {7 if bias == 3 else 3}" not in source
+    assert len(stage_sources(source)) == 2

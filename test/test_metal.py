@@ -13176,7 +13176,7 @@ class TestMetalWarmCall(unittest.TestCase):
         args = (x.to(DEVICE), 16777217, 1.0)
         code = dynamic_shift.bind(args).to_code()
         self.assertIn("x.stride(0), k, f", code)
-        self.assertIn("_by_value=(5, 6)", code)
+        self.assertIn("_by_value=(4, 5)", code)
         # k binds exactly; ``k * f`` is float arithmetic, so 16777217 rounds
         # to float32 as torch rounds it.
         self._assert_bitwise(dynamic_shift(*args), torch.full_like(x, 16777216.0))

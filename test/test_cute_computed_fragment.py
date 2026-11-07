@@ -16,8 +16,6 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._sympy.functions import FloorDiv
 
-from test.cute_population_contracts import _target
-
 import helion
 from helion import exc
 from helion._compiler.cute.computed_fragment import Fragment
@@ -32,6 +30,8 @@ from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import tcgen05_target as _target
+from helion._testing.cute_fragment_layout import _fragment_singleton_scan
 import helion.language as hl
 from helion.runtime.ref_mode import RefMode
 
@@ -1590,26 +1590,6 @@ def test_fragment_singleton_view_logical_coordinates(
     )
 
 
-@helion.kernel(backend="cute", autotune_effort="none")
-def _fragment_singleton_scan(x: torch.Tensor, steps: hl.constexpr):
-    out = torch.empty_like(x)
-    for row in hl.tile(x.size(0), block_size=1):
-        value = (x[row, :, :] + 1).transpose(-2, -1)
-        value = value.unsqueeze(-1).squeeze(-1)
-        value = value.unsqueeze(1).unsqueeze(-1).squeeze((1, -1))
-        # Restore the logical shape after testing singleton and non-singleton
-        # last axes. Default squeeze also removes the temporary leading one.
-        shape = value.shape
-        value = value.squeeze(-1).reshape(shape)
-        value = value.unsqueeze(0).squeeze().reshape(shape)
-        value = value.unsqueeze(0).squeeze(0)
-        carry = hl.cumsum(value, dim=-1)
-        for _ in range(steps):
-            carry = hl.cumsum(carry.unsqueeze(-2).squeeze(-2) + 1, dim=-1)
-        out[row, :, :] = carry.transpose(-2, -1)
-    return out
-
-
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _fragment_singleton_native_path(x: torch.Tensor):
     out = torch.empty_like(x)
@@ -1617,59 +1597,6 @@ def _fragment_singleton_native_path(x: torch.Tensor):
         value = x[row, column].unsqueeze(-1).squeeze(-1)
         out[row, column] = value + 1
     return out
-
-
-@pytest.mark.parametrize("static_shapes", [False, True])
-@pytest.mark.parametrize("steps", [0, 2])
-def test_fragment_singleton_scan_codegen_and_rebind(static_shapes, steps):
-    kernel = helion.kernel(
-        _fragment_singleton_scan.fn,
-        backend="cute",
-        static_shapes=static_shapes,
-        autotune_effort="none",
-        disable_autotuner_heuristics=True,
-    )
-    shapes = [(3, 5, 7), (3, 9, 3), (3, 1, 4)]
-    inputs = [
-        torch.randn(shape).transpose(-2, -1).contiguous().transpose(-2, -1)
-        for shape in shapes
-    ]
-    with (
-        mock_cuda_unavailable(),
-        _target(),
-        forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch("helion.runtime.kernel.target_device_capability", return_value=(10, 0)),
-        patch(
-            "helion._compiler.compile_environment.target_device_capability",
-            return_value=(10, 0),
-        ),
-        patch("helion.runtime.get_num_sm", return_value=148),
-        patch(
-            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
-        bounds = [kernel.bind((value, steps)) for value in inputs]
-        assert len({id(bound) for bound in bounds}) == len(inputs)
-        for value, bound in zip(inputs, bounds, strict=True):
-            assert (
-                kernel.bind((value.clone(memory_format=torch.preserve_format), steps))
-                is bound
-            )
-            if not static_shapes:
-                assert (
-                    "input_tensor_metadata"
-                    in bound.env.compiler_fact_specialization_facts
-                )
-            code = bound.to_code(bound.config_spec.default_config())
-            assert "fragment_index" in code and "SmemAllocator" in code
-        with ExitStack() as stack:
-            for index, bound in enumerate(bounds):
-                stack.enter_context(patch.object(bound, "_run", return_value=index))
-                stack.enter_context(patch.object(bound, "_prepare_direct_call"))
-            for index, value in enumerate(inputs):
-                assert bounds[0](value, steps) == index
 
 
 def test_fragment_singleton_views_alone_preserve_native_codegen():

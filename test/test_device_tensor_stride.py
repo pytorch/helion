@@ -38,13 +38,23 @@ def test_repeated_host_created_stride_uses_one_symbol_during_both_passes():
             and node.func.attr == "stride"
         ]
         propagated = {call._type_info.value._sympy_() for call in calls}
+        # Output-layout metadata may have another symbol with the same host
+        # origin. Compare the explicit calls against their actual scalar uses.
+        arithmetic_symbols = {
+            node.args[1].args[0]
+            for graph in bound.host_function.device_ir.graphs
+            for node in graph.graph.nodes
+            if node.target is torch.ops.aten.add.Tensor
+            and isinstance(node.args[1], torch.fx.Node)
+        }
         lowered = {
             expr
             for expr, origin in bound.host_function.expr_to_origin.items()
-            if isinstance(origin.origin, TensorStrideOrigin)
+            if str(expr) in arithmetic_symbols
+            and isinstance(origin.origin, TensorStrideOrigin)
             and origin.origin.host_str() == "created.stride(0)"
         }
-        assert len(propagated) == 1
+        assert len(propagated) == len(arithmetic_symbols) == 1
         assert propagated == lowered
         ast.parse(bound.to_code())
 
@@ -194,7 +204,7 @@ def test_unrolled_stride_calls_use_each_receiver_and_dimension():
         }
         assert host_strides == {
             f"values[{index}].stride({axis})" for index in range(2) for axis in range(2)
-        }
+        } | {"out.stride(0)", "out.stride(1)"}
 
 
 def _traced_stride_increment(bound, arguments):
@@ -218,7 +228,8 @@ def _traced_stride_increment(bound, arguments):
 
 @pytest.mark.parametrize("container", [list, tuple])
 def test_aliased_unrolled_strides_preserve_runtime_layout_and_alias_guards(container):
-    x = torch.empty(3, 4)
+    # Both layouts stay outside the canonical-layout specialization.
+    x = torch.empty_strided((3, 4), (12, 2))
     padded = torch.empty_strided(x.shape, (20, 1))
     other = torch.empty_strided(x.shape, (40, 3))
     initial = (container((x, x)),)
@@ -283,7 +294,8 @@ def _nested_alias_stride(values):
 
 
 def test_nested_aliased_field_saved_stride_uses_current_receiver():
-    x = torch.empty(3, 4)
+    # Both layouts stay outside the canonical-layout specialization.
+    x = torch.empty_strided((3, 4), (12, 2))
     padded = torch.empty_strided(x.shape, (20, 1))
     separate_tensor = torch.empty_strided(x.shape, (40, 3))
 
@@ -352,9 +364,13 @@ def test_host_created_stride_preserves_runtime_shape(form):
         for x in (torch.empty(3, 4), torch.empty(5, 7), torch.empty(4, 3).t()):
             current = fn.bind((x, form))
             if bound.settings.backend == "triton":
-                assert current is bound
-            # Other backends may specialize layout or alignment. Validate
-            # whichever normal binding their existing guards select.
+                if x.is_contiguous():
+                    assert current is bound
+                else:
+                    assert current is not bound
+            # Contiguous shapes reuse the canonical-layout proof; a transpose
+            # changes that guard. Stride arithmetic must follow the selected
+            # binding in both cases, independently of alignment specialization.
             current_code = code if current is bound else current.to_code()
             _capture_launch(current_code, fn.name, (x, form))
             created = torch.empty_like(x)

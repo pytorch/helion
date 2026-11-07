@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import copy
 import dataclasses
 import functools
+from itertools import starmap
 import re
 import types
 from typing import TYPE_CHECKING
@@ -57,6 +59,8 @@ from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .host_function import SymbolOrigin
 from .utils import compute_slice_size
+from .utils import host_subscript_geometry
+from .utils import is_basic_host_subscript
 from .variable_origin import AttributeOrigin
 from .variable_origin import GetItemOrigin
 from .variable_origin import GridOrigin
@@ -88,6 +92,16 @@ regexp_allowed_host_ops: re.Pattern[str] = re.compile(
 def _is_symbolic_numeric(value: object) -> bool:
     return isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)) and bool(
         value._sympy_().free_symbols
+    )
+
+
+def _is_discarded_host_result(origin: Origin) -> bool:
+    nodes = ExtendedAST.current()
+    return (
+        origin.is_host()
+        and len(nodes) > 1
+        and isinstance(nodes[-2], ast.Expr)
+        and nodes[-2].value is nodes[-1]
     )
 
 
@@ -402,6 +416,10 @@ class TensorType(TypeInfo):
 
     def __init__(self, origin: Origin, fake_value: torch.Tensor) -> None:
         super().__init__(origin)
+        if origin.is_host() and CompileEnvironment.has_current():
+            env = CompileEnvironment.current()
+            if env.tensor_has_runtime_layout(fake_value):
+                fake_value = env.runtime_layout_tensor(fake_value)
         self.fake_value = fake_value
         if origin.is_device():
             CompileEnvironment.current().add_kernel_tensor_size(
@@ -433,7 +451,12 @@ class TensorType(TypeInfo):
                 )
             return SymBoolType.new_unbacked(origin)
         try:
-            return TypeInfo.from_example(_eval_unary(op, self.fake_value), origin)
+            result = _eval_unary(op, self.fake_value)
+            if origin.is_host():
+                CompileEnvironment.current().propagate_runtime_tensor_layout(
+                    self.fake_value, result
+                )
+            return TypeInfo.from_example(result, origin)
         except exc.Base:
             raise
         except Exception as e:
@@ -598,9 +621,48 @@ class TensorType(TypeInfo):
             try:
                 # Suppress shape guards to prevent symbolic variables from
                 # being specialized to concrete values during type inference.
-                with CompileEnvironment.current().shape_env.suppress_guards():
+                env = CompileEnvironment.current()
+                with env.shape_env.suppress_guards():
+                    index = key.proxy()
+                    if (
+                        isinstance(index, (tuple, list))
+                        and sum(item is Ellipsis for item in index) > 1
+                    ):
+                        raise exc.TypeInferenceError(
+                            "Host tensor indexing supports at most one ellipsis"
+                        )
+
+                    def example_index(item: object) -> object:
+                        if isinstance(item, slice) and isinstance(
+                            item.step, torch.SymInt
+                        ):
+                            # aten.slice takes a concrete step. Passing the
+                            # original SymInt would specialize it through
+                            # __index__; only its example execution needs a hint.
+                            return slice(
+                                item.start, item.stop, env.size_hint(item.step)
+                            )
+                        return item
+
+                    example = index
+                    if is_basic_host_subscript(index):
+                        example = (
+                            tuple(map(example_index, index))
+                            if isinstance(index, tuple)
+                            else example_index(index)
+                        )
                     # pyrefly: ignore [bad-index]
-                    return TypeInfo.from_example(self.fake_value[key.proxy()], origin)
+                    result = self.fake_value[example]
+                    geometry = host_subscript_geometry(self.fake_value, index)
+                    if geometry is not None:
+                        with torch.no_grad():
+                            result = torch.as_strided(result, *geometry)
+                    # Advanced indexing can allocate instead of sharing the
+                    # source storage, so its result needs the same provenance.
+                    env.propagate_runtime_tensor_layout(
+                        (self.fake_value, index), result
+                    )
+                    return TypeInfo.from_example(result, origin)
             except NotImplementedError:
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
@@ -630,12 +692,14 @@ class TensorType(TypeInfo):
                     var=var_name,
                     details=f"rank {self.fake_value.dim()} != {other.fake_value.dim()}",
                 )
-            if self.fake_value.size() != other.fake_value.size():
+            shape = self.fake_value.size()
+            same_shape = shape == other.fake_value.size()
+            if not same_shape:
                 # A static size and the reduction dimension allocated for it
                 # later (e.g. by a ``:`` slice) name the same dim; compare the
                 # shapes in their block-variable form.
                 env = CompileEnvironment.current()
-                shape = env._normalize_shape_to_block_vars([*self.fake_value.size()])
+                shape = env._normalize_shape_to_block_vars([*shape])
                 if shape != env._normalize_shape_to_block_vars(
                     [*other.fake_value.size()]
                 ):
@@ -643,10 +707,43 @@ class TensorType(TypeInfo):
                         var=var_name,
                         details=f"size {self.fake_value.size()} != {other.fake_value.size()}",
                     )
-                return TensorType(other.origin, self.fake_value.new_empty(shape))
-            # TODO(jansel): handle symbolic shapes
-            # TODO(jansel): stride check?
-            return TensorType(other.origin, torch.empty_like(self.fake_value))
+            host = other.origin.is_host()
+            env = CompileEnvironment.current()
+            common_strides = False
+            if host:
+                common_strides = all(
+                    starmap(
+                        env.known_equal,
+                        zip(
+                            self.fake_value.stride(),
+                            other.fake_value.stride(),
+                            strict=True,
+                        ),
+                    )
+                )
+            if common_strides:
+                # empty_like compacts non-dense layouts. Preserve a proven
+                # common stride tuple on fresh storage, without selecting
+                # either branch's alias or origin as the join.
+                merged = torch.empty_strided(
+                    shape,
+                    self.fake_value.stride(),
+                    dtype=self.fake_value.dtype,
+                    device=self.fake_value.device,
+                )
+            elif same_shape:
+                merged = torch.empty_like(self.fake_value)
+            else:
+                merged = self.fake_value.new_empty(shape)
+            if host:
+                if not common_strides:
+                    # A host branch may select different layouts even when
+                    # both inputs have statically known shapes and strides.
+                    env.mark_runtime_tensor_layout(merged)
+                env.propagate_runtime_tensor_layout(
+                    (self.fake_value, other.fake_value), merged
+                )
+            return TensorType(other.origin, merged)
         return super().merge(other, var_name=var_name)
 
     def populate_symbol_origins(self, origin: Origin) -> None:
@@ -662,6 +759,17 @@ class TensorType(TypeInfo):
             if isinstance(size, torch.SymInt):
                 expr = shape_env.simplify(size._sympy_())
                 sub_origin = TensorSizeOrigin(origin, i)
+                if (
+                    expr not in expr_to_origin
+                    or sub_origin.depth() < expr_to_origin[expr].depth()
+                ):
+                    expr_to_origin[expr] = SymbolOrigin(
+                        sub_origin, fake_value=self.fake_value
+                    )
+        for i, stride in enumerate(self.fake_value.stride()):
+            if isinstance(stride, torch.SymInt):
+                expr = shape_env.simplify(stride._sympy_())
+                sub_origin = TensorStrideOrigin(origin, i)
                 if (
                     expr not in expr_to_origin
                     or sub_origin.depth() < expr_to_origin[expr].depth()
@@ -778,10 +886,20 @@ class TensorAttributeType(TypeInfo):
         proxy_kwargs = {k: v.tree_map(_to_proxy) for k, v in kwargs.items()}
         try:
             fn = getattr(self.tensor.fake_value, attr)
-            result = _CheckForIndexCalls.retry_call(fn, proxy_args, proxy_kwargs)
+            with (
+                CompileEnvironment.current().track_runtime_layout_mutations(
+                    (self.tensor.fake_value, proxy_args, proxy_kwargs)
+                )
+                if origin.is_host()
+                else contextlib.nullcontext()
+            ):
+                result = _CheckForIndexCalls.retry_call(fn, proxy_args, proxy_kwargs)
             if origin.is_host():
                 # ``Tensor.new_*`` allocate like the ``torch.*`` factories;
                 # the receiver is the method's first argument.
+                CompileEnvironment.current().propagate_runtime_tensor_layout(
+                    (self.tensor.fake_value, proxy_args, proxy_kwargs), result
+                )
                 CompileEnvironment.current().register_tensor_factory_layout(
                     getattr(torch.Tensor, attr, None),
                     (self.tensor.fake_value, *proxy_args),
@@ -1119,6 +1237,25 @@ class CallableType(LiteralType):
             else:
                 elements = slice(args[0], args[1], args[2])
             return SliceType(origin, elements)
+        if (
+            any(self.value is builtin for builtin in (len, bool))
+            and len(args) == 1
+            and not kwargs
+            and isinstance(args[0], CollectionType)
+            and type(args[0]) in (SequenceType, DictType)
+            and args[0].contains_approximate_contents()
+        ):
+            collection = args[0]
+            if not collection.contents_exact:
+                return (
+                    SymIntType.new_unbacked(origin)
+                    if self.value is len
+                    else SymBoolType.new_unbacked(origin)
+                )
+            if collection.length_projection_safe:
+                # Filtered children do not change the length of a proved
+                # outer builtin collection. Do not inspect their proxies.
+                return LiteralType(origin, self.value(collection.element_types))
         # TODO(jansel): add no-tracing mode
 
         def warn_wrong_device(arg: TypeInfo) -> None:
@@ -1209,10 +1346,20 @@ class CallableType(LiteralType):
                 if env.process_group_name is not None
                 else contextlib.nullcontext(),
             ):
-                result = _CheckForIndexCalls.retry_call(
-                    self.value, proxy_args, proxy_kwargs
-                )
+                # Exit before constructing result provenance: a resized input
+                # must already have its runtime strides if the result aliases it.
+                with (
+                    env.track_runtime_layout_mutations((proxy_args, proxy_kwargs))
+                    if origin.is_host()
+                    else contextlib.nullcontext()
+                ):
+                    result = _CheckForIndexCalls.retry_call(
+                        self.value, proxy_args, proxy_kwargs
+                    )
                 if origin.is_host():
+                    env.propagate_runtime_tensor_layout(
+                        (proxy_args, proxy_kwargs), result
+                    )
                     env.register_tensor_factory_layout(
                         self.value,
                         proxy_args,
@@ -1231,6 +1378,40 @@ class CallableType(LiteralType):
                     # provenance, including a capture aliased by this input.
                     output_origin = args[0].origin
                 output_type = TypeInfo.from_example(result, output_origin)
+                if any(
+                    isinstance(arg, CollectionType)
+                    and arg.contains_approximate_contents()
+                    for arg in (*args, *kwargs.values())
+                ):
+                    if isinstance(output_type, CollectionType):
+                        # Host calls execute with representative proxy elements;
+                        # their result cannot establish exact collection contents.
+                        output_type.mark_approximate_contents(
+                            length_projection_safe=False
+                        )
+                        output_type.length_projection_safe = any(
+                            self.value is builtin
+                            for builtin in (list, tuple, dict, sorted)
+                        )
+                    else:
+                        numeric_type = (
+                            type(output_type)
+                            if isinstance(output_type, NumericType)
+                            else _numeric_types.get(type(result))
+                        )
+                        if _is_discarded_host_result(origin):
+                            # The original host call still executes. Its unused
+                            # representative result cannot affect device code.
+                            output_type = NoType(origin)
+                        elif not origin.is_host() or numeric_type is None:
+                            raise exc.TracedArgNotSupported(
+                                "a non-numeric result from representative collection contents"
+                            )
+                        # The host computes this scalar from the actual collection.
+                        # A fresh symbol passes that value instead of specializing
+                        # the representative result or its symbolic expression.
+                        else:
+                            output_type = numeric_type.new_unbacked(origin)
                 if not any(self.value is cls for cls in _BUILTIN_TUNABLE_FRAGMENTS):
                     if not any(self.value is fn for fn in (tuple, list, dict)):
                         record_opaque_container_result(result)
@@ -1769,10 +1950,6 @@ class CollectionType(TypeInfo):
         list[TypeInfo] | tuple[TypeInfo, ...] | dict[str | int, TypeInfo] | slice
     )
 
-    def membership_container(self) -> object:
-        """Return literal membership operands only when contents are proved."""
-        raise NotImplementedError
-
     def __init__(
         self,
         origin: Origin,
@@ -1781,6 +1958,7 @@ class CollectionType(TypeInfo):
         | dict[str | int, TypeInfo]
         | slice,
         *,
+        contents_exact: bool = True,
         original_value: object = None,
     ) -> None:
         super().__init__(origin)
@@ -1792,6 +1970,60 @@ class CollectionType(TypeInfo):
             if original_value is not None
             else None
         )
+        # An opaque call can return a different collection subclass for the
+        # actual contents. Only proved builtin collections permit a pure
+        # host-length projection into device code.
+        self.length_projection_safe = self._original_identity is None or type(
+            self._original_identity.value
+        ) in (list, tuple, dict)
+        # Comprehension propagation may retain only representative elements.
+        # Those describe element types, not the runtime collection contents.
+        self.contents_exact = contents_exact
+        if not contents_exact:
+            self.mark_approximate_contents()
+
+    def membership_container(self) -> object:
+        """Return literal membership operands only when contents are proved."""
+        raise NotImplementedError
+
+    def _nested_collections(self) -> list[CollectionType]:
+        elements = self.element_types
+        # Slice bounds are scalar; only list/tuple/dict values can contain
+        # another collection.
+        if isinstance(elements, slice):
+            return []
+        children = elements.values() if isinstance(elements, dict) else elements
+        return [child for child in children if isinstance(child, CollectionType)]
+
+    def contains_approximate_contents(self) -> bool:
+        return not self.contents_exact or any(
+            child.contains_approximate_contents()
+            for child in self._nested_collections()
+        )
+
+    def mark_approximate_contents(
+        self, *, length_projection_safe: bool | None = None
+    ) -> None:
+        # Representative contents cannot prove a nested collection's values.
+        self.contents_exact = False
+        if length_projection_safe is not None:
+            self.length_projection_safe = length_projection_safe
+        self.element_types = tree_map_only(
+            CollectionType,
+            lambda child: child.with_approximate_contents(
+                length_projection_safe=length_projection_safe
+            ),
+            self.element_types,
+        )
+
+    def with_approximate_contents(
+        self, *, length_projection_safe: bool | None = None
+    ) -> CollectionType:
+        # Keep origins and subclass metadata while isolating shared children:
+        # extracting an uncertain item must not taint an exact source alias.
+        result = copy.copy(self)
+        result.mark_approximate_contents(length_projection_safe=length_projection_safe)
+        return result
 
     def _preserve_identity(self, proxy: _T) -> _T:
         # Output-spec consumers reconstruct proxies after binding has left its
@@ -1815,6 +2047,8 @@ class CollectionType(TypeInfo):
 
     def propagate_unary(self, op: ast.unaryop, origin: Origin) -> TypeInfo:
         if isinstance(op, ast.Not):
+            if not self.contents_exact:
+                return SymBoolType.new_unbacked(origin)
             return LiteralType(origin, not self.element_types)
         return super().propagate_unary(op, origin)
 
@@ -1836,23 +2070,71 @@ class CollectionType(TypeInfo):
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         try:
+            # A slice with uncertain provenance still supplies representative
+            # bounds for element types, but cannot prove the result's contents.
             literal_key = key.as_literal()
         except NotImplementedError:
             pass
         else:
+            element_key = (
+                0
+                if not self.contents_exact
+                and isinstance(self, SequenceType)
+                and isinstance(literal_key, int)
+                else literal_key
+            )
             try:
                 # pyrefly: ignore [bad-index]
-                result = self.element_types[literal_key]
+                result = self.element_types[element_key]
             except (KeyError, IndexError) as e:
                 raise exc.TypeInferenceError(f"{type(e).__name__}: {e}") from None
             if isinstance(result, TypeInfo):
+                if not self.contents_exact and origin.is_host():
+                    return self._runtime_item(result, origin)
                 return result
             if type(result) is self.python_type:  # sliced!
-                # pyrefly: ignore [bad-argument-type]
-                return type(self)(origin=origin, element_types=result)
+                output = type(self)(
+                    origin=origin,
+                    element_types=result,  # pyrefly: ignore [bad-argument-type]
+                    contents_exact=self.contents_exact
+                    and (not isinstance(key, SliceType) or key.contents_exact),
+                )
+                output.length_projection_safe = self.length_projection_safe
+                return output
         return super().propagate_getitem(key, origin)
 
+    @staticmethod
+    def _runtime_item(item: TypeInfo, origin: Origin) -> TypeInfo:
+        # Each read selects an actual runtime value, not the representative
+        # element's scalar or tensor identity. In particular, positive and
+        # negative indices must not share one unbacked symbol.
+        if isinstance(item, (NumericType, LiteralType)) and item.python_type in (
+            int,
+            float,
+            bool,
+        ):
+            return NumericType.subtype(item.python_type).new_unbacked(origin)
+        if isinstance(item, TensorType):
+            value = item.fake_value
+            env = CompileEnvironment.current()
+            # Keep this selection independent of the representative's storage.
+            # Host allocations derived from it inherit runtime layout metadata.
+            selected = torch.empty_strided(
+                value.size(), value.stride(), dtype=value.dtype, device=value.device
+            )
+            env.mark_runtime_tensor_layout(selected)
+            return TensorType(origin, selected)
+        if isinstance(item, CollectionType):
+            # Nested collections already carry approximate contents. Preserve
+            # their source alias without treating those contents as constants.
+            return item
+        raise exc.TracedArgNotSupported(
+            "a non-numeric result from representative collection contents"
+        )
+
     def truth_value(self) -> bool:
+        if not self.contents_exact:
+            raise NotImplementedError
         return bool(self.element_types)
 
     def tree_map(self, fn: Callable[[TypeInfo], object]) -> object:
@@ -1862,9 +2144,6 @@ class CollectionType(TypeInfo):
 class SequenceType(CollectionType):
     # pyrefly: ignore [bad-override]
     element_types: list[TypeInfo] | tuple[TypeInfo, ...]
-
-    def membership_container(self) -> object:
-        return self.as_literal()
 
     def __str__(self) -> str:
         start, *_, end = repr(self.element_types)
@@ -1879,11 +2158,18 @@ class SequenceType(CollectionType):
         return x
 
     def proxy(self) -> list[object] | tuple[object, ...]:
+        if self.contains_approximate_contents():
+            raise NotImplementedError
         return self._preserve_identity(
             self._maybe_tuple([x.proxy() for x in self.element_types])
         )
 
+    def membership_container(self) -> object:
+        return self.as_literal()
+
     def as_literal(self) -> list[object] | tuple[object, ...]:
+        if not self.contents_exact:
+            raise NotImplementedError
         return self._preserve_identity(
             self._maybe_tuple([x.as_literal() for x in self.element_types])
         )
@@ -1913,6 +2199,8 @@ class SequenceType(CollectionType):
                 raise exc.TypeInferenceError(
                     "Sequence indexing with non-literal index requires all elements to have the same type"
                 )
+            if origin.is_host() and not self.contents_exact:
+                return self._runtime_item(first_type, origin)
             return first_type
 
         return super().propagate_getitem(key, origin)
@@ -1924,11 +2212,14 @@ class SequenceType(CollectionType):
             if not self.element_types:
                 raise exc.TypeInferenceError("Cannot index empty sequence")
             new_elements = [elem.merge(value) for elem in self.element_types]
-            return SequenceType(
+            result = SequenceType(
                 origin=origin,
                 element_types=new_elements,
+                contents_exact=self.contents_exact,
                 original_value=self._original_identity,
             )
+            result.length_projection_safe = self.length_projection_safe
+            return result
         return super().propagate_setitem(key, value, origin)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
@@ -1936,8 +2227,9 @@ class SequenceType(CollectionType):
             self_elements = self.element_types
             other_elements = other.element_types
             if len(self_elements) == len(other_elements):
-                return SequenceType(
+                result = SequenceType(
                     origin=other.origin,
+                    contents_exact=self.contents_exact and other.contents_exact,
                     original_value=self._merged_original(other),
                     element_types=self._maybe_tuple(
                         [
@@ -1946,6 +2238,10 @@ class SequenceType(CollectionType):
                         ]
                     ),
                 )
+                result.length_projection_safe = (
+                    self.length_projection_safe and other.length_projection_safe
+                )
+                return result
         return super().merge(other, var_name=var_name)
 
     def tree_map(
@@ -1960,19 +2256,25 @@ class DictType(CollectionType):
     # pyrefly: ignore [bad-override]
     element_types: dict[str | int, TypeInfo]
 
-    def membership_container(self) -> object:
-        return self.element_types.keys()
-
     def __str__(self) -> str:
         items = ", ".join(f"{k!r}: {v!s}" for k, v in self.element_types.items())
         return f"{type(self).__name__}({{{items}}})"
 
     def proxy(self) -> dict[str | int, object]:
+        if self.contains_approximate_contents():
+            raise NotImplementedError
         return self._preserve_identity(
             {k: v.proxy() for k, v in self.element_types.items()}
         )
 
+    def membership_container(self) -> object:
+        if not self.contents_exact:
+            raise NotImplementedError
+        return self.element_types.keys()
+
     def as_literal(self) -> dict[str | int, object]:
+        if not self.contents_exact:
+            raise NotImplementedError
         return self._preserve_identity(
             {k: v.as_literal() for k, v in self.element_types.items()}
         )
@@ -1990,8 +2292,9 @@ class DictType(CollectionType):
             self_elements = self.element_types
             other_elements = other.element_types
             if set(self_elements.keys()) == set(other_elements.keys()):
-                return type(self)(
+                result = type(self)(
                     origin=other.origin,
+                    contents_exact=self.contents_exact and other.contents_exact,
                     original_value=self._merged_original(other),
                     element_types={
                         key: self_elements[key].merge(
@@ -2000,6 +2303,10 @@ class DictType(CollectionType):
                         for key in self_elements
                     },
                 )
+                result.length_projection_safe = (
+                    self.length_projection_safe and other.length_projection_safe
+                )
+                return result
         return super().merge(other, var_name=var_name)
 
     def tree_map(self, fn: Callable[[TypeInfo], object]) -> dict[str | int, object]:
@@ -2015,7 +2322,8 @@ class ClassType(DictType):
         identity = self._original_identity
         original = identity.value if identity is not None else None
         if (
-            not isinstance(original, tuple)
+            not self.contents_exact
+            or not isinstance(original, tuple)
             or type(original).__contains__ is not tuple.__contains__
         ):
             raise NotImplementedError
@@ -2213,6 +2521,9 @@ class SliceType(CollectionType):
         return slice(self.lower.proxy(), self.upper.proxy(), self.step.proxy())
 
     def as_literal(self) -> slice:
+        # These bounds may be representative. Collection slicing separately
+        # carries contents_exact; literal Python descriptors retain their
+        # existing type-propagation behavior.
         return slice(
             self.lower.as_literal(), self.upper.as_literal(), self.step.as_literal()
         )
@@ -2226,6 +2537,7 @@ class SliceType(CollectionType):
             other_elements = other.element_types
             return SliceType(
                 origin=other.origin,
+                contents_exact=self.contents_exact and other.contents_exact,
                 element_types=slice(
                     self_elements.start.merge(other_elements.start, var_name=var_name),
                     self_elements.stop.merge(other_elements.stop, var_name=var_name),

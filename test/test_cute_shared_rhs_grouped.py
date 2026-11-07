@@ -23,6 +23,7 @@ import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.cute_mma import analyze_tcgen05_grouped_worklist
 from helion._testing import import_example
+from helion._testing.cute_structural_kernels import _offset_mm
 from helion.exc import BackendUnsupported
 import helion.language as hl
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
@@ -42,27 +43,6 @@ if TYPE_CHECKING:
     from typing import Any
 
     from helion.runtime.kernel import BoundKernel
-
-
-def _offset_mm(a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-    m, k = a.shape
-    k2, n = b.shape
-    assert k == k2
-    out = torch.zeros((m, n), dtype=a.dtype, device=a.device)
-    groups = offsets.size(0) - 1
-    for group in hl.grid(groups):
-        start = offsets[group]
-        end = offsets[group + 1]
-        count = end - start
-        if count != 0:
-            for row, column in hl.tile([count, n]):
-                acc = hl.zeros([row, column], dtype=torch.float32)
-                for reduction in hl.tile(k):
-                    x = a[start + row.index, reduction]
-                    y = b[reduction, column]
-                    acc = torch.addmm(acc, x, y)
-                out[start + row.index, column] = acc.to(out.dtype)
-    return out
 
 
 def _explicit_offset_mm(

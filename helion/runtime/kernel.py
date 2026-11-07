@@ -74,6 +74,7 @@ from .._compiler.generate_ast import generate_ast
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.kernel_compiler import KernelCompiler
 from .._compiler.output_header import assert_no_conflicts
+from .._compiler.runtime_tensor_guards import _CanonicalLayoutClassifier
 from .._compiler.variable_origin import ArgumentOrigin
 from .._compiler.variable_origin import BlockSizeOrigin
 from .._dist_utils import _find_process_group_name
@@ -819,6 +820,8 @@ def _evaluate_fast_dispatch_extras(
         else:
             result = extractor(args)
             dispatch = None if _implied_by_exact_metadata(extractor) else extractor
+            if isinstance(dispatch, _RuntimeInputSpecializationExtractor):
+                dispatch = _fast_canonical_metadata_dispatch(dispatch, result, args)
         results.append(result)
         if dispatch is not None:
             per_call.append((index, dispatch))
@@ -868,6 +871,15 @@ def _evaluate_specialization_alias(
     results = tuple(extractor(normalized) for extractor in canonical)
     if not per_call:
         return results, None
+    per_call = tuple(
+        (
+            index,
+            _fast_canonical_metadata_dispatch(extractor, results[index], normalized)
+            if isinstance(extractor, _RuntimeInputSpecializationExtractor)
+            else extractor,
+        )
+        for index, extractor in per_call
+    )
     return results, _SpecializationAliasDispatch(
         alias.trailing_defaults, results, per_call
     )
@@ -878,6 +890,11 @@ def _capture_safe_specialization(
 ) -> bool:
     if isinstance(extractor, PreparedMetadataSpecializationExtractor):
         return True
+    if isinstance(extractor, _RuntimeInputSpecializationExtractor):
+        # This classifier reads only projected tensor layout/size/stride
+        # metadata. Keep its live call; capture safety is not a promise that
+        # eager prepared argument guards imply its result.
+        return type(extractor.classifier) is _CanonicalLayoutClassifier
     if isinstance(extractor, _SpecializationAlias):
         return all(
             _capture_safe_specialization(item)
@@ -904,6 +921,26 @@ class _RuntimeInputSpecializationExtractor:
 
     def __call__(self, args: Sequence[object]) -> Hashable:
         return self.classifier(self.source_values(args))
+
+
+def _fast_canonical_metadata_dispatch(
+    extractor: _RuntimeInputSpecializationExtractor,
+    expected: Hashable,
+    args: Sequence[object],
+) -> Callable[[Sequence[object]], Hashable]:
+    # A fast-schema hit already pins the same container/tensor metadata as
+    # prepared dispatch. Only the typed canonical classifier supplies this
+    # narrow residual-layout predicate; generic classifiers remain live.
+    if type(extractor.classifier) is not _CanonicalLayoutClassifier:
+        return extractor
+    guard = _build_prepared_fact_guard(extractor, expected, tuple(args))
+    if guard is None:
+        return extractor
+
+    def read(values: Sequence[object]) -> Hashable:
+        return expected if guard(values) else extractor(values)
+
+    return read
 
 
 def _partition_prepared_extra_guards(
@@ -3830,10 +3867,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             # two shapes that emit byte-identical source (e.g. compact_worklist, whose
             # token dim enters only via runtime offsets + a data-dependent loop) would
             # share one module.  For backends whose generated module caches shape-
-            # specific state (Backend.requires_shape_specialized_module -- e.g. Pallas,
-            # whose output-meta descriptor / launcher cache / ds-pad decision /
-            # signature lock are all monomorphic) that shared module returns the first
-            # shape's cached output extent for both.  Fold the specialization key into
+            # specific state (Backend.requires_shape_specialized_module -- e.g. Pallas
+            # output-meta descriptors proved fixed by the input specialization),
+            # that shared module returns the first shape's cached output extent for
+            # both. Fold the specialization key into
             # the PyCodeCache key (via ``extra``, leaving the source untouched) so each
             # specialization gets its own module.  Reusing the same key that
             # distinguishes BoundKernels (``self._base_spec_key``, computed from the

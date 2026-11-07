@@ -13,7 +13,6 @@ import pytest
 import torch
 
 from test.test_cute_full_slice_matmul import _bind
-from test.test_cute_materialized_fission import _se_args
 from test.test_cute_materialized_fission import _sources
 
 import helion
@@ -22,6 +21,7 @@ from helion._compiler.cute.state import cute_env_state
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_structural_kernels import _se_args
 
 matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
 squeeze_and_excitation_net_fwd = import_example(
