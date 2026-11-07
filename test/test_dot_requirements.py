@@ -1621,10 +1621,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
         self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
         self.assertTrue(spec._cute_tcgen05_config.paired_pipeline_search_enabled())
+        # The compact paired family's seeds (the 192-wide aligned-N family,
+        # which also fits N=192, seeds its own physical tile and raster).
         seeds = [
             seed
             for seed in spec.compiler_seed_configs
-            if seed.get("tcgen05_cta_group") == "two"
+            if seed.get("tcgen05_cta_group") == "two" and not seed.get("tcgen05_tile_n")
         ]
         self.assertTrue(seeds)
         generation = spec.create_config_generation()
