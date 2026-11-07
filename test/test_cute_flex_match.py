@@ -1572,14 +1572,11 @@ _LSE_STORE = "        lse[tile_b, tile_h, tile_m] = lse_row[None, None, :]\n"
 _RETURN = "    return out, lse\n"
 
 
-def _row_max_kernel(tmp_path: pathlib.Path, value: str, *, lse: bool = True) -> Kernel:
-    """The example kernel storing ``value`` (an expression of the epilogue's
-    names) to a third output ``row_max``; ``lse=False`` drops the LSE
-    store."""
+def _row_max_edits(value: str, *, lse: bool = True) -> list[tuple[str, str]]:
+    """Edits storing ``value`` (an expression of the epilogue's names) to a
+    third output ``row_max``; ``lse=False`` drops the LSE store."""
     store = f"        row_max[tile_b, tile_h, tile_m] = ({value})[None, None, :]\n"
-    return _variant_kernel(
-        tmp_path,
-        "row_max_" + re.sub(r"\W+", "_", value) + ("" if lse else "_no_lse"),
+    return [
         (
             _LSE_ALLOC,
             _LSE_ALLOC + "    row_max = torch.empty((B, H, M), dtype=torch.float32,"
@@ -1589,6 +1586,15 @@ def _row_max_kernel(tmp_path: pathlib.Path, value: str, *, lse: bool = True) -> 
             _LSE_STORE + _RETURN,
             (_LSE_STORE if lse else "") + store + "    return out, lse, row_max\n",
         ),
+    ]
+
+
+def _row_max_kernel(tmp_path: pathlib.Path, value: str, *, lse: bool = True) -> Kernel:
+    """The example kernel with ``_row_max_edits(value, lse=lse)``."""
+    return _variant_kernel(
+        tmp_path,
+        "row_max_" + re.sub(r"\W+", "_", value) + ("" if lse else "_no_lse"),
+        *_row_max_edits(value, lse=lse),
     )
 
 
@@ -1754,3 +1760,116 @@ def test_row_max_store_renders_beside_the_lse(
     assert (
         f"_flash_mRowMax = cute.make_tensor(arg{plan['row_max_idx']}.iterator, " in host
     )
+
+
+# -- the LSE store's units --------------------------------------------------------
+#
+# The running max ``m`` is in the units of the softmax's exp base (base 2 for
+# ``exp2``, natural for ``exp``) and the fused body's LSE is base 2: the plan
+# stores it or ``ln 2`` times it, so the row-sum log must share ``m``'s base.
+
+_LSE_ROW = (
+    "        lse_row = (m_i + torch.log2(l_i)) / log_2_e"
+    "  # Convert back to natural log\n"
+)
+_LN2 = 0.6931471805599453
+
+
+def _exp_softmax_edits() -> list[tuple[str, str]]:
+    """Edits turning the example's ``exp2`` softmax into an ``exp`` one with
+    no trailing ``* log2(e)`` (``m`` in natural units), in both bodies."""
+    edits: list[tuple[str, str]] = []
+    for indent in (" " * 16, " " * 20):
+        edits += [
+            (f"\n{indent}qk *= log_2_e\n", "\n"),
+            (f"\n{indent}p = torch.exp2(qk)\n", f"\n{indent}p = torch.exp(qk)\n"),
+            (
+                f"\n{indent}alpha = torch.exp2(m_i - m_safe)\n",
+                f"\n{indent}alpha = torch.exp(m_i - m_safe)\n",
+            ),
+        ]
+    return edits
+
+
+def _lse_kernel(
+    tmp_path: pathlib.Path,
+    exp_base: str,
+    lse_value: str,
+    row_max: str | None = None,
+) -> Kernel:
+    """The example kernel with an ``exp_base`` softmax storing ``lse_value``
+    (an expression of the epilogue's names) as the LSE and, with
+    ``row_max``, that expression as a row max beside it."""
+    name = f"lse_{exp_base}_" + re.sub(r"\W+", "_", lse_value)
+    edits = [(_LSE_ROW, f"        lse_row = {lse_value}\n")]
+    if exp_base == "exp":
+        edits += _exp_softmax_edits()
+    if row_max is not None:
+        name += "_row_max_" + re.sub(r"\W+", "_", row_max)
+        edits += _row_max_edits(row_max)
+    return _variant_kernel(tmp_path, name, *edits)
+
+
+@pytest.mark.parametrize(
+    ("exp_base", "lse_value", "log_base"),
+    [
+        ("exp2", "m_i + torch.log2(l_i)", "log2"),
+        ("exp2", "(m_i + torch.log2(l_i)) / log_2_e", "log"),
+        ("exp2", f"(m_i + torch.log2(l_i)) * {_LN2}", "log"),
+        ("exp", "m_i + torch.log(l_i)", "log"),
+    ],
+)
+def test_lse_store_units_follow_the_exp_base(
+    tmp_path: pathlib.Path, exp_base: str, lse_value: str, log_base: str
+) -> None:
+    """An LSE whose row-sum log shares ``m``'s base (base 2 for an ``exp2``
+    softmax, possibly converted to natural units, natural for ``exp``)
+    matches with the stored units' scale of the fused log2-unit LSE."""
+    kernel = _lse_kernel(tmp_path, exp_base, lse_value)
+    match = _match_or_fail(_bind(kernel, _causal_args()))
+    assert match.exp_base == exp_base
+    assert (match.lse_name, match.lse_log_base) == ("lse", log_base)
+    assert match.plan.lse_scale == pytest.approx(1.0 if log_base == "log2" else _LN2)
+
+
+@pytest.mark.parametrize(
+    ("exp_base", "lse_value", "log"),
+    [
+        ("exp", "m_i + torch.log2(l_i)", "log2"),
+        ("exp", "(m_i + torch.log2(l_i)) / log_2_e", "log2"),
+        ("exp", f"(m_i + torch.log2(l_i)) * {_LN2}", "log2"),
+        ("exp2", "m_i + torch.log(l_i)", "log"),
+    ],
+)
+def test_lse_store_mixing_units_declines(
+    tmp_path: pathlib.Path, exp_base: str, lse_value: str, log: str
+) -> None:
+    """``m + log2(l)`` beside an ``exp`` softmax's natural-unit ``m`` (or
+    its natural conversion) and ``m + log(l)`` beside an ``exp2`` softmax's
+    base-2 ``m`` add terms of different units, which no scale of the fused
+    log2-unit LSE gives: the generic path keeps the kernel's value."""
+    kernel = _lse_kernel(tmp_path, exp_base, lse_value)
+    reasons: list[str] = []
+    assert _match(_bind(kernel, _causal_args()), reasons) is None
+    assert reasons == [
+        (
+            f"flex: the LSE store to lse adds {log}(l) to the {exp_base} "
+            "softmax's running max (mixed units)"
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "scale"), [("m_i", _LN2), ("m_i / log_2_e", _LN2 * _LN2)]
+)
+def test_row_max_store_scale_follows_the_exp_base(
+    tmp_path: pathlib.Path, value: str, scale: float
+) -> None:
+    """A row max is a plain multiple of ``m``, so an ``exp`` softmax (``m``
+    in natural units, ``ln 2`` times the fused log2-unit row max) matches
+    with that factor folded into ``row_max_scale``."""
+    kernel = _lse_kernel(tmp_path, "exp", "m_i + torch.log(l_i)", value)
+    match = _match_or_fail(_bind(kernel, _causal_args()))
+    assert (match.lse_name, match.row_max_name) == ("lse", "row_max")
+    assert match.plan.lse_scale == pytest.approx(_LN2)
+    assert match.plan.row_max_scale == pytest.approx(scale)
