@@ -103,13 +103,18 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE = 4
 TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE = 1
 TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES = 2
 # Plain 16-bit two-CTA epilogues take the (128, 32) subtile (and the
-# explicit-store family's no-unroll K loop) on this N tile, where CuTe's
+# explicit-store family's no-unroll K loop) on these N tiles, where CuTe's
 # with-source rule would give (128, 64); narrower tiles already get (128, 32)
 # from the default rule. Measured in ``cute_mma`` next to the decision
-# (``tcgen05_plain_narrow_subtile``).
+# (``tcgen05_plain_narrow_subtile``); 192 is the aligned-N physical tile.
 TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N = 256
+TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS = (192, TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N)
 # The C-ring subtile width of that rule: ``(128, 32)`` stages.
 TCGEN05_PLAIN_NARROW_SUBTILE_N = 32
+# Tall 16-bit aligned-N problems (at least this many 256-row pair rows) also
+# seed the grouped persistent raster at these L2 groupings.
+TCGEN05_ALIGNED_N_TALL_PAIR_ROWS = 64
+TCGEN05_ALIGNED_N_TALL_L2_GROUPINGS = (8, 16)
 assert (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
     <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
