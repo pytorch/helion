@@ -306,3 +306,40 @@ def test_model_needs_a_recorded_budget() -> None:
     assert not config.default_layout_smem_fits(
         bm=128, bn=128, bk=64, cluster_m=1, ab_stages=2, c_stages=2, stage_rows=False
     )
+
+
+def test_output_edge_tma_store_admission_charges_the_ring_once() -> None:
+    """The edge plan's (128, 64) C ring next to a 256x256x64 ab=6 ring fits."""
+    config = _config(2, NO_ROWS)
+    tile = {"bm": 256, "bn": 256, "bk": 64, "cluster_m": 2}
+    assert config.output_edge_tma_store_smem_fits({}, ab_stages=6, c_stages=2, **tile)
+    assert not config.output_edge_tma_store_smem_fits(
+        {}, ab_stages=7, c_stages=2, **tile
+    )
+    assert not config.output_edge_tma_store_smem_fits(
+        {}, ab_stages=6, c_stages=4, **tile
+    )
+    # A configured explicit subtile wider than the plan's (128, 32) on a
+    # 128-wide tile is charged at its width: 192 KiB AB + 2 x 16 KiB fits, a
+    # 4-deep ring of the wider subtile does not.
+    narrow = {"bm": 256, "bn": 128, "bk": 64, "cluster_m": 2}
+    explicit = {"tcgen05_layout_overrides_epi_tile_n": 64}
+    assert config.output_edge_tma_store_smem_fits(
+        explicit, ab_stages=8, c_stages=2, **narrow
+    )
+    assert config.output_edge_tma_store_smem_fits({}, ab_stages=8, c_stages=4, **narrow)
+    assert not config.output_edge_tma_store_smem_fits(
+        explicit, ab_stages=8, c_stages=4, **narrow
+    )
+    # Staged ``pre_acc_wait`` rows keep the SIMT epilogue on edge shapes.
+    staged = _config(2, F32_ROW)
+    assert not staged.output_edge_tma_store_smem_fits(
+        {"tcgen05_aux_load_placement": "pre_acc_wait"},
+        ab_stages=6,
+        c_stages=2,
+        **tile,
+    )
+    # Without store facts the ring cannot be sized; the admission fails closed.
+    assert not _config(2, None).output_edge_tma_store_smem_fits(
+        {}, ab_stages=6, c_stages=2, **tile
+    )
