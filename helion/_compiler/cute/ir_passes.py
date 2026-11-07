@@ -58,6 +58,7 @@ def canonicalize_traced_graphs_pass(
     from .elide_split_join import elide_split_join_roundtrips
     from .fold_noop_stores import fold_noop_stores
     from .fuse_mm_accumulation import fuse_mm_accumulation
+    from .fuse_native_s2f6 import fuse_native_s2f6
     from .fuse_u32_multiply import fuse_u32_multiply
     from .mxfp8_mma import expose_mxfp8
     from .scaled_contraction import expose_scaled_contractions
@@ -69,6 +70,10 @@ def canonicalize_traced_graphs_pass(
         fold_noop_stores(graph_info.graph)
         fuse_mm_accumulation(graph_info)
         fuse_u32_multiply(graph_info.graph)
+        fuse_native_s2f6(
+            graph_info.graph,
+            CompileEnvironment.current().config_spec.target_device_capability,
+        )
     expose_mxfp8(device_ir)
     # ``refresh_active_blocks_pass`` needs the count after the core's
     # ``prepare_graph_lowerings``; it crosses that step on the env.
