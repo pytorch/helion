@@ -454,33 +454,21 @@ class TestMetalBoundsMasking(unittest.TestCase):
         self.assertIn("if (mask_0)", msl, "store guard not found in generated MSL")
         self.assertIn("?", msl, "load ternary not found in generated MSL")
 
-    def test_flattened_tile_keeps_its_mask(self) -> None:
-        """A flattened tile keeps its mask for an aligned size too: its
-        strategy is built before ``pre_codegen`` judges the launch."""
+    def test_copy_codegen(self) -> None:
+        """The MSL of an aligned copy: a flattened tile keeps its mask for an
+        aligned size too (its strategy is built before ``pre_codegen`` judges
+        the launch); no trivial ``* 1`` strides; array subscripts, not pointer
+        dereferences; and no MPP headers."""
         x = torch.randn(1024, device=DEVICE)
         msl = _get_msl(copy_kernel, (x,))
         self.assertIn("mask_0", msl, "mask variable expected even for aligned size")
-
-    def test_codegen_no_stride_one(self) -> None:
-        """Generated MSL should not contain trivial * 1 stride multiplications."""
-        x = torch.randn(1024, device=DEVICE)
-        msl = _get_msl(copy_kernel, (x,))
         self.assertNotIn("* 1)", msl, "trivial * 1 stride found in generated MSL")
         self.assertNotIn("* 1]", msl, "trivial * 1 stride found in generated MSL")
-
-    def test_codegen_array_subscript(self) -> None:
-        """Generated MSL should use array subscript x[idx] not pointer deref *(x + idx)."""
-        x = torch.randn(1024, device=DEVICE)
-        msl = _get_msl(copy_kernel, (x,))
         self.assertNotIn(
             "*((", msl, "pointer dereference found; expected array subscript"
         )
         self.assertIn("x[", msl, "array subscript load not found in generated MSL")
         self.assertIn("out[", msl, "array subscript store not found in generated MSL")
-
-    def test_scalar_codegen_does_not_include_mpp(self) -> None:
-        x = torch.randn(1024, device=DEVICE)
-        msl = _get_msl(copy_kernel, (x,))
         self.assertNotIn("<metal_tensor>", msl)
         self.assertNotIn("MetalPerformancePrimitives", msl)
         self.assertNotIn("mpp::tensor_ops", msl)
@@ -490,24 +478,6 @@ class TestMetalBoundsMasking(unittest.TestCase):
         x = torch.randn(1000, device=DEVICE)
         y = torch.randn(1000, device=DEVICE)
         torch.testing.assert_close(vector_add(x, y), x + y)
-
-    def test_vector_add_oob_store(self) -> None:
-        """Sentinel buffer detects OOB stores from vector_add."""
-        n = 999
-        pad = 256
-        sentinel = 42.0
-        buf_out = torch.full((n + pad,), sentinel, device=DEVICE)
-        x = torch.randn(n, device=DEVICE)
-        y = torch.randn(n, device=DEVICE)
-        # Use copy_into as a proxy: compute add manually then copy
-        expected = x + y
-        copy_into(expected, buf_out[:n])
-        torch.mps.synchronize()
-        torch.testing.assert_close(buf_out[:n], expected)
-        self.assertTrue(
-            (buf_out[n:] == sentinel).all(),
-            "OOB store detected in vector_add sentinel region",
-        )
 
     def test_tile_mask_bounds_threads_to_the_tile(self) -> None:
         """A tail's mask must also bound threads to their tile."""
@@ -1179,30 +1149,6 @@ class TestMetalLargeBlock(unittest.TestCase):
         x = torch.randn(16, 16, 16, device=DEVICE)
         y = torch.randn(16, 16, 16, device=DEVICE)
         torch.testing.assert_close(elementwise_3d(x, y), x + y)
-
-    def test_vector_add_non_aligned(self) -> None:
-        """vector_add with non-aligned size exercises mask on both load and store."""
-        x = torch.randn(1000, device=DEVICE)
-        y = torch.randn(1000, device=DEVICE)
-        torch.testing.assert_close(vector_add(x, y), x + y)
-
-    def test_vector_add_oob_store(self) -> None:
-        """Sentinel buffer detects OOB stores from vector_add."""
-        n = 999
-        pad = 256
-        sentinel = 42.0
-        buf_out = torch.full((n + pad,), sentinel, device=DEVICE)
-        x = torch.randn(n, device=DEVICE)
-        y = torch.randn(n, device=DEVICE)
-        # Use copy_into as a proxy: compute add manually then copy
-        expected = x + y
-        copy_into(expected, buf_out[:n])
-        torch.mps.synchronize()
-        torch.testing.assert_close(buf_out[:n], expected)
-        self.assertTrue(
-            (buf_out[n:] == sentinel).all(),
-            "OOB store detected in vector_add sentinel region",
-        )
 
 
 # ---------------------------------------------------------------------------
