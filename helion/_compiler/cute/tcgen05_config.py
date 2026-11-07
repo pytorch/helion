@@ -46,6 +46,7 @@ from .dense_aligned_n import dense_aligned_n_block_m
 from .dense_aligned_n import dense_aligned_n_defaults
 from .dense_aligned_n import dense_aligned_n_plan
 from .dense_aligned_n import dense_aligned_n_sixteen_bit
+from .dense_aligned_n import pair_tile_wave_cost
 from .epilogue_fanout import FANOUT_CONFIG_KEY
 from .epilogue_fanout import FANOUT_MODES
 from .epilogue_fanout import schedule_supported as fanout_schedule_supported
@@ -153,6 +154,7 @@ from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENTS
+from .tcgen05_constants import TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN
 from .tcgen05_constants import TCGEN05_ALIGNED_N_TALL_L2_GROUPINGS
 from .tcgen05_constants import TCGEN05_ALIGNED_N_TALL_PAIR_ROWS
 from .tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
@@ -629,6 +631,13 @@ def _tile_in_fragments(
     )
 
 
+def _stored_block_n(config: Mapping[str, object], bn: int) -> int:
+    """The N extent a tile stores: the aligned-N family's physical width
+    behind its power-of-two carrier ``bn``, else ``bn``."""
+    width = config.get(TILE_N_KEY, 0)
+    return width if type(width) is int and width > 0 else bn
+
+
 class CuteTcgen05Config:
     """CuTe-owned tcgen05 ConfigSpec state and normalization hooks."""
 
@@ -764,6 +773,8 @@ class CuteTcgen05Config:
         # SM count of the bound device (0 when unknown); small-grid seeds use
         # it to decide whether the standard tiling can fill the machine.
         self.device_sm_count: int = 0
+        # (key, widths) of ``_dense_aligned_n_clipped_widths``.
+        self._dense_aligned_n_clipped_cache: tuple[object, frozenset[int]] | None = None
         # The register-MMA GEMM family (``cute_matmul_family="warp_mma"``):
         # admitted by the search plan (static latency-bound problem, one
         # matmul, supported layouts); its 16x8 tiles widen the M / N block
@@ -2198,7 +2209,7 @@ class CuteTcgen05Config:
         fragments = [
             cast("BlockSizeFragment", item._fragment(spec)) for item in spec.block_sizes
         ]
-        pairs_per_wave = max(1, (self.device_sm_count or 148) // 2)
+        pairs_per_wave = self._sm_pairs()
         placement = (
             TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
             if self.aux_loads_on_every_store
@@ -6538,7 +6549,22 @@ class CuteTcgen05Config:
     def _dense_aligned_n_width_plans(
         self, width: int
     ) -> Iterator[tuple[dict[str, Any], DenseAlignedNPlan]]:
-        """Normal-store seed values (in seed order) proved for one physical N."""
+        """Normal-store seed values (in seed order) proved for one physical N;
+        a width with a partial last N tile is seeded (and searched) only where
+        its wave fill pays for the clipped columns."""
+        facts = self.dense_gemm_facts
+        if (
+            facts is not None
+            and facts.shape[1] % width
+            and width not in self._dense_aligned_n_clipped_widths()
+        ):
+            return
+        yield from self._dense_aligned_n_proved_plans(width)
+
+    def _dense_aligned_n_proved_plans(
+        self, width: int
+    ) -> Iterator[tuple[dict[str, Any], DenseAlignedNPlan]]:
+        """``_dense_aligned_n_width_plans`` without the clipped-width choice."""
         facts = self.dense_gemm_facts
         block_m = self._dense_aligned_n_block_m()
         sixteen_bit = self._dense_aligned_n_sixteen_bit()
@@ -6547,16 +6573,16 @@ class CuteTcgen05Config:
             or facts is None
             or block_m is None
             # dense_aligned_n_plan needs a physical width that divides N and
-            # pair-M tiles that divide M (the 16-bit pair: or whole K tiles);
-            # skip widths that cannot qualify.
+            # pair-M tiles that divide M (the 16-bit pair: or whole K tiles,
+            # its TMA store clipping the partial last tiles); skip widths
+            # that cannot qualify.
             or (
-                facts.shape[0] % block_m
+                (facts.shape[0] % block_m or facts.shape[1] % width)
                 and not (
                     sixteen_bit
                     and facts.shape[2] % DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K == 0
                 )
             )
-            or facts.shape[1] % width
             or not _tcgen05_mma_impl_allowed()
         ):
             return
@@ -6579,6 +6605,83 @@ class CuteTcgen05Config:
                 plan = self._dense_aligned_n_plan(values)
                 if plan is not None:
                     yield values, plan
+
+    def _sm_pairs(self) -> int:
+        """CTA pairs of one wave (B200's 148 SMs without a device count)."""
+        return max(1, (self.device_sm_count or 148) // 2)
+
+    def _dense_aligned_n_clipped_widths(self) -> frozenset[int]:
+        """The physical widths with a partial last N tile that beat, by
+        ``TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN`` in wave-quantized pair-tile
+        time, every reference width: the power-of-two pair widths the N
+        bounds admit (the ordinary tiles, clipped or not) and the aligned
+        widths that divide N. Computed once per problem (normalization asks
+        for the widths on every fragment pass).
+
+        A pair tile's time is ``pair_tile_wave_cost``'s.
+        3072x1024x6272 bf16 -> fp32 (C4_15) on 74 SM pairs: one wave of 72
+        256x192 pairs against one of 48 256x256, 22% less (measured 36.4 ->
+        33.9 us between the seeds); 256x224 12% less by the model but measured
+        13% more, so the margin is wide. Small problems keep the narrow
+        power-of-two pairs (1024x1024x512: 256x64 pairs measured 2.8 us
+        against 3.5 us for the clipped 96).
+        """
+        facts = self.dense_gemm_facts
+        bounds = self._dense_aligned_n_bounds()
+        block_m = self._dense_aligned_n_block_m()
+        if (
+            facts is None
+            or bounds is None
+            or block_m is None
+            # FP8 takes whole N tiles only (``dense_aligned_n_plan``)
+            or not self._dense_aligned_n_sixteen_bit()
+        ):
+            return frozenset()
+        # everything the proofs below read
+        key = (
+            facts,
+            self.device_sm_count,
+            bounds,
+            tuple(self.allowed_pid_types),
+            self.search_enabled,
+            _tcgen05_mma_impl_allowed(),
+        )
+        cached = self._dense_aligned_n_clipped_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        m, n, k = facts.shape
+        sm_pairs = self._sm_pairs()
+
+        def cost(width: int) -> float:
+            return pair_tile_wave_cost(
+                m, n, k, width=width, block_m=block_m, sm_pairs=sm_pairs
+            )
+
+        low, high = bounds[1]
+        references = [w for w in (64, 128, TCGEN05_TWO_CTA_BLOCK_N) if low <= w <= high]
+        references.extend(
+            width
+            for width in ALIGNED_N_CHOICES
+            if n % width == 0 and self._dense_aligned_n_proved(width)
+        )
+        widths: frozenset[int] = frozenset()
+        if references:
+            limit = (1.0 - TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN) * min(
+                map(cost, references)
+            )
+            widths = frozenset(
+                width
+                for width in ALIGNED_N_CHOICES
+                if n % width
+                and cost(width) <= limit
+                and self._dense_aligned_n_proved(width)
+            )
+        self._dense_aligned_n_clipped_cache = (key, widths)
+        return widths
+
+    def _dense_aligned_n_proved(self, width: int) -> bool:
+        """Whether one physical width has a proved seed, clipped or not."""
+        return next(self._dense_aligned_n_proved_plans(width), None) is not None
 
     def _dense_aligned_n_widths(self) -> tuple[int, ...]:
         """Physical widths with at least one proved seed, in seed order."""
@@ -6691,10 +6794,11 @@ class CuteTcgen05Config:
         if plan is None:
             raise InvalidConfig(
                 "tcgen05_tile_n requires a proved dense paired GEMM (dense_aligned_n_plan): "
-                "whole N tiles of the physical width, unchanged tile bounds, "
-                "whole M tiles for FP8 or whole K tiles under a 16-bit M tail, "
-                "and for 16-bit a row-major output, a width that is a multiple "
-                "of 32 and an epilogue subtile that divides it"
+                "unchanged tile bounds; for FP8 whole M and N tiles; for 16-bit "
+                "whole K tiles under a partial last M or N tile, a row-major "
+                "output, a width that is a multiple of 32, an epilogue subtile "
+                "that divides it, and a persistent pid type (under a partial "
+                "last K tile only 16-bit outputs restore it)"
             )
         for key, value in self._dense_aligned_n_surface(
             acc_stages=cast("int", config.get("tcgen05_acc_stages", 2)),
@@ -8225,7 +8329,9 @@ class CuteTcgen05Config:
             and cluster_m in (1, 2)
         ):
             return False
-        if not self._static_full_tiles(bm=bm, bn=bn, bk=bk, region=region):
+        if not self._static_full_tiles(
+            bm=bm, bn=_stored_block_n(config, bn), bk=bk, region=region
+        ):
             return False
         if region is not None and (
             # The one-shot flat launch of a chain has no whole-fragment hoist
@@ -8536,7 +8642,9 @@ class CuteTcgen05Config:
         if not all(type(value) is int and value > 0 for value in (bm, bn, bk)):
             return "requires integer tcgen05 block sizes"
         bm, bn, bk = cast("int", bm), cast("int", bn), cast("int", bk)
-        if not self._static_full_tiles(bm=bm, bn=bn, bk=bk, region=region):
+        if not self._static_full_tiles(
+            bm=bm, bn=_stored_block_n(config, bn), bk=bk, region=region
+        ):
             return "requires static full output tiles"
         if cluster_m == 2 and not (
             self._config_is_two_cta_mma(config, bm=bm, cluster_m=2)
@@ -10947,7 +11055,9 @@ class CuteTcgen05Config:
         if not all(type(value) is int and value > 0 for value in (bm, bn, bk)):
             return "requires integer tcgen05 block sizes"
         bm, bn, bk = cast("int", bm), cast("int", bn), cast("int", bk)
-        if not self._static_full_tiles(bm=bm, bn=bn, bk=bk, region=region):
+        if not self._static_full_tiles(
+            bm=bm, bn=_stored_block_n(config, bn), bk=bk, region=region
+        ):
             return "requires static full output tiles"
         if config.get(
             TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY, Tcgen05LayoutStrategy.DEFAULT.value

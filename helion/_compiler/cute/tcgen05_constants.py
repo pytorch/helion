@@ -118,6 +118,19 @@ TCGEN05_PLAIN_NARROW_SUBTILE_N = 32
 # tiles that it would also accept are not admitted).
 TCGEN05_RADIX_STORE_BOX_M = 128
 TCGEN05_RADIX_STORE_BOX_N = TCGEN05_PLAIN_NARROW_SUBTILE_N
+# The wave-quantized pair-tile time that ranks 16-bit pair widths
+# (``CuteTcgen05Config._dense_aligned_n_clipped_widths``; rough constants). The
+# operand stream per K block relative to the MMA time per column: (256 +
+# width) x 64 x 2 B from L2 at ~270 GB/s per SM pair (~20 TB/s over 74)
+# against 2 x 256 x width x 64 FLOP at ~30 TFLOP/s per pair, so tiles narrower
+# than ~200 columns are stream-bound. A tile's fixed prologue and epilogue, in
+# 256-wide K blocks (~2.4k cycles measured at 1000x4096x2880). A width that
+# clips its last N tile must save at least the minimum gain over every
+# reference width: the model ranked a clipped 256x224 tile 12% ahead of
+# 256x256 where it measured 13% behind.
+TCGEN05_PAIR_TILE_STREAM_RATIO = 0.44
+TCGEN05_PAIR_TILE_FIXED_KBLOCKS = 4.5
+TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN = 0.15
 # Tall 16-bit aligned-N problems (at least this many 256-row pair rows) also
 # seed the grouped persistent raster at these L2 groupings.
 TCGEN05_ALIGNED_N_TALL_PAIR_ROWS = 64
