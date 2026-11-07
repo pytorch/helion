@@ -183,8 +183,15 @@ jobs:
     with:
       runner: linux.rocm.gpu.ecosystem.mi350.1
       python-version: "3.12"
-      image: rocm/dev-ubuntu-24.04:7.2.4-complete
-      runtime-version: rocm7.2
+      image: rocm/dev-ubuntu-24.04:10.0.0-full
+      runtime-version: rocm10.0
+      # ROCm 7.2's HIP never resets a stream whose capture was invalidated
+      # (fixed by ROCm/rocm-systems#6509, shipped from ROCm 7.14), so one
+      # failed CUDA-graph capture fails every later capture of the process.
+      # ROCm 10.0 matches the 10.x line of the MI350X test job; its first
+      # torch is 2.15, which has no cu130 wheel, so the NVIDIA jobs stay on
+      # the 2.13 default.
+      torch-version: "2.15.*"
       # Benchmark workloads can retain many ROCm modules; Welford 8192 has
       # exhausted the container's default limit with 1002 open HSACO files.
       container-options: --device=/dev/kfd --device=/dev/dri --ulimit nofile=65536:65536
