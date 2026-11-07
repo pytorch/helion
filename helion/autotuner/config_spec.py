@@ -1461,10 +1461,29 @@ class ConfigSpec:
         # kernels on cute once device-IR analysis proves the fact.
         self.cute_reflatten_candidates: list[FlattenLoopSpec] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
-        unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
+        # A backend may give a fragment to any of its own surface's keys
+        # (built-in or plugin) except Helion's gated generic ones;
+        # _surface_key_fragments adds those to the search.
+        unknown_tunables = (
+            set(self.backend_tunable_fragments)
+            - BACKEND_TUNABLE_KEYS
+            - self._own_surface_keys()
+        )
         if unknown_tunables:
             raise RuntimeError(
                 f"Backend {self.backend_name!r} returned unknown tunables: {sorted(unknown_tunables)!r}"
+            )
+        unsupported = sorted(
+            key
+            for key in self._surface_key_fragments()
+            if not self.backend.supports_config_key(key)
+        )
+        if unsupported:
+            raise RuntimeError(
+                f"Backend {self.backend_name!r} gives fragments to its surface keys "
+                f"{unsupported!r} but its supports_config_key rejects them here; "
+                "return a fragment only for a key it supports (an override must "
+                "defer to super() for its surface keys)"
             )
 
     def rollable_reduction_block_ids(self) -> set[int]:
@@ -2848,6 +2867,25 @@ class ConfigSpec:
                     num_items=0,
                 )
 
+    def _own_surface_keys(self) -> frozenset[str]:
+        """Surface config keys the backend may give fragments to: not the gated
+        generic keys (e.g. ``xcd_remap``), whose fields Helion builds itself."""
+        return self.search_surface.config_keys - _BACKEND_GATED_GENERIC_KEYS
+
+    def _surface_key_fragments(self) -> dict[str, ConfigSpecFragment]:
+        """Fragments the backend returns for its own surface's config keys.
+
+        The generic table already holds every ``tunable_fragments`` entry; a
+        surface's own ``fields()`` table gets these added, replacing its
+        fragment for the same key so the search and ``normalize``'s defaults
+        agree."""
+        own_keys = self._own_surface_keys()
+        return {
+            key: fragment
+            for key, fragment in self.backend_tunable_fragments.items()
+            if key in own_keys
+        }
+
     def _flat_fields(
         self,
     ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
@@ -2865,7 +2903,7 @@ class ConfigSpec:
             self, flash_pipeline_family=_flash_pipeline_family_override
         )
         if surface_fields is not None:
-            return surface_fields
+            return {**surface_fields, **self._surface_key_fragments()}
         fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment] = {
             "block_sizes": self.block_sizes,
         }
