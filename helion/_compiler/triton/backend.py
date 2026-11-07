@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ..autotuner_heuristics.registry import AutotunerHeuristicType
+    from ..compile_environment import CompileEnvironment
     from ..device_function import Argument
 
     InductorOpOverrides = OpsHandler[Any]
@@ -57,6 +58,8 @@ _warned_unavailable_options: set[str] = set()
 
 class TritonBackend(Backend):
     """Triton code generation backend."""
+
+    _pre_inductor_squeeze = True
 
     def scalar_literal_expr(self, value: float | bool) -> str:
         if isinstance(value, float) and value == 0 and math.copysign(1.0, value) < 0:
@@ -737,6 +740,15 @@ class TritonBackend(Backend):
             )
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
+
+    def pdl_capability(self, env: CompileEnvironment) -> tuple[int, int] | None:
+        return env.ptx_capability
+
+    def pdl_instruction(self, operation: str) -> str:
+        return {
+            "wait": "tl.extra.cuda.gdc_wait()",
+            "launch_dependents": "tl.extra.cuda.gdc_launch_dependents()",
+        }[operation]
 
     @staticmethod
     def reserved_launch_param_names() -> frozenset[str]:

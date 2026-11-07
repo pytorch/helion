@@ -3311,14 +3311,16 @@ def build_flex_region(
         aux_tensors.append(tensor)
     scalars: list[object] = []
     scalar_names: list[str] = []
-    for name, kind in host_scalar_specs:
-        scalar_names.append(name)
-        if kind is float:
-            scalars.append(env.shape_env.create_unbacked_symfloat())
-        elif kind is int:
-            scalars.append(env.shape_env.create_unbacked_symint())
-        else:
-            raise _unsupported(f"host scalar {name}: unsupported kind {kind!r}")
+    # These symbols represent caller inputs, not data-dependent results of fn.
+    with env.shape_env.ignore_fresh_unbacked_symbols():
+        for name, kind in host_scalar_specs:
+            scalar_names.append(name)
+            if kind is float:
+                scalars.append(env.shape_env.create_unbacked_symfloat())
+            elif kind is int:
+                scalars.append(env.shape_env.create_unbacked_symint())
+            else:
+                raise _unsupported(f"host scalar {name}: unsupported kind {kind!r}")
     score = torch.empty(128, 128, dtype=torch.float32)
     b = torch.empty(1, 1, dtype=torch.int32)
     h = torch.empty(1, 1, dtype=torch.int32)

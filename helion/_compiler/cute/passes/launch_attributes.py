@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from ...ast_extension import statement_from_string
 from ...source_location import SyntheticLocation
+from ..pdl_ops import has_explicit_pdl
 from ..thread_block_projection import update_launch_block
 from .pdl import pdl_applies
 
@@ -46,7 +47,7 @@ def module_statements(fn: DeviceFunction) -> list[ast.stmt]:
                 f"{fn.name}._helion_cute_cluster_shape = (1, {simt_cluster_n}, 1)"
             )
         )
-    if pdl_applies(fn):
+    if has_explicit_pdl() or pdl_applies(fn):
         # The CuTe launcher reads this attribute to launch the kernel
         # with programmatic dependent launch (``use_pdl``).
         with SyntheticLocation():

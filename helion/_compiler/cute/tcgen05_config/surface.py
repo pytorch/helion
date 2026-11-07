@@ -417,8 +417,11 @@ def restrict_cluster_m_search(
     state: CuteTcgen05Config, choices: tuple[int, ...]
 ) -> None:
     assert choices, "tcgen05_cluster_m search must allow at least one value"
+    if state.config_spec.has_explicit_pdl:
+        choices = (1,)
     state.cluster_m_search_choices = choices
     if 2 not in choices:
+        # Also disables clustered heuristic/FFI seeds after an allow request.
         state.cluster_m2_search_constraints = None
 
 
@@ -496,13 +499,9 @@ def _pdl_searched(state: CuteTcgen05Config) -> bool:
     (``optional_fragments``).  Fission bundles are excluded: their stages
     carry the materialized-operand protocol.
     """
-    capability = state.config_spec.target_device_capability
-    return (
-        state.config_spec.supports_config_key("cute_pdl")
-        and not state.fission_bundle
-        and capability is not None
-        and capability >= (9, 0)
-    )
+    from ..autotune.flash_surface import pdl_searched
+
+    return pdl_searched(state.config_spec) and not state.fission_bundle
 
 
 def split_k_search_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
@@ -1081,7 +1080,9 @@ def optional_fragments(
     # runs its GEMM launches persistent, so the two-CTA coordinates and
     # the per-region ring depths are live there.
     region_chain = region_pid_type_choices(state) is not None
-    two_cta_regions = not flat_only or region_chain
+    two_cta_regions = (not flat_only or region_chain) and not (
+        for_search and state.config_spec.has_explicit_pdl
+    )
     if (
         paired_search
         or state.full_tile_added_pairing
@@ -1102,6 +1103,10 @@ def optional_fragments(
     cluster_n_choices: tuple[int, ...] = (
         (1, 2) if not for_search or cluster_n_searchable else (1,)
     )
+    if for_search and state.config_spec.has_explicit_pdl:
+        # Pin unrestricted defaults and N-edge cluster facts as well as
+        # heuristic-restricted choices: explicit markers own one launch.
+        cluster_m_choices = cluster_n_choices = (1,)
     if for_search:
         # Pinned (``TCGEN05_NUM_EPI_WARPS_SEARCH_CHOICES``) unless the
         # ``restrict_num_epi_warps_search`` seam lifts the gate.
@@ -1226,7 +1231,11 @@ def optional_fragments(
     if not for_search or state.grouped_balanced_workers_supported:
         fragments[TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY] = BooleanFragment()
     if not for_search or state.grouped_prefix_adaptive_n_search_enabled:
-        fragments[TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY] = BooleanFragment()
+        fragments[TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY] = (
+            EnumFragment((False, True), search_choices=(False,))
+            if for_search and state.config_spec.has_explicit_pdl
+            else BooleanFragment()
+        )
     if not for_search or state.grouped_device_mn_swizzle_supported:
         fragments[GROUPED_PANEL_ALTERNATE_KEY] = EnumFragment(
             (None, *TCGEN05_LEGAL_L2_SWIZZLE_SIZES),

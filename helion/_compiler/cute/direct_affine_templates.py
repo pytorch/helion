@@ -41,6 +41,7 @@ from .direct_affine_replay_core import _contains_expression
 from .direct_affine_replay_core import _dump
 from .direct_affine_replay_core import _inferred_bindings
 from .direct_affine_replay_core import _result_snapshots_are_intact
+from .lane_loops.owner_guards import _linear_thread_axis_strides
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -234,11 +235,22 @@ def _feature_reduction_markers_are_supported(
             or marker.reduction_type != "sum"
             or marker.threads_in_group != coordinates.feature.thread_extent
             or marker.group_pre != 1
-            or marker.group_span != 0
-            or marker.group_count != 1
             or marker.group_cluster_n != 1
         ):
             return False
+        if not (marker.group_span == 0 and marker.group_count == 1):
+            # Retaining physical launch coordinates does not change a whole
+            # feature warp's sum. Prove its row groups and modulo-32 owner.
+            try:
+                group_lane_expr = ast.parse(marker.group_lane_expr, mode="eval").body
+            except SyntaxError:
+                return False
+            if (
+                marker.group_span != 32
+                or marker.group_count != coordinates.row.thread_extent
+                or not _physical_feature_warp_lane(group_lane_expr, coordinates.feature)
+            ):
+                return False
         try:
             input_expression = ast.parse(marker.input_name, mode="eval").body
         except SyntaxError:
@@ -1068,7 +1080,7 @@ def _ordinary_ownership_guard(
     expression: ast.expr,
     feature: DirectAffineOrdinaryAxis,
 ) -> bool:
-    return (
+    if (
         isinstance(expression, ast.Compare)
         and len(expression.ops) == 1
         and isinstance(expression.ops[0], ast.Eq)
@@ -1081,6 +1093,47 @@ def _ordinary_ownership_guard(
         and _integer_constant(expression.left.right) == 32
         and isinstance(expression.left.left, ast.expr)
         and _ordinary_lane_expression(expression.left.left, feature)
+    ):
+        return True
+    return (
+        isinstance(expression, ast.Compare)
+        and len(expression.ops) == 1
+        and isinstance(expression.ops[0], ast.Lt)
+        and len(expression.comparators) == 1
+        and isinstance(expression.comparators[0], ast.expr)
+        and _integer_constant(expression.comparators[0]) == 1
+        and isinstance(expression.left, ast.BinOp)
+        and isinstance(expression.left.op, ast.Mod)
+        and isinstance(expression.left.right, ast.expr)
+        and _integer_constant(expression.left.right) == 32
+        and _physical_feature_warp_lane(expression.left.left, feature)
+    )
+
+
+def _physical_feature_warp_lane(
+    expression: ast.expr, feature: DirectAffineOrdinaryAxis
+) -> bool:
+    """Prove a physical lane expression is the feature coordinate modulo 32."""
+    if feature.thread_axis != 0 or feature.thread_extent != 32:
+        return False
+    # The shared coefficient reader trusts generated casts. Here the expression
+    # is a replay proof input: reject unknown calls before using that reader.
+    for node in ast.walk(expression):
+        if isinstance(node, ast.Call):
+            path = call_path_str(node.func)
+            if node.keywords or not (
+                (path in _INTEGER_CASTS and len(node.args) == 1)
+                or (path == "cute.arch.thread_idx" and not node.args)
+            ):
+                return False
+    strides = _linear_thread_axis_strides(expression)
+    return (
+        strides is not None
+        and strides.get(0) == 1
+        and all(
+            axis == 0 or (axis in (1, 2) and stride > 0 and stride % 32 == 0)
+            for axis, stride in strides.items()
+        )
     )
 
 

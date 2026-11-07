@@ -173,6 +173,22 @@ def find_block_size_symbols(
     return block_sizes, non_block_size_symbols
 
 
+def substitute_configured_block_sizes(expr: sympy.Expr, config: Config) -> sympy.Expr:
+    """Substitute only block-size symbols fixed by this config, without hints.
+
+    Runtime size symbols remain symbolic. This also works before the device
+    function's strategies exist, when Metal budgets their thread counts.
+    """
+    env = CompileEnvironment.current()
+    block_symbols, _ = find_block_size_symbols(expr)
+    values = {
+        symbol: sympy.Integer(size)
+        for symbol, block_id in block_symbols.items()
+        if isinstance(size := env.block_sizes[block_id].from_config(config), int)
+    }
+    return expr.xreplace(values)
+
+
 def contains_only_block_size_symbols(expr: sympy.Expr) -> bool:
     """Check if expression contains only block size symbols (no other variables)."""
     _, non_block = find_block_size_symbols(expr)
@@ -1365,18 +1381,12 @@ class DeviceFunction:
             and "wait" not in env.pdl_entry
         ):
             raise exc.PdlStateWithoutWait
-        pdl = {
-            "wait": "tl.extra.cuda.gdc_wait()",
-            "launch_dependents": "tl.extra.cuda.gdc_launch_dependents()",
-        }
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
-                *[statement_from_string(pdl[op]) for op in env.pdl_entry],
                 *scalar_preamble,
                 *self.preamble,
                 *self.body,
-                *[statement_from_string(pdl[op]) for op in env.pdl_exit],
             ],
         )
         body_context = DeviceBodyContext(
@@ -1387,7 +1397,7 @@ class DeviceFunction:
             constexpr_to_inline=constexpr_to_inline,
             wrapper_only_params=wrapper_only_params,
             bounded_cache_request=bounded_cache_request,
-            body_start=len(env.pdl_entry) + len(scalar_preamble) + len(self.preamble),
+            body_start=len(scalar_preamble) + len(self.preamble),
         )
         kernel_body, extra_args = backend.finalize_device_body(
             kernel_body, body_context
@@ -1405,6 +1415,20 @@ class DeviceFunction:
             {k: v[0] for k, v in self._variable_renames.items()},
         )
         trailing = backend.finalize_kernel_def(definition, prefix, body_context)
+        # Explicit entry/exit markers surround the final body: backend schedule
+        # rewrites must neither move the wait past memory nor release earlier
+        # than an explicit exit trigger.
+        definition.body = [
+            *[
+                statement_from_string(backend.pdl_instruction(op))
+                for op in env.pdl_entry
+            ],
+            *definition.body,
+            *[
+                statement_from_string(backend.pdl_instruction(op))
+                for op in env.pdl_exit
+            ],
+        ]
         return [*prefix, definition, *trailing]
 
     def proven_disjoint_tensor_pairs(self) -> set[frozenset[str]]:

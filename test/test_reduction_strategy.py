@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import operator
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
@@ -7,18 +8,21 @@ from unittest.mock import Mock
 from unittest.mock import patch
 
 import pytest
-import sympy
 import torch
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 import helion
+from helion._compiler.compile_environment import BlockSizeInfo
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.compile_environment import LoopSpecBlockSizeSource
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_ir import ReductionLoopGraphInfo
 from helion._compiler.flydsl.backend import FlyDSLBackend
 from helion._compiler.metal.backend import MetalBackend
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._testing import import_example
+from helion.autotuner.config_spec import BlockSizeSpec
+from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import ReductionOnNonTile
 import helion.language as hl
 
@@ -48,28 +52,52 @@ def test_merged_reduction_preserves_backend_thread_coverage(
     # Small merged reductions must not acquire CuTe lanes; larger reductions
     # must retain their backend's thread count instead of being capped at 32.
     backend = backend_type()
-    first, second = sympy.symbols("first second", integer=True, positive=True)
+    shape_env = ShapeEnv()
+    first_var = shape_env.create_unbacked_symint()
+    second_var = shape_env.create_unbacked_symint()
+    first, second = first_var.node.expr, second_var.node.expr
     block_ids = {first: 1, second: 2}
+    config = helion.Config(block_sizes=[tile_size, tile_size])
+    config_spec = ConfigSpec(
+        backend=backend, device=torch.device("cpu"), target_device_capability=None
+    )
+    # The trace hint differs from every selected size, so only actual config
+    # resolution can produce the expected thread coverage below.
+    config_spec.block_sizes.extend(
+        BlockSizeSpec(block_id=block_id, size_hint=64) for block_id in (1, 2)
+    )
+    tile_infos = [
+        BlockSizeInfo(
+            block_id=block_id,
+            size=64,
+            var=var,
+            reduction=False,
+            block_size_source=LoopSpecBlockSizeSource(),
+        )
+        for block_id, var in ((1, first_var), (2, second_var))
+    ]
     env = SimpleNamespace(
         backend=backend,
-        block_sizes=[SimpleNamespace(numel=first * second)],
+        block_sizes=[SimpleNamespace(numel=first * second), *tile_infos],
+        config_spec=config_spec,
         specialize_expr=lambda expr: expr,
-        shape_env=ShapeEnv(),
+        shape_env=shape_env,
         get_block_id=block_ids.get,
+        known_equal=operator.eq,
     )
     graph = Mock(spec=ReductionLoopGraphInfo, block_ids=[0])
     fn = Mock(
         spec=DeviceFunction,
+        config=config,
         block_size_var_cache={},
         tile_strategy=None,
         codegen=SimpleNamespace(codegen_graphs=[graph] if graph_reduction else []),
-        resolved_block_size=Mock(return_value=tile_size),
         new_var=Mock(side_effect=lambda name, **kwargs: name),
     )
     with (
         patch.object(CompileEnvironment, "current", return_value=env),
         patch(
-            "helion._compiler.reduction_strategy.find_block_size_symbols",
+            "helion._compiler.device_function.find_block_size_symbols",
             return_value=(block_ids, set()),
         ),
     ):

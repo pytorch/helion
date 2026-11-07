@@ -899,6 +899,9 @@ class ConfigSpec:
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
+        # Explicit dependency markers fix launch placement independently of
+        # backend scheduling knobs; populated during type propagation.
+        self.has_explicit_pdl = False
         # The backend's contribution to this spec's search surface (keys,
         # fields, normalization phases, seeds); stateless, so one object per
         # backend serves every spec.

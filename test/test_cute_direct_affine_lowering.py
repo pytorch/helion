@@ -716,6 +716,7 @@ def _real_codegen_tensor_metadata(
     )
 
 
+@pytest.mark.cpu_only
 def test_fixed_rank1_t3_real_codegen_reaches_direct_async_emission() -> None:
     from test.test_cute_affine_scan_heuristic import _fake_cute_context
     from test.test_cute_fixed_token_rank1_recurrence import _fixed_rank1

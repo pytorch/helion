@@ -40,6 +40,7 @@ from ..access_regions import block_size_symbol
 from ..access_regions import tile_begin_symbol
 from .barriers import add_thread_barriers
 from .markers import _encloses
+from .markers import required_lane_reduce_owners
 from .placement import distribute_lane_loops
 from .placement import full_nest_inexactness
 from .placement import inexact_nest_error
@@ -104,7 +105,10 @@ def check_lane_loop_nest(state: DeviceLoopState) -> None:
         statement for statement in state.inner_statements if id(statement) not in setup
     ]
     needed, kept_setup, spliced_wrappers = _live_lane_setup(
-        body, state.lane_setup_statements, state.vec_lane_wrappers
+        body,
+        state.lane_setup_statements,
+        state.vec_lane_wrappers,
+        semantic_reads=required_lane_reduce_owners(body),
     )
     live_loops = [
         (lane_var, extent)

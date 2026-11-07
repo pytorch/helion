@@ -1627,6 +1627,8 @@ class Backend(abc.ABC):
         """
         return False
 
+    _pre_inductor_squeeze = False
+
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         """Return a backend-owned lowering that must bypass Inductor IR.
 
@@ -1634,6 +1636,15 @@ class Backend(abc.ABC):
         override this for operations whose Inductor representation cannot be
         consumed by that shared path.
         """
+        if self._pre_inductor_squeeze and node.target in (
+            torch.ops.aten.squeeze.default,
+            torch.ops.aten.squeeze.dims,
+        ):
+            from .aten_lowering import squeeze_lowering
+
+            # These logical views use the traced output shape, like squeeze.dim.
+            # Route them before Inductor creates an unsupported ReinterpretView.
+            return squeeze_lowering
         return None
 
     def argreduce_uses_aten_lowering(self, node: torch.fx.Node) -> bool:
@@ -2040,6 +2051,10 @@ class Backend(abc.ABC):
         qualifies; runs once per strategy, before its first device loop."""
         return None
 
+    def lane_loop_semantic_reads(self, body: list[ast.AST]) -> set[str]:
+        """Lane dependencies carried by backend markers rather than AST names."""
+        return set()
+
     def check_lane_loop_nest(self, state: DeviceLoopState) -> None:
         """Make the lane loop nest a device loop built around its body the
         tile program (redistribute or reject an inexact nest, order the
@@ -2092,14 +2107,22 @@ class Backend(abc.ABC):
         """
         return None
 
+    def pdl_capability(self, env: CompileEnvironment) -> tuple[int, int] | None:
+        """NVIDIA target capability for explicit programmatic launch, if any."""
+        return None
+
+    def pdl_instruction(self, operation: str) -> str:
+        """Render an explicit PDL marker at its validated entry/exit position."""
+        raise exc.BackendUnsupported(self.name, "programmatic dependent launch")
+
     def finalize_device_body(
         self, body: list[ast.stmt], ctx: DeviceBodyContext
     ) -> tuple[list[ast.stmt], list[ast.arg]]:
         """Rewrite the rendered kernel body before variable renaming.
 
         Called by ``DeviceFunction.codegen_function_def`` once every statement
-        of the kernel body (dependent-launch prologue, preambles, body) is
-        rendered and before ``ast_rename`` applies the loop-carried aliases.
+        of the kernel body (preambles and computation, without explicit PDL
+        markers) is rendered and before ``ast_rename`` applies the loop-carried aliases.
         Returns the body and the kernel parameters to append to the signature
         (``ctx.args`` is the signature so far).  Facts for
         ``finalize_kernel_def`` go on ``ctx``.  The default changes nothing.

@@ -146,6 +146,7 @@ from ..config_keys import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from ..config_keys import _cute_chunk_recurrence_config_is_safe
 from ..flash_surface import cute_flash_gated_seed_configs
 from ..flash_surface import cute_flash_seed_configs
+from ..flash_surface import pdl_searched
 from ..search_surface import enable_cute_affine_scan_search
 from ..search_surface import enable_cute_async_load_pipeline
 from ..search_surface import enable_cute_bf16x2_recurrence
@@ -3336,12 +3337,7 @@ def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
     idle (vanilla linear attention forward: 7.45 us per call packed, 4.1
     spread); a tie in isolation, it is searched and preferred among ties.
     """
-    capability = spec.target_device_capability
-    if (
-        spec.supports_config_key("cute_pdl")
-        and capability is not None
-        and capability >= (9, 0)
-    ):
+    if pdl_searched(spec):
         return {"cute_pdl": True, CUTE_PDL_SPREAD_KEY: True}
     return {}
 

@@ -11,6 +11,16 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
+def is_full_slice(value: object) -> bool:
+    """Whether a subscript is the bare ``:`` without bounds or a step."""
+    return (
+        isinstance(value, slice)
+        and value.start is None
+        and value.stop is None
+        and value.step is None
+    )
+
+
 def _min(a: int | torch.SymInt, b: int | torch.SymInt) -> int | torch.SymInt:
     if isinstance(a, int) and isinstance(b, int):
         return min(a, b)

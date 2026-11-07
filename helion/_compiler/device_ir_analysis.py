@@ -1196,6 +1196,11 @@ class GraphAnalysis:
             if isinstance(lowering, ReductionLowering):
                 block_id = getattr(lowering, "block_index", None)
                 if isinstance(block_id, int):
+                    # Codegen gives an untiled registered extent its own
+                    # reduction alias. Facts retain the registered owner: its
+                    # extent is still unknown until a configuration is chosen.
+                    if (owner := env.registered_extent_owner(block_id)) is not None:
+                        block_id = owner
                     reduction_axis_by_node_id[id(node)] = block_id
                     if block_id not in seen_reductions:
                         seen_reductions.add(block_id)
@@ -1532,7 +1537,9 @@ class DeviceIRAnalysis:
             matches = [
                 info.block_id
                 for info in env.block_sizes
-                if info.reduction and next_power_of_2(info.size_hint()) == extent
+                if info.reduction
+                and env.registered_extent_owner(info.block_id) is None
+                and next_power_of_2(info.size_hint()) == extent
             ]
             if len(matches) == 1:
                 return matches[0]

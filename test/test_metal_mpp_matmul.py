@@ -9082,9 +9082,10 @@ class TestMppColonSlices(unittest.TestCase):
         y = torch.randn(72, 40, device=DEVICE, dtype=torch.bfloat16)
         c = torch.randn(48, 40, device=DEVICE)
         staged = (re.escape(_staged_tile(torch.bfloat16)), re.escape("(72 - 0)"))
-        ey = torch.exp(y.cpu().double() * 0.1).to(torch.bfloat16)
+        # Match each authored bfloat16 operation before the FP64 matmul reference.
+        ey = torch.exp(y.cpu() * 0.1).to(torch.bfloat16)
         self._check(colon_staged_rhs, (x, y), None, _mm(x, ey), *staged)
-        ex = torch.exp(x.cpu().double() * 0.1).to(torch.bfloat16)
+        ex = torch.exp(x.cpu() * 0.1).to(torch.bfloat16)
         self._check(
             colon_staged_both,
             (x, y, c),
@@ -9352,7 +9353,7 @@ class TestMppColonSlices(unittest.TestCase):
                 )
         x = torch.randn(48, 72, device=DEVICE, dtype=bf)
         v = torch.randn(72, 128, device=DEVICE, dtype=bf)
-        ex = torch.exp(x.cpu().double() * 0.1).to(bf)
+        ex = torch.exp(x.cpu() * 0.1).to(bf)
         self._check(
             colon_n_staged,
             (x, v),

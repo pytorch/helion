@@ -487,6 +487,15 @@ def _split_feature_reduction_loop(
             call = _find_lane_reduce_call(statement)
             assert call is not None
             set_marker_owner(call, destination_lane)
+            # Template validation proved an ordinary whole-feature warp and
+            # its unique modulo-32 writer. This detached materialization uses
+            # the replacement schedule's lane coordinate, so retain the warp
+            # sum while discarding the source CTA's physical group metadata.
+            call.keywords = [
+                keyword
+                for keyword in call.keywords
+                if keyword.arg not in ("group_span", "group_count", "group_lane_expr")
+            ]
     markers = tuple(
         marker
         for statement in loop.body

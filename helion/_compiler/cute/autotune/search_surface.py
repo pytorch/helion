@@ -1363,6 +1363,12 @@ def _normalize_cute_pdl(
         config.pop(CUTE_PDL_SPREAD_KEY, None)
     elif CUTE_PDL_SPREAD_KEY in config:
         config[CUTE_PDL_SPREAD_KEY] = spread
+    if config_spec.has_explicit_pdl:
+        # Explicit markers own the wait/release; canonicalize all automatic
+        # policies to one identity so search does not retime identical code.
+        config["cute_pdl"] = False
+        config.pop("cute_pdl_release", None)
+        config.pop(CUTE_PDL_SPREAD_KEY, None)
 
 
 def _normalize_cute_tiles_per_block(
@@ -2783,11 +2789,13 @@ def cute_flat_fields(
         )
     if config_spec.cute_materialized_schedule_search_enabled:
         fields["cute_materialized_schedule"] = EnumFragment(
-            choices=config_spec.cute_materialized_schedule_choices
+            choices=config_spec.cute_materialized_schedule_choices,
+            search_choices=("off",) if config_spec.has_explicit_pdl else None,
         )
     if config_spec.cute_materialized_operand_schedule_search_enabled:
         fields["cute_materialized_operand_schedule"] = EnumFragment(
-            choices=("off", "warp_narrow4")
+            choices=("off", "warp_narrow4"),
+            search_choices=("off",) if config_spec.has_explicit_pdl else None,
         )
     if config_spec.cute_fragment_private_scalar_loops_search_enabled:
         fields["cute_fragment_private_scalar_loops"] = BooleanFragment()
@@ -3138,7 +3146,10 @@ def cute_flat_fields(
                     "resident",
                     "bounded",
                     "bounded_layout",
-                )
+                ),
+                search_choices=("scalar", "reload", "resident")
+                if config_spec.has_explicit_pdl
+                else None,
             )
         if config_spec.cute_resident_reduction_blocks:
             fields["cute_reduction_local_tree"] = BooleanFragment()
@@ -3211,10 +3222,16 @@ def cute_flat_fields(
                         (CUTE_MMA_F32_WARP_RAW,)
                         if config_spec.cute_grouped_warp_tf32_available
                         else ()
-                    )
+                    ),
+                    search_choices=(CUTE_MMA_F32_AUTO,)
+                    if config_spec.has_explicit_pdl
+                    else None,
                 )
             if config_spec.cute_grouped_rna_k_choices:
-                fields[GROUPED_RNA_WARPS_KEY] = EnumFragment(choices=GROUPED_RNA_WARPS)
+                fields[GROUPED_RNA_WARPS_KEY] = EnumFragment(
+                    choices=GROUPED_RNA_WARPS,
+                    search_choices=(0,) if config_spec.has_explicit_pdl else None,
+                )
                 fields[GROUPED_RNA_K_KEY] = EnumFragment(
                     choices=config_spec.cute_grouped_rna_k_choices
                 )
@@ -3230,7 +3247,12 @@ def cute_flat_fields(
                         choices=GROUPED_PREFIX_SCANS
                     )
             if config_spec.cute_split_k_cluster_facts is not None:
-                fields[SPLIT_K_SCHEDULE_KEY] = EnumFragment(SPLIT_K_SCHEDULES)
+                fields[SPLIT_K_SCHEDULE_KEY] = EnumFragment(
+                    SPLIT_K_SCHEDULES,
+                    search_choices=("legacy",)
+                    if config_spec.has_explicit_pdl
+                    else None,
+                )
                 fields[SPLIT_K_FINALIZER_KEY] = EnumFragment(FINALIZER_WARPS)
             if config_spec.cute_collective_knobs_enabled:
                 fields["cute_collective_mma"] = BooleanFragment()

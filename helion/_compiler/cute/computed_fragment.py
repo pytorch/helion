@@ -87,11 +87,15 @@ class FragmentOps(GenerateASTFromInductor):
     """Use Inductor's index expressions instead of dropping them as SIMT does."""
 
     def __init__(
-        self, compiler: FragmentCompiler, inputs: dict[str, tuple[Node, Fragment]]
+        self,
+        compiler: FragmentCompiler,
+        inputs: dict[str, tuple[Node, Fragment]],
+        input_layouts: dict[str, tuple[list[sympy.Expr], list[sympy.Expr]]],
     ) -> None:
         super().__init__(compiler.cg, {})
         self.compiler = compiler
         self.inputs = inputs
+        self.input_layouts = input_layouts
 
     def load(self, name: str, index: sympy.Expr) -> str:
         node, value = self.inputs[name]
@@ -99,9 +103,15 @@ class FragmentOps(GenerateASTFromInductor):
         if not isinstance(fake, torch.Tensor):
             return self._lift(expr_from_string(value.read(())))
         assert isinstance(fake, torch.Tensor)
-        # Inductor indexes the fake input's physical layout, including its
-        # transposes and broadcasts. Recover coordinates in that same layout.
-        strides = self.compiler.shape(fake.stride())
+        # The inner function indexes the layout saved when it was lowered.
+        # A later _mask_to can replace that input with a contiguous fake value;
+        # its logical coordinates remain the same, but its strides do not.
+        # Buffers synthesized within a multi-buffer lowering have no saved
+        # input layout; their current fake value describes that new buffer.
+        layout = self.input_layouts.get(name)
+        strides = self.compiler.shape(
+            layout[1] if layout is not None else fake.stride()
+        )
         indices = self.direct_coordinates(index, strides, value.shape)
         if indices is None:
             indices = ["0"] * len(value.shape)
@@ -269,7 +279,9 @@ class FragmentCompiler(
                     node.meta["location"],
                     V.set_current_node(node),
                     install_inductor_kernel_handlers(self.cg, {}),
-                    V.set_ops_handler(FragmentOps(self, lookup)),
+                    V.set_ops_handler(
+                        FragmentOps(self, lookup, lowering.input_layouts)
+                    ),
                 ):
                     indices = [
                         sympy.Symbol(f"i{i}")
@@ -2104,6 +2116,19 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                 ranges = [*ranges, *lowering.buffer.data.reduction_ranges]
             if any(compiler.static_extent(dim) is None for dim in ranges):
                 return decline()
+            # Captured placeholders do not invoke their producer's inner function.
+            if node.op != "call_function":
+                continue
+            inputs: list[Node] = []
+            map_arg(
+                (node.args, {**node.kwargs, "_extra_deps": None}),
+                inputs.append,
+            )
+            input_layouts = {
+                source: lowering.input_layouts[name]
+                for name, source in zip(lowering.input_names, inputs, strict=True)
+                if name in lowering.input_layouts
+            }
             for source in node.all_input_nodes:
                 value = source.meta.get("val")
                 if not isinstance(value, torch.Tensor):
@@ -2114,10 +2139,15 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                         continue
                     return decline()
                 shape = tuple(compiler.static_extent(dim) for dim in value.shape)
-                strides = tuple(compiler.static_extent(dim) for dim in value.stride())
-                if any(dim is None for dim in (*shape, *strides)):
-                    # Ordinary lowering can retain host constexpr dimensions.
-                    # This owner requires proved capacities and coordinate strides.
+                layout = input_layouts.get(source)
+                index_strides = layout[1] if layout is not None else value.stride()
+                strides = tuple(compiler.static_extent(dim) for dim in index_strides)
+                if len(shape) != len(strides) or any(
+                    dim is None for dim in (*shape, *strides)
+                ):
+                    # Saved strides decode the inner function's index, but loads
+                    # address the current fragment shape. Their ranks must agree.
+                    # This owner also requires static capacities and strides.
                     return decline()
                 span = 1
                 for stride, size in sorted(

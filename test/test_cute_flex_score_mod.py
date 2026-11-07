@@ -2629,6 +2629,44 @@ class TestCuteFlexScoreMod(TestCase):
         self.assertIn("cutlass.Float32(_flash_scale)", code.chunk_body)
         self.assertIn("cutlass.Float32(_flash_hs0)", code.chunk_body)
 
+    def test_host_example_scalars_preserve_result_bindings(self) -> None:
+        def dynamic_result(score, b, h, q_idx, kv_idx, prefix):
+            return torch.nonzero(score > prefix)
+
+        # Stop after the real make_fx trace: nonzero is outside the supported
+        # score-hook operations, but its data-dependent result must still bind
+        # a fresh symbol before region lowering checks that operation.
+        class Traced(Exception):
+            pass
+
+        graphs: list[torch.fx.Graph] = []
+
+        def capture(graph: torch.fx.Graph) -> None:
+            graphs.append(graph)
+            raise Traced
+
+        with (
+            _environment(),
+            patch(
+                "helion._compiler.cute.flash_score_mod._ensure_lowerings",
+                side_effect=capture,
+            ),
+            self.assertRaises(Traced),
+        ):
+            build_flex_region(dynamic_result, host_scalar_specs=(("prefix", int),))
+        self.assertEqual(len(graphs), 1)
+        graph = graphs[0]
+        result = next(
+            node
+            for node in graph.nodes
+            if node.target is torch.ops.aten.nonzero.default
+        )
+        symbol = result.meta["val"].shape[0]._sympy_()
+        self.assertIn(symbol, result.meta["unbacked_bindings"])
+        prefix = list(graph.find_nodes(op="placeholder"))[-1]
+        self.assertIsInstance(prefix.meta["val"], torch.SymInt)
+        self.assertNotIn("unbacked_bindings", prefix.meta)
+
     def test_matcher_copied_load_sources(self) -> None:
         """A region may keep the ``_host_tensor`` source node of a copied load
         (with ``meta["flex_source_name"]``) instead of an aux placeholder."""
