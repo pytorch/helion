@@ -181,6 +181,7 @@ from .tcgen05_constants import TCGEN05_CLC_QUERY_PACING_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CLC_QUERY_PACING_TILE
 from .tcgen05_constants import TCGEN05_CLC_QUERY_PACINGS
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
@@ -779,6 +780,10 @@ class CuteTcgen05Config:
         self.fission_bundle: bool = False
         self.tcgen05_min_search_m: int = 64
         self.tcgen05_min_search_n: int = 8
+        # A 16-bit output-edge GEMM (ragged M or N, K whole) admitted to the
+        # persistent and CtaGroup.TWO schedules; persistent cluster_m=1 runs
+        # whole tiles only, so its partial-tile samples are flattened.
+        self.output_edge_persistent_admitted: bool = False
         # Block id of the leading passthrough (batch) axis, when any.
         self.matmul_leading_block_id: int | None = None
 
@@ -2539,6 +2544,29 @@ class CuteTcgen05Config:
                                             TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
                                         ] = aux_mode
                                     seeds.append(seed)
+                                    if (
+                                        cluster_n == 2
+                                        and len(self.config_spec.l2_groupings) == 1
+                                    ):
+                                        # The same twin on a grouped raster: the
+                                        # co-resident 2x2 wave then sweeps a band
+                                        # of pair rows across the cluster-N
+                                        # columns while those A rows are still
+                                        # in L2, instead of re-streaming A once
+                                        # per cluster-N column (bf16
+                                        # 16384x1024x4096: 0.91 -> 0.99 of
+                                        # cuBLAS, whose 2x2 nvjet tile it now
+                                        # matches).
+                                        seeds.append(
+                                            Config.from_dict(
+                                                {
+                                                    **seed.config,
+                                                    "l2_groupings": [
+                                                        TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
+                                                    ],
+                                                }
+                                            )
+                                        )
         return seeds
 
     def _small_grid_seed_configs(self) -> list[Config]:
@@ -4088,6 +4116,12 @@ class CuteTcgen05Config:
         bk = self.full_tile_direct_entry_seed_bk()
         if bk is None:
             return False
+        # The flat-role coordinates and the FFI launch validator assume whole
+        # 256x256 tiles; output-edge shapes reach CtaGroup.TWO search too.
+        if not self._static_full_tiles(
+            bm=TCGEN05_TWO_CTA_BLOCK_M, bn=TCGEN05_TWO_CTA_BLOCK_N, bk=bk
+        ):
+            return False
         if not tcgen05_direct_entry_stage_tuple_allowed(
             bk=bk, ab_stage_count=3, c_stage_count=2
         ):
@@ -5081,7 +5115,9 @@ class CuteTcgen05Config:
                 # 934 vs 898; fp16 16384^3 899 vs 881).
                 clc_n2_seed_config: dict[str, Any] = dict(plain_clc_seed.config)
                 clc_n2_seed_config["tcgen05_cluster_n"] = 2
-                clc_n2_seed_config["l2_groupings"] = [8]
+                clc_n2_seed_config["l2_groupings"] = [
+                    TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
+                ]
                 seeds.append(Config(**clc_n2_seed_config))
         # An expanded K ceiling must not evict earlier/default geometries'
         # pipeline/aux placement. Rebuild each family at each K tile so its
@@ -5096,7 +5132,7 @@ class CuteTcgen05Config:
                 if alternate_n2 is not None:
                     clc_n2 = dict(alternate_clc.config)
                     clc_n2["tcgen05_cluster_n"] = 2
-                    clc_n2["l2_groupings"] = [8]
+                    clc_n2["l2_groupings"] = [TCGEN05_CLUSTER_N2_SEED_L2_GROUPING]
                     seeds.append(Config.from_dict(clc_n2))
         plain_m_pair_seed = self._plain_m_pair_seed_config()
         if plain_m_pair_seed is not None:
@@ -9938,7 +9974,19 @@ class CuteTcgen05Config:
             return
         bm = block_sizes[m_index]
         if isinstance(bm, int) and not isinstance(bm, bool):
-            block_sizes[m_index] = min(bm, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+            block_sizes[m_index] = bm = min(bm, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+        bn, bk = block_sizes[n_index], block_sizes[k_index]
+        if (
+            self.output_edge_persistent_admitted
+            and isinstance(bm, int)
+            and isinstance(bn, int)
+            and isinstance(bk, int)
+            and not self._static_full_tiles(bm=bm, bn=bn, bk=bk)
+        ):
+            # The output-edge admission's persistent schedules belong to its
+            # CtaGroup.TWO pairs; one-CTA persistent kernels run whole tiles
+            # only (the host multi-tile guard), so partial tiles go flat.
+            config["pid_type"] = "flat"
 
     def restrict_num_epi_warps_search(self, choices: tuple[int, ...]) -> None:
         assert choices, "tcgen05_num_epi_warps search must allow at least one value"
