@@ -189,6 +189,7 @@ jobs:
       # exhausted the container's default limit with 1002 open HSACO files.
       container-options: --device=/dev/kfd --device=/dev/dri --ulimit nofile=65536:65536
       alias: mi350x
+      rocm-gpu: ${{ strategy.job-index }}
       kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
       custom-args: ${{ github.event.inputs.custom_args }}
