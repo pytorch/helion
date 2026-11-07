@@ -35,6 +35,7 @@ _EXPECTED_ALL = [
     "Argument",
     "BACKEND_API_VERSION",
     "Backend",
+    "BackendSearchSurface",
     "BackendState",
     "BlockSizeSpec",
     "BoundKernel",
@@ -124,6 +125,7 @@ _BACKEND_HOOKS = {
     "launches_surplus_tile_threads": "(self) -> 'bool'",
     "launcher_keyword_args": "(self, config: 'Config', *, has_barrier: 'bool') -> 'list[str]'",
     "supports_config_key": "(self, key: 'str') -> 'bool'",
+    "config_spec_extension": "(self) -> 'BackendSearchSurface'",
     "tunable_fragments": "(self) -> 'dict[str, ConfigSpecFragment]'",
     "supports_precompile": "(self) -> 'bool'",
     "adjust_block_size_constraints": "(self, block_specs: 'list[object]', ndim: 'int', block_sizes: 'list[object] | None' = None, kernel_tensor_sizes: 'dict[tuple[object, ...], int] | None' = None, min_element_bits: 'int' = 32) -> 'None'",
@@ -288,6 +290,13 @@ class TestBackendApiSurface(unittest.TestCase):
         for name, expected in _BACKEND_HOOKS.items():
             with self.subTest(name=name):
                 self.assertEqual(_signature(backend_api.Backend, name), expected)
+
+    def test_surface_hook_signatures(self) -> None:
+        # The BackendSearchSurface members the docs cover.
+        self.assertEqual(
+            _signature(backend_api.BackendSearchSurface, "fingerprint_extra"),
+            "(self, config_spec: 'ConfigSpec') -> 'object | None'",
+        )
 
     def test_strategy_hook_signatures(self) -> None:
         for qualname, expected in _STRATEGY_HOOKS.items():

@@ -47,9 +47,22 @@ other attributes of the classes listed here, may change without notice.
    `reduction_block_size_is_inlined_constexpr`,
    `launches_surplus_tile_threads`;
    `launcher_keyword_args`;
-   `supports_config_key`, `tunable_fragments`, `supports_precompile`,
-   `adjust_block_size_constraints`, `autotune`,
+   `supports_config_key`, `config_spec_extension`, `tunable_fragments`,
+   `supports_precompile`, `adjust_block_size_constraints`, `autotune`,
    `get_do_bench`, `get_interleaved_bench`.
+   `config_spec_extension` returns a module-level `BackendSearchSurface`
+   whose `config_keys` are the backend's own autotuner keys. A key is searched
+   when `tunable_fragments` gives it a fragment (that fragment also replaces
+   one the surface's own `fields()` table has for the key; as for built-in
+   tunables, `normalize` fills in its default but does not check a given value);
+   `supports_config_key` overrides must defer to `super()` for these keys.
+   Registering raises `ValueError` if the surface declares a generic key such
+   as `num_warps`. The surface's `fingerprint_extra(config_spec)` returns extra
+   identity for the autotune cache (e.g. the plugin's package version): return
+   a value whose `repr` is the same in every process and host, or `None` (the
+   default, which leaves cache keys unchanged). A changed value makes cached
+   configs miss, so an upgraded plugin re-tunes; it also stops older results
+   from seeding the new search.
    The autotuner times candidates with `get_do_bench()` (single config) and
    `get_interleaved_bench()` (candidates compared side by side); returning
    `None` keeps Helion's GPU-event timers. A returned timer is called like
