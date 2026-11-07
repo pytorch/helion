@@ -651,3 +651,40 @@ def test_l2_resident_regime_batches_without_a_flush_graph(monkeypatch) -> None:
     assert [(flush_only, calls) for flush_only, calls, _ in seen] == [(False, 16)]
     assert isinstance(median, float)
     assert 0 < median < 0.05
+
+
+@pytest.mark.skipif(DEVICE.type != "cuda", reason="requires a GPU")
+@pytest.mark.parametrize("hip", [True, False])
+def test_do_bench_drains_the_launch_queue_on_hip(monkeypatch, hip: bool) -> None:
+    """HIP segfaults once tens of thousands of launches are queued, so on ROCm
+    do_bench synchronizes every ``_HIP_MAX_QUEUED_CALLS`` calls of its warm-up
+    and timed loops (each loop counts its own, so the end of the warm-up and the
+    start of the timing queue under twice that); elsewhere those loops never
+    wait on the device."""
+    monkeypatch.delenv("HELION_BENCHMARK_CUDAGRAPH", raising=False)
+    monkeypatch.setattr(torch.version, "hip", "7.2" if hip else None)
+    monkeypatch.setattr(benchmarking, "_HIP_MAX_QUEUED_CALLS", 10)
+    trace: list[str] = []
+    synchronize = torch.cuda.synchronize
+
+    def traced_synchronize(*args: object, **kwargs: object) -> None:
+        trace.append("sync")
+        synchronize(*args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "synchronize", traced_synchronize)
+    x = torch.zeros(1024, device=DEVICE)
+
+    def fn() -> None:
+        trace.append("call")
+        x.add_(1)
+
+    benchmarking.do_bench(fn, warmup=20, rep=20, l2_flush_mode="off")
+    longest = max(
+        len(run)
+        for run in "".join("c" if event == "call" else " " for event in trace).split()
+    )
+    assert trace.count("call") > 100
+    if hip:
+        assert longest < 2 * 10
+    else:
+        assert longest > 2 * 10
