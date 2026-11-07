@@ -109,7 +109,7 @@ def test_physical_operands_and_column_major_output_roundtrip(
     assert ab["ab_stage_count"] == _DEPTHS[index]
     assert output["c_stage_count"] == 2
     assert output["d_column_major"] is True
-    assert "make_tma_umma_pipeline(" in source
+    assert "PipelineTmaUmma.create" in source or "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
     assert "CtaGroup.TWO" in source
     assert "LayoutEnum.COL_MAJOR" in source
@@ -340,7 +340,10 @@ def test_early_mma_selection_receives_already_physical_tiles(
 def test_column_major_acc1_pipeline_releases_after_last_tmem_load(index: int) -> None:
     bound = scaled_mm_column_major._bind_isolated(column_major_args())
     source = bound.to_code(_config(index, tcgen05_acc_stages=1))
-    assert "make_umma_async_pipeline(num_stages=1," in source
+    assert (
+        "PipelineUmmaAsync.create(num_stages=1," in source
+        or "make_umma_async_pipeline(num_stages=1," in source
+    )
     assert (
         "tcgen05_acc_pipeline_barriers = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(2))"
         in source
