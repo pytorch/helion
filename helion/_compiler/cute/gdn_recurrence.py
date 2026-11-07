@@ -75,6 +75,7 @@ from .gdn_recurrence_geometry import gdn_stage_choices
 from .gdn_recurrence_geometry import gdn_state_replicas
 from .gdn_recurrence_geometry import gdn_tmem_layout
 from .gdn_recurrence_geometry import gdn_token_group_choices
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -907,7 +908,8 @@ def codegen_gdn_recurrence(cg: GenerateAST) -> bool:
     k, w, u, g, h = names
     _emit_module_imports(cg)
     geometry = plan.geometry
-    cg.cute_wrapper_plans.append(
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(
         {
             "kind": GDN_RECURRENCE_KIND,
             "k_name": k,
@@ -940,7 +942,7 @@ def codegen_gdn_recurrence(cg: GenerateAST) -> bool:
     df.placeholder_args.update(names)
     df.preamble = []
     df.body = [ast.Pass()]
-    cg.cute_uses_matmul = True
+    codegen_state.declare_matmul()
     return True
 
 

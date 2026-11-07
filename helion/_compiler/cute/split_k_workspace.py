@@ -47,6 +47,7 @@ from .split_k_workspace_config import PARTITIONS_KEY
 from .split_k_workspace_config import STAGES_KEY
 from .split_k_workspace_config import WORKSPACE_CONFIG_KEYS as WORKSPACE_CONFIG_KEYS
 from .split_k_workspace_config import WORKSPACE_KEY as WORKSPACE_KEY
+from .state import cute_env_state
 
 if TYPE_CHECKING:
     from torch.fx import Node
@@ -240,7 +241,8 @@ def _getitem(node: object, source: Node, index: int, matched: set[Node]) -> bool
 
 
 def _fresh_zero_output(host: HostFunction, name: str, env: CompileEnvironment) -> bool:
-    if name not in env.cute_half_atomic_output_promotions and name not in (
+    promotions = cute_env_state(env).half_atomic_output_promotions
+    if name not in promotions and name not in (
         fresh_half_atomic_outputs(host.body, {name: torch.float32})
     ):
         return False
@@ -275,7 +277,7 @@ def _fresh_zero_output(host: HostFunction, name: str, env: CompileEnvironment) -
             and parent.attr == "to"
             and isinstance(call := parents[id(parent)], ast.Call)
             and isinstance(parents[id(call)], ast.Return)
-            and name in env.cute_half_atomic_output_promotions
+            and name in promotions
         ):
             continue
         if (
@@ -414,11 +416,12 @@ def analyze_split_k_reduction(
 ) -> SplitKWorkspaceProof | None:
     """Use typed graph identities, never source names or sample shape hints."""
     host = ir.host_function
+    env_state = cute_env_state(env)
     if (
         env.backend_name != "cute"
         or host is None
         or env._is_distributed
-        or env.cute_fission_plan is not None
+        or env_state.fission_plan is not None
         or len(ir.root_ids) != 1
         or len(ir.grid_block_ids[0]) != 3
         or env.config_spec.target_device_capability is None
@@ -655,7 +658,9 @@ def analyze_split_k_reduction(
     if chunk is None:
         return None
     returns = [stmt for stmt in host.body if isinstance(stmt, ast.Return)]
-    output_dtype = env.cute_half_atomic_output_promotions.get(output_name, output.dtype)
+    output_dtype = env_state.half_atomic_output_promotions.get(
+        output_name, output.dtype
+    )
     expected_return = (
         output_name
         if output_dtype is output.dtype
@@ -787,7 +792,7 @@ def analyze_split_k_store_reduction(
         env.backend_name != "cute"
         or host is None
         or env._is_distributed
-        or env.cute_fission_plan is not None
+        or cute_env_state(env).fission_plan is not None
         or len(ir.root_ids) != 1
         or len(ir.grid_block_ids[0]) != 2
         or env.config_spec.target_device_capability is None

@@ -23,6 +23,7 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.mma_support import CuteMmaSupport
 from helion._compiler.cute.promote_output_axis import _access_tensor
+from helion._compiler.cute.state import cute_env_state
 from helion._compiler.cute.target_facts import TargetFacts
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import cpu_render_target
@@ -592,7 +593,7 @@ def test_fission_gives_each_stage_independent_axis_and_config_slots(
     bound = _bind(
         squeeze_and_excitation_net_fwd, *_se_args(), static_shapes=static_shapes
     )
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     ir = bound.host_function.device_ir
     assert ir.grid_block_ids == [[0, 1], [3, 4]]
     assert [
@@ -727,7 +728,7 @@ def test_cpu_reference_preserves_materialization_with_independent_tiles(
 ) -> None:
     args = _se_args(shape, dtype)
     bound = _bind(squeeze_and_excitation_net_fwd, *args)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     expected = _run_reference(bound, args, False)
     actual = _run_reference(bound, args, True)
     for value, reference in zip(actual, expected, strict=True):
@@ -741,7 +742,7 @@ def test_cpu_reference_preserves_materialization_with_independent_tiles(
 def test_general_pointwise_program_and_default_arguments() -> None:
     x = torch.randn(13, 37)
     bound = _bind(_pointwise_pair, x, 2)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     out, middle = _run_reference(bound, (x, 2), True)
     torch.testing.assert_close(middle, x + 1)
     torch.testing.assert_close(out, (x + 1) * 2)
@@ -781,7 +782,7 @@ def test_rejects_unsafe_fission_and_leaves_original_structure(
     x = torch.empty(13, 37)
     original = _bind(kernel, x, enabled=False)
     candidate = _bind(kernel, x, enabled=True)
-    assert candidate.env.cute_fission_plan is None
+    assert cute_env_state(candidate.env).fission_plan is None
     assert (
         candidate.host_function.device_ir.grid_block_ids
         == original.host_function.device_ir.grid_block_ids
@@ -798,7 +799,7 @@ def test_opt_in_and_reference_mode_do_not_run_analysis_by_default() -> None:
         side_effect=AssertionError("unexpected analysis"),
     ):
         bound = _bind(_pointwise_pair, torch.empty(13, 37), 2, enabled=False)
-        assert bound.env.cute_fission_plan is None
+        assert cute_env_state(bound.env).fission_plan is None
         reference = helion.kernel(
             backend="cute", cute_region_fission=True, ref_mode=RefMode.EAGER
         )(_pointwise_pair.fn)
@@ -830,7 +831,7 @@ def test_planners_respect_independent_opt_outs(
         ) as region_planner,
     ):
         bound = kernel._bind_isolated((torch.empty(13, 37), 2))
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
     assert operand_planner.call_count == int(operand_enabled)
     assert region_planner.call_count == int(region_enabled)
 
@@ -841,7 +842,7 @@ def test_second_gemm_exposes_tcgen05_search_after_fission() -> None:
         "helion._compiler.cute.mma_support.get_cute_mma_support", return_value=support
     ):
         bound = _bind(squeeze_and_excitation_net_fwd, *_se_args((128, 256, 64)))
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     assert bound.config_spec.tcgen05.search_enabled
 
 
@@ -890,7 +891,7 @@ def test_tcgen05_codegen_preserves_second_stage_wrapper_metadata(
     assert "cute.gemm(" not in stages[0]
     assert "cute.gemm(" in stages[1]
     assert "tcgen05_ab_tma" in stages[1]
-    plans = bound.env.cute_resolved_wrapper_plans
+    plans = cute_env_state(bound.env).resolved_wrapper_plans
     assert (plans[0]["lhs_idx"], plans[0]["rhs_idx"]) == (0, 1)
     if shape != (73, 88, 56):
         assert [plan["kind"] for plan in plans] == [
@@ -1011,7 +1012,7 @@ def test_forwarding_retains_zero_padded_reload_before_dot(kernel: Kernel[Any]) -
         torch.ones((19, 19), dtype=torch.float16),
     )
     bound = _bind(kernel, *args)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     ir = bound.host_function.device_ir
     root = ir.graphs[ir.root_ids[1]].graph
     stores = [node for node in root.nodes if node.target is memory_ops.store]
@@ -1093,13 +1094,13 @@ def test_analysis_does_not_repeat_opaque_host_callbacks() -> None:
     assert original_count > 0
     _allocation_calls.clear()
     candidate = _bind(_opaque_host_callback, x, enabled=True)
-    assert candidate.env.cute_fission_plan is None
+    assert cute_env_state(candidate.env).fission_plan is None
     assert len(_allocation_calls) == original_count
 
 
 def test_rejects_input_rows_broadcast_on_a_different_axis() -> None:
     bound = _bind(_transposed_row_read, torch.empty(32, 32))
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
 
 
 def test_single_kernel_cache_helpers_keep_legacy_behavior() -> None:

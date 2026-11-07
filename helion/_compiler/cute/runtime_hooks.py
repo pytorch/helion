@@ -74,16 +74,17 @@ def plan_bound_kernel(
         from .materialized_fission import plan_materialized_fission
 
         env = bound.env
+        env_state = cute_env_state(env)
         with (
             maybe_skip_dtype_check_in_meta_registrations(),
             patch_inductor_lowerings(),
         ):
             if settings.cute_materialize_transformed_operands:
-                env.cute_fission_plan = plan_operand_materialization(
+                env_state.fission_plan = plan_operand_materialization(
                     bound.kernel, args, env
                 )
-            if settings.cute_region_fission and env.cute_fission_plan is None:
-                env.cute_fission_plan = plan_materialized_fission(
+            if settings.cute_region_fission and env_state.fission_plan is None:
+                env_state.fission_plan = plan_materialized_fission(
                     bound.kernel, args, env
                 )
 

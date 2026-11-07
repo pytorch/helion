@@ -27,6 +27,7 @@ from ..device_ir import RootGraphInfo
 from ..indexing_strategy import subscript_tile_info
 from .analysis.match_common import node_tensor
 from .promote_output_axis import _PromotedGridAxisGraphInfo
+from .state import cute_env_state
 from .tcgen05_flat_grouped_host import prove_flat_grouped_host
 
 if TYPE_CHECKING:
@@ -288,7 +289,7 @@ def prove_flat_grouped_rna(
         or env.device.type != "cuda"
         or host is None
         or env._is_distributed
-        or env.cute_fission_plan is not None
+        or cute_env_state(env).fission_plan is not None
         or len(ir.root_ids) != 1
         or len(ir.graphs) != 4
         or len(ir.grid_block_ids) != 1

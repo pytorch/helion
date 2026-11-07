@@ -305,6 +305,7 @@ from .flash_tuning import FLASH_FLOAT16_MAX_LOG2
 from .flash_tuning import FlashPackedExp2Mode
 from .flash_tuning import FlashSoftmaxLowering
 from .fx_matcher import _is_full_slice
+from .state import cute_codegen_state
 
 _T = TypeVar("_T")
 _CallableT = TypeVar("_CallableT", bound="Callable[..., object]")
@@ -27312,6 +27313,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     """
 
     df = cg.device_function
+    codegen_state = cute_codegen_state(cg)
     if df.cute_state.flash.block_ids is None:
         return False
 
@@ -27604,7 +27606,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         )
     ):
         bias_arg = bias_args[0]
-        cg.cute_wrapper_plans.append(
+        codegen_state.wrapper_plans.append(
             {
                 "kind": "helion_small_biased_attention",
                 "batch": batch,
@@ -27672,7 +27674,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         ):
             return False
         emit_flash_row_mma_module_statements(cg)
-        cg.cute_wrapper_plans.append(
+        codegen_state.wrapper_plans.append(
             {
                 "kind": ROW_MMA_PLAN_KIND,
                 "batch": batch,
@@ -28063,7 +28065,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         for index, aux_arg in enumerate(plan.epi_aux_args):
             wrapper_plan[f"epi_aux{index}_name"] = aux_arg.name
         wrapper_plan["epi_aux_tma"] = aux_smem_staging
-    cg.cute_wrapper_plans.append(wrapper_plan)
+    codegen_state.wrapper_plans.append(wrapper_plan)
     if cfg.use_2cta_instrs:
         df.cute_state.tcgen05.cluster_shape = (2 * cfg.pair_cluster, 1, 1)
     elif cfg.use_cga2_local_cta:
@@ -28134,7 +28136,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     # device body reads by name (no wrapper-built views).
     df.placeholder_args.update(arg.name for arg in plan.kv_walk_args)
     df.placeholder_args.update(arg.name for arg in plan.aux_args)
-    cg.cute_uses_matmul = True
+    codegen_state.declare_matmul()
 
     if cfg.topology == "ws_overlap":
         df.cute_state.flash.threads = 256 if cfg.s_stage == 2 else 128

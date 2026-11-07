@@ -10,10 +10,8 @@ import json
 import pickle
 import random
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import pytest
-import torch
 
 from .test_cute_operand_pipeline import _run_stage
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandDescriptorPlan
@@ -23,29 +21,16 @@ from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandTransf
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandTransformPlan
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandType
 from helion._compiler.cute.tcgen05_operand_transform import prove_operand_stage_span
-from helion._compiler.cute.tcgen05_pipeline import make_pipeline_state
 from helion._testing import skipUnlessCuteAvailable
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.runtime.cute.launcher import _cute_disk_cache_key
 
-if TYPE_CHECKING:
-    from collections.abc import Iterator
+pytestmark = pytest.mark.cpu_render(forbid_native=False)
+
 
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
 pipeline = pytest.importorskip("cutlass.pipeline")
 ir = pytest.importorskip("cutlass._mlir.ir")
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    with mock_cuda_unavailable():
-
-        def forbidden(*args: object, **kwargs: object) -> None:
-            raise AssertionError("GPU forbidden in the multiwarp operand proof")
-
-        monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
-        yield
 
 
 @pytest.mark.parametrize(
@@ -344,7 +329,7 @@ def _converter_phases(
         cute.make_layout(warps * len(counts) * 3),
     )
     for rank in cutlass.range_constexpr(warps):
-        state = make_pipeline_state(pipeline.PipelineUserType.Consumer, stages)
+        state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, stages)
         for item in cutlass.range_constexpr(len(counts)):
             for _step in cutlass.range_constexpr(counts[item]):
                 state.advance()

@@ -33,6 +33,7 @@ from helion._compiler.cute.split_k_workspace_codegen import _reducer_source
 from helion._compiler.cute.split_k_workspace_codegen import (
     _rewrite_producer_for_atomic_epilogue,
 )
+from helion._compiler.cute.state import cute_env_state
 from helion._testing import default_cute_mma_support
 from helion._testing import import_example
 from helion.autotuner.benchmarking import _make_cudagraph_replay
@@ -518,7 +519,7 @@ def test_fp16_output_is_proved_without_promotion() -> None:
         cute_promote_half_atomic_outputs=False,
     )
     bound = _bind(kernel, _args())
-    assert not bound.env.cute_half_atomic_output_promotions
+    assert not cute_env_state(bound.env).half_atomic_output_promotions
     proof = _proof(bound)
     assert proof is not None
     assert proof.output_dtype is torch.float16
@@ -542,7 +543,7 @@ def test_bf16_output_is_proved_without_promotion() -> None:
     # reducer casts the FP32 partial sum to bfloat16 once.
     args = _args(dtype=torch.bfloat16)
     bound = _bind(_partitioned_matmul, args)
-    assert not bound.env.cute_half_atomic_output_promotions
+    assert not cute_env_state(bound.env).half_atomic_output_promotions
     proof = _proof(bound)
     assert proof is not None
     assert proof.output_dtype is torch.bfloat16
@@ -587,7 +588,7 @@ def test_unaligned_base_cannot_borrow_the_internal_producer_alignment(
     assert _proof(bound) is not None
     with pytest.raises(helion.exc.BackendUnsupported, match="TensorMap alignment"):
         bound.to_code(_config())
-    assert not bound.env.cute_proven_tma_inputs
+    assert not cute_env_state(bound.env).proven_tma_inputs
 
 
 def test_child_compilation_restores_the_parent_environment_on_failure() -> None:
@@ -602,7 +603,7 @@ def test_child_compilation_restores_the_parent_environment_on_failure() -> None:
     ):
         bound.to_code(_config())
     assert not CompileEnvironment.has_current()
-    assert not bound.env.cute_proven_tma_inputs
+    assert not cute_env_state(bound.env).proven_tma_inputs
     assert _proof(bound) is not None
     assert len(_embedded_sources(bound.to_code(_config()))) == 2
 

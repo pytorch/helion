@@ -39,6 +39,7 @@ from ..emitters.role_item_loop import StaticSchedulerHandle
 from ..emitters.role_item_loop import persistent_tile_scheduler_params_stmt
 from ..grouped_panel_raster import GROUPED_PANEL_ALTERNATE_KEY
 from ..grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
+from ..state import cute_env_state
 from ..strategies import TCGEN05_BATCH_RASTER_DEFAULT
 from ..strategies import TCGEN05_BATCH_RASTER_SLOWEST
 from ..strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
@@ -1339,7 +1340,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         (no re-derivation; this is what makes Path B cheap vs the independent
         store-warp loop of Path A). Inside the loop the per-subtile tail is
         split by warp role with inline gates emitted in the tail source
-        (``memory_ops._codegen_cute_store_tcgen05_tile``): the 4 epi warps
+        (``store_epilogue._codegen_cute_store_tcgen05_tile``): the 4 epi warps
         (``epi_active`` = ``warp_idx < epi_warp_count``) own T2R/R2S + the
         C-store producer commit, and the store warp (``warp_idx ==
         store_warp_id``) owns the consumer-wait + TMA-D + consumer-release
@@ -2731,7 +2732,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         general_pdl = (
             device_function.config.get("cute_pdl") is True
             and not materialized_pdl
-            and CompileEnvironment.current().cute_fission_plan is None
+            and cute_env_state(CompileEnvironment.current()).fission_plan is None
             and (
                 tma_load_role
                 or role_block.role_predicate == self._tcgen05_epi_role_predicate()
@@ -3665,7 +3666,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         epilogue_pdl = (
             device_function.config.get("cute_pdl") is True
             and not device_function.config.get("tcgen05_materialized_pdl", False)
-            and CompileEnvironment.current().cute_fission_plan is None
+            and cute_env_state(CompileEnvironment.current()).fission_plan is None
             # Only where the TMA-load role waits too (the two-CTA kernels):
             # the one-CTA scheduler kernel keeps its entry wait, and a role
             # wait beside it would be redundant.

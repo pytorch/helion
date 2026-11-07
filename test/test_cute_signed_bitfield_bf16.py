@@ -21,6 +21,8 @@ from helion._compiler.cute.autotune.search_surface import (
 )
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.emitters import lane_packets
+from helion._compiler.cute.state import CuteCodegenState
+from helion._compiler.cute.state import cute_codegen_state
 from helion._compiler.lane_loop_context import LaneLoopContext
 from helion._compiler.tile_strategy import DeviceGridState
 from helion.autotuner.config_spec import ConfigSpec
@@ -311,7 +313,7 @@ def _physical(monkeypatch):
     )
     grid = object.__new__(DeviceGridState)
     codegen = SimpleNamespace(
-        _cute_branch_path=[],
+        backend_state=CuteCodegenState(),
         active_device_loops={1: [grid]},
         statements_stack=[statements],
     )
@@ -463,7 +465,7 @@ def test_physical_proof_declines_before_store_change(monkeypatch, fault):
     elif fault == "reassignment":
         context.lane_body.append(ast.parse("packet = 0").body[0])
     elif fault == "branch":
-        state.codegen._cute_branch_path = [(7, 0)]
+        cute_codegen_state(state.codegen).branch_path = [(7, 0)]
     elif fault == "alias":
         case.output.meta["val"] = case.source.meta["val"]
         monkeypatch.setattr(sb, "_fresh_tensors", lambda host: set())

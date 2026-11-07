@@ -4,7 +4,7 @@ Isolation: a ``helion.Kernel`` caches its bound kernels (``bind``) and tests
 mutate bound state (``bound.config_spec.tcgen05.search_enabled = ...``,
 ``spec.block_sizes[...]``), so a shared kernel must not be ``bind``-ed by a test
 that mutates or inspects per-bind state.  Either bind in isolation
-(``kernel._bind_isolated(args)`` / ``test._cute_binding._cpu_bind``, which never
+(``kernel._bind_isolated(args)`` / ``helion._testing.cute_codegen.cpu_bind``, which never
 reads or publishes the cache) or take a fresh wrapper per test with
 :func:`fresh`; ``kernel.reset()`` after a test is the fallback when the test
 needs the cached ``bind`` itself.  The kernel names are the ones the suite

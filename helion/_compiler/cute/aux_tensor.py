@@ -106,7 +106,7 @@ class Tcgen05AuxTensorDescriptor:
     The descriptor is intentionally minimal — just the fields the
     productive body needs. Per-aux-step splice locals (var names,
     TMEM partition state, etc.) are still owned by the store-codegen
-    splice (``memory_ops._codegen_cute_store_tcgen05_tile``); the
+    splice (``store_epilogue._codegen_cute_store_tcgen05_tile``); the
     descriptor only carries the *identity* of the aux tensor so the
     producer-side TMA atom / SMEM ring can be allocated at MMA
     codegen time. Cross-graph FX node identity (the same load node
@@ -268,7 +268,7 @@ def discover_tcgen05_aux_tensor_descriptors(
     aux steps. The productive-body codegen consumes the tuple as
     an ordered list keyed by aux index (mirroring the existing
     ``_AuxStepRecord``-per-aux-step indexing in
-    ``memory_ops._codegen_cute_store_tcgen05_tile``).
+    ``store_epilogue._codegen_cute_store_tcgen05_tile``).
     """
     if matmul_fx_node not in cg.device_function.cute_state.tcgen05.matmul_fx_nodes:
         return ()

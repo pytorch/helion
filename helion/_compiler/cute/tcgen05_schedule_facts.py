@@ -10,6 +10,7 @@ from typing import cast
 import torch
 
 from .pipeline_smem import has_other_store
+from .state import cute_env_state
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import tcgen05_role_local_schedule
 
@@ -275,7 +276,7 @@ def analyze_native_gemm(
         if output is None or has_other_store(device_ir.graphs, store):
             return None
         owns_output_ring = (
-            env.cute_fission_plan is None
+            cute_env_state(env).fission_plan is None
             and not device_ir.has_atomic_ops()
             and not candidate.requires_fragment_epilogue
             and output in _fresh_tensors(host)

@@ -3,8 +3,8 @@
 Role: state.  ``Backend.new_device_state(config)`` builds one per kernel
 render (``state.new_device_state``); the fields are grouped into the
 namespaces defined in ``state.py`` (``tcgen05``, ``flash``, ``lanes``,
-``root_plans``); every reader names the namespace (the flat-name
-``AttributeAlias`` layer each field had after the grouping is retired).  The
+``root_plans``); every reader names the namespace through
+``DeviceFunction.cute_state`` (the core object carries no flat names).  The
 tcgen05 plan records the pipeline emitters read live here too:
 ``CuteTcgen05MatmulPlan`` (the kernel-wide collective contract),
 ``CuteTcgen05GroupedPlan``, ``CuteTcgen05StoreValue`` and the vloop-sink facts.

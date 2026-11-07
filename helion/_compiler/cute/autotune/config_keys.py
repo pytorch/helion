@@ -84,8 +84,6 @@ def _cute_chunk_recurrence_config_is_safe(
     return dv_partitions != 2 or register_cap is None
 
 
-# -- the flash backward family (the forward keys are ``FLASH_CONFIG_KEYS``) ---
-CUTE_FLASH_BWD_KEYS: tuple[str, ...] = FLASH_BWD_CONFIG_KEYS
 # The gated (softmax-free) attention body's gate warpgroup count,
 # ``cute_flash_gated.FLASH_GATE_WARPGROUPS_KEY``.  Spelled out: importing the
 # gated emitter here pulls ``device_ir`` into ``config_spec``'s import and
@@ -242,7 +240,7 @@ CUTE_CONFIG_KEYS: frozenset[str] = frozenset(
         *GROUPED_RNA_CONFIG_KEYS,
         *FLASH_CONFIG_KEYS,
         *CUTE_FLASH_GATE_KEYS,
-        *CUTE_FLASH_BWD_KEYS,
+        *FLASH_BWD_CONFIG_KEYS,
         *CUTE_RECURRENCE_KEYS,
         *MMA_DAG_KEYS,
         *RSB_KEYS,

@@ -17,7 +17,6 @@ from helion._compiler.cute.tensor_layout_relations import TensorLayoutRelation
 from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
-from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
@@ -235,7 +234,6 @@ def _reciprocal_times(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 @skipIfRefEager("compiles the generated kernel")
 @skipIfNotCUDA()
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("threads", [8, 512])
 def test_three_tensor_guard_compiles_with_dynamic_shapes(threads):
     """A dynamic-shape kernel over three tensors gets the 14-term guard; it

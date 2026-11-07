@@ -25,7 +25,6 @@ from .ast_extension import statement_from_string
 from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
-from .attribute_alias import AttributeAlias
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .emitter_protocols import KernelTransforms
@@ -200,34 +199,6 @@ class ResidentPrepLowering:
 
 
 class GenerateAST(NodeVisitor, CodegenInterface):
-    # The CuTe backend's per-pass state lives on ``backend_state``
-    # (``cute/state.py``: ``CuteCodegenState``); these names alias into it for
-    # one release while the readers in this module and in tests move over.
-    cute_wrapper_plans: AttributeAlias[list[dict[str, object]]] = AttributeAlias(
-        "backend_state.wrapper_plans"
-    )
-    _cute_uses_matmul: AttributeAlias[bool] = AttributeAlias(
-        "backend_state.uses_matmul"
-    )
-    _cute_matmul_declaration_count: AttributeAlias[int] = AttributeAlias(
-        "backend_state.matmul_declaration_count"
-    )
-    cute_synthetic_arange_axes: AttributeAlias[dict[tuple[object, ...], int]] = (
-        AttributeAlias("backend_state.synthetic_arange_axes")
-    )
-    cute_synthetic_arange_axis_sizes: AttributeAlias[dict[int, int]] = AttributeAlias(
-        "backend_state.synthetic_arange_axis_sizes"
-    )
-    cute_synthetic_arange_access_positions: AttributeAlias[
-        dict[tuple[torch.fx.Node, object], int]
-    ] = AttributeAlias("backend_state.synthetic_arange_access_positions")
-    _cute_branch_path: AttributeAlias[list[tuple[int, int]]] = AttributeAlias(
-        "backend_state.branch_path"
-    )
-    cute_synthetic_arange_lane_exprs: AttributeAlias[dict[tuple[object, ...], str]] = (
-        AttributeAlias("backend_state.synthetic_arange_lane_exprs")
-    )
-
     def __init__(
         self,
         func: HostFunction,
@@ -253,7 +224,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         backend = CompileEnvironment.current().backend
         self.backend = backend
         # The backend's per-pass state (``Backend.new_codegen_state``); the
-        # ``cute_*`` names below alias into it for one release.
+        # CuTe backend reads it through ``cute.state.cute_codegen_state``.
         self.backend_state: object | None = backend.new_codegen_state()
         config = backend.codegen_config(config)
         self.codegen_graphs = (
@@ -322,18 +293,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self._compute_inter_loop_barriers()
         # Same, for a store->load read-after-write *within* one loop body.
         self._compute_intra_loop_barriers()
-
-    @property
-    def cute_uses_matmul(self) -> bool:
-        return self._cute_uses_matmul
-
-    @cute_uses_matmul.setter
-    def cute_uses_matmul(self, value: bool) -> None:
-        self._cute_uses_matmul = value
-        # Count declarations, not False-to-True transitions: an unrelated
-        # matmul path must not inherit a register chain's shape-bake exemption.
-        if value:
-            self._cute_matmul_declaration_count += 1
 
     def allow_dead_assignments_owned_by_nodes(self, nodes: tuple[Node, ...]) -> None:
         """Allow liveness-based DCE for assignments from proven pure FX nodes.

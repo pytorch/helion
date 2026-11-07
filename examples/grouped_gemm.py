@@ -252,11 +252,11 @@ def grouped_gemm_shared_weight(
     example's; that example additionally pins two range knobs). The two
     kernels above keep the group structure in the program:
     ``grouped_gemm_jagged_persistent`` schedules tiles itself (register-index
-    tiles under data-dependent branches, a structure the CuTe backend
-    lowers as scalar loops), and ``grouped_gemm_jagged`` tiles each group
-    on its own (a data-dependent M extent per group). This kernel lives
-    beside them to show that, for a shared weight, the grouping adds
-    nothing the dense product does not already compute.
+    tiles under data-dependent branches, a schedule the CuTe segmented-matmul
+    normalization reads back as the per-group tile loop under the autotuner's
+    structural policy), and ``grouped_gemm_jagged`` tiles each group on its own
+    (a data-dependent M extent per group). This kernel lives beside them to show
+    that, for a shared weight, the grouping adds nothing the dense product lacks.
 
     Args:
         A_packed: Row-wise concatenation of the groups' inputs, ``[sum(M_i), K]``.

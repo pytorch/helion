@@ -14,22 +14,20 @@ staged twin and torch.
 from __future__ import annotations
 
 import re
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_fp32_dot import _batched_dot
 from test.test_cute_fp32_dot import _chunk_cumsum
 
 import helion
 from helion import exc
 from helion._testing import DEVICE
+from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_fragment import BooleanFragment
 import helion.language as hl
 
@@ -42,7 +40,6 @@ MMA = "_helion_fragment_mma.mma_tf32("
 SYNC = "cute.arch.sync_threads()"
 PACKET = "fragment_mma_packet"
 PAIR = "num_bits_per_copy=64"
-
 pytestmark = skipUnlessBackends(["cute"])
 
 
@@ -213,12 +210,7 @@ def _chunk_cumsum_input_load_between(
 
 @pytest.fixture
 def _cpu_only():
-    with (
-        mock_cuda_unavailable(),
-        _target(),
-        forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
 
 

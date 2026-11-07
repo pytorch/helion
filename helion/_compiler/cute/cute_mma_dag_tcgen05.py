@@ -144,6 +144,7 @@ from .cute_mma_dag_emitter_base import _TmaMap
 from .cute_mma_dag_emitter_base import tma_wrapper_plan
 from .cute_warp_mma_gemm import _swizzled_chunk
 from .matmul_utils import strip_new_vars
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -2329,8 +2330,9 @@ def codegen_mma_dag_tcgen05(cg: GenerateAST, plan: MmaDagPlan) -> None:
     else:
         for statement in ast.parse(textwrap.dedent(source)).body:
             cg.add_statement(statement)
+    wrapper_plans = cute_codegen_state(cg).wrapper_plans
     if tc.tma:
-        cg.cute_wrapper_plans.append(
+        wrapper_plans.append(
             tma_wrapper_plan(
                 df, tc.tma, lambda access: emitter.tensor_names[access.node]
             )
@@ -2340,7 +2342,7 @@ def codegen_mma_dag_tcgen05(cg: GenerateAST, plan: MmaDagPlan) -> None:
         # The renderer placed the griddepcontrol calls itself; the launcher
         # still needs the programmatic-dependent-launch attribute.
         alias_plan["use_pdl"] = True
-    cg.cute_wrapper_plans.append(alias_plan)
+    wrapper_plans.append(alias_plan)
     df.cute_state.lanes.owned_root_block_dims = (plan.launch_threads, 1, 1)
     if plan.cluster > 1 and plan.split_mode == MMA_DAG_SPLIT_FIXUP:
         # The fixup grid: ``cluster`` N tiles per root tile folded into the
@@ -2353,7 +2355,7 @@ def codegen_mma_dag_tcgen05(cg: GenerateAST, plan: MmaDagPlan) -> None:
         assert isinstance(emitter, Tcgen05RegionMmaDagEmitter)
         df.cute_state.lanes.launch_grid_multiplier = plan.cluster
         if emitter.split_reduces:
-            cg.cute_wrapper_plans.append(
+            wrapper_plans.append(
                 {
                     "kind": "helion_mma_dag_fixup",
                     "param": FIXUP_WORKSPACE_PARAM,

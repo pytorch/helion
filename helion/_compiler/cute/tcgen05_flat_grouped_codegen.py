@@ -16,6 +16,7 @@ from typing import cast
 
 from ... import exc
 from ._ast_pass_utils import _bound_names
+from .state import cute_env_state
 from .tcgen05_flat_grouped_config import CONFIG_KEYS
 from .tcgen05_flat_grouped_config import PREFIX_SCAN_KEY
 from .tcgen05_flat_grouped_config import RESIDENT_CTAS_KEY
@@ -346,5 +347,5 @@ def _compose_flat_grouped_host(
         f"{func.name}._helion_cute_kernels = ({native},)\n"
         f"{func.name}._helion_cute_native_grouped_plan = {identity!r}\n"
     ).body
-    env.cute_resolved_wrapper_plans = plans
+    cute_env_state(env).resolved_wrapper_plans = plans
     return module

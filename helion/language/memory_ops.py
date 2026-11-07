@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -426,40 +425,6 @@ def _(
             valid_mask = valid_mask & in_bounds
 
     return torch.where(valid_mask, values, result)
-
-
-# Compatibility re-exports (PEP 562).  The CuTe index/mask/packet helpers and the
-# tcgen05 store emitter moved out of this module into
-# helion._compiler.cute.emitters.{memory_access,lane_packets} and
-# helion._compiler.cute.tcgen05.store_epilogue.  Nothing in helion/ or test/
-# imports them from here any more; the lazy lookup keeps the old import path
-# working for out-of-tree callers without an eager language -> cute import.
-# mock.patch must target the module that binds a name (its reader), not this one.
-_LANE_PACKETS = "helion._compiler.cute.emitters.lane_packets"
-_MEMORY_ACCESS = "helion._compiler.cute.emitters.memory_access"
-_STORE_EPILOGUE = "helion._compiler.cute.tcgen05.store_epilogue"
-_MOVED_CUTE_NAMES: dict[str, str] = {
-    "CuteTileVecStoreSite": _LANE_PACKETS,
-    "_cute_register_tile_unroll_vec_store": _LANE_PACKETS,
-    "_cute_unroll_vec_extract": _LANE_PACKETS,
-    "_cute_unroll_vec_load_expr": _LANE_PACKETS,
-    "_cute_combined_mask": _MEMORY_ACCESS,
-    "_cute_index_exprs": _MEMORY_ACCESS,
-    "_cute_remap_block_id": _MEMORY_ACCESS,
-    "_cute_scalar_load_expr": _MEMORY_ACCESS,
-    "_cute_scalar_pointer_expr": _MEMORY_ACCESS,
-    "_cute_tile_id_thread_extent_is_complete": _MEMORY_ACCESS,
-    "_maybe_codegen_cute_packed_affine_lhs_load": _MEMORY_ACCESS,
-    "_codegen_cute_store_tcgen05_tile": _STORE_EPILOGUE,
-    "_tcgen05_rowvec_aux_stage_copy_elems": _STORE_EPILOGUE,
-}
-
-
-def __getattr__(name: str) -> object:
-    module_name = _MOVED_CUTE_NAMES.get(name)
-    if module_name is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    return getattr(importlib.import_module(module_name), name)
 
 
 @has_side_effect

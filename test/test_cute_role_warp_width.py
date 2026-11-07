@@ -8,10 +8,7 @@ from .test_cute_grid_launch_extents import _launch_block
 import helion
 from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
 import helion.language as hl
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

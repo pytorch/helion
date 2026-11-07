@@ -33,6 +33,7 @@ from .block_scaled_provenance import PackedOperand
 from .block_scaled_provenance import operand_fingerprint
 from .fold_noop_stores import _is_read_only
 from .promote_output_axis import _fresh_tensors
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -818,7 +819,8 @@ def codegen_block_scaled(cg: GenerateAST) -> bool:
         )
     )
     alpha = df.literal_expr(plan.alpha)
-    cg.cute_wrapper_plans.append(
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(
         plan.to_wrapper_dict(
             names=names,
             workspace_name=workspace_arg,
@@ -829,5 +831,5 @@ def codegen_block_scaled(cg: GenerateAST) -> bool:
     df.placeholder_args.update((*names, workspace_arg, alpha))
     df.preamble = []
     df.body = [ast.Pass()]
-    cg.cute_uses_matmul = True
+    codegen_state.declare_matmul()
     return True

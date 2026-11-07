@@ -14,7 +14,6 @@ from test.test_cute_resident_serial_row_seeds import _bind
 from test.test_cute_resident_serial_row_seeds import _cpu_only  # noqa: F401
 
 from helion._compiler.cute.resident_reductions import _local_tree_update
-from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 
@@ -99,7 +98,6 @@ def test_pipeline_tree_preserves_carries_masks_and_copy_lifetimes(
         _run_pipeline(source, rows, depth, group_rows)
 
 
-@skipUnlessBackends(["cute"])
 def test_default_off_and_searchable_seed_siblings():
     bound, args = _bind(256, 1024, kind="layer")
     seeds = [
@@ -142,7 +140,6 @@ def test_default_off_and_searchable_seed_siblings():
 
 
 @pytest.mark.parametrize("kind,columns", (("layer", 8192), ("rms", 4096)))
-@skipUnlessBackends(["cute"])
 def test_true_seeds_survive_the_actual_full_population(kind, columns):
     bound, args = _bind(256, columns, kind=kind)
     with bound.env:

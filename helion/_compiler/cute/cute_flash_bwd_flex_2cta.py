@@ -85,6 +85,7 @@ from .cute_flash_bwd_flex import additive_bias_region
 from .cute_flash_bwd_flex import flex_bwd_bindings
 from .cute_flash_bwd_flex import flex_bwd_exp2_emu
 from .cute_flash_bwd_flex import flex_bwd_wrapper_plan
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1301,10 +1302,11 @@ def codegen_flex_bwd_2cta(
     wrapper_plan = flex_bwd_wrapper_plan(
         match, args, io_dtype_str, total_tiles=total_ctas, family="flex_two_cta"
     )
-    cg.cute_wrapper_plans.append(wrapper_plan)  # type: ignore[attr-defined]
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(wrapper_plan)
     df.wrapper_only_params.extend(_FLASH_BWD_2CTA_KERNEL_PARAMS)
     df.placeholder_args.update(a.name for a in args.values())
-    cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+    codegen_state.declare_matmul()
     df.cute_state.flash.threads = 512
     df.cute_state.tcgen05.cluster_shape = (2, 1, 1)
     emitted = emit_flash_bwd_flex_2cta_body(

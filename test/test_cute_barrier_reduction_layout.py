@@ -7,11 +7,8 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipUnlessBackends
 
 split_k_matmul = import_example("split_k_barrier").split_k_matmul
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @pytest.mark.parametrize("shape", [(16, 4096, 16), (13, 33, 17)])

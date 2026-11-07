@@ -106,6 +106,7 @@ from .flash_template_runs import flash_ws_p_store_partitions
 from .flash_template_runs import flash_ws_pv_step
 from .flash_template_runs import flash_ws_qk_step
 from .flash_template_runs import flash_ws_s_load_partitions
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -4041,11 +4042,12 @@ def codegen_gated_attention_flash(cg: GenerateAST) -> bool:
     for key, access in accesses.items():
         wrapper_plan[f"{key}_row_dim"] = access.row_dim
         wrapper_plan[f"{key}_lane_dim"] = access.lane_dim
-    cg.cute_wrapper_plans.append(wrapper_plan)
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(wrapper_plan)
     df.wrapper_only_params.extend(GATED_KERNEL_PARAMS)
     df.placeholder_args.update(arg.name for arg in args.values())
     df.placeholder_args.update(emitted.reads)
-    cg.cute_uses_matmul = True
+    codegen_state.declare_matmul()
     df.cute_state.flash.threads = plan.threads
     if match.form == "sequence":
         assert match.lane_extent is not None

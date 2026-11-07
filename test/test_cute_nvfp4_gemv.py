@@ -8,11 +8,8 @@ from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipUnlessBackends
 
 nvfp4_gemv = import_example("nvfp4_gemv")
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @pytest.mark.parametrize("packed_input", [False, True])

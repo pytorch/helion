@@ -37,6 +37,7 @@ from .ring_mma_dot import RingMmaNotApplied
 from .ring_mma_dot import ring_mma_off_config
 from .sink_vector_loops import VloopSinkNotApplied
 from .sink_vector_loops import vloop_sink_off_config
+from .state import cute_env_state
 from .tcgen05_flat_grouped_config import CONFIG_KEYS as GROUPED_CONFIG_KEYS
 from .tcgen05_flat_grouped_config import K_KEY as GROUPED_RNA_K_KEY
 from .tcgen05_flat_grouped_config import K_STAGES
@@ -177,7 +178,7 @@ def _generate_materialized_fission(
 ) -> ast.Module:
     from .materialized_fission_codegen import generate_materialized_fission
 
-    plan = CompileEnvironment.current().cute_fission_plan
+    plan = cute_env_state(CompileEnvironment.current()).fission_plan
     assert plan is not None
     return generate_materialized_fission(
         func,
@@ -311,7 +312,7 @@ KERNEL_GENERATORS: tuple[KernelGenerator, ...] = (
     KernelGenerator(
         "materialized_fission",
         applies=lambda func, config, transforms: (
-            CompileEnvironment.current().cute_fission_plan is not None
+            cute_env_state(CompileEnvironment.current()).fission_plan is not None
             and len(func.device_ir.root_ids) > 1
         ),
         generate=_generate_materialized_fission,
@@ -378,19 +379,20 @@ class CuteRegeneration(RetryPolicy):
 
     @contextlib.contextmanager
     def scope(self) -> Iterator[None]:
-        env = CompileEnvironment.current()
-        register_tiles_disabled = env.cute_register_tile_disabled
+        env_state = cute_env_state(CompileEnvironment.current())
+        register_tiles_disabled = env_state.register_tile_disabled
         try:
             yield
         finally:
-            env.cute_register_tile_disabled = register_tiles_disabled
+            env_state.register_tile_disabled = register_tiles_disabled
 
     def repair(
         self, signal: BaseException, config: Config, *, caller_graphs: bool
     ) -> Config | None:
         env = CompileEnvironment.current()
+        env_state = cute_env_state(env)
         if isinstance(signal, RegisterTileUnsupported):
-            if env.cute_register_tile_disabled:
+            if env_state.register_tile_disabled:
                 return None
             log.debug("regenerating with the rolled reduction lane: %s", signal)
             if not caller_graphs:
@@ -403,7 +405,7 @@ class CuteRegeneration(RetryPolicy):
                         retried.reduction_loops,
                     )
                     config = retried
-            env.cute_register_tile_disabled = True
+            env_state.register_tile_disabled = True
             return config
         if isinstance(signal, VloopSinkNotApplied):
             if caller_graphs:

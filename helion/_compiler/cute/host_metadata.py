@@ -134,7 +134,6 @@ _PLAN_TENSOR_NAME_KEYS: tuple[str, ...] = (
     "k_sizes_name",
     "direct_pointers_name",
     "direct_strides_name",
-    "scale_name",
     "m_extent_name",
     "epi_aux0_name",
     "epi_aux1_name",

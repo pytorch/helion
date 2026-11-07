@@ -36,6 +36,7 @@ from helion._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
 from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion._compiler.cute.flash_tuning import FlashPackedExp2Mode
 from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
+from helion._compiler.cute.state import cute_env_state
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_config import facts
 from helion._compiler.cute.tcgen05_config import repair
@@ -17965,7 +17966,7 @@ class TestCuteBackend(TestCase):
             grouped_static_has_m_tail=True,
             grouped_static_has_n_tail=False,
         )
-        bound.env.cute_resolved_wrapper_plans = [plan]
+        cute_env_state(bound.env).resolved_wrapper_plans = [plan]
         self.assertEqual(bound._base_spec_key, signature)
         with bound.env, bound._runtime_arg_values_for_codegen():
             self.assertEqual(

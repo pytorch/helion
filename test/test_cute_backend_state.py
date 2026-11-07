@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 
 from helion import exc
-from helion._compiler.attribute_alias import AttributeAlias
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.emitters import PlannedRootEmitter
@@ -17,28 +16,6 @@ from helion._compiler.cute.state import CuteTcgen05State
 from helion._compiler.cute.tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from helion._compiler.triton.backend import TritonBackend
 from helion.runtime.config import Config
-
-
-class _Inner:
-    def __init__(self) -> None:
-        self.count = 1
-
-
-class _Outer:
-    count: AttributeAlias[int] = AttributeAlias("inner.count")
-
-    def __init__(self) -> None:
-        self.inner = _Inner()
-
-
-class TestAttributeAlias(unittest.TestCase):
-    def test_reads_and_writes_forward_to_the_path(self) -> None:
-        outer = _Outer()
-        self.assertEqual(outer.count, 1)
-        outer.count = 5
-        self.assertEqual(outer.inner.count, 5)
-        self.assertIsInstance(_Outer.count, AttributeAlias)
-        self.assertEqual(repr(_Outer.count), "AttributeAlias('inner.count')")
 
 
 class TestCuteDeviceFunctionStateNamespaces(unittest.TestCase):

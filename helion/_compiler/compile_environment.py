@@ -39,7 +39,6 @@ from .._compat import shape_env_size_hint
 from .._compat import target_device_capability
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
-from .attribute_alias import AttributeAlias
 from .backend import BackendState
 from .backend_registry import get_backend
 from .fake_tensor import create_fake_tensor_mode
@@ -376,7 +375,6 @@ if TYPE_CHECKING:
     from ..runtime.settings import Settings
     from .autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from .backend import Backend
-    from .cute.materialized_fission import MaterializedFissionPlan
     from .pallas.compact_worklist import CompactWorklistPlan
     from .pallas.compact_worklist import ResidentCacheDecision
     from .pallas.compact_worklist import ResidentPrepHoist
@@ -433,35 +431,6 @@ class CompileEnvironment:
     and a single CompileEnvironment will be used for multiple Configs.
     No config or codegen specific state should be stored here.
     """
-
-    # The CuTe backend's per-compile facts live on ``backend_state``
-    # (``cute/state.py``: ``CuteEnvState``); these names stay for one release
-    # for the readers outside the backend (``runtime_hooks`` sets the fission
-    # plan, tests assert on it).
-    cute_resolved_wrapper_plans: AttributeAlias[list[dict[str, object]]] = (
-        AttributeAlias("backend_state.resolved_wrapper_plans")
-    )
-    cute_hint_sized_reduction_extents: AttributeAlias[set[sympy.Expr]] = AttributeAlias(
-        "backend_state.hint_sized_reduction_extents"
-    )
-    cute_fission_plan: AttributeAlias[MaterializedFissionPlan | None] = AttributeAlias(
-        "backend_state.fission_plan"
-    )
-    cute_half_atomic_output_promotions: AttributeAlias[dict[str, torch.dtype]] = (
-        AttributeAlias("backend_state.half_atomic_output_promotions")
-    )
-    cute_scaled_contraction_count: AttributeAlias[int] = AttributeAlias(
-        "backend_state.scaled_contraction_count"
-    )
-    cute_dot_scaled_scales_exposed: AttributeAlias[bool] = AttributeAlias(
-        "backend_state.dot_scaled_scales_exposed"
-    )
-    cute_proven_tma_inputs: AttributeAlias[set[torch.Tensor]] = AttributeAlias(
-        "backend_state.proven_tma_inputs"
-    )
-    cute_register_tile_disabled: AttributeAlias[bool] = AttributeAlias(
-        "backend_state.register_tile_disabled"
-    )
 
     def __init__(
         self,

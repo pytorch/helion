@@ -10,12 +10,9 @@ from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipUnlessBackends
 
 broadcast_matmul = import_example("broadcast_matmul").broadcast_matmul
 matmul = import_example("matmul").matmul
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

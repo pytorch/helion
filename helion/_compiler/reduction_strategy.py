@@ -580,9 +580,11 @@ class ReductionStrategy(TileStrategy):
         a warp. Others keep the natural strategy order.
         """
         env = CompileEnvironment.current()
-        partner = getattr(self, "_cute_axis_partner", None)
-        if partner is not None:
-            return partner._get_thread_axis()
+        if (
+            isinstance(self, PersistentReductionStrategy)
+            and self._cute_axis_partner is not None
+        ):
+            return self._cute_axis_partner._get_thread_axis()
         if (axis := self.fn.tile_strategy.thread_axis_for_strategy(self)) is not None:
             return axis
         if env.backend.reduction_axis_first():

@@ -20,6 +20,7 @@ from .gathered_mma import analyze_gathered_mma_region
 from .gathered_mma_codegen import emit_gathered_mma_region
 from .memory_ops import tensor_has_specialized_base_alignment
 from .promote_output_axis import _fresh_tensors
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from ..device_function import DeviceFunction
@@ -119,7 +120,7 @@ def lower_gathered_matmul(
         or len(sites) != 1
         or facts is None
         or thread_dims is None
-        or df.codegen.cute_wrapper_plans
+        or cute_codegen_state(df.codegen).wrapper_plans
         or df.cute_state.tcgen05.matmul_plan is not None
         or df.cute_state.tcgen05.matmul_fx_nodes
         or df.cute_state.has_tcgen05_fragment_epilogue_plan

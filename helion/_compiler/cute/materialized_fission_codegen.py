@@ -33,6 +33,7 @@ from ..device_ir import RootGraphInfo
 from ..host_function import HostFunction
 from ..output_header import get_needed_import_lines
 from .host_zero_fills import lower_host_zero_fills
+from .state import cute_env_state
 from .tcgen05_config import facts
 from .tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
@@ -372,6 +373,7 @@ def generate_materialized_fission(
     from .sink_vector_loops import vloop_sink_off_config
 
     env = CompileEnvironment.current()
+    env_state = cute_env_state(env)
     roots = func.body[plan.root_index : plan.root_index + plan.region_count]
     assert len(func.device_ir.root_ids) == len(roots) == plan.region_count
     assert all(
@@ -487,7 +489,7 @@ def generate_materialized_fission(
         if pdl_roots is not None and root_id == pdl_roots[1]:
             ab_plans = [
                 item
-                for item in env.cute_resolved_wrapper_plans
+                for item in env_state.resolved_wrapper_plans
                 if item["kind"] == "tcgen05_ab_tma"
             ]
             device = next(
@@ -530,7 +532,7 @@ def generate_materialized_fission(
                     "consumer whose TMA role waits on the dependency before its "
                     "first load of the materialized operand"
                 )
-        resolved_plans.extend(env.cute_resolved_wrapper_plans)
+        resolved_plans.extend(env_state.resolved_wrapper_plans)
         host_def = next(
             stmt
             for stmt in module.body
@@ -598,7 +600,7 @@ def generate_materialized_fission(
             value=ast.Constant(value=hashlib.sha256(stage_source.encode()).hexdigest()),
         )
         module_loads.extend((load_statement, source_hash_statement))
-    env.cute_resolved_wrapper_plans = resolved_plans
+    env_state.resolved_wrapper_plans = resolved_plans
     assert generated_return is not None
     # The stages saw one root each, so the wrapper's shared allocations are
     # proven against the whole kernel: a zero-filled workspace one phase

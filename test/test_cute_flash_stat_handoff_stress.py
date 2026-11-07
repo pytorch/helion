@@ -57,7 +57,6 @@ pytest.importorskip("cutlass.cute")
 from helion._compiler.cute import cute_flash
 from helion._testing import DEVICE
 from helion._testing import import_example
-from helion._testing import onlyBackends
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
 
@@ -376,13 +375,11 @@ def _run_in_subprocesses(module: str, config: dict[str, object]) -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_whole_row_ring2_attention_survives_flushed_launches() -> None:
     _run_in_subprocesses("attention", _ATTENTION_WHOLE_ROW_RING2)
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_flex_list_walk_survives_flushed_launches() -> None:
     """The BlockMask list walk over random tables (zero counts, an empty
     pair, an asymmetric pair) on the chunked fa4 body with the two-slot
@@ -392,7 +389,6 @@ def test_flex_list_walk_survives_flushed_launches() -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @skipIfFn(
     lambda: not _soak_requested(),
     reason=f"soak run only: set {_LAUNCHES_ENV} (the chunked-body hang was rare)",

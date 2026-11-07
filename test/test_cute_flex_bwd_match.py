@@ -42,7 +42,7 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing.cute_aux import cpu_codegen
+from helion._testing.cute_aux import as_sm100
 import helion.language as hl
 from helion.runtime.kernel import Kernel
 
@@ -131,24 +131,14 @@ def _args(
 
 
 @contextlib.contextmanager
-def _as_sm100() -> Iterator[None]:
-    with (
-        cpu_codegen(),
-        patch(
-            "helion._compiler.cute.analysis.attention_match._attention_flash_supported",
-            return_value=True,
-        ),
-        patch(
-            "helion._compiler.cute.analysis.attention_match._attention_flash_gate_enabled",
-            return_value=True,
-        ),
-        patch.object(flex_match, "FLEX_PLAN_ENABLED", True),
-    ):
+def _as_sm100_flex() -> Iterator[None]:
+    """The shared SM100 CPU codegen context with the flex plan enabled."""
+    with as_sm100(), patch.object(flex_match, "FLEX_PLAN_ENABLED", True):
         yield
 
 
 def _bind(args: tuple[Any, ...]) -> BoundKernel:
-    with _as_sm100():
+    with _as_sm100_flex():
         return _bwd_kernel()._bind_isolated(args)
 
 
@@ -228,7 +218,7 @@ def _render(bound: BoundKernel, **overrides: object) -> str:
     config = bound.config_spec.default_config()
     if overrides:
         config = helion.Config(**{**config.config, **overrides})
-    with _as_sm100():
+    with _as_sm100_flex():
         return bound.to_code(config)
 
 
@@ -489,7 +479,7 @@ def test_head_dim_256_pair_assembles_without_gpu(tmp_path: Path) -> None:
     namespace: dict[str, object] = {}
     exec(compile(code, str(path), "exec"), namespace)
     host = namespace["helion_flex_attention_backward_kernel"]
-    with patch.dict(os.environ, {"CUTE_DSL_ARCH": "sm_100a"}), _as_sm100():
+    with patch.dict(os.environ, {"CUTE_DSL_ARCH": "sm_100a"}), _as_sm100_flex():
         host(*args, _launcher=_ptx_dump_launcher(tmp_path))  # pyrefly: ignore[not-callable]
     ptx_files = sorted(tmp_path.glob("*.ptx"))
     assert ptx_files, list(tmp_path.iterdir())
@@ -1053,7 +1043,7 @@ def test_declines_dk_store_with_another_factor(tmp_path: pathlib.Path) -> None:
     )
     kernel = _cute_kernel(import_path(path).helion_flex_attention_backward_kernel)
     t = _tensors()
-    with _as_sm100():
+    with _as_sm100_flex():
         bound = kernel._bind_isolated(_args(t, _causal))
     reasons: list[str] = []
     assert _match(bound, reasons) is None
@@ -1138,7 +1128,7 @@ def test_contiguous_operands_keep_the_rank3_maps() -> None:
     plan = match.plan
     assert plan.strides == ((131072, 32768, 64, 1),) * 6
     assert plan.operand_strides is None
-    with _as_sm100():
+    with _as_sm100_flex():
         code = bound.to_code(bound.config_spec.default_config())
     wrapper = _wrapper_plan(code)
     assert "flex_strides" not in wrapper
@@ -1172,7 +1162,7 @@ def test_transposed_operands_take_the_rank4_maps(kv_heads: int, head_dim: int) -
     contiguous = _bind(_args(_tensors(head_dim=head_dim, kv_heads=kv_heads), _causal))
     assert sorted(spec._flat_fields()) == sorted(contiguous.config_spec._flat_fields())
     assert spec.default_config() == contiguous.config_spec.default_config()
-    with _as_sm100():
+    with _as_sm100_flex():
         code = bound.to_code(spec.default_config())
     assert "fbwd_sSteps" in code
     wrapper = _wrapper_plan(code)
@@ -1493,7 +1483,7 @@ class TestContiguousRenderPin(TestCase):
 
     def test_contiguous_backward_render(self) -> None:
         bound = _bind(_args(_tensors(), _causal))
-        with _as_sm100():
+        with _as_sm100_flex():
             code = bound.to_code(bound.config_spec.default_config())
         assert "'flex_strides'" not in code
         self.assertExpectedJournal(_without_source_comments(code))
@@ -1772,7 +1762,7 @@ class TestTwoCtaRenderPin(TestCase):
 
     def test_two_cta_backward_render(self) -> None:
         bound = _bind_d128(None, heads=4, kv_heads=2, q_seq=512, kv_seq=512)
-        with _as_sm100():
+        with _as_sm100_flex():
             config = bound.config_spec.default_config()
             code = bound.to_code(
                 helion.Config(**{**config.config, "cute_flash_bwd_two_cta": 1})

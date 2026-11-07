@@ -80,6 +80,7 @@ from .matmul_utils import cute_synthetic_lane_k_extent
 from .matmul_utils import emit_cute_serial_mm_from_load_views
 from .matmul_utils import emit_cute_serial_scalar_mm_from_loads
 from .matmul_utils import emit_cute_synthetic_lane_fold_mm
+from .state import cute_codegen_state
 from .synthetic_axes import allocate_arange_coord
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 
@@ -904,7 +905,7 @@ def _cute_free_arange_axis_expr(
     # collapse: Helion indexes two tensor entries as a cartesian tile, so
     # ``x[r.unsqueeze(1), r.unsqueeze(0)]`` and ``x[r + 1, r + 2]`` both need a
     # second lane coordinate that this arange's one axis cannot provide.
-    positions = cg.cute_synthetic_arange_access_positions
+    positions = cute_codegen_state(cg).synthetic_arange_access_positions
     claimed: set[Node] = set()
     for access, position in cute_free_arange_memory_index_positions(source_node):
         if (

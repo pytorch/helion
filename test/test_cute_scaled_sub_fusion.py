@@ -11,6 +11,8 @@ import torch
 
 from .test_cute_bounded_cache_codegen import _config
 from .test_cute_bounded_cache_codegen import _cpu_target
+from .test_cute_bounded_cache_cuda import CacheCase
+from .test_cute_bounded_cache_cuda import run_guarded_cache_case
 import helion
 from helion._compiler.cute.fuse_fma import fuse_fma
 from helion._compiler.cute.hoist_loop_invariant_recip import hoist_loop_invariant_recips
@@ -19,7 +21,6 @@ from helion._compiler.cute.scaled_sub_fusion import (
     contract_distributed_scale_subtractions,
 )
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 
 pytestmark = pytest.mark.cpu_only
 
@@ -276,7 +277,6 @@ def test_explicit_contract_preserves_fp32_fma_width_and_nonfinite_classes(
 @pytest.mark.parametrize("fast_math", [False, True])
 @pytest.mark.parametrize("aligned", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@skipUnlessBackends(["cute"])
 def test_actual_masked_and_vector_sources_follow_the_same_fusion_policy(
     fast_math, aligned, dtype
 ):
@@ -325,3 +325,21 @@ def test_actual_masked_and_vector_sources_follow_the_same_fusion_policy(
         )
     assert ("cute.arch.load(" in scalar) is aligned
     assert ("cute.arch.load(" in generated) is aligned
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("fast_math", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("layout", ["dense", "unaligned"])
+def test_scaled_sub_fusion_exact_masked_and_vector_replays(fast_math, dtype, layout):
+    case = CacheCase(
+        f"scaled-fusion-{dtype}-{layout}-fast{int(fast_math)}",
+        (17, 513),
+        dtype,
+        False,
+        4096,
+        128,
+        4 if dtype == torch.float32 else 8,
+        layout=layout,
+    )
+    run_guarded_cache_case(case, fast_math=fast_math)

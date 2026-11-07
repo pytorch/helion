@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
@@ -23,19 +22,11 @@ from helion.runtime.cute.launcher import _tcgen05_grouped_device_source_m_tile_s
 from helion.runtime.cute.launcher import _tcgen05_grouped_device_split_total_clusters
 from helion.runtime.cute.launcher import _validate_tcgen05_grouped_device_split_sizes
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
-
-if TYPE_CHECKING:
-    from collections.abc import Generator
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only() -> Generator[None, None, None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipUnlessBackends(["cute"]),
+    pytest.mark.cpu_render,
+]
 
 
 @pytest.fixture(scope="module")

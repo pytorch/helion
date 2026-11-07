@@ -15,6 +15,7 @@ from test.test_cute_collective_chunk_seeds import _partitioned_matmul
 
 import helion
 from helion._compiler.cute.atomic_output_promotions import fresh_half_atomic_outputs
+from helion._compiler.cute.state import cute_env_state
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
@@ -181,7 +182,7 @@ def test_unhashable_host_callable_is_not_a_proven_fresh_factory() -> None:
     bound = cpu_bind(
         _unhashable_host_factory_output, (torch.empty(32, dtype=torch.float16),)
     )
-    assert not bound.env.cute_half_atomic_output_promotions
+    assert not cute_env_state(bound.env).half_atomic_output_promotions
 
 
 @pytest.mark.parametrize("collective", [False, True])
@@ -193,7 +194,7 @@ def test_output_storage_aliases_preserve_requested_half_atomics(
 ) -> None:
     kernel = _metadata_alias_output_matmul if metadata_alias else _aliased_output_matmul
     bound = cpu_bind(kernel, (*_inputs(), broadcast))
-    assert not bound.env.cute_half_atomic_output_promotions
+    assert not cute_env_state(bound.env).half_atomic_output_promotions
     config = _config(collective=collective).config.copy()
     config.pop("partitions")
     code = bound.to_code(helion.Config.from_dict(config))
@@ -216,7 +217,7 @@ def test_argument_atomic_destination_keeps_its_requested_dtype(
 ) -> None:
     args = (torch.empty(32, dtype=dtype), torch.empty(32, dtype=torch.float32))
     bound = cpu_bind(_atomic_into_argument, args)
-    assert not bound.env.cute_half_atomic_output_promotions
+    assert not cute_env_state(bound.env).half_atomic_output_promotions
     code = bound.to_code(helion.Config(block_sizes=[32], num_threads=[32]))
     name = "Float16" if dtype == torch.float16 else "Float32"
     assert f"val=cutlass.{name}(" in code
@@ -230,7 +231,9 @@ def test_all_accumulation_schedules_keep_fp32_storage_and_the_final_cast(
     collective: bool,
 ) -> None:
     bound = cpu_bind(_partitioned_matmul, _inputs())
-    assert bound.env.cute_half_atomic_output_promotions == {"out": torch.float16}
+    assert cute_env_state(bound.env).half_atomic_output_promotions == {
+        "out": torch.float16
+    }
     config = _config(collective=collective)
     code = bound.to_code(config)
     _assert_fp32_atomic_output(code, "a")
@@ -261,7 +264,7 @@ def test_retired_accumulation_override_is_not_a_valid_config(
 @skipUnlessBackends(["cute"])
 def test_nonpromoted_output_dtype_remains_unchanged(collective: bool) -> None:
     bound = cpu_bind(_partitioned_matmul, _inputs(torch.bfloat16))
-    assert not bound.env.cute_half_atomic_output_promotions
+    assert not cute_env_state(bound.env).half_atomic_output_promotions
     code = bound.to_code(_config(collective=collective))
     assert "val=cutlass.BFloat16(" in code
     assert "dtype=a.dtype, device=a.device" in code
@@ -498,7 +501,7 @@ def test_promotion_setting_off_keeps_the_requested_half_storage(
         cute_promote_half_atomic_outputs=False,
     )
     bound = cpu_bind(kernel, _inputs())
-    assert not bound.env.cute_half_atomic_output_promotions
+    assert not cute_env_state(bound.env).half_atomic_output_promotions
     options = _config(collective=collective).config.copy()
     options["split_k"] = options.pop("partitions")
     code = bound.to_code(helion.Config.from_dict(options))

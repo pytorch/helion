@@ -20,13 +20,12 @@ is grouped into:
 
 This module is a leaf: it imports nothing from the emitters (``cute_mma``,
 ``backend``, the launcher import the state) and names plan types only under
-``TYPE_CHECKING``.  CuTe code reads the env state through the typed accessor
-``cute_env_state``; core (and, for one release, the emitters) read every state
-through the ``cute_*`` alias attributes (``attribute_alias.AttributeAlias``).
-The core defaults of the ``Backend.new_*_state`` hooks return these objects
-UNSEEDED for every backend (``new_unseeded_device_state``) until core's
-unconditional ``cute_state`` reads sit behind hooks; only ``CuteBackend`` seeds
-the device state from the config.
+``TYPE_CHECKING``.  CuTe code reads the env and codegen state through the
+typed accessors ``cute_env_state`` / ``cute_codegen_state`` and the device
+state through ``DeviceFunction.cute_state``; the core objects carry no flat
+``cute_*`` names.  The core defaults of the ``Backend.new_*_state`` hooks
+return ``None``: only a CuTe compile carries these objects, and
+``CuteBackend.new_device_state`` seeds the device state from the config.
 """
 
 from __future__ import annotations
@@ -199,6 +198,14 @@ class CuteCodegenState:
     # when the host wrapper is finalized.
     remainder_fills: list[RemainderFill] = dataclasses.field(default_factory=list)
 
+    def declare_matmul(self) -> None:
+        """A matmul lowering declared itself: ``uses_matmul`` and one more
+        declaration.  Declarations are counted, not False-to-True transitions:
+        an unrelated matmul path must not inherit a register chain's
+        shape-bake exemption (``host_metadata.can_bake_tensor_shapes``)."""
+        self.uses_matmul = True
+        self.matmul_declaration_count += 1
+
 
 def cute_codegen_state(codegen: GenerateAST) -> CuteCodegenState:
     """The CuTe state of ``codegen`` (``codegen.backend_state``, typed)."""
@@ -221,12 +228,8 @@ def new_codegen_state() -> CuteCodegenState:
 
 
 def new_unseeded_device_state() -> CuteDeviceFunctionState:
-    """A bare ``CuteDeviceFunctionState``: the core default of
-    ``Backend.new_device_state`` for every other backend (core still reads the
-    launch facts, post-loop marks and branch path off it unconditionally).
-    Config keys are not read: a Triton/Pallas config carrying
-    ``tcgen05_split_k`` keeps the key ignored, as the ``backend_name == "cute"``
-    gate the seed used to sit behind did."""
+    """A bare ``CuteDeviceFunctionState`` (no config read); ``new_device_state``
+    seeds it."""
     from .device_state import CuteDeviceFunctionState
 
     return CuteDeviceFunctionState()

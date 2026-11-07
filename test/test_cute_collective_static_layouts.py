@@ -13,6 +13,7 @@ from test.cute_population_contracts import checked_initial_population
 import helion
 from helion._compiler.cute.host_metadata import has_complete_static_collectives
 from helion._compiler.cute.state import CuteCodegenState
+from helion._compiler.cute.state import cute_codegen_state
 from helion._compiler.generate_ast import GenerateAST
 from helion._testing import import_example
 from helion._testing.cute_codegen import cpu_bind
@@ -93,17 +94,17 @@ def test_incomplete_or_mixed_lowerings_keep_runtime_layouts():
         )
     )
     codegen.device_function = SimpleNamespace(config={KEY: True}, cute_state=state)
-    codegen.cute_uses_matmul = True
+    cute_codegen_state(codegen).declare_matmul()
     assert has_complete_static_collectives(codegen)
     # A second matmul declaration must not inherit the first site's proof.
-    codegen.cute_uses_matmul = True
+    cute_codegen_state(codegen).declare_matmul()
     assert not has_complete_static_collectives(codegen)
     state.lanes.collective_mma_sites.append(object())
     assert has_complete_static_collectives(codegen)
     state.lanes.collective_mma_static_layouts = False
     assert not has_complete_static_collectives(codegen)
     state.lanes.collective_mma_static_layouts = True
-    codegen.cute_wrapper_plans = [{"kind": "unrelated"}]
+    cute_codegen_state(codegen).wrapper_plans = [{"kind": "unrelated"}]
     assert not has_complete_static_collectives(codegen)
 
 

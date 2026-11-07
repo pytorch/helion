@@ -81,6 +81,7 @@ from ...host_function import HostFunction
 from ..autotune.search_surface import cute_fragment_mma_fact
 from ..fragment_mma_dot import FRAGMENT_MMA_KEY
 from ..ring_mma_dot import RING_MMA_KEY
+from ..state import cute_codegen_state
 
 if TYPE_CHECKING:
     from ....runtime.config import Config
@@ -473,7 +474,7 @@ def _lower_simt_gemm(s: _DeviceBodyState) -> None:
 def _has_gathered_mma_tma_plan(s: _DeviceBodyState) -> bool:
     return any(
         plan.get("kind") == "gathered_mma_tma"
-        for plan in s.fn.codegen.cute_wrapper_plans
+        for plan in cute_codegen_state(s.fn.codegen).wrapper_plans
     )
 
 
@@ -598,7 +599,7 @@ def _hoist_warp_reduce_from_vloop(s: _DeviceBodyState) -> None:
 
     s.kernel_body = hoist_warp_reduce_from_vloop(
         s.kernel_body,
-        running_sum_accumulators=s.fn.cute_matmul_running_sums,
+        running_sum_accumulators=s.fn.cute_state.lanes.matmul_running_sums,
         rename_groups=s.ctx.rename_groups,
         unfoldable_vec_lanes=s.fn.cute_state.lanes.unfoldable_vec_lanes,
     )
@@ -1068,7 +1069,7 @@ def _simplify_proven_loop_bounds(s: _DeviceBodyState) -> None:
         and type(fn.pid) in (FlatProgramIDs, XYZProgramIDs)
         and fn.cute_state.lanes.simt_cluster_n == 1
         and fn.cute_state.lanes.collective_mma_sites
-        and not fn.codegen.cute_wrapper_plans
+        and not cute_codegen_state(fn.codegen).wrapper_plans
     ):
         collective_grid = exact_static_grid(fn.pid.codegen_grid(), ctx.constexpr_values)
     s.kernel_body = simplify_proven_loop_bounds(

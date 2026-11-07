@@ -23,7 +23,6 @@ if TYPE_CHECKING:
 
     from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import Kernel
-
 pytestmark = skipUnlessBackends("cute")
 
 

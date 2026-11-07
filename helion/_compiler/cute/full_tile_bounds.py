@@ -21,6 +21,7 @@ from .proven_loop_bounds import _Value
 from .proven_loop_bounds import supported_statements
 from .simplify_proven_bounds import _assigned_names
 from .simplify_proven_bounds import _call_path
+from .state import cute_codegen_state
 from .tensor_layout_relations import TensorLayoutRelation
 from .tensor_layout_relations import prove_tensor_layout_relations
 
@@ -479,10 +480,11 @@ def lower_full_tile_bounds(
     from ..host_function import HostFunction
 
     env = CompileEnvironment.current()
+    codegen_state = cute_codegen_state(function.codegen)
     if (
         not env.config_spec.pointwise_facts
-        or function.codegen.cute_wrapper_plans
-        or function.codegen.cute_uses_matmul
+        or codegen_state.wrapper_plans
+        or codegen_state.uses_matmul
         or function.cute_state.lanes.simt_cluster_n != 1
         or function._scratch_args
         or function.wrapper_only_params

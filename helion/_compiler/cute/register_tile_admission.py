@@ -16,7 +16,7 @@ therefore read the device IR instead of the generated statements:
   ``register_tile_reductions.py`` cannot place (a guard inside the element
   loops, a per-element store, a register budget overrun).  The lowering raises
   ``RegisterTileUnsupported`` and ``generate_ast`` regenerates the kernel with
-  ``CompileEnvironment.cute_register_tile_disabled`` set, which keeps the
+  ``CuteEnvState.register_tile_disabled`` set, which keeps the
   rolled lane nesting the strategy used before register tiles existed.
 """
 

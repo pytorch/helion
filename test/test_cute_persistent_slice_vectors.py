@@ -20,7 +20,6 @@ from __future__ import annotations
 import ast
 import re
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -28,10 +27,10 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
+from helion._testing import cpu_render_target
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -44,10 +43,7 @@ pytestmark = skipUnlessBackends(["cute"])
 
 @pytest.fixture
 def cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
-    ):
+    with cpu_render_target():
         yield
 
 

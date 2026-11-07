@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import ast
 import copy
-from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -18,21 +16,12 @@ from test.test_cute_collective_warp_tf32 import _seeded_fp32
 import helion
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
+pytestmark = [
+    pytest.mark.cpu_render,
+    pytest.mark.cpu_only,
+    skipUnlessBackends(["cute"]),
+]
 
 
 def _packet_config(

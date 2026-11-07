@@ -11,14 +11,11 @@ import helion
 from helion._compiler.cute.fuse_fp4_pair_dot import fuse_fp4_pair_dot
 from helion._testing import DEVICE
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 
 _examples_nvfp4_gemv = import_example("nvfp4_gemv")
 _nvfp4_gemv_fp4in_body = _examples_nvfp4_gemv._nvfp4_gemv_fp4in_body
 reference_nvfp4_gemv_fp4in = _examples_nvfp4_gemv.reference_nvfp4_gemv_fp4in
 swizzle_fp8_scales = _examples_nvfp4_gemv.swizzle_fp8_scales
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 def _config(groups: int, threads: int, **extra: object) -> helion.Config:
@@ -44,7 +41,7 @@ def test_fp4_group_dot_replaces_the_byte_chain(threads: int, extra: dict) -> Non
     kernel = helion.kernel(
         _nvfp4_gemv_fp4in_body, backend="cute", static_shapes=True, config=config
     )
-    source = kernel.bind(args).to_triton_code(config)
+    source = kernel.bind(args).to_code(config)
     assert "_cute_float4_e2m1fn_x16_dot_float32(_helion_literal_vec_" in source
     assert "_cute_float4_e2m1fn_x2_to_float32(" not in source
     kernel(*args)
@@ -84,9 +81,7 @@ def test_fp4_group_dot_is_exact_at_the_largest_products() -> None:
     kernel = helion.kernel(
         _nvfp4_gemv_fp4in_body, backend="cute", static_shapes=True, config=config
     )
-    assert "_cute_float4_e2m1fn_x16_dot_float32(" in kernel.bind(args).to_triton_code(
-        config
-    )
+    assert "_cute_float4_e2m1fn_x16_dot_float32(" in kernel.bind(args).to_code(config)
     kernel(*args)
     torch.testing.assert_close(out.float(), expected.float(), rtol=0, atol=0)
     assert out.float().abs().max().item() == 256 * 16 * 36

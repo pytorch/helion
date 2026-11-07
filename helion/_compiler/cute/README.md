@@ -231,11 +231,10 @@ where `LaneLoopContext` attaches) and `root_plans` (`CuteRootPlans`, whose
 planner).  `state.py` imports nothing from the emitters.  The flat names every field had
 before the regrouping are gone: every reader names the namespace.  The
 `cute_*` / `_cute_*` names the core objects (`CompileEnvironment`,
-`GenerateAST`, `DeviceFunction`) carried before the slot existed survive this
-commit as `AttributeAlias` descriptors (`helion/_compiler/attribute_alias.py`)
-that the next commit retires; new code reads the state through
-`cute_env_state(env)`, `cute_codegen_state(codegen)` and the device-state
-accessor (`DeviceFunction.cute_state`).  The
+`GenerateAST`, `DeviceFunction`) carried before the slot existed are gone as
+well: readers call `cute_env_state(env)`, `cute_codegen_state(codegen)` and
+the device-state accessor (`DeviceFunction.cute_state`); core forwards no
+flat names.  The
 core defaults of the `new_*_state` hooks are `None`: only a CuTe compile
 carries these objects, and core reaches them through `Backend` hooks
 (`synthetic_thread_axis_sizes`,
@@ -427,15 +426,11 @@ Module docstrings carry a `Role:` line using one of these words:
   `new_*_state` defaults are `None` (section 5), and the register-tile gate
   and shared-memory budget the reduction strategies call are
   `thread_budget.register_tile_shape` / `shared_memory_budget_bytes`.
-* **Pending retirements in this stack.** Modules with no importer left after
-  the moves above stay for one commit each: the leftover layout modules
-  (`layout.py`, `layout_rules.py`, `tcgen05_pipeline.py`, `errors.py`), the
-  `AttributeAlias` layer, the `memory_ops` shim and `CodegenDict` go in the
-  next commit; the pre-move copies beside `selection/` (`topk.py`,
-  `row_topk*.py`, `selection_*.py`, `ordered_selection.py`,
-  `sorting_networks.py`) and the scan / reduction scaffolds
-  (`completed_scan.py`, `scan_helper.py`, `free_iota_reduction.py`) in the
-  one after.
+* **Pending retirements in this stack.** The pre-move copies beside
+  `selection/` (`topk.py`, `row_topk*.py`, `selection_*.py`,
+  `ordered_selection.py`, `sorting_networks.py`) and the scan / reduction
+  scaffolds (`completed_scan.py`, `scan_helper.py`, `free_iota_reduction.py`)
+  have no importer left and go in the next commit.
 * **Decision-gated retirements.** The legacy single-warpgroup flash body
   (`emit_flash_device_body`, `ws_overlap` with `s_stage == 1`) is the only
   body at `num_kv == 1` and stays; the `ws_overlap` family stays (it wins the
