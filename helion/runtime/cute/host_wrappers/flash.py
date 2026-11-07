@@ -181,6 +181,8 @@ def emit_flash(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
     v_idx = ctx.plan_int("v_idx")
     o_idx = ctx.plan_int("o_idx")
     lse_idx = ctx.plan_optional_int("lse_idx")
+    # The flex row-max store beside the LSE (the same (S, B) view).
+    row_max_idx = ctx.plan_optional_int("row_max_idx")
     bias_idx = ctx.plan_optional_int("bias_idx")
     # The staged bias ring's depth (``cute_flash_bias_stage='tma'``; None
     # or 0: the softmax warps read the bias from global memory).
@@ -541,6 +543,10 @@ def emit_flash(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
         flash_lines.append(
             f"_flash_mLSE = cute.make_tensor(arg{lse_idx}.iterator, {sb})"
         )
+    if row_max_idx is not None:
+        flash_lines.append(
+            f"_flash_mRowMax = cute.make_tensor(arg{row_max_idx}.iterator, {sb})"
+        )
     epi_tma = bool(plan.get("epi_tma"))
     epi_stg = bool(plan.get("epi_stg"))
     if epi_tma or epi_stg:
@@ -699,6 +705,8 @@ def emit_flash(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
         ctx.call_args.append("_flash_tail_base")
     if lse_idx is not None:
         ctx.call_args.append("_flash_mLSE")
+    if row_max_idx is not None:
+        ctx.call_args.append("_flash_mRowMax")
     if bias_idx is not None:
         ctx.call_args.extend(["_flash_mBias", "_flash_score_bias_scale"])
         if bias_stage:

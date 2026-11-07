@@ -129,7 +129,7 @@ def wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
 STAGED_PLAN_OPERANDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "helion_flash": (
         ("q_idx", "k_idx", "v_idx", "bias_idx", "alibi_idx", "document_idx"),
-        ("o_idx", "lse_idx"),
+        ("o_idx", "lse_idx", "row_max_idx"),
     ),
     "helion_flash_row_mma": (
         ("q_idx", "k_idx", "v_idx", "bias_idx"),

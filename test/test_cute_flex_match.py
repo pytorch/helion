@@ -1558,3 +1558,199 @@ def test_trivial_walk_with_a_mask_region_keeps_the_flex_surface() -> None:
     with _as_sm100_flex(flex=True):
         code = bound.to_code(spec.default_config())
     assert "flash_flex_needs_mask" in code and "flash_flex_status" in code
+
+
+# -- the row-max store ------------------------------------------------------------
+#
+# FlexAttention's ``max_scores``: a third ``[B, H, M]`` fp32 output holding the
+# running row max ``m`` (base-2 units, or natural ones) beside the LSE.
+
+_LSE_ALLOC = (
+    "    lse = torch.empty((B, H, M), dtype=torch.float32, device=out.device)\n"
+)
+_LSE_STORE = "        lse[tile_b, tile_h, tile_m] = lse_row[None, None, :]\n"
+_RETURN = "    return out, lse\n"
+
+
+def _row_max_kernel(tmp_path: pathlib.Path, value: str, *, lse: bool = True) -> Kernel:
+    """The example kernel storing ``value`` (an expression of the epilogue's
+    names) to a third output ``row_max``; ``lse=False`` drops the LSE
+    store."""
+    store = f"        row_max[tile_b, tile_h, tile_m] = ({value})[None, None, :]\n"
+    return _variant_kernel(
+        tmp_path,
+        "row_max_" + re.sub(r"\W+", "_", value) + ("" if lse else "_no_lse"),
+        (
+            _LSE_ALLOC,
+            _LSE_ALLOC + "    row_max = torch.empty((B, H, M), dtype=torch.float32,"
+            " device=out.device)\n",
+        ),
+        (
+            _LSE_STORE + _RETURN,
+            (_LSE_STORE if lse else "") + store + "    return out, lse, row_max\n",
+        ),
+    )
+
+
+def _causal_args() -> tuple[Any, ...]:
+    q, k, v = _qkv()
+    block_mask = create_block_mask(
+        _causal, None, None, 1024, 1024, BLOCK_SIZE=128, device=_CPU
+    )
+    return _flex_args(q, k, v, _identity, block_mask)
+
+
+@pytest.mark.parametrize(
+    ("value", "scale"),
+    [
+        ("m_i", 1.0),
+        ("m_i / log_2_e", 0.6931471805599453),
+        ("m_i * 0.6931471805599453", 0.6931471805599453),
+    ],
+)
+def test_row_max_store_matches_beside_the_lse(
+    tmp_path: pathlib.Path, value: str, scale: float
+) -> None:
+    """The running max ``m`` itself (base 2, the kernel's own units) or in
+    natural units (``/ log2e``, ``* ln2``) stored beside the LSE: the match
+    names the row-max output and the plan carries the factor from the
+    fused body's log2-unit row max to the stored value."""
+    kernel = _row_max_kernel(tmp_path, value)
+    match = _match_or_fail(_bind(kernel, _causal_args()))
+    assert (match.lse_name, match.row_max_name) == ("lse", "row_max")
+    assert match.plan.row_max_scale == pytest.approx(scale)
+    assert match.plan.lse_scale == pytest.approx(0.6931471805599453)
+    assert match.plan.flex_envelope and match.plan.has_list_walk
+    plain = _match_or_fail(_bind(_flex_kernel(), _causal_args()))
+    assert plain.row_max_name is None and plain.plan.row_max_scale is None
+
+
+_NOT_A_ROW_STORE = (
+    "flex: the row store to row_max is neither the LSE (m + log2(l), "
+    "or its natural-log form) nor the row max m"
+)
+
+
+@pytest.mark.parametrize(
+    ("value", "lse", "reason"),
+    [
+        (
+            "l_i",
+            True,
+            _NOT_A_ROW_STORE,
+        ),
+        (
+            "m_i * 2.0",
+            True,
+            _NOT_A_ROW_STORE,
+        ),
+        ("m_i", False, "flex: a row-max store needs the LSE store beside it"),
+    ],
+)
+def test_row_max_store_declines(
+    tmp_path: pathlib.Path, value: str, lse: bool, reason: str
+) -> None:
+    """Another row value (the row sum, a rescaled max) or a row max without
+    the LSE beside it (the fused bodies store both from the same final
+    statistics, under the same row guards) keeps the generic path."""
+    kernel = _row_max_kernel(tmp_path, value, lse=lse)
+    reasons: list[str] = []
+    assert _match(_bind(kernel, _causal_args()), reasons) is None
+    assert reasons == [reason]
+
+
+def test_row_max_store_keeps_the_flex_body_on_an_empty_block_mask(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The dense flex plan routes to the dense bodies, which store no row
+    max: with the row-max store the empty BlockMask keeps the flex plan."""
+    q, k, v = _qkv()
+    kernel = _row_max_kernel(tmp_path, "m_i")
+    plan = _match_or_fail(_bind(kernel, _empty_mask_args(q, k, v))).plan
+    assert plan.row_max_scale == 1.0
+    assert plan.is_flex and not plan.flex_dense and plan.flex_envelope
+    bound = _bind(kernel, _empty_mask_args(q, k, v), flex=True)
+    with _as_sm100_flex(flex=True):
+        code = bound.to_code(bound.config_spec.default_config())
+    assert "flash_flex_status" in code and "_flash_mRowMax[" in code
+
+
+# The split renders' last-step unpin.
+_UNPIN = "& (flash_true_row_max > flash_row_max):"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "tracks", "unpins"),
+    [
+        # The one-CTA walk: the softmax warps store the tracked true max.
+        ({cute_flash.FLASH_KV_SPLIT_KEY: 1}, True, False),
+        # Split renders: the merges fold the published row max, so the walk's
+        # last step unpins it.
+        ({cute_flash.FLASH_KV_SPLIT_KEY: 2}, True, True),
+        (
+            {
+                cute_flash.FLASH_KV_SPLIT_KEY: 1,
+                cute_flash.FLASH_PERSISTENT_KEY: False,
+                cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: 2,
+            },
+            True,
+            True,
+        ),
+        (
+            {
+                cute_flash.FLASH_KV_SPLIT_KEY: 1,
+                cute_flash.FLASH_PERSISTENT_KEY: False,
+                cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: True,
+                cute_flash.FLASH_FLEX_DEAD_STAGE_SPLIT_KEY: True,
+            },
+            True,
+            True,
+        ),
+        # No alpha pin: the row max is exact.
+        (
+            {
+                cute_flash.FLASH_KV_SPLIT_KEY: 1,
+                cute_flash.FLASH_RESCALE_THRESHOLD_KEY: 0.0,
+            },
+            False,
+            False,
+        ),
+        # The cooperative pair (ws_overlap, 2-CTA).
+        ({cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta"}, True, False),
+    ],
+)
+def test_row_max_store_renders_beside_the_lse(
+    tmp_path: pathlib.Path,
+    overrides: dict[str, object],
+    tracks: bool,
+    unpins: bool,
+) -> None:
+    """The row-max store renders as a kernel output beside the LSE (the
+    launcher's view of the same geometry) in every schedule, with the true
+    max tracked apart under the alpha pin and the split renders' last step
+    unpinned."""
+    kernel = _row_max_kernel(tmp_path, "m_i")
+    bound = _bind(kernel, _causal_args(), flex=True)
+    config = bound._normalized_config_copy(
+        helion.Config(**{**bound.config_spec.default_config().config, **overrides})
+    )
+    with _as_sm100_flex(flex=True):
+        code = bound.to_code(config)
+    assert "_flash_mRowMax[" in code
+    # The device view follows the LSE's among the kernel parameters.
+    (kernel_def,) = [
+        line
+        for line in code.splitlines()
+        if line.startswith("def _helion_helion_flex_attention_kernel(")
+    ]
+    assert "lse, row_max, " in kernel_def
+    assert "_flash_mLSE, _flash_mRowMax, " in kernel_def
+    assert ("flash_true_row_max" in code) is tracks
+    assert (_UNPIN in code) is unpins
+    plan = _wrapper_plan(code)
+    assert plan["kind"] == "helion_flash"
+    assert plan["row_max_idx"] == plan["lse_idx"] + 1
+    host = "\n".join(_host_lines(plan))
+    assert (
+        f"_flash_mRowMax = cute.make_tensor(arg{plan['row_max_idx']}.iterator, " in host
+    )

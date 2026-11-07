@@ -14,7 +14,9 @@ matcher, the hook renderer and the list-walk emitter. Expectations:
 * a random table mask with empty rows, pairs and heads launched repeatedly
   (the statistics handoff under contention) gives stable output;
 * the persistent list walk (host-sorted longest-first item order) is bitwise
-  the one-item-per-CTA grid and follows in-place table rewrites.
+  the one-item-per-CTA grid and follows in-place table rewrites;
+* a kernel that also stores the running row max (FlexAttention's
+  ``max_scores``) matches torch's in every schedule hosting the store.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ import torch
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
+from torch.nn.attention.flex_attention import AuxRequest
 from torch.nn.attention.flex_attention import create_block_mask
 from torch.nn.attention.flex_attention import flex_attention as torch_flex
 from torch.nn.attention.flex_attention import noop_mask
@@ -2864,3 +2867,251 @@ def test_shared_staged_output_tile_is_bitwise_the_two_tiles(case: str) -> None:
         q, k, v, None, block_mask, enable_gqa=kv_heads is not None
     )
     _assert_close_to_reference(*results[1], out_ref, lse_ref)
+
+
+# -- the row-max store (FlexAttention's ``max_scores``) ---------------------------
+
+_LSE_ALLOC = (
+    "    lse = torch.empty((B, H, M), dtype=torch.float32, device=out.device)\n"
+)
+_LSE_STORE_RETURN = (
+    "        lse[tile_b, tile_h, tile_m] = lse_row[None, None, :]\n"
+    "    return out, lse\n"
+)
+# The stored running max (base-2 ``m``, or natural units) and the factor that
+# takes it to FlexAttention's natural-unit ``max_scores``.
+_ROW_MAX_FORMS: dict[str, tuple[str, float]] = {
+    "log2": ("m_i", math.log(2.0)),
+    "natural": ("m_i / log_2_e", 1.0),
+}
+
+
+@pytest.fixture(scope="module")
+def row_max_kernel(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Callable[[str], Kernel]:
+    """The example kernel with a third ``[B, H, M]`` fp32 output, the running
+    row max of ``_ROW_MAX_FORMS[form]`` stored beside the LSE."""
+    root = tmp_path_factory.mktemp("flex_row_max")
+
+    @functools.cache
+    def build(form: str) -> Kernel:
+        value = _ROW_MAX_FORMS[form][0]
+        source = (EXAMPLES_DIR / "flex_attention.py").read_text()
+        for old, new in (
+            (
+                _LSE_ALLOC,
+                _LSE_ALLOC + "    row_max = torch.empty((B, H, M), dtype=torch.float32,"
+                " device=out.device)\n",
+            ),
+            (
+                _LSE_STORE_RETURN,
+                _LSE_STORE_RETURN.replace(
+                    "    return out, lse\n",
+                    f"        row_max[tile_b, tile_h, tile_m] = ({value})[None, None, :]\n"
+                    "    return out, lse, row_max\n",
+                ),
+            ),
+        ):
+            assert source.count(old) == 1, old
+            source = source.replace(old, new)
+        path = root / f"flex_attention_row_max_{form}.py"
+        path.write_text(source)
+        return _cute_kernel(import_path(path).helion_flex_attention_kernel)
+
+    return build
+
+
+def _compile_row_max(
+    kernel: Kernel, args: tuple[Any, ...], overrides: dict[str, object]
+) -> tuple[Any, cute_flash.FlashAttentionConfig]:
+    """Compile the row-max kernel at the default config plus ``overrides``
+    (any family), asserting the fused flex body hosts the store."""
+    bound = kernel.bind(args)
+    spec = bound.config_spec
+    assert spec.cute_flash_search_enabled
+    assert spec._cute_flash_score_modifier_kinds == ("flex",)
+    requested = {**spec.default_config().config, **overrides}
+    normalized = bound._normalized_config_copy(helion.Config(**requested))
+    resolved = _resolve_cute_flash_config(spec, normalized.config)
+    fn, code = compile_and_source(bound, normalized)
+    assert "flash_flex_status" in code and "_flash_mRowMax[" in code
+    return fn, resolved
+
+
+def _softcap(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+    return 30.0 * torch.tanh(score / 30.0)
+
+
+def _assert_row_max_matches(
+    row_max: torch.Tensor,
+    form: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    score_mod: Callable[..., Any] | None,
+    block_mask: Any,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+) -> None:
+    """The stored row max against torch's fp32 ``max_scores`` (natural units,
+    ``-inf`` for a row with no visible key), and O / LSE against torch."""
+    out_ref, aux = torch_flex(
+        q.float(),
+        k.float(),
+        v.float(),
+        score_mod=score_mod,
+        block_mask=block_mask,
+        scale=1.0 / math.sqrt(q.size(-1)),
+        return_aux=AuxRequest(lse=True, max_scores=True),
+    )
+    _assert_close_to_reference(out, lse, out_ref, aux.lse)
+    natural = row_max * _ROW_MAX_FORMS[form][1]
+    finite = torch.isfinite(aux.max_scores)
+    torch.testing.assert_close(
+        natural[finite], aux.max_scores[finite], atol=1e-4, rtol=1e-5
+    )
+    assert torch.all(row_max[~finite] == float("-inf"))
+
+
+def _documents(seq: int) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """A captured-tensor document mask (documents of 300, 129, 500 and the
+    rest), causal within each: the Helion form and torch's."""
+    lengths = [300, 129, 500, seq - 929]
+    doc = torch.cat(
+        [torch.full((n,), i, dtype=torch.int32) for i, n in enumerate(lengths)]
+    ).to(DEVICE)
+
+    def documents(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (hl.load(doc, [q_idx]) == hl.load(doc, [kv_idx])) & (q_idx >= kv_idx)
+
+    def documents_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (doc[q_idx] == doc[kv_idx]) & (q_idx >= kv_idx)
+
+    return documents, documents_ref
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("case", ["causal", "softcap", "documents"])
+def test_row_max_store_matches_torch_max_scores(
+    row_max_kernel: Callable[[str], Kernel], case: str, head_dim: int
+) -> None:
+    """The fused flex forward storing the running row max beside the LSE at
+    the default config (the split-KV walk at this grid): torch's fp32
+    ``max_scores`` within fp32 rounding, for a causal mask, a soft-capped
+    score under it and a captured-tensor document mask."""
+    batch, heads, seq = 2, 4, 1152
+    q, k, v = _qkv(batch, heads, seq, seq, head_dim=head_dim)
+    score_mod = _softcap if case == "softcap" else _identity
+    mask_mod = mask_ref = _causal
+    if case == "documents":
+        mask_mod, mask_ref = _documents(seq)
+    block_mask = create_block_mask(
+        mask_ref, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, score_mod, block_mask, mask_mod=mask_mod)
+    fn, _ = _compile_row_max(row_max_kernel("log2"), args, {})
+    out, lse, row_max = fn(*args)
+    torch.cuda.synchronize()
+    _assert_row_max_matches(
+        row_max,
+        "log2",
+        q,
+        k,
+        v,
+        None if score_mod is _identity else score_mod,
+        block_mask,
+        out,
+        lse,
+    )
+
+
+# (name: config overrides, the stored form)
+_ROW_MAX_SCHEDULES: dict[str, tuple[dict[str, object], str]] = {
+    "unsplit": ({**PAIR_DESC}, "log2"),
+    "unsplit_natural": ({**PAIR_DESC}, "natural"),
+    "no_alpha_pin": (
+        {**PAIR_DESC, cute_flash.FLASH_RESCALE_THRESHOLD_KEY: 0.0},
+        "log2",
+    ),
+    "persistent": (
+        {cute_flash.FLASH_KV_SPLIT_KEY: 1, cute_flash.FLASH_PERSISTENT_KEY: True},
+        "log2",
+    ),
+    "staged_ascending": ({**STAGED_ASC}, "log2"),
+    "shared_softmax_region": (
+        {**PAIR_DESC, cute_flash.FLASH_SOFTMAX_REGION_KEY: "shared"},
+        "log2",
+    ),
+    "kv_split_2": (
+        {**PAIR_DESC, cute_flash.FLASH_KV_SPLIT_KEY: 2},
+        "log2",
+    ),
+    "kv_split_4_persistent": (
+        {cute_flash.FLASH_KV_SPLIT_KEY: 4, cute_flash.FLASH_PERSISTENT_KEY: True},
+        "natural",
+    ),
+    "dead_stage_split": (
+        {
+            **STAGED_ASC,
+            cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: True,
+            cute_flash.FLASH_FLEX_DEAD_STAGE_SPLIT_KEY: True,
+        },
+        "log2",
+    ),
+    "tail_split_2": (
+        {**PAIR_DESC, cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: 2},
+        "log2",
+    ),
+    "ws_2cta": ({cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta"}, "log2"),
+}
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@pytest.mark.parametrize("name", list(_ROW_MAX_SCHEDULES))
+def test_row_max_store_across_schedules(
+    row_max_kernel: Callable[[str], Kernel], name: str
+) -> None:
+    """Every schedule hosting the row-max store, on a soft-capped score
+    with every fourth 128-row block seeing no key (row max ``-inf``): the
+    one-CTA walks store the true max the softmax tracks apart from the
+    alpha-pinned one, the split renders (split-KV, the tail split, the
+    dead-stage split) unpin the walk's last step and fold the published
+    maxima, and the cooperative 2-CTA pair stores its own."""
+    overrides, form = _ROW_MAX_SCHEDULES[name]
+    batch, heads, seq = 2, 4, 1152
+    q, k, v = _qkv(batch, heads, seq, seq)
+    block_mask = create_block_mask(
+        _empty_rows, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _softcap, block_mask)
+    fn, resolved = _compile_row_max(row_max_kernel(form), args, overrides)
+    if name == "ws_2cta":
+        assert resolved.pipeline_family == "ws_2cta"
+    out, lse, row_max = fn(*args)
+    torch.cuda.synchronize()
+    _assert_row_max_matches(row_max, form, q, k, v, _softcap, block_mask, out, lse)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+def test_row_max_store_leaves_the_unsplit_outputs_bitwise(
+    row_max_kernel: Callable[[str], Kernel],
+) -> None:
+    """The one-CTA walk's row-max store only adds the tracked maximum and
+    its store: O and the LSE are bitwise the kernel without it."""
+    batch, heads, seq = 2, 4, 1152
+    q, k, v = _qkv(batch, heads, seq, seq)
+    block_mask = create_block_mask(
+        _causal, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _softcap, block_mask)
+    out, lse = _run_flex(args, PAIR_DESC)
+    fn, _ = _compile_row_max(row_max_kernel("log2"), args, PAIR_DESC)
+    out_max, lse_max, _ = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out_max, out)
+    assert torch.equal(lse_max, lse)

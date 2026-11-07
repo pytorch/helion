@@ -4199,6 +4199,8 @@ def fa4_split_merge_rows(
     lse_scale: float,
     tile_elems: int,
     *,
+    row_max_out: cute.Tensor | None = None,
+    row_max_scale: float = 1.0,
     loc: object = None,
     ip: object = None,
 ) -> None:
@@ -4217,7 +4219,10 @@ def fa4_split_merge_rows(
     forms them, the sum in split order, the cast rows (``o_row_stride``
     elements per row of the tile) and, from the chunk-0 lane, the row's LSE;
     rows at or past the stage's live count store nothing (their loads read
-    the workspace's stale rows, harmlessly)."""
+    the workspace's stale rows, harmlessly).  ``row_max_out`` (the flex
+    row-max store, LSE geometry) takes the merged statistics' row max
+    beside the LSE, in log2 units times ``row_max_scale``."""
+    assert row_max_out is None or lse is not None
     rows_per_cta = 32 // splits
     chunks = head_dim // corr_tile_size
     chunks_per_lane = chunks // splits
@@ -4305,9 +4310,16 @@ def fa4_split_merge_rows(
                 value = row_max * scale_log2 + cute.math.log2(total)
                 if not math.isclose(lse_scale, 1.0, rel_tol=1e-6, abs_tol=1e-7):
                     value = value * cutlass.Float32(lse_scale)
+                max_value = None
+                if row_max_out is not None:
+                    max_value = row_max * scale_log2
+                    if not math.isclose(row_max_scale, 1.0, rel_tol=1e-6, abs_tol=1e-7):
+                        max_value = max_value * cutlass.Float32(row_max_scale)
 
                 def _store_lse() -> None:
                     lse[lse_row_base + row, lse_bh] = value
+                    if row_max_out is not None:
+                        row_max_out[lse_row_base + row, lse_bh] = max_value
 
                 cutlass.cutlass_dsl.if_generate(
                     chunk_group == 0, _store_lse, lambda: None, [], []
