@@ -1,4 +1,4 @@
-"""Alias-only MMA plans specialize guarded tensor layouts in the launch schema."""
+"""Paged attention specializes guarded tensor layouts in its launch schema."""
 
 from __future__ import annotations
 
@@ -41,6 +41,36 @@ def _state_recurrence(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _kernel(*kinds: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        _helion_cute_wrapper_plans=[
+            {
+                "kind": kind,
+                "tensor_idx": [0],
+                "tensor_names": ["view"],
+                "stored": [False],
+            }
+            if kind == "helion_mma_dag_alias"
+            else {"kind": kind}
+            for kind in kinds
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "kinds,expected",
+    [
+        (("helion_paged_attention",), True),
+        (("helion_mma_dag_alias",), True),
+        (("helion_paged_attention", "helion_mma_dag_alias"), True),
+        (("helion_paged_attention", "unrecognized_plan"), False),
+        (("helion_mma_dag_alias", "unrecognized_plan"), False),
+    ],
+)
+def test_plan_layout_requirements_compose(kinds: tuple[str, ...], expected: bool):
+    assert bake_tensor_shapes(_kernel(*kinds)) is expected
+
+
 def test_alias_guard_preserves_partial_mma_runtime_layout_requirement():
     for rows, expected in ((250, False), (256, True)):
         kernel = SimpleNamespace(
@@ -66,6 +96,27 @@ def fake_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
         return address, assumed_align
 
     mock_cute_launcher_runtime(monkeypatch, pointer)
+
+
+def test_attention_schema_and_guard_retain_actual_view_metadata(fake_runtime):
+    kernel = _kernel("helion_paged_attention", "helion_mma_dag_alias")
+    storage = torch.empty((4, 16), dtype=torch.bfloat16)
+    view = storage[:2, :8]
+    grid = (1, 1, 1)
+    first = launcher._build_cute_schema_and_args(kernel, (view,), grid)
+    assert first.schema == (("tensor", "torch.bfloat16", 2, (2, 8), (16, 1)),)
+    # Beyond the pointer and launch grid, no layout scalars are marshalled.
+    # The wrapper reconstructs them from the schema in its compiled key.
+    assert first.launch_args[1:] == grid
+    guard = launcher._cute_last_launch_arg_guard(kernel, (view,), grid)
+    assert guard.matches(kernel, (storage[:2, :8],), grid)
+
+    changed_views = (view.T, storage.as_strided((2, 8), (8, 1)))
+    for changed in changed_views:
+        assert changed.data_ptr() == view.data_ptr()
+        next_args = launcher._build_cute_schema_and_args(kernel, (changed,), grid)
+        assert next_args.schema != first.schema
+        assert not guard.matches(kernel, (changed,), grid)
 
 
 def test_actual_alias_only_recurrence_specializes_guarded_layouts(
@@ -122,3 +173,14 @@ def test_actual_alias_only_recurrence_specializes_guarded_layouts(
         )
         assert not guard.matches(kernel, changed, grid)
     assert torch.cuda.is_initialized() == initialized
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_opt_out_and_empty_layout_keep_runtime_metadata(fake_runtime, empty: bool):
+    kernel = _kernel("helion_paged_attention", "helion_mma_dag_alias")
+    if not empty:
+        kernel._helion_cute_disable_bake_tensor_shapes = True
+    tensor = torch.empty((0 if empty else 2, 8), dtype=torch.bfloat16)
+    built = launcher._build_cute_schema_and_args(kernel, (tensor,), (1, 1, 1))
+    assert built.schema == (("tensor", "torch.bfloat16", 2),)
+    assert built.launch_args[1:-3] == (*tensor.shape, *tensor.stride())

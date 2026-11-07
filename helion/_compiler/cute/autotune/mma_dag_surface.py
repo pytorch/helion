@@ -17,6 +17,7 @@ from ....exc import InvalidConfig
 from ..cute_mma_dag import AXIS_LEAD
 from ..cute_mma_dag import AXIS_LOOP
 from ..cute_mma_dag import AXIS_ROOT
+from ..cute_mma_dag import MMA_DAG_ATTENTION_PASS_WARPS
 from ..cute_mma_dag import MMA_DAG_AUX_CHOICES
 from ..cute_mma_dag import MMA_DAG_AUX_KEY
 from ..cute_mma_dag import MMA_DAG_AUX_RING
@@ -78,6 +79,7 @@ from ..cute_mma_dag import mma_dag_pass_warps_reason
 from ..cute_mma_dag import mma_dag_persistent_reason
 from ..cute_mma_dag import mma_dag_ragged_ceilings
 from ..cute_mma_dag import mma_dag_seed_configs
+from ..cute_mma_dag import paged_attention_pass_warp_choices
 from ..cute_register_subblocks import COLSIDE_CHOICES as RSB_COLSIDE_CHOICES
 from ..cute_register_subblocks import COLSIDE_KEY as RSB_COLSIDE_KEY
 from ..cute_register_subblocks import COLSIDE_RMW as RSB_COLSIDE_RMW
@@ -245,6 +247,12 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
     for block_id, atom in mma_dag_ragged_ceilings(facts).items():
         if block_id in block_ids:
             config_spec.block_sizes.block_id_lookup(block_id).allow_overshoot(atom)
+    if facts.attention is not None:
+        query_axis = facts.axes[facts.attention.query_axis]
+        if query_axis.block_id in block_ids:
+            config_spec.block_sizes.block_id_lookup(
+                query_axis.block_id
+            ).allow_overshoot(facts.attention.query_block)
     modes = MMA_DAG_MODES
     if facts.tcgen05 is not None:
         modes = (*modes, MMA_DAG_TCGEN05)
@@ -282,8 +290,13 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
     )
     config_spec.cute_mma_dag_store = EnumFragment(choices=MMA_DAG_STORE_CHOICES)
     config_spec.cute_mma_dag_exchange = EnumFragment(choices=MMA_DAG_EXCHANGE_CHOICES)
+    attention_choices = paged_attention_pass_warp_choices(facts)
     config_spec.cute_mma_dag_pass_warps = EnumFragment(
-        choices=MMA_DAG_PASS_WARPS_CHOICES
+        choices=tuple(
+            choice
+            for choice in MMA_DAG_PASS_WARPS_CHOICES
+            if choice not in MMA_DAG_ATTENTION_PASS_WARPS or choice in attention_choices
+        )
     )
     config_spec.cute_mma_dag_loads = EnumFragment(choices=MMA_DAG_LOADS_CHOICES)
     if facts.aux_candidates:
@@ -462,6 +475,7 @@ def _normalize_cute_mma_dag(
     and pin the knobs the replaced body ignores to one identity."""
     from ..cute_mma_dag import mma_dag_config_reason
     from ..cute_mma_dag import mma_dag_repair
+    from ..paged_attention_config import paged_attention_config_reason
 
     facts = config_spec.cute_mma_dag_facts
     assert facts is not None
@@ -665,6 +679,15 @@ def _normalize_cute_mma_dag(
     ):
         config[MMA_DAG_PERSISTENT_KEY] = 0
     persistent = cast("int", config[MMA_DAG_PERSISTENT_KEY])
+    if config[MMA_DAG_PASS_WARPS_KEY] in MMA_DAG_ATTENTION_PASS_WARPS:
+        attention_reason = paged_attention_config_reason(
+            facts, sizes_by_block, config, before_inert_globals=True
+        )
+        if attention_reason is not None:
+            if not fix_invalid:
+                raise InvalidConfig(attention_reason)
+            config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
+            pass_warps = MMA_DAG_PASS_WARPS_OFF
     reason = mma_dag_config_reason(
         facts,
         sizes_by_block,
@@ -758,6 +781,7 @@ def _normalize_cute_mma_dag(
             config[MMA_DAG_PERSISTENT_KEY] = 0
         for block_id, index in indices.items():
             block_sizes[index] = new_sizes[block_id]
+        sizes_by_block = dict(new_sizes)
         # The repaired split axis slice names the split count (1 when
         # the repair kept the whole axis, or fell back to the warp mode);
         # beyond a portable cluster it is the fixup grid's.
@@ -855,10 +879,42 @@ def _normalize_cute_mma_dag(
         config[MMA_DAG_PERSISTENT_KEY] = 0
         config["pid_type"] = "flat"
         config.pop("num_sm_multiplier", None)
+    policies = config.get("load_eviction_policies")
+    if config[MMA_DAG_PASS_WARPS_KEY] in MMA_DAG_ATTENTION_PASS_WARPS and isinstance(
+        policies, str
+    ):
+        config["load_eviction_policies"] = [
+            policies
+        ] * config_spec.load_eviction_policies.length
     if config_spec.cute_mma_dag_phase_index is not None:
         _normalize_mma_dag_phase_owned_fields(config_spec, config)
-        return
-    _normalize_mma_dag_owned_fields(config_spec, config)
+    else:
+        _normalize_mma_dag_owned_fields(config_spec, config)
+    if config[MMA_DAG_PASS_WARPS_KEY] in MMA_DAG_ATTENTION_PASS_WARPS:
+        attention_config = config
+        policies = config.get("load_eviction_policies")
+        if config_spec.cute_mma_dag_phase_index is not None and isinstance(
+            policies, list
+        ):
+            # Sibling launches retain their own policies. Only this phase's
+            # projected slots belong to the attention schedule's contract.
+            attention_config = {
+                **config,
+                "load_eviction_policies": project_load_policies(
+                    policies, config_spec.cute_mma_dag_phase_eviction_map
+                ),
+            }
+        attention_reason = paged_attention_config_reason(
+            facts, sizes_by_block, attention_config
+        )
+        if attention_reason is not None:
+            if not fix_invalid:
+                raise InvalidConfig(attention_reason)
+            config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
+            # The ordinary layout has a different resource budget. A late
+            # topology repair must validate that body before returning it.
+            _normalize_cute_mma_dag(config_spec, config, fix_invalid=True)
+            return
 
 
 def _normalize_mma_dag_phase_owned_fields(

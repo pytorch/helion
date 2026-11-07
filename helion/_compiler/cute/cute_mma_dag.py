@@ -89,10 +89,14 @@ if TYPE_CHECKING:
 
     from torch.fx.node import Node
 
+    from ...runtime.config import Config
     from ..device_ir import GraphInfo
+    from .analysis.separable_index_map import SeparableIndexMap
     from .cute_mma_dag_tcgen05 import StreamedLoopFacts
     from .cute_mma_dag_tcgen05 import Tcgen05Facts
     from .cute_mma_dag_tcgen05 import Tcgen05Plan
+    from .paged_attention_transport import PagedAttentionSchedule
+    from .paged_attention_transport import PagedAttentionScheduleFacts
 
     Layouts = dict[tuple[int, int], tuple[int, int]]
 
@@ -164,6 +168,12 @@ MMA_DAG_PASS_WARPS_KEY = "cute_mma_dag_pass_warps"
 MMA_DAG_PASS_WARPS_OFF = "off"
 MMA_DAG_PASS_WARPS_ON = "on"
 MMA_DAG_PASS_WARPS_MMA = "mma"
+MMA_DAG_PASS_WARPS_ATTENTION = "attention"
+MMA_DAG_PASS_WARPS_ATTENTION_SCOPED = "attention_scoped"
+MMA_DAG_ATTENTION_PASS_WARPS: tuple[str, ...] = (
+    MMA_DAG_PASS_WARPS_ATTENTION,
+    MMA_DAG_PASS_WARPS_ATTENTION_SCOPED,
+)
 # tcgen05 at eight warps with loop operand passes: ``on`` has warps 4-7
 # rewrite the operand tiles one tile ahead of the epilogue warps' chain
 # (handing each over through a per-stage mbarrier); ``off`` runs the passes
@@ -178,11 +188,38 @@ MMA_DAG_PASS_WARPS_MMA = "mma"
 # graph; bit-equal to the chain schedule's render of the same tile).  The
 # warp owns no packet of the passes and drains it reaches outside its loop
 # (``pass_guard``).
+# ``attention`` uses the proved paged recurrence's ten- or thirteen-warp
+# topology. ``attention_scoped`` retains the per-key recurrence's pipeline
+# with twelve warps and 128/64/32 compute/conversion/control register quotas.
+# Both are explicit search choices; reduced denominators retain ``attention``.
 MMA_DAG_PASS_WARPS_CHOICES: tuple[str, ...] = (
     MMA_DAG_PASS_WARPS_OFF,
     MMA_DAG_PASS_WARPS_ON,
     MMA_DAG_PASS_WARPS_MMA,
+    *MMA_DAG_ATTENTION_PASS_WARPS,
 )
+
+
+def paged_attention_pass_warp_choices(facts: CuteMmaDagFacts) -> tuple[str, ...]:
+    """Schedules whose role topology implements the proved recurrence."""
+    if facts.attention is None:
+        return ()
+    if facts.attention.denominator_per_key:
+        return MMA_DAG_ATTENTION_PASS_WARPS
+    return (MMA_DAG_PASS_WARPS_ATTENTION,)
+
+
+def paged_attention_pass_warps_reason(
+    facts: CuteMmaDagFacts, pass_warps: object
+) -> str | None:
+    """Shared semantic gate for the explicit attention schedule family."""
+    if facts.attention is None:
+        return "the paged-attention semantic and transport proof did not match"
+    if pass_warps not in paged_attention_pass_warp_choices(facts):
+        return f"{pass_warps} requires the per-key denominator"
+    return None
+
+
 # Ring depth the pass-warp seed asks for: the next tile must land before
 # its pass is due (at two slots the TMA of tile i + 1 goes out with
 # iteration i and the pass warps wait on it: gated fwd_h_delta at s2 305 us
@@ -676,6 +713,10 @@ class Access:
     # without an explicit policy in program order, as the ordinary lowering
     # numbers its sites); None for a store.
     eviction_slot: int | None = None
+    # Explicit logical coordinates for a rank-one physical storage view.
+    # This is not an affine tensor layout: dim_strides/subscripts are empty,
+    # and only a consumer implementing the map may lower the access.
+    index_map: SeparableIndexMap | None = None
 
     @property
     def dtype(self) -> torch.dtype:
@@ -693,6 +734,8 @@ class Access:
     @property
     def tile_dim_strides(self) -> tuple[int, ...]:
         """Element strides of ``tile_dims`` (lead dims dropped)."""
+        if self.index_map is not None:
+            raise _NotMine
         return tuple(
             stride
             for axis, stride in zip(self.dims, self.dim_strides, strict=True)
@@ -707,6 +750,8 @@ class Access:
     def stride_of(self, axis: Axis) -> int:
         """Element stride of the tensor dim ``axis`` indexes (the axis must
         index exactly one dim; positional lookups use ``stride_at``)."""
+        if self.index_map is not None:
+            raise _NotMine
         strides = [
             stride
             for subscript, stride in zip(self.subscripts, self.strides, strict=True)
@@ -718,6 +763,8 @@ class Access:
 
     def subscript_index(self, position: int) -> int:
         """The subscript (tensor dim) behind value dim ``position``."""
+        if self.index_map is not None:
+            raise _NotMine
         axis_positions = [
             index
             for index, subscript in enumerate(self.subscripts)
@@ -727,6 +774,8 @@ class Access:
 
     def stride_at(self, position: int) -> int:
         """Element stride of the tensor dim behind value dim ``position``."""
+        if self.index_map is not None:
+            raise _NotMine
         return self.dim_strides[position]
 
     @property
@@ -1660,6 +1709,10 @@ class CuteMmaDagFacts:
     # innermost ring loop of the bound inputs): the smem estimate's and the
     # per-thread cap's inputs under ``MMA_DAG_AUX_RING``.
     aux_loads: tuple[AuxLoadFacts, ...] = ()
+    # The explicit paged-attention topology: graph-free facts only after
+    # both the online recurrence and physical byte transport are proved.
+    attention: PagedAttentionScheduleFacts | None = None
+    mapped_io: bool = False
 
     def block_size(self, axis: int, sizes: Mapping[int, object]) -> int | None:
         facts = self.axes[axis]
@@ -1831,6 +1884,9 @@ class MmaDagPlan:
     # ``threads`` stays the config's warps (the passes, the epilogue), the
     # launch adds the warp (``launch_threads``).
     mma_warp: bool = False
+    # Explicitly selected paged attention has its own producer topology;
+    # ordinary choices retain the existing tcgen05 or warp plan.
+    attention: PagedAttentionSchedule | None = None
 
     @property
     def threads(self) -> int:
@@ -1839,6 +1895,8 @@ class MmaDagPlan:
     @property
     def launch_threads(self) -> int:
         """The CTA's thread count: the config's warps plus the MMA warp."""
+        if self.attention is not None:
+            return 32 * self.attention.launch_warps
         return self.threads + (32 if self.mma_warp else 0)
 
     def block(self, axis: Axis) -> int:
@@ -3086,6 +3144,11 @@ def mma_dag_config_reason(
     ``cute_mma_dag_pass_warps`` schedule (``mma`` adds the streamed loops'
     ``ready`` barriers and needs their accumulators in tensor memory).
     """
+    if facts.mapped_io and pass_warps not in MMA_DAG_ATTENTION_PASS_WARPS:
+        return Reason(
+            "folded storage index maps require the proved attention transport",
+            MMA_DAG_PASS_WARPS_KEY,
+        )
     if mode == MMA_DAG_TCGEN05:
         from .cute_mma_dag_tcgen05 import tcgen05_warps_reason
 
@@ -3128,7 +3191,15 @@ def mma_dag_config_reason(
             # A root tile past its extent (a 16-row MMA atom over M = 8)
             # runs on the warp path where the emitter predicates the ragged
             # rows; the tensor-memory renderers keep whole tiles.
-            if not (axis.ragged and mode == MMA_DAG_WARP):
+            attention = facts.attention
+            attention_padding = (
+                pass_warps in MMA_DAG_ATTENTION_PASS_WARPS
+                and attention is not None
+                and index == attention.query_axis
+                and axis.extent == attention.query_rows
+                and size == attention.query_block
+            )
+            if not attention_padding and not (axis.ragged and mode == MMA_DAG_WARP):
                 return Reason(
                     f"block size {size} must divide the extent {axis.extent} of tile axis {axis.block_id}"
                 )
@@ -3157,6 +3228,26 @@ def mma_dag_config_reason(
                 f" is not a multiple of its block size {resolved[loop.axis]} in every"
                 " CTA and no operand pass can mask the partial trip"
             )
+    if pass_warps in MMA_DAG_ATTENTION_PASS_WARPS:
+        from .paged_attention_config import paged_attention_config_reason
+
+        reason = paged_attention_config_reason(
+            facts,
+            sizes,
+            {
+                MMA_DAG_KEY: mode,
+                MMA_DAG_PASS_WARPS_KEY: pass_warps,
+                MMA_DAG_WARPS_KEY: warps,
+                MMA_DAG_STAGES_KEY: stages,
+                MMA_DAG_DERIVED_KEY: derived,
+                MMA_DAG_EPILOGUE_KEY: epilogue,
+                MMA_DAG_LOOKAHEAD_KEY: lookahead,
+                MMA_DAG_AUX_KEY: aux,
+                MMA_DAG_PERSISTENT_KEY: int(persistent),
+                MMA_DAG_CLUSTER_KEY: facts.cluster_of(sizes),
+            },
+        )
+        return None if reason is None else Reason(reason, MMA_DAG_PASS_WARPS_KEY)
     assert type(warps) is int
     if mode == MMA_DAG_TCGEN05:
         from .cute_mma_dag_tcgen05 import tcgen05_config_reason
@@ -3414,6 +3505,19 @@ def mma_dag_pass_warps_reason(
     tile otherwise, ``streamed_loop_subject``)."""
     if mode != MMA_DAG_TCGEN05:
         return "the warp mode runs its passes on every warp"
+    if pass_warps in MMA_DAG_ATTENTION_PASS_WARPS:
+        reason = paged_attention_pass_warps_reason(facts, pass_warps)
+        if reason is not None:
+            return reason
+        attention = facts.attention
+        assert attention is not None
+        if warps != attention.compute_warps or stages != attention.raw_stages:
+            return (
+                "the attention schedule needs "
+                f"{attention.compute_warps} compute warps and "
+                f"{attention.raw_stages} raw stages"
+            )
+        return None
     if pass_warps == MMA_DAG_PASS_WARPS_MMA:
         if facts.tcgen05 is None or not facts.tcgen05.regions:
             return "the MMA warp serves the region renderer's streamed loops"
@@ -4146,8 +4250,10 @@ def _tile_signature(access: Access) -> tuple[object, ...] | None:
     """What makes two loads of a region the same tile: the tensor, its
     dtype and strides, and whole-tile subscripts of the same axes (loads
     with scalar subscripts are not deduplicated)."""
-    if access.grouped or any(
-        subscript.kind != "axis" for subscript in access.subscripts
+    if (
+        access.index_map is not None
+        or access.grouped
+        or any(subscript.kind != "axis" for subscript in access.subscripts)
     ):
         return None
     return (
@@ -4564,6 +4670,7 @@ class _Matcher:
         self.graphs = graphs
         self.axes: dict[int, Axis] = {}
         self.axis_list: list[Axis] = []
+        self.mapped_accesses: dict[Node, Access] = {}
         self.root_block_ids: tuple[int, ...] = ()
         # Canonical block id -> loop index of the tile loops and of the
         # grid-like (fixed step one) loops; the latter's index symbols.
@@ -5118,9 +5225,13 @@ class _Matcher:
         if not _plain_integer_scalar_load(node):
             return None
         access = self.access(node)
-        if access.dims or any(
-            subscript.kind != "scalar" or subscript.loop_dependent
-            for subscript in access.subscripts
+        if (
+            access.dims
+            or access.index_map is not None
+            or any(
+                subscript.kind != "scalar" or subscript.loop_dependent
+                for subscript in access.subscripts
+            )
         ):
             # (A per-iteration scalar -- ``decay[idx, i_t]`` -- is a side
             # load of the iteration, not a uniform of the CTA.)
@@ -5336,6 +5447,59 @@ class _Matcher:
         return axis, divisor
 
     def access(self, node: Node) -> Access:
+        """Keep ordinary indexing first, then prove explicitly mapped storage."""
+        if node in self.mapped_accesses:
+            return self.mapped_accesses[node]
+        try:
+            return self._ordinary_access(node)
+        except _NotMine:
+            return self._mapped_access(node)
+
+    def _mapped_access(self, node: Node) -> Access:
+        from ...language import memory_ops
+        from .analysis.separable_index_map import prove_separable_index_map
+        from .fx_matcher import _host_tensor_ref
+
+        is_load = _is_call(node, memory_ops.load)
+        if not is_load and not _is_call(node, memory_ops.store):
+            raise _NotMine
+        if len(node.args) < 4 or (is_load and node.args[3] is not None):
+            raise _NotMine
+        mask = node.args[2] if is_load else node.args[3]
+        ref = _host_tensor_ref(node.args[0])
+        indices = node.args[1]
+        if (
+            ref is None
+            or ref.fake.ndim != 1
+            or tuple(ref.fake.stride()) != (1,)
+            or mask is not None
+            or not isinstance(indices, (tuple, list))
+            or len(indices) != 1
+            or not isinstance(indices[0], torch.fx.Node)
+        ):
+            raise _NotMine
+        extent = _static_int(ref.fake.shape[0])
+        mapped = (
+            prove_separable_index_map(self, indices[0], extent)
+            if extent is not None
+            else None
+        )
+        if mapped is None:
+            raise _NotMine
+        access = Access(
+            node=node,
+            fake=ref.fake,
+            name=ref.name,
+            strides=(1,),
+            subscripts=(),
+            dims=tuple(part.axis for part in mapped.axes),
+            eviction_slot=self.eviction_slots.get(node) if is_load else None,
+            index_map=mapped,
+        )
+        self.mapped_accesses[node] = access
+        return access
+
+    def _ordinary_access(self, node: Node) -> Access:
         """Decode a load / store site; ``_NotMine`` for unsupported indexing."""
         from ...language import memory_ops
         from ..indexing_strategy import subscript_tile_info
@@ -5935,17 +6099,26 @@ class _Matcher:
             # loaded: the tile is staged as loaded, no per-element pass.
             pointwise = False
             chain = ()
-        contiguous = [
-            position
-            for position, stride in enumerate(access.tile_dim_strides)
-            if stride == 1
-        ]
+        if access.index_map is not None:
+            column = access.index_map.axes[1]
+            if column.divisor != 1 or column.major_stride != 1:
+                raise _NotMine
+            contiguous = [1]
+        else:
+            contiguous = [
+                position
+                for position, stride in enumerate(access.tile_dim_strides)
+                if stride == 1
+            ]
         if len(contiguous) != 1:
             raise _NotMine
         cols_pos = contiguous[0]
         rows_pos = 1 - cols_pos
         rows, cols = source_dims[rows_pos], source_dims[cols_pos]
-        if (access.tile_dim_strides[rows_pos] * access.dtype.itemsize) % 4:
+        if (
+            access.index_map is None
+            and (access.tile_dim_strides[rows_pos] * access.dtype.itemsize) % 4
+        ):
             raise _NotMine
         # The tile is staged as loaded, or rewritten per element (a 16-bit
         # tile in place or from an fp32 source, an fp32 operand from a 16-bit
@@ -7717,7 +7890,24 @@ def match_mma_dag(
     autotuner heuristic enters them; pre-codegen already runs inside them).
     Heuristics omit the resolver; plan-time matching uses configured extents.
     """
-    return _Matcher(graphs, resolve_block_size).match()
+    program = _Matcher(graphs, resolve_block_size).match()
+    if program is not None and any(
+        access.index_map is not None for access in program.accesses
+    ):
+        from .analysis.paged_attention_match import match_paged_attention
+        from .paged_attention_transport import _direct_io
+
+        semantic = match_paged_attention(program)
+        # Recognition precedes pointer-residue specialization. Prove the
+        # logical/physical index relation now; selected transport repeats
+        # alignment and target checks after those cache-key facts exist.
+        if (
+            semantic is None
+            or semantic.key.raw.fake.ndim != 5
+            or _direct_io(semantic, int(semantic.key.raw.fake.shape[3])) is None
+        ):
+            return None
+    return program
 
 
 def _frag_readers(program: MmaDagProgram) -> dict[Node, list[tuple[object, ...]]]:
@@ -7835,6 +8025,11 @@ def ragged_root_axes(program: MmaDagProgram) -> frozenset[int]:
     candidates = {axis.index for axis in program.axes if axis.kind == AXIS_ROOT}
     candidates.difference_update(dot.k.index for dot in program.dots)
     for access in program.accesses:
+        if access.index_map is not None:
+            # Ordinary warp predication has no folded-address contract.
+            # The selected attention schedule proves its row padding itself.
+            candidates.difference_update(axis.index for axis in access.dims)
+            continue
         if access.repeated_axes:
             candidates.difference_update(axis.index for axis in access.dims)
         if len(access.tile_dims) == 2:
@@ -7868,7 +8063,7 @@ def mma_dag_staged_loads(program: MmaDagProgram) -> tuple[Access, ...]:
     for dot in program.dots:
         for operand in (dot.a, dot.b):
             load = operand.load
-            if load is not None and load.node not in seen:
+            if load is not None and load.index_map is None and load.node not in seen:
                 seen[load.node] = load
     for derived in program.derived:
         for access in derived.loads:
@@ -7899,7 +8094,9 @@ def mma_dag_load_hints(program: MmaDagProgram, policies: object) -> dict[Node, s
 
 
 def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
+    from .analysis.paged_attention_match import match_paged_attention
     from .cute_warp_mma_gemm import _device_sm_count
+    from .paged_attention_transport import paged_attention_schedule_facts
 
     env = CompileEnvironment.current()
     ragged = ragged_root_axes(program)
@@ -7989,6 +8186,7 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
 
     split = cluster_split_axis(program)
     aux_loads = mma_dag_aux_loads(env, program)
+    attention = match_paged_attention(program)
     return CuteMmaDagFacts(
         axes=tuple(
             AxisFacts(a.block_id, a.kind, a.extent, a.loop, a.index in ragged, a.size)
@@ -8089,6 +8287,12 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
         aux_loads=tuple(
             record for records in aux_loads.values() for _node, record in records
         ),
+        attention=(
+            paged_attention_schedule_facts(env, attention)
+            if attention is not None
+            else None
+        ),
+        mapped_io=any(access.index_map is not None for access in program.accesses),
     )
 
 
@@ -8507,6 +8711,14 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     if reason is not None:
         raise _decline(reason)
     assert type(cluster) is int and isinstance(split_mode, str)
+    if pass_warps in MMA_DAG_ATTENTION_PASS_WARPS:
+        from .paged_attention_config import paged_attention_config_reason
+
+        reason = paged_attention_config_reason(
+            facts, sizes_by_block, cast("Mapping[str, object]", config)
+        )
+        if reason is not None:
+            raise _decline(reason)
     if pass_warps not in MMA_DAG_PASS_WARPS_CHOICES:
         raise _decline(
             f"{MMA_DAG_PASS_WARPS_KEY} {pass_warps!r} must be one of {MMA_DAG_PASS_WARPS_CHOICES}"
@@ -8580,6 +8792,31 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     sizes = (
         tuple(mma_dag_padded_sizes(facts, blocks)) if mode == MMA_DAG_WARP else blocks
     )
+    if pass_warps in MMA_DAG_ATTENTION_PASS_WARPS:
+        from .analysis.paged_attention_match import match_paged_attention
+        from .paged_attention_transport import plan_paged_attention_schedule
+
+        # The proved attention topology keeps its state in registers/TMEM;
+        # it does not allocate the generic renderer's derived-value layout.
+        selected = MmaDagPlan(
+            program=program,
+            sizes=sizes,
+            warps=warps,
+            stages=stages,
+            routes={},
+            staged_stores=(),
+            exchange_mode=cast("str", exchange_mode),
+            compute=MMA_DAG_TCGEN05,
+            blocks=blocks,
+        )
+        semantic = match_paged_attention(program)
+        assert semantic is not None
+        schedule = plan_paged_attention_schedule(
+            env, semantic, selected, cast("Config", config)
+        )
+        if schedule is None:
+            raise _decline("the selected plan cannot run the attention schedule")
+        return dataclasses.replace(selected, attention=schedule)
     layouts, routes = solve_mma_dag_layouts(program, facts, sizes, warps)
     bound_masks = mma_dag_bound_masks(program, sizes)
     if mma_dag_vec_violations(facts, sizes, layouts, warps):
@@ -8760,6 +8997,7 @@ def tma_tile_source(load: Access, cols_pos: int) -> bool:
     es = load.dtype.itemsize
     return (
         len(load.tile_dims) == 2
+        and load.index_map is None
         and not load.windows
         and load.tile_dim_strides[cols_pos] == 1
         and all(stride == 1 or (stride * es) % 16 == 0 for stride in load.strides)
@@ -8770,7 +9008,9 @@ def mma_dag_fixed_derived(program: MmaDagProgram) -> bool:
     """Whether an epilogue value reads a loop-invariant 2-D tile with
     contiguous columns (the alignment check is per config, the planner's)."""
     return any(
-        program.fixed_derived_load(derived, access) and access.tile_dim_strides[1] == 1
+        access.index_map is None
+        and program.fixed_derived_load(derived, access)
+        and access.tile_dim_strides[1] == 1
         for derived in program.derived
         for access in derived.loads
     )

@@ -1948,6 +1948,10 @@ class MmaDagEmitterBase:
         ):
             visit(access)
         for access in ordered:
+            if access.index_map is not None:
+                # A selected mapped-layout consumer forms its own complete
+                # address; the ordinary affine base would discard folding.
+                continue
             if access.node in self.base_vars:
                 continue
             name = self.df.tensor_arg(access.fake, prefer_name=access.name).name

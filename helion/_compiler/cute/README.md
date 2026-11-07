@@ -194,6 +194,16 @@ MMA dataflow operand recipes may read a typed 2D grouped auxiliary tensor at
 INT8/UINT8 auxiliaries require this recipe. Grouped values use scalar addressing
 and stay outside affine vector rings, prefetch tables, and raw carry seeds.
 
+`analysis/separable_index_map.py` proves explicit storage offsets whose logical
+axes use independent quotient/remainder folds. It preserves the physical tensor
+and checks each original integer intermediate before simplifying the map.
+`Access.index_map` is an explicit consumer contract; it has no affine logical
+strides. The initial consumer is the paged attention transport for original
+`[request, query, grouped head, dimension]` Q/O and optional rank-three LSE. The
+transport proves the request/head relation, nonoverlapping output strides, and
+masked query tails; `_paged_attention_io.py` renders those addresses without packing.
+Ordinary MMA, packet loads, auxiliary rings, and TMA routes reject these maps.
+
 ### 3.3 Whole-kernel generators and regeneration
 
 `KERNEL_GENERATORS` (`kernel_generators.py`): `grouped_prefix_adaptive_n`,

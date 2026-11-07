@@ -61,6 +61,14 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_pdl import CONTROL_DELAY as _CONTROL_DELAY
+from helion._testing.cute_pdl import PRODUCER_BLOCK as _BLOCK
+from helion._testing.cute_pdl import PRODUCER_GRID as _PRODUCER_GRID
+from helion._testing.cute_pdl import WAIT_CALL as _WAIT
+from helion._testing.cute_pdl import attribute_only_control as _attribute_only_control
+from helion._testing.cute_pdl import kernel_definition as _kernel_def
+from helion._testing.cute_pdl import produce as _produce
+from helion._testing.cute_pdl import triton_kernels as _tk
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
 
@@ -71,7 +79,6 @@ rms_norm_batched = import_example("aot_example").rms_norm_batched
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
-    from types import ModuleType
 
 cutlass = pytest.importorskip("cutlass")
 
@@ -113,7 +120,6 @@ _COLUMN_SUM = {
     "cute_lane_unroll": 8,
 }
 
-_WAIT = "cute.arch.griddepcontrol_wait()"
 _RELEASE = "cute.arch.griddepcontrol_launch_dependents()"
 _ATTRIBUTE = "._helion_cute_use_pdl = True"
 # Attribute names of calls that touch memory or take part in dependent launch.
@@ -151,19 +157,6 @@ def _launch(code: str) -> tuple[str, int]:
         assert isinstance(element, ast.Constant)
         threads *= int(element.value)
     return ast.unparse(call.args[1]), threads
-
-
-def _kernel_def(code: str) -> ast.FunctionDef:
-    """The kernel proper (the module may also hold zero-fill kernels)."""
-    module = ast.parse(code)
-    (kernel,) = [
-        node
-        for node in module.body
-        if isinstance(node, ast.FunctionDef)
-        and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
-        and not node.name.startswith(ZERO_FILL_KERNEL_PREFIX)
-    ]
-    return kernel
 
 
 def _fill_kernels(code: str) -> list[ast.FunctionDef]:
@@ -1219,61 +1212,12 @@ _COLUMN = {
 }
 
 
-_PRODUCER_GRID = 128
-_BLOCK = 1024
-# The positive control's producer spins this many rounds ahead of every store
-# (about a millisecond per run) so a dependent launched without the wait is
-# certain to read ``x`` before the producer rewrites it; at the default 64
-# rounds the producer can finish inside the consumer's host launch latency
-# and the control is a coin flip.
-_CONTROL_DELAY = 4096
-
-
-def _tk() -> ModuleType:
-    """The Triton reference kernels, imported on first use: this module is
-    imported by ``test_autotuner_final_preference`` on CPU rows without Triton."""
-    import test._cute_pdl_triton_kernels as kernels
-
-    return kernels
-
-
-def _produce(
-    src: torch.Tensor, dst: torch.Tensor, *, delay: int = 64, release: bool = True
-) -> None:
-    n = dst.numel()
-    programs = (n + _PRODUCER_GRID - 1) // _PRODUCER_GRID
-    per_program = (programs + _BLOCK - 1) // _BLOCK * _BLOCK
-    _tk()._late_writer[(_PRODUCER_GRID,)](
-        src.view(-1),
-        dst.view(-1),
-        n,
-        per_program,
-        delay,
-        RELEASE=release,
-        BLOCK=_BLOCK,
-    )
-
-
 def _build(
     kernel: helion.Kernel, x: torch.Tensor, **config: object
 ) -> tuple[helion.runtime.kernel.BoundKernel, Callable[..., torch.Tensor], str]:
     bound = kernel.bind((x,))
     normalized = bound.config_spec.normalized_config(helion.Config(**config))
     return bound, bound.compile_config(normalized), bound.to_code(normalized)
-
-
-def _attribute_only_control(
-    bound: helion.runtime.kernel.BoundKernel, on: str
-) -> Callable[..., torch.Tensor]:
-    """The knob-on module minus its wait: a programmatic dependent launch
-    that reads its input right away."""
-    lines = on.splitlines()
-    kept = [line for line in lines if _WAIT not in line]
-    assert len(kept) == len(lines) - 1
-    source = "\n".join(kept) + "\n"
-    module = PyCodeCache.load(source)
-    bound.env.backend.annotate_compiled_module(module, source, bound.kernel.name)
-    return getattr(module, bound.kernel.name)
 
 
 def _stale_runs(

@@ -1789,6 +1789,7 @@ class CuteBackend(Backend):
         from .cute_mma_dag import AXIS_LEAD
         from .cute_mma_dag import AXIS_LOOP
         from .cute_mma_dag import AXIS_ROOT
+        from .cute_mma_dag import MMA_DAG_ATTENTION_PASS_WARPS
         from .cute_mma_dag import MMA_DAG_AUX_KEY
         from .cute_mma_dag import MMA_DAG_AUX_REGISTER
         from .cute_mma_dag import MMA_DAG_CLUSTER_KEY
@@ -1799,12 +1800,15 @@ class CuteBackend(Backend):
         from .cute_mma_dag import MMA_DAG_KEY
         from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
         from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
+        from .cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+        from .cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
         from .cute_mma_dag import MMA_DAG_SPLIT_CLUSTER
         from .cute_mma_dag import MMA_DAG_SPLIT_KEY
         from .cute_mma_dag import MMA_DAG_TCGEN05
         from .cute_mma_dag import MMA_DAG_WARP
         from .cute_mma_dag import apply_mma_dag_cluster
         from .cute_mma_dag import mma_dag_config_reason
+        from .paged_attention_config import paged_attention_config_reason
         from .pdl_ops import config_conflicts_with_explicit_pdl
 
         if config_spec.has_explicit_pdl and config_conflicts_with_explicit_pdl(config):
@@ -1852,6 +1856,14 @@ class CuteBackend(Backend):
             is not None
         ):
             return False
+        if (
+            config.config.get(MMA_DAG_PASS_WARPS_KEY) in MMA_DAG_ATTENTION_PASS_WARPS
+            and paged_attention_config_reason(
+                facts, sizes, config.config, before_inert_globals=True
+            )
+            is not None
+        ):
+            return False
         return (
             mma_dag_config_reason(
                 facts,
@@ -1873,6 +1885,12 @@ class CuteBackend(Backend):
                 aux=cast(
                     "str",
                     config.config.get(MMA_DAG_AUX_KEY, MMA_DAG_AUX_REGISTER),
+                ),
+                pass_warps=(
+                    cast("str", config.config[MMA_DAG_PASS_WARPS_KEY])
+                    if config.config.get(MMA_DAG_PASS_WARPS_KEY)
+                    in MMA_DAG_ATTENTION_PASS_WARPS
+                    else MMA_DAG_PASS_WARPS_OFF
                 ),
             )
             is None
