@@ -57,6 +57,7 @@ from .autotuner.config_fragment import ConfigSpecFragment as ConfigSpecFragment
 from .autotuner.config_spec import BlockSizeSpec as BlockSizeSpec
 from .autotuner.config_spec import ConfigSpec as ConfigSpec
 from .autotuner.config_spec import CuteVectorWidthSpec as CuteVectorWidthSpec
+from .autotuner.search_surface import BackendSearchSurface as BackendSearchSurface
 from .language._decorators import codegen as codegen
 from .language._tracing_ops import _mask_to as mask_to_op
 from .language.reduce_ops import _reduce as reduce_op
@@ -67,6 +68,7 @@ __all__ = [
     "BACKEND_API_VERSION",
     "Argument",
     "Backend",
+    "BackendSearchSurface",
     "BackendState",
     "BlockSizeSpec",
     "BoundKernel",

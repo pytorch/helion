@@ -695,6 +695,7 @@
  "test/test_pallas_worklist.py": 2.5,
  "test/test_pdl.py": 0.0,
  "test/test_persistent_kernels.py": 18.7,
+ "test/test_plugin_config_keys.py": 1.7,
  "test/test_precompile_shim.py": 0.0,
  "test/test_prefetch.py": 0.0,
  "test/test_prepared_call.py": 11.8,

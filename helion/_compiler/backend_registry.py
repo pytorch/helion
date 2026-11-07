@@ -60,10 +60,16 @@ def register_compiler_backend(backend_class: type[Backend]) -> None:
 
     Args:
         backend_class: A :class:`Backend` subclass.
+
+    Raises:
+        ValueError: if a non-built-in backend's search surface declares a
+            generic config key.
     """
     global _GENERATION, _REPAIRED_CODEGEN_NAMES
 
     backend = backend_class()
+    if backend_class not in _BUILTIN_BACKENDS:
+        _check_surface_keys(backend)  # calls plugin code: not under the lock
     with _CODEGEN_REPAIR_LOCK:
         existing = _REGISTRY.get(backend.name)
         if existing is backend_class:
@@ -91,6 +97,21 @@ def _is_reloaded(existing: type[Backend], backend_class: type[Backend]) -> bool:
     ) and getattr(
         sys.modules.get(backend_class.__module__), name, None
     ) is backend_class
+
+
+def _check_surface_keys(backend: Backend) -> None:
+    # Not run for built-ins: they register while config_spec is importing.
+    surface = backend.config_spec_extension()
+    from ..autotuner.config_spec import GENERIC_KEYS
+
+    # A surface key becomes backend-specific, so a generic one would be
+    # rejected by every other backend from then on.
+    clashes = (surface.config_keys | surface.debug_keys) & GENERIC_KEYS
+    if clashes:
+        raise ValueError(
+            f"Backend {backend.name!r} declares generic config keys on its "
+            f"search surface: {sorted(clashes)}"
+        )
 
 
 def unregister_compiler_backend(name: str) -> None:
