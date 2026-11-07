@@ -4,6 +4,7 @@ import contextlib
 import dataclasses
 import functools
 import glob
+import itertools
 import logging
 import math
 import os
@@ -14,10 +15,16 @@ import time
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import NamedTuple
 from typing import TypeVar
 from typing import cast
 
 import torch
+import torch.autograd.profiler as autograd_profiler
+import torch.distributed as dist
+from torch.profiler import ProfilerActivity
+from torch.profiler import profile
+from torch.profiler import supported_activities
 from torch.utils._pytree import tree_flatten
 
 from ..runtime.settings import _env_get_bool
@@ -60,14 +67,27 @@ _REPLAY_BATCH_MAX_CALLS = 256
 
 
 # The regime of the final selection's steady windows; unset derives it from
-# the search regime (see ``final_selection_l2_flush_mode``).
+# the search regime and the backend's default (see
+# ``final_selection_l2_flush_mode``).
 _FINAL_L2_FLUSH_ENV = "HELION_AUTOTUNE_FINAL_L2_FLUSH"
-_L2_FLUSH_MODES = ("call", "off", "replay")
+_L2_FLUSH_MODES = ("call", "off", "replay", "kernel")
+# ``kernel`` mode times at most this many flushed calls per window, after a
+# warmup traced in the same session (an idle gap before the timed calls,
+# such as a session start's, lets the device run 3-5% fast for tens of
+# milliseconds).
+_KERNEL_TIMER_MAX_CALLS = 1000
+# Back-to-back flushed calls that size a ``kernel`` window: a single call
+# after a session stop reads up to 3x long.
+_KERNEL_TIMER_ESTIMATE_CALLS = 5
+# The trace events of one flush, read once per process; zero (another tool
+# holds the CUDA activity API) disables the kernel timer.
+_flush_trace: int | None = None
 # The regime the final selection selects by (see
 # ``final_selection_second_regime``): ``auto`` (unset) ranks in the final
 # selection's regime and, when that is a warm one (``replay`` / ``off``),
 # breaks ties within the policy's noise band by a per-call-flushed column;
-# ``call`` / ``replay`` / ``0`` select by that regime's column outright.
+# ``call`` / ``replay`` / ``0`` / ``kernel`` select by that regime's column
+# outright.
 _TARGET_REGIME_ENV = "HELION_AUTOTUNE_TARGET_REGIME"
 
 
@@ -83,7 +103,10 @@ def _l2_flush_mode() -> str:
     where pipeline depth, epilogue ring depth and dependent-launch overlap
     separate candidates that read alike resident or per-call flushed.
     """
-    return _l2_flush_mode_from_env(_L2_FLUSH_ENV) or "call"
+    mode = _l2_flush_mode_from_env(_L2_FLUSH_ENV) or "call"
+    # The kernel timer serves the final selection's steady windows; the
+    # search's interleaved and batched timers keep the per-call flush.
+    return "call" if mode == "kernel" else mode
 
 
 def _l2_flush_mode_from_env(name: str) -> str | None:
@@ -94,8 +117,8 @@ def _l2_flush_mode_from_env(name: str) -> str | None:
     lowered = raw.strip().lower()
     if lowered in _L2_FLUSH_REPLAY_LITERALS:
         return "replay"
-    if lowered == "call":
-        return "call"
+    if lowered in ("call", "kernel"):
+        return lowered
     return "call" if _env_get_bool(name, default=True) else "off"
 
 
@@ -111,7 +134,7 @@ def _resolve_l2_flush_mode(override: str | None) -> str:
     return override
 
 
-def final_selection_l2_flush_mode() -> str:
+def final_selection_l2_flush_mode(backend_default: str | None = None) -> str:
     """The regime the final selection times its finalists in.
 
     The search's candidate timings rank the population in the regime of
@@ -124,13 +147,20 @@ def final_selection_l2_flush_mode() -> str:
     flushed 16-call graph run in. The final selection therefore times its
     shortlist and finalists in the ``replay`` regime whenever the search
     runs resident; the per-call flush (default) and ``replay`` searches keep
-    their own regime. ``HELION_AUTOTUNE_FINAL_L2_FLUSH`` (``0``/``1``/``replay``)
-    names the final selection's regime explicitly.
+    their own regime. A backend may name the regime that replaces the
+    default per-call flush (``backend_default``: CuTe times its finalists by
+    their trace kernel durations, ``kernel``). ``HELION_AUTOTUNE_FINAL_L2_FLUSH``
+    (``0``/``1``/``replay``/``kernel``) names the final selection's regime
+    explicitly.
     """
     explicit = _l2_flush_mode_from_env(_FINAL_L2_FLUSH_ENV)
     if explicit is not None:
         return explicit
-    search = _l2_flush_mode()
+    # the raw search variable: ``kernel`` reaches the final selection while
+    # the search times per-call flushed (``_l2_flush_mode``)
+    search = _l2_flush_mode_from_env(_L2_FLUSH_ENV)
+    if search is None:
+        return backend_default or "call"
     return "replay" if search == "off" else search
 
 
@@ -145,7 +175,16 @@ def final_selection_target_regime() -> str:
     return regime
 
 
-def final_selection_second_regime(regime: str) -> str | None:
+def untraced_regime(regime: str | None) -> str | None:
+    """The regime a warmup with ``regime``'s work runs untimed in: the trace
+    timer's flushed calls without the trace (a warmup's reading is thrown
+    away), else ``regime``."""
+    return "call" if regime == "kernel" else regime
+
+
+def final_selection_second_regime(
+    regime: str, backend_default: str | None = None
+) -> str | None:
     """The second regime the final selection times its finalists in when it
     ranks them in ``regime``, ``None`` when one column decides.
 
@@ -156,9 +195,11 @@ def final_selection_second_regime(regime: str) -> str | None:
     a prefetch, a pipeline depth) tie there within the steady windows'
     noise while they differ by 20-40% per call flushed. Under the default
     target (``auto``) the final selection therefore times the finalists
-    tied within its tie tolerance in the ``call`` regime as well and lets
-    that cold column break the tie; the per-call flushed regime ranks
-    alone (a cold reading already carries the warm one's steady state).
+    tied within its tie tolerance per call flushed as well -- in
+    ``backend_default`` when that is a per-call flushed regime (``call`` or
+    the trace's ``kernel``), else ``call`` -- and lets that cold column
+    break the tie; a per-call flushed regime ranks alone (a cold reading
+    already carries the warm one's steady state).
     An explicit ``HELION_AUTOTUNE_TARGET_REGIME`` names the regime the
     kernel is scored in: every finalist is timed in it in addition to
     ``regime`` and that column selects outright. ``regime`` names a timer
@@ -170,7 +211,9 @@ def final_selection_second_regime(regime: str) -> str | None:
         return None
     target = final_selection_target_regime()
     if target == "auto":
-        return "call" if regime in ("replay", "off") else None
+        if regime not in ("replay", "off"):
+            return None
+        return backend_default if backend_default in ("call", "kernel") else "call"
     return None if target == regime else target
 
 
@@ -859,15 +902,19 @@ def interleaved_bench(
             lockstep; the graph batch size is agreed across it so every rank
             launches the same number of kernels
         l2_flush_mode: L2 regime of the timed calls (``call``, ``off`` or
-            ``replay``, see ``_l2_flush_mode``); ``None`` reads
-            ``HELION_AUTOTUNE_L2_FLUSH``
+            ``replay``, see ``_l2_flush_mode``; the ``kernel`` timer is
+            ``do_bench``'s); ``None`` reads ``HELION_AUTOTUNE_L2_FLUSH``
     """
     from triton import runtime
 
+    flush_mode = _resolve_l2_flush_mode(l2_flush_mode)
+    if flush_mode == "kernel":
+        raise ValueError(
+            "interleaved_bench times with CUDA events; the kernel timer is do_bench's"
+        )
     # warmup
     for fn in fns:
         fn()
-    flush_mode = _resolve_l2_flush_mode(l2_flush_mode)
     clear_cache: Callable[[], None]
     if flush_mode != "off":
         clear_cache = functools.partial(
@@ -1341,6 +1388,333 @@ def _estimate_runtime_and_warmup(
     return estimate_ms, max(1, int(warmup / estimate_ms)), False
 
 
+class _TraceEvent(NamedTuple):
+    """A CUDA kernel activity of a ``kernel`` window: name, start and end in
+    integer nanoseconds (epoch nanoseconds in float microseconds would snap to
+    a 0.25 us grid)."""
+
+    name: str
+    start: int
+    end: int
+
+
+def _cuda_kernel_events(run: Callable[[], None]) -> list[_TraceEvent]:
+    """The CUDA kernel activities ``run`` launches on the current device, in
+    start order, read from the raw activity records (building the profiler's
+    event tree costs more than the window). Work this process runs on another
+    device meanwhile is not the window's."""
+    device = torch.cuda.current_device()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        run()
+    events = [
+        _TraceEvent(event.name(), event.start_ns(), event.end_ns())
+        for event in prof.profiler.kineto_results.events()  # pyrefly: ignore[missing-attribute]
+        if event.device_type() == torch.autograd.DeviceType.CUDA
+        and event.device_index() == device
+    ]
+    return sorted(events, key=lambda event: event.start)
+
+
+def _kernel_trace_samples(
+    events: Sequence[_TraceEvent], calls: int, per_flush: int
+) -> list[tuple[int, float]] | None:
+    """Per call of a trace of ``calls`` x [flush, marker, call]: its first
+    kernel's start (ns) and its device milliseconds; ``None`` when the trace
+    is not that. The marker (``_TRACE_MARKER``, a kernel named for this timer)
+    delimits the calls: a call's own fills may share the flush's name and
+    size, and calls may launch different kernels."""
+    starts = [
+        index for index, event in enumerate(events) if event.name == _TRACE_MARKER
+    ]
+    if (
+        calls < 1
+        or len(starts) != calls
+        or starts[0] != per_flush
+        or any(
+            after - before <= per_flush + 1
+            for before, after in itertools.pairwise(starts)
+        )
+        or starts[-1] + 1 >= len(events)
+    ):
+        return None
+    ends = [after - per_flush for after in starts[1:]] + [len(events)]
+    calls_events = [
+        events[begin + 1 : end] for begin, end in zip(starts, ends, strict=True)
+    ]
+    # A call's span, first kernel start to last kernel end: summing the
+    # kernels would count a dependent launch's (PDL) overlap with its
+    # primary twice and drop the gaps between kernels.
+    return [
+        (call[0].start, (max(event.end for event in call) - call[0].start) / 1e6)
+        for call in calls_events
+    ]
+
+
+# The kernel that delimits the calls of a ``kernel`` window, and its launcher
+# per CUDA device.
+_TRACE_MARKER = "helion_kernel_timer_marker"
+_trace_markers: dict[int, Callable[[], None]] = {}
+
+
+@functools.cache
+def _trace_marker_kernel() -> Any:  # noqa: ANN401
+    """``_TRACE_MARKER``: a one-program Triton store no benchmarked call
+    launches (compiled once, launched per device)."""
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def helion_kernel_timer_marker(flag) -> None:  # noqa: ANN001
+        tl.store(flag, 1)
+
+    assert helion_kernel_timer_marker.__name__ == _TRACE_MARKER
+    return helion_kernel_timer_marker
+
+
+def _trace_marker() -> None:
+    """Launch ``_TRACE_MARKER`` on the current device."""
+    device = torch.cuda.current_device()
+    launch = _trace_markers.get(device)
+    if launch is None:
+        # uninitialized: a fill would be a kernel of its own in the trace
+        flag = torch.empty(1, dtype=torch.int32, device=f"cuda:{device}")
+        launch = _trace_markers[device] = functools.partial(
+            _trace_marker_kernel()[(1,)], flag
+        )
+    launch()
+
+
+def _learn_flush_trace(
+    clear_cache: Callable[[], None],
+    di: Any,  # noqa: ANN401
+) -> int:
+    """The trace events one flush issues, traced once per process (the first
+    profiling session takes ~1 s to start); zero disables the timer for the
+    process: no events (another tool holds the activity API) or a trace that
+    is not [flush, marker] twice (foreign work on the device)."""
+    global _flush_trace
+    if _flush_trace is None:
+
+        def footprint() -> None:
+            for _ in range(2):
+                clear_cache()
+                _trace_marker()
+            di.synchronize()
+
+        _trace_marker()  # compiled outside the trace
+        events = _cuda_kernel_events(footprint)
+        markers = [
+            index for index, event in enumerate(events) if event.name == _TRACE_MARKER
+        ]
+        per_flush = markers[0] if markers else 0
+        if (
+            per_flush > 0
+            and markers == [per_flush, 2 * per_flush + 1]
+            and len(events) == 2 * per_flush + 2
+        ):
+            _flush_trace = per_flush
+        else:
+            _flush_trace = 0
+            _log.warning(
+                "the CUDA activity trace shows %d events for two flushed "
+                "markers (another tool holds it, or other work ran on the "
+                "device); timing per-call flushed with CUDA events",
+                len(events),
+            )
+    return _flush_trace
+
+
+def kernel_timer_available(process_group_name: str | None = None) -> bool:
+    """Whether the build and the process group admit ``kernel`` windows: an
+    NVIDIA build that collects CUDA activity, and no process group (whether a
+    rank can trace is its own; ranks that time in lockstep must take one
+    path). Checked without a profiling session, which would leave the
+    activity API attached to this process and slow its every later launch;
+    the process that times the windows also checks its own profiler state
+    (``kernel_timer_ready``)."""
+    return (
+        torch.cuda.is_available()
+        and getattr(torch.version, "hip", None) is None
+        and ProfilerActivity.CUDA in supported_activities()
+        and not (process_group_name is not None and dist.is_initialized())
+    )
+
+
+def _kernel_timer_preconditions(process_group_name: str | None) -> bool:
+    """``kernel_timer_available`` and no profiler running in any thread of
+    this process: a second session would cancel its trace."""
+    return (
+        kernel_timer_available(process_group_name)
+        # a session of any thread (the flag), or of this one
+        and not autograd_profiler._is_profiler_enabled
+        and not torch.autograd._profiler_enabled()
+    )
+
+
+def kernel_timer_unready_reason() -> str | None:
+    """Why this process cannot time ``kernel`` windows from the trace on the
+    current device, ``None`` when it can: the preconditions, and the flush's
+    trace footprint learned (a profiling session, once per process; the
+    benchmark worker answers before the final selection labels its column
+    ``kernel``)."""
+    if not kernel_timer_available():
+        return "the build collects no CUDA activity"
+    if not _kernel_timer_preconditions(None):
+        return "a profiler is running in the timing process"
+    if _flush_trace is None:
+        _learn_flush_trace(_make_l2_cache_clearer(), torch.cuda)
+    assert _flush_trace is not None
+    if _flush_trace == 0:
+        return "the CUDA activity trace is held by another tool or shows other work"
+    return None
+
+
+def kernel_timer_ready() -> bool:
+    """Whether this process times ``kernel`` windows from the trace on the
+    current device (``kernel_timer_unready_reason``)."""
+    return kernel_timer_unready_reason() is None
+
+
+def _do_bench_kernel_durations(
+    benchmark_function: Callable[[], object],
+    clear_cache: Callable[[], None],
+    di: Any,  # noqa: ANN401
+    *,
+    warmup: int,
+    rep: int,
+    quantiles: list[float] | None,
+    return_mode: str,
+    fixed_repetitions: int | None,
+    process_group_name: str | None = None,
+    probe_long_kernel: bool = False,
+    grad_to_none: torch.Tensor | None = None,
+) -> float | tuple[float, ...] | None:
+    """``kernel`` mode: every call follows an L2 flush, and a sample is the
+    device time of the kernels that call launched, read from the CUDA
+    activity trace.
+
+    The per-call flush regime timed by CUDA events reads the flush plus the
+    call minus the flush alone. Once the flush's dirty lines and the call's
+    streamed operands saturate DRAM, that difference is the bandwidth's, not
+    the kernel's: on B200, a 2x1-cluster GEMM that runs 2.5% shorter than a
+    2x2-cluster one (16.05 vs 16.47 us, 8192x1024x1024 bf16) reads 23.52 us
+    against 23.52 us that way, and one flushed call between two events reads
+    20.45 us against 20.45 us (event times are quantized to 1.953 us). The
+    trace's kernel durations keep the kernel's own time.
+
+    The warmup runs inside the profiling session, so no idle gap separates
+    it from the timed calls: the calls that start within ``warmup`` ms of the
+    first call's first kernel are traced but not timed (dropped by their
+    timestamps), and the window times the next ``n_repeat``.
+
+    ``None`` asks the caller to time per-call flushed with CUDA events
+    instead: the build collects no CUDA activity, a profiler is running (a
+    second session would cancel its trace), the ranks of a process group time
+    in lockstep, or the flush's trace footprint could not be learned (another
+    tool holds the activity API; then for every later window of the process
+    alike). A trace that does not split into the flushed calls reads
+    infinite (the candidate's window cannot win)."""
+    from triton.testing import _summarize_statistics
+
+    if not _kernel_timer_preconditions(process_group_name):
+        return None
+    per_flush = _learn_flush_trace(clear_cache, di)
+    if per_flush == 0:
+        return None
+    _trace_marker()  # built for this device outside any trace
+
+    def flushed_call() -> None:
+        if grad_to_none is not None:
+            # a backward benchmark measures every call from the same state
+            for tensor in grad_to_none:
+                tensor.grad = None
+        clear_cache()
+        _trace_marker()
+        benchmark_function()
+
+    def summarized(samples: list[float]) -> float | tuple[float, ...]:
+        return cast(
+            "float | tuple[float, ...]",
+            _summarize_statistics(samples, quantiles, return_mode),
+        )
+
+    def unsplit(events: list[_TraceEvent], calls: int) -> float | tuple[float, ...]:
+        # CUDA events would put this candidate on another scale than its
+        # rivals: the window reads infinite, so it cannot win.
+        _log.warning(
+            "kernel timer could not split %d trace events into %d flushed "
+            "calls; the window reads inf",
+            len(events),
+            calls,
+        )
+        return summarized([math.inf])
+
+    if fixed_repetitions is None:
+        # Flushed calls size the windows with the flush, which every warmup
+        # and timed iteration runs too; a first call longer than both
+        # windows is its own sample (``do_bench``'s long-kernel probe), so
+        # it is traced where the probe applies.
+        start, end = di.Event(enable_timing=True), di.Event(enable_timing=True)
+
+        def calls(count: int) -> None:
+            start.record()
+            for _ in range(count):
+                flushed_call()
+            end.record()
+            di.synchronize()
+
+        first_events = (
+            _cuda_kernel_events(functools.partial(calls, 1))
+            if probe_long_kernel
+            else None
+        )
+        if first_events is not None and start.elapsed_time(end) >= max(warmup, rep):
+            first_samples = _kernel_trace_samples(first_events, 1, per_flush)
+            if first_samples is None:
+                return unsplit(first_events, 1)
+            return summarized([ms for _start, ms in first_samples])
+        # one call after a profiling session reads up to 3x long
+        calls(_KERNEL_TIMER_ESTIMATE_CALLS)
+        estimate_ms = float(start.elapsed_time(end)) / _KERNEL_TIMER_ESTIMATE_CALLS
+        settle_ms = float(warmup)
+        n_warmup = math.ceil(settle_ms / estimate_ms)
+        n_repeat = min(_KERNEL_TIMER_MAX_CALLS, max(1, int(rep / estimate_ms)))
+    else:
+        settle_ms, n_warmup, n_repeat = 0.0, 0, fixed_repetitions
+
+    # An estimate that ran long leaves too few settled calls: a second
+    # session is sized by the traced call period.
+    samples: list[float] = []
+    for _session in range(2):
+        traced_calls = n_warmup + n_repeat
+
+        def timed(count: int = traced_calls) -> None:
+            for _ in range(count):
+                flushed_call()
+            di.synchronize()
+
+        events = _cuda_kernel_events(timed)
+        traced = _kernel_trace_samples(events, traced_calls, per_flush)
+        if traced is None:
+            return unsplit(events, traced_calls)
+        # integer nanoseconds: a float sum would round the epoch clock
+        settled = traced[0][0] + round(settle_ms * 1e6)
+        samples = [ms for began, ms in traced if began >= settled][:n_repeat]
+        if len(samples) * 2 >= n_repeat:
+            return summarized(samples)
+        period_ms = max(
+            (traced[-1][0] - traced[0][0]) / 1e6 / max(1, traced_calls - 1), 1e-6
+        )
+        # a quarter over the traced period: the next session's calls may run
+        # a little faster than this one's
+        n_warmup = math.ceil(1.25 * settle_ms / period_ms) + 1
+        n_repeat = min(_KERNEL_TIMER_MAX_CALLS, max(1, int(rep / period_ms)))
+    if samples:
+        return summarized(samples)
+    _log.warning("kernel timer traced no settled call; the window reads inf")
+    return summarized([math.inf])
+
+
 # This function is copied from triton._testing.do_bench with modification
 # to make sure different ranks run the benchmark for the same number
 # of times.
@@ -1382,8 +1756,9 @@ def do_bench(
         CuTe flash enables it for multi-second attention candidates.
     :param pre_warmed: Skip the setup launch when the caller has already run
         and synchronized this exact benchmark callable.
-    :param l2_flush_mode: L2 regime of the timed calls (``call``, ``off`` or
-        ``replay``, see ``_l2_flush_mode``); ``None`` reads
+    :param l2_flush_mode: L2 regime of the timed calls (``call``, ``off``,
+        ``replay`` or ``kernel``, see ``_l2_flush_mode`` and
+        ``_do_bench_kernel_durations``); ``None`` reads
         ``HELION_AUTOTUNE_L2_FLUSH``.
     """
     from triton import runtime
@@ -1404,6 +1779,8 @@ def do_bench(
         else _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
     )
 
+    if fixed_repetitions is not None and fixed_repetitions < 1:
+        raise ValueError("fixed_repetitions must be at least 1")
     flush_mode = _resolve_l2_flush_mode(l2_flush_mode)
     clear_cache: Callable[[], None] = _no_cache_clear
     if flush_mode != "off":
@@ -1418,6 +1795,23 @@ def do_bench(
         clear_cache()
         benchmark_function()
         di.synchronize()
+    if flush_mode == "kernel":
+        kernel_timing = _do_bench_kernel_durations(
+            benchmark_function,
+            clear_cache,
+            di,
+            warmup=warmup,
+            rep=rep,
+            quantiles=quantiles,
+            return_mode=return_mode,
+            fixed_repetitions=fixed_repetitions,
+            process_group_name=process_group_name,
+            probe_long_kernel=probe_long_kernel,
+            grad_to_none=grad_to_none,
+        )
+        if kernel_timing is not None:
+            return kernel_timing
+        flush_mode = "call"
 
     if fixed_repetitions is None and probe_long_kernel:
 
@@ -1463,8 +1857,6 @@ def do_bench(
         n_warmup = max(1, int(warmup / estimate_ms))
         n_repeat = max(1, int(rep / estimate_ms))
     else:
-        if fixed_repetitions < 1:
-            raise ValueError("fixed_repetitions must be at least 1")
         n_warmup = 0
         n_repeat = fixed_repetitions
         estimate_ms = math.inf

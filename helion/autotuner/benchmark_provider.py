@@ -45,6 +45,8 @@ from .benchmark_job import AccuracyCheckJob
 from .benchmark_job import AccuracyCheckResult
 from .benchmark_job import BenchmarkJob
 from .benchmark_job import CompiledFunctionLoadError
+from .benchmark_job import KernelTimerProbeJob
+from .benchmark_job import cuda_device_of
 from .benchmark_worker import BenchmarkCompileTimeout
 from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkTimeout
@@ -729,6 +731,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_baseline_post_args_path: str | None = None
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
+        # ``worker_kernel_timer_available``'s answer, once asked.
+        self._worker_kernel_timer: bool | None = None
         self._last_benchmark_failure_status: Literal["error", "timeout"] | None = None
         self._no_viable_config_error: Exception | None = None
         # Configs of the batch in progress whose compile has started; read by
@@ -2924,10 +2928,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         except RuntimeError:
             return None
 
-        if self._benchmark_worker is None:
-            self._benchmark_worker = BenchmarkWorker(
-                device=None, log_warning=self.log.warning
-            )
+        worker = self._ensure_benchmark_worker()
 
         if (
             len(self.mutated_arg_indices) > 0
@@ -2949,7 +2950,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         try:
             return cast(
                 "AccuracyCheckResult",
-                self._benchmark_worker.run(
+                worker.run(
                     job,
                     timeout=float(self.settings.autotune_benchmark_timeout),
                 ),
@@ -2976,10 +2977,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         except RuntimeError:
             return None
 
-        if self._benchmark_worker is None:
-            self._benchmark_worker = BenchmarkWorker(
-                device=None, log_warning=self.log.warning
-            )
+        worker = self._ensure_benchmark_worker()
 
         job = BenchmarkJob(
             fn_spec=fn_spec,
@@ -2997,7 +2995,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             timeout = float(self.settings.autotune_benchmark_timeout)
         try:
             return float(
-                self._benchmark_worker.run(
+                worker.run(
                     job,
                     timeout=timeout,
                     compile_timeout=self._worker_compile_timeout(),
@@ -3041,6 +3039,40 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self._subprocess_benchmark_enabled()
             and self.settings.autotune_benchmark_fn is None
         )
+
+    def worker_kernel_timer_available(self) -> bool:
+        """Whether the benchmark worker times ``kernel`` windows from the
+        CUDA activity trace on the arguments' device (``KernelTimerProbeJob``),
+        asked once: the profiling session runs in the worker, never in this
+        process."""
+        if self._worker_kernel_timer is None:
+            available = False
+            if self.steady_window_benchmark_available():
+                device = cuda_device_of(self.args)
+                try:
+                    reason = self._ensure_benchmark_worker().run(
+                        KernelTimerProbeJob(None if device is None else device.index),
+                        timeout=float(self.settings.autotune_benchmark_timeout),
+                    )
+                except BenchmarkWorkerUnkillable:
+                    raise
+                except (BenchmarkSubprocessError, RuntimeError) as error:
+                    reason = f"the probe failed: {error}"
+                available = reason is None
+                if not available:
+                    self.log.warning(
+                        f"The benchmark worker cannot time kernel windows: {reason}"
+                    )
+            self._worker_kernel_timer = available
+        return self._worker_kernel_timer
+
+    def _ensure_benchmark_worker(self) -> BenchmarkWorker:
+        """The killable benchmark worker, started on first use."""
+        if self._benchmark_worker is None:
+            self._benchmark_worker = BenchmarkWorker(
+                device=None, log_warning=self.log.warning
+            )
+        return self._benchmark_worker
 
     def private_argument_copies_affordable(self, count: int) -> bool:
         """Whether ``count`` private copies of the kernel arguments fit on the

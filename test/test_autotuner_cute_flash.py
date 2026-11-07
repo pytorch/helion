@@ -7241,8 +7241,10 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
             backend=SimpleNamespace(
                 config_value_priors_version=1,
                 # Like the CuTe backend: no precompile pool, so the cache
-                # policy reports no precompile mode.
+                # policy reports no precompile mode, and the trace kernel
+                # timer for its final selection.
                 supports_precompile=lambda: False,
+                default_final_selection_regime=lambda: "kernel",
             ),
             backend_name="cute",
             cute_flash_search_enabled=True,

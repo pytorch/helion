@@ -711,6 +711,16 @@ class Backend(abc.ABC):
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
 
+    def default_final_selection_regime(self) -> str | None:
+        """The regime the autotuner's final selection times finalists in
+        when neither ``HELION_AUTOTUNE_L2_FLUSH`` nor
+        ``HELION_AUTOTUNE_FINAL_L2_FLUSH`` names one (see
+        ``final_selection_l2_flush_mode``); a per-call flushed one (``call``
+        or ``kernel``) also times a warm selection's cold tie-break column
+        (``final_selection_second_regime``). ``None`` keeps the search's
+        regime and a ``call`` column."""
+        return None
+
     def get_do_bench(self) -> Callable[..., float | tuple[float, ...]] | None:
         """Return the benchmarking function for this backend.
 

@@ -1911,6 +1911,12 @@ class CuteBackend(Backend):
     def name(self) -> str:
         return "cute"
 
+    def default_final_selection_regime(self) -> str | None:
+        """Finalists are timed from the CUDA activity trace (``kernel``):
+        CUDA events read tcgen05 GEMM finalists that differ by 2-3% alike
+        (see ``benchmarking._do_bench_kernel_durations``)."""
+        return "kernel"
+
     @property
     def state(self) -> BackendState:
         return BackendState.BETA

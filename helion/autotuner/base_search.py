@@ -53,6 +53,9 @@ from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _searching_candidates
 from .benchmark_provider import _unset_fn
 from .benchmark_worker import BenchmarkWorkerUnkillable
+from .benchmarking import _FINAL_L2_FLUSH_ENV
+from .benchmarking import _L2_FLUSH_ENV
+from .benchmarking import _TARGET_REGIME_ENV
 from .benchmarking import MirroredBenchmarkTrace
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
@@ -61,7 +64,9 @@ from .benchmarking import final_selection_l2_flush_mode
 from .benchmarking import final_selection_second_regime
 from .benchmarking import final_selection_target_regime
 from .benchmarking import interleaved_bench
+from .benchmarking import kernel_timer_available
 from .benchmarking import mirrored_bench_generic
+from .benchmarking import untraced_regime
 from .effort_profile import get_effort_profile
 from .handoff import _observe_handoff
 from .handoff import _refresh_handoff
@@ -175,6 +180,8 @@ _FINAL_SELECTION_IGNORED_ENVS = (
     _FINAL_REBENCHMARK_MAX_SPREAD_ENV,
 )
 _final_selection_ignored_envs_warned = False
+# The final selection's kernel-timer fallback is said once per process.
+_kernel_timer_fallback_warned = False
 _CUTE_FLASH_CONFIG_GENERATION_POLICY_VERSION = 8
 
 
@@ -1664,7 +1671,7 @@ class _WorkerFinalSelectionMeasurer:
             warmup=duration_ms,
             rep=1,
             desc=f"{self.desc} warmup",
-            l2_flush_mode=self.l2_flush_mode,
+            l2_flush_mode=untraced_regime(self.l2_flush_mode),
         )
 
     def measure(
@@ -1881,7 +1888,7 @@ class PopulationBasedSearch(BaseSearch):
         return roles
 
     def _final_rebenchmark_cache_policy(self) -> dict[str, object]:
-        return {
+        policy: dict[str, object] = {
             "enabled": True,
             # 2: the non-isolated finalist shootout uses paired interleaved
             # timing instead of sequential steady windows.
@@ -1910,6 +1917,14 @@ class PopulationBasedSearch(BaseSearch):
                 else dataclasses.asdict(self.final_selection)
             ),
         }
+        if self.final_selection is not None:
+            backend_regime = self._backend_final_regime()
+            if backend_regime is not None:
+                # A backend's own final-selection timer (CuTe: the trace
+                # kernel timer) picks other finalists than the search's
+                # regime would.
+                policy["backend_final_regime"] = backend_regime
+        return policy
 
     @staticmethod
     def _final_selection_from_profile(
@@ -1985,17 +2000,21 @@ class PopulationBasedSearch(BaseSearch):
         takes nor sheds rounds to fit one, and less the family quota where
         the spec names no family knob. The cache policy keeps the
         profile's fields (``_final_rebenchmark_cache_policy``), so the key
-        stays regime-independent. The regime is read from the environment
-        here, a superset of what the measurer will honour: a timer without
-        regimes (a backend's own bench) still reserves the column under
-        ``replay``, an upper bound.
+        ignores the regime environment variables. The regimes are read from
+        the environment and the backend here, a superset of what the
+        measurer will honour (an upper bound): a timer without regimes (a
+        backend's own bench) still reserves the column under ``replay``, and
+        ``kernel`` and ``call`` reserve a second column for each other
+        without asking the worker whether it can trace (``_traceable``: the
+        probe is a profiling session in the worker that times the search, so
+        only the selection itself asks).
         """
         policy = self.final_selection
         assert policy is not None
-        if (
-            policy.tiebreak_rounds > 0
-            and final_selection_second_regime(final_selection_l2_flush_mode()) is None
-        ):
+        backend_regime = self._backend_final_regime()
+        regime = final_selection_l2_flush_mode(backend_regime)
+        second = final_selection_second_regime(regime, backend_regime)
+        if policy.tiebreak_rounds > 0 and second is None:
             policy = dataclasses.replace(policy, tiebreak_rounds=0)
         # the family quota admits nothing where the spec names no family knob
         if policy.family_finalists > 0 and not self._final_selection_family_keys():
@@ -3464,14 +3483,90 @@ class PopulationBasedSearch(BaseSearch):
             self.args, self.kernel.env.process_group_name, idx_to_clone=mutated
         )
 
+    def _final_selection_in_worker(self) -> bool:
+        """Whether the final selection times its finalists in the benchmark
+        worker (``_final_selection_measurer``) rather than in this process."""
+        provider = self.benchmark_provider
+        return (
+            isinstance(provider, LocalBenchmarkProvider)
+            and provider.steady_window_benchmark_available()
+        )
+
+    def _kernel_timer_usable(self) -> bool:
+        """Whether the final selection can time ``kernel`` windows: the
+        benchmark worker times the finalists, the build and the process group
+        admit the trace (``kernel_timer_available``), and the worker's trace
+        works (``LocalBenchmarkProvider.worker_kernel_timer_available``).
+        Profiling sessions stay out of this process: one leaves the activity
+        API attached, slowing every later launch."""
+        provider = self.benchmark_provider
+        return (
+            isinstance(provider, LocalBenchmarkProvider)
+            and provider.steady_window_benchmark_available()
+            # a wall-clock worker always flushes and ignores the regime
+            and not provider._subprocess_benchmark_uses_wall_clock()
+            and kernel_timer_available(self.kernel.env.process_group_name)
+            and provider.worker_kernel_timer_available()
+        )
+
+    def _traceable(self, regime: str | None) -> str | None:
+        """``regime``, with ``kernel`` (from the backend or the environment)
+        replaced by ``call`` where the selection cannot time it
+        (``_kernel_timer_usable``): a selection labelled ``kernel`` must not
+        time with CUDA events unseen. Said once per process."""
+        global _kernel_timer_fallback_warned
+        if regime != "kernel" or self._kernel_timer_usable():
+            return regime
+        if not _kernel_timer_fallback_warned:
+            _kernel_timer_fallback_warned = True
+            message = (
+                "The final selection times per-call flushed with CUDA events: "
+                "the kernel trace timer runs in the benchmark worker only (not "
+                "a wall-clock one), on an NVIDIA build that collects CUDA "
+                "activity, outside a process group, where the worker's trace "
+                "works"
+            )
+            # loud only where ``kernel`` was asked for, not the backend default
+            if any(
+                os.environ.get(name, "").strip().lower() == "kernel"
+                for name in (_L2_FLUSH_ENV, _FINAL_L2_FLUSH_ENV, _TARGET_REGIME_ENV)
+            ):
+                self.log.warning(message)
+            else:
+                self.log.debug(message)
+        return "call"
+
+    def _backend_final_regime(self) -> str | None:
+        """The backend's final-selection regime
+        (``Backend.default_final_selection_regime``)."""
+        return self.config_spec.backend.default_final_selection_regime()
+
+    def _final_selection_second_regime(self, regime: str) -> str | None:
+        """``final_selection_second_regime`` where this process can time it,
+        ``None`` when that falls back to ``regime`` itself (a ``kernel``
+        target timed as ``call`` beside a ``call`` selection)."""
+        second = self._traceable(
+            final_selection_second_regime(regime, self._backend_final_regime())
+        )
+        return None if second == regime else second
+
+    def _final_selection_regime(self) -> str:
+        """The regime the final selection times its finalists in, with the
+        backend's default (``final_selection_l2_flush_mode``)."""
+        regime = self._traceable(
+            final_selection_l2_flush_mode(self._backend_final_regime())
+        )
+        assert regime is not None
+        return regime
+
     def _final_selection_measurer(
         self, finalists: Sequence[PopulationMember], policy: FinalSelectionConfig
     ) -> _FinalSelectionMeasurer:
         """Steady-window timer for the finalists: the killable benchmark worker
         when the search benchmarks in one, otherwise in-process. Both time in
-        the final selection's L2 regime (``final_selection_l2_flush_mode``)."""
+        the final selection's L2 regime (``_final_selection_regime``)."""
         provider = self.benchmark_provider
-        l2_flush_mode = final_selection_l2_flush_mode()
+        l2_flush_mode = self._final_selection_regime()
         window_s = (policy.warmup_ms + policy.rep_ms) / 1000.0
         thermal_s = (policy.thermal_warmup_ms + policy.rep_ms) / 1000.0
         # The timer sizes its repetitions from an estimate pass, so a kernel
@@ -3484,7 +3579,7 @@ class PopulationBasedSearch(BaseSearch):
         )
         if isinstance(provider, LocalBenchmarkProvider):
             private_copies = provider.private_argument_copies_affordable(len(finalists))
-            if provider.steady_window_benchmark_available():
+            if self._final_selection_in_worker():
                 provider.register_isolated_candidates(
                     [member.fn for member in finalists],
                     [member.config for member in finalists],
@@ -3618,7 +3713,7 @@ class PopulationBasedSearch(BaseSearch):
                     if reading is not None:
                         samples[index].append(reading)
 
-        regime_label = final_selection_l2_flush_mode()
+        regime_label = self._final_selection_regime()
         try:
             with self._final_selection_measurer(finalists, policy) as measurer:
                 regime_label = getattr(measurer, "regime_label", regime_label)
@@ -3678,7 +3773,7 @@ class PopulationBasedSearch(BaseSearch):
                 run_rounds(survivors, policy.rounds, readings, failures, None)
 
                 if policy.tiebreak_rounds > 0:
-                    second_regime = final_selection_second_regime(regime_label)
+                    second_regime = self._final_selection_second_regime(regime_label)
                 if second_regime is not None:
                     select_by_second = final_selection_target_regime() != "auto"
                     group = sync_object(

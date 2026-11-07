@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 from typing import TYPE_CHECKING
@@ -16,6 +17,7 @@ from .benchmark_worker import PHASE_COMPILED
 from .benchmark_worker import PhasedJob
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
+from .benchmarking import kernel_timer_unready_reason
 from .benchmarking import steady_graph_dispatch
 from .benchmarking import synchronize_device
 from .kernel_args import _clone_args
@@ -74,9 +76,9 @@ class BenchmarkJob(PhasedJob):
     # their original values for every later job (an accuracy check among
     # them). Private finalist copies are already the finalist's own.
     mutated_arg_indices: tuple[int, ...] = ()
-    # L2 regime of the timed calls (``call``, ``off`` or ``replay``); None
-    # reads HELION_AUTOTUNE_L2_FLUSH in the worker. The final selection names
-    # its own regime (``final_selection_l2_flush_mode``).
+    # L2 regime of the timed calls (``call``, ``off``, ``replay`` or
+    # ``kernel``); None reads HELION_AUTOTUNE_L2_FLUSH in the worker. The
+    # final selection names its own regime (``final_selection_l2_flush_mode``).
     l2_flush_mode: str | None = None
 
     def __call__(self, report_phase: Callable[[str], None] | None = None) -> float:
@@ -96,30 +98,67 @@ class BenchmarkJob(PhasedJob):
                 bench = do_bench_generic if self.use_wall_clock else do_bench
                 # The worker warmed the current device before this job; the
                 # kernel's graphs run on its arguments' device.
-                steady_graph_dispatch(device=_cuda_device_of(args))
+                device = cuda_device_of(args)
+                steady_graph_dispatch(device=device)
                 benchmark_fn = functools.partial(fn, *args)
                 # Compile and run once; the timers then skip their setup call.
                 benchmark_fn()
                 synchronize_device()
                 if report_phase is not None:
                     report_phase(PHASE_COMPILED)
-                # return_mode="median" guarantees a float return.
-                result = bench(
-                    benchmark_fn,
-                    return_mode="median",
-                    warmup=self.warmup,
-                    rep=self.rep,
-                    fixed_repetitions=self.fixed_repetitions,
-                    probe_long_kernel=self.probe_long_kernel,
-                    l2_flush_mode=self.l2_flush_mode,
-                    pre_warmed=True,
-                )
+                # return_mode="median" guarantees a float return. The timers
+                # flush, mark and trace the current device: the arguments'.
+                with (
+                    torch.cuda.device(device)
+                    if device is not None
+                    else contextlib.nullcontext()
+                ):
+                    if self.l2_flush_mode == "kernel" and not self.use_wall_clock:
+                        reason = kernel_timer_unready_reason()
+                        if reason is not None:
+                            # The parent labelled this window ``kernel``
+                            # (``LocalBenchmarkProvider.worker_kernel_timer_available``):
+                            # a reading timed with CUDA events instead must
+                            # not pass as one.
+                            raise RuntimeError(
+                                f"the kernel trace timer is unavailable in the "
+                                f"benchmark worker: {reason}"
+                            )
+                    result = bench(
+                        benchmark_fn,
+                        return_mode="median",
+                        warmup=self.warmup,
+                        rep=self.rep,
+                        fixed_repetitions=self.fixed_repetitions,
+                        probe_long_kernel=self.probe_long_kernel,
+                        l2_flush_mode=self.l2_flush_mode,
+                        pre_warmed=True,
+                    )
                 return cast(
                     "float",
                     result,
                 )
             finally:
                 _unload_compiled_fn(fn)
+
+
+@dataclasses.dataclass(frozen=True)
+class KernelTimerProbeJob:
+    """Why the benchmark worker cannot time ``kernel`` windows from the trace
+    on ``device``, ``None`` when it can: the profiling session runs in the
+    worker, which keeps the learned footprint for the windows that follow."""
+
+    device: int | None = None
+
+    def __call__(self) -> str | None:
+        """``kernel_timer_unready_reason``: ``None`` when the worker traces."""
+        with (
+            capture_output(),
+            torch.cuda.device(self.device)
+            if self.device is not None
+            else contextlib.nullcontext(),
+        ):
+            return kernel_timer_unready_reason()
 
 
 @functools.cache
@@ -131,7 +170,7 @@ def _load_trusted_baseline_output(path: str) -> object:
     return resolve_portable_args(torch.load(path, weights_only=False))
 
 
-def _cuda_device_of(args: object) -> torch.device | None:
+def cuda_device_of(args: object) -> torch.device | None:
     """The CUDA device of the first CUDA tensor in ``args`` (None without one)."""
     for leaf in tree_flatten(args)[0]:
         if isinstance(leaf, torch.Tensor) and leaf.device.type == "cuda":
@@ -179,7 +218,7 @@ class AccuracyCheckJob:
                 baseline_output = _load_trusted_baseline_output(self.baseline_path)
                 # The worker ran the previous candidates on these arguments:
                 # a fresh output must not inherit their (correct) values.
-                poison_cached_device_memory(_cuda_device_of(args))
+                poison_cached_device_memory(cuda_device_of(args))
                 output = fn(*args)
                 synchronize_device()
             finally:

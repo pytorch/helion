@@ -123,6 +123,10 @@ class _FakeMeasurer:
         return [window[1] for window in self.windows if window[0] == "measure"]
 
 
+# A backend that leaves the final selection in the search's regime.
+_BACKEND_WITHOUT_REGIME = SimpleNamespace(default_final_selection_regime=lambda: None)
+
+
 def _make_search(
     members: list[PopulationMember],
     *,
@@ -147,7 +151,9 @@ def _make_search(
     search.benchmark_provider = SimpleNamespace(mutated_arg_indices=[])
     # no family knobs: the family quota admits nothing (``_family_search``
     # names some)
-    search.config_spec = SimpleNamespace(final_selection_family_keys=())  # type: ignore[misc]
+    search.config_spec = SimpleNamespace(  # type: ignore[misc]
+        final_selection_family_keys=(), backend=_BACKEND_WITHOUT_REGIME
+    )
     search._autotune_metrics = AutotuneMetrics()
     search._autotune_budget_start = (
         None if budget_seconds is None else time.perf_counter() - budget_elapsed
@@ -217,7 +223,9 @@ def _family_search(
     search = _make_search(
         members, policy=policy, pinned=pinned, budget_seconds=budget_seconds
     )
-    search.config_spec = SimpleNamespace(final_selection_family_keys=keys)  # type: ignore[misc]
+    search.config_spec = SimpleNamespace(  # type: ignore[misc]
+        final_selection_family_keys=keys, backend=_BACKEND_WITHOUT_REGIME
+    )
     return search
 
 
@@ -233,6 +241,7 @@ def _mock_kernel(settings: Settings) -> SimpleNamespace:
             autotune_config_is_viable=lambda _config_spec, _config: True,
             should_deduplicate_generated_sources=lambda config_spec: False,
             get_do_bench=lambda: None,
+            default_final_selection_regime=lambda: None,
             classify_autotune_exception=lambda error: None,
             probe_long_autotune_kernels=lambda _config_spec: False,
             supports_precompile=lambda: True,
@@ -864,6 +873,19 @@ class TestFinalSelection(TestCase):
             ):
                 # the target is the ranking regime already: one column
                 self.assertEqual(search._final_selection_sizing_policy(), one_column)
+            # a ``kernel`` target reserves its column without asking whether
+            # the worker traces (an upper bound); where it cannot, the
+            # selection times it as ``call``, the ranking regime again, and
+            # takes one column
+            with (
+                patch.dict(os.environ, {"HELION_AUTOTUNE_TARGET_REGIME": "kernel"}),
+                patch.object(
+                    search, "_kernel_timer_usable", return_value=False
+                ) as usable,
+            ):
+                self.assertEqual(search._final_selection_sizing_policy(), policy)
+                usable.assert_not_called()
+                self.assertIsNone(search._final_selection_second_regime("call"))
 
         # The phase is sized to the time left by the same policy: with room
         # for the rounds but not the column, the default regime runs the
@@ -1019,7 +1041,9 @@ class TestFinalSelection(TestCase):
         search.log = Mock()
         search._budget_reserve_seconds = lambda: 25.0  # type: ignore[method-assign]
         search.config_spec = SimpleNamespace(
-            cute_flash_search_enabled=False, final_selection_family_keys=()
+            cute_flash_search_enabled=False,
+            final_selection_family_keys=(),
+            backend=_BACKEND_WITHOUT_REGIME,
         )
         self.assertEqual(search._longest_generation_seconds, 0.0)
 
@@ -1457,7 +1481,9 @@ class TestFinalSelection(TestCase):
         provider.benchmark_isolated.return_value = [1.0]
         search.benchmark_provider = provider
         search.config_spec = SimpleNamespace(
-            backend=SimpleNamespace(get_do_bench=lambda: None)
+            backend=SimpleNamespace(
+                get_do_bench=lambda: None, default_final_selection_regime=lambda: None
+            )
         )
         for env, regime in [
             ({"HELION_AUTOTUNE_L2_FLUSH": "0"}, "replay"),
@@ -1485,6 +1511,35 @@ class TestFinalSelection(TestCase):
                 kwargs = provider.benchmark_isolated.call_args.kwargs
                 self.assertEqual(kwargs["l2_flush_mode"], regime)
                 self.assertEqual((kwargs["warmup"], kwargs["rep"]), (3, 4))
+        # a backend's regime (CuTe: the trace kernel timer) replaces the
+        # default per-call flush, not an explicit one
+        search.config_spec.backend.default_final_selection_regime = lambda: "kernel"
+        for env, available, regime in [
+            ({}, True, "kernel"),
+            ({"HELION_AUTOTUNE_L2_FLUSH": "1"}, True, "call"),
+            # a worker that cannot trace times with CUDA events, labelled so
+            ({}, False, "call"),
+        ]:
+            provider.worker_kernel_timer_available.return_value = available
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    base_search_module, "kernel_timer_available", return_value=True
+                ),
+            ):
+                for name in (
+                    "HELION_AUTOTUNE_L2_FLUSH",
+                    "HELION_AUTOTUNE_FINAL_L2_FLUSH",
+                ):
+                    if name not in env:
+                        os.environ.pop(name, None)
+                provider.benchmark_isolated.reset_mock()
+                with search._final_selection_measurer([member], policy) as measurer:
+                    self.assertEqual(measurer.regime_label, regime)
+                    self.assertEqual(measurer.measure(0, 3, 4), 1.0)
+                kwargs = provider.benchmark_isolated.call_args.kwargs
+                self.assertEqual(kwargs["l2_flush_mode"], regime)
+        search.config_spec.backend.default_final_selection_regime = lambda: None
         # a wall-clock worker always flushes, whatever the regime says
         provider._subprocess_benchmark_uses_wall_clock.return_value = True
         with patch.dict(os.environ, {"HELION_AUTOTUNE_L2_FLUSH": "0"}):
@@ -1654,6 +1709,98 @@ class TestFinalSelection(TestCase):
         self.assertIn("the tie within 1.0% broken by 2 rounds of L2 call", line)
         self.assertIn("call=3.9[3.9 3.9]", line)
         self.assertIn("call=5.41[5.41 5.41]", line)
+
+    def test_explicit_regime_does_not_probe_the_trace(self) -> None:
+        """A regime named in the environment that is not ``kernel`` leaves
+        the trace alone: no profiling session or flush buffer in the
+        parent for a backend whose default would trace."""
+        search = _make_search([_member(32, 1.0)], policy=FinalSelectionConfig())
+        search.config_spec = SimpleNamespace(  # type: ignore[misc]
+            final_selection_family_keys=(),
+            backend=SimpleNamespace(default_final_selection_regime=lambda: "kernel"),
+        )
+        with (
+            patch.dict(os.environ, {"HELION_AUTOTUNE_FINAL_L2_FLUSH": "call"}),
+            patch.object(search, "_kernel_timer_usable") as probe,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            self.assertEqual(search._final_selection_regime(), "call")
+            self.assertIsNone(search._final_selection_second_regime("call"))
+        probe.assert_not_called()
+        # sizing the phase under a budget never asks the worker: a ``kernel``
+        # selection reserves no second column, and an explicit ``call``
+        # target on it does (an upper bound whether or not it traces)
+        assert search.final_selection is not None
+        for target, rounds in (
+            (None, 0),
+            ("call", search.final_selection.tiebreak_rounds),
+        ):
+            with (
+                patch.dict(os.environ, {}),
+                patch.object(search, "_kernel_timer_usable") as probe,
+            ):
+                for name in (
+                    "HELION_AUTOTUNE_FINAL_L2_FLUSH",
+                    "HELION_AUTOTUNE_L2_FLUSH",
+                    "HELION_AUTOTUNE_TARGET_REGIME",
+                ):
+                    os.environ.pop(name, None)
+                if target is not None:
+                    os.environ["HELION_AUTOTUNE_TARGET_REGIME"] = target
+                sized = search._final_selection_sizing_policy()
+            probe.assert_not_called()
+            self.assertEqual(sized.tiebreak_rounds, rounds)
+
+    def test_cold_column_takes_the_backend_kernel_timer(self) -> None:
+        """A warm CuTe selection's cold column times per call flushed from
+        the trace (the backend's ``kernel`` regime) where the benchmark worker
+        times the finalists and can trace, and with CUDA events (``call``)
+        where it cannot or the finalists run in this process (no profiling
+        session in the user's process)."""
+        for available, in_worker, cold_regime in (
+            (True, True, "kernel"),
+            (False, True, "call"),
+            (True, False, "call"),
+        ):
+            search, measurer, members = self._tied_warm_search(
+                cold={"a": 5.41, "b": 3.90, "c": 3.80}
+            )
+            search.config_spec = SimpleNamespace(  # type: ignore[misc]
+                final_selection_family_keys=(),
+                backend=SimpleNamespace(
+                    default_final_selection_regime=lambda: "kernel"
+                ),
+            )
+            with (
+                patch.dict(
+                    os.environ,
+                    {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"},
+                ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+                patch.object(
+                    search,
+                    "benchmark_provider",
+                    new=Mock(
+                        spec=LocalBenchmarkProvider,
+                        steady_window_benchmark_available=Mock(return_value=in_worker),
+                        worker_kernel_timer_available=Mock(return_value=available),
+                        _subprocess_benchmark_uses_wall_clock=Mock(return_value=False),
+                    ),
+                ),
+                patch.object(
+                    base_search_module, "kernel_timer_available", return_value=True
+                ),
+            ):
+                os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+                os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+                self.assertIs(search.final_rebenchmark_best(members["a"]), members["b"])
+            self.assertEqual(
+                {window[0] for window in measurer.second_windows}, {cold_regime}
+            )
+            metrics = search._autotune_metrics.final_selection
+            assert metrics is not None
+            self.assertEqual(metrics["second_l2_flush_mode"], cold_regime)
 
     def test_cold_column_keeps_the_warm_pick_when_cold_ties_too(self) -> None:
         """The replay ranking stands unless a tied rival is faster cold by
