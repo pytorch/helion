@@ -54,8 +54,14 @@ from .type_info import TileIndexType
 from .type_info import TypeInfo
 from .type_info import _eval_binary
 from .type_info import _eval_compare
+from .type_info import _guard_host_membership_protocol
+from .type_info import _has_untraced_host_protocol
 from .type_info import _is_discarded_host_result
+from .type_info import _is_known_host_format_value
 from .type_info import _is_size_backed_float
+from .type_info import _register_host_operator_allocation
+from .type_info import _reject_untraced_host_protocol
+from .type_info import _track_host_storage_effects
 from .variable_origin import ArgumentOrigin
 from .variable_origin import AttributeOrigin
 from .variable_origin import BuiltinOrigin
@@ -342,9 +348,20 @@ class TypePropagation(ast.NodeVisitor):
             f"{type(op).__name__} not supported on {left!s} and {right!s}"
         )
 
+    def _compare_values(self, op: ast.cmpop, left: object, right: object) -> object:
+        if isinstance(op, (ast.Is, ast.IsNot)):
+            return _eval_compare(op, left, right)
+        with _track_host_storage_effects((left, right), self.origin()):
+            result = _eval_compare(op, left, right)
+        if self.origin().is_host():
+            _register_host_operator_allocation((left, right), result)
+        return result
+
     def _compare(self, op: ast.cmpop, left: TypeInfo, right: TypeInfo) -> TypeInfo:
         if isinstance(op, CMP_IN):
             guard_fragment_membership(left, right)
+            if self.origin().is_host():
+                _guard_host_membership_protocol(left, right)
         # Handle `tensor is None` and `tensor is not None` checks
         # When comparing a TensorType with LiteralType(None), we can determine the result
         if isinstance(op, (ast.Is, ast.IsNot)):
@@ -361,7 +378,7 @@ class TypePropagation(ast.NodeVisitor):
                 result = isinstance(op, ast.Is)
                 return LiteralType(origin=self.origin(), value=result)
         if isinstance(left, LiteralType) and isinstance(right, LiteralType):
-            result = _eval_compare(op, left.value, right.value)
+            result = self._compare_values(op, left.value, right.value)
             guard_fragment_comparison(op, left, right, result)
             return LiteralType(
                 origin=self.origin(),
@@ -380,7 +397,7 @@ class TypePropagation(ast.NodeVisitor):
             else:
                 return LiteralType(
                     origin=self.origin(),
-                    value=_eval_compare(op, left.value, values),
+                    value=self._compare_values(op, left.value, values),
                 )
         if isinstance(left, (NumericType, LiteralType)) and isinstance(
             right,
@@ -393,7 +410,7 @@ class TypePropagation(ast.NodeVisitor):
             # block-size-dependent control flow work on the host.
             if not isinstance(op, CMP_ALWAYS_BOOL):
                 try:
-                    result = _eval_compare(op, left.proxy(), right.proxy())
+                    result = self._compare_values(op, left.proxy(), right.proxy())
                 except NotImplementedError:
                     result = None
                 if isinstance(result, torch.SymBool):
@@ -409,7 +426,7 @@ class TypePropagation(ast.NodeVisitor):
                 pass
             else:
                 try:
-                    example = _eval_compare(op, left_example, right_example)
+                    example = self._compare_values(op, left_example, right_example)
                     if self.device_loop_depth == 0:
                         CompileEnvironment.current().propagate_runtime_tensor_layout(
                             (left_example, right_example), example
@@ -425,13 +442,23 @@ class TypePropagation(ast.NodeVisitor):
             and isinstance(op, ast.Eq)
         ):
             guard_fragment_sequence_equality(left, right)
-            if (
+            if self.origin().is_host() and any(
+                _has_untraced_host_protocol(value, nested=False)
+                for value in (left, right)
+            ):
+                _reject_untraced_host_protocol()
+            approximate = (
                 left.contains_approximate_contents()
                 or right.contains_approximate_contents()
-            ):
-                return SymBoolType.new_unbacked(self.origin())
-            if len(left.element_types) != len(right.element_types):
+            )
+            if not approximate and len(left.element_types) != len(right.element_types):
                 return LiteralType(origin=self.origin(), value=False)
+            if self.origin().is_host() and any(
+                _has_untraced_host_protocol(value) for value in (left, right)
+            ):
+                _reject_untraced_host_protocol()
+            if approximate:
+                return SymBoolType.new_unbacked(self.origin())
 
             can_determine_statically = True
             all_elements_equal = True
@@ -441,7 +468,9 @@ class TypePropagation(ast.NodeVisitor):
                 if isinstance(left_elem, LiteralType) and isinstance(
                     right_elem, LiteralType
                 ):
-                    if left_elem.value != right_elem.value:
+                    if self._compare_values(
+                        ast.NotEq(), left_elem.value, right_elem.value
+                    ):
                         all_elements_equal = False
                         break
                 elif isinstance(left_elem, (NumericType, LiteralType)) and isinstance(
@@ -599,11 +628,20 @@ class TypePropagation(ast.NodeVisitor):
         return LiteralType(value=node.value, origin=self.origin())
 
     def visit_FormattedValue(self, node: ast.FormattedValue) -> TypeInfo:
-        # Visit the value expression for type checking, but ignore the result
-        self.visit(node.value)
+        value_type = self.visit(node.value)
         # Visit the format spec if present
         if node.format_spec is not None:
             self.visit(node.format_spec)
+        if self.origin().is_host() and not _is_known_host_format_value(value_type):
+            # Formatting executes only in the generated wrapper. Its hooks can
+            # change captured tensors' rank as well as storage/layout. Dropping
+            # alias proofs alone cannot make those untraced metadata changes
+            # safe. This applies equally to !s, !r and !a conversions.
+            raise exc.TypeInferenceError(
+                "Host formatting with custom protocols is unsupported because "
+                "formatting may mutate tensor storage or metadata; "
+                "pass declared fields explicitly"
+            )
         # Return StringType for unknown strings
         return StringType(origin=self.origin())
 
@@ -719,6 +757,21 @@ class TypePropagation(ast.NodeVisitor):
     def visit_BinOp(self, node: ast.BinOp) -> TypeInfo:
         left = self.visit(node.left)
         right = self.visit(node.right)
+        if self.origin().is_host() and any(
+            _has_untraced_host_protocol(operand, nested=False)
+            for operand in (left, right)
+        ):
+            _reject_untraced_host_protocol()
+        if (
+            self.origin().is_host()
+            and isinstance(node.op, ast.Mod)
+            and (
+                isinstance(left, StringType)
+                or (isinstance(left, LiteralType) and type(left.value) in (str, bytes))
+            )
+            and not _is_known_host_format_value(right)
+        ):
+            _reject_untraced_host_protocol()
         if (
             isinstance(left, TensorType) or isinstance(right, TensorType)
         ) and self.device_loop_depth == 0:
@@ -748,11 +801,26 @@ class TypePropagation(ast.NodeVisitor):
                         self.origin(),
                     )
 
-                example = _eval_binary(node.op, left_example, right_example)
+                with _track_host_storage_effects(
+                    (left_example, right_example), self.origin()
+                ):
+                    example = _eval_binary(node.op, left_example, right_example)
                 if self.device_loop_depth == 0:
-                    CompileEnvironment.current().propagate_runtime_tensor_layout(
+                    env = CompileEnvironment.current()
+                    env.propagate_runtime_tensor_layout(
                         (left_example, right_example), example
                     )
+                    active_nodes = ExtendedAST.current()
+                    if not (
+                        len(active_nodes) > 1
+                        and isinstance(active_nodes[-2], ast.AugAssign)
+                    ):
+                        # AugAssign probes a synthetic BinOp, but Tensor +=
+                        # retains its runtime storage. Its probe allocation
+                        # cannot establish disjointness.
+                        _register_host_operator_allocation(
+                            (left_example, right_example), example
+                        )
                 result = self._preserve_host_float(
                     TypeInfo.from_example(example, self.origin()),
                     (left_example, right_example),

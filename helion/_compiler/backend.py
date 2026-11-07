@@ -2346,12 +2346,19 @@ class Backend(abc.ABC):
         return host_str
 
     def tensors_proven_disjoint(
-        self, env: CompileEnvironment, left: torch.Tensor, right: torch.Tensor
+        self,
+        env: CompileEnvironment,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        *,
+        allow_unbound: bool = False,
     ) -> bool:
         """Whether two input tensors behind kernel arguments are proven not to
         alias by a runtime fact that is part of the bound kernel's cache key
         (``DeviceFunction.proven_disjoint_tensor_pairs``).  ``False`` by
-        default: no backend-owned runtime storage fact."""
+        default: no backend-owned runtime storage fact. Discovery may explicitly
+        request registered live facts before bound results exist; the backend
+        must opt into that proof as well."""
         return False
 
     def scalar_arg_preamble(self, arg: Argument) -> list[ast.AST]:

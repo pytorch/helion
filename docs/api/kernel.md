@@ -21,6 +21,78 @@ A `Kernel` object is typically created via the `@helion.kernel` decorator. It ma
 
 The kernel compilation process converts Python functions using `helion.language` constructs into optimized Triton GPU kernels.
 
+### Host tensor aliases and storage proofs
+
+Some CuTe reduction and Metal lane-loop lowerings require buffers to have
+non-overlapping storage. Selecting a tensor in a host `if` statement does not
+allocate storage: every possible branch, including views and nested selections,
+must satisfy the disjointness requirement. A distinct `torch.empty_like(...)`
+or `clone()` allocation can provide that proof; an `out=` operation writing an
+existing argument does not. Out-of-place native tensor arithmetic creates fresh
+storage, but augmented assignment such as `tensor += 1` does not establish that
+allocation proof.
+
+Replacing tensor storage with `set_` invalidates the affected storage proofs,
+including when replacement occurs in a sibling branch or a loop that may run
+zero times, or the original storage is later restored. Ordinary native writes
+that keep the storage, such as `fill_`, preserve alias proofs.
+Shape and stride changes through a host-selected tensor require each possible
+owner's runtime metadata. Rank-changing mutations through such a selection are
+rejected because one branch can retain the original rank.
+Rank-changing host mutations are also rejected when execution is conditional,
+including later `and`/`or` operands, later chained-comparison operands, and
+comprehension filters or bodies. A single traced rank cannot describe both
+executing and skipping the mutation. An unconditional first operand or outer
+comprehension iterable can still change rank before subsequent device loops.
+
+Opaque host helpers and overloaded Python operations discard existing storage
+proofs because their storage changes may be transient or affect
+captured tensors. This also removes allocation alignment and exact-layout facts;
+Triton may need additional runtime stride arguments as a result.
+An output allocated after such a call has independent fresh storage and can
+still be proved separate from direct inputs. This does not restore input-input
+span facts or prove a selected join independent. Outputs created before the
+call remain conservative even when they were not passed to it, since Python
+closures can reach captured tensors.
+Known native operations and pure builtins with supported tensor/scalar arguments
+retain the appropriate checks. Unproved Python effects can prevent a lowering
+even when a particular execution happens to be safe.
+
+Host f-strings support builtin scalars, tensors and proved builtin collections.
+Formatting custom objects is rejected when their conversion protocols cannot be
+proved safe: those runtime hooks can change tensor rank or metadata without being
+traced during binding. This includes `!s`, `!r`, `!a` and nested format specs.
+The same restriction applies to `str`, `repr`, `ascii`, `format` and percent
+formatting, including `str.format`, `format_map` and bytes formatting.
+Dataclasses, named tuples and container subclasses use structural
+proxies during tracing; their custom truth, length, conversion, binary operator
+and membership protocols are also rejected. Membership and sequence equality
+that could call contained records' equality methods are rejected too. Identity
+comparisons, empty native sequences, proved unequal sequence lengths, and
+membership that only observes builtin dictionary keys retain their ordinary
+behavior. Passing these proxies to opaque Python helpers is rejected because the
+helper could invoke a runtime record method that tracing cannot see.
+This can reject a pure helper too; pass its declared fields explicitly, for
+example `helper(record.tensor)`, so the compiler can trace the actual operands.
+Accessing declared fields, native named-tuple length/truth, and inspecting the
+length or truth of a plain builtin collection containing such records remain
+supported. `type(record)`, ordinary `isinstance(record, RecordType)`, and
+`hasattr(record, "declared_field")` are also supported when the query cannot call
+custom attribute or instance-check hooks. Undeclared attributes and custom
+properties remain unsupported. Native tuple/list conversion of a named tuple,
+including `tuple(torch.sort(x))`, preserves its positional values.
+Custom formatting remains unsupported in assertion messages, including messages
+on statically false assertions: those hooks can affect later invocations too.
+Format a declared field instead, such as `f"shape: {record.tensor.shape}"`.
+Plain list and tuple concatenation or repetition also remain supported;
+these outer operations do not invoke the contained records' binary protocols.
+
+When disjointness cannot be proved, optional optimizations are disabled. A
+lowering that requires independent buffers instead raises
+`helion.exc.BackendUnsupported` during binding or code generation. Unsafe or
+unproved aliasing patterns accepted by older versions can therefore stop
+compiling; this shared compiler behavior can affect backends beyond CuTe.
+
 Host sizes can pass through symbolic float conversion and division before an
 integer extent, including `int(x.size(0) / 2)` and assigning that quotient to a
 local first. Additive and multiplicative floating-point size expressions remain

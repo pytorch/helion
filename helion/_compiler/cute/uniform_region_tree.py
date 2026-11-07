@@ -949,7 +949,7 @@ def uniform_output_stores_are_writeonly(
     """
     from ...language import memory_ops
     from ..runtime_tensor_guards import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
-    from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
+    from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
     from .register_loads import host_load_is_readonly
 
     if not tree.output_stores:
@@ -978,7 +978,8 @@ def uniform_output_stores_are_writeonly(
                 )
             ):
                 return False
-        # Fake storage inequality is only sufficient for compiler allocations.
+        # Check origins even for fresh outputs: another target can be a
+        # synthetic join that includes that allocation.
         others = {id(value): value for value in env.input_sources}
         others.update(targets)
         for other in others.values():
@@ -987,12 +988,8 @@ def uniform_output_stores_are_writeonly(
             other_storage = other.untyped_storage()
             if storage == other_storage:
                 return False
-            if (
-                not fresh
-                and not env.tensor_storage_is_compiler_allocated(other)
-                and not runtime_tensors_are_proven_disjoint(
-                    env, target, other, allow_unbound=allow_unbound
-                )
+            if not tensors_have_proven_disjoint_storage(
+                env, target, other, allow_unbound=allow_unbound
             ):
                 return False
     local_reads = {read.node for read in tree.indexed_reads}

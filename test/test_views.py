@@ -27,6 +27,7 @@ from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing.squeeze_overloads import squeeze_overloads
+from helion._testing.tensor_views import chunk_unbind_axes
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -574,29 +575,7 @@ class TestViews(RefEagerTestBase, TestCase):
 
     @skipUnlessChunkLowering
     def test_torch_chunk_unbind_axes(self):
-        @helion.kernel(autotune_effort="none")
-        def fn(
-            x: torch.Tensor, leading_axis: hl.constexpr
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            n, d, k = x.shape
-            d, k = hl.specialize((d, k))
-            lo = x.new_empty((n, d // 2, k))
-            hi = torch.empty_like(lo)
-            for tile in hl.tile(n):
-                values = x[tile, :, :].reshape(tile, d, k)
-                if leading_axis:
-                    # Default dim=0 and the unbound Tensor method form.
-                    transposed = values.permute(1, 0, 2)
-                    left, right = torch.Tensor.chunk(transposed, 2)
-                    a = left.permute(1, 0, 2)
-                    b = right.permute(1, 0, 2)
-                else:
-                    a, b = values.chunk(2, dim=-2)
-                grouped = torch.stack((a, b), dim=0)
-                c, e = grouped.unbind()
-                lo[tile, :, :] = c
-                hi[tile, :, :] = e
-            return lo, hi
+        fn = helion.kernel(chunk_unbind_axes, autotune_effort="none")
 
         x = torch.arange(65 * 8 * 4, device=DEVICE, dtype=torch.float32).reshape(
             65, 8, 4

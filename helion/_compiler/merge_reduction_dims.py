@@ -40,6 +40,7 @@ from .loop_dependency_checker import memory_write_target
 from .runtime_tensor_guards import _tensor_alias_sources
 from .runtime_tensor_guards import register_tensor_alias_specializations
 from .runtime_tensor_guards import runtime_tensors_have_disjoint_storage
+from .runtime_tensor_guards import tensors_have_proven_disjoint_storage
 from .variable_origin import FlattenOrigin
 
 if TYPE_CHECKING:
@@ -444,24 +445,23 @@ class _Merger:
         tensor = host.meta["val"]
         if id(tensor.untyped_storage()) in self.excluded_storages:
             return None
-        fresh = self.env.tensor_storage_is_compiler_allocated(tensor)
-        for written in self.excluded_storages.values():
-            if written is None:
-                return None
-            if self.env.tensor_storage_is_compiler_allocated(written):
-                continue
-            if fresh:
-                if self.env.tensor_storage_input_source(written) is None:
-                    return None
-                continue
+
+        def disjoint_inputs(left: torch.Tensor, right: torch.Tensor) -> bool:
             if self._alias_sources is None:
                 # Classification is read-only; cloning starts after the whole chain proof.
                 self._alias_sources = _tensor_alias_sources(self.env)
             if not runtime_tensors_have_disjoint_storage(
-                self.env, tensor, written, self._alias_sources
+                self.env, left, right, self._alias_sources
+            ):
+                return False
+            self.needs_alias_guard = True
+            return True
+
+        for written in self.excluded_storages.values():
+            if written is None or not tensors_have_proven_disjoint_storage(
+                self.env, tensor, written, runtime_proof=disjoint_inputs
             ):
                 return None
-            self.needs_alias_guard = True
         index = cast("list[Argument]", node.args[1])
         first = node.meta["val"].ndim + self.offsets[0]
         merged = range(first, first + len(self.offsets))

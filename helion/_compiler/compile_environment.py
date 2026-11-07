@@ -5,6 +5,7 @@ import collections
 import contextlib
 import contextvars
 import dataclasses
+import itertools
 import logging
 import math
 import sys
@@ -273,6 +274,12 @@ _FRESH_ALLOCATION_FACTORIES: tuple[object, ...] = (
     torch.ones_like,
     torch.full,
     torch.full_like,
+    # Clones allocate storage without proving zero contents or exact layout.
+    torch.clone,
+    torch.Tensor.clone,
+    # Constant padding copies even when every pad is zero or negative.
+    # Its contents are not uniformly zero and its layout is proved separately.
+    torch.constant_pad_nd,
     torch.Tensor.new_empty,
     torch.Tensor.new_empty_strided,
     torch.Tensor.new_zeros,
@@ -595,6 +602,26 @@ class CompileEnvironment:
         # base alignment of any view of it.
         self._fresh_allocation_storages: set[torch.UntypedStorage] = set()
         self._zero_filled_allocation_storages: set[torch.UntypedStorage] = set()
+        # A host control-flow join has synthetic fake storage, not a runtime
+        # allocation. Retain original storage separately from watched Tensor
+        # owners: a view keeps its storage when its former owner calls set_.
+        self._joined_tensor_storage_origins: dict[
+            torch.UntypedStorage, tuple[torch.UntypedStorage, ...]
+        ] = {}
+        self._joined_tensor_storage_owners: dict[
+            torch.UntypedStorage,
+            tuple[tuple[torch.Tensor, torch.UntypedStorage], ...],
+        ] = {}
+        # Metadata belongs to Tensor objects, not their shared storage. A
+        # selected Tensor aliases an owner; a view of it has independent shape
+        # and stride metadata even though its storage origins are identical.
+        self._joined_tensor_metadata_owners: dict[
+            torch.Tensor, tuple[torch.Tensor, ...]
+        ] = {}
+        # Branches and zero-trip loop bodies share representative tensors.
+        # A storage replacement makes both old and new storage ambiguous even
+        # before a join is registered, including for ordinary tensor pairs.
+        self._invalidated_storage_provenance: set[torch.UntypedStorage] = set()
         # A host-selected tensor can change layout without changing the input
         # signature. Derived host results must not inherit a representative
         # layout, even when input shapes and strides are otherwise static.
@@ -1160,6 +1187,8 @@ class CompileEnvironment:
         share the proof without separately classifying every view operation.
         """
         storage = tensor.untyped_storage()
+        if storage in self._invalidated_storage_provenance:
+            return False
         if storage in self._symbolically_exact_layout_storages:
             return True
 
@@ -1190,7 +1219,8 @@ class CompileEnvironment:
 
         A dynamic-shape kernel's traced stride is only the first call's
         unless something fixes it: the wrapper allocating the tensor, or an
-        ``hl.specialize`` of the stride.
+        ``hl.specialize`` of the stride. A subsequent host metadata mutation
+        voids that entry-stride specialization.
         """
         v = tensor.stride(dim)
         # Only literalize a dynamic-kernel stride with positive provenance that
@@ -1199,9 +1229,11 @@ class CompileEnvironment:
         if isinstance(v, int) and self.tensor_layout_is_symbolically_exact(tensor):
             return v
         source = self.tensor_input_source(tensor)
-        # Check if this input stride was explicitly specialized.
+        # An explicitly specialized input stride remains known only while host
+        # metadata mutations have not made its layout a runtime property.
         if (
             source is not None
+            and not self.tensor_has_runtime_layout(tensor)
             and TensorPropertySource(source, TensorProperty.STRIDE, dim)
             in self.specialized_strides
         ):
@@ -1209,6 +1241,111 @@ class CompileEnvironment:
         if isinstance(v, int) and self.settings.static_shapes:
             return v
         return None
+
+    def tensor_storage_provenance(
+        self, tensor: torch.Tensor
+    ) -> tuple[tuple[torch.UntypedStorage, bool], ...] | None:
+        """Possible storage origins and positive allocation facts for each.
+
+        An ordinary fake tensor contributes its storage, not proof of freshness.
+        Only an independently recorded factory allocation or guarded input
+        source can establish disjointness for that origin.
+        """
+        storage = tensor.untyped_storage()
+        origins = self._joined_tensor_storage_origins.get(storage, (storage,))
+        if storage in self._invalidated_storage_provenance or any(
+            origin in self._invalidated_storage_provenance for origin in origins
+        ):
+            return None
+        return tuple(
+            (origin, origin in self._fresh_allocation_storages) for origin in origins
+        )
+
+    def fresh_allocation_is_disjoint_from_input(
+        self, allocation: torch.Tensor, tensor: torch.Tensor
+    ) -> bool:
+        """A surviving allocation fact proves independence from older inputs.
+
+        Opaque effects discard every allocation fact already known at the call.
+        A later fresh allocation is therefore independent of a direct input even
+        when that input's earlier span proof is invalid. A synthetic joined
+        storage is never such an input or a direct allocation.
+        """
+        allocation_storage = allocation.untyped_storage()
+        input_storage = tensor.untyped_storage()
+        return (
+            allocation_storage != input_storage
+            and allocation_storage not in self._joined_tensor_storage_origins
+            and input_storage not in self._joined_tensor_storage_origins
+            and self.tensor_storage_provenance(allocation)
+            == ((allocation_storage, True),)
+            and any(
+                known.untyped_storage() == input_storage for known in self.input_sources
+            )
+        )
+
+    def _invalidate_tensor_storage_provenance(
+        self, storages: typing.Iterable[torch.UntypedStorage]
+    ) -> None:
+        """Discard facts permanently; later input guards cannot restore them."""
+        invalid = self._invalidated_storage_provenance
+        invalid.update(storages)
+        # A join is an alias of one of its owners at runtime. Propagate both
+        # upward from a changed owner and downward from a changed receiver,
+        # including through nested joins and owners' current/original storage.
+        changed = True
+        while changed:
+            changed = False
+            for storage, origins in self._joined_tensor_storage_origins.items():
+                related = {storage, *origins}
+                for owner, original in self._joined_tensor_storage_owners[storage]:
+                    related.update((original, owner.untyped_storage()))
+                if invalid.intersection(related) and not related <= invalid:
+                    invalid.update(related)
+                    changed = True
+        self._fresh_allocation_storages.difference_update(invalid)
+        self._zero_filled_allocation_storages.difference_update(invalid)
+        self._symbolically_exact_layout_storages.difference_update(invalid)
+
+    def register_tensor_storage_join(
+        self, result: torch.Tensor, branches: typing.Sequence[torch.Tensor]
+    ) -> None:
+        """Flatten host-join alternatives without granting allocation provenance."""
+        result_storage = result.untyped_storage()
+        origins: dict[torch.UntypedStorage, None] = {}
+        owners: dict[int, tuple[torch.Tensor, torch.UntypedStorage]] = {}
+        metadata_owners: dict[int, torch.Tensor] = {}
+        for branch in branches:
+            branch_storage = branch.untyped_storage()
+            provenance = self.tensor_storage_provenance(branch)
+            if provenance is None:
+                self._invalidated_storage_provenance.add(result_storage)
+            else:
+                origins.update((storage, None) for storage, _fresh in provenance)
+            # Keep the intermediate joined Tensor as well as its leaf owners.
+            # Tensor objects sharing a storage can later change independently.
+            for owner in self._joined_tensor_storage_owners.get(branch_storage, ()):
+                owners.setdefault(id(owner[0]), owner)
+            owners.setdefault(id(branch), (branch, branch_storage))
+            for owner in self._joined_tensor_metadata_owners.get(branch, ()):
+                metadata_owners.setdefault(id(owner), owner)
+            metadata_owners.setdefault(id(branch), branch)
+        self._joined_tensor_storage_origins[result_storage] = tuple(origins)
+        self._joined_tensor_storage_owners[result_storage] = tuple(owners.values())
+        self._joined_tensor_metadata_owners[result] = tuple(metadata_owners.values())
+
+    def _invalidate_mutated_tensor_storage_joins(self) -> None:
+        """A mutation permanently invalidates the original alias alternatives."""
+        changed = set()
+        for storage, owners in self._joined_tensor_storage_owners.items():
+            for tensor, original_storage in owners:
+                current = tensor.untyped_storage()
+                if current is not original_storage:
+                    # Never substitute the current owner: earlier views retain
+                    # old storage, and a traced sibling may not run at runtime.
+                    changed.update((storage, original_storage, current))
+        if changed:
+            self._invalidate_tensor_storage_provenance(changed)
 
     def tensor_storage_is_compiler_allocated(self, fake_tensor: torch.Tensor) -> bool:
         """Whether ``fake_tensor`` views storage a wrapper factory freshly allocated.
@@ -1219,6 +1356,27 @@ class CompileEnvironment:
         too while inheriting an arbitrary runtime base.
         """
         return fake_tensor.untyped_storage() in self._fresh_allocation_storages
+
+    def register_compiler_allocation_replacement(
+        self, original: torch.Tensor, replacement: torch.Tensor
+    ) -> None:
+        """Retain allocation facts after rewriting a proved host factory.
+
+        The caller must rewrite the runtime allocation as well as its fake
+        value, preserving the factory's initialization. This is not a proof
+        for arbitrary tensor conversions or synthetic control-flow joins.
+        Layout facts remain separate and are not transferred here.
+        """
+        original_storage = original.untyped_storage()
+        replacement_storage = replacement.untyped_storage()
+        if (
+            original_storage not in self._fresh_allocation_storages
+            or replacement_storage == original_storage
+        ):
+            return
+        self._fresh_allocation_storages.add(replacement_storage)
+        if original_storage in self._zero_filled_allocation_storages:
+            self._zero_filled_allocation_storages.add(replacement_storage)
 
     def tensor_has_canonical_contiguous_strides(self, tensor: torch.Tensor) -> bool:
         """Prove the canonical dense formula without ordering by size hints."""
@@ -1314,28 +1472,116 @@ class CompileEnvironment:
         self._runtime_layout_storages.add(storage)
         self._symbolically_exact_layout_storages.discard(storage)
 
+    def _metadata_permutation_preserves_storage(
+        self, before: tuple[int | torch.SymInt, ...], tensor: torch.Tensor
+    ) -> bool:
+        """Prove an unchanged element-address set, including empty dimensions."""
+        rank = tensor.ndim
+        if len(before) != 2 * rank + 1 or not self.known_equal(
+            before[-1], tensor.storage_offset()
+        ):
+            return False
+        remaining = list(zip(before[:rank], before[rank:-1], strict=True))
+        for size, stride in zip(tensor.size(), tensor.stride(), strict=True):
+            for i, (old_size, old_stride) in enumerate(remaining):
+                if self.known_equal(size, old_size) and self.known_equal(
+                    stride, old_stride
+                ):
+                    remaining.pop(i)
+                    break
+            else:
+                return False
+        return True
+
+    def _refresh_mutated_tensor_metadata(
+        self,
+        tensor: torch.Tensor,
+        changed_dimensions: set[int],
+        mutation_site: tuple[object, ...],
+    ) -> None:
+        """Read post-call metadata from this Tensor, without reusing old origins."""
+        shape = tuple(
+            self.cached_create_unbacked_symint(
+                ("host_mutation_size", tensor, mutation_site, dim), self.size_hint(size)
+            )
+            if dim in changed_dimensions
+            else size
+            for dim, size in enumerate(tensor.size())
+        )
+        strides = tuple(
+            self.cached_create_unbacked_symint(
+                ("host_mutation_stride", tensor, mutation_site, dim),
+                self.size_hint(stride),
+            )
+            for dim, stride in enumerate(tensor.stride())
+        )
+        self.mark_runtime_tensor_layout(tensor)
+        symbols = self._runtime_layout_stride_symbols.setdefault(
+            tensor.untyped_storage(), set()
+        )
+        for stride in strides:
+            symbols.update(_symint_free_symbols(stride))
+        with torch.no_grad():
+            tensor.as_strided_(shape, strides, tensor.storage_offset())
+
     @contextlib.contextmanager
-    def track_runtime_layout_mutations(self, inputs: object) -> typing.Iterator[None]:
+    def track_runtime_layout_mutations(
+        self, inputs: object, *, opaque: bool
+    ) -> typing.Iterator[None]:
         """Retain exact aliases only when the host call preserves their metadata."""
+        from .ast_extension import ExtendedAST
+
+        # A second statement can mutate the same Tensor after an earlier
+        # allocation captured its size. Reusing that statement's symbols would
+        # rewrite the earlier allocation's extent to the final Tensor state.
+        # Repeated inference of the same loop site still needs stable symbols.
+        mutation_site = tuple(ExtendedAST.current())
+        if opaque:
+            # Python can replace .data and restore it without changing the
+            # Tensor version. Its captures/record fields can reach owners not
+            # present in the arguments, even before any join exists. Factories
+            # after this call can still establish independent fresh storage.
+            known = (
+                self._fresh_allocation_storages
+                | self._zero_filled_allocation_storages
+                | self._symbolically_exact_layout_storages
+                | set(self._joined_tensor_storage_origins)
+                | {tensor.untyped_storage() for tensor in self.input_sources}
+            )
+            for origins in self._joined_tensor_storage_origins.values():
+                known.update(origins)
+            for owners in self._joined_tensor_storage_owners.values():
+                for owner, original in owners:
+                    known.update((original, owner.untyped_storage()))
+            self._invalidate_tensor_storage_provenance(known)
         tensors = [
             value
             for value in pytree.tree_leaves(inputs)
             if isinstance(value, torch.Tensor)
         ]
-        before = (
-            [
-                (
-                    value,
-                    value.untyped_storage(),
-                    (*value.size(), *value.stride(), value.storage_offset()),
-                )
-                for value in tensors
-            ]
-            if any(self.tensor_has_runtime_layout(value) for value in tensors)
-            else []
-        )
+        storage_before = [(value, value.untyped_storage()) for value in tensors]
+        before = [
+            (
+                value,
+                value.untyped_storage(),
+                tuple(value.size()),
+                (*value.size(), *value.stride(), value.storage_offset()),
+            )
+            for value in tensors
+        ]
         yield
-        for value, storage, metadata in before:
+        changed = set()
+        for value, storage in storage_before:
+            current_storage = value.untyped_storage()
+            if current_storage is not storage:
+                changed.update((storage, current_storage))
+        if changed:
+            self._invalidate_tensor_storage_provenance(changed)
+        # Native value writes do not change storage. Opaque calls were already
+        # invalidated, so neither version counters nor inference-mode counters
+        # are needed for the remaining storage watches.
+        self._invalidate_mutated_tensor_storage_joins()
+        for value, storage, original_shape, metadata in before:
             current = (*value.size(), *value.stride(), value.storage_offset())
             if (
                 value.untyped_storage() is not storage
@@ -1345,13 +1591,82 @@ class CompileEnvironment:
                     for left, right in zip(metadata, current, strict=True)
                 )
             ):
-                # An out= call may resize an existing destination. Update the
-                # original fake as well as the result: callers can discard the
-                # return value and keep reading the destination's existing type.
-                runtime_value = self.runtime_layout_tensor(value)
-                with torch.no_grad():
-                    value.as_strided_(
-                        value.size(), runtime_value.stride(), value.storage_offset()
+                if not self._metadata_permutation_preserves_storage(metadata, value):
+                    # Entry span/alignment facts do not describe resized or
+                    # restrided views. A pure dimension permutation preserves
+                    # the actual address set, even for zero/singleton sizes.
+                    self._invalidate_tensor_storage_provenance((storage,))
+                # Only the selected Tensor itself shares its owners' metadata;
+                # an actual view merely shares storage. Upward propagation then
+                # refreshes every selection that may name a changed owner,
+                # without resizing that selection's other, untouched owners.
+                affected = dict.fromkeys(
+                    (value, *self._joined_tensor_metadata_owners.get(value, ()))
+                )
+                while True:
+                    dependent = [
+                        joined
+                        for joined, owners in self._joined_tensor_metadata_owners.items()
+                        if joined not in affected
+                        and any(owner in affected for owner in owners)
+                    ]
+                    if not dependent:
+                        break
+                    affected.update(dict.fromkeys(dependent))
+                changed_dimensions = {
+                    dim
+                    for dim, (old_size, new_size) in enumerate(
+                        zip(original_shape, value.size(), strict=False)
+                    )
+                    if not self.known_equal(old_size, new_size)
+                }
+                if len(original_shape) != value.ndim:
+                    if (
+                        len(affected) > 1
+                        or any(
+                            isinstance(
+                                node, (ast.If, ast.IfExp, ast.For, ast.While, ast.Try)
+                            )
+                            # The first Boolean operand and first comparison pair
+                            # run unconditionally. Later operands may short-circuit.
+                            or (
+                                isinstance(node, ast.BoolOp)
+                                and child is not node.values[0]
+                            )
+                            or (
+                                isinstance(node, ast.Compare)
+                                and any(
+                                    child is value for value in node.comparators[1:]
+                                )
+                            )
+                            # Only a comprehension's outer iterable runs eagerly
+                            # once. Its filters and body may run zero or many times.
+                            or (
+                                isinstance(
+                                    node,
+                                    (
+                                        ast.ListComp,
+                                        ast.SetComp,
+                                        ast.DictComp,
+                                        ast.GeneratorExp,
+                                    ),
+                                )
+                                and child is not node.generators[0].iter
+                            )
+                            for node, child in itertools.pairwise(mutation_site)
+                        )
+                    ):
+                        raise exc.TypeInferenceError(
+                            "Host tensor metadata mutation cannot change its rank across control flow"
+                        )
+                    changed_dimensions = set(range(value.ndim))
+                for tensor in affected:
+                    if tensor.ndim != value.ndim:
+                        raise exc.TypeInferenceError(
+                            "Mutation through a host tensor join cannot change its rank"
+                        )
+                    self._refresh_mutated_tensor_metadata(
+                        tensor, changed_dimensions, mutation_site
                     )
 
     def propagate_runtime_tensor_layout(self, inputs: object, result: object) -> None:
@@ -1397,7 +1712,15 @@ class CompileEnvironment:
             changed = True
         if not changed:
             return tensor
-        return torch.as_strided(tensor, tensor.size(), strides, tensor.storage_offset())
+        result = torch.as_strided(
+            tensor, tensor.size(), strides, tensor.storage_offset()
+        )
+        if tensor in self._joined_tensor_metadata_owners:
+            # This is an internal representation change, not a runtime view.
+            self._joined_tensor_metadata_owners[result] = (
+                self._joined_tensor_metadata_owners[tensor]
+            )
+        return result
 
     def register_tensor_factory_layout(
         self,
@@ -1472,6 +1795,23 @@ class CompileEnvironment:
             self._runtime_layout_storages.discard(result_storage)
             self._runtime_layout_stride_symbols.pop(result_storage, None)
             self._symbolically_exact_layout_storages.add(result_storage)
+
+    def register_host_tensor_allocation(
+        self, inputs: list[FakeTensor], result: object
+    ) -> None:
+        """Record a proven native nonaliasing result, without contents/layout facts.
+
+        The caller establishes the native operation and exact argument contract.
+        Distinct fake storage alone is insufficient for conditional-copy methods
+        such as contiguous/reshape, whose runtime result can alias an input.
+        """
+        if type(result) is not FakeTensor or result.layout != torch.strided:
+            return
+        if not inputs or any(
+            result.untyped_storage() == value.untyped_storage() for value in inputs
+        ):
+            return
+        self._fresh_allocation_storages.add(result.untyped_storage())
 
     def runtime_value_for_tensor(self, fake_tensor: torch.Tensor) -> object | None:
         """Replay a traced tensor's input source against the current real arguments."""

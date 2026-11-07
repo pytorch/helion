@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Hashable
 import dataclasses
 import itertools
 from typing import TYPE_CHECKING
+from typing import TypeVar
 from typing import cast
 
 import sympy
@@ -25,7 +27,7 @@ from .compile_environment import _symint_expr
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from collections.abc import Hashable
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from torch._guards import Source
@@ -491,6 +493,10 @@ def runtime_tensors_have_disjoint_storage(
     A transform using this provisional fact must register the alias
     specialization before committing its rewrite.
     """
+    if not env.tensor_storage_provenance(left) or not env.tensor_storage_provenance(
+        right
+    ):
+        return False
     sources: list[Source] = []
     for tensor in (left, right):
         source = env.tensor_storage_input_source(tensor)
@@ -512,6 +518,10 @@ def runtime_tensors_are_proven_disjoint(
     allow_unbound: bool = False,
 ) -> bool:
     """Return a cache-specialized positive runtime storage-disjointness fact."""
+    if not env.tensor_storage_provenance(left) or not env.tensor_storage_provenance(
+        right
+    ):
+        return False
     left_source = env.tensor_input_source(left)
     right_source = env.tensor_input_source(right)
     if left_source is None:
@@ -543,6 +553,24 @@ def runtime_tensor_sources_are_proven_disjoint(
     """
     if left_source == right_source:
         return False
+    from .host_function import HostFunction
+
+    # Input-span guards describe arguments at entry, not their storage after a
+    # host mutation. Explicit Sources (including duplicate argument aliases)
+    # must not bypass the tensor-level invalidation check above.
+    for source in (left_source, right_source):
+        tensor = _replay_tensor_input_source(
+            source, HostFunction.current().params.arguments
+        )
+        if isinstance(tensor, torch.Tensor) and not env.tensor_storage_provenance(
+            tensor
+        ):
+            return False
+        if any(
+            registered_source == source and not env.tensor_storage_provenance(value)
+            for value, registered_source in env.input_sources.items()
+        ):
+            return False
     specialization = env.runtime_input_specializations.get(
         _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
     )
@@ -597,3 +625,95 @@ def runtime_tensor_sources_are_proven_disjoint(
         if frozenset(pair) == wanted:
             return fact is True
     return False
+
+
+def tensors_have_proven_disjoint_storage(
+    env: CompileEnvironment,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    allow_unbound: bool = False,
+    runtime_proof: Callable[[torch.Tensor, torch.Tensor], bool] | None = None,
+) -> bool:
+    """Prove every possible origin pair, without trusting synthetic storage.
+
+    A factory can prove disjointness from another allocation or known input.
+    External pairs require the caller's input-span policy. The default uses
+    registered runtime facts; read-only candidate proofs and backend-owned
+    codegen proofs may supply a narrower callback. No callback may restore
+    missing or invalidated provenance.
+    """
+    left_origins = env.tensor_storage_provenance(left)
+    right_origins = env.tensor_storage_provenance(right)
+    if not left_origins or not right_origins:
+        # This allocation proof is independent of input span facts discarded
+        # by an earlier opaque effect. It cannot bless joined or old outputs.
+        return env.fresh_allocation_is_disjoint_from_input(
+            left, right
+        ) or env.fresh_allocation_is_disjoint_from_input(right, left)
+    input_storages = {tensor.untyped_storage(): tensor for tensor in env.input_sources}
+    for (left_storage, left_fresh), (right_storage, right_fresh) in itertools.product(
+        left_origins, right_origins
+    ):
+        if left_storage == right_storage:
+            return False
+        left_input = input_storages.get(left_storage)
+        right_input = input_storages.get(right_storage)
+        if (left_fresh and (right_fresh or right_input is not None)) or (
+            right_fresh and left_input is not None
+        ):
+            continue
+        if left_input is None or right_input is None:
+            return False
+        if runtime_proof is not None:
+            disjoint = runtime_proof(left_input, right_input)
+        else:
+            disjoint = runtime_tensors_are_proven_disjoint(
+                env, left_input, right_input, allow_unbound=allow_unbound
+            )
+        if not disjoint:
+            return False
+    return True
+
+
+_TensorKey = TypeVar("_TensorKey", bound=Hashable)
+
+
+def tensor_pairs_with_proven_disjoint_storage(
+    env: CompileEnvironment,
+    tensors: Mapping[_TensorKey, torch.Tensor],
+    *,
+    allow_unbound: bool = False,
+) -> set[frozenset[_TensorKey]]:
+    """Use one storage/origin rule at bind and during device code generation.
+
+    Positively identified factory storage is disjoint from inputs and other
+    fresh allocations. Host joins require every possible origin pair to pass;
+    their synthetic fake storage is not an allocation. External pairs need the
+    backend's immutable bound proof, or the same registered runtime classifier's
+    live facts when discovery explicitly allows them.
+    """
+    from .host_function import HostFunction
+
+    host = HostFunction.current()
+
+    def disjoint_inputs(left: torch.Tensor, right: torch.Tensor) -> bool:
+        return env.backend.tensors_proven_disjoint(
+            env, left, right, allow_unbound=allow_unbound
+        )
+
+    roots = {}
+    for key, tensor in tensors.items():
+        origin = host.tensor_to_origin.get(tensor)
+        root = origin.root_rw_name() if origin is not None else None
+        if root is not None:
+            roots[key] = root
+    result = set()
+    for (left, left_root), (right, right_root) in itertools.combinations(
+        roots.items(), 2
+    ):
+        if left_root != right_root and tensors_have_proven_disjoint_storage(
+            env, tensors[left], tensors[right], runtime_proof=disjoint_inputs
+        ):
+            result.add(frozenset((left, right)))
+    return result

@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 import weakref
 
+import pytest
 import sympy
 import torch
 from torch._dynamo.source import LocalSource
@@ -634,6 +635,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         self.assertEqual(replacement_calls, 1)
         self.assertEqual(stale_calls, 0)
 
+    @pytest.mark.cpu_only
     def test_disjoint_fact_rejects_post_bind_alias_change(self) -> None:
         state_source = LocalSource("state", is_input=True)
         other_source = LocalSource("other", is_input=True)
@@ -651,8 +653,8 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         bound_values = (backing[:32], backing[16:48])
         current_values = (torch.empty(32), torch.empty(32))
         bound_result = specialization.classifier(bound_values)
-        fake_state = object()
-        fake_other = object()
+        fake_state = torch.empty(32)
+        fake_other = torch.empty(32)
         env = SimpleNamespace(
             input_sources={},
             bound_runtime_input_specialization_results={
@@ -668,11 +670,22 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             tensor_input_source=lambda tensor: (
                 state_source if tensor is fake_state else other_source
             ),
+            tensor_storage_provenance=lambda tensor: (
+                (tensor.untyped_storage(), False),
+            ),
+        )
+        host = SimpleNamespace(
+            params=SimpleNamespace(arguments={"state": fake_state, "other": fake_other})
         )
 
-        with patch(
-            "helion._compiler.runtime_tensor_guards._tensor_alias_sources",
-            return_value=sources,
+        with (
+            patch(
+                "helion._compiler.runtime_tensor_guards._tensor_alias_sources",
+                return_value=sources,
+            ),
+            patch(
+                "helion._compiler.host_function.HostFunction.current", return_value=host
+            ),
         ):
             self.assertFalse(
                 runtime_tensors_are_proven_disjoint(
