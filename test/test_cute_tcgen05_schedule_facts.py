@@ -604,3 +604,39 @@ def test_default_tile_leaves_small_grids_to_their_seeds() -> None:
     bound = _plain_bind(1024, 1024, 4096)
     with bound.env:
         assert CuteTcgen05DefaultTileHeuristic._pick(bound.env) is None
+
+
+def test_plain_pair_prices_the_narrow_store_subtile() -> None:
+    """A plain 16-bit 256x256 pair stores through (128, 32) C subtiles, so a
+    six-deep 64-wide AB ring keeps a four-deep C ring (192 + 32 KiB).  Pricing
+    the C ring at CuTe's with-source (128, 64) subtile capped the ring at five
+    stages and rejected the config."""
+    bound = _plain_bind(16384, 768, 768)
+    values = {
+        "block_sizes": [256, 256, 64],
+        "pid_type": "persistent_blocked",
+        "tcgen05_cta_group": "two",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": 6,
+        "tcgen05_c_stages": 4,
+        "tcgen05_tvm_ffi_launch": False,
+    }
+    state = bound.config_spec._cute_tcgen05_config
+    assert state._paired_pipeline_stage_limit(values) == 6
+    # Each epilogue warp group owns its own ring: two groups of four (128, 32)
+    # stages take 64 KiB, which leaves room for five AB stages, not six.
+    assert (
+        state._paired_pipeline_stage_limit(values | {"tcgen05_epi_warp_groups": 2}) == 5
+    )
+    # A K tail leaves the static-full-tile rule: codegen keeps the with-source
+    # (128, 64) subtile, so four C stages again cap the AB ring at five.
+    k_tail = _plain_bind(16384, 768, 800).config_spec._cute_tcgen05_config
+    assert k_tail._paired_pipeline_stage_limit(values) == 5
+    config = helion.Config(**values)
+    bound.config_spec.normalize(config)
+    assert config["tcgen05_ab_stages"] == 6
+    assert config["tcgen05_c_stages"] == 4
+    source = bound.to_code(config)
+    assert "PipelineTmaStore.create(num_stages=4" in source
+    assert "(cute.make_layout(128), cute.make_layout(32))" in source

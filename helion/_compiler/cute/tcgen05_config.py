@@ -239,6 +239,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from .tcgen05_constants import TCGEN05_REGION_PID_TYPE_CHOICES
 from .tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
 from .tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
@@ -1509,6 +1510,33 @@ class CuteTcgen05Config:
             "tuple[int, int, int, int, int]", (bm, bn, bk, c_stages, acc_stages)
         )
 
+    def _paired_pipeline_store_subtile_n(
+        self, config: dict[str, object], *, bm: int, bn: int, bk: int
+    ) -> int | None:
+        """The C-ring subtile width the 256-row pair's store codegen allocates.
+
+        A configured ``tcgen05_epi_subtile_n`` wins; otherwise the plain
+        narrow rule's 32 columns where codegen applies it: the epilogue facts
+        ``epilogue_subtile`` checks (``_plain_narrow_subtile_facts``) plus the
+        static full tiles, row-major output and TMA-store epilogue the plan
+        also asks for.  ``None`` keeps ``pipeline_smem_bytes``' with-source
+        tile, the only place that width is computed.
+        """
+        configured = self._config_epi_subtile_n(config)
+        if configured is not None:
+            return configured
+        facts = self.pipeline_smem_facts
+        if (
+            bm == TCGEN05_TWO_CTA_BLOCK_M
+            and facts is not None
+            and not facts.output_column_major
+            and config.get("tcgen05_c_store_mode", "normal") == "normal"
+            and self._plain_narrow_subtile_facts(bm=bm, bn=bn, cluster_m=2)
+            and self._static_full_tiles(bm=bm, bn=bn, bk=bk)
+        ):
+            return TCGEN05_PLAIN_NARROW_SUBTILE_N
+        return None
+
     def _paired_pipeline_stage_limit(self, config: dict[str, object]) -> int | None:
         parameters = self._paired_pipeline_parameters(config)
         if parameters is None:
@@ -1523,6 +1551,10 @@ class CuteTcgen05Config:
             bk=bk,
             c_stages=c_stages,
             acc_stages=acc_stages,
+            epi_warp_groups=self._config_epi_warp_groups(config),
+            epi_subtile_n=self._paired_pipeline_store_subtile_n(
+                config, bm=bm, bn=bn, bk=bk
+            ),
             aux_load_placement=cast(
                 "str",
                 config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY, "post_acc_wait"),
@@ -8196,6 +8228,41 @@ class CuteTcgen05Config:
             and self.matmul_input_dtype == torch.float8_e4m3fn
         )
 
+    def _plain_narrow_subtile_facts(self, *, bm: int, bn: int, cluster_m: int) -> bool:
+        """The epilogue facts of ``cute_mma``'s plain narrow-subtile rule.
+
+        A plain 16-bit store on the 256-wide two-CTA tile -- one output, no
+        broadcast rows, no auxiliary operand (an exact-shape one keeps the
+        plan's with-source subtile) -- renders ``(128,
+        TCGEN05_PLAIN_NARROW_SUBTILE_N)`` subtiles.  The plan also asks for
+        static full tiles, a row-major output and a TMA-store epilogue; the
+        callers that know those facts check them.
+        """
+        facts = self.rowvec_aux_facts
+        constraints = self.ab_stages_three_search_constraints
+        return (
+            facts is not None
+            and constraints is not None
+            and facts.output_itemsize == 2
+            and not facts.rows
+            and facts.output_count == 1
+            and not self.aux_kernel_detected
+            and constraints.dtype_bytes == 2
+            and cluster_m == 2
+            and bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+            and facts.exact_aux_count == 0
+            and tcgen05_explicit_epilogue_tile_supported(
+                is_two_cta=True,
+                bm=bm,
+                bn=bn,
+                tile_shape=(
+                    128,
+                    TCGEN05_PLAIN_NARROW_SUBTILE_N,
+                    TCGEN05_PLAIN_NARROW_SUBTILE_N,
+                ),
+            )
+        )
+
     def epilogue_subtile(
         self,
         *,
@@ -8231,24 +8298,9 @@ class CuteTcgen05Config:
             and constraints is not None
             and facts.output_itemsize == 2
             and (
-                (
-                    stage_rows
-                    and bool(facts.rows)
-                    and all(row.promoted for row in facts.rows)
-                )
-                or (
-                    not facts.rows
-                    and facts.output_count == 1
-                    and not self.aux_kernel_detected
-                    and constraints.dtype_bytes == 2
-                    and cluster_m == 2
-                    and bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
-                    # An exact-shape auxiliary operand keeps the plan's
-                    # with-source subtile (``cute_mma``:
-                    # ``tcgen05_plain_narrow_subtile`` needs an aux-free
-                    # epilogue).
-                    and facts.exact_aux_count == 0
-                )
+                stage_rows
+                and bool(facts.rows)
+                and all(row.promoted for row in facts.rows)
             )
             and tcgen05_explicit_epilogue_tile_supported(
                 is_two_cta=cluster_m == 2,
@@ -8256,7 +8308,7 @@ class CuteTcgen05Config:
                 bn=bn,
                 tile_shape=(128, 32, 32),
             )
-        )
+        ) or self._plain_narrow_subtile_facts(bm=bm, bn=bn, cluster_m=cluster_m)
         if narrow_subtile:
             return 128, 32
         return tcgen05_default_epilogue_tile_size(

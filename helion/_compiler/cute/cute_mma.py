@@ -227,6 +227,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SPLIT_K_BARRIER_ID
 from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
@@ -12206,13 +12207,17 @@ def _emit_mma_pipeline(
                 is_two_cta=tcgen05_is_two_cta,
                 bm=tcgen05_mma_bm,
                 bn=tcgen05_mma_bn,
-                tile_shape=(128, 32, 32),
+                tile_shape=(
+                    128,
+                    TCGEN05_PLAIN_NARROW_SUBTILE_N,
+                    TCGEN05_PLAIN_NARROW_SUBTILE_N,
+                ),
             )
         )
         if tcgen05_plain_narrow_subtile:
             tcgen05_explicit_epi_tile_m = 128
-            tcgen05_explicit_epi_tile_n = 32
-            tcgen05_explicit_d_store_box_n = 32
+            tcgen05_explicit_epi_tile_n = TCGEN05_PLAIN_NARROW_SUBTILE_N
+            tcgen05_explicit_d_store_box_n = TCGEN05_PLAIN_NARROW_SUBTILE_N
         # Both narrow subtiles also take the explicit-store family's no-unroll
         # K loop (``cutlass.range(..., unroll=1)`` on the TMA and MMA warps,
         # ``tcgen05_use_nounroll_k_loop`` below), decided here by name rather
