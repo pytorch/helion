@@ -38,11 +38,14 @@ from .cute_warp_mma_gemm import warp_mma_max_legal_warps
 from .cute_warp_mma_gemm import warp_mma_tile_reason
 from .cute_warp_mma_gemm import warp_mma_warp_layout
 from .dense_aligned_n import ALIGNED_N_CHOICES
+from .dense_aligned_n import DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K
 from .dense_aligned_n import TILE_N_KEY
 from .dense_aligned_n import DenseAlignedNPlan
 from .dense_aligned_n import carrier_n
+from .dense_aligned_n import dense_aligned_n_block_m
 from .dense_aligned_n import dense_aligned_n_defaults
 from .dense_aligned_n import dense_aligned_n_plan
+from .dense_aligned_n import dense_aligned_n_sixteen_bit
 from .epilogue_fanout import FANOUT_CONFIG_KEY
 from .epilogue_fanout import FANOUT_MODES
 from .epilogue_fanout import schedule_supported as fanout_schedule_supported
@@ -150,6 +153,8 @@ from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENTS
+from .tcgen05_constants import TCGEN05_ALIGNED_N_TALL_L2_GROUPINGS
+from .tcgen05_constants import TCGEN05_ALIGNED_N_TALL_PAIR_ROWS
 from .tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
@@ -238,7 +243,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
-from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from .tcgen05_constants import TCGEN05_REGION_PID_TYPE_CHOICES
 from .tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
@@ -6501,17 +6506,56 @@ class CuteTcgen05Config:
             bounds=bounds,
         )
 
+    def _dense_aligned_n_block_m(self) -> int | None:
+        """Pair M of the aligned-N family for this kernel's input dtype."""
+        facts = self.dense_gemm_facts
+        return None if facts is None else dense_aligned_n_block_m(facts.input_dtype)
+
+    def _dense_aligned_n_surface(
+        self, *, acc_stages: int = 2, store_mode: str = "normal"
+    ) -> dict[str, object]:
+        """The family's pinned values in the search schema's representation:
+        an inactive direct-entry control is absent rather than pinned off
+        (``_apply_paired_pipeline_surface``)."""
+        values = dense_aligned_n_defaults(acc_stages=acc_stages, store_mode=store_mode)
+        self._drop_inactive_direct_entry_controls(values)
+        return values
+
+    def _drop_inactive_direct_entry_controls(self, config: dict[str, object]) -> None:
+        """Remove the two direct-entry controls where the search schema does
+        not carry them.  ``optional_fragments`` adds them exactly when the
+        direct-entry seed is eligible; asking it directly would recurse
+        through the aligned-N width fragment into the seeds."""
+        if not self.full_tile_direct_entry_seed_eligible():
+            config.pop(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY, None)
+            config.pop(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, None)
+
+    def _dense_aligned_n_sixteen_bit(self) -> bool:
+        """Whether the aligned-N family runs the 16-bit paired M256 instruction."""
+        facts = self.dense_gemm_facts
+        return facts is not None and dense_aligned_n_sixteen_bit(facts.input_dtype)
+
     def _dense_aligned_n_width_plans(
         self, width: int
     ) -> Iterator[tuple[dict[str, Any], DenseAlignedNPlan]]:
         """Normal-store seed values (in seed order) proved for one physical N."""
         facts = self.dense_gemm_facts
+        block_m = self._dense_aligned_n_block_m()
+        sixteen_bit = self._dense_aligned_n_sixteen_bit()
         if (
             not self.search_enabled
             or facts is None
-            # dense_aligned_n_plan needs 128-row tiles that divide M and a
-            # physical width that divides N; skip widths that cannot qualify.
-            or facts.shape[0] % 128
+            or block_m is None
+            # dense_aligned_n_plan needs a physical width that divides N and
+            # pair-M tiles that divide M (the 16-bit pair: or whole K tiles);
+            # skip widths that cannot qualify.
+            or (
+                facts.shape[0] % block_m
+                and not (
+                    sixteen_bit
+                    and facts.shape[2] % DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K == 0
+                )
+            )
             or facts.shape[1] % width
             or not _tcgen05_mma_impl_allowed()
         ):
@@ -6519,13 +6563,15 @@ class CuteTcgen05Config:
         pid = self._preferred_persistent_pid_type()
         if pid is None:
             return
-        for bk in (64, 128):
-            for acc_stages in (2, 1):
+        # The 16-bit pair's short-K families want the deep 64-wide ring with
+        # both accumulators: one seed per width.
+        for bk in (DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K,) if sixteen_bit else (64, 128):
+            for acc_stages in (2,) if sixteen_bit else (2, 1):
                 values: dict[str, Any] = {
-                    **dense_aligned_n_defaults(acc_stages=acc_stages),
+                    **self._dense_aligned_n_surface(acc_stages=acc_stages),
                     TILE_N_KEY: width,
                     "block_sizes": self._matmul_seed_block_sizes(
-                        bm=128, bn=carrier_n(width), bk=bk
+                        bm=block_m, bn=carrier_n(width), bk=bk
                     ),
                     "pid_type": pid,
                     "tcgen05_c_stages": 2,
@@ -6543,12 +6589,41 @@ class CuteTcgen05Config:
         )
 
     def dense_aligned_n_seed_configs(self) -> list[Config]:
+        facts = self.dense_gemm_facts
+        sixteen_bit = self._dense_aligned_n_sixteen_bit()
         seeds: list[Config] = [
             Config.from_dict(values | {"tcgen05_ab_stages": depth})
             for width in ALIGNED_N_CHOICES
             for values, plan in self._dense_aligned_n_width_plans(width)
-            for depth in dict.fromkeys((min(2, plan.max_ab_stages), plan.max_ab_stages))
+            for depth in dict.fromkeys(
+                (plan.max_ab_stages,)
+                if sixteen_bit
+                else (min(2, plan.max_ab_stages), plan.max_ab_stages)
+            )
         ]
+        if sixteen_bit:
+            # Tall 16-bit GEMMs read every A row block once per N tile; the
+            # grouped persistent raster keeps a band of them L2-resident.
+            # 25216x768x768 at width 192: grouping 2 0.93, 8 0.96, 16 1.00 of
+            # cuBLAS; 32768x768x768: 8 0.98, 16 0.96.
+            assert facts is not None
+            if (
+                facts.shape[0]
+                >= TCGEN05_ALIGNED_N_TALL_PAIR_ROWS * TCGEN05_TWO_CTA_BLOCK_M
+                and "persistent_interleaved" in self.allowed_pid_types
+            ):
+                seeds.extend(
+                    Config.from_dict(
+                        seed.config
+                        | {
+                            "pid_type": "persistent_interleaved",
+                            "l2_groupings": [group],
+                        }
+                    )
+                    for seed in tuple(seeds)
+                    for group in TCGEN05_ALIGNED_N_TALL_L2_GROUPINGS
+                )
+            return seeds
         # Preserve the ranked normal-store prefix exactly. Direct stores use
         # the same conservative allocation bound and append only after their
         # complete graph/geometry proof succeeds.
@@ -6570,10 +6645,15 @@ class CuteTcgen05Config:
             )
         if fix_invalid:
             view = self._matmul_config_view(config)
-            if view is not None:
-                blocks, mi, ni, _ki = view
+            block_m = self._dense_aligned_n_block_m()
+            if view is not None and block_m is not None:
+                blocks, mi, ni, ki = view
                 blocks = list(blocks)
-                blocks[mi], blocks[ni] = 128, carrier_n(width)
+                blocks[mi], blocks[ni] = block_m, carrier_n(width)
+                if self._dense_aligned_n_sixteen_bit():
+                    blocks[ki] = DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K
+                elif blocks[ki] not in (64, 128):
+                    blocks[ki] = 64
                 config["block_sizes"] = blocks
             acc_stages = config.get("tcgen05_acc_stages", 2)
             if type(acc_stages) is not int or acc_stages not in (1, 2):
@@ -6581,21 +6661,42 @@ class CuteTcgen05Config:
             store_mode = config.get("tcgen05_c_store_mode", "normal")
             if store_mode not in ("normal", "direct"):
                 store_mode = "normal"
-            config.update(
-                dense_aligned_n_defaults(
-                    acc_stages=acc_stages, store_mode=cast("str", store_mode)
-                )
+            # The 16-bit pair admits its own L2 grouping and N pairing; keep a
+            # sampled value the plan accepts instead of the family default.
+            sampled = {
+                key: config[key]
+                for key in ("l2_groupings", "tcgen05_cluster_n")
+                if key in config
+            }
+            surface = self._dense_aligned_n_surface(
+                acc_stages=acc_stages, store_mode=cast("str", store_mode)
             )
+            config.update(surface)
+            self._drop_inactive_direct_entry_controls(config)
             if config.get("pid_type") not in self.allowed_pid_types or config.get(
                 "pid_type"
             ) not in ("persistent_interleaved", "persistent_blocked"):
                 config["pid_type"] = self._preferred_persistent_pid_type()
+            if self._dense_aligned_n_sixteen_bit():
+                # A configured subtile that does not partition the physical
+                # width is dropped rather than leaving the family.
+                subtile = config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY)
+                if type(subtile) is int and subtile > 0 and width % subtile:
+                    config[TCGEN05_EPI_SUBTILE_N_CONFIG_KEY] = None
+                for key, value in sampled.items():
+                    trial = {**config, key: value}
+                    if self._dense_aligned_n_plan(trial) is not None:
+                        config[key] = value
         plan = self._dense_aligned_n_plan(config)
         if plan is None:
             raise InvalidConfig(
-                "tcgen05_tile_n requires its proved full-M/N dense FP8 paired static schedule and unchanged tile bounds"
+                "tcgen05_tile_n requires a proved dense paired GEMM (dense_aligned_n_plan): "
+                "whole N tiles of the physical width, unchanged tile bounds, "
+                "whole M tiles for FP8 or whole K tiles under a 16-bit M tail, "
+                "and for 16-bit a row-major output, a width that is a multiple "
+                "of 32 and an epilogue subtile that divides it"
             )
-        for key, value in dense_aligned_n_defaults(
+        for key, value in self._dense_aligned_n_surface(
             acc_stages=cast("int", config.get("tcgen05_acc_stages", 2)),
             store_mode=cast("str", config.get("tcgen05_c_store_mode", "normal")),
         ).items():
@@ -7610,10 +7711,11 @@ class CuteTcgen05Config:
         232 448 B opt-in) fell back to the SIMT epilogue and lost to ab=5,
         while the hand-kept TMA store at ab=6 compiled and ran 2.8% faster.
         This judges the measured arena model (``default_layout_smem_fits``)
-        at the C subtile the output-edge plan renders: edge tiles never take
-        the plain (128, 32) narrow subtile (it needs static full tiles), so
-        the ring is charged at CuTe's with-source subtile, or at a configured
-        explicit tile when that is wider. Fails closed like the model.
+        at the C subtile the output-edge plan renders: power-of-two edge tiles
+        never take the plain (128, 32) narrow subtile (it needs static full
+        tiles; the aligned-N family prices its own M-edge ring), so the ring
+        is charged at CuTe's with-source subtile, or at a configured explicit
+        tile when that is wider. Fails closed like the model.
         """
         facts = self.rowvec_aux_facts
         if facts is None or cluster_m not in (1, 2):
@@ -8231,12 +8333,14 @@ class CuteTcgen05Config:
     def _plain_narrow_subtile_facts(self, *, bm: int, bn: int, cluster_m: int) -> bool:
         """The epilogue facts of ``cute_mma``'s plain narrow-subtile rule.
 
-        A plain 16-bit store on the 256-wide two-CTA tile -- one output, no
-        broadcast rows, no auxiliary operand (an exact-shape one keeps the
-        plan's with-source subtile) -- renders ``(128,
+        A plain 16-bit store on the 192- or 256-wide two-CTA tile (the
+        aligned-N family's physical width, or the ordinary 256-wide tile) --
+        one output, no broadcast rows, no auxiliary operand (an exact-shape
+        one keeps the plan's with-source subtile) -- renders ``(128,
         TCGEN05_PLAIN_NARROW_SUBTILE_N)`` subtiles.  The plan also asks for
-        static full tiles, a row-major output and a TMA-store epilogue; the
-        callers that know those facts check them.
+        static full tiles (the aligned-N physical tile: whole N and K tiles),
+        a row-major output and a TMA-store epilogue; the callers that know
+        those facts check them.
         """
         facts = self.rowvec_aux_facts
         constraints = self.ab_stages_three_search_constraints
@@ -8249,7 +8353,7 @@ class CuteTcgen05Config:
             and not self.aux_kernel_detected
             and constraints.dtype_bytes == 2
             and cluster_m == 2
-            and bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+            and bn in TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
             and facts.exact_aux_count == 0
             and tcgen05_explicit_epilogue_tile_supported(
                 is_two_cta=True,
@@ -8277,8 +8381,8 @@ class CuteTcgen05Config:
         The matmul plan's choice (``cute_mma``): a configured subtile
         (``tcgen05_epi_subtile_n``, the explicit-tile path: ``(per-CTA M,
         n)``) wins; then the plan's (128, 32) for promoted 16-bit rows that
-        are staged, or for a plain 16-bit store on the 256-wide two-CTA tile
-        (``tcgen05_plain_narrow_subtile``: one output store and no auxiliary
+        are staged, or for a plain 16-bit store on the 192- or 256-wide
+        two-CTA tile (``tcgen05_plain_narrow_subtile``: one output store and no auxiliary
         operand -- a two-output or aux epilogue keeps CuTe's with-source
         (128, 64) subtile there, 64 KiB of C rings for two outputs; the plan
         also asks for a single static-full-tile store, which every plain

@@ -22,11 +22,18 @@ from helion._compiler.cute.dense_aligned_n import dense_aligned_n_defaults
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import tcgen05_two_cta_m128_epilogue_tile_expr
+from helion._compiler.cute.tcgen05_schedule_facts import analyze_native_gemm
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import aligned_n_bf16_config
+from helion._testing.cute_dense_tcgen05 import bf16_mm_args
 from helion._testing.cute_dense_tcgen05 import gb300_target
+from helion._testing.cute_dense_tcgen05 import output_alias_reading_mm
+from helion._testing.cute_dense_tcgen05 import output_reading_mm
+from helion._testing.cute_dense_tcgen05 import plain_mm_into
 from helion._testing.cute_dense_tcgen05 import scaled_args
 from helion._testing.cute_dense_tcgen05 import scaled_mm
+from helion._testing.cute_dense_tcgen05 import scaled_mm_into
 from helion._testing.cute_dense_tcgen05 import wrapper_plans
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import BackendUnsupported
@@ -836,3 +843,187 @@ def test_direct_output_ownership_and_vector_alignment(width):
     # same pointer and copy alignment in both logical dimensions.
     assert width * 2 % 16 == 0
     assert 128 * row_stride * 2 % 16 == 0
+
+
+@pytest.mark.parametrize("rhs_k_major", (True, False))
+def test_sixteen_bit_pair_writes_physical_n_into_argument_output(rhs_k_major):
+    """The 16-bit family is the paired M256 instruction at a 192-wide physical N
+    behind the 256 carrier; an Inductor-style argument output the kernel never
+    reads owns its store ring, and 16-bit operands may be MN-major."""
+    bound = plain_mm_into._bind_isolated(
+        bf16_mm_args(8192, 768, 768, rhs_k_major=rhs_k_major)
+    )
+    state = bound.config_spec._cute_tcgen05_config
+    facts = state.dense_gemm_facts
+    assert facts is not None and facts.plain_epilogue
+    with bound.env:
+        plan = state._dense_aligned_n_plan(aligned_n_bf16_config().config)
+        assert plan is not None
+        assert plan.public_tile == (256, 256, 64)
+        assert plan.physical_tile == (256, 192, 64)
+        # (128, 32) C subtiles leave room for seven 28 KiB stages; CuTe's
+        # with-source (128, 64) subtile would cap the ring at six.
+        assert plan.max_ab_stages == 7
+        # One deepest-ring seed per width that divides N.
+        seeds = {
+            s.config["tcgen05_tile_n"]: s.config["tcgen05_ab_stages"]
+            for s in bound.config_spec.compiler_seed_configs
+            if s.config.get("tcgen05_tile_n")
+        }
+        assert set(seeds) == {96, 192} and seeds[192] == 7
+        # Two N tiles per pair split N evenly (A multicast).
+        assert (
+            state._dense_aligned_n_plan(
+                aligned_n_bf16_config(tcgen05_cluster_n=2).config
+            )
+            is not None
+        )
+    source = bound.to_code(aligned_n_bf16_config())
+    ab, d = wrapper_plans(source)
+    assert (ab["bm"], ab["bn"], ab["bk"]) == (256, 192, 64)
+    assert ab["ab_stage_count"] == 7
+    assert ab.get("b_k_major", False) is rhs_k_major
+    assert (d["bm"], d["bn"], d["epi_tile_n"]) == (256, 192, 32)
+
+
+def test_sixteen_bit_pair_prices_configured_epilogue_and_keeps_sampled_raster():
+    bound = plain_mm_into._bind_isolated(bf16_mm_args(8192, 768, 768))
+    state = bound.config_spec._cute_tcgen05_config
+    with bound.env:
+        # A configured wider subtile or a second epilogue warp group grows the
+        # C ring past what seven AB stages leave.
+        for changes in (
+            {"tcgen05_epi_subtile_n": 64},
+            {"tcgen05_epi_warp_groups": 2},
+        ):
+            plan = state._dense_aligned_n_plan(aligned_n_bf16_config(**changes).config)
+            assert plan is not None and plan.max_ab_stages == 6
+        # A configured subtile must partition the physical width (96), not
+        # only the 128 carrier.
+        assert (
+            state._dense_aligned_n_plan(
+                aligned_n_bf16_config(
+                    tcgen05_tile_n=96,
+                    block_sizes=[256, 128, 64],
+                    tcgen05_epi_subtile_n=64,
+                ).config
+            )
+            is None
+        )
+        # The search projection keeps a sampled L2 grouping and N pairing the
+        # 16-bit pair admits instead of resetting them to the family default,
+        # pins the 64-deep K block, and drops a configured subtile that does
+        # not partition the physical width before judging them.
+        values = dict(
+            aligned_n_bf16_config(
+                l2_groupings=[8], tcgen05_cluster_n=2, tcgen05_ab_stages=9
+            )
+        )
+        bound.config_spec.normalize(values, _fix_invalid=True)
+        narrow = dict(
+            aligned_n_bf16_config(
+                tcgen05_tile_n=96,
+                block_sizes=[256, 128, 32],
+                tcgen05_epi_subtile_n=64,
+                l2_groupings=[8],
+                tcgen05_cluster_n=2,
+            )
+        )
+        bound.config_spec.normalize(narrow, _fix_invalid=True)
+    assert values["l2_groupings"] == [8]
+    assert values["tcgen05_cluster_n"] == 2
+    assert values["tcgen05_ab_stages"] == 7
+    assert narrow["block_sizes"] == [256, 128, 64]
+    assert narrow["tcgen05_epi_subtile_n"] is None
+    assert narrow["l2_groupings"] == [8]
+    assert narrow["tcgen05_cluster_n"] == 2
+
+
+def test_sixteen_bit_pair_rings_tails_and_refusals():
+    # An argument output the epilogue also reads owns no store ring.
+    for reader in (output_reading_mm, output_alias_reading_mm):
+        reads = reader._bind_isolated(bf16_mm_args(8192, 768, 768))
+        gemm = analyze_native_gemm(reads.env, reads.host_function.device_ir)
+        assert gemm is not None and not gemm.owns_output_ring
+    # The TMA store clips at the destination's edge: an output with rows past
+    # M leaves the family.
+    x, y, _out = bf16_mm_args(1152, 768, 768)
+    taller = plain_mm_into._bind_isolated(
+        (x, y, torch.empty((1280, 768), dtype=torch.bfloat16))
+    )
+    assert taller.config_spec._cute_tcgen05_config.dense_gemm_facts is None
+    # Any 16-bit output: an fp16 GEMM keeping its dtype, or bf16 into fp16.
+    x, y, out = bf16_mm_args(8192, 768, 768)
+    for args in (
+        (x.to(torch.float16), y.to(torch.float16), out.to(torch.float16)),
+        (x, y, out.to(torch.float16)),
+    ):
+        half = plain_mm_into._bind_isolated(args)
+        assert half.config_spec._cute_tcgen05_config._dense_aligned_n_widths() == (
+            96,
+            192,
+        )
+    # A partial last M tile is clipped by the TMA store: 8320 rows keep the
+    # family, its (128, 32) C ring and the full-tile TMA-store epilogue.
+    tail = plain_mm_into._bind_isolated(bf16_mm_args(8320, 768, 768))
+    tail_state = tail.config_spec._cute_tcgen05_config
+    with tail.env:
+        tail_plan = tail_state._dense_aligned_n_plan(aligned_n_bf16_config().config)
+    assert tail_plan is not None and tail_plan.max_ab_stages == 7
+    tail_source = tail.to_code(aligned_n_bf16_config())
+    assert "tcgen05_tma_store_atom" in tail_source
+    assert "(cute.make_layout(128), cute.make_layout(32))" in tail_source
+    # A partial last K tile is not: the C stage falls back to the with-source
+    # (128, 64) subtile and the ring to six stages.
+    k_tail = plain_mm_into._bind_isolated(bf16_mm_args(8192, 768, 800))
+    with k_tail.env:
+        k_tail_plan = k_tail.config_spec._cute_tcgen05_config._dense_aligned_n_plan(
+            aligned_n_bf16_config().config
+        )
+    assert k_tail_plan is not None and k_tail_plan.max_ab_stages == 6
+    # The M-edge schedule needs whole K tiles: M and K tails together leave.
+    both = plain_mm_into._bind_isolated(bf16_mm_args(8320, 768, 800))
+    with both.env:
+        assert (
+            both.config_spec._cute_tcgen05_config._dense_aligned_n_plan(
+                aligned_n_bf16_config().config
+            )
+            is None
+        )
+        # A non-positive configured subtile is left to the epilogue validation.
+        assert (
+            k_tail.config_spec._cute_tcgen05_config._dense_aligned_n_plan(
+                aligned_n_bf16_config(tcgen05_epi_subtile_n=0).config
+            )
+            is not None
+        )
+    # Each CTA's half of an 80-wide K-major B tile is not whole 16-row atoms.
+    odd = plain_mm_into._bind_isolated(bf16_mm_args(8192, 960, 768))
+    with pytest.raises(InvalidConfig, match="tcgen05_tile_n"):
+        odd.to_code(
+            aligned_n_bf16_config(tcgen05_tile_n=80, block_sizes=[256, 128, 64])
+        )
+    assert {
+        s.config["tcgen05_tile_n"]
+        for s in odd.config_spec.compiler_seed_configs
+        if s.config.get("tcgen05_tile_n")
+    } == {96, 160, 192}
+    # 960 columns split into five 192-wide tiles: no N pairing.
+    with pytest.raises(InvalidConfig, match="tcgen05_tile_n"):
+        odd.to_code(aligned_n_bf16_config(tcgen05_cluster_n=2))
+
+
+def test_fp8_argument_output_owns_its_ring():
+    """An FP8 scaled GEMM writing an argument output it never reads owns its
+    store ring: the dense aligned-N and one-CTA pipeline families apply."""
+    a, b, scale_a, scale_b = scaled_args(256, 5120, 2880)
+    bound = scaled_mm_into._bind_isolated(
+        (a, b, scale_a, scale_b, torch.empty((256, 5120), dtype=torch.bfloat16))
+    )
+    state = bound.config_spec._cute_tcgen05_config
+    assert state.dense_gemm_facts is not None
+    assert state.one_cta_pipeline_facts is not None
+    assert any(
+        s.config.get("tcgen05_tile_n") == 80
+        for s in bound.config_spec.compiler_seed_configs
+    )

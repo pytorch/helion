@@ -1,6 +1,8 @@
-"""Compile checks for the fp32-row geometries the SMEM model admits (sm_100 GPU).
+"""Compile checks for the geometries the SMEM model admits (sm_100 GPU).
 
-Each case is a ``pre_acc_wait`` row-vector GEMM whose 192 KiB AB ring, 32 KiB
+The fp32-row cases first, then the 16-bit aligned-N pair.
+
+Each fp32-row case is a ``pre_acc_wait`` row-vector GEMM whose 192 KiB AB ring, 32 KiB
 c=4 ring and 2 KiB fp32 row stage fill the per-CTA opt-in to within a KiB
 (231 588-231 716 B of 232 448 modelled; the cubins report 232 612-232 740 B
 ``SHARED`` with the 1 KiB reservation). The 3 KiB seed headroom demoted every
@@ -21,6 +23,9 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_dense_tcgen05 import aligned_n_bf16_config
+from helion._testing.cute_dense_tcgen05 import bf16_mm_args
+from helion._testing.cute_dense_tcgen05 import plain_mm_into
 import helion.language as hl
 
 pytestmark = [
@@ -187,3 +192,48 @@ def test_admitted_fp32_row_geometry_compiles_and_runs(case: str) -> None:
     torch.cuda.synchronize()
     for out in outputs:
         torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=1e-1)
+
+
+@pytest.mark.parametrize(
+    ("m", "rhs_k_major", "dtype", "changes"),
+    (
+        (1024, True, torch.bfloat16, {}),
+        (1024, False, torch.bfloat16, {}),
+        (1152, True, torch.bfloat16, {}),
+        (1024, True, torch.float16, {}),
+        # The seeded grouped raster with N tiles paired (A multicast).
+        (
+            1024,
+            True,
+            torch.bfloat16,
+            {
+                "tcgen05_cluster_n": 2,
+                "pid_type": "persistent_interleaved",
+                "l2_groupings": [8],
+            },
+        ),
+    ),
+    ids=("nt", "nn", "nt_m_tail", "nt_fp16", "nt_2x2_grouped"),
+)
+def test_sixteen_bit_aligned_n_pair_compiles_and_runs(
+    m: int, rhs_k_major: bool, dtype: torch.dtype, changes: dict[str, object]
+) -> None:
+    """The 192-wide paired M256 tile behind the 256 carrier: seven 28 KiB AB
+    stages beside a (128, 32) C ring fill the opt-in, writing an argument
+    output (the Inductor calling convention); a partial last M tile is
+    clipped by the TMA store, and an fp16 GEMM keeps its dtype."""
+    torch.manual_seed(0)
+    x, y, out = (
+        t.to(dtype)
+        for t in bf16_mm_args(m, 768, 512, rhs_k_major=rhs_k_major, device=DEVICE)
+    )
+    bound = plain_mm_into.bind((x, y, out))
+    config = aligned_n_bf16_config(**changes)
+    assert "_BLOCK_SIZE_1 = 192" in bound.to_code(config)
+    bound.set_config(config)
+    expected = (x.float() @ y.float()).to(dtype)
+    for _ in range(LAUNCHES):
+        out.zero_()
+        bound(x, y, out)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected, rtol=2e-2, atol=1e-1)
