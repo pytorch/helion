@@ -32,7 +32,7 @@ from helion.experimental.linear_attention import recurrent_step
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-# Test/benchmark config (use T=128 to avoid numerical overflow in cumulative decay)
+# Test/benchmark config
 B, H, T, D, DV = 2, 4, 128, 32, 16
 C = 32
 DTYPE = torch.bfloat16

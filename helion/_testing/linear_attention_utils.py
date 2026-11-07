@@ -61,6 +61,9 @@ def chunked_linear_attn_reference(
     Supports both scalar decay (g: [B,H,T]) and diagonal decay (g: [B,H,T,D]).
     For correction case (beta provided): uses sequential recurrence within chunks.
     For no-correction case: uses parallel matmul-based intra-chunk computation.
+    The diagonal-decay branch keeps the factored ``exp(g_i) * exp(-g_j)`` form
+    (it can overflow past ~88 of cumulated decay per chunk, which the examples
+    do not reach); the scalar branch masks the pairwise exponent before the exp.
     """
     B, H, T, D = q.shape
     DV = v.shape[-1]
@@ -92,6 +95,8 @@ def chunked_linear_attn_reference(
         state = initial_state.float().clone()
     else:
         state = q.new_zeros(B, H, D, DV, dtype=torch.float32)
+    # Intra-chunk pairs (i, j) with j <= i.
+    causal = torch.ones(C, C, dtype=torch.bool, device=q.device).tril()
 
     def correction_chunk(
         qi: torch.Tensor,
@@ -159,8 +164,7 @@ def chunked_linear_attn_reference(
             o_cross = torch.einsum("bhcd,bhdv->bhcv", q_scaled, state)
 
             attn = torch.einsum("bhid,bhjd->bhij", q_scaled, k_scaled_intra)
-            causal_mask = torch.tril(torch.ones(C, C, device=q.device))
-            attn = attn * causal_mask
+            attn = attn * causal
             o_intra = torch.einsum("bhij,bhjv->bhiv", attn, vi)
 
             outputs.append((o_cross + o_intra).to(input_dtype))
@@ -178,9 +182,15 @@ def chunked_linear_attn_reference(
             o_cross = o_cross * torch.exp(g_cs).unsqueeze(-1)
 
             attn = torch.einsum("bhid,bhjd->bhij", qi, ki)
-            decay_mask = torch.exp(g_cs.unsqueeze(-1) - g_cs.unsqueeze(-2))
-            causal_mask = torch.tril(torch.ones(C, C, device=q.device))
-            attn = attn * decay_mask * causal_mask
+            # exp(g_i - g_j) only where j <= i (an exponent <= 0): above the
+            # diagonal it is exp of a positive cumulated decay, which
+            # overflows fp32 past 88 and turns the masked 0 into inf * 0.
+            decay_mask = torch.exp(
+                (g_cs.unsqueeze(-1) - g_cs.unsqueeze(-2)).masked_fill(
+                    ~causal, float("-inf")
+                )
+            )
+            attn = attn * decay_mask
             o_intra = torch.einsum("bhij,bhjv->bhiv", attn, vi)
 
             outputs.append((o_cross + o_intra).to(input_dtype))

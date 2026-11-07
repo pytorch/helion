@@ -36,6 +36,10 @@ class Case:
     # Defaults to the reference output's dtype. Overrides name one provider's
     # single-tensor result, not an allowed set shared by every implementation.
     output_dtypes: dict[str, torch.dtype] = dataclasses.field(default_factory=dict)
+    # (rtol, atol) of one implementation (``provider:impl``) judged more
+    # loosely than the case; every other implementation, the Helion kernels
+    # included, keeps the case's bound.
+    tolerances: dict[str, tuple[float, float]] = dataclasses.field(default_factory=dict)
     reference_note: str = ""
     # Only read when check == "mismatch_budget"; see run_example's knobs.
     max_mismatch_pct: float | None = None
@@ -43,6 +47,14 @@ class Case:
     # baseline_factories adds torch.compile of the first baseline unless the
     # case already names a compiled baseline or opts out (unrolled loops).
     auto_compile: bool = True
+
+    def for_impl(self, provider: str, impl: str) -> Case:
+        """This case as ``provider:impl`` is judged: with the implementation's
+        own tolerance when ``tolerances`` names one, else unchanged."""
+        if f"{provider}:{impl}" not in self.tolerances:
+            return self
+        rtol, atol = self.tolerances[f"{provider}:{impl}"]
+        return dataclasses.replace(self, rtol=rtol, atol=atol)
 
 
 # Three deliberately different workload sizes for every operation. Dimensions
@@ -301,6 +313,7 @@ def collect(module: str, shape_index: int) -> list[Case]:
         max_mismatch_pct: float | None = None,
         max_mismatched_abs_diff: float | None = None,
         output_dtypes: dict[str, torch.dtype] | None = None,
+        tolerances: dict[str, tuple[float, float]] | None = None,
         reference_note: str = "",
         auto_compile: bool = True,
         **kwargs: Any,
@@ -335,6 +348,7 @@ def collect(module: str, shape_index: int) -> list[Case]:
                 check,
                 description=description,
                 output_dtypes={} if output_dtypes is None else output_dtypes,
+                tolerances={} if tolerances is None else tolerances,
                 reference_note=reference_note,
                 max_mismatch_pct=max_mismatch_pct,
                 max_mismatched_abs_diff=max_mismatched_abs_diff,
@@ -843,6 +857,10 @@ def collect(module: str, shape_index: int) -> list[Case]:
                 q = rand(batch, qh, seq, d, dtype=torch.bfloat16, grad=True)
                 k = rand(batch, kh, seq, d, dtype=torch.bfloat16, grad=True)
                 angles = rand(batch, seq, d, dtype=torch.bfloat16)
+                # The example checks its kernel at atol 1e-2; the torch.compile
+                # baseline's fused rounding flips one BF16 ulp (0.0156) where
+                # the eager reference cancels to zero (15 of 2M elements), so
+                # that baseline alone is allowed one more ulp.
                 for mode in [False, True]:
                     record(
                         m.rope,
@@ -851,6 +869,7 @@ def collect(module: str, shape_index: int) -> list[Case]:
                         bwd=mode,
                         rtol=1e-2,
                         atol=1e-2,
+                        tolerances={"baselines:torch.compile": (1e-2, 2e-2)},
                     )
             elif module == "segment_reduction":
                 nodes, edges, features = [
@@ -916,6 +935,11 @@ def collect(module: str, shape_index: int) -> list[Case]:
                     (2, 8, 1024, 128, 64, 128),
                 ][i]
                 m.test(*shape)
+                # The example checks its kernel at atol 0.1; torch.compile's
+                # fused reference accumulates two state elements differently
+                # (0.115 off at workload 2), so that baseline alone is allowed
+                # 0.2.
+                cases[0].tolerances["baselines:torch.compile"] = (cases[0].rtol, 0.2)
             elif module == "nvfp4_gemm":
                 # This example pins backend='cute' at decoration time. Explicitly
                 # retarget its bodies for the Triton experiment, so a Triton result
