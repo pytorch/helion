@@ -35,6 +35,7 @@ from .cute.fragment_mma_dot import fragment_mma_off_config
 from .cute.register_tile_admission import RegisterTileUnsupported
 from .cute.ring_mma_dot import RingMmaNotApplied
 from .cute.ring_mma_dot import ring_mma_off_config
+from .cute.scalar_recipe import PURE_HELPERS
 from .cute.thread_budget import referenced_thread_axes
 from .cute.unroll_lane_loads import LaneUnrollNotApplied
 from .cute.unroll_lane_loads import lane_unroll_off_config
@@ -128,15 +129,18 @@ _PURE_SCALAR_CALL_MODULES = frozenset({"cutlass", "operator"})
 
 def _is_pure_scalar_expr(expr: ast.expr) -> bool:
     """Whether ``expr`` only combines names and constants: arithmetic,
-    comparisons, ``operator`` calls and ``cutlass`` scalar casts."""
+    comparisons, ``operator`` calls, ``cutlass`` scalar casts and the CuTe
+    backend's side-effect-free helpers (``scalar_recipe.PURE_HELPERS``)."""
     for node in ast.walk(expr):
         if isinstance(node, ast.Call):
             func = node.func
-            if not (
-                isinstance(func, ast.Attribute)
-                and isinstance(func.value, ast.Name)
-                and func.value.id in _PURE_SCALAR_CALL_MODULES
-                and not node.keywords
+            if node.keywords or not (
+                (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id in _PURE_SCALAR_CALL_MODULES
+                )
+                or (isinstance(func, ast.Name) and func.id in PURE_HELPERS)
             ):
                 return False
         elif not isinstance(

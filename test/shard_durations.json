@@ -481,6 +481,8 @@
  "test/test_cute_radix_cached_payload_inverse.py": 2.6,
  "test/test_cute_radix_schedule_efficiency.py": 7.2,
  "test/test_cute_radix_selection.py": 24.1,
+ "test/test_cute_radix_store.py": 5.3,
+ "test/test_cute_radix_store_gpu.py": 2.7,
  "test/test_cute_rank3_rhs_b_tma.py": 14.0,
  "test/test_cute_readonly_packet_loads.py": 1.8,
  "test/test_cute_readonly_packet_loads_cuda.py": 1.4,

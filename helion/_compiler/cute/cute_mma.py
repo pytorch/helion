@@ -117,6 +117,10 @@ from .mma_support import cute_fp32_dot_uses_tf32
 from .mma_support import get_cute_mma_support
 from .mma_support import tcgen05_supports_input_dtype
 from .pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
+from .radix_store import RadixStoreLayout
+from .radix_store import accept_radix_store_layout
+from .radix_store import proven_radix_store_layout
+from .radix_store import radix_store_layout
 from .simt_gemm import mark_simt_gemm
 from .simt_gemm import simt_mma_requested
 from .simt_gemm import simt_owned_loop_declined
@@ -228,6 +232,8 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
+from .tcgen05_constants import TCGEN05_RADIX_STORE_BOX_M
+from .tcgen05_constants import TCGEN05_RADIX_STORE_BOX_N
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SPLIT_K_BARRIER_ID
 from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
@@ -1348,6 +1354,19 @@ def _tcgen05_tma_destination_is_legal(
     tensor = tensor_node.meta.get("val") if isinstance(tensor_node, Node) else None
     if not isinstance(tensor, torch.Tensor):
         return False
+    radix_layout = proven_radix_store_layout(store)
+    if radix_layout is not None:
+        # The hierarchical destination's TensorMap: its innermost column run
+        # is contiguous and holds whole (128, 32) store boxes.
+        return (
+            not output_column_major
+            and radix_layout.tma_store_supported(
+                rows_per_store=TCGEN05_RADIX_STORE_BOX_M,
+                cols_per_store=TCGEN05_RADIX_STORE_BOX_N,
+                element_bytes=tensor.element_size(),
+            )
+            and _tcgen05_tma_tensor_is_aligned(env, tensor)
+        )
     expected_major = "col" if output_column_major else "row"
     return _tcgen05_tma_matrix_major(
         tensor
@@ -7321,6 +7340,8 @@ def _analyze_mma_output_stores(
     env = CompileEnvironment.current()
     explicit_epi_tile_compatible = True
     output_column_major: bool | None = None
+    radix_layout: RadixStoreLayout | None = None
+    radix_store: Node | None = None
     for store, chain in analyzed_stores:
         tensor_node = store.args[0] if store.args else None
         tensor_fake = (
@@ -7334,15 +7355,28 @@ def _analyze_mma_output_stores(
         subscripts = store.args[1] if len(store.args) > 1 else None
         if not isinstance(subscripts, (list, tuple)):
             return None
-        if exact_tile_block_ids(env, subscripts) != analysis.output_block_ids:
-            return None
         if len(store.args) > 3 and store.args[3] is not None:
             return None
+        if exact_tile_block_ids(env, subscripts) != analysis.output_block_ids:
+            # A fused view/permute store (the only store of the accumulator,
+            # of the accumulator itself: the store lowering renders the
+            # identity epilogue only) whose address separates into row-major
+            # hierarchical row and column layouts.
+            if len(analyzed_stores) != 1 or chain.steps:
+                return None
+            radix_layout = _mma_output_radix_layout(store, analysis)
+            if radix_layout is None:
+                return None
+            radix_store = store
         explicit_epi_tile_compatible &= (
             tensor_fake.dtype == analysis.lhs.source_fake.dtype
             and all(step.broadcast_axis == 1 for step in chain.auxiliary_tensor_loads)
         )
-        store_major = _tcgen05_tma_matrix_major(tensor_fake)
+        store_major = (
+            "row"
+            if radix_layout is not None
+            else _tcgen05_tma_matrix_major(tensor_fake)
+        )
         if store_major is None:
             return None
         store_column_major = store_major == "col"
@@ -7350,10 +7384,39 @@ def _analyze_mma_output_stores(
             output_column_major = store_column_major
         elif output_column_major != store_column_major:
             return None
+    if radix_store is not None:
+        assert radix_layout is not None
+        accept_radix_store_layout(radix_store, radix_layout)
     return _MmaOutputStoreAnalysis(
         explicit_epi_tile_compatible=explicit_epi_tile_compatible,
         output_column_major=bool(output_column_major),
     )
+
+
+def _mma_output_radix_layout(
+    store: Node, analysis: _MmaOperandAnalysis
+) -> RadixStoreLayout | None:
+    """The hierarchical destination layout of a rank-two MMA store, for a
+    static two-dimensional problem whose column layout is contiguous."""
+    rows, cols = analysis.lhs.matrix_rows, analysis.rhs.matrix_cols
+    if (
+        analysis.has_leading_passthrough
+        or len(analysis.output_block_ids) != 2
+        or type(rows) is not int
+        or type(cols) is not int
+    ):
+        return None
+    layout = radix_store_layout(
+        store,
+        block_ids=cast("tuple[int, int]", tuple(analysis.output_block_ids)),
+        extents=(rows, cols),
+    )
+    # Admit only a layout the TMA store can address at all (a contiguous
+    # innermost column run): a refused store keeps the kernel off the
+    # tcgen05 path, where the generic store lowering takes it.
+    if layout is None or layout.cols[0][1] != 1:
+        return None
+    return layout
 
 
 def _tcgen05_fp32_lowering_blocked(
