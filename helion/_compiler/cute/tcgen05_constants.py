@@ -108,6 +108,8 @@ TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES = 2
 # from the default rule. Measured in ``cute_mma`` next to the decision
 # (``tcgen05_plain_narrow_subtile``).
 TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N = 256
+# The C-ring subtile width of that rule: ``(128, 32)`` stages.
+TCGEN05_PLAIN_NARROW_SUBTILE_N = 32
 assert (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
     <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
