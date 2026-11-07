@@ -124,6 +124,13 @@ TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N = 256
 TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS = (192, TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N)
 # The C-ring subtile width of that rule: ``(128, 32)`` stages.
 TCGEN05_PLAIN_NARROW_SUBTILE_N = 32
+# The radix-store admission box, (128-lane accumulator rows, the plain narrow
+# rule's 32 columns): the pre-filter admits a hierarchical destination whose
+# innermost runs hold whole boxes of it, the epilogue tile the paired family
+# renders (the store lowering checks the configured tile; smaller explicit
+# tiles that it would also accept are not admitted).
+TCGEN05_RADIX_STORE_BOX_M = 128
+TCGEN05_RADIX_STORE_BOX_N = TCGEN05_PLAIN_NARROW_SUBTILE_N
 # Tall 16-bit aligned-N problems (at least this many 256-row pair rows) also
 # seed the grouped persistent raster at these L2 groupings.
 TCGEN05_ALIGNED_N_TALL_PAIR_ROWS = 64

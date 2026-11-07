@@ -190,7 +190,18 @@ def emit_d_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
     output_dtype = str(plan["output_dtype"])
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     d_tensor_name = None
-    if bool(plan.get("d_leading_passthrough")):
+    hier_layout = plan.get("d_hier_layout")
+    if hier_layout is not None:
+        # A fused view/permute store (``radix_store``): the TMA store
+        # addresses the destination through its proved hierarchical
+        # [M, N] layout instead of the argument's own shape.
+        hier_shape, hier_stride = cast("list[str]", hier_layout)
+        d_tensor_name = f"{kernel_args[0]}_d_hier"
+        ctx.body.append(
+            f"    {d_tensor_name} = cute.make_tensor(arg{d_idx}.iterator, "
+            f"layout=cute.make_layout({hier_shape}, stride={hier_stride}))"
+        )
+    elif bool(plan.get("d_leading_passthrough")):
         d_tensor_name = f"{kernel_args[0]}_d_tma"
         ctx.append_permuted_cute_tensor_view(d_tensor_name, d_idx, (1, 2, 0))
     append_epilogue_tma_wrapper(

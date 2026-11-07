@@ -241,6 +241,7 @@ def _check_tcgen05_tma_store_destination(
     *,
     transposed_store: bool,
     output_column_major: bool,
+    radix_store: bool = False,
 ) -> None:
     """Refuse a TMA store whose destination is known to break TensorMap rules.
 
@@ -268,7 +269,9 @@ def _check_tcgen05_tma_store_destination(
     signature = _bound_vec_alignment_signature(env, env.tensor_input_source(tensor))
     if signature is not None and signature[0] != 0:
         problems.append(f"base address residue {signature[0]} B")
-    if not transposed_store and tensor.ndim in (2, 3):
+    # A radix store addresses the destination through its proved row-major
+    # [M, N] view, whatever the tensor's own orientation.
+    if not transposed_store and not radix_store and tensor.ndim in (2, 3):
         expected_major = "col" if output_column_major else "row"
         if _tcgen05_tma_matrix_major(tensor) != expected_major:
             problems.append(
@@ -326,11 +329,20 @@ def _codegen_cute_store_tcgen05_tile(
         )
         if not proved_segment_store and not grouped_tail_mask:
             return None
-    if tensor.ndim not in (2, 3):
-        return None
-    leading_passthrough_output = tensor.ndim == 3
+    # ``radix_store`` imports ``helion.language``, which imports this module.
+    from ..radix_store import proven_radix_store_layout
+
     env = CompileEnvironment.current()
     store_node = state.fx_node
+    # A fused view/permute store into a hierarchical [M, N] destination
+    # (``radix_store``): the identity tile store, addressed through the
+    # proved layout by the TMA store.
+    radix_layout = (
+        proven_radix_store_layout(store_node) if store_node is not None else None
+    )
+    if tensor.ndim not in (2, 3) and radix_layout is None:
+        return None
+    leading_passthrough_output = tensor.ndim == 3 and radix_layout is None
     store_subscripts = store_node.args[1] if store_node is not None else None
     actual_block_ids = None
     if isinstance(store_subscripts, (list, tuple)):
@@ -354,6 +366,41 @@ def _codegen_cute_store_tcgen05_tile(
         # the exact compact destination tile. ``exact_tile_block_ids`` cannot
         # see through the reshape/split/floor-divide address expression.
         actual_block_ids = expected_block_ids
+    if radix_layout is not None:
+        # ``radix_store`` proved the subscript addresses the output tile
+        # through the hierarchical layout. Only the TMA store addresses the
+        # destination through it: the SIMT fringe store and the direct store
+        # would index the destination's own (higher-rank) layout, so every
+        # tile must be a full TMA-store tile, and each explicit epilogue box
+        # must sit inside one innermost run of the layout.
+        actual_block_ids = expected_block_ids
+        if (
+            not tcgen05_value.use_tma_store_epilogue
+            or tcgen05_value.tma_store_full_tiles_only
+            or not tcgen05_value.has_explicit_epilogue_tile
+            or epilogue_chain is not None
+            or grouped_tail_epilogue is not None
+            or fragment_epilogue is not None
+            or row_union is not None
+            or segment_store
+            or tcgen05_value.orientation is Tcgen05Orientation.NM
+            or len(expected_block_ids) != 2
+            or not radix_layout.tma_store_supported(
+                rows_per_store=cast("int", tcgen05_value.explicit_epi_tile_m),
+                cols_per_store=cast("int", tcgen05_value.explicit_epi_tile_n),
+                element_bytes=tensor.element_size(),
+            )
+            or not radix_layout.tiles(
+                tcgen05_value.source_tile_m, tcgen05_value.source_tile_n
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "a hierarchical (view/permute) store destination requires the "
+                "identity full-tile TMA-store epilogue, an explicit epilogue "
+                "tile inside the layout's innermost runs and CTA tiles that "
+                "partition the layout",
+            )
     if actual_block_ids != expected_block_ids:
         raise exc.BackendUnsupported(
             "cute",
@@ -506,7 +553,9 @@ def _codegen_cute_store_tcgen05_tile(
             f"epi_tile={tcgen05_nm_store_shape[:2]} and "
             f"d_store_box_n={tcgen05_nm_store_shape[2]}",
         )
-    if len(subscript) != (3 if leading_passthrough_output else 2):
+    if radix_layout is None and len(subscript) != (
+        3 if leading_passthrough_output else 2
+    ):
         return None
     if fragment_epilogue is not None and fragment_epilogue.changes_shape:
         source_base_indices = [
@@ -531,6 +580,11 @@ def _codegen_cute_store_tcgen05_tile(
             "",
             _cute_tile_begin_expr(state, subscript[1]),
         ]
+    elif radix_layout is not None:
+        base_indices = [
+            _cute_tile_begin_expr(state, env.block_sizes[block_id].var)
+            for block_id in expected_block_ids
+        ]
     else:
         base_indices = [
             _cute_tile_begin_expr(
@@ -540,8 +594,11 @@ def _codegen_cute_store_tcgen05_tile(
         ]
     leading_index = base_indices[0] if leading_passthrough_output else None
     m_index, n_index = base_indices[-2:]
-    m_size = _cute_tensor_dim_size_expr(state, tensor, tensor.ndim - 2)
-    n_size = _cute_tensor_dim_size_expr(state, tensor, tensor.ndim - 1)
+    if radix_layout is not None:
+        m_size, n_size = (str(extent) for extent in radix_layout.extents)
+    else:
+        m_size = _cute_tensor_dim_size_expr(state, tensor, tensor.ndim - 2)
+        n_size = _cute_tensor_dim_size_expr(state, tensor, tensor.ndim - 1)
     if row_union is not None:
         m_size, n_size = str(row_union.m), str(row_union.n)
     segment_store_local_m = tcgen05_value.segment_store_m_offset
@@ -2833,6 +2890,7 @@ def _codegen_cute_store_tcgen05_tile(
             tensor_name,
             transposed_store=tcgen05_nm_store or row_union is not None,
             output_column_major=tcgen05_value.output_column_major,
+            radix_store=radix_layout is not None,
         )
         df.placeholder_args.add(tensor_name)
         df.wrapper_only_params.extend(
@@ -2905,6 +2963,8 @@ def _codegen_cute_store_tcgen05_tile(
             d_tma_plan["d_leading_passthrough"] = True
         if tcgen05_value.output_column_major:
             d_tma_plan["d_column_major"] = True
+        if radix_layout is not None:
+            d_tma_plan["d_hier_layout"] = list(radix_layout.cute_layout_args())
         wrapper_plans = cute_codegen_state(state.codegen).wrapper_plans
         wrapper_plans.append(d_tma_plan)
         if d_tma_uses_tail_rank3_mnl_tensor:
@@ -3309,8 +3369,9 @@ def _codegen_cute_store_tcgen05_tile(
         tcgen05_value.tma_store_full_tiles_only
         and not grouped_dynamic_d_tensormap_edge_only
     )
-    static_m_size = tensor.shape[-2]
-    static_n_size = tensor.shape[-1]
+    static_m_size, static_n_size = (
+        radix_layout.extents if radix_layout is not None else tensor.shape[-2:]
+    )
     simt_edge_only = simt_edge_only or (
         isinstance(static_m_size, int)
         and isinstance(static_n_size, int)

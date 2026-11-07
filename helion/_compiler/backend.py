@@ -879,6 +879,11 @@ class Backend(abc.ABC):
         """Whether ``indexing="block_ptr"`` is a valid config value for this backend."""
         return True
 
+    # Generated-code helper functions with no side effects: dead-code
+    # elimination may drop a scalar assignment whose value only calls them
+    # (``generate_ast._is_pure_scalar_expr``).
+    pure_scalar_helpers: frozenset[str] = frozenset()
+
     def process_fake_tensor_load(
         self,
         tensor: torch.Tensor,
