@@ -45,6 +45,7 @@ from helion._testing.cute_dense_tcgen05 import scaled_mm
 from helion._testing.cute_dense_tcgen05 import user_bound_mm
 from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
 from helion.autotuner.config_generation import ConfigGeneration
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -544,9 +545,104 @@ def test_default_tile_pair_replaces_ffi_on_a_partial_wave() -> None:
 
 
 def test_default_tile_keeps_ffi_on_whole_waves() -> None:
+    """The direct-entry default runs six 64-deep AB stages."""
     config = _default_with_sms((4096, 4096, 4096), 148)
     assert config.config.get("tcgen05_tvm_ffi_launch") is True
-    assert config.block_sizes[:2] == [256, 256]
+    assert config.block_sizes == [256, 256, 64]
+    assert config.config["tcgen05_ab_stages"] == 6
+    assert config.config["tcgen05_c_stages"] == 2
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _mm_k128(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.shape[1]
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    block_k = hl.register_block_size(128, 128)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k, block_size=block_k):
+            acc = hl.dot(a[rows, inner], b[inner, cols], acc=acc)
+        out[rows, cols] = acc.to(torch.bfloat16)
+    return out
+
+
+def test_direct_entry_seed_deepens_64_deep_k_tiles() -> None:
+    """K=576 takes only 64-deep tiles: six stages instead of three."""
+    seed = seeds.full_tile_direct_entry_seed_config(
+        _plain_bind(8192, 4096, 576).config_spec.tcgen05
+    )
+    assert seed is not None
+    assert seed.block_sizes == [256, 256, 64]
+    assert seed.config["tcgen05_ab_stages"] == 6
+    assert seed.config["tcgen05_c_stages"] == 2
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _mm_three_outputs(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, k = a.shape
+    n = b.shape[1]
+    out0 = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    out1 = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    out2 = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = hl.dot(a[rows, inner], b[inner, cols], acc=acc)
+        out0[rows, cols] = acc.to(torch.bfloat16)
+        out1[rows, cols] = (acc * 2.0).to(torch.bfloat16)
+        out2[rows, cols] = (acc + 1.0).to(torch.bfloat16)
+    return out0, out1, out2
+
+
+def test_direct_entry_seed_stays_shallow_when_the_c_rings_do_not_fit() -> None:
+    """K=576 with three outputs: 192 KiB of AB plus three 16 KiB C rings
+    overflow the arena, so the 64-deep seed keeps three stages."""
+    bound = _mm_three_outputs._bind_isolated(
+        (
+            torch.empty((8192, 576), dtype=torch.bfloat16),
+            torch.empty((4096, 576), dtype=torch.bfloat16).T,
+        )
+    )
+    seed = seeds.full_tile_direct_entry_seed_config(bound.config_spec.tcgen05)
+    assert seed is not None
+    assert seed.block_sizes == [256, 256, 64]
+    assert seed.config["tcgen05_ab_stages"] == 3
+
+
+def test_direct_entry_seed_takes_three_64_deep_stages_past_the_128_deep_ring() -> None:
+    """K=1024 with three outputs: the three 128-deep stages hold the deep
+    ring's 192 KiB of AB, beside which three C rings overflow the arena as
+    well, so the seed runs three 64-deep stages."""
+    bound = _mm_three_outputs._bind_isolated(
+        (
+            torch.empty((8192, 1024), dtype=torch.bfloat16),
+            torch.empty((4096, 1024), dtype=torch.bfloat16).T,
+        )
+    )
+    state = bound.config_spec.tcgen05
+    seed = seeds.full_tile_direct_entry_seed_config(state)
+    assert seed is not None
+    assert seed.block_sizes == [256, 256, 64]
+    assert seed.config["tcgen05_ab_stages"] == 3
+    assert seeds.full_tile_direct_entry_seed_eligible(state)
+
+
+def test_direct_entry_seed_keeps_a_declared_k_block_size() -> None:
+    """A K fragment pinned to 128 keeps the three-stage 128-deep seed."""
+    bound = _mm_k128._bind_isolated(
+        (
+            torch.empty((4096, 1024), dtype=torch.bfloat16),
+            torch.empty((4096, 1024), dtype=torch.bfloat16).T,
+        )
+    )
+    seed = seeds.full_tile_direct_entry_seed_config(bound.config_spec.tcgen05)
+    assert seed is not None
+    # The registered K block size is block 0; the M/N tile follows.
+    assert seed.block_sizes == [128, 256, 256]
+    assert seed.config["tcgen05_ab_stages"] == 3
 
 
 def test_default_tile_one_cta_tile_keeps_a_registered_k_block() -> None:

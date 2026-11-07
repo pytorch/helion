@@ -6179,10 +6179,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # envelopes: the canonical 256x256 tile, the M-paired block_m=512 tile
         # (two 256-row subtiles sharing B; baseline ab=2 at the expected K
         # step, or its 64-wide deep ring: ab=3 next to a four-deep C ring),
-        # or the deep-staged short-K variant (bk=64 with the ab=6 pipeline).
-        # At least one canonical-envelope seed must be present. Explicit
-        # paired-CTA seeds have independent geometry and allocation checks
-        # below.
+        # or the deep-staged bk=64 ab=6 pipeline, which the direct-entry seed
+        # runs where K takes 64-deep tiles (it then counts as canonical, and
+        # can be the first canonical seed returned). At least one
+        # canonical-envelope seed must be present. Explicit paired-CTA seeds
+        # have independent geometry and allocation checks below.
         self.assertGreaterEqual(len(seeded), 1)
         canonical: list[dict[str, object]] = []
         for seed in seeded:
@@ -6210,6 +6211,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     block_sizes,
                     [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 64],
                 )
+                if seed.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True:
+                    # The direct-entry seed's deep pipeline (bk=64, ab=6) is
+                    # its canonical envelope wherever K takes 64-deep tiles.
+                    self.assertEqual(seed["tcgen05_c_stages"], 2)
+                    canonical.append(seed)
             else:
                 self.assertEqual(
                     block_sizes,
@@ -9326,12 +9332,14 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,
         )
         bk = seeds.full_tile_direct_entry_seed_bk(spec.tcgen05)
-        self.assertIsNotNone(bk)
+        self.assertEqual(bk, 128)
+        # K=1024 also takes 64-deep tiles: the seed runs the same AB bytes as
+        # six 64-deep stages (nvjet's 64x6 staging).
         self.assertEqual(
             seed["block_sizes"],
-            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 64],
         )
-        self.assertEqual(seed["tcgen05_ab_stages"], 3)
+        self.assertEqual(seed["tcgen05_ab_stages"], 6)
         self.assertEqual(seed["tcgen05_cluster_m"], 2)
         self.assertEqual(seed["tcgen05_cluster_n"], 1)
         self.assertEqual(seed["tcgen05_c_stages"], 2)
@@ -9391,9 +9399,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             requested_ffi_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True
         )
         self.assertEqual(
-            requested_ffi_config.config["block_sizes"],
-            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
+            requested_ffi_config.config["block_sizes"], seed["block_sizes"]
         )
+        self.assertEqual(requested_ffi_config.config["tcgen05_ab_stages"], 6)
 
         # With the automatic CTA group, ab > 3 still requires the FFI stage
         # envelope. The explicit paired family must not relax these defaults:

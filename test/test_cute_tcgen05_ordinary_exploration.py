@@ -290,7 +290,8 @@ def test_one_cta_n_multicast_repairs_only_search(
 @pytest.mark.parametrize(
     "invalid",
     [
-        {"tcgen05_ab_stages": 6, "tcgen05_c_stages": 4},
+        # The seed's 64-deep tiles cannot hold eight AB stages.
+        {"tcgen05_ab_stages": 8, "tcgen05_c_stages": 4},
         {"tcgen05_cta_group": "two"},
         {"tcgen05_num_epi_warps": 2},
         {"tcgen05_tvm_ffi_launch": 1},

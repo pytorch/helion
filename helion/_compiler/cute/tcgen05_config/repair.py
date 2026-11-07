@@ -3773,7 +3773,8 @@ def _validate_direct_entry_ab_stage_envelope(
         raise InvalidConfig(f"tcgen05_ab_stages={ab_stages} {mismatch}")
     # After the grouped dynamic/worklist exceptions above, ab>3 is only valid
     # on the TVM-FFI direct-entry path and for its accepted (bk, ab, c) tuples
-    # (bk=64 admits (ab=6, c=4)). Everything else clamps or rejects to ab=3.
+    # (bk=64 admits (ab=6, c=2) and (ab=6, c=4)). Everything else clamps or
+    # rejects to ab=3.
     block_sizes = config.get("block_sizes")
     k_block_index = facts._direct_entry_k_block_index(state)
     bk = (

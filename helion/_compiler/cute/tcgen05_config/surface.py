@@ -1122,13 +1122,13 @@ def optional_fragments(
         num_epi_warps_fragment = IntegerFragment(1, 4, 4)
     if not for_search:
         # Validation admits what the direct-entry codegen supports: bk=64
-        # accepts the deep (ab=6, c=4) tuple (see
+        # accepts the deep (ab=6, c=2) and (ab=6, c=4) tuples (see
         # ``TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK``), so the validation
         # surface lifts the AB cap to 6 for structurally identified 16-bit
         # direct-entry matmuls. The actual (bk, ab, c) tuple is gated by
-        # ``_validate_direct_entry_ab_stage_envelope``;
-        # SEARCH stays capped at 3 (budget-aware) since the generalized seed
-        # runs at ab=3 and deeper pipelines are not worth searching.
+        # ``_validate_direct_entry_ab_stage_envelope``. The generalized seed
+        # runs the deep (6, 2) tuple where K takes 64-deep tiles and FFI
+        # search samples project onto it.
         ab_stages_max = 6 if state.deep_direct_entry_validation_enabled else 3
         # Operands whose AB SMEM fits the per-CTA budget run the dtype's
         # deep AB pipeline (12 stages for fp8 and 16-bit operands): small
