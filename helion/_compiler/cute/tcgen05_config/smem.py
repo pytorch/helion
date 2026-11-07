@@ -56,7 +56,6 @@ from ..tcgen05_constants import TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_DYNAMIC_MODES
 from ..tcgen05_constants import TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
-from ..tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
 from ..tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES
 from ..tcgen05_constants import TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES
@@ -127,6 +126,10 @@ def _paired_pipeline_stage_limit(
         bk=bk,
         c_stages=c_stages,
         acc_stages=acc_stages,
+        epi_warp_groups=epi_warp_groups_knob(config),
+        epi_subtile_n=seeds._paired_pipeline_store_subtile_n(
+            state, config, bm=bm, bn=bn, bk=bk
+        ),
         aux_load_placement=cast(
             "str",
             config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY, "post_acc_wait"),
@@ -1086,36 +1089,21 @@ def epilogue_subtile(
     output width, sized for a 32-bit output without store facts.
     """
     constraints = state.ab_stages_three_search_constraints
-    facts = state.rowvec_aux_facts
+    rowvec_facts = state.rowvec_aux_facts
     if epi_subtile_n is not None:
         return (
             tcgen05_epilogue_subtile_m(bm=bm, is_two_cta=cluster_m == 2),
             epi_subtile_n,
         )
-    out_bits = 32 if facts is None else facts.output_itemsize * 8
+    out_bits = 32 if rowvec_facts is None else rowvec_facts.output_itemsize * 8
     narrow_subtile = (
-        facts is not None
+        rowvec_facts is not None
         and constraints is not None
-        and facts.output_itemsize == 2
+        and rowvec_facts.output_itemsize == 2
         and (
-            (
-                stage_rows
-                and bool(facts.rows)
-                and all(row.promoted for row in facts.rows)
-            )
-            or (
-                not facts.rows
-                and facts.output_count == 1
-                and not state.aux_kernel_detected
-                and constraints.dtype_bytes == 2
-                and cluster_m == 2
-                and bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
-                # An exact-shape auxiliary operand keeps the plan's
-                # with-source subtile (``cute_mma``:
-                # ``tcgen05_plain_narrow_subtile`` needs an aux-free
-                # epilogue).
-                and facts.exact_aux_count == 0
-            )
+            stage_rows
+            and bool(rowvec_facts.rows)
+            and all(row.promoted for row in rowvec_facts.rows)
         )
         and tcgen05_explicit_epilogue_tile_supported(
             is_two_cta=cluster_m == 2,
@@ -1123,7 +1111,7 @@ def epilogue_subtile(
             bn=bn,
             tile_shape=(128, 32, 32),
         )
-    )
+    ) or facts._plain_narrow_subtile_facts(state, bm=bm, bn=bn, cluster_m=cluster_m)
     if narrow_subtile:
         return 128, 32
     return tcgen05_default_epilogue_tile_size(
