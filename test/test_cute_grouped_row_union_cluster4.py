@@ -580,7 +580,16 @@ def test_actual_producer_all_ranks_and_ring_wrap(k):
     for rank in range(4):
         state, copies, acquisitions, commits = State(), [], [], []
 
-        def copy(atom, source, destination, *, tma_bar_ptr, mcast_mask, copies=copies):
+        def copy(
+            atom,
+            source,
+            destination,
+            *,
+            tma_bar_ptr,
+            mcast_mask,
+            cache_policy=None,
+            copies=copies,
+        ):
             assert destination == tma_bar_ptr
             copies.append((atom, source, destination, mcast_mask))
 
@@ -596,7 +605,10 @@ def test_actual_producer_all_ranks_and_ring_wrap(k):
         )
         scope: dict[str, Any] = {
             "cutlass": SimpleNamespace(
-                Int32=int, Boolean=bool, range=lambda *args, **kwargs: range(*args)
+                Int32=int,
+                Int64=int,
+                Boolean=bool,
+                range=lambda *args, **kwargs: range(*args),
             ),
             "cute": SimpleNamespace(
                 arch=SimpleNamespace(

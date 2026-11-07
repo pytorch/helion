@@ -23,6 +23,7 @@ import torch
 
 from . import cutedsl_compat
 from .cutedsl_compat import L2_EVICT_LAST_STORE_ABI_VERSION
+from .strategies import L2_EVICT_LAST_CACHE_POLICY
 
 __all__ = [
     "L2_EVICT_LAST_STORE_ABI_VERSION",
@@ -61,7 +62,7 @@ _ASM_V4_B32_L2_EVICT_LAST = _l2_only_assembly(4)
 _ASM_STORE_V4_B32_L2_EVICT_LAST = (
     "st.global.L2::cache_hint.v4.u32 [$0], {$1,$2,$3,$4}, $5;"
 )
-_L2_EVICT_LAST_POLICY = 0x14F0000000000000
+_L2_EVICT_LAST_POLICY = L2_EVICT_LAST_CACHE_POLICY
 # The ``.cs`` (cache streaming) operator: evict-first at L1 and L2, so an
 # output written once does not displace the inputs the next launch re-reads.
 # Portable PTX (no policy descriptor).

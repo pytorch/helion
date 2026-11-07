@@ -21,6 +21,7 @@ from helion._compiler.autotuner_heuristics.cute_tcgen05_schedule import (
 )
 from helion._compiler.cute.dense_gemm import prove_dense_gemm_facts
 from helion._compiler.cute.one_cta_pipeline import prove_one_cta_pipeline_facts
+from helion._compiler.cute.strategies import L2_EVICT_LAST_CACHE_POLICY
 from helion._compiler.cute.tcgen05_config import _TWO_CTA_PERSISTENT_PID_VETO
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from helion._compiler.cute.tcgen05_schedule_facts import Tcgen05FullTileScheduleFacts
@@ -604,3 +605,38 @@ def test_default_tile_leaves_small_grids_to_their_seeds() -> None:
     bound = _plain_bind(1024, 1024, 4096)
     with bound.env:
         assert CuteTcgen05DefaultTileHeuristic._pick(bound.env) is None
+
+
+def test_tma_load_l2_policy_tags_the_operand_loads() -> None:
+    """The default ``tcgen05_tma_load_l2_policy`` (``evict_last``) passes the
+    EVICT_LAST cache policy to every A/B TMA load (initial prefill and steady
+    state); ``none`` leaves the loads untagged."""
+    bound = plain_mm._bind_isolated(
+        (
+            torch.empty((8192, 768), dtype=torch.bfloat16),
+            torch.empty((768, 768), dtype=torch.bfloat16).T,
+        )
+    )
+    config = {
+        "block_sizes": [256, 256, 64],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": 6,
+        "tcgen05_c_stages": 2,
+    }
+    policy = f"cache_policy=cutlass.Int64({L2_EVICT_LAST_CACHE_POLICY})"
+    tagged = bound.to_code(helion.Config(**config))
+    loads = [
+        line
+        for line in tagged.splitlines()
+        if "cute.copy(tma_atom_a" in line or "cute.copy(tma_atom_b" in line
+    ]
+    assert loads
+    assert all(policy in line for line in loads)
+    untagged = bound.to_code(helion.Config(**config, tcgen05_tma_load_l2_policy="none"))
+    assert "cache_policy" not in untagged
+    with pytest.raises(helion.exc.InvalidConfig):
+        bound.config_spec.normalize(
+            helion.Config(**config, tcgen05_tma_load_l2_policy="evict_first")
+        )

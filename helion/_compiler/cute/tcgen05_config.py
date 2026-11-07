@@ -105,6 +105,8 @@ from .strategies import TCGEN05_PERSISTENT_GRID_CAP_DEFAULT
 from .strategies import TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS
 from .strategies import TCGEN05_STRATEGY_CONFIG_KEY
 from .strategies import TCGEN05_STRATEGY_CONFIG_KEYS
+from .strategies import TCGEN05_TMA_LOAD_L2_POLICY_CHOICES
+from .strategies import TCGEN05_TMA_LOAD_L2_POLICY_CONFIG_KEY
 from .strategies import TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY
 from .strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
 from .strategies import TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY
@@ -530,6 +532,7 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
     TCGEN05_BATCH_RASTER_CONFIG_KEY,
     TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY,
+    TCGEN05_TMA_LOAD_L2_POLICY_CONFIG_KEY,
     TCGEN05_CLC_QUERY_PACING_CONFIG_KEY,
     WARP_MMA_FAMILY_KEY,
     WARP_MMA_WARPS_KEY,
@@ -10383,6 +10386,11 @@ class CuteTcgen05Config:
             fragments[TCGEN05_BATCH_RASTER_CONFIG_KEY] = EnumFragment(
                 TCGEN05_BATCH_RASTER_CHOICES
             )
+        # The operand loads' L2 eviction priority (see
+        # ``TCGEN05_TMA_LOAD_L2_POLICY_CONFIG_KEY``).
+        fragments[TCGEN05_TMA_LOAD_L2_POLICY_CONFIG_KEY] = EnumFragment(
+            TCGEN05_TMA_LOAD_L2_POLICY_CHOICES
+        )
         if not self.matmul_has_leading_passthrough and (
             not for_search or 2 in cluster_n_choices
         ):

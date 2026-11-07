@@ -138,6 +138,7 @@ from .strategies import tcgen05_explicit_epilogue_tile_supported
 from .strategies import tcgen05_is_two_cta_m128
 from .strategies import tcgen05_resolve_epilogue_tile
 from .strategies import tcgen05_smem_layout_expr
+from .strategies import tma_load_cache_policy_expr
 from .strategies import warp_spec_from_config
 from .tcgen05_config import CuteTcgen05Config
 from .tcgen05_config import parse_tcgen05_grouped_static_problem_signature
@@ -6177,6 +6178,15 @@ class _PerKiterTmaArgs:
     tma_sA2: str = ""
     a_producer_predicate: str | None = None
     scalar_smem_sync: _Tcgen05ScalarSmemSync | None = None
+    # ``cache_policy=`` operand of the A/B loads (``tcgen05_tma_load_l2_policy``).
+    tma_cache_policy: str | None = None
+
+
+def _tma_load_trailing_kwargs(desc_ptr: str | None, cache_policy: str | None) -> str:
+    """The ``tma_desc_ptr=`` / ``cache_policy=`` arguments of an A/B TMA load."""
+    desc = f", tma_desc_ptr={desc_ptr}" if desc_ptr else ""
+    policy = f", cache_policy={cache_policy}" if cache_policy is not None else ""
+    return desc + policy
 
 
 def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
@@ -6190,7 +6200,7 @@ def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
     if not args.use_tma_a:
         return ""
     mcast = f", mcast_mask={args.tma_a_mcast_mask}" if args.is_two_cta else ""
-    desc = f", tma_desc_ptr={args.tma_desc_ptr_a}" if args.tma_desc_ptr_a else ""
+    desc = _tma_load_trailing_kwargs(args.tma_desc_ptr_a, args.tma_cache_policy)
     src = (
         f"    cute.copy({args.tma_atom_a}, "
         f"{args.tma_gA}[None, {k_offset}], "
@@ -6219,7 +6229,7 @@ def _kloop_tma_copy_b_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
     if not args.use_tma_b:
         return ""
     mcast = f", mcast_mask={args.tma_b_mcast_mask}" if args.use_tma_b_mcast_mask else ""
-    desc = f", tma_desc_ptr={args.tma_desc_ptr_b}" if args.tma_desc_ptr_b else ""
+    desc = _tma_load_trailing_kwargs(args.tma_desc_ptr_b, args.tma_cache_policy)
     return (
         f"    cute.copy({args.tma_atom_b}, "
         f"{args.tma_gB}[None, {k_offset}], "
@@ -6849,6 +6859,8 @@ class _InitialPrefetchTmaArgs:
     tma_gA2: str = ""
     tma_sA2: str = ""
     a_producer_predicate: str | None = None
+    # ``cache_policy=`` operand of the A/B loads (``tcgen05_tma_load_l2_policy``).
+    tma_cache_policy: str | None = None
 
 
 def _initial_prefetch_copy_a_src(
@@ -6863,7 +6875,7 @@ def _initial_prefetch_copy_a_src(
     A buffer (same barrier / transaction).
     """
     mcast = f", mcast_mask={args.tma_a_mcast_mask}" if args.is_two_cta else ""
-    desc = f", tma_desc_ptr={args.tma_desc_ptr_a}" if args.tma_desc_ptr_a else ""
+    desc = _tma_load_trailing_kwargs(args.tma_desc_ptr_a, args.tma_cache_policy)
     src = (
         f"    cute.copy({args.tma_atom_a}, "
         f"{args.tma_gA}[None, {k_offset}], "
@@ -6892,7 +6904,7 @@ def _initial_prefetch_copy_b_src(
     local-B loads while satisfying CuTe's multicast-atom contract.
     """
     mcast = f", mcast_mask={args.tma_b_mcast_mask}" if args.use_tma_b_mcast_mask else ""
-    desc = f", tma_desc_ptr={args.tma_desc_ptr_b}" if args.tma_desc_ptr_b else ""
+    desc = _tma_load_trailing_kwargs(args.tma_desc_ptr_b, args.tma_cache_policy)
     return (
         f"    cute.copy({args.tma_atom_b}, "
         f"{args.tma_gB}[None, {k_offset}], "
@@ -8585,6 +8597,8 @@ def _emit_mma_pipeline(
         return _operand_gmem_access(rhs_operand, rhs_arg_name, (k_expr, n_expr))
 
     tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
+    # ``cache_policy=`` of the A/B TMA loads (``tcgen05_tma_load_l2_policy``).
+    tcgen05_tma_load_cache_policy = tma_load_cache_policy_expr(df.config.config)
     row_profile = row_union_plan.schedule if row_union_plan is not None else None
     tcgen05_nm_orientation = (
         requested_schedule is Tcgen05Orientation.NM or row_profile is not None
@@ -15288,6 +15302,7 @@ def _emit_mma_pipeline(
                         ),
                         tma_gA2=tma_gA2 if tcgen05_m_subtile_count > 1 else "",
                         tma_sA2=tma_sA2 if tcgen05_m_subtile_count > 1 else "",
+                        tma_cache_policy=tcgen05_tma_load_cache_policy,
                     )
                     # The throttled CLC scheduler's per-tile credit leads the
                     # tile's loads so the next tile's query overlaps them.
@@ -16031,6 +16046,7 @@ def _emit_mma_pipeline(
                 static_full_tiles=tcgen05_static_full_tma_fast_path,
                 tma_gA2=tma_gA2 if tcgen05_m_subtile_count > 1 else "",
                 tma_sA2=tma_sA2 if tcgen05_m_subtile_count > 1 else "",
+                tma_cache_policy=tcgen05_tma_load_cache_policy,
                 tma_desc_ptr_a=(
                     grouped_tensormap_a_desc_ptr
                     if tcgen05_grouped_dynamic_ab_tensormaps

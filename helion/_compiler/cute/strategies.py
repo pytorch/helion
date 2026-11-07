@@ -569,6 +569,43 @@ def persistent_grid_cap_from_config(config: Mapping[str, object]) -> str:
     return str(value)
 
 
+# L2 eviction priority of the dense tcgen05 operand TMA loads.  ``evict_last``
+# (the default) tags the A/B loads with CUTLASS's
+# ``TMA::CacheHintSm90::EVICT_LAST`` policy so operand tiles that later work
+# tiles reuse (A across the N tiles of a row block, B across the M tiles)
+# outlive the lines the epilogue's stores and earlier kernels left in L2;
+# short-K GEMMs, whose A is re-read per N tile, gain the most.  ``none``
+# issues the loads without a cache policy and stays searchable for GEMMs that
+# re-read little.
+TCGEN05_TMA_LOAD_L2_POLICY_CONFIG_KEY = "tcgen05_tma_load_l2_policy"
+TCGEN05_TMA_LOAD_L2_POLICY_EVICT_LAST = "evict_last"
+TCGEN05_TMA_LOAD_L2_POLICY_NONE = "none"
+TCGEN05_TMA_LOAD_L2_POLICY_CHOICES: tuple[str, ...] = (
+    TCGEN05_TMA_LOAD_L2_POLICY_EVICT_LAST,
+    TCGEN05_TMA_LOAD_L2_POLICY_NONE,
+)
+TCGEN05_TMA_LOAD_L2_POLICY_DEFAULT = TCGEN05_TMA_LOAD_L2_POLICY_EVICT_LAST
+# ``createpolicy.fractional.L2::evict_last`` with fraction 1.0: the policy
+# descriptor CUTLASS passes as ``TMA::CacheHintSm90::EVICT_LAST``.
+L2_EVICT_LAST_CACHE_POLICY = 0x14F0000000000000
+
+
+def tma_load_l2_policy_from_config(config: Mapping[str, object]) -> str:
+    """Decode ``tcgen05_tma_load_l2_policy`` (default ``evict_last``)."""
+    value = config.get(
+        TCGEN05_TMA_LOAD_L2_POLICY_CONFIG_KEY, TCGEN05_TMA_LOAD_L2_POLICY_DEFAULT
+    )
+    assert value in TCGEN05_TMA_LOAD_L2_POLICY_CHOICES, value
+    return str(value)
+
+
+def tma_load_cache_policy_expr(config: Mapping[str, object]) -> str | None:
+    """The ``cache_policy=`` operand of the operand TMA loads, or ``None``."""
+    if tma_load_l2_policy_from_config(config) == TCGEN05_TMA_LOAD_L2_POLICY_EVICT_LAST:
+        return f"cutlass.Int64({L2_EVICT_LAST_CACHE_POLICY})"
+    return None
+
+
 def batch_raster_from_config(config: Mapping[str, object]) -> str:
     """Decode ``tcgen05_batch_raster`` (default ``batch_fastest``)."""
     value = config.get(TCGEN05_BATCH_RASTER_CONFIG_KEY, TCGEN05_BATCH_RASTER_DEFAULT)

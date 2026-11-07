@@ -408,7 +408,8 @@ def test_the_render_of_a_pinned_record_is_unchanged() -> None:
     # The campaign winner of squeeze_and_excitation_net 00_backward shape 2
     # (``bwd_dc``: the 128x256 pair at bk=128, four region stages, the relu
     # mask read ahead of the accumulator wait through registers) carries no
-    # mechanism; its render is the pre-change one, byte for byte.
+    # mechanism; its render is the pre-change one, byte for byte (the record
+    # pins the untagged operand loads it was rendered with).
     bound = _bind_chain()
     winner = json.loads(
         '{"block_sizes": [8, 64, 128, 256, 128], "num_threads": [8, 4, 0, 0, 0],'
@@ -439,7 +440,8 @@ def test_the_render_of_a_pinned_record_is_unchanged() -> None:
         ' "tcgen05_layout_overrides_epi_tile_m": null, "tcgen05_layout_overrides_epi_tile_n": null,'
         ' "tcgen05_layout_overrides_smem_swizzle_a": null,'
         ' "tcgen05_layout_overrides_smem_swizzle_b": null,'
-        ' "tcgen05_layout_overrides_d_store_box_n": null}'
+        ' "tcgen05_layout_overrides_d_store_box_n": null,'
+        ' "tcgen05_tma_load_l2_policy": "none"}'
     )
     config = _strict(bound, helion.Config.from_dict(winner))
     assert dict(config.config) == winner
