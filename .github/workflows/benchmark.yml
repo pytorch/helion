@@ -45,6 +45,11 @@ on:
         required: false
         type: number
         default: 0
+      torch-version:
+        description: 'PyTorch version, installed as torch==<version> (a trailing .* is allowed) from the runtime-version wheel index'
+        required: false
+        type: string
+        default: "2.13.*"
 
 jobs:
   benchmark:
@@ -116,7 +121,7 @@ jobs:
 
           # On OSDC, route through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
           PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
-          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.13.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==${{ inputs.torch-version }}" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
 
       - name: Install Helion
         run: |
