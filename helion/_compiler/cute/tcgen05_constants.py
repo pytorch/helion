@@ -879,11 +879,12 @@ TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY = "tcgen05_warp_register_reallocat
 # Stage tuples that the TVM-FFI flat-role seed accepts, keyed by ``bk``. The
 # general FFI seed eligibility (``tcgen05_config.py``) consumes this table via
 # ``tcgen05_direct_entry_stage_tuple_allowed``. ``bk=64`` admits the shallow
-# ``(3, 2)`` and deep ``(6, 4)`` A/B pipelines; ``bk=128`` admits the
-# ``(3, 2)`` pipeline. The admission is otherwise structural (any CtaGroup.TWO
-# ``bm=bn=256`` shape) — these stage tuples are the only per-``bk`` constraint.
+# ``(3, 2)`` and the deep ``(6, 2)`` / ``(6, 4)`` A/B pipelines; ``bk=128``
+# admits the ``(3, 2)`` pipeline. The admission is otherwise structural (any
+# CtaGroup.TWO ``bm=bn=256`` shape) — these stage tuples are the only
+# per-``bk`` constraint.
 TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK: dict[int, tuple[tuple[int, int], ...]] = {
-    64: ((3, 2), (6, 4)),
+    64: ((3, 2), (6, 2), (6, 4)),
     128: ((3, 2),),
 }
 

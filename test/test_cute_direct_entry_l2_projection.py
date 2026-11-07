@@ -30,7 +30,9 @@ def _metadata(
     )
     metadata.matmul_block_ids = (matmul_root, matmul_root + 1, matmul_root + 2)
     monkeypatch.setattr(metadata, "full_tile_direct_entry_seed_eligible", lambda: True)
-    monkeypatch.setattr(metadata, "full_tile_direct_entry_seed_bk", lambda: 128)
+    monkeypatch.setattr(
+        metadata, "full_tile_direct_entry_seed_pipeline", lambda: (128, 3, 2)
+    )
     monkeypatch.setattr(
         metadata, "_matmul_seed_block_sizes", lambda **kwargs: [256, 256, 128]
     )

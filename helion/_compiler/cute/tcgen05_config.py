@@ -4064,6 +4064,53 @@ class CuteTcgen05Config:
             bk //= 2
         return None
 
+    def full_tile_direct_entry_seed_pipeline(self) -> tuple[int, int, int] | None:
+        """``(bk, ab_stages, c_stages)`` of the direct-entry seed.
+
+        Six 64-deep AB stages (nvjet's 64x6 staging, the same AB bytes as
+        three 128-deep stages) where the K fragment and ``static_k`` admit
+        64-deep tiles, validation admits the deep tuple and the arena with
+        every output's C ring fits, else three stages of the largest valid K
+        tile. Device time vs cuBLAS, B200 bf16, same
+        process: 16384x768x768 0.925 -> 0.957, 8192x1024x1024 0.915 -> 0.958,
+        16384x1024x1024 0.940 -> 0.980, 4096^3 0.969 -> 0.983 (against three
+        128-deep stages); 8192x4096x576 42.3 -> 37.2 us, 16384x2048x704 52.5
+        -> 42.6 us (against three 64-deep stages). A 4-stage C ring cost
+        0.4-1.7% more.
+        """
+        bk = self.full_tile_direct_entry_seed_bk()
+        if bk is None:
+            return None
+        deep_bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K
+        deep_ab = TCGEN05_TWO_CTA_DEEP_AB_STAGES
+        constraints = self.cluster_m2_search_constraints
+        fragments = self._matmul_block_fragments()
+        if (
+            bk >= deep_bk
+            and self.deep_direct_entry_validation_enabled
+            and tcgen05_direct_entry_stage_tuple_allowed(
+                bk=deep_bk, ab_stage_count=deep_ab, c_stage_count=2
+            )
+            and constraints is not None
+            and fragments is not None
+            and fragments[2].low <= deep_bk
+            and self.cluster_m2_bk_is_valid(deep_bk, constraints)
+            # Where K already takes only 64-deep tiles the deep ring doubles
+            # the AB bytes; every output's (128, 32) C ring must still fit.
+            and self.default_layout_smem_fits(
+                bm=TCGEN05_TWO_CTA_BLOCK_M,
+                bn=TCGEN05_TWO_CTA_BLOCK_N,
+                bk=deep_bk,
+                cluster_m=2,
+                ab_stages=deep_ab,
+                c_stages=2,
+                stage_rows=False,
+                epi_subtile_n=32,
+            )
+        ):
+            return deep_bk, deep_ab, 2
+        return bk, 3, 2
+
     def full_tile_direct_entry_seed_eligible(self) -> bool:
         """Structural eligibility for the generalized TVM-FFI direct-entry seed.
 
@@ -4148,9 +4195,10 @@ class CuteTcgen05Config:
         """
         if not self.full_tile_direct_entry_seed_eligible():
             return None
-        bk = self.full_tile_direct_entry_seed_bk()
-        if bk is None:
+        pipeline = self.full_tile_direct_entry_seed_pipeline()
+        if pipeline is None:
             return None
+        bk, ab_stages, c_stages = pipeline
         block_sizes = self._matmul_seed_block_sizes(
             bm=TCGEN05_TWO_CTA_BLOCK_M,
             bn=TCGEN05_TWO_CTA_BLOCK_N,
@@ -4177,9 +4225,9 @@ class CuteTcgen05Config:
             "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
             "tcgen05_cluster_m": 2,
             "tcgen05_cluster_n": 1,
-            "tcgen05_ab_stages": 3,
+            "tcgen05_ab_stages": ab_stages,
             "tcgen05_acc_stages": 2,
-            "tcgen05_c_stages": 2,
+            "tcgen05_c_stages": c_stages,
             TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 1,
             "tcgen05_num_epi_warps": 4,
             TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
@@ -9517,7 +9565,8 @@ class CuteTcgen05Config:
             raise InvalidConfig(f"tcgen05_ab_stages={ab_stages} {mismatch}")
         # After the grouped dynamic/worklist exceptions above, ab>3 is only valid
         # on the TVM-FFI direct-entry path and for its accepted (bk, ab, c) tuples
-        # (bk=64 admits (ab=6, c=4)). Everything else clamps or rejects to ab=3.
+        # (bk=64 admits (ab=6, c=2) and (ab=6, c=4)). Everything else clamps or
+        # rejects to ab=3.
         block_sizes = config.get("block_sizes")
         k_block_index = self._direct_entry_k_block_index()
         bk = (
@@ -10207,13 +10256,14 @@ class CuteTcgen05Config:
             num_epi_warps_fragment = IntegerFragment(1, 4, 4)
         if not for_search:
             # Validation admits what the direct-entry codegen supports: bk=64
-            # accepts the deep (ab=6, c=4) tuple (see
+            # accepts the deep (ab=6, c=2) and (ab=6, c=4) tuples (see
             # ``TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK``), so the validation
             # surface lifts the AB cap to 6 for structurally identified 16-bit
             # direct-entry matmuls. The actual (bk, ab, c) tuple is gated by
-            # ``_validate_direct_entry_ab_stage_envelope``;
-            # SEARCH stays capped at 3 (budget-aware) since the generalized seed
-            # runs at ab=3 and deeper pipelines are not worth searching.
+            # ``_validate_direct_entry_ab_stage_envelope``. The generalized seed
+            # runs the deep (6, 2) tuple where K takes 64-deep tiles and FFI
+            # search samples project onto it; the SEARCH surface itself stays
+            # capped at 3 (budget-aware).
             ab_stages_max = 6 if self.deep_direct_entry_validation_enabled else 3
             # Operands whose AB SMEM fits the per-CTA budget run the dtype's
             # deep AB pipeline (12 stages for fp8 and 16-bit operands): small
