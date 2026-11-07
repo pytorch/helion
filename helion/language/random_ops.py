@@ -8,6 +8,7 @@ import torch
 from torch.fx import Node
 
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import _symint_free_symbols
 from .._compiler.host_function import HostFunction
 from .._compiler.rng_utils import BOX_MULLER_MIN
 from .._compiler.rng_utils import HALF_MASK16
@@ -259,15 +260,18 @@ def _philox_randint_from_seed_and_offset(
     seed: int | torch.SymInt | torch.Tensor,
     offset: torch.Tensor,
     *,
-    low: int,
-    high: int,
+    low: int | torch.SymInt,
+    high: int | torch.SymInt,
 ) -> torch.Tensor:
     if low >= high:
         raise ValueError(f"low ({low}) must be less than high ({high})")
     c0, _, _, _ = _philox_uint32x4(seed, offset)
     signed = _uint32_to_signed_int64(c0)
     magnitude = torch.where(signed < 0, -signed, signed)
-    return _convert_element_type(low + (magnitude % (high - low)), torch.int32)
+    # pyrefly: ignore[unsupported-operation]
+    reduced = magnitude % (high - low)
+    # pyrefly: ignore[unsupported-operation]
+    return _convert_element_type(low + reduced, torch.int32)
 
 
 @_decorators.api()
@@ -352,8 +356,8 @@ def decompose_rand4x(
 def decompose_randint(
     shape: list[int | torch.SymInt],
     *,
-    low: int,
-    high: int,
+    low: int | torch.SymInt,
+    high: int | torch.SymInt,
     seed: int | torch.SymInt | torch.Tensor,
 ) -> torch.Tensor:
     env = CompileEnvironment.current()
@@ -573,9 +577,9 @@ def _resolve_shape_desc(
 def _resolve_int_desc(
     flat_args: tuple[object, ...],
     desc: _ArgDesc,
-) -> int:
+) -> int | torch.SymInt:
     value = _resolve_rewrite_arg(flat_args, desc)
-    assert isinstance(value, int)
+    assert isinstance(value, (int, torch.SymInt))
     return value
 
 
@@ -1023,16 +1027,20 @@ def randint(
 @_decorators.register_fake(randint)
 def _randint_fake(
     shape: list[int | torch.SymInt],
-    low: int,
-    high: int,
+    low: int | torch.SymInt,
+    high: int | torch.SymInt,
     seed: int | torch.Tensor,
     device: torch.device | None = None,
 ) -> torch.Tensor:
     if not isinstance(shape, (list, tuple)):
         raise TypeError(f"Expected list[SymInt], got {type(shape).__name__}")
+    env = CompileEnvironment.current()
+    # Re-run the validity check when an input bound changes.
+    for bound in (low, high):
+        if isinstance(bound, torch.SymInt):
+            env.specialized_vars.update(_symint_free_symbols(bound))
     if low >= high:
         raise ValueError(f"low ({low}) must be less than high ({high})")
-    env = CompileEnvironment.current()
     env.add_kernel_tensor_size(shape)
     return torch.empty(
         [*shape],

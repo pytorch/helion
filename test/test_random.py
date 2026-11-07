@@ -768,6 +768,28 @@ class TestRandom(RefEagerTestBase, TestCase):
     "Skip due to unaligned/unpadded tensor inputs that don't meet MTIA HW requirements"
 )
 class TestRandomPhiloxParity(TestCase):
+    def test_randint_runtime_bounds(self):
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def sample(x: torch.Tensor, low: int, high: int) -> torch.Tensor:
+            out = torch.empty_like(x, dtype=torch.int32)
+            for tile in hl.tile(x.numel(), block_size=256):
+                out[tile] = hl.randint([tile], low=low, high=high, seed=42)
+            return out
+
+        x = torch.empty(1024, device=DEVICE)
+        offsets = torch.arange(x.numel(), dtype=torch.int64, device=DEVICE)
+        for low, high in [(-17, 23), (10, 50), (-200, -100)]:
+            actual = sample(x, low, high)
+            expected = philox_randint_ref(42, offsets, low, high)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        # Reusing a cached kernel with invalid bounds must still reject them.
+        for low, high in [(20, 10), (10, 10)]:
+            with self.assertRaisesRegex(
+                helion.exc.InternalError, "must be less than high"
+            ):
+                sample(x, low, high)
+
     def test_reference_matches_triton(self):
         seed = 42
         offsets = torch.arange(257, device=DEVICE, dtype=torch.int64)
