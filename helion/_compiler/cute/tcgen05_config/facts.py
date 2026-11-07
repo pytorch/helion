@@ -32,6 +32,7 @@ from ..dense_aligned_n import dense_aligned_n_block_m
 from ..dense_aligned_n import dense_aligned_n_defaults
 from ..dense_aligned_n import dense_aligned_n_plan
 from ..dense_aligned_n import dense_aligned_n_sixteen_bit
+from ..dense_aligned_n import pair_tile_wave_cost
 from ..epilogue_fanout import FANOUT_CONFIG_KEY
 from ..grouped_row_union import CONFIG_KEY as GROUPED_ROW_UNION_KEY
 from ..grouped_row_union import PAIRED_CLC_SCHEDULE
@@ -52,6 +53,7 @@ from ..strategies import Tcgen05PersistenceModel
 from ..strategies import tcgen05_explicit_epilogue_tile_supported
 from ..tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
+from ..tcgen05_constants import TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN
 from ..tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
@@ -901,7 +903,23 @@ def _dense_aligned_n_sixteen_bit(state: CuteTcgen05Config) -> bool:
 def _dense_aligned_n_width_plans(
     state: CuteTcgen05Config, width: int
 ) -> Iterator[tuple[dict[str, Any], DenseAlignedNPlan]]:
-    """Normal-store seed values (in seed order) proved for one physical N."""
+    """Normal-store seed values (in seed order) proved for one physical N;
+    a width with a partial last N tile is seeded (and searched) only where
+    its wave fill pays for the clipped columns."""
+    facts = state.dense_gemm_facts
+    if (
+        facts is not None
+        and facts.shape[1] % width
+        and width not in _dense_aligned_n_clipped_widths(state)
+    ):
+        return
+    yield from _dense_aligned_n_proved_plans(state, width)
+
+
+def _dense_aligned_n_proved_plans(
+    state: CuteTcgen05Config, width: int
+) -> Iterator[tuple[dict[str, Any], DenseAlignedNPlan]]:
+    """``_dense_aligned_n_width_plans`` without the clipped-width choice."""
     facts = state.dense_gemm_facts
     block_m = _dense_aligned_n_block_m(state)
     sixteen_bit = _dense_aligned_n_sixteen_bit(state)
@@ -910,16 +928,16 @@ def _dense_aligned_n_width_plans(
         or facts is None
         or block_m is None
         # dense_aligned_n_plan needs a physical width that divides N and
-        # pair-M tiles that divide M (the 16-bit pair: or whole K tiles);
-        # skip widths that cannot qualify.
+        # pair-M tiles that divide M (the 16-bit pair: or whole K tiles,
+        # its TMA store clipping the partial last tiles); skip widths
+        # that cannot qualify.
         or (
-            facts.shape[0] % block_m
+            (facts.shape[0] % block_m or facts.shape[1] % width)
             and not (
                 sixteen_bit
                 and facts.shape[2] % DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K == 0
             )
         )
-        or facts.shape[1] % width
         or not _tcgen05_mma_impl_allowed()
     ):
         return
@@ -942,6 +960,84 @@ def _dense_aligned_n_width_plans(
             plan = _dense_aligned_n_plan(state, values)
             if plan is not None:
                 yield values, plan
+
+
+def _sm_pairs(state: CuteTcgen05Config) -> int:
+    """CTA pairs of one wave (B200's 148 SMs without a device count)."""
+    return max(1, (state.device_sm_count or 148) // 2)
+
+
+def _dense_aligned_n_clipped_widths(state: CuteTcgen05Config) -> frozenset[int]:
+    """The physical widths with a partial last N tile that beat, by
+    ``TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN`` in wave-quantized pair-tile
+    time, every reference width: the power-of-two pair widths the N
+    bounds admit (the ordinary tiles, clipped or not) and the aligned
+    widths that divide N. Computed once per problem (normalization asks
+    for the widths on every fragment pass).
+
+    A pair tile's time is ``pair_tile_wave_cost``'s.
+    3072x1024x6272 bf16 -> fp32 (C4_15) on 74 SM pairs: one wave of 72
+    256x192 pairs against one of 48 256x256, 22% less (measured 36.4 ->
+    33.9 us between the seeds); 256x224 12% less by the model but measured
+    13% more, so the margin is wide. Small problems keep the narrow
+    power-of-two pairs (1024x1024x512: 256x64 pairs measured 2.8 us
+    against 3.5 us for the clipped 96).
+    """
+    facts = state.dense_gemm_facts
+    bounds = _dense_aligned_n_bounds(state)
+    block_m = _dense_aligned_n_block_m(state)
+    if (
+        facts is None
+        or bounds is None
+        or block_m is None
+        # FP8 takes whole N tiles only (``dense_aligned_n_plan``)
+        or not _dense_aligned_n_sixteen_bit(state)
+    ):
+        return frozenset()
+    # everything the proofs below read
+    key = (
+        facts,
+        state.device_sm_count,
+        bounds,
+        tuple(state.allowed_pid_types),
+        state.search_enabled,
+        _tcgen05_mma_impl_allowed(),
+    )
+    cached = state._dense_aligned_n_clipped_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    m, n, k = facts.shape
+    sm_pairs = _sm_pairs(state)
+
+    def cost(width: int) -> float:
+        return pair_tile_wave_cost(
+            m, n, k, width=width, block_m=block_m, sm_pairs=sm_pairs
+        )
+
+    low, high = bounds[1]
+    references = [w for w in (64, 128, TCGEN05_TWO_CTA_BLOCK_N) if low <= w <= high]
+    references.extend(
+        width
+        for width in ALIGNED_N_CHOICES
+        if n % width == 0 and _dense_aligned_n_proved(state, width)
+    )
+    widths: frozenset[int] = frozenset()
+    if references:
+        limit = (1.0 - TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN) * min(map(cost, references))
+        widths = frozenset(
+            width
+            for width in ALIGNED_N_CHOICES
+            if n % width
+            and cost(width) <= limit
+            and _dense_aligned_n_proved(state, width)
+        )
+    state._dense_aligned_n_clipped_cache = (key, widths)
+    return widths
+
+
+def _dense_aligned_n_proved(state: CuteTcgen05Config, width: int) -> bool:
+    """Whether one physical width has a proved seed, clipped or not."""
+    return next(_dense_aligned_n_proved_plans(state, width), None) is not None
 
 
 def _dense_aligned_n_widths(state: CuteTcgen05Config) -> tuple[int, ...]:

@@ -89,6 +89,7 @@ from ..tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ....autotuner.config_fragment import BlockSizeFragment
@@ -421,3 +422,10 @@ def _tile_in_fragments(
         fragment.low <= value <= fragment.high
         for fragment, value in zip(fragments, tile, strict=True)
     )
+
+
+def _stored_block_n(config: Mapping[str, object], bn: int) -> int:
+    """The N extent a tile stores: the aligned-N family's physical width
+    behind its power-of-two carrier ``bn``, else ``bn``."""
+    width = config.get(TILE_N_KEY, 0)
+    return width if type(width) is int and width > 0 else bn

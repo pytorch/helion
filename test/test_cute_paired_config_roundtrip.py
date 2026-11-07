@@ -9,6 +9,7 @@ from test.cute_population_contracts import with_flat_min_blocks_default
 from test.test_cute_pipeline_smem import _cpu_b200 as _cpu_b200
 
 import helion
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
 )
@@ -35,7 +36,9 @@ def _direct_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.parametrize(
     "shape,controls_active",
-    [((256, 64, 192), False), ((512, 1024, 512), True)],
+    # 3072x1024 seeds the clipped 192-wide aligned-N tile (one wave of 72
+    # pairs) beside the direct-entry default's layout overrides.
+    [((256, 64, 192), False), ((3072, 2048, 1024), True)],
 )
 def test_paired_seed_roundtrip_and_strict_transfer(
     shape: tuple[int, int, int], controls_active: bool
@@ -60,12 +63,22 @@ def test_paired_seed_roundtrip_and_strict_transfer(
             if seed.get("tcgen05_cta_group") == "two"
         ]
         assert seeds
+        # The direct-entry default names explicit layout overrides (its
+        # (128, 32) epilogue tile); the aligned-N seeds merged onto it must
+        # normalize back onto the family's own tile.
+        if controls_active:
+            assert any(seed.get("tcgen05_tile_n") for seed in seeds)
         generation = spec.create_config_generation()
         for seed in seeds:
             normalized = helion.Config.from_dict(
                 spec.default_config().config | seed.config
             )
             spec.normalize(normalized, _fix_invalid=True)
+            if normalized.config.get("tcgen05_tile_n"):
+                assert all(
+                    normalized.config.get(key) is None
+                    for key in TCGEN05_LAYOUT_OVERRIDES_KEYS
+                )
             assert all(
                 (key in normalized.config) is controls_active for key in controls
             )

@@ -224,6 +224,7 @@ from . import facts
 from . import seeds
 from . import smem
 from . import surface
+from .knobs import _stored_block_n
 
 if TYPE_CHECKING:
     from ..epilogue_fanout import PairedFanoutPlan
@@ -2173,10 +2174,11 @@ def _normalize_dense_aligned_n(
     if plan is None:
         raise InvalidConfig(
             "tcgen05_tile_n requires a proved dense paired GEMM (dense_aligned_n_plan): "
-            "whole N tiles of the physical width, unchanged tile bounds, "
-            "whole M tiles for FP8 or whole K tiles under a 16-bit M tail, "
-            "and for 16-bit a row-major output, a width that is a multiple "
-            "of 32 and an epilogue subtile that divides it"
+            "unchanged tile bounds; for FP8 whole M and N tiles; for 16-bit "
+            "whole K tiles under a partial last M or N tile, a row-major "
+            "output, a width that is a multiple of 32, an epilogue subtile "
+            "that divides it, and a persistent pid type (FP32 outputs with a "
+            "partial last K tile have none)"
         )
     for key, value in facts._dense_aligned_n_surface(
         state,
@@ -2741,7 +2743,9 @@ def aux_fragment_hoist_admissible(
         and cluster_m in (1, 2)
     ):
         return False
-    if not facts._static_full_tiles(state, bm=bm, bn=bn, bk=bk, region=region):
+    if not facts._static_full_tiles(
+        state, bm=bm, bn=_stored_block_n(config, bn), bk=bk, region=region
+    ):
         return False
     if region is not None and (
         # The one-shot flat launch of a chain has no whole-fragment hoist
@@ -2864,7 +2868,9 @@ def _standard_tma_epilogue_schedule_refusal(
     if not all(type(value) is int and value > 0 for value in (bm, bn, bk)):
         return "requires integer tcgen05 block sizes"
     bm, bn, bk = cast("int", bm), cast("int", bn), cast("int", bk)
-    if not facts._static_full_tiles(state, bm=bm, bn=bn, bk=bk, region=region):
+    if not facts._static_full_tiles(
+        state, bm=bm, bn=_stored_block_n(config, bn), bk=bk, region=region
+    ):
         return "requires static full output tiles"
     if cluster_m == 2 and not (
         facts._config_is_two_cta_mma(state, config, bm=bm, cluster_m=2)
@@ -4309,7 +4315,9 @@ def epi_tma_refusal(
     if not all(type(value) is int and value > 0 for value in (bm, bn, bk)):
         return "requires integer tcgen05 block sizes"
     bm, bn, bk = cast("int", bm), cast("int", bn), cast("int", bk)
-    if not facts._static_full_tiles(state, bm=bm, bn=bn, bk=bk, region=region):
+    if not facts._static_full_tiles(
+        state, bm=bm, bn=_stored_block_n(config, bn), bk=bk, region=region
+    ):
         return "requires static full output tiles"
     if config.get(
         TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY, Tcgen05LayoutStrategy.DEFAULT.value

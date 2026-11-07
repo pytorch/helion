@@ -453,7 +453,7 @@ def region_two_cta_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     fragments = [
         cast("BlockSizeFragment", item._fragment(spec)) for item in spec.block_sizes
     ]
-    pairs_per_wave = max(1, (state.device_sm_count or 148) // 2)
+    pairs_per_wave = facts._sm_pairs(state)
     placement = (
         TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
         if state.aux_loads_on_every_store
