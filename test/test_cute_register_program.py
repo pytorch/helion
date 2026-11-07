@@ -517,7 +517,7 @@ def test_conditional_specializes_literal_captures_without_mutating_trace(positiv
 @pytest.mark.parametrize("recovery", ["direct", "packed"])
 @pytest.mark.parametrize("fallback", [False, True])
 def test_coarse_tensor_program(recovery, fallback):
-    from helion._compiler.cute.selection_coarse import coarse_rank_selection
+    from helion._compiler.cute.selection.selection_coarse import coarse_rank_selection
 
     def function(x):
         return coarse_rank_selection(x, 4, "batcher", "sequential", 5, 2, 8, recovery)
@@ -535,7 +535,7 @@ def test_coarse_tensor_program(recovery, fallback):
     "lanes,registers,k", [(1, 8, 4), (4, 8, 8), (8, 4, 4), (8, 8, 16)]
 )
 def test_tensor_selection_program(distributed, lanes, registers, k):
-    from helion._compiler.cute.selection_network import selection_network
+    from helion._compiler.cute.selection.selection_network import selection_network
 
     def function(x):
         return selection_network(

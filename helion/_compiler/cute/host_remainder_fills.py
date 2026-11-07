@@ -11,14 +11,18 @@ at the end of the body (:func:`_cute_remainder_fill`) and the host statement
 is dropped. The value is exact (a constant representable in the dtype), so
 numerics are unchanged.
 
-Admission (built on the zero-fill coverage proof): a top-level host
-statement after the last device loop ``name[...] = <int or float constant>``
-whose slices are the ``_remainder_fill`` shape (full ranges except one
-``-r`` / ``-r:`` dimension); every device access to the tensor is a complete
-tile store with that remainder (no loads, no masked, conditional, atomic or
-view stores); no host statement between the launch and the fill reads or
-rebinds the name; the tensor is a kernel argument of rank <= 4; the kernel
-body has no early return and no grid barrier.
+Admission (built on the zero-fill coverage proof): a host statement after
+the last device loop ``name[...] = <int or float constant>`` whose slices are
+the ``_remainder_fill`` shape (full ranges except one ``-r`` / ``-r:``
+dimension); every device access to the tensor is a complete tile store with
+that remainder (no loads, no masked, conditional, atomic or view stores); no
+host statement between the launch and the fill reads or rebinds the name; the
+tensor is a kernel argument of rank <= 4; the kernel body has no early return
+and no grid barrier.  The host body is read through the constexpr branches
+the specialization fixes (:attr:`HostFillElision.body`): a fill under ``if
+True:`` or under a constexpr argument is a top-level statement of this
+variant, so the proof admits it and the lowering drops it from the generated
+``if``'s branch.
 """
 
 from __future__ import annotations
@@ -41,8 +45,11 @@ from .host_zero_fills import _is_load
 from .host_zero_fills import _Range
 from .host_zero_fills import _reads
 from .host_zero_fills import _remainder_fill
+from .host_zero_fills import walk_proven_fills
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
     from ..generate_ast import GenerateAST
@@ -234,19 +241,28 @@ def append_device_remainder_fills(
 def lower_host_remainder_fills(
     body: list[ast.AST], fills: list[RemainderFill]
 ) -> list[ast.AST]:
-    """Drop the host fills the kernel now performs."""
+    """Drop the host fills the kernel now performs.
+
+    The proof read the host body through its constexpr branches
+    (:attr:`HostFillElision.body`), so a proven fill may sit in a branch of a
+    generated ``if``: the branches are rewritten in place, matching the fill
+    by its own location and text, and a body left empty keeps a ``pass``.
+    """
     if not fills:
         return body
     sites = {fill.location: fill for fill in fills}
-    result: list[ast.AST] = []
-    for statement in body:
-        fill = (
-            sites.get(statement._location)
-            if isinstance(statement, ExtendedAST)
-            else None
-        )
-        if fill is not None and ast.unparse(statement) == fill.statement:
-            continue
-        result.append(statement)
-    assert len(result) == len(body) - len(fills), "remainder fill statement missing"
+    result = _drop_fills(body, sites)
+    assert not sites, "remainder fill statement missing"
     return result
+
+
+def _drop_fills(
+    body: Sequence[ast.AST], sites: dict[SourceLocation, RemainderFill]
+) -> list[ast.AST]:
+    """``body`` without the proven fills (``sites`` loses each one it drops)."""
+
+    def drop(_statement: ast.AST, fill: RemainderFill) -> list[ast.AST]:
+        del sites[fill.location]
+        return []
+
+    return walk_proven_fills(body, sites, drop)

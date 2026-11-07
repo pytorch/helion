@@ -11,7 +11,6 @@ from dataclasses import dataclass
 import operator
 from typing import TYPE_CHECKING
 from typing import cast
-import weakref
 
 import sympy
 import torch
@@ -25,6 +24,8 @@ from ...language import inline_asm_ops
 from ...language import memory_ops
 from ...language import scan_ops
 from ..compile_environment import CompileEnvironment
+from ..device_function import DeviceFunction
+from ..device_function import NoCurrentFunction
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import GraphInfo
 from ..device_ir import RootGraphInfo
@@ -32,6 +33,8 @@ from ..device_ir import WhileConditionGraphInfo
 from ..device_ir import WhileLoopGraphInfo
 from ..inductor_lowering import SympyExprLowering
 from .bounded_gather import inline_asm_shape
+from .state import cute_codegen_state
+from .state import cute_env_state
 from .uniform_control import _carry_map
 from .uniform_control import _outputs
 from .uniform_control import _require
@@ -403,42 +406,65 @@ def _legacy_resident_while_plan(
     )
 
 
-# Per compile environment: (id(call), ids of graphs) -> (call, graphs, plan or
-# refusal).  The entry keeps the call and the graphs alive so their ids cannot
-# be reused by later nodes within the environment's lifetime.
-_PLAN_CACHE: weakref.WeakKeyDictionary[
-    CompileEnvironment,
-    dict[
-        tuple[int, tuple[int, ...]],
-        tuple[Node, tuple[GraphInfo, ...], ResidentWhilePlan | exc.InvalidConfig],
-    ],
-] = weakref.WeakKeyDictionary()
+# The memo of ``resident_while_plan``: ``(id(call), ids of graphs) -> (call,
+# graphs, plan or refusal message)``.  The entry keeps the call and the graphs
+# alive so their ids cannot be reused by later nodes within the memo's
+# lifetime.  A refusal is kept as its message, never as the raised exception:
+# an exception object accumulates the traceback frames of every raise, and
+# those frames reach the compile environment through the callers' locals.
+ResidentWhileMemo = dict[
+    tuple[int, tuple[int, ...]],
+    tuple[Node, tuple[GraphInfo, ...], ResidentWhilePlan | str],
+]
+
+
+def _plan_memo() -> ResidentWhileMemo | None:
+    """The memo a plan lives in: the state of whatever owns the graphs.
+
+    Inside a code generation pass (a ``DeviceFunction`` is current) the graphs
+    are that pass's copies -- ``DeviceIR.build_codegen_graphs`` copies every
+    ``GraphInfo`` per config, and reduction rolling, epilogue subtiling, poll
+    hoisting and the backend's IR passes edit only the copies -- so the memo
+    lives on the pass (``CuteCodegenState``) and dies with it.  Outside a
+    pass but inside a compile environment (the binding-time heuristics, the
+    seeds, the per-config validation) the graphs are the traced ones, final
+    once the device IR is lowered and alive as long as the environment, so
+    the memo lives on the environment (``CuteEnvState``).  Outside a compile
+    environment nothing is cached: the structural tests mutate a graph in
+    place and re-plan the same call.
+    """
+    try:
+        codegen = DeviceFunction.current().codegen
+    except NoCurrentFunction:
+        if CompileEnvironment.has_current():
+            return cute_env_state(CompileEnvironment.current()).resident_while_plans
+        return None
+    return cute_codegen_state(codegen).resident_while_plans
 
 
 def resident_while_plan(call: Node, graphs: Sequence[GraphInfo]) -> ResidentWhilePlan:
-    """The plan of one while call, memoized per compile environment.
+    """The plan of one while call, memoized for the graphs' lifetime.
 
     The fragment compiler, the bounded-gather admission, the local-atomic and
     register-snapshot proofs and the register-snapshot heuristic all plan the
     same call over the same graphs; the plan depends on nothing but the two,
-    so one compile environment computes it (or its ``InvalidConfig``) once.
-    Outside a compile environment nothing is cached: the structural tests
-    mutate a graph in place and re-plan the same call.
+    so each memo (``_plan_memo``) computes it, or its refusal, once.  A
+    memoized refusal raises a fresh ``InvalidConfig`` per lookup.
     """
-    if not CompileEnvironment.has_current():
+    memo = _plan_memo()
+    if memo is None:
         return _resident_while_plan(call, graphs)
-    cache = _PLAN_CACHE.setdefault(CompileEnvironment.current(), {})
     key = (id(call), tuple(id(info) for info in graphs))
-    entry = cache.get(key)
+    entry = memo.get(key)
     if entry is None:
-        result: ResidentWhilePlan | exc.InvalidConfig
+        result: ResidentWhilePlan | str
         try:
             result = _resident_while_plan(call, graphs)
         except exc.InvalidConfig as error:
-            result = error
-        entry = cache[key] = (call, tuple(graphs), result)
-    if isinstance(entry[2], exc.InvalidConfig):
-        raise entry[2]
+            result = str(error)[: error.base_msg_len]
+        entry = memo[key] = (call, tuple(graphs), result)
+    if isinstance(entry[2], str):
+        raise exc.InvalidConfig(entry[2])
     return entry[2]
 
 
