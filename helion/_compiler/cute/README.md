@@ -342,7 +342,7 @@ Classify a module by grep before moving it.
   `test/test_cute_pass_pipeline.py`, `test/test_backend_capabilities.py` (the
   no-op defaults of every hook), `test/test_backend_registry.py`,
   `test/test_cute_device_state.py`, `test/test_cute_device_helper_names.py`,
-  `test/test_cute_launch_shape.py`.
+  `test/test_cute_device_modules.py`, `test/test_cute_launch_shape.py`.
 * Render identity: the refactor's gate is a CPU render dump of
   `BoundKernel.to_code()` for every test on a base tree and a tip tree,
   compared file by file (a pytest plugin that records every render or its

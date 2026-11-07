@@ -9,11 +9,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test._cute_grouped_gemm_split_sizes import _device_offsets_kernel
+from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from test.cute_population_contracts import _target
 from test.test_cute_grouped_ab_k import _observed_logical_k
 from test.test_cute_grouped_ab_k import _unsupported_k_loop
-from test.test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
-from test.test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 
 import helion
 from helion._compiler.cute.grouped_d_shift import bounded_d_shift_index_domain

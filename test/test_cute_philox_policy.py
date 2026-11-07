@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import ExitStack
 from copy import deepcopy
 import dataclasses
 import pickle
@@ -13,16 +12,18 @@ import torch
 
 import helion
 from helion._compiler.rng_utils import philox_rand_ref
+from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+# Backend-independent (runs under every HELION_BACKEND, like a non-cute test);
+# the conftest gate over test_cute_* files leaves it alone.
 
 
 @pytest.fixture(autouse=True)
@@ -31,19 +32,7 @@ def cpu_only(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     initialized = torch.cuda.is_initialized()
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
-    with ExitStack() as stack:
-        for name, value in (
-            ("helion.runtime.kernel.target_device_capability", (10, 0)),
-            ("helion._compiler.compile_environment.target_device_capability", (10, 0)),
-            ("helion.runtime.get_num_sm", 148),
-            ("helion._compat._is_hip", False),
-        ):
-            stack.enter_context(patch(name, return_value=value))
-        stack.enter_context(mock_cuda_unavailable())
-        stack.enter_context(
-            patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden"))
-        )
-        stack.enter_context(forbid_native_compile())
+    with cpu_render_target():
         yield
     torch.set_num_threads(previous_threads)
     assert torch.cuda.is_initialized() == initialized

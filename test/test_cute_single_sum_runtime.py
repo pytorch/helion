@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 import torch
 from torch.overrides import TorchFunctionMode
 from torch.utils._python_dispatch import TorchDispatchMode
-
-from helion._testing.cute_codegen import mock_cuda_unavailable
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
@@ -21,19 +18,7 @@ from helion.runtime.cute.paired_sum import sum_plan
 from helion.runtime.cute.single_sum import plan_for_single
 from helion.runtime.cute.single_sum import try_single_sum_cast
 
-pytestmark = pytest.mark.cpu_only
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
+pytestmark = [pytest.mark.cpu_only, pytest.mark.cpu_render]
 
 
 @pytest.mark.parametrize("layout", ("mapped", "narrow"))

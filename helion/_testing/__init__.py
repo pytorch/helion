@@ -261,9 +261,9 @@ if EXAMPLES_PACKAGE not in sys.modules:
     _examples_spec.submodule_search_locations = [str(EXAMPLES_DIR)]
     sys.modules[EXAMPLES_PACKAGE] = importlib.util.module_from_spec(_examples_spec)
 PRETUNED_KERNELS_DIR: Path = PROJECT_ROOT / "pretuned_kernels"
+
 # The skip reason of ``skipUnlessBackends`` / ``onlyBackends``, followed by the
-# backend name; ``test/conftest.py`` recognizes an item's own backend decision
-# by this prefix and uses it for the ``test_cute_*`` suite gate.
+# backend name.
 BACKEND_SKIP_REASON = "disabled for HELION_BACKEND="
 DEVICE = None
 

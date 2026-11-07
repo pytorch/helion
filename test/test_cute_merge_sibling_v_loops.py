@@ -22,13 +22,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-import helion
+from test._cute_kernels import _reduction_kernel
+
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-import helion.language as hl
 
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
@@ -42,29 +42,6 @@ def _disable_online_to_3pass(monkeypatch: pytest.MonkeyPatch) -> None:
     ``test_cute_online_to_3pass.py``.
     """
     monkeypatch.setenv("HELION_DISABLE_ONLINE_TO_3PASS", "1")
-
-
-@helion.kernel(backend="cute")
-def _reduction_kernel(x: torch.Tensor) -> torch.Tensor:
-    m, n = x.size()
-    out = torch.empty_like(x)
-    block_size_m = hl.register_block_size(m)
-    block_size_n = hl.register_block_size(n)
-    for tile_m in hl.tile(m, block_size=block_size_m):
-        mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-        di = hl.zeros([tile_m], dtype=torch.float32)
-        for tile_n in hl.tile(n, block_size=block_size_n):
-            values = x[tile_m, tile_n]
-            local_amax = torch.amax(values, dim=1)
-            mi_next = torch.maximum(mi, local_amax)
-            di = di * torch.exp(mi - mi_next) + torch.exp(
-                values - mi_next[:, None]
-            ).sum(dim=1)
-            mi = mi_next
-        for tile_n in hl.tile(n, block_size=block_size_n):
-            values = x[tile_m, tile_n]
-            out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
-    return out
 
 
 @onlyBackends(["cute"])
