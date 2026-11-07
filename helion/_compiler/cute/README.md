@@ -167,6 +167,7 @@ radix selection -> top-k -> register region -> direct affine scan (when
 rank-1 -> split rank-1 -> fixed-token rank-1; a kernel nobody claims gets
 `annotate_view_subtiles`, `annotate_literal_dims` and `execution_plans.plan_execution`
 (the thread-axis plans).  `ROOT_EMITTERS` is tried in this order:
+`required_computed_fragment` (a full uint8 chain with no scalar fallback),
 `register_subblocks`, `radix_selection`, the gated `computed_fragment` (when the
 root asks for fragments), `block_scaled`, `topk`, `register_region`,
 `chunk_prepare`, `chunk_recurrence`, `gdn_recurrence`, `mma_dag`,

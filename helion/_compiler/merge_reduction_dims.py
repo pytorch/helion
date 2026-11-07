@@ -8,7 +8,8 @@ requires static_shapes so a later input cannot change the view's strides.
 input to read ``x.flatten(1, 2)`` instead of ``x`` and replaces the chain
 with a single reduction. Chains it cannot rewrite stay chains of single-dim
 reductions, except on a backend whose ``requires_merged_reduction_dims`` is
-set (CuTe), which refuses them with ``BackendUnsupported``.
+set (CuTe). Such a backend must either select a required complete-coordinate
+owner for that chain or refuse it with ``BackendUnsupported``.
 """
 
 from __future__ import annotations
@@ -265,6 +266,10 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                                 break
             merger = _Merger(source, dims, flat_views, flat_nodes, excluded)
             if (chain := merger.chain(source, node, tag.nodes)) is None:
+                if env.backend.defer_unmerged_reduction_chain(
+                    node, source, tuple(dims)
+                ):
+                    continue
                 require_chain_support(
                     "multi-dimensional reduction cannot be flattened without "
                     "changing its layout or merging a writable tensor; "

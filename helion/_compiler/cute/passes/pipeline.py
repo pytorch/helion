@@ -1338,6 +1338,11 @@ def _lower_packet_store_policy(s: _KernelDefState) -> None:
     )
 
 
+def _validate_shared_arenas(s: _KernelDefState) -> None:
+    for request in s.fn.cute_state.shared_arena_requests:
+        request.validate(s.definition.body, s.ctx.rename_groups)
+
+
 # ---------------------------------------------------------------------------
 # The ordered tables (the call sequence of ``codegen_function_def``, verbatim)
 # ---------------------------------------------------------------------------
@@ -1675,6 +1680,12 @@ KERNEL_DEF_PASSES: tuple[KernelDefPass, ...] = (
         _always,
         _lower_packet_store_policy,
         requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "validate_shared_arenas",
+        _always,
+        _validate_shared_arenas,
+        requires=(RENAMED, "published_scalars_lowered", "register_producers_lowered"),
     ),
 )
 

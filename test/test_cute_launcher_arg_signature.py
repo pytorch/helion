@@ -17,7 +17,6 @@ only for a deliberate key change:
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import json
 from pathlib import Path
@@ -25,12 +24,14 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
-from unittest import mock
 
 import pytest
 import torch
 
+from helion._testing.cute_launcher import mock_cute_launcher_runtime
 from helion.runtime.cute import launcher
+
+pytestmark = pytest.mark.cpu_only
 
 GOLDEN = Path(__file__).parent / "data" / "cute_launcher_arg_signature.json"
 
@@ -97,24 +98,6 @@ class _Arena:
     def relative(self, pointer: int) -> int:
         # A zero-sized tensor's data pointer is 0 (recorded as is).
         return pointer - self.base.data_ptr() if pointer else 0
-
-
-def _fake_runtime(arena: _Arena, constexpr: tuple[bool, ...]) -> list[Any]:
-    def make_ptr(
-        dtype: object, address: int, space: object, *, assumed_align: int
-    ) -> tuple[str, int, int]:
-        return ("ptr", arena.relative(address), assumed_align)
-
-    return [
-        mock.patch.object(
-            launcher, "_get_cute_launcher_imports", lambda: (None, make_ptr, None)
-        ),
-        mock.patch.object(launcher, "_validate_cute_launcher_tensor", lambda t: None),
-        mock.patch.object(launcher, "_torch_dtype_to_cutlass", str),
-        mock.patch.object(
-            launcher, "_cute_kernel_param_is_constexpr", lambda kernel: constexpr
-        ),
-    ]
 
 
 def _plain(value: object, arena: _Arena) -> object:
@@ -263,9 +246,14 @@ def _cases(arena: _Arena) -> list[_Case]:
 
 def _record(case: _Case, arena: _Arena) -> dict[str, object]:
     kernel = SimpleNamespace(**case.kernel_attributes)
-    with contextlib.ExitStack() as stack:
-        for patch in _fake_runtime(arena, case.constexpr):
-            stack.enter_context(patch)
+
+    def make_ptr(
+        dtype: object, address: int, space: object, *, assumed_align: int
+    ) -> tuple[str, int, int]:
+        return ("ptr", arena.relative(address), assumed_align)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        mock_cute_launcher_runtime(monkeypatch, make_ptr, constexpr=case.constexpr)
         built = (
             launcher._build_cute_schema_and_args(kernel, case.args, case.grid)
             if case.bake is None

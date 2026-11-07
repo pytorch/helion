@@ -5088,8 +5088,10 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
             loop if begin == "0" else f"({loop} - {begin})"
         )
         if program.loop_axis is not None:
-            step = self.plan.size(program.loop_axis)
-            self.emit(f"{self.axis_base(program.loop_axis)} = {loop} * {step}")
+            self.emit(
+                f"{self.axis_base(program.loop_axis)} = "
+                f"{self.axis_product(program.loop_axis, loop)}"
+            )
         # The ring's full barriers count the CTA's iterations across its
         # tiles under a cross-tile prefetch (``phase_base``).
         ring = offset if self.phase_base is None else f"({self.phase_base} + {offset})"

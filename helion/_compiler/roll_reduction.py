@@ -598,24 +598,54 @@ class ReductionRoller:
 
         return any(is_matmul_with_rdim(node) for node in graph.nodes)
 
-    def has_gather_along_rdim(self, graph: torch.fx.Graph) -> bool:
-        """Check if a graph gathers along the rdim.
+    def has_indexing_along_rdim(self, graph: torch.fx.Graph) -> bool:
+        """Check if a graph reads fixed coordinates along the rdim.
 
         ``torch.gather(row, dim, index)`` reads ``row`` at any position of
         ``dim``, which one chunk of the rdim per loop iteration does not hold
-        (Triton's ``tl.gather`` would pick positions within the chunk).
+        (Triton's ``tl.gather`` would pick positions within the chunk). Static
+        slice/select likewise address the complete tensor, not each chunk.
+        Slices whose result keeps the rdim axis (start zero, unit step and full
+        end) remain rollable.
         """
         env = CompileEnvironment.current()
         for node in graph.nodes:
-            if node.target is not torch.ops.aten.gather.default:
+            if node.target not in (
+                torch.ops.aten.gather.default,
+                torch.ops.aten.slice.Tensor,
+                torch.ops.aten.select.int,
+            ):
                 continue
-            input_node, dim = node.args[0], node.args[1]
+            input_node = node.args[0]
+            dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
             assert isinstance(input_node, torch.fx.Node)
             assert isinstance(dim, int)
             val = input_node.meta["val"]
             assert isinstance(val, torch.Tensor)
-            if env.get_block_id(val.size(dim)) == self.rdim.block_id:
-                return True
+            if env.get_block_id(val.size(dim)) != self.rdim.block_id:
+                continue
+            if node.target is torch.ops.aten.slice.Tensor:
+                start, step = (
+                    node.args[i]
+                    if len(node.args) > i
+                    else node.kwargs.get(key, default)
+                    for i, key, default in (
+                        (2, "start", None),
+                        (4, "step", 1),
+                    )
+                )
+                if (
+                    (start is None or type(start) is int and start == 0)
+                    and type(step) is int
+                    and step == 1
+                    and env.get_block_id(node.meta["val"].size(dim))
+                    == self.rdim.block_id
+                ):
+                    # A literal end equal to the logical size can still erase
+                    # the rdim symbol (its hint may be padded). Only a result
+                    # carrying that same axis stays in the rolled inner graph.
+                    continue
+            return True
         return False
 
     def has_pinned_rdim(self) -> bool:

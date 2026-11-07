@@ -188,7 +188,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
             def has_matmul_with_rdim(self, graph: torch.fx.Graph) -> bool:
                 return False
 
-            def has_gather_along_rdim(self, graph: torch.fx.Graph) -> bool:
+            def has_indexing_along_rdim(self, graph: torch.fx.Graph) -> bool:
                 return False
 
             def has_stack_tensor_with_rdim(self, graph: torch.fx.Graph) -> bool:

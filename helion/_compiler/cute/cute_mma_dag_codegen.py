@@ -2877,7 +2877,7 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         var = self.loop_index_var(loop.index)
         for axis in loop.axes:
             offset = self.axis_offset(axis, var)
-            self.emit(f"{self.axis_base(axis)} = {offset} * {self.plan.size(axis)}")
+            self.emit(f"{self.axis_base(axis)} = {self.axis_product(axis, offset)}")
         self.forget_iteration_bases(loop.index)
 
     def emit_outer_iteration(

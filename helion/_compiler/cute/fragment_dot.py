@@ -8,6 +8,8 @@ builds on the memory emitter for that direct store."""
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
+import functools
 import math
 from typing import TYPE_CHECKING
 from typing import cast
@@ -27,6 +29,10 @@ from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
 from .fragment_context import DirectStoreSink
 from .fragment_context import Fragment
 from .fragment_context import HostTensor
+from .fragment_domain import CoordinateOrigin
+from .fragment_domain import OwnershipTerm
+from .fragment_domain import project_contracted_ownership
+from .fragment_domain import rewrite_ownership
 from .fragment_dot_support import fragment_half_dot_supported
 from .fragment_dot_support import fragment_tf32_dot_supported
 from .fragment_memory import FragmentMemoryEmitter
@@ -80,6 +86,52 @@ def _consumed_by_direct_store(_coords: tuple[str, ...]) -> str:
     raise AssertionError("a dot result stored by its lanes has no other reader")
 
 
+def _dot_output_domain(
+    lhs: Fragment,
+    rhs: Fragment,
+    acc: Fragment | None,
+    axes: tuple[str, ...],
+    contracted: str,
+) -> Callable[[tuple[str, ...]], tuple[OwnershipTerm, ...]] | None:
+    """Lazily project ownership when a consumer needs the output domain."""
+    if not any(value is not None and value.logical_domain for value in (lhs, rhs, acc)):
+        return None
+
+    @functools.cache
+    def project() -> tuple[OwnershipTerm, ...]:
+        # A direct store never consumes ownership. Only consumers that need
+        # it should require proof of a mixed free/contraction predicate.
+        # The accumulator has no contracted axis, including empty masks.
+        projected = list(acc.broadcast_domain(axes)) if acc is not None else []
+        for operand, coordinates in (
+            (lhs, (*axes[:-2], axes[-2], contracted)),
+            (rhs, (*axes[:-2], contracted, axes[-1])),
+        ):
+            coordinates = coordinates[-len(operand.shape) :]
+            broadcast: dict[CoordinateOrigin, str] = {
+                coordinate: "0"
+                for dim, (coordinate, size) in enumerate(
+                    zip(coordinates, operand.shape, strict=True)
+                )
+                if dim < len(operand.shape) - 2 and size == 1
+            }
+            for term in project_contracted_ownership(
+                operand.domain(coordinates),
+                dict(zip(coordinates, operand.shape, strict=True)),
+                contracted,
+            ):
+                # Fold the value while retaining its free-axis origin for a
+                # later broadcast or another contraction of this result.
+                projected.append(rewrite_ownership(term, broadcast, {}))
+        return tuple(projected)
+
+    def domain(coordinates: tuple[str, ...]) -> tuple[OwnershipTerm, ...]:
+        mapping: dict[CoordinateOrigin, str] = dict(zip(axes, coordinates, strict=True))
+        return tuple(rewrite_ownership(term, mapping) for term in project())
+
+    return domain
+
+
 class FragmentDotEmitter(FragmentMemoryEmitter):
     """``hl.dot`` over staged fragments, including native mma.sync paths."""
 
@@ -106,6 +158,13 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
         assert acc is None or isinstance(acc, Fragment)
         out = cast("torch.Tensor", node.meta["val"])
         shape = self.shape(out.shape)
+        domain = _dot_output_domain(
+            lhs,
+            rhs,
+            acc,
+            tuple(self.df.new_var("fragment_dot_axis") for _ in shape),
+            self.df.new_var("fragment_dot_contracted"),
+        )
         out_dtype = cast("torch.dtype | None", node.args[3]) or _compute_out_dtype(
             lhs.dtype, rhs.dtype, acc.dtype if acc is not None else None
         )
@@ -123,8 +182,9 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
         )
         half = lhs.dtype in (torch.float16, torch.bfloat16)
         k_step = 16 if half else 8
-        # Operand recipes must finish before the contraction begins: the same
-        # input can have different coordinates in its two operand roles.
+        # Materialize shared inputs before contracting: the same input can
+        # have different coordinates in its two operand roles. View reads
+        # still evaluate their coordinates within the contraction loop.
         if mma_contraction is None:
             lhs = self.materialize(lhs)
             self.held.append(lhs)
@@ -192,7 +252,7 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
             )
             self.held.pop()
             self.held.pop()
-            return result
+            return replace(result, logical_domain=domain)
         result = self.allocate(Fragment(shape, out_dtype, lambda _: "0"))
 
         contraction = self.logical_axis_extent(left_fake, -1, lhs.shape[-1])
@@ -204,17 +264,24 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
             self.emit(f"{total} = {self.cast(initial, compute_dtype)}")
             # All operands are in shared memory, so this serial per-output
             # contraction has ordinary IEEE FP32 multiplication and addition.
-            left = lhs.broadcast((*coords[:-2], coords[-2], k))
-            right = rhs.broadcast((*coords[:-2], k, coords[-1]))
-            self.emit(
-                f"for {k} in range({contraction}):\n    {total} = {total} + {self.cast(left, compute_dtype)} * {self.cast(right, compute_dtype)}"
-            )
+            loop = statement_from_string(f"for {k} in range({contraction}):\n    pass")
+            assert isinstance(loop, ast.For)
+            loop.body.clear()
+            self.cg.add_statement(loop)
+            with self.cg.set_statements(cast("list[ast.AST]", loop.body)):
+                # View recipes may emit coordinate locals; their K index is
+                # defined only inside this contraction loop.
+                left = lhs.broadcast((*coords[:-2], coords[-2], k))
+                right = rhs.broadcast((*coords[:-2], k, coords[-1]))
+                self.emit(
+                    f"{total} = {total} + {self.cast(left, compute_dtype)} * {self.cast(right, compute_dtype)}"
+                )
             self.emit(f"{result.read(coords)} = {self.cast(total, out_dtype)}")
 
         self.elements(shape, contract)
         self.held.pop()
         self.held.pop()
-        return result
+        return replace(result, logical_domain=domain)
 
     @staticmethod
     def pure_recipe(value: Fragment) -> bool:

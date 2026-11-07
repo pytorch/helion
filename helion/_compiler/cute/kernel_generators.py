@@ -211,6 +211,18 @@ def _generate_ordered_phases(
 
 KERNEL_GENERATORS: tuple[KernelGenerator, ...] = (
     KernelGenerator(
+        "dependent_phases",
+        applies=lambda func, config, transforms: (
+            cute_env_state(CompileEnvironment.current()).dependent_phase_plan
+            is not None
+            and len(func.device_ir.root_ids) > 1
+        ),
+        generate=_plain_generator("dependent_phases", "generate_dependent_phases"),
+        transform_policy=_complete_kernel_only(
+            "dependent phases require their complete ordered-launch owner"
+        ),
+    ),
+    KernelGenerator(
         "grouped_prefix_adaptive_n",
         applies=lambda func, config, transforms: bool(
             config.get("tcgen05_grouped_prefix_adaptive_n", False)

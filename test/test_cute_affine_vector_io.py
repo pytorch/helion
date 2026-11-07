@@ -7,9 +7,15 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
+import torch
 
+from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.affine_vector_io import _Vectorizer
+from helion._compiler.cute.affine_vector_io import vectorize_affine_tile_lanes
+from helion._compiler.cute.pure_lane_packets import _PacketVectorizer
 from helion._compiler.cute.scalar_integer import _integer_expression
+from helion._compiler.device_function import Argument
+from helion._compiler.device_function import TensorArg
 
 pytestmark = pytest.mark.cpu_only
 
@@ -93,6 +99,7 @@ def _rewrite(
     disjoint: bool = True,
     integer_tensors: frozenset[str] = frozenset(),
     strides: dict[tuple[str, int], int] | None = None,
+    builtin_abs: bool = True,
 ):
     tree = ast.parse(source)
     function = tree.body[0]
@@ -105,6 +112,8 @@ def _rewrite(
         disjoint={frozenset(("src", "out"))} if disjoint else set(),
         constexpr={},
         integer_tensors=integer_tensors,
+        unshadowed_abs=builtin_abs
+        and all(arg.arg != "abs" for arg in function.args.args),
     )
     function.body = rewriter.body(function.body)
     return ast.fix_missing_locations(tree), rewriter.changed
@@ -164,6 +173,173 @@ def test_vector_path_and_scalar_tails_preserve_memory_values(
     expected_vectors = length // 4 if start % 4 == 0 else 0
     assert after["vector_loads"] == after["vector_stores"] == expected_vectors
     assert after["scalar_loads"] == length - expected_vectors * 4
+
+
+def _computed_row_source() -> str:
+    source = _SOURCE.replace("vec_lane_1", "synthetic_lane_1").replace(
+        "cutlass.Int32(tile_offset_1) + cutlass.Int32(lane_1) * 4",
+        "cutlass.Int32(tile_offset_1 // 16) * 16 + cutlass.Int32(lane_1) * 4",
+    )
+    # This value DAG exceeds the address proof's expansion budget. Its values
+    # are consumed, but neither the addresses nor their masks depend on it.
+    values = ["fp_0 = value - 40.0"] + [
+        f"fp_{i} = fp_{i - 1} * 0.5 + fp_{i - 1} * 0.5" for i in range(1, 15)
+    ]
+    return source.replace(
+        "result = value * 1.25 + 2",
+        "\n                ".join([*values, "result = abs(fp_14)"]),
+    )
+
+
+@pytest.mark.parametrize("start,length", [(0, 32), (1, 17), (4, 5), (0, 0)])
+def test_implicit_computed_rows_keep_large_value_recipes_and_scalar_tails(
+    start: int, length: int
+) -> None:
+    source = _computed_row_source()
+    transformed, changed = _rewrite(source)
+    assert changed == 1
+    expected, before = _execute(ast.parse(source), start, length)
+    actual, after = _execute(transformed, start, length)
+    assert actual == expected
+    assert before["scalar_loads"] == length
+    vectors = length // 4 if start % 4 == 0 else 0
+    assert after["vector_loads"] == after["vector_stores"] == vectors
+    assert after["scalar_loads"] == length - vectors * 4
+
+
+@pytest.mark.parametrize("failure", ["alignment", "alias", "effect", "address"])
+def test_implicit_rows_keep_memory_and_effect_refusals(failure: str) -> None:
+    source = _computed_row_source()
+    if failure == "effect":
+        source = source.replace("result = abs(fp_14)", "result = opaque(fp_14)")
+    elif failure == "address":
+        # Every lane points at the same element. Dropping the oversized
+        # address dependency would falsely prove consecutive addresses.
+        terms = ["term_0 = cutlass.Int32(synthetic_lane_1)"] + [
+            f"term_{i} = term_{i - 1} + term_{i - 1}" for i in range(1, 14)
+        ]
+        source = source.replace(
+            "address = cutlass.Int32(start) + indices_1",
+            "\n                ".join(
+                [
+                    *terms,
+                    "hidden = (term_13 - term_13) - cutlass.Int32(synthetic_lane_1)",
+                    "address = cutlass.Int32(start) + indices_1 + hidden",
+                ]
+            ),
+        )
+    transformed, changed = _rewrite(
+        source, aligned=failure != "alignment", disjoint=failure != "alias"
+    )
+    assert changed == 0
+    assert ast.dump(transformed) == ast.dump(ast.parse(source))
+
+
+@pytest.mark.parametrize(
+    "call", ["abs()", "abs(value, value)", "abs(value=value)", "abs(*value)"]
+)
+def test_scalar_abs_requires_exact_builtin_signature(call: str) -> None:
+    source = _SOURCE.replace("result = value * 1.25 + 2", f"result = {call}")
+    transformed, changed = _rewrite(source)
+    assert changed == 0
+    assert ast.dump(transformed) == ast.dump(ast.parse(source))
+
+
+@pytest.mark.parametrize("binding", ["argument", "assignment", "function", "global"])
+def test_shadowed_abs_does_not_authorize_memory_motion(binding: str) -> None:
+    source = _SOURCE.replace("result = value * 1.25 + 2", "result = abs(value)")
+    if binding == "argument":
+        source = source.replace("start, length):", "start, length, abs):")
+    elif binding == "assignment":
+        source += "    abs = replacement\n"
+    elif binding == "function":
+        source += "    def abs(value):\n        return value\n"
+    elif binding == "global":
+        source = source.replace(
+            "    for tile_offset_1", "    global abs\n    for tile_offset_1", 1
+        )
+    transformed, changed = _rewrite(source)
+    assert changed == 0
+    assert ast.dump(transformed) == ast.dump(ast.parse(source))
+
+
+def _generated_function(*, binding: str = "none"):
+    arguments = [TensorArg(name, torch.empty(80), None) for name in ("src", "out")]
+    if binding == "argument":
+        arguments.append(Argument("abs"))
+    return SimpleNamespace(
+        arguments=arguments,
+        proven_tensor_stride_values=lambda: {("src", 0): 1, ("out", 0): 1},
+        proven_disjoint_tensor_pairs=lambda: {frozenset(("src", "out"))},
+        _variable_renames={},
+        _expr_args={},
+        codegen=SimpleNamespace(
+            module_statements=ast.parse(
+                "abs = replacement" if binding == "module" else ""
+            ).body
+        ),
+    )
+
+
+@pytest.mark.parametrize("binding", ["none", "argument", "module"])
+def test_generated_caller_checks_abs_argument_and_module_bindings(binding: str) -> None:
+    source = _SOURCE.replace("result = value * 1.25 + 2", "result = abs(value)")
+    module = ast.parse(source)
+    function = module.body[0]
+    env = SimpleNamespace(
+        input_sources=(),
+        backend=SimpleNamespace(dtype_str=lambda dtype: "cutlass.Float32"),
+        config_spec=SimpleNamespace(pointwise_facts=False),
+    )
+    with patch.object(CompileEnvironment, "current", return_value=env):
+        function.body = vectorize_affine_tile_lanes(
+            function.body, _generated_function(binding=binding), {}
+        )
+    if binding == "none":
+        expected, _ = _execute(ast.parse(source), 0, 17)
+        actual, stats = _execute(module, 0, 17)
+        assert actual == expected
+        assert stats["vector_loads"] == stats["vector_stores"] == 4
+    else:
+        assert ast.dump(module) == ast.dump(ast.parse(source))
+
+
+@pytest.mark.parametrize("start", [0, 1])
+def test_pointwise_packet_pass_handles_synthetic_lanes_and_scalar_tails(
+    start: int,
+) -> None:
+    # The packet pass requires a proved integer offset before speculating its
+    # alignment check. An arbitrary runtime scalar cast keeps its old refusal.
+    source = _SOURCE.replace("vec_lane_1", "synthetic_lane_1").replace(
+        "cutlass.Int32(start)", f"cutlass.Int32({start})"
+    )
+    module = ast.parse(source)
+    function = module.body[0]
+    env = SimpleNamespace(
+        input_sources=(),
+        backend=SimpleNamespace(dtype_str=lambda dtype: "cutlass.Float32"),
+        config_spec=SimpleNamespace(pointwise_facts=True),
+    )
+    packet_body = _PacketVectorizer.body
+    changed = []
+
+    def track_packet_body(packetizer, *args, **kwargs):
+        result = packet_body(packetizer, *args, **kwargs)
+        changed.append(packetizer.changed)
+        return result
+
+    with (
+        patch.object(CompileEnvironment, "current", return_value=env),
+        patch.object(_PacketVectorizer, "body", track_packet_body),
+    ):
+        function.body = vectorize_affine_tile_lanes(
+            function.body, _generated_function(), {}
+        )
+    assert max(changed) == 1
+    expected, _ = _execute(ast.parse(source), start, 17)
+    actual, stats = _execute(module, start, 17)
+    assert actual == expected
+    assert stats["vector_loads"] == stats["vector_stores"] == (4 if start == 0 else 0)
 
 
 # A sixteen-lane loop of a 4-byte dtype: four sixteen-byte packets per access

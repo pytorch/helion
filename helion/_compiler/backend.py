@@ -19,6 +19,7 @@ from torch._inductor.codegen.simd import constant_repr
 from .. import exc
 from .ast_extension import expr_from_string
 from .emitter_protocols import NO_RETRY
+from .utils import is_full_slice
 
 if TYPE_CHECKING:
     import ast
@@ -132,10 +133,7 @@ def _validate_subscript_indices(index: list[object]) -> int:
     """Validate supported kernel-tensor indices and count narrowing entries."""
     narrowed = 0
     for value in index:
-        if value is None or (
-            isinstance(value, slice)
-            and (value.start, value.stop, value.step) == (None, None, None)
-        ):
+        if value is None or is_full_slice(value):
             continue
         if isinstance(value, int):
             valid = value >= 0
@@ -433,7 +431,19 @@ class Backend(abc.ABC):
     def requires_merged_reduction_dims(self) -> bool:
         """Whether a multi-dim reduction chain ``merge_reduction_dims`` cannot
         flatten is a refusal (``BackendUnsupported``) rather than lowered as
-        its chain of single-dim reductions."""
+        its chain of single-dim reductions, unless
+        ``defer_unmerged_reduction_chain`` requires a complete backend owner."""
+        return False
+
+    def defer_unmerged_reduction_chain(
+        self, result: torch.fx.Node, source: torch.fx.Node, dims: tuple[int, ...]
+    ) -> bool:
+        """Require a complete backend owner for an otherwise unsupported chain.
+
+        Returning True retains the original producer coordinates. The backend
+        must reject code generation if that complete owner cannot lower it;
+        this is not permission to use an unsupported scalar reduction chain.
+        """
         return False
 
     @property
@@ -902,7 +912,7 @@ class Backend(abc.ABC):
         for value in index:
             if value is None:
                 output_size.append(1)
-            elif isinstance(value, slice) and repr(value) == "slice(None, None, None)":
+            elif is_full_slice(value):
                 output_size.append(input_size.popleft())
             else:
                 raise exc.InvalidIndexingType(repr(value))
@@ -2236,6 +2246,16 @@ class Backend(abc.ABC):
         """Whether the backend launches this kernel's root loops separately
         itself (CuTe's materialized fission), so the shared-program-id rules
         of a multi-root kernel do not apply.  ``False`` by default."""
+        return False
+
+    def lower_dependency_phases_as_ordered_launches(
+        self, host: HostFunction, ir: DeviceIR
+    ) -> bool:
+        """Discharge analyzed local dependencies through proved ordered launches.
+
+        Called only after the normal dependency graph and phases are installed;
+        it cannot substitute for that analysis or mark roots as already split.
+        """
         return False
 
     # Backend state.  Each core compile object carries one opaque

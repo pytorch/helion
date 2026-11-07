@@ -3440,12 +3440,16 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         # tiles, the N tile fastest (``md_mtile``, ``md_crank``).
         for axis in self.program.axes:
             if self.is_split_axis(axis):
-                self.emit(f"{self.axis_base(axis)} = md_crank * {self.plan.size(axis)}")
+                self.emit(
+                    f"{self.axis_base(axis)} = {self.axis_product(axis, 'md_crank')}"
+                )
             elif axis.kind == AXIS_ROOT:
-                self.emit(f"{self.axis_base(axis)} = md_mtile * {self.plan.size(axis)}")
+                self.emit(
+                    f"{self.axis_base(axis)} = {self.axis_product(axis, 'md_mtile')}"
+                )
             elif axis.kind not in (AXIS_LOOP, AXIS_RDIM):
                 self.emit(
-                    f"{self.axis_base(axis)} = cutlass.Int32({self.cg.tile_begin_var(axis.block_id)})"
+                    f"{self.axis_base(axis)} = {self.index_cast(self.cg.tile_begin_var(axis.block_id))}"
                 )
 
     # -- the split's exchange rounds --------------------------------------------
@@ -5805,7 +5809,7 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         var = self.loop_index_var(loop.index)
         for axis in loop.axes:
             offset = self.axis_offset(axis, var)
-            self.emit(f"{self.axis_base(axis)} = {offset} * {self.plan.size(axis)}")
+            self.emit(f"{self.axis_base(axis)} = {self.axis_product(axis, offset)}")
         self.forget_iteration_bases(loop.index)
         if loop.index in self.counted:
             count = self.counter(loop.index)

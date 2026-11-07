@@ -188,6 +188,10 @@ def test_native_seed_screen_matches_generator_registry() -> None:
         "split_k_workspace": {"cute_split_k_workspace": True},
     }
     assert set(witnesses) == {g.name for g in KERNEL_GENERATORS} - {
+        # These generators require an actual bound source/dependency proof,
+        # rather than a Config knob. The dependent-phase module binds its
+        # real witness and checks normal ordered, non-PDL emission.
+        "dependent_phases",
         "materialized_fission",
         "ordered_phases",
     }

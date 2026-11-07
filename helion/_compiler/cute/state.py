@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from .cute_mma_dag import MmaDagPlan
     from .cute_register_subblocks import RegisterSubblockPlan
     from .cute_warp_mma_gemm import CuteWarpMmaGemmMatch
+    from .dependent_phases import DependentPhasePlan
     from .device_state import CuteDeviceFunctionState
     from .device_state import CuteTcgen05MatmulPlan
     from .device_state import CuteTcgen05StoreValue
@@ -109,6 +110,7 @@ class CuteEnvState:
         default_factory=set
     )
     fission_plan: MaterializedFissionPlan | None = None
+    dependent_phase_plan: DependentPhasePlan | None = None
     half_atomic_output_promotions: dict[str, torch.dtype] = dataclasses.field(
         default_factory=dict
     )

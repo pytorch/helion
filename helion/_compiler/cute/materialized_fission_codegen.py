@@ -280,7 +280,9 @@ def _stage_config(
     return result
 
 
-def _region_graph_ids(graphs: list[GraphInfo], root_id: int) -> frozenset[int]:
+def _region_graph_ids(
+    graphs: list[GraphInfo], root_id: int, *, allow_conditionals: bool = False
+) -> frozenset[int]:
     pending = [root_id]
     result: set[int] = set()
     while pending:
@@ -288,7 +290,16 @@ def _region_graph_ids(graphs: list[GraphInfo], root_id: int) -> frozenset[int]:
         assert graph_id not in result, "fission regions cannot share nested graphs"
         result.add(graph_id)
         for node in graphs[graph_id].graph.nodes:
-            assert node.target is not _tracing_ops._if
+            if node.target is _tracing_ops._if:
+                assert allow_conditionals, "unproved conditional fission region"
+                for child_id, slot in ((node.args[1], 3), (node.args[2], 4)):
+                    assert isinstance(child_id, int)
+                    captures = node.args[slot]
+                    assert isinstance(captures, (tuple, list))
+                    assert len(captures) == len(
+                        list(graphs[child_id].graph.find_nodes(op="placeholder"))
+                    ), "conditional capture arity changed"
+                    pending.append(child_id)
             if _tracing_ops.is_for_loop_target(node.target) or node.target in (
                 _reduce,
                 _associative_scan,
@@ -392,6 +403,7 @@ def generate_materialized_fission(
     store_transform: Callable[..., ast.AST] | None = None,
     load_transform: Callable[..., ast.AST] | None = None,
     extra_params: list[str] | None = None,
+    allow_conditionals: bool = False,
 ) -> ast.Module:
     from ..generate_ast import emit_main_def
     from ..generate_ast import generate_ast
@@ -457,7 +469,11 @@ def generate_materialized_fission(
 
     for stage_index, root in enumerate(roots):
         assert isinstance(root, ast.For)
-        graph_ids = _region_graph_ids(graphs, func.device_ir.root_ids[stage_index])
+        graph_ids = _region_graph_ids(
+            graphs,
+            func.device_ir.root_ids[stage_index],
+            allow_conditionals=allow_conditionals,
+        )
         assert not claimed_graphs.intersection(graph_ids)
         claimed_graphs.update(graph_ids)
         stage = _stage_host(func, root, stage_index, graphs, graph_ids, plan)

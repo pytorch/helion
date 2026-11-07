@@ -1175,7 +1175,7 @@ class DeviceIR:
             graph_to_info: dict[int, RolledReductionInfo] = {}
             allow_loop = False
 
-            # Check if any graph contains matmul, a gather or dev_prts
+            # Check if any graph contains matmul, fixed indexing or dev_prts
             # stacking with rdim, or reduces over rdim along a non-tile
             # (hl.arange) axis that cannot be sliced inside the reduction loop.
             can_roll_graphs = True
@@ -1183,7 +1183,7 @@ class DeviceIR:
                 roller = ReductionRoller(self, rdim, {}, allow_unbound_alias_facts=True)
                 if (
                     roller.has_matmul_with_rdim(graph_info.graph)
-                    or roller.has_gather_along_rdim(graph_info.graph)
+                    or roller.has_indexing_along_rdim(graph_info.graph)
                     or roller.has_stack_tensor_with_rdim(graph_info.graph)
                     or roller.has_unrollable_reduction(graph_info.graph)
                 ):
@@ -3994,7 +3994,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 device_ir.tile_dependency_graph,
                 source_phase_starts,
             )
-            if device_ir.implicit_dependency_starts:
+            if device_ir.implicit_dependency_starts and not (
+                env.backend.lower_dependency_phases_as_ordered_launches(func, device_ir)
+            ):
                 if env.device.type != "cuda" or not config_spec.supports_config_key(
                     "cross_loop_pipeline"
                 ):

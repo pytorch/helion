@@ -9,6 +9,21 @@ import helion.language as hl
 
 
 @helion.kernel(backend="cute", autotune_effort="none")
+def expanded_mask_counts(
+    value: torch.Tensor, mask: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output = torch.empty_like(value)
+    counts_output = torch.empty_like(value, dtype=torch.int64)
+    for rows in hl.tile(value.size(0)):
+        viewed = mask[:].reshape(-1, 1)
+        expanded = viewed.expand(viewed.shape[0], 2)
+        counts = expanded.sum(-1)
+        output[rows, :] = torch.where(counts > 1, value[rows, :], 0)
+        counts_output[rows, :] = counts[None, :]
+    return output, counts_output
+
+
+@helion.kernel(backend="cute", autotune_effort="none")
 def _fragment_singleton_scan(x: torch.Tensor, steps: hl.constexpr) -> torch.Tensor:
     out = torch.empty_like(x)
     for row in hl.tile(x.size(0), block_size=1):

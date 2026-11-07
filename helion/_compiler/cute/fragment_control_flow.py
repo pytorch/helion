@@ -72,6 +72,7 @@ class FragmentControlFlow(FragmentContext):
         # Match each output to its captured value through the actual phi edge.
         # Read-only captures can appear before, between, or after mutable ones.
         carries: list[Fragment] = []
+        copied_slots: set[int] = set()
         self.held.append(carries)
         inner_args = list(args)
         for index, output in enumerate(outputs):
@@ -84,6 +85,8 @@ class FragmentControlFlow(FragmentContext):
                     else self.materialize(incoming, copy=True)
                 )
                 inner_args[slot] = carry
+                if carry is not incoming:
+                    copied_slots.add(slot)
             else:
                 fake = cast("torch.Tensor", output.meta["val"])
                 carry = self.allocate(
@@ -99,8 +102,15 @@ class FragmentControlFlow(FragmentContext):
         starts: list[str] = []
         steps: list[str] = []
 
+        range_values: list[object] = []
+
         def range_scalar(value: object) -> str:
-            return self.scalar(values[value] if isinstance(value, Node) else value)
+            result = values[value] if isinstance(value, Node) else value
+            # These scalar recipes can read shared storage again in body masks,
+            # extents and loop headers, even when the same value is a copied
+            # mutable capture. Keep their dependencies live through the backedge.
+            range_values.append(result)
+            return self.scalar(result)
 
         for index, (bid, begin, end) in enumerate(
             zip(
@@ -119,7 +129,25 @@ class FragmentControlFlow(FragmentContext):
                     step = range_scalar(explicit)
             steps.append(step)
             self.offsets[bid] = self.df.new_var("fragment_tile")
-        with self.cg.set_statements(body):
+        # Carry copies above have completed before the loop, including its
+        # zero-trip case. The child uses those copies, not consumed originals.
+        captured_nodes = cast("list[Node]", node.args[3])
+        with (
+            self.cg.set_statements(body),
+            self.retired_loop_initials(
+                node,
+                values,
+                {captured_nodes[slot] for slot in copied_slots},
+                [
+                    *range_values,
+                    *(
+                        value
+                        for slot, value in enumerate(args)
+                        if slot not in copied_slots
+                    ),
+                ],
+            ),
+        ):
             results = self.graph(
                 graph.graph, dict(zip(placeholders, inner_args, strict=True))
             )
@@ -541,6 +569,18 @@ class FragmentControlFlow(FragmentContext):
                 raise exc.InvalidConfig(
                     "computed fragment conditional requires a captured unchanged output"
                 )
+        # Both parent result halves name the same merged fragments. Only these
+        # declared integer slots escape each branch; other returns are tracing
+        # bookkeeping. All branch computation and side effects still execute.
+        output_indices = tuple(
+            frozenset(
+                slot
+                for slots in info.branches_outputs
+                for slot in (slots[side],)
+                if isinstance(slot, int)
+            )
+            for side in range(2)
+        )
         merged: list[Fragment] = []
         self.held.append(merged)
         fake_outputs = cast("list[torch.Tensor]", node.meta["val"])
@@ -579,6 +619,7 @@ class FragmentControlFlow(FragmentContext):
                             strict=True,
                         )
                     ),
+                    output_indices=output_indices[side],
                 )
                 if branch_local:
                     # Each arm starts with no pending incoming atomic epoch.
