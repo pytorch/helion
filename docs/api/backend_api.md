@@ -50,9 +50,38 @@ other attributes of the classes listed here, may change without notice.
    `reduction_block_size_is_inlined_constexpr`,
    `launches_surplus_tile_threads`;
    `launcher_keyword_args`;
-   `supports_config_key`, `tunable_fragments`, `supports_precompile`,
-   `adjust_block_size_constraints`, `autotune`,
+   `supports_config_key`, `config_spec_extension`, `tunable_fragments`,
+   `supports_precompile`, `adjust_block_size_constraints`, `autotune`,
    `get_do_bench`, `get_interleaved_bench`.
+
+   `config_spec_extension` returns a `BackendSearchSurface` (normally one
+   module-level instance) whose `config_keys` are the backend's own autotuner
+   keys and whose `debug_keys` are keys `normalize` accepts but the search
+   does not try. Other backends reject these keys unless they list them
+   explicitly, and while the backend is registered no kernel can use their
+   names (or the names without a trailing `s`) for `hl.register_tunable`, so
+   prefix them with the plugin's name. A plugin key is searched when
+   `tunable_fragments` gives it a fragment; as for built-in tunables,
+   `normalize` fills in its default but does not check a given value.
+   `tunable_fragments` may return Helion's built-in backend tunables and the
+   backend's own surface keys; declaring a gated generic key such as
+   `xcd_remap` on the surface does not add it. `supports_config_key`
+   overrides must defer to `super()` for these keys (an override that accepts
+   a fixed list of keys must list them), or `ConfigSpec` raises; for a key
+   supported only on some targets, `tunable_fragments` must return its
+   fragment only on those targets.
+   Registering raises `ValueError` if either set holds a generic key such as
+   `num_warps`. Of `BackendSearchSurface`, `config_keys`, `debug_keys` and
+   `fingerprint_extra` are covered; its other members (e.g. `fields`) are
+   not.
+
+   The surface's `fingerprint_extra(config_spec)` returns extra
+   identity for the autotune cache (e.g. the plugin's package version): return
+   a value whose `repr` is the same in every process and host, or `None` (the
+   default, which leaves cache keys unchanged). A changed value makes cached
+   configs miss, so an upgraded plugin re-tunes; it also stops older results
+   from seeding the new search.
+
    The autotuner times candidates with `get_do_bench()` (single config) and
    `get_interleaved_bench()` (candidates compared side by side); returning
    `None` keeps Helion's GPU-event timers. A returned timer is called like
