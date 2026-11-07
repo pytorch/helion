@@ -7,12 +7,12 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from ..ast_read_writes import ReadWrites
+from .collective_epilogue import _load_pointer_roots
 from .collective_epilogue import _RemoveFullThreadBounds
 from .collective_epilogue import _scalar_epilogue
-from .collective_tmem_seed import prune_pure_scalar_statements
+from .collective_epilogue import prune_pure_scalar_statements
 from .collective_vector_recipe import emit_vector_recipe
 from .contiguous_copy import _expr
-from .contiguous_copy import _path
 from .contiguous_copy import plan_contiguous_copy
 from .scalar_recipe import _GLOBALS
 from .scalar_recipe import _clone
@@ -27,179 +27,6 @@ if TYPE_CHECKING:
     from ..device_function import DeviceFunction
     from .collective_matmul import CollectiveMmaSite
     from .contiguous_copy import CopyTensorFacts
-
-
-def _load_pointer_roots(
-    statements: Sequence[ast.AST],
-    *,
-    tensor_names: frozenset[str],
-    integer_names: set[str],
-) -> set[str] | None:
-    """Require an explicit tensor base and integral offsets for every load.
-
-    Counting iterator syntax can miss another base behind a pointer alias or
-    conditional. Decline those bases rather than infer their identity. Track
-    only integer type facts in statement order; aliases never expand into an
-    expression tree, and a rebind cannot retain an earlier integer fact.
-    """
-    roots: set[str] = set()
-
-    def integer_type(value: ast.expr) -> bool:
-        return (
-            isinstance(value, ast.Attribute)
-            and isinstance(value.value, ast.Name)
-            and value.value.id == "cutlass"
-            and value.attr
-            in {
-                "Int8",
-                "Int16",
-                "Int32",
-                "Int64",
-                "Uint8",
-                "Uint16",
-                "Uint32",
-                "Uint64",
-            }
-        )
-
-    def integer(value: ast.expr, known: set[str]) -> bool:
-        pending: list[ast.AST] = [value]
-        while pending:
-            node = pending.pop()
-            if isinstance(node, ast.Constant) and type(node.value) is int:
-                continue
-            if isinstance(node, ast.Name) and node.id in known:
-                continue
-            if isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
-                if integer_type(node.func) or (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr in {"to", "bitcast"}
-                    and integer_type(node.args[0])
-                ):
-                    continue
-            if isinstance(node, ast.UnaryOp) and isinstance(
-                node.op, (ast.UAdd, ast.USub, ast.Invert)
-            ):
-                pending.append(node.operand)
-                continue
-            if isinstance(node, ast.BinOp) and isinstance(
-                node.op,
-                (
-                    ast.Add,
-                    ast.Sub,
-                    ast.Mult,
-                    ast.FloorDiv,
-                    ast.Mod,
-                    ast.BitAnd,
-                    ast.BitOr,
-                    ast.BitXor,
-                    ast.LShift,
-                    ast.RShift,
-                ),
-            ):
-                pending.extend((node.left, node.right))
-                continue
-            if isinstance(node, ast.IfExp):
-                pending.extend((node.body, node.orelse))
-                continue
-            if (
-                isinstance(node, ast.Subscript)
-                and isinstance(node.slice, ast.Constant)
-                and type(node.slice.value) is int
-                and node.slice.value >= 0
-                and isinstance(node.value, ast.Attribute)
-                and node.value.attr in {"shape", "stride"}
-            ):
-                owner = node.value.value
-                if isinstance(owner, ast.Attribute) and owner.attr == "layout":
-                    owner = owner.value
-                if isinstance(owner, ast.Name) and owner.id in tensor_names:
-                    continue
-            if (
-                isinstance(node, ast.Call)
-                and _path(node.func) == "cute.crd2idx"
-                and len(node.args) == 2
-                and not node.keywords
-                and isinstance(node.args[0], ast.Tuple)
-                and isinstance(node.args[1], ast.Attribute)
-                and node.args[1].attr == "layout"
-                and isinstance(node.args[1].value, ast.Name)
-                and node.args[1].value.id in tensor_names
-            ):
-                pending.extend(node.args[0].elts)
-                continue
-            return False
-        return True
-
-    def expression(value: ast.AST, known: set[str]) -> bool:
-        for node in ast.walk(value):
-            if (
-                isinstance(node, ast.Subscript)
-                and isinstance(node.value, ast.Name)
-                and node.value.id in tensor_names
-            ):
-                roots.add(node.value.id)
-            if not (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "load"
-            ):
-                continue
-            pointer = node.func.value
-            if _path(pointer) == "cute.arch":
-                if len(node.args) != 2 or node.keywords:
-                    return False
-                pointer = node.args[0]
-            elif node.args or node.keywords:
-                return False
-            while isinstance(pointer, ast.BinOp) and isinstance(
-                pointer.op, (ast.Add, ast.Sub)
-            ):
-                if not integer(pointer.right, known):
-                    return False
-                pointer = pointer.left
-            if not (
-                isinstance(pointer, ast.Attribute)
-                and pointer.attr == "iterator"
-                and isinstance(pointer.value, ast.Name)
-                and pointer.value.id in tensor_names
-            ):
-                return False
-            roots.add(pointer.value.id)
-        return True
-
-    def visit(body: Sequence[ast.AST], known: set[str]) -> bool:
-        for statement in body:
-            if isinstance(statement, ast.Assign):
-                if (
-                    len(statement.targets) != 1
-                    or not isinstance(statement.targets[0], ast.Name)
-                    or not expression(statement.value, known)
-                ):
-                    return False
-                is_integer = integer(statement.value, known)
-                known.discard(statement.targets[0].id)
-                if is_integer:
-                    known.add(statement.targets[0].id)
-            elif isinstance(statement, ast.If):
-                if not expression(statement.test, known):
-                    return False
-                left, right = set(known), set(known)
-                if not visit(statement.body, left) or not visit(
-                    statement.orelse, right
-                ):
-                    return False
-                known.clear()
-                known.update(left & right)
-            elif isinstance(statement, ast.Pass):
-                continue
-            elif not isinstance(statement, (ast.expr, ast.Expr)) or not expression(
-                statement, known
-            ):
-                return False
-        return True
-
-    return roots if visit(statements, set(integer_names)) else None
 
 
 def _crd2idx_pointer_arithmetic(

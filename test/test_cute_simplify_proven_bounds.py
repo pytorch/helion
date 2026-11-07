@@ -65,7 +65,7 @@ def _transform(
     *,
     enabled: bool = True,
     xyz_grid: bool = True,
-    thread_block_dims: tuple[int, int, int] = (16, 8, 1),
+    thread_block_dims: tuple[int, int, int] | None = (16, 8, 1),
     block_grid_dims: tuple[int | None, int | None, int | None] = (12, 256, 1),
     constexpr_values: dict[str, int] | None = None,
     proven_tensor_size_values: (dict[tuple[str, int], tuple[str, int]] | None) = None,
@@ -117,6 +117,16 @@ def test_generated_full_row_bounds_are_removed_but_dynamic_state_guard_remains(
     assert "and column < 128" not in result
     assert "and column + 7 < 128" not in result
     assert "if cutlass.Int32(state_index) < initial_state_size_0:" in result
+
+
+def test_unproven_launch_shape_returns_the_body_unchanged() -> None:
+    # ``None`` (an argument-sized or otherwise unproven launch axis) proves
+    # nothing; no ``(1, 1, 1)`` placeholder stands in for it.
+    result = _transform(thread_block_dims=None)
+
+    assert result == ast.unparse(ast.parse(SOURCE))
+    assert "< a_size_1" in result
+    assert "_cute_proven_bounds_0_abi_version" not in result
 
 
 def test_missing_size_proof_retains_only_that_tensor_guard() -> None:

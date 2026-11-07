@@ -19,7 +19,9 @@ import torch
 from test.cute_population_contracts import _target
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteMaskedRolledClusterHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteMaskedRolledClusterHeuristic,
+)
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output

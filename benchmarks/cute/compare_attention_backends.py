@@ -133,6 +133,9 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from helion import Config
+    from helion._compiler.cute.autotune.config_generation_ext import (
+        CuteConfigGenerationExtension,
+    )
     from helion.autotuner.config_generation import ConfigGeneration
     from helion.autotuner.config_spec import ConfigSpec
 
@@ -255,6 +258,38 @@ _SOURCE_STABILITY_KEYS = (
     "helion_source_tree_file_count",
     "helion_source_tree_dirty",
 )
+
+
+# The CuTe extensions built (below) for generations whose backend contributed
+# none, by ``id(generation)``; the generation is kept alive alongside so the id
+# stays its own, and one coverage-design cache serves every accessor read.
+_FALLBACK_FLASH_GENERATIONS: dict[
+    int, tuple[ConfigGeneration, CuteConfigGenerationExtension]
+] = {}
+
+
+def _flash_generation(
+    config_generation: ConfigGeneration,
+) -> CuteConfigGenerationExtension:
+    """The CuTe generation extension holding the flash coverage accessors.
+
+    A backend without an extension of its own (the no-op base object; the
+    Triton provenance path) gets the CuTe accessors over its generation, which
+    report the empty design exactly as they did on ``ConfigGeneration``.
+    """
+    from helion._compiler.cute.autotune.config_generation_ext import (
+        CuteConfigGenerationExtension,
+    )
+    from helion.autotuner.search_surface import ConfigGenerationExtension
+
+    extension = config_generation.extension
+    if type(extension) is not ConfigGenerationExtension:
+        return cast("CuteConfigGenerationExtension", extension)
+    entry = _FALLBACK_FLASH_GENERATIONS.get(id(config_generation))
+    if entry is None or entry[0] is not config_generation:
+        entry = (config_generation, CuteConfigGenerationExtension(config_generation))
+        _FALLBACK_FLASH_GENERATIONS[id(config_generation)] = entry
+    return entry[1]
 
 
 def _canonical_json_sha256(value: object) -> str:
@@ -2321,8 +2356,8 @@ def _flash_clc_lane_provenance(
     """Serialize ConfigGeneration's deterministic CLC catalog and witnesses."""
     from helion.autotuner.search_space_logger import canonical_config_id
 
-    catalog = config_generation.flash_clc_lane_catalog()
-    witnesses = config_generation.flash_clc_lane_witnesses()
+    catalog = _flash_generation(config_generation).flash_clc_lane_catalog()
+    witnesses = _flash_generation(config_generation).flash_clc_lane_witnesses()
     allowed = (
         None
         if leaf_catalog is None
@@ -2334,7 +2369,7 @@ def _flash_clc_lane_provenance(
         }
     )
     records: list[dict[str, object]] = []
-    for leaf in config_generation.flash_structural_leaf_catalog():
+    for leaf in _flash_generation(config_generation).flash_structural_leaf_catalog():
         if leaf not in catalog or (
             allowed is not None
             and (
@@ -2373,10 +2408,10 @@ def _helion_autotune_provenance(
     expected_baseline_fn: Callable[..., object],
     strict_runtime_environment: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_INTERACTION_KEY_GROUPS
     from helion._compiler.cute.cute_flash import FLASH_EXP2_PACKET_KEY
     from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
     from helion._compiler.cute.cute_flash import flash_exp2_packet_is_compound
+    from helion._compiler.cute.flash_knobs import FLASH_AUTOTUNE_INTERACTION_KEY_GROUPS
     from helion.autotuner.base_cache import should_skip_cache
     from helion.autotuner.config_generation import ConfigGeneration
     from helion.autotuner.effort_profile import get_effort_profile
@@ -2402,19 +2437,27 @@ def _helion_autotune_provenance(
     compiler_seed_policy = _compiler_seed_policy(config_spec, config_generation)
     structural_coverage_design_configs = [
         dict(config.config)
-        for config in config_generation.flash_deterministic_population_configs()
+        for config in _flash_generation(
+            config_generation
+        ).deterministic_population_configs()
     ]
     structural_coverage_uncovered_values = [
         {"key": key, "value": value}
-        for key, value in config_generation.flash_structural_coverage_uncovered_values()
+        for key, value in _flash_generation(
+            config_generation
+        ).flash_structural_coverage_uncovered_values()
     ]
     structural_coverage_underqualified_values = [
         {"key": key, "value": value, "witness_count": witness_count}
         for key, value, witness_count in (
-            config_generation.flash_structural_coverage_underqualified_values()
+            _flash_generation(
+                config_generation
+            ).flash_structural_coverage_underqualified_values()
         )
     ]
-    structural_leaves = config_generation.flash_structural_leaf_catalog()
+    structural_leaves = _flash_generation(
+        config_generation
+    ).flash_structural_leaf_catalog()
     structural_leaf_catalog = [
         {
             "family": leaf.pipeline_family,
@@ -2423,7 +2466,9 @@ def _helion_autotune_provenance(
         }
         for leaf in structural_leaves
     ]
-    pipeline_lanes_by_leaf = config_generation.flash_pipeline_lane_catalog()
+    pipeline_lanes_by_leaf = _flash_generation(
+        config_generation
+    ).flash_pipeline_lane_catalog()
     pipeline_lane_catalog = [
         {
             "family": leaf.pipeline_family,
@@ -2448,24 +2493,32 @@ def _helion_autotune_provenance(
             "witness_count": witness_count,
         }
         for leaf, witness_count in (
-            config_generation.flash_structural_coverage_underqualified_leaves()
+            _flash_generation(
+                config_generation
+            ).flash_structural_coverage_underqualified_leaves()
         )
     ]
     structural_coverage_active_interactions = [
         {"keys": list(keys), "values": list(values)}
         for keys, values in (
-            config_generation.flash_structural_coverage_active_interactions()
+            _flash_generation(
+                config_generation
+            ).flash_structural_coverage_active_interactions()
         )
     ]
     structural_coverage_uncovered_interactions = [
         {"keys": list(keys), "values": list(values)}
         for keys, values in (
-            config_generation.flash_structural_coverage_uncovered_interactions()
+            _flash_generation(
+                config_generation
+            ).flash_structural_coverage_uncovered_interactions()
         )
     ]
     structural_coverage_active_values = [
         {"key": key, "value": value}
-        for key, value in config_generation.flash_structural_coverage_active_values()
+        for key, value in _flash_generation(
+            config_generation
+        ).flash_structural_coverage_active_values()
     ]
     structural_qualification_values = [
         active
@@ -2503,7 +2556,7 @@ def _helion_autotune_provenance(
         else None
     )
     terminal_coordinate_surface_catalog = (
-        config_generation.flash_terminal_coordinate_surface_catalog(
+        _flash_generation(config_generation).flash_terminal_coordinate_surface_catalog(
             radius=_FLASH_TERMINAL_COORDINATE_RADIUS
         )
         if terminal_coordinate_policy is not None
@@ -2513,7 +2566,7 @@ def _helion_autotune_provenance(
         effort_profile.initial_population if effort_profile is not None else None
     )
     exact_effective_configs = (
-        config_generation.flash_exact_effective_search_space_configs(
+        _flash_generation(config_generation).exact_effective_search_space_configs(
             initial_population_size
         )
         if initial_population_size is not None
@@ -2525,7 +2578,9 @@ def _helion_autotune_provenance(
         else None
     )
     structural_population_budget = (
-        config_generation.flash_structural_population_budget(initial_population_size)
+        _flash_generation(config_generation).structural_population_budget(
+            initial_population_size
+        )
         if initial_population_size is not None
         else None
     )
@@ -2540,12 +2595,14 @@ def _helion_autotune_provenance(
         else None
     )
     retained_family_limit = (
-        config_generation.flash_structural_effective_family_limit(retained_family_cap)
+        _flash_generation(config_generation).flash_structural_effective_family_limit(
+            retained_family_cap
+        )
         if flash_structural_search is not None
         else None
     )
     promoted_path_limit = (
-        config_generation.flash_structural_starting_path_limit(
+        _flash_generation(config_generation).flash_structural_starting_path_limit(
             minimum=max(
                 effort_profile.copies,
                 flash_structural_search.starting_paths,
@@ -2559,7 +2616,7 @@ def _helion_autotune_provenance(
         else None
     )
     family_probe_path_limit = (
-        config_generation.flash_structural_family_probe_path_limit(
+        _flash_generation(config_generation).flash_structural_family_probe_path_limit(
             flash_structural_search.retained_families,
             flash_structural_search.family_probe_generations,
         )
@@ -2704,10 +2761,12 @@ def _helion_autotune_provenance(
         ),
         "flash_structural_qualification_values": structural_qualification_values,
         "flash_structural_parent_coverage_prefix_count": (
-            config_generation.flash_structural_parent_coverage_prefix_count()
+            _flash_generation(
+                config_generation
+            ).flash_structural_parent_coverage_prefix_count()
         ),
         "flash_structural_qualification_prefix_count": (
-            config_generation.flash_structural_qualification_prefix_count()
+            _flash_generation(config_generation).structural_qualification_prefix_count()
         ),
         "flash_structural_population_budget": structural_population_budget,
         "flash_structural_injected_design_count": (structural_injected_design_count),
@@ -2954,7 +3013,7 @@ def _validate_required_full_autotune(provenance: dict[str, object]) -> None:
     if not provenance["require_full_autotune"]:
         return
 
-    from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_INTERACTION_KEY_GROUPS
+    from helion._compiler.cute.flash_knobs import FLASH_AUTOTUNE_INTERACTION_KEY_GROUPS
     from helion.autotuner.effort_profile import get_effort_profile
 
     violations: list[str] = []
@@ -4191,7 +4250,7 @@ def _independent_flash_schedule_anchor_configs(
 
     base = [fragment.default() for fragment in config_generation.flat_spec]
     config_generation._shrink_for_numel_constraints(base)
-    config_generation._repair_cute_num_threads(base)
+    _flash_generation(config_generation).repair_flat_config(base)
     result: list[_ConfigLike] = []
     seen_configs: set[object] = set()
     for family, packet, softmax_disc in product(
@@ -4229,7 +4288,9 @@ def _strict_flash_schedule_anchor_configs(
 ) -> list[_ConfigLike]:
     """Return independently rebuilt anchors after auditing producer output."""
     independent = _independent_flash_schedule_anchor_configs(config_generation)
-    produced = config_generation.flash_low_confound_schedule_anchor_configs()
+    produced = _flash_generation(
+        config_generation
+    ).flash_low_confound_schedule_anchor_configs()
     independent_configs = [dict(config.config) for config in independent]
     produced_configs = [dict(config.config) for config in produced]
     if produced_configs != independent_configs:
@@ -7136,7 +7197,7 @@ def _validate_flash_structural_qualification_phase(
             cast("int", value),
         ): dict(config.config)
         for (witness_leaf, key, value), config in (
-            config_generation.flash_pipeline_lane_witnesses().items()
+            _flash_generation(config_generation).flash_pipeline_lane_witnesses().items()
         )
     }
     for leaf, result in zip(ordinary_catalog, leaf_results, strict=True):
@@ -9265,10 +9326,10 @@ def _validate_required_full_autotune_trials(
     expected_terminal_policy = _flash_terminal_coordinate_refinement_policy(
         get_effort_profile("full")
     )
-    live_terminal_surface_catalog = (
-        config_generation.flash_terminal_coordinate_surface_catalog(
-            radius=_FLASH_TERMINAL_COORDINATE_RADIUS
-        )
+    live_terminal_surface_catalog = _flash_generation(
+        config_generation
+    ).flash_terminal_coordinate_surface_catalog(
+        radius=_FLASH_TERMINAL_COORDINATE_RADIUS
     )
     if (
         provenance.get("flash_terminal_coordinate_refinement_policy")
@@ -9354,7 +9415,9 @@ def _validate_required_full_autotune_trials(
 
     expected_design_configs = [
         dict(config.config)
-        for config in config_generation.flash_deterministic_population_configs()
+        for config in _flash_generation(
+            config_generation
+        ).deterministic_population_configs()
     ]
     expected_design = [
         {
@@ -9365,7 +9428,9 @@ def _validate_required_full_autotune_trials(
         }
         for config in expected_design_configs
     ]
-    expected_leaves = config_generation.flash_structural_leaf_catalog()
+    expected_leaves = _flash_generation(
+        config_generation
+    ).flash_structural_leaf_catalog()
     expected_leaf_catalog = [
         {
             "family": leaf.pipeline_family,
@@ -9374,10 +9439,14 @@ def _validate_required_full_autotune_trials(
         }
         for leaf in expected_leaves
     ]
-    expected_pipeline_lanes = config_generation.flash_pipeline_lane_catalog()
+    expected_pipeline_lanes = _flash_generation(
+        config_generation
+    ).flash_pipeline_lane_catalog()
     expected_active_values = [
         {"key": key, "value": value}
-        for key, value in config_generation.flash_structural_coverage_active_values()
+        for key, value in _flash_generation(
+            config_generation
+        ).flash_structural_coverage_active_values()
     ]
     expected_structural_provenance = {
         "flash_structural_coverage_design": expected_design,
@@ -9391,13 +9460,17 @@ def _validate_required_full_autotune_trials(
         "flash_structural_coverage_uncovered_values": [
             {"key": key, "value": value}
             for key, value in (
-                config_generation.flash_structural_coverage_uncovered_values()
+                _flash_generation(
+                    config_generation
+                ).flash_structural_coverage_uncovered_values()
             )
         ],
         "flash_structural_coverage_underqualified_values": [
             {"key": key, "value": value, "witness_count": count}
             for key, value, count in (
-                config_generation.flash_structural_coverage_underqualified_values()
+                _flash_generation(
+                    config_generation
+                ).flash_structural_coverage_underqualified_values()
             )
         ],
         "flash_structural_leaf_catalog": expected_leaf_catalog,
@@ -9421,19 +9494,25 @@ def _validate_required_full_autotune_trials(
                 "witness_count": count,
             }
             for leaf, count in (
-                config_generation.flash_structural_coverage_underqualified_leaves()
+                _flash_generation(
+                    config_generation
+                ).flash_structural_coverage_underqualified_leaves()
             )
         ],
         "flash_structural_coverage_active_interactions": [
             {"keys": list(keys), "values": list(values)}
             for keys, values in (
-                config_generation.flash_structural_coverage_active_interactions()
+                _flash_generation(
+                    config_generation
+                ).flash_structural_coverage_active_interactions()
             )
         ],
         "flash_structural_coverage_uncovered_interactions": [
             {"keys": list(keys), "values": list(values)}
             for keys, values in (
-                config_generation.flash_structural_coverage_uncovered_interactions()
+                _flash_generation(
+                    config_generation
+                ).flash_structural_coverage_uncovered_interactions()
             )
         ],
         "flash_structural_qualification_values": [
@@ -9446,13 +9525,15 @@ def _validate_required_full_autotune_trials(
             )
         ],
         "flash_structural_parent_coverage_prefix_count": (
-            config_generation.flash_structural_parent_coverage_prefix_count()
+            _flash_generation(
+                config_generation
+            ).flash_structural_parent_coverage_prefix_count()
         ),
         "flash_structural_qualification_prefix_count": (
-            config_generation.flash_structural_qualification_prefix_count()
+            _flash_generation(config_generation).structural_qualification_prefix_count()
         ),
         "flash_structural_population_budget": (
-            config_generation.flash_structural_population_budget(
+            _flash_generation(config_generation).structural_population_budget(
                 initial_population_size
             )
         ),
@@ -9479,9 +9560,9 @@ def _validate_required_full_autotune_trials(
             "required full autotune CLC provenance does not match the live "
             "ConfigGeneration"
         )
-    live_exact_configs = config_generation.flash_exact_effective_search_space_configs(
-        initial_population_size
-    )
+    live_exact_configs = _flash_generation(
+        config_generation
+    ).exact_effective_search_space_configs(initial_population_size)
     live_exact_ids = (
         None
         if live_exact_configs is None

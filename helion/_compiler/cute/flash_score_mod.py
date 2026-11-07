@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-import inspect
 import math
 import operator
 import re
@@ -69,7 +68,6 @@ from typing import cast
 from unittest.mock import patch
 
 import torch
-from torch._inductor.virtualized import V
 from torch.fx import Node
 from torch.fx import map_arg
 from torch.fx.experimental import proxy_tensor
@@ -83,6 +81,7 @@ from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
 from ..device_function import DeviceFunction
 from ..source_location import SourceLocation
+from ._ast_pass_utils import rename_names
 from .attention_plan import FlexAuxBuffer
 from .attention_plan import FlexRegion
 from .flex_coop_layout import COOP_WIDTHS
@@ -264,16 +263,8 @@ _BOOL_NOT_TARGETS = frozenset(
     {torch.ops.aten.bitwise_not.default, torch.ops.aten.logical_not.default}
 )
 _ABS_TARGET = torch.ops.aten.abs.default
-# ``a cmp b`` as ``b cmp' a`` and as ``not (a cmp b)``.
+# ``a cmp b`` as ``b cmp' a``.
 _FLIP_COMPARE = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
-_NEGATE_COMPARE = {
-    "lt": "ge",
-    "le": "gt",
-    "gt": "le",
-    "ge": "lt",
-    "eq": "ne",
-    "ne": "eq",
-}
 # Mask forms of ``render_flex_hook``: the per-chunk keep word applied through
 # the R2P select chain, or the per-element predicate.
 
@@ -296,8 +287,6 @@ _INT_DTYPES = frozenset(
     {torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64}
 )
 
-# Natural 16-byte vector width per element size.
-_VECTOR_WIDTH = {1: 16, 2: 8, 4: 4}
 _VECTOR_BYTES = 16
 # Lanes of one window vector (``load_window``): a lane-affine gather
 # ``table[.., a*kv_idx + rest]`` with ``a = +-1`` reads ``chunk_cols``
@@ -1955,8 +1944,8 @@ class _HookEmitter:
     def _pointwise(
         self, info: _RegionInfo, node: Node, meta: _NodeInfo, name: str
     ) -> None:
-        from ..aten_lowering import LoweringContext
         from ..inductor_lowering import PointwiseLowering
+        from .scalar_lowering import lower_pointwise_scalar
 
         lowering = node.meta.get("lowering")
         if not isinstance(lowering, PointwiseLowering):
@@ -1979,12 +1968,10 @@ class _HookEmitter:
                 f"{lowering.input_names}"
             )
         input_asts = [expr_from_string(self.value(info, value)) for value in inputs]
-        ctx = LoweringContext.__new__(LoweringContext)
-        ctx.cg = self.codegen
-        ctx.env = {}
         statements: list[ast.AST] = []
-        with self.codegen.set_statements(statements), V.set_current_node(node):
-            result = lowering.codegen_from_input_asts(ctx, node, input_asts)
+        result = lower_pointwise_scalar(
+            self.codegen, node, lowering, input_asts, env={}, statements=statements
+        )
         if not isinstance(result, ast.AST):
             raise _unsupported(f"{node.name}: invalid pointwise result {result!r}")
         statements, result = _rename_temporaries(statements, result, name)
@@ -2452,18 +2439,6 @@ def _join_lines(lines: list[str]) -> str:
     return "".join(f"{line}\n" for line in lines)
 
 
-class _RenameNames(ast.NodeTransformer):
-    def __init__(self, mapping: dict[str, str]) -> None:
-        super().__init__()
-        self.mapping = mapping
-
-    def visit_Name(self, node: ast.Name) -> ast.AST:
-        renamed = self.mapping.get(node.id)
-        if renamed is None:
-            return node
-        return ast.copy_location(ast.Name(id=renamed, ctx=node.ctx), node)
-
-
 def _rename_temporaries(
     statements: list[ast.AST], result: ast.AST, prefix: str
 ) -> tuple[list[ast.AST], ast.AST]:
@@ -2481,9 +2456,8 @@ def _rename_temporaries(
                     mapping[target.id] = f"{prefix}_t{len(mapping)}"
     if not mapping:
         return statements, result
-    transformer = _RenameNames(mapping)
-    return [transformer.visit(statement) for statement in statements], (
-        transformer.visit(result)
+    return [rename_names(statement, mapping) for statement in statements], (
+        rename_names(result, mapping)
     )
 
 
@@ -3366,8 +3340,3 @@ def build_flex_region(
         for buffer, index_class in zip(buffers, classes, strict=True)
     )
     return region, classified, tuple(scalar_names)
-
-
-def region_signature(fn: Callable[..., object]) -> list[str]:
-    """Parameter names of a region function (for harness plumbing)."""
-    return list(inspect.signature(fn).parameters)

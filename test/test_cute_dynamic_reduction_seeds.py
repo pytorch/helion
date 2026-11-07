@@ -10,21 +10,28 @@ import sympy
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteReductionTileHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteReductionWideChunkHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteResidentMultiRowHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteResidentRowHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteRolledClusterLadderHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteRolledRowLadderHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteTileVecHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteTileVecWarpPerRowHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteTileVecWarpReduceHeuristic
-from helion._compiler.autotuner_heuristics.cute import _cute_tile_inner_block_dtype
+from helion._compiler.cute.autotune.heuristics.cute import CuteReductionTileHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteReductionWideChunkHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute import CuteResidentMultiRowHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteResidentRowHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteRolledClusterLadderHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute import CuteRolledRowLadderHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteTileVecHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteTileVecWarpPerRowHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteTileVecWarpReduceHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute import _cute_tile_inner_block_dtype
 from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
@@ -107,7 +114,6 @@ def _jagged_sum(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 @skipIfRefEager("asserts generated CuTe source, which ref eager does not emit")
 @pytest.mark.parametrize("fn", [_softmax, _masked_softmax, _memory_masked_softmax])
 def test_cute_dynamic_reduction_seeds_vector_memory(
@@ -153,7 +159,6 @@ def test_cute_dynamic_reduction_seeds_vector_memory(
         (CuteRolledClusterLadderHeuristic, 65536),
     ],
 )
-@skipUnlessBackends(["cute"])
 @skipIfNotCUDA()
 @skipIfRefEager("checks compiled dynamic seed execution")
 def test_dynamic_seed_handles_changed_extent_and_alignment(
@@ -196,7 +201,6 @@ def test_dynamic_seed_handles_changed_extent_and_alignment(
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 @skipIfRefEager("checks dynamic tile heuristic eligibility")
 def test_dynamic_tile_heuristics_keep_their_existing_static_gate(
     dtype: torch.dtype,
@@ -222,7 +226,6 @@ def test_dynamic_tile_heuristics_keep_their_existing_static_gate(
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 @skipIfRefEager("checks persistent dynamic seed settings")
 def test_dynamic_persistent_seed_keeps_scalar_memory(dtype: torch.dtype) -> None:
     kernel = helion.kernel(
@@ -440,7 +443,6 @@ def test_jagged_dtype_walk_keeps_inner_axis_intermediates(
     "fn", [_square_row_bias_softmax, _square_row_bias_softmax_bias_first]
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.int8])
-@skipUnlessBackends(["cute"])
 @skipIfRefEager("checks reduction axis provenance")
 def test_square_row_bias_does_not_override_reduction_payload(
     fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
@@ -470,7 +472,6 @@ def test_square_row_bias_does_not_override_reduction_payload(
         )
 
 
-@skipUnlessBackends(["cute"])
 @skipIfRefEager("checks vector slots for a jagged axis")
 def test_jagged_tile_vector_seed_admission_is_preserved() -> None:
     kernel = helion.kernel(_jagged_sum, backend="cute", autotune_effort="none")

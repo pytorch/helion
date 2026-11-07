@@ -12,14 +12,19 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
+from functools import partial
 import math
 import re
 from typing import TYPE_CHECKING
 
 from ..ast_read_writes import ReadWrites
+from ._ast_pass_utils import loop_extent
+from ._ast_pass_utils import reparse_expr as _clone_expr
+from ._ast_pass_utils import replace_call
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
-from .cache_policy_loads import cache_hinted_load_helper
-from .cache_policy_loads import is_cache_policy_suffix
+from .cache_policy_loads import CachePolicy
+from .packet_access import match_packet_access
+from .packet_access import render_packet_load
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -48,11 +53,6 @@ PACKET_STORE_BYTES = {
 }
 
 
-def _clone_expr(node: ast.AST) -> ast.expr:
-    """Clone generated/extended AST without relying on ``deepcopy``."""
-    return ast.parse(ast.unparse(node), mode="eval").body
-
-
 def _marker_call(node: ast.AST, name: str, nargs: int) -> ast.Call | None:
     if (
         isinstance(node, ast.Call)
@@ -72,19 +72,7 @@ def _literal(node: ast.AST, typ: type[int | str]) -> int | str | None:
 
 
 def _range_extent(loop: ast.For) -> int | None:
-    call = loop.iter
-    if not (
-        isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "range_constexpr"
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "cutlass"
-        and len(call.args) == 1
-        and not call.keywords
-    ):
-        return None
-    value = _literal(call.args[0], int)
-    return value if isinstance(value, int) and value > 1 else None
+    return loop_extent(loop, kinds=("constexpr",), minimum=2)
 
 
 def _single_name_definitions(statements: list[ast.stmt]) -> dict[str, ast.expr]:
@@ -444,21 +432,6 @@ _PACKED_LOAD_CARRIERS = frozenset(
 )
 
 
-def _vector_type_width(node: ast.AST) -> int | None:
-    """Element count of a generated ``ir.VectorType.get([V], ...)`` type."""
-    if (
-        isinstance(node, ast.Call)
-        and ast.unparse(node.func) == "ir.VectorType.get"
-        and node.args
-        and isinstance(node.args[0], ast.List)
-        and len(node.args[0].elts) == 1
-        and isinstance(node.args[0].elts[0], ast.Constant)
-        and isinstance(node.args[0].elts[0].value, int)
-    ):
-        return node.args[0].elts[0].value
-    return None
-
-
 def _generated_access_pointer(call: ast.Call) -> tuple[ast.expr, int] | None:
     """Pointer and element width of a generated scalar or vector access.
 
@@ -469,35 +442,24 @@ def _generated_access_pointer(call: ast.Call) -> tuple[ast.expr, int] | None:
     packet flush (``PACKET_STORE_BYTES``) of a V-loop's values.  The
     flush's element count is not visible in the call, so it
     reports the widest fragment its helper can write.  Anything else returns
-    ``None``: atomics, unknown helpers, and byte-packed loads through a word
+    ``None``: atomics, unknown helpers, the predicated packet loads of the
+    V-loop sink (which runs later), and byte-packed loads through a word
     carrier (``cute.arch.load(PTR, cutlass.Uint64)`` reads as many elements
     as fit the word, a count the call does not show).
     """
-    pointer = _plain_scalar_load_pointer(call)
-    if pointer is None:
-        pointer = _plain_scalar_store_pointer(call)
-    if pointer is not None:
-        return pointer, 1
-    func = call.func
-    name = ast.unparse(func) if isinstance(func, (ast.Attribute, ast.Name)) else ""
-    if name == "cute.arch.load" or name in _VECTOR_LOAD_HELPERS:
-        if len(call.args) < 2 or not isinstance(call.args[0], ast.expr):
+    access = match_packet_access(call)
+    if access is None:
+        return None
+    if access.kind in ("load", "store"):
+        return access.pointer, 1
+    if access.kind in ("packet", "hinted_packet"):
+        return None if access.width is None else (access.pointer, access.width)
+    if access.kind == "arch_load":
+        if access.carrier in _PACKED_LOAD_CARRIERS:
             return None
-        carrier = call.args[1]
-        width = _vector_type_width(carrier)
-        if width is not None:
-            return call.args[0], width
-        if name != "cute.arch.load" or ast.unparse(carrier) in _PACKED_LOAD_CARRIERS:
-            return None
-        return call.args[0], 1
-    if (
-        isinstance(func, ast.Name)
-        and func.id in _VECTOR_FLUSH_MAX_WIDTH
-        and len(call.args) == 2
-        and not call.keywords
-        and isinstance(call.args[0], ast.expr)
-    ):
-        return call.args[0], _VECTOR_FLUSH_MAX_WIDTH[func.id]
+        return access.pointer, 1
+    if access.kind == "flush" and access.helper in _VECTOR_FLUSH_MAX_WIDTH:
+        return access.pointer, _VECTOR_FLUSH_MAX_WIDTH[access.helper]
     return None
 
 
@@ -1301,23 +1263,6 @@ def _scalar_load_and_mask(node: ast.expr) -> tuple[ast.Call, ast.expr | None] | 
     return None
 
 
-class _ReplaceCall(ast.NodeTransformer):
-    def __init__(self, target: ast.Call, replacement: ast.expr) -> None:
-        super().__init__()
-        self.target = ast.dump(target, include_attributes=False)
-        self.replacement = replacement
-        self.replaced = False
-
-    def visit_Call(self, node: ast.Call) -> ast.AST:
-        if (
-            not self.replaced
-            and ast.dump(node, include_attributes=False) == self.target
-        ):
-            self.replaced = True
-            return _clone_expr(self.replacement)
-        return self.generic_visit(node)
-
-
 class _RestoreLoadMarkers(ast.NodeTransformer):
     def visit_Call(self, node: ast.Call) -> ast.AST:
         marker = _marker_call(node, _LOAD_MARKER, 6)
@@ -1332,6 +1277,7 @@ class _BranchLocalPersistentVectorizer:
         body: list[ast.stmt],
         proven_disjoint_tensor_pairs: set[frozenset[str]],
         proven_tensor_stride_values: Mapping[tuple[str, int], int],
+        wide_packet_hints: bool = False,
     ) -> None:
         self.name_counts = Counter(
             node.id
@@ -1343,6 +1289,9 @@ class _BranchLocalPersistentVectorizer:
         self.counter = 0
         self.proven_disjoint_tensor_pairs = proven_disjoint_tensor_pairs
         self.proven_tensor_stride_values = proven_tensor_stride_values
+        # Hinted 32-byte packets take their ``_32b`` helpers
+        # (``cache_policy_loads.hint_wide_packets`` of the config).
+        self.wide_packet_hints = wide_packet_hints
 
     def _fresh(self, prefix: str) -> str:
         while True:
@@ -1643,26 +1592,20 @@ class _BranchLocalPersistentVectorizer:
                     if base is not None:
                         carrier, itemsize, _store_helper = dtype_info
                         vec_name = self._fresh("_persistent_branch_vec")
-                        vector_type = (
-                            f"ir.VectorType.get([{width}], {carrier}.mlir_type)"
+                        # An L2-policy hint is not a ``cute.arch.load``
+                        # kwarg: the packet goes through the inline-PTX
+                        # helper of its width (32 bytes: nc_l2_first, and
+                        # the L2 policies under ``cute_wide_packet_hints``).
+                        policy = CachePolicy.from_suffix(eviction)
+                        load_source = render_packet_load(
+                            ast.unparse(base),
+                            width,
+                            carrier,
+                            helper=policy.vector_helper(
+                                width * itemsize, wide_packets=self.wide_packet_hints
+                            ),
+                            kwargs=policy.load_kwargs,
                         )
-                        if is_cache_policy_suffix(eviction):
-                            # An L2-policy marker is not a ``cute.arch.load``
-                            # kwarg: the packet goes through the inline-PTX
-                            # helper of its width (32 bytes: nc_l2_first only).
-                            helper = cache_hinted_load_helper(
-                                eviction, width * itemsize
-                            )
-                            load_source = (
-                                f"{helper}({ast.unparse(base)}, {vector_type})"
-                                if helper is not None
-                                else f"cute.arch.load({ast.unparse(base)}, {vector_type})"
-                            )
-                        else:
-                            load_source = (
-                                f"cute.arch.load({ast.unparse(base)}, {vector_type}"
-                                f"{eviction})"
-                            )
                         vector_load = ast.parse(load_source, mode="eval").body
                         before.append(
                             ast.Assign(
@@ -1674,11 +1617,19 @@ class _BranchLocalPersistentVectorizer:
                             f"{carrier}({vec_name}[{lane_var}]).bitcast({dtype})",
                             mode="eval",
                         ).body
-                        replacement = _ReplaceCall(scalar_load, extract).visit(
-                            _clone_expr(original)
+                        replacement, _ = replace_call(
+                            _clone_expr(original),
+                            scalar_load,
+                            partial(_clone_expr, extract),
+                            first_only=True,
                         )
                         assert isinstance(replacement, ast.expr)
-                        stmt = _ReplaceCall(marker, replacement).visit(stmt)
+                        stmt, _ = replace_call(
+                            stmt,
+                            marker,
+                            partial(_clone_expr, replacement),
+                            first_only=True,
+                        )
                         assert isinstance(stmt, ast.stmt)
 
             store_marker = self._store_marker(stmt)
@@ -1858,8 +1809,12 @@ def vectorize_branch_local_persistent_fragments(
     *,
     proven_disjoint_tensor_pairs: set[frozenset[str]] | None = None,
     proven_tensor_stride_values: Mapping[tuple[str, int], int] | None = None,
+    wide_packet_hints: bool = False,
 ) -> list[ast.stmt]:
-    """Vectorize marked exact fragments and erase every unhandled marker."""
+    """Vectorize marked exact fragments and erase every unhandled marker.
+
+    ``wide_packet_hints`` (``cache_policy_loads.hint_wide_packets`` of the
+    config) lets a hinted 32-byte packet take its ``_32b`` helper."""
     if not any(
         isinstance(node, ast.Name) and node.id in (_LOAD_MARKER, _STORE_MARKER)
         for stmt in body
@@ -1873,6 +1828,7 @@ def vectorize_branch_local_persistent_fragments(
         body,
         proven_disjoint_tensor_pairs or set(),
         proven_tensor_stride_values or {},
+        wide_packet_hints,
     )
     transformed = vectorizer.transform_body(body)
     # Most kernels have no persistent-fragment load markers.  Avoid running an

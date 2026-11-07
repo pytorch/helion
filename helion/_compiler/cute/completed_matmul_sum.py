@@ -270,7 +270,7 @@ def record_completed_matmul_sum(
     assert isinstance(cg, GenerateAST)
     path = match_matmul_sum_path(cg, producer, n_block_id, n_extent)
     if path is not None:
-        cg.device_function.cute_state.completed_matmul_sums[path.consumer] = (
+        cg.device_function.cute_state.lanes.completed_matmul_sums[path.consumer] = (
             CompletedMatmulSum(cg, path, expression)
         )
 
@@ -282,7 +282,7 @@ def completed_matmul_sum_input(ctx: LoweringContext, node: Node) -> ast.AST | No
     cg = ctx.cg
     if not isinstance(cg, GenerateAST):
         return None
-    completed = cg.device_function.cute_state.completed_matmul_sums.get(node)
+    completed = cg.device_function.cute_state.lanes.completed_matmul_sums.get(node)
     if completed is None or completed.codegen is not cg:
         return None
     path = completed.path

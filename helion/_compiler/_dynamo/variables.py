@@ -24,7 +24,7 @@ from helion._compat import supports_torch_compile_fusion
 from helion._compat import supports_torch_compile_template_lowering
 from helion._compiler.ast_extension import ExtendedAST
 from helion._compiler.ast_read_writes import ReadWrites
-from helion._compiler.backend_registry import get_backend_class
+from helion._compiler.backend_registry import get_backend
 from helion._compiler.type_info import TensorType
 import helion.exc as exc
 from helion.runtime.kernel import Kernel
@@ -529,7 +529,7 @@ def torch_compile_captures_kernel_hop(backend: str) -> bool:
     """
     return (
         supports_torch_compile_fusion()
-        or not get_backend_class(backend)().dynamo_captures_kernel_launch
+        or not get_backend(backend).dynamo_captures_kernel_launch
     )
 
 
@@ -539,7 +539,7 @@ def register_dynamo_variable() -> None:
     def wrap_helion_kernel(self: VariableBuilder, value: Kernel) -> VariableTracker:
         inline = None
         if not supports_torch_compile_fusion():
-            backend = get_backend_class(value.settings.backend)()
+            backend = get_backend(value.settings.backend)
             # A backend that lowers unfused anyway gains nothing from upgrading.
             if value.settings.torch_compile_fusion and backend.supports_inductor_fusion:
                 raise RuntimeError(

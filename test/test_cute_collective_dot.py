@@ -17,11 +17,10 @@ if TYPE_CHECKING:
 
 import helion
 from helion import exc
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_matmul import _is_scalar_carry_alias
 from helion._compiler.cute.collective_matmul import _remove_dead_staged_operands
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 helion_mamba2_chunk_scan_kernel = import_example(
@@ -91,7 +90,6 @@ def _seed_inputs(dtype: torch.dtype, device: str = "cpu") -> tuple[torch.Tensor,
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_explicit_dot_stages_original_fp32_seed(dtype: torch.dtype) -> None:
     inputs = _seed_inputs(dtype)
     source = cpu_bind(_seeded_dot, inputs).to_code(_config())
@@ -105,7 +103,6 @@ def test_explicit_dot_stages_original_fp32_seed(dtype: torch.dtype) -> None:
     assert "_helion_pending_collective_mma" not in source
 
 
-@skipUnlessBackends(["cute"])
 def test_invariant_seed_is_not_a_loop_carry() -> None:
     inputs = _seed_inputs(torch.float16)
     source = cpu_bind(_invariant_seed_dot, inputs).to_code(_config())
@@ -115,7 +112,6 @@ def test_invariant_seed_is_not_a_loop_carry() -> None:
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("k", [5, 21, 32, 128])
-@skipUnlessBackends(["cute"])
 def test_full_slice_dot_owns_entire_synthetic_k(dtype: torch.dtype, k: int) -> None:
     inputs = (
         torch.empty((130, k), dtype=dtype),
@@ -162,7 +158,6 @@ def _partial_synthetic_k_render(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("collective_requested", [False, True])
-@skipUnlessBackends(["cute"])
 def test_partial_synthetic_k_folds_the_full_k_per_thread(
     dtype: torch.dtype, collective_requested: bool
 ) -> None:
@@ -179,7 +174,6 @@ def test_partial_synthetic_k_folds_the_full_k_per_thread(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("collective_requested", [False, True])
-@skipUnlessBackends(["cute"])
 def test_partial_synthetic_k_without_a_static_extent_cannot_fall_back(
     dtype: torch.dtype, collective_requested: bool
 ) -> None:
@@ -191,7 +185,6 @@ def test_partial_synthetic_k_without_a_static_extent_cannot_fall_back(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("static_shapes", [False, True])
-@skipUnlessBackends(["cute"])
 def test_full_thread_k_keeps_the_complete_scalar_dot(
     dtype: torch.dtype, static_shapes: bool
 ) -> None:
@@ -241,7 +234,9 @@ def test_staged_dce_preserves_effectful_rebinding_with_the_same_name() -> None:
     df = SimpleNamespace(
         dce_vars=[],
         cute_state=SimpleNamespace(
-            collective_mma_pure_stmt_ids={id(body[0])}, collective_mma_sites=[]
+            lanes=SimpleNamespace(
+                collective_mma_pure_stmt_ids={id(body[0])}, collective_mma_sites=[]
+            )
         ),
     )
     _remove_dead_staged_operands(body, cast("DeviceFunction", df))
@@ -252,7 +247,6 @@ def test_staged_dce_preserves_effectful_rebinding_with_the_same_name() -> None:
 
 @pytest.mark.parametrize("shape", [0, 1, 2])
 @pytest.mark.parametrize("static_shapes", [False, True])
-@skipUnlessBackends(["cute"])
 def test_mamba_contractions_receive_complete_ordinary_seeds(
     shape: int, static_shapes: bool
 ) -> None:
@@ -313,7 +307,6 @@ def test_mamba_contractions_receive_complete_ordinary_seeds(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_seeded_dot_correctness(dtype: torch.dtype) -> None:
     torch.manual_seed(173)
     inputs = _seed_inputs(dtype, "cuda")

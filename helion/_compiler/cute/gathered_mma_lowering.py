@@ -110,7 +110,7 @@ def lower_gathered_matmul(
 ) -> list[ast.stmt]:
     """Lower only an explicitly selected and fully proved pipeline region."""
     env = CompileEnvironment.current()
-    sites = df.cute_state.collective_mma_sites
+    sites = df.cute_state.lanes.collective_mma_sites
     facts = gathered_tensor_facts(df)
     thread_dims = _exact_thread_block_dims(df.tile_strategy)
     if (
@@ -120,8 +120,8 @@ def lower_gathered_matmul(
         or facts is None
         or thread_dims is None
         or df.codegen.cute_wrapper_plans
-        or df.cute_state.matmul_plan is not None
-        or df.cute_state.matmul_fx_nodes
+        or df.cute_state.tcgen05.matmul_plan is not None
+        or df.cute_state.tcgen05.matmul_fx_nodes
         or df.cute_state.has_tcgen05_fragment_epilogue_plan
     ):
         raise exc.BackendUnsupported(

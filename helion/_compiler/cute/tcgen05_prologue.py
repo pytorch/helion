@@ -33,11 +33,12 @@ def split_barrier_init_supported() -> bool:
     """Whether the clustered kernels may build their pipelines through the
     runtime's no-init constructors: the installed DSL must be the release
     whose private pipeline surface they mirror
-    (``_tcgen05_prologue_runtime.SPLIT_BARRIER_INIT_SUPPORTED``); otherwise
-    codegen keeps the DSL constructors with their serial warp-0 inits."""
-    from ._tcgen05_prologue_runtime import SPLIT_BARRIER_INIT_SUPPORTED
+    (``_tcgen05_prologue_runtime.split_barrier_init_supported``); otherwise
+    codegen keeps the DSL constructors with their serial warp-0 inits.  The
+    runtime imports the DSL, so it is loaded here on first use."""
+    from . import _tcgen05_prologue_runtime
 
-    return SPLIT_BARRIER_INIT_SUPPORTED
+    return _tcgen05_prologue_runtime.split_barrier_init_supported()
 
 
 def prologue_runtime(device_function: DeviceFunction) -> str:

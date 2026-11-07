@@ -1176,7 +1176,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             bound,
             bound._base_spec_key,
             [
-                kernel_module._PreparedMetadataSpecializationExtractor(tensor_size),
+                kernel_module.PreparedMetadataSpecializationExtractor(tensor_size),
                 scalar_value,
             ],
             (x, 2),
@@ -1244,7 +1244,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         bound = next(iter(aot_scale._dispatch_cache.values()))  # type: ignore[attr-defined]
         params = tuple(aot_scale.signature.parameters)
         size = kernel_module.sympy.Symbol("x_size0", integer=True)
-        fact = kernel_module._PreparedMetadataSpecializationExtractor(
+        fact = kernel_module.PreparedMetadataSpecializationExtractor(
             kernel_module._GuardedInputFact(
                 size,
                 kernel_module.sympy.Integer(1),
@@ -1365,7 +1365,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         zero, offset = storage[:128], storage[16:]
         torch.testing.assert_close(add_one(zero), zero + 1)
         offset_symbol = kernel_module.sympy.Symbol("x_offset", integer=True)
-        fact = kernel_module._PreparedMetadataSpecializationExtractor(
+        fact = kernel_module.PreparedMetadataSpecializationExtractor(
             kernel_module._GuardedInputFact(
                 offset_symbol,
                 kernel_module.sympy.Integer(0),

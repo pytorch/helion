@@ -346,11 +346,11 @@ def cute_serial_axis(
     state: CodegenState, value: torch.Tensor, dim: int, what: str
 ) -> CuteSerialAxis:
     """The serial walk of dim ``dim`` of ``value`` in the current scope."""
-    from ...language.memory_ops import _cute_active_index_var
     from ..compile_environment import CompileEnvironment
     from ..tile_strategy import PerThreadFlattenedTileStrategy
     from .cute_reshape import _get_dim_local_coord
     from .cute_reshape import _resolve_dim_block_id
+    from .emitters.memory_access import _cute_active_index_var
     from .tile_ops import cute_masked_block_end
 
     env = CompileEnvironment.current()
@@ -436,9 +436,9 @@ def cute_reread_index(
     lane-validity bounds, but not for an ``extra_mask`` that varies along
     the walked dim: such a load is refused.
     """
-    from ...language.memory_ops import _cute_tensor_dim_size_expr
     from ..compile_environment import CompileEnvironment
     from .cute_reshape import _resolve_dim_block_id
+    from .emitters.memory_access import _cute_tensor_dim_size_expr
 
     pattern = re.compile(rf"\b{re.escape(axis.index_var)}\b")
     positions = [
@@ -1036,7 +1036,7 @@ def _cute_scan_inner_lanes(
     """
     from ..tile_strategy import DeviceGridState
     from ..tile_strategy import PerThreadNDTileStrategy
-    from ..tile_strategy import _static_lane_loop_extent
+    from .lane_loops.markers import _static_lane_loop_extent
 
     lanes: list[_CuteScanInnerLane] = []
     if isinstance(owner, DeviceGridState):
@@ -1069,11 +1069,11 @@ def _cute_scan_inner_lanes(
         extent = strategy._elements_per_thread_for_block(other)
         if extent <= 1:
             continue
-        vec_lane_var = strategy._cute_vec_lane_var_by_block.get(other)
+        vec_lane_var = strategy.lane_context(other).vec_lane_var
         if vec_lane_var is None:
             lanes.append(_CuteScanInnerLane(f"cutlass.Int32({var})", extent))
             continue
-        width = strategy._cute_lane_vec_width_by_block.get(other, 1)
+        width = strategy.lane_context(other).vec_width
         if extent % width:
             return None
         lanes.append(_cute_scan_lane_slot(var, vec_lane_var, extent, width))
@@ -1269,13 +1269,13 @@ def _cute_scan_prepare_lane_direction(
     """
     from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
     from ..tile_strategy import DeviceGridState
-    from ..tile_strategy import _lane_loop_reversible
-    from ..tile_strategy import _reverse_lane_loop_iter
+    from .lane_loops.markers import _lane_loop_reversible
+    from .lane_loops.markers import _reverse_lane_loop_iter
 
     lane_var = geometry.lane_var
     if lane_var is None or geometry.lane_steps * geometry.vec_width <= 1:
         return True
-    directions = state.device_function.cute_state.scan_lane_directions
+    directions = state.device_function.cute_state.lanes.scan_lane_directions
     previous = directions.get(lane_var)
     if previous is not None:
         return previous == reverse

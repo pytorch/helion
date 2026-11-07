@@ -8,22 +8,27 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
-from helion._compiler.backend import TritonBackend
+from helion._compiler.cute.autotune.heuristics.cute import CutePointwiseVecHeuristic
+from helion._compiler.cute.autotune.search_surface import (
+    _normalize_cute_packet_prefetch,
+)
+from helion._compiler.cute.autotune.search_surface import enable_cute_packet_prefetch
+from helion._compiler.cute.autotune.search_surface import enable_cute_proven_bounds
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.full_tile_bounds import FullTilePlan
 from helion._compiler.cute.full_tile_bounds import specialize_full_tile_bounds
 from helion._compiler.cute.tensor_layout_relations import TensorLayoutRelation
 from helion._compiler.device_function import DeviceFunction
+from helion._compiler.triton.backend import TritonBackend
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.search_surface import ConfigGenerationExtension
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -34,11 +39,7 @@ vector_scale = import_example("aot_example").vector_scale
 
 @pytest.fixture(autouse=True)
 def _cpu_only():
-    with (
-        _target(),
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
 
 
@@ -75,7 +76,6 @@ def _dump(body):
     return ast.dump(ast.Module(body=body, type_ignores=[]))
 
 
-@skipUnlessBackends(["cute"])
 def test_default_is_source_identical_and_does_not_collect_new_storage_facts():
     bound = _bound()
     explicit = _config()
@@ -100,7 +100,6 @@ def test_default_is_source_identical_and_does_not_collect_new_storage_facts():
 
 @pytest.mark.parametrize("batch", [2, 4, 8])
 @pytest.mark.parametrize("dtype,width", [(torch.bfloat16, 8), (torch.float32, 4)])
-@skipUnlessBackends(["cute"])
 def test_ordinary_allocating_caller_abi_fallback_and_math_are_preserved(
     batch, dtype, width
 ):
@@ -154,7 +153,6 @@ def test_ordinary_allocating_caller_abi_fallback_and_math_are_preserved(
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_original_timed_shape_uses_real_fresh_storage_proof():
     bound = _bound(length=33554432)
     observed = []
@@ -172,7 +170,6 @@ def test_original_timed_shape_uses_real_fresh_storage_proof():
 
 
 @pytest.mark.parametrize("pairs", [set(), {frozenset(("unrelated", "out"))}])
-@skipUnlessBackends(["cute"])
 def test_missing_or_wrong_actual_storage_proof_preserves_source(pairs):
     bound = _bound()
     with patch.object(
@@ -188,7 +185,6 @@ def _store(x: torch.Tensor, out: torch.Tensor, scale: float) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("overlap", [False, True])
-@skipUnlessBackends(["cute"])
 def test_actual_same_or_overlapping_input_output_declines(overlap):
     storage = torch.empty(8193, dtype=torch.bfloat16)
     x = storage[:8192]
@@ -200,12 +196,12 @@ def test_actual_same_or_overlapping_input_output_declines(overlap):
 @pytest.mark.parametrize("batch", [False, True, -2, 1, 3, 16, 2.0, "2"])
 def test_exact_integer_admission_and_fix_invalid(batch):
     spec = ConfigSpec(backend=CuteBackend())
-    spec.enable_cute_proven_bounds()
-    spec.enable_cute_packet_prefetch()
+    enable_cute_proven_bounds(spec)
+    enable_cute_packet_prefetch(spec)
     values = {"cute_proven_bounds": True, "cute_packet_prefetch": batch}
     with pytest.raises(InvalidConfig, match="must be 0, 2, 4, or 8"):
-        spec._normalize_cute_packet_prefetch(values.copy(), fix_invalid=False)
-    spec._normalize_cute_packet_prefetch(values, fix_invalid=True)
+        _normalize_cute_packet_prefetch(spec, values.copy(), fix_invalid=False)
+    _normalize_cute_packet_prefetch(spec, values, fix_invalid=True)
     assert "cute_packet_prefetch" not in values
 
 
@@ -216,18 +212,17 @@ def test_positive_choice_requires_pointwise_and_complete_tile_admission(
     enabled, bounds
 ):
     spec = ConfigSpec(backend=CuteBackend())
-    spec.enable_cute_proven_bounds()
+    enable_cute_proven_bounds(spec)
     if enabled:
-        spec.enable_cute_packet_prefetch()
+        enable_cute_packet_prefetch(spec)
     values = {"cute_proven_bounds": bounds, "cute_packet_prefetch": 2}
     with pytest.raises(InvalidConfig, match="requires pointwise facts"):
-        spec._normalize_cute_packet_prefetch(values.copy(), fix_invalid=False)
-    spec._normalize_cute_packet_prefetch(values, fix_invalid=True)
+        _normalize_cute_packet_prefetch(spec, values.copy(), fix_invalid=False)
+    _normalize_cute_packet_prefetch(spec, values, fix_invalid=True)
     assert "cute_packet_prefetch" not in values
 
 
 @pytest.mark.parametrize("batch", [0, 2, 4, 8])
-@skipUnlessBackends(["cute"])
 def test_search_coordinate_roundtrip_and_config_identity(batch):
     bound = _bound()
     with bound.env:
@@ -240,7 +235,6 @@ def test_search_coordinate_roundtrip_and_config_identity(batch):
         assert helion.Config.from_json(config.to_json()) == config
 
 
-@skipUnlessBackends(["cute"])
 def test_all_old_seeds_remain_before_exact_bounded_strided_pairs():
     bound = _bound()
     spec = bound.config_spec
@@ -297,7 +291,6 @@ def _name_collision(x: torch.Tensor, _helion_prefetched_vectors: float) -> torch
     return out
 
 
-@skipUnlessBackends(["cute"])
 def test_final_parameter_renaming_cannot_capture_new_packet_lists():
     bound = _bound(function=_name_collision)
     off = _functions(bound.to_code(_config()))[-2]
@@ -316,7 +309,6 @@ def test_final_parameter_renaming_cannot_capture_new_packet_lists():
 
 
 @pytest.mark.parametrize("length,stride", [(0, 1), (1027, 1), (8192, 2)])
-@skipUnlessBackends(["cute"])
 def test_empty_tail_and_nonunit_stride_choose_exact_original_fallback(length, stride):
     tensor = torch.empty(max(length * stride, 1), dtype=torch.bfloat16)[
         : length * stride : stride
@@ -348,7 +340,7 @@ def test_knob_is_not_admitted_by_other_backends():
     spec = ConfigSpec(backend=TritonBackend())
     assert not spec.supports_config_key("cute_packet_prefetch")
     with pytest.raises(InvalidConfig, match="requires CuTe"):
-        spec.enable_cute_packet_prefetch()
+        enable_cute_packet_prefetch(spec)
     with pytest.raises(InvalidConfig, match="Unsupported config keys"):
         spec.normalize(helion.Config(cute_packet_prefetch=2))
 
@@ -448,7 +440,6 @@ def test_final_rename_cannot_hide_a_loop_carried_load_address():
 
 @pytest.mark.parametrize("bounds", [False, True])
 @pytest.mark.parametrize("prefetch", [0, 2, 4, 8])
-@skipUnlessBackends(["cute"])
 def test_flat_dependency_repair_changes_only_prefetch(bounds, prefetch):
     bound = _bound()
     with bound.env:
@@ -458,13 +449,12 @@ def test_flat_dependency_repair_changes_only_prefetch(bounds, prefetch):
         b = generation._key_to_flat_indices["cute_proven_bounds"][0][0]
         flat[p], flat[b] = prefetch, bounds
         before = deepcopy(flat)
-        generation._repair_cute_num_threads(flat)
+        generation.extension.repair_flat_config(flat)
         assert flat[p] == (prefetch if bounds else 0)
         assert flat[:p] + flat[p + 1 :] == before[:p] + before[p + 1 :]
         assert generation.flatten(generation.unflatten(flat)) == flat
 
 
-@skipUnlessBackends(["cute"])
 def test_flat_repair_is_inert_when_fields_or_backend_are_absent():
     bound = _bound()
     with bound.env:
@@ -472,16 +462,18 @@ def test_flat_repair_is_inert_when_fields_or_backend_are_absent():
         flat = generation.default_flat()
         before = deepcopy(flat)
         with patch.object(generation, "_key_to_flat_indices", {}):
-            generation._repair_cute_packet_prefetch(flat)
+            generation.extension._repair_packet_prefetch(flat)
         assert flat == before
     generation = ConfigGeneration(ConfigSpec(backend=TritonBackend()))
+    # A backend without a generation extension of its own gets the no-op base
+    # object, whose repair hook leaves every flat config alone.
+    assert type(generation.extension) is ConfigGenerationExtension
     flat = generation.default_flat()
     before = deepcopy(flat)
-    generation._repair_cute_packet_prefetch(flat)
+    generation.extension.repair_flat_config(flat)
     assert flat == before
 
 
-@skipUnlessBackends(["cute"])
 def test_random_biased_and_coordinate_neighbors_round_trip():
     import random
 

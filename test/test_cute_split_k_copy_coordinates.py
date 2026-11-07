@@ -7,13 +7,19 @@ import pytest
 
 from test.test_cute_split_k_cluster import _bind
 from test.test_cute_split_k_cluster import _carrier
-from test.test_cute_split_k_cluster import cpu_only as cpu_only
 from test.test_cute_split_k_workspace import _embedded_sources
 
 from helion._compiler.cute.split_k_cluster_codegen import _a_copy_coordinates
-from helion._testing import skipUnlessBackends
+from helion._testing import default_cute_mma_support
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
+# ``tcgen05_cpu_target``: the B200 model with the default (tcgen05-on) MMA
+# support record and the full 227 KiB opt-in SMEM as the AB budget.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(
+        mma_support=default_cute_mma_support(), smem_budget_bytes=232448
+    ),
+]
 
 
 def test_a_packet_coordinates_preserve_flat_index_for_every_bk_residue():
@@ -39,7 +45,6 @@ def test_a_packet_coordinates_preserve_flat_index_for_every_bk_residue():
 @pytest.mark.parametrize("shape", ((32, 4096, 64), (48, 8192, 80)))
 @pytest.mark.parametrize("bias", (False, True))
 @pytest.mark.parametrize("finalizer_warps", (1, 4))
-@skipUnlessBackends(["cute"])
 def test_emitted_a_packets_cover_each_private_slab_once(shape, bias, finalizer_warps):
     bound, args = _bind(shape, bias=bias)
     config = _carrier(bound)

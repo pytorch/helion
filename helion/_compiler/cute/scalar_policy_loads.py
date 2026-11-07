@@ -5,12 +5,10 @@ from __future__ import annotations
 import ast
 from typing import cast
 
+from .cache_policy_loads import LOAD_POLICY_KEYWORDS
+from .cache_policy_loads import CachePolicy
+
 _SCALAR_TYPES = frozenset(("Float32", "Float64", "Int32", "Int64", "Uint32", "Uint64"))
-_POLICIES = {
-    ("level1_eviction_priority", "evict_first"): "first",
-    ("level1_eviction_priority", "evict_last"): "last",
-    ("cop", "cs"): "streaming",
-}
 
 
 class _LowerScalarPolicyLoads(ast.NodeTransformer):
@@ -28,18 +26,15 @@ class _LowerScalarPolicyLoads(ast.NodeTransformer):
         ):
             return node
         dtype = node.args[1]
-        keyword = node.keywords[0]
         if (
             not isinstance(dtype, ast.Attribute)
             or not isinstance(dtype.value, ast.Name)
             or dtype.value.id != "cutlass"
             or dtype.attr not in _SCALAR_TYPES
-            or keyword.arg is None
-            or not isinstance(keyword.value, ast.Constant)
-            or not isinstance(keyword.value.value, str)
         ):
             return node
-        policy = _POLICIES.get((keyword.arg, keyword.value.value))
+        cache_policy = CachePolicy.from_load_keywords(node.keywords)
+        policy = cache_policy.scalar_policy if cache_policy is not None else None
         if policy is None:
             return node
         return ast.copy_location(
@@ -60,9 +55,8 @@ def lower_scalar_policy_loads(body: list[ast.stmt]) -> list[ast.stmt]:
     changing the selected cache hints. Earlier scheduling and alias passes
     must still see their original ``cute.arch.load`` nodes.
     """
-    policy_keywords = {name for name, _ in _POLICIES}
     if not any(
-        isinstance(node, ast.keyword) and node.arg in policy_keywords
+        isinstance(node, ast.keyword) and node.arg in LOAD_POLICY_KEYWORDS
         for statement in body
         for node in ast.walk(statement)
     ):

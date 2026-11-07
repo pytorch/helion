@@ -14,8 +14,15 @@ import numpy as np
 import pytest
 
 import helion
-from helion._compiler import tile_strategy as lanes
 from helion._compiler.ast_read_writes import ast_rename
+from helion._compiler.cute._ast_pass_utils import assigned_name
+from helion._compiler.cute.lane_loops.markers import _create_lane_loop
+from helion._compiler.cute.lane_loops.markers import _is_lane_reduce_marker_assign
+from helion._compiler.cute.lane_loops.markers import _lane_reduce_marker_expr
+from helion._compiler.cute.lane_loops.owner_guards import _clone_stmt
+from helion._compiler.cute.lane_loops.split import _certify_lane_running_sum
+from helion._compiler.cute.lane_loops.split import _validate_owned_lane_carry_schedule
+from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
 pytestmark = pytest.mark.cpu_only
 
@@ -35,7 +42,7 @@ def _source(body: list[ast.AST]) -> str:
 
 
 def _marker(owner: str | None = "lane", value: str = "partial") -> str:
-    return lanes._lane_reduce_marker_expr(
+    return _lane_reduce_marker_expr(
         value, "sum", "cutlass.Float32(0)", 1, owner_lane=owner
     )
 
@@ -48,7 +55,7 @@ def _loop(
         "product = values[offset + lane]\n"
         "fold = fold + product\nacc_next = base + fold\n"
     )
-    return lanes._create_lane_loop(
+    return _create_lane_loop(
         "lane",
         extent,
         _body(
@@ -64,7 +71,7 @@ class _SplitOptions(TypedDict, total=False):
 
 
 def _split(loop: ast.For, **kwargs: Unpack[_SplitOptions]) -> list[ast.AST]:
-    return lanes.split_lane_loop_reductions(
+    return split_lane_loop_reductions(
         [loop], rename_groups=_RENAMES, running_sums={"fold"}, **kwargs
     )
 
@@ -90,7 +97,7 @@ def test_full_lane_sum_and_matmul_fold_have_distinct_scopes(
         orelse=[],
     )
     ast.fix_missing_locations(outer)
-    body = lanes.split_lane_loop_reductions(
+    body = split_lane_loop_reductions(
         [outer], rename_groups=_RENAMES, running_sums={"fold"}
     )
     values = np.resize(np.array([2**24, 1, -(2**24), 3, -2], np.float32), 3 * extent)
@@ -122,7 +129,7 @@ def test_full_lane_sum_and_matmul_fold_have_distinct_scopes(
     assert isinstance(lowered_outer, ast.For)
     inner = next(stmt for stmt in lowered_outer.body if isinstance(stmt, ast.For))
     assert ast.dump(inner.iter) == ast.dump(loop.iter)
-    names = [lanes._plain_assignment_name(stmt) for stmt in inner.body]
+    names = [assigned_name(stmt) for stmt in inner.body]
     assert names.count("fold") == 1
     assert names.index("product") < names.index("fold")
     assert (names.index("fold") < names.index("reduced_lane_acc")) != marker_first
@@ -156,7 +163,7 @@ def test_fp32_running_additions_are_not_regrouped_into_a_fresh_sum() -> None:
 def test_provenance_does_not_depend_on_a_temporary_name_convention() -> None:
     loop = _loop()
     ast_rename(loop, {"fold": "opaque_temporary"})
-    lowered = lanes.split_lane_loop_reductions(
+    lowered = split_lane_loop_reductions(
         [loop], rename_groups=_RENAMES, running_sums={"opaque_temporary"}
     )
     assert "opaque_temporary = opaque_temporary + product" in _source(lowered)
@@ -167,7 +174,7 @@ def test_a_self_add_without_compiler_provenance_still_declines(
     provenance: set[str] | None,
 ) -> None:
     with pytest.raises(helion.exc.BackendUnsupported, match="loop-carried value"):
-        lanes.split_lane_loop_reductions(
+        split_lane_loop_reductions(
             [_loop()], rename_groups=_RENAMES, running_sums=provenance
         )
 
@@ -225,7 +232,7 @@ def test_multiple_provenance_accumulators_need_a_separate_schedule() -> None:
     loop = _loop()
     loop.body.insert(4, ast.parse("second = second + product").body[0])
     with pytest.raises(helion.exc.BackendUnsupported, match="one scalar accumulator"):
-        lanes.split_lane_loop_reductions(
+        split_lane_loop_reductions(
             [loop], rename_groups=_RENAMES, running_sums={"fold", "second"}
         )
 
@@ -287,14 +294,12 @@ def test_iterator_form_is_preserved(constexpr: bool) -> None:
 
 
 def test_unowned_marker_and_no_marker_behaviors_are_unchanged() -> None:
-    legacy = lanes.split_lane_loop_reductions(
-        [_loop(owner=None)], rename_groups=_RENAMES
-    )
+    legacy = split_lane_loop_reductions([_loop(owner=None)], rename_groups=_RENAMES)
     certified_arg = _split(_loop(owner=None))
     assert _source(legacy) == _source(certified_arg)
     assert "reduced = partial" in _source(legacy)
     body = _body("product = lane + 1\nfold = fold + product")
-    loop = lanes._create_lane_loop("lane", 4, body)
+    loop = _create_lane_loop("lane", 4, body)
     assert _source(_split(loop)) == _source([loop])
 
 
@@ -323,18 +328,14 @@ def test_final_schedule_proof_rejects_corrupted_placements(fault: str) -> None:
     markers = [
         (index, marker)
         for index, stmt in enumerate(original)
-        if (marker := lanes._is_lane_reduce_marker_assign(stmt)) is not None
+        if (marker := _is_lane_reduce_marker_assign(stmt)) is not None
     ]
-    certificate = lanes._certify_lane_running_sum(
-        loop, "lane", markers, _RENAMES, {"fold"}
-    )
+    certificate = _certify_lane_running_sum(loop, "lane", markers, _RENAMES, {"fold"})
     assert certificate is not None
     result = _split(loop)
     phase1 = next(stmt for stmt in result if isinstance(stmt, ast.For))
     position = next(
-        index
-        for index, stmt in enumerate(phase1.body)
-        if lanes._plain_assignment_name(stmt) == "fold"
+        index for index, stmt in enumerate(phase1.body) if assigned_name(stmt) == "fold"
     )
     update = phase1.body[position]
     if fault == "omitted_update":
@@ -360,12 +361,12 @@ def test_final_schedule_proof_rejects_corrupted_placements(fault: str) -> None:
     elif fault == "regrouped_add":
         phase1.body[position] = ast.parse("fold = fold + product * 4").body[0]
     elif fault == "duplicate_sweep":
-        result.append(lanes._clone_stmt(phase1))
+        result.append(_clone_stmt(phase1))
     elif fault in ("early_finalization", "missing_finalization"):
         index = next(
             index
             for index, stmt in enumerate(result)
-            if lanes._plain_assignment_name(stmt) == "reduced"
+            if assigned_name(stmt) == "reduced"
         )
         finalized = result.pop(index)
         if fault == "early_finalization":
@@ -374,20 +375,20 @@ def test_final_schedule_proof_rejects_corrupted_placements(fault: str) -> None:
         index = next(
             index
             for index, stmt in enumerate(result)
-            if lanes._plain_assignment_name(stmt) == "acc_next"
+            if assigned_name(stmt) == "acc_next"
         )
         result.insert(0, result.pop(index))
     else:
         index = next(
             index
             for index, stmt in enumerate(result)
-            if lanes._plain_assignment_name(stmt) == "extra_next"
+            if assigned_name(stmt) == "extra_next"
         )
         other = result.pop(index)
         if fault == "repeated_other_carry":
             phase1.body.append(cast("ast.stmt", other))
     with pytest.raises(helion.exc.BackendUnsupported):
-        lanes._validate_owned_lane_carry_schedule(
+        _validate_owned_lane_carry_schedule(
             original,
             result,
             "lane",

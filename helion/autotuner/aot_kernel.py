@@ -36,14 +36,15 @@ from typing import overload
 
 import torch
 
-from ..runtime.cute_structural_config import StructuralPolicyError
+from ..runtime.structural_policy import StructuralPolicyError
 from .aot_structural_policy import load_policy_module
 from .aot_structural_policy import model_configs
 
 if TYPE_CHECKING:
-    from ..runtime.cute_structural_policy import CuteStructuralPolicy
+    from ..runtime.cute.structural_policy import CuteStructuralPolicy
     from ..runtime.kernel import ConfigLike
     from ..runtime.kernel import Kernel
+    from ..runtime.structural_policy import StructuralPolicy
 
 
 _R = TypeVar("_R")
@@ -230,7 +231,7 @@ class HeuristicKeyFunction:
         self.kernel_name = kernel_name
         self.batched = batched
         self.user_key = user_key
-        self.structural_policy: CuteStructuralPolicy | None = None
+        self.structural_policy: StructuralPolicy | None = None
         self._loaded: bool = False
         self._key_fn: KeyFunction | None = None
 

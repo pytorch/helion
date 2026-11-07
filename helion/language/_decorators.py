@@ -78,31 +78,49 @@ def _register_codegen_handler(
     implementations[backend] = handler
 
 
-class CodegenDict(dict[str, "Callable[[CodegenState], object]"]):
-    """A dict subclass that falls back to the 'common' key when a backend key is missing."""
+class BackendDispatchTable(dict[str, _CodegenT]):
+    """Codegen handlers keyed by a backend's ``codegen_name``, with the
+    ``"common"`` fallback.
 
-    def __getitem__(self, key: str) -> Callable[[CodegenState], object]:
+    ``table[name]`` first lets ``repair_backend_codegen`` re-register a
+    backend whose codegen modules a reload dropped (on a hit too: a partial
+    module may have registered a handler before defining helpers it calls),
+    then returns the backend's handler or the ``"common"`` one; a miss is a
+    ``KeyError`` (``lookup`` raises ``BackendImplementationMissing`` instead).
+    Both codegen registries -- ``APIFunc._codegen`` and
+    ``AtenLowering.codegen_impls`` -- are one of these.
+    """
+
+    def __getitem__(self, key: str) -> _CodegenT:
         if key != "common":
             from .._compiler.backend_registry import repair_backend_codegen
 
-            # Exact hits also wait: a partial module may have registered a
-            # handler before defining helpers that it calls.
             repair_backend_codegen(key)
         return dict.__getitem__(self, key)
 
-    def __missing__(self, key: str) -> Callable[[CodegenState], object]:
+    def __missing__(self, key: str) -> _CodegenT:
         if key != "common" and "common" in self:
             return dict.__getitem__(self, "common")
         raise KeyError(key)
 
     # pyrefly: ignore[bad-override]
-    def get(
-        self, key: str, default: Callable[[CodegenState], object] | None = None
-    ) -> Callable[[CodegenState], object] | None:
+    def get(self, key: str, default: _CodegenT | None = None) -> _CodegenT | None:
         try:
             return self[key]
         except KeyError:
             return default
+
+    def lookup(self, codegen_name: str, *, backend_name: str, what: str) -> _CodegenT:
+        """The handler for ``codegen_name``; ``BackendImplementationMissing``
+        naming ``backend_name`` and ``what`` when there is none."""
+        try:
+            return self[codegen_name]
+        except KeyError:
+            raise exc.BackendImplementationMissing(backend_name, what) from None
+
+
+# The ``APIFunc._codegen`` registries' former name.
+CodegenDict = BackendDispatchTable
 
 
 class APIFunc(Protocol):
@@ -135,6 +153,7 @@ class APIFunc(Protocol):
         _signature: The function signature for binding and validating arguments.
     """
 
+    __name__: str
     __qualname__: str
     _helion_api: Literal[True]
     # a device loop can transition between host and device code
@@ -143,7 +162,7 @@ class APIFunc(Protocol):
     _tiles_as_sizes: bool
     _cache_type: bool
     _type_function: Callable[..., TypeInfo] | None
-    _codegen: CodegenDict
+    _codegen: BackendDispatchTable[Callable[[CodegenState], object]]
     _fake_fn: Callable[..., object] | None
     _prepare_args: Callable[[tuple[object, ...]], tuple[object, ...]]
     _post_create_proxy: Callable[..., None] | None
@@ -268,7 +287,7 @@ def api(
             api._prepare_args = no_op_prepare_args
         api._cache_type = cache_type
         api._type_function = None
-        api._codegen = CodegenDict()
+        api._codegen = BackendDispatchTable()
         api._fake_fn = None
         api._post_create_proxy = None
         api._get_masked_value = None

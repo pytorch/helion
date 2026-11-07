@@ -396,7 +396,10 @@ class NotEnoughConfigs(BaseError):
 
 
 class NoConfigFound(BaseError):
-    message = "No working config found from autotuning"
+    message = "No working config found from autotuning{0}"
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(detail)
 
 
 class ReductionOnNonTile(BaseError):
@@ -556,6 +559,13 @@ class FastMathUnused(BaseWarning):
         "or drop NaNs; without it the exact forms are used. If the "
         "kernel's consumers tolerate that, set @helion.kernel(fast_math=True) or "
         "HELION_FAST_MATH=1. Silence with ignore_warnings=[helion.exc.FastMathUnused]."
+    )
+
+
+class LaunchShapeMismatch(BaseWarning):
+    message = (
+        "The structural launch shape {0} disagrees with the launch block {1} "
+        "derived from the kernel text (CuTe launch-shape check mode)."
     )
 
 

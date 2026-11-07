@@ -13,11 +13,13 @@ from test.test_cute_shared_rhs_grouped import _target as _cpu_codegen_target
 
 import helion
 from helion._compat import requires_cuda_version
+from helion._compiler.cute import target_facts
 from helion._compiler.cute.cute_mma import _TCGEN05_INSTR_DESC_N_FIELD_SHIFT
 from helion._compiler.cute.cute_mma import _TCGEN05_INSTR_DESC_N_LOW_BITS
 from helion._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute.tcgen05_config import facts
+from helion._compiler.cute.tcgen05_config import smem
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
 from helion._compiler.cute.tcgen05_constants import (
@@ -48,7 +50,6 @@ from helion._compiler.cute.tcgen05_constants import Tcgen05GroupedRuntimeTileFie
 from helion._testing import DEVICE
 from helion._testing import matchesBackends
 from helion._testing import patch_cute_mma_support
-from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessTcgen05RuntimeNPtx
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
@@ -65,7 +66,6 @@ from helion.runtime.cute.launcher import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-pytestmark = skipUnlessBackends(["cute"])
 if matchesBackends(["cute"]):
     pytest.importorskip("cutlass")
     pytest.importorskip("cutlass.cute")
@@ -250,7 +250,7 @@ def _configured_bound(
 ):
     _selected_kernel.reset()
     bound = _selected_kernel.bind(args)
-    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    bound.env.config_spec.tcgen05.search_enabled = True
     config = _selected_config(
         block_k,
         source_m_tile,
@@ -272,12 +272,12 @@ def _code_for(
 ) -> str:
     _selected_kernel.reset()
     bound = _selected_kernel.bind(args)
-    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    bound.env.config_spec.tcgen05.search_enabled = True
     with (
         patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
         patch_cute_mma_support(),
     ):
-        return bound.to_triton_code(config)
+        return bound.to_code(config)
 
 
 def _wrapper_plans(code: str) -> list[dict[str, object]]:
@@ -289,7 +289,9 @@ def _wrapper_plans(code: str) -> list[dict[str, object]]:
 
 
 def _scheduler_mailbox_publish_fields(code: str) -> tuple[set[int], set[int]]:
-    from helion._compiler.program_id import _literal_mailbox_access_fields
+    from helion._compiler.cute.tcgen05.scheduler_pids import (
+        _literal_mailbox_access_fields,
+    )
 
     tree = ast.parse(code)
     scheduler_roles = [
@@ -957,7 +959,9 @@ def test_grouped_worklist_nm_runtime_direct_clc_rejects_dynamic_tensormaps() -> 
 
 
 def test_grouped_worklist_nm_can_retain_scheduler_mailbox() -> None:
-    from helion._compiler.program_id import _literal_mailbox_access_fields
+    from helion._compiler.cute.tcgen05.scheduler_pids import (
+        _literal_mailbox_access_fields,
+    )
 
     _require_codegen_cuda()
 
@@ -1080,13 +1084,13 @@ def test_grouped_worklist_nm_codegen_backstop_rejects_generated_smem() -> None:
         )
         _selected_kernel.reset()
         bound = cpu_bind(_selected_kernel, args)
-        bound.env.config_spec.cute_tcgen05_search_enabled = True
-        bound.env.config_spec._tcgen05_ab_stages_three_search_constraints = None
+        bound.env.config_spec.tcgen05.search_enabled = True
+        bound.env.config_spec.tcgen05.ab_stages_three_search_constraints = None
         with (
             patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
             patch_cute_mma_support(),
             patch.object(
-                CuteTcgen05Config,
+                target_facts,
                 "per_cta_smem_capacity_bytes",
                 return_value=1,
             ),
@@ -1098,7 +1102,7 @@ def test_grouped_worklist_nm_codegen_backstop_rejects_generated_smem() -> None:
                 ),
             ),
         ):
-            bound.to_triton_code(config)
+            bound.to_code(config)
 
 
 def test_grouped_worklist_nm_rejects_alpha_scaled_row() -> None:
@@ -1107,8 +1111,8 @@ def test_grouped_worklist_nm_rejects_alpha_scaled_row() -> None:
     args = (*_make_args((224, 256), n=224, k=128), 2)
     _selected_kernel.reset()
     bound = _selected_kernel.bind(args)
-    assert not bound.env.config_spec.cute_tcgen05_search_enabled
-    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    assert not bound.env.config_spec.tcgen05.search_enabled
+    bound.env.config_spec.tcgen05.search_enabled = True
     with (
         patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
         patch_cute_mma_support(),
@@ -1117,7 +1121,7 @@ def test_grouped_worklist_nm_rejects_alpha_scaled_row() -> None:
             match="rank3 grouped semantic proof failed",
         ),
     ):
-        bound.to_triton_code(_selected_config())
+        bound.to_code(_selected_config())
 
 
 def test_tcgen05_runtime_instr_desc_n_field_matches_cutlass() -> None:
@@ -1270,7 +1274,9 @@ def test_grouped_worklist_nm_fixed_full_allocation_tensormaps_codegen(
     block_k: int,
     source_m_tile: int,
 ) -> None:
-    from helion._compiler.program_id import _literal_mailbox_access_fields
+    from helion._compiler.cute.tcgen05.scheduler_pids import (
+        _literal_mailbox_access_fields,
+    )
 
     _require_codegen_cuda()
 
@@ -1427,7 +1433,9 @@ def test_grouped_worklist_nm_one_cta_codegen(runtime_direct: bool) -> None:
     assert ("StaticPersistentGroupTileScheduler.create" in code) is not runtime_direct
     assert ("tcgen05_grouped_runtime_tile_records.iterator" in code) is runtime_direct
     if not runtime_direct:
-        from helion._compiler.program_id import _literal_mailbox_access_fields
+        from helion._compiler.cute.tcgen05.scheduler_pids import (
+            _literal_mailbox_access_fields,
+        )
 
         consumer_fields, producer_fields = _literal_mailbox_access_fields(
             ast.parse(code), "tcgen05_work_tile_smem"
@@ -1782,8 +1790,9 @@ def test_grouped_worklist_nm_compiler_facts_reject_over_budget_profile() -> None
     )
     _selected_kernel.reset()
     bound = _selected_kernel.bind(args)
-    bound.env.config_spec.cute_tcgen05_search_enabled = True
-    bound.env.config_spec.register_cute_tcgen05_grouped_worklist_smem_facts(
+    bound.env.config_spec.tcgen05.search_enabled = True
+    facts.register_grouped_worklist_smem_facts(
+        bound.env.config_spec.tcgen05,
         group_count=int(args[2].size(0)),
         device_split_sizes=False,
     )
@@ -1796,23 +1805,23 @@ def test_grouped_worklist_nm_compiler_facts_reject_over_budget_profile() -> None
             "SMEM footprint",
         ),
     ):
-        bound.to_triton_code(config)
+        bound.to_code(config)
     # The rejection names what the config missed: the footprint for a
     # worklist-shaped ring, the envelope for a ring outside the worklist
     # shape (cluster_n=2, a third C stage, more than seven AB stages).
     tcgen05 = bound.env.config_spec._cute_tcgen05_config
     values = dict(config.config)
-    footprint = tcgen05._grouped_worklist_nm_ab_config_mismatch(values, 7)
+    footprint = smem._grouped_worklist_nm_ab_config_mismatch(tcgen05, values, 7)
     assert footprint is not None
     assert "per-CTA SMEM footprint" in footprint
-    assert tcgen05._grouped_worklist_nm_ab_config_mismatch(values, 6) is None
+    assert smem._grouped_worklist_nm_ab_config_mismatch(tcgen05, values, 6) is None
     for override, ab_stages in (
         ({"tcgen05_cluster_n": 2}, 6),
         ({"tcgen05_c_stages": 4}, 6),
         ({}, 8),
     ):
-        mismatch = tcgen05._grouped_worklist_nm_ab_config_mismatch(
-            {**values, **override}, ab_stages
+        mismatch = smem._grouped_worklist_nm_ab_config_mismatch(
+            tcgen05, {**values, **override}, ab_stages
         )
         assert mismatch is not None
         assert "outside the grouped N,M worklist envelope" in mismatch
@@ -1824,8 +1833,8 @@ def test_grouped_worklist_nm_rejects_shifted_load_mask() -> None:
     args = (*_make_args((224, 256), n=224, k=128), 1, 1)
     _selected_kernel.reset()
     bound = _selected_kernel.bind(args)
-    assert not bound.env.config_spec.cute_tcgen05_search_enabled
-    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    assert not bound.env.config_spec.tcgen05.search_enabled
+    bound.env.config_spec.tcgen05.search_enabled = True
     with (
         patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
         patch_cute_mma_support(),
@@ -1834,7 +1843,7 @@ def test_grouped_worklist_nm_rejects_shifted_load_mask() -> None:
             match="rank3 grouped semantic proof failed",
         ),
     ):
-        bound.to_triton_code(_selected_config())
+        bound.to_code(_selected_config())
 
 
 def test_grouped_worklist_nm_rejects_extra_metadata_columns() -> None:
@@ -1849,8 +1858,8 @@ def test_grouped_worklist_nm_rejects_extra_metadata_columns() -> None:
     args = (a_packed, b_grouped, torch.cat((worklist, extra_column), dim=1))
     _selected_kernel.reset()
     bound = _selected_kernel.bind(args)
-    assert not bound.env.config_spec.cute_tcgen05_search_enabled
-    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    assert not bound.env.config_spec.tcgen05.search_enabled
+    bound.env.config_spec.tcgen05.search_enabled = True
     with (
         patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
         patch_cute_mma_support(),
@@ -1862,7 +1871,7 @@ def test_grouped_worklist_nm_rejects_extra_metadata_columns() -> None:
             ),
         ),
     ):
-        bound.to_triton_code(_selected_config())
+        bound.to_code(_selected_config())
 
 
 @pytest.mark.parametrize(

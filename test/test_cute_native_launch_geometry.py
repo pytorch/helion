@@ -18,7 +18,6 @@ from test.test_cute_materialized_fission import _sources
 
 import helion
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
@@ -39,12 +38,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_b200() -> Iterator[None]:
-    with (
-        cpu_target(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
-    ):
+    with cpu_target():
         yield
 
 

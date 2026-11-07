@@ -20,8 +20,10 @@ from test.cute_population_contracts import _target
 
 import helion
 from helion._compiler.ast_extension import ExtendedAST
-from helion._compiler.autotuner_heuristics.cute_epilogue_fanout import _fits_one_wave
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.autotune.heuristics.cute_epilogue_fanout import (
+    _fits_one_wave,
+)
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.epilogue_fanout import FANOUT_CONFIG_KEY
 from helion._compiler.cute.epilogue_fanout import FanoutIteration
@@ -33,13 +35,13 @@ from helion._compiler.cute.epilogue_fanout import prove_paired_fanout
 from helion._compiler.cute.epilogue_fanout import render_chain
 from helion._compiler.cute.epilogue_fanout import render_shared_suffix
 from helion._compiler.cute.epilogue_fanout import schedule_supported
+from helion._compiler.cute.tcgen05_config import repair
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from helion._compiler.type_info import LiteralType
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
@@ -444,7 +446,6 @@ def plan_for(bound: BoundKernel[Any]) -> PairedFanoutPlan:
     "fn", (paired, rounded_sigmoid, renamed_relu, duplicate, unrounded, bias_gelu_aux)
 )
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
-@skipUnlessBackends(["cute"])
 def test_typed_public_fanout_and_default_source(
     fn: Callable[..., object], dtype: torch.dtype
 ) -> None:
@@ -463,7 +464,6 @@ def test_typed_public_fanout_and_default_source(
     assert plan.unrounded_prefix is (fn in (unrounded, bias_gelu_aux))
 
 
-@skipUnlessBackends(["cute"])
 def test_bias_gelu_aux_shares_one_tmem_read_and_the_fp32_prefix() -> None:
     # The cuBLASLt GELU_AUX pattern: ``aux = pre.to(dt); out = gelu(pre)`` with a
     # row-vector bias in the shared prefix. One subtile loop reads TMEM once,
@@ -533,7 +533,6 @@ def _pre_wait_shared(bn: int) -> helion.Config:
         (bias_gelu_aux, torch.float16, 128, False),
     ),
 )
-@skipUnlessBackends(["cute"])
 def test_pre_wait_shared_fanout_decides_smem_staged_rowvec_leaves_at_normalization(
     fn: Callable[..., object], bias_dtype: torch.dtype, bn: int, staged: bool
 ) -> None:
@@ -571,7 +570,6 @@ def test_pre_wait_shared_fanout_decides_smem_staged_rowvec_leaves_at_normalizati
     assert spec.normalized_config(requested).config[FANOUT_CONFIG_KEY] == "shared"
 
 
-@skipUnlessBackends(["cute"])
 def test_shared_fanout_second_chain_binds_rank0_scalars_once() -> None:
     # ``out = (gelu(pre) * out_scale[()])``: the scalar belongs to the second
     # chain's suffix.  The shared traversal renders that suffix against the
@@ -645,7 +643,6 @@ def test_c_stages_gate_charges_every_output_store_ring() -> None:
 
 
 @pytest.mark.parametrize("fn", (aliased_outputs, output_reload))
-@skipUnlessBackends(["cute"])
 def test_unproved_alias_and_reload_decline(fn: Callable[..., object]) -> None:
     bound = bind(fn)
     assert not bound.config_spec._cute_tcgen05_config.epilogue_fanout_plans
@@ -659,7 +656,6 @@ def test_unproved_alias_and_reload_decline(fn: Callable[..., object]) -> None:
 
 
 @pytest.mark.parametrize("rows,columns", ((257, 128), (256, 129), (130, 65)))
-@skipUnlessBackends(["cute"])
 def test_partial_tiles_retain_separate_fallback(rows: int, columns: int) -> None:
     bound = bind(rows=rows, columns=columns)
     assert plan_for(bound)
@@ -674,7 +670,6 @@ def test_partial_tiles_retain_separate_fallback(rows: int, columns: int) -> None
 
 
 @pytest.mark.parametrize("value", (None, True, False, 0, 1, "invalid"))
-@skipUnlessBackends(["cute"])
 def test_mode_is_typed_and_normalized(value: object) -> None:
     bound = bind()
     raw = deepcopy(config(bound, "off").config)
@@ -722,7 +717,6 @@ def original_bound() -> BoundKernel[Any]:
     return kernel._bind_isolated(args)
 
 
-@skipUnlessBackends(["cute"])
 def test_original_cuda_traced_two_region_binding() -> None:
     bound = original_bound()
     plan = plan_for(bound)
@@ -755,7 +749,6 @@ def test_original_cuda_traced_two_region_binding() -> None:
         "gate_out[0] = 1",
     ),
 )
-@skipUnlessBackends(["cute"])
 def test_typed_host_freshness_rejects_effects_and_rebinding(statement: str) -> None:
     bound = bind()
     host = bound.host_function
@@ -774,7 +767,6 @@ def test_typed_host_freshness_rejects_effects_and_rebinding(statement: str) -> N
 
 
 @pytest.mark.parametrize("fn", (opaque_scalar, opaque_property, opaque_factory))
-@skipUnlessBackends(["cute"])
 def test_actual_typed_opaque_metadata_declines(fn: Callable[..., object]) -> None:
     reads = _metadata_provider.reads
     bound = bind(fn)
@@ -806,7 +798,6 @@ def test_actual_typed_opaque_metadata_declines(fn: Callable[..., object]) -> Non
         assert literals
 
 
-@skipUnlessBackends(["cute"])
 def test_opaque_scalar_fallback_preserves_actual_allocating_host_effect() -> None:
     global _mutate_output_storage
     values = (
@@ -844,14 +835,12 @@ def test_opaque_scalar_fallback_preserves_actual_allocating_host_effect() -> Non
         defaults["_launcher"] = launcher.default_cute_launcher
 
 
-@skipUnlessBackends(["cute"])
 def test_known_metadata_constants_and_fp32_outputs_remain_supported() -> None:
     bound = bind(known_metadata)
     assert plan_for(bound).output_dtype is torch.float32
     assert bound.to_code(config(bound))
 
 
-@skipUnlessBackends(["cute"])
 def test_carrierless_binding_keeps_old_search_registry() -> None:
     # A 256x128 output has fewer 128x128 tiles than SMs, so the tcgen05 seeds
     # include one-CTA small-grid tiles (128x{16,32,64}x64), and those carry
@@ -881,7 +870,6 @@ def test_carrierless_binding_keeps_old_search_registry() -> None:
 @pytest.mark.parametrize(
     "change", ("mask", "indices", "third_store", "wrong_graph", "dtype")
 )
-@skipUnlessBackends(["cute"])
 def test_live_typed_store_proof_negatives(change: str) -> None:
     bound = bind()
     plan = plan_for(bound)
@@ -925,7 +913,6 @@ def test_live_typed_store_proof_negatives(change: str) -> None:
         target.meta["val"] = target_value
 
 
-@skipUnlessBackends(["cute"])
 def test_store_mode_field_survives_the_fanout_registration() -> None:
     # The fan-out carriers are normalized before the heuristic flips
     # ``epilogue_fanout_search_enabled``; a store-mode field that left the
@@ -957,7 +944,6 @@ def test_store_mode_field_survives_the_fanout_registration() -> None:
             spec.normalize(dict(carrier.config))
 
 
-@skipUnlessBackends(["cute"])
 def test_registered_witnesses_are_independent_and_cache_visible() -> None:
     bound = original_bound()
     spec = bound.config_spec
@@ -1027,7 +1013,6 @@ def _hoist_geometries(bound: BoundKernel[Any]) -> list[tuple[int, ...]]:
     return seen
 
 
-@skipUnlessBackends(["cute"])
 def test_one_wave_geometry_fills_a_free_fanout_witness_slot() -> None:
     # 1024x512 has 32 standard tiles, so the small-grid seeds spread the
     # output over 64x64 (128 tiles: one wave on 148 SMs) and 128x{16,32,64}.
@@ -1092,7 +1077,6 @@ def test_one_wave_geometry_fills_a_free_fanout_witness_slot() -> None:
     ]
 
 
-@skipUnlessBackends(["cute"])
 def test_an_admitted_pair_seed_leaves_the_fanout_group_one_cta() -> None:
     # 4096x4096 at K = 64 is seeded with the machine-filling 256x256x64 CTA
     # pairs alone, and the pair fanout admits that seed by budget (three AB
@@ -1123,8 +1107,8 @@ def test_an_admitted_pair_seed_leaves_the_fanout_group_one_cta() -> None:
         seed
         for seed in seeds
         if schedule_supported(seed.config)
-        and state.epilogue_fanout_refusal(
-            dict(seed.config) | {FANOUT_CONFIG_KEY: "shared"}
+        and repair.epilogue_fanout_refusal(
+            state, dict(seed.config) | {FANOUT_CONFIG_KEY: "shared"}
         )
         is None
     ]
@@ -1138,7 +1122,6 @@ def test_an_admitted_pair_seed_leaves_the_fanout_group_one_cta() -> None:
     assert _hoist_geometries(bound) == [(256, 128, 64), (128, 128, 64)]
 
 
-@skipUnlessBackends(["cute"])
 def test_one_wave_counts_the_cluster_footprint() -> None:
     # 2048x2048 in 256x128 pair tiles is 128 tiles -- within the 148 SMs as
     # tiles, but each pair occupies two SMs. The hoist group's synthesized
@@ -1181,7 +1164,6 @@ def _rendered_plan(
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 @pytest.mark.parametrize("fn", (paired, rounded_sigmoid))
-@skipUnlessBackends(["cute"])
 def test_actual_typed_suffix_ieee_bits_and_required_rounding(
     dtype: torch.dtype,
     fn: Callable[..., object],
@@ -1291,7 +1273,6 @@ def _store_records() -> tuple[FanoutStore, FanoutStore]:
         "missing_advance",
     ),
 )
-@skipUnlessBackends(["cute"])
 def test_pair_lifetime_negatives(fault: str) -> None:
     first, second = _store_records()
     if fault == "reversed":
@@ -1310,7 +1291,6 @@ def test_pair_lifetime_negatives(fault: str) -> None:
         combine_stores(first, second)
 
 
-@skipUnlessBackends(["cute"])
 def test_complete_store_registration_and_single_commit_group() -> None:
     first, second = _store_records()
     state = CuteDeviceFunctionState()
@@ -1319,9 +1299,9 @@ def test_complete_store_registration_and_single_commit_group() -> None:
         state.register_tcgen05_epi_role_stmts([store.main])
     assert not state.register_paired_fanout_store(first, [])
     with pytest.raises(BackendUnsupported, match="incomplete"):
-        state.finalize_tcgen05_pure_lifecycle_stores()
+        state.finalize_tcgen05_paired_fanout_stores()
     assert state.register_paired_fanout_store(second, [])
-    state.finalize_tcgen05_pure_lifecycle_stores()
+    state.finalize_tcgen05_paired_fanout_stores()
     emitted = ast.unparse(first.main)
     assert emitted.count("commit()") == 1
     assert emitted.count("barrier0.arrive_and_wait()") == 2

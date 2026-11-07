@@ -26,6 +26,10 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as prims
 
+from .device.sync import mbar_arrive_elected
+from .device.sync import mbar_wait
+from .device.sync import mbar_wait_flip
+
 
 def packed_f32x2_binary(
     op: Callable,
@@ -402,150 +406,6 @@ def raw_v_ldmatrix_trans_ptr(raw_v_smem, value_dim_base, lane):
 
 
 @cute.jit
-def tma_transfer_wait(tma_mbar, tma_phase) -> None:
-    """Spin until one tma_mbar ring slot's expect_tx transaction completes."""
-
-    while not prims.mbarrier_wait_parity(
-        tma_mbar,
-        tma_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-
-
-@cute.jit
-def output_ready_arrive(output_ready_mbar) -> None:
-    """Signal that this CG1 warp has finished staging output SMEM."""
-
-    if prims.elect_sync():
-        prims.mbarrier_arrive(output_ready_mbar)
-
-
-@cute.jit
-def output_ready_wait(output_ready_mbar, output_ready_phase):
-    """Wait until all CG1 warps have staged the output tile."""
-
-    while not prims.mbarrier_wait_parity(
-        output_ready_mbar,
-        output_ready_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return output_ready_phase ^ cutlass.Int32(1)
-
-
-@cute.jit
-def raw_ready_arrive(raw_ready_mbar) -> None:
-    """Signal that raw SMEM inputs are ready (k2-chain relay only)."""
-
-    if prims.elect_sync():
-        prims.mbarrier_arrive(raw_ready_mbar)
-
-
-@cute.jit
-def raw_ready_wait(raw_ready_mbar, raw_ready_phase):
-    """Generic mbarrier parity spin-wait.
-
-    The engine-class kernels observe raw readiness directly on the
-    chunk's tma_mbar ring slot (consumer-direct wait); the k2 chain
-    kernels still wait their raw_ready relay ring, and the ws_stored /
-    The deltas_issued relay ring uses this helper too.
-    """
-
-    while not prims.mbarrier_wait_parity(
-        raw_ready_mbar,
-        raw_ready_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return raw_ready_phase ^ cutlass.Int32(1)
-
-
-@cute.jit
-def raw_consumed_arrive(raw_consumed_mbar) -> None:
-    """Signal that one participating warp has finished raw-slot reads."""
-
-    if prims.elect_sync():
-        prims.mbarrier_arrive(raw_consumed_mbar)
-
-
-@cute.jit
-def raw_consumed_wait(raw_consumed_mbar, raw_consumed_phase):
-    """Wait until the previous chunk no longer reads raw input SMEM."""
-
-    while not prims.mbarrier_wait_parity(
-        raw_consumed_mbar,
-        raw_consumed_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return raw_consumed_phase ^ cutlass.Int32(1)
-
-
-@cute.jit
-def state_input_ready_arrive(state_input_ready_mbar) -> None:
-    """Signal that this CG1 warp has packed state_as_input TMEM."""
-
-    if prims.elect_sync():
-        prims.mbarrier_arrive(state_input_ready_mbar)
-
-
-@cute.jit
-def state_input_ready_wait(state_input_ready_mbar, state_input_ready_phase):
-    """Wait until all CG1 warps have packed state_as_input TMEM."""
-
-    while not prims.mbarrier_wait_parity(
-        state_input_ready_mbar,
-        state_input_ready_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return state_input_ready_phase ^ cutlass.Int32(1)
-
-
-@cute.jit
-def update_ready_arrive(update_ready_mbar) -> None:
-    """Signal that this CG1 warp has staged update for qkv MMA."""
-
-    if prims.elect_sync():
-        prims.mbarrier_arrive(update_ready_mbar)
-
-
-@cute.jit
-def update_ready_wait(update_ready_mbar, update_ready_phase):
-    """Wait until all CG1 warps have staged update for qkv MMA."""
-
-    while not prims.mbarrier_wait_parity(
-        update_ready_mbar,
-        update_ready_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return update_ready_phase ^ cutlass.Int32(1)
-
-
-@cute.jit
-def final_state_stored_arrive(final_state_stored_mbar) -> None:
-    """Signal that this CG1 warp has finished draining final_state TMEM."""
-
-    if prims.elect_sync():
-        prims.mbarrier_arrive(final_state_stored_mbar)
-
-
-@cute.jit
-def final_state_stored_wait(final_state_stored_mbar, final_state_stored_phase):
-    """Wait until CG1 has drained final_state before TMEM deallocation."""
-
-    while not prims.mbarrier_wait_parity(
-        final_state_stored_mbar,
-        final_state_stored_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return final_state_stored_phase ^ cutlass.Int32(1)
-
-
-@cute.jit
 def pack_output_b16x2_to_i32(
     value0: cutlass.Float32,
     value1: cutlass.Float32,
@@ -756,7 +616,7 @@ def tcgen05_rescale_state_dv2_half_regs(
 
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-    state_input_ready_arrive(state_input_ready_mbar)
+    mbar_arrive_elected(state_input_ready_mbar)
     prims.tcgen05_st("16x256b", state_ptr, scaled_state[0:32])
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -850,22 +710,6 @@ def tcgen05_issue_state_k_mma(
         COMMIT,
         M_DIM,
     )
-
-
-@cute.jit
-def tcgen05_wait_acc_buffer_ready(
-    acc_ready_mbar,
-    acc_ready_phase,
-):
-    """Wait until a producer commit has filled the corresponding TMEM acc tile."""
-
-    while not prims.mbarrier_wait_parity(
-        acc_ready_mbar,
-        acc_ready_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return acc_ready_phase ^ cutlass.Int32(1)
 
 
 @cute.jit
@@ -1550,7 +1394,7 @@ def kernel_chain_dv2(
             ws_chunk = chunk_base + chunk
             ws_row_start = ws_chunk * cutlass.Int32(BT)
             v_row_start = sequence_start + chunk * cutlass.Int32(BT)
-            raw_consumed_wait(
+            mbar_wait_flip(
                 raw_consumed_mbar.subview(raw_stage),
                 raw_consumed_phase,
             )
@@ -1579,12 +1423,12 @@ def kernel_chain_dv2(
                 issue_mbar_slot, 1, K2_TMA_MBAR_STAGE_COUNT
             )
             if chunk >= cutlass.Int32(K2_TMA_MBAR_STAGE_COUNT - 1):
-                tma_transfer_wait(tma_mbar.subview(wait_mbar_slot), tma_phase)
+                mbar_wait(tma_mbar.subview(wait_mbar_slot), tma_phase)
                 wait_mbar_slot, wait_wrapped = advance_ring_stage(
                     wait_mbar_slot, 1, K2_TMA_MBAR_STAGE_COUNT
                 )
                 tma_phase = tma_phase ^ wait_wrapped
-                raw_ready_arrive(raw_ready_mbar.subview(ready_stage))
+                mbar_arrive_elected(raw_ready_mbar.subview(ready_stage))
                 ready_stage, _ = advance_ring_stage(ready_stage, 1, K2_RAW_STAGE_COUNT)
             raw_stage, raw_wrapped = advance_ring_stage(
                 raw_stage, 1, K2_RAW_STAGE_COUNT
@@ -1598,12 +1442,12 @@ def kernel_chain_dv2(
             + (cutlass.Int32(1) - tma_full) * num_chunks
         )
         for _tail in cutlass.range(tma_tail, unroll=1):
-            tma_transfer_wait(tma_mbar.subview(wait_mbar_slot), tma_phase)
+            mbar_wait(tma_mbar.subview(wait_mbar_slot), tma_phase)
             wait_mbar_slot, wait_wrapped = advance_ring_stage(
                 wait_mbar_slot, 1, K2_TMA_MBAR_STAGE_COUNT
             )
             tma_phase = tma_phase ^ wait_wrapped
-            raw_ready_arrive(raw_ready_mbar.subview(ready_stage))
+            mbar_arrive_elected(raw_ready_mbar.subview(ready_stage))
             ready_stage, _ = advance_ring_stage(ready_stage, 1, K2_RAW_STAGE_COUNT)
 
     # ====== warp 12: output-group issuer (OUT_ISSUER12) / flag relay ======
@@ -1618,20 +1462,20 @@ def kernel_chain_dv2(
             acc_stage = chunk % 2
             if chunk > 0:
                 prev12 = chunk - cutlass.Int32(1)
-                tcgen05_wait_acc_buffer_ready(
+                mbar_wait_flip(
                     qstate_acc_ready_mbar.subview(prev12 % K2_QSTATE_STAGE_COUNT),
                     (prev12 // K2_QSTATE_STAGE_COUNT) % 2,
                 )
-                raw_consumed_arrive(
+                mbar_arrive_elected(
                     raw_consumed_mbar.subview(prev12 % K2_RAW_STAGE_COUNT)
                 )
-            raw_ready_wait(
+            mbar_wait_flip(
                 raw_ready_mbar.subview(raw_stage),
                 (chunk // K2_RAW_STAGE_COUNT) % 2,
             )
-            si_phase12 = state_input_ready_wait(state_input_ready_mbar, si_phase12)
+            si_phase12 = mbar_wait_flip(state_input_ready_mbar, si_phase12)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-            output_ready_wait(
+            mbar_wait_flip(
                 output_ready_mbar.subview(qstate_stage),
                 (chunk // K2_QSTATE_STAGE_COUNT + cutlass.Int32(1)) % 2,
             )
@@ -1647,7 +1491,7 @@ def kernel_chain_dv2(
                 True,
                 DV_HALF,
             )
-            upd_phase12 = update_ready_wait(update_ready_mbar, upd_phase12)
+            upd_phase12 = mbar_wait_flip(update_ready_mbar, upd_phase12)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             xpack_col12 = tcgen05_shared_input_tmem_col_offset(acc_stage)
             tcgen05_chain_issue_qkv_mma(
@@ -1675,9 +1519,9 @@ def kernel_chain_dv2(
             kd_stage_smem = kd_smem.subview(raw_stage * TILE_ELEMS)
             w_stage_smem = w_smem.subview(raw_stage * TILE_ELEMS)
 
-            raw_ready_wait(raw_ready_mbar.subview(raw_stage), raw_phase)
+            mbar_wait_flip(raw_ready_mbar.subview(raw_stage), raw_phase)
 
-            si_l_phase = state_input_ready_wait(state_input_ready_l_mbar, si_l_phase)
+            si_l_phase = mbar_wait_flip(state_input_ready_l_mbar, si_l_phase)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             tcgen05_issue_state_k_mma(
                 kd_stage_smem,
@@ -1691,7 +1535,7 @@ def kernel_chain_dv2(
                 False,
                 DV_HALF,
             )
-            si_phase = state_input_ready_wait(state_input_ready_mbar, si_phase)
+            si_phase = mbar_wait_flip(state_input_ready_mbar, si_phase)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             tcgen05_issue_state_k_mma(
                 kd_stage_smem,
@@ -1707,7 +1551,7 @@ def kernel_chain_dv2(
             )
 
             xpack_col = tcgen05_shared_input_tmem_col_offset(acc_stage)
-            upd_phase = update_ready_wait(update_ready_mbar, upd_phase)
+            upd_phase = mbar_wait_flip(update_ready_mbar, upd_phase)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             tcgen05_chain_issue_delta_half_mma(
                 w_stage_smem,
@@ -1726,7 +1570,7 @@ def kernel_chain_dv2(
             )
             tcgen05_commit(k_restore_consumed_mbar.subview(kr_stage))
 
-        final_state_stored_wait(final_state_stored_mbar, cutlass.Int32(0))
+        mbar_wait_flip(final_state_stored_mbar, cutlass.Int32(0))
         tmem_ptr = cutlass.inttoptr(tmem_raw_addr, 6, cutlass.Float32)
         prims.tcgen05_dealloc(tmem_ptr, TMEM_ALLOC_COLS, group="cta_1")
 
@@ -1751,7 +1595,7 @@ def kernel_chain_dv2(
                 input_dtype,
                 0,
             )
-            raw_ready_wait(raw_ready_mbar.subview(0), 0)
+            mbar_wait_flip(raw_ready_mbar.subview(0), 0)
             tcgen05_rescale_state_dv2_half_regs(
                 tmem_raw_addr,
                 diag_raw_stage,
@@ -1774,7 +1618,7 @@ def kernel_chain_dv2(
                 state_input_ready_mbar,
                 1,
             )
-            tcgen05_wait_acc_buffer_ready(shared_acc_ready_mbar.subview(0), 0)
+            mbar_wait_flip(shared_acc_ready_mbar.subview(0), 0)
             vmx_lane = cute.arch.lane_idx()
             tcgen05_chain_stage_vmx_input_tmem(
                 tmem_raw_addr,
@@ -1785,27 +1629,23 @@ def kernel_chain_dv2(
                 0,
                 input_dtype,
             )
-            update_ready_arrive(update_ready_mbar)
+            mbar_arrive_elected(update_ready_mbar)
         for chunk in cutlass.range(1, num_chunks, 1, unroll=1):
             prev = chunk - cutlass.Int32(1)
             raw_stage = chunk % K2_RAW_STAGE_COUNT
             diag_raw_stage = diag_raw_smem.subview(raw_stage * DIAG_REC_ELEMS)
             acc_stage = chunk % 2
             prev_kr_phase = (prev // 2) % 2
-            tcgen05_wait_acc_buffer_ready(
-                stateq_done_mbar.subview(prev % 2), prev_kr_phase
-            )
-            tcgen05_wait_acc_buffer_ready(
-                k_restore_consumed_mbar.subview(prev % 2), prev_kr_phase
-            )
+            mbar_wait_flip(stateq_done_mbar.subview(prev % 2), prev_kr_phase)
+            mbar_wait_flip(k_restore_consumed_mbar.subview(prev % 2), prev_kr_phase)
             state_right = tcgen05_stage_state_input_dv2_half_tmem(
                 tmem_raw_addr,
                 warp_idx,
                 input_dtype,
                 1,
             )
-            raw_consumed_arrive(raw_consumed_mbar.subview(prev % K2_RAW_STAGE_COUNT))
-            raw_ready_wait(
+            mbar_arrive_elected(raw_consumed_mbar.subview(prev % K2_RAW_STAGE_COUNT))
+            mbar_wait_flip(
                 raw_ready_mbar.subview(raw_stage),
                 (chunk // K2_RAW_STAGE_COUNT) % 2,
             )
@@ -1817,9 +1657,7 @@ def kernel_chain_dv2(
                 state_input_ready_mbar,
                 1,
             )
-            tcgen05_wait_acc_buffer_ready(
-                shared_acc_ready_mbar.subview(acc_stage), (chunk // 2) % 2
-            )
+            mbar_wait_flip(shared_acc_ready_mbar.subview(acc_stage), (chunk // 2) % 2)
             vmx_lane = cute.arch.lane_idx()
             tcgen05_chain_stage_vmx_input_tmem(
                 tmem_raw_addr,
@@ -1830,16 +1668,12 @@ def kernel_chain_dv2(
                 acc_stage,
                 input_dtype,
             )
-            update_ready_arrive(update_ready_mbar)
+            mbar_arrive_elected(update_ready_mbar)
         if num_chunks > 0:
             last = num_chunks - cutlass.Int32(1)
             last_kr_phase = (last // 2) % 2
-            tcgen05_wait_acc_buffer_ready(
-                k_restore_consumed_l_mbar.subview(last % 2), last_kr_phase
-            )
-            tcgen05_wait_acc_buffer_ready(
-                k_restore_consumed_mbar.subview(last % 2), last_kr_phase
-            )
+            mbar_wait_flip(k_restore_consumed_l_mbar.subview(last % 2), last_kr_phase)
+            mbar_wait_flip(k_restore_consumed_mbar.subview(last % 2), last_kr_phase)
         final_lane = cute.arch.lane_idx()
         tcgen05_store_final_state_tmem(
             tmem_raw_addr,
@@ -1851,7 +1685,7 @@ def kernel_chain_dv2(
             warp_idx,
             final_lane,
         )
-        final_state_stored_arrive(final_state_stored_mbar)
+        mbar_arrive_elected(final_state_stored_mbar)
     elif is_compute_group0_warp(warp_idx):
         if warp_idx < 4:
             prims.setmaxregister(KDA_CG1_REGS, prims.SetMaxRegisterAction.INCREASE)
@@ -1860,7 +1694,7 @@ def kernel_chain_dv2(
                 qstate_stage = chunk % K2_QSTATE_STAGE_COUNT
                 qstate_phase = (chunk // K2_QSTATE_STAGE_COUNT) % 2
                 output_stage = chunk % K2_OUTPUT_SMEM_STAGE_COUNT
-                tcgen05_wait_acc_buffer_ready(
+                mbar_wait_flip(
                     qstate_acc_ready_mbar.subview(qstate_stage), qstate_phase
                 )
                 output_regs = tcgen05_chain_load_qstate_output_regs(
@@ -1873,7 +1707,7 @@ def kernel_chain_dv2(
                 # Release the two-stage TMEM accumulator as soon as its values
                 # are in registers.  Output-SMEM reuse is independently
                 # protected by the seven-deep async TMA store group.
-                output_ready_arrive(output_ready_mbar.subview(qstate_stage))
+                mbar_arrive_elected(output_ready_mbar.subview(qstate_stage))
                 if warp_idx == 0:
                     prims.cp_async_bulk_wait_group(6, read=True)
                 output_drain_sync()
@@ -1914,28 +1748,28 @@ def kernel_chain_dv2(
             if warp_idx == 0:
                 prims.cp_async_bulk_wait_group(0, read=True)
             output_drain_sync()
-            final_state_stored_arrive(final_state_stored_mbar)
+            mbar_arrive_elected(final_state_stored_mbar)
         else:
             # Chunk 0 is initialized by CG1. Afterwards, warps 4-7 own the
             # fused left-half state pack and FP32 decay while CG1 owns right.
             prims.setmaxregister(KDA_CG1_REGS, prims.SetMaxRegisterAction.INCREASE)
             tmem_raw_addr = tmem_ptr_i32.load()
             if num_chunks > 0:
-                state_input_ready_wait(
+                mbar_wait_flip(
                     state_input_ready_l_mbar,
                     cutlass.Int32(0),
                 )
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                update_ready_arrive(update_ready_mbar)
+                mbar_arrive_elected(update_ready_mbar)
             for chunk in cutlass.range(1, num_chunks, 1, unroll=1):
                 prev = chunk - cutlass.Int32(1)
                 raw_stage = chunk % K2_RAW_STAGE_COUNT
                 prev_kr_phase = (prev // 2) % 2
-                tcgen05_wait_acc_buffer_ready(
+                mbar_wait_flip(
                     stateq_done_mbar.subview(prev % 2),
                     prev_kr_phase,
                 )
-                tcgen05_wait_acc_buffer_ready(
+                mbar_wait_flip(
                     k_restore_consumed_l_mbar.subview(prev % 2),
                     prev_kr_phase,
                 )
@@ -1945,7 +1779,7 @@ def kernel_chain_dv2(
                     input_dtype,
                     0,
                 )
-                raw_ready_wait(
+                mbar_wait_flip(
                     raw_ready_mbar.subview(raw_stage),
                     (chunk // K2_RAW_STAGE_COUNT) % 2,
                 )
@@ -1958,7 +1792,7 @@ def kernel_chain_dv2(
                     state_input_ready_l_mbar,
                     0,
                 )
-                update_ready_arrive(update_ready_mbar)
+                mbar_arrive_elected(update_ready_mbar)
 
 
 @cute.jit

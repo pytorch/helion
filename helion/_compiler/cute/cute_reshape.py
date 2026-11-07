@@ -32,7 +32,6 @@ from ...language._tracing_ops import _for_loop_step
 from ...language._tracing_ops import _new_var
 from ...language.inline_asm_ops import inline_asm_elementwise
 from ...language.matmul_ops import dot as hl_dot
-from ...language.memory_ops import _cute_resolve_active_slice_block_id
 from ...language.memory_ops import store
 from ...language.reduce_ops import _reduce
 from ...language.scan_ops import _associative_scan
@@ -52,8 +51,10 @@ from ..tile_strategy import PerThreadFlattenedTileStrategy
 from ..variable_origin import BlockSizeOrigin
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import reach_matmul_anchors
+from .emitters.memory_access import _cute_resolve_active_slice_block_id
 from .indexing import CuteShapeChainView
 from .indexing import is_cute_shape_chain_target
+from .scalar_lowering import scalar_lowering_context
 from .split_exchange import emitted_definitions
 
 if TYPE_CHECKING:
@@ -1068,17 +1069,6 @@ def resolve_cute_shape_chain_value(
     )
 
 
-def _lowering_context(state: CodegenState) -> LoweringContext:
-    """The ``LoweringContext`` the shape-chain resolvers read (the codegen
-    object and the fx-node -> argument map) for a memory op's ``state``."""
-    from ..aten_lowering import LoweringContext
-
-    ctx = LoweringContext.__new__(LoweringContext)
-    ctx.cg = state.codegen
-    ctx.env = state.env
-    return ctx
-
-
 def resolve_cute_shape_chain_value_at(
     state: CodegenState,
     node: Node,
@@ -1092,7 +1082,7 @@ def resolve_cute_shape_chain_value_at(
     chain resolver only needs the ``GenerateAST`` codegen object and the
     fx-node -> argument map, both of which ``CodegenState`` already carries.
     """
-    ctx = _lowering_context(state)
+    ctx = scalar_lowering_context(state.codegen, state.env)
     return _resolve_shape_chain_expr(ctx, node, flat_index, leaf_resolver)
 
 
@@ -1502,7 +1492,9 @@ def cute_affine_rows_keep_thread_elements(
         _normalized_coord([(_AFFINE_LANE_BLOCK, 1, factor), m_digit]),
         _normalized_coord([n_digit]),
     ]
-    return _chain_keeps_thread_elements(_lowering_context(state), node, coords)
+    return _chain_keeps_thread_elements(
+        scalar_lowering_context(state.codegen, state.env), node, coords
+    )
 
 
 def _reshape_value_consumer(
@@ -2416,18 +2408,19 @@ def check_pointwise_rebound_block_ids(
         if (
             defer_tcgen05_epilogues
             and isinstance(cg, GenerateAST)
-            and cute_state.matmul_fx_nodes
+            and cute_state.tcgen05.matmul_fx_nodes
         ):
-            if cute_state.rebound_inner_outputs_index is None:
-                cute_state.rebound_inner_outputs_index = (
+            inner_outputs_index = cute_state.tcgen05.rebound_inner_outputs_index
+            if inner_outputs_index is None:
+                inner_outputs_index = cute_state.tcgen05.rebound_inner_outputs_index = (
                     build_inner_outputs_index_from_graphs(cg.codegen_graphs)
                 )
             if reach_matmul_anchors(
                 node,
-                target_fx_nodes=cute_state.matmul_fx_nodes,
-                inner_outputs_by_graph_id=cute_state.rebound_inner_outputs_index,
+                target_fx_nodes=cute_state.tcgen05.matmul_fx_nodes,
+                inner_outputs_by_graph_id=inner_outputs_index,
             ):
-                cute_state.deferred_rebound_pointwise_nodes.append(node)
+                cute_state.tcgen05.deferred_rebound_pointwise_nodes.append(node)
                 return {}
         for dim, _operand_block_id, result_block_id in rebound:
             operand_extent = _resolve_tile_extent(operand_val.shape[dim], env, config)
@@ -2478,9 +2471,9 @@ def run_deferred_rebound_checks(
     no store consumed.
     """
     cute_state = cg.device_function.cute_state
-    pending = cute_state.deferred_rebound_pointwise_nodes
+    pending = cute_state.tcgen05.deferred_rebound_pointwise_nodes
     selected = [node for node in pending if nodes is None or node in nodes]
-    cute_state.deferred_rebound_pointwise_nodes = [
+    cute_state.tcgen05.deferred_rebound_pointwise_nodes = [
         node for node in pending if node not in selected
     ]
     for node in selected:

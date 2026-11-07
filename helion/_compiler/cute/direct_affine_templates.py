@@ -16,6 +16,10 @@ from typing import cast
 import torch
 from torch.fx import Node
 
+from ... import exc
+from ...language import reduce_ops
+from ._ast_pass_utils import call_path_str
+from ._ast_pass_utils import flatten_addition
 from .direct_affine_plan import DirectAffinePlan
 from .direct_affine_plan import DirectAffineStateIngress
 from .direct_affine_replay_core import DirectAffineAsyncEntryReplay
@@ -36,7 +40,6 @@ from .direct_affine_replay_core import _clone_ast
 from .direct_affine_replay_core import _contains_expression
 from .direct_affine_replay_core import _dump
 from .direct_affine_replay_core import _inferred_bindings
-from .direct_affine_replay_core import _qualified_name
 from .direct_affine_replay_core import _result_snapshots_are_intact
 
 if TYPE_CHECKING:
@@ -44,6 +47,31 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from .short_affine_scan import ShortAffineScanAccess
+
+
+_ATEN_REDUCTION_TARGETS = frozenset(
+    {
+        torch.ops.aten.sum.dim_IntList,
+        torch.ops.aten.sum.default,
+        torch.ops.aten.amax.default,
+        torch.ops.aten.amin.default,
+        torch.ops.aten.prod.default,
+        torch.ops.aten.prod.dim_int,
+        torch.ops.aten.mean.default,
+        torch.ops.aten.mean.dim,
+        torch.ops.aten.max.default,
+        torch.ops.aten.max.dim,
+        torch.ops.aten.min.default,
+        torch.ops.aten.min.dim,
+        torch.ops.aten.argmax.default,
+        torch.ops.aten.argmin.default,
+    }
+)
+
+
+def _is_reduction_target(target: object) -> bool:
+    """True if *target* is a tile reduction op (collapses one or more dims)."""
+    return target is reduce_ops._reduce or target in _ATEN_REDUCTION_TARGETS
 
 
 _INTEGER_CASTS = frozenset(
@@ -121,8 +149,6 @@ def _dependency_value_replay(
     statements = _statements_for_nodes(replay, slices[0].nodes)
     if statements is None:
         return None
-    from .layout_propagation import _is_reduction_target
-
     reductions = tuple(
         node
         for node in slices[0].nodes
@@ -172,7 +198,7 @@ def _feature_reduction_markers_are_supported(
 ) -> bool:
     """Require each reduction marker to be a direct feature-lane reduction."""
 
-    from ..tile_strategy import _is_lane_reduce_marker_assign
+    from .lane_loops.markers import _is_lane_reduce_marker_assign
 
     marker_statements = tuple(
         (index, statement)
@@ -190,9 +216,18 @@ def _feature_reduction_markers_are_supported(
     ) != len(marker_statements):
         return False
     for index, statement in marker_statements:
+        # ``_LaneReduceMarker.from_call`` rejects a malformed marker with
+        # ``BackendUnsupported``; the positional parser it replaced returned
+        # ``None`` for a wrong arity, raised ``ValueError`` / ``TypeError``
+        # for a non-literal field (caught here) and ``BackendUnsupported``
+        # for four malformed fields (not caught, so it escaped this
+        # predicate).  Catching it here only changes where the rejection
+        # surfaces: a rejection means the statements are not a direct-affine
+        # template, and the lane root passes of the generic path parse every
+        # marker again (``validate_lane_reduce_owners``) and raise it there.
         try:
             marker = _is_lane_reduce_marker_assign(statement)
-        except (AssertionError, TypeError, ValueError):
+        except (AssertionError, TypeError, ValueError, exc.BackendUnsupported):
             return False
         if (
             marker is None
@@ -316,7 +351,7 @@ def _flat_unique_assignments(statements: Sequence[ast.stmt]) -> bool:
 
 
 def _assignments_are_pure(statements: Sequence[ast.stmt], *, allow_load: bool) -> bool:
-    from ..tile_strategy import _is_proven_relocatable_assignment
+    from ._ast_pass_utils import _is_proven_relocatable_assignment
 
     return all(
         _is_proven_relocatable_assignment(statement, allow_load=allow_load)
@@ -331,7 +366,7 @@ def _dropped_assignments_are_pure(
 ) -> bool:
     """Prove assignments discarded while extracting one memory op are inert."""
 
-    from ..tile_strategy import _is_proven_relocatable_assignment
+    from ._ast_pass_utils import _is_proven_relocatable_assignment
 
     kept_ids = {id(statement) for statement in kept}
     return all(
@@ -359,7 +394,7 @@ def _load_details(
     def zero(expression: ast.expr) -> bool:
         while (
             isinstance(expression, ast.Call)
-            and (_qualified_name(expression.func) or "").startswith("cutlass.")
+            and (call_path_str(expression.func) or "").startswith("cutlass.")
             and len(expression.args) == 1
             and not expression.keywords
             and isinstance(expression.args[0], ast.expr)
@@ -476,7 +511,7 @@ def _store_details(
 def _strip_integer_cast(expression: ast.expr) -> ast.expr:
     while (
         isinstance(expression, ast.Call)
-        and _qualified_name(expression.func) in _INTEGER_CASTS
+        and call_path_str(expression.func) in _INTEGER_CASTS
         and len(expression.args) == 1
         and not expression.keywords
         and isinstance(expression.args[0], ast.expr)
@@ -559,7 +594,7 @@ def _store_value_is_logical_cast(
             continue
         if (
             isinstance(current, ast.Call)
-            and _qualified_name(current.func) == cast_name
+            and call_path_str(current.func) == cast_name
             and len(current.args) == 1
             and not current.keywords
             and isinstance(current.args[0], ast.expr)
@@ -579,7 +614,7 @@ def _output_store_value_is_logical(
 ) -> bool:
     """Prove a pure, single-use dataflow from the logical output to the store."""
 
-    from ..tile_strategy import _is_proven_relocatable_call
+    from ._ast_pass_utils import _is_proven_relocatable_call
 
     assignments: dict[str, list[ast.expr]] = {}
     for statement in statements[: stop_index + 1]:
@@ -677,20 +712,11 @@ def _packed_state_replay(
     )
 
 
-def _flatten_addition(expression: ast.expr) -> tuple[ast.expr, ...]:
-    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
-        return (
-            *_flatten_addition(expression.left),
-            *_flatten_addition(expression.right),
-        )
-    return (expression,)
-
-
 def _layout_stride_details(expression: ast.expr) -> tuple[str, int] | None:
     value = expression
     if (
         isinstance(value, ast.Call)
-        and _qualified_name(value.func) in _INTEGER_CASTS
+        and call_path_str(value.func) in _INTEGER_CASTS
         and len(value.args) == 1
         and not value.keywords
     ):
@@ -724,7 +750,7 @@ def _pointer_has_tensor_layout(
 ) -> bool:
     if row_dimension < 0 or (feature is not None and feature_dimension is None):
         return False
-    terms = _flatten_addition(pointer)
+    terms = flatten_addition(pointer)
     iterator = ast.Attribute(
         value=ast.Name(id=argument_name, ctx=ast.Load()),
         attr="iterator",
@@ -798,7 +824,7 @@ def _row_stride(pointer: ast.expr, row: ast.expr) -> ast.expr | None:
     if _expression_occurrences(pointer, row) != 1:
         return None
     matches: list[ast.expr] = []
-    for term in _flatten_addition(pointer):
+    for term in flatten_addition(pointer):
         if not isinstance(term, ast.BinOp) or not isinstance(term.op, ast.Mult):
             continue
         for coordinate, stride in ((term.left, term.right), (term.right, term.left)):
@@ -899,8 +925,6 @@ def resolve_direct_affine_templates(
     entry_statements = _statements_for_nodes(replay, entry_nodes)
     entry_result = _result_expression(replay, region.entry_state)
     entry_load = replay.node_replay(region.entry_load)
-    from .layout_propagation import _is_reduction_target
-
     if (
         entry_statements is None
         or entry_result is None
@@ -1023,7 +1047,7 @@ def _ordinary_lane_expression(
     expression = _strip_integer_cast(expression)
     if (
         isinstance(expression, ast.Call)
-        and _qualified_name(expression.func) == "cute.arch.lane_idx"
+        and call_path_str(expression.func) == "cute.arch.lane_idx"
         and not expression.args
         and not expression.keywords
     ):
@@ -1031,7 +1055,7 @@ def _ordinary_lane_expression(
     return (
         isinstance(expression, ast.Subscript)
         and isinstance(expression.value, ast.Call)
-        and _qualified_name(expression.value.func) == "cute.arch.thread_idx"
+        and call_path_str(expression.value.func) == "cute.arch.thread_idx"
         and not expression.value.args
         and not expression.value.keywords
         and isinstance(expression.slice, ast.expr)
@@ -1179,7 +1203,7 @@ def _discharge_output_effect(
         statement_index,
     ):
         return None
-    from ..tile_strategy import _is_proven_relocatable_assignment
+    from ._ast_pass_utils import _is_proven_relocatable_assignment
 
     if any(
         index != statement_index
@@ -1307,7 +1331,7 @@ def _expand_expression_assignments(
 
 
 def _guard_calls_are_pure(expression: ast.expr, *, allow_load: bool = False) -> bool:
-    from ..tile_strategy import _is_proven_relocatable_call
+    from ._ast_pass_utils import _is_proven_relocatable_call
 
     return all(
         _is_proven_relocatable_call(call, allow_load=allow_load)
@@ -1551,7 +1575,7 @@ def _has_unbound_hardware_coordinate(
             and node.id in forbidden_names
         ):
             return True
-        if isinstance(node, ast.Call) and _qualified_name(node.func) in hardware:
+        if isinstance(node, ast.Call) and call_path_str(node.func) in hardware:
             return True
         return any(contains(child, bound) for child in ast.iter_child_nodes(node))
 

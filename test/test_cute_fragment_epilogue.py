@@ -115,7 +115,7 @@ def test_fragment_epilogue_computed_broadcast_loads(n: int) -> None:
     before = tuple(value.clone() for value in args[:-1])
     _indexed_scale_matmul.reset()
     bound = _indexed_scale_matmul.bind(args)
-    assert bound.config_spec.cute_tcgen05_search_enabled
+    assert bound.config_spec.tcgen05.search_enabled
     config = helion.Config(block_sizes=[128, 64, 64], pid_type="flat")
     code = bound.to_code(config)
     assert "cute.gemm(" in code
@@ -148,7 +148,7 @@ def test_fragment_epilogue_rejects_data_dependent_loads() -> None:
     )
     _indexed_scale_matmul.reset()
     bound = _indexed_scale_matmul.bind(args)
-    assert not bound.config_spec.cute_tcgen05_search_enabled
+    assert not bound.config_spec.tcgen05.search_enabled
 
 
 @pytest.mark.skipif(
@@ -191,4 +191,4 @@ def test_fragment_epilogue_rejects_computed_output_alias(reassign: bool) -> None
         reassign,
     )
     bound = with_output.bind(args)
-    assert not bound.config_spec.cute_tcgen05_search_enabled
+    assert not bound.config_spec.tcgen05.search_enabled

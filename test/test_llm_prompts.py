@@ -6,8 +6,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from helion._compiler.backend import CuteBackend
-from helion._compiler.backend import TritonBackend
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.triton.backend import TritonBackend
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import NumThreadsFragment
 from helion.autotuner.config_spec import BlockSizeSpec
@@ -49,7 +50,8 @@ def _flash_config_spec() -> ConfigSpec:
     spec = _config_spec("cute")
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=128,
         num_kv=12288,
         num_bh=8,
@@ -215,7 +217,7 @@ def test_generic_guidance_preserves_applicable_tuning_controls(backend: str) -> 
 
 def test_cute_tcgen05_preserves_shared_scheduling_and_indexing_guidance() -> None:
     spec = _config_spec("cute")
-    spec.cute_tcgen05_search_enabled = True
+    spec.tcgen05.search_enabled = True
     spec.indexing.length = 2
     fields = spec._flat_fields()
     assert {"pid_type", "indexing", "l2_groupings"} <= fields.keys()

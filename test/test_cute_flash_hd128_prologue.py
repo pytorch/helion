@@ -553,7 +553,7 @@ def test_lse_body_config_generation_accepts_every_structural_leaf() -> None:
     assert spec.cute_flash_search_enabled
     generation = spec.create_config_generation()
     leaves = set()
-    for base in generation.flash_deterministic_population_configs():
+    for base in generation.extension.deterministic_population_configs():
         leaf = cute_flash.flash_structural_leaf_from_config(base.config)
         assert leaf is not None
         leaves.add(leaf)
@@ -573,7 +573,7 @@ def test_lse_body_config_generation_accepts_every_structural_leaf() -> None:
     assert not any(leaf.compound_exp2_packet == _DEG2_PACKET for leaf in leaves)
     packets = {
         base.config.get(cute_flash.FLASH_EXP2_PACKET_KEY)
-        for base in generation.flash_deterministic_population_configs()
+        for base in generation.extension.deterministic_population_configs()
     }
     assert set(_PLAIN_PACKETS) <= packets
     for plain in _PLAIN_PACKETS[1:]:

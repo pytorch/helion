@@ -28,11 +28,12 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 import helion
-from helion._compiler import backend as _compiler_backend
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute import flex_match
+from helion._compiler.cute.analysis import attention_match as _attention_match
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
 from helion._compiler.cute.flex_match import FlexMatch
 from helion._compiler.cute.flex_match import flex_host_scalar_symbol
 from helion._compiler.cute.flex_match import match_flex_envelope
@@ -148,9 +149,13 @@ def _as_sm100(*, flex: bool) -> Iterator[None]:
     """CPU codegen with the flash gate forced on; ``flex`` sets the flag."""
     with (
         cpu_codegen(),
-        patch("helion._compiler.backend._attention_flash_supported", return_value=True),
         patch(
-            "helion._compiler.backend._attention_flash_gate_enabled", return_value=True
+            "helion._compiler.cute.analysis.attention_match._attention_flash_supported",
+            return_value=True,
+        ),
+        patch(
+            "helion._compiler.cute.analysis.attention_match._attention_flash_gate_enabled",
+            return_value=True,
         ),
         patch.object(flex_match, "FLEX_PLAN_ENABLED", flex),
     ):
@@ -690,9 +695,9 @@ def test_surface_and_codegen_claim_every_walk_loop() -> None:
 
     def spy(cg: Any) -> bool:
         state = cg.device_function.cute_state
-        captured["block_ids"] = list(state.attention_flash_block_ids or [])
-        captured["plan"] = state.attention_flash_score_plan
-        captured["match"] = state.attention_flex_match
+        captured["block_ids"] = list(state.flash.block_ids or [])
+        captured["plan"] = state.flash.score_plan
+        captured["match"] = state.flash.flex_match
         captured["tensor_plan"] = cute_flash.flash_attention_tensor_plan(
             cg.device_function
         )
@@ -720,8 +725,7 @@ def test_surface_and_codegen_claim_every_walk_loop() -> None:
     assert (tensor_plan.tensor_4d_batch, tensor_plan.tensor_4d_heads) == (2, 4)
     assert (tensor_plan.batch, tensor_plan.seq) == (8, 1024)
     assert (tensor_plan.q_seq, tensor_plan.kv_seq) == (1024, 1024)
-    assert tensor_plan.flex_scale_expr == "cutlass.Float32(scale)"
-    assert tensor_plan.flex_scale_arg_name == "scale"
+    assert tensor_plan.scale_arg_name == "scale"
     assert tensor_plan.flex_scalar_exprs == ()
     assert tensor_plan.flex_scalar_arg_names == ()
     assert tuple(tensor_plan.q_arg.fake_value.shape) == (2, 4, 1024, 64)
@@ -775,7 +779,7 @@ def test_collapsed_envelope_surface_unchanged(name: str) -> None:
         host_function = _host(bound)
         device_ir = host_function.device_ir
         with _as_sm100(flex=flex), bound.env, host_function:
-            surfaces.append(_compiler_backend.detect_flash_search_surface(device_ir))
+            surfaces.append(_attention_match.detect_flash_search_surface(device_ir))
         assert bound.config_spec.cute_flash_search_enabled
     before, after = surfaces
     assert before is not None
@@ -843,8 +847,8 @@ def test_short_query_lengths_enable_the_search(q_seq: int) -> None:
 
     def spy(cg: Any) -> bool:
         state = cg.device_function.cute_state
-        captured["block_ids"] = list(state.attention_flash_block_ids or [])
-        captured["match"] = state.attention_flex_match
+        captured["block_ids"] = list(state.flash.block_ids or [])
+        captured["match"] = state.flash.flex_match
         return real_codegen(cg)
 
     with (
@@ -1176,9 +1180,9 @@ def _without_source_comments(code: str) -> str:
     return re.sub(r"^[ \t]*# src\[.*\n", "", code, flags=re.MULTILINE)
 
 
-# unittest runners ignore pytestmark.
+# unittest runners see neither pytest marks nor the conftest path gate.
 @onlyBackends(["cute"])
-class TestContiguousRenderPin(TestCase):
+class TestContiguousForwardRenderPin(TestCase):
     """The exact text of one contiguous forward render (the
     ``.expected_cute`` journal next to this file): the strided-operand
     support must not change the code contiguous inputs produce."""
@@ -1358,7 +1362,7 @@ def _bind_dense_attention(
 def _flash_choices(spec: Any) -> dict[str, tuple[object, ...]]:
     """The searched values of every flash knob of a surface."""
     with patch.dict(os.environ, {}, clear=True):
-        fragments = spec._cute_flash_autotune_fragments()
+        fragments = _cute_flash_autotune_fragments(spec)
     return {
         key: tuple(
             getattr(fragment, "search_choices", None)
@@ -1446,9 +1450,12 @@ def test_dense_flex_plan_takes_the_dense_surface() -> None:
 
     with patch.dict(os.environ, {}, clear=True):
         generation = ConfigGeneration(spec)
-        generation.validate_flash_structural_coverage()
-        assert generation.flash_structural_coverage_uncovered_values() == []
-        assert generation.flash_structural_coverage_uncovered_interactions() == []
+        generation.extension.validate_flash_structural_coverage()
+        assert generation.extension.flash_structural_coverage_uncovered_values() == []
+        assert (
+            generation.extension.flash_structural_coverage_uncovered_interactions()
+            == []
+        )
         messages: list[str] = []
         pairs = generation.seed_flat_config_pairs(messages.append)
     assert not messages

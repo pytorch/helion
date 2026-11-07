@@ -12,14 +12,15 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_grouped_coverage_search import _bound
 from test.test_cute_grouped_coverage_search import _search
 from test.test_cute_grouped_k128_full_coverage import _bound as _generic_bound
 from test.test_cute_native_schedule_cuda import _row_union_bound
 from test.test_cute_shared_rhs_grouped import _OffsetPointer
 from test.test_cute_shared_rhs_grouped import _plans
-from test.test_cute_shared_rhs_grouped import _target
 
+from helion._compiler.cute import target_facts
 from helion._compiler.cute.grouped_row_union import AB_STAGES_KEY
 from helion._compiler.cute.grouped_row_union import CONFIG_KEY
 from helion._compiler.cute.grouped_row_union import PAIRED_CLC_SCHEDULE
@@ -28,12 +29,11 @@ from helion._compiler.cute.grouped_row_union import SCHEDULE_KEY
 from helion._compiler.cute.grouped_row_union import TRANSPOSED
 from helion._compiler.cute.grouped_row_union import TRANSPOSED_SCHEDULE
 from helion._compiler.cute.grouped_row_union import GroupedRowUnionPlan
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute.tcgen05.scheduler_pids import Tcgen05PersistentProgramIDs
+from helion._compiler.cute.tcgen05_config import facts
+from helion._compiler.cute.tcgen05_config import surface
 from helion._compiler.program_id import ProgramIDs
-from helion._compiler.program_id import Tcgen05PersistentProgramIDs
-from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing import cpu_render_target
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
@@ -48,7 +48,6 @@ def cpu_only():
     torch.set_num_threads(1)
     try:
         with (
-            mock_cuda_unavailable(),
             patch(
                 "torch.cuda.current_device", side_effect=AssertionError("CPU only")
             ) as current_device,
@@ -61,25 +60,14 @@ def cpu_only():
                 side_effect=AssertionError("CPU only"),
             ) as properties,
             patch(
-                "torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")
-            ) as initialization,
-            patch(
                 "torch.cuda.synchronize", side_effect=AssertionError("GPU forbidden")
             ) as synchronize,
-            forbid_native_compile() as native_compilation,
-            _target(),
+            cpu_render_target(mma_support=tcgen05_mma_support()),
         ):
             yield
-            for prohibited in (
-                current_device,
-                capability,
-                properties,
-                initialization,
-                synchronize,
-                *native_compilation,
-            ):
+            for prohibited in (current_device, capability, properties, synchronize):
                 prohibited.assert_not_called()
-            assert torch.cuda.is_initialized() == initialized
+        assert torch.cuda.is_initialized() == initialized
     finally:
         torch.set_num_threads(previous)
 
@@ -112,7 +100,6 @@ def wrapper(source):
     return result
 
 
-@skipUnlessBackends(["cute"])
 def test_ordinary_profile_and_original_allocation(case):
     bound, _args, config, source = case
     source = ast.unparse(ast.parse(source))
@@ -215,7 +202,6 @@ def test_transposed_row_union_advances_accumulator_once_per_output_tile():
         {"block_sizes": [128.0, 64, 128]},
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_incoherent_explicit_schedule_rejects(case, updates):
     config = deepcopy(case[2])
     config.config.update(updates)
@@ -234,7 +220,6 @@ def test_incoherent_explicit_schedule_rejects(case, updates):
         ("row_union_schedule", "unknown"),
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_wrapper_rejects_descriptor_and_schedule_mutations(case, field, value):
     plan = deepcopy(_plans(case[3])[0])
     plan[field] = value
@@ -243,7 +228,6 @@ def test_wrapper_rejects_descriptor_and_schedule_mutations(case, field, value):
 
 
 @pytest.mark.parametrize("m,n,k,groups", [(640, 256, 128, 2), (1280, 768, 1024, 5)])
-@skipUnlessBackends(["cute"])
 def test_general_aligned_domains_emit(m, n, k, groups):
     bound, args = _generic_bound(m, n, k, groups)
     source = bound.to_code(selected(bound))
@@ -256,7 +240,6 @@ def test_general_aligned_domains_emit(m, n, k, groups):
 @pytest.mark.parametrize(
     "m,n,k", [(319, 256, 64), (320, 255, 64), (320, 256, 63), (320, 256, 16448)]
 )
-@skipUnlessBackends(["cute"])
 def test_shape_proof_declines_spatial_k_tails_and_loop_limit(m, n, k):
     assert not TRANSPOSED.index_domain(2, m, n, k)
     bound, _ = _generic_bound(m, n, k, 2)
@@ -265,7 +248,6 @@ def test_shape_proof_declines_spatial_k_tails_and_loop_limit(m, n, k):
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_actual_full_population_transfers_dependent_witness(case):
     bound, args = case[:2]
     seeds = deepcopy(bound.config_spec.compiler_seed_configs)
@@ -310,7 +292,6 @@ def test_actual_full_population_transfers_dependent_witness(case):
     assert seeds == bound.config_spec.compiler_seed_configs
 
 
-@skipUnlessBackends(["cute"])
 def test_off_override_blocks_physical_seed():
     bound, args = _bound(1, autotune_config_overrides={CONFIG_KEY: False})
     search = _search(bound, args)
@@ -323,7 +304,6 @@ def test_off_override_blocks_physical_seed():
 
 
 @pytest.mark.parametrize("disable_heuristics", [False, True])
-@skipUnlessBackends(["cute"])
 def test_random_full_population_retains_physical_witness(disable_heuristics):
     bound, args = _bound(
         1,
@@ -371,11 +351,10 @@ def test_thread_coordinate_omission_does_not_drop_observable_work():
         assert not cls._tcgen05_shared_stmt_safe_to_omit(ast.parse(source).body[0])
 
 
-@skipUnlessBackends(["cute"])
 def test_late_shared_capacity_failure_cannot_fall_back_to_scalar(case):
     with (
         patch.object(
-            CuteTcgen05Config,
+            target_facts,
             "per_cta_smem_capacity_bytes",
             return_value=TRANSPOSED.shared_upper_bound - 1,
         ),
@@ -385,7 +364,6 @@ def test_late_shared_capacity_failure_cannot_fall_back_to_scalar(case):
 
 
 @pytest.mark.parametrize("stride", [1, 2])
-@skipUnlessBackends(["cute"])
 def test_actual_interval_normalization_and_dense_guard(case, stride):
     device = next(
         n
@@ -524,7 +502,6 @@ def test_actual_interval_normalization_and_dense_guard(case, stride):
 
 
 @pytest.mark.parametrize("k", [128, 512, 768, 16384])
-@skipUnlessBackends(["cute"])
 def test_actual_producer_all_ranks_and_ring_wrap(k):
     # The prologue runtime imports cutlass at module level: CPU-only runners skip.
     _helion_tc_pro = pytest.importorskip(
@@ -661,6 +638,7 @@ def test_physical_pid_maps_to_original_rows_and_columns(order):
         ],
         _tcgen05_plan=lambda: plan,
         _tcgen05_logical_m_coord_expr=lambda value: f"({value}) // 2",
+        pid_division_exprs=lambda state: None,
     )
     expression = (
         Tcgen05PersistentProgramIDs._tcgen05_linear_virtual_pid_from_coords_expr(
@@ -695,7 +673,6 @@ def test_physical_pid_maps_to_original_rows_and_columns(order):
         assert (scope["pid_17"], scope["pid_23"], scope["pid_31"]) == (0, pn, pm // 2)
 
 
-@skipUnlessBackends(["cute"])
 def test_actual_wrapper_descriptor_and_device_copy_coremlir(case, tmp_path):
     initialized = torch.cuda.is_initialized()
     import cutlass
@@ -934,7 +911,6 @@ def test_actual_wrapper_descriptor_and_device_copy_coremlir(case, tmp_path):
     assert torch.cuda.is_initialized() == initialized
 
 
-@skipUnlessBackends(["cute"])
 def test_actual_epilogue_cross_lane_publication(case):
     import cutlass
     from cutlass._mlir import ir as mlir_ir
@@ -1145,7 +1121,6 @@ def _launched_warps(source: str) -> int:
     return x * y * z // 32
 
 
-@skipUnlessBackends(["cute"])
 def test_tma_warp_skips_prologue_publication(case):
     """The row-union prologue publishes the TMEM allocation (and, on the
     paired profile, the coverage tables) through a named barrier the
@@ -1185,7 +1160,6 @@ def test_tma_warp_skips_prologue_publication(case):
     assert not any(line == "cute.arch.sync_threads()" for line in paired_lines)
 
 
-@skipUnlessBackends(["cute"])
 def test_dependent_launch_needs_no_entry_wait(case):
     """Under ``cute_pdl`` the group offsets are read inside the epilogue
     role behind its own ``griddepcontrol_wait``; nothing reads global memory
@@ -1232,7 +1206,6 @@ def test_dependent_launch_needs_no_entry_wait(case):
     assert "griddepcontrol_wait" not in ast.unparse(plain_epilogue)
 
 
-@skipUnlessBackends(["cute"])
 def test_tma_load_role_is_hoisted_ahead_of_the_cluster_wait(case):
     """The transposed profile's TMA-load role block sits right after the
     cluster ``pipeline_init_arrive``: its scheduler setup overlaps the
@@ -1285,7 +1258,6 @@ def test_tma_load_role_is_hoisted_ahead_of_the_cluster_wait(case):
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_ab_stage_knob_normalizes_projects_and_launches(case):
     """``tcgen05_grouped_row_union_ab_stages`` picks the physical AB ring depth
     of a named profile (``None`` = its own, deepest fitting ring); it is
@@ -1298,7 +1270,7 @@ def test_ab_stage_knob_normalizes_projects_and_launches(case):
 
     bound, _args, config, source = case
     spec = bound.config_spec
-    fields = spec._cute_tcgen05_config.optional_fragments(for_search=True)
+    fields = surface.optional_fragments(spec._cute_tcgen05_config, for_search=True)
     assert tuple(fields[AB_STAGES_KEY].choices) == AB_STAGES_CHOICES
     assert AB_STAGES_KEY not in spec.normalized_config(config).config
     for stages in (4, 6, 8, 10):
@@ -1363,7 +1335,6 @@ def test_ab_stage_knob_normalizes_projects_and_launches(case):
     assert bound.to_code(ten) == source
 
 
-@skipUnlessBackends(["cute"])
 def test_tma_role_hoist_fails_closed_without_exactly_one_role_block():
     """The hoist moves the one TMA-load role block behind its anchor; a
     setup without it, or with a second one (a scheduler full/edge phase
@@ -1388,7 +1359,6 @@ def test_tma_role_hoist_fails_closed_without_exactly_one_role_block():
                 pids._hoist_tcgen05_tma_role_block(bad, anchor)
 
 
-@skipUnlessBackends(["cute"])
 def test_two_cta_row_union_drains_stores_after_the_tmem_free(case):
     """The two-CTA row-union teardown issues the store warp's bulk-store drain
     after the TMEM dealloc handshake so the two overlap (one tile per CTA at
@@ -1420,7 +1390,6 @@ def test_two_cta_row_union_drains_stores_after_the_tmem_free(case):
     assert paired_free < paired_drain
 
 
-@skipUnlessBackends(["cute"])
 def test_mma_warp_owns_tmem_on_the_transposed_profile(case):
     """The transposed profile's MMA warp allocates TMEM and frees it right
     after its accumulator ``producer_tail`` (every epilogue release follows a
@@ -1472,7 +1441,6 @@ def test_mma_warp_owns_tmem_on_the_transposed_profile(case):
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_tma_load_role_waits_per_tile_ahead_of_its_first_stage(case):
     """Under ``cute_pdl`` the TMA-load role's dependent-launch wait sits inside
     its persistent loop, after the tile's address math (scheduler step, local
@@ -1530,7 +1498,6 @@ def test_tma_load_role_waits_per_tile_ahead_of_its_first_stage(case):
     assert ast.unparse(body[0]) != "cute.arch.griddepcontrol_wait()"
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("rounds", [2, 4])
 def test_epilogue_round_knob_renders_rounds_and_sizes_the_c_ring(case, rounds):
     """``tcgen05_epi_round_subtiles`` on the transposed profile: the five
@@ -1546,8 +1513,8 @@ def test_epilogue_round_knob_renders_rounds_and_sizes_the_c_ring(case, rounds):
     normalized = bound.config_spec.normalized_config(knob)
     assert normalized[ROUND_SUBTILES_KEY] == rounds
     assert normalized[AB_STAGES_KEY] == 6
-    projected = bound.config_spec._cute_tcgen05_config.project_row_union_codegen(
-        normalized
+    projected = facts.project_row_union_codegen(
+        bound.config_spec._cute_tcgen05_config, normalized
     )
     subtiles = TRANSPOSED.epilogue_subtiles
     assert subtiles == 5
@@ -1592,7 +1559,6 @@ def test_epilogue_round_knob_renders_rounds_and_sizes_the_c_ring(case, rounds):
     assert "PipelineTmaStore.create(num_stages=2," in plain
 
 
-@skipUnlessBackends(["cute"])
 def test_epilogue_round_knob_normalizes_against_the_profile(case):
     """The round must be a choice no wider than the tile's subtiles and its C
     ring must fit beside the physical AB ring; the paired CLC profile keeps
@@ -1600,7 +1566,7 @@ def test_epilogue_round_knob_normalizes_against_the_profile(case):
     knob (1 is canonical as absent)."""
     bound, _args, config, _source = case
     spec = bound.config_spec
-    fields = spec._cute_tcgen05_config.optional_fragments(for_search=True)
+    fields = surface.optional_fragments(spec._cute_tcgen05_config, for_search=True)
     assert tuple(fields[ROUND_SUBTILES_KEY].choices) == (1, 2, 4)
     assert ROUND_SUBTILES_KEY not in spec.normalized_config(config).config
     one = deepcopy(config)
@@ -1638,7 +1604,6 @@ def test_epilogue_round_knob_normalizes_against_the_profile(case):
         assert repaired[CONFIG_KEY] is True
 
 
-@skipUnlessBackends(["cute"])
 def test_prologue_trims_on_the_transposed_profile(case):
     """The TMA-load warp's prologue is the critical path of the CTAs the
     hardware dispatches last (after the dependent-launch release): the
@@ -1752,7 +1717,6 @@ def test_prologue_trims_on_the_transposed_profile(case):
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_register_reallocation_optional_on_the_transposed_profile(case):
     """At one CTA per SM the transposed profile's six warps hold their
     registers from launch, so ``tcgen05_warp_register_reallocation=False``
@@ -1793,7 +1757,6 @@ def test_register_reallocation_optional_on_the_transposed_profile(case):
         assert key not in repaired
 
 
-@skipUnlessBackends(["cute"])
 def test_split_init_falls_back_to_the_dsl_constructors(case):
     """When the installed DSL is not the release the runtime's no-init
     constructors mirror, the clustered kernel keeps the DSL constructors

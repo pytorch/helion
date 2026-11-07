@@ -11,13 +11,13 @@ as the last wave starts and never hold slots the earlier waves need; a grid
 that fits in one wave releases at plain entry), and ``auto`` (the default)
 picks ``entry`` while the launch grid is known to fit in one wave of
 resident CTAs and ``last_wave`` past it or when the host sizes the grid at
-runtime (``DeviceFunction._implicit_pdl_release``).  The placement follows
+runtime (``passes.pdl._implicit_pdl_release``).  The placement follows
 the grid, so the search leaves it at ``auto``; the explicit values serve
 pins, seeds and users.  The tcgen05 GEMM kernels, whose lowering waits in
 its warp roles and releases after the MMA warp's last MMA, take the same
 placements: ``entry`` and ``last_wave`` add the (guarded) release right
 after each of those waits, ``exit`` and ``none`` keep the late release
-alone (``DeviceFunction._tcgen05_early_pdl_release``).  The choices live
+alone (``passes.pdl._tcgen05_early_pdl_release``).  The choices live
 here, a leaf module, because both the config spec (the fragment and
 normalization) and the device-function codegen read them.
 

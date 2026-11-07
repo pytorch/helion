@@ -18,7 +18,9 @@ from torch.utils._pytree import tree_leaves
 
 from .._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 from .._utils import triton_is_available
-from . import patch_cute_mma_support
+from . import cpu_render_target
+from . import default_cute_mma_support
+from . import patch_target_facts
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -58,23 +60,19 @@ def cpu_bind(
     """
     if reason := codegen_skip_reason(kernel.settings.backend):
         raise SkipTest(reason)
-    with ExitStack() as stack:
-        for name, value in (
-            ("helion.runtime.kernel.target_device_capability", capability),
-            (
-                "helion._compiler.compile_environment.target_device_capability",
-                capability,
-            ),
-            ("helion.runtime.get_num_sm", 148),
-            ("helion._compat._is_hip", False),
-        ):
-            stack.enter_context(patch(name, return_value=value))
+    with patch_target_facts(capability=capability, num_sm=148, is_hip=False):
         return kernel._bind_isolated(args)
 
 
 @contextmanager
 def mock_cuda_unavailable() -> Generator[None, None, None]:
-    """Model CPU code generation without filling process-wide device caches."""
+    """Model CPU code generation without filling process-wide device caches.
+
+    The capability probes are ``functools.cache``'d for the process, so each
+    is patched itself rather than computed under ``torch.cuda.is_available``
+    False; the CuTe environment check becomes a skip when the DSL is missing
+    so source-generation tests stay runnable in Triton-only installations.
+    """
     with (
         patch(
             "helion._compiler.cute.backend.CuteBackend.validate_environment",
@@ -183,33 +181,22 @@ class RejectNativeCuda(TorchDispatchMode):
 
 
 @contextmanager
-def cpu_target() -> Generator[None, None, None]:
+def cpu_target(*, forbid_native: bool = True) -> Generator[None, None, None]:
     """Generate tcgen05 CuTe source for a 148-SM sm100 target without CUDA.
 
-    Extends ``mock_cuda_unavailable`` with the compute capability, SM count and
-    tcgen05 shared-memory budget the schedule heuristics read, and fails the
-    test if anything initializes CUDA.
+    ``cpu_render_target`` with the default (tcgen05-on) MMA support record and
+    the full 227 KiB opt-in SMEM as the AB budget: the B200 model's compute
+    capability, SM count and HIP flag, ``mock_cuda_unavailable`` and the
+    ``torch.cuda._lazy_init`` guard that fails the test if anything
+    initializes CUDA.  ``forbid_native=False`` keeps ``cute.compile`` callable
+    for a test that compiles its own CPU driver (the split-K workspace
+    protocol checks).
     """
-    with ExitStack() as stack:
-        stack.enter_context(patch_cute_mma_support())
-        stack.enter_context(mock_cuda_unavailable())
-        stack.enter_context(
-            patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU test"))
-        )
-        for name, value in (
-            ("helion.runtime.kernel.target_device_capability", (10, 0)),
-            ("helion._compiler.compile_environment.target_device_capability", (10, 0)),
-            ("helion.runtime.get_num_sm", 148),
-            ("helion._compat._is_hip", False),
-            (
-                (
-                    "helion._compiler.cute.tcgen05_config."
-                    "CuteTcgen05Config.per_cta_smem_budget_bytes"
-                ),
-                232448,
-            ),
-        ):
-            stack.enter_context(patch(name, return_value=value))
+    with cpu_render_target(
+        mma_support=default_cute_mma_support(),
+        smem_budget_bytes=232448,
+        forbid_native=forbid_native,
+    ):
         yield
 
 
@@ -217,7 +204,9 @@ def cuda_fake(backend: object, tensor: torch.Tensor) -> torch.Tensor:
     """Stand-in for ``CuteBackend.normalize_input_fake_tensor`` on a CPU process.
 
     Re-homes a CPU fake tensor on ``cuda:0`` so CuTe code generation sees device
-    inputs without a CUDA context.
+    inputs without a CUDA context (the device-type gates of the tcgen05
+    planners, the recurrence planners and the TMA routes then see a CUDA
+    target).
     """
     assert isinstance(tensor, FakeTensor)
     with torch._C._DisableTorchDispatch():

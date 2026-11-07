@@ -13,9 +13,9 @@ SIMD_WIDTH = 32
 
 #: Maximum threads in a Metal threadgroup.
 #:
-#: Numerically equal to ``cute.thread_budget.MAX_THREADS_PER_BLOCK``: one
-#: Apple hardware limit under two names.  The MPP budget in ``backend.py``
-#: uses the CuTe name; everything else on this backend uses this one.
+#: Numerically equal to ``per_thread_planning.MAX_THREADS_PER_BLOCK``, the cap
+#: the shared per-thread tile planner (``plan_per_thread_loop_strategy``)
+#: enforces; everything on this backend uses this name.
 MAX_THREADS_PER_THREADGROUP = 1024
 
 #: Threadgroup memory available to one threadgroup

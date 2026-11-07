@@ -246,7 +246,7 @@ def mark_simt_gemm(
         )
         or "cutlass.Int32(0)"
     )
-    sites = df.cute_state.simt_gemm_sites
+    sites = df.cute_state.lanes.simt_gemm_sites
     site = SimtGemmSite(
         identity=len(sites),
         bm=bm,
@@ -687,7 +687,7 @@ def lower_simt_gemm(
     from ..ast_read_writes import ReadWrites
     from ..ast_read_writes import ast_rename
 
-    sites = df.cute_state.simt_gemm_sites
+    sites = df.cute_state.lanes.simt_gemm_sites
     if not sites:
         return body
     # Phi names must be canonical before the carried result is rebound.

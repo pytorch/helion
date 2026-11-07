@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 from copy import deepcopy
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -13,34 +12,20 @@ from test.test_cute_host_single_sum import _arguments
 from test.test_cute_host_single_sum import _single
 
 import helion
-from helion._compiler.cute.host_paired_sum import PAIRED_SUM_KEY
+from helion._compiler.cute.host_sum_site import PAIRED_SUM_KEY
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 
 rms_norm_bwd = import_example("rms_norm").rms_norm_bwd
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(reduction_smem_budget_bytes=232448),
+]
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from helion.runtime.kernel import BoundKernel
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
-        yield
 
 
 def _original(static: bool) -> tuple[BoundKernel, tuple[torch.Tensor, ...]]:

@@ -14,7 +14,7 @@ from test.test_cute_mxfp8_mma import _wrapper_plan
 from test.test_cute_mxfp8_packed_provenance import _packed_mxfp8
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_block_scaled import (
+from helion._compiler.cute.autotune.heuristics.cute_block_scaled import (
     CuteBlockScaledMmaHeuristic,
 )
 from helion._compiler.cute.block_scaled_config import BLOCK_SCALED_CHOICES

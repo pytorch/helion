@@ -11,6 +11,8 @@ import torch
 from torch._dynamo.source import LocalSource
 
 import helion
+from helion._compiler.cute.emitters.lane_packets import _cute_unroll_vec_extract
+from helion._compiler.cute.emitters.lane_packets import _cute_unroll_vec_load_expr
 from helion._compiler.cute.memory_ops import (
     _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
 )
@@ -18,12 +20,9 @@ from helion._compiler.cute.memory_ops import _cute_tile_packet_is_aligned
 from helion._compiler.cute.memory_ops import (
     register_persistent_vec_alignment_specializations,
 )
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
-from helion.language.memory_ops import _cute_unroll_vec_extract
-from helion.language.memory_ops import _cute_unroll_vec_load_expr
 
 pytestmark = pytest.mark.cpu_only
 
@@ -268,7 +267,6 @@ def _high_nibble_to_bf16(packed: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_grid_lane_flush_uses_packet_from_deferred_hoist(enabled: bool) -> None:
     """Grid-owned hoists and flushes are emitted when the root body is wrapped.

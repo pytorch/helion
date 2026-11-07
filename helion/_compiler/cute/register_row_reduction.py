@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import ast
-from itertools import pairwise
 import math
 from typing import TYPE_CHECKING
 from typing import cast
 
 from . import cluster_online_pair as pair
+from ._ast_pass_utils import is_name_assign
+from .analysis.online_pair import OnlinePairMatcher
+from .analysis.online_pair import _assigned_name
+from .analysis.online_pair import _wrap_sites
+from .analysis.online_pair import rolled_pair_gate
 from .hoist_warp_reduce import _static_trip_count
-from .rolled_cluster_online_pair import _prove
-from .rolled_cluster_online_pair import _wrap_sites
 
 if TYPE_CHECKING:
     from .register_row_tensor_copy import TensorCopyContext
@@ -41,31 +43,20 @@ def lower_register_row_reduction(
     from .fuse_two_pass_loads import _range_bounds
 
     working, owners = _wrap_sites(body)
-    sites = pair._find_sites(working)
-    if sites is None:
+    matcher = OnlinePairMatcher(working, rolled_pair_gate(owners))
+    if matcher.sites is None:
         return body
-    for site_a, site_b in pairwise(sites):
-        if not (
-            id(site_a.for_node) in owners
-            and id(site_b.for_node) in owners
-            and site_a.op == "max"
-            and site_b.op == "sum"
-            and site_a.group_span == site_b.group_span
-            and site_a.group_span is not None
-            and site_a.group_span >= 64
-            and site_a.cluster_n == site_b.cluster_n
-            and site_a.cluster_n is not None
-            and 1 < site_a.cluster_n <= 16
-        ):
-            continue
-        proof = _prove(working, site_a, site_b)
-        if proof is None:
-            continue
-        maximum, scale, _subtractions = proof
+    for match in matcher.proved():
+        site_a, site_b, maximum, scale = (
+            match.site_a,
+            match.site_b,
+            match.maximum,
+            match.scale,
+        )
         caches = {
-            pair._assigned_name(statement)
+            _assigned_name(statement)
             for statement in working
-            if pair._is_name_assign(statement)
+            if is_name_assign(statement)
             and isinstance(statement.value, ast.Call)
             and ast.unparse(statement.value.func) == "cute.make_rmem_tensor"
         }
@@ -74,10 +65,7 @@ def lower_register_row_reduction(
             for statement in working
             if statement is not site_a.for_node
             and statement is not site_b.for_node
-            and not (
-                pair._is_name_assign(statement)
-                and pair._assigned_name(statement) in caches
-            )
+            and not (is_name_assign(statement) and _assigned_name(statement) in caches)
             for name in pair._loads(statement)
         ):
             continue
@@ -103,7 +91,7 @@ def lower_register_row_reduction(
             if isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and pair._assigned_name(node) == acc.id
+            and _assigned_name(node) == acc.id
             and isinstance(node.value, ast.Call)
             and ast.unparse(node.value.func)
             in ("cute.arch.fmax", "cute.math.max", "_cute_nan_max")
@@ -179,8 +167,7 @@ def lower_register_row_reduction(
                     and isinstance(statement.targets[0].value, ast.Name)
                     and statement.targets[0].value.id in _caches
                 ) or (
-                    pair._is_name_assign(statement)
-                    and pair._assigned_name(statement) == _acc.id
+                    is_name_assign(statement) and _assigned_name(statement) == _acc.id
                 ):
                     continue
                 else:
@@ -209,7 +196,7 @@ def lower_register_row_reduction(
                 *(
                     statement
                     for statement in site_a.for_node.body[: site_a.stmt_idx]
-                    if pair._is_name_assign(statement) and statement is not fold
+                    if is_name_assign(statement) and statement is not fold
                 ),
             ]
             if copy_plan is not None
@@ -243,8 +230,8 @@ def lower_register_row_reduction(
         lane_assignments = [
             statement
             for statement in site_b.for_node.body[: site_b.stmt_idx]
-            if pair._is_name_assign(statement)
-            and pair._assigned_name(statement) == ast.unparse(site_b.call.args[3])
+            if is_name_assign(statement)
+            and _assigned_name(statement) == ast.unparse(site_b.call.args[3])
         ]
         sum_tail = site_b.for_node.body[site_b.stmt_idx + 1 :]
         site_b.for_node.body = [
@@ -268,8 +255,8 @@ def lower_register_row_reduction(
         pair._rebuffer_pair(working, site_a, site_b)
         for statement in working:
             if (
-                pair._is_name_assign(statement)
-                and pair._assigned_name(statement) == site_b.buf_name
+                is_name_assign(statement)
+                and _assigned_name(statement) == site_b.buf_name
             ):
                 statement.value = cast(
                     "ast.Assign",
@@ -280,10 +267,7 @@ def lower_register_row_reduction(
         working = [
             statement
             for statement in working
-            if not (
-                pair._is_name_assign(statement)
-                and pair._assigned_name(statement) in caches
-            )
+            if not (is_name_assign(statement) and _assigned_name(statement) in caches)
         ]
         break
     result: list[ast.stmt] = []

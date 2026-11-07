@@ -2,19 +2,34 @@ from __future__ import annotations
 
 import ast
 import operator
+import os
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 import torch
 
+from test.cute_population_contracts import tcgen05_mma_support
+
 import helion
-from helion._compiler import tile_strategy as lanes
 from helion._compiler.ast_read_writes import ast_rename
 from helion._compiler.cute import matmul_fallback
+from helion._compiler.cute._ast_pass_utils import _is_proven_relocatable_assignment
+from helion._compiler.cute._ast_pass_utils import _is_proven_relocatable_call
+from helion._compiler.cute._ast_pass_utils import assigned_name
+from helion._compiler.cute._ast_pass_utils import call_path_str
+from helion._compiler.cute.lane_loops.markers import _create_lane_loop
+from helion._compiler.cute.lane_loops.markers import _is_lane_reduce_marker_assign
+from helion._compiler.cute.lane_loops.markers import _lane_reduce_marker_expr
+from helion._compiler.cute.lane_loops.owner_guards import _clone_stmt
+from helion._compiler.cute.lane_loops.split import _validate_owned_lane_carry_schedule
+from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 from helion._compiler.cute.scalar_recipe import PURE_DECODE_HELPERS
+from helion._testing import EXAMPLES_DIR
+from helion._testing import import_path
 
 pytestmark = pytest.mark.cpu_only
 
@@ -23,7 +38,7 @@ _RENAMES = {"next_high": "high", "next_mass": "mass", "next_total": "total"}
 
 def _marker(value: str, operation: str, *, product: bool = False) -> str:
     identity = "float('-inf')" if operation == "max" else "0"
-    return lanes._lane_reduce_marker_expr(
+    return _lane_reduce_marker_expr(
         value,
         operation,
         f"cutlass.Float32({identity})",
@@ -57,7 +72,7 @@ next_high = high_value
 
 
 def _loop(extent: int = 8, source: str | None = None) -> ast.For:
-    return lanes._create_lane_loop(
+    return _create_lane_loop(
         "lane", extent, list(ast.parse(source if source is not None else _body()).body)
     )
 
@@ -71,7 +86,7 @@ def _source(body: list[ast.AST]) -> str:
 
 
 def _lower(loop: ast.For) -> list[ast.AST]:
-    return lanes.split_lane_loop_reductions([loop], rename_groups=_RENAMES)
+    return split_lane_loop_reductions([loop], rename_groups=_RENAMES)
 
 
 def _execute(body: list[ast.AST], **values: object) -> tuple[dict[str, Any], int]:
@@ -132,7 +147,7 @@ def test_staged_products_and_rescale_preserve_FP32_recurrence(
         orelse=[],
     )
     ast.fix_missing_locations(outer)
-    lowered = lanes.split_lane_loop_reductions([outer], rename_groups=_RENAMES)
+    lowered = split_lane_loop_reductions([outer], rename_groups=_RENAMES)
     scores = np.resize(np.array([-2, -1, 0, 1, 2], np.float32), 3 * extent)
     scores[extent : 2 * extent] += 4
     scores[2 * extent :] += 8
@@ -295,35 +310,37 @@ def test_existing_final_carry_validator_rejects_corrupt_staged_schedules(
     marker_indices = {
         index
         for index, statement in enumerate(original)
-        if lanes._is_lane_reduce_marker_assign(statement) is not None
+        if _is_lane_reduce_marker_assign(statement) is not None
     }
     lowered = _lower(loop)
     update_index = next(
         index
         for index, statement in enumerate(lowered)
-        if lanes._plain_assignment_name(statement) == "next_total"
+        if assigned_name(statement) == "next_total"
     )
     update = lowered[update_index]
     if fault == "drop":
         lowered.pop(update_index)
     elif fault == "repeat":
-        lowered.append(lanes._clone_stmt(update))
+        lowered.append(_clone_stmt(update))
     elif fault == "inside":
-        lowered[update_index] = lanes._create_lane_loop("lane", 8, [update])
+        lowered[update_index] = _create_lane_loop("lane", 8, [update])
     else:
         lowered.pop(update_index)
         lowered.insert(0, update)
     with pytest.raises(helion.exc.BackendUnsupported, match="once-per-tile"):
-        lanes._validate_owned_lane_carry_schedule(
+        _validate_owned_lane_carry_schedule(
             original, lowered, "lane", marker_indices, _RENAMES
         )
 
 
 @pytest.mark.parametrize("bad", ["1", "'matmul'", "None"])
 def test_product_provenance_is_a_typed_internal_marker(bad: str) -> None:
-    marker = _marker("product", "sum", product=True).replace(", True)", f", {bad})")
+    marker = _marker("product", "sum", product=True).replace(
+        "matmul_contribution=True", f"matmul_contribution={bad}"
+    )
     with pytest.raises(helion.exc.BackendUnsupported, match="matmul contribution"):
-        lanes._is_lane_reduce_marker_assign(ast.parse(f"result = {marker}").body[0])
+        _is_lane_reduce_marker_assign(ast.parse(f"result = {marker}").body[0])
 
 
 @pytest.mark.parametrize(
@@ -367,9 +384,7 @@ def test_product_marker_preserves_physical_group_and_serial_owner(
         k_block_id=7,
         owner_lane="contraction_lane",
     )
-    marker = lanes._is_lane_reduce_marker_assign(
-        ast.parse(f"result = {expression}").body[0]
-    )
+    marker = _is_lane_reduce_marker_assign(ast.parse(f"result = {expression}").body[0])
     assert marker is not None
     assert marker.input_name == "contribution" and marker.matmul_contribution
     assert marker.owner_lane == "contraction_lane" and marker.reduction_type == "sum"
@@ -425,15 +440,15 @@ def test_quantized_decode_helpers_are_proven_relocatable(helper: str) -> None:
     call = next(
         node
         for node in ast.walk(stmt)
-        if isinstance(node, ast.Call) and lanes._qualified_name(node.func) == helper
+        if isinstance(node, ast.Call) and call_path_str(node.func) == helper
     )
-    assert lanes._is_proven_relocatable_call(call, allow_load=False)
-    assert lanes._is_proven_relocatable_assignment(stmt, allow_load=False)
+    assert _is_proven_relocatable_call(call, allow_load=False)
+    assert _is_proven_relocatable_assignment(stmt, allow_load=False)
 
 
 def test_unlisted_cute_helper_is_not_proven_relocatable() -> None:
     stmt = ast.parse("decoded = _cute_inline_asm_elementwise(byte)").body[0]
-    assert not lanes._is_proven_relocatable_assignment(stmt, allow_load=False)
+    assert not _is_proven_relocatable_assignment(stmt, allow_load=False)
 
 
 def test_fp8_decoded_product_gets_a_complete_staged_schedule() -> None:
@@ -459,3 +474,99 @@ def test_fp8_decoded_product_gets_a_complete_staged_schedule() -> None:
     assert actual["product_sum"] == np.float32(3)
     assert actual["total"] == np.float32(8)
     assert "_helion_lane_reduce" not in _source(lowered)
+
+
+_F32X2_MULTIPLY_ASM = """
+{
+    .reg .b64 ra, rb, rc;
+    mov.b64 ra, { $2, $3 };
+    mov.b64 rb, { $4, $5 };
+    mul.f32x2 rc, ra, rb;
+    mov.b64 { $0, $1 }, rc;
+}
+"""
+
+
+def _packed_multiply(left: str, right: str, asm: str = _F32X2_MULTIPLY_ASM) -> str:
+    """``blackwell_attention``'s vectorized rescale as the cute lowering emits
+    it: a packed, pure ``hl.inline_asm_elementwise`` over two fp32 registers."""
+    return (
+        f"_cute_inline_asm_elementwise(({left}, {right}), asm={asm!r}, "
+        "constraints='=r,=r,r,r,r,r', dtype=cutlass.Float32, is_pure=True, pack=2)"
+    )
+
+
+def test_packed_pure_asm_is_proven_relocatable() -> None:
+    # The pack width changes the asm's register ABI, not its purity: the
+    # lowering replays the same effect-free scalar arithmetic once per element.
+    stmt = ast.parse(f"scaled = {_packed_multiply('value', 'alpha')}").body[0]
+    assert _is_proven_relocatable_assignment(stmt, allow_load=False)
+
+
+@pytest.mark.parametrize(
+    "asm",
+    [
+        "ld.global.u32 $0, [$1];",
+        "{ bar.sync 0; }",
+        "mov.b64 ra, { %tid.x, $1 };",
+        "{ .reg .pred p; setp.ne.u32 p, $1, 0; @p st.global.u32 [$2], $1; }",
+        "{ .reg .b64 ra; mov.b64 ra, { $2, $3 }; unknown.f32x2 ra, ra, ra; }",
+    ],
+)
+def test_packed_asm_outside_the_scalar_envelope_is_not_relocatable(asm: str) -> None:
+    stmt = ast.parse(f"scaled = {_packed_multiply('value', 'alpha', asm)}").body[0]
+    assert not _is_proven_relocatable_assignment(stmt, allow_load=False)
+
+
+def test_packed_pure_asm_rescale_gets_a_complete_staged_schedule() -> None:
+    # ``blackwell_attention`` rescales its accumulator with a packed
+    # ``mul.f32x2``: the staged splitter relocates the pure asm like the ``*``
+    # it replaces, and the lane-invariant rescale still runs once.
+    before = "scaled_total = old_total * alpha"
+    source = _body()
+    assert source.count(before) == 1
+    rescale = f"scaled_total = {_packed_multiply('old_total', 'alpha')}"
+    lowered = _lower(_loop(4, source.replace(before, rescale)))
+    values = np.array([2**24, 1, -(2**24), 3], np.float32)
+    actual, calls = _execute(
+        lowered,
+        _cute_inline_asm_elementwise=lambda args, **kwargs: np.float32(
+            args[0] * args[1]
+        ),
+        offset=0,
+        scores=np.zeros(4, np.float32),
+        values=values,
+        high=np.float32(0),
+        mass=np.float32(0),
+        total=np.float32(5),
+    )
+    assert calls == 4
+    assert actual["product_sum"] == np.float32(3)
+    assert actual["total"] == np.float32(8)
+    text = _source(lowered)
+    assert "_helion_lane_reduce" not in text
+    assert text.count("pack=2") == 1
+
+
+@pytest.mark.cpu_render(
+    mma_support=tcgen05_mma_support(),
+    forbid_native=False,
+    fake_device_sm_count=148,
+    reduction_smem_budget_bytes=232448,
+)
+def test_blackwell_attention_forward_renders_a_staged_lane_schedule() -> None:
+    # The example's forward on the generic SIMT path (the fused flash body
+    # it takes by default is gated off): the split/join round trip over the
+    # accumulator is elided into one packed ``mul.f32x2`` on the source tile,
+    # which the staged lane schedule relocates (the matmul contribution's
+    # lane sweep used to be refused on it).
+    kernel = import_path(
+        EXAMPLES_DIR / "blackwell_attention.py"
+    ).blackwell_attention_kernel
+    q, k, v = (torch.empty((1, 4, 256, 64), dtype=torch.bfloat16) for _ in range(3))
+    with patch.dict(os.environ, {"HELION_CUTE_FLASH": "0"}):
+        bound = kernel.bind((q, k, v, 0.125))
+        code = bound.to_code(bound.config_spec.default_config())
+    assert "split_smem" not in code
+    assert "_lane_stash_" in code
+    assert code.count("pack=2") == 1

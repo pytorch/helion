@@ -137,9 +137,13 @@ def _render(
     """CPU render of the default flash config (plus ``overrides``)."""
     with (
         cpu_codegen(),
-        patch("helion._compiler.backend._attention_flash_supported", return_value=True),
         patch(
-            "helion._compiler.backend._attention_flash_gate_enabled", return_value=True
+            "helion._compiler.cute.analysis.attention_match._attention_flash_supported",
+            return_value=True,
+        ),
+        patch(
+            "helion._compiler.cute.analysis.attention_match._attention_flash_gate_enabled",
+            return_value=True,
         ),
     ):
         bound = kernel._bind_isolated(args)

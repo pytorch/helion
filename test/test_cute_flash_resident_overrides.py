@@ -92,16 +92,19 @@ def test_fixed_controls_remove_only_incompatible_resident_search_choices(
         # unreachable. Preserve that telemetry against the resident-free domain.
         with memoized_flash_fragments():
             assert (
-                generation.flash_structural_coverage_uncovered_values()
-                == reference.flash_structural_coverage_uncovered_values()
+                generation.extension.flash_structural_coverage_uncovered_values()
+                == reference.extension.flash_structural_coverage_uncovered_values()
             )
             assert (
-                generation.flash_structural_coverage_uncovered_interactions()
-                == reference.flash_structural_coverage_uncovered_interactions()
+                generation.extension.flash_structural_coverage_uncovered_interactions()
+                == reference.extension.flash_structural_coverage_uncovered_interactions()
             )
     else:
-        assert generation.flash_structural_coverage_uncovered_values() == []
-        assert generation.flash_structural_coverage_uncovered_interactions() == []
+        assert generation.extension.flash_structural_coverage_uncovered_values() == []
+        assert (
+            generation.extension.flash_structural_coverage_uncovered_interactions()
+            == []
+        )
         # Ordinary auto/standard paths already canonicalize some fixed controls.
         # The new mode must leave that entire pre-resident population unchanged.
         saved = random.getstate()
@@ -119,7 +122,7 @@ def test_fixed_controls_remove_only_incompatible_resident_search_choices(
     # a contradictory user request instead of silently changing the request.
     assert resident in fragment.choices
     assert (flash.FLASH_SOFTMAX_LOWERING_KEY, resident) not in (
-        generation.flash_structural_coverage_active_values()
+        generation.extension.flash_structural_coverage_active_values()
     )
 
 
@@ -200,4 +203,7 @@ def test_unpaired_store_override_retains_unrelated_coverage_gap(
     # cannot survive this P32 override. Keep that gap visible too.
     expected.append((flash.FLASH_P_CHUNK_ARRIVE_KEY, True))
     with memoized_flash_fragments():
-        assert generation.flash_structural_coverage_uncovered_values() == expected
+        assert (
+            generation.extension.flash_structural_coverage_uncovered_values()
+            == expected
+        )

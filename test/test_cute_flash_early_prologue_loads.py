@@ -27,12 +27,12 @@ import torch
 
 import helion
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute import flash_knobs
 from helion._compiler.cute.attention_plan import SLIDING_WINDOW_MASK_KIND
 from helion._compiler.cute.attention_plan import AttentionScoreModifier
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.attention_plan import dense_score_plan
 from helion._testing import DEVICE
-from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 import helion.language as hl
 
@@ -242,7 +242,7 @@ def test_knob_is_an_appended_schema_axis() -> None:
     # Appended once behind the axes it was introduced after; knobs added later
     # (the flex list walk's) append behind it in turn, so the tail itself is
     # not pinned.
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     assert keys.count(KEY) == 1
     assert keys.index(KEY) > keys.index(cute_flash.FLASH_CAUSAL_HEAD_PAIR_KEY)
     assert (
@@ -619,7 +619,6 @@ def _run(
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     ("kernel", "base", "shape", "is_causal"),
     (

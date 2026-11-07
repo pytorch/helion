@@ -6,8 +6,6 @@ import ast
 from dataclasses import dataclass
 from dataclasses import replace
 from typing import TYPE_CHECKING
-from typing import Protocol
-from typing import cast
 
 import torch
 from torch.fx import Node
@@ -21,6 +19,7 @@ from .promote_output_axis import _ordinary_operation
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
+    from ..lane_loop_context import LaneLoopContext
 
 KEY = "cute_signed_bitfield_bf16"
 _SIGNED_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64)
@@ -211,8 +210,7 @@ def mask_implies(output_mask: str | None, input_mask: str | None) -> bool:
 class SignedBytePacket:
     load: Node
     env: object
-    strategy: object
-    block_id: int
+    context: LaneLoopContext
     width: int
     tensor: torch.Tensor
     carrier: str
@@ -264,29 +262,20 @@ def signed_byte_site(state: CodegenState) -> SignedByteSite:
     )
 
 
-class _TileUnrollStrategy(Protocol):
-    _cute_lane_body_by_block: dict[int, list[ast.AST]]
-    _cute_lane_vloop_by_block: dict[int, ast.For]
-    _cute_lane_axis_pos_by_block: dict[int, int]
-
-
 def _lane_context(
-    strategy: object, block_id: int
+    context: LaneLoopContext, index_exprs: list[str]
 ) -> tuple[list[ast.AST], ast.For, int]:
-    # The existing tile_unroll admission supplies this protocol. The common
-    # strategy base also serves scalar/reduction paths without these fields.
-    context = cast("_TileUnrollStrategy", strategy)
-    return (
-        context._cute_lane_body_by_block[block_id],
-        context._cute_lane_vloop_by_block[block_id],
-        context._cute_lane_axis_pos_by_block[block_id],
-    )
+    """The lane body, V-loop and lane-axis position of an admitted packet."""
+    lane_body = context.lane_body
+    vloop = context.vloop
+    assert lane_body is not None
+    assert vloop is not None
+    return lane_body, vloop, context.lane_axis(index_exprs)
 
 
 def record_signed_byte_packet(
     state: CodegenState,
-    strategy: object,
-    block_id: int,
+    context: LaneLoopContext,
     tensor: torch.Tensor,
     width: int,
     index_exprs: list[str],
@@ -308,7 +297,7 @@ def record_signed_byte_packet(
         or not site.grid_only
     ):
         return
-    lane_body, vloop, lane_pos = _lane_context(strategy, block_id)
+    lane_body, vloop, lane_pos = _lane_context(context, index_exprs)
     records = state.device_function.cute_state.signed_byte_packets
     if definition is None:
         # Cache reuse retains the original definition object; never recognize
@@ -328,8 +317,7 @@ def record_signed_byte_packet(
     records[node] = SignedBytePacket(
         node,
         state.env,
-        strategy,
-        block_id,
+        context,
         width,
         tensor,
         carrier,
@@ -391,7 +379,7 @@ class PackedStoreValue:
     The store site inside the constexpr V-loop then computes nothing per
     lane.  It binds the packet ``carrier`` under the flush operand's name, so
     the site depends on the lane loop that loaded the packet and the flush
-    depends on the site: ``lane_loop_distribution`` orders the other
+    depends on the site: ``lane_loops/placement.py`` orders the other
     statements against the flush through that site.
     """
 
@@ -410,8 +398,7 @@ class PackedStoreValue:
 
 def packed_store_value(
     state: CodegenState,
-    strategy: object,
-    block_id: int,
+    context: LaneLoopContext,
     width: int,
     tensor: torch.Tensor,
     index_exprs: list[str],
@@ -436,13 +423,12 @@ def packed_store_value(
         is None
     ):
         return None
-    lane_body, vloop, lane_pos = _lane_context(strategy, block_id)
+    lane_body, vloop, lane_pos = _lane_context(context, index_exprs)
     if (
         packet.env is not state.env
-        or packet.strategy is not strategy
+        or packet.context is not context
         or packet.load.graph is not node.graph
         or not field.nodes.issubset(state.env)
-        or packet.block_id != block_id
         or packet.width != width
         or packet.lane_body is not lane_body
         or packet.vloop is not vloop

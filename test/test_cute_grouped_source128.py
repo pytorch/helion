@@ -9,16 +9,24 @@ from packaging.version import Version
 import pytest
 import torch
 
+from test._cute_grouped_gemm_split_sizes import _device_offsets_kernel
+from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
 from test.test_autotuner_heuristics import _grouped_worklist_kernel_body
 from test.test_cute_grouped_fp32_output import _grouped_fp32_output
-from test.test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
-from test.test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 
 import helion
-from helion._compiler.autotuner_heuristics import cute as heuristics
-from helion._compiler.autotuner_heuristics.cute import (
+
+# Imported before any test patches ``cutedsl_compat._installed_cute_dsl_version``:
+# the runtime computes ``SPLIT_BARRIER_INIT_SUPPORTED`` once, at import, from the
+# installed DSL version, and a worker whose first import of it happened inside
+# this module's "newer DSL" patch would keep the DSL-constructor prologue for
+# every later tcgen05 render it dumps (the clustered-kernel barrier-init
+# variant pair seen between sweeps).
+import helion._compiler.cute._tcgen05_prologue_runtime  # noqa: F401
+from helion._compiler.cute.autotune.heuristics import cute as heuristics
+from helion._compiler.cute.autotune.heuristics.cute import (
     CuteTcgen05GroupedWorklistHeuristic,
 )
 from helion._compiler.cute.cutedsl_compat import _CuteDSLVersionProbe
@@ -28,7 +36,6 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
@@ -306,7 +313,7 @@ def test_source128_seed_depths_use_physical_smem_and_preserve_old_prefix() -> No
         _target(),
         mock_cuda_unavailable(),
         patch(
-            "helion._compiler.autotuner_heuristics.cute._tcgen05_grouped_physical_k_seeds",
+            "helion._compiler.cute.autotune.heuristics.cute._tcgen05_grouped_physical_k_seeds",
             return_value=[],
         ),
         patch.object(
@@ -316,7 +323,7 @@ def test_source128_seed_depths_use_physical_smem_and_preserve_old_prefix() -> No
         ),
     ):
         with patch(
-            "helion._compiler.autotuner_heuristics.cute._tcgen05_grouped_source128_seeds",
+            "helion._compiler.cute.autotune.heuristics.cute._tcgen05_grouped_source128_seeds",
             return_value=[],
         ):
             previous = cpu_bind(_grouped_fp32_output, args)
@@ -364,7 +371,6 @@ def test_source128_seed_depths_use_physical_smem_and_preserve_old_prefix() -> No
 @pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("cluster_m", [1, 2])
 @pytest.mark.parametrize("block_k", [64, 128])
-@skipUnlessBackends(["cute"])
 def test_source128_cuda_live_routing_rows_and_feature_tails(
     metadata_kind: str,
     offset_dtype: torch.dtype,

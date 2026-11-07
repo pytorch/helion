@@ -39,13 +39,12 @@ def _(origin: Origin, **kwargs: object) -> LiteralType:
 
     env = CompileEnvironment.current()
     # A barrier introduces a sequential phase boundary between top-level loops,
-    # so force persistent kernels (other PID choices are incompatible).  CuTe
-    # can instead launch the phases in order with ``pid_type="flat"``; DeviceIR
-    # keeps ``flat`` only once it has proved those launches
-    # (``ordered_phases_supported``).
+    # so force persistent kernels (other PID choices are incompatible) unless
+    # the backend launches the phases in order under a pid type itself
+    # (``Backend.barrier_allows_pid_type``).
     env.has_barrier = True
     for disallowed in ("flat", "xyz", "persistent_interleaved"):
-        if disallowed == "flat" and env.backend_name == "cute":
+        if env.backend.barrier_allows_pid_type(disallowed):
             continue
         env.config_spec.disallow_pid_type(disallowed, reason=BARRIER_PID_TYPE_REASON)
 

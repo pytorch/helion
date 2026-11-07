@@ -16,8 +16,14 @@ import helion
 from helion import exc
 from helion._compiler import tile_strategy
 from helion._compiler.cute.interchanged_store_dce import eliminate_interchanged_stores
+from helion._compiler.cute.lane_loops.markers import (
+    restore_unprocessed_lane_reduce_markers,
+)
+from helion._compiler.cute.lane_loops.split import (
+    interchange_lane_outside_serial_reductions,
+)
+from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
@@ -43,7 +49,7 @@ for lane in range(4):
         grad_w = grad_w + value
         w = (weight.iterator + col).load()
         product = value * w
-        reduced = _helion_lane_reduce(product, 'sum', 0.0, 1, 1, 0, '', 1)
+        reduced = _helion_lane_reduce(product, 'sum', 0.0, threads_in_group=1)
         scaled = reduced * 2.0
         result = product - scaled
         if mask:
@@ -61,7 +67,7 @@ def _interchanged(loop: ast.For) -> tuple[ast.For, ast.For, list[ast.AST], set[i
         "helion._compiler.cute.interchanged_store_dce.eliminate_interchanged_stores",
         return_value=0,
     ):
-        body = tile_strategy.interchange_lane_outside_serial_reductions([loop])
+        body = interchange_lane_outside_serial_reductions([loop])
     first = body[0]
     assert isinstance(first, ast.For)
     serial = next(
@@ -129,7 +135,7 @@ class _Pointer:
 def _execute(
     body: list[ast.AST], rows: int, valid_rows: int, valid_cols: int
 ) -> dict[str, _Buffer]:
-    body = tile_strategy.split_lane_loop_reductions(
+    body = split_lane_loop_reductions(
         body,
         uniform_names={
             "source",
@@ -142,7 +148,7 @@ def _execute(
         },
         proven_disjoint_tensor_pairs=_PAIRS,
     )
-    body = tile_strategy.restore_unprocessed_lane_reduce_markers(body)
+    body = restore_unprocessed_lane_reduce_markers(body)
     buffers = {
         "source": _Buffer(np.arange(rows * 4, dtype=np.float64) + 0.5),
         "weight": _Buffer(np.array([1.0, 2.0, 4.0, 8.0])),
@@ -303,7 +309,6 @@ def test_pending_scalar_alias_in_address_preserves_store() -> None:
 
 
 @pytest.mark.parametrize("name", ["rms_norm", "layer_norm"])
-@skipUnlessBackends(["cute"])
 def test_norm_backward_emits_one_dx_store(name: str) -> None:
     layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
     rms_norm_bwd = import_example("rms_norm").rms_norm_bwd
@@ -330,7 +335,7 @@ def test_norm_backward_emits_one_dx_store(name: str) -> None:
         ignore_warnings=[helion.exc.TensorOperationInWrapper],
     ).bind(inputs)
     with patch(
-        "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+        "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
         return_value=128 * 1024,
     ):
         code = bound.to_code(bound.env.config_spec.default_config())
@@ -404,7 +409,7 @@ for lane in range(4):
         row_mask = row < valid_rows
         mask = row_mask and col < valid_cols
         value = (source.iterator + row * 4 + col).load() if mask else 0.0{total}
-        reduced = _helion_lane_reduce(value, 'sum', 0.0, 1, 1, 0, '', 1)
+        reduced = _helion_lane_reduce(value, 'sum', 0.0, threads_in_group=1)
         if row_mask:
             cute.arch.atomic_add((output.iterator + row).llvm_ptr, val=reduced, sem='relaxed'){extra}{suffix}
 """
@@ -447,7 +452,7 @@ class _AtomicPointer(_Pointer):
 def _execute_atomics(
     body: list[ast.AST], rows: int, valid_rows: int, valid_cols: int
 ) -> dict[str, _AtomicBuffer]:
-    body = tile_strategy.split_lane_loop_reductions(
+    body = split_lane_loop_reductions(
         body,
         uniform_names={
             "source",
@@ -459,7 +464,7 @@ def _execute_atomics(
         },
         proven_disjoint_tensor_pairs=_PAIRS,
     )
-    body = tile_strategy.restore_unprocessed_lane_reduce_markers(body)
+    body = restore_unprocessed_lane_reduce_markers(body)
     buffers = {
         "source": _AtomicBuffer(np.arange(rows * 4, dtype=np.float64) + 0.5),
         "output": _AtomicBuffer(np.zeros(rows)),
@@ -492,7 +497,7 @@ def test_an_atomic_consumer_of_the_reduction_is_applied_by_the_final_pass_only(
     reduction's per-lane partial is dropped (a store there is overwritten by
     the final pass, an add would double the total) and the final pass adds
     each row's full reduction once."""
-    body = tile_strategy.interchange_lane_outside_serial_reductions([_atomic_program()])
+    body = interchange_lane_outside_serial_reductions([_atomic_program()])
     first, *final = body
     assert isinstance(first, ast.For) and first.target.id == "lane"  # pyrefly: ignore [missing-attribute]
     assert not _atomics([first])
@@ -511,7 +516,7 @@ def test_an_atomic_consumer_of_the_reduction_is_applied_by_the_final_pass_only(
 
 
 def test_a_first_pass_whose_only_effect_was_the_atomic_is_dropped() -> None:
-    body = tile_strategy.interchange_lane_outside_serial_reductions(
+    body = interchange_lane_outside_serial_reductions(
         [_atomic_program(row_total=False)]
     )
     assert len(body) == 1 and isinstance(body[0], ast.For)
@@ -528,7 +533,7 @@ def test_an_atomic_statement_with_other_work_declines_the_interchange() -> None:
     """Dropping the statement from the first pass would drop its other
     effect too, and keeping it would double the total: decline the nest."""
     with pytest.raises(exc.BackendUnsupported, match="atomic consumer"):
-        tile_strategy.interchange_lane_outside_serial_reductions(
+        interchange_lane_outside_serial_reductions(
             [_atomic_program(extra="\n            seen = reduced")]
         )
 
@@ -542,7 +547,6 @@ def _column_sums_added(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@skipUnlessBackends(["cute"])
 def test_column_sums_over_a_lane_looped_row_tile_are_added_once() -> None:
     """Eight rows of a tile on one thread walk a lane loop around the column
     loop; the interchange puts the column loop outside and the kernel holds

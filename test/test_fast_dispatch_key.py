@@ -50,14 +50,20 @@ from torch._dynamo.source import TensorPropertySource
 import helion
 from helion._argument_device import _ArgumentDeviceResolver
 from helion._argument_device import _find_argument_device
+from helion._compiler.compile_environment import (
+    _concrete_tensor_satisfies_alignment_guard,
+)
+from helion._compiler.cute.grouped_static_tail import make_tail_extractor
+from helion._compiler.cute.runtime_hooks import _CuteReductionExtent
+from helion._compiler.cute.runtime_hooks import _CuteReductionExtentExtractor
 import helion.language as hl
 from helion.language.constexpr import ConstExpr
+from helion.runtime.kernel import PreparedMetadataSpecializationExtractor
 from helion.runtime.kernel import _contains_tensor
 from helion.runtime.kernel import _GuardedInputFact
 from helion.runtime.kernel import _IdentityKey
 from helion.runtime.kernel import _implied_by_exact_metadata
 from helion.runtime.kernel import _make_prepared_arg_guard
-from helion.runtime.kernel import _PreparedMetadataSpecializationExtractor
 from helion.runtime.kernel import _RuntimeInputSpecializationExtractor
 from helion.runtime.kernel import _SpecializationAlias
 from helion.runtime.kernel import _TensorDescriptorAlignmentExtractor
@@ -177,7 +183,7 @@ def _make_extras_kernel(key: Callable[..., Hashable] | None = None) -> helion.Ke
 def _storage_offset_is_zero_fact(name: str, params: tuple[str, ...]) -> Hashable:
     """A guard fact over a storage-offset symbol (exact metadata omits it)."""
     offset = sympy.Symbol(f"{name}_offset", integer=True)
-    return _PreparedMetadataSpecializationExtractor(
+    return PreparedMetadataSpecializationExtractor(
         _GuardedInputFact(
             offset,
             sympy.Integer(0),
@@ -1090,7 +1096,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
     def _extractors(self) -> dict[str, Callable[[Sequence[object]], Hashable]]:
         params = ("x", "y", "n")
         return {
-            "size": _PreparedMetadataSpecializationExtractor(
+            "size": PreparedMetadataSpecializationExtractor(
                 _Counted(lambda values: values[0].size(0))  # type: ignore[union-attr]
             ),
             "x_offset": _storage_offset_is_zero_fact("x", params),
@@ -1116,12 +1122,12 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
             size, sympy.Integer(1), ((size, x_size),), False, True, params
         )
         implied = (
-            _PreparedMetadataSpecializationExtractor(operator.itemgetter(0)),
-            _PreparedMetadataSpecializationExtractor(size_fact),
+            PreparedMetadataSpecializationExtractor(operator.itemgetter(0)),
+            PreparedMetadataSpecializationExtractor(size_fact),
             # A CuTe reduction extent's power-of-2 bucket reads input sizes.
-            _PreparedMetadataSpecializationExtractor(
-                kernel_module._CuteReductionExtentExtractor(
-                    kernel_module._CuteReductionExtent(size, (size,), (x_size,)),
+            PreparedMetadataSpecializationExtractor(
+                _CuteReductionExtentExtractor(
+                    _CuteReductionExtent(size, (size,), (x_size,)),
                     params,
                 )
             ),
@@ -1129,7 +1135,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
         offset = sympy.Symbol("x_offset", integer=True)
         x_offset = TensorPropertySource(LocalSource("x"), TensorProperty.STORAGE_OFFSET)
         # One storage-offset source makes the whole fact per call.
-        offset_equals_size_fact = _PreparedMetadataSpecializationExtractor(
+        offset_equals_size_fact = PreparedMetadataSpecializationExtractor(
             _GuardedInputFact(
                 offset - size,
                 sympy.Integer(0),
@@ -1149,9 +1155,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
             ),
             _SpecializationAlias({}, (), ()),
             # A CuTe grouped static tail reads an int tensor's contents.
-            kernel_module._make_cute_grouped_static_tail_extractor(
-                ("cute_grouped_static_tail", 0, 2, 64, None, None)
-            ),
+            make_tail_extractor(("cute_grouped_static_tail", 0, 2, 64, None, None)),
         )
         for extractor in implied:
             self.assertTrue(_implied_by_exact_metadata(extractor))
@@ -1183,7 +1187,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
                 result = extractor((view,))
                 self.assertIs(
                     result,
-                    kernel_module._concrete_tensor_satisfies_alignment_guard(
+                    _concrete_tensor_satisfies_alignment_guard(
                         view, requires_zero_storage_offset
                     ),
                 )
@@ -1229,7 +1233,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
         a = torch.empty(64)
         misaligned = storage[1:65]
         extractors = [
-            _PreparedMetadataSpecializationExtractor(
+            PreparedMetadataSpecializationExtractor(
                 lambda values: tuple(t.size(0) for t in values[0])  # type: ignore[union-attr]
             ),
             lambda values: values[1]["a"],  # type: ignore[index]
@@ -1385,7 +1389,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
         # A schema extension: replace the published list, bump the generation.
         kernel._specialize_extra[signature] = [  # type: ignore[attr-defined]
             operator.itemgetter(2),
-            _PreparedMetadataSpecializationExtractor(
+            PreparedMetadataSpecializationExtractor(
                 lambda values: values[0].size(0)  # type: ignore[union-attr]
             ),
         ]
@@ -1544,7 +1548,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
                 args, is_distributed=is_distributed
             )
             kernel._specialize_extra[signature] = [  # type: ignore[attr-defined]
-                _PreparedMetadataSpecializationExtractor(
+                PreparedMetadataSpecializationExtractor(
                     lambda values, is_distributed=is_distributed: is_distributed
                 ),
                 operator.itemgetter(2),
@@ -1603,7 +1607,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
         first, second = torch.empty(4), torch.empty(4)
         size = _Counted(lambda values: values[1].size(0))  # type: ignore[union-attr]
         for w in (first, second):
-            _publish(add, (x, w), [_PreparedMetadataSpecializationExtractor(size)])
+            _publish(add, (x, w), [PreparedMetadataSpecializationExtractor(size)])
         for _ in range(2):
             for w in (first, second):
                 self.assertEqual(
@@ -1648,7 +1652,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
         add = self._omitted_default_kernel(
             1e-5,
             [
-                _PreparedMetadataSpecializationExtractor(size),
+                PreparedMetadataSpecializationExtractor(size),
                 _TensorDescriptorAlignmentExtractor(extract, False),
                 default,
             ],
@@ -1669,7 +1673,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
     def test_omitted_mutable_default_alias_stays_per_call(self) -> None:
         size = _Counted(lambda values: values[0].size(0))  # type: ignore[union-attr]
         add = self._omitted_default_kernel(
-            [1], [_PreparedMetadataSpecializationExtractor(size)]
+            [1], [PreparedMetadataSpecializationExtractor(size)]
         )
         x = torch.empty(64)
         for _ in range(3):
@@ -1693,7 +1697,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
         offsets: a guard fact over a storage offset is checked every call."""
         params = ("x",)
         size = sympy.Symbol("x_size0", integer=True)
-        size_fact = _PreparedMetadataSpecializationExtractor(
+        size_fact = PreparedMetadataSpecializationExtractor(
             _GuardedInputFact(
                 size,
                 sympy.Integer(1),
@@ -1718,7 +1722,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
 
     def test_prepared_guards_look_through_omitted_default_alias(self) -> None:
         x = torch.empty(64)
-        size = _PreparedMetadataSpecializationExtractor(
+        size = PreparedMetadataSpecializationExtractor(
             _Counted(lambda values: values[0].size(0))  # type: ignore[union-attr]
         )
         default = operator.itemgetter(1)
@@ -1767,7 +1771,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
     def test_alias_per_call_split_follows_replaced_canonical_list(self) -> None:
         """The split of the canonical schema is cached per published list,
         which a schema extension replaces rather than mutates."""
-        size = _PreparedMetadataSpecializationExtractor(
+        size = PreparedMetadataSpecializationExtractor(
             lambda values: values[0].size(0)  # type: ignore[union-attr]
         )
         default = operator.itemgetter(1)
@@ -1826,7 +1830,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
             add = self._omitted_default_kernel(
                 1e-5,
                 [
-                    _PreparedMetadataSpecializationExtractor(
+                    PreparedMetadataSpecializationExtractor(
                         lambda values: values[0].size(0)  # type: ignore[union-attr]
                     ),
                     _TensorDescriptorAlignmentExtractor(operator.itemgetter(0), False),
@@ -1838,7 +1842,7 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
             add = self._omitted_default_kernel(
                 [1],
                 [
-                    _PreparedMetadataSpecializationExtractor(
+                    PreparedMetadataSpecializationExtractor(
                         lambda values: values[0].size(0)  # type: ignore[union-attr]
                     )
                 ],

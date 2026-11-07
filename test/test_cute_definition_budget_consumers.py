@@ -9,9 +9,10 @@ from test.test_cute_interchanged_store_dce import _PAIRS
 from test.test_cute_interchanged_store_dce import _interchanged
 from test.test_cute_interchanged_store_dce import _program
 
-from helion._compiler import tile_strategy
 from helion._compiler.cute.fuse_two_pass_loads import fuse_two_pass_loads
 from helion._compiler.cute.interchanged_store_dce import eliminate_interchanged_stores
+from helion._compiler.cute.lane_loops.markers import _is_lane_reduce_marker_assign
+from helion._compiler.cute.lane_loops.split import _lane_split_reorders_aliasing_memory
 from helion._compiler.cute.persistent_branch_vec import _definition_snapshots
 from helion._compiler.cute.persistent_branch_vec import _freeze_definition
 
@@ -112,14 +113,14 @@ def test_lane_split_budget_retains_aliasing_memory_order(depth, address_dependen
         + ast.parse(
             f"""
 value = (x.iterator + {offset}).load()
-reduced = _helion_lane_reduce(value, 'sum', 0.0, 1, 1, 0, '', 1)
+reduced = _helion_lane_reduce(value, 'sum', 0.0, threads_in_group=1)
 (x.iterator + {offset}).store(reduced + budget_{depth})
 """
         ).body
     )
     index = len(body) - 2
-    marker = tile_strategy._is_lane_reduce_marker_assign(body[index])
+    marker = _is_lane_reduce_marker_assign(body[index])
     assert marker is not None
-    assert tile_strategy._lane_split_reorders_aliasing_memory(
+    assert _lane_split_reorders_aliasing_memory(
         body, [(index, marker)], set(), "lane", 8, {}
     ) == (address_dependent and depth == 12)

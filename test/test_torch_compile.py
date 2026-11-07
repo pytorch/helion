@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
 import math
 import operator
@@ -789,15 +790,32 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipUnlessBackendFuses
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_fusion_survives_a_codegen_retry(self):
-        """The CuTe register-tile fallback throws a first codegen pass away
-        and generates the kernel again through the same memory transforms.
-        The prologue transform's record of emitted fused-input placeholders
-        belongs to the pass; a stale record would make the retried kernel
-        skip the placeholder and read an undefined variable."""
+        """A backend's retry policy (the CuTe register-tile fallback) throws a
+        first codegen pass away and generates the kernel again through the
+        same memory transforms.  The prologue transform's record of emitted
+        fused-input placeholders belongs to the pass; a stale record would
+        make the retried kernel skip the placeholder and read an undefined
+        variable."""
         from helion._compiler import generate_ast as generate_ast_module
+        from helion._compiler.backend import Backend
         from helion._compiler.cute.register_tile_admission import (
             RegisterTileUnsupported,
         )
+        from helion._compiler.emitter_protocols import RetryPolicy
+
+        repairs: list[BaseException] = []
+
+        @dataclasses.dataclass(frozen=True)
+        class RetryOnce(RetryPolicy):
+            signals: tuple[type[BaseException], ...] = (RegisterTileUnsupported,)
+
+            def repair(self, signal, config, *, caller_graphs):
+                # One repair only: a second signal propagates and fails the
+                # test instead of regenerating forever.
+                if repairs:
+                    return None
+                repairs.append(signal)
+                return config
 
         generate = generate_ast_module._generate_ast
         fused_passes: list[object] = []
@@ -818,7 +836,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
-        with patch.object(generate_ast_module, "_generate_ast", generate_failing_once):
+        with (
+            patch.object(generate_ast_module, "_generate_ast", generate_failing_once),
+            patch.object(Backend, "retry_policy", return_value=RetryOnce()),
+        ):
             self._run_compile_test(
                 f,
                 (x, y),

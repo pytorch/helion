@@ -13,7 +13,7 @@ from test.test_cute_collective_chunk_seeds import _matmul_with_unrelated_knob
 from test.test_cute_collective_chunk_seeds import _partitioned_matmul
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind

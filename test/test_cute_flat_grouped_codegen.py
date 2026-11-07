@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import itertools
 import json
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -25,6 +26,8 @@ from helion._compiler.cute.tcgen05_flat_grouped_codegen import (
 )
 from helion._compiler.cute.tcgen05_flat_grouped_ir import prove_flat_grouped_rna
 from helion._compiler.cute.tcgen05_flat_grouped_plan import flat_grouped_rna_schedule
+from helion._compiler.cute.tcgen05_grouped_descriptors import DYNAMIC
+from helion._compiler.cute.tcgen05_grouped_descriptors import WRAPPED
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandRolePlan
 
 pytestmark = pytest.mark.cpu_only
@@ -354,3 +357,60 @@ def owner(_helion_native_grouped_module, *, _helion_native_grid_z=0):
         "_helion_native_code_cache",
         "_helion_native_tensormap_workspace",
     } <= _bound_names(tree)
+
+
+def test_no_placeholder_survives_the_substitution() -> None:
+    """Every ``__native_*`` name of the kernel template is a plan value the
+    renderer substitutes or a branch selector it resolves, under every
+    schedule variant: a leaked placeholder would otherwise surface only at
+    the CuTe JIT on a GPU."""
+    variants: list[dict[str, object]] = [
+        {
+            "converter_warps": warps,
+            "block_k": bk,
+            "ab_stages": {32: 6, 64: 3}[bk],
+            "descriptor_policy": policy,
+        }
+        for warps, bk, policy in itertools.product(
+            (1, 2, 4, 8), (32, 64), (DYNAMIC, WRAPPED)
+        )
+    ]
+    variants += [
+        {
+            "converter_warps": 0,
+            "block_k": 32,
+            "ab_stages": 2,
+            "tma_rn": True,
+            "resident_ctas": ctas,
+            "descriptor_policy": policy,
+        }
+        for ctas, policy in itertools.product((1, 2), (DYNAMIC, WRAPPED))
+    ]
+    variants += [
+        {**variant, "prefix_scan": "block"} for variant in (variants[2], variants[-1])
+    ]
+    with cuda_binding(static=True, original=True) as bound:
+        proof = prove_flat_grouped_rna(bound.env, _host(bound).device_ir)
+        assert proof is not None
+        rendered: list[dict[str, object]] = []
+        for kwargs in variants:
+            schedule = flat_grouped_rna_schedule(
+                bound.env,
+                proof,
+                shared_capacity=232448,
+                **kwargs,  # pyrefly: ignore[bad-argument-type]
+            )
+            if schedule is None:
+                continue
+            rendered.append(kwargs)
+            leaked = sorted(
+                {
+                    node.id
+                    for node in ast.walk(
+                        ast.parse(flat_grouped_kernel_module(schedule))
+                    )
+                    if isinstance(node, ast.Name) and node.id.startswith("__native")
+                }
+            )
+            assert not leaked, (kwargs, leaked)
+    assert len(rendered) >= 8, rendered

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import patch
 
+from packaging.version import Version
 import pytest
 
 from helion._compiler.cute.tcgen05_prologue import inline_floordiv_nonneg_expr
@@ -72,7 +74,29 @@ def test_split_init_surface_is_pinned_to_the_installed_dsl():
     assert tuple(f.name for f in dataclasses.fields(PipelineUmmaAsync)) == (
         rt._PIPELINE_UMMA_ASYNC_FIELDS
     )
-    assert rt.SPLIT_BARRIER_INIT_SUPPORTED is True
+    assert rt.split_barrier_init_supported() is True
+    assert split_barrier_init_supported() is True
+
+
+def test_split_init_probe_follows_the_patched_dsl_version():
+    """The probe is answered on first use from the version the compat layer
+    reports, not fixed at import: a test that patches the version probe to a
+    newer release renders the DSL-constructor fallback, and the next render
+    in the same process is back on the no-init path (an import-time constant
+    kept whichever answer the importing test happened to see)."""
+    pytest.importorskip("cutlass")
+    from helion._compiler.cute import _tcgen05_prologue_runtime as rt
+    from helion._compiler.cute.cutedsl_compat import _CuteDSLVersionProbe
+    from helion._compiler.cute.tcgen05_prologue import split_barrier_init_supported
+
+    assert split_barrier_init_supported() is True
+    with patch(
+        "helion._compiler.cute.cutedsl_compat._installed_cute_dsl_version",
+        return_value=_CuteDSLVersionProbe(version=Version("4.8.0")),
+    ):
+        assert rt.split_barrier_init_supported() is False
+        assert split_barrier_init_supported() is False
+    assert rt.split_barrier_init_supported() is True
     assert split_barrier_init_supported() is True
 
 

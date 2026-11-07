@@ -25,6 +25,7 @@ from test.test_cute_flash_flex_skip_absent import _render
 from test.test_cute_flash_flex_skip_absent import _resolve
 
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute import flash_knobs
 from helion._compiler.cute.attention_plan import dense_score_plan
 
 pytestmark = pytest.mark.cpu_only
@@ -71,10 +72,10 @@ def test_resolver_defaults_the_knob_off_and_pins_it_to_the_skip() -> None:
 
 
 def test_knob_is_an_appended_schema_axis_with_the_skip_as_its_witness() -> None:
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     assert keys.count(KEY) == 1
     assert keys.index(KEY) > keys.index(SKIP)
-    witness = cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(KEY, True)]
+    witness = flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(KEY, True)]
     assert witness == {cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4", SKIP: True}
     assert _resolve({**witness, KEY: True}).flex_dead_stage_split is True
     for value in (False, True):

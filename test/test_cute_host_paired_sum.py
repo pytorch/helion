@@ -9,12 +9,12 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.cute.host_paired_sum import PAIRED_SUM_KEY
 from helion._compiler.cute.host_paired_sum import lower_host_sum_pairs
 from helion._compiler.cute.host_paired_sum import prove_host_sum_pairs
+from helion._compiler.cute.host_sum_site import PAIRED_SUM_KEY
+from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -28,10 +28,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
+    with cpu_render_target():
         yield
 
 

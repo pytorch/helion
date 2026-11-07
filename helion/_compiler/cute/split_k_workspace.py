@@ -37,6 +37,7 @@ from ..device_ir import ForLoopGraphInfo
 from ..device_ir import IfGraphInfo
 from ..indexing_strategy import subscript_tile_info
 from ..type_info import CallableType
+from .analysis.match_common import node_tensor
 from .atomic_output_promotions import fresh_half_atomic_outputs
 from .pipeline_smem import Tcgen05PipelineSmemFacts
 from .pipeline_smem import max_pipeline_ab_stages
@@ -138,14 +139,6 @@ class SplitKWorkspaceSchedule:
     atomic_epilogue: bool = False
 
 
-def _tensor(node: object) -> torch.Tensor | None:
-    if isinstance(node, torch.fx.Node):
-        value = node.meta.get("val")
-        if isinstance(value, torch.Tensor):
-            return value
-    return None
-
-
 def _is_call(node: object, target: object) -> bool:
     return (
         isinstance(node, torch.fx.Node)
@@ -207,7 +200,7 @@ def _direct_load(
         return None
     source = node.args[0]
     assert isinstance(source, torch.fx.Node)
-    tensor = _tensor(source)
+    tensor = node_tensor(source)
     indices = node.args[1]
     if (
         tensor is None
@@ -382,8 +375,8 @@ def _first_partition_bias(
         not _is_call(result, torch.ops.aten.add.Tensor)
         or not isinstance(result, torch.fx.Node)
         or len(result.args) != 2
-        or _tensor(result) is None
-        or cast("torch.Tensor", _tensor(result)).dtype is not torch.float32
+        or node_tensor(result) is None
+        or cast("torch.Tensor", node_tensor(result)).dtype is not torch.float32
     ):
         return False, None
     left, right = result.args
@@ -471,8 +464,8 @@ def analyze_split_k_reduction(
         or not _is_call(atomic.args[0], _tracing_ops._host_tensor)
         or not isinstance(atomic.args[1], (tuple, list))
         or len(atomic.args[1]) != 2
-        or _tensor(atomic.args[2]) is None
-        or cast("torch.Tensor", _tensor(atomic.args[2])).dtype is not torch.float32
+        or node_tensor(atomic.args[2]) is None
+        or cast("torch.Tensor", node_tensor(atomic.args[2])).dtype is not torch.float32
         or loop.kwargs
         or len(loop.args) != 4
         or type(loop.args[0]) is not int
@@ -481,7 +474,7 @@ def analyze_split_k_reduction(
     ):
         return None
     output_node = cast("Node", atomic.args[0])
-    output = _tensor(output_node)
+    output = node_tensor(output_node)
     output_name = output_node.args[0]
     # The destination is either FP32 (a user FP32 output, or a float16 output
     # the atomic lowering promoted to FP32 storage) or a half output the
@@ -848,7 +841,7 @@ def analyze_split_k_store_reduction(
     ):
         return None
     output_node = cast("Node", store.args[0])
-    output = _tensor(output_node)
+    output = node_tensor(output_node)
     output_name = output_node.args[0]
     if (
         output is None
@@ -996,8 +989,8 @@ def analyze_split_k_store_reduction(
         _is_call(value, torch.ops.aten.add.Tensor)
         and isinstance(value, torch.fx.Node)
         and len(value.args) == 2
-        and _tensor(value) is not None
-        and cast("torch.Tensor", _tensor(value)).dtype is torch.float32
+        and node_tensor(value) is not None
+        and cast("torch.Tensor", node_tensor(value)).dtype is torch.float32
         and _strip_new_vars(value.args[0], matched) is loop_value
     ):
         load = _direct_load(value.args[1], env)

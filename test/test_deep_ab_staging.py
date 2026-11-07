@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from helion._compiler.cute.tcgen05_config import smem
 from helion._testing import TestCase
 
 pytestmark = pytest.mark.cpu_only
@@ -19,23 +20,22 @@ class TestDeepABStagingHelpers(TestCase):
 
     def test_get_dtype_ab_stages_hard_cap(self) -> None:
         """Test dtype-specific hard cap calculation."""
-        from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 
         # FP8 (1 byte) -> 12 stages
-        self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(1), 12)
+        self.assertEqual(smem._get_dtype_ab_stages_hard_cap(1), 12)
 
         # FP16/BF16 (2 bytes) -> 12 stages (the SMEM budget clamps per tile)
-        self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2), 12)
+        self.assertEqual(smem._get_dtype_ab_stages_hard_cap(2), 12)
 
         # FP32 (4 bytes) -> 3 stages
-        self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(4), 3)
+        self.assertEqual(smem._get_dtype_ab_stages_hard_cap(4), 3)
 
         # Larger dtypes -> 3 stages (baseline)
-        self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(8), 3)
+        self.assertEqual(smem._get_dtype_ab_stages_hard_cap(8), 3)
 
         # Invalid input
-        self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(0), 0)
-        self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(-1), 0)
+        self.assertEqual(smem._get_dtype_ab_stages_hard_cap(0), 0)
+        self.assertEqual(smem._get_dtype_ab_stages_hard_cap(-1), 0)
 
 
 class TestMaxABStagesThatFit(TestCase):
@@ -43,7 +43,7 @@ class TestMaxABStagesThatFit(TestCase):
 
     def test_fp8_vs_bf16_capacity(self) -> None:
         """Test that FP8 fits ~2x more stages than BF16 for same tile."""
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
         from helion._compiler.cute.tcgen05_config import (
             Tcgen05AbStagesThreeSearchConstraints,
@@ -76,8 +76,8 @@ class TestMaxABStagesThatFit(TestCase):
         # Test with 256x256x64 cluster_m=2 (common config)
         tile_params = {"bm": 256, "bn": 256, "bk": 64, "cluster_m": 2}
 
-        fp8_max = fp8_config.max_ab_stages_that_fit(**tile_params)
-        bf16_max = bf16_config.max_ab_stages_that_fit(**tile_params)
+        fp8_max = smem.max_ab_stages_that_fit(fp8_config, **tile_params)
+        bf16_max = smem.max_ab_stages_that_fit(bf16_config, **tile_params)
 
         # FP8 should fit more stages
         self.assertGreater(fp8_max, bf16_max, "FP8 should fit more stages than BF16")
@@ -96,7 +96,7 @@ class TestMaxABStagesThatFit(TestCase):
 
     def test_invalid_tile_dimensions(self) -> None:
         """Test that invalid tile dimensions return 0."""
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
         from helion._compiler.cute.tcgen05_config import (
             Tcgen05AbStagesThreeSearchConstraints,
@@ -114,22 +114,22 @@ class TestMaxABStagesThatFit(TestCase):
 
         # bm = 0
         self.assertEqual(
-            config.max_ab_stages_that_fit(bm=0, bn=256, bk=64, cluster_m=1), 0
+            smem.max_ab_stages_that_fit(config, bm=0, bn=256, bk=64, cluster_m=1), 0
         )
 
         # bn = -1
         self.assertEqual(
-            config.max_ab_stages_that_fit(bm=256, bn=-1, bk=64, cluster_m=1), 0
+            smem.max_ab_stages_that_fit(config, bm=256, bn=-1, bk=64, cluster_m=1), 0
         )
 
         # bk = 0
         self.assertEqual(
-            config.max_ab_stages_that_fit(bm=256, bn=256, bk=0, cluster_m=1), 0
+            smem.max_ab_stages_that_fit(config, bm=256, bn=256, bk=0, cluster_m=1), 0
         )
 
     def test_invalid_cluster_m(self) -> None:
         """Test that invalid cluster_m values return 0."""
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
         from helion._compiler.cute.tcgen05_config import (
             Tcgen05AbStagesThreeSearchConstraints,
@@ -147,22 +147,22 @@ class TestMaxABStagesThatFit(TestCase):
 
         # cluster_m = 0 (invalid)
         self.assertEqual(
-            config.max_ab_stages_that_fit(bm=256, bn=256, bk=64, cluster_m=0), 0
+            smem.max_ab_stages_that_fit(config, bm=256, bn=256, bk=64, cluster_m=0), 0
         )
 
         # cluster_m = 3 (not supported)
         self.assertEqual(
-            config.max_ab_stages_that_fit(bm=256, bn=256, bk=64, cluster_m=3), 0
+            smem.max_ab_stages_that_fit(config, bm=256, bn=256, bk=64, cluster_m=3), 0
         )
 
         # cluster_m = -1 (invalid)
         self.assertEqual(
-            config.max_ab_stages_that_fit(bm=256, bn=256, bk=64, cluster_m=-1), 0
+            smem.max_ab_stages_that_fit(config, bm=256, bn=256, bk=64, cluster_m=-1), 0
         )
 
     def test_no_constraints_returns_zero(self) -> None:
         """Test that missing constraints return 0."""
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
         from helion.autotuner.config_spec import ConfigSpec
 
@@ -170,12 +170,12 @@ class TestMaxABStagesThatFit(TestCase):
         config.ab_stages_three_search_constraints = None
         config.search_enabled = True
 
-        result = config.max_ab_stages_that_fit(bm=256, bn=256, bk=64, cluster_m=1)
+        result = smem.max_ab_stages_that_fit(config, bm=256, bn=256, bk=64, cluster_m=1)
         self.assertEqual(result, 0, "Should return 0 when constraints are None")
 
     def test_cluster_m_scaling(self) -> None:
         """Test that cluster_m=2 fits more stages than cluster_m=1."""
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
         from helion._compiler.cute.tcgen05_config import (
             Tcgen05AbStagesThreeSearchConstraints,
@@ -193,8 +193,12 @@ class TestMaxABStagesThatFit(TestCase):
 
         tile_params = {"bm": 256, "bn": 256, "bk": 64}
 
-        stages_cluster1 = config.max_ab_stages_that_fit(**tile_params, cluster_m=1)
-        stages_cluster2 = config.max_ab_stages_that_fit(**tile_params, cluster_m=2)
+        stages_cluster1 = smem.max_ab_stages_that_fit(
+            config, **tile_params, cluster_m=1
+        )
+        stages_cluster2 = smem.max_ab_stages_that_fit(
+            config, **tile_params, cluster_m=2
+        )
 
         # cluster_m=2 partitions operands across 2 CTAs, so per-CTA SMEM is halved
         self.assertGreater(
@@ -211,7 +215,7 @@ class TestMaxABStagesThatFit(TestCase):
 
     def test_hard_cap_enforcement(self) -> None:
         """Test that hard_cap parameter is respected."""
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
         from helion._compiler.cute.tcgen05_config import (
             Tcgen05AbStagesThreeSearchConstraints,
@@ -229,18 +233,20 @@ class TestMaxABStagesThatFit(TestCase):
         config.search_enabled = True
 
         # Without explicit hard cap, should hit dtype default (12 for FP8)
-        max_default = config.max_ab_stages_that_fit(bm=64, bn=64, bk=32, cluster_m=2)
+        max_default = smem.max_ab_stages_that_fit(
+            config, bm=64, bn=64, bk=32, cluster_m=2
+        )
         self.assertLessEqual(max_default, 12, "Should hit FP8 default cap of 12")
 
         # With explicit hard cap of 5
-        max_capped = config.max_ab_stages_that_fit(
-            bm=64, bn=64, bk=32, cluster_m=2, hard_cap=5
+        max_capped = smem.max_ab_stages_that_fit(
+            config, bm=64, bn=64, bk=32, cluster_m=2, hard_cap=5
         )
         self.assertEqual(max_capped, 5, "Should respect explicit hard cap")
 
     def test_returns_at_least_one_when_valid(self) -> None:
         """Test that result is at least 1 when ab_stages=1 fits."""
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
         from helion._compiler.cute.tcgen05_config import (
             Tcgen05AbStagesThreeSearchConstraints,
@@ -258,7 +264,9 @@ class TestMaxABStagesThatFit(TestCase):
         config.search_enabled = True
 
         # Large tile
-        result = config.max_ab_stages_that_fit(bm=256, bn=256, bk=128, cluster_m=1)
+        result = smem.max_ab_stages_that_fit(
+            config, bm=256, bn=256, bk=128, cluster_m=1
+        )
 
         # Should return at least 1 if ab_stages=1 fits, or 0 if it doesn't
         self.assertIn(result, [0, 1, 2, 3], "Result should be in valid range")

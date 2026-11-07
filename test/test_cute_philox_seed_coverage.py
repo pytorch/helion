@@ -9,7 +9,7 @@ import torch
 from test.test_cute_philox_stream import cpu_only  # noqa: F401
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CutePointwiseVecHeuristic
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile

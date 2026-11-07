@@ -8,7 +8,9 @@ from test.test_cute_rolled_cluster import _rms_ref
 from test.test_cute_rolled_cluster import rms_norm_rolled_kernel
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteMaskedRolledClusterHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteMaskedRolledClusterHeuristic,
+)
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import skipIfNotCUDA

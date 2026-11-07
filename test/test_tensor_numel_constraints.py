@@ -8,11 +8,11 @@ import unittest
 import pytest
 import sympy
 
-from helion._compiler.backend import TileIRBackend
-from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.compile_environment import FixedBlockSizeSource
 from helion._compiler.compile_environment import ReductionLoopBlockSizeSource
+from helion._compiler.triton.backend import TileIRBackend
+from helion._compiler.triton.backend import TritonBackend
 from helion.autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec

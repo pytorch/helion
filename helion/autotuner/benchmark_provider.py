@@ -605,6 +605,12 @@ class BenchmarkProvider(abc.ABC):
         provider does not track them."""
         return []
 
+    def compile_deadline_cascade(self) -> str | None:
+        """Why a search found no config when every candidate it tested was
+        dropped by the benchmark worker's compile deadline (the detail of
+        its ``NoConfigFound``); None when that is not what happened."""
+        return None
+
     def invalidate_effective_source_hash(self, source_hash: str) -> None:
         """Prevent a failed rebenchmark source from being reused as an alias."""
         return None
@@ -698,6 +704,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     # by ``id(fn)`` (``register_isolated_candidates``), so a failed
     # re-timing can name its candidate.
     _isolated_candidate_configs: Mapping[int, Config] = MappingProxyType({})
+    # Candidates the worker's compile deadline dropped, and the longest start
+    # of a worker whose first job was one of them (``compile_deadline_cascade``).
+    _compile_deadline_failures: int = 0
+    _longest_cold_start_seconds: float = 0.0
 
     def __init__(
         self,
@@ -1055,7 +1065,29 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         )
         self._warn_timed_out_role(config, error)
         self._last_benchmark_failure_status = "timeout"
+        self._compile_deadline_failures += 1
+        if error.cold_start_seconds is not None:
+            self._longest_cold_start_seconds = max(
+                self._longest_cold_start_seconds, error.cold_start_seconds
+            )
         self._record_compile_failure(config, error)
+
+    def compile_deadline_cascade(self) -> str | None:
+        tested = self._autotune_metrics.num_configs_tested
+        if tested == 0 or self._compile_deadline_failures != tested:
+            return None
+        message = (
+            f"all {tested} tested configs exceeded the benchmark worker's "
+            f"compile deadline of {self._worker_compile_timeout():.0f}s "
+            "(HELION_AUTOTUNE_COMPILE_TIMEOUT)"
+        )
+        if self._longest_cold_start_seconds:
+            message += (
+                "; a fresh worker took up to "
+                f"{self._longest_cold_start_seconds:.1f}s to start, and its "
+                "first job also loads the arguments and the backend's runtime"
+            )
+        return message
 
     def register_isolated_candidates(
         self, fns: Sequence[Callable[..., object]], configs: Sequence[Config]
@@ -1630,7 +1662,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if backend is None:
             return False
         custom_bench = backend.get_do_bench()
-        return backend.name == "cute" and custom_bench is do_bench_generic
+        return backend.prefers_wall_clock_bench() and custom_bench is do_bench_generic
 
     def _probe_long_kernel(self) -> bool:
         """Whether timing should stop its estimate after one long launch."""
@@ -2748,7 +2780,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         eligible timed-out compiler seed, or the search's default config, gets
         one budget-gated retry with a fixed repetition count
         (``_timeout_retry_repetitions``). A candidate past the worker's
-        compile deadline is a compile failure, never retried.
+        compile deadline is a compile failure, retried only when it was a
+        fresh worker's first job (``_run_candidate_benchmark_job``).
         """
         retry_repetitions = self._timeout_retry_repetitions(
             config, effective_source_hash
@@ -2756,7 +2789,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         retried_repetitions: int | None = None
         try:
             try:
-                latency = self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
+                latency = self._run_candidate_benchmark_job(config, fn)
             except BenchmarkTimeout:
                 if (
                     retry_repetitions is None
@@ -2912,6 +2945,30 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         return float(latency)
 
+    def _run_candidate_benchmark_job(
+        self, config: Config, fn: CompiledConfig
+    ) -> float | None:
+        """The candidate's benchmark job, run once more (budget permitting)
+        when its compile deadline passed on the first job of a fresh worker.
+
+        The worker's start is not charged to that job, but the first job also
+        loads the arguments and the backend's runtime, which a host loaded
+        enough to stretch the start stretches too; so a deadline hit there is
+        a verdict on the candidate only once a second worker's first job
+        confirms it.
+        """
+        try:
+            return self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
+        except BenchmarkCompileTimeout as error:
+            if error.cold_start_seconds is None or self.budget_exceeded_fn():
+                raise
+            self.log(
+                f"Retrying {config!r} once: it exceeded the benchmark worker's "
+                f"compile deadline ({error}) as the first job of a fresh worker "
+                f"that took {error.cold_start_seconds:.1f}s to start"
+            )
+        return self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
+
     def _run_subprocess_accuracy_check_job(
         self, fn: CompiledConfig
     ) -> AccuracyCheckResult | None:
@@ -2924,10 +2981,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         except RuntimeError:
             return None
 
-        if self._benchmark_worker is None:
-            self._benchmark_worker = BenchmarkWorker(
-                device=None, log_warning=self.log.warning
-            )
+        worker = self._get_benchmark_worker()
 
         if (
             len(self.mutated_arg_indices) > 0
@@ -2949,7 +3003,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         try:
             return cast(
                 "AccuracyCheckResult",
-                self._benchmark_worker.run(
+                worker.run(
                     job,
                     timeout=float(self.settings.autotune_benchmark_timeout),
                 ),
@@ -2976,10 +3030,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         except RuntimeError:
             return None
 
-        if self._benchmark_worker is None:
-            self._benchmark_worker = BenchmarkWorker(
-                device=None, log_warning=self.log.warning
-            )
+        worker = self._get_benchmark_worker()
 
         job = BenchmarkJob(
             fn_spec=fn_spec,
@@ -2997,7 +3048,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             timeout = float(self.settings.autotune_benchmark_timeout)
         try:
             return float(
-                self._benchmark_worker.run(
+                worker.run(
                     job,
                     timeout=timeout,
                     compile_timeout=self._worker_compile_timeout(),
@@ -3007,16 +3058,38 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self._disable_unloadable_benchmark_worker(error)
             return None
 
+    def _get_benchmark_worker(self) -> BenchmarkWorker:
+        if self._benchmark_worker is None:
+            self._benchmark_worker = BenchmarkWorker(
+                device=None,
+                start_timeout=self._worker_start_timeout(),
+                log=self.log,
+                log_warning=self.log.warning,
+            )
+        return self._benchmark_worker
+
     def _worker_compile_timeout(self) -> float:
         """Deadline for a candidate's compile and first call in the benchmark
-        worker (``autotune_compile_timeout``), never below the benchmark
-        timeout: before the phases were separated the whole job had that
-        long, and a fresh worker's spawn, imports and argument load count
-        against this phase too."""
+        worker: the current ``autotune_compile_timeout`` (read live, so the
+        adaptive timeout ``set_adaptive_compile_timeout`` fits to the
+        precompile times lowers it too), never below the benchmark timeout
+        (before the phases were separated the whole job had that long). It is
+        armed once the worker is ready, so a fresh worker's spawn, imports and
+        device initialization are not the candidate's."""
         return max(
             float(self.settings.autotune_compile_timeout),
             float(self.settings.autotune_benchmark_timeout),
         )
+
+    def _worker_start_timeout(self) -> float:
+        """How long a fresh benchmark worker may take to report ready:
+        ``autotune_worker_start_timeout``, or twice the worker's compile
+        deadline and at least 120 s (a loaded host stretches the spawn and
+        imports as much as the compiles)."""
+        configured = self.settings.autotune_worker_start_timeout
+        if configured is not None:
+            return float(configured)
+        return max(120.0, 2 * self._worker_compile_timeout())
 
     def _disable_unloadable_benchmark_worker(
         self, error: CompiledFunctionLoadError

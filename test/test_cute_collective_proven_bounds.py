@@ -13,7 +13,7 @@ from test.test_cute_collective_tmem_seed import _dependent_inputs
 from test.test_cute_collective_vector_epilogue_codegen import _mamba_config
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.benchmarking import _make_cudagraph_replay

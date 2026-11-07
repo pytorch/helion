@@ -74,9 +74,11 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ..ast_read_writes import ReadWrites
-from ..tile_strategy import _is_proven_relocatable_call
+from ._ast_pass_utils import _is_proven_relocatable_call
+from ._ast_pass_utils import loop_extent
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
-from .lane_loop_distribution import contains_compiler_marker
+from .lane_loops.statements import contains_compiler_marker
+from .packet_access import match_packet_access
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -114,23 +116,9 @@ _MAX_UNROLLED_LANES = 64
 _MAX_LIVE_PACKETS = 16
 
 
-def _ascending_range_extent(loop: ast.For) -> int | None:
+def _ascending_range_extent(loop: ast.AST) -> int | None:
     """``for <name> in range(<int>)`` -> the extent; ``None`` for anything else."""
-    iterator = loop.iter
-    if (
-        not isinstance(loop.target, ast.Name)
-        or loop.orelse
-        or not isinstance(iterator, ast.Call)
-        or not isinstance(iterator.func, ast.Name)
-        or iterator.func.id != "range"
-        or iterator.keywords
-        or len(iterator.args) != 1
-    ):
-        return None
-    arg = iterator.args[0]
-    if not isinstance(arg, ast.Constant) or not isinstance(arg.value, int):
-        return None
-    return arg.value if arg.value >= 1 else None
+    return loop_extent(loop, kinds=("range",), minimum=1)
 
 
 def _is_lane_loop(stmt: ast.AST) -> bool:
@@ -152,18 +140,13 @@ def _is_load_call(call: ast.Call) -> bool:
 
 
 def _is_packet_load(stmt: ast.AST) -> bool:
-    """Whether the hoisted statement loads a vector packet (not a scalar)."""
-    for call in _calls(stmt):
-        if not _is_load_call(call):
-            continue
-        name = ast.unparse(call.func)
-        if name in _CUTE_CACHE_LOAD_HELPER_NAMES:
-            return True
-        if name == "cute.arch.load" and any(
-            "VectorType" in ast.unparse(arg) for arg in call.args[1:]
-        ):
-            return True
-    return False
+    """Whether the hoisted statement loads a vector packet (not a scalar):
+    a plain or L2-hinted ``cute.arch.load`` packet form."""
+    return any(
+        (access := match_packet_access(call)) is not None
+        and access.kind in ("packet", "hinted_packet")
+        for call in _calls(stmt)
+    )
 
 
 def _has_scalar_policy_load(loop: ast.For) -> bool:
@@ -333,7 +316,7 @@ class _Planner:
 
         for stmt in loop.body:
             if _is_lane_loop(stmt) and not effect_seen:
-                nested_extent = _ascending_range_extent(stmt)  # type: ignore[arg-type]
+                nested_extent = _ascending_range_extent(stmt)
                 if nested_extent is not None:
                     nested, nested_deps = self.plan(
                         stmt,  # type: ignore[arg-type]
@@ -583,7 +566,7 @@ def unroll_lane_loads(
         for stmt in statements:
             if _is_lane_loop(stmt):
                 lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR)
-                extent = _ascending_range_extent(stmt)  # type: ignore[arg-type]
+                extent = _ascending_range_extent(stmt)
                 if lane_var in forced and extent is not None and extent >= 2:
                     replacement = _unroll_one(
                         stmt,  # type: ignore[arg-type]

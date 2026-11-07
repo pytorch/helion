@@ -423,14 +423,16 @@ jobs:
           elif [[ "${{ matrix.lane }}" == "cpu" ]]; then
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
-            MARK="cpu_only"
+            # ``cuda``-marked items (GPU tests kept beside the CPU render
+            # tests of their module) belong to the GPU lane, not this one.
+            MARK="cpu_only and not cuda"
             # test/conftest.py sizes the workers to the CPUs for this lane.
             export HELION_TEST_LANE=cpu
             PARALLEL="-n auto"
           else
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
-            if [[ "$HELION_BACKEND" == "cute" ]]; then MARK="not cpu_only"; fi
+            if [[ "$HELION_BACKEND" == "cute" ]]; then MARK="not cpu_only or cuda"; fi
           fi
           # Pull requests skip the slow tier (fresh-interpreter replays, real
           # autotune searches); pushes to main run it.

@@ -5,11 +5,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from test.cute_population_contracts import _target
-from test.test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 
 import helion
-from helion._compiler.autotuner_heuristics import cute as heuristics
+from helion._compiler.cute.autotune.heuristics import cute as heuristics
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work

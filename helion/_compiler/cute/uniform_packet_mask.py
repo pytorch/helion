@@ -8,7 +8,9 @@ import math
 from typing import cast
 
 from . import cluster_online_pair as pair
-from . import rolled_cluster_online_pair as rolled
+from ._ast_pass_utils import is_name_assign
+from .analysis.online_pair import _assigned_name
+from .analysis.online_pair import _domain
 from .memory_ops import _cute_lane_uniform_mask
 from .memory_ops import _cute_tile_unroll_uniform_definitions
 from .memory_ops import _CuteLaneIndexFacts
@@ -144,14 +146,13 @@ def uniform_packet_mask(
         and store.targets[0].value.id == row
     ):
         return None
-    domain, _value = rolled._domain(store.value, -math.inf)
+    domain, _value = _domain(store.value, -math.inf)
     if not isinstance(domain, ast.Name):
         return None
     masks = [
         statement
         for statement in loop.body[:-1]
-        if pair._is_name_assign(statement)
-        and pair._assigned_name(statement) == domain.id
+        if is_name_assign(statement) and _assigned_name(statement) == domain.id
     ]
     if len(masks) != 1:
         return None
@@ -159,7 +160,7 @@ def uniform_packet_mask(
     indices = [
         statement
         for statement in loop.body[:-1]
-        if pair._is_name_assign(statement)
+        if is_name_assign(statement)
         and isinstance(statement.value, ast.BinOp)
         and isinstance(statement.value.op, ast.Add)
         and isinstance(statement.value.left, ast.Name)
@@ -173,14 +174,14 @@ def uniform_packet_mask(
     for statement in prefix:
         alignment = (
             integer_alignment(statement.value, alignments)
-            if pair._is_name_assign(statement)
+            if is_name_assign(statement)
             else None
         )
         for node in ast.walk(statement):
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
                 alignments.pop(node.id, None)
-        if pair._is_name_assign(statement):
-            name = pair._assigned_name(statement)
+        if is_name_assign(statement):
+            name = _assigned_name(statement)
             if alignment is not None:
                 alignments[name] = alignment
     if base not in alignments or alignments[base] % width:
@@ -194,26 +195,24 @@ def uniform_packet_mask(
     constants = [
         statement
         for statement in prefix
-        if pair._is_name_assign(statement)
+        if is_name_assign(statement)
         and isinstance(statement.value, ast.Constant)
         and type(statement.value.value) is int
-        and writes[pair._assigned_name(statement)] == 1
+        and writes[_assigned_name(statement)] == 1
     ]
     scope = _CuteVloopScope(
         [*constants, *loop.body],
-        frozenset((pair._assigned_name(index), loop.target.id)),
+        frozenset((_assigned_name(index), loop.target.id)),
         [],
         [loop],
         loop,
-        _CuteLaneIndexFacts(
-            pair._assigned_name(index), base, loop.target.id, width, True
-        ),
+        _CuteLaneIndexFacts(_assigned_name(index), base, loop.target.id, width, True),
     )
     expression = _cute_lane_uniform_mask(scope, ast.unparse(mask.value))
     if expression is None:
         return None
     proof = _cute_tile_unroll_uniform_definitions(
-        scope, [pair._assigned_name(index)], 0, expression
+        scope, [_assigned_name(index)], 0, expression
     )
     if proof is None or any(statement is mask for statement in proof.moved):
         return None

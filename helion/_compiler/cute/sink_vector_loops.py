@@ -67,16 +67,15 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+from functools import partial
 import re
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import cast
 
+from ... import exc
 from ...autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
-from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
-from ...language.memory_ops import _CUTE_VECTOR_UNROLL_DTYPES
-from ...language.memory_ops import _cute_unroll_vec_elem_type
-from ...language.memory_ops import _cute_unroll_vec_load_expr
+from ...runtime.config import Config
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -84,10 +83,25 @@ from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ..ast_read_writes import ReadWrites
 from ..ast_read_writes import ast_rename
 from ..compile_environment import CompileEnvironment
-from .masked_packet_load_names import MASKED_PACKET_LOAD_HELPERS
+from ._ast_pass_utils import expand_lane
+from ._ast_pass_utils import exposed_reads
+from ._ast_pass_utils import loop_extent
+from ._ast_pass_utils import rename_names
+from ._ast_pass_utils import replace_call
+from ._ast_pass_utils import replace_node
+from .cache_policy_loads import MASKED_PACKET_LOAD_HELPERS
+from .cache_policy_loads import CachePolicy
+from .cache_policy_loads import hint_wide_packets
+from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_CARRIER
+from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_DTYPES
+from .emitters.lane_packets import _cute_unroll_vec_elem_type
+from .emitters.lane_packets import _cute_unroll_vec_load_expr
+from .packet_access import match_packet_access
+from .packet_access import render_masked_packet_load
 from .persistent_branch_vec import _LOAD_MARKER
 from .persistent_branch_vec import _STORE_MARKER
 from .persistent_branch_vec import _marker_call
+from .reduce_call import ReduceScope
 from .vector_reduction_packets import _clone
 
 if TYPE_CHECKING:
@@ -106,8 +120,8 @@ _VSINK_VECTOR_LOAD_ATTR = "_helion_vsink_vector_load"
 # A select whose lane-invariant conjunct was moved onto the fold it feeds
 # (``_hoist_fold_masks``): the widened load drops it.
 _VSINK_FOLD_MASKED_ATTR = "_helion_vsink_fold_masked"
-_TWO_STAGE_REDUCE = "_cute_grouped_reduce_shared_two_stage"
-_TWO_STAGE_REDUCE_FRAGMENT = "_cute_grouped_reduce_shared_two_stage_fragment"
+_TWO_STAGE_REDUCE = ReduceScope.SHARED_TWO_STAGE.value
+_TWO_STAGE_REDUCE_FRAGMENT = ReduceScope.SHARED_TWO_STAGE_FRAGMENT.value
 # Calls whose result carries the dtype of their first argument.
 _DTYPE_PRESERVING_CALLS = (
     "cute.arch.warp_reduction",
@@ -147,36 +161,16 @@ def _plain_target(stmt: ast.AST) -> str | None:
 
 def _is_constexpr_loop(stmt: ast.AST) -> tuple[str, int] | None:
     """``for X in cutlass.range_constexpr(V)`` -> ``(X, V)``."""
-    if not isinstance(stmt, ast.For) or not isinstance(stmt.target, ast.Name):
+    extent = loop_extent(stmt, kinds=("constexpr",), minimum=None)
+    if extent is None:
         return None
-    call = stmt.iter
-    if (
-        isinstance(call, ast.Call)
-        and ast.unparse(call.func) == "cutlass.range_constexpr"
-        and len(call.args) == 1
-        and not call.keywords
-        and isinstance(call.args[0], ast.Constant)
-        and isinstance(call.args[0].value, int)
-        and not stmt.orelse
-    ):
-        return stmt.target.id, call.args[0].value
-    return None
+    assert isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Name)
+    return stmt.target.id, extent
 
 
 def _lane_loop_extent(loop: ast.For) -> int | None:
     """Extent of an ascending ``range(N)`` lane loop, else None."""
-    call = loop.iter
-    if (
-        isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Name)
-        and call.func.id == "range"
-        and len(call.args) == 1
-        and not call.keywords
-        and isinstance(call.args[0], ast.Constant)
-        and isinstance(call.args[0].value, int)
-    ):
-        return call.args[0].value
-    return None
+    return loop_extent(loop, kinds=("range",), minimum=None)
 
 
 def _is_dtype_ctor(name: str) -> bool:
@@ -195,7 +189,7 @@ def _is_relocatable_statement(
     ``t[i] if mask else 0`` with no load call, and moving that read past a
     store or atomic to ``t`` would change the value it sees.
     """
-    from ..tile_strategy import _is_proven_relocatable_call
+    from ._ast_pass_utils import _is_proven_relocatable_call
 
     if not isinstance(stmt, ast.Assign) or _plain_target(stmt) is None:
         return False
@@ -255,8 +249,12 @@ class _Sinker:
         tensor_dtypes: Mapping[str, torch.dtype],
         proven_disjoint_tensor_pairs: Collection[frozenset[str]] = (),
         stores: Mapping[str, CuteVloopStoreFact] | None = None,
+        wide_packets: bool = False,
     ) -> None:
         self.vec_var = fact.vec_lane_var
+        # Hinted 32-byte packets take their ``_32b`` helpers
+        # (``cache_policy_loads.hint_wide_packets``).
+        self.wide_packets = wide_packets
         self.vec_width = fact.vec_width
         self.fact = fact
         self.loads = loads
@@ -586,7 +584,7 @@ class _Sinker:
         definition = definitions[0]
         if not isinstance(definition, ast.Assign) or _plain_target(definition) is None:
             return
-        _RenameLoads({fact.index_var: fact.base_index_var}).visit(definition)
+        rename_names(definition, {fact.index_var: fact.base_index_var}, loads_only=True)
 
     def _lane_fold(self, body: list[ast.stmt], name: str) -> bool:
         """Whether ``name`` is only folded across the lanes of the body.
@@ -712,7 +710,7 @@ class _Sinker:
             return
         chunk_mask = self.new_var("_vsink_chunk_mask", dce=False)
         base_test = _clone(test)
-        _RenameLoads({fact.index_var: fact.base_index_var}).visit(base_test)
+        rename_names(base_test, {fact.index_var: fact.base_index_var}, loads_only=True)
         body.insert(
             body.index(definition) + 1,
             statement_from_string(f"{chunk_mask} = {{test}}", test=base_test),
@@ -739,7 +737,7 @@ class _Sinker:
             if self.vec_var in reads or reads & varying or mask_var in reads:
                 return None
         guard = _clone(test)
-        _RenameLoads({mask_var: chunk_mask}).visit(guard)
+        rename_names(guard, {mask_var: chunk_mask}, loads_only=True)
         return guard
 
     def _index_definition_ok(self, body: list[ast.stmt]) -> bool:
@@ -908,26 +906,9 @@ class _Sinker:
 
     def _exposed_reads(self, stmts: Sequence[ast.AST], defined: set[str]) -> set[str]:
         """Names read in ``stmts`` before ``stmts`` (or ``defined``) write them."""
-        exposed: set[str] = set()
-        defined = set(defined)
-        for stmt in stmts:
-            if isinstance(stmt, ast.For):
-                exposed |= _names_read(stmt.iter) - defined
-                target = cast("ast.Name", stmt.target).id
-                exposed |= self._exposed_reads(stmt.body, defined | {target}) - defined
-                defined |= _names_written(stmt)
-            elif isinstance(stmt, ast.If):
-                exposed |= _names_read(stmt.test) - defined
-                exposed |= self._exposed_reads(stmt.body, defined) - defined
-                exposed |= self._exposed_reads(stmt.orelse, defined) - defined
-                if stmt.orelse:
-                    defined |= _names_written_list(stmt.body) & _names_written_list(
-                        stmt.orelse
-                    )
-            else:
-                exposed |= _names_read(stmt) - defined
-                defined |= _names_written(stmt)
-        return exposed
+        return set(
+            exposed_reads(stmts, defined=defined, defines="writes", loops="runs_once")
+        )
 
     def _segments(self, stmts: Sequence[ast.AST]) -> list[list[ast.stmt] | ast.For]:
         groups: list[list[ast.stmt] | ast.For] = []
@@ -1368,8 +1349,10 @@ class _Sinker:
         """
         call, pointer, fact, guard = match
         vector_pointer = _clone(pointer)
-        _RenameLoads({self.fact.index_var: self.fact.base_index_var}).visit(
-            vector_pointer
+        rename_names(
+            vector_pointer,
+            {self.fact.index_var: self.fact.base_index_var},
+            loads_only=True,
         )
         needed = _names_read(vector_pointer)
         if guard is not None:
@@ -1409,8 +1392,8 @@ class _Sinker:
         shared-memory reduce is such a call.  Every other statement form
         (``if`` blocks, bare expressions) counts.
         """
-        from ..tile_strategy import _has_side_effect
-        from ..tile_strategy import _is_proven_relocatable_call
+        from ._ast_pass_utils import _is_proven_relocatable_call
+        from .lane_loops.owner_guards import _has_side_effect
 
         if isinstance(stmt, ast.Assign):
             inplace = set(ReadWrites.from_ast(stmt).inplace_writes)
@@ -1629,7 +1612,7 @@ class _Sinker:
         effect (an atomic, a barrier, a shared-memory reduce, a store through
         an unresolved pointer) makes the set unknown.
         """
-        from ..tile_strategy import _is_proven_relocatable_call
+        from ._ast_pass_utils import _is_proven_relocatable_call
         from .fuse_two_pass_loads import _is_store_call
         from .fuse_two_pass_loads import _store_tensor_roots
 
@@ -1688,8 +1671,10 @@ class _Sinker:
         pointer = _scalar_load_pointer(call)
         assert pointer is not None
         vector_pointer = _clone(pointer)
-        _RenameLoads({self.fact.index_var: self.fact.base_index_var}).visit(
-            vector_pointer
+        rename_names(
+            vector_pointer,
+            {self.fact.index_var: self.fact.base_index_var},
+            loads_only=True,
         )
         needed = _names_read(vector_pointer)
         if mask is not None:
@@ -1728,6 +1713,7 @@ class _Sinker:
                     load_fact.dtype,
                     load_fact.vec_width,
                     load_fact.eviction_suffix,
+                    wide_packets=self.wide_packets,
                 )
             load_stmt = statement_from_string(f"{vector_var} = {load_expr}")
             setattr(load_stmt, _VSINK_VECTOR_LOAD_ATTR, True)
@@ -1804,8 +1790,11 @@ class _Sinker:
                         )
                     )
                     replaced = _clone(stmt)
-                    _ReplaceCall(call, f"{result_fragment}[{self.vec_var}]").visit(
-                        replaced
+                    replace_call(
+                        replaced,
+                        call,
+                        partial(expr_from_string, f"{result_fragment}[{self.vec_var}]"),
+                        match="text",
                     )
                     result.append(replaced)
                     continue
@@ -1841,7 +1830,7 @@ class _Sinker:
                     continue
                 base_stmt, step_stmt, replacement = reduced
                 pre.extend((base_stmt, step_stmt))
-                _ReplaceNode(pointer, replacement).visit(load_stmt)
+                replace_node(load_stmt, pointer, replacement)
         return pre
 
     def _unroll_lane_loop(self, loop: ast.For, extent: int) -> ast.For:
@@ -1874,7 +1863,7 @@ class _Sinker:
             for stmt in body:
                 cloned = _clone(stmt)
                 ast_rename(cloned, renames)
-                _SubstituteLane(lane_var, unroll, copy_index).visit(cloned)
+                expand_lane(cloned, lane_var, unroll, copy_index)
                 copy.append(cloned)
             head_indices = {
                 index
@@ -1919,8 +1908,6 @@ _LANE_EXTRACT = re.compile(
     r"^(cutlass\.\w+\()?cutlass\.U?[Ii]nt\d+\(_vsink_vec\w*\[\w+\]\)"
     r"\.bitcast\(cutlass\.\w+\)\)?$"
 )
-# ``level1_eviction_priority='...'`` of a load site -> PTX L1 qualifier name.
-_L1_PRIORITY = re.compile(r"level1_eviction_priority='(\w+)'")
 
 
 def _ctor_operand_name(node: ast.expr) -> str | None:
@@ -1953,17 +1940,14 @@ def _masked_packet_load_expr(
     ``'evict_last'``, or the streaming ``cop='cs'``); the inline-PTX L2
     policy helpers have no predicated form, so their marker is dropped.
     """
-    helper = MASKED_PACKET_LOAD_HELPERS[vec_width * dtype.itemsize]
-    vec_type = f"ir.VectorType.get([{vec_width}], {_cute_unroll_vec_elem_type(dtype)}.mlir_type)"
-    priority = ""
-    if (match := _L1_PRIORITY.search(eviction_suffix)) is not None:
-        priority = match.group(1)
-    elif "cop='cs'" in eviction_suffix:
-        priority = "cs"
-    arguments = f"{pointer}, {guard}, {vec_type}"
-    if priority:
-        arguments += f", {priority!r}"
-    return f"{helper}({arguments})"
+    return render_masked_packet_load(
+        MASKED_PACKET_LOAD_HELPERS[vec_width * dtype.itemsize],
+        pointer,
+        guard,
+        vec_width,
+        _cute_unroll_vec_elem_type(dtype),
+        CachePolicy.from_suffix(eviction_suffix).masked_priority,
+    )
 
 
 def _statement_reads_outside_bodies(stmt: ast.AST) -> set[str]:
@@ -2016,31 +2000,17 @@ def _packet_load_parts(stmt: ast.AST) -> tuple[str, str, int, str] | None:
         ),
         None,
     )
-    vector_type = next(
-        (
-            node
-            for node in ast.walk(stmt.value)
-            if isinstance(node, ast.Call)
-            and ast.unparse(node.func) == "ir.VectorType.get"
-            and len(node.args) == 2
-        ),
-        None,
-    )
+    access = match_packet_access(stmt.value)
     if (
         target is None
         or root is None
-        or vector_type is None
-        or not isinstance(vector_type.args[0], ast.List)
-        or len(vector_type.args[0].elts) != 1
-        or not isinstance(vector_type.args[0].elts[0], ast.Constant)
-        or not isinstance(vector_type.args[1], ast.Attribute)
-        or vector_type.args[1].attr != "mlir_type"
+        or access is None
+        or not access.is_vector
+        or access.width is None
+        or access.carrier is None
     ):
         return None
-    width = vector_type.args[0].elts[0].value
-    if type(width) is not int:
-        return None
-    return target, root, width, ast.unparse(vector_type.args[1].value)
+    return target, root, access.width, access.carrier
 
 
 def _reuse_sibling_packets(
@@ -2211,19 +2181,9 @@ def _remove_statements(stmts: list[ast.stmt], targets: set[int]) -> None:
 
 def _scalar_load_pointer(call: ast.Call) -> ast.expr | None:
     """Pointer expression of ``(ptr).load()`` / ``cute.arch.load(ptr, dtype)``."""
-    if (
-        isinstance(call.func, ast.Attribute)
-        and call.func.attr == "load"
-        and not call.args
-        and not call.keywords
-    ):
-        return call.func.value
-    if (
-        ast.unparse(call.func) == "cute.arch.load"
-        and len(call.args) == 2
-        and isinstance(call.args[1], (ast.Name, ast.Attribute))
-    ):
-        return call.args[0]
+    access = match_packet_access(call)
+    if access is not None and access.kind in ("load", "arch_load"):
+        return access.pointer
     return None
 
 
@@ -2413,18 +2373,6 @@ def _fragment_reduce_match(
     )
 
 
-class _RenameLoads(ast.NodeTransformer):
-    """Rename ``ast.Name`` loads (not stores) by a mapping."""
-
-    def __init__(self, renames: dict[str, str]) -> None:
-        self.renames = renames
-
-    def visit_Name(self, node: ast.Name) -> ast.AST:
-        if isinstance(node.ctx, ast.Load) and node.id in self.renames:
-            node.id = self.renames[node.id]
-        return node
-
-
 class _ExpandNames(ast.NodeTransformer):
     """Replace expanded scalars by their fragment element ``frag[vec]``."""
 
@@ -2446,52 +2394,6 @@ class _ExpandNames(ast.NodeTransformer):
         )
 
 
-class _SubstituteLane(ast.NodeTransformer):
-    """``lane`` -> ``lane * unroll + copy`` in load contexts."""
-
-    def __init__(self, lane_var: str, unroll: int, copy_index: int) -> None:
-        self.lane_var = lane_var
-        self.unroll = unroll
-        self.copy_index = copy_index
-
-    def visit_Name(self, node: ast.Name) -> ast.AST:
-        if isinstance(node.ctx, ast.Load) and node.id == self.lane_var:
-            return ast.copy_location(
-                cast(
-                    "ast.expr",
-                    expr_from_string(
-                        f"{self.lane_var} * {self.unroll} + {self.copy_index}"
-                    ),
-                ),
-                node,
-            )
-        return node
-
-
-class _ReplaceCall(ast.NodeTransformer):
-    """Replace one call node (matched by source text) with an expression."""
-
-    def __init__(self, call: ast.Call, replacement: str) -> None:
-        self.text = ast.unparse(call)
-        self.replacement = replacement
-
-    def visit_Call(self, node: ast.Call) -> ast.AST:
-        if ast.unparse(node) == self.text:
-            return cast("ast.AST", expr_from_string(self.replacement))
-        return self.generic_visit(node)
-
-
-class _ReplaceNode(ast.NodeTransformer):
-    def __init__(self, target: ast.AST, replacement: ast.expr) -> None:
-        self.target = target
-        self.replacement = replacement
-
-    def visit(self, node: ast.AST) -> ast.AST:
-        if node is self.target:
-            return self.replacement
-        return super().visit(node)
-
-
 def sink_grid_vector_loops(
     body: list[ast.AST],
     *,
@@ -2503,6 +2405,7 @@ def sink_grid_vector_loops(
     tensor_dtypes: Mapping[str, torch.dtype],
     proven_disjoint_tensor_pairs: Collection[frozenset[str]] = (),
     stores: Mapping[str, CuteVloopStoreFact] | None = None,
+    wide_packet_hints: bool = False,
 ) -> tuple[list[ast.AST], bool, bool]:
     """Sink every recorded grid V-loop that encloses a vectorizable serial
     reduction nest; bodies outside the proven forms are left untouched.
@@ -2511,7 +2414,9 @@ def sink_grid_vector_loops(
     subscript of one of these names is a memory read.
     ``proven_disjoint_tensor_pairs`` are the argument pairs whose storages
     cannot overlap; a vector load may move above a segment's stores into
-    such a tensor.
+    such a tensor.  ``wide_packet_hints`` is the ``cute_wide_packet_hints``
+    config knob: hinted 32-byte packets take their ``_32b`` helpers
+    (``cache_policy_loads.hint_wide_packets``).
 
     Returns the body, whether any V-loop was sunk and whether this pass
     unrolled a lane loop itself (``lane_unroll``; a sunk nest whose loads are
@@ -2521,6 +2426,7 @@ def sink_grid_vector_loops(
         return body, False, False
     fired = False
     unrolled = False
+    wide_packets = hint_wide_packets(wide_packet_hints)
     # Packets of a tensor may be served to a sibling lane loop from the first
     # loop's registers only when no write of the kernel can reach that
     # tensor's storage: the tensor is not written itself and is proven
@@ -2559,6 +2465,7 @@ def sink_grid_vector_loops(
                     tensor_dtypes,
                     proven_disjoint_tensor_pairs,
                     stores,
+                    wide_packets,
                 )
                 try:
                     replacement = sinker.run()
@@ -2578,3 +2485,22 @@ def sink_grid_vector_loops(
         return result
 
     return visit(body), fired, unrolled
+
+
+class VloopSinkNotApplied(exc.Base):
+    """``cute_vloop_sink`` shaped the thread layout but sank no vector loop.
+
+    The knob must not change the code by itself, so the kernel is regenerated
+    with the knob off (``vloop_sink_off_config``): by ``generate_ast`` for the
+    codegen graphs it builds, and by a caller that supplied its own graphs
+    (materialized fission), which layout planning has annotated in place and
+    which therefore have to be rebuilt.  An ``exc.Base`` so the statement
+    visitor propagates it instead of wrapping it.
+    """
+
+
+def vloop_sink_off_config(config: Config) -> Config:
+    """``config`` with vector-loop sinking (and its lane unroll) off."""
+    return Config.from_dict(
+        {**config.config, "cute_vloop_sink": False, "cute_lane_unroll": 1}
+    )

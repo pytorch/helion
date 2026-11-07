@@ -22,9 +22,9 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir
 from .._compat import extract_device
 from .._compat import get_device_name
 from ..runtime.config import Config
-from ..runtime.cute_structural_config import bound_structural_policy
-from ..runtime.cute_structural_config import decode_structural_policy
-from ..runtime.cute_structural_config import require_same_structural_policy
+from ..runtime.cute.structural_config import decode_structural_policy
+from ..runtime.structural_policy import bound_structural_policy
+from ..runtime.structural_policy import require_same_structural_policy
 from .base_cache import AutotuneCacheBase
 from .base_cache import LooseAutotuneCacheKey
 from .base_cache import StrictAutotuneCacheKey
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from typing import Callable
 
-    from ..runtime.cute_structural_policy import CuteStructuralPolicy
+    from ..runtime.structural_policy import StructuralPolicy
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -169,7 +169,7 @@ class SavedBestConfig:
     config: Config
     config_spec_hash: str
     flat_config: tuple[object, ...] | None
-    cute_structural_policy: CuteStructuralPolicy | None = None
+    cute_structural_policy: StructuralPolicy | None = None
 
     def to_mutable_flat_config(self) -> list[object]:
         """Return the stored flat_config as a mutable list."""

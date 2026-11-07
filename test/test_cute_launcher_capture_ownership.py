@@ -8,6 +8,7 @@ import weakref
 import torch
 
 from helion._testing import skipIfNotCUDA
+from helion.runtime.cute import launch_caches
 from helion.runtime.cute import launcher
 
 
@@ -22,7 +23,7 @@ def _launch_entry(storage: torch.Tensor) -> launcher._CuteLaunchArgCacheEntry:
 
 def test_managed_capture_retains_ungrouped_descriptor_through_lru_eviction() -> None:
     cute_kernel = SimpleNamespace()
-    resources = launcher._CuteCudaGraphResources({}, {}, set(), set())
+    resources = launch_caches.CudaGraphResources({}, {}, set(), set())
     graph = SimpleNamespace(_helion_resources=resources)
     first_ref: weakref.ReferenceType[torch.Tensor] | None = None
     build_count = 0
@@ -31,6 +32,7 @@ def test_managed_capture_retains_ungrouped_descriptor_through_lru_eviction() -> 
         _kernel: object,
         _args: tuple[object, ...],
         _grid: tuple[int, int, int],
+        **_kwargs: object,
     ) -> launcher._CuteLaunchArgCacheEntry:
         nonlocal build_count, first_ref
         build_count += 1
@@ -39,7 +41,7 @@ def test_managed_capture_retains_ungrouped_descriptor_through_lru_eviction() -> 
             first_ref = weakref.ref(storage)
         return _launch_entry(storage)
 
-    token = launcher._CUTE_ACTIVE_CUDA_GRAPH.set(graph)  # pyrefly: ignore
+    token = launch_caches.ACTIVE_CUDA_GRAPH.set(graph)  # pyrefly: ignore
     try:
         with (
             patch.object(
@@ -56,7 +58,7 @@ def test_managed_capture_retains_ungrouped_descriptor_through_lru_eviction() -> 
                 cute_kernel, (), (1, 1, 1)
             )
     finally:
-        launcher._CUTE_ACTIVE_CUDA_GRAPH.reset(token)
+        launch_caches.ACTIVE_CUDA_GRAPH.reset(token)
 
     capture_cache = cute_kernel._helion_cute_capture_owned_launch_tensors
     assert len(capture_cache) == 1
@@ -142,8 +144,8 @@ def test_last_launch_fast_hit_promotes_owned_tensors_to_capture() -> None:
 
 @skipIfNotCUDA()
 def test_managed_graph_reset_releases_resources_before_recapture() -> None:
-    graph = launcher._CuteCUDAGraph.__new__(launcher._CuteCUDAGraph)
-    resources = launcher._CuteCudaGraphResources({}, {}, set(), set())
+    graph = launch_caches.CuteCUDAGraph.__new__(launch_caches.CuteCUDAGraph)
+    resources = launch_caches.CudaGraphResources({}, {}, set(), set())
     graph._helion_resources = resources
     owner = SimpleNamespace(cache={})
 
@@ -174,12 +176,12 @@ def test_managed_graph_reset_releases_resources_before_recapture() -> None:
         graph.reset()
         assert first_ref() is None
         assert owner.cache == {}
-        assert resources == launcher._CuteCudaGraphResources({}, {}, set(), set())
+        assert resources == launch_caches.CudaGraphResources({}, {}, set(), set())
 
         second_ref = retain("second")
         graph.reset()
         assert second_ref() is None
         assert owner.cache == {}
-        assert resources == launcher._CuteCudaGraphResources({}, {}, set(), set())
+        assert resources == launch_caches.CudaGraphResources({}, {}, set(), set())
 
     assert reset.call_count == 2

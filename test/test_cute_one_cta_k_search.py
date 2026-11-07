@@ -15,10 +15,14 @@ import torch
 
 import test.test_cute_backend as backend_tests
 
-from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2FfiHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.compile_environment import FixedBlockSizeSource
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteTcgen05ClusterM2FfiHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute import CuteTcgen05ClusterM2Heuristic
+from helion._compiler.cute.tcgen05_config import facts
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import surface
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_dense_tcgen05 import blackwell_capability
@@ -44,9 +48,7 @@ def _cpu_codegen() -> Iterator[None]:
 
 
 def _before_widening() -> BoundKernel:
-    with patch.object(
-        CuteTcgen05Config, "widen_one_cta_pipeline_k_search", return_value=False
-    ):
+    with patch.object(surface, "widen_one_cta_pipeline_k_search", return_value=False):
         bound = scaled_mm._bind_isolated(scaled_args())
     state = bound.config_spec._cute_tcgen05_config
     cap = state._native_k_search_cap
@@ -61,9 +63,9 @@ def _before_widening() -> BoundKernel:
 def test_owned_cap_widens_and_bk256_seeds_round_trip(mode: int) -> None:
     bound = scaled_mm._bind_isolated(scaled_args(mode=mode))
     state = bound.config_spec._cute_tcgen05_config
-    assert state._matmul_block_fragments()[2].high == 256
-    seeds = state.one_cta_pipeline_seed_configs()
-    seed = next(seed for seed in seeds if seed.block_sizes == [64, 32, 256])
+    assert facts._matmul_block_fragments(state)[2].high == 256
+    seed_configs = seeds.one_cta_pipeline_seed_configs(state)
+    seed = next(seed for seed in seed_configs if seed.block_sizes == [64, 32, 256])
     assert seed.config["tcgen05_ab_stages"] == 9
     with bound.env:
         gen = ConfigGeneration(bound.config_spec)
@@ -80,8 +82,8 @@ def test_owned_cap_preserves_default_and_is_idempotent() -> None:
     bound = _before_widening()
     state = bound.config_spec._cute_tcgen05_config
     before = bound.config_spec._base_default_config()
-    assert state.widen_one_cta_pipeline_k_search(bound.env)
-    assert not state.widen_one_cta_pipeline_k_search(bound.env)
+    assert surface.widen_one_cta_pipeline_k_search(state, bound.env)
+    assert not surface.widen_one_cta_pipeline_k_search(state, bound.env)
     assert bound.config_spec._base_default_config() == before
 
 
@@ -94,7 +96,7 @@ def test_effective_clamped_default_stays_fixed() -> None:
     block.default_size = 256
     old_default = block._fragment(bound.config_spec).default()
     assert old_default == 128
-    assert state.widen_one_cta_pipeline_k_search(bound.env)
+    assert surface.widen_one_cta_pipeline_k_search(state, bound.env)
     assert block._fragment(bound.config_spec).default() == old_default
 
 
@@ -111,7 +113,7 @@ def test_replacement_block_cannot_inherit_matching_revision() -> None:
     replacement.update_max(128)
     assert replacement.max_size_revision == cap[1]
     bound.config_spec.block_sizes[index] = replacement
-    assert not state.widen_one_cta_pipeline_k_search(bound.env)
+    assert not surface.widen_one_cta_pipeline_k_search(state, bound.env)
     assert replacement.max_size == 128
 
 
@@ -126,7 +128,7 @@ def test_cap_aliasing_survives_bound_spec_deepcopy() -> None:
     assert cap[2] is block
     assert block is not original.block_sizes.block_id_lookup(cap[0])
     assert replica.cache_fingerprint_hash() == original.cache_fingerprint_hash()
-    assert state.widen_one_cta_pipeline_k_search(bound.env)
+    assert surface.widen_one_cta_pipeline_k_search(state, bound.env)
     assert block.max_size == 256
     assert original.block_sizes.block_id_lookup(cap[0]).max_size == 128
 
@@ -151,7 +153,7 @@ def test_internal_ownership_does_not_enter_persistent_cache_key() -> None:
 def test_explicit_user_maximum_survives(maximum: int) -> None:
     bound = user_bound_mm._bind_isolated((*scaled_args()[:2], maximum))
     state = bound.config_spec._cute_tcgen05_config
-    fragments = state._matmul_block_fragments()
+    fragments = facts._matmul_block_fragments(state)
     assert fragments is not None
     assert fragments[2].high <= maximum
     if maximum <= 128:
@@ -174,7 +176,7 @@ def test_intervening_constraint_invalidates_cap_ownership(mutation: str) -> None
     else:
         block.update_hint(4096)
     assert block.max_size_revision != cap[1]
-    assert not state.widen_one_cta_pipeline_k_search(bound.env)
+    assert not surface.widen_one_cta_pipeline_k_search(state, bound.env)
     assert block.max_size <= 128
 
 
@@ -200,14 +202,15 @@ def test_independent_vetoes_survive(reason: str) -> None:
         state.one_cta_pipeline_facts = replace(
             facts, allocations=facts.allocations._replace(capacity_bytes=1024)
         )
-    assert not state.widen_one_cta_pipeline_k_search(bound.env)
+    assert not surface.widen_one_cta_pipeline_k_search(state, bound.env)
     assert block.max_size == 128
 
 
 def test_k_tail_keeps_global_k128_cap() -> None:
     bound = scaled_mm._bind_isolated(scaled_args(k=2880))
     assert (
-        bound.config_spec._cute_tcgen05_config._matmul_block_fragments()[2].high == 128
+        facts._matmul_block_fragments(bound.config_spec._cute_tcgen05_config)[2].high
+        == 128
     )
 
 
@@ -233,7 +236,7 @@ def _bind() -> BoundKernel:
 
 
 def _k_block(bound: BoundKernel) -> BlockSizeSpec:
-    indices = bound.config_spec._cute_tcgen05_config._matmul_block_indices()
+    indices = facts._matmul_block_indices(bound.config_spec._cute_tcgen05_config)
     assert indices is not None
     return bound.config_spec.block_sizes[indices[2]]
 
@@ -262,8 +265,8 @@ def test_registered_default_is_additive_and_does_not_mutate_bounds(
     block.default_size = default
     before = block.max_size, block.max_size_revision, state._native_k_search_cap
     expected = tuple(dict.fromkeys((256, 128, default)))
-    assert state.cluster_m2_seed_bk_choices() == expected
-    assert state.cluster_m2_seed_bk_choices() == expected
+    assert seeds.cluster_m2_seed_bk_choices(state) == expected
+    assert seeds.cluster_m2_seed_bk_choices(state) == expected
     assert (
         block.max_size,
         block.max_size_revision,
@@ -280,7 +283,7 @@ def test_unregistered_duplicate_or_unreachable_default_adds_no_seed(
     state._native_k_widened_block = None
     block = _k_block(bound)
     block.default_size = default
-    assert state.cluster_m2_seed_bk_choices() == (256,)
+    assert seeds.cluster_m2_seed_bk_choices(state) == (256,)
 
 
 @pytest.mark.parametrize("constraint", ("lower", "upper", "bounded", "k_loop"))
@@ -298,8 +301,8 @@ def test_default_cannot_bypass_live_constraints(constraint: str) -> None:
         assert state.matmul_block_ids is not None
         block.bounded_by_block_id = state.matmul_block_ids[0]
     else:
-        state.allow_cluster_m2_search(static_k=32768, max_k_tiles=256)
-    choices = state.cluster_m2_seed_bk_choices()
+        surface.allow_cluster_m2_search(state, static_k=32768, max_k_tiles=256)
+    choices = seeds.cluster_m2_seed_bk_choices(state)
     assert 64 not in choices
     assert choices == ((32,) if constraint == "upper" else (256,))
 
@@ -308,22 +311,22 @@ def test_ordinary_multi_seed_primary_default_and_search_roundtrip() -> None:
     bound = _bind()
     spec = bound.config_spec
     state = spec._cute_tcgen05_config
-    assert state.cluster_m2_seed_bk_choices() == (256, 128, 32)
+    assert seeds.cluster_m2_seed_bk_choices(state) == (256, 128, 32)
     assert CuteTcgen05ClusterM2Heuristic.is_eligible(
         bound.env, bound.host_function.device_ir
     )
     with bound.env:
-        seeds = CuteTcgen05ClusterM2Heuristic.get_seed_configs(
+        seed_configs = CuteTcgen05ClusterM2Heuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
         )
-        assert seeds is not None
-        assert seeds[0] == CuteTcgen05ClusterM2Heuristic.get_seed_config(
+        assert seed_configs is not None
+        assert seed_configs[0] == CuteTcgen05ClusterM2Heuristic.get_seed_config(
             bound.env, bound.host_function.device_ir
         )
-        assert [seed.block_sizes[2] for seed in seeds] == [256, 128, 32]
-        assert all(seed in spec.compiler_seed_configs for seed in seeds)
+        assert [seed.block_sizes[2] for seed in seed_configs] == [256, 128, 32]
+        assert all(seed in spec.compiler_seed_configs for seed in seed_configs)
         generator = ConfigGeneration(spec)
-        for seed in seeds:
+        for seed in seed_configs:
             flat, canonical = generator.canonicalize_flat(generator.flatten(seed))
             again, recanonical = generator.canonicalize_flat(flat)
             assert flat == again and canonical == recanonical
@@ -342,7 +345,7 @@ def test_restored_row_scale_anchor_keeps_pre_wait_through_codegen() -> None:
     assert _k_block(bound).default_size == 32
     seed = next(
         seed
-        for seed in state.autotune_seed_configs()
+        for seed in seeds.autotune_seed_configs(state)
         if seed.block_sizes == [256, 256, 128]
         and seed.config.get("tcgen05_cluster_n") == 2
         and seed.config.get("tcgen05_aux_load_placement") == "pre_acc_wait"
@@ -365,19 +368,20 @@ def test_clc_twins_keep_high_anchor_and_default_geometry() -> None:
         scaled_args(m=2048, n=2048)[:2]
     )
     state = bound.config_spec._cute_tcgen05_config
-    assert state.cluster_m2_seed_bk_choices() == (256, 128, 32)
-    seeds = [
+    assert seeds.cluster_m2_seed_bk_choices(state) == (256, 128, 32)
+    seed_configs = [
         seed
-        for seed in state.autotune_seed_configs()
+        for seed in seeds.autotune_seed_configs(state)
         if seed.config.get("tcgen05_persistence_model") == "clc_persistent"
         and seed.block_sizes[2] in (256, 128, 32)
     ]
     assert {
-        (seed.block_sizes[2], seed.config.get("tcgen05_cluster_n", 1)) for seed in seeds
+        (seed.block_sizes[2], seed.config.get("tcgen05_cluster_n", 1))
+        for seed in seed_configs
     } == {(bk, cn) for bk in (256, 128, 32) for cn in (1, 2)}
     with bound.env:
         generator = ConfigGeneration(bound.config_spec)
-        for seed in seeds:
+        for seed in seed_configs:
             _, canonical = generator.canonicalize_flat(generator.flatten(seed))
             assert canonical.block_sizes == seed.block_sizes
             cn = seed.config.get("tcgen05_cluster_n", 1)
@@ -389,7 +393,7 @@ def test_clc_twins_keep_high_anchor_and_default_geometry() -> None:
             assert canonical.config.get("tcgen05_cluster_n", 1) == cn
     anchor = next(
         seed
-        for seed in seeds
+        for seed in seed_configs
         if seed.block_sizes[2] == 128 and seed.config.get("tcgen05_cluster_n", 1) == 1
     )
     source = bound.to_code(anchor)
@@ -409,12 +413,10 @@ def test_widened_k_block_is_cache_key_neutral_and_default_config_unchanged() -> 
 
 @pytest.mark.parametrize("changed", ("equal_cap", "replacement"))
 def test_failed_owned_widening_does_not_record_widened_k_block(changed: str) -> None:
-    with patch.object(
-        CuteTcgen05Config, "widen_one_cta_pipeline_k_search", return_value=False
-    ):
+    with patch.object(surface, "widen_one_cta_pipeline_k_search", return_value=False):
         bound = _bind()
     state = bound.config_spec._cute_tcgen05_config
-    indices = state._matmul_block_indices()
+    indices = facts._matmul_block_indices(state)
     assert indices is not None
     block = bound.config_spec.block_sizes[indices[2]]
     assert state._native_k_widened_block is None
@@ -422,7 +424,7 @@ def test_failed_owned_widening_does_not_record_widened_k_block(changed: str) -> 
         block.max_size = block.max_size
     else:
         bound.config_spec.block_sizes[indices[2]] = copy.copy(block)
-    assert not state.widen_one_cta_pipeline_k_search(bound.env)
+    assert not surface.widen_one_cta_pipeline_k_search(state, bound.env)
     assert state._native_k_widened_block is None
 
 
@@ -431,20 +433,20 @@ def test_user_bound_does_not_record_widened_k_block(maximum: int) -> None:
     bound = user_bound_mm._bind_isolated((*scaled_args(m=2048, n=2048)[:2], maximum))
     state = bound.config_spec._cute_tcgen05_config
     assert state._native_k_widened_block is None
-    assert all(bk <= maximum for bk in state.cluster_m2_seed_bk_choices())
+    assert all(bk <= maximum for bk in seeds.cluster_m2_seed_bk_choices(state))
 
 
 def test_widened_k_block_requires_same_block_and_survives_deepcopy() -> None:
     bound = _bind()
     spec = copy.deepcopy(bound.config_spec)
     state = spec._cute_tcgen05_config
-    indices = state._matmul_block_indices()
+    indices = facts._matmul_block_indices(state)
     assert indices is not None
     block = spec.block_sizes[indices[2]]
     assert state._native_k_widened_block is block
-    assert state.cluster_m2_seed_bk_choices() == (256, 128, 32)
+    assert seeds.cluster_m2_seed_bk_choices(state) == (256, 128, 32)
     spec.block_sizes[indices[2]] = copy.copy(block)
-    assert state.cluster_m2_seed_bk_choices() == (256, 32)
+    assert seeds.cluster_m2_seed_bk_choices(state) == (256, 32)
 
 
 def test_ffi_keeps_its_independent_single_seed_hook() -> None:

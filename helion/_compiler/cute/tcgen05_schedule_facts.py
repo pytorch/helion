@@ -11,6 +11,7 @@ import torch
 
 from .pipeline_smem import has_other_store
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .tcgen05_constants import tcgen05_role_local_schedule
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -43,17 +44,15 @@ class Tcgen05FullTileScheduleFacts:
 
 
 def n_edge_cluster_schedule_defaults() -> dict[str, object]:
-    """The unsplit, direct-aux protocol for the additional N-edge family."""
+    """The unsplit, direct-aux protocol for the additional N-edge family.
+
+    The AB-load and MMA warp counts are left to the strategy's defaults.
+    """
     return {
-        "tcgen05_strategy": "role_local_monolithic",
-        "tcgen05_persistence_model": "static_persistent",
-        "tcgen05_layout_strategy": "default",
+        **tcgen05_role_local_schedule(
+            without=("tcgen05_warp_spec_ab_load_warps", "tcgen05_warp_spec_mma_warps")
+        ),
         "tcgen05_cta_group": "auto",
-        "tcgen05_warp_spec_scheduler_warps": 0,
-        "tcgen05_warp_spec_c_input_warps": 0,
-        "tcgen05_warp_spec_store_warps": 0,
-        "tcgen05_warp_spec_epi_load_warps": 0,
-        "tcgen05_num_epi_warps": 4,
         "tcgen05_l2_swizzle_size": 1,
         "l2_groupings": [1],
         "tcgen05_aux_load_mode": "simt",

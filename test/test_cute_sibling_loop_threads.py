@@ -10,13 +10,15 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from helion._compiler import per_thread_planning as contraction_threads
 from helion._compiler.autotuner_heuristics import get_heuristics
-from helion._compiler.autotuner_heuristics.cute import CuteSiblingRowHeuristic
-from helion._compiler.backend import CuteBackend
 from helion._compiler.compile_environment import BlockSizeInfo
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.compile_environment import LoopSpecBlockSizeSource
-from helion._compiler.cute.layout_propagation import _plan_warp_per_row_execution
+from helion._compiler.cute.autotune.heuristics.cute import CuteSiblingRowHeuristic
+from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.cute.device_state import CuteDeviceFunctionState
+from helion._compiler.cute.execution_plans import _plan_warp_per_row_execution
 from helion._compiler.cute.loop_nesting import sibling_row_loop_blocks
 from helion._compiler.cute.loop_nesting import tile_loop_paths
 from helion._compiler.cute.thread_budget import tile_loop_thread_count
@@ -25,6 +27,8 @@ from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import GraphInfo
 from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.host_function import HostFunction
+from helion._compiler.lane_loop_context import LaneLoopContext
+from helion._compiler.metal.backend import MetalBackend
 from helion._compiler.tile_dispatch import TileStrategyDispatch
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -74,6 +78,8 @@ class _Function:
     def __init__(self, ir: DeviceIR, config: Config) -> None:
         self.config = config
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
+        self.cute_state = CuteDeviceFunctionState()
+        self.lane_contexts: dict[int, LaneLoopContext] = {}
         self.codegen = SimpleNamespace(
             codegen_graphs=ir.graphs,
             current_root_graph_info=ir.graphs[ir.root_ids[0]],
@@ -81,6 +87,13 @@ class _Function:
 
     def new_var(self, name: str, *, dce: bool = False) -> str:
         return name
+
+    def register_lane(
+        self, block_id: int, *, flat_multi: bool = False
+    ) -> LaneLoopContext:
+        context = LaneLoopContext(block_id, flat_multi=flat_multi)
+        self.lane_contexts[block_id] = context
+        return context
 
 
 @contextmanager
@@ -132,7 +145,7 @@ def _context(
             HostFunction, "current", return_value=SimpleNamespace(device_ir=ir)
         ),
         patch.object(
-            CuteBackend, "_cute_matmul_contraction_thread_reserve", return_value=1
+            contraction_threads, "matmul_contraction_thread_reserve", return_value=1
         ),
         patch(
             "helion._compiler.cute.backend._is_mma_candidate_loop", return_value=False
@@ -408,3 +421,27 @@ def test_sibling_cache_seeds_follow_tensor_pass_and_eviction_slot(
             seed.block_sizes == [1, 4096, 4096] and seed.num_threads[1:] == [256, 256]
             for seed in cache_seeds
         )
+
+
+def test_contraction_thread_reserve_takes_any_backend() -> None:
+    """Metal and CuTe share ``plan_per_thread_loop_strategy``, so the
+    contraction reserve (a ``Backend`` method before it moved to
+    ``per_thread_planning``) must accept any backend."""
+    with patch.object(
+        contraction_threads, "matmul_contraction_extents", return_value=[48, 3]
+    ):
+        for backend in (CuteBackend(), MetalBackend()):
+            assert (
+                contraction_threads.matmul_contraction_thread_reserve(backend, [1])
+                == 64 * 4
+            )
+
+
+def test_metal_resolves_cute_loop_strategy_unbound() -> None:
+    """``MetalBackend.create_loop_strategy`` reaches the CuTe planner through an
+    unbound call; the planner's helpers must resolve with a Metal ``self``."""
+    ir = _row_ir()
+    config = Config(block_sizes=[16, 16, 16])
+    with _context(ir, config) as (_env, fn):
+        strategy = CuteBackend.create_loop_strategy(MetalBackend(), fn, [1], config)
+    assert strategy.block_ids == [1]

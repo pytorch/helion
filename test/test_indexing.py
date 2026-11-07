@@ -5069,7 +5069,7 @@ def test_partition_allocation_slices_preserve_configured_extent(backend, stepped
         forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
@@ -5314,7 +5314,7 @@ def test_cute_inactive_broadcast_axes_generated_values(shape, width, tiles, reve
 
     inputs = (torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape), width)
     aliases = []
-    original = TileStrategyDispatch._inactive_cute_broadcast_aliases
+    original = TileStrategyDispatch._inactive_broadcast_aliases
 
     def observe(dispatch, function):
         result = original(dispatch, function)
@@ -5326,7 +5326,7 @@ def test_cute_inactive_broadcast_axes_generated_values(shape, width, tiles, reve
         _target(),
         forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch.object(TileStrategyDispatch, "_inactive_cute_broadcast_aliases", observe),
+        patch.object(TileStrategyDispatch, "_inactive_broadcast_aliases", observe),
     ):
         bound = cpu_bind(
             _broadcast_coordinate_pad_2d
@@ -5417,7 +5417,7 @@ def test_cute_inactive_broadcast_axes_preserve_other_owners(kind):
     }
     kernel, inputs = cases[kind]
     aliases = []
-    original = TileStrategyDispatch._inactive_cute_broadcast_aliases
+    original = TileStrategyDispatch._inactive_broadcast_aliases
 
     def observe(dispatch, function):
         result = original(dispatch, function)
@@ -5432,12 +5432,10 @@ def test_cute_inactive_broadcast_axes_preserve_other_owners(kind):
     ):
         bound = cpu_bind(kernel, inputs)
         config = bound.config_spec.default_config()
-        with patch.object(
-            TileStrategyDispatch, "_inactive_cute_broadcast_aliases", observe
-        ):
+        with patch.object(TileStrategyDispatch, "_inactive_broadcast_aliases", observe):
             actual = bound.to_code(config)
         with patch.object(
-            TileStrategyDispatch, "_inactive_cute_broadcast_aliases", return_value=set()
+            TileStrategyDispatch, "_inactive_broadcast_aliases", return_value=set()
         ):
             previous = bound.to_code(config)
     assert aliases and not any(aliases)
@@ -5703,7 +5701,7 @@ def test_cute_nested_broadcast_alias_values(shape, flat, reverse, static_shapes)
     table = (torch.arange(k * p * q).reshape(k, p, q) % 7).float()
     inputs = column, values, table, flat
     aliases = []
-    original = TileStrategyDispatch._inactive_cute_broadcast_aliases
+    original = TileStrategyDispatch._inactive_broadcast_aliases
 
     def observe(dispatch, function):
         result = original(dispatch, function)
@@ -5719,7 +5717,7 @@ def test_cute_nested_broadcast_alias_values(shape, flat, reverse, static_shapes)
         _target(),
         forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch.object(TileStrategyDispatch, "_inactive_cute_broadcast_aliases", observe),
+        patch.object(TileStrategyDispatch, "_inactive_broadcast_aliases", observe),
     ):
         kernel = helion.kernel(
             _nested_broadcast_gather.fn,
@@ -5769,7 +5767,7 @@ def test_cute_nested_broadcast_alias_scope_guards(guard):
         torch.ones(7, 9, 11),
         False,
     )
-    original = TileStrategyDispatch._inactive_cute_broadcast_aliases
+    original = TileStrategyDispatch._inactive_broadcast_aliases
     checked = []
 
     def observe(dispatch, function):
@@ -5817,7 +5815,7 @@ def test_cute_nested_broadcast_alias_scope_guards(guard):
         _target(),
         forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch.object(TileStrategyDispatch, "_inactive_cute_broadcast_aliases", observe),
+        patch.object(TileStrategyDispatch, "_inactive_broadcast_aliases", observe),
     ):
         bound = cpu_bind(_nested_broadcast_gather, inputs)
         bound.to_code(helion.Config(block_sizes=[2, 2, 4, 4, 4]))
@@ -6667,7 +6665,7 @@ class TestCuteBoundedGatherCPU(TestCase):
 
         from test.cute_population_contracts import checked_initial_population
 
-        from helion._compiler import autotuner_heuristics
+        from helion._compiler.cute.autotune import heuristics as cute_heuristics
         from helion.autotuner.pattern_search import InitialPopulationStrategy
         from helion.autotuner.pattern_search import PatternSearch
 
@@ -6676,8 +6674,8 @@ class TestCuteBoundedGatherCPU(TestCase):
 
         def capture(enabled):
             with patch(
-                "helion._compiler.autotuner_heuristics.register_fragment_bounded_gather_coverage",
-                wraps=autotuner_heuristics.register_fragment_bounded_gather_coverage
+                "helion._compiler.cute.autotune.heuristics.register_fragment_bounded_gather_coverage",
+                wraps=cute_heuristics.register_fragment_bounded_gather_coverage
                 if enabled
                 else None,
             ) as hook:
@@ -7632,7 +7630,7 @@ class TestCuteGatherWarpScanCPU(TestCase):
                                 self.assertEqual("shuffle_sync_up" in code, scan)
 
     def test_dependent_carrier_and_strict_mutation(self):
-        from helion._compiler.autotuner_heuristics.cute_fragment_warp_scan import (
+        from helion._compiler.cute.autotune.heuristics.cute_fragment_warp_scan import (
             register_gather_warp_scan_coverage,
         )
 
@@ -7669,7 +7667,7 @@ class TestCuteGatherWarpScanCPU(TestCase):
             self.assertEqual(spec.compiler_coverage_groups, groups)
 
     def test_mixed_roots_and_unsupported_gather(self):
-        from helion._compiler.autotuner_heuristics.cute_fragment_warp_scan import (
+        from helion._compiler.cute.autotune.heuristics.cute_fragment_warp_scan import (
             active_warp_scan_roots,
         )
 

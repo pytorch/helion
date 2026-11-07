@@ -30,21 +30,17 @@ from typing import TYPE_CHECKING
 import torch
 
 from ..ast_extension import ExtendedAST
-from ..ast_extension import LoopType
 from ..ast_extension import statement_from_string
 from ..device_function import TensorArg
 from ..device_ir import ReductionLoopGraphInfo
-from ..device_ir import RootGraphInfo
-from ..device_ir import control_flow_parent_entries
 from ..type_info import TensorType
+from .host_zero_fills import HostFillElision
 from .host_zero_fills import _assigns
 from .host_zero_fills import _combine_coverages
 from .host_zero_fills import _is_load
 from .host_zero_fills import _Range
 from .host_zero_fills import _reads
 from .host_zero_fills import _remainder_fill
-from .host_zero_fills import _store_coverage
-from .host_zero_fills import _top_graph
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -108,17 +104,8 @@ def _exact_in_dtype(value: float, dtype: torch.dtype) -> bool:
 def prove_host_remainder_fills(
     host: HostFunction, env: CompileEnvironment, config: Config
 ) -> list[RemainderFill]:
-    device_ir = host.device_ir
-    graphs = device_ir.graphs
-    skewed = device_ir.noncanonical_task_origin_block_ids
-    roots = {
-        graphs[root_id].graph: set(block_ids) - skewed
-        for root_id, block_ids in zip(
-            device_ir.root_ids, device_ir.grid_block_ids, strict=True
-        )
-        if isinstance(graphs[root_id], RootGraphInfo)
-    }
-    if not roots:
+    analysis = HostFillElision.analyze(host, env, config)
+    if analysis is None:
         return []
     nodes = list(ast.walk(ast.Module(body=host.body, type_ignores=[])))
     if any(
@@ -126,26 +113,11 @@ def prove_host_remainder_fills(
         for node in nodes
     ) or any(isinstance(node, ast.Name) and node.id == FILL_HELPER for node in nodes):
         return []
-    device_loops = [
-        index
-        for index, statement in enumerate(host.body)
-        if isinstance(statement, ExtendedAST) and statement._loop_type == LoopType.GRID
-    ]
-    if not device_loops:
-        return []
-    last_device_loop = device_loops[-1]
-    host_tensors: dict[torch.Tensor, list[torch.fx.Node]] = {}
-    for info in graphs:
-        for node in info.graph.nodes:
-            if node.target is _host_tensor_target():
-                value = node.meta.get("val")
-                if isinstance(value, torch.Tensor):
-                    host_tensors.setdefault(value, []).append(node)
-    parents = control_flow_parent_entries(graphs)
+    last_device_loop = analysis.last_device_loop
     result: list[RemainderFill] = []
     seen: set[str] = set()
-    for position in range(last_device_loop + 1, len(host.body)):
-        statement = host.body[position]
+    for position in analysis.host_statements_after_device_loops():
+        statement = analysis.body[position]
         found = _constant_fill(statement)
         if found is None:
             continue
@@ -166,15 +138,15 @@ def prove_host_remainder_fills(
         fake = tensor_type.fake_value
         if fake.ndim > MAX_RANK or not _exact_in_dtype(value, fake.dtype):
             continue
-        tensors = host_tensors.get(fake, [])
+        tensors = analysis.host_tensors.get(fake, [])
         if not tensors:
             continue
         coverages: list[tuple[int | _Range, ...] | None] = []
         admitted = True
         for tensor in tensors:
             for user in tensor.users:
-                top = _top_graph(user, graphs, parents)
-                if top.graph not in roots:
+                top = analysis.top_graph(user)
+                if top.graph not in analysis.roots:
                     if isinstance(top, ReductionLoopGraphInfo):
                         continue
                     admitted = False
@@ -182,11 +154,7 @@ def prove_host_remainder_fills(
                 if _is_load(user, tensor):
                     admitted = False
                     break
-                coverages.append(
-                    _store_coverage(
-                        user, tensor, fake, env, graphs, parents, roots, host, config
-                    )
-                )
+                coverages.append(analysis.store_coverage(user, tensor, fake))
             if not admitted:
                 break
         if not admitted or not coverages or None in coverages:
@@ -198,7 +166,7 @@ def prove_host_remainder_fills(
             continue
         if not _remainder_fill(statement, name, remainders):
             continue
-        between = host.body[last_device_loop + 1 : position]
+        between = analysis.body[last_device_loop + 1 : position]
         if any(_reads(other, name) or _assigns(other, name) for other in between):
             continue
         dim = next(index for index, remainder in enumerate(remainders) if remainder)
@@ -214,12 +182,6 @@ def prove_host_remainder_fills(
             )
         )
     return result
-
-
-def _host_tensor_target() -> object:
-    from ...language import _tracing_ops
-
-    return _tracing_ops._host_tensor
 
 
 def append_device_remainder_fills(

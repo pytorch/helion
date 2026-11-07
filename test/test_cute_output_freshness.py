@@ -183,7 +183,7 @@ def test_expand_preserves_tma_output_proof(
     shape: tuple[int, int, int], tile: tuple[int, int, int]
 ) -> None:
     bound = vector_scaled_mm._bind_isolated(scaled_args(*shape))
-    assert bound.config_spec.cute_tcgen05_matmul_operands_tma_provable
+    assert bound.config_spec.tcgen05.matmul_operands_tma_provable
     source = bound.to_code(
         helion.Config(
             block_sizes=list(tile),

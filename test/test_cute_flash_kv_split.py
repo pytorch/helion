@@ -37,6 +37,7 @@ from test.test_cute_flash_flex_walk import _codegen_with_flex_plan
 from test.test_cute_flash_flex_walk import _stub_hook  # noqa: F401  (autouse)
 
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute import flash_knobs
 from helion._compiler.cute.attention_plan import FLEX_SCORE_KIND
 from helion._compiler.cute.attention_plan import dense_score_plan
 from helion.exc import InvalidConfig
@@ -153,14 +154,14 @@ def test_resolver_defaults_to_one_and_pins_it_off_the_list_walk() -> None:
 
 
 def test_knob_is_an_appended_schema_axis_with_fa4_witnesses() -> None:
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     assert keys.count(KEY) == 1
     assert keys.index(KEY) > keys.index(cute_flash.FLASH_FLEX_MASK_FORM_KEY)
     for value in (2, 4):
-        witness = cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(KEY, value)]
+        witness = flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(KEY, value)]
         assert witness == {cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"}
         assert _resolve({**witness, KEY: value}).kv_split == value
-    assert (KEY, 1) not in cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
+    assert (KEY, 1) not in flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
     for value in cute_flash.FLASH_KV_SPLITS:
         resolved = _resolve({**BODY, KEY: value})
         assert cute_flash.flash_effective_config_values(resolved)[KEY] == value

@@ -26,6 +26,7 @@ from ...language import tile_ops
 from ...language import view_ops
 from ...language._gelu_tanh_approx import _gelu_erf
 from ...language._gelu_tanh_approx import _gelu_tanh_approx
+from .analysis.match_common import node_tensor
 
 if TYPE_CHECKING:
     from torch.fx.node import Argument
@@ -132,16 +133,8 @@ def _same_index(left: object, right: object) -> bool:
     return False
 
 
-def _tensor_value(value: object) -> torch.Tensor | None:
-    if isinstance(value, torch.fx.Node):
-        result = value.meta.get("val")
-        if isinstance(result, torch.Tensor):
-            return result
-    return None
-
-
 def _is_bool_tensor(value: object) -> TypeGuard[torch.fx.Node]:
-    tensor = _tensor_value(value)
+    tensor = node_tensor(value)
     return tensor is not None and tensor.dtype is torch.bool
 
 
@@ -199,7 +192,7 @@ def _rewrite_store(
         or load_args[2] is not None
     ):
         return False
-    tensors = [_tensor_value(item) for item in (tensor, value, update, old)]
+    tensors = [node_tensor(item) for item in (tensor, value, update, old)]
     target_value, result_value, update_value, old_value = tensors
     if (
         target_value is None
@@ -219,8 +212,8 @@ def _rewrite_store(
     if extra_mask is not None and extra_mask is not condition:
         if not _is_bool_tensor(extra_mask):
             return False
-        condition_value = _tensor_value(condition)
-        extra_value = _tensor_value(extra_mask)
+        condition_value = node_tensor(condition)
+        extra_value = node_tensor(extra_mask)
         assert condition_value is not None and extra_value is not None
         shape = _mask_shape(condition_value, extra_value)
         if shape is None:

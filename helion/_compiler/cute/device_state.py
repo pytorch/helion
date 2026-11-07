@@ -1,6 +1,17 @@
+"""``CuteDeviceFunctionState``: the per-``DeviceFunction`` state of the CuTe backend.
+
+Role: state.  ``Backend.new_device_state(config)`` builds one per kernel
+render (``state.new_device_state``); the fields are grouped into the
+namespaces defined in ``state.py`` (``tcgen05``, ``flash``, ``lanes``,
+``root_plans``); every reader names the namespace (the flat-name
+``AttributeAlias`` layer each field had after the grouping is retired).  The
+tcgen05 plan records the pipeline emitters read live here too:
+``CuteTcgen05MatmulPlan`` (the kernel-wide collective contract),
+``CuteTcgen05GroupedPlan``, ``CuteTcgen05StoreValue`` and the vloop-sink facts.
+"""
+
 from __future__ import annotations
 
-import ast
 import dataclasses
 import enum
 from typing import TYPE_CHECKING
@@ -9,54 +20,31 @@ from typing import Protocol
 from typing import cast
 
 from ... import exc
+from .state import CuteFlashState
+from .state import CuteLaneState
+from .state import CuteRootPlans
+from .state import CuteTcgen05State
 
 if TYPE_CHECKING:
+    import ast
     from collections.abc import Sequence
 
     import torch
     from torch.fx.node import Node
 
-    from ..tile_strategy import DeviceLoopState
-    from .attention_plan import AttentionScorePlan
     from .aux_tensor import Tcgen05AuxTensorDescriptor
-    from .block_scaled_mma import BlockScaledMmaPlan
-    from .chunk_prepare import CuteChunkPreparePlan
-    from .chunk_recurrence import CuteChunkRecurrencePlan
-    from .collective_matmul import CollectiveMmaSite
-    from .completed_matmul_sum import CompletedMatmulSum
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
-    from .cute_flash_bwd import AttentionBwdMatch
-    from .cute_flash_gated import GatedAttentionMatch
-    from .cute_flash_gated import GatedAttentionPlan
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
-    from .cute_mma_dag import MmaDagPlan
-    from .cute_register_subblocks import RegisterSubblockPlan
-    from .cute_warp_mma_gemm import CuteWarpMmaGemmMatch
-    from .direct_affine_candidate import DirectAffineCandidate
-    from .direct_affine_plan import DirectAffinePlan
     from .epilogue_fanout import FanoutStore
-    from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
-    from .flex_bwd_match import FlexBwdMatch
-    from .flex_match import FlexMatch
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
-    from .gdn_recurrence import CuteGdnRecurrencePlan
     from .grouped_balanced_workers import GroupedBalancedWorkersPlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
     from .published_scalars import PublishedScalarRequest
-    from .radix_selection import RadixSelectionPlan
     from .register_producers import RegisterProducerRequest
-    from .register_region import RegisterRegionPlan
-    from .resident_reductions import ResidentReductionLayout
-    from .resident_sequence import SequenceRegion
     from .signed_bitfield import SignedBytePacket
-    from .simt_gemm import SimtGemmSite
-    from .single_token_rank1_recurrence import CuteSingleTokenRank1Plan
-    from .split_single_token_rank1_recurrence import CuteSplitSingleTokenRank1Plan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
-    from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
-    from .topk import CuteTopKPlan
 
 
 @dataclasses.dataclass(frozen=True)
@@ -302,7 +290,6 @@ class _CuteTcgen05OrientationMixin:
 class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     lifecycle_context: Tcgen05LifecycleContext
     output_block_ids: tuple[int, ...]
-    pure_matmul_object: Tcgen05PureMatmulObjectModel | None = None
     output_stores: tuple[Node, ...] | None = None
     bm: int = 0
     bn: int = 0
@@ -364,8 +351,6 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
         return super().d_store_layout
 
     def __post_init__(self) -> None:
-        if self.pure_matmul_object is not None:
-            assert self.pure_matmul_object.lifecycle_context is self.lifecycle_context
         explicit_tile_values = (
             self.explicit_epi_tile_m,
             self.explicit_epi_tile_n,
@@ -388,10 +373,6 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     def has_explicit_epilogue_tile(self) -> bool:
         return self.explicit_epi_tile_m is not None
 
-    @property
-    def pure_matmul_role_lifecycle(self) -> bool:
-        return self.pure_matmul_object is not None
-
 
 @dataclasses.dataclass(frozen=True)
 class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
@@ -411,7 +392,6 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     cluster_m: int
     is_two_cta: bool
     uses_role_local_persistent_body: bool
-    uses_cluster_m2_one_cta_role_local_bridge: bool
     cta_thread_count: int
     physical_m_threads: int
     acc_stage_count: int
@@ -718,91 +698,34 @@ class CuteVloopStoreFact:
     dtype: torch.dtype
 
 
+# Stand-in codegen result for a node the tcgen05 fragment epilogue emits later
+# (``Backend.deferred_node_codegen``); the committed store checks for it.
+DEFERRED_TCGEN05_FRAGMENT_EPILOGUE = object()
+
+
+def is_deferred_tcgen05_fragment_epilogue(value: object) -> bool:
+    return value is DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
+
+
 class CuteDeviceFunctionState:
-    """CuTe-owned state for one DeviceFunction codegen instance."""
+    """CuTe-owned state for one DeviceFunction codegen instance.
+
+    The fields are grouped by the emitter family that owns them
+    (``cute/state.py``): ``tcgen05`` (the GEMM pipeline), ``flash`` (the
+    attention bodies), ``lanes`` (lane loops, thread axes, the launch shape)
+    and ``root_plans`` (the whole-root plan slots); a few kernel-wide node
+    facts stay flat.
+    """
 
     def __init__(self) -> None:
-        # Physical (axis, thread extent) for grid index/base assignments.
-        # The launcher consults only names that survive final AST lowering;
-        # this does not depend on blocked/strided index-expression spelling.
-        self.grid_thread_extents: dict[str, tuple[int, int]] = {}
-        # Grid V-loop wrappers (by constexpr lane variable) and sinkable scalar
-        # loads (by pointer expression) for ``cute/sink_vector_loops.py``.
-        self.vloop_sink_wrappers: dict[str, CuteVloopWrapperFact] = {}
-        self.vloop_sink_loads: dict[str, CuteVloopLoadFact] = {}
-        self.vloop_sink_stores: dict[str, CuteVloopStoreFact] = {}
-        # ``cute_vloop_sink`` kept the vectorized grid axis on thread x; when
-        # no V-loop is sunk after all, codegen restarts with the knob off.
-        self.vloop_sink_layout_applied = False
-        # The sinking pass unrolled a lane loop itself (``cute_lane_unroll``);
-        # otherwise the loads-first unroll of ``cute/unroll_lane_loads.py``
-        # applies to the sunk lane loops once their packets are placed.
-        self.vloop_sink_unrolled = False
-        # ``(subject, per-axis thread extents)`` a cross-lane reduce (a staged
-        # matmul product sum or a lane-loop reduction marker) assumed for the
-        # launch of an ``hl.barrier()`` kernel.  The launcher rejects a final
-        # block shape that differs from them on any axis.
-        self.multi_phase_lane_reduce_layouts: list[tuple[str, dict[int, int]]] = []
+        self.tcgen05 = CuteTcgen05State()
+        self.flash = CuteFlashState()
+        self.lanes = CuteLaneState()
+        self.root_plans = CuteRootPlans()
+        # Kernel-wide per-node lowering facts.
         self.explicit_rng_seed_exprs: set[str] = set()
         self.uniform_comparison_marker: str | None = None
         self.signed_byte_packets: dict[Node, SignedBytePacket] = {}
-        # SIMT reduction-kernel thread-block cluster width (from the
-        # ``cute_cluster_n`` config knob, applied by
-        # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
-        # across cluster CTAs).  1 = no cluster.
-        self.simt_cluster_n: int = 1
-        # A trailing grid dim of CTAs forming one thread-block cluster per
-        # program id (the ``cute_mma_dag`` cluster split of a full-slice
-        # axis); 1 for an ordinary launch.
-        self.grid_cluster_n: int = 1
-        # Lane loops claimed by a register/shuffle ``hl.associative_scan``
-        # lowering, mapped to the direction (``True`` = reverse) their lanes
-        # are visited in.  A second scan over the same lane loop must agree
-        # or it falls back to the serial lowering (see ``cute/scan_ops.py``).
-        self.scan_lane_directions: dict[str, bool] = {}
-        # Constexpr V-loop variables that enclose a reduction over ANOTHER block
-        # (``s[tile] = x[tile, :].sum(-1)`` with a vector width on ``tile``):
-        # each V lane is a different output element, so
-        # ``cute/hoist_warp_reduce.py`` must not fold the lanes into one
-        # accumulator before the cross-thread reduce.
-        self.unfoldable_vec_lanes: set[str] = set()
-        # Matmul ``dot_acc`` running sums whose K-loop carry is only exact
-        # once ``hoist_lane_invariant_chunk_recurrence`` restructures it to
-        # update once per tile (``cute/matmul_fallback.py``); a nest the pass
-        # does not recognize is rejected rather than summed across tiles.
-        self.chunk_recurrence_running_sums: set[str] = set()
-        # Rolled reductions over a symbolic extent expose their trip count as
-        # a host-computed ``cutlass.Constexpr`` kernel parameter so the
-        # two-pass load fuser can size a per-thread register cache that is
-        # exact for every runtime extent.  Keyed by the roll's offset variable
-        # (``roffset_N``), the loop target the AST passes see: (size-hint trip
-        # count used for profitability decisions, constexpr parameter name).
-        self.dynamic_reduction_trips: dict[str, tuple[int, str]] = {}
-        # Cross-thread reductions over a block that a device loop's VECTORIZED
-        # lane loop distributes (several packets per thread per trip).  The
-        # reduce is emitted once per lane and so reduces one lane's packet;
-        # ``cute/fold_lane_reductions.py`` folds the per-lane partials across
-        # the unrolled lanes and runs the cross-thread combine once per trip.
-        # The lane variable of each such loop, mapped to the keys of the
-        # reduce calls emitted inside it (``fold_site_key``: the call with its
-        # input replaced).  Two loops may emit identical calls (the grouped
-        # warp reduce takes a raw thread-index expression), so the lane
-        # variable is the primary key.
-        self.lane_fold_reduce_sites: dict[str, set[str]] = {}
-        self.resident_reduction_layouts: dict[str, ResidentReductionLayout] = {}
-        # A reshape can reuse source lanes and leave its synthetic loop dead.
-        # Resolve this recorded alternative only after actual loop pruning.
-        self.reshape_lane_fallbacks: dict[str, tuple[str, int, int, str]] = {}
-        self.reshape_physical_fallbacks: dict[str, tuple[int, int, str]] = {}
-        self.resident_sequence_regions: dict[int, SequenceRegion] = {}
-        self.completed_matmul_sums: dict[Node, CompletedMatmulSum] = {}
-        # ``hl.atomic_add`` nodes that receive the per-K-lane partial sums of a
-        # scalar matmul whose K axis is split across a serial lane loop
-        # (``cute/matmul_fallback.py``), mapped to the lane variables of those
-        # loops.  Such an atomic varies along the loop although its index does
-        # not cover the loop's block, so the atomic lowering does not record
-        # it as uniform along the loop (``atomic_ops._cute_uniform_lane_vars``).
-        self.per_lane_atomic_lane_vars: dict[Node, set[str]] = {}
         # The load_eviction_policies slot each load node took
         # (``memory_ops._cute_load_eviction_slot``): a load lowered again (a
         # matmul operand re-lowered under a block remap) keeps its slot.
@@ -814,355 +737,86 @@ class CuteDeviceFunctionState:
         # where they sit may store such a value, the generic store refuses
         # (``cute_reshape.is_cute_thread_moving_reshape_value``).
         self.reshape_elements_in_place: dict[Node, bool] = {}
-        # Number of DSM cluster-reduce call sites emitted; > 0 makes the
-        # device function emit one mbarrier fence + cluster arrive/wait
-        # after the preamble (covering every site's mbarrier init).
-        self.simt_cluster_reduce_sites: int = 0
-        self._tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
-        self._tcgen05_grouped_tail_proofs: dict[
-            torch.fx.Node, Tcgen05GroupedTailEpilogueMatch
-        ] = {}
-        self._tcgen05_consumed_store_value_ids: set[int] = set()
-        # A same-graph fanout shares one accumulator pipeline transaction.
-        # The first store waits; the final store releases/advances only after
-        # every output has read TMEM. Each TMA store gets separate descriptors.
-        self._tcgen05_emitted_store_nodes: dict[int, set[Node | None]] = {}
-        self._tcgen05_pending_paired_stores: dict[Node, FanoutStore] = {}
-        # FX matmul / hl.dot / addmm nodes lowered through tcgen05. The store
-        # path uses this to recognize fused epilogue chains that must use the
-        # tcgen05 store splice instead of falling through to SIMT store codegen.
-        self.matmul_fx_nodes: set[torch.fx.Node] = set()
-        # Pointwise ops on a tcgen05 epilogue chain whose block-id re-binding
-        # check waits for the store's epilogue classifier
-        # (``cute_reshape.check_pointwise_rebound_block_ids``).
-        self.deferred_rebound_pointwise_nodes: list[torch.fx.Node] = []
-        # ``build_inner_outputs_index_from_graphs`` of the codegen graphs,
-        # built once for those checks (the graphs are fixed per codegen).
-        self.rebound_inner_outputs_index: (
-            dict[int, tuple[torch.fx.Node | None, ...]] | None
-        ) = None
-        # tcgen05 matmul anchor -> registered result var. Fused epilogue walks
-        # from a store value back to the anchor and reuses the store value
-        # registered under this result var, even when user-visible names were
-        # renamed through casts or epilogue nodes.
-        self.matmul_fx_node_result_vars: dict[torch.fx.Node, str] = {}
-        # Exact fp32 SIMT GEMM sites awaiting ``lower_simt_gemm``.
-        self.simt_gemm_sites: list[SimtGemmSite] = []
-        self._fragment_epilogue_plan: Tcgen05FragmentEpiloguePlan | None = None
-        # Rejected proofs are stable for this per-config codegen state. Keep
-        # the tile shape in the key so callers cannot accidentally reuse a
-        # verdict if this helper is ever exercised with multiple shapes.
-        self._rejected_fragment_epilogue_plans: set[
-            tuple[torch.fx.Node, int, int, int]
-        ] = set()
-        self._collective_lane_loop_suppression_vetoed = False
-        self.matmul_plan: CuteTcgen05MatmulPlan | None = None
-        # Variable-name containers allocated in cute_mma and consumed by
-        # program_id / memory_ops role builders. They live here so CuTe pipeline
-        # ownership does not leak into the generic DeviceFunction body.
-        self.sched_pipeline_plan: _Tcgen05SchedPipelinePlan | None = None
-        self.aux_pipeline_plan: _Tcgen05AuxPipelinePlan | None = None
-        self.ab_startup_prefill: Tcgen05AbStartupPrefill | None = None
-        # Name of the CLC throttle named barrier once the TMA-load role has
-        # emitted its per-tile credit (``cute_mma``); the scheduler-warp body
-        # (``program_id``) syncs on it before every CLC query only then, so a
-        # producer path without the credit never leaves the scheduler waiting.
-        self.clc_throttle_barrier: str | None = None
-        # The materialized-operand dependency wait was emitted inside the
-        # initial AB prefetch (independent operand first); the role-local
-        # prelude must not wait again ahead of those loads.
-        self.tcgen05_pdl_wait_in_prefetch: bool = False
-        # ``cute_pdl`` on a tcgen05 kernel: the launch carries ``use_pdl`` and
-        # the generic entry wait (``DeviceFunction._cute_pdl_applies``) heads
-        # the body, ahead of every prologue read.
-        self.cute_pdl_entry_wait: bool = False
-        # One-shot clustered tcgen05 kernels: the cluster ``pipeline_init_arrive``
-        # statement after which ``program_id`` re-emits the TMA-load warp's
-        # role block (see ``cute_mma`` ``tcgen05_hoist_tma_role``).
-        self.tcgen05_tma_role_hoist_anchor: ast.stmt | None = None
-        # Row-union kernels whose TMA-load role is hoisted: the cluster
-        # ``pipeline_init_wait`` the role executes once in its prelude, after
-        # its scheduler setup and ahead of its persistent loop.
-        self.tcgen05_tma_role_prelude_wait: str | None = None
-        # ``cute_pdl`` on a persistent role-local tcgen05 kernel: the TMA-load
-        # role's ``griddepcontrol_wait`` is emitted per tile right ahead of the
-        # first stage (``cute_mma``), after the tile's address math, so
-        # ``program_id`` leaves the role's prelude without a wait.
-        self.tcgen05_tma_role_wait_per_tile: bool = False
-        self._per_tile_stmt_ids: set[int] = set()
-        self._post_loop_stmt_ids: set[int] = set()
-        self._tma_load_role_stmt_ids: set[int] = set()
-        self._mma_exec_role_stmt_ids: set[int] = set()
-        self._epi_role_stmt_ids: set[int] = set()
-        self._epi_role_prelude_stmt_ids: set[int] = set()
-        # One-shot TMA-load role setup (the once-per-CTA TMA partitions of
-        # the whole tiled operands, ``cute_mma``) that ``program_id`` places
-        # in the role's prelude ahead of its cluster join.
-        self._tma_role_prelude_stmt_ids: set[int] = set()
-        self._epi_role_full_tile_stmt_ids: set[int] = set()
-        self._epi_role_edge_tile_stmt_ids: set[int] = set()
-        self._tcgen05_kloop_owned_stmt_ids_by_loop: dict[int, set[int]] = {}
-        self._tcgen05_kloop_cleanup_requested_loop_ids: set[int] = set()
-        self._tcgen05_pure_lifecycle_pending_store_loops: dict[
-            int, DeviceLoopState
-        ] = {}
-        self.epi_role_tile_counter_var: str | None = None
-        self.epi_role_tile_counter_increment_per_tile: bool = True
-        self._collective_handled_loads: set[Node] = set()
-        self._collective_handled_load_or_dependency_node_ids: set[int] = set()
-        self.cluster_shape: tuple[int, int, int] | None = None
-        self.block_shape: tuple[int, int, int] | None = None
-        # ``min_blocks_per_mp`` the tcgen05 role launch requires (the
-        # epilogue warp groups' 10+-warp block runs without a ``setmaxnreg``
-        # split and needs ptxas to cap the per-thread allocation at
-        # ``65536 / threads``); emitted as ``_helion_cute_min_blocks_per_mp``
-        # by the device function.
-        self.tcgen05_min_blocks_per_mp: int | None = None
-        self.suppress_root_lane_loops = False
-        # Active block-id remapping for matmul operand re-materialization.
-        # Maps a source block_id (e.g. the rhs operand's loop-invariant
-        # contraction index) to the active contraction block_id so a
-        # re-lowered operand load reads ``rhs[..., k, ...]`` per contraction
-        # step instead of the loop-invariant ``rhs[..., m, ...]``.  Empty
-        # except while re-materializing a matmul operand load.
-        self.matmul_operand_block_remap: dict[int, int] = {}
-        # Active block-id -> raw index-expression override for matmul operand
-        # re-materialization.  Used by the static-MN-collapse baddbmm path: the
-        # rhs free (N) axis shares a block_id with the lhs M (output) axis, so
-        # the standard resolver would index the rhs at the M thread index
-        # (computing only the diagonal).  Re-lowering the rhs with this override
-        # makes its N axis read a serial N-loop variable instead, and suppresses
-        # masking for that axis (the serial loop already covers exactly [0, C)).
-        # Empty except while re-materializing such an operand load.
-        self.matmul_operand_index_override: dict[int, str] = {}
-        self.collective_mma_sites: list[CollectiveMmaSite] = []
-        self.collective_mma_static_layouts = False
-        # Late scalar-recipe staging may compose several contractions. These
-        # statements access only fresh compiler-owned shared buffers, so later
-        # sites can keep proving effects against the original global accesses.
-        self.collective_mma_emitted_stmt_ids: set[int] = set()
-        self.collective_mma_shared_results: set[str] = set()
-        self.collective_mma_pure_stmt_ids: set[int] = set()
-        # Grouped two-phase lowering for structurally proven fixed-token,
-        # split-input BF16 rank-1 recurrences.
-        self.fixed_token_rank1_plan: CuteFixedTokenRank1Plan | None = None
-        # Names-agnostic affine regions awaiting late address and ownership
-        # proofs. Discovery alone never changes the ordinary lowering.
-        self.direct_affine_candidates: tuple[DirectAffineCandidate, ...] = ()
-        # Installed only after late generated-address and effect proofs succeed.
-        # Its CTA shape is authoritative because the direct lowering replaces
-        # the ordinary lane topology.
-        self.direct_affine_plan: DirectAffinePlan | None = None
-        self.topk_plan: CuteTopKPlan | None = None
-        self.radix_selection_plan: RadixSelectionPlan | None = None
-        self.register_region_plan: RegisterRegionPlan | None = None
-        # Packed one-warp lowering for structurally proven split-input T=1
-        # BF16 rank-1 recurrences.  It precedes the grouped fixed-token path.
-        self.split_single_token_rank1_plan: CuteSplitSingleTokenRank1Plan | None = None
-        # Whole-body packed lowering for a structurally proven single-token
-        # BF16 rank-1 state recurrence. The plan is absent by default and is
-        # additionally gated by the user-facing fast_math setting.
-        self.single_token_rank1_plan: CuteSingleTokenRank1Plan | None = None
-        self.collective_register_chain_lowered = False
-        self.collective_register_chain_block_dims: tuple[int, int, int] | None = None
-        # Launch shape ``finalize_shared_reduce_groups`` sized the shared
-        # cross-warp reductions for (None when it rewrote nothing); the
-        # launcher refuses to emit a different ``block=`` for such a body.
-        self.shared_reduce_launch_block: tuple[int, int, int] | None = None
-        # The static ``block=`` the launcher call was emitted with
-        # (``CuteBackend.launcher_keyword_args``, which runs ahead of the
-        # kernel definition's codegen); None before that call, and for a
-        # launch with an argument-sized axis.  ``_implicit_pdl_release``
-        # estimates the resident CTAs per SM from it.
-        self.launch_block: tuple[int, int, int] | None = None
-        self.owned_root_block_dims: tuple[int, int, int] | None = None
-        # ``(needed, capacity)`` when the computed-fragment owner declined the
-        # current root because its shared memory exceeds the CTA capacity; a
-        # generic-lowering refusal of that root is then a config failure.
-        self.fragment_capacity_decline: tuple[int, int] | None = None
         self.published_scalar_requests: list[PublishedScalarRequest] = []
         self.register_producer_requests: list[RegisterProducerRequest] = []
-        # Whole-root BT16 five-factor prepare schedule.  This is installed only
-        # after the complete semantic graph and packed workspace ABI match.
-        self.chunk_prepare_plan: CuteChunkPreparePlan | None = None
-        self.block_scaled_plan: BlockScaledMmaPlan | None = None
-        # Whole-root BT16 KDA recurrence/output schedule. Like the
-        # prepare plan, this exists only after the complete semantic graph and
-        # packed workspace ABI have matched.
-        self.chunk_recurrence_plan: CuteChunkRecurrencePlan | None = None
-        # Whole-root gated-delta-rule (gdn_fwd_h) chunk recurrence.  Installed
-        # only after the semantic two-contraction graph match and the shape
-        # admission limits of the SM100 tcgen05 schedule both hold.
-        self.gdn_recurrence_plan: CuteGdnRecurrencePlan | None = None
-        # Set by the backend's flash-attention detector when the fused
-        # tcgen05 QK->softmax->PV path is active (HELION_CUTE_FLASH). Holds the
-        # tile_n device-loop block ids. The dedicated flash codegen emits the
-        # whole device body and host launch, mirroring
-        # ``.notes/spikes/fa_tcgen05_spike.py``.
-        self.attention_flash_block_ids: list[int] | None = None
-        self.attention_flash_score_plan: AttentionScorePlan | None = None
-        # Set by the flex-envelope matcher (``flex_match.py``): the
-        # whole-graph-set match, probed once per device function. Every
-        # device loop of the two BlockMask list walks answers ``mma_mode``
-        # from it, and the flash codegen reads its operands from it.
-        self.attention_flex_match: FlexMatch | None = None
-        self.attention_flex_probed: bool = False
-        # Launch block thread count for the flash path: 128 (single-warpgroup
-        # Stage-3) or 256 (Stage-4 warp-spec, double-buffered-S overlap).
-        self.attention_flash_threads: int = 128
-        # Set by the gated (softmax-free) attention detector: the matched
-        # kernel facts plus the config-selected KV tile / TMA ring depth.
-        self.attention_flash_gated_match: GatedAttentionPlan | None = None
-        # Config-independent gated match, probed once per device function
-        # (``attention_flash_gated_probed`` records that the probe ran).
-        self.attention_flash_gated_probe: GatedAttentionMatch | None = None
-        self.attention_flash_gated_probed: bool = False
-        # The fused body may run one CTA per (grid index, lane): the launch
-        # grid is the PID strategy's grid times this factor.
-        self.launch_grid_multiplier: int = 1
-        # The CTA count of a launch the launcher sizes from a wrapper plan
-        # instead of the program-id grid (the register-MMA flash backward
-        # runs one CTA per ``kv_rows`` KV rows: ``total_tiles`` of its
-        # plan); None when the program-id grid is the launch grid.  The
-        # dependent-launch release rule (``_implicit_pdl_release``) counts
-        # the launch's CTAs from it.
-        self.launch_ctas: int | None = None
-        # ``tcgen05_split_k``: the flat grid carries ``divisor`` CTAs per
-        # output tile, so the program-id decode reads ``block_idx // divisor``
-        # and the launch grid is multiplied by it (``launch_grid_multiplier``).
-        # ``tcgen05_split_k_applied`` records that the tcgen05 pipeline honored
-        # the split; the launch codegen rejects the config otherwise.
-        self.program_id_divisor: int = 1
-        self.tcgen05_split_k_applied: bool = False
-        # Set by the backward-attention detector (cute_flash_bwd.py): the
-        # matched kernel facts and the inner Q-loop block ids.
-        self.attention_flash_bwd_match: AttentionBwdMatch | FlexBwdMatch | None = None
-        self.attention_flash_bwd_block_ids: list[int] | None = None
-        # The FlexAttention backward envelope (``flex_bwd_match.py``): the
-        # whole-graph-set match, probed once per device function.
-        self.attention_flex_bwd_match: FlexBwdMatch | None = None
-        self.attention_flex_bwd_probed: bool = False
-        # Set by the register-MMA GEMM detector (``cute_matmul_family=
-        # "warp_mma"``, cute_warp_mma_gemm.py): the matched plain GEMM and
-        # its tile; the dedicated codegen emits the whole device body and
-        # the launch runs ``32 * warps`` threads per CTA.
-        self.warp_mma_gemm_plan: CuteWarpMmaGemmMatch | None = None
-        # Set by ``plan_register_subblocks`` (``cute_register_subblocks=
-        # "on"``, cute_register_subblocks.py): the flattened static
-        # sub-block program of the root and its knobs; the dedicated
-        # codegen renders the whole device body as one register program
-        # per warp and the launch runs ``32 * warps`` threads per CTA.
-        self.register_subblocks_plan: RegisterSubblockPlan | None = None
-        # Set by ``plan_mma_dag`` (``cute_mma_dag="warp"``, cute_mma_dag.py):
-        # the matched serial MMA state recurrence and its tile / warp /
-        # stage selection; the dedicated codegen owns the matched root and
-        # the launch runs ``32 * warps`` threads per CTA.
-        self.mma_dag_plan: MmaDagPlan | None = None
-        # The mma_dag emitters' 16-bit-typed values whose fp32 widening is
-        # already at hand (name -> the exact fp32 expression: an unpacked
-        # tile element, a widening side load): the pointwise lowering's
-        # ``to_dtype(x, float32)`` takes it instead of a cast round trip.
-        self.mma_dag_exact_f32: dict[str, str] = {}
-        # SASS-level checks the launcher runs on the compiled kernel before
-        # its first launch (``helion.runtime.cute.sass_check``), declared by
-        # the emitters whose instruction forms the DSL's assembler has
-        # miscompiled (the mma_dag emitter's hinted ``cp.async`` packets);
-        # emitted as the kernel's ``_helion_cute_sass_checks`` attribute.
-        self.sass_checks: tuple[str, ...] = ()
+
+    # -- tcgen05 registries -----------------------------------------------------
 
     def register_tcgen05_fragment_epilogue_plan(
         self, plan: Tcgen05FragmentEpiloguePlan
     ) -> None:
         """Atomically commit one fully validated live-FX fragment plan."""
-        if self._fragment_epilogue_plan is not None:
+        if self.tcgen05.fragment_epilogue_plan is not None:
             raise exc.BackendUnsupported(
                 "cute", "tcgen05 fragment epilogue plan must be unique"
             )
-        self._fragment_epilogue_plan = plan
+        self.tcgen05.fragment_epilogue_plan = plan
 
     def reject_tcgen05_fragment_epilogue_plan(
         self, anchor: Node, *, bm: int, bn: int, bk: int
     ) -> None:
         """Memoize a failed thread-locality proof for this config."""
-        self._rejected_fragment_epilogue_plans.add((anchor, bm, bn, bk))
+        self.tcgen05.rejected_fragment_epilogue_plans.add((anchor, bm, bn, bk))
 
     def tcgen05_fragment_epilogue_plan_was_rejected(
         self, anchor: Node, *, bm: int, bn: int, bk: int
     ) -> bool:
-        return (anchor, bm, bn, bk) in self._rejected_fragment_epilogue_plans
+        return (anchor, bm, bn, bk) in self.tcgen05.rejected_fragment_epilogue_plans
 
     @property
     def has_tcgen05_fragment_epilogue_plan(self) -> bool:
-        return self._fragment_epilogue_plan is not None
+        return self.tcgen05.fragment_epilogue_plan is not None
 
     def tcgen05_fragment_epilogue_plan_for_anchor(
         self, anchor: Node
     ) -> Tcgen05FragmentEpiloguePlan | None:
-        plan = self._fragment_epilogue_plan
+        plan = self.tcgen05.fragment_epilogue_plan
         return plan if plan is not None and plan.anchor is anchor else None
 
     def tcgen05_fragment_epilogue_plan_for_store(
         self, store: Node | None
     ) -> Tcgen05FragmentEpiloguePlan | None:
-        plan = self._fragment_epilogue_plan
+        plan = self.tcgen05.fragment_epilogue_plan
         return plan if plan is not None and plan.store_node is store else None
 
     def is_deferred_tcgen05_fragment_epilogue_node(self, node: Node) -> bool:
-        plan = self._fragment_epilogue_plan
+        plan = self.tcgen05.fragment_epilogue_plan
         return plan is not None and node in plan.owned_nodes
 
     def veto_collective_lane_loop_suppression(self) -> None:
-        self._collective_lane_loop_suppression_vetoed = True
+        self.lanes.collective_lane_loop_suppression_vetoed = True
 
     def collective_lane_loop_suppression_is_vetoed(self) -> bool:
-        return self._collective_lane_loop_suppression_vetoed
+        return self.lanes.collective_lane_loop_suppression_vetoed
 
     def register_tcgen05_store_value(
         self, name: str, value: CuteTcgen05StoreValue
     ) -> None:
-        self._tcgen05_store_values[name] = value
+        self.tcgen05.store_values[name] = value
 
     def register_tcgen05_grouped_tail_proof(
         self, proof: Tcgen05GroupedTailEpilogueMatch
     ) -> None:
-        if proof.store_node in self._tcgen05_grouped_tail_proofs:
+        if proof.store_node in self.tcgen05.grouped_tail_proofs:
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 grouped tail proof must be unique per store node",
             )
-        self._tcgen05_grouped_tail_proofs[proof.store_node] = proof
+        self.tcgen05.grouped_tail_proofs[proof.store_node] = proof
 
     def grouped_tail_proof_for_store(
         self, store_node: Node
     ) -> Tcgen05GroupedTailEpilogueMatch | None:
-        return self._tcgen05_grouped_tail_proofs.get(store_node)
+        return self.tcgen05.grouped_tail_proofs.get(store_node)
 
     def get_tcgen05_store_value(
         self,
         candidate_names: Sequence[str],
     ) -> CuteTcgen05StoreValue | None:
+        store_values = self.tcgen05.store_values
         for candidate_name in candidate_names:
-            if (value := self._tcgen05_store_values.get(candidate_name)) is not None:
+            if (value := store_values.get(candidate_name)) is not None:
                 return value
-        return None
-
-    def consume_tcgen05_store_value(
-        self,
-        candidate_names: Sequence[str],
-    ) -> CuteTcgen05StoreValue | None:
-        for candidate_name in candidate_names:
-            if (value := self._tcgen05_store_values.get(candidate_name)) is None:
-                continue
-            value_id = id(value)
-            if value_id in self._tcgen05_consumed_store_value_ids:
-                raise exc.BackendUnsupported(
-                    "cute",
-                    "tcgen05 pure role-lifecycle store supports exactly one "
-                    f"store of {candidate_name!r}; multi-store fan-out must use "
-                    "the standard store path",
-                )
-            self._tcgen05_consumed_store_value_ids.add(value_id)
-            return value
         return None
 
     def claim_tcgen05_store_site(
@@ -1176,7 +830,7 @@ class CuteDeviceFunctionState:
         role reuse TMEM while a later epilogue still reads the old tile.
         """
         value_id = id(value)
-        emitted = self._tcgen05_emitted_store_nodes.setdefault(value_id, set())
+        emitted = self.tcgen05.emitted_store_nodes.setdefault(value_id, set())
         expected = value.output_stores
         if expected is None:
             if emitted:
@@ -1199,13 +853,13 @@ class CuteDeviceFunctionState:
         return is_secondary, len(emitted) == len(expected)
 
     def register_tcgen05_matmul_plan(self, plan: CuteTcgen05MatmulPlan) -> None:
-        if self.matmul_plan is not None:
-            if self.matmul_plan != plan:
+        if self.tcgen05.matmul_plan is not None:
+            if self.tcgen05.matmul_plan != plan:
                 raise exc.BackendUnsupported(
                     "cute", "mixed tcgen05 matmul collective plans in one kernel"
                 )
             return
-        self.matmul_plan = plan
+        self.tcgen05.matmul_plan = plan
 
     def register_paired_fanout_store(
         self, store: FanoutStore, post_loop_stmts: Sequence[ast.AST]
@@ -1213,27 +867,30 @@ class CuteDeviceFunctionState:
         """Keep the first marked body alive until its complete second store."""
         from .epilogue_fanout import combine_stores
 
+        tcgen05 = self.tcgen05
         first, second = store.plan.stores
         if store.site is first:
-            if first in self._tcgen05_pending_paired_stores:
+            if first in tcgen05.pending_paired_stores:
                 raise exc.BackendUnsupported("cute", "duplicate paired fanout store")
-            self._tcgen05_pending_paired_stores[first] = store
+            tcgen05.pending_paired_stores[first] = store
             return False
-        if store.site is not second or first not in self._tcgen05_pending_paired_stores:
+        if store.site is not second or first not in tcgen05.pending_paired_stores:
             raise exc.BackendUnsupported("cute", "unordered paired fanout stores")
-        combine_stores(self._tcgen05_pending_paired_stores.pop(first), store)
-        self._per_tile_stmt_ids.remove(id(store.main))
-        self._epi_role_stmt_ids.remove(id(store.main))
-        self._post_loop_stmt_ids.difference_update(id(stmt) for stmt in post_loop_stmts)
+        combine_stores(tcgen05.pending_paired_stores.pop(first), store)
+        tcgen05.per_tile_stmt_ids.remove(id(store.main))
+        tcgen05.epi_role_stmt_ids.remove(id(store.main))
+        tcgen05.post_loop_stmt_ids.difference_update(
+            id(stmt) for stmt in post_loop_stmts
+        )
         return True
 
     def register_tcgen05_sched_pipeline_plan(
         self, plan: _Tcgen05SchedPipelinePlan
     ) -> None:
-        self.sched_pipeline_plan = plan
+        self.tcgen05.sched_pipeline_plan = plan
 
     def register_tcgen05_aux_pipeline_plan(self, plan: _Tcgen05AuxPipelinePlan) -> None:
-        self.aux_pipeline_plan = plan
+        self.tcgen05.aux_pipeline_plan = plan
 
     def register_tcgen05_per_tile_stmts(self, stmts: list[ast.AST]) -> None:
         """Keep per-tile setup inside the persistent work-tile loop.
@@ -1242,21 +899,21 @@ class CuteDeviceFunctionState:
         statements that read per-tile coordinates or advance per-tile pipeline
         state must be marked here.
         """
-        self._per_tile_stmt_ids.update(id(stmt) for stmt in stmts)
+        self.tcgen05.per_tile_stmt_ids.update(id(stmt) for stmt in stmts)
 
     def is_tcgen05_per_tile(self, stmt: ast.stmt) -> bool:
-        return id(stmt) in self._per_tile_stmt_ids
+        return id(stmt) in self.tcgen05.per_tile_stmt_ids
 
     @property
     def has_tcgen05_per_tile_marks(self) -> bool:
-        return bool(self._per_tile_stmt_ids)
+        return bool(self.tcgen05.per_tile_stmt_ids)
 
     def register_tcgen05_post_loop_stmts(self, stmts: Sequence[ast.AST]) -> None:
         """Move one-shot drains and teardown after the persistent tile loop."""
-        self._post_loop_stmt_ids.update(id(stmt) for stmt in stmts)
+        self.tcgen05.post_loop_stmt_ids.update(id(stmt) for stmt in stmts)
 
     def is_tcgen05_post_loop(self, stmt: ast.stmt) -> bool:
-        return id(stmt) in self._post_loop_stmt_ids
+        return id(stmt) in self.tcgen05.post_loop_stmt_ids
 
     def move_tcgen05_post_loop_stmts_to_end(self, body: list[ast.AST]) -> list[ast.AST]:
         """Reorder ``body`` so post-loop-tagged statements run last.
@@ -1270,12 +927,13 @@ class CuteDeviceFunctionState:
         tagged statements to the end (preserving relative order) keeps the
         single-store case a no-op while fixing the fan-out ordering.
         """
-        if not self._post_loop_stmt_ids:
+        post_loop_stmt_ids = self.tcgen05.post_loop_stmt_ids
+        if not post_loop_stmt_ids:
             return body
         remaining: list[ast.AST] = []
         post_loop: list[ast.AST] = []
         for stmt in body:
-            if id(stmt) in self._post_loop_stmt_ids:
+            if id(stmt) in post_loop_stmt_ids:
                 post_loop.append(stmt)
             else:
                 remaining.append(stmt)
@@ -1283,7 +941,7 @@ class CuteDeviceFunctionState:
 
     @property
     def has_tcgen05_post_loop_marks(self) -> bool:
-        return bool(self._post_loop_stmt_ids)
+        return bool(self.tcgen05.post_loop_stmt_ids)
 
     def register_tcgen05_tma_load_role_stmts(self, stmts: list[ast.AST]) -> None:
         """Mark work owned by the TMA-load warp role.
@@ -1292,244 +950,104 @@ class CuteDeviceFunctionState:
         invariant hoisting. Nested role statements are found by the role
         partitioner's one-level loop recursion.
         """
-        self._tma_load_role_stmt_ids.update(id(stmt) for stmt in stmts)
+        self.tcgen05.tma_load_role_stmt_ids.update(id(stmt) for stmt in stmts)
 
     @property
     def tcgen05_tma_load_role_stmt_ids(self) -> frozenset[int]:
-        return frozenset(self._tma_load_role_stmt_ids)
+        return frozenset(self.tcgen05.tma_load_role_stmt_ids)
 
     def register_tcgen05_mma_exec_role_stmts(self, stmts: list[ast.AST]) -> None:
         """Mark AB consumer / UMMA / acc producer work for the MMA-exec warp."""
-        self._mma_exec_role_stmt_ids.update(id(stmt) for stmt in stmts)
+        self.tcgen05.mma_exec_role_stmt_ids.update(id(stmt) for stmt in stmts)
 
     @property
     def tcgen05_mma_exec_role_stmt_ids(self) -> frozenset[int]:
-        return frozenset(self._mma_exec_role_stmt_ids)
+        return frozenset(self.tcgen05.mma_exec_role_stmt_ids)
 
     def register_tcgen05_epi_role_stmts(self, stmts: list[ast.AST]) -> None:
         """Mark acc consumer and TMEM-to-GMEM store work for epilogue warps."""
-        self._epi_role_stmt_ids.update(id(stmt) for stmt in stmts)
+        self.tcgen05.epi_role_stmt_ids.update(id(stmt) for stmt in stmts)
 
     def register_tcgen05_epi_role_prelude_stmts(self, stmts: Sequence[ast.AST]) -> None:
         """Mark one-shot epilogue setup that must stay inside the epi role."""
-        self._epi_role_prelude_stmt_ids.update(id(stmt) for stmt in stmts)
+        self.tcgen05.epi_role_prelude_stmt_ids.update(id(stmt) for stmt in stmts)
 
     def register_tcgen05_epi_role_full_edge_stmts(
         self, *, full_tile_stmts: list[ast.AST], edge_tile_stmts: list[ast.AST]
     ) -> None:
         """Mark scheduler-split epilogue work for full vs fringe tiles."""
         self.register_tcgen05_epi_role_stmts([*full_tile_stmts, *edge_tile_stmts])
-        self._epi_role_full_tile_stmt_ids.update(id(stmt) for stmt in full_tile_stmts)
-        self._epi_role_edge_tile_stmt_ids.update(id(stmt) for stmt in edge_tile_stmts)
+        self.tcgen05.epi_role_full_tile_stmt_ids.update(
+            id(stmt) for stmt in full_tile_stmts
+        )
+        self.tcgen05.epi_role_edge_tile_stmt_ids.update(
+            id(stmt) for stmt in edge_tile_stmts
+        )
 
     def register_tcgen05_epi_role_tile_counter(
         self, name: str, *, increment_per_tile: bool = True
     ) -> None:
         """Publish the role-local epilogue tile counter used by TMA stores."""
-        if self.epi_role_tile_counter_var is None:
-            self.epi_role_tile_counter_var = name
-            self.epi_role_tile_counter_increment_per_tile = increment_per_tile
+        tcgen05 = self.tcgen05
+        if tcgen05.epi_role_tile_counter_var is None:
+            tcgen05.epi_role_tile_counter_var = name
+            tcgen05.epi_role_tile_counter_increment_per_tile = increment_per_tile
             return
-        assert self.epi_role_tile_counter_var == name
-        assert self.epi_role_tile_counter_increment_per_tile == increment_per_tile
+        assert tcgen05.epi_role_tile_counter_var == name
+        assert tcgen05.epi_role_tile_counter_increment_per_tile == increment_per_tile
 
     def is_tcgen05_epi_role(self, stmt: ast.stmt) -> bool:
-        return id(stmt) in self._epi_role_stmt_ids
+        return id(stmt) in self.tcgen05.epi_role_stmt_ids
 
     def is_tcgen05_epi_role_prelude(self, stmt: ast.stmt) -> bool:
-        return id(stmt) in self._epi_role_prelude_stmt_ids
+        return id(stmt) in self.tcgen05.epi_role_prelude_stmt_ids
 
     def register_tcgen05_tma_role_prelude_stmts(self, stmts: Sequence[ast.AST]) -> None:
         """Mark one-shot TMA-load role setup that must stay inside the role,
         ahead of its persistent loop and its cluster join."""
-        self._tma_role_prelude_stmt_ids.update(id(stmt) for stmt in stmts)
+        self.tcgen05.tma_role_prelude_stmt_ids.update(id(stmt) for stmt in stmts)
 
     def is_tcgen05_tma_role_prelude(self, stmt: ast.stmt) -> bool:
-        return id(stmt) in self._tma_role_prelude_stmt_ids
+        return id(stmt) in self.tcgen05.tma_role_prelude_stmt_ids
 
     def is_tcgen05_epi_role_full_tile(self, stmt: ast.stmt) -> bool:
-        return id(stmt) in self._epi_role_full_tile_stmt_ids
+        return id(stmt) in self.tcgen05.epi_role_full_tile_stmt_ids
 
     def is_tcgen05_epi_role_edge_tile(self, stmt: ast.stmt) -> bool:
-        return id(stmt) in self._epi_role_edge_tile_stmt_ids
+        return id(stmt) in self.tcgen05.epi_role_edge_tile_stmt_ids
 
     @property
     def has_tcgen05_epi_role_full_edge_split(self) -> bool:
         return bool(
-            self._epi_role_full_tile_stmt_ids or self._epi_role_edge_tile_stmt_ids
+            self.tcgen05.epi_role_full_tile_stmt_ids
+            or self.tcgen05.epi_role_edge_tile_stmt_ids
         )
 
     @property
     def tcgen05_epi_role_stmt_ids(self) -> frozenset[int]:
-        return frozenset(self._epi_role_stmt_ids)
+        return frozenset(self.tcgen05.epi_role_stmt_ids)
 
-    def register_collective_handled_load(
-        self,
-        load_node: Node,
-        *,
-        dependency_nodes: Sequence[Node] = (),
-    ) -> None:
-        """Register collective operand-load state for later codegen decisions.
-
-        FX node object identities drive both regular load suppression and
-        statement-ownership marking for load/dependency scaffolding; this is
-        scoped to one codegen pass where the FX graph and AST lists retain the
-        same objects.  Node names are only unique within one graph: the root
-        graph's first load is ``load`` like the K loop's operand load.
-        """
-        self._collective_handled_loads.add(load_node)
-        self._collective_handled_load_or_dependency_node_ids.update(
-            id(node) for node in dependency_nodes
-        )
+    def register_collective_handled_load(self, load_node: Node) -> None:
+        """Register a collective operand load for later codegen decisions
+        (``CuteLaneState.collective_handled_loads``)."""
+        self.lanes.collective_handled_loads.add(load_node)
 
     def is_collective_handled_load(self, load_node: Node) -> bool:
-        return load_node in self._collective_handled_loads
+        return load_node in self.lanes.collective_handled_loads
 
     @property
     def collective_handled_loads(self) -> frozenset[Node]:
-        return frozenset(self._collective_handled_loads)
+        return frozenset(self.lanes.collective_handled_loads)
 
-    def is_collective_handled_load_or_dependency_node(self, node: Node) -> bool:
-        return id(node) in self._collective_handled_load_or_dependency_node_ids
-
-    def register_tcgen05_kloop_owned_stmts(
-        self, device_loop: DeviceLoopState, stmts: Sequence[ast.AST]
-    ) -> None:
-        """Record exact K-loop statements emitted by tcgen05 matmul lowering.
-
-        Future role-lifecycle cleanup must remove only statements registered by
-        object identity here. This deliberately does not infer ownership from
-        variable names or statement shapes.
-        """
-        if not stmts:
-            return
-        owned_ids = self._tcgen05_kloop_owned_stmt_ids_by_loop.setdefault(
-            id(device_loop), set()
-        )
-        owned_ids.update(id(stmt) for stmt in stmts)
-
-    def register_tcgen05_pure_lifecycle_pending_store(
-        self, device_loop: DeviceLoopState
-    ) -> None:
-        loop_id = id(device_loop)
-        if loop_id in self._tcgen05_pure_lifecycle_pending_store_loops:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 pure role-lifecycle supports only one pending "
-                "matmul/store pair per K loop",
-            )
-        self._tcgen05_pure_lifecycle_pending_store_loops[loop_id] = device_loop
-
-    def request_tcgen05_owned_kloop_cleanup(self, device_loop: DeviceLoopState) -> None:
-        loop_id = id(device_loop)
-        if loop_id not in self._tcgen05_pure_lifecycle_pending_store_loops:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 role-lifecycle K-loop cleanup was requested without a "
-                "matching pending pure-matmul store",
-            )
-        self._tcgen05_pure_lifecycle_pending_store_loops.pop(loop_id)
-        self._tcgen05_kloop_cleanup_requested_loop_ids.add(loop_id)
-
-    def is_tcgen05_kloop_owned_stmt(
-        self, device_loop: DeviceLoopState, stmt: ast.AST
-    ) -> bool:
-        return id(stmt) in self._tcgen05_kloop_owned_stmt_ids_by_loop.get(
-            id(device_loop), set()
-        )
-
-    def tcgen05_unowned_kloop_stmts(
-        self, device_loop: DeviceLoopState, stmts: Sequence[ast.AST]
-    ) -> list[ast.AST]:
-        owned_ids = self._tcgen05_kloop_owned_stmt_ids_by_loop.get(
-            id(device_loop), set()
-        )
-        return [stmt for stmt in stmts if id(stmt) not in owned_ids]
-
-    def replace_tcgen05_owned_kloop_stmts_with_pass(
-        self, device_loop: DeviceLoopState, stmts: Sequence[ast.AST]
-    ) -> None:
-        """Fail closed unless the requested cleanup slice is tcgen05-owned.
-
-        Real K-loop bodies may contain prelude/scaffold statements before the
-        tcgen05 matmul-owned region. Consumers must pass the exact contiguous
-        region they intend to remove so unrelated prelude/suffix statements are
-        preserved and never classified by name or statement shape.
-        """
-        if not stmts:
-            return
-        inner_stmts = device_loop.inner_statements
-        slice_start = next(
-            (
-                start
-                for start in range(len(inner_stmts) - len(stmts) + 1)
-                if all(
-                    inner_stmts[start + index] is stmt
-                    for index, stmt in enumerate(stmts)
-                )
-            ),
-            None,
-        )
-        if slice_start is None:
-            first_stmt = ast.unparse(stmts[0])
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 role-lifecycle K-loop cleanup requires an exact "
-                f"contiguous statement slice; first requested statement: {first_stmt}",
-            )
-        unowned_stmts = self.tcgen05_unowned_kloop_stmts(device_loop, stmts)
-        if unowned_stmts:
-            first_unowned = ast.unparse(unowned_stmts[0])
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 role-lifecycle K-loop cleanup requires exact ownership "
-                f"of every cleanup-region statement; first unowned statement: "
-                f"{first_unowned}",
-            )
-        inner_stmts[slice_start : slice_start + len(stmts)] = [ast.Pass()]
-
-    def finalize_tcgen05_owned_kloop_cleanup(
-        self, device_loop: DeviceLoopState
-    ) -> None:
-        loop_id = id(device_loop)
-        if loop_id not in self._tcgen05_kloop_cleanup_requested_loop_ids:
-            return
-
-        inner_stmts = device_loop.inner_statements
-        owned_ids = self._tcgen05_kloop_owned_stmt_ids_by_loop.get(loop_id, set())
-        owned_positions = [
-            index for index, stmt in enumerate(inner_stmts) if id(stmt) in owned_ids
-        ]
-        if not owned_positions:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 role-lifecycle K-loop cleanup found no exactly owned "
-                "statements to consume",
-            )
-        cleanup_stmts = inner_stmts[min(owned_positions) :]
-        self.replace_tcgen05_owned_kloop_stmts_with_pass(device_loop, cleanup_stmts)
-        self._tcgen05_kloop_cleanup_requested_loop_ids.remove(loop_id)
-
-    def consume_tcgen05_owned_kloop_cleanup(self, device_loop: DeviceLoopState) -> None:
-        self.request_tcgen05_owned_kloop_cleanup(device_loop)
-        self.finalize_tcgen05_owned_kloop_cleanup(device_loop)
-
-    def finalize_tcgen05_pure_lifecycle_stores(self) -> None:
-        if self._tcgen05_pending_paired_stores:
+    def finalize_tcgen05_paired_fanout_stores(self) -> None:
+        if self.tcgen05.pending_paired_stores:
             raise exc.BackendUnsupported("cute", "incomplete paired fanout stores")
-        if not self._tcgen05_pure_lifecycle_pending_store_loops:
-            return
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 pure role-lifecycle requires exactly one store consuming "
-            "the matmul result before function codegen finishes",
-        )
 
     def request_root_lane_loop_suppression(self) -> None:
-        self.suppress_root_lane_loops = True
+        self.lanes.suppress_root_lane_loops = True
 
     def consume_root_lane_loop_suppression(self) -> bool:
         """Return and clear the one-shot root lane-loop suppression request."""
-        suppress = self.suppress_root_lane_loops
-        self.suppress_root_lane_loops = False
+        suppress = self.lanes.suppress_root_lane_loops
+        self.lanes.suppress_root_lane_loops = False
         return suppress

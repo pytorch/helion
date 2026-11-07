@@ -14,16 +14,12 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
-pytestmark = [
-    skipUnlessBackends(["cute"]),
-    pytest.mark.skipif(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
-        reason="tcgen05 requires an sm_100 GPU",
-    ),
-]
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="tcgen05 requires an sm_100 GPU",
+)
 
 
 def _masked_gemm_gt(x: torch.Tensor, w: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -79,7 +75,7 @@ def test_fp16_comparison_mask_matches_eager(
         kernel_fn, backend="cute", static_shapes=True, autotune_effort="none"
     )
     bound = kernel.bind((x, w, c))
-    assert bound.config_spec.cute_tcgen05_search_enabled
+    assert bound.config_spec.tcgen05.search_enabled
     config = bound.config_spec.default_config()
     bound.set_config(config)
     source = bound.to_code(config)

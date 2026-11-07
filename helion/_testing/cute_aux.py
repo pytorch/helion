@@ -10,9 +10,9 @@ from unittest.mock import patch
 import torch
 
 from . import patch_cute_mma_support
+from . import patch_target_facts
 from .cute_codegen import mock_cuda_unavailable
 import helion
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -52,22 +52,28 @@ def rank_two_aux(
     return out
 
 
+# The role-local tcgen05 GEMM configuration the AUX tests start from; a
+# sparse base, independent of the host.
+AUX_CONFIG_BASE: dict[str, Any] = {
+    "block_sizes": [64, 256, 64],
+    "num_warps": 8,
+    "pid_type": "persistent_interleaved",
+    "tcgen05_cluster_m": 1,
+    "tcgen05_cluster_n": 1,
+    "tcgen05_ab_stages": 2,
+    "tcgen05_acc_stages": 2,
+    "tcgen05_c_stages": 2,
+    "tcgen05_num_epi_warps": 4,
+    "tcgen05_strategy": "role_local_with_scheduler",
+    "tcgen05_warp_spec_scheduler_warps": 1,
+    "tcgen05_warp_spec_c_input_warps": 1,
+    "tcgen05_aux_load_mode": "tma",
+}
+
+
 def aux_config(**overrides: object) -> helion.Config:
-    values: dict[str, Any] = {
-        "block_sizes": [64, 256, 64],
-        "num_warps": 8,
-        "pid_type": "persistent_interleaved",
-        "tcgen05_cluster_m": 1,
-        "tcgen05_cluster_n": 1,
-        "tcgen05_ab_stages": 2,
-        "tcgen05_acc_stages": 2,
-        "tcgen05_c_stages": 2,
-        "tcgen05_num_epi_warps": 4,
-        "tcgen05_strategy": "role_local_with_scheduler",
-        "tcgen05_warp_spec_scheduler_warps": 1,
-        "tcgen05_warp_spec_c_input_warps": 1,
-        "tcgen05_aux_load_mode": "tma",
-    }
+    """:data:`AUX_CONFIG_BASE` with ``overrides`` applied."""
+    values: dict[str, Any] = dict(AUX_CONFIG_BASE)
     values.update(overrides)
     return helion.Config(**values)
 
@@ -98,8 +104,10 @@ def cpu_codegen() -> Generator[None, None, None]:
     """Generate tcgen05 AUX source on CPU for a 148-SM sm103 target.
 
     These tests inspect generated source without compiling or launching CuTe.
-    ``mock_cuda_unavailable`` supplies the CPU-only device probes; the patches
-    below pin the target the schedule heuristics read.
+    ``mock_cuda_unavailable`` supplies the CPU-only device probes; the target
+    facts below pin what the schedule heuristics read.  Only the compile
+    environment sees the GB300 capability (the bind key keeps the host's); a
+    two-sided model is a separate change.
     """
     with (
         patch_cute_mma_support(),
@@ -109,10 +117,7 @@ def cpu_codegen() -> Generator[None, None, None]:
             "helion._compiler.compile_environment.target_device_capability",
             return_value=(10, 3),
         ),
-        patch("helion.runtime.get_num_sm", return_value=148),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
+        patch_target_facts(num_sm=148, smem_capacity_bytes=232448),
     ):
         yield
 

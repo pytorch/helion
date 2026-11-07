@@ -24,6 +24,7 @@ after the dependent-launch release):
 from __future__ import annotations
 
 import dataclasses
+from functools import cache
 import inspect
 from typing import TYPE_CHECKING
 from typing import Any
@@ -88,13 +89,14 @@ _PIPELINE_UMMA_ASYNC_FIELDS = (
 )
 
 
-def _private_surface_matches() -> bool:
-    """One check, at import: the installed DSL is the validated release and
+@cache
+def _private_surface_matches(installed: Version | None) -> bool:
+    """Whether ``installed`` is the validated DSL release and the loaded DSL
     still exposes exactly the private surface the constructors mirror.  When
-    it does not, ``SPLIT_BARRIER_INIT_SUPPORTED`` is False and the codegen
+    it does not, :func:`split_barrier_init_supported` is False and the codegen
     falls back to the DSL constructors (``create(..., defer_sync=True)``, the
     serial warp-0 inits; ``cute_mma`` ``tcgen05_split_barrier_init``)."""
-    if installed_cute_dsl_version() != SPLIT_INIT_VALIDATED_DSL_VERSION:
+    if installed != SPLIT_INIT_VALIDATED_DSL_VERSION:
         return False
     # The DSL pins a documentation signature ``(self)`` on the decorated
     # ``__init__``; the wrapped function carries the real one.
@@ -122,7 +124,13 @@ def _private_surface_matches() -> bool:
     return all(helper is not None for helper in helpers)
 
 
-SPLIT_BARRIER_INIT_SUPPORTED: bool = _private_surface_matches()
+def split_barrier_init_supported() -> bool:
+    """Whether the clustered kernels may build their pipelines through the
+    no-init constructors below.  Probed on first use and cached per installed
+    DSL version (never at import), so a process that patches the version
+    probe gets the answer for the version it reports while the patch is in
+    effect, and the real one afterwards."""
+    return _private_surface_matches(installed_cute_dsl_version())
 
 
 def _const_like(value: int, like: object, *, loc: object, ip: object) -> object:
@@ -190,7 +198,7 @@ def _uninitialized_mbarrier_array(
     """An ``MbarrierArray`` whose barriers the caller initializes later
     (``MbarrierArray.__init__`` initializes them from warp 0 at once); the
     DSL constructor's fields and validation otherwise."""
-    assert SPLIT_BARRIER_INIT_SUPPORTED, (
+    assert split_barrier_init_supported(), (
         "the installed CuTe DSL is not the release these constructors mirror"
     )
     if num_stages <= 0:

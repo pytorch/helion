@@ -604,17 +604,18 @@ class ReductionRoller:
                     continue
                 if (
                     indexes_load(node)
-                    or env.backend_name != "cute"
+                    or not env.backend.rolls_free_iota_reductions()
                     or read_inside_loop(node)
                 ):
                     return True
                 free_iota = True
             if free_iota:
-                # Only the reductions the computed-fragment lowering takes
-                # over roll; every other lowering would refuse them.
-                from .cute.free_iota_reduction import free_iota_reductions
-
-                if reduction not in free_iota_reductions(env, self.device_ir.graphs):
+                # Only the reductions the backend's lowering takes over roll
+                # (CuTe's computed fragments); every other lowering would
+                # refuse them.
+                if reduction not in env.backend.free_iota_reductions(
+                    self.device_ir.graphs
+                ):
                     return True
                 reduction.meta[FREE_IOTA_REDUCTION_META] = True
             return False

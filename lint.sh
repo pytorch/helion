@@ -33,6 +33,7 @@ PYREFLY="scripts/pyrefly_check.sh"
 if [ "$ACTION" = "fix" ]; then
   run ruff format
   run ruff check --fix
+  run python scripts/check_backend_isolation.py --strict
   run pre-commit run codespell --all-files
   run $PYREFLY
 fi
@@ -40,6 +41,7 @@ fi
 if [ "$ACTION" = "unsafe" ]; then
   run ruff format
   run ruff check --fix --unsafe-fixes
+  run python scripts/check_backend_isolation.py --strict
   run pre-commit run codespell --all-files
   run $PYREFLY
 fi
@@ -47,6 +49,7 @@ fi
 if [ "$ACTION" = "check" ]; then
   run ruff format --check --diff
   run ruff check --no-fix
+  run python scripts/check_backend_isolation.py --strict
   run pre-commit run codespell --all-files
   run $PYREFLY
 fi

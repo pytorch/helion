@@ -16,12 +16,10 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 import helion
 from helion._testing import onlyBackends
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
-pytestmark = skipUnlessBackends(["cute"])
 _fixed_token_rank1_recurrence = importlib.import_module(
     "helion._compiler.cute.fixed_token_rank1_recurrence"
 )
@@ -203,7 +201,7 @@ def _config(
     )
 
 
-# unittest runners ignore pytestmark.
+# unittest runners see neither pytest marks nor the conftest path gate.
 @onlyBackends(["cute"])
 class TestCuteFixedTokenRank1Recurrence(unittest.TestCase):
     def _code(
@@ -279,7 +277,7 @@ class TestCuteFixedTokenRank1Recurrence(unittest.TestCase):
                     shrink_sequence_axis,
                 )
             )
-            return bound.to_triton_code(
+            return bound.to_code(
                 _config(
                     block_v,
                     num_warps=num_warps,
@@ -419,7 +417,7 @@ class TestCuteFixedTokenRank1Recurrence(unittest.TestCase):
                 and "loop_orders" not in seed.config
             ]
             self.assertEqual(len(matching), 1)
-            code = bound.to_triton_code(matching[0])
+            code = bound.to_code(matching[0])
         self.assertIn("fixed_rank1_key_split = 4", code)
         self.assertIn("fixed_rank1_value_split = 4", code)
         self.assertIn("block=(128, 1, 1)", code)
@@ -500,18 +498,18 @@ class TestCuteFixedTokenRank1Recurrence(unittest.TestCase):
         self.assertNotIn("fixed_rank1_codegen_abi_version", code)
 
     def test_generated_locals_do_not_shadow_tensor_arguments(self) -> None:
-        from helion._compiler.cute import single_token_rank1_recurrence
+        from helion._compiler.cute import fx_matcher
 
-        original = single_token_rank1_recurrence._host_tensor_ref
+        original = fx_matcher._host_tensor_ref
 
         def colliding_name(node: object) -> object:
             ref = original(node)
-            if ref is not None and ref.suggested_name == "first_vector":
-                return dataclasses.replace(ref, suggested_name="fixed_rank1_value_head")
+            if ref is not None and ref.name == "first_vector":
+                return dataclasses.replace(ref, name="fixed_rank1_value_head")
             return ref
 
         with patch.object(
-            single_token_rank1_recurrence,
+            fx_matcher,
             "_host_tensor_ref",
             side_effect=colliding_name,
         ):

@@ -26,10 +26,9 @@ from test.test_cute_resident_serial_row_seeds import (
 
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
-from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
+from helion._compiler.cute.autotune.heuristics.cute_resident_reductions import (
     CuteResidentReductionHeuristic,
 )
-from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 
 pytestmark = pytest.mark.cpu_only
@@ -198,7 +197,6 @@ def test_depth_does_not_bypass_effect_alignment_or_alias_proofs() -> None:
         assert "resident_state" not in source
 
 
-@skipUnlessBackends(["cute"])
 def test_depth_config_default_validation_and_inactive_repair() -> None:
     assert helion.Config().cute_reduction_pipeline_depth == 2
     assert KEY not in helion.Config()
@@ -229,7 +227,6 @@ def test_depth_config_default_validation_and_inactive_repair() -> None:
         spec.normalized_config(helion.Config.from_dict({KEY: 4}))
 
 
-@skipUnlessBackends(["cute"])
 def test_old_seed_prefix_default_and_owned_lists_are_preserved() -> None:
     bound, _args = _bind(64, 4096, kind="layer", dtype=torch.bfloat16)
     assert bound.host_function is not None
@@ -275,7 +272,6 @@ def test_old_seed_prefix_default_and_owned_lists_are_preserved() -> None:
     assert family[0] == first and family[2].config["num_threads"][0] != 7
 
 
-@skipUnlessBackends(["cute"])
 def test_depth_survives_flat_random_biased_and_neighbor_routes() -> None:
     bound, _args = _bind(64, 4096)
     spec = bound.config_spec
@@ -322,7 +318,6 @@ def test_depth_survives_flat_random_biased_and_neighbor_routes() -> None:
             assert explicit.unflatten(flat.copy()) == config
 
 
-@skipUnlessBackends(["cute"])
 def test_full_lfbo_initial_population_receives_deep_pipeline_seeds() -> None:
     bound, args = _bind(64, 4096, kind="layer", dtype=torch.bfloat16)
     family = _family(bound)
@@ -341,7 +336,6 @@ def test_full_lfbo_initial_population_receives_deep_pipeline_seeds() -> None:
         ("rms", torch.float32, False, 17, 1024),
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_ordinary_codegen_preserves_host_abi_and_compute(
     kind: str, dtype: torch.dtype, static: bool, rows: int, columns: int
 ) -> None:
@@ -405,13 +399,11 @@ def test_ordinary_codegen_preserves_host_abi_and_compute(
 
 
 @pytest.mark.parametrize("columns", (32, 256, 513, 1025))
-@skipUnlessBackends(["cute"])
 def test_unmatched_feature_lattice_has_no_deeper_seed(columns: int) -> None:
     bound, _args = _bind(17, columns)
     assert not _family(bound)
 
 
-@skipUnlessBackends(["cute"])
 def test_disabling_heuristics_keeps_explicit_depth_support() -> None:
     bound, _args = _bind(17, 1024, disable_autotuner_heuristics=True)
     assert not bound.config_spec.compiler_seed_configs

@@ -156,8 +156,10 @@ def _cpu_lane(config: pytest.Config) -> bool:
     """Whether this run is the CPU lane: ``HELION_TEST_LANE=cpu`` (set by CI)
     or an ``-m`` expression that selects only ``cpu_only`` items.
 
-    ``-m "not cpu_only"`` is the GPU lane and ``-m "not slow"`` selects
-    everything, so neither counts.
+    ``-m "not cpu_only or cuda"`` is the GPU lane and ``-m "not slow"``
+    selects everything, so neither counts; ``-m "cpu_only and not cuda"`` is
+    the CPU lane proper (``cuda``-marked items ride the GPU lane even inside a
+    ``cpu_only`` module).
     """
     if os.environ.get("HELION_TEST_LANE") == "cpu":
         return True
@@ -428,6 +430,23 @@ def pytest_runtest_makereport(
     return report
 
 
+@pytest.fixture(autouse=True)
+def _cpu_render_marker(request: pytest.FixtureRequest) -> Generator[None, None, None]:
+    # ``@pytest.mark.cpu_render(**kwargs)`` runs the test under
+    # ``helion._testing.cpu_render_target(**kwargs)`` (imported lazily: the
+    # controller process must not import helion or torch).  A ``cuda``-marked
+    # item opts out of a module-wide model: the GPU tests folded into a CPU
+    # render module must see the real device.
+    marker = request.node.get_closest_marker("cpu_render")
+    if marker is None or request.node.get_closest_marker("cuda") is not None:
+        yield
+        return
+    from helion._testing import cpu_render_target
+
+    with cpu_render_target(*marker.args, **marker.kwargs):
+        yield
+
+
 def pytest_configure(config: pytest.Config) -> None:
     # xdist workers inherit this environment.  Left alone, OpenMP and OpenBLAS
     # in every worker start a busy-waiting thread per CPU when torch is
@@ -451,6 +470,12 @@ def pytest_configure(config: pytest.Config) -> None:
     # ignores the two knobs above. Keep the suite on the single-pass
     # verification they size; tests of the selection enable it themselves.
     os.environ.setdefault("HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS", "0")
+
+    # The CuTe launch-shape check (``helion/_compiler/cute/launch_shape.py``)
+    # compares the structural launch fact with the text-derived launch on
+    # every render; users get a warning on a disagreement, the suites fail
+    # the render so the fact is asserted on every kernel they build.
+    os.environ.setdefault("HELION_CUTE_LAUNCH_SHAPE_CHECK", "1")
 
     # The device-us re-rank needs the TPU profiler plane; under interpret
     # (CPU) it burns ~100 traced calls per candidate just to return inf.

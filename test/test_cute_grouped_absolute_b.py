@@ -10,17 +10,16 @@ import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
 
-from test.test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
-from test.test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
-from test.test_cute_grouped_gemm_split_sizes import _selected_config
+from test._cute_grouped_gemm_split_sizes import _device_offsets_kernel
+from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
+from test._cute_grouped_gemm_split_sizes import _selected_config
 from test.test_cute_shared_rhs_grouped import _bind
 from test.test_cute_shared_rhs_grouped import _plans
 from test.test_cute_shared_rhs_grouped import _target
 
 from helion._compiler.cute.cute_mma import _tcgen05_full_allocation_b_index_domain
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 
@@ -38,10 +37,7 @@ if TYPE_CHECKING:
 def _cpu_only() -> Generator[None, None, None]:
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
+    with cpu_render_target():
         yield
     torch.set_num_threads(previous)
 
@@ -164,7 +160,6 @@ def _check_absolute_b(source: str, *, shared_rhs: bool) -> None:
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("column_major", [False, True])
 @pytest.mark.parametrize("k,stages", [(64, 2), (64, 5), (128, 3)])
-@skipUnlessBackends(["cute"])
 def test_one_shared_rhs_uses_immutable_packed_b(
     dtype: torch.dtype, column_major: bool, k: int, stages: int
 ) -> None:
@@ -179,7 +174,6 @@ def test_one_shared_rhs_uses_immutable_packed_b(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["offsets", "split_sizes"])
-@skipUnlessBackends(["cute"])
 def test_one_grouped_rhs_preserves_its_dynamic_a_descriptor(
     dtype: torch.dtype, layout: str
 ) -> None:
@@ -199,7 +193,6 @@ def test_one_grouped_rhs_preserves_its_dynamic_a_descriptor(
 
 
 @pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
-@skipUnlessBackends(["cute"])
 def test_offset_values_and_stride_do_not_specialize_absolute_b(
     offset_dtype: torch.dtype,
 ) -> None:
@@ -221,7 +214,6 @@ def test_offset_values_and_stride_do_not_specialize_absolute_b(
 
 
 @pytest.mark.parametrize("bad", ["a_gap", "a_offset", "b_gap", "b_offset"])
-@skipUnlessBackends(["cute"])
 def test_one_declines_unproved_input_layout_or_alignment(bad: str) -> None:
     a, b, offsets = _shared_inputs(torch.bfloat16)
     if bad == "a_gap":
@@ -238,7 +230,6 @@ def test_one_declines_unproved_input_layout_or_alignment(bad: str) -> None:
             bound.to_code(_one_config())
 
 
-@skipUnlessBackends(["cute"])
 def test_one_grouped_rhs_declines_input_output_alias() -> None:
     source = inspect.getsource(_device_offsets_kernel.fn)
     source = source[source.index("def _device_offsets_kernel(") :]
@@ -263,12 +254,11 @@ def test_one_grouped_rhs_declines_input_output_alias() -> None:
     offsets = _grouped_inputs(a.dtype)[2]
     with _target():
         bound = _bind(module._device_offsets_kernel, (a, b, offsets))
-        assert not bound.config_spec.cute_tcgen05_search_enabled
+        assert not bound.config_spec.tcgen05.search_enabled
         with pytest.raises(InvalidConfig, match="tcgen05-enabled"):
             bound.to_code(_one_config())
 
 
-@skipUnlessBackends(["cute"])
 def test_one_grouped_rhs_declines_unproved_effect_order() -> None:
     args = _grouped_inputs(torch.bfloat16)
     with _target():
@@ -305,7 +295,6 @@ def test_absolute_b_signed_index_domain(
     assert _tcgen05_full_allocation_b_index_domain(m, k, tile) is expected
 
 
-@skipUnlessBackends(["cute"])
 def test_existing_two_cta_shared_rhs_keeps_dynamic_b() -> None:
     args = _shared_inputs(torch.bfloat16)
     with _target():
@@ -316,7 +305,6 @@ def test_existing_two_cta_shared_rhs_keeps_dynamic_b() -> None:
     assert "cute.domain_offset((tcgen05_grouped_global_m_start" not in source
 
 
-@skipUnlessBackends(["cute"])
 def test_one_config_roundtrip_and_discoverable_seed() -> None:
     import helion
 

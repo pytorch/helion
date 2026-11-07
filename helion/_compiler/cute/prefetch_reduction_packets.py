@@ -14,6 +14,11 @@ from typing import cast
 
 from ..ast_extension import clone_ast
 from ..ast_extension import statement_from_string
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import names_read
+from ._ast_pass_utils import names_stored_or_deleted
+from ._ast_pass_utils import rename_names
+from ._ast_pass_utils import tensor_roots_may_alias
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .fuse_two_pass_loads import _CuteFuseTwoPassLoads
 from .fuse_two_pass_loads import _LexicalMemoryOrder
@@ -22,10 +27,11 @@ from .fuse_two_pass_loads import _rewrite_vec_extract
 from .fuse_two_pass_loads import _static_int
 from .fuse_two_pass_loads import _store_tensor_roots
 from .fuse_two_pass_loads import _tensor_arg_roots
-from .fuse_two_pass_loads import _tensor_roots_may_alias
 from .fuse_two_pass_loads import _trip_count_for
+from .packet_access import match_packet_access
 from .proven_loop_bounds import _Context
 from .proven_loop_bounds import _Proof
+from .reduce_call import ReduceScope
 
 # A conservative *cache* policy, in 32-bit register slots, not an occupancy
 # guarantee. Include all explicit retained fragments, not just this input.
@@ -47,9 +53,8 @@ _STORES = {"_cute_store_u16_vec", "_cute_store_u32_vec"}
 _COLLECTIVES = {
     "cute.arch.sync_threads",
     "cute.arch.warp_reduction_sum",
-    "_cute_grouped_reduce_shared_two_stage",
-    "_cute_grouped_reduce_shared",
-    "_cute_grouped_reduce_cluster",
+    ReduceScope.SHARED_TWO_STAGE.value,
+    ReduceScope.CLUSTER.value,
 }
 _PREAMBLE_SYNC = {
     "cute.arch.griddepcontrol_wait",
@@ -84,32 +89,6 @@ _PURE = _CASTS | {
 
 def _path(node: ast.AST) -> str:
     return ast.unparse(node)
-
-
-def _names(node: ast.AST) -> set[str]:
-    return {
-        n.id
-        for n in ast.walk(node)
-        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
-    }
-
-
-def _assigned(node: ast.AST) -> set[str]:
-    return {
-        n.id
-        for n in ast.walk(node)
-        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del))
-    }
-
-
-def _assignment(node: ast.AST) -> str | None:
-    if (
-        isinstance(node, ast.Assign)
-        and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Name)
-    ):
-        return node.targets[0].id
-    return None
 
 
 def _index_expression(node: ast.AST, tensors: set[str]) -> bool:
@@ -199,7 +178,7 @@ def _containers(
     lists: set[str] = set()
     slots = 0
     for statement in ast.walk(module):
-        name = _assignment(statement)
+        name = assigned_name(statement)
         if name is None or counts[name] != 1:
             continue
         value = cast("ast.Assign", statement).value
@@ -235,7 +214,7 @@ def _containers(
     if len(allocs) != sum(
         1
         for s in body
-        if _assignment(s) in private
+        if assigned_name(s) in private
         and isinstance(cast("ast.Assign", s).value, ast.Call)
         and _path(cast("ast.Call", cast("ast.Assign", s).value).func)
         == "cute.make_rmem_tensor"
@@ -266,7 +245,7 @@ def _effects_safe(
                 name = node.value.id
                 if name not in private and (
                     name not in tensors
-                    or _tensor_roots_may_alias(source, frozenset({name}), disjoint)
+                    or tensor_roots_may_alias(source, frozenset({name}), disjoint)
                 ):
                     return False
             if isinstance(node, ast.Attribute) and isinstance(
@@ -280,7 +259,7 @@ def _effects_safe(
                 isinstance(node.func, ast.Attribute) and node.func.attr == "store"
             ):
                 roots = _store_tensor_roots(node, tensors)
-                if _tensor_roots_may_alias(source, roots, disjoint):
+                if tensor_roots_may_alias(source, roots, disjoint):
                     return False
             elif (
                 path
@@ -321,37 +300,21 @@ def _effects_safe(
 def _packet(
     statement: ast.stmt, tensors: set[str]
 ) -> tuple[str, ast.Call, int, str, frozenset[str]] | None:
-    name = _assignment(statement)
+    name = assigned_name(statement)
     if name is None:
         return None
     call = cast("ast.Assign", statement).value
+    access = match_packet_access(call)
     if (
-        not isinstance(call, ast.Call)
-        or _path(call.func) not in {"cute.arch.load", *_CUTE_CACHE_LOAD_HELPER_NAMES}
-        or len(call.args) != 2
-        or call.keywords
+        access is None
+        or access.kind not in ("packet", "hinted_packet")
+        or access.keywords
+        or access.width is None
+        or access.carrier is None
     ):
         return None
-    vector = call.args[1]
-    if (
-        not isinstance(vector, ast.Call)
-        or _path(vector.func) != "ir.VectorType.get"
-        or len(vector.args) != 2
-        or vector.keywords
-    ):
-        return None
-    shape, element = vector.args
-    if (
-        not isinstance(shape, ast.List)
-        or len(shape.elts) != 1
-        or not isinstance(shape.elts[0], ast.Constant)
-        or type(shape.elts[0].value) is not int
-    ):
-        return None
-    width = shape.elts[0].value
-    if not isinstance(element, ast.Attribute) or element.attr != "mlir_type":
-        return None
-    dtype = _path(element.value)
+    assert isinstance(call, ast.Call)
+    width, dtype = access.width, access.carrier
     if (
         width not in (2, 4, 8)
         or dtype not in {"cutlass.Uint16", "cutlass.Uint32"}
@@ -380,13 +343,13 @@ def _index_context(
         if value is not None:
             context.values[name] = value
     for statement in statements[:stop]:
-        target = _assignment(statement)
+        target = assigned_name(statement)
         value = (
             proof.value(cast("ast.Assign", statement).value, context)
             if target is not None
             else None
         )
-        for name in _assigned(statement):
+        for name in names_stored_or_deleted(statement):
             context.values.pop(name, None)
         if target is not None and value is not None:
             context.values[target] = value
@@ -465,16 +428,6 @@ def _domain(
     return bounds[0], bounds[2], lane
 
 
-class _Rename(ast.NodeTransformer):
-    def __init__(self, names: dict[str, str]) -> None:
-        self.names = names
-
-    def visit_Name(self, node: ast.Name) -> ast.AST:
-        if node.id in self.names:
-            node.id = self.names[node.id]
-        return node
-
-
 def prefetch_reduction_packets(
     body: list[ast.stmt],
     *,
@@ -492,7 +445,7 @@ def prefetch_reduction_packets(
     ):
         return body
     module = ast.Module(body=body, type_ignores=[])
-    occupied = _names(module) | _assigned(module)
+    occupied = names_read(module) | names_stored_or_deleted(module)
     tensors = set(tensor_dtypes)
     reserved = {
         "cute",
@@ -503,7 +456,7 @@ def prefetch_reduction_packets(
         *_STORES,
         *_COLLECTIVES,
     }
-    if argument_names & reserved or _assigned(module) & (
+    if argument_names & reserved or names_stored_or_deleted(module) & (
         reserved | tensors | set(constexpr_values)
     ):
         return body
@@ -547,8 +500,8 @@ def prefetch_reduction_packets(
         region_ast = ast.Module(body=region, type_ignores=[])
         first_bounds = _range_bounds(first.iter)
         assert first_bounds is not None
-        bound_names = set().union(*(_names(bound) for bound in first_bounds))
-        if bound_names & _assigned(region_ast):
+        bound_names = set().union(*(names_read(bound) for bound in first_bounds))
+        if bound_names & names_stored_or_deleted(region_ast):
             # Identical syntax must retain identical values on both sweeps.
             # Otherwise the prefetched packet would belong to another slice.
             continue
@@ -606,14 +559,14 @@ def prefetch_reduction_packets(
             ):
                 continue
             prefix = consumer[:index]
-            defs = {_assignment(s): s for s in prefix if _assignment(s) is not None}
+            defs = {assigned_name(s): s for s in prefix if assigned_name(s) is not None}
             counts = Counter(
                 n.id
                 for s in prefix
                 for n in ast.walk(s)
                 if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
             )
-            needed = _names(call.args[0])
+            needed = names_read(call.args[0])
             selected: set[str] = set()
             valid = True
             while needed:
@@ -628,18 +581,20 @@ def prefetch_reduction_packets(
                         valid = False
                         break
                     selected.add(current)
-                    needed.update(_names(definition.value))
-                elif current not in available or current in _assigned(region_ast):
+                    needed.update(names_read(definition.value))
+                elif current not in available or current in names_stored_or_deleted(
+                    region_ast
+                ):
                     valid = False
                     break
             if not valid:
                 continue
             # Snapshot dependencies must not change after their definition.
             if any(
-                _names(cast("ast.Assign", s).value)
-                & set().union(*(_assigned(t) for t in prefix[j + 1 :]))
+                names_read(cast("ast.Assign", s).value)
+                & set().union(*(names_stored_or_deleted(t) for t in prefix[j + 1 :]))
                 for j, s in enumerate(prefix)
-                if _assignment(s) in selected
+                if assigned_name(s) in selected
             ):
                 continue
             allowed = {id(cast("ast.Assign", statement).targets[0])}
@@ -667,14 +622,14 @@ def prefetch_reduction_packets(
             cache = f"_consume_prefetch_{serial}"
             renames = {n: f"{cache}_{n}" for n in [name, *selected]}
             moved = [
-                cast("ast.stmt", _Rename(renames).visit(cast("ast.stmt", clone_ast(s))))
+                rename_names(cast("ast.stmt", clone_ast(s)), renames)
                 for s in prefix
-                if _assignment(s) in selected
+                if assigned_name(s) in selected
             ]
             moved.append(
                 cast(
                     "ast.stmt",
-                    _Rename(renames).visit(cast("ast.stmt", clone_ast(statement))),
+                    rename_names(cast("ast.stmt", clone_ast(statement)), renames),
                 )
             )
             moved.extend(

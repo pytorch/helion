@@ -1,3 +1,15 @@
+"""Constants and byte models of the tcgen05 GEMM family (an import leaf).
+
+Role: knob table.  The validated tile envelopes (``TCGEN05_TWO_CTA_BLOCK_M``,
+...), the config-key names (``TCGEN05_*_CONFIG_KEY``) and the per-CTA SMEM /
+per-thread fragment byte models the planners and the search surface price
+schedules with (``tcgen05_ab_smem_bytes_per_cta``,
+``tcgen05_c_smem_bytes_per_cta``, ``tcgen05_aux_ring_smem_bytes_per_cta``, the
+grouped-worklist profiles of ``resolve_tcgen05_grouped_worklist_mma_profile``).
+``state.py``, ``tcgen05_config/``, ``cute_mma`` and the heuristics import it;
+it imports nothing from them.
+"""
+
 from __future__ import annotations
 
 from enum import IntEnum
@@ -30,7 +42,7 @@ TCGEN05_TWO_CTA_MAX_K_TILES = 256
 # shape probed from 1000 to 4160 (bf16 3000^3 45 us against cuBLAS's 45,
 # 1500x2500x3000 47.5 against 118.6, 2048x2048x2050 30.7 against 71.6, all
 # matching torch within bf16 rounding) and, through its 128-row CTA pair
-# (``CuteTcgen05Config.plain_edge_pair128_admitted``), down to 1000^3 (the
+# (``tcgen05_config.repair.plain_edge_pair128_admitted``), down to 1000^3 (the
 # pair 7.2 us burst / 8.2 us sustained against cuBLAS's 6.5 / 7.4 in the
 # interleaved runs; the flat one-CTA winner 8.4 burst). The quarter-wave
 # work gate in ``enable_cute_tcgen05_search`` counts 128x128 tiles for
@@ -136,7 +148,7 @@ TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES = 28 * 1024
 # CTA) the static profiles are bounded against.
 SM100_SMEM_PER_BLOCK_OPTIN_BYTES = 232448
 # Static SMEM model of the DEFAULT-layout role-local GEMM
-# (``CuteTcgen05Config.default_layout_smem_bytes``), measured on B200 from the
+# (``tcgen05_config.smem.default_layout_smem_bytes``), measured on B200 from the
 # compiled cubins and the kept PTX. Every ``cute.arch.alloc_smem`` becomes one
 # PTX ``.shared`` variable; ptxas places them in reverse allocation order,
 # each at the next offset rounded up to its alignment, and the arena may fill
@@ -406,8 +418,35 @@ TCGEN05_REGION_PID_TYPE_CHOICES: tuple[str, ...] = (
     "persistent_blocked",
     "persistent_interleaved",
 )
+# The monolithic role-local schedule every proved tcgen05 family pins: one
+# AB-load (TMA) warp, one MMA warp, four epilogue warps and no scheduler,
+# C-input, epilogue-load or store warps, static persistent, the default
+# layout.  Each family's surface -- ``one_cta_pipeline_defaults``,
+# ``n_edge_cluster_schedule_defaults``, the two-CTA region projection below,
+# the fanout and row-union admission -- composes its own pins over it.
+TCGEN05_ROLE_LOCAL_SCHEDULE: tuple[tuple[str, object], ...] = (
+    ("tcgen05_strategy", "role_local_monolithic"),
+    ("tcgen05_persistence_model", "static_persistent"),
+    ("tcgen05_layout_strategy", "default"),
+    ("tcgen05_warp_spec_ab_load_warps", 1),
+    ("tcgen05_warp_spec_mma_warps", 1),
+    ("tcgen05_warp_spec_epi_load_warps", 0),
+    ("tcgen05_warp_spec_scheduler_warps", 0),
+    ("tcgen05_warp_spec_c_input_warps", 0),
+    ("tcgen05_warp_spec_store_warps", 0),
+    ("tcgen05_num_epi_warps", 4),
+)
+
+
+def tcgen05_role_local_schedule(*, without: tuple[str, ...] = ()) -> dict[str, object]:
+    """``TCGEN05_ROLE_LOCAL_SCHEDULE`` as a dict, minus the keys a surface leaves open."""
+    return {
+        key: value for key, value in TCGEN05_ROLE_LOCAL_SCHEDULE if key not in without
+    }
+
+
 # The recipe a persistent GEMM launch of a chain runs under, projected onto
-# its launch config by ``CuteTcgen05Config.region_launch_config`` (the
+# its launch config by ``tcgen05_config.facts.region_launch_config`` (the
 # standalone paired pipeline's fixed coordinates, ``_paired_pipeline_parameters``;
 # ``materialized_fission_codegen._stage_config`` renders exactly that config).
 # The chain's whole-kernel config keeps the flat recipe of its ``inherit``
@@ -418,16 +457,7 @@ TCGEN05_REGION_PID_TYPE_CHOICES: tuple[str, ...] = (
 # normalizer, and a launch without an exact-shape auxiliary operand takes
 # the register reads whatever the kernel's knob says.
 TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION: tuple[tuple[str, object], ...] = (
-    ("tcgen05_persistence_model", "static_persistent"),
-    ("tcgen05_strategy", "role_local_monolithic"),
-    ("tcgen05_layout_strategy", "default"),
-    ("tcgen05_warp_spec_mma_warps", 1),
-    ("tcgen05_warp_spec_ab_load_warps", 1),
-    ("tcgen05_warp_spec_epi_load_warps", 0),
-    ("tcgen05_warp_spec_scheduler_warps", 0),
-    ("tcgen05_warp_spec_c_input_warps", 0),
-    ("tcgen05_warp_spec_store_warps", 0),
-    ("tcgen05_num_epi_warps", 4),
+    *TCGEN05_ROLE_LOCAL_SCHEDULE,
     ("tcgen05_acc_stages", 2),
     ("tcgen05_c_store_mode", "normal"),
     ("tcgen05_acc_wait_placement", "subtile_loop"),
@@ -592,7 +622,7 @@ class Tcgen05RowvecAuxFacts(NamedTuple):
     ``output_itemsize`` is the element size of the stored output(s); ``rows``
     lists every N-broadcast aux leaf the analyzed epilogue chains load. The
     autotune seeds use them to model the SMEM the ``pre_acc_wait`` row stages
-    add (``CuteTcgen05Config.rowvec_aux_stage_fits``). ``output_count`` is the
+    add (``tcgen05_config.smem.rowvec_aux_stage_fits``). ``output_count`` is the
     number of analyzed output stores: the store lowering allocates one
     TMA-store C ring per output, so the SMEM model charges the ring that many
     times (two fresh outputs of one accumulator keep two rings, with or
@@ -716,70 +746,6 @@ TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON = (
     "requires TMA-legal auxiliary tensors (a 16-byte base, 16-byte outer "
     "strides and a contiguous last axis)"
 )
-TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY = "tcgen05_acc_producer_mode"
-TCGEN05_ACC_PRODUCER_MODE_NORMAL = "normal"
-# Skips UMMA fence/issue while keeping AB and accumulator pipeline handshakes.
-TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA = "skip_umma"
-TCGEN05_ACC_PRODUCER_MODES = (
-    TCGEN05_ACC_PRODUCER_MODE_NORMAL,
-    TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA,
-)
-TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY = "tcgen05_acc_producer_advance_mode"
-TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL = "normal"
-# Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
-# removes only the accumulator producer PipelineState advance edge.
-TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP = "skip"
-TCGEN05_ACC_PRODUCER_ADVANCE_MODES = (
-    TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL,
-    TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP,
-)
-TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY = "tcgen05_ab_producer_acquire_mode"
-TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL = "normal"
-# Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
-# removes only AB producer acquire/try-acquire edges.
-TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP = "skip"
-TCGEN05_AB_PRODUCER_ACQUIRE_MODES = (
-    TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL,
-    TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP,
-)
-TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY = (
-    "tcgen05_ab_initial_producer_acquire_mode"
-)
-TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL = "normal"
-# Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
-# removes only the first initial-prefetch AB producer acquire edge.
-TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST = "skip_first"
-TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODES = (
-    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL,
-    TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST,
-)
-TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY = "tcgen05_ab_producer_advance_mode"
-TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL = "normal"
-# Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
-# removes only the AB producer PipelineState advance edge.
-TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP = "skip"
-TCGEN05_AB_PRODUCER_ADVANCE_MODES = (
-    TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL,
-    TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP,
-)
-TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY = "tcgen05_ab_consumer_wait_mode"
-TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL = "normal"
-# Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
-# removes only AB consumer try-wait/wait edges.
-TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP = "skip"
-TCGEN05_AB_CONSUMER_WAIT_MODES = (
-    TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL,
-    TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP,
-)
-TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY = "tcgen05_ab_consumer_phase_mode"
-TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL = "normal"
-# Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
-# initializes the AB consumer pipeline state with phase 1 instead of phase 0.
-TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1 = "phase1"
-TCGEN05_AB_CONSUMER_PHASE_MODES = (
-    TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL,
-    TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1,
-)
 TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY = "tcgen05_sched_consumer_wait_mode"
 TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL = "normal"
 # Diagnostic-only scheduler-broadcast wait topology. Lane 0 waits on the
@@ -823,8 +789,8 @@ TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY = "tcgen05_tvm_ffi_launch"
 # measured optimum; the knob remains in the search surface so future
 # targets can re-explore. ``{2, 3}`` fit structurally on B200 — see
 # ``cute_plan.md`` for the SMEM-budget audit. The autotune gate
-# (``aux_stages_autotune_fragments`` in ``tcgen05_config.py``) admits
-# the knob only for the ``_aux_tma_edge_search_enabled`` family so other
+# (``aux_stages_autotune_fragments`` in ``tcgen05_config/surface.py``)
+# admits the knob only for the ``_aux_tma_edge_search_enabled`` family so other
 # paths stay byte-identical at the default. (Cycle 46 widened
 # ``_aux_tma_search_enabled`` to also admit the full-tile cluster_m=2
 # family, but this stage-count knob remains scoped to the edge gate
@@ -834,7 +800,7 @@ TCGEN05_AUX_STAGE_COUNT_DEFAULT = 2
 TCGEN05_AUX_STAGE_COUNT_CHOICES = (2, 3)
 # The epilogue-issued ring (``tcgen05_aux_load_mode="epi_tma"``) may also
 # hold a whole four-subtile per-CTA tile ahead of the accumulator wait; its
-# SMEM model (``CuteTcgen05Config.epi_tma_ab_stage_limit``) prices the depth.
+# SMEM model (``tcgen05_config.smem.epi_tma_ab_stage_limit``) prices the depth.
 TCGEN05_EPI_TMA_AUX_STAGE_COUNT_CHOICES = (2, 3, 4)
 TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES = tuple(
     dict.fromkeys(
@@ -852,7 +818,7 @@ TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES = tuple(
 # cycle 14 (NCU reg count stayed at 255). Surface: the call site is
 # ``cute_mma.py`` ``_emit_mma_pipeline`` consumer branch; the
 # autotune gate (``consumer_regs_autotune_fragments`` in
-# ``tcgen05_config.py``) admits the knob only for the
+# ``tcgen05_config/surface.py``) admits the knob only for the
 # ``_aux_tma_edge_search_enabled`` family (mirroring the aux_stages
 # gate) so other paths stay byte-identical at the 256 default. (Cycle
 # 46 widened ``_aux_tma_search_enabled`` to also admit the full-tile
@@ -871,7 +837,8 @@ TCGEN05_CONSUMER_REGS_CHOICES = (224, 232, 240, 256)
 TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY = "tcgen05_warp_register_reallocation"
 
 # Stage tuples that the TVM-FFI flat-role seed accepts, keyed by ``bk``. The
-# general FFI seed eligibility (``tcgen05_config.py``) consumes this table via
+# general FFI seed eligibility (``tcgen05_config/seeds.py``) and the FFI
+# AB-stage repair (``tcgen05_config/repair.py``) consume this table via
 # ``tcgen05_direct_entry_stage_tuple_allowed``. ``bk=64`` admits the shallow
 # ``(3, 2)`` and deep ``(6, 4)`` A/B pipelines; ``bk=128`` admits the
 # ``(3, 2)`` pipeline. The admission is otherwise structural (any CtaGroup.TWO
@@ -966,6 +933,11 @@ TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY = (
 # The physical UMMA M dimension is the logical output-column tile in N,M
 # orientation. None retains the established CTA-group-dependent geometry.
 TCGEN05_GROUPED_WORKLIST_MMA_M_CONFIG_KEY = "tcgen05_grouped_worklist_mma_m"
+TCGEN05_GROUPED_WORKLIST_MMA_N_CONFIG_KEY = "tcgen05_grouped_worklist_mma_n"
+# The per-region pipeline depths of a materialized-fission chain (one entry
+# per tcgen05 region; see ``TCGEN05_REGION_PID_TYPES_CONFIG_KEY``).
+TCGEN05_REGION_AB_STAGES_CONFIG_KEY = "tcgen05_region_ab_stages"
+TCGEN05_REGION_C_STAGES_CONFIG_KEY = "tcgen05_region_c_stages"
 TCGEN05_GROUPED_WORKLIST_MMA_M_CHOICES = (None, 64, 128, 256)
 # Independent AB staging may combine two pure logical K64 iterations. The
 # registered logical block and its caller-declared search ceiling stay intact.
@@ -1078,10 +1050,6 @@ TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS = (
     ("tcgen05_acc_stages", 1),
     ("tcgen05_c_stages", 2),
 )
-# Diagnostic-only codegen proof for the guarded clustered CtaGroup.ONE bridge.
-TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY = (
-    "tcgen05_cluster_m2_one_cta_role_local"
-)
 
 # CtaGroup.ONE tcgen05 MMA covers 64/128 M tiles; 256 M tiles are validated only
 # after projecting onto the CtaGroup.TWO path.
@@ -1155,7 +1123,7 @@ def resolve_tcgen05_grouped_worklist_mma_profile(
         return None
     if config.get("tcgen05_grouped_worklist_orientation", "nm") == "mn":
         source_m = config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY, 128)
-        mma_n = config.get("tcgen05_grouped_worklist_mma_n", 256)
+        mma_n = config.get(TCGEN05_GROUPED_WORKLIST_MMA_N_CONFIG_KEY, 256)
         if (
             type(source_m) is int
             and source_m in (128, 256)

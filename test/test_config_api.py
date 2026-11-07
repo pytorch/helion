@@ -21,15 +21,24 @@ import torch
 
 import helion
 from helion import exc
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute import target_facts
+from helion._compiler.cute.autotune.heuristics.cute import (
     _tcgen05_grouped_worklist_seed_family,
 )
-from helion._compiler.backend import PallasBackend
-from helion._compiler.backend import TritonBackend
-from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.autotune.search_surface import (
+    enable_cute_chunk_prepare_schedule_search,
+)
+from helion._compiler.cute.autotune.search_surface import (
+    enable_cute_chunk_recurrence_search,
+)
 from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
+from helion._compiler.cute.tcgen05_config import facts
+from helion._compiler.cute.tcgen05_config import repair
+from helion._compiler.cute.tcgen05_config import smem
+from helion._compiler.cute.tcgen05_config import surface
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN,
 )
@@ -82,6 +91,8 @@ from helion._compiler.cute.tcgen05_constants import (
     resolve_tcgen05_grouped_worklist_mma_profile,
 )
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from helion._compiler.pallas.backend import PallasBackend
+from helion._compiler.triton.backend import TritonBackend
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
@@ -762,7 +773,7 @@ class TestConfigAPI(TestCase):
         self.assertEqual(dict(cache_entry.config), values)
 
     def test_cute_chunk_recurrence_register_cap_serialization_and_scope(self) -> None:
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
         from helion.autotuner.config_generation import ConfigGeneration
 
         config = helion.Config.from_dict(
@@ -779,7 +790,7 @@ class TestConfigAPI(TestCase):
         ):
             spec.normalize(config)
 
-        spec.enable_cute_chunk_recurrence_search(preferred_partitions=2)
+        enable_cute_chunk_recurrence_search(spec, preferred_partitions=2)
         field = spec._flat_fields()["cute_chunk_recurrence_register_cap"]
         self.assertIs(field, spec.cute_chunk_recurrence_register_cap)
         self.assertEqual(field.choices, (None, 72, 76, 80))
@@ -805,10 +816,10 @@ class TestConfigAPI(TestCase):
             )
 
     def test_cute_chunk_recurrence_integer_knobs_require_exact_integers(self) -> None:
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         spec = ConfigSpec(backend=CuteBackend())
-        spec.enable_cute_chunk_recurrence_search(preferred_partitions=4)
+        enable_cute_chunk_recurrence_search(spec, preferred_partitions=4)
         for key, value, expected in (
             ("cute_chunk_recurrence_dv_partitions", True, 4),
             ("cute_chunk_recurrence_dv_partitions", 4.0, 4),
@@ -824,7 +835,7 @@ class TestConfigAPI(TestCase):
                 self.assertEqual(config[key], expected)
 
     def test_cute_chunk_prepare_schedule_serialization_and_scope(self) -> None:
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         config = helion.Config.from_dict(
             {"cute_chunk_prepare_schedule": "split_alias_cpc2"}
@@ -837,8 +848,8 @@ class TestConfigAPI(TestCase):
         ):
             spec.normalize(config)
 
-        spec.enable_cute_chunk_prepare_schedule_search(
-            preferred_schedule="split_alias_cpc2"
+        enable_cute_chunk_prepare_schedule_search(
+            spec, preferred_schedule="split_alias_cpc2"
         )
         field = spec._flat_fields()["cute_chunk_prepare_schedule"]
         self.assertIs(field, spec.cute_chunk_prepare_schedule)
@@ -1162,8 +1173,8 @@ class TestSettingsEnv(TestCase):
     def test_pallas_backend_uses_exact_factory_and_static_reduction_dims(
         self,
     ) -> None:
-        from helion._compiler.backend import PallasBackend
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.pallas.backend import PallasBackend
+        from helion._compiler.triton.backend import TritonBackend
 
         triton = TritonBackend()
         pallas = PallasBackend()
@@ -1199,7 +1210,7 @@ class TestSettingsEnv(TestCase):
         self.assertLessEqual(spec.max_size, size_hint // world_size)
 
     def test_bounded_inner_block_size_clamped_to_outer_value(self) -> None:
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_spec import BlockSizeSpec
         from helion.autotuner.config_spec import ConfigSpec
 
@@ -1238,7 +1249,7 @@ class TestSettingsEnv(TestCase):
         self.assertEqual(spec._fragment(ConfigSpec(backend=TritonBackend())).high, 32)
 
     def test_bounded_inner_block_size_keeps_valid_inner_value(self) -> None:
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_spec import BlockSizeSpec
         from helion.autotuner.config_spec import ConfigSpec
 
@@ -1254,7 +1265,7 @@ class TestSettingsEnv(TestCase):
         self.assertEqual(config["block_sizes"][:2], [256, 64])
 
     def test_bounded_inner_block_size_clamps_multi_level_nesting(self) -> None:
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_spec import BlockSizeSpec
         from helion.autotuner.config_spec import ConfigSpec
 
@@ -1273,7 +1284,7 @@ class TestSettingsEnv(TestCase):
         self.assertEqual(config["block_sizes"][:3], [64, 64, 64])
 
     def test_bounded_inner_block_size_repairs_cute_num_threads(self) -> None:
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
         from helion.autotuner.config_spec import BlockSizeSpec
         from helion.autotuner.config_spec import ConfigSpec
         from helion.autotuner.config_spec import NumThreadsSpec
@@ -1391,7 +1402,7 @@ class TestHardwareConfigSpecRanges(TestCase):
 
     def test_flat_config_uses_nvidia_ranges_when_not_amd(self) -> None:
         """Test that flat_config uses NVIDIA ranges (1-32, 1-8) when not on AMD."""
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_fragment import IntegerFragment
         from helion.autotuner.config_fragment import NumWarpsFragment
         from helion.autotuner.config_spec import ConfigSpec
@@ -1426,7 +1437,7 @@ class TestHardwareConfigSpecRanges(TestCase):
 
     def test_flat_config_uses_amd_ranges_when_amd(self) -> None:
         """Test that flat_config uses AMD ranges (1-16, 1-4) when on AMD CDNA."""
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_fragment import IntegerFragment
         from helion.autotuner.config_fragment import NumWarpsFragment
         from helion.autotuner.config_spec import ConfigSpec
@@ -1461,7 +1472,7 @@ class TestHardwareConfigSpecRanges(TestCase):
 
     def test_flat_config_uses_tileir_ranges_when_tileir(self) -> None:
         """Test that flat_config uses TileIR ranges (4-4, 1-10) when on TileIR backend."""
-        from helion._compiler.backend import TileIRBackend
+        from helion._compiler.triton.backend import TileIRBackend
         from helion.autotuner.config_fragment import NumWarpsFragment
         from helion.autotuner.config_spec import ConfigSpec
 
@@ -1490,7 +1501,7 @@ class TestHardwareConfigSpecRanges(TestCase):
 
     def test_eviction_policy_choices_do_not_leak_mocked_amd_state(self) -> None:
         """Mocked AMD capability detection should not poison later Triton specs."""
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_spec import ConfigSpec
 
         with patch(
@@ -1511,7 +1522,7 @@ class TestHardwareConfigSpecRanges(TestCase):
         )
 
     def test_scalar_empty_eviction_policy_survives_normalization(self) -> None:
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_spec import ConfigSpec
 
         with patch(
@@ -1528,7 +1539,7 @@ class TestHardwareConfigSpecRanges(TestCase):
 
     def test_load_cache_modifier_choices_do_not_leak_mocked_amd_state(self) -> None:
         """Mocked AMD capability detection should not poison later Triton specs."""
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_spec import ConfigSpec
 
         with patch(
@@ -1547,7 +1558,7 @@ class TestHardwareConfigSpecRanges(TestCase):
 
     def test_store_cache_modifier_choices_do_not_leak_mocked_amd_state(self) -> None:
         """Mocked AMD capability detection should not poison later Triton specs."""
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_spec import ConfigSpec
 
         with patch(
@@ -1611,12 +1622,12 @@ class TestConfigSpecNormalizedCopy(TestCase):
 class TestCuteTcgen05ConfigSpecSplit(TestCase):
     @staticmethod
     def _make_cute_tcgen05_spec():
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
         from helion.autotuner.config_spec import BlockSizeSpec
         from helion.autotuner.config_spec import ConfigSpec
 
         spec = ConfigSpec(backend=CuteBackend())
-        spec.cute_tcgen05_search_enabled = True
+        spec.tcgen05.search_enabled = True
         for block_id, size_hint in enumerate((4096, 4096, 4096)):
             spec.block_sizes.append(
                 BlockSizeSpec(
@@ -1629,13 +1640,13 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
 
     @staticmethod
     def _make_permuted_cute_tcgen05_spec():
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
         from helion.autotuner.config_spec import BlockSizeSpec
         from helion.autotuner.config_spec import ConfigSpec
 
         # Config order is [N, K, M], while semantic MMA axes are M=2, N=0, K=1.
         spec = ConfigSpec(backend=CuteBackend())
-        spec.cute_tcgen05_search_enabled = True
+        spec.tcgen05.search_enabled = True
         for block_id, max_size in enumerate((256, 128, 256)):
             spec.block_sizes.append(
                 BlockSizeSpec(
@@ -1644,7 +1655,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                     max_size=max_size,
                 )
             )
-        spec.register_cute_tcgen05_mma_analysis(
+        facts.register_mma_analysis(
+            spec.tcgen05,
             m_block_id=2,
             n_block_id=0,
             k_block_id=1,
@@ -1657,7 +1669,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
 
     @staticmethod
     def _register_default_cute_tcgen05_mma_analysis(spec):
-        spec.register_cute_tcgen05_mma_analysis(
+        facts.register_mma_analysis(
+            spec.tcgen05,
             m_block_id=0,
             n_block_id=1,
             k_block_id=2,
@@ -1795,7 +1808,7 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             tuple(sorted(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES)),
         )
         self.assertEqual(
-            spec._tcgen05_optional_fragments()[
+            surface.optional_fragments(spec.tcgen05)[
                 TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
             ].default(),
             TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
@@ -2056,7 +2069,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
 
     def test_grouped_worklist_two_cta_fix_preserves_logical_tile(self) -> None:
         spec = self._make_cute_tcgen05_spec()
-        spec.register_cute_tcgen05_mma_analysis(
+        facts.register_mma_analysis(
+            spec.tcgen05,
             m_block_id=0,
             n_block_id=1,
             k_block_id=2,
@@ -2065,7 +2079,7 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             has_leading_passthrough=False,
             explicit_epi_tile_compatible=True,
         )
-        spec.allow_tcgen05_cluster_m2_search(static_k=128)
+        surface.allow_cluster_m2_search(spec.tcgen05, static_k=128)
 
         for source_m_tile in (
             TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
@@ -2115,7 +2129,7 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                     cluster_m=cluster_m,
                 )
 
-                spec._cute_tcgen05_config.fix_search_config(config.config)
+                repair.fix_search_config(spec._cute_tcgen05_config, config.config)
 
                 self.assertEqual(config.block_sizes[:3], expected)
                 self.assertEqual(config.config["tcgen05_cluster_m"], expected_cluster)
@@ -2124,7 +2138,7 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         spec = self._register_default_cute_tcgen05_mma_analysis(
             self._make_cute_tcgen05_spec()
         )
-        spec.allow_tcgen05_cluster_m2_search(static_k=96)
+        surface.allow_cluster_m2_search(spec.tcgen05, static_k=96)
         config = self._grouped_worklist_config(
             block_sizes=[256, 256, 128],
             source_m_tile=224,
@@ -2283,7 +2297,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                         spec,
                         static_k=fact_static_k,
                     )
-                spec.allow_tcgen05_cluster_m2_search(
+                surface.allow_cluster_m2_search(
+                    spec.tcgen05,
                     static_k=static_k,
                     allow_edge_k_tail_family=allow_edge_k_tail_family,
                 )
@@ -2343,10 +2358,10 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                 self.assertEqual(unflattened.config["block_sizes"][:3], [256, 128, 64])
 
     def test_tcgen05_search_fields_do_not_leak_to_other_backends(self) -> None:
-        from helion._compiler.backend import MetalBackend
-        from helion._compiler.backend import PallasBackend
-        from helion._compiler.backend import TileIRBackend
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.metal.backend import MetalBackend
+        from helion._compiler.pallas.backend import PallasBackend
+        from helion._compiler.triton.backend import TileIRBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_generation import ConfigGeneration
         from helion.autotuner.config_spec import BlockSizeSpec
         from helion.autotuner.config_spec import ConfigSpec
@@ -2358,7 +2373,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             MetalBackend(),
         ):
             spec = ConfigSpec(backend=backend)
-            spec.cute_tcgen05_search_enabled = True
+            # Only the CuTe surface builds a tcgen05 facade for its spec.
+            self.assertIsNone(spec._cute_tcgen05_config)
             spec.block_sizes.append(
                 BlockSizeSpec(block_id=0, size_hint=128, max_size=128)
             )
@@ -2751,7 +2767,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                 )
 
                 spec = self._constrained_grouped_worklist_spec(constrained_budget_bytes)
-                spec.register_cute_tcgen05_grouped_worklist_smem_facts(
+                facts.register_grouped_worklist_smem_facts(
+                    spec.tcgen05,
                     group_count=1,
                     device_split_sizes=False,
                 )
@@ -2775,7 +2792,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         for group_count, should_fit in ((20, True), (21, False)):
             with self.subTest(group_count=group_count, should_fit=should_fit):
                 spec = self._constrained_grouped_worklist_spec(constrained_budget_bytes)
-                spec.register_cute_tcgen05_grouped_worklist_smem_facts(
+                facts.register_grouped_worklist_smem_facts(
+                    spec.tcgen05,
                     group_count=group_count,
                     device_split_sizes=True,
                 )
@@ -2810,7 +2828,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN
             - TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
         )
-        spec.register_cute_tcgen05_grouped_worklist_smem_facts(
+        facts.register_grouped_worklist_smem_facts(
+            spec.tcgen05,
             group_count=8,
             device_split_sizes=False,
         )
@@ -2823,29 +2842,30 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                 # must pass the conservative all-scheduler SMEM upper bound.
                 self.assertTrue(
                     ab_stages < 4
-                    or spec._cute_tcgen05_config._grouped_worklist_nm_ab_config_matches(
-                        config.config, ab_stages
+                    or smem._grouped_worklist_nm_ab_config_matches(
+                        spec._cute_tcgen05_config, config.config, ab_stages
                     )
                 )
 
     def test_grouped_dynamic_deep_stage_smem_accounts_for_output_dtype(self) -> None:
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 
         config = CuteTcgen05Config(ConfigSpec(backend=CuteBackend()))
         with (
             patch.object(
-                CuteTcgen05Config,
+                target_facts,
                 "per_cta_smem_capacity_bytes",
                 return_value=232448,
             ),
             patch(
-                "helion._compiler.cute.tcgen05_config.tcgen05_default_epilogue_tile_size",
+                "helion._compiler.cute.tcgen05_config.smem.tcgen05_default_epilogue_tile_size",
                 return_value=(128, 32),
             ),
         ):
             self.assertTrue(
-                config.grouped_dynamic_stages_fit_for_target(
+                smem.grouped_dynamic_stages_fit_for_target(
+                    config,
                     dtype_bytes=2,
                     output_dtype_bytes=2,
                     device=torch.device("cuda"),
@@ -2858,7 +2878,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                 )
             )
             self.assertFalse(
-                config.grouped_dynamic_stages_fit_for_target(
+                smem.grouped_dynamic_stages_fit_for_target(
+                    config,
                     dtype_bytes=2,
                     output_dtype_bytes=4,
                     device=torch.device("cuda"),
@@ -2880,12 +2901,15 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         with (
             patch("torch.cuda.is_available", return_value=True),
             patch("torch.cuda.current_device", return_value=0),
+            # ConfigSpec's indexing choices probe the (faked) device through
+            # this memoized seam; without a GPU the probe would initialize CUDA.
+            patch("helion._compat._supports_tensor_descriptor", return_value=True),
             # Patch the helion seam: torch.cuda.get_device_capability is
             # memoized behind _target_device_capability (is_hip / _is_hip
             # pattern), so config_spec's get_target_device_capability() must
             # be patched at the wrapper, not the cached torch query.
             patch(
-                "helion.autotuner.config_spec.get_target_device_capability",
+                "helion._compiler.cute.autotune.search_surface.get_target_device_capability",
                 return_value=(9, 0),
             ),
         ):
@@ -2917,14 +2941,14 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         def choices(fragments: Mapping[str, object], key: str) -> tuple[object, ...]:
             return self._enum_fragment(fragments[key]).choices
 
-        narrow = tcgen05_config.strategy_autotune_fragments()
+        narrow = surface.strategy_autotune_fragments(tcgen05_config)
         self.assertEqual(
             choices(narrow, "tcgen05_strategy"), ("role_local_monolithic",)
         )
         self.assertEqual(choices(narrow, "tcgen05_warp_spec_c_input_warps"), (0,))
 
         tcgen05_config.aux_kernel_detected = True
-        widened = tcgen05_config.strategy_autotune_fragments()
+        widened = surface.strategy_autotune_fragments(tcgen05_config)
         self.assertEqual(
             choices(widened, "tcgen05_strategy"),
             ("role_local_monolithic", "role_local_with_scheduler"),
@@ -2960,11 +2984,13 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         tcgen05_config = spec._cute_tcgen05_config
 
         consumer = self._enum_fragment(
-            tcgen05_config.consumer_regs_autotune_fragments()["tcgen05_consumer_regs"]
+            surface.consumer_regs_autotune_fragments(tcgen05_config)[
+                "tcgen05_consumer_regs"
+            ]
         )
-        strategy = tcgen05_config.strategy_autotune_fragments()
+        strategy = surface.strategy_autotune_fragments(tcgen05_config)
         persistence = self._enum_fragment(
-            tcgen05_config.persistence_model_autotune_fragments()[
+            surface.persistence_model_autotune_fragments(tcgen05_config)[
                 "tcgen05_persistence_model"
             ]
         )
@@ -3003,7 +3029,7 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                 tcgen05_persistence_model="non_persistent",
             )
         ]
-        fields = spec._cute_tcgen05_config.flat_fields()
+        fields = surface.flat_fields(spec._cute_tcgen05_config)
 
         self.assertNotIn("tcgen05_consumer_regs", fields)
         self.assertNotIn("tcgen05_persistence_model", fields)
@@ -3016,7 +3042,7 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             )
         ]
         persistence = self._enum_fragment(
-            spec._cute_tcgen05_config.flat_fields()["tcgen05_persistence_model"]
+            surface.flat_fields(spec._cute_tcgen05_config)["tcgen05_persistence_model"]
         )
         self.assertEqual(
             persistence.choices,
