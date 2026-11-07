@@ -98,6 +98,8 @@ from ..cute_register_subblocks import RegisterSubblockFacts
 from ..cute_register_subblocks import register_subblocks_config_reason
 from ..cute_register_subblocks import register_subblocks_repair
 from ..cutedsl_compat import hinted_cp_async_available
+from ..phase_load_policies import project_load_policies
+from ..phase_load_policies import scatter_load_policies
 
 if TYPE_CHECKING:
     from ....autotuner.config_spec import ConfigSpec
@@ -226,6 +228,14 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
     targets, the promoted default) selects ``warp``.
     """
     config_spec.cute_mma_dag_facts = facts
+    ordered_phase = config_spec.cute_mma_dag_phase_index is not None
+    if ordered_phase:
+        # MMA modes normalize to separate flat launches. Keep that default,
+        # but the off mode can still use the ordinary persistent barrier
+        # lowering and must retain its existing search choices.
+        config_spec.allowed_pid_types = tuple(
+            sorted(config_spec.allowed_pid_types, key=lambda pid: pid != "flat")
+        )
     # A ragged root axis below its MMA atom (M = 8 under the 16-row atom)
     # is computed at the atom on the warp path, and the seeds walk that
     # tile: its search ceiling, the extent where the frontend left it,
@@ -291,8 +301,10 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
         )
     )
     config_spec.cute_mma_dag_lookahead = EnumFragment(choices=MMA_DAG_LOOKAHEAD_CHOICES)
-    if facts.tcgen05 is not None and (
-        not facts.tcgen05.regions or facts.tcgen05.persistent_reason is None
+    if (
+        not ordered_phase
+        and facts.tcgen05 is not None
+        and (not facts.tcgen05.regions or facts.tcgen05.persistent_reason is None)
     ):
         # The persistent launch: the single-loop renderer's tile loop,
         # or a region program's (``cute_mma_dag_tcgen05_regions``;
@@ -300,7 +312,12 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
         config_spec.cute_mma_dag_persistent = EnumFragment(
             choices=MMA_DAG_PERSISTENT_CHOICES
         )
-    if facts.tcgen05 is not None and facts.tcgen05.regions and facts.split_axis >= 0:
+    if (
+        not ordered_phase
+        and facts.tcgen05 is not None
+        and facts.tcgen05.regions
+        and facts.split_axis >= 0
+    ):
         # The split count: a portable cluster's (<= 8), and the fixup
         # grid's wider ones where the program admits the fixup form.
         admitted = fixup_admitted(facts)
@@ -394,6 +411,7 @@ def _normalize_cute_register_subblocks(
     # search does not sample inert variations of one kernel.
     for key in (
         "cute_fp32_dot",
+        "cute_fragment_half_mma",
         "cute_fragment_padded_rows",
         "cute_fragment_unrolled_loops",
         "cute_fragment_vector_io",
@@ -837,6 +855,61 @@ def _normalize_cute_mma_dag(
         config[MMA_DAG_PERSISTENT_KEY] = 0
         config["pid_type"] = "flat"
         config.pop("num_sm_multiplier", None)
+    if config_spec.cute_mma_dag_phase_index is not None:
+        _normalize_mma_dag_phase_owned_fields(config_spec, config)
+        return
+    _normalize_mma_dag_owned_fields(config_spec, config)
+
+
+def _normalize_mma_dag_phase_owned_fields(
+    config_spec: ConfigSpec, config: dict[str, object]
+) -> None:
+    """Canonicalize only knobs no sibling launch consumes."""
+    owned = config_spec.cute_mma_dag_phase_owned_blocks
+    for key, sequence in (
+        ("num_threads", config_spec.num_threads),
+        ("loop_orders", config_spec.loop_orders),
+        ("l2_groupings", config_spec.l2_groupings),
+        ("cute_vector_widths", config_spec.cute_vector_widths),
+        ("cute_lane_layouts", config_spec.cute_lane_layouts),
+        ("cute_reduction_reloads", config_spec.cute_reduction_reloads),
+        ("reduction_loops", config_spec.reduction_loops),
+        ("flatten_loops", config_spec.flatten_loops),
+        ("range_unroll_factors", config_spec.range_unroll_factors),
+        ("range_warp_specializes", config_spec.range_warp_specialize),
+        ("range_num_stages", config_spec.range_num_stages),
+        ("range_multi_buffers", config_spec.range_multi_buffers),
+        ("range_flattens", config_spec.range_flattens),
+        ("static_ranges", config_spec.static_ranges),
+    ):
+        values = config.get(key)
+        if isinstance(values, list):
+            config[key] = [
+                item._fill_missing() if set(item.block_ids) <= owned else value
+                for item, value in zip(sequence, values, strict=True)
+            ]
+    policies = config.get("load_eviction_policies")
+    if isinstance(policies, list):
+        mapping = config_spec.cute_mma_dag_phase_eviction_map
+        local_policies = project_load_policies(policies, mapping)
+        projected = {**config, "load_eviction_policies": local_policies}
+        _normalize_mma_dag_owned_fields(config_spec, projected)
+        canonical = cast("list[str]", projected["load_eviction_policies"])
+        policies = list(policies)
+        for global_slot in config_spec.cute_mma_dag_phase_load_slots:
+            policies[global_slot] = ""
+        config["load_eviction_policies"] = scatter_load_policies(
+            canonical, mapping, policies
+        )
+        config[MMA_DAG_LOADS_KEY] = projected[MMA_DAG_LOADS_KEY]
+
+
+def _normalize_mma_dag_owned_fields(
+    config_spec: ConfigSpec, config: dict[str, object]
+) -> None:
+    """Pin layout knobs only for a launch whose body MMA-DAG replaces."""
+    facts = config_spec.cute_mma_dag_facts
+    assert facts is not None
     if "loop_orders" in config:
         config["loop_orders"] = [
             item._fill_missing() for item in config_spec.loop_orders

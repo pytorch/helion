@@ -188,6 +188,11 @@ root asks for fragments), `block_scaled`, `topk`, `register_region`,
 | computed fragments, register sub-blocks / region / program, block scaled | `computed_fragment.prefer_computed_fragment_root`, `cute_register_subblocks.py`, `register_region.py`, `block_scaled_mma.py` | `computed_fragment.codegen_computed_fragment_root` + `fragment_*.py`; `register_program.py`; `block_scaled_*.py`, `mxfp8_*.py` | `host_wrappers/block_scaled.py` |
 | host-sum tails | `host_sums.py` | `host_single_sum.py`, `host_paired_sum.py`, `host_full_sum.py`, `host_remainder_fills.py` | `runtime/cute/single_sum.py`, `paired_sum.py`, `full_sum.py` |
 
+MMA dataflow operand recipes may read a typed 2D grouped auxiliary tensor at
+`floor(global_axis / positive_group)`. The matcher proves its physical capacity;
+INT8/UINT8 auxiliaries require this recipe. Grouped values use scalar addressing
+and stay outside affine vector rings, prefetch tables, and raw carry seeds.
+
 ### 3.3 Whole-kernel generators and regeneration
 
 `KERNEL_GENERATORS` (`kernel_generators.py`): `grouped_prefix_adaptive_n`,

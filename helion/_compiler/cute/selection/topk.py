@@ -343,8 +343,8 @@ def topk_tensors_are_proven_disjoint(
         # the same memory twice. Use the cache-specialized span proof,
         # which becomes available after structural matching and binding.
         if (
-            left.untyped_storage() not in env._symbolically_exact_layout_storages
-            and right.untyped_storage() not in env._symbolically_exact_layout_storages
+            not env.tensor_storage_is_compiler_allocated(left)
+            and not env.tensor_storage_is_compiler_allocated(right)
             and not runtime_tensors_are_proven_disjoint(
                 env, left, right, allow_unbound=allow_unbound
             )

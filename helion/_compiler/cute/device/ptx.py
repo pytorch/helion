@@ -518,6 +518,26 @@ ldg_s32_pred = ptx_op(
     doc="``ld.global.s32`` under ``pred`` (0 when it is 0).",
 )
 
+ldg_s8_pred = ptx_op(
+    "ldg_s8_pred",
+    "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.s32 $0, 0; @p ld.global.s8 $0, [$1]; }",
+    (cutlass.Int64, cutlass.Int32),
+    (cutlass.Int32,),
+    side_effects=True,
+    memory=True,
+    doc="One signed byte widened to int32 under pred (zero when false).",
+)
+
+ldg_u8_pred = ptx_op(
+    "ldg_u8_pred",
+    "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.u32 $0, 0; @p ld.global.u8 $0, [$1]; }",
+    (cutlass.Int64, cutlass.Int32),
+    (cutlass.Uint32,),
+    side_effects=True,
+    memory=True,
+    doc="One unsigned byte widened to uint32 under pred (zero when false).",
+)
+
 ldg_b32_pred = ptx_op(
     "ldg_b32_pred",
     "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.b32 $0, 0; @p ld.global.b32 $0, [$1]; }",

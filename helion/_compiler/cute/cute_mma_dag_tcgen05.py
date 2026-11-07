@@ -2419,6 +2419,9 @@ class _PassEvaluator(_Evaluator):
     def _load(self, node: Node, coords: Coords) -> str:
         em = cast("Tcgen05MmaDagEmitter", self.emitter)
         access = em.accesses[node]
+        if access.grouped:
+            # These scalar accesses have no affine vector prefetch protocol.
+            return super()._load(node, coords)
         if len(access.tile_dims) == 2:
             # A tile leaf: nothing to record (the scratch render has none).
             if em.table_recording is not None:
@@ -2645,6 +2648,7 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
             32 * TCGEN05_EPILOGUE_WARPS if tc.pass_warps else plan.threads
         )
         self.loop_var = "md_i"
+        self.bounded_ordinal: str | None = None
         self.tensor_names: dict[Node, str] = {}
         # Name prefix of the fragment row vectors (``md_v{slot}_{chunk}``).
         self.vec = "md_v"
@@ -3158,8 +3162,12 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
             lo, hi = self.pair_load(
                 address, load.dtype, paired, readonly=self.readonly(load)
             )
-            self.evaluator.tile_leaves[(load.node, 0)] = lo
-            self.evaluator.tile_leaves[(load.node, 1)] = hi
+            if load.dtype in (torch.int8, torch.uint8):
+                self.set_tile_leaf(load, 0, lo)
+                self.set_tile_leaf(load, 1, hi)
+            else:
+                self.evaluator.tile_leaves[(load.node, 0)] = lo
+                self.evaluator.tile_leaves[(load.node, 1)] = hi
             values = []
             for half in range(2):
                 self.evaluator.element = half
@@ -3333,6 +3341,51 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
         for rep, (prow, _pch, _guard) in enumerate(rounds):
             self.round_of[prow] = (rep * per, cpr)
 
+    def emit_byte_convert_pass(
+        self, tile: Tcgen05Tile, stage: str, idx_base: str, threads: int
+    ) -> None:
+        """Convert sixteen raw bytes into two swizzled 16-bit packets."""
+        operand = tile.operand
+        load = operand.load
+        assert load is not None and load.dtype in (torch.int8, torch.uint8)
+        assert tile.elem_bytes == 2 and tile.route == ROUTE_CONVERT
+        value = self.pass_value(operand)
+        self.hoist_scalars(value)
+        raw_cpr = tile.raw_row_bytes // 16
+
+        def packet_load(prow: str, pch: str) -> list[str]:
+            words = [self.df.new_var("md_w") for _ in range(4)]
+            self.emit(
+                f"{', '.join(words)} = {_RUNTIME}.lds_v4_b32({self.raw_address(tile, stage, prow, pch)})"
+            )
+            return words
+
+        def rewrite(words: list[str], prow: str, pch: str) -> None:
+            self.set_byte_packet(load, words)
+            packed = []
+            for q in range(8):
+                pair = []
+                for e in (2 * q, 2 * q + 1):
+                    self.evaluator.element = e
+                    coords = self.tile_coords(operand, prow, f"({pch} * 16 + {e})")
+                    pair.append(self.evaluator.unrounded(value, coords))
+                self.evaluator.element = None
+                packed.append(self.pack(pair[0], pair[1], operand.dtype))
+            for half in range(2):
+                chunk = f"({pch} * 2 + {half})"
+                self.emit(
+                    f"{_RUNTIME}.sts_v4_b32({self.tile_address(tile, stage, prow, chunk)}, "
+                    f"{', '.join(packed[4 * half : 4 * half + 4])})"
+                )
+
+        self.emit_pipelined_pass(
+            self.packet_rounds(
+                tile.rows * raw_cpr, threads, idx_base, raw_cpr, tile.tag
+            ),
+            packet_load,
+            rewrite,
+        )
+
     def emit_convert_pass(
         self, tile: Tcgen05Tile, stage: str, idx_base: str, threads: int
     ) -> None:
@@ -3341,6 +3394,9 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
         operand = tile.operand
         load = operand.load
         assert load is not None
+        if load.dtype in (torch.int8, torch.uint8):
+            self.emit_byte_convert_pass(tile, stage, idx_base, threads)
+            return
         value = self.pass_value(operand)
         self.hoist_scalars(value)
         raw_cpr = tile.raw_row_bytes // 16
@@ -3755,8 +3811,10 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
         """This thread's table entries (those of ``window``, or all) for
         iteration ``loop_value``, from the vectors read at that iteration's
         bases."""
-        saved = (self.iter_vars, self.evaluator)
+        saved = (self.iter_vars, self.evaluator, self.values)
         self.iter_vars = dict(saved[0])
+        # Pointwise index expressions must use the same iteration as the loads.
+        self.values = {**self.values, 0: loop_value}
         for access in self.program.accesses:
             if self.loop_dependent(access):
                 self.iter_vars[access.node] = self.iteration_base(access, loop_value)
@@ -3773,7 +3831,7 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
             result = self.evaluator.evaluate(*key)
             self.emit(f"{register} = cutlass.Float32({result})")
         self.computing_tables = False
-        self.iter_vars, self.evaluator = saved
+        self.iter_vars, self.evaluator, self.values = saved
 
     def emit_tables_ahead(self, loop: str, end: str, window: int) -> None:
         """The next iteration's table entries of ``window`` (after a batch
@@ -4657,6 +4715,11 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
                     self.emit_epilogue_tma_issue()
         self.emit(self.sync)
         self.table_lookup = True
+        self.bounded_ordinal = (
+            "md_ring" if self.phase_base is None and self.wide_loop_bounds() else None
+        )
+        if self.bounded_ordinal is not None:
+            self.emit(f"{self.bounded_ordinal} = cutlass.Int32(0)")
         if tc.pass_warps:
             # Warps 4-7 rewrite the operand tiles as their TMA lands, up to
             # S - 1 tiles ahead; the epilogue warps run the chain on their
@@ -4673,6 +4736,8 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
                     self.emit_general_iteration(begin, end)
                 else:
                     self.emit_iteration(begin, end)
+                if self.bounded_ordinal is not None:
+                    self.advance_ring_counter(self.bounded_ordinal, 2 * tc.stages)
             self.sync = "cute.arch.barrier()"
         else:
             # Loop-invariant per-thread side loads (a scalar read by a pass)
@@ -4692,6 +4757,8 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
                     self.emit_general_iteration(begin, end)
                 else:
                     self.emit_iteration(begin, end)
+                if self.bounded_ordinal is not None:
+                    self.advance_ring_counter(self.bounded_ordinal, 2 * tc.stages)
             self.hoists.pop()
         self.table_lookup = False
         if self.epilogue_sites and not self.epilogue_sites_in_loop:
@@ -4759,7 +4826,9 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
         tile's coordinates): a single static-trip TMA ring without pass
         warps, epilogue tiles or TMA stores, over the generic
         persistent_interleaved program ids (their mixed-radix decomposition
-        of ``virtual_pid + grid`` gives the next tile)."""
+        of ``virtual_pid + grid`` gives the next tile). Table-loaded indices
+        are excluded: their current-tile bases cannot be reused for the
+        next tile's lookups."""
         tc = self.tc
         _begin, _end, trip = self.loop_bounds()
         if (
@@ -4767,6 +4836,7 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
             or not tc.tx_bytes
             or tc.pass_warps
             or self.general_loop
+            or self.program.index_loads
             or tc.store_tma
             or not trip
         ):
@@ -4999,6 +5069,8 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
                 32 * TCGEN05_EPILOGUE_WARPS,
             )
             self.emit(f"{_PRIMS}.mbarrier_arrive(md_pass + md_stage)")
+            if self.bounded_ordinal is not None:
+                self.advance_ring_counter(self.bounded_ordinal, 2 * self.tc.stages)
         (
             self.loop_var,
             self.iter_vars,
@@ -5012,7 +5084,9 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
         ``md_i``; returns the iteration offset expression."""
         tc, program = self.tc, self.program
         loop = self.loop_var
-        offset = loop if begin == "0" else f"({loop} - {begin})"
+        offset = self.bounded_ordinal or (
+            loop if begin == "0" else f"({loop} - {begin})"
+        )
         if program.loop_axis is not None:
             step = self.plan.size(program.loop_axis)
             self.emit(f"{self.axis_base(program.loop_axis)} = {loop} * {step}")

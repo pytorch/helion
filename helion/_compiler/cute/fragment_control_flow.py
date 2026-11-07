@@ -93,17 +93,33 @@ class FragmentControlFlow(FragmentContext):
         body: list[ast.AST] = []
         deferred_barrier: ast.AST | None = None
         outer_offsets, outer_bounds = dict(self.offsets), dict(self.bounds)
-        with self.cg.set_statements(body):
-            for bid, _begin, end in zip(
+        # Range arguments are evaluated in the enclosing scope, including
+        # tensor-derived scalar recipes. Rendering an end inside the body can
+        # make the loop header refer to a temporary that the body defines.
+        starts: list[str] = []
+        steps: list[str] = []
+
+        def range_scalar(value: object) -> str:
+            return self.scalar(values[value] if isinstance(value, Node) else value)
+
+        for index, (bid, begin, end) in enumerate(
+            zip(
                 graph.block_ids,
                 cast("list[object]", node.args[1]),
                 cast("list[object]", node.args[2]),
                 strict=True,
-            ):
-                self.offsets[bid] = self.df.new_var("fragment_tile")
-                self.bounds[bid] = self.scalar(
-                    values[end] if isinstance(end, Node) else end
-                )
+            )
+        ):
+            starts.append(range_scalar(begin))
+            self.bounds[bid] = range_scalar(end)
+            step = self.sym(self.df.resolved_block_size(bid))
+            if node.target is _tracing_ops._for_loop_step:
+                explicit = cast("list[object]", node.args[4])[index]
+                if explicit is not None:
+                    step = range_scalar(explicit)
+            steps.append(step)
+            self.offsets[bid] = self.df.new_var("fragment_tile")
+        with self.cg.set_statements(body):
             results = self.graph(
                 graph.graph, dict(zip(placeholders, inner_args, strict=True))
             )
@@ -150,15 +166,7 @@ class FragmentControlFlow(FragmentContext):
                 deferred_barrier = body.pop()
         for index in reversed(range(len(graph.block_ids))):
             bid = graph.block_ids[index]
-            begin = cast("list[object]", node.args[1])[index]
-            start = self.scalar(values[begin] if isinstance(begin, Node) else begin)
-            step = self.df.resolved_block_size(bid)
-            if node.target is _tracing_ops._for_loop_step:
-                explicit = cast("list[object]", node.args[4])[index]
-                if explicit is not None:
-                    step = self.scalar(
-                        values[explicit] if isinstance(explicit, Node) else explicit
-                    )
+            start, step = starts[index], steps[index]
             loop = statement_from_string(
                 f"for {self.offsets[bid]} in range(cutlass.{loop_index_type}({start}), cutlass.{loop_index_type}({self.bounds[bid]}), {step}):\n    pass"
             )

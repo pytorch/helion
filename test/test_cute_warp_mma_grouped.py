@@ -19,7 +19,6 @@ import torch
 
 from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_grouped_coverage_search import _bound
-from test.test_cute_warp_mma_gemm import _repaired
 
 import helion
 from helion._compiler.cute import cute_warp_mma_gemm as family
@@ -28,6 +27,7 @@ from helion._compiler.cute.tcgen05_config import seeds
 from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_mma_dag import repaired_config as _repaired
 from helion.exc import InvalidConfig
 
 grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged

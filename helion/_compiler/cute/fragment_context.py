@@ -169,8 +169,8 @@ class HostTensor:
 
 @dataclass
 class DirectStoreSink:
-    """The host store that consumes a tf32 mma result straight from the lane
-    registers (``emit_tf32_mma``): ``memory`` fills in the window's address
+    """The host store that consumes an mma result straight from the lane
+    registers (``emit_mma``): ``memory`` fills in the window's address
     recipe without emitting the staged walk, the lane loop writes through it,
     and the store node itself then lowers to nothing."""
 
@@ -479,20 +479,20 @@ class FragmentContext:
         self.batched_loads = bool(
             self.df.config.get("cute_fragment_batched_loads", False)
         )
-        # ``cute_fragment_split_k``: idle warps of a tf32 mma phase take a
+        # ``cute_fragment_split_k``: idle warps of an mma phase take a
         # share of K (partials summed at the read).
         self.split_k = bool(self.df.config.get("cute_fragment_split_k", False))
-        # ``cute_fragment_mma_rows``: the tf32 mma lanes walk whole tile rows
+        # ``cute_fragment_mma_rows``: the mma lanes walk whole tile rows
         # and evaluate each row's A words once for all of its column tiles.
         self.mma_rows = bool(self.df.config.get("cute_fragment_mma_rows", False))
         # A load phase emitted without its trailing barrier: the next node
         # that is not another independent host load issues it.
         self.pending_barrier = False
-        # A tf32 ``mma.sync`` phase was emitted: the generated module needs
+        # An ``mma.sync`` phase was emitted: the generated module needs
         # the helpers' import, added once the root is committed (a capacity
         # decline of the scratch body must leave the module untouched).
         self.wants_mma_preamble = False
-        # Host stores already written by the tf32 mma lanes of the dot they
+        # Host stores already written by the mma lanes of the dot they
         # consume (``DirectStoreSink``): the store node lowers to nothing.
         self.direct_stores: set[Node] = set()
         # The graph walk's active atomic-consumer region and producer-cache

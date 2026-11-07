@@ -602,14 +602,9 @@ def _flash_is_root_batch_index(node: torch.fx.Node, block_id: int) -> bool:
 
 
 def _flash_is_block_symnode(node: torch.fx.Node, block_id: int) -> bool:
-    from ...language._tracing_ops import _get_symnode
+    from .analysis.attention_match import _attention_is_block_symnode
 
-    return bool(
-        node.op == "call_function"
-        and node.target is _get_symnode
-        and len(node.args) >= 1
-        and node.args[0] == f"block_size_{block_id}"
-    )
+    return _attention_is_block_symnode(node, block_id)
 
 
 def _flash_lse_tensor_geometry(value: torch.Tensor, *, flattened: bool) -> bool:

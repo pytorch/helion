@@ -292,6 +292,18 @@ class _Evaluator:
             # (A uniform scalar read from a tensor -- a window's limit --
             # was loaded once with the bases.)
             result = em.scalar_vars.get(node) or self._load(node, coords)
+        elif node in self.program.aux_indices:
+            result = em.uniform(self.program.aux_indices[node], em.values)
+        elif node in self.program.uniform_values and isinstance(
+            node.meta.get("val"), (int, torch.SymInt)
+        ):
+            val = node.meta["val"]
+            if isinstance(val, torch.SymInt):
+                expr = val._sympy_()
+                assert isinstance(expr, sympy.Expr)
+                result = em.df.sympy_expr(expr)
+            else:
+                result = str(val)
         elif node.op == "call_function" and node.target is _tracing_ops._get_symnode:
             val = node.meta["val"]
             result = em.df.sympy_expr(val._sympy_())
@@ -317,23 +329,37 @@ class _Evaluator:
             # shape inputs are no values); the consumer casts it.
             from torch._inductor.codegen.simd import constant_repr
 
-            fill = cast("float | int", node.args[1])
+            fill = cast("float | int | Node", node.args[1])
             val = node.meta.get("val")
-            if isinstance(val, torch.Tensor) and val.dtype.is_floating_point:
-                fill = float(fill)
-            result = constant_repr(fill)
+            if (
+                node in self.program.uniform_values
+                and isinstance(val, torch.Tensor)
+                and not val.dtype.is_floating_point
+            ):
+                # Integer full_like truncates its fill before downstream
+                # arithmetic, even when the fill argument is a float. Only
+                # uniform bounds use this path: narrow epilogue fills retain
+                # their existing literal lowering below.
+                result = (
+                    em.typed(self.evaluate(fill, ()), val.dtype)
+                    if isinstance(fill, torch.fx.Node)
+                    else em.constant(fill, val.dtype)
+                )
+            else:
+                if isinstance(val, torch.Tensor) and val.dtype.is_floating_point:
+                    fill = float(cast("float | int", fill))
+                result = constant_repr(cast("float | int", fill))
         elif node.op == "call_function" and node.target is creation_ops.full:
-            # ``hl.zeros`` / ``hl.full`` beside a fragment: the constant
-            # (``hl.full(..., float("-inf"))`` under a ``where`` spelled as
-            # a call: ``repr(-inf)`` is a bare name in the DSL module).
-            fill = cast("float", node.args[1])
-            result = em.bind(
-                "md_v",
-                em.typed(
-                    f"cutlass.Float32({_float_literal(float(fill))})",
-                    node.meta["val"].dtype,
-                ),
+            # Preserve integer fills exactly and evaluate a scalar tensor fill
+            # at its own width before converting it to the result's dtype.
+            fill = node.args[1]
+            dtype = node.meta["val"].dtype
+            value = (
+                em.typed(self.evaluate(fill, ()), dtype)
+                if isinstance(fill, torch.fx.Node)
+                else em.constant(fill, dtype)
             )
+            result = em.bind("md_v", value)
         elif (
             node.op == "call_function" and node.target is torch.ops.aten.expand.default
         ):
@@ -629,7 +655,7 @@ class _Evaluator:
         access = self.emitter.accesses.get(source)
         if access is None or access.dtype not in _WIDENED:
             return None
-        if len(access.tile_dims) == 2:
+        if len(access.tile_dims) == 2 and not access.grouped:
             assert self.element is not None
             raw = self.raw_leaves.get((source, self.element))
             if raw is None:
@@ -663,7 +689,7 @@ class _Evaluator:
     def _load(self, node: Node, coords: Coords) -> str:
         em = self.emitter
         access = em.accesses[node]
-        if len(access.tile_dims) == 2:
+        if len(access.tile_dims) == 2 and not access.grouped:
             assert self.element is not None
             leaf = self.tile_leaves[(node, self.element)]
             return self.tile_leaf(
@@ -694,6 +720,20 @@ class _Evaluator:
         # An element past a ragged axis' extent loads as zero (the
         # frontend's masked-value model), under a predicate.
         bounds = em.bounds(access, coords)
+        if access.grouped:
+            # Grouped scales are read at the current logical coordinate.
+            # They do not share the affine vector ring/prefetch protocol.
+            pred = None if bounds is None else em.bind("md_ok", em.pred_int(bounds))
+            value = em.bind(
+                "md_v",
+                em.scalar_load(
+                    address, access.dtype, pred, readonly=em.readonly(access)
+                ),
+            )
+            if access.dtype in _WIDENED:
+                self.scopes[-1][("raw", (node, coords))] = value
+                return em.retyped(value, access.dtype)
+            return em.bind("md_v", em.typed(value, access.dtype))
         hoist = em.hoist_level(access, coords)
         if hoist is not None:
             # A loop-invariant per-thread load goes out once, ahead of the
@@ -860,6 +900,14 @@ def _float_literal(value: float) -> str:
     if math.isnan(value):
         return "float('nan')"
     return repr(value)
+
+
+def _reduce_combine(kind: str, lhs: str, rhs: str) -> str:
+    """One fp32 reduction step, preserving ``amax``'s NaN propagation."""
+    if kind == "sum":
+        return f"{lhs} + {rhs}"
+    assert kind == "max", kind
+    return f"cute.math.max({lhs}, {rhs}, propagate_nan=True)"
 
 
 def _frag_dtype(node: Node) -> torch.dtype | None:
@@ -1438,7 +1486,7 @@ class MmaDagEmitterBase:
         return f"md_r{slot}_{atom}_{half}"
 
     def typed(self, value: str, dtype: torch.dtype) -> str:
-        """``value`` (an fp32 scalar) re-typed to the DSL type of ``dtype``."""
+        """``value`` re-typed to the DSL scalar type of ``dtype``."""
         if dtype == torch.float32:
             return value
         return f"{self.env.backend.dtype_str(dtype)}({value})"
@@ -1475,10 +1523,14 @@ class MmaDagEmitterBase:
         *,
         readonly: bool = False,
     ) -> str:
-        """One element at ``address`` as an fp32 / int32 scalar; under an
-        Int32 ``pred`` (see ``pred_int``) a zero where it is 0, else the
-        read-only (``ld.global.nc``) form when ``readonly`` (the predicated
-        loads have no ``.nc`` form)."""
+        """One element widened to fp32 or int32, zero under a false predicate.
+
+        Floating and int32 loads use the read-only form when ``readonly``
+        and unpredicated. Byte loads always use their predicated integer row.
+        """
+        if dtype in (torch.int8, torch.uint8):
+            op = "ldg_s8_pred" if dtype == torch.int8 else "ldg_u8_pred"
+            return f"{_RUNTIME}.{op}({address}, {pred or 'cutlass.Int32(1)'})"
         suffix = "" if pred is None else "_pred"
         args = _load_args(address, pred, readonly)
         if dtype == torch.float32:
@@ -1499,12 +1551,13 @@ class MmaDagEmitterBase:
         *,
         readonly: bool = False,
     ) -> tuple[str, str]:
-        """Two adjacent elements at ``address`` as fp32 scalars (zeros
+        """Two adjacent elements widened to fp32 or int32 scalars (zeros
         under a false Int32 ``pred``)."""
         lo, hi = self.df.new_var("md_lo"), self.df.new_var("md_hi")
         suffix = "" if pred is None else "_pred"
         args = _load_args(address, pred, readonly)
-        if not paired:
+        # A byte pair must read exactly two bytes, including at an odd base.
+        if not paired or dtype in (torch.int8, torch.uint8):
             self.emit(
                 f"{lo} = {self.scalar_load(address, dtype, pred, readonly=readonly)}"
             )
@@ -1523,8 +1576,8 @@ class MmaDagEmitterBase:
     def constant(self, value: object, dtype: torch.dtype) -> str:
         """A scalar constant of the DSL type of ``dtype`` (a ``_mask_to``
         fill)."""
-        if dtype == torch.int32:
-            return f"cutlass.Int32({int(cast('int', value))})"
+        if dtype in (torch.int8, torch.uint8, torch.int32, torch.int64):
+            return f"{self.env.backend.dtype_str(dtype)}({int(cast('int', value))})"
         if dtype == torch.bool:
             return f"cutlass.Boolean({bool(value)})"
         if not dtype.is_floating_point:
@@ -1559,12 +1612,30 @@ class MmaDagEmitterBase:
         return f"{_RUNTIME}.{pack}(cutlass.Float32({lo}), cutlass.Float32({hi}))"
 
     def set_tile_leaf(self, load: Access, element: int, raw: str) -> None:
-        """Bind element ``element`` of the loaded tile: ``raw`` is its exact
-        fp32 value (an unpacked packet half or a widening load), the typed
-        leaf the DSL value of the tile's dtype."""
+        """Bind a loaded tile element: ``raw`` is an exact widened fp32
+        half or a sign/zero-extended byte, and the leaf retains its DSL type."""
         key = (load.node, element)
-        self.evaluator.raw_leaves[key] = raw
-        self.evaluator.tile_leaves[key] = self.retyped(raw, load.dtype)
+        if load.dtype in (torch.int8, torch.uint8):
+            # The raw byte has been sign/zero extended to an integer, not fp32.
+            # Preserve the original byte type before evaluating the recipe.
+            self.evaluator.tile_leaves[key] = self.bind(
+                "md_byte", self.typed(raw, load.dtype)
+            )
+        else:
+            self.evaluator.raw_leaves[key] = raw
+            self.evaluator.tile_leaves[key] = self.retyped(raw, load.dtype)
+
+    def set_byte_packet(self, load: Access, words: list[str]) -> None:
+        """Unpack four words as sixteen typed signed or unsigned byte leaves."""
+        assert load.dtype in (torch.int8, torch.uint8)
+        for q, word in enumerate(words):
+            for byte in range(4):
+                value = (
+                    f"(cutlass.Int32({word} << {24 - 8 * byte}) >> 24)"
+                    if load.dtype == torch.int8
+                    else f"(({word} >> {8 * byte}) & 255)"
+                )
+                self.set_tile_leaf(load, 4 * q + byte, value)
 
     def pairs_aligned(self, access: Access, cols_pos: int) -> bool:
         """Whether adjacent elements along tile dim ``cols_pos`` may move as
@@ -1597,7 +1668,8 @@ class MmaDagEmitterBase:
     def uniform(self, expr: sympy.Expr, values: dict[int, str] | str) -> str:
         """Render a uniform scalar subscript with the grid loops' indices as
         ``values`` (loop index -> value expression; a string is the single
-        loop's value)."""
+        loop's value). Table lookups are rendered at those same indices,
+        including future-iteration indices supplied by the prefetcher."""
         if isinstance(values, str):
             values = {0: values}
         symbols = {
@@ -1608,7 +1680,14 @@ class MmaDagEmitterBase:
         replacements: dict[sympy.Symbol, sympy.Symbol] = {}
         for symbol in expr.free_symbols:
             symbol = cast("sympy.Symbol", symbol)
-            if symbol in symbols:
+            if symbol in self.program.index_loads:
+                access = self.program.index_loads[symbol]
+                address = self.iteration_base_expr(access, values)
+                suffix = "s32" if access.dtype == torch.int32 else "s64"
+                replacements[symbol] = sympy.Symbol(
+                    f"{_RUNTIME}.ldg_{suffix}({address})", integer=True
+                )
+            elif symbol in symbols:
                 replacements[symbol] = sympy.Symbol(
                     values[symbols[symbol]], integer=True
                 )
@@ -1620,31 +1699,33 @@ class MmaDagEmitterBase:
 
     def bound(self, value: object) -> str:
         if isinstance(value, torch.fx.Node):
+            value = self.program.resolve(value)
             if value in self.scalar_vars:
                 return self.scalar_vars[value]
             val = value.meta["val"]
             if isinstance(val, int):
                 return str(val)
-            return self.df.sympy_expr(val._sympy_())
+            return f"({self.df.sympy_expr(val._sympy_())})"
         return str(value)
 
     def define_scalar_load(self, access: Access) -> None:
         """A uniform scalar read from a tensor (a loop bound, a window's
-        offset or limit) as an Int32: one load at the access's base (its
+        offset or limit): one load at the access's base (its
         only address: a 0-d access has no tile dims).  Defined with the
         bases, ahead of the accesses that window on it and of every loop."""
         if access.node in self.scalar_vars:
             return
         base = self.base_vars[access.node]
-        # An int64 table value is narrowed to Int32: the value is a row
-        # index or a row count of a tensor dim (a static extent, below
-        # 2**31), so the narrowing is exact for every in-range value; a
-        # value past 2**31 is not representable and is not guarded here.
-        load = (
-            f"{_RUNTIME}.ldg_s32({base})"
-            if access.dtype == torch.int32
-            else f"cutlass.Int32({_RUNTIME}.ldg_s64({base}))"
-        )
+        if access.dtype == torch.int32:
+            load = f"{_RUNTIME}.ldg_s32({base})"
+        elif access.node in self.program.uniform_values:
+            # Bounds retain their integer width through arithmetic and induction.
+            load = f"{_RUNTIME}.ldg_s64({base})"
+        else:
+            # The existing window protocol uses Int32 row indices into a static
+            # tensor extent. General uniform bounds do not share that restriction.
+            # Out-of-range window values beyond Int32 are not guarded here.
+            load = f"cutlass.Int32({_RUNTIME}.ldg_s64({base}))"
         self.scalar_vars[access.node] = self.bind("md_scalar", load)
 
     def window_guard(self, access: Access, position: int, coord: str) -> str | None:
@@ -1754,12 +1835,34 @@ class MmaDagEmitterBase:
     def define_bases(self) -> None:
         """Per-access byte bases: the tensor pointer plus the loop-invariant
         scalar subscripts and the root / leading tile offsets (Int64).  The
-        uniform scalar loads come first (their bases are their addresses),
-        so the accesses windowing on them can add the offsets they hold."""
+        scalar and table-load address dependencies come before consumers,
+        so table-indexed bounds and window offsets use defined bases."""
         scalar_nodes = {access.node for access in self.program.scalar_loads}
-        ordered = sorted(
+        ordered: list[Access] = []
+        seen: set[Node] = set()
+
+        def visit(access: Access) -> None:
+            if access.node in seen:
+                return
+            seen.add(access.node)
+            # A table index can itself read another table. Define every
+            # address dependency first, including those of uniform bounds.
+            for subscript in access.subscripts:
+                if subscript.window is not None:
+                    visit(subscript.window.offset)
+                for expr in (subscript.expr, subscript.offset):
+                    if expr is not None:
+                        for symbol in sorted(expr.free_symbols, key=str):
+                            assert isinstance(symbol, sympy.Symbol)
+                            dependency = self.program.index_loads.get(symbol)
+                            if dependency is not None:
+                                visit(dependency)
+            ordered.append(access)
+
+        for access in sorted(
             self.program.accesses, key=lambda access: access.node not in scalar_nodes
-        )
+        ):
+            visit(access)
         for access in ordered:
             if access.node in self.base_vars:
                 continue
@@ -1774,6 +1877,10 @@ class MmaDagEmitterBase:
                 if subscript.kind == "axis":
                     axis = subscript.axis
                     assert axis is not None
+                    if subscript.divisor is not None:
+                        # Divide the complete global coordinate at the load;
+                        # adding an affine tile base here would divide twice.
+                        continue
                     if subscript.offset is not None:
                         terms.append(
                             f"cutlass.Int64({self.uniform(subscript.offset, {})}) * {scale}"
@@ -1795,6 +1902,23 @@ class MmaDagEmitterBase:
             self.base_vars[access.node] = self.bind("md_base", " + ".join(terms))
             if access.node in scalar_nodes:
                 self.define_scalar_load(access)
+        for loop in self.program.loops:
+            for value in (loop.begin, loop.end):
+                if isinstance(value, torch.fx.Node):
+                    value = self.program.resolve(value)
+                # Symbolic endpoints may also feed tensor bounds; they
+                # remain symbolic and have no tensor dtype to materialize.
+                if (
+                    isinstance(value, torch.fx.Node)
+                    and isinstance(value.meta["val"], torch.Tensor)
+                    and value in self.program.uniform_values
+                    and value not in self.scalar_vars
+                ):
+                    result = self.evaluator.evaluate(value, ())
+                    dtype = self.env.backend.dtype_str(value.meta["val"].dtype)
+                    self.scalar_vars[value] = self.bind(
+                        "md_bound", f"{dtype}({result})"
+                    )
 
     def iteration_base(self, access: Access, values: dict[int, str] | str) -> str:
         """The access base for the iterations whose loop indices are
@@ -1823,6 +1947,8 @@ class MmaDagEmitterBase:
             elif subscript.kind == "axis":
                 axis = subscript.axis
                 assert axis is not None
+                if subscript.divisor is not None:
+                    continue
                 if axis.kind == AXIS_LOOP:
                     step = self.plan.size(axis)
                     offset = self.axis_offset(axis, values[axis.loop])
@@ -1839,6 +1965,14 @@ class MmaDagEmitterBase:
                 continue
             stride = access.dim_strides[position] * es
             coord = coords[position]
+            subscript = access.subscripts[access.subscript_index(position)]
+            if subscript.divisor is not None:
+                global_base = (
+                    "0"
+                    if axis.kind == AXIS_RDIM and not self.is_split_axis(axis)
+                    else self.axis_base(axis)
+                )
+                coord = f"(({global_base} + ({coord})) // {subscript.divisor})"
             if coord == "0":
                 continue
             terms.append(
@@ -2134,6 +2268,8 @@ class MmaDagEmitterBase:
         that does not fold addresses spells every term out.)"""
         base = self.iter_vars[access.node]
         es = access.dtype.itemsize
+        if access.grouped:
+            return self.plain_address(access, base, coords)
         if not self.fold_addresses:
             terms = [base]
             for position, axis in enumerate(access.dims):
@@ -2340,6 +2476,29 @@ class MmaDagEmitterBase:
         return names
 
     # -- loops ----------------------------------------------------------------
+
+    def wide_loop_bounds(self, loop: Loop | None = None) -> bool:
+        """Whether a grid loop retains an Int64 tensor endpoint."""
+        if loop is None:
+            loop = self.program.loops[0]
+        if loop.axes:
+            return False
+        for value in (loop.begin, loop.end):
+            if isinstance(value, torch.fx.Node):
+                val = self.program.resolve(value).meta.get("val")
+                if isinstance(val, torch.Tensor) and val.dtype == torch.int64:
+                    return True
+        return False
+
+    def advance_ring_counter(self, name: str, period: int) -> None:
+        """Advance a small Int32 slot/phase ordinal without growing indefinitely.
+
+        Only ring state uses this ordinal; memory indices retain the original
+        loop induction type. ``period`` is a multiple of every derived ring's
+        slot count and, when needed, its two barrier phases.
+        """
+        self.emit(f"{name} = {name} + 1")
+        self.emit(f"{name} = cutlass.Int32(0) if {name} == {period} else {name}")
 
     def loop_bounds(self, loop: Loop | None = None) -> tuple[str, str, int | None]:
         """``(begin, end, static trip count)`` of the emitted loop: a grid
@@ -2570,6 +2729,7 @@ def _scalar_nodes(
     frag_slots = cast("dict[Node, int]", program.frag_slots)  # pyrefly: ignore[missing-attribute]
     vec_leaves = cast("dict[Node, int]", program.vec_leaves)  # pyrefly: ignore[missing-attribute]
     aliases = cast("dict[Node, Node]", program.aliases)  # pyrefly: ignore[missing-attribute]
+    aux_indices = cast("dict[Node, sympy.Expr]", program.aux_indices)  # pyrefly: ignore[missing-attribute]
 
     def visit(node: Node) -> None:
         if node in aliases:
@@ -2580,6 +2740,7 @@ def _scalar_nodes(
             or node.op != "call_function"
             or (node in frag_slots and node not in inline)
             or node in vec_leaves
+            or node in aux_indices
         ):
             return
         seen.add(node)

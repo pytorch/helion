@@ -585,9 +585,8 @@ def plan_register_region(
             if output.untyped_storage()._cdata == other.untyped_storage()._cdata:
                 return None
             if (
-                output.untyped_storage() not in env._symbolically_exact_layout_storages
-                and other.untyped_storage()
-                not in env._symbolically_exact_layout_storages
+                not env.tensor_storage_is_compiler_allocated(output)
+                and not env.tensor_storage_is_compiler_allocated(other)
                 and not runtime_tensors_are_proven_disjoint(env, output, other)
             ):
                 return None

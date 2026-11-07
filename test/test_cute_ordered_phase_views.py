@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import ast
-import importlib.util
-import sys
 
 import pytest
 import torch
@@ -15,6 +13,8 @@ from helion._testing import DEVICE
 from helion._testing import cpu_render_target
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import load_generated_module
+from helion._testing.cute_codegen import stage_sources
 import helion.language as hl
 
 
@@ -94,12 +94,7 @@ def test_ordered_contiguous_view_captures(shape, offset, tmp_path):
     x = torch.arange(n + offset, dtype=torch.float32)[offset:].reshape(shape)
     original = x.clone()
     code = _code(_view_phases, x)
-    tree = ast.parse(code)
-    bodies = [
-        node.args[0].value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and ast.unparse(node.func) == "PyCodeCache.load"
-    ]
+    bodies = stage_sources(code)
     assert len(bodies) == 2
     for body in bodies:
         host = next(
@@ -116,10 +111,7 @@ def test_ordered_contiguous_view_captures(shape, offset, tmp_path):
         )
     path = tmp_path / "views_generated.py"
     path.write_text(code)
-    spec = importlib.util.spec_from_file_location("views_generated", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    module = load_generated_module(path)
     calls = []
 
     def launch(kernel, grid, *args, **kwargs):

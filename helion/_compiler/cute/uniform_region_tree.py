@@ -864,8 +864,9 @@ def uniform_local_regions(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                         )
                         require(
                             bool(
-                                user.args[3] == "relaxed"
-                                and (not user.users or dtype == torch.int32)
+                                isinstance(user.args[3], str)
+                                and user.args[3] == "relaxed"
+                                and (not user.users or dtype is torch.int32)
                             ),
                             "local atomic type/order",
                         )
@@ -960,7 +961,7 @@ def uniform_output_stores_are_writeonly(
     }
     for target in targets.values():
         storage = target.untyped_storage()
-        fresh = storage in env._symbolically_exact_layout_storages
+        fresh = env.tensor_storage_is_compiler_allocated(target)
         if not fresh:
             source = env.tensor_input_source(target)
             specialization = env.runtime_input_specializations.get(
@@ -988,7 +989,7 @@ def uniform_output_stores_are_writeonly(
                 return False
             if (
                 not fresh
-                and other_storage not in env._symbolically_exact_layout_storages
+                and not env.tensor_storage_is_compiler_allocated(other)
                 and not runtime_tensors_are_proven_disjoint(
                     env, target, other, allow_unbound=allow_unbound
                 )
