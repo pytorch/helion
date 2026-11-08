@@ -297,14 +297,16 @@ _TRACE_THROUGH_TARGETS = {
 
 # Extra forward-trace targets used only for output store/dtype/lifetime
 # analysis. Operand tracing remains restricted to _TRACE_THROUGH_TARGETS.
-# These are the fused epilogue unary and auxiliary-binary operations. The
-# store's epilogue classifier separately validates complete renderability.
+# These are the fused epilogue unary, auxiliary-binary and select
+# (``where(cond, literal, carrier)``) operations. The store's epilogue
+# classifier separately validates complete renderability.
 _DTYPE_TRACE_EXTRA_TARGETS = {
     *_ZERO_ARG_TARGETS,
     torch.ops.aten.mul.Tensor,
     torch.ops.aten.add.Tensor,
     torch.ops.aten.sub.Tensor,
     torch.ops.aten.div.Tensor,
+    torch.ops.aten.where.self,
 }
 _MMA_OUTPUT_STORE_ANALYSIS_META_KEY = "cute_mma_output_store_analysis"
 _MMA_REQUIRES_ACCUMULATOR_SEED_META_KEY = "cute_mma_requires_accumulator_seed"
@@ -12154,9 +12156,7 @@ def _emit_mma_pipeline(
             cg, fx_node
         )
         c_input_aux_tensor_descriptors_value = tuple(
-            d
-            for d in aux_tensor_descriptors_value
-            if d.broadcast_axis is None and d.host_tensor_val.ndim == 2
+            d for d in aux_tensor_descriptors_value if d.stages_through_smem_ring
         )
         aux_tma_productive_body_gate_open = (
             tcgen05_warp_spec.c_input_warps > 0

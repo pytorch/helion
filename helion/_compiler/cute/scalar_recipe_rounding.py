@@ -24,6 +24,7 @@ from typing import cast
 import torch
 
 from ..ast_extension import expr_from_string
+from ..stripped_inputs import restore_stripped_operands
 from .indexing import is_cute_shape_chain_target
 from .scalar_recipe import _MATH_CALLS
 from .scalar_recipe import ROUNDED_FP32_MULTIPLY_ASM
@@ -174,17 +175,16 @@ def _product_factors(product: Node) -> tuple[object, object] | None:
     ``x ** 2`` is ``pow(x, 2)``; ``inductor_lowering.strip_unused_inputs``
     masks a repeated operand with None after the lowering (``x * x`` arrives
     as ``mul(x, None)``), and the masked operand is the node's unique tensor
-    input (``flash_row_epilogue._operands``).
+    input (``stripped_inputs.restore_stripped_operands``).
     """
     if product.target is _SQUARE:
         return product.args[0], product.args[0]
     if product.target is not torch.ops.aten.mul.Tensor or len(product.args) != 2:
         return None
-    left, right = product.args
-    if right is None and isinstance(left, torch.fx.Node):
-        return left, left
-    if left is None and isinstance(right, torch.fx.Node):
-        return right, right
+    factors = restore_stripped_operands(product)
+    if factors is None:
+        return None
+    left, right = factors
     return left, right
 
 

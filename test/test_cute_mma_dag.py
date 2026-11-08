@@ -34,12 +34,12 @@ import helion
 from helion._compiler.autotuner_heuristics.cute_mma_dag import CuteMmaDagHeuristic
 from helion._compiler.cute import cute_mma_dag as dag
 from helion._compiler.cute import cutedsl_compat
-from helion._compiler.cute.cute_mma_dag_codegen import _float_literal
 from helion._compiler.cute.cute_mma_dag_codegen import _Layout
 from helion._compiler.cute.cute_mma_dag_tcgen05 import tcgen05_corner_seeds
 from helion._compiler.cute.cute_mma_dag_tcgen05 import tcgen05_seed_configs
 from helion._compiler.cute.cute_warp_mma_gemm import _swizzled_chunk
 from helion._compiler.cute.cute_warp_mma_gemm import warp_mma_warp_layout
+from helion._compiler.cute.math_templates import float_literal
 from helion._compiler.host_function import SymbolOrigin
 from helion._compiler.variable_origin import BlockSizeOrigin
 from helion._testing import skipUnlessBackends
@@ -7834,7 +7834,7 @@ def test_float_literals_spell_non_finite_values_as_calls(
 ) -> None:
     # ``repr(float("inf"))`` is the bare name ``inf``, undefined in the
     # generated module: the DSL source spells it as a ``float(...)`` call.
-    assert _float_literal(value) == literal
+    assert float_literal(value) == literal
 
 
 def test_a_non_finite_fill_beside_a_fragment_renders_as_a_call() -> None:

@@ -424,7 +424,9 @@ def strip_unused_inputs(
 ) -> list[str]:
     """
     Remove unused inputs from the node.  Inplace updates node.args and
-    node.kwargs to replace unused inputs with None.
+    node.kwargs to replace unused inputs with None.  A repeated input keeps
+    its first use only (``x * x`` becomes ``mul(x, None)``);
+    ``stripped_inputs.restore_stripped_operands`` restores it.
 
     Args:
         node: Node to mutate args of

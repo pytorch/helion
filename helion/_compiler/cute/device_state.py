@@ -523,16 +523,15 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
 
     @property
     def c_input_aux_tensor_descriptors(self) -> tuple[Tcgen05AuxTensorDescriptor, ...]:
-        """Aux descriptors staged by the C-input warp.
+        """Aux descriptors staged by the C-input warp
+        (``Tcgen05AuxTensorDescriptor.stages_through_smem_ring``).
 
-        Exact-shape rank-2 MxN aux tensors use the SMEM-ring producer.
-        Broadcast row vectors and leading-passthrough rank-3 residuals stay on
-        the direct per-thread load path; the producer scheduler is 2-D only.
+        The producer scheduler is 2-D only: broadcast row vectors,
+        leading-passthrough rank-3 residuals and boolean masks stay on the
+        direct per-thread load path.
         """
         return tuple(
-            d
-            for d in self.aux_tensor_descriptors
-            if d.broadcast_axis is None and d.host_tensor_val.ndim == 2
+            d for d in self.aux_tensor_descriptors if d.stages_through_smem_ring
         )
 
     @property

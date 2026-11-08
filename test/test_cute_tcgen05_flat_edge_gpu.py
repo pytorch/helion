@@ -21,6 +21,8 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_dense_tcgen05 import bias_mm_into
+from helion._testing.cute_dense_tcgen05 import promoted_bias_mm_into
 import helion.language as hl
 
 pytestmark = pytest.mark.skipif(
@@ -323,6 +325,31 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
         for seed in seeds:
             bound.set_config(seed)
             torch.testing.assert_close(bound(a, b), expected, rtol=1e-2, atol=1e-1)
+
+    def test_staged_row_on_the_hybrid_store_edge(self) -> None:
+        # A ``pre_acc_wait`` row stage lives in the full-tile branch of the
+        # hybrid TMA/SIMT store; the SIMT edge tiles (N=3000 is ragged) read
+        # the row from global memory. Inductor's ``bias.to(float32) + acc``
+        # stages promoted like the bare ``acc + bias``.
+        a = torch.randn(2048, 128, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(128, 3000, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(3000, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty(2048, 3000, device=DEVICE, dtype=torch.bfloat16)
+        expected = (a.float() @ b.float() + bias.float()).to(a.dtype)
+        for kernel in (promoted_bias_mm_into, bias_mm_into):
+            bound = kernel.bind((a, b, bias, out))
+            config = bound.config_spec.default_config()
+            # ab5 leaves SMEM for the C ring and the row stage: the hybrid store
+            config.config.update(
+                tcgen05_aux_load_placement="pre_acc_wait", tcgen05_ab_stages=5
+            )
+            code = bound.to_code(config)
+            self.assertIn("tcgen05_tma_store_atom", code)
+            self.assertIn("tcgen05_aux_rowvec_smem_0", code)
+            bound.set_config(config)
+            out.zero_()
+            bound(a, b, bias, out)
+            torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-1)
 
 
 if __name__ == "__main__":

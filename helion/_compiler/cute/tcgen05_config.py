@@ -7838,10 +7838,12 @@ class CuteTcgen05Config:
         if facts is None or cluster_m not in (1, 2):
             return False
         if self._store_lowering_stages_rows(config) and facts.rows:
-            # The hybrid full-tile TMA / edge SIMT epilogue does not stage
-            # ``pre_acc_wait`` rows for its edge branch (the row-stage tensor
-            # is created inside the full-tile branch only); keep those
-            # kernels on the SIMT epilogue.
+            # ``pre_acc_wait`` rows keep the SIMT epilogue here (the hybrid
+            # store's edge tiles would read them from global memory). The
+            # default relies on it to keep few-tile bias GEMMs on the SIMT
+            # store, which wins there (32768x576x128 + bias: 36.9 us, against
+            # 51.3 with the staged row beside the TMA store; see
+            # ``CuteTcgen05DefaultTileHeuristic._pick``).
             return False
         out_bits = facts.output_itemsize * 8
         _subtile_m, subtile_n = tcgen05_default_epilogue_tile_size(

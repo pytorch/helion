@@ -9280,22 +9280,15 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("0.044715", code)
         self.assertNotIn("tcgen05_chain_step_in", code)
 
-    def test_tcgen05_fused_gelu_tanh_approx_eager_polynomial_rejected(
+    def test_tcgen05_fused_gelu_tanh_approx_eager_polynomial(
         self,
     ) -> None:
         """The eager Python form of the tanh-approx GELU polynomial
-        (``0.5 * acc * (1 + torch.tanh(acc * (a + b * acc * acc)))``)
-        is rejected by the chain analyzer's linear-chain assumption
-        and bails to the loud-failure ``BackendUnsupported`` backstop.
-
-        Pins the chain analyzer's reuse limitation: the carrier
-        ``acc`` appears four times in the FX graph for the eager
-        form, but each chain step consumes exactly one tensor input
-        (the previous step's output). Folding the polynomial behind
-        the ``_gelu_tanh_approx`` decomp (driven by
-        ``F.gelu(approximate="tanh")``) is the load-bearing reason
-        this test exists — without it, the user cannot fuse the
-        tanh-approx GELU into a tcgen05 epilogue.
+        (``0.5 * acc * (1 + torch.tanh(acc * (a + b * acc * acc)))``) reads
+        the carrier ``acc`` four times; the chain analyzer takes steps that
+        read the carrier more than once, so it fuses into the tcgen05
+        epilogue like the ``F.gelu(approximate="tanh")`` decomposition
+        instead of bailing to the ``BackendUnsupported`` backstop.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -9325,10 +9318,7 @@ class TestCuteLowerings(unittest.TestCase):
 
         x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
         y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
+        with patch_cute_mma_support():
             bound = cute_matmul_gelu_eager.bind((x, y))
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             cfg = _make_tcgen05_persistent_config(
@@ -9336,22 +9326,17 @@ class TestCuteLowerings(unittest.TestCase):
                 pid_type="persistent_interleaved",
             )
             bound.set_config(cfg)
-            bound(x, y)
-        msg = str(cm.exception)
-        # Pin the loud-failure backstop wording so an unrelated
-        # rejection path (e.g. an aux load misclassification) cannot
-        # accidentally satisfy this assertion. The backstop fires
-        # because the eager ``acc * acc`` multiply has two tensor
-        # operands (both reach the matmul carrier), which the
-        # whitelist rejects as a non-scalar binary op.
-        self.assertIn(
-            "non-whitelisted fused epilogues",
-            msg,
-        )
-        self.assertIn(
-            "non-scalar binary ops",
-            msg,
-        )
+            code = bound.to_triton_code(cfg)
+            out = bound(x, y)
+        self.assertIn("tcgen05_acc_loaded", code)
+        self.assertIn("cute.math.tanh", code)
+        acc = x.float() @ y.float()
+        expected = (
+            0.5
+            * acc
+            * (1.0 + torch.tanh(acc * (0.7978845608 + 0.0356774081 * acc * acc)))
+        ).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=2e-2)
 
     def test_tcgen05_fused_symfloat_scalar_epilogue_runtime_correctness(
         self,

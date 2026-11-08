@@ -185,6 +185,25 @@ def bias_gelu_aux_single(
     return out, aux
 
 
+def bias_gelu_aux_single_cast(
+    left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Inductor's spelling of ``bias_gelu_aux_single``: the row is converted to
+    # FP32 explicitly, which the FP32 root reads unrounded like the bare load.
+    rows, reduction = left.shape
+    columns = right.size(1)
+    out = torch.empty((rows, columns), dtype=left.dtype, device=left.device)
+    aux = torch.empty_like(out)
+    for i, j in hl.tile((rows, columns)):
+        accumulator = hl.zeros([i, j], dtype=torch.float32)
+        for k in hl.tile(reduction):
+            accumulator = torch.addmm(accumulator, left[i, k], right[k, j])
+        pre = bias[j].to(torch.float32) + accumulator
+        aux[i, j] = pre.to(left.dtype)
+        out[i, j] = torch.nn.functional.gelu(pre).to(left.dtype)
+    return out, aux
+
+
 def gelu_aux_scaled(
     left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor, out_scale: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -525,6 +544,8 @@ def _pre_wait_shared(bn: int) -> helion.Config:
         # 16-bit row consumed by the FP32 root alone: the promoted shared stage.
         (bias_gelu_aux_single, torch.float16, 128, True),
         (bias_gelu_aux_single, torch.float16, 64, True),
+        # Inductor's explicit FP32 conversion of that row promotes the same way.
+        (bias_gelu_aux_single_cast, torch.float16, 128, True),
         # 32-bit row on bn=128: the warp-private stage; bn=64 does not split
         # into whole 32-lane copies of four, so it stays a per-subtile read.
         (bias_gelu_aux, torch.float32, 128, True),

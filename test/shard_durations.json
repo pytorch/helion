@@ -350,6 +350,8 @@
  "test/test_cute_host_single_sum_seeds.py": 5.1,
  "test/test_cute_host_zero_fills.py": 7.1,
  "test/test_cute_independent_row_carrier.py": 4.7,
+ "test/test_cute_inductor_epilogues.py": 19.4,
+ "test/test_cute_inductor_epilogues_gpu.py": 29.7,
  "test/test_cute_input_view_layout.py": 0.1,
  "test/test_cute_int64_value_network.py": 5.6,
  "test/test_cute_integer_vector_io.py": 4.6,

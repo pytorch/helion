@@ -22,6 +22,7 @@ from helion._compiler.cute.tcgen05_constants import Tcgen05RowvecAuxRow
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import bias_mm_into
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
@@ -341,6 +342,29 @@ def test_bias_row_epilogue_keeps_the_paired_pipeline(placement: str) -> None:
         )
     )
     assert "CtaGroup.TWO" in code
+
+
+def test_inductor_cast_bias_row_stages_promoted() -> None:
+    """Inductor's addmm epilogue converts the row explicitly
+    (``bias[col].to(torch.float32) + acc``): the row reaches the FP32 root
+    unrounded like the bare load, so ``pre_acc_wait`` stages it promoted to
+    FP32 (the conversion of the staged value is the identity) instead of
+    loading it per subtile."""
+    a, b, out = _args()
+    bias = torch.empty(b.shape[1], dtype=a.dtype)
+    bound = bias_mm_into._bind_isolated((a, b, bias, out))
+    facts = bound.config_spec._cute_tcgen05_config.pipeline_smem_facts
+    assert facts is not None
+    assert facts.rows == (Tcgen05RowvecAuxRow(itemsize=2, promoted=True),)
+    code = bound.to_code(
+        _config(
+            block_sizes=[256, 256, 64],
+            tcgen05_ab_stages=5,
+            tcgen05_aux_load_placement="pre_acc_wait",
+        )
+    )
+    assert "alloc_smem(cutlass.Float32" in code
+    assert "cute.autovec_copy(tcgen05_tTR_gAux_subtile" not in code
 
 
 def test_bias_rows_record_their_width_and_columns_decline() -> None:

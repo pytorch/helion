@@ -71,8 +71,12 @@ def _aligned_n_efficiency(cluster_m: int, bm: int, width: int) -> float | None:
 
 
 # Tiles per CTA (waves) from which an output-edge bias GEMM's default takes
-# the hybrid TMA store (``post_acc_wait``) over the SIMT store (see ``_pick``).
+# the hybrid TMA store (``post_acc_wait``, or a staged ``pre_acc_wait`` row on
+# epilogue-bound pairs) over the SIMT store (see ``_pick``).
 _TMA_STORE_MIN_WAVES = 16
+# K tiles per output tile up to which the epilogue bounds a pair GEMM, so its
+# default stages promoted bias rows (``pre_acc_wait``; see ``_pick``).
+_EPILOGUE_BOUND_MAX_K_TILES = 2
 # A candidate replaces the FFI default only below this fraction of its cost.
 _FFI_REPLACEMENT_MARGIN = 0.9
 
@@ -278,26 +282,66 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
                 values[key] = None
         pipeline_facts = state.pipeline_smem_facts
         assert pipeline_facts is not None
+        many_tiles = best[2] >= _TMA_STORE_MIN_WAVES
+        bm, bn, bk = best_tile
+        staged_row = False
         if (
-            best[2] >= _TMA_STORE_MIN_WAVES
+            many_tiles
+            and k // bk <= _EPILOGUE_BOUND_MAX_K_TILES
+            and values.get("tcgen05_cluster_m", 1) == 2
+            and not values.get(TILE_N_KEY)
+            and pipeline_facts.rows
+            and all(row.promoted for row in pipeline_facts.rows)
+            # a column-major output reads its rows per subtile, unstaged
+            and not pipeline_facts.output_column_major
+        ):
+            # With at most two K tiles per output tile the epilogue bounds the
+            # pair, and loading a bias row from global memory per subtile
+            # leaves its latency on every subtile; ``pre_acc_wait`` stages the
+            # promoted row once per tile. Beside a row stage the hybrid TMA
+            # store is admitted through ``c_stages_fits`` alone
+            # (``output_edge_tma_store_smem_fits`` refuses row stages, see
+            # below), which costs one AB stage: the deepest ring it admits
+            # that also fits the stage. Inductor corpus on B200, 256x256x64
+            # pairs + bf16 bias, post ab6 -> pre ab5: 4096x30000x128 (26
+            # tiles per pair) 136 -> 98 us, 32768x30528x128 746 -> 596 us; at
+            # K=768 the shallower ring costs 0-4%, and below 16 tiles per pair
+            # the SIMT store wins (32768x576x128: 36.9 us SIMT, 51.3 staged
+            # beside the TMA store).
+            c_stages = cast("int", values.get("tcgen05_c_stages", 2))
+            for depth in range(cast("int", values.get("tcgen05_ab_stages", 2)), 1, -1):
+                fits = {"bm": bm, "bn": bn, "bk": bk, "cluster_m": 2}
+                if state.c_stages_fits(
+                    **fits, ab_stages=depth, c_stages=c_stages, has_source_c=True
+                ) and state.rowvec_aux_stage_fits(
+                    **fits, ab_stages=depth, c_stages=c_stages
+                ):
+                    values[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                        TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                    )
+                    values["tcgen05_ab_stages"] = depth
+                    staged_row = True
+                    break
+        if (
+            many_tiles
+            and not staged_row
             and values.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
             == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
             and pipeline_facts.rows
             and all(row.itemsize == 2 for row in pipeline_facts.rows)
-            and not state._static_full_tiles(
-                bm=best_tile[0], bn=best_tile[1], bk=best_tile[2]
-            )
+            and not state._static_full_tiles(bm=bm, bn=bn, bk=bk)
         ):
-            # On an output edge a ``pre_acc_wait`` bias row keeps every tile
-            # on the predicated SIMT store (``output_edge_tma_store_smem_fits``
-            # refuses the hybrid full-tile TMA store beside row stages);
-            # ``post_acc_wait`` stores the full tiles through TMA. The TMA
-            # store wins from 16 tiles per CTA (pair) on, the SIMT store
-            # below. Inductor corpus, 256x256x64 ab6 pairs + bf16 bias, of
-            # cuBLAS, SIMT -> TMA store: 104 tiles per pair
-            # (16384x30528x768) 0.63 -> 0.92, 26 (4096x30000x128) 0.41 ->
-            # 0.52; 13 (25216x2304x768) 0.67 -> 0.61, 6 (32768x576x192)
-            # 0.50 -> 0.29, 4 (2048x8008x2560) 1.06 -> 0.86.
+            # On an output edge a ``pre_acc_wait`` bias row at the seed's deep
+            # ring keeps every tile on the predicated SIMT store
+            # (``output_edge_tma_store_smem_fits`` refuses the hybrid TMA
+            # store beside row stages, and ``c_stages_fits`` does not admit it
+            # at that ring); ``post_acc_wait`` stores the full tiles through
+            # TMA. The TMA store wins from 16
+            # tiles per CTA (pair) on, the SIMT store below. Inductor corpus,
+            # 256x256x64 ab6 pairs + bf16 bias, of cuBLAS, SIMT -> TMA store:
+            # 104 tiles per pair (16384x30528x768) 0.63 -> 0.92, 26
+            # (4096x30000x128) 0.41 -> 0.52; 13 (25216x2304x768) 0.67 -> 0.61,
+            # 6 (32768x576x192) 0.50 -> 0.29, 4 (2048x8008x2560) 1.06 -> 0.86.
             values[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
                 TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
             )

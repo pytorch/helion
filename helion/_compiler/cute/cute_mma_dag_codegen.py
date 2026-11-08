@@ -57,7 +57,6 @@ import contextlib
 import dataclasses
 import functools
 import itertools
-import math
 import re
 import textwrap
 from typing import TYPE_CHECKING
@@ -113,6 +112,7 @@ from .cute_mma_dag import loop_trip_range
 from .cute_mma_dag import rounded_dot_dtype
 from .cute_warp_mma_gemm import _swizzled_chunk
 from .cute_warp_mma_gemm import warp_mma_warp_layout
+from .math_templates import float_literal
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -482,7 +482,7 @@ class _Evaluator:
             result = em.bind(
                 "md_v",
                 em.typed(
-                    f"cutlass.Float32({_float_literal(float(fill))})",
+                    f"cutlass.Float32({float_literal(float(fill))})",
                     node.meta["val"].dtype,
                 ),
             )
@@ -991,17 +991,6 @@ def _load_args(address: str, pred: str | None, readonly: bool) -> str:
     if pred is not None:
         return f"{address}, {pred}"
     return f"{address}, nc=True" if readonly else address
-
-
-def _float_literal(value: float) -> str:
-    """Python source for a float constant: ``repr`` for a finite value;
-    ``inf``, ``-inf`` and ``nan`` repr to bare names (undefined in the
-    generated module), so they are spelled as ``float(...)`` calls."""
-    if math.isinf(value):
-        return "float('inf')" if value > 0 else "float('-inf')"
-    if math.isnan(value):
-        return "float('nan')"
-    return repr(value)
 
 
 def _frag_dtype(node: Node) -> torch.dtype | None:
@@ -1888,7 +1877,7 @@ class _Emitter:
         if not dtype.is_floating_point:
             raise _decline(f"no {dtype} fill for a masked value")
         return self.typed(
-            f"cutlass.Float32({_float_literal(float(cast('float', value)))})", dtype
+            f"cutlass.Float32({float_literal(float(cast('float', value)))})", dtype
         )
 
     def pair_store(

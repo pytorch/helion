@@ -87,6 +87,7 @@ from .attention_plan import FlexAuxBuffer
 from .attention_plan import FlexRegion
 from .flex_coop_layout import COOP_WIDTHS
 from .flex_coop_layout import coop_pitch
+from .math_templates import float_literal
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -319,11 +320,7 @@ def _py_literal(value: object) -> str:
     if isinstance(value, bool):
         return repr(value)
     if isinstance(value, float):
-        if math.isinf(value):
-            return "float('inf')" if value > 0 else "float('-inf')"
-        if math.isnan(value):
-            return "float('nan')"
-        return repr(value)
+        return float_literal(value)
     if isinstance(value, int):
         return repr(value)
     raise _unsupported(f"unsupported literal {value!r}")

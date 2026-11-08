@@ -68,6 +68,7 @@ from typing import cast
 import torch
 
 from ..compile_environment import CompileEnvironment
+from ..stripped_inputs import restore_stripped_operands
 from .cute_mma_dag import AXIS_LOOP
 from .cute_mma_dag import AXIS_RDIM
 from .cute_mma_dag import AXIS_ROOT
@@ -3467,11 +3468,14 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         value = program.resolve(second.value)
         # The Inductor lowering masks a repeated input to None (``x * x``
         # arrives as ``mul(x, None)``).
-        if (
-            _is_call(value, torch.ops.aten.mul.Tensor)
-            and len(value.args) == 2
-            and value.args[1] in (None, value.args[0])
-        ) or (
+        factors = (
+            restore_stripped_operands(value)
+            if _is_call(value, torch.ops.aten.mul.Tensor)
+            else None
+        )
+        if factors is not None and len(factors) == 2 and factors[0] is factors[1]:
+            deviation = factors[0]
+        elif (
             _is_call(value, torch.ops.aten.pow.Tensor_Scalar)
             and len(value.args) == 2
             and value.args[1] == 2

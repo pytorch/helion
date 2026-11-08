@@ -229,3 +229,25 @@ def cuda_fake(backend: object, tensor: torch.Tensor) -> torch.Tensor:
             requires_grad=tensor.requires_grad,
         )
     return FakeTensor(tensor.fake_mode, meta, torch.device("cuda:0"))
+
+
+def full_and_edge_store_bodies(code: str) -> tuple[str, str]:
+    """The full-tile and edge-tile bodies of a hybrid tcgen05 store: the
+    ``if tcgen05_full_tile:`` branch and its ``else:`` branch, at the
+    indentation the generated code gives them."""
+    lines = code.splitlines()
+    start = next(
+        i for i, line in enumerate(lines) if line.strip() == "if tcgen05_full_tile:"
+    )
+    indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
+    end = next(i for i in range(start + 1, len(lines)) if lines[i] == f"{indent}else:")
+    stop = next(
+        (
+            i
+            for i in range(end + 1, len(lines))
+            if lines[i].strip()
+            and len(lines[i]) - len(lines[i].lstrip()) <= len(indent)
+        ),
+        len(lines),
+    )
+    return "\n".join(lines[start + 1 : end]), "\n".join(lines[end + 1 : stop])

@@ -108,6 +108,7 @@ from ..compile_environment import FixedBlockSizeSource
 from ..compile_environment import LoopSpecBlockSizeSource
 from ..compile_environment import shape_env_size_hint
 from ..compile_environment import shape_env_var_hints
+from ..stripped_inputs import restore_stripped_operands
 from ..variable_origin import BlockSizeOrigin
 from ..variable_origin import GridOrigin
 
@@ -1751,11 +1752,10 @@ class _Matcher:
             return args
         if "lowering" not in node.meta:
             raise _NotMine(f"a None operand of {node.target}")
-        nodes = {a for a in args if isinstance(a, torch.fx.Node)}
-        if len(nodes) != 1:
+        restored = restore_stripped_operands(node)
+        if restored is None:
             raise _NotMine(f"ambiguous repeated operand of {node.target}")
-        (only,) = nodes
-        return tuple(only if a is None else a for a in args)
+        return restored
 
     def build_row_reduce(self, node: Node, values: dict[Node, object]) -> Value:
         """``x.sum(dim=-1, keepdim=True)`` of an fp32 tile value over a static

@@ -37,6 +37,7 @@ from torch.fx import Node
 from ...language import _tracing_ops
 from ...language import memory_ops
 from ...language import view_ops
+from ..stripped_inputs import restore_stripped_operands
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -425,21 +426,12 @@ def match_flash_row_epilogue(
         return const(arg)
 
     def _operands(node: Node) -> tuple[str, ...]:
-        """Operands of a lowered pointwise node.
-
-        ``inductor_lowering.strip_unused_inputs`` masks every repeated operand
-        after its first occurrence with ``None`` (``x * x`` becomes
-        ``mul(x, None)``); the masked operand is the node's unique tensor input.
-        """
-        nodes = {arg for arg in node.args if isinstance(arg, Node)}
-        resolved = []
-        for arg in node.args:
-            if arg is None:
-                if len(nodes) != 1:
-                    raise _Unsupported
-                arg = next(iter(nodes))
-            resolved.append(_operand(arg))
-        return tuple(resolved)
+        """Operands of a lowered pointwise node, repeated operands restored
+        (``stripped_inputs.restore_stripped_operands``)."""
+        args = restore_stripped_operands(node)
+        if args is None:
+            raise _Unsupported
+        return tuple(_operand(arg) for arg in args)
 
     try:
         output = visit(store.args[2])
