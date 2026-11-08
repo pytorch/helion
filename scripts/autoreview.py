@@ -6,10 +6,26 @@ Usage:
     scripts/autoreview.py --head           # review last commit (git diff HEAD~ HEAD)
     scripts/autoreview.py FILE_OR_URL      # review the thing described by args
     scripts/autoreview.py --no-codex       # skip codex
+
+Either reviewer is enough: when only one of the claude and codex CLIs is
+installed, the review runs with that one and prints a warning that the agent
+must pass on to the user. With neither installed it fails.
+
+When the review finds nothing (LGTM), the script prints the line that records
+it in the reviewed commits' messages, naming the reviewers that ran:
+    autoreview passed: claude, codex
     scripts/autoreview.py --codex-sandbox workspace-write  # codex may write /tmp
     scripts/autoreview.py --fix            # ask claude to fix the reported issues
     scripts/autoreview.py --fix --add      # also `git add` modified files after fixing
     scripts/autoreview.py --meta           # add Meta-internal launcher flags
+    scripts/autoreview.py --claude-model fable --claude-effort max   # deeper review
+
+Reviewer models and efforts (flags, or the environment variables in brackets):
+    claude: --claude-model opus [HELION_AUTOREVIEW_CLAUDE_MODEL], an alias for the
+            latest Opus, and --claude-effort xhigh [HELION_AUTOREVIEW_CLAUDE_EFFORT]
+    codex:  --codex-model [HELION_AUTOREVIEW_CODEX_MODEL], unset by default so the
+            model configured in ~/.codex/config.toml (or Codex's default) is used,
+            and --codex-effort xhigh [HELION_AUTOREVIEW_CODEX_EFFORT]
 """
 
 from __future__ import annotations
@@ -24,6 +40,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -37,7 +54,15 @@ if TYPE_CHECKING:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOGS_BASE = REPO_ROOT / ".logs" / "autoreview"
 META_MARKER = Path("/usr/local/bin/claude_code/api-key-helper")
-CLAUDE_EFFORT = "max"
+# Defaults for the reviewers. The review must not depend on whichever model
+# and effort a contributor last picked interactively, so Claude gets a model
+# alias that tracks the latest Opus (available to every Claude Code user) and an
+# explicit effort. Codex has no aliases and its model names vary by account and
+# provider, so its model stays whatever the contributor's Codex is configured
+# with unless one is given; its effort is explicit.
+CLAUDE_MODEL = "opus"
+CLAUDE_EFFORT = "xhigh"
+CODEX_MODEL = ""
 CODEX_REASONING_EFFORT = "xhigh"
 
 
@@ -68,26 +93,36 @@ PROMPT_DIFF_PREFIX = (
 )
 
 PROMPT_HEAD_PREFIX = (
-    "Review only the changes introduced by the last commit "
-    "(`git diff HEAD~ HEAD`); ignore any uncommitted changes in the worktree."
+    "Review only the last commit (`git show HEAD`): the changes it introduces "
+    "and its commit message. Ignore any uncommitted changes in the worktree."
 )
 
 PROMPT_ARGS_PREFIX = """\
 Review only the thing described by these command-line arguments. Treat them as
 the user's description of what to review, and resolve any referenced commits,
 URLs, diffs, files, issues, or pull requests as needed. Inspect commits with
-`git show` or `git diff`; never check out, reset, stash, rebase or otherwise
-move HEAD or change the working tree. Do not review staged/uncommitted changes
-or the last commit unless the arguments explicitly ask for that.
+`git show` or `git diff`, and review their commit messages as well as their
+changes; never check out, reset, stash, rebase or otherwise move HEAD or change
+the working tree. Do not review staged/uncommitted changes or the last commit
+unless the arguments explicitly ask for that.
 
 Review target:
 {review_target}\
 """
 
 PROMPT_REVIEW_BODY = """\
+You are the reviewer: report findings, and do not edit, commit, rebase or run
+scripts/autoreview.py. The repository's AGENTS.md workflow rules (committing,
+fixing, rebasing, sharing GPUs) are for the author; its coding, compatibility
+and testing rules are what you check against. An `autoreview passed: ...` line
+or a `stack-info:` trailer in a commit message is bookkeeping, not something
+to review.
+
 Check for:
-- Correctness issues
-- Feature regressions (such as disabled/weakened tests)
+- Correctness issues, including bugs you notice in the code around the change
+  (say when one predates the change)
+- Feature regressions (such as disabled or weakened tests, or a code path
+  silently lost)
 - Opportunities for simplification or cleanups
 - Places that are hacky or overly narrow
 - Code duplication
@@ -95,6 +130,30 @@ Check for:
 - Too broad `try/except:` lines that could hide bugs
 - Overly defensive getattr/hasattr checks that should be base class schema updates
 - Comments that might go stale quickly (e.g. line numbers)
+- Compatibility (AGENTS.md, "Compatibility guardrails"): changes to the
+  user-facing language (`helion.language`, `@helion.kernel` and its arguments,
+  `Settings` fields, `HELION_*` environment variables, public exceptions) that
+  the commit message does not flag; Triton `Config` changes that would stop
+  configs saved by older versions from loading or working (a new option needs
+  a default that keeps the old behavior; a renamed or retired option must
+  still be accepted). Adding config options, and changing those of
+  experimental backends such as CuTe, is fine.
+- Tests against AGENTS.md's "Test Budget Rules": tests that only inspect
+  generated source but do not bind on CPU in a `cpu_only` module; parametrize
+  grids above 8 cases without a reason or `pairwise`; tests that spawn
+  interpreters, run a real autotune search or take over ~20s without
+  `@pytest.mark.slow`; shared test helpers outside `helion/_testing/`; deleted
+  or renamed test modules still listed in `test/shard_durations.json`;
+  changes to generated code that no test covers
+- AGENTS.md coding rules that lint cannot check: `print()` inside kernels,
+  `import helion as hl` (the pattern is `import helion.language as hl`), `del`
+  or `_ =` for unused arguments, needless local imports
+- Commit messages, when reviewing commits (they become pull request
+  descriptions): a `[area] Imperative summary` title; a body that matches the
+  changes (why, what changed, a `Testing:` paragraph whose claims are
+  plausible); compatibility-relevant changes flagged. In a range of commits,
+  also commits that should be squashed (the same code changed twice, tiny
+  commits) or that would not work if landed in order.
 - Other important issues
 
 If you hit a permission error or other system error that makes it hard to conduct the review respond only with "ERROR: <1-line reason>" and stop.
@@ -315,9 +374,17 @@ class Spinner:
 class ClaudeSession:
     """Multi-turn Claude session driven by `claude -p` and `--resume <id>`."""
 
-    def __init__(self, log_path: Path, meta: bool) -> None:
+    def __init__(
+        self,
+        log_path: Path,
+        meta: bool,
+        model: str = CLAUDE_MODEL,
+        effort: str = CLAUDE_EFFORT,
+    ) -> None:
         self.log_path = log_path
         self.meta = meta
+        self.model = model
+        self.effort = effort
         self.session_id: str | None = None
         self.log_path.write_text("")
 
@@ -327,8 +394,10 @@ class ClaudeSession:
             cmd.append("--dangerously-enable-internet-mode")
         cmd += [
             "--dangerously-skip-permissions",
+            "--model",
+            self.model,
             "--effort",
-            CLAUDE_EFFORT,
+            self.effort,
             "-p",
             prompt,
             "--output-format",
@@ -377,6 +446,8 @@ def run_codex_review(
     meta: bool,
     no_sandbox: bool = False,
     sandbox: str = "read-only",
+    model: str = CODEX_MODEL,
+    effort: str = CODEX_REASONING_EFFORT,
 ) -> str:
     """Run codex one-shot, return the last message text. Codex only ever
     reviews — fixes are performed by the claude session — so by default the
@@ -387,27 +458,32 @@ def run_codex_review(
     importing torch creates its cache directory under ``tempfile`` at import
     time, so a read-only codex cannot run any Python that imports Helion.
 
-    ``no_sandbox=True`` is a trust-the-model escape hatch for hosts without
-    bubblewrap: it switches Codex to ``-s danger-full-access`` and passes
-    ``--dangerously-disable-linux-sandbox``, so a misbehaving model could
-    modify the repo. Use only when the host can't run the sandbox launcher.
+    ``no_sandbox=True`` is a trust-the-model escape hatch for hosts where
+    Codex's sandbox cannot run (no bubblewrap): it switches Codex to
+    ``-s danger-full-access``, so a misbehaving model could modify the repo.
+    With ``meta`` it also passes ``--dangerously-disable-linux-sandbox``, a
+    flag of Meta's Codex launcher (which sandboxes Codex itself); upstream
+    Codex does not know it. Use only when the sandbox cannot run.
     """
     cmd = ["codex"]
     if meta:
+        # Flags of Meta's launcher, not of upstream Codex.
         cmd.append("--dangerously-enable-internet-mode")
-    if no_sandbox:
-        # Required on hosts without bubblewrap (`sandbox launcher failed
-        # because bubblewrap is unavailable`).
-        cmd.append("--dangerously-disable-linux-sandbox")
+        if no_sandbox:
+            # The launcher's own sandbox needs bubblewrap too (`sandbox
+            # launcher failed because bubblewrap is unavailable`).
+            cmd.append("--dangerously-disable-linux-sandbox")
     cmd += [
         "-c",
-        f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
+        f'model_reasoning_effort="{effort}"',
         "exec",
         # danger-full-access avoids the sandbox launcher path entirely when
         # bubblewrap is unavailable; the requested sandbox otherwise.
         "-s",
         "danger-full-access" if no_sandbox else sandbox,
     ]
+    if model:
+        cmd += ["-m", model]
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tf:
         out_path = Path(tf.name)
     try:
@@ -434,6 +510,19 @@ def run_codex_review(
         return result
     finally:
         out_path.unlink(missing_ok=True)
+
+
+def passed_line(reviewers: list[str]) -> str:
+    """The commit-message line recording a review that found nothing."""
+    return f"autoreview passed: {', '.join(reviewers)}"
+
+
+def missing_reviewer_warning(missing: str, used: str) -> str:
+    return (
+        f"WARNING: the {missing} CLI is not installed, so only {used} reviewed "
+        "this change. Tell the user that this review ran with one reviewer "
+        f"(install {missing} for the second opinion)."
+    )
 
 
 def fmt_seconds(seconds: float) -> str:
@@ -485,7 +574,9 @@ def run_parallel(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "review_args",
         nargs="*",
@@ -520,8 +611,43 @@ def main() -> int:
         "--codex-no-sandbox",
         action="store_true",
         help=(
-            "Pass `--dangerously-disable-linux-sandbox` to codex. "
-            "Required on hosts without bubblewrap installed."
+            "Run codex without its sandbox (-s danger-full-access; with --meta "
+            "also --dangerously-disable-linux-sandbox for Meta's launcher). "
+            "For hosts where the sandbox cannot run, such as without bubblewrap."
+        ),
+    )
+    parser.add_argument(
+        "--claude-model",
+        default=os.environ.get("HELION_AUTOREVIEW_CLAUDE_MODEL") or CLAUDE_MODEL,
+        help=(
+            "Claude reviewer model: an alias (opus, fable, sonnet) or a full "
+            f"model name (default: {CLAUDE_MODEL}, or "
+            "HELION_AUTOREVIEW_CLAUDE_MODEL)."
+        ),
+    )
+    parser.add_argument(
+        "--claude-effort",
+        default=os.environ.get("HELION_AUTOREVIEW_CLAUDE_EFFORT") or CLAUDE_EFFORT,
+        help=(
+            f"Claude reviewer effort (default: {CLAUDE_EFFORT}, or "
+            "HELION_AUTOREVIEW_CLAUDE_EFFORT)."
+        ),
+    )
+    parser.add_argument(
+        "--codex-model",
+        default=os.environ.get("HELION_AUTOREVIEW_CODEX_MODEL") or CODEX_MODEL,
+        help=(
+            "Codex reviewer model (default: the model your Codex is configured "
+            "with, or HELION_AUTOREVIEW_CODEX_MODEL)."
+        ),
+    )
+    parser.add_argument(
+        "--codex-effort",
+        default=os.environ.get("HELION_AUTOREVIEW_CODEX_EFFORT")
+        or CODEX_REASONING_EFFORT,
+        help=(
+            f"Codex reasoning effort (default: {CODEX_REASONING_EFFORT}, or "
+            "HELION_AUTOREVIEW_CODEX_EFFORT)."
         ),
     )
     parser.add_argument(
@@ -558,6 +684,25 @@ def main() -> int:
     if args.head and args.review_args:
         parser.error("--head cannot be used with review target arguments")
 
+    # Either reviewer is enough; a missing one is warned about, not fatal.
+    use_claude = shutil.which("claude") is not None
+    use_codex = not args.no_codex and shutil.which("codex") is not None
+    warning = None
+    if not use_claude and not use_codex:
+        reason = (
+            "the claude CLI is not installed and --no-codex was given"
+            if args.no_codex
+            else "neither the claude nor the codex CLI is installed"
+        )
+        sys.stderr.write(f"autoreview.py: {reason}; install one of them\n")
+        return 2
+    if not use_claude:
+        if args.fix:
+            parser.error("--fix needs the claude CLI, which is not installed")
+        warning = missing_reviewer_warning("claude", "Codex")
+    elif not use_codex and not args.no_codex:
+        warning = missing_reviewer_warning("codex", "Claude")
+
     review_prompt = build_review_prompt(args.head, args.review_args)
     # Include PID so two near-simultaneous runs don't share log_dir.
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
@@ -567,30 +712,40 @@ def main() -> int:
     spinner = Spinner()
     spinner.start()
     spinner.log(f"logs: {log_dir.relative_to(REPO_ROOT)}")
+    if warning:
+        spinner.log(f"autoreview.py: {warning}")
 
-    claude = ClaudeSession(log_dir / "claude.log", args.meta)
+    claude = ClaudeSession(
+        log_dir / "claude.log", args.meta, args.claude_model, args.claude_effort
+    )
     combined = ""
 
     try:
-        jobs = {"claude review": lambda: claude.send(review_prompt)}
-        if not args.no_codex:
+        jobs: dict[str, Callable[[], str]] = {}
+        if use_claude:
+            jobs["claude review"] = lambda: claude.send(review_prompt)
+        if use_codex:
             jobs["codex review"] = lambda: run_codex_review(
                 review_prompt,
                 log_dir / "codex.log",
                 args.meta,
                 no_sandbox=args.codex_no_sandbox,
                 sandbox=args.codex_sandbox,
+                model=args.codex_model,
+                effort=args.codex_effort,
             )
         results = run_parallel(spinner, jobs)
-        claude_review = results["claude review"]
-        codex_review = results.get("codex review", "")
-        codex_stripped = codex_review.strip()
-
-        (log_dir / "claude-review.txt").write_text(claude_review)
-        if not args.no_codex:
+        claude_review = results.get("claude review")
+        codex_review = results.get("codex review")
+        if claude_review is not None:
+            (log_dir / "claude-review.txt").write_text(claude_review)
+        if codex_review is not None:
             (log_dir / "codex-review.txt").write_text(codex_review)
 
-        if codex_stripped and codex_stripped != "LGTM":
+        if claude_review is None:
+            assert codex_review is not None
+            combined = codex_review
+        elif codex_review and codex_review.strip() != "LGTM":
             combine_prompt = PROMPT_COMBINE.format(codex_review=codex_review)
             combined = run_with_timing(
                 "combining", spinner, lambda: claude.send(combine_prompt)
@@ -615,12 +770,26 @@ def main() -> int:
         spinner.stop()
         if claude.session_id:
             meta_flag = "--dangerously-enable-internet-mode " if args.meta else ""
-            effort_flag = f"--effort {CLAUDE_EFFORT} "
+            model_flag = f"--model {claude.model} --effort {claude.effort} "
             sys.stderr.write(
                 f"\nresume session: claude "
-                f"{meta_flag}{effort_flag}--resume {claude.session_id}\n"
+                f"{meta_flag}{model_flag}--resume {claude.session_id}\n"
             )
+        if warning:
+            # Repeated after the review, where it cannot scroll out of sight.
+            sys.stderr.write(f"\nautoreview.py: {warning}\n")
 
+    if combined.strip() == "LGTM":
+        reviewers = [
+            name
+            for name, used in (("claude", use_claude), ("codex", use_codex))
+            if used
+        ]
+        sys.stderr.write(
+            "\nautoreview.py: the review passed; record it as the last line of "
+            "each reviewed commit's message (above any stack-info line):\n"
+            f"{passed_line(reviewers)}\n"
+        )
     return 0
 
 
