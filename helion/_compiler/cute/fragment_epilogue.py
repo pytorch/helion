@@ -488,7 +488,7 @@ def _shape_only_subscript(node: Node) -> bool:
     indices = node.args[1] if len(node.args) > 1 else None
     source_value = source.meta.get("val") if isinstance(source, Node) else None
     output_value = node.meta.get("val")
-    return (
+    return bool(
         isinstance(source_value, torch.Tensor)
         and isinstance(output_value, torch.Tensor)
         and isinstance(indices, (list, tuple))
