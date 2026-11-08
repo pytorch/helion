@@ -919,10 +919,12 @@ def enable_cute_tcgen05_search(
         # these tiles cannot fill a quarter of the SMs).
         allow_one_wave_cluster_m2_search = (
             allow_full_tile_cluster_m2_search
+            # the one-wave two-CTA tiles run whole M tiles only
+            and static_m % TCGEN05_TWO_CTA_BLOCK_M == 0
             and static_n % min(TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS) == 0
             and plan.leading_work_multiplier
-            * (static_m // TCGEN05_TWO_CTA_BLOCK_M)
-            * (static_n // TCGEN05_TWO_CTA_BLOCK_N)
+            * -(-static_m // TCGEN05_TWO_CTA_BLOCK_M)
+            * -(-static_n // TCGEN05_TWO_CTA_BLOCK_N)
             * 2
             < _cuda_num_sms_or_zero(lhs.device)
         )
@@ -961,16 +963,18 @@ def enable_cute_tcgen05_search(
             else:
                 cluster_m = TCGEN05_TWO_CTA_BLOCK_M
                 cluster_n = TCGEN05_TWO_CTA_BLOCK_N
+            # Partial last tiles run too (the persistent pair schedules clip
+            # them): a 1000x2560 GEMM is 40 256x256 pairs, not 30.
             work_clusters = (
                 plan.leading_work_multiplier
-                * (static_m // cluster_m)
-                * (static_n // cluster_n)
+                * -(-static_m // cluster_m)
+                * -(-static_n // cluster_n)
             )
             if allow_one_wave_cluster_m2_search:
                 one_wave_work_clusters = (
                     plan.leading_work_multiplier
-                    * (static_m // TCGEN05_TWO_CTA_BLOCK_M)
-                    * (static_n // min(TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS))
+                    * -(-static_m // TCGEN05_TWO_CTA_BLOCK_M)
+                    * -(-static_n // min(TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS))
                 )
                 one_wave_only_cluster_m2_search = (
                     work_clusters < num_sms // 4 <= one_wave_work_clusters

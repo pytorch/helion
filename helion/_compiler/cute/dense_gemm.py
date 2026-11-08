@@ -35,6 +35,9 @@ class DenseGemmFacts:
     capacity_bytes: int
     # The stored element type: the C ring stages it.
     output_dtype: torch.dtype
+    # B staged K-major (else N-major: each CTA's half of an N tile is one
+    # swizzled SMEM row).
+    rhs_k_major: bool
     output_column_major: bool = False
     plain_epilogue: bool = False
 
@@ -131,4 +134,5 @@ def prove_dense_gemm_facts(
         output_dtype=gemm.output.dtype,
         output_column_major=gemm.candidate.output_column_major,
         plain_epilogue=not gemm.chain.steps,
+        rhs_k_major=base.rhs_k_major,
     )

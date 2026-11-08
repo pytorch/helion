@@ -155,6 +155,7 @@ from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENTS
 from .tcgen05_constants import TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN
+from .tcgen05_constants import TCGEN05_ALIGNED_N_MN_B_ROW_BYTES
 from .tcgen05_constants import TCGEN05_ALIGNED_N_TALL_L2_GROUPINGS
 from .tcgen05_constants import TCGEN05_ALIGNED_N_TALL_PAIR_ROWS
 from .tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
@@ -6572,6 +6573,16 @@ class CuteTcgen05Config:
             not self.search_enabled
             or facts is None
             or block_m is None
+            # Each CTA stages half of an N-major B tile as one SMEM row: a
+            # row of fewer than 64-byte swizzle atoms runs the MMA's B reads
+            # at a fraction of their bandwidth (MN-major 8008x2560x4096: the
+            # 160-wide pair 0.74 of cuBLAS against 1.09 at 256; 20008x768x2048
+            # at 96: 0.66 against 0.88). 192 keeps 64-byte atoms.
+            or (
+                not facts.rhs_k_major
+                and (width // 2 * facts.input_dtype.itemsize)
+                % TCGEN05_ALIGNED_N_MN_B_ROW_BYTES
+            )
             # dense_aligned_n_plan needs a physical width that divides N and
             # pair-M tiles that divide M (the 16-bit pair: or whole K tiles,
             # its TMA store clipping the partial last tiles); skip widths

@@ -498,14 +498,62 @@ def test_default_tile_one_cta_tile_quantizes_m_into_whole_waves() -> None:
 
 
 def test_default_tile_pair_replaces_ffi_on_a_partial_wave() -> None:
-    """8192x768x3072: 96 FFI pair tiles are 1.3 waves; the 256x128 pair wins,
-    with the FFI controls off and the grouped raster for its several waves."""
+    """8192x768x3072: 96 FFI pair tiles are 1.3 waves; the aligned-N 192-wide
+    pair (128 tiles, under two waves; 0.95 -> 1.03 of cuBLAS against the
+    256x128 pair) wins, with the FFI controls off and the grouped raster for
+    its several waves."""
     config = _default_with_sms((8192, 768, 3072), 148)
-    assert config.block_sizes == [256, 128, 64]
+    assert config.block_sizes == [256, 256, 64]
+    assert config.config["tcgen05_tile_n"] == 192
     assert config.config["tcgen05_cluster_m"] == 2
     assert not config.config.get("tcgen05_tvm_ffi_launch")
     assert config.config.get("tcgen05_layout_strategy") == "default"
     assert config.config["l2_groupings"] == [TCGEN05_TWO_CTA_SEED_L2_GROUPING]
+
+
+def test_default_tile_counts_partial_tiles() -> None:
+    """1000x2560x2048: 40 256x256 pair tiles counting the partial last row.
+    30 whole ones fell below the quarter-wave gate: only the one-wave tiles,
+    which need whole M tiles, stayed on, no two-CTA seed survived and the GEMM
+    defaulted to the flat 128x16 kernel (0.11 of cuBLAS). Counted, the
+    256x256 families seed again, and one wave of 64 aligned-N 256x160 pairs
+    (0.93) beats one of 40 256x256 pairs (0.72) as the default."""
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = _plain_bind(1000, 2560, 2048)
+        state = bound.config_spec._cute_tcgen05_config
+        constraints = state.cluster_m2_search_constraints
+        assert constraints is not None and not constraints.one_wave_only
+        with bound.env:
+            assert any(
+                seed.config.get("block_sizes") == [256, 256, 64]
+                for seed in state.autotune_seed_configs()
+            )
+        config = bound.config_spec.default_config()
+    assert config.block_sizes == [256, 256, 64]
+    assert config.config["tcgen05_tile_n"] == 160
+    assert config.config["pid_type"] == "persistent_interleaved"
+
+
+def test_default_tile_keeps_the_256x128_pair() -> None:
+    """8192x1408x3072: no aligned-N width beats the 256x128 pair's waves."""
+    config = _default_with_sms((8192, 1408, 3072), 148)
+    assert config.block_sizes == [256, 128, 64]
+    assert not config.config.get("tcgen05_tile_n")
+
+
+def test_default_tile_mn_major_b_takes_192() -> None:
+    """MN-major B seeds only the 192-wide aligned-N pair (whole 64-byte
+    swizzle rows): 20008x768x2048 defaults to it."""
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = plain_mm._bind_isolated(
+            (
+                torch.empty((20008, 2048), dtype=torch.bfloat16),
+                torch.empty((2048, 768), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+    assert config.block_sizes == [256, 256, 64]
+    assert config.config["tcgen05_tile_n"] == 192
 
 
 def test_default_tile_keeps_ffi_on_whole_waves() -> None:
