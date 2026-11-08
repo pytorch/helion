@@ -700,6 +700,18 @@ def tcgen05_rowvec_stage_smem_bytes(
     return total
 
 
+def tcgen05_partial_output_row_stage_smem_bytes(
+    *, rows: tuple[Tcgen05RowvecAuxRow, ...], bn: int
+) -> int:
+    """An upper bound on the per-CTA SMEM of the partial-output TMA store's row
+    stages for an N tile of ``bn``: each row-vector operand at its own dtype
+    (``store_epilogue``'s ``stage_partial_tma_rowvec`` stages those its predicated
+    copy covers, promoted or not; boolean masks and rows off the 128-bit copy
+    width read behind the full-tile guard instead, and the facts count every
+    tcgen05 matmul's rows)."""
+    return sum(bn * row.itemsize for row in rows)
+
+
 def tcgen05_two_cta_edge_k_tail_seed_overrides() -> dict[str, object]:
     """Return the measured CtaGroup.TWO edge+K-tail seed/fixup knobs."""
     return {
