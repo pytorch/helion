@@ -10113,6 +10113,104 @@ class TestMetalLaneFoldRewrite(unittest.TestCase):
                 unroll_lane_folds(ast.parse(source).body, names_read)
 
 
+@helion.kernel(backend="metal", static_shapes=True)
+def add_into(x: torch.Tensor, y: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def double_in_place(x: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.size(0)):
+        x[tile] = x[tile] * 2
+    return x
+
+
+@helion.kernel(backend="metal", static_shapes=False)
+def prefix_or(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """x where it reaches, y past its end: x's loads are all masked off
+    when x is empty."""
+    m = x.size(0)
+    out = torch.empty_like(y)
+    for tile in hl.tile(y.size(0)):
+        valid = tile.index < m
+        xv = hl.load(x, [tile], extra_mask=valid)
+        out[tile] = torch.where(valid, xv, y[tile])
+    return out
+
+
+@_requires_darwin
+class TestMetalMaskedLoads(unittest.TestCase):
+    """A masked load reads unconditionally, at element 0 when masked off,
+    and selects its fill afterwards, unless its tensor is empty, written by
+    the kernel or sharing storage with another argument."""
+
+    def test_tail(self) -> None:
+        x, y = (torch.randn(1000, device=DEVICE) for _ in range(2))
+        out, _, msl = _run_with_msl(
+            vector_add, (x, y), helion.Config(block_sizes=[256])
+        )
+        self.assertIn("inline auto _helion_masked(", msl)
+        self.assertIn("_helion_masked(x[(mask_0 ? indices_0 : 0)], mask_0, 0)", msl)
+        torch.testing.assert_close(out, x + y, atol=0, rtol=0)
+
+    def test_written_tensor_loads_conditionally(self) -> None:
+        """A tensor the kernel also stores to keeps its loads under their
+        mask: a masked-off lane reading element 0 would race the thread
+        that writes it."""
+        x = torch.randn(1000, device=DEVICE)
+        expected = x * 2
+        _, _, msl = _run_with_msl(
+            double_in_place, (x,), helion.Config(block_sizes=[256])
+        )
+        self.assertNotIn("_helion_masked(", msl)
+        self.assertIn("(mask_0 ? x[indices_0] : (0))", msl)
+        torch.testing.assert_close(x, expected, atol=0, rtol=0)
+
+    def test_aliased_tensor_loads_conditionally(self) -> None:
+        """A tensor passed again as the output keeps its loads under their
+        mask: the in-place call races element 0 just as a store would.  The
+        launch plan keys on the aliasing, so the module compiled for distinct
+        tensors compiles again."""
+        x = torch.randn(1000, device=DEVICE)
+        y = torch.randn(1000, device=DEVICE)
+        out = torch.empty_like(x)
+        code = add_into.bind((x, y, out)).to_code(helion.Config(block_sizes=[256]))
+        module = PyCodeCache.load(code)
+        (jit,) = [o for o in vars(module).values() if isinstance(o, _MetalKernel)]
+        for aliased in (False, True):
+            with self.subTest(aliased=aliased):
+                dst = x.clone() if aliased else out
+                src = dst if aliased else x
+                expected = src + y
+                module.add_into(src, y, dst)
+                assert jit.msl_source is not None
+                self.assertEqual("_helion_masked(x[" in jit.msl_source, not aliased)
+                torch.testing.assert_close(dst, expected, atol=0, rtol=0)
+
+    def test_empty_tensor_loads_conditionally(self) -> None:
+        """An empty x has no element 0, so its loads stay under their mask.
+        The launch plan keys on emptiness: the module compiled for a 5-long x
+        compiles again for an empty one instead of reusing the shader."""
+        y = torch.randn(70, device=DEVICE)  # a masked tail tile
+        code = prefix_or.bind((torch.randn(5, device=DEVICE), y)).to_code(
+            helion.Config(block_sizes=[32])
+        )
+        module = PyCodeCache.load(code)
+        (jit,) = [o for o in vars(module).values() if isinstance(o, _MetalKernel)]
+        for m in (5, 0):
+            with self.subTest(m=m):
+                x = torch.randn(m, device=DEVICE)
+                out = module.prefix_or(x, y)
+                assert jit.msl_source is not None
+                self.assertEqual("_helion_masked(x[" in jit.msl_source, m > 0)
+                self.assertIn("_helion_masked(y[", jit.msl_source)
+                expected = y.clone()
+                expected[:m] = x
+                torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
 # ---------------------------------------------------------------------------
 # Kernel definitions - hl.arange over a block size that no loop owns
 # ---------------------------------------------------------------------------

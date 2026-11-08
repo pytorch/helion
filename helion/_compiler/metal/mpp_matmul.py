@@ -111,6 +111,8 @@ from .lane_fold import LaneArrayBudget
 from .lane_fold import LaneJam
 from .lane_fold import const_extent
 from .lane_fold import folded_lanes
+from .lane_fold import load_mask_other
+from .lane_fold import tl_load
 from .msl_expr import PURE_CALLS
 from .msl_reduction import REDUCTION_NAMESPACE
 from .reduction import alloc_threadgroup_buffer
@@ -4181,7 +4183,7 @@ def _defines(s: ast.AST) -> set[str]:
 def _loaded(s: ast.AST) -> set[str]:
     """The names the pointers of a statement's ``tl.load`` calls read."""
     return set().union(
-        *(names_read(load.args[0]) for node in ast.walk(s) if (load := _tl_load(node)))
+        *(names_read(load.args[0]) for node in ast.walk(s) if (load := tl_load(node)))
     )
 
 
@@ -4346,30 +4348,6 @@ def _is_lane_loop(s: ast.stmt) -> TypeGuard[ast.For]:
     )
 
 
-def _tl_load(node: ast.AST) -> ast.Call | None:
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "tl"
-        and node.func.attr == "load"
-    ):
-        return node
-    return None
-
-
-def _load_mask_other(load: ast.Call) -> tuple[ast.expr, ast.expr] | None:
-    """The mask and fill value of ``tl.load(ptr, mask, other=...)``, or None
-    for an unmasked load."""
-    mask = load.args[1]
-    if isinstance(mask, ast.Constant) and mask.value is None:
-        return None
-    other = load.args[2] if len(load.args) > 2 else None
-    other = next((k.value for k in load.keywords if k.arg == "other"), other)
-    assert other is not None
-    return mask, other
-
-
 def _loads_first_all(
     stmts: list[ast.stmt],
     split: list[ast.For],
@@ -4455,7 +4433,7 @@ def _loads_first(
     decls: list[ast.stmt] = []
     for i, s in enumerate(body):
         assigned = _assigned(s)
-        if assigned is None or (load := _tl_load(assigned[1])) is None:
+        if assigned is None or (load := tl_load(assigned[1])) is None:
             continue
         # Helion spells every load's pointer ``<tensor> + <offset>``.
         ptr = load.args[0]
@@ -4478,7 +4456,7 @@ def _loads_first(
                     f"{DTYPE_TO_METAL[tensor_dtypes[tensor]]!r}, {lanes})"
                 )
             )
-    loads = sum(1 for s in body for node in ast.walk(s) if _tl_load(node))
+    loads = sum(1 for s in body for node in ast.walk(s) if tl_load(node))
     if not moved or len(moved) < loads:
         return [loop]
     first: list[ast.stmt] = []
@@ -4491,17 +4469,18 @@ def _loads_first(
             continue
         array = moved[i]
         name, value = cast("tuple[str, ast.expr]", _assigned(s))
-        load = cast("ast.Call", _tl_load(value))
+        load = cast("ast.Call", tl_load(value))
         first += [
             s,
             statement_from_string(f"{LANE_PUT}({array}, {lane}, {name})"),
         ]
         read = f"_metal_lane_get({array}, {lane})"
-        masked = _load_mask_other(load)
+        masked = load_mask_other(load)
         if masked is None:
             second.append(statement_from_string(f"{name} = {read}"))
             continue
         mask, other = masked
+        assert other is not None
         # The array holds ``mask ? x : other``; the select keeps the load's
         # own MSL type.
         second.append(
