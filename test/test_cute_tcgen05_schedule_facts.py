@@ -33,10 +33,13 @@ from helion._compiler.cute.tcgen05_schedule_facts import (
 from helion._compiler.cute.tcgen05_schedule_facts import prove_full_tile_schedule_facts
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import atomic_output_mm
+from helion._testing.cute_dense_tcgen05 import bias_mm_into
 from helion._testing.cute_dense_tcgen05 import blackwell_capability
 from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
 from helion._testing.cute_dense_tcgen05 import extra_store_mm
 from helion._testing.cute_dense_tcgen05 import plain_mm
+from helion._testing.cute_dense_tcgen05 import plain_mm_into
 from helion._testing.cute_dense_tcgen05 import scaled_args
 from helion._testing.cute_dense_tcgen05 import scaled_mm
 from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
@@ -554,6 +557,111 @@ def test_default_tile_mn_major_b_takes_192() -> None:
         config = bound.config_spec.default_config()
     assert config.block_sizes == [256, 256, 64]
     assert config.config["tcgen05_tile_n"] == 192
+
+
+@pytest.mark.parametrize(
+    ("n", "placement", "tma_store"),
+    (
+        # 32 x 38 pair tiles: 17 per CTA pair
+        (9536, "post_acc_wait", True),
+        # 32 x 9: 4 per pair
+        (2112, "pre_acc_wait", False),
+    ),
+)
+def test_default_tile_bias_row_takes_the_tma_store_on_many_tiles(
+    n: int, placement: str, tma_store: bool
+) -> None:
+    """On an output edge, a ``pre_acc_wait`` bias row keeps every tile on the
+    SIMT store; from 16 tiles per CTA pair on the default takes
+    ``post_acc_wait``, which stores the full tiles through TMA (16384x30528x768
+    + bias: 0.63 -> 0.92 of cuBLAS; 32768x576x192, 6 tiles per pair, runs
+    0.50 on the SIMT store and 0.29 on TMA)."""
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = bias_mm_into._bind_isolated(
+            (
+                torch.empty((8192, 768), dtype=torch.bfloat16),
+                torch.empty((768, n), dtype=torch.bfloat16),
+                torch.empty((n,), dtype=torch.bfloat16),
+                torch.empty((8192, n), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+        code = bound.to_code(config)
+    assert config.block_sizes == [256, 256, 64]
+    assert config.config["tcgen05_aux_load_placement"] == placement
+    assert ("tcgen05_tma_store_atom" in code) == tma_store
+
+
+def _k_tail_bind(m: int, n: int, k: int) -> BoundKernel:
+    return plain_mm_into._bind_isolated(
+        (
+            torch.empty((m, k), dtype=torch.bfloat16),
+            torch.empty((n, k), dtype=torch.bfloat16).T,
+            torch.empty((m, n), dtype=torch.float32),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("shape", "family"),
+    (
+        # whole M and N, a K no 64-deep tile divides (Blenderbot's 8008)
+        ((2048, 2560, 8008), True),
+        # ragged in both M and N with a K tail: the family's own shapes
+        ((3000, 3000, 3000), True),
+        # a single ragged edge with a K tail: outside the validated runtime
+        ((1000, 2560, 8008), False),
+        # whole K: the dense families
+        ((2048, 2560, 8000), False),
+    ),
+)
+def test_k_tail_shapes_take_the_edge_k_tail_family(
+    shape: tuple[int, int, int], family: bool
+) -> None:
+    """A K tail on whole M and N tiles runs the edge + K-tail CtaGroup.TWO
+    family (bf16 2048x2560x8008: 0.92 of cuBLAS on its 256x256x64 seed, 0.75
+    on the flat winner), and the autotune-off default promotes that seed
+    instead of the flat 128x16 kernel (0.08)."""
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = _k_tail_bind(*shape)
+        state = bound.config_spec._cute_tcgen05_config
+        constraints = state.cluster_m2_search_constraints
+        config = bound.config_spec.default_config()
+    assert (constraints is not None and constraints.allow_edge_k_tail_family) == family
+    if family:
+        assert config.block_sizes == [256, 256, 64]
+        assert config.config["tcgen05_persistence_model"] == "clc_persistent"
+        # the family's deep bk=64 ring, as normalization keeps it
+        assert config.config["tcgen05_ab_stages"] == 5
+
+
+def test_edge_k_tail_default_needs_the_dense_gemm_body() -> None:
+    """The family's default promotes only a plain dense GEMM body: an atomic
+    beside the warp roles keeps the flat default."""
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = atomic_output_mm._bind_isolated(
+            (
+                torch.empty((3000, 3000), dtype=torch.bfloat16),
+                torch.empty((3000, 3000), dtype=torch.bfloat16),
+                torch.zeros((1,), dtype=torch.int32),
+            )
+        )
+        config = bound.config_spec.default_config()
+    assert config.config.get("tcgen05_persistence_model") != "clc_persistent"
+
+
+def test_edge_k_tail_cluster_n2_seed_needs_even_n_tiles() -> None:
+    """The family's 4-CTA seed pairs N tiles: 1100 columns are 5 tiles of
+    256, which the cluster refuses."""
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = _k_tail_bind(1100, 1100, 3000)
+        state = bound.config_spec._cute_tcgen05_config
+        with bound.env:
+            seeds = state.autotune_seed_configs()
+    assert state.cluster_m2_search_constraints is not None
+    assert state.cluster_m2_search_constraints.allow_edge_k_tail_family
+    assert seeds
+    assert all(seed.config.get("tcgen05_cluster_n") != 2 for seed in seeds)
 
 
 def test_default_tile_keeps_ffi_on_whole_waves() -> None:

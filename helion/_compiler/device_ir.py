@@ -4151,7 +4151,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                                 allow_leading_passthrough=(
                                     candidate.operands.has_leading_passthrough
                                 ),
-                                allow_fp8_broadcasts=(
+                                allow_broadcasts=(
                                     len(device_ir.root_ids) == 1
                                     and env.cute_fission_plan is None
                                 ),

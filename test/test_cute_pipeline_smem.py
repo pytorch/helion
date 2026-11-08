@@ -10,11 +10,15 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.cute.aux_tensor import _tcgen05_aux_detector_mma_nodes
 from helion._compiler.cute.cute_mma import _tcgen05_use_2cta_instrs
+from helion._compiler.cute.cute_mma import analyze_cute_mma_node
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
+from helion._compiler.cute.pipeline_smem import analyze_pipeline_smem_facts
 from helion._compiler.cute.pipeline_smem import max_pipeline_ab_stages
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute.tcgen05_constants import Tcgen05RowvecAuxRow
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_codegen import forbid_cuda_work
@@ -279,13 +283,10 @@ def test_pair_cluster_n2_is_a_modelled_paired_configuration() -> None:
     assert "CtaGroup.TWO" in source
 
 
-@pytest.mark.parametrize("other", ("bias", "fanout", "no_capacity"))
+@pytest.mark.parametrize("other", ("fanout", "no_capacity"))
 def test_unknown_allocations_keep_conservative_profile(other: str) -> None:
     a, b, out = args = _args()
-    if other == "bias":
-        bias = torch.empty(b.shape[1], dtype=a.dtype)
-        bound = _biased_gemm._bind_isolated((a, b, bias, out))
-    elif other == "fanout":
+    if other == "fanout":
         second = torch.empty_like(out)
         bound = _fanout_gemm._bind_isolated((a, b, out, second))
     else:
@@ -302,6 +303,89 @@ def test_unknown_allocations_keep_conservative_profile(other: str) -> None:
     )
     with pytest.raises(helion.exc.InvalidConfig):
         bound.to_code(_config())
+
+
+@pytest.mark.parametrize("placement", ("post_acc_wait", "pre_acc_wait"))
+def test_bias_row_epilogue_keeps_the_paired_pipeline(placement: str) -> None:
+    """A 16-bit bias row (``bias[col]``, an N-broadcast) loads per subtile
+    under ``post_acc_wait`` and stages through one row of shared memory under
+    ``pre_acc_wait``, which the allocation proof charges: the paired pipeline,
+    and with it the autotune-off default tile, reach Inductor's addmm
+    epilogues (bf16 16384x30528x768 + bias defaulted to the flat 128x16
+    kernel without the proof)."""
+    a, b, out = _args()
+    bias = torch.empty(b.shape[1], dtype=a.dtype)
+    bound = _biased_gemm._bind_isolated((a, b, bias, out))
+    config = bound.config_spec._cute_tcgen05_config
+    facts = config.pipeline_smem_facts
+    assert facts is not None and facts.has_auxiliary_loads
+    # the row only the FP32 root ``acc + bias`` reads stages promoted to FP32
+    assert facts.rows == (Tcgen05RowvecAuxRow(itemsize=2, promoted=True),)
+    assert config.paired_pipeline_search_enabled()
+    stages = {
+        seed.config["tcgen05_aux_load_placement"]: seed.config["tcgen05_ab_stages"]
+        for seed in config._paired_pipeline_seed_configs()
+        if seed.config["block_sizes"] == [256, 256, 64]
+        and seed.config["tcgen05_ab_stages"] > 2
+    }
+    # ``pre_acc_wait`` is priced at the (128, 64) C subtile plus the row:
+    # codegen takes the (128, 32) subtile for a promoted row only on facts
+    # the model does not see (``tcgen05_promoted_rowvec_epilogue``), so the
+    # model stays one stage conservative rather than over-admit a ring
+    assert stages == {"post_acc_wait": 6, "pre_acc_wait": 5}
+    code = bound.to_code(
+        _config(
+            block_sizes=[256, 256, 64],
+            tcgen05_ab_stages=stages[placement],
+            tcgen05_aux_load_placement=placement,
+        )
+    )
+    assert "CtaGroup.TWO" in code
+
+
+def test_bias_rows_record_their_width_and_columns_decline() -> None:
+    """An FP32 bias row on a 16-bit GEMM stages unpromoted, four bytes a
+    column; a broadcast column (``scale[row]``) has no modeled stage and
+    still declines the proof; an explicit (1, N) row needs no stage."""
+    a, b, out = _args()
+    bias = torch.empty(b.shape[1], dtype=torch.float32)
+    facts = _biased_gemm._bind_isolated(
+        (a, b, bias, out)
+    ).config_spec._cute_tcgen05_config.pipeline_smem_facts
+    assert facts is not None
+    assert facts.rows == (Tcgen05RowvecAuxRow(itemsize=4, promoted=False),)
+    column = torch.empty(a.shape[0], 1, dtype=a.dtype).expand_as(out)
+    bound = _masked_gemm._bind_isolated((a, b, column, out))
+    assert bound.config_spec._cute_tcgen05_config.pipeline_smem_facts is None
+    # an explicit (1, N) row is read in place: no stage to charge
+    row = torch.empty(1, out.shape[1], dtype=a.dtype)
+    facts = _masked_gemm._bind_isolated(
+        (a, b, row, out)
+    ).config_spec._cute_tcgen05_config.pipeline_smem_facts
+    assert facts is not None and facts.has_auxiliary_loads
+    assert facts.rows == () and facts.exact_aux_count == 0
+
+
+def test_other_pipeline_analyzer_callers_refuse_bias_rows() -> None:
+    """Only the single-root launch, whose stage limit prices the
+    ``pre_acc_wait`` row stage, admits a 16-bit bias row: a materialized
+    region's limits price no placement and would over-admit the ring."""
+    a, b, out = _args()
+    bias = torch.empty(b.shape[1], dtype=a.dtype)
+    bound = _biased_gemm._bind_isolated((a, b, bias, out))
+    ir = bound.host_function.device_ir
+    node = next(iter(_tcgen05_aux_detector_mma_nodes(ir.graphs)))
+    with bound.env, bound.host_function:
+        candidate = analyze_cute_mma_node(node, device_ir=ir)
+    assert candidate is not None
+    assert (
+        analyze_pipeline_smem_facts(candidate, node, ir.graphs, capacity_bytes=232448)
+        is None
+    )
+    facts = analyze_pipeline_smem_facts(
+        candidate, node, ir.graphs, capacity_bytes=232448, allow_broadcasts=True
+    )
+    assert facts is not None and len(facts.rows) == 1
 
 
 def test_column_major_output_prices_its_actual_store_ring() -> None:
@@ -385,8 +469,8 @@ def test_exact_shape_auxiliary_epilogue_keeps_the_paired_pipeline(
     residual) loads it per subtile into registers: no shared memory beyond
     the one-ring budget, so the complete allocation proof and the two-CTA
     paired pipeline (both auxiliary placements seeded) stay available.
-    Broadcast rows (``bias[col]``) still decline the proof (see
-    ``test_unknown_allocations_keep_conservative_profile``)."""
+    Broadcast rows (``bias[col]``) keep it too
+    (``test_bias_row_epilogue_keeps_the_paired_pipeline``)."""
     a, b, out = _args()
     mask = torch.empty_like(out)
     bound = _masked_gemm._bind_isolated((a, b, mask, out))

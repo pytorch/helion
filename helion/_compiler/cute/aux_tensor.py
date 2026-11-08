@@ -35,8 +35,8 @@ from ..compile_environment import CompileEnvironment
 from .cute_epilogue import Tcgen05UnaryEpilogueChain
 from .cute_epilogue import _AuxiliaryTensorLoadExpr
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
-from .cute_epilogue import aux_leaf_promoted_by_f32_root
 from .cute_epilogue import aux_leaf_takes_promoted_f32_stage
+from .cute_epilogue import tcgen05_rowvec_aux_row
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import reach_matmul_anchors
 from .tcgen05_constants import Tcgen05RowvecAuxFacts
@@ -480,13 +480,8 @@ def host_function_tcgen05_rowvec_aux_facts(
                 host_val = host_tensor.meta.get("val")
                 if not isinstance(host_val, torch.Tensor):
                     return None
-                itemsize = host_val.dtype.itemsize
                 rows.append(
-                    Tcgen05RowvecAuxRow(
-                        itemsize=itemsize,
-                        promoted=itemsize == 2
-                        and aux_leaf_promoted_by_f32_root(chain, leaf),
-                    )
+                    tcgen05_rowvec_aux_row(chain, leaf, host_val.dtype.itemsize)
                 )
     if output_itemsize is None:
         return None

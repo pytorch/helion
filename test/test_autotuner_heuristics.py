@@ -10991,28 +10991,25 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertTrue(residual_tcfg.exact_shape_aux_kernel_detected)
 
         # The plain output has an exact allocation proof for deeper paired-CTA
-        # pipelines. Auxiliary loads keep the legacy fragment, whose high is
-        # the operand dtype's deep-ring cap (12 for 16-bit operands: the
-        # one-wave 256x64x64 ring runs 9 stages, the one-CTA 128x64x64 ring
-        # 8); the separate AB/source-C budget checks below decide what fits.
+        # pipelines, and so do the bias and residual epilogues below; the
+        # separate AB/source-C budget checks below decide what fits.
         self.assertTrue(plain_tcfg.paired_pipeline_search_enabled())
         self.assertEqual(
             plain_tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"].high,
             TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
         )
-        # The broadcast (rowvec) bias keeps the legacy fragment: no allocation
-        # proof, the dtype hard cap. An exact-shape 16-bit auxiliary load is a
+        # The broadcast (rowvec) bias records its row in the allocation proof
+        # (a ``pre_acc_wait`` row stage the model charges) and takes the
+        # budget-aware ring. An exact-shape 16-bit auxiliary load is a
         # register-resident SIMT load that takes no shared memory, so the
         # residual kernel keeps the complete allocation proof (facts that record
         # the auxiliary loads) and the same budget-aware ring as the plain GEMM.
-        self.assertIsNone(bias_tcfg.pipeline_smem_facts)
-        bias_ab_fragment = bias_tcfg.optional_fragments(for_search=True)[
-            "tcgen05_ab_stages"
-        ]
+        self.assertIsNotNone(bias_tcfg.pipeline_smem_facts)
+        self.assertEqual(len(bias_tcfg.pipeline_smem_facts.rows), 1)
         self.assertEqual(
-            bias_ab_fragment.high, CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2)
+            bias_tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"].high,
+            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
         )
-        self.assertEqual(bias_ab_fragment.high, 12)
         self.assertIsNotNone(residual_tcfg.pipeline_smem_facts)
         self.assertTrue(residual_tcfg.pipeline_smem_facts.has_auxiliary_loads)
         self.assertEqual(

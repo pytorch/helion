@@ -14805,12 +14805,16 @@ class TestCuteBackend(TestCase):
         x = torch.empty((2048, 4096), device=DEVICE, dtype=torch.float16)
         y = torch.empty((4096, 2048), device=DEVICE, dtype=torch.float16)
         bias = torch.empty(2048, device=DEVICE, dtype=torch.float16)
+        # The paired-pipeline family (persistent_blocked; the allocation
+        # proof covers the bias row) seeds every tile beside these; the
+        # static 2x2 family is the persistent_interleaved one.
         seeds = [
             seed.config
             for seed in cute_matmul_mma_epilogue.bind(
                 (x, y, bias)
             ).config_spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
+            and seed.config["pid_type"] != "persistent_blocked"
         ]
         staged = sorted(
             (seed["block_sizes"][1], seed["block_sizes"][2], seed["tcgen05_ab_stages"])
@@ -14850,7 +14854,15 @@ class TestCuteBackend(TestCase):
             ),
         ):
             spec = cute_matmul_mma_epilogue.bind((x, y, bias)).config_spec
-            seeds = [dict(seed.config) for seed in spec.autotune_seed_configs()]
+            # The paired-pipeline family (persistent_blocked) seeds every
+            # tile, 256x256 pairs included, as it does for a plain GEMM; the
+            # allocation proof covers the bias row. The families below are
+            # the one-wave-gated ones.
+            seeds = [
+                dict(seed.config)
+                for seed in spec.autotune_seed_configs()
+                if seed.config.get("pid_type") != "persistent_blocked"
+            ]
             tiles = {
                 (
                     tuple(seed["block_sizes"]),
@@ -14917,7 +14929,11 @@ class TestCuteBackend(TestCase):
             y = torch.empty((4096, 2048), device=DEVICE, dtype=torch.float16)
             bias = torch.empty(2048, device=DEVICE, dtype=torch.float16)
             spec = cute_matmul_mma_epilogue.bind((x, y, bias)).config_spec
-            seeds = [dict(seed.config) for seed in spec.autotune_seed_configs()]
+            seeds = [
+                dict(seed.config)
+                for seed in spec.autotune_seed_configs()
+                if seed.config.get("pid_type") != "persistent_blocked"
+            ]
             constraints = spec._tcgen05_cluster_m2_search_constraints
         assert constraints is not None
         self.assertFalse(constraints.one_wave_only)
@@ -15295,26 +15311,38 @@ class TestCuteBackend(TestCase):
             for seed in spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
         ]
-        staged = sorted(
-            (
-                seed["block_sizes"][1],
-                seed["block_sizes"][2],
-                seed["tcgen05_ab_stages"],
-                seed.get("tcgen05_aux_load_placement"),
+
+        def staged(pid_type: str) -> list[tuple[object, ...]]:
+            return sorted(
+                (
+                    seed["block_sizes"][1],
+                    seed["block_sizes"][2],
+                    seed["tcgen05_ab_stages"],
+                    seed.get("tcgen05_aux_load_placement"),
+                )
+                for seed in seeds
+                if seed["pid_type"] == pid_type
             )
-            for seed in seeds
-        )
+
         # The multi-tile 256x128 pair seed keeps the stage next to its
         # 8-deep ring: at bn=128 the row stage and the (128, 64) C ring are
         # half the 256-wide seeds' and fit beside 8 x 24 KiB of AB stages.
         self.assertEqual(
-            staged,
+            staged("persistent_interleaved"),
             [
                 (128, 64, 8, "pre_acc_wait"),
                 (256, 64, 5, "pre_acc_wait"),
                 (256, 128, 3, None),
             ],
         )
+        # The paired-pipeline family (persistent_blocked; the allocation
+        # proof covers the row) seeds each 2x2 tile at the deepest ring the
+        # same model fits for each placement: the row stage takes one AB
+        # stage of the 256x256x64 tile under pre_acc_wait.
+        paired = staged("persistent_blocked")
+        self.assertIn((256, 64, 5, "pre_acc_wait"), paired)
+        self.assertIn((256, 64, 6, "post_acc_wait"), paired)
+        self.assertNotIn((256, 64, 6, "pre_acc_wait"), paired)
         tcgen05 = spec._cute_tcgen05_config
         facts = tcgen05.rowvec_aux_facts
         assert facts is not None
@@ -15371,6 +15399,7 @@ class TestCuteBackend(TestCase):
             )
             for seed in chain_spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
+            and seed.config["pid_type"] != "persistent_blocked"
         )
         self.assertEqual(
             chain_seeds,

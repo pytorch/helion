@@ -304,15 +304,25 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
                 bound(a, b, bias), expected, rtol=1e-2, atol=1e-1
             )
 
-    def test_k_tail_only_gemm_keeps_the_one_cta_search(self) -> None:
-        # Only M and N fringes qualify for the edge family; a K tail alone
-        # stays on the one-CTA surface (its own TMA zero-fill handles it).
+    def test_k_tail_on_whole_tiles_runs_the_edge_family(self) -> None:
+        # A 16-bit K tail on whole M and N tiles runs the edge + K-tail
+        # family's pairs (TMA zero-fills past K; nothing is clipped): its
+        # cluster_m=2 seeds compile and match torch.
         a = torch.randn(1024, 1000, device=DEVICE, dtype=torch.bfloat16)
         b = torch.randn(1000, 1024, device=DEVICE, dtype=torch.bfloat16)
         bound = _gemm.bind((a, b))
-        self.assertEqual(
-            bound.config_spec._cute_tcgen05_config.cluster_m_search_choices, (1,)
-        )
+        state = bound.config_spec._cute_tcgen05_config
+        self.assertIn(2, state.cluster_m_search_choices)
+        seeds = [
+            seed
+            for seed in bound.config_spec.compiler_seed_configs
+            if seed.get("tcgen05_cluster_m") == 2
+        ]
+        self.assertTrue(seeds)
+        expected = (a.float() @ b.float()).to(a.dtype)
+        for seed in seeds:
+            bound.set_config(seed)
+            torch.testing.assert_close(bound(a, b), expected, rtol=1e-2, atol=1e-1)
 
 
 if __name__ == "__main__":
