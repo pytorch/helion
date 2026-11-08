@@ -38,6 +38,7 @@ import torch
 
 from ... import exc
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
+from .fma_fusion import fuse_multiply_adds
 from .lane_fold import unroll_lane_folds
 from .msl_ast_walker import MASKED_LOAD
 from .msl_ast_walker import MASKED_LOAD_PREAMBLE
@@ -259,6 +260,19 @@ def _generate_msl(
         referenced,
         reduction_sites,
         required_threads_per_threadgroup,
+    )
+    body_stmts = fuse_multiply_adds(
+        body_stmts,
+        {
+            **{n: DTYPE_TO_METAL[d] for n, d in tensor_dtypes.items()},
+            **{n: dtype for n, dtype, _ in threadgroup_buffers},
+            **by_value,
+            **{
+                n: "float" if type(a) is float else "int"
+                for n, a in zip(param_names, args, strict=True)
+                if n not in by_value and type(a) in (int, float)
+            },
+        },
     )
     shared = _shared_storage(args)
     body_stmts = select_masked_loads(

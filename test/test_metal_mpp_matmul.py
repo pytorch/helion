@@ -800,6 +800,22 @@ def plain_g(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(**S)
+def epilogue_fma(
+    x: torch.Tensor, y: torch.Tensor, s: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    """An epilogue whose float multiply-adds metal_jit fuses into fmas."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tm, tn] = b[tm, tn] * s[tn] + b[tm, tn] + acc * s[tn]
+    return out
+
+
+@helion.kernel(**S)
 def epilogue(
     x: torch.Tensor, y: torch.Tensor, b: torch.Tensor, c: torch.Tensor
 ) -> torch.Tensor:
@@ -4325,6 +4341,24 @@ class TestMppMatmul(_MppCase):
             self._assert_mpp(code)
             self.assertNotIn("_mpp_mat", msl)
             self.assertNotIn("_mpp_vec", msl)
+
+    def test_epilogue_fma(self) -> None:
+        """metal_jit's fma fusion inside an MPP kernel's element loop keeps
+        its results."""
+        x = torch.randn(48, 72, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(72, 40, device=DEVICE, dtype=torch.float16)
+        s = torch.randn(40, device=DEVICE)
+        b = torch.randn(48, 40, device=DEVICE)
+        sd, bd = s.cpu().double(), b.cpu().double()
+        ref = bd * sd + bd + _mm(x, y) * sd
+        for config in (
+            helion.Config(block_sizes=[16, 16, 16]),
+            helion.Config(block_sizes=[32, 32, 16], num_threads=[8, 8, 1]),
+        ):
+            out, code, msl = _run(epilogue_fma, (x, y, s, b), config)
+            _close(out, ref)
+            self._assert_mpp(code)
+            self.assertIn("metal::fma(", msl)
 
     def test_transposed_operands(self) -> None:
         x = torch.randn(48, 72, device=DEVICE, dtype=torch.float16)
