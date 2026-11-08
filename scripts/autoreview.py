@@ -10,6 +10,14 @@ Usage:
     scripts/autoreview.py --fix            # ask claude to fix the reported issues
     scripts/autoreview.py --fix --add      # also `git add` modified files after fixing
     scripts/autoreview.py --meta           # add Meta-internal launcher flags
+    scripts/autoreview.py --claude-model fable --claude-effort max   # deeper review
+
+Reviewer models and efforts (flags, or the environment variables in brackets):
+    claude: --claude-model opus [HELION_AUTOREVIEW_CLAUDE_MODEL], an alias for the
+            latest Opus, and --claude-effort xhigh [HELION_AUTOREVIEW_CLAUDE_EFFORT]
+    codex:  --codex-model [HELION_AUTOREVIEW_CODEX_MODEL], unset by default so the
+            model configured in ~/.codex/config.toml (or Codex's default) is used,
+            and --codex-effort xhigh [HELION_AUTOREVIEW_CODEX_EFFORT]
 """
 
 from __future__ import annotations
@@ -37,7 +45,15 @@ if TYPE_CHECKING:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOGS_BASE = REPO_ROOT / ".logs" / "autoreview"
 META_MARKER = Path("/usr/local/bin/claude_code/api-key-helper")
-CLAUDE_EFFORT = "max"
+# Defaults for the reviewers. The review must not depend on whichever model
+# and effort a contributor last picked interactively, so Claude gets a model
+# alias that tracks the latest Opus (available to every Claude Code user) and an
+# explicit effort. Codex has no aliases and its model names vary by account and
+# provider, so its model stays whatever the contributor's Codex is configured
+# with unless one is given; its effort is explicit.
+CLAUDE_MODEL = "opus"
+CLAUDE_EFFORT = "xhigh"
+CODEX_MODEL = ""
 CODEX_REASONING_EFFORT = "xhigh"
 
 
@@ -315,9 +331,17 @@ class Spinner:
 class ClaudeSession:
     """Multi-turn Claude session driven by `claude -p` and `--resume <id>`."""
 
-    def __init__(self, log_path: Path, meta: bool) -> None:
+    def __init__(
+        self,
+        log_path: Path,
+        meta: bool,
+        model: str = CLAUDE_MODEL,
+        effort: str = CLAUDE_EFFORT,
+    ) -> None:
         self.log_path = log_path
         self.meta = meta
+        self.model = model
+        self.effort = effort
         self.session_id: str | None = None
         self.log_path.write_text("")
 
@@ -327,8 +351,10 @@ class ClaudeSession:
             cmd.append("--dangerously-enable-internet-mode")
         cmd += [
             "--dangerously-skip-permissions",
+            "--model",
+            self.model,
             "--effort",
-            CLAUDE_EFFORT,
+            self.effort,
             "-p",
             prompt,
             "--output-format",
@@ -377,6 +403,8 @@ def run_codex_review(
     meta: bool,
     no_sandbox: bool = False,
     sandbox: str = "read-only",
+    model: str = CODEX_MODEL,
+    effort: str = CODEX_REASONING_EFFORT,
 ) -> str:
     """Run codex one-shot, return the last message text. Codex only ever
     reviews — fixes are performed by the claude session — so by default the
@@ -401,13 +429,15 @@ def run_codex_review(
         cmd.append("--dangerously-disable-linux-sandbox")
     cmd += [
         "-c",
-        f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
+        f'model_reasoning_effort="{effort}"',
         "exec",
         # danger-full-access avoids the sandbox launcher path entirely when
         # bubblewrap is unavailable; the requested sandbox otherwise.
         "-s",
         "danger-full-access" if no_sandbox else sandbox,
     ]
+    if model:
+        cmd += ["-m", model]
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tf:
         out_path = Path(tf.name)
     try:
@@ -485,7 +515,9 @@ def run_parallel(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "review_args",
         nargs="*",
@@ -522,6 +554,40 @@ def main() -> int:
         help=(
             "Pass `--dangerously-disable-linux-sandbox` to codex. "
             "Required on hosts without bubblewrap installed."
+        ),
+    )
+    parser.add_argument(
+        "--claude-model",
+        default=os.environ.get("HELION_AUTOREVIEW_CLAUDE_MODEL") or CLAUDE_MODEL,
+        help=(
+            "Claude reviewer model: an alias (opus, fable, sonnet) or a full "
+            f"model name (default: {CLAUDE_MODEL}, or "
+            "HELION_AUTOREVIEW_CLAUDE_MODEL)."
+        ),
+    )
+    parser.add_argument(
+        "--claude-effort",
+        default=os.environ.get("HELION_AUTOREVIEW_CLAUDE_EFFORT") or CLAUDE_EFFORT,
+        help=(
+            f"Claude reviewer effort (default: {CLAUDE_EFFORT}, or "
+            "HELION_AUTOREVIEW_CLAUDE_EFFORT)."
+        ),
+    )
+    parser.add_argument(
+        "--codex-model",
+        default=os.environ.get("HELION_AUTOREVIEW_CODEX_MODEL") or CODEX_MODEL,
+        help=(
+            "Codex reviewer model (default: the model your Codex is configured "
+            "with, or HELION_AUTOREVIEW_CODEX_MODEL)."
+        ),
+    )
+    parser.add_argument(
+        "--codex-effort",
+        default=os.environ.get("HELION_AUTOREVIEW_CODEX_EFFORT")
+        or CODEX_REASONING_EFFORT,
+        help=(
+            f"Codex reasoning effort (default: {CODEX_REASONING_EFFORT}, or "
+            "HELION_AUTOREVIEW_CODEX_EFFORT)."
         ),
     )
     parser.add_argument(
@@ -568,7 +634,9 @@ def main() -> int:
     spinner.start()
     spinner.log(f"logs: {log_dir.relative_to(REPO_ROOT)}")
 
-    claude = ClaudeSession(log_dir / "claude.log", args.meta)
+    claude = ClaudeSession(
+        log_dir / "claude.log", args.meta, args.claude_model, args.claude_effort
+    )
     combined = ""
 
     try:
@@ -580,6 +648,8 @@ def main() -> int:
                 args.meta,
                 no_sandbox=args.codex_no_sandbox,
                 sandbox=args.codex_sandbox,
+                model=args.codex_model,
+                effort=args.codex_effort,
             )
         results = run_parallel(spinner, jobs)
         claude_review = results["claude review"]
@@ -615,10 +685,10 @@ def main() -> int:
         spinner.stop()
         if claude.session_id:
             meta_flag = "--dangerously-enable-internet-mode " if args.meta else ""
-            effort_flag = f"--effort {CLAUDE_EFFORT} "
+            model_flag = f"--model {claude.model} --effort {claude.effort} "
             sys.stderr.write(
                 f"\nresume session: claude "
-                f"{meta_flag}{effort_flag}--resume {claude.session_id}\n"
+                f"{meta_flag}{model_flag}--resume {claude.session_id}\n"
             )
 
     return 0
