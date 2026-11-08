@@ -1,8 +1,9 @@
-"""Tests of the agent tooling in ``scripts/``: ``gpu_board.py``, the shared-GPU
-board."""
+"""Tests of the agent tooling in ``scripts/``: ``gpu_board.py`` (the shared-GPU
+board) and ``run_tests.py`` (the lane runner), which mirror CI's test lanes."""
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import replace
 import fcntl
 import importlib.util
@@ -37,6 +38,7 @@ def _load(name: str) -> types.ModuleType:
 
 
 gpu_board = _load("gpu_board")
+run_tests = _load("run_tests")
 
 NOW = 1_800_000_000.0
 GPU_CSV = """\
@@ -969,3 +971,465 @@ def test_cli_pick_claim_say_release(board, capsys):
     assert data["free"] == [0] and data["fair_share"] == 3
     assert data["version"] == gpu_board.VERSION and data["protocol"] == 1
     assert data["published_version"] == gpu_board.VERSION
+
+
+# --------------------------------------------------------------------------
+# run_tests
+
+
+def test_lane_markers_match_the_ci_workflow():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "test.yml").read_text()
+    assert f'MARK="{run_tests.GPU_LANE_MARK}"' in workflow
+    assert f'MARK="{run_tests.CPU_LANE_MARK}"' in workflow
+    assert f'MARK="${{MARK:+($MARK) and }}{run_tests.PR_TIER_MARK}"' in workflow
+    assert (
+        run_tests.lane_marker("gpu", slow=False)
+        == "(not cpu_only or cuda) and not slow"
+    )
+    assert (
+        run_tests.lane_marker("cpu", slow=False)
+        == "(cpu_only and not cuda) and not slow"
+    )
+    assert run_tests.lane_marker("cpu", slow=True) == "cpu_only and not cuda"
+    assert run_tests.lane_marker("serial", slow=False) == "not slow"
+    assert run_tests.lane_marker("serial", slow=True) == ""
+    assert (
+        run_tests.lane_marker("gpu", slow=False, user="not foo")
+        == "(not cpu_only or cuda) and not slow and (not foo)"
+    )
+    assert run_tests.lane_marker("serial", slow=True, user="a or b") == "a or b"
+
+
+def _marker(argv: list[str]) -> str:
+    # The last -m is pytest's marker option; the first is python's -m pytest.
+    return argv[max(i for i, arg in enumerate(argv) if arg == "-m") + 1]
+
+
+def test_build_jobs_shards_the_gpu_lane_and_sets_lane_env(tmp_path):
+    jobs = run_tests.build_jobs(
+        ["cute"], "all", {"cute": ["2", "5"]}, False, [], [], tmp_path
+    )
+    assert [j.name for j in jobs] == ["cute-gpu2", "cute-gpu5", "cute-cpu"]
+    first, second, cpu = jobs
+    assert first.env["HELION_BACKEND"] == "cute"
+    assert first.env["CUDA_VISIBLE_DEVICES"] == "2"
+    assert first.env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    assert first.env["HELION_TEST_SHARD"] == "0/2"
+    assert second.env["HELION_TEST_SHARD"] == "1/2"
+    assert _marker(first.argv) == "(not cpu_only or cuda) and not slow"
+    assert f"--junitxml={tmp_path / 'cute-gpu2.xml'}" in first.argv
+    assert "--ignore=test/test_examples_dist.py" in first.argv
+    assert first.argv[-1] == "test"  # the whole suite by default
+    assert cpu.env["CUDA_VISIBLE_DEVICES"] == ""
+    assert cpu.env["HELION_TEST_LANE"] == "cpu"
+    assert "HELION_TEST_SHARD" not in cpu.env
+    assert _marker(cpu.argv) == "(cpu_only and not cuda) and not slow"
+
+    (single,) = run_tests.build_jobs(
+        ["triton"],
+        "gpu",
+        {"triton": ["3"]},
+        True,
+        ["test/test_misc.py"],
+        ["-k", "x"],
+        tmp_path,
+    )
+    assert "HELION_TEST_SHARD" not in single.env
+    assert single.argv[-3:] == ["test/test_misc.py", "-k", "x"]
+    assert _marker(single.argv) == "not cpu_only or cuda"
+
+    (serial,) = run_tests.build_jobs(
+        ["pallas-interpret"], "all", {"pallas-interpret": []}, False, [], [], tmp_path
+    )
+    assert serial.lane == "serial"
+    assert serial.env["HELION_BACKEND"] == "pallas"
+    assert serial.env["HELION_PALLAS_INTERPRET"] == "1"
+    assert "-n0" in serial.argv
+    assert f"--timeout={run_tests.SERIAL_TIMEOUT}" in serial.argv
+    assert _marker(serial.argv) == "not slow"
+
+
+def test_job_environment_drops_the_shell_values_of_runner_variables(tmp_path):
+    job = run_tests.Job(
+        "triton-gpu3",
+        "triton",
+        "gpu",
+        "3",
+        None,
+        [],
+        run_tests.lane_env("triton", "gpu", "3", None),
+        tmp_path / "x.log",
+        tmp_path / "x.xml",
+    )
+    shell = {
+        "HELION_TEST_SHARD": "1/2",  # stale: would silently halve the run
+        "HELION_TEST_LANE": "cpu",
+        "CUDA_VISIBLE_DEVICES": "7",
+        "HELION_AUTOTUNE_EFFORT": "none",  # the user's, kept
+        "PATH": "/bin",
+    }
+    env = run_tests.job_environment(job, {**shell, "PYTHONPATH": "/extra"})
+    assert env["PYTHONPATH"] == f"{run_tests.REPO_ROOT}{os.pathsep}/extra"
+    env = run_tests.job_environment(job, shell)
+    assert env["PYTHONPATH"] == str(run_tests.REPO_ROOT)
+    assert "HELION_TEST_SHARD" not in env and "HELION_TEST_LANE" not in env
+    assert env["CUDA_VISIBLE_DEVICES"] == "3"
+    assert env["HELION_BACKEND"] == "triton"
+    assert env["HELION_AUTOTUNE_EFFORT"] == "none" and env["PATH"] == "/bin"
+
+
+def test_split_gpus_deals_round_robin():
+    assert run_tests.split_gpus(["triton", "cute"], ["0", "1", "2"]) == {
+        "triton": ["0", "2"],
+        "cute": ["1"],
+    }
+    assert run_tests.split_gpus(["pallas-interpret"], []) == {"pallas-interpret": []}
+    # A CPU-lane-only run needs no GPU.
+    assert run_tests.split_gpus(["triton", "cute"], [], need_gpu=False) == {
+        "triton": [],
+        "cute": [],
+    }
+    with pytest.raises(SystemExit):
+        run_tests.split_gpus(["triton", "cute"], ["0"])
+
+
+def test_read_junit_counts_outcomes_and_node_ids(tmp_path):
+    report = tmp_path / "report.xml"
+    report.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" tests="5">
+  <testcase classname="test.test_agent_scripts.TestX" name="test_a[1]" time="0.1"><failure message="boom"/></testcase>
+  <testcase classname="test.test_agent_scripts" name="test_b" time="0.1"><error message="crash"/></testcase>
+  <testcase classname="test.test_agent_scripts" name="test_b" time="0.1"><failure message="again"/></testcase>
+  <testcase classname="test.test_agent_scripts" name="test_c" time="0.1"><skipped message="no gpu"/></testcase>
+  <testcase classname="test.test_agent_scripts" name="test_d" time="0.1"/>
+  <testcase classname="" name="test/test_broken.py" time="0"><error message="collection"/></testcase>
+</testsuite></testsuites>
+"""
+    )
+    junit = run_tests.read_junit(report, REPO_ROOT)
+    assert junit.counts == {"tests": 5, "failures": 2, "errors": 1, "skipped": 1}
+    assert junit.failed == [
+        "test/test_agent_scripts.py::TestX::test_a[1]",
+        "test/test_agent_scripts.py::test_b",
+    ]
+    assert junit.outcomes["test/test_agent_scripts.py::test_c"] == "skipped"
+    assert junit.outcomes["test/test_agent_scripts.py::test_d"] == "passed"
+    assert junit.collection_errors == ["test/test_broken.py"]
+    assert (
+        run_tests.node_id("nowhere.module", "test_x", REPO_ROOT)
+        == "nowhere.module::test_x"
+    )
+
+
+def test_select_modules_for_changed_files(tmp_path):
+    root = tmp_path
+    (root / "test").mkdir()
+    (root / "helion").mkdir()
+    (root / "examples").mkdir()
+    (root / "test" / "test_alpha.py").write_text(
+        "from helion import widget\nimport common\n"
+    )
+    (root / "test" / "test_beta.py").write_text("gadget = 1\nimport common\n")
+    (root / "test" / "test_examples.py").write_text("import common\n")
+    (root / "test" / "_helpers.py").write_text("")
+    (root / "test" / "conftest.py").write_text("")
+    for name in ("widget", "common", "gadget_impl", "__init__"):
+        (root / "helion" / f"{name}.py").write_text("")
+    (root / "examples" / "demo.py").write_text("")
+    (root / "scripts").mkdir()
+    (root / "scripts" / "gadget.py").write_text("")
+
+    select = run_tests.select_modules
+    assert select(["helion/widget.py"], root) == (["test/test_alpha.py"], [], False)
+    assert select(["test/test_beta.py", "README.md"], root) == (
+        ["test/test_beta.py"],
+        [],
+        False,
+    )
+    modules, notes, broad = select(["examples/demo.py"], root)
+    assert (modules, broad) == (["test/test_examples.py"], False)
+    modules, notes, broad = select(["helion/gadget_impl.py"], root)
+    assert modules == [] and not broad and "no test module names it" in notes[0]
+    assert select(["helion/common.py"], root)[2] is True  # named in every module
+    assert select(["helion/__init__.py"], root)[2] is True
+    modules, notes, broad = select(["test/conftest.py"], root)
+    assert broad and "shared test infrastructure" in notes[0]
+    assert select(["test/_helpers.py"], root)[2] is True
+    assert select(["docs/index.md", "benchmarks/run.py"], root) == ([], [], False)
+    # Golden files belong to their module; scripts are found by name like sources.
+    assert select(["test/test_alpha.expected_cute"], root) == (
+        ["test/test_alpha.py"],
+        [],
+        False,
+    )
+    modules, notes, broad = select(["test/test_gone.expected"], root)
+    assert modules == [] and not broad and "golden file with no" in notes[0]
+    assert select(["scripts/gadget.py"], root) == (["test/test_beta.py"], [], False)
+    modules, notes, broad = select(["test/test_removed.py"], root)
+    assert (modules, broad) == ([], False) and "deleted test module" in notes[0]
+
+
+def test_parse_args_separates_paths_from_pytest_options():
+    args = run_tests.parse_args(
+        [
+            "--backend",
+            "triton,cute",
+            "--gpus",
+            "2,5",
+            "test/test_misc.py",
+            "--",
+            "-k",
+            "softmax",
+        ]
+    )
+    assert args.backends == ["triton", "cute"]
+    assert args.gpus == ["2", "5"]
+    assert args.paths == ["test/test_misc.py"]
+    assert args.extra == ["-k", "softmax"]
+    assert not args.changed and args.since == "origin/main"
+    args = run_tests.parse_args(["--changed", "--since", "HEAD~3", "test/test_misc.py"])
+    assert (
+        args.changed and args.since == "HEAD~3" and args.paths == ["test/test_misc.py"]
+    )
+    assert run_tests.parse_args(["--gpus", "5,2,5"]).gpus == ["2", "5"]
+    with pytest.raises(SystemExit):
+        run_tests.parse_args(["--gpus", "GPU-abc"])
+    with pytest.raises(SystemExit):
+        run_tests.parse_args(["--backend", "pallas-interpret", "--lane", "cpu"])
+    args = run_tests.parse_args(["test/x.py", "--", "-m", "not foo", "-k", "y"])
+    assert (args.marker, args.extra, args.paths) == (
+        "not foo",
+        ["-k", "y"],
+        ["test/x.py"],
+    )
+
+
+def test_no_board_needs_explicit_gpus(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    with pytest.raises(SystemExit):
+        run_tests.parse_args(["--no-board", "-n", "1"])
+    assert run_tests.parse_args(["--no-board", "--gpus", "3"]).gpus == ["3"]
+
+
+def test_explicit_gpus_from_the_environment(monkeypatch):
+    args = run_tests.parse_args([])
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3, 1")
+    assert run_tests.explicit_gpus(args) == ["1", "3"]
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-0a1b")
+    with pytest.raises(SystemExit):
+        run_tests.explicit_gpus(args)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    assert run_tests.explicit_gpus(args) == []
+    assert run_tests.explicit_gpus(run_tests.parse_args(["--gpus", "4"])) == ["4"]
+
+
+def test_acquire_gpus_refuses_claimed_or_busy_gpus_unless_forced(board, monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    with contextlib.ExitStack() as stack, pytest.raises(SystemExit) as info:
+        run_tests.acquire_gpus(run_tests.parse_args(["--gpus", "1"]), "t", stack)
+    assert "GPU 1 is busy (vasiliy)" in str(info.value)
+    assert gpu_board.load_claims(gpu_board.BoardDir(board)) == []
+    with contextlib.ExitStack() as stack, pytest.raises(SystemExit) as info:
+        run_tests.acquire_gpus(run_tests.parse_args(["--gpus", "2"]), "t", stack)
+    assert "has idle processes of vasiliy" in str(info.value)
+    with contextlib.ExitStack() as stack:
+        args = run_tests.parse_args(["--gpus", "2", "--shared"])
+        assert run_tests.acquire_gpus(args, "t", stack) == ["2"]
+    assert gpu_board.load_claims(gpu_board.BoardDir(board)) == []
+
+    with contextlib.ExitStack() as stack:
+        gpus = run_tests.acquire_gpus(
+            run_tests.parse_args(["--gpus", "1", "--force"]), "t", stack
+        )
+        assert gpus == ["1"]
+        assert [c.gpus for c in gpu_board.load_claims(gpu_board.BoardDir(board))] == [
+            [1]
+        ]
+    assert (
+        gpu_board.load_claims(gpu_board.BoardDir(board)) == []
+    )  # released with the stack
+
+    with contextlib.ExitStack() as stack:
+        picked = run_tests.acquire_gpus(run_tests.parse_args(["-n", "1"]), "t", stack)
+        assert picked == ["0"]
+        with pytest.raises(SystemExit) as info:
+            run_tests.acquire_gpus(run_tests.parse_args(["-n", "1"]), "t", stack)
+        assert "only 0 of 1 GPUs are free" in str(info.value)
+
+
+def test_acquire_gpus_stops_on_a_security_alert(board, monkeypatch, tmp_path, capsys):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    (board / "chat" / "me.jsonl").symlink_to(tmp_path)
+    for argv in (["-n", "1"], ["--gpus", "0"]):  # explicit GPUs must not fall back
+        with contextlib.ExitStack() as stack, pytest.raises(SystemExit) as info:
+            run_tests.acquire_gpus(run_tests.parse_args(argv), "t", stack)
+        assert info.value.code == gpu_board.SECURITY_EXIT
+        assert "SECURITY ALERT" in capsys.readouterr().err
+
+
+def test_acquire_gpus_skips_the_board_on_a_single_gpu_machine(board, monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    for gpus in ([_gpus()[1]], None):  # one busy GPU; no nvidia-smi at all
+        monkeypatch.setattr(gpu_board, "sample_gpus", lambda *a, gpus=gpus, **k: gpus)
+        with contextlib.ExitStack() as stack:
+            assert run_tests.acquire_gpus(run_tests.parse_args([]), "t", stack) == ["0"]
+            args = run_tests.parse_args(["--gpus", "0"])
+            assert run_tests.acquire_gpus(args, "t", stack) == ["0"]
+        assert gpu_board.load_claims(gpu_board.BoardDir(board)) == []
+
+
+def test_acquire_gpus_respects_other_sessions_of_this_account(board, monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("GPU_BOARD_SESSION", "agent-a")
+    gpu_board.pick_and_claim(1, False, [], "a", 60, samples=1)  # GPU 0
+    monkeypatch.setenv("GPU_BOARD_SESSION", "agent-b")
+    with contextlib.ExitStack() as stack, pytest.raises(SystemExit) as info:
+        run_tests.acquire_gpus(run_tests.parse_args(["--gpus", "0"]), "t", stack)
+    assert "another session of yours" in str(info.value)
+    # The same session (e.g. run_tests started by `gpu_board.py run`) may.
+    monkeypatch.setenv("GPU_BOARD_SESSION", "agent-a")
+    with contextlib.ExitStack() as stack:
+        assert run_tests.acquire_gpus(
+            run_tests.parse_args(["--gpus", "0"]), "t", stack
+        ) == ["0"]
+
+
+def test_runner_serializes_jobs_of_one_group(tmp_path):
+    stamps = tmp_path / "stamps"
+    stamps.mkdir()
+    program = (
+        "import sys, time, pathlib; d = pathlib.Path(sys.argv[1]); n = sys.argv[2]; "
+        "(d / f'{n}.start').write_text(str(time.time())); time.sleep(0.4); "
+        "(d / f'{n}.end').write_text(str(time.time()))"
+    )
+
+    def job(name: str, group: str | None) -> object:
+        return run_tests.Job(
+            name,
+            "triton",
+            "cpu",
+            None,
+            None,
+            [sys.executable, "-c", program, str(stamps), name],
+            {},
+            tmp_path / f"{name}.log",
+            tmp_path / f"{name}.xml",
+            group=group,
+        )
+
+    handler = signal.getsignal(signal.SIGINT)
+    results = run_tests.Runner(heartbeat=0).run(
+        [job("a", "lane"), job("b", "lane"), job("c", None)], quiet=True
+    )
+    assert signal.getsignal(signal.SIGINT) is handler  # restored afterwards
+    assert sorted(results) == ["a", "b", "c"]
+    assert [r.returncode for r in results.values()] == [0, 0, 0]
+    assert all(r.junit is None and not r.crashed for r in results.values())
+    a_end = float((stamps / "a.end").read_text())
+    b_start = float((stamps / "b.start").read_text())
+    assert b_start >= a_end  # same group: one at a time
+    # The ungrouped job did not wait for the group.
+    assert float((stamps / "c.start").read_text()) < b_start
+
+
+def _result(
+    name: str,
+    failed: list[str],
+    returncode: int = 1,
+    tests: int = 10,
+    backend: str = "triton",
+):
+    job = run_tests.Job(
+        name,
+        backend,
+        "gpu",
+        "0",
+        None,
+        [],
+        {},
+        Path(f"{name}.log"),
+        Path(f"{name}.xml"),
+    )
+    junit = run_tests.Junit(
+        {"tests": tests, "failures": len(failed), "errors": 0, "skipped": 0},
+        dict.fromkeys(failed, "failed"),
+    )
+    return run_tests.JobResult(job, returncode, 12.0, junit)
+
+
+def test_summarize_verdicts(tmp_path):
+    passed = _result("ok", [], returncode=0)
+    assert run_tests.summarize(tmp_path, [passed], None, None)[1] == 0
+
+    failing = _result("bad", ["test/a.py::t1", "test/a.py::t2"])
+    k1, k2 = ("triton", "gpu", "test/a.py::t1"), ("triton", "gpu", "test/a.py::t2")
+    text, code = run_tests.summarize(
+        tmp_path, [failing], {k1: "passed", k2: "failed"}, None
+    )
+    assert code == 1
+    assert "VERDICT: FAIL (1 failing, 1 passed in isolation)" in text
+    assert "test/a.py::t1  -> passed in isolation" in text
+    assert "test/a.py::t2  -> fails in isolation" in text
+    text, code = run_tests.summarize(
+        tmp_path, [failing], {k1: "passed", k2: "passed"}, None
+    )
+    assert code == 2 and "VERDICT: FLAKY" in text
+    # Only a recorded pass counts: a skipped or missing rerun is still a failure.
+    text, code = run_tests.summarize(
+        tmp_path, [failing], {k1: "skipped", k2: "missing"}, None
+    )
+    assert (
+        code == 1
+        and "skipped when run alone" in text
+        and "no result when run alone" in text
+    )
+    text, code = run_tests.summarize(tmp_path, [failing], None, "--no-rerun")
+    assert code == 1 and "-> --no-rerun" in text
+
+    crashed = _result("crash", [], returncode=137, tests=0)
+    text, code = run_tests.summarize(tmp_path, [crashed], None, None)
+    assert code == 1 and "crashed jobs: crash" in text
+    empty = run_tests.JobResult(crashed.job, 5, 1.0, None)
+    assert run_tests.summarize(tmp_path, [empty], None, None)[1] == 3
+
+    # A module that never imported fails the run, even if every rerun passed.
+    broken = _result("broken", ["test/a.py::t1"])
+    broken.junit.collection_errors.append("test/test_broken.py")
+    text, code = run_tests.summarize(tmp_path, [broken], {k1: "passed"}, None)
+    assert code == 1 and "1 collection errors" in text and "test/test_broken.py" in text
+
+    # The same node id failing under two backends is two failures, labeled.
+    both = [
+        _result("t", ["test/a.py::t1"]),
+        _result("c", ["test/a.py::t1"], backend="cute"),
+    ]
+    outcomes = {
+        ("triton", "gpu", "test/a.py::t1"): "passed",
+        ("cute", "gpu", "test/a.py::t1"): "failed",
+    }
+    text, code = run_tests.summarize(tmp_path, both, outcomes, None)
+    assert (
+        code == 1
+        and "[triton] test/a.py::t1  -> passed" in text
+        and "[cute] test/a.py::t1  -> fails" in text
+    )
+
+
+def test_run_directories_never_collide(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_tests, "LOGS_DIR", tmp_path / "logs")
+    first = run_tests.unused_run_dir("tag", create=True)
+    second = run_tests.unused_run_dir("tag", create=True)
+    assert first != second and first.is_dir() and second.is_dir()
+    assert not run_tests.unused_run_dir("other", create=False).exists()
+
+
+def test_main_dry_run_previews_without_the_board(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("GPU_BOARD_DIR", str(tmp_path / "board"))
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert run_tests.main(["--dry-run", "--backend", "cute", "--lane", "cpu"]) == 0
+    assert capsys.readouterr().out.startswith("# cute-cpu\n")
+    assert run_tests.main(["--dry-run", "--backend", "triton,cute"]) == 0
+    names = [line for line in capsys.readouterr().out.splitlines() if line[:1] == "#"]
+    assert names == ["# triton-gpu0", "# triton-cpu", "# cute-gpu1", "# cute-cpu"]
+    assert not (tmp_path / "board").exists()
