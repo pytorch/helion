@@ -863,8 +863,10 @@ def uniform_local_regions(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                             "no mutation through parent captures",
                         )
                         require(
-                            user.args[3] == "relaxed"
-                            and (not user.users or dtype == torch.int32),
+                            bool(
+                                user.args[3] == "relaxed"
+                                and (not user.users or dtype == torch.int32)
+                            ),
                             "local atomic type/order",
                         )
                         require(
