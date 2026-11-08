@@ -327,6 +327,21 @@ def bias_mm_into(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def promoted_bias_mm_into(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor, out: torch.Tensor
+) -> None:
+    """``acc + bias``: the 16-bit row joins the FP32 accumulator unrounded, so a
+    ``pre_acc_wait`` epilogue stages it promoted to FP32."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = (acc + bias[cols]).to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def output_reading_mm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
     """An argument output that the epilogue also reads."""
     m, k = a.shape

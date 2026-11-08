@@ -105,7 +105,6 @@ from .cute_mma_dag_emitter_base import _TMA_SWIZZLE
 from .cute_mma_dag_emitter_base import Coords
 from .cute_mma_dag_emitter_base import MmaDagEmitterBase
 from .cute_mma_dag_emitter_base import _Evaluator
-from .cute_mma_dag_emitter_base import _float_literal
 from .cute_mma_dag_emitter_base import _frag_dtype
 from .cute_mma_dag_emitter_base import _Hoist
 from .cute_mma_dag_emitter_base import _Lane
@@ -121,6 +120,7 @@ from .cute_mma_dag_emitter_base import _TmaMap
 from .cute_mma_dag_emitter_base import _transposed_swizzle
 from .cute_mma_dag_emitter_base import tma_wrapper_plan
 from .cute_warp_mma_gemm import _swizzled_chunk
+from .math_templates import float_literal
 from .state import cute_codegen_state
 
 if TYPE_CHECKING:
@@ -3304,7 +3304,7 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
             for atom, half in self.vec_regs(carry.slot):
                 self.emit(
                     f"{self.vreg(carry.slot, atom, half)} = "
-                    f"cutlass.Float32({_float_literal(carry.init_fill)})"
+                    f"cutlass.Float32({float_literal(carry.init_fill)})"
                 )
 
     def emit_reduce(self, step: Reduce) -> None:

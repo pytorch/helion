@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from ... import exc
+from .math_templates import float_literal
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import tcgen05_role_local_schedule
 
@@ -623,9 +624,18 @@ def _chain_key(chain: Tcgen05UnaryEpilogueChain) -> tuple[object, ...]:
     from .cute_epilogue import _BinaryTensorExpr
     from .cute_epilogue import _CurrentTensorExpr
     from .cute_epilogue import _RuntimeScalarExpr
+    from .cute_epilogue import _SelectTensorExpr
     from .cute_epilogue import _UnaryTensorExpr
 
+    keys: dict[int, object] = {}
+
     def key(expr: object) -> object:
+        # a subtree several uses share is keyed once
+        if id(expr) not in keys:
+            keys[id(expr)] = expr_key(expr)
+        return keys[id(expr)]
+
+    def expr_key(expr: object) -> object:
         if isinstance(expr, _CurrentTensorExpr):
             return ("current",)
         if isinstance(expr, _RuntimeScalarExpr):
@@ -641,6 +651,18 @@ def _chain_key(chain: Tcgen05UnaryEpilogueChain) -> tuple[object, ...]:
                 expr.op_template,
                 key(expr.lhs),
                 key(expr.rhs),
+            )
+        if isinstance(expr, _SelectTensorExpr):
+            return (
+                "select",
+                key(expr.condition),
+                *(
+                    # spelled, so 0.0 and -0.0 differ
+                    ("literal", float_literal(branch))
+                    if isinstance(branch, float)
+                    else key(branch)
+                    for branch in (expr.on_true, expr.on_false)
+                ),
             )
         raise AssertionError(f"unexpected typed epilogue expression {type(expr)}")
 

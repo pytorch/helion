@@ -774,9 +774,13 @@ def output_edge_tma_store_smem_fits(
     if _store_lowering_stages_rows(config) and facts.rows:
         # This route does not admit ``pre_acc_wait`` rows (the hybrid
         # store's edge tiles read them from global memory beside the full
-        # tiles' staged row); the two-stage route,
+        # tiles' staged row; the two-stage route,
         # ``TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES``, and
-        # ``c_stages_fits`` still take the hybrid store for them.
+        # ``c_stages_fits`` still take the hybrid store for them). The default
+        # relies on this refusal to keep few-tile bias GEMMs on the SIMT
+        # store, which wins there (32768x576x128 + bias: 36.9 us, against
+        # 51.3 with the staged row beside the TMA store; see
+        # ``CuteTcgen05DefaultTileHeuristic._pick``).
         return False
     out_bits = facts.output_itemsize * 8
     _subtile_m, subtile_n = tcgen05_default_epilogue_tile_size(

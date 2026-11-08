@@ -124,6 +124,26 @@ class _AuxStepRecord:
     # every N subtile, so retain it in a scalar register for the whole tile.
     colvec_scalar_full: str | None = None
 
+    @property
+    def is_boolean_mask(self) -> bool:
+        return self.aux_dtype == "cutlass.Boolean"
+
+    @property
+    def edge_rmem_dtype(self) -> str:
+        """The register fragment type of element-wise (edge) copies: one
+        element of a Boolean global tensor reads as its Int8 storage."""
+        return "cutlass.Int8" if self.is_boolean_mask else self.aux_dtype
+
+    def mask_value(self, loaded: str) -> str:
+        """The operand value of ``loaded``: a boolean mask loads as its Int8
+        storage and is read as ``!= 0``."""
+        return f"{loaded} != 0" if self.is_boolean_mask else loaded
+
+    @property
+    def edge_rmem_value(self) -> str:
+        """The value of the element-wise filled fragment ``aux_rmem``."""
+        return self.mask_value(f"{self.aux_rmem}.load()")
+
 
 def _exact_shape_aux_fragment_hoisted(
     *, requested: bool, broadcast_axis: int | None, aux_ndim: int
@@ -1015,13 +1035,14 @@ def _codegen_cute_store_tcgen05_tile(
     def rowvec_stage_promotes_to_f32(rec: _AuxStepRecord) -> bool:
         """16-bit row vector consumed only by the FP32 carrier op.
 
-        The chain's root ``acc <op> aux`` promotes the 16-bit operand to FP32
+        The chain's root ``acc <op> aux`` reads the 16-bit operand as FP32
         (the result dtype is FP32, so ``_round_epilogue_expression`` left the
-        template unrounded) and the leaf carries no cast wrapper, so staging
-        the row already converted is bit-identical: fp16/bf16 -> fp32 is
-        exact. Any other use (a rounded 16-bit sub-expression, a wrapped
-        leaf, a multi-step chain) takes no stage: the row is read from GMEM
-        per subtile in its source dtype. The predicate
+        template unrounded) and the leaf carries no cast wrapper but an
+        explicit FP32 conversion, so staging the row already converted is
+        bit-identical: fp16/bf16 -> fp32 is exact. Any other use (a rounded
+        16-bit sub-expression, another wrapped leaf, a multi-step chain)
+        takes no stage: the row is read from GMEM per subtile in its source
+        dtype. The predicate
         (``aux_leaf_takes_promoted_f32_stage``) is shared with the matmul
         plan, which picks the (128, 32) subtile for these rows.
         """
@@ -1495,6 +1516,9 @@ def _codegen_cute_store_tcgen05_tile(
             and tcgen05_value.use_tma_store_epilogue
             and rec.broadcast_axis == 1
             and copy_elems is not None
+            # a ``cutlass.Boolean`` stage and copy atom are one bit wide
+            # against the mask's byte storage: a mask reads it directly
+            and not rec.is_boolean_mask
         )
         stage_rowvec_per_warp = can_stage_rowvec_per_warp(
             rec, has_full_register_hoist=rec.aux_rmem_full is not None
@@ -2069,7 +2093,8 @@ def _codegen_cute_store_tcgen05_tile(
         ``tRS_rD`` instead of the raw T2R fragment layout.
         ``force_gmem_aux`` is used by the hybrid edge-only
         SIMT path: C-input staging is only safe for full tiles because
-        the producer-side bulk copy is not predicated for M/N fringes.
+        the producer-side bulk copy is not predicated for M/N fringes, and
+        only the full-tile TMA body fills a ``pre_acc_wait`` row stage.
         """
         lines: list[str] = [
             line for line in runtime_scalar_prelude.splitlines() if line.strip()
@@ -2156,7 +2181,10 @@ def _codegen_cute_store_tcgen05_tile(
                 else:
                     source_for_local_tile = rec.aux_tensor_name
                 aux_tile_is_local = False
-            elif rowvec_stage is not None:
+            # Only the full-tile TMA body fills a row stage, so the SIMT edge
+            # body of a hybrid TMA-store epilogue (``force_gmem_aux``) reads
+            # the row from global memory (the broadcast view below).
+            elif rowvec_stage is not None and not force_gmem_aux:
                 assert rec.broadcast_axis == 1
                 assert rec.aux_view2d is not None
                 # The compact SMEM rowvec is allocated and populated per output
@@ -2304,11 +2332,11 @@ def _codegen_cute_store_tcgen05_tile(
         return (
             f"{indent}{rec.aux_rmem} = "  # type: ignore[attr-defined]
             f"cute.make_rmem_tensor(cute.make_layout({carrier_name}.shape), "
-            f"{rec.aux_dtype})\n"  # type: ignore[attr-defined]
+            f"{rec.edge_rmem_dtype})\n"  # type: ignore[attr-defined]
             f"{indent}cute.autovec_copy("
             f"{rec.ttr_aux_subtile}, {rec.aux_rmem})\n"  # type: ignore[attr-defined]
             f"{indent}{rec.aux_loaded} = "  # type: ignore[attr-defined]
-            f"{rec.aux_rmem}.load()\n"  # type: ignore[attr-defined]
+            f"{rec.edge_rmem_value}\n"  # type: ignore[attr-defined]
         )
 
     def _aux_subtile_load_source(
@@ -2481,7 +2509,7 @@ def _codegen_cute_store_tcgen05_tile(
                         (
                             f"{prelude_indent}{rec.aux_rmem} = "
                             f"cute.make_rmem_tensor({rec.ttr_aux_subtile}.shape, "
-                            f"{rec.aux_dtype})\n"
+                            f"{rec.edge_rmem_dtype})\n"
                         ),
                         f"{prelude_indent}{rec.aux_rmem}.fill(0)\n",
                     ]
@@ -2508,7 +2536,7 @@ def _codegen_cute_store_tcgen05_tile(
                 )
             for rec in aux_step_records:
                 lines.append(
-                    f"{prelude_indent}{rec.aux_loaded} = {rec.aux_rmem}.load()\n"
+                    f"{prelude_indent}{rec.aux_loaded} = {rec.edge_rmem_value}\n"
                 )
             return "".join(lines)
         for aux_idx, rec in enumerate(aux_step_records):
@@ -2525,7 +2553,7 @@ def _codegen_cute_store_tcgen05_tile(
             if force_simt_edge_aux:
                 include_coord_setup = not force_simt_edge_coord_emitted
                 force_simt_edge_coord_emitted = True
-                if rec.broadcast_axis is None:
+                if rec.broadcast_axis is None and not rec.is_boolean_mask:
                     edge_aux_copy_source = _simt_edge_logical_divide_copy_source(
                         prelude_indent,
                         rec.ttr_aux_subtile,
@@ -2537,6 +2565,8 @@ def _codegen_cute_store_tcgen05_tile(
                 else:
                     # Rowvec broadcast stayed scalar in the cycle-74 ablation:
                     # vectorizing it did not reduce stack pressure or runtime.
+                    # A boolean mask copies element-wise too: a Boolean copy
+                    # atom is narrower than the mask's byte storage.
                     edge_aux_copy_source = _simt_edge_scalar_copy_source(
                         prelude_indent,
                         rec.ttr_aux_subtile,
@@ -2549,11 +2579,11 @@ def _codegen_cute_store_tcgen05_tile(
                     f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
                     f"{prelude_indent}{rec.aux_rmem} = "
                     f"cute.make_rmem_tensor({rec.ttr_aux_subtile}.shape, "
-                    f"{rec.aux_dtype})\n"
+                    f"{rec.edge_rmem_dtype})\n"
                     f"{prelude_indent}{rec.aux_rmem}.fill(0)\n"
                     + edge_aux_copy_source
                     + f"{prelude_indent}{rec.aux_loaded} = "
-                    f"{rec.aux_rmem}.load()\n"
+                    f"{rec.edge_rmem_value}\n"
                 )
                 continue
             if tcgen05_value.output_column_major and unconditional_full_tile:
@@ -2586,6 +2616,28 @@ def _codegen_cute_store_tcgen05_tile(
             if rowvec_stage is None and (
                 safe_direct_aux_with_full_tile or not tcgen05_aux_use_tma_store_epilogue
             ):
+                if rec.is_boolean_mask:
+                    # A boolean mask on partial tiles. The DSL rejects
+                    # rebinding a Boolean TensorSSA across the full/edge
+                    # branches (CONTAINER_STRUCTURE_CHANGED): both branches
+                    # fill one Int8 fragment (``edge_rmem_dtype``), and the
+                    # mask is read after them.
+                    lines.append(
+                        f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                        f"{rec.ttr_aux_grouped}"
+                        f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                        f"{prelude_indent}{rec.aux_rmem} = "
+                        f"cute.make_rmem_tensor({rec.ttr_aux_subtile}.shape, "
+                        f"{rec.edge_rmem_dtype})\n"
+                        f"{prelude_indent}{rec.aux_rmem}.fill(0)\n"
+                        f"{prelude_indent}if {full_tile}:\n"
+                        f"{prelude_indent}    {rec.aux_rmem}.store("
+                        f"{rec.ttr_aux_subtile}.load().to(cutlass.Int8))\n"
+                        f"{prelude_indent}else:\n"
+                        f"{_simt_edge_scalar_copy_source(prelude_indent + '    ', rec.ttr_aux_subtile, rec.aux_rmem)}"
+                        f"{prelude_indent}{rec.aux_loaded} = {rec.edge_rmem_value}\n"
+                    )
+                    continue
                 lines.append(
                     f"{prelude_indent}{rec.ttr_aux_subtile} = "
                     f"{rec.ttr_aux_grouped}"
@@ -2644,17 +2696,17 @@ def _codegen_cute_store_tcgen05_tile(
                     f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
                 )
                 if tcgen05_colvec_fragment_single_m_row:
-                    if rec.colvec_scalar_full is not None:
-                        lines.append(
-                            f"{prelude_indent}{rec.aux_loaded} = "
-                            f"{rec.colvec_scalar_full}\n"
-                        )
-                    else:
-                        lines.append(
-                            f"{prelude_indent}{rec.aux_loaded} = "
-                            f"{rec.ttr_aux_grouped}"
-                            "[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
-                        )
+                    # A boolean mask's element reads as its byte storage,
+                    # which torch reads as ``!= 0``.
+                    scalar = (
+                        rec.colvec_scalar_full
+                        if rec.colvec_scalar_full is not None
+                        else f"{rec.ttr_aux_grouped}"
+                        "[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]"
+                    )
+                    lines.append(
+                        f"{prelude_indent}{rec.aux_loaded} = {rec.mask_value(scalar)}\n"
+                    )
                 else:
                     lines.append(
                         _materialize_broadcast_aux_source(
@@ -3381,7 +3433,7 @@ def _codegen_cute_store_tcgen05_tile(
     simt_edge_aux_atom_setup: list[str] = []
     if simt_edge_only:
         for aux_idx, rec in enumerate(aux_step_records):
-            if rec.broadcast_axis is None:
+            if rec.broadcast_axis is None and not rec.is_boolean_mask:
                 edge_aux_atom = df.new_var(f"{rec.aux_rmem}_edge_atom")
                 simt_edge_aux_atoms[aux_idx] = edge_aux_atom
                 # Use a per-aux atom typed to the aux dtype. Reusing the
