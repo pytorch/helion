@@ -284,6 +284,7 @@ def _runtime_settings(**overrides: object) -> SimpleNamespace:
         "autotune_baseline_fn": None,
         "autotune_baseline_accuracy_check_fn": None,
         "autotune_benchmark_fn": None,
+        "autotune_benchmark_input_banks": 1,
         "autotune_config_filter": None,
         "autotune_config_overrides": {},
         "autotune_search_acf": [],
@@ -378,6 +379,12 @@ class TestMultiShapeRuntime(unittest.TestCase):
                 _runtime_settings(autotune_benchmark_fn=Mock()),
                 {"cache_tag": "callback-v1"},
                 "does not support",
+            ),
+            (
+                "rotating benchmark input banks",
+                _runtime_settings(autotune_benchmark_input_banks=3),
+                {},
+                "does not support rotating benchmark input banks",
             ),
             (
                 "dynamic shapes without cache tag",

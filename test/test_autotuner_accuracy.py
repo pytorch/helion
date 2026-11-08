@@ -1455,13 +1455,16 @@ class TestAutotuneIgnoreErrors(TestCase):
 
     def _run_late_compile_failures(
         self,
-        late_configs: Sequence[str],
-        error_for: Callable[[str], Exception],
+        late_configs: Sequence[helion.Config],
+        error_for: Callable[[helion.Config], Exception],
     ) -> tuple[list[object], list[object]]:
         search = self._make_compile_failure_search()
+        valid = helion.Config(block_sizes=[1])
 
-        def compile_config(config: str, **_kwargs: object) -> Callable[..., None]:
-            if config == "valid":
+        def compile_config(
+            config: helion.Config, **_kwargs: object
+        ) -> Callable[..., None]:
+            if config == valid:
                 return lambda *args, **kwargs: None
             raise error_for(config)
 
@@ -1473,8 +1476,11 @@ class TestAutotuneIgnoreErrors(TestCase):
                 return_value=1.0,
             ),
         ):
-            initial = search.benchmark_batch(["valid"], desc="initial")
+            initial = search.benchmark_batch([valid], desc="initial")
             late = search.benchmark_batch(list(late_configs), desc="late")
+        self.assertIs(initial[0].config, valid)
+        for result, config in zip(late, late_configs, strict=True):
+            self.assertIs(result.config, config)
         return initial, late
 
     def test_settings_flag_from_env(self):
@@ -1739,6 +1745,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         # Verify we can still get the error type and message
         assert type(err.value.__cause__).__name__ == "RuntimeError"
 
+    @pytest.mark.cpu_only
     def test_benchmark_results_aligned_when_compile_fails(self):
         """benchmark_batch must return one result per input config even when some
         fail to compile."""
@@ -1759,7 +1766,7 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         search.kernel.compile_config = None
         search.kernel.env = SimpleNamespace(process_group_name=None, device=DEVICE)
-        configs = ["cfg_a", "cfg_b", "cfg_c"]
+        configs = [helion.Config(block_sizes=[size]) for size in (1, 2, 4)]
         with (
             patch.object(search.kernel, "compile_config", side_effect=fail_second),
             patch.object(
@@ -1771,6 +1778,8 @@ class TestAutotuneIgnoreErrors(TestCase):
             results = search.benchmark_batch(configs, desc="test")
 
         self.assertEqual(len(results), 3)
+        for result, config in zip(results, configs, strict=True):
+            self.assertIs(result.config, config)
         self.assertEqual(results[0].perf, 1.0)
         self.assertEqual(results[1].perf, float("inf"))
         self.assertEqual(results[1].status, "error")
@@ -1839,6 +1848,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                 if visible:
                     self.assertIn(str(error), text)
 
+    @pytest.mark.cpu_only
     def test_initial_compile_failures_raise(self) -> None:
         cases: tuple[tuple[str, type[Exception], str, Exception], ...] = (
             (
@@ -1865,22 +1875,28 @@ class TestAutotuneIgnoreErrors(TestCase):
                     ),
                     self.assertRaisesRegex(error_type, message),
                 ):
-                    search.benchmark_batch([config], desc="initial")
+                    search.benchmark_batch(
+                        [helion.Config(block_sizes=[1])], desc="initial"
+                    )
 
+    @pytest.mark.cpu_only
     def test_initial_compile_failures_skipped_when_fallback_available(self) -> None:
         search = self._make_compile_failure_search()
+        config = helion.Config(block_sizes=[1])
         with patch.object(
             search.kernel,
             "compile_config",
             side_effect=exc.BackendUnsupported("cute", "seed config unsupported"),
         ):
             results = search.benchmark_batch(
-                ["seed"], desc="initial", raise_if_no_viable_config=False
+                [config], desc="initial", raise_if_no_viable_config=False
             )
+        self.assertIs(results[0].config, config)
         self.assertEqual([result.perf for result in results], [float("inf")])
         self.assertEqual([result.status for result in results], ["error"])
         self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
 
+    @pytest.mark.cpu_only
     def test_late_compile_failures_are_skipped(self) -> None:
         cases = (
             (
@@ -1898,7 +1914,8 @@ class TestAutotuneIgnoreErrors(TestCase):
         for prefix, error_for in cases:
             with self.subTest(prefix=prefix):
                 initial, late = self._run_late_compile_failures(
-                    (f"{prefix}_a", f"{prefix}_b"), error_for
+                    (helion.Config(block_sizes=[2]), helion.Config(block_sizes=[4])),
+                    error_for,
                 )
                 self.assertEqual(initial[0].perf, 1.0)
                 self.assertEqual([result.perf for result in late], [float("inf")] * 2)
@@ -2652,7 +2669,7 @@ class TestAccuracyCheck(unittest.TestCase):
         settings = Settings(autotune_baseline_accuracy_check_fn=check)
         self.assertIs(settings.to_dict()["autotune_baseline_accuracy_check_fn"], check)
 
-    def test_other_kernels_key_only_an_enabled_accuracy_check(self) -> None:
+    def test_other_kernels_key_enabled_accuracy_check_with_clone_version(self) -> None:
         def key(check: object = None, *, enabled: bool = True) -> str:
             settings = Settings(
                 autotune_baseline_accuracy_check_fn=check,  # type: ignore[arg-type]
@@ -2669,15 +2686,15 @@ class TestAccuracyCheck(unittest.TestCase):
         class Subclass(AccuracyCheck):
             pass
 
-        self.assertEqual(key(), "")
-        self.assertNotEqual(key(peak()), "")
+        self.assertNotEqual(key(), "")
+        self.assertNotEqual(key(peak()), key())
         self.assertEqual(key(peak()), key(peak()))
         self.assertNotEqual(key(peak()), key(peak(0.05)))
         # A disabled check validates nothing; arbitrary callbacks keep the
-        # historical key.
-        self.assertEqual(key(peak(), enabled=False), "")
-        self.assertEqual(key(lambda actual, expected: None), "")
-        self.assertEqual(key(Subclass(atol=0.02, rtol=0.0)), "")
+        # baseline key within the current input-cloning version.
+        self.assertEqual(key(peak(), enabled=False), key())
+        self.assertEqual(key(lambda actual, expected: None), key())
+        self.assertEqual(key(Subclass(atol=0.02, rtol=0.0)), key())
 
     def test_bitwise_fp8_byte_tolerance_never_reaches_inf_or_nan(self) -> None:
         check = AccuracyCheck(atol=0.02, rtol=0.02, fp8_accuracy="bitwise")
@@ -2733,7 +2750,7 @@ class TestAccuracyCheck(unittest.TestCase):
             base.cache_policy(),
             {
                 "check": "accuracy_check",
-                "version": 1,
+                "version": 3,
                 "atol": 0.02,
                 "rtol": 0.0,
                 "atol_scale": "peak",

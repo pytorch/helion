@@ -19,7 +19,7 @@
  "test/test_autotuner_settings.py": 8.4,
  "test/test_barrier.py": 8.9,
  "test/test_benchmark_graph_warmup.py": 0.1,
- "test/test_benchmark_worker.py": 0.0,
+ "test/test_benchmark_worker.py": 0.4,
  "test/test_benchmarking_batched_replay.py": 0.3,
  "test/test_best_available.py": 0.2,
  "test/test_block_ptr_support.py": 0.0,

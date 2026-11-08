@@ -2002,6 +2002,7 @@ class LFBOPatternSearch(PatternSearch):
             "sweep_count": trace.sweep_count,
             "calls_per_sample": trace.calls_per_sample,
             "total_calls": trace.total_calls,
+            **({"statuses": trace.statuses} if trace.statuses is not None else {}),
             "elapsed_ms": [list(times) for times in trace.elapsed_ms],
             "median_ms": [
                 {"config_id": config_id, "value": timing}
@@ -2012,6 +2013,18 @@ class LFBOPatternSearch(PatternSearch):
                 )
             ],
         }
+
+    @staticmethod
+    def _complete_mirrored_members(
+        members: Sequence[PopulationMember], trace: MirroredBenchmarkTrace
+    ) -> list[PopulationMember]:
+        if trace.statuses is None:
+            return list(members)
+        return [
+            member
+            for member, status in zip(members, trace.statuses, strict=True)
+            if status == "ok"
+        ]
 
     def run_terminal_refinement(self, best: PopulationMember) -> PopulationMember:
         """Close the final CuTe-flash basin with a deterministic coordinate beam."""
@@ -2344,10 +2357,14 @@ class LFBOPatternSearch(PatternSearch):
                 if config in candidate_member_by_config
             ]
 
-            round_best = min(measured, key=self._flash_member_rank_key)
+            complete = self._complete_mirrored_members(measured, trace)
+            round_best = min(
+                complete, key=self._flash_member_rank_key, default=incumbent
+            )
             improvement = (
                 1.0 - round_best.perf / incumbent.perf
-                if math.isfinite(round_best.perf)
+                if any(member is incumbent for member in complete)
+                and math.isfinite(round_best.perf)
                 and math.isfinite(incumbent.perf)
                 and incumbent.perf > 0.0
                 else 0.0
@@ -2366,7 +2383,7 @@ class LFBOPatternSearch(PatternSearch):
                     assert isinstance(accepted_config_ids, list)
                     accepted_config_ids.append(canonical_config_id(incumbent.config))
 
-            ranked = sorted(measured, key=self._flash_member_rank_key)
+            ranked = sorted(complete, key=self._flash_member_rank_key)
             next_beam = [incumbent]
             for member in ranked:
                 if member.config in {item.config for item in next_beam}:
@@ -2408,13 +2425,16 @@ class LFBOPatternSearch(PatternSearch):
                 desc="Terminal coordinate refinement: confirming",
                 target_ms=_FLASH_TERMINAL_CONFIRMATION_TARGET_MS,
             )
+            complete = self._complete_mirrored_members(
+                confirmation_members, confirmation_trace
+            )
             confirmed_best = min(
-                confirmation_members,
-                key=self._flash_member_rank_key,
+                complete, key=self._flash_member_rank_key, default=best
             )
             confirmation_improvement = (
                 1.0 - confirmed_best.perf / best.perf
-                if math.isfinite(confirmed_best.perf)
+                if any(member is best for member in complete)
+                and math.isfinite(confirmed_best.perf)
                 and math.isfinite(best.perf)
                 and best.perf > 0.0
                 else 0.0

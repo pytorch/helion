@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import types
 from typing import TYPE_CHECKING
 from typing import ClassVar
 from typing import Literal
@@ -11,6 +12,7 @@ import torch
 from torch.utils._pytree import tree_flatten
 
 from .kernel_args import PortableFunction
+from .kernel_args import _input_tree_leaves
 
 if TYPE_CHECKING:
     from typing import Callable
@@ -166,11 +168,48 @@ def relative_l2_disagreement(
     too (``|a - b| <= atol + rtol * |b|``: the default ``rtol=1e-2`` admits
     an index of 101 against 100).  Leaves that are not tensors are not
     compared."""
+    return _relative_l2_disagreement(actual, expected, max_relative_l2, {})
+
+
+def _relative_l2_disagreement(
+    actual: object,
+    expected: object,
+    max_relative_l2: float,
+    compared_records: dict[tuple[int, int], tuple[object, object]],
+) -> str | None:
     actual_leaves, actual_spec = tree_flatten(actual)
     expected_leaves, expected_spec = tree_flatten(expected)
     if actual_spec != expected_spec or len(actual_leaves) != len(expected_leaves):
         return "the outputs differ in structure"
     for index, (a, b) in enumerate(zip(actual_leaves, expected_leaves, strict=True)):
+        a_operands = _callback_tensor_values(a)
+        b_operands = _callback_tensor_values(b)
+        if a_operands is not None or b_operands is not None:
+            if a_operands is None or b_operands is None:
+                return f"leaf {index} has a different callback type"
+            reason = _relative_l2_disagreement(
+                a_operands, b_operands, max_relative_l2, compared_records
+            )
+            if reason is not None:
+                return f"leaf {index} callback operands: {reason}"
+            continue
+        a_fields = _record_field_values(a)
+        b_fields = _record_field_values(b)
+        if a_fields is not None or b_fields is not None:
+            if type(a) is not type(b) or a_fields is None or b_fields is None:
+                return f"leaf {index} has a different dataclass type"
+            pair = (id(a), id(b))
+            if pair in compared_records:
+                continue
+            # Pytree flatteners may create temporary records. Keep them alive
+            # so a later sibling cannot reuse a visited pair of object IDs.
+            compared_records[pair] = (a, b)
+            reason = _relative_l2_disagreement(
+                a_fields, b_fields, max_relative_l2, compared_records
+            )
+            if reason is not None:
+                return f"leaf {index}: {reason}"
+            continue
         if not (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)):
             if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
                 return f"leaf {index} is a tensor on one side only"
@@ -252,17 +291,37 @@ def assert_close(
     both are 0); ``"ulp"`` compares dequantized values within one fp8 ulp plus
     the tolerances (see ``_assert_close_fp8_ulp``).
     """
-    if fp8_accuracy not in FP8_ACCURACY_MODES:
-        raise ValueError(
-            f"fp8_accuracy must be one of {FP8_ACCURACY_MODES}, got {fp8_accuracy!r}"
-        )
     if scale_atol_by_expected_rms:
         if atol_scale not in (None, "rms"):
             raise ValueError(
                 f"scale_atol_by_expected_rms contradicts atol_scale={atol_scale!r}"
             )
         atol_scale = "rms"
+    _assert_close_records(
+        actual,
+        expected,
+        atol,
+        rtol,
+        atol_scale=atol_scale,
+        fp8_accuracy=fp8_accuracy,
+        compared_records={},
+    )
 
+
+def _assert_close_records(
+    actual: object,
+    expected: object,
+    atol: float,
+    rtol: float,
+    *,
+    atol_scale: AtolScale | None,
+    fp8_accuracy: str,
+    compared_records: dict[tuple[int, int], tuple[object, object]],
+) -> None:
+    if fp8_accuracy not in FP8_ACCURACY_MODES:
+        raise ValueError(
+            f"fp8_accuracy must be one of {FP8_ACCURACY_MODES}, got {fp8_accuracy!r}"
+        )
     actual_flat, actual_spec = tree_flatten(actual)
     expected_flat, expected_spec = tree_flatten(expected)
 
@@ -274,6 +333,52 @@ def assert_close(
         )
 
     for actual_leaf, expected_leaf in zip(actual_flat, expected_flat, strict=True):
+        actual_operands = _callback_tensor_values(actual_leaf)
+        expected_operands = _callback_tensor_values(expected_leaf)
+        if actual_operands is not None or expected_operands is not None:
+            if actual_operands is None or expected_operands is None:
+                raise AssertionError(
+                    "Output leaf type mismatch during autotuner accuracy check: "
+                    f"actual is {type(actual_leaf).__name__}, expected is "
+                    f"{type(expected_leaf).__name__}"
+                )
+            _assert_close_records(
+                actual_operands,
+                expected_operands,
+                atol,
+                rtol,
+                atol_scale=atol_scale,
+                fp8_accuracy=fp8_accuracy,
+                compared_records=compared_records,
+            )
+            continue
+        actual_fields = _record_field_values(actual_leaf)
+        expected_fields = _record_field_values(expected_leaf)
+        if actual_fields is not None or expected_fields is not None:
+            if (
+                type(actual_leaf) is not type(expected_leaf)
+                or actual_fields is None
+                or expected_fields is None
+            ):
+                raise AssertionError(
+                    "Dataclass type mismatch during autotuner accuracy check"
+                )
+            pair = (id(actual_leaf), id(expected_leaf))
+            if pair in compared_records:
+                continue
+            # Pytree flatteners may create temporary records. Keep them alive
+            # so a later sibling cannot reuse a visited pair of object IDs.
+            compared_records[pair] = (actual_leaf, expected_leaf)
+            _assert_close_records(
+                actual_fields,
+                expected_fields,
+                atol=atol,
+                rtol=rtol,
+                atol_scale=atol_scale,
+                fp8_accuracy=fp8_accuracy,
+                compared_records=compared_records,
+            )
+            continue
         actual_kind = _leaf_kind(actual_leaf)
         if actual_kind != _leaf_kind(expected_leaf):
             # Two leaves of different kinds would reach a comparison that has
@@ -327,13 +432,6 @@ def assert_close(
                 raise AssertionError(
                     f"string mismatch {actual_leaf} vs {expected_leaf}"
                 )
-        elif actual_kind == "function":
-            # A callable argument (an epilogue, possibly serialized by code
-            # for the benchmark subprocess) is not something a kernel can
-            # write to; comparing the post-call arguments against the
-            # baseline's only concerns the tensors around it, and
-            # ``torch.testing.assert_close`` has no pair for functions.
-            pass
         elif _is_number(actual_leaf) and _is_number(expected_leaf):
             torch.testing.assert_close(actual_leaf, expected_leaf, atol=atol, rtol=rtol)
         elif actual_leaf != expected_leaf:
@@ -394,6 +492,62 @@ def _is_function_leaf(leaf: object) -> bool:
     return callable(leaf) or isinstance(leaf, PortableFunction)
 
 
+def _callback_tensor_values(value: object) -> tuple[torch.Tensor, ...] | None:
+    # Functions themselves are not writable kernel outputs, but their captured
+    # tensors are operands. Reuse cloning's cycle-safe traversal without calling
+    # the callback or comparing its code, opaque metadata, or Python identity.
+    if not _is_function_leaf(value):
+        return None
+    if not isinstance(value, (types.FunctionType, PortableFunction)):
+        # Arbitrary callable objects retain their existing opaque contract.
+        return ()
+    return tuple(
+        leaf for leaf in _input_tree_leaves(value) if isinstance(leaf, torch.Tensor)
+    )
+
+
+def _record_field_values(value: object) -> dict[str, object] | None:
+    if (
+        dataclasses.is_dataclass(value)
+        and not isinstance(value, type)
+        and not _is_function_leaf(value)
+    ):
+        return {
+            field.name: getattr(value, field.name)
+            for field in dataclasses.fields(value)
+        }
+    return None
+
+
+def tensor_dtypes(value: object) -> set[torch.dtype]:
+    """Dtypes of tensor leaves visited by the accuracy comparison.
+
+    Registered pytrees keep their flattening contract; otherwise opaque records
+    expose only the same declared fields as comparison. Retain visited records
+    through this walk so cycles terminate and ephemeral pytree children cannot
+    reuse a visited object's identity. No records or pytrees are rebuilt.
+    """
+    dtypes: set[torch.dtype] = set()
+    records: dict[int, object] = {}
+
+    def collect(tree: object) -> None:
+        for leaf in tree_flatten(tree)[0]:
+            if isinstance(leaf, torch.Tensor):
+                dtypes.add(leaf.dtype)
+            elif id(leaf) not in records:
+                operands = _callback_tensor_values(leaf)
+                if operands is not None:
+                    dtypes.update(tensor.dtype for tensor in operands)
+                    continue
+                fields = _record_field_values(leaf)
+                if fields is not None:
+                    records[id(leaf)] = leaf
+                    collect(fields)
+
+    collect(value)
+    return dtypes
+
+
 def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
     assert_close(actual, expected, atol=atol, rtol=rtol)
 
@@ -444,7 +598,7 @@ class AccuracyCheck:
     # Bump whenever a behavior reachable from ``assert_close`` changes: cached
     # autotune results are keyed by it, and the loose cache key holds no hash
     # of Helion's source.
-    VERSION: ClassVar[int] = 1
+    VERSION: ClassVar[int] = 3
 
     def __post_init__(self) -> None:
         for name in ("atol", "rtol"):

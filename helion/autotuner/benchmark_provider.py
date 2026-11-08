@@ -41,6 +41,7 @@ from .accuracy import effective_fp8_accuracy
 from .accuracy import is_fp8_dtype
 from .accuracy import poison_cached_device_memory
 from .accuracy import relative_l2_disagreement
+from .accuracy import tensor_dtypes
 from .benchmark_job import AccuracyCheckJob
 from .benchmark_job import AccuracyCheckResult
 from .benchmark_job import BenchmarkJob
@@ -50,12 +51,23 @@ from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkTimeout
 from .benchmark_worker import BenchmarkWorker
 from .benchmark_worker import BenchmarkWorkerUnkillable
+from .benchmarking import _BATCH_MEMORY_FRACTION
+from .benchmarking import _resolve_l2_flush_mode
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
+from .benchmarking import final_selection_l2_flush_mode
+from .benchmarking import final_selection_second_regime
 from .benchmarking import synchronize_device
+from .input_banks import InputBankError
+from .input_banks import InputBankMemoryError
+from .input_banks import _tensor_operands
+from .input_banks import check_input_bank_mode
+from .input_banks import tensor_storage_bytes
 from .kernel_args import _clone_args
-from .kernel_args import make_portable_args
+from .kernel_args import _input_tree_leaves
+from .kernel_args import _make_portable_args
+from .kernel_args import _NotPortable
 from .kernel_args import release_private_kernel_args
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
@@ -462,6 +474,9 @@ class IsolatedBenchmarkFailure(NamedTuple):
 
     ``None`` remains the provider's backward-compatible signal that isolated
     timing was unavailable and the caller should retain its prior timing.
+    An explicit error or execution timeout instead makes the candidate ineligible
+    for primary final-selection fallback. Its old samples can remain in the
+    diagnostic history without making it eligible to win.
     """
 
     status: Literal["error", "timeout"]
@@ -697,6 +712,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     # the configs the search registered by role (``set_config_roles``, for
     # ``_timed_out_config_role``). Created on first use so a provider built
     # without ``__init__`` keeps working.
+    _input_bank_count: int = 1
+    _private_argument_copies_disabled: bool = False
     _measured_config_values: set[tuple[str, object]] | None = None
     _compile_failure_values: dict[tuple[str, object], tuple[int, str]] | None = None
     _config_roles: Mapping[Config, str] = MappingProxyType({})
@@ -729,6 +746,38 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self.args = args
         self.log = log
         self._autotune_metrics = autotune_metrics
+        self._input_bank_count = settings.autotune_benchmark_input_banks
+        if settings.autotune_benchmark_input_banks > 1:
+            if (
+                not settings.autotune_benchmark_subprocess
+                or settings.autotune_benchmark_fn is not None
+                or settings.autotune_handoff
+                or self._subprocess_benchmark_uses_wall_clock()
+                or config_spec.backend.get_do_bench() is not None
+            ):
+                raise exc.InvalidAPIUsage(
+                    "rotating input banks require the built-in isolated CUDA benchmark "
+                    "provider without custom benchmark callbacks or handoff"
+                )
+            check_input_bank_mode(settings.autotune_benchmark_input_banks)
+            final_regime = final_selection_l2_flush_mode()
+            check_input_bank_mode(
+                settings.autotune_benchmark_input_banks, l2_flush_mode=final_regime
+            )
+            if final_selection_second_regime(final_regime) is not None:
+                raise exc.InvalidAPIUsage(
+                    "rotating input banks require HELION_AUTOTUNE_TARGET_REGIME "
+                    "to match the final L2 regime (replay or off)"
+                )
+            if (
+                dist.is_initialized()
+                or kernel.env.device.type == "mtia"
+                or not kernel.supports_subprocess_benchmark()
+            ):
+                raise exc.InvalidAPIUsage(
+                    "rotating input banks require an isolated benchmark worker; "
+                    "distributed, MTIA, and unsupported worker contexts are not supported"
+                )
         self._accuracy_failure_config_ids: list[int] = []
         self._compile_failure_config_ids: list[int] = []
         self._worker_failure_config_ids: list[int] = []
@@ -1134,21 +1183,27 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         original_args_flat, _ = tree_flatten(self.args)
         new_args_flat, _ = tree_flatten(new_args)
         mutated_arg_idxs = []
-        # we should only count tensors, since they won't be bound or removed
+        # Keep the original pytree positions used by every candidate-copy path.
+        # An opaque dataclass or callback occupies one position even when
+        # several fields, closure cells or defaults contain tensors.
         arg_idx = 0
         for old, new in zip(original_args_flat, new_args_flat, strict=False):
-            if not (isinstance(old, torch.Tensor) and isinstance(new, torch.Tensor)):
-                arg_idx += 1
-                continue
-            try:
-                equal = torch.equal(new, old)
-            except RuntimeError:
-                # torch.equal and device-to-host copies can fail on some
-                # devices (e.g., TPU for large tensors).  Conservatively
-                # assume the argument was not mutated.
-                equal = True
-            if not equal:
-                mutated_arg_idxs.append(arg_idx)
+            for old_leaf, new_leaf in zip(
+                _input_tree_leaves(old), _input_tree_leaves(new), strict=True
+            ):
+                if not (
+                    isinstance(old_leaf, torch.Tensor)
+                    and isinstance(new_leaf, torch.Tensor)
+                ):
+                    continue
+                try:
+                    equal = torch.equal(new_leaf, old_leaf)
+                except RuntimeError:
+                    # Keep the existing device-specific equality fallback.
+                    equal = True
+                if not equal:
+                    mutated_arg_idxs.append(arg_idx)
+                    break
             arg_idx += 1
         baseline_post_args = _clone_args(
             new_args,
@@ -1423,16 +1478,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         rtol = self.settings.autotune_baseline_rtol
 
         # Collect all dtypes from baseline output and mutated args
-        dtypes = set()
-
-        def collect_dtypes(obj: object) -> object:
-            if isinstance(obj, torch.Tensor):
-                dtypes.add(obj.dtype)
-            return obj
-
-        tree_map_only(torch.Tensor, collect_dtypes, self._baseline_output)
+        dtypes = tensor_dtypes(self._baseline_output)
         if len(self.mutated_arg_indices) > 0 and self._baseline_post_args is not None:
-            tree_map_only(torch.Tensor, collect_dtypes, self._baseline_post_args)
+            dtypes.update(tensor_dtypes(self._baseline_post_args))
 
         # Only apply strict tolerances if ALL dtypes are fp8
         # Mixed dtypes (fp8 + fp32) would be too strict with atol=0.0, rtol=0.0
@@ -1567,44 +1615,45 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         """Keep the benchmark and accuracy check in this process (the
         arguments cannot cross the spawn boundary) instead of failing the
         whole autotune."""
+        if self._input_bank_count > 1:
+            raise InputBankError(
+                "rotating input banks require arguments that can cross the "
+                f"benchmark subprocess boundary: {error}"
+            ) from error
         self._args_unpicklable = True
         self.log.warning(
-            f"Autotune args are not picklable ({error}); benchmarking "
-            "in-process instead of in a killable subprocess."
+            f"Autotune args cannot cross the benchmark subprocess boundary ({error}); "
+            "benchmarking in-process instead of in a killable subprocess."
         )
 
     def _save_kernel_args(self, args: Sequence[object], path: str) -> Exception | None:
-        """Write an argument tree for the benchmark subprocess; the pickling
-        error when it cannot be written.
+        """Write subprocess arguments; return an expected transport error.
 
-        Kernel args holding lambdas/closures (e.g. an epilogue callable)
-        cannot cross a spawn boundary as they are.  The worker rebuilds such
-        functions from their code (``PortableFunction``): benchmarking must
-        stay out of this process, because an in-process cuda-graph benchmark
-        leaves the process in a state where every later CUDA graph runs each
-        kernel node of a Helion-launched kernel ~0.35 us slower (measured on
-        B200: a 2.8 us two-kernel call reads 3.5 us afterwards, for the cute
-        and the triton backends alike).  Only when that fails too (a function
-        that cannot be serialized by code, or another argument that still
-        refuses to pickle) does the caller fall back to the in-process
-        benchmark/accuracy path.
+        Callbacks are serialized by code before ordinary pickling, including
+        module-level functions: pickling those by name would discard the
+        parent's defaults and captures in favor of the worker module's state.
+        The worker restores their registered globals namespace and public
+        module metadata separately. Arguments without callbacks keep the
+        ordinary tensor-tree save path.
+
+        Only unsupported callback graphs or other unpicklable arguments use
+        the caller's in-process fallback. Keeping supported callbacks in the
+        worker avoids the persistent CUDA-graph slowdown caused by in-process
+        graph benchmarking (measured on B200).
         """
         try:
-            save_tensor_tree(args, path)
-            return None
+            portable = _make_portable_args(args)
+        except _NotPortable as error:
+            return error
+        try:
+            save_tensor_tree(args if portable is None else portable, path)
         except (pickle.PicklingError, AttributeError, TypeError) as error:
-            portable = make_portable_args(args)
-            if portable is None:
-                return error
-            try:
-                save_tensor_tree(portable, path)
-            except (pickle.PicklingError, AttributeError, TypeError):
-                return error
+            return error
+        if portable is not None:
             self.log.debug(
-                f"Autotune args hold functions standard pickling refuses ({error}); "
-                "serialized them by code for the benchmark subprocess."
+                "Serialized autotune callbacks by code for the benchmark subprocess."
             )
-            return None
+        return None
 
     def _next_precompile_result_path(self) -> str:
         """Return a fresh path for a precompile result file."""
@@ -2577,6 +2626,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             # None means the subprocess path could not handle this config
             # (e.g., serialization failed); fall through to in-process.
 
+        if self._input_bank_count > 1:
+            raise exc.InvalidAPIUsage(
+                "rotating input banks cannot fall back to in-process benchmarking"
+            )
+
         if len(self.mutated_arg_indices) > 0:
             working_args = _clone_args(
                 self.args,
@@ -2823,6 +2877,14 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 return None
         except BenchmarkWorkerUnkillable:
             raise
+        except InputBankMemoryError as error:
+            self.log.warning(
+                f"Input-bank memory budget exceeded for {config!r}: {error}"
+            )
+            self._record_worker_failure(config, "error")
+            return inf
+        except InputBankError:
+            raise
         except BenchmarkCompileTimeout as e:
             self._record_compile_timeout(config, e)
             return inf
@@ -2985,6 +3047,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         try:
             fn_spec = _serialize_compiled_fn(fn)
         except RuntimeError:
+            if self._input_bank_count > 1:
+                raise
             return None
 
         worker = self._get_benchmark_worker()
@@ -3015,6 +3079,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 ),
             )
         except CompiledFunctionLoadError as error:
+            if self._input_bank_count > 1:
+                # Rotating banks cannot fall back in-process. Reject only this
+                # candidate, keeping the worker available for later wrappers.
+                raise
             self._disable_unloadable_benchmark_worker(error)
             return None
 
@@ -3034,6 +3102,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         try:
             fn_spec = _serialize_compiled_fn(fn)
         except RuntimeError:
+            if self._input_bank_count > 1:
+                raise
             return None
 
         worker = self._get_benchmark_worker()
@@ -3049,6 +3119,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             args_slot=args_slot,
             mutated_arg_indices=tuple(self.mutated_arg_indices),
             l2_flush_mode=l2_flush_mode,
+            input_banks=self._input_bank_count,
         )
         if timeout is None:
             timeout = float(self.settings.autotune_benchmark_timeout)
@@ -3061,6 +3132,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
             )
         except CompiledFunctionLoadError as error:
+            if self._input_bank_count > 1:
+                # Rotating banks cannot fall back in-process. Reject only this
+                # candidate, keeping the worker available for later wrappers.
+                raise
             self._disable_unloadable_benchmark_worker(error)
             return None
 
@@ -3123,27 +3198,62 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
     def private_argument_copies_affordable(self, count: int) -> bool:
         """Whether ``count`` private copies of the kernel arguments fit on the
-        device next to the originals (CUDA tensors only; other devices share)."""
+        device next to the originals and leave room for rotating input banks
+        (CUDA tensors only; other devices share)."""
+        if self._private_argument_copies_disabled:
+            return False
         tensors = [
-            leaf
-            for leaf in tree_flatten(self.args)[0]
-            if isinstance(leaf, torch.Tensor) and leaf.device.type != "cpu"
+            tensor
+            for tensor in _tensor_operands(self.args)
+            if tensor.device.type != "cpu"
         ]
         if not tensors:
             return True
         if not all(tensor.is_cuda for tensor in tensors):
             return False
-        total_bytes = 0
-        seen_storages: set[int] = set()
-        for tensor in tensors:
-            storage = tensor.untyped_storage()
-            if storage.data_ptr() in seen_storages:
-                continue
-            seen_storages.add(storage.data_ptr())
-            total_bytes += storage.nbytes()
+        total_bytes = tensor_storage_bytes(tensors)
         free_bytes, _total = torch.cuda.mem_get_info(tensors[0].device)
+        private_bytes = count * total_bytes
+        bank_bytes = (self._input_bank_count - 1) * total_bytes
+        if self._input_bank_count > 1:
+            # The baseline is already live (and excluded from free_bytes).
+            # A captured cycle retains a fresh output for each bank. Charge
+            # every unique baseline output allocation conservatively, even
+            # when the reference returns a view of its arguments.
+            outputs = [
+                tensor
+                for tensor in _tensor_operands((self._baseline_output,))
+                if tensor.device == tensors[0].device
+            ]
+            # Either the search or final selection can explicitly request a
+            # resident cycle. Reserve both primer and timed outputs in that
+            # case; the worker also measures the actual live allocation before
+            # capturing, including an explicit per-job regime override.
+            cycles = (
+                2
+                if "off"
+                in (_resolve_l2_flush_mode(None), final_selection_l2_flush_mode())
+                else 1
+            )
+            bank_bytes += (
+                cycles * self._input_bank_count * tensor_storage_bytes(outputs)
+            )
         return (
-            count * total_bytes <= _PRIVATE_ARGUMENT_COPIES_MEMORY_FRACTION * free_bytes
+            private_bytes + bank_bytes
+            <= _PRIVATE_ARGUMENT_COPIES_MEMORY_FRACTION * free_bytes
+            # Bank creation checks its own budget after private copies exist.
+            and bank_bytes <= _BATCH_MEMORY_FRACTION * (free_bytes - private_bytes)
+        )
+
+    def disable_private_argument_copies(self, fn_index: int, reason: str) -> None:
+        """Reap every optional copy and captured closure before a phase retries."""
+        self._private_argument_copies_disabled = True
+        if self._benchmark_worker is not None:
+            self._shutdown_isolated_worker(fn_index)
+        self.log.warning(
+            "Input-bank memory budget exhausted with optional finalist copies: "
+            f"{reason}. Discarding this phase's readings and restarting the entire "
+            "phase without private finalist copies."
         )
 
     def release_private_argument_copies(self) -> None:
@@ -3187,6 +3297,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         args_slots: Sequence[int | None] | None = None,
         timeout: float | None = None,
         l2_flush_mode: str | None = None,
+        fixed_repetitions: int | None = None,
     ) -> list[IsolatedBenchmarkTiming] | None:
         if not self._subprocess_benchmark_enabled():
             return None
@@ -3208,10 +3319,27 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         args_slot=args_slot,
                         timeout=timeout,
                         l2_flush_mode=l2_flush_mode,
+                        **(
+                            {"fixed_repetitions": fixed_repetitions}
+                            if fixed_repetitions is not None
+                            else {}
+                        ),
                     )
                 except BenchmarkWorkerUnkillable as error:
                     # the worker that could not be reaped ran this candidate
                     error.fn_index = index
+                    raise
+                except InputBankMemoryError as error:
+                    if args_slot is not None:
+                        # Optional finalist copies can be released and the
+                        # entire phase retried with its original arguments.
+                        raise
+                    self.log.warning(
+                        f"{self._isolated_failure_subject(fn, desc)}: {error}"
+                    )
+                    timings.append(IsolatedBenchmarkFailure("error"))
+                    continue
+                except InputBankError:
                     raise
                 except BenchmarkTimeout as e:
                     self.log.warning(f"{self._isolated_failure_subject(fn, desc)}: {e}")
