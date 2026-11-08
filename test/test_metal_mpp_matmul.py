@@ -86,17 +86,21 @@ def _masked_load(name: str) -> str:
 
 
 def _run(
-    kernel: helion.Kernel, args: tuple[object, ...], config: helion.Config | None
+    kernel: helion.Kernel,
+    args: tuple[object, ...],
+    config: helion.Config | None,
+    module_key: str = "",
 ) -> tuple[torch.Tensor, str, str]:
     """Compile and run ``kernel`` at ``config`` (None: its default config);
-    return its output, its generated Python and the MSL it compiled."""
+    return its output, its generated Python and the MSL it compiled.  A new
+    *module_key* loads a fresh module, whose MSL is generated anew."""
     from torch._inductor.codecache import PyCodeCache
 
     from helion._compiler.metal.metal_jit import _MetalKernel
 
     bound = kernel.bind(args)
     code = bound.to_code(config or bound.config_spec.default_config())
-    module = PyCodeCache.load(code)
+    module = PyCodeCache.load(code, module_key)
     out = getattr(module, kernel.fn.__name__)(*args)
     torch.mps.synchronize()
     (msl,) = [
@@ -15935,15 +15939,25 @@ class TestMppLaneDistribution(unittest.TestCase):
         so every other name it assigns is per lane too: its start and its
         readers stay in the lane loop."""
         ysum = self.y.cpu().double().sum(0)
-        for config in (
-            None,
-            helion.Config(block_sizes=[32, 16, 16, 16], num_warps=4),
-        ):
+        configs = (None, helion.Config(block_sizes=[32, 16, 16, 16], num_warps=4))
+        for config in configs:
             with self.subTest(kernel="loop", config=config):
-                out, _, msl = _run(dist_loop_reset, (self.x, self.y), config)
+                out, _, _ = _run(dist_loop_reset, (self.x, self.y), config)
                 _close(out, self.xy + 2.0 * ysum[None, :])
-                self.assertTrue(_lane_looped(msl, re.escape("auto t = float(0.0);")))
-                self.assertTrue(_lane_looped(msl, r"\(t \* v_\d+\)"))
+        # The lane loops as distributed, before metal_jit's jam takes the
+        # loop's lane-independent load of y out of the lanes.
+        with patch(
+            "helion._compiler.metal.metal_jit.jam_lanes_into_loops",
+            lambda body: body,
+        ):
+            for config in configs:
+                with self.subTest(kernel="loop", config=config, jam=False):
+                    _, _, msl = _run(
+                        dist_loop_reset, (self.x, self.y), config, "no jam"
+                    )
+                    t0 = re.escape("auto t = float(0.0);")
+                    self.assertTrue(_lane_looped(msl, t0))
+                    self.assertTrue(_lane_looped(msl, r"\(t \* v_\d+\)"))
         flag = torch.ones(1, dtype=torch.int32, device=DEVICE)
         config = helion.Config(
             block_sizes=[16, 16, 16], num_threads=[8, 16, 0], num_warps=4

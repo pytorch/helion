@@ -65,7 +65,6 @@ import dataclasses
 import math
 import operator
 from typing import TYPE_CHECKING
-from typing import TypeGuard
 from typing import cast
 
 import torch
@@ -111,6 +110,7 @@ from .lane_fold import LaneArrayBudget
 from .lane_fold import LaneJam
 from .lane_fold import const_extent
 from .lane_fold import folded_lanes
+from .lane_fold import is_lane_loop
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
 from .msl_expr import PURE_CALLS
@@ -4344,16 +4344,6 @@ def _distribute_lane_loop(
     return out
 
 
-def _is_lane_loop(s: ast.stmt) -> TypeGuard[ast.For]:
-    # slice_lane_*: a persistent reduction's lanes over a ':' K.
-    return (
-        isinstance(s, ast.For)
-        and isinstance(s.target, ast.Name)
-        and s.target.id.startswith(("lane_", "slice_lane_"))
-        and _call_name(s.iter) == "range"
-    )
-
-
 def _loads_first_all(
     stmts: list[ast.stmt],
     split: list[ast.For],
@@ -4386,7 +4376,7 @@ def _loads_first_all(
                 out += _loads_first(s, coop, tensor_dtypes, tg_buffers, names)
                 continue
             if isinstance(s, (ast.For, ast.While, ast.If)) and not _is_elements(s):
-                inner = in_lane or _is_lane_loop(s)
+                inner = in_lane or is_lane_loop(s)
                 s.body = walk(s.body, inner)
                 s.orelse = walk(s.orelse, inner)
             out.append(s)
@@ -4781,19 +4771,19 @@ def _run_lane_loops_once(
         for s in ss:
             if isinstance(s, ast.For) and _call_name(s.iter) != ELEMENTS:
                 s.body = splice(s.body, uniform and replicas.uniform(s.iter))
-                if _is_lane_loop(s) and any(_is_coop_stmt(x, coop) for x in s.body):
+                if is_lane_loop(s) and any(_is_coop_stmt(x, coop) for x in s.body):
                     lane = cast("ast.Name", s.target).id
                     if not any(lane in names_read(x) for x in s.body):
                         out.extend(s.body)
                     elif _split_schedulable(s, coop):
                         parts = _split_lane_loop(s, lane, coop)
-                        split.extend(p for p in parts if _is_lane_loop(p))
+                        split.extend(p for p in parts if is_lane_loop(p))
                         out += parts
                     elif (
                         distributed := _distribute_lane_loop(s, lane, coop)
                     ) is not None:
                         out += [
-                            replicas.spread(x) if uniform and _is_lane_loop(x) else x
+                            replicas.spread(x) if uniform and is_lane_loop(x) else x
                             for x in distributed
                         ]
                     else:

@@ -39,6 +39,8 @@ import torch
 from ... import exc
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
 from .fma_fusion import fuse_multiply_adds
+from .lane_fold import MSL_SCALAR_BYTES
+from .lane_fold import jam_lanes_into_loops
 from .lane_fold import unroll_lane_folds
 from .msl_ast_walker import MASKED_LOAD
 from .msl_ast_walker import MASKED_LOAD_PREAMBLE
@@ -238,7 +240,7 @@ def _generate_msl(
         ),
         required_threads_per_threadgroup,
     )
-    body_stmts = unroll_lane_folds(body_stmts, names_read)
+    body_stmts = jam_lanes_into_loops(unroll_lane_folds(body_stmts, names_read))
     msl_parts: list[str] = [
         "#include <metal_stdlib>",
         "#include <c10/metal/utils.h>",
@@ -466,23 +468,6 @@ def _reduction_sites(
     return sites
 
 
-#: Size of each MSL scalar type a scratch buffer can hold.
-_MSL_SCALAR_BYTES = {
-    "bool": 1,
-    "char": 1,
-    "uchar": 1,
-    "short": 2,
-    "ushort": 2,
-    "half": 2,
-    "bfloat": 2,
-    "int": 4,
-    "uint": 4,
-    "float": 4,
-    "long": 8,
-    "ulong": 8,
-}
-
-
 def _threadgroup_buffers(
     body_stmts: list[ast.stmt],
     fn_globals: dict[str, object],
@@ -524,7 +509,7 @@ def _threadgroup_buffers(
 
     def site_bytes(site: str) -> int:
         return sum(
-            _MSL_SCALAR_BYTES[dtype] * slots(buf_slots)
+            MSL_SCALAR_BYTES[dtype] * slots(buf_slots)
             for _, dtype, buf_slots in declared
             if buf_slots == site
         )
@@ -533,7 +518,7 @@ def _threadgroup_buffers(
         return [(name, dtype, slots(buf_slots)) for name, dtype, buf_slots in declared]
 
     def used() -> int:
-        return sum(_MSL_SCALAR_BYTES[dtype] * n for _, dtype, n in buffers())
+        return sum(MSL_SCALAR_BYTES[dtype] * n for _, dtype, n in buffers())
 
     strided = sorted(s for s, (path, _) in reduction_sites.items() if path == "strided")
     while used() > MAX_THREADGROUP_MEMORY_BYTES and strided:
