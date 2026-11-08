@@ -27,6 +27,12 @@ repos:
       # Run the linter.
       - id: ruff
         args: [--fix]
+      # The linter with ruff's unsafe fixes as well; only `./lint.sh unsafe`
+      # runs it (manual stage).
+      - id: ruff
+        alias: ruff-unsafe
+        args: [--fix, --unsafe-fixes]
+        stages: [manual]
       # Run the formatter.
       - id: ruff-format
 
