@@ -80,6 +80,7 @@ from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
 from .gelu_tanh_approx import FAST_MATH_UNARY_OPS
 from .gelu_tanh_approx import fast_math_unary_template
 from .math_templates import SIGMOID_TEMPLATE
+from .tcgen05_constants import Tcgen05RowvecAuxRow
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -269,6 +270,18 @@ def aux_leaf_promoted_by_f32_root(
         return False
     return (isinstance(root.lhs, _CurrentTensorExpr) and root.rhs is leaf) or (
         isinstance(root.rhs, _CurrentTensorExpr) and root.lhs is leaf
+    )
+
+
+def tcgen05_rowvec_aux_row(
+    chain: Tcgen05UnaryEpilogueChain, leaf: _AuxiliaryTensorLoadExpr, itemsize: int
+) -> Tcgen05RowvecAuxRow:
+    """The row stage an N-broadcast (``bias[tile_n]``) aux leaf of
+    ``itemsize`` bytes takes: staged converted to FP32 when it is a 16-bit
+    leaf only the FP32 root reads (``aux_leaf_promoted_by_f32_root``)."""
+    return Tcgen05RowvecAuxRow(
+        itemsize=itemsize,
+        promoted=itemsize == 2 and aux_leaf_promoted_by_f32_root(chain, leaf),
     )
 
 

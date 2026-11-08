@@ -37,7 +37,8 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K = 256
 # edge-family default.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES = 2
 TCGEN05_TWO_CTA_MAX_K_TILES = 256
-# The double-output-edge + K-tail CtaGroup.TWO search family: originally
+# The edge + K-tail CtaGroup.TWO search family (ragged M with ragged N, or a
+# 16-bit K tail on whole tiles; ``enable_cute_tcgen05_search``): originally
 # validated on large square-ish GEMMs (5000^3), it holds on every ragged
 # shape probed from 1000 to 4160 (bf16 3000^3 45 us against cuBLAS's 45,
 # 1500x2500x3000 47.5 against 118.6, 2048x2048x2050 30.7 against 71.6, all
@@ -51,7 +52,8 @@ TCGEN05_TWO_CTA_MAX_K_TILES = 256
 # the launch-bound regime.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 256
 # Smallest K tile the planner caps a K-tail shape to so that whole K tiles
-# keep the persistent and CtaGroup.TWO schedules (``enable_cute_tcgen05_search``).
+# keep the persistent and CtaGroup.TWO schedules (``enable_cute_tcgen05_search``);
+# a K no such tile divides is the edge + K-tail family's K tail.
 TCGEN05_WHOLE_K_TILE_MIN = 64
 # The tile of the edge family's 128-row CTA pair (each CTA owns 64 rows of a
 # 128 x 128 pair tile); the planner counts a 16-bit edge grid in these.
