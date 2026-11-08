@@ -3696,6 +3696,91 @@ def sum_after_loop(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="metal", static_shapes=True)
+def sums_after_two_roots(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """sum_after_loop over x and over y, in two roots sharing one block."""
+    m, n = x.shape
+    a = torch.empty([m], dtype=torch.float32, device=x.device)
+    b = torch.empty([m], dtype=torch.float32, device=x.device)
+    block_n = hl.register_block_size(16, 64)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            acc += x[tile_m, tile_n]
+        a[tile_m] = acc.sum(-1)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            acc += y[tile_m, tile_n]
+        b[tile_m] = acc.sum(-1)
+    return a, b
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def colsum_then_rowsum(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """x's column sums (x one tile of rows), then y's row sums, both over one
+    host block: the roots lay the shared block's loop out differently."""
+    m1, n = x.shape
+    m2 = y.size(0)
+    a = torch.empty([n], dtype=torch.float32, device=x.device)
+    b = torch.empty([m2], dtype=torch.float32, device=x.device)
+    block_n = hl.register_block_size(16, 64)
+    for tile_m in hl.tile(m1):
+        for tile_n in hl.tile(n, block_size=block_n):
+            a[tile_n] = x[tile_m, tile_n].sum(0)
+    for tile_m in hl.tile(m2):
+        acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            acc += y[tile_m, tile_n]
+        b[tile_m] = acc.sum(-1)
+    return a, b
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile2d_then_rows(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A 2-D tile over two host blocks, then a root that loops over only one
+    of them: that loop is the second root's alone."""
+    b, m, n = x.shape
+    out0 = torch.empty_like(x)
+    out1 = torch.empty([b], dtype=torch.float32, device=y.device)
+    block_m = hl.register_block_size(4, 32)
+    block_n = hl.register_block_size(4, 32)
+    for tile_b in hl.tile(b):
+        for tile_m, tile_n in hl.tile([m, n], block_size=[block_m, block_n]):
+            out0[tile_b, tile_m, tile_n] = x[tile_b, tile_m, tile_n] + 1
+    for tile_b in hl.tile(b):
+        acc = hl.zeros([tile_b, block_m], dtype=torch.float32)
+        for tile_m in hl.tile(m, block_size=block_m):
+            acc += y[tile_b, tile_m, 0]
+        out1[tile_b] = acc.sum(-1)
+    return out0, out1
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def rolled_sums_in_two_roots(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Row sums over one reduction dim in two roots, which share its rolled
+    loop's strategy."""
+    m, j, _ = x.shape
+    a2 = torch.empty([m, j], dtype=torch.float32, device=x.device)
+    a = torch.empty([m], dtype=torch.float32, device=x.device)
+    b = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        for tile_j in hl.tile(j):
+            a2[tile_m, tile_j] = x[tile_m, tile_j, :].sum(-1)
+        a[tile_m] = y[tile_m, :].sum(-1)
+    for tile_m in hl.tile(m):
+        b[tile_m] = z[tile_m, :].sum(-1)
+    return a2, a, b
+
+
 @helion.kernel(backend="metal")
 def max_carry_after_loop(
     x: torch.Tensor,
@@ -4784,6 +4869,54 @@ class TestMetalReductionAfterTileLoop(unittest.TestCase):
                     rtol=1e-4,
                     atol=1e-4,
                 )
+
+    def test_host_block_in_two_roots(self) -> None:
+        """A block registered on the host, which both roots loop over, is
+        threaded in each root's loop and combined after it."""
+        x = torch.randn(64, 128, device=DEVICE)
+        y = torch.randn(64, 128, device=DEVICE)
+        config = helion.Config(block_sizes=[16, 32, 32], num_threads=[16, 0, 0])
+        a, b = self._run(sums_after_two_roots, config, x, y)
+        torch.testing.assert_close(a, x.sum(-1), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(b, y.sum(-1), rtol=1e-4, atol=1e-4)
+
+    def test_host_block_on_two_axes(self) -> None:
+        """Roots that would thread a shared host block's loop on different
+        axes are refused: the body indexes that loop with one axis."""
+        x = torch.randn(16, 128, device=DEVICE)
+        y = torch.randn(64, 128, device=DEVICE)
+        config = helion.Config(block_sizes=[16, 32, 32], num_threads=[16, 0, 0])
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "several roots run needs one thread axis"
+        ):
+            self._run(colsum_then_rowsum, config, x, y)
+        a, b = self._run(
+            colsum_then_rowsum, helion.Config(block_sizes=[16, 32, 32]), x, y
+        )
+        torch.testing.assert_close(a, x.sum(0), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(b, y.sum(-1), rtol=1e-4, atol=1e-4)
+
+    def test_host_block_loops_by_root(self) -> None:
+        """A root gets only the host-block loops in its own graphs: a 1-D
+        loop over one block of another root's 2-D tile is the second root's
+        alone, and a rolled reduction two roots share stays out of the loop
+        assignment."""
+        x = torch.randn(4, 32, 32, device=DEVICE)
+        y = torch.randn(4, 32, 32, device=DEVICE)
+        config = helion.Config(block_sizes=[8, 8, 1, 1], num_threads=[8, 8, 0, 0])
+        out0, out1 = self._run(tile2d_then_rows, config, x, y)
+        torch.testing.assert_close(out0, x + 1)
+        torch.testing.assert_close(out1, y[:, :, 0].sum(-1), rtol=1e-4, atol=1e-4)
+        x = torch.randn(8, 4, 64, device=DEVICE)
+        y = torch.randn(8, 256, device=DEVICE)
+        z = torch.randn(8, 256, device=DEVICE)
+        config = helion.Config(
+            block_sizes=[8, 4, 8], num_warps=32, reduction_loops=[64]
+        )
+        a2, a, b = self._run(rolled_sums_in_two_roots, config, x, y, z)
+        torch.testing.assert_close(a2, x.sum(-1), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(a, y.sum(-1), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(b, z.sum(-1), rtol=1e-4, atol=1e-4)
 
     def test_reduction_over_dim_0(self) -> None:
         x = torch.randn(100, 48, device=DEVICE)
