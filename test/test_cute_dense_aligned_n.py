@@ -885,13 +885,15 @@ def test_sixteen_bit_pair_writes_physical_n_into_argument_output(rhs_k_major):
         # (128, 32) C subtiles leave room for seven 28 KiB stages; CuTe's
         # with-source (128, 64) subtile would cap the ring at six.
         assert plan.max_ab_stages == 7
-        # One deepest-ring seed per searched width: the widths dividing N.
+        # One deepest-ring seed per searched width: the widths dividing N
+        # (MN-major B: those whose half rows keep 64-byte swizzle atoms).
         seeds = {
             s.config["tcgen05_tile_n"]: s.config["tcgen05_ab_stages"]
             for s in bound.config_spec.compiler_seed_configs
             if s.config.get("tcgen05_tile_n")
         }
-        assert set(seeds) == set(facts._dense_aligned_n_widths(state)) == {96, 192}
+        assert set(seeds) == set(facts._dense_aligned_n_widths(state))
+        assert set(seeds) == ({96, 192} if rhs_k_major else {192})
         assert seeds[192] == 7
         # Two N tiles per pair split N evenly (A multicast).
         assert (
@@ -1130,6 +1132,10 @@ def test_sixteen_bit_pair_rings_tails_and_refusals():
             aligned_n_bf16_config(tcgen05_tile_n=80, block_sizes=[256, 128, 64])
         )
     assert _seeded_widths(odd) == {96, 160, 192}
+    # MN-major B: each CTA stages half of an N tile as one SMEM row; only the
+    # 192-wide pair's 96-column (192-byte) halves keep 64-byte swizzle atoms.
+    mn_b = plain_mm_into._bind_isolated(bf16_mm_args(8192, 960, 768, rhs_k_major=False))
+    assert _seeded_widths(mn_b) == {192}
     # 960 columns split into five 192-wide tiles: no N pairing.
     with pytest.raises(InvalidConfig, match="tcgen05_tile_n"):
         odd.to_code(aligned_n_bf16_config(tcgen05_cluster_n=2))

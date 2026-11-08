@@ -3,8 +3,9 @@
 Inductor's native-matmul path runs Helion kernels with
 ``autotune_effort="none"``, so the default config is what such a GEMM runs.
 Among the compiler's proved tcgen05 seeds (plus the one-CTA 128x256 tile on
-whole tiles) this heuristic promotes the one whose tile minimizes
-wave-quantized MMA time; whole 256x256-tile shapes keep the FFI direct-entry
+whole tiles, and the 16-bit dense aligned-N pairs at their physical widths)
+this heuristic promotes the one whose tile minimizes wave-quantized MMA
+time; whole 256x256-tile shapes keep the FFI direct-entry
 default unless a candidate is clearly cheaper.
 """
 
@@ -17,6 +18,7 @@ from typing import cast
 from ....._utils import cdiv
 from .....runtime.config import Config
 from ....autotuner_heuristics.registry import AutotunerHeuristic
+from ...dense_aligned_n import TILE_N_KEY
 from ...strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
 from ...strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from ...strategies import Tcgen05LayoutStrategy
@@ -25,6 +27,8 @@ from ...tcgen05_config import seeds
 from ...tcgen05_config import smem
 from ...tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from ...tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ...tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from ...tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 
@@ -45,6 +49,22 @@ _TILE_EFFICIENCY = {
     (1, 128, 256): 0.92,
     (1, 128, 128): 0.85,
 }
+
+
+def _aligned_n_efficiency(cluster_m: int, bm: int, width: int) -> float | None:
+    """Per-SM MMA efficiency of a 16-bit dense aligned-N pair tile at its
+    physical ``width`` (``tcgen05_tile_n``), interpolated between the 256x128
+    and 256x256 pairs: bf16 1000x2560x2048 runs one wave of 64 256x160 pairs
+    at 0.93 of cuBLAS where one wave of 40 256x256 pairs runs 0.72;
+    4096x2560x2560: 256x160 pairs 0.96 against the 256x256 direct-entry
+    default's 0.85. Narrower widths are not default candidates (16384x960x1024:
+    the 96-wide pair runs 40-42 us against 38 for the 256x256 one), nor is
+    the FP8 family's 128-row pair (64 rows per CTA: below the per-SM floor)."""
+    if (cluster_m, bm) != (2, TCGEN05_TWO_CTA_BLOCK_M) or width < 128:
+        return None
+    low = _TILE_EFFICIENCY[(2, TCGEN05_TWO_CTA_BLOCK_M, 128)]
+    high = _TILE_EFFICIENCY[(2, TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N)]
+    return low + (high - low) * (width - 128) / (TCGEN05_TWO_CTA_BLOCK_N - 128)
 
 
 # A candidate replaces the FFI default only below this fraction of its cost.
@@ -162,6 +182,7 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         for seed in [
             *seeds.autotune_seed_configs(state),
             *cls._one_cta_candidates(env, m, n, k),
+            *seeds.dense_aligned_n_seed_configs(state),
         ]:
             values: dict[str, Any] = seed.config
             if (
@@ -180,7 +201,13 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             bm, bn, bk = (cast("int", blocks[i]) for i in (mi, ni, ki))
             cluster_m = cast("int", values.get("tcgen05_cluster_m", 1))
             stages = cast("int", values.get("tcgen05_ab_stages", 2))
-            efficiency = _TILE_EFFICIENCY.get((cluster_m, bm, bn))
+            # an aligned-N seed stores its physical width behind the carrier
+            width = cast("int", values.get(TILE_N_KEY) or 0)
+            if width:
+                bn = width
+                efficiency = _aligned_n_efficiency(cluster_m, bm, width)
+            else:
+                efficiency = _TILE_EFFICIENCY.get((cluster_m, bm, bn))
             if (
                 efficiency is None
                 or k % bk

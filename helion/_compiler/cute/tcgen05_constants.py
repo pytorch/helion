@@ -144,6 +144,9 @@ TCGEN05_RADIX_STORE_BOX_N = TCGEN05_PLAIN_NARROW_SUBTILE_N
 TCGEN05_PAIR_TILE_STREAM_RATIO = 0.44
 TCGEN05_PAIR_TILE_FIXED_KBLOCKS = 4.5
 TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN = 0.15
+# An N-major B half row of the aligned-N pair must hold whole swizzle atoms
+# of at least this many bytes to be seeded.
+TCGEN05_ALIGNED_N_MN_B_ROW_BYTES = 64
 # Tall 16-bit aligned-N problems (at least this many 256-row pair rows) also
 # seed the grouped persistent raster at these L2 groupings.
 TCGEN05_ALIGNED_N_TALL_PAIR_ROWS = 64
