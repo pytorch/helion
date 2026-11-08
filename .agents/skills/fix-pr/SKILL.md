@@ -1,13 +1,17 @@
 ---
 name: fix-pr
-description: Address CI failures and unresolved review comments on a Helion pull request. Auto-activate when the user mentions a URL like https://github.com/pytorch/helion/pull/<number>.
+description: Address CI failures and unresolved review comments on a single Helion pull request that is not part of a stack you own — leaving the fixes uncommitted for its author. Auto-activate when the user mentions a URL like https://github.com/pytorch/helion/pull/<number>; for your own stack-pr stack, use fix-pr-stack instead.
 ---
 
 # Fix a Helion pull request
 
 Goal: bring a PR green by fixing CI failures and addressing unresolved review comments. Leave the fixes **uncommitted and unstaged** — the user handles committing and updating the PR.
 
-This skill fixes the single PR for the HEAD commit. To fix every PR in a stack-pr stack, use the fix-pr-stack skill instead.
+This skill fixes the single PR for the HEAD commit and is for pull requests you
+do not own, or one-off branches not managed with stack-pr. For a stack-pr stack
+of your own (even one commit), use the fix-pr-stack skill: it amends the fixes,
+resubmits and watches CI. If GitHub is unreachable from your session, step 0 of
+fix-pr-stack lists the fallback routes.
 
 ## 1. Identify the target PR
 

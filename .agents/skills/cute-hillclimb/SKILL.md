@@ -35,7 +35,7 @@ Pick a run name at the start (e.g. `softmax-2026-08-30`) and write ALL non-commi
 
 ## Shared machine
 
-Follow the GPU Usage rules in `AGENTS.md`. Prefer GPUs you have not seen recently used by others, and stick to the same GPU for the same benchmark+shape. Good ways to parallelize: run `HELION_BACKEND=triton` tests on one GPU and `HELION_BACKEND=cute` tests on another, shard different shapes or kernels across GPUs, or use a spare GPU to try out ideas or re-run autotuning to check robustness (autotuning is randomized).
+Follow the GPU Usage rules in `AGENTS.md`: take GPUs through `scripts/gpu_board.py` (`pick` for a session, `run -- <command>` around one autotune or benchmark), and stick to the same GPU for the same benchmark+shape. Good ways to parallelize: `scripts/run_tests.py --backend triton,cute -n 2` runs both backends' lanes on two GPUs, shard different shapes or kernels across GPUs, or use a spare GPU to try out ideas or re-run autotuning to check robustness (autotuning is randomized).
 
 ## Measurement pitfalls
 
@@ -49,7 +49,7 @@ Each of these has produced a convincing-but-fake regression on this hardware; gu
 
 ## Commit your work as you go
 
-Group work into logical, complete chunks where everything is working, and commit each chunk to save progress. Use the cute-verify skill to test and review each chunk before committing it.
+Group work into logical, complete chunks where everything is working, and commit each chunk (`AGENTS.md`, Commits and the Stack). Use the verify skill to test and review each chunk before committing it.
 
 # Hillclimbing task
 
@@ -114,7 +114,7 @@ You should now have a git history (relative to `origin/main`) of all the optimiz
 - Group the remaining work into logical pieces that are easy to review. Avoid numerous small commits, but use your best judgment.
 - Prefix CuTe backend commits with `[cutedsl]`.
 
-Use cute-verify as needed to review and test each commit.
+The stack-history skill has the rewriting recipes; use the verify skill to review and test each commit.
 
 ## Step 5: Final report
 
