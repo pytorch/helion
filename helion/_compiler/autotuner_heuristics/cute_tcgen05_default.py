@@ -5,8 +5,9 @@ Inductor's native-matmul path runs Helion kernels with
 Among the compiler's proved tcgen05 seeds (plus the one-CTA 128x256 tile on
 whole tiles, and the 16-bit dense aligned-N pairs at their physical widths)
 this heuristic promotes the one whose tile minimizes wave-quantized MMA
-time; whole 256x256-tile shapes keep the FFI direct-entry
-default unless a candidate is clearly cheaper. Plain GEMMs only the edge +
+time; whole 256x256-tile shapes keep the FFI direct-entry pair unless a
+candidate is clearly cheaper, with its promoted bias rows staged
+(``pre_acc_wait``) where the heuristic promotes that seed. Plain GEMMs only the edge +
 K-tail family runs (a 16-bit K tail on whole M and N tiles, or a K tail with
 ragged M and N) take that family's CLC pair seed.
 """
@@ -77,6 +78,9 @@ _TMA_STORE_MIN_WAVES = 16
 # K tiles per output tile up to which the epilogue bounds a pair GEMM, so its
 # default stages promoted bias rows (``pre_acc_wait``; see ``_pick``).
 _EPILOGUE_BOUND_MAX_K_TILES = 2
+# The M-tile grouping of a many-tile output-edge auxiliary GEMM's default
+# (see ``_pick``). The many-tile cutoff is ``_TMA_STORE_MIN_WAVES``'s.
+_EDGE_AUX_L2_GROUPING = 32
 # A candidate replaces the FFI default only below this fraction of its cost.
 _FFI_REPLACEMENT_MARGIN = 0.9
 
@@ -98,6 +102,28 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         return cls._pick(env)
+
+    @staticmethod
+    def _direct_entry_staged_row(state: CuteTcgen05Config) -> Config | None:
+        """The FFI direct-entry default with its promoted bias rows staged.
+
+        Whole 256x256 tiles keep the direct-entry pair; under ``post_acc_wait``
+        its epilogue loads the bias row from global memory on every subtile,
+        which leaves the latency on each tile's epilogue and on the last
+        tile's unoverlapped tail. ``pre_acc_wait`` stages the promoted row
+        once per tile at the seed's own rings where the arena holds the stage.
+        Inductor corpus, bf16 + bias on B200, of cuBLAS: 8192x2304x768 (3.9
+        tiles per pair) 0.945 -> 0.983, 16384x2304x768 0.979 -> 1.000,
+        32768x1536x768 (10.4 per pair) 0.980 -> 0.982.
+        """
+        seed = state.full_tile_direct_entry_seed_config()
+        if seed is None or not state.direct_entry_row_stage_fits():
+            return None
+        values: dict[str, Any] = dict(seed.config)
+        values[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+            TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+        )
+        return Config(**values)
 
     @staticmethod
     def _edge_k_tail_default(state: CuteTcgen05Config) -> Config | None:
@@ -265,7 +291,7 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
                 best = (key, seed, waves)
                 best_tile = (bm, bn, bk)
         if best is None or (ffi_cost is not None and best[0][0] >= ffi_cost):
-            return None
+            return None if ffi_cost is None else cls._direct_entry_staged_row(state)
         values = dict(best[1].config)
         # PDL stays a target decision of the base default.
         values.pop("cute_pdl", None)
@@ -290,10 +316,8 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             and k // bk <= _EPILOGUE_BOUND_MAX_K_TILES
             and values.get("tcgen05_cluster_m", 1) == 2
             and not values.get(TILE_N_KEY)
-            and pipeline_facts.rows
-            and all(row.promoted for row in pipeline_facts.rows)
             # a column-major output reads its rows per subtile, unstaged
-            and not pipeline_facts.output_column_major
+            and state.promoted_row_epilogue()
         ):
             # With at most two K tiles per output tile the epilogue bounds the
             # pair, and loading a bias row from global memory per subtile
@@ -335,17 +359,39 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             # ring keeps every tile on the predicated SIMT store
             # (``output_edge_tma_store_smem_fits`` refuses the hybrid TMA
             # store beside row stages, and ``c_stages_fits`` does not admit it
-            # at that ring); ``post_acc_wait`` stores the full tiles through
-            # TMA. The TMA store wins from 16
-            # tiles per CTA (pair) on, the SIMT store below. Inductor corpus,
-            # 256x256x64 ab6 pairs + bf16 bias, of cuBLAS, SIMT -> TMA store:
+            # at that ring); ``post_acc_wait`` stores every tile through TMA
+            # where the arena holds the row stage (the partial-output store,
+            # ``cute_mma``), else the full tiles. Measured against the full-
+            # tile split, before the partial-output store took the fringe
+            # tiles too, the TMA store won from 16 tiles per CTA (pair) on and
+            # the SIMT store below. Inductor corpus, 256x256x64 ab6 pairs +
+            # bf16 bias, of cuBLAS, SIMT -> full-tile TMA store:
             # 104 tiles per pair (16384x30528x768) 0.63 -> 0.92, 26
             # (4096x30000x128) 0.41 -> 0.52; 13 (25216x2304x768) 0.67 -> 0.61,
             # 6 (32768x576x192) 0.50 -> 0.29, 4 (2048x8008x2560) 1.06 -> 0.86.
             values[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
                 TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
             )
-        if (
+        if state.aux_kernel_detected and state._has_any_matmul_fact_edge_tile(values):
+            # An output-edge auxiliary GEMM walks its tiles in groups of 32 M
+            # tiles (12.6 MB of a K=768 A operand per group, resident in L2
+            # while the group sweeps N) where it runs many tiles per CTA pair
+            # over more than 32 M tiles (on fewer the groups are the plain
+            # raster), and the plain raster otherwise. Inductor corpus on
+            # B200, + bias, of the ATen GEMM, plain / grouped (8) / grouped
+            # (32): 32768x30528x768 0.86 / 0.94 / 0.96, 16384x30528x768 0.96
+            # / 0.94 / 0.98.
+            assert state.matmul_block_ids is not None
+            groupings = list(values.get("l2_groupings") or [1] * len(spec.l2_groupings))
+            groupings[
+                spec.l2_groupings.block_id_to_index(state.matmul_block_ids[0])
+            ] = (
+                _EDGE_AUX_L2_GROUPING
+                if many_tiles and cdiv(m, bm) > _EDGE_AUX_L2_GROUPING
+                else 1
+            )
+            values["l2_groupings"] = groupings
+        elif (
             best[2] > 1
             and len(spec.l2_groupings) == 1
             and values.get("l2_groupings", [1]) == [1]

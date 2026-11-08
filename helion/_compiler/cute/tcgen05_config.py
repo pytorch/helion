@@ -303,6 +303,7 @@ from .tcgen05_constants import tcgen05_default_epilogue_tile_size
 from .tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
 from .tcgen05_constants import tcgen05_fixed_smem_overhead_bytes
 from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from .tcgen05_constants import tcgen05_partial_output_row_stage_smem_bytes
 from .tcgen05_constants import tcgen05_role_launch_n_width
 from .tcgen05_constants import tcgen05_round_up_smem_bytes
 from .tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
@@ -7572,6 +7573,7 @@ class CuteTcgen05Config:
         aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
         epi_subtile_n: int | None = None,
         epi_warp_groups: int = 1,
+        extra_stage_bytes: int = 0,
     ) -> int | None:
         """Modelled static SMEM arena of a DEFAULT-layout tile, in bytes.
 
@@ -7600,7 +7602,9 @@ class CuteTcgen05Config:
         subtile to ``(per-CTA M, epi_subtile_n)`` (``tcgen05_epi_subtile_n``,
         the explicit-tile path) and ``epi_warp_groups`` multiplies the C
         stages (each epilogue warp group owns ``c_stages`` stages of the
-        ring, ``tcgen05_epi_warp_groups``).
+        ring, ``tcgen05_epi_warp_groups``). ``extra_stage_bytes`` adds row
+        stages taken outside ``pre_acc_wait`` (the partial-output store's,
+        ``partial_output_row_stage_fits``) to the leading stage chunk.
         """
         constraints = self.ab_stages_three_search_constraints
         facts = self.rowvec_aux_facts
@@ -7632,6 +7636,7 @@ class CuteTcgen05Config:
                 if stage_rows
                 else 0
             )
+        stage_bytes += extra_stage_bytes
         if stage_bytes:
             # The row stages lead the arena and the C ring's 1 KiB alignment
             # follows them: a 256 B or 512 B promoted row occupies a whole KiB.
@@ -7702,6 +7707,7 @@ class CuteTcgen05Config:
         aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
         epi_subtile_n: int | None = None,
         epi_warp_groups: int = 1,
+        extra_stage_bytes: int = 0,
     ) -> bool:
         """Whether a DEFAULT-layout tile's SMEM plan fits the opt-in capacity.
 
@@ -7726,6 +7732,7 @@ class CuteTcgen05Config:
             aux_stages=aux_stages,
             epi_subtile_n=epi_subtile_n,
             epi_warp_groups=epi_warp_groups,
+            extra_stage_bytes=extra_stage_bytes,
         )
         if arena_bytes is None:
             return False
@@ -7817,6 +7824,7 @@ class CuteTcgen05Config:
         cluster_m: int,
         ab_stages: int,
         c_stages: int,
+        extra_stage_bytes: int = 0,
     ) -> bool:
         """Whether an output-edge kernel's TMA-store C ring fits beside its AB ring.
 
@@ -7833,6 +7841,8 @@ class CuteTcgen05Config:
         tiles; the aligned-N family prices its own M-edge ring), so the ring
         is charged at CuTe's with-source subtile, or at a configured explicit
         tile when that is wider. Fails closed like the model.
+        ``extra_stage_bytes`` adds the partial-output store's row stages
+        (``partial_output_row_stage_fits``).
         """
         facts = self.rowvec_aux_facts
         if facts is None or cluster_m not in (1, 2):
@@ -7845,6 +7855,68 @@ class CuteTcgen05Config:
             # 51.3 with the staged row beside the TMA store; see
             # ``CuteTcgen05DefaultTileHeuristic._pick``).
             return False
+        return self._config_arena_fits(
+            config,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=cluster_m,
+            ab_stages=ab_stages,
+            c_stages=c_stages,
+            epi_subtile_n=self._output_edge_epi_subtile_n(config, bm=bm, bn=bn),
+            extra_stage_bytes=extra_stage_bytes,
+        )
+
+    def partial_output_row_stage_fits(
+        self,
+        config: dict[str, object],
+        *,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+        ab_stages: int,
+        c_stages: int,
+    ) -> bool:
+        """Whether a partial-output TMA-store epilogue's row stages fit.
+
+        With register (SIMT) auxiliary loads the output-edge TMA store also
+        takes the fringe tiles (``cute_mma``'s
+        ``tcgen05_partial_output_tma_store``), and each row-vector operand
+        then stages one N tile in its own dtype through a predicated copy
+        (``memory_ops``' ``stage_partial_tma_rowvec``), which the arena judged
+        by ``output_edge_tma_store_smem_fits`` does not hold: an unpromoted
+        BF16 row is no ``pre_acc_wait`` stage there, but 512 B of a 256-wide
+        tile here. This judges that arena with those stages (an upper bound:
+        ``tcgen05_partial_output_row_stage_smem_bytes``).  Callers keep
+        ``pre_acc_wait`` and C-input configs away (their rows stage
+        elsewhere).
+        """
+        facts = self.rowvec_aux_facts
+        return facts is not None and self.output_edge_tma_store_smem_fits(
+            config,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=cluster_m,
+            ab_stages=ab_stages,
+            c_stages=c_stages,
+            extra_stage_bytes=tcgen05_partial_output_row_stage_smem_bytes(
+                rows=facts.rows, bn=bn
+            ),
+        )
+
+    def _output_edge_epi_subtile_n(
+        self, config: dict[str, object], *, bm: int, bn: int
+    ) -> int:
+        """The C subtile width the output-edge TMA-store plan renders.
+
+        Power-of-two edge tiles never take the plain (128, 32) narrow subtile
+        (it needs static full tiles), so the ring is charged at CuTe's
+        with-source subtile, or at a configured explicit tile when wider.
+        """
+        facts = self.rowvec_aux_facts
+        assert facts is not None
         out_bits = facts.output_itemsize * 8
         _subtile_m, subtile_n = tcgen05_default_epilogue_tile_size(
             bm, bn, elem_width_d=out_bits, elem_width_c=out_bits
@@ -7855,16 +7927,7 @@ class CuteTcgen05Config:
         ):
             if configured is not None:
                 subtile_n = max(subtile_n, configured)
-        return self._config_arena_fits(
-            config,
-            bm=bm,
-            bn=bn,
-            bk=bk,
-            cluster_m=cluster_m,
-            ab_stages=ab_stages,
-            c_stages=c_stages,
-            epi_subtile_n=subtile_n,
-        )
+        return subtile_n
 
     def _config_arena_fits(
         self,
@@ -7877,6 +7940,7 @@ class CuteTcgen05Config:
         ab_stages: int,
         c_stages: int,
         epi_subtile_n: int | None,
+        extra_stage_bytes: int = 0,
     ) -> bool:
         """``default_layout_smem_fits`` with every other input read from ``config``."""
         return self.default_layout_smem_fits(
@@ -7893,6 +7957,7 @@ class CuteTcgen05Config:
             aux_stages=self._config_aux_stages(config),
             epi_subtile_n=epi_subtile_n,
             epi_warp_groups=self._config_epi_warp_groups(config),
+            extra_stage_bytes=extra_stage_bytes,
         )
 
     @staticmethod
@@ -10234,9 +10299,9 @@ class CuteTcgen05Config:
         self._set_aux_edge_monolithic_prefix(config)
         config["tcgen05_acc_stages"] = 2
         config["tcgen05_c_stages"] = 4
-        config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
-        if isinstance(config.get("l2_groupings"), list):
-            config["l2_groupings"] = [1] * len(self.config_spec.l2_groupings)
+        # The tile order (``l2_groupings``, ``tcgen05_l2_swizzle_size``) is
+        # left to the sample (``_fix_edge_swizzle_search_config`` drops the
+        # swizzle where it is inert or refused once the walk is final).
         if isinstance(config.get("indexing"), list):
             indexing = cast("list[object]", config["indexing"])
             for i in range(len(indexing)):
@@ -11000,8 +11065,52 @@ class CuteTcgen05Config:
             ):
                 config[key] = None
             return
+        placement = config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
         self._clear_target1_tvm_ffi_promotion_surface(config)
         config.update(seed.config)
+        if (
+            placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            and self.direct_entry_row_stage_fits()
+        ):
+            # The staged promoted bias row rides the direct entry's own rings
+            # (``CuteTcgen05DefaultTileHeuristic._direct_entry_staged_row``).
+            config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = placement
+
+    def promoted_row_epilogue(self) -> bool:
+        """Whether every row-vector operand is a promoted 16-bit row (staged
+        as an FP32 row by the store lowering) beside a row-major output: the
+        epilogues whose rows the defaults stage (``pre_acc_wait``)."""
+        facts = self.pipeline_smem_facts
+        return (
+            facts is not None
+            and bool(facts.rows)
+            and all(row.promoted for row in facts.rows)
+            and not facts.output_column_major
+        )
+
+    def direct_entry_row_stage_fits(self) -> bool:
+        """Whether the direct-entry pair stages its promoted rows.
+
+        ``pre_acc_wait`` stages a promoted row once per tile; the defaults
+        stage only promoted rows (``promoted_row_epilogue``, the measured
+        case), judged here at the seed's own rings and (128, 32) subtile.
+        """
+        pipeline = self.full_tile_direct_entry_seed_pipeline()
+        if pipeline is None or not self.promoted_row_epilogue():
+            return False
+        bk, ab_stages, c_stages = pipeline
+        return bool(
+            self.default_layout_smem_fits(
+                bm=TCGEN05_TWO_CTA_BLOCK_M,
+                bn=TCGEN05_TWO_CTA_BLOCK_N,
+                bk=bk,
+                cluster_m=2,
+                ab_stages=ab_stages,
+                c_stages=c_stages,
+                stage_rows=True,
+                epi_subtile_n=32,
+            )
+        )
 
     def aux_load_mode_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         choices = [TCGEN05_AUX_LOAD_MODE_SIMT]
@@ -12164,8 +12273,11 @@ class CuteTcgen05Config:
         # run last, on every path of the body (its early returns included:
         # the one-CTA pipeline, the dense-N tile, the materialized chains
         # and the explicit pair): the persistent grid cap is inert once a
-        # projection drops the cluster to one N tile, and the split-K knobs
-        # apply only on the flat one-CTA family.
+        # projection drops the cluster to one N tile, an edge or K-tail
+        # sample's swizzle is inert on a flat walk and refused under two
+        # N clusters, and the split-K knobs apply only on the flat one-CTA
+        # family.
+        self._fix_edge_swizzle_search_config(config)
         self._fix_persistent_grid_cap_search_config(config)
         self._fix_split_k_search_config(config)
         self._fix_split_k_workspace_search_config(config)
@@ -12336,6 +12448,33 @@ class CuteTcgen05Config:
                 return None
             entries.append(matches[0])
         return entries
+
+    def _fix_edge_swizzle_search_config(self, config: dict[str, object]) -> None:
+        """Return an edge or K-tail sample's swizzle to 1 where nothing runs it.
+
+        Only a persistent walk's tile scheduler reads
+        ``tcgen05_l2_swizzle_size``: a flat kernel is the same code at any
+        value, and two samples differing only in it would be the same kernel
+        twice. Under ``tcgen05_cluster_n=2`` the edge and K-tail families
+        refuse any swizzle (``cute_mma``: their split full/fringe scheduler
+        does not compose with it). Runs after the body, whose projections may
+        still change the pid type and the cluster.
+        """
+        if not self.search_enabled:
+            return
+        if config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1) == 1:
+            return
+        if not self._has_any_matmul_fact_edge_tile(config):
+            return
+        persistent = ("persistent_blocked", "persistent_interleaved")
+        # A flat ordered chain whose GEMM launches run persistent
+        # (``tcgen05_region_pid_types``) shares the swizzle with them.
+        walks_persistent = config.get("pid_type") in persistent or any(
+            pid_type in persistent for pid_type in self._region_pid_types(config)
+        )
+        if walks_persistent and config.get("tcgen05_cluster_n", 1) == 1:
+            return
+        config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
 
     def _fix_persistent_grid_cap_search_config(self, config: dict[str, object]) -> None:
         """Return the grid cap to its default where the projected tuple makes it inert.

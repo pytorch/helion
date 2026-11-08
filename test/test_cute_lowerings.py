@@ -18371,10 +18371,12 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             code,
         )
 
-    def test_aux_edge_target_shape_ab2_uses_full_tile_tma_store_with_simt_fallback(
-        self,
-    ) -> None:
-        """5000x5000x5000 output-edge kernels use TMA store on interior tiles."""
+    def test_aux_edge_target_shape_ab2_stores_every_tile_through_tma(self) -> None:
+        """5000x5000x5000 output-edge kernels with register auxiliary loads
+        store every tile through TMA (the D descriptor drops the clipped part
+        of a fringe tile): the residual reads behind the full-tile guard
+        (predicated element loads on fringe tiles), the bias row stages
+        through a predicated copy, and no tile takes the SIMT store."""
 
         kernel = self._bias_residual_gelu_kernel()
         args = (
@@ -18403,39 +18405,17 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         self.assertIn("'kind': 'tcgen05_d_tma'", code)
         self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
-        self.assertIn("if tcgen05_full_tile:", code)
-        self.assertEqual(code.count("tcgen05_full_tile = "), 1, code)
-        self.assertEqual(code.count("if tcgen05_full_tile:"), 1, code)
-        full_tile_branch = code.index("if tcgen05_full_tile:")
-        full_tile_indent = code[
-            code.rfind("\n", 0, full_tile_branch) + 1 : full_tile_branch
-        ]
-        edge_branch_match = re.search(
-            rf"(?m)^{re.escape(full_tile_indent)}else:[ \t]*$",
-            code[full_tile_branch:],
-        )
-        self.assertIsNotNone(
-            edge_branch_match,
-            "could not find else branch paired with if tcgen05_full_tile",
-        )
-        assert edge_branch_match is not None
-        edge_branch = full_tile_branch + edge_branch_match.start()
         self.assertLess(
             code.index("cutlass.pipeline.PipelineTmaStore.create"),
             code.index("while tcgen05_role_local_"),
         )
-        for full_tile_setup in (
-            "tcgen05_kernel_desc = type('Tcgen05KernelDesc'",
-            "tcgen05_sD_layout = ",
-            "tcgen05_tAcc = ",
-        ):
-            setup_pos = code.index(full_tile_setup)
-            self.assertGreater(setup_pos, full_tile_branch)
-            self.assertLess(setup_pos, edge_branch)
-        self.assertGreater(
-            code.index("tcgen05_kernel_desc = type('Tcgen05KernelDesc'", edge_branch),
-            edge_branch,
-        )
+        # the full-tile guard covers the residual load only
+        self.assertEqual(code.count("tcgen05_full_tile = "), 1, code)
+        self.assertEqual(code.count("if tcgen05_full_tile:"), 1, code)
+        self.assertIn("tcgen05_aux_loaded_0 = tcgen05_tTR_gAux_subtile_0.load()", code)
+        self.assertIn("pred=tcgen05_aux_rowvec_pred_", code)
+        self.assertEqual(code.count("cute.copy(tcgen05_tma_store_atom"), 1, code)
+        self.assertNotIn("tcgen05_simt_atom", code)
         self.assertGreater(
             code.index("tcgen05_c_pipeline.producer_tail()"),
             code.index("while tcgen05_role_local_"),
@@ -18453,8 +18433,6 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             f"cutlass.Int32({TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES})",
             code,
         )
-        self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
-        self.assertIn("cute.nvgpu.CopyUniversalOp()", code)
 
     def test_aux_edge_target_shape_c_input_stages_residual_only(self) -> None:
         """Target8 scheduler split stages residual only on full tiles."""
@@ -19299,9 +19277,13 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIn("tcgen05_bSG_sD, tcgen05_bSG_gD_partitioned", code)
         self.assertNotIn("tcgen05_edge_src = cute.logical_divide(", code)
 
-    def test_aux_edge_hybrid_tma_store_runtime_correctness(self) -> None:
-        """Hybrid full-tile TMA store and SIMT edge fallback run together."""
-
+    def _bias_residual_gelu_640(
+        self, **config: object
+    ) -> tuple[Any, str, tuple[torch.Tensor, ...]]:
+        """The 640x640 bias + residual + gelu GEMM on 256x256 pairs -- four
+        full tiles and output-edge tiles in one persistent CtaGroup.TWO
+        kernel -- at the edge K-tail ring with ``config`` on top; returns the
+        bound kernel, its code and its arguments."""
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
         if not get_cute_mma_support().tcgen05_f16bf16:
@@ -19309,10 +19291,6 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         kernel = self._bias_residual_gelu_kernel()
         torch.manual_seed(0)
-        # 640x640 with 256x256 tiles gives four full tiles plus output-edge
-        # tiles in the same persistent CtaGroup.TWO kernel, so the hybrid path
-        # exercises a hoisted TMA-store pipeline/tail for full tiles plus the
-        # SIMT edge fallback in one launch.
         args = (
             torch.randn(640, 128, device=DEVICE, dtype=torch.bfloat16),
             torch.randn(128, 640, device=DEVICE, dtype=torch.bfloat16),
@@ -19331,121 +19309,115 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
                 tcgen05_acc_stages=1,
                 tcgen05_c_stages=TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
                 tcgen05_l2_swizzle_size=TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
-                tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
-                tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
                 indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
+                **config,
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
-            self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
-            self.assertEqual(code.count("if tcgen05_full_tile:"), 1, code)
-            self.assertIn(
-                "tcgen05_c_buffer = (tcgen05_tma_store_role_tile * "
-                "cutlass.Int32(tcgen05_subtile_count) + "
-                "cutlass.Int32(_tcgen05_subtile)) % "
-                f"cutlass.Int32({TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES})",
-                code,
-            )
-            self.assertIn(
-                "tcgen05_tma_store_role_tile = "
-                "tcgen05_tma_store_role_tile + cutlass.Int32(1)",
-                code,
-            )
-            self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
-            self.assertIn("cute.nvgpu.CopyUniversalOp()", code)
-            self.assertIn(
-                "tcgen05_aux_rmem_0_edge_atom = cute.make_copy_atom("
-                "cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16)",
-                code,
-            )
-            self.assertIn(
-                "cute.copy(tcgen05_aux_rmem_0_edge_atom, "
-                "tcgen05_aux_rmem_0_edge_src, tcgen05_aux_rmem_0_edge_dst, "
-                "pred=tcgen05_aux_rmem_0_edge_pred)",
-                code,
-            )
-            self.assertIn(
-                "tcgen05_edge_src = cute.logical_divide("
-                "tcgen05_tTR_rD, cute.make_layout(1))",
-                code,
-            )
-            self.assertIn(
-                "cute.copy(tcgen05_simt_atom, tcgen05_edge_src, "
-                "tcgen05_edge_dst, pred=tcgen05_edge_pred)",
-                code,
-            )
-            out = bound(*args)
+        return bound, code, args
 
+    def _check_bias_residual_gelu_640(
+        self, bound: Any, args: tuple[torch.Tensor, ...]
+    ) -> None:
+        """Run ``_bias_residual_gelu_640``'s kernel against torch."""
+        with patch_cute_mma_support():
+            out = bound(*args)
         expected = torch.nn.functional.gelu(
             1.25 * (args[0] @ args[1]).float() + 0.5 * args[3] + args[2],
             approximate="tanh",
         ).to(args[0].dtype)
         torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+
+    def test_aux_edge_register_aux_tma_store_runtime_correctness(self) -> None:
+        """Register auxiliary loads with every tile on the TMA store: one
+        hoisted TMA-store pipeline/tail stores both, the residual reads behind
+        the full-tile guard and the bias row stages through a predicated
+        copy."""
+        bound, code, args = self._bias_residual_gelu_640(
+            tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+            tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+        )
+        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self.assertEqual(code.count("if tcgen05_full_tile:"), 1, code)
+        self.assertIn(
+            "tcgen05_c_buffer = (tcgen05_tma_store_role_tile * "
+            "cutlass.Int32(tcgen05_subtile_count) + "
+            "cutlass.Int32(_tcgen05_subtile)) % "
+            f"cutlass.Int32({TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES})",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_tma_store_role_tile = "
+            "tcgen05_tma_store_role_tile + cutlass.Int32(1)",
+            code,
+        )
+        self.assertEqual(code.count("cute.copy(tcgen05_tma_store_atom"), 1, code)
+        self.assertIn("pred=tcgen05_aux_rowvec_pred_", code)
+        self.assertNotIn("tcgen05_simt_atom", code)
+        self._check_bias_residual_gelu_640(bound, args)
+
+    def test_aux_edge_hybrid_tma_store_runtime_correctness(self) -> None:
+        """Hybrid full-tile TMA store and SIMT edge fallback run together:
+        ``pre_acc_wait`` keeps the split (the partial-output body refuses its
+        per-subtile loads ahead of the accumulator wait), the residual read
+        on both."""
+        bound, code, args = self._bias_residual_gelu_640(
+            tcgen05_aux_load_placement="pre_acc_wait"
+        )
+        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self.assertIn("if tcgen05_full_tile:", code)
+        self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
+        self.assertIn(
+            "tcgen05_aux_rmem_0_edge_atom = cute.make_copy_atom("
+            "cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16)",
+            code,
+        )
+        self.assertIn(
+            "cute.copy(tcgen05_aux_rmem_0_edge_atom, "
+            "tcgen05_aux_rmem_0_edge_src, tcgen05_aux_rmem_0_edge_dst, "
+            "pred=tcgen05_aux_rmem_0_edge_pred)",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_edge_src = cute.logical_divide("
+            "tcgen05_tTR_rD, cute.make_layout(1))",
+            code,
+        )
+        self.assertIn(
+            "cute.copy(tcgen05_simt_atom, tcgen05_edge_src, "
+            "tcgen05_edge_dst, pred=tcgen05_edge_pred)",
+            code,
+        )
+        self._check_bias_residual_gelu_640(bound, args)
 
     def test_aux_edge_partial_tma_store_runtime_correctness(self) -> None:
         """Partial-output TMA store handles full and edge tiles together."""
-
-        from helion._compiler.cute.mma_support import get_cute_mma_support
-
-        if not get_cute_mma_support().tcgen05_f16bf16:
-            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
-
-        kernel = self._bias_residual_gelu_kernel()
-        torch.manual_seed(0)
-        # 640x640 with 256x256 tiles gives full and output-edge tiles in one
-        # persistent CtaGroup.TWO kernel.
-        args = (
-            torch.randn(640, 128, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(128, 640, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(640, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(640, 640, device=DEVICE, dtype=torch.bfloat16),
+        bound, code, args = self._bias_residual_gelu_640(
+            tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+            tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+            **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
         )
-        with patch_cute_mma_support():
-            bound = kernel.bind(args)
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[256, 256, 128],
-                l2_groupings=[TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
-                pid_type="persistent_interleaved",
-                num_warps=4,
-                tcgen05_cluster_m=2,
-                tcgen05_ab_stages=2,
-                tcgen05_acc_stages=1,
-                tcgen05_c_stages=TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
-                tcgen05_l2_swizzle_size=TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
-                tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
-                tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
-                tcgen05_strategy="role_local_with_scheduler",
-                tcgen05_warp_spec_scheduler_warps=1,
-                tcgen05_warp_spec_c_input_warps=1,
-                **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
-                indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
-            )
-            bound.set_config(cfg)
-            code = bound.to_triton_code(cfg)
-            self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
-            self._assert_partial_tma_rowvec_bias_staged(code)
-            self.assertIn(
-                "tcgen05_c_buffer = (tcgen05_tma_store_role_tile * "
-                "cutlass.Int32(tcgen05_subtile_count) + "
-                "cutlass.Int32(_tcgen05_subtile)) % "
-                f"cutlass.Int32({TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES})",
-                code,
-            )
-            self.assertIn(
-                "tcgen05_tma_store_role_tile = "
-                "tcgen05_tma_store_role_tile + cutlass.Int32(1)",
-                code,
-            )
-            self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
-            self.assertNotIn("tcgen05_aux_rmem_0_edge_atom", code)
-            self.assertNotIn("tcgen05_edge_src = cute.logical_divide(", code)
-            out = bound(*args)
-
-        expected = torch.nn.functional.gelu(
-            1.25 * (args[0] @ args[1]).float() + 0.5 * args[3] + args[2],
-            approximate="tanh",
-        ).to(args[0].dtype)
-        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self._assert_partial_tma_rowvec_bias_staged(code)
+        self.assertIn(
+            "tcgen05_c_buffer = (tcgen05_tma_store_role_tile * "
+            "cutlass.Int32(tcgen05_subtile_count) + "
+            "cutlass.Int32(_tcgen05_subtile)) % "
+            f"cutlass.Int32({TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES})",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_tma_store_role_tile = "
+            "tcgen05_tma_store_role_tile + cutlass.Int32(1)",
+            code,
+        )
+        self.assertIn("cute.copy(tcgen05_tma_store_atom", code)
+        self.assertNotIn("tcgen05_aux_rmem_0_edge_atom", code)
+        self.assertNotIn("tcgen05_edge_src = cute.logical_divide(", code)
+        self._check_bias_residual_gelu_640(bound, args)
 
     def test_aux_edge_target_shape_ab3_keeps_simt_store_to_fit_smem(self) -> None:
         """5000x5000x5000 ab=3 avoids the over-budget TMA-store SMEM tile."""
@@ -21021,8 +20993,10 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertEqual(config_dict["tcgen05_ab_stages"], 2)
         self.assertEqual(config_dict["tcgen05_acc_stages"], 2)
         self.assertEqual(config_dict["tcgen05_c_stages"], 4)
+        # the grouping stays as sampled; without a persistent pid_type the
+        # tile scheduler's swizzle is inert and goes back to 1
         self.assertEqual(config_dict["tcgen05_l2_swizzle_size"], 1)
-        self.assertEqual(config_dict["l2_groupings"], [1])
+        self.assertEqual(config_dict["l2_groupings"], [32])
         self.assertEqual(config_dict["indexing"], ["pointer"] * 5)
         self.assertEqual(config_dict["block_sizes"], [128, 256, 128])
         self.assertNotIn("epilogue_subtile", config_dict)

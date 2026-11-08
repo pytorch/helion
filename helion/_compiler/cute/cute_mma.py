@@ -12172,8 +12172,40 @@ def _emit_mma_pipeline(
         # nothing to read out of bounds, the D descriptor's clamping is the
         # complete edge story and every tile can take the TMA-store path
         # instead of draining fringe tiles through the predicated SIMT store.
-        # Kernels with unstaged aux operands keep the original predicated
-        # full-tile/edge split.
+        # Register (SIMT) auxiliary loads take it as well: a row-vector operand
+        # stages per tile through a predicated copy and every other operand
+        # reads behind the full-tile guard (``memory_ops``:
+        # ``stage_partial_tma_rowvec``, ``partial_tma_needs_full_tile_guard``).
+        # The SIMT edge store writes one 16-bit element per thread and
+        # instruction: a 32768x30528x768 bias GEMM spent ~27K cycles on each
+        # of its 128 partial-N tiles (3.3K for a full tile), and the static
+        # schedule handed 37 of the 74 pairs 3-4 of them, so those pairs ran
+        # 9% longer and set the kernel's time (1.34 vs 1.46M cycles).
+        # ``pre_acc_wait`` keeps the split (its per-subtile loads precede the
+        # accumulator wait, which the partial-output body refuses), as does a
+        # row stage the SMEM arena cannot hold, and a column-major output:
+        # there the staged and guarded auxiliary reads keep the R2S
+        # partition's register layout, not the accumulator's, and CuTe
+        # refuses their sum ("profile of input tuples doesn't match").
+        tcgen05_simt_aux_partial_output = (
+            not output_column_major
+            and df.config.get(
+                TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, TCGEN05_AUX_LOAD_MODE_SIMT
+            )
+            == TCGEN05_AUX_LOAD_MODE_SIMT
+            and df.config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+            != TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            and tcgen05_warp_spec.c_input_warps == 0
+            and env.config_spec._cute_tcgen05_config.partial_output_row_stage_fits(
+                df.config.config,
+                bm=tcgen05_source_bm,
+                bn=tcgen05_source_bn,
+                bk=bk,
+                cluster_m=tcgen05_cluster_m,
+                ab_stages=tcgen05_ab_stage_count_value,
+                c_stages=tcgen05_c_stage_count_value,
+            )
+        )
         tcgen05_partial_output_tma_store = (
             tcgen05_use_tma_store_epilogue
             and tcgen05_use_output_edge_tma_store_for_full_tiles
@@ -12185,6 +12217,7 @@ def _emit_mma_pipeline(
                     and aux_tma_productive_body_gate_open
                 )
                 or not aux_tensor_descriptors_value
+                or tcgen05_simt_aux_partial_output
             )
         )
         tcgen05_tma_store_full_tiles_only = tcgen05_tma_store_full_tiles_only_for(

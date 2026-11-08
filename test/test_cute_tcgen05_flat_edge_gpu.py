@@ -326,6 +326,55 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
             bound.set_config(seed)
             torch.testing.assert_close(bound(a, b), expected, rtol=1e-2, atol=1e-1)
 
+    def test_output_edge_bias_stores_every_tile_through_tma(self) -> None:
+        # Register auxiliary loads: the ragged N=3000 tiles take the TMA store
+        # like the full tiles (the D descriptor drops the columns past N)
+        # and the bias row stages through a predicated copy.
+        a = torch.randn(2048, 768, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(768, 3000, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(3000, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty(2048, 3000, device=DEVICE, dtype=torch.bfloat16)
+        expected = (a.float() @ b.float() + bias.float()).to(a.dtype)
+        bound = bias_mm_into.bind((a, b, bias, out))
+        config = bound.config_spec.default_config()
+        config.config.update(
+            tcgen05_aux_load_placement="post_acc_wait", tcgen05_ab_stages=5
+        )
+        code = bound.to_code(config)
+        self.assertIn("tcgen05_tma_store_atom", code)
+        self.assertNotIn("cute.nvgpu.CopyR2GOp()", code)
+        bound.set_config(config)
+        out.zero_()
+        bound(a, b, bias, out)
+        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-1)
+
+    def test_column_major_output_edge_bias_keeps_the_simt_edge_store(self) -> None:
+        # A column-major output: the partial-output body's register auxiliary
+        # reads do not match its accumulator layout there (CuTe: "profile of
+        # input tuples doesn't match"), so the ragged N=3000 tiles keep the
+        # SIMT edge store beside the full tiles' TMA store.
+        a = torch.randn(2048, 768, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(768, 3000, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(3000, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty(3000, 2048, device=DEVICE, dtype=torch.bfloat16).T
+        expected = (a.float() @ b.float() + bias.float()).to(a.dtype)
+        bound = bias_mm_into.bind((a, b, bias, out))
+        config = bound.config_spec.default_config()
+        config.config.update(
+            block_sizes=[256, 256, 64],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_aux_load_placement="post_acc_wait",
+            tcgen05_ab_stages=5,
+        )
+        code = bound.to_code(config)
+        self.assertIn("cute.nvgpu.CopyR2GOp()", code)
+        self.assertIn("tcgen05_tma_store_atom", code)
+        bound.set_config(config)
+        out.zero_()
+        bound(a, b, bias, out)
+        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-1)
+
     def test_staged_row_on_the_hybrid_store_edge(self) -> None:
         # A ``pre_acc_wait`` row stage lives in the full-tile branch of the
         # hybrid TMA/SIMT store; the SIMT edge tiles (N=3000 is ragged) read

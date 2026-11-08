@@ -343,3 +343,22 @@ def test_output_edge_tma_store_admission_charges_the_ring_once() -> None:
     assert not _config(2, None).output_edge_tma_store_smem_fits(
         {}, ab_stages=6, c_stages=2, **tile
     )
+
+
+def test_partial_output_row_stages_are_charged_in_their_dtype() -> None:
+    """The partial-output row stages hold each row in its own dtype: four
+    BF16 rows (2 KiB of a 256-wide tile) fit beside a 256x256 ab=6 pair, four
+    FP32 rows (4 KiB) do not."""
+    fits = {
+        itemsize: _config(
+            2,
+            Tcgen05RowvecAuxFacts(
+                output_itemsize=2,
+                rows=(Tcgen05RowvecAuxRow(itemsize=itemsize, promoted=False),) * 4,
+            ),
+        ).partial_output_row_stage_fits(
+            {}, bm=256, bn=256, bk=64, cluster_m=2, ab_stages=6, c_stages=2
+        )
+        for itemsize in (2, 4)
+    }
+    assert fits == {2: True, 4: False}
