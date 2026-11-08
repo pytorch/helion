@@ -13,6 +13,7 @@ import pytest
 import torch
 
 import helion
+from helion import exc
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -41,6 +42,82 @@ def elementwise_min(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _add_grid_2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # Both dims tiled by the top-level loop: FlyDSL maps grid tiles to rows only.
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+def _add_grid_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # A 1-D tensor tiled by the top-level loop.
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+def _add_grid_cols(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # The top-level loop tiles the second dim; the first is a whole ``:``.
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(x.size(1)):
+        out[:, tile_n] = x[:, tile_n] + y[:, tile_n]
+    return out
+
+
+def _shift_cols(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # A column index computed from the top-level tile.
+    out = torch.full_like(x, float("nan"))
+    for tile_n in hl.tile(x.size(1) - 1):
+        out[:, tile_n.index + 1] = x[:, tile_n.index + 1] + y[:, tile_n.index + 1]
+    return out
+
+
+def _shift_rows(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # A row index computed from the top-level tile.
+    out = torch.full_like(x, float("nan"))
+    for tile_m in hl.tile(x.size(0) - 1):
+        out[tile_m.index + 1, :] = x[tile_m.index + 1, :] + y[tile_m.index + 1, :]
+    return out
+
+
+def _pick_col(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # A constant column index.
+    out = x.new_empty(x.size(0))
+    for tile_m in hl.tile(x.size(0)):
+        out[tile_m] = x[tile_m, 3] + y[tile_m, 3]
+    return out
+
+
+def _inner_row(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # An inner tile, not the top-level one, indexes the rows of y.
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        acc = hl.zeros([tile_m, x.size(1)], dtype=torch.float32)
+        for tile_k in hl.tile(y.size(0)):
+            acc = acc + y[tile_k, :].to(torch.float32).sum(0)[None, :]
+        out[tile_m, :] = (x[tile_m, :].to(torch.float32) + acc).to(x.dtype)
+    return out
+
+
+def _masked_load(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        for tile_n in hl.tile(x.size(1)):
+            keep = (tile_n.index < 100)[None, :]
+            out[tile_m, tile_n] = hl.load(x, [tile_m, tile_n], extra_mask=keep)
+    return out
+
+
+def _scale_rows(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    # A per-row 1-D operand indexed by the row tile.
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        out[tile_m, :] = x[tile_m, :] * s[tile_m][:, None]
+    return out
+
+
 class TestFlydslImports(TestCase):
     # No GPU or HELION_BACKEND needed: runs wherever flydsl is installed.
     def test_library_imports_resolve(self) -> None:
@@ -55,6 +132,29 @@ class TestFlydslImports(TestCase):
 
 @onlyBackends(["flydsl"])
 class TestFlydslElementwise(TestCase):
+    def test_unsupported_tensor_access_rejected(self) -> None:
+        # All but _scale_rows used to run and silently return wrong values.
+        x2 = torch.randn(64, 512, device=DEVICE, dtype=torch.float16)
+        x1 = torch.randn(1024, device=DEVICE, dtype=torch.float16)
+        s = torch.randn(64, device=DEVICE, dtype=torch.float16)
+        cases = (
+            (_add_grid_2d, (x2, x2), "more than one dimension"),
+            (_add_grid_cols, (x2, x2), "column dimension"),
+            (_add_grid_1d, (x1, x1), "1-D tensor"),
+            (_scale_rows, (x2, s), "1-D tensor"),
+            (_shift_cols, (x2, x2), "tensor index"),
+            (_shift_rows, (x2, x2), "tensor index"),
+            (_pick_col, (x2, x2), "constant index 3"),
+            (_inner_row, (x2, x2[:32]), "row dimension"),
+            (_masked_load, (x2, x2), "extra_mask"),
+        )
+        for fn, args, message in cases:
+            for effort in ("none", "quick"):
+                with self.subTest(kernel=fn.__name__, autotune=effort):
+                    kernel = helion.kernel(backend="flydsl", autotune_effort=effort)(fn)
+                    with self.assertRaisesRegex(exc.BackendUnsupported, message):
+                        kernel(*args)
+
     def test_elementwise_map_no_reduction(self) -> None:
         # Non-reduction path: grid mapping + elementwise + load/store, no fold.
         for bm, dt in ((1, torch.float16), (4, torch.float16), (1, torch.float32)):
