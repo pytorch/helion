@@ -1224,7 +1224,7 @@ def _match_inner_body(
 def _permute_is_transpose(node: object) -> bool:
     if _is_call(node, _aten.permute.default):
         assert isinstance(node, torch.fx.Node)
-        return node.args[1] == [1, 0]
+        return bool(node.args[1] == [1, 0])
     if _is_call(node, _aten.transpose.int):
         assert isinstance(node, torch.fx.Node)
         return tuple(node.args[1:3]) in ((0, 1), (1, 0))
