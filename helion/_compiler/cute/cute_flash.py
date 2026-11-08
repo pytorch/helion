@@ -599,7 +599,7 @@ def _flash_is_root_batch_index(node: torch.fx.Node, block_id: int) -> bool:
 def _flash_is_block_symnode(node: torch.fx.Node, block_id: int) -> bool:
     from ...language._tracing_ops import _get_symnode
 
-    return (
+    return bool(
         node.op == "call_function"
         and node.target is _get_symnode
         and len(node.args) >= 1
