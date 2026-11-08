@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     from torch.fx.graph import Graph
 
     from ..aten_lowering import LoweringContext
+    from ..device_ir import ForLoopGraphInfo
     from ..device_ir import GraphInfo
     from ..device_ir import IfGraphInfo
     from ..generate_ast import GenerateAST
@@ -296,6 +297,9 @@ class _View:
     dims: tuple[_Dim, _Dim]
     #: The tensor dims the op's two dims read.
     positions: tuple[int, int]
+    #: Their strides, compile-time facts: the descriptor's transpose flag
+    #: and the view's unit-stride dim depend on them.
+    strides: tuple[int, int]
     #: ``(tensor dim, index)`` of every other dim, each a uniform integer.
     outer: tuple[tuple[int, Node | int], ...]
     #: ``(tensor dim, block)`` of a batched matmul's batch tile, whose one
@@ -683,10 +687,6 @@ def _view(
         raise _NotAView("an MPP view whose subscript does not index every tensor dim")
     if tensor.dtype not in _DTYPES:
         raise _unsupported(f"an MPP operand of dtype {tensor.dtype}")
-    if not all(isinstance(x, int) for x in (*tensor.shape, *tensor.stride())):
-        # The descriptor's transpose flag and the view's unit-stride dim are
-        # compile-time facts.
-        raise _NotAView("an MPP view of a tensor with symbolic sizes or strides")
     positions: list[int] = []
     outer: list[tuple[int, Node | int]] = []
     batch_dim: tuple[int, int] | None = None
@@ -713,7 +713,16 @@ def _view(
             outer.append((b, 0))
         else:
             raise _NotAView("an MPP view whose batch index is not the batch tile")
-    if 1 not in (tensor.stride(positions[0]), tensor.stride(positions[1])):
+    # The matrix dims' strides decide the descriptor's transpose flag and the
+    # view's unit-stride dim, so they must be compile-time facts.  A symbolic
+    # size, or an outer dim's stride, only moves the handle's base or bounds
+    # its extents, which the view reads at run time (_view_args).
+    env = CompileEnvironment.current()
+    known = [env.known_stride(tensor, p) for p in positions]
+    if None in known:
+        raise _NotAView("an MPP view whose matrix dims have run-time strides")
+    strides = cast("list[int]", known)
+    if 1 not in strides:
         raise _NotAView("an MPP view without a unit stride")
     first = rank - 2
     value_dims = [
@@ -727,11 +736,17 @@ def _view(
     if transposed:
         value_dims.reverse()
         positions.reverse()
+        strides.reverse()
     view_dims = (value_dims[0], value_dims[1])
     if tuple((d.block_id, d.factor) for d in view_dims) != dims:
         raise _unsupported("an MPP view whose dims are not the matmul's blocks")
     return _View(
-        tensor, view_dims, (positions[0], positions[1]), tuple(outer), batch_dim
+        tensor,
+        view_dims,
+        (positions[0], positions[1]),
+        (strides[0], strides[1]),
+        tuple(outer),
+        batch_dim,
     )
 
 
@@ -1578,7 +1593,12 @@ def _stage_in_float(group: MppGroup, plan: MppPlan, graphs: _Graphs) -> None:
             or operand.hoist is not None
             or operand.elements is not None
             or operand.dtype != torch.bfloat16
-            or (in_for and _reloaded(node, graphs.info(loop.args[0]).graph, graphs))
+            or (
+                in_for
+                and _reloaded(
+                    node, cast("ForLoopGraphInfo", graphs.info(loop.args[0])), graphs
+                )
+            )
         ):
             continue
         if not in_for or group.k_factor != 1:
@@ -1736,18 +1756,28 @@ def _enclosing_loop(graph: Graph, graphs: _Graphs) -> Node | None:
         graph = owner.graph
 
 
-def _reloaded(node: Node, body: Graph, graphs: _Graphs) -> bool:
-    """Whether every value *node* is computed from is a load inside *body*
-    or a constant fill.  A load ends its path: its index and mask decide
-    where it reads, not whether the loop reloads it."""
+def _reloaded(node: Node, loop: ForLoopGraphInfo, graphs: _Graphs) -> bool:
+    """Whether every value *node* is computed from is a load inside *loop*'s
+    body, a constant fill, or the index of a tile *loop* iterates beside such
+    a load (the nibble a dequantized weight element takes from its loaded
+    word is ``tile_k.index % 8``; the index alone may repeat its values every
+    iteration).  A load ends its path: its index and mask decide where it
+    reads, not whether the loop reloads it."""
     work, seen = [node], {node}
+    loaded = indexed = False
     while work:
         n = graphs.origin(work.pop())
         if n.op != "call_function":
             return False
         if n.target is load:
-            if not graphs.within(n.graph, body):
+            if not graphs.within(n.graph, loop.graph):
                 return False
+            loaded = True
+            continue
+        if n.target is tile_index:
+            if _block(n.meta["val"].size(0)) not in loop.block_ids:
+                return False
+            indexed = True
             continue
         if n.target is full:
             value = n.args[1]
@@ -1766,7 +1796,7 @@ def _reloaded(node: Node, body: Graph, graphs: _Graphs) -> bool:
             if i not in seen:
                 seen.add(i)
                 work.append(i)
-    return True
+    return loaded or not indexed
 
 
 def _launch_constant(val: object) -> bool:
@@ -2486,7 +2516,7 @@ def _plan() -> MppPlan:
 def _transposed(operand: _Operand) -> bool:
     """A staged tile is written row-major."""
     view = operand.view
-    return view is not None and view.tensor.stride(view.positions[1]) != 1
+    return view is not None and view.strides[1] != 1
 
 
 def _sides(group: MppGroup) -> tuple[tuple[_Operand, tuple[int, int], int], ...]:
@@ -2934,7 +2964,7 @@ def _view_args(
     list[str],
     list[tuple[int, str | None]],
     list[bool],
-    list[tuple[str, int, int, str | None]],
+    list[tuple[str, str, str, str | None]],
 ]:
     """``tensor, (origin, extent, size, stride) per dim`` for ``_helion_mpp_run``,
     the anchors through which :class:`_Copies` reads a base or a bound,
@@ -2950,24 +2980,38 @@ def _view_args(
     computed and at the load itself; each anchor names that statement's
     target.
     """
+    from .backend import static_extent
+
     fn = cg.device_function
     t = view.tensor
     value_anchor = value.id if isinstance(value, ast.Name) else None
+
+    def size_of(i: int) -> tuple[int | None, str]:
+        """Dim *i*'s size as an int (None: symbolic, read at run time) and
+        as text."""
+        size = static_extent(t.size(i))
+        return size, str(size) if size is not None else fn.literal_expr(t.size(i))
+
+    def stride_text(i: int) -> str:
+        # Read at run time unless the kernel fixes it.
+        return fn.tensor_stride(t, i).name
+
     parts = [fn.tensor_arg(t).name]
     anchors: list[tuple[int, str | None]] = []
     always_live: list[bool] = []
-    for dim, i in zip(view.dims, view.positions, strict=True):
-        size, stride = int(t.size(i)), int(t.stride(i))
+    for dim, i, stride in zip(view.dims, view.positions, view.strides, strict=True):
+        size, size_expr = size_of(i)
         if dim.full:
-            parts += ["0", str(size), str(size), str(stride)]
+            parts += ["0", size_expr, size_expr, str(stride)]
             always_live.append(True)
             continue
         if dim.factor != 1:
             always_live.append(True)
             # A widened hl.arange covers [c * begin, c * end) of K, and the
             # load's lowering (factored_dims._check_extent) proved the dim is
-            # c x the loop's end: the view's extent, the dim's size, is the
-            # live K.
+            # c x the loop's end, a literal: the view's extent, the dim's
+            # size, is the live K.
+            assert size is not None
             info = cg.active_device_loops[dim.block_id][-1].block_id_to_info[
                 dim.block_id
             ]
@@ -2990,8 +3034,12 @@ def _view_args(
             # from the same base.  Rows and columns past M's and N's loop ends
             # are computed but never stored: the element loop re-runs the
             # store's mask.
+            # Only an end every call the kernel serves matches: a literal K
+            # can match a dynamic loop end in the first call alone.
             if dim.block_id == k_block and not (
-                base is None and info is not None and info.is_end_matching(size)
+                base is None
+                and info is not None
+                and info.is_end_matching_keyed(t.size(i))
             ):
                 assert info is not None and info.end_var_name is not None
                 extent = (
@@ -3003,38 +3051,48 @@ def _view_args(
                     anchors.append((len(parts) + 1, _anchor(dim.index)))
                 always_live.append(False)
             else:
-                extent = str(size)
+                extent = size_expr
                 always_live.append(base is None)
         else:
             always_live.append(False)
             origin = "0" if dim.base is None else _expr(dim.base)
             if dim.bound is None:
-                extent = str(size)
-            elif isinstance(dim.bound, int):
-                # Clamped here: the walker prints a literal extent with no min.
+                extent = size_expr
+            elif isinstance(dim.bound, int) and size is not None:
+                # Clamped here: the walker prints a literal extent beside a
+                # literal size with no min.
                 extent = str(max(0, min(dim.bound, size)))
+            elif isinstance(dim.bound, int):
+                # The walker clamps an extent beside a symbolic size to it.
+                extent = str(max(0, dim.bound))
             else:
                 extent = _expr(dim.bound)
             if dim.base is not None:
                 anchors.append((len(parts), _anchor(dim.index)))
             if isinstance(dim.bound, Node):
                 anchors.append((len(parts) + 1, _anchor(dim.mask)))
-        parts += [origin, extent, str(size), str(stride)]
-    outer: list[tuple[str, int, int, str | None]] = []
+        parts += [origin, extent, size_expr, str(stride)]
+    outer: list[tuple[str, str, str, str | None]] = []
     for i, x in view.outer:
-        size, stride = int(t.size(i)), int(t.stride(i))
         if isinstance(x, int):
             # A negative literal counts from the end, as the Scalar load reads it.
-            outer.append((str(x + size if x < 0 else x), size, stride, None))
+            size, size_expr = size_of(i)
+            if x < 0:
+                if size is None:
+                    raise _unsupported(
+                        "an MPP view indexed from the end of a symbolic dim"
+                    )
+                x += size
+            outer.append((str(x), size_expr, stride_text(i), None))
             continue
         val = x.meta["val"]
         # A SymInt prints as the Scalar load prints its index.
         expr = fn.literal_expr(val) if isinstance(val, torch.SymInt) else _expr(x)
-        outer.append((expr, size, stride, value_anchor))
+        outer.append((expr, size_of(i)[1], stride_text(i), value_anchor))
     if view.batch is not None:
         i, block = view.batch
         # The batch block holds one index (_check_batch): its tile's offset.
-        outer.append((cg.offset_var(block), int(t.size(i)), int(t.stride(i)), None))
+        outer.append((cg.offset_var(block), size_of(i)[1], stride_text(i), None))
     return parts, anchors, always_live, outer
 
 
@@ -3229,7 +3287,7 @@ def _codegen_matmul(
     tile_dims: list[str] = []
     parts: list[list[str]] = []
     anchors: list[tuple[int, str | None]] = []
-    outers: list[list[tuple[str, int, int, str | None]]] = []
+    outers: list[list[tuple[str, str, str, str | None]]] = []
     pos = 2
     for (operand, blocks, k_pos), value, fx_value in zip(
         _sides(group), values, _operands(node)[1:], strict=True
@@ -3267,8 +3325,7 @@ def _codegen_matmul(
             # Each handle is rebased at its tile in 64 bits, so every offset
             # MPP computes inside it (in int32) is below the tile's span; the
             # outer dims are folded into the base.
-            strides = [view.tensor.stride(p) for p in view.positions]
-            span = 1 + sum((b - 1) * s for b, s in zip(tile, strides, strict=True))
+            span = 1 + sum((b - 1) * s for b, s in zip(tile, view.strides, strict=True))
             if span >= 2**31:
                 raise _unsupported(
                     f"an MPP view whose tile spans {span} elements (MPP tensor "

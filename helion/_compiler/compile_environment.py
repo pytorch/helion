@@ -1041,6 +1041,32 @@ class CompileEnvironment:
             for dim in range(input_tensor.ndim)
         )
 
+    def known_stride(self, tensor: torch.Tensor, dim: int) -> int | None:
+        """``tensor.stride(dim)`` when every call the kernel serves has it,
+        else None (the stride is read at run time).
+
+        A dynamic-shape kernel's traced stride is only the first call's
+        unless something fixes it: the wrapper allocating the tensor, or an
+        ``hl.specialize`` of the stride.
+        """
+        v = tensor.stride(dim)
+        # Only literalize a dynamic-kernel stride with positive provenance that
+        # the generated wrapper fixes this layout.  A missing input source is
+        # not such a proof: views and aliases of inputs commonly have none.
+        if isinstance(v, int) and self.tensor_layout_is_symbolically_exact(tensor):
+            return v
+        source = self.tensor_input_source(tensor)
+        # Check if this input stride was explicitly specialized.
+        if (
+            source is not None
+            and TensorPropertySource(source, TensorProperty.STRIDE, dim)
+            in self.specialized_strides
+        ):
+            return int(v)
+        if isinstance(v, int) and self.settings.static_shapes:
+            return v
+        return None
+
     def tensor_storage_is_compiler_allocated(self, fake_tensor: torch.Tensor) -> bool:
         """Whether ``fake_tensor`` views storage a wrapper factory freshly allocated.
 

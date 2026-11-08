@@ -1232,24 +1232,9 @@ class DeviceFunction:
         return self._tensor_property(TensorSizeArg, fake_value, dim, "size")
 
     def tensor_stride(self, fake_value: torch.Tensor, dim: int) -> Argument:
-        v = fake_value.stride(dim)
-        env = CompileEnvironment.current()
-        # Only literalize a dynamic-kernel stride with positive provenance that
-        # the generated wrapper fixes this layout.  A missing input source is
-        # not such a proof: views and aliases of inputs commonly have none.
-        if isinstance(v, int) and env.tensor_layout_is_symbolically_exact(fake_value):
-            return StaticShape(v)
-        source = env.tensor_input_source(fake_value)
-        # Check if this input stride was explicitly specialized.
-        if (
-            source is not None
-            and TensorPropertySource(source, TensorProperty.STRIDE, dim)
-            in env.specialized_strides
-        ):
-            return StaticShape(int(v))
-        if isinstance(v, int):
-            if env.settings.static_shapes:
-                return StaticShape(v)
+        known = CompileEnvironment.current().known_stride(fake_value, dim)
+        if known is not None:
+            return StaticShape(known)
         return self._tensor_property(TensorStrideArg, fake_value, dim, "stride")
 
     def sorted_args(self) -> list[Argument]:

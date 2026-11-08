@@ -161,6 +161,107 @@ def addmm_sized(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="metal", static_shapes=False)
+def dequant_rows(x: torch.Tensor, wq: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """x @ W.T for any number of rows of x, W 4-bit (element k is nibble
+    k % 8 of word k // 8, scaled per 32 elements); x's strides are fixed."""
+    m = x.size(0)
+    k = hl.specialize(x.size(1))
+    n = hl.specialize(wq.size(0))
+    hl.specialize(x.stride())
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            words = wq[tile_n, tile_k.index // 8]
+            nib = (words >> ((tile_k.index % 8) * 4)[None, :]) & 0xF
+            w = (nib.to(torch.float32) - 8.0) * s[tile_n, tile_k.index // 32]
+            acc = torch.addmm(acc, x[tile_m, tile_k], w.T.to(x.dtype))
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=False)
+def dynamic_mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """x @ y with x's rows and K dynamic and both operands' strides fixed."""
+    m, k = x.size()
+    n = hl.specialize(y.size(1))
+    hl.specialize(x.stride())
+    hl.specialize(y.stride())
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=False)
+def dynamic_free_rows_30(
+    a: torch.Tensor, b: torch.Tensor, nbm: int, nbn: int
+) -> torch.Tensor:
+    """free_rows over a dynamic number of rows, masked to the first 30."""
+    m, k = a.shape
+    n = hl.specialize(b.size(1))
+    hl.specialize(a.stride())
+    hl.specialize(b.stride())
+    out = torch.zeros([m, n], dtype=torch.float32, device=a.device)
+    bm = hl.register_block_size(16, 64)
+    bn = hl.register_block_size(16, 64)
+    for gm in hl.grid(nbm):
+        for gn in hl.grid(nbn):
+            rows = gm * bm + hl.arange(bm)
+            cols = gn * bn + hl.arange(bn)
+            rv = rows < 30
+            cv = cols < n
+            acc = hl.zeros([bm, bn], dtype=torch.float32)
+            for tk in hl.tile(k):
+                a_blk = hl.load(a, [rows, tk.index], extra_mask=rv[:, None])
+                b_blk = hl.load(b, [tk.index, cols], extra_mask=cv[None, :])
+                acc = torch.addmm(acc, a_blk, b_blk)
+            mask = rv[:, None] & cv[None, :] & (rows < m)[:, None]
+            hl.store(out, [rows, cols], acc, extra_mask=mask)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=False)
+def mm_k_from_z(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """x @ y over z's length of K: x's and y's K pinned at 64, the loop's end
+    dynamic."""
+    m = x.size(0)
+    n = hl.specialize(y.size(1))
+    hl.specialize(x.size(1))
+    hl.specialize(y.size(0))
+    hl.specialize(x.stride())
+    hl.specialize(y.stride())
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(z.size(0)):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=False)
+def batched_rows(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """x[b] @ y for each b, with x's batch stride left to run time."""
+    b, m, _ = x.size()
+    k = hl.specialize(x.size(2))
+    n = hl.specialize(y.size(1))
+    hl.specialize(x.stride(1))
+    hl.specialize(x.stride(2))
+    hl.specialize(y.stride())
+    out = torch.empty([b, m, n], dtype=torch.float32, device=x.device)
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n], block_size=[1, None, None]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_b.begin, tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_b.begin, tile_m, tile_n] = acc
+    return out
+
+
 @helion.kernel(**S)
 def free_rows_if(
     a: torch.Tensor, b: torch.Tensor, sizes: torch.Tensor, nbm: int, nbn: int
@@ -1981,6 +2082,23 @@ def kloop_tile_index(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(**S)
+def kloop_k_index(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """An operand of the K tile's index alone: ``tk.index % 8`` takes the
+    same values in every iteration."""
+    m, k = x.shape
+    _, n = y.shape
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            nib = (tk.index % 8).to(torch.float32)
+            a = (nib[None, :] + hl.zeros([tm, tk], dtype=torch.float32)).to(x.dtype)
+            acc = torch.addmm(acc, a, y[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
 def kloop_outer_begin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """A load the K loop reloads, plus ``tm.begin``, which it doesn't."""
     m, k = x.shape
@@ -2021,6 +2139,22 @@ def kloop_load_exp(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         acc = hl.zeros([tm, tn], dtype=torch.float32)
         for tk in hl.tile(k):
             a = torch.exp(x[tm, tk].to(torch.float32) * 0.5).to(x.dtype)
+            acc = torch.addmm(acc, a, y[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def kloop_load_k_index(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A load beside the K tile's index, as a dequantized weight's nibble."""
+    m, k = x.shape
+    _, n = y.shape
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            nib = (tk.index % 8).to(torch.float32)[None, :]
+            a = (x[tm, tk].to(torch.float32) * 0.5 + nib).to(x.dtype)
             acc = torch.addmm(acc, a, y[tk, tn])
         out[tm, tn] = acc
     return out
@@ -4073,6 +4207,87 @@ class TestMppMatmul(_MppCase):
                 _close(out, _mm(x, y))
                 self._assert_mpp(code)
                 self.assertRegex(msl, r"constant long& k \[\[buffer")
+                # Strides are read at run time, so neither operand is a view.
+                self.assertIn("spaces=[1, 1]", code)
+
+    def test_runtime_rows_view(self) -> None:
+        """With its strides fixed (``hl.specialize``), a dynamic-shape
+        operand is a device view whose row count is read at run time; a
+        dequantized weight computed from ``tile_k.index`` stages in bfloat.
+        A strided x specializes a second kernel."""
+        config = helion.Config(block_sizes=[16, 16, 32])
+        wq = torch.randint(
+            -(2**31), 2**31 - 1, (48, 8), device=DEVICE, dtype=torch.int32
+        )
+        s = (torch.rand(48, 2, device=DEVICE) * 0.1).to(torch.bfloat16)
+        idx = torch.arange(64)
+        nib = (wq.cpu()[:, idx // 8] >> ((idx % 8) * 4)) & 0xF
+        w = ((nib.double() - 8.0) * s.cpu().double()[:, idx // 32]).to(torch.bfloat16)
+        for m in (5, 40):
+            wide = torch.randn(m, 128, device=DEVICE, dtype=torch.bfloat16)
+            for x in (wide[:, 64:].contiguous(), wide[:, :64]):
+                with self.subTest(m=m, stride=x.stride(0)):
+                    out, code, _ = _run(dequant_rows, (x, wq, s), config)
+                    _close(out, _mm(x, w.T))
+                    self.assertRegex(
+                        code,
+                        rf"_helion_mpp_run\(\w+, 0, x, offset_\d+, m, m, {x.stride(0)}, ",
+                    )
+                    self.assertIn("spaces=[0, 1]", code)
+                    self.assertIn("('bfloat', 'bfloat')", code)
+
+    def test_runtime_outer_stride(self) -> None:
+        """A view's batch stride left dynamic is read at run time."""
+        config = helion.Config(block_sizes=[16, 16, 16])
+        y = torch.randn(32, 24, device=DEVICE, dtype=torch.float16)
+        for b, m in ((2, 5), (3, 40)):
+            wide = torch.randn(b, m + 3, 32, device=DEVICE, dtype=torch.float16)
+            for x in (wide[:, :m].contiguous(), wide[:, 3:]):
+                with self.subTest(b=b, m=m, stride=x.stride(0)):
+                    out, code, _ = _run(batched_rows, (x, y), config)
+                    _close(out, x.cpu().double() @ y.cpu().double())
+                    self.assertIn("outer=[[(offset_0, b, x_stride_0, ", code)
+
+    def test_runtime_views(self) -> None:
+        """Dynamic-shape views with fixed strides: an x at a storage offset
+        and a y transposed on the host are device views, and a literal row
+        bound beside a symbolic row count is clamped to it."""
+        h = torch.float16
+        config = helion.Config(block_sizes=[16, 16, 16])
+        for m, k in ((5, 40), (40, 64)):
+            with self.subTest(m=m, k=k):
+                x = torch.randn(m + 3, k + 13, device=DEVICE, dtype=h)[3:, 5 : 5 + k]
+                y = torch.randn(24, k, device=DEVICE, dtype=h).T
+                out, code, _ = _run(dynamic_mm, (x, y), config)
+                _close(out, x.cpu().double() @ y.cpu().double())
+                self.assertIn("spaces=[0, 0]", code)
+        b = torch.randn(32, 24, device=DEVICE, dtype=h)
+        for m in (20, 37):
+            with self.subTest(m=m):
+                a = torch.randn(m, 32, device=DEVICE, dtype=h)
+                out, _, msl = _run(
+                    dynamic_free_rows_30,
+                    (a, b, 3, 2),
+                    helion.Config(block_sizes=[16, 16, 16], num_threads=[16, 16, 1]),
+                )
+                ref = a.cpu().double() @ b.cpu().double()
+                ref[30:] = 0
+                _close(out, ref)
+                self.assertRegex(msl, r"metal::min\(\(long\)\(30\), \(long\)\(m\)\)")
+
+    def test_runtime_k_end(self) -> None:
+        """A view's literal K that matches the K loop's dynamic end in the
+        first call isn't taken for it: a second call with a shorter loop,
+        which reuses the kernel, sums only its K."""
+        h = torch.float16
+        x = torch.randn(40, 64, device=DEVICE, dtype=h)
+        y = torch.randn(64, 24, device=DEVICE, dtype=h)
+        bound = mm_k_from_z.bind((x, y, torch.empty(64, device=DEVICE)))
+        fn = bound.compile_config(helion.Config(block_sizes=[16, 16, 16]))
+        for k in (64, 40):
+            with self.subTest(k=k):
+                out = fn(x, y, torch.empty(k, device=DEVICE))
+                _close(out, x[:, :k].cpu().double() @ y[:k].cpu().double())
 
     def test_free_rows_under_ifs(self) -> None:
         """Data-dependent ifs on 0-d loads lower to ``else: pass``.  The if
@@ -4706,7 +4921,8 @@ class TestMppStaging(_MppCase):
 
     def test_bfloat_staged_from_reloaded_values(self) -> None:
         """A bfloat operand staged in its K loop from loads the loop reloads,
-        at a fixed address too, from a constant fill, a scalar argument or a
+        at a fixed address too or beside the K tile's index, from a constant
+        fill, a scalar argument or a
         block size, and a ':' K view staged in its loop because the loop
         writes its tensor, under a lane jam."""
         bf = torch.bfloat16
@@ -4726,6 +4942,12 @@ class TestMppStaging(_MppCase):
         jams = (None, JAM64)
         for kernel, args, configs, expected in (
             (kloop_load_exp, (x, y), jams, ref(torch.exp(xf * 0.5))),
+            (
+                kloop_load_k_index,
+                (x, y),
+                jams,
+                ref(xf * 0.5 + torch.arange(72) % 8),
+            ),
             (kloop_load_chain, (x, y), jams, ref(torch.sigmoid(xf) * xf + 0.25)),
             (kloop_const, (x, y), jams, ref(ones)),
             (kloop_load0, (x, y), jams, ref(ones)),
@@ -4929,9 +5151,9 @@ class TestMppFloatStaging(_FloatStagingCase):
 
     def test_values_not_reloaded(self) -> None:
         """A row loaded or computed before the K loop, a carry, a tile's
-        index or offset, a fill of a scalar loaded before the K loop, a carry
-        seeded by a constant fill, and a load in an outer loop before the K
-        loop."""
+        index or offset, the K tile's index alone, a fill of a scalar loaded
+        before the K loop, a carry seeded by a constant fill, and a load in an
+        outer loop before the K loop."""
         x, y, d = self.x, self.y, self.d
         s = torch.randn(1, device=DEVICE)
 
@@ -4966,6 +5188,12 @@ class TestMppFloatStaging(_FloatStagingCase):
                 rows(torch.sigmoid(d) * d + 0.5),
             ),
             (kloop_tile_index, (x, y), (None, k32, JAM64), rows(torch.arange(48.0))),
+            (
+                kloop_k_index,
+                (x, y),
+                (None, k32, JAM64),
+                lambda _: (_bf(torch.arange(72) % 8.0) @ _d(y)).expand(48, -1),
+            ),
             (kloop_outer_begin, (x, y), (None, JAM64), begins),
             (kloop_full_scalar, (x, y, s), (None, JAM64), rows(s.expand(48))),
             (kloop_carry_zero, (x, y), (None, JAM64), carry_zero),
