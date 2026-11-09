@@ -47,6 +47,10 @@ def _cpu_codegen() -> Iterator[None]:
         yield
 
 
+# The transcendental forms over an exact-shape operand: the ring's depth.
+_RING_PREFETCH = {"gelu_grad": 2, "gelu_tanh_grad": 1, "selu_grad": 1}
+
+
 # One axis, one case per epilogue form.
 @pytest.mark.parametrize(
     "epilogue", INDUCTOR_EPILOGUES, ids=[e.name for e in INDUCTOR_EPILOGUES]
@@ -69,7 +73,18 @@ def test_inductor_pointwise_epilogues_join_the_chain(
     code = bound.to_code(config)
     assert config.block_sizes[:2] == [256, 256]
     assert re.search(epilogue.step, code, re.MULTILINE), epilogue.step
-    assert ("tcgen05_epi_group = " in code) is epilogue.two_epilogue_groups
+    assert ("tcgen05_epi_group = " in code) is epilogue.multiple_epilogue_groups
+    if epilogue.name in _RING_PREFETCH:
+        # Its exact-shape operand two subtiles ahead under two transcendental
+        # ops, one under one, on three groups at the short K loop's three AB
+        # stages.
+        assert config.config["tcgen05_epi_warp_groups"] == 3
+        assert config.config["tcgen05_epi_subtile_n"] == 32
+        assert (
+            config.config["tcgen05_aux_prefetch_subtiles"]
+            == _RING_PREFETCH[epilogue.name]
+        )
+        assert config.config["tcgen05_ab_stages"] == 3
     # one load per auxiliary tensor, however often the epilogue reads it (a
     # rank-0 scalar binds once per tile instead)
     loads = set(re.findall(r"\btcgen05_aux_loaded(?:_\d+)*\b", code))
@@ -390,7 +405,77 @@ def _fp32_erf_mm(
         out[rows, cols] = acc * torch.erf(x[rows, cols])
 
 
-# One-CTA two-group defaults whose coverage carriers come from the aux-hoist
+def test_masked_ring_reads_one_ahead_on_two_groups() -> None:
+    """Beside a mask the ring's operand reads one subtile ahead, and the
+    chain's two exact-shape operands keep two groups at the deep AB ring
+    (no short-K cap)."""
+    (form,) = [e for e in INDUCTOR_EPILOGUES if e.name == "masked_gelu_grad"]
+    bound = form.kernel._bind_isolated(
+        inductor_epilogue_args(form, 8192, 4096, 1024, device="cpu", random=False)
+    )
+    default = bound.config_spec.default_config()
+    assert default.block_sizes[:2] == [256, 256]
+    assert default.config["tcgen05_epi_warp_groups"] == 2
+    assert default.config["tcgen05_ab_stages"] > 3
+    assert default.config["tcgen05_aux_prefetch_subtiles"] == 1
+
+
+def test_two_masks_take_the_capped_three_group_ring() -> None:
+    """Two masks over a short K loop take the ring's AB cap (four stages on
+    the 256x128 pair) and its third group, where a lone mask keeps two groups
+    at the deepest ring
+    (``test_register_mask_epilogue_runs_two_groups_over_a_short_k_loop``)."""
+    (form,) = [e for e in INDUCTOR_EPILOGUES if e.name == "two_mask"]
+    bound = form.kernel._bind_isolated(
+        inductor_epilogue_args(form, 8192, 2048, 512, device="cpu", random=False)
+    )
+    default = bound.config_spec.default_config()
+    assert default.block_sizes[:2] == [256, 128]
+    assert default.config["tcgen05_epi_warp_groups"] == 3
+    assert default.config["tcgen05_ab_stages"] == 4
+    assert default.config["tcgen05_aux_prefetch_subtiles"] == 1
+
+
+def test_long_k_ring_keeps_the_deepest_ab_ring() -> None:
+    """Over 64 k-blocks the ring keeps two groups and the AB stages their
+    rings leave (the MMA wants them), not the short loop's three groups at
+    three stages."""
+    (form,) = [e for e in INDUCTOR_EPILOGUES if e.name == "gelu_grad"]
+    bound = form.kernel._bind_isolated(
+        inductor_epilogue_args(form, 4096, 2048, 4096, device="cpu", random=False)
+    )
+    default = bound.config_spec.default_config()
+    assert default.block_sizes[:2] == [256, 256]
+    assert default.config["tcgen05_epi_warp_groups"] == 2
+    assert default.config["tcgen05_aux_prefetch_subtiles"] == 2
+    assert default.config["tcgen05_ab_stages"] > 3
+
+
+@pytest.mark.parametrize(
+    ("k", "groups", "ab_stages"), ((1024, 2, 5), (4096, 1, 6)), ids=("short", "long")
+)
+def test_register_mask_epilogue_runs_two_groups_over_a_short_k_loop(
+    k: int, groups: int, ab_stages: int
+) -> None:
+    """A boolean mask read on registers bounds the 256x256 pair by its
+    epilogue over at most 16 k-blocks: two groups and the one-deep ring at
+    the five AB stages the groups' rings leave (a mask leaves L1 alone, so
+    the ring's AB cap stays off); a long K loop keeps one group's deeper
+    ring."""
+    (form,) = [e for e in INDUCTOR_EPILOGUES if e.name == "dropout"]
+    bound = form.kernel._bind_isolated(
+        inductor_epilogue_args(form, 8192, 4096, k, device="cpu", random=False)
+    )
+    default = bound.config_spec.default_config()
+    assert default.block_sizes[:2] == [256, 256]
+    assert default.config["tcgen05_epi_warp_groups"] == groups
+    assert default.config["tcgen05_ab_stages"] == ab_stages
+    if groups == 2:
+        assert default.config["tcgen05_epi_subtile_n"] == 32
+        assert default.config["tcgen05_aux_prefetch_subtiles"] == 1
+
+
+# One-CTA multi-group defaults whose coverage carriers come from the aux-hoist
 # witnesses (GELU backward, two geometries) or from the seeds (FP32 erf).
 @pytest.mark.parametrize(
     ("kernel", "shape"),
@@ -400,10 +485,10 @@ def _fp32_erf_mm(
         ("fp32_erf", (6272, 4096, 1024)),
     ),
 )
-def test_two_group_default_keeps_the_coverage_population(
+def test_multi_group_default_keeps_the_coverage_population(
     kernel: str, shape: tuple[int, int, int]
 ) -> None:
-    """The default's two epilogue warp groups stay out of the coverage
+    """The default's epilogue warp groups stay out of the coverage
     carriers drawn from the seeds (``coverage_seed_carriers``): a carrier
     holds every group it does not declare at its legacy mode, or the
     population step refuses its witnesses (both aux-hoist witnesses and the
@@ -425,20 +510,29 @@ def test_two_group_default_keeps_the_coverage_population(
         bound = _fp32_erf_mm._bind_isolated(args)
     spec = bound.config_spec
     default = spec.default_config()
-    assert default.config["tcgen05_epi_warp_groups"] == 2
+    # GELU backward's capped short-K ring runs a third group
+    assert default.config["tcgen05_epi_warp_groups"] == (
+        3 if kernel == "gelu_grad" else 2
+    )
     if kernel == "gelu_grad" and shape == (6272, 4096, 1024):
-        # The one-CTA AB envelope prices one group's C ring: beside two
-        # groups' rings the 128x256 tile keeps the three 64-deep AB stages
-        # the arena fits (four need 262 KB of the 232 KB B200 cap, which
-        # NVVM refused).
+        # The one-CTA AB envelope prices one group's C ring: beside several
+        # groups' rings the 128x256 tile fits three 64-deep AB stages at most
+        # (four need 262 KB of the 232 KB B200 cap beside two groups, which
+        # NVVM refused), and over the 16 k-blocks the ring keeps two of them
+        # (96 KiB), beside three groups.
         assert default.block_sizes[:2] == [128, 256]
-        assert default.config["tcgen05_ab_stages"] == 3
+        assert default.config["tcgen05_ab_stages"] == 2
+        # The exact-shape operand reads two 32-column subtiles ahead.
+        assert default.config["tcgen05_epi_subtile_n"] == 32
+        assert default.config["tcgen05_aux_load_placement"] == "pre_acc_wait"
+        assert default.config["tcgen05_aux_prefetch_subtiles"] == 2
         code = bound.to_code(default)
         assert (
             "tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create("
-            "num_stages=3," in code
+            "num_stages=2," in code
         )
         assert "tcgen05_epi_group = " in code
+        assert "tcgen05_aux_ring_0_2" in code
     groups = {group.key: group for group in spec.compiler_coverage_groups}
     assert "tcgen05_aux_fragment_hoist" not in groups
     assert all(

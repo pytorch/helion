@@ -47,6 +47,29 @@ def test_inductor_epilogue_matches_torch(epilogue: InductorEpilogue) -> None:
     torch.testing.assert_close(out, expected, atol=0.25, rtol=1.6e-2)
 
 
+# The three-group ring's other subtile splits: the 256x128 pair's four
+# subtiles per CTA (2/1/1) and the one-CTA 128x256 tile's eight (3/3/2) over
+# an M edge the pair would cut.
+@pytest.mark.parametrize(
+    ("shape", "block_sizes"),
+    (((8192, 384, 192), [256, 128]), ((4224, 768, 192), [128, 256])),
+)
+def test_three_group_ring_splits_match_torch(
+    shape: tuple[int, int, int], block_sizes: list[int]
+) -> None:
+    (epilogue,) = [e for e in INDUCTOR_EPILOGUES if e.name == "gelu_grad"]
+    args = inductor_epilogue_args(epilogue, *shape, device=DEVICE, random=True)
+    a, b, *aux, out = args
+    bound = epilogue.kernel.bind(args)
+    config = bound.config_spec.default_config()
+    assert config.block_sizes[:2] == block_sizes
+    assert config.config["tcgen05_epi_warp_groups"] == 3
+    bound.set_config(config)
+    bound(*args)
+    expected = epilogue.reference(a.float() @ b.float(), *aux).to(out.dtype)
+    torch.testing.assert_close(out, expected, atol=0.25, rtol=1.6e-2)
+
+
 _MASK_EPILOGUES = [e for e in INDUCTOR_EPILOGUES if "mask" in e.aux]
 
 

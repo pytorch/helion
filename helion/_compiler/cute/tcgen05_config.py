@@ -9056,7 +9056,7 @@ class CuteTcgen05Config:
 
         Both act on a heavy epilogue -- several output stores, an exact-shape
         auxiliary read or a transcendental op (whose default runs two groups,
-        ``CuteTcgen05DefaultTileHeuristic._transcendental_epilogue_values``)
+        ``CuteTcgen05DefaultTileHeuristic._multi_group_epilogue_values``)
         -- whose per-subtile chain a one-tile per-CTA grid leaves exposed; a
         plain store's search keeps its surface (an explicit config is
         validated everywhere).

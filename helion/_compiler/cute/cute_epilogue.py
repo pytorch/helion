@@ -125,7 +125,7 @@ class _UnaryOp:
     local directly without a second alias. ``transcendental`` marks an op a
     math library call (or a polynomial) renders: per element it costs tens of
     instructions, where an add or a cast costs one
-    (``Tcgen05UnaryEpilogueChain.has_transcendental_op``).
+    (``Tcgen05UnaryEpilogueChain.transcendental_op_count``).
     """
 
     op_name: str
@@ -1465,13 +1465,15 @@ class Tcgen05UnaryEpilogueChain:
         )
 
     @property
-    def has_transcendental_op(self) -> bool:
-        """Whether a step applies a transcendental unary op (``exp``,
-        ``erf``, ``tanh``, ...; ``_UnaryOp.transcendental``), each shared
-        subtree visited once (``_distinct_tensor_expr_nodes``)."""
-        return any(
-            isinstance(node, _UnaryTensorExpr) and node.step.transcendental
+    def transcendental_op_count(self) -> int:
+        """The distinct transcendental unary ops the chain applies per
+        element (``exp``, ``erf``, ``tanh``, ...; ``_UnaryOp.transcendental``:
+        GELU backward's ``erf`` and ``exp`` two, a sigmoid or a ``tanh`` one),
+        each shared subtree counted once (``_distinct_tensor_expr_nodes``)."""
+        return sum(
+            1
             for node in _distinct_tensor_expr_nodes([step.expr for step in self.steps])
+            if isinstance(node, _UnaryTensorExpr) and node.step.transcendental
         )
 
     @property

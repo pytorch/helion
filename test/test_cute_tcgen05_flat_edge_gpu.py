@@ -744,10 +744,17 @@ class TestCuteTcgen05DefaultTilesGpu(RefEagerTestDisabled, TestCase):
                 atol=1e-1,
             )
 
-    def test_batched_pair_default_walks_batches_slowest(self) -> None:
-        # The batched pair defaults walk their batches slowest and match
-        # torch: the 256x256 direct entry, and a promoted 256x128 pair seed.
-        for batch, m, n, k in ((64, 512, 1024, 64), (75, 256, 256, 64)):
+    def test_batched_defaults_walk_batches_slowest(self) -> None:
+        # The batched pair defaults and the narrow persistent one-CTA tile
+        # walk their batches slowest and match torch: the 256x256 direct
+        # entry, a promoted 256x128 pair seed, and the narrow tile over eight
+        # k-blocks, 64x256 (one M tile per batch) and 128x64 (four).
+        for batch, m, n, k in (
+            (64, 512, 1024, 64),
+            (75, 256, 256, 64),
+            (192, 64, 512, 512),
+            (64, 512, 64, 512),
+        ):
             a = torch.randn(batch, m, k, device=DEVICE, dtype=torch.bfloat16)
             b = torch.randn(batch, k, n, device=DEVICE, dtype=torch.bfloat16)
             bound = _bmm.bind((a, b))

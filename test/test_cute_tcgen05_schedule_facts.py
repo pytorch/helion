@@ -1130,7 +1130,15 @@ def test_boolean_mask_rides_no_staged_ring() -> None:
         state = spec._cute_tcgen05_config
         facts = state.pipeline_smem_facts
         config = spec.default_config()
-        explicit = dict(config.config, tcgen05_aux_load_mode="tma")
+        # on the one-group register epilogue the producer ring would replace
+        explicit = dict(
+            config.config,
+            tcgen05_aux_load_mode="tma",
+            tcgen05_epi_warp_groups=1,
+            tcgen05_epi_subtile_n=None,
+            tcgen05_aux_load_placement="post_acc_wait",
+            tcgen05_aux_prefetch_subtiles=0,
+        )
         with bound.env, pytest.raises(InvalidConfig, match="producer's ring carries"):
             spec.normalize(explicit)
     assert facts is not None
@@ -1734,6 +1742,10 @@ def test_narrow_batched_default_takes_the_one_cta_tile(
     assert config.config["pid_type"] == pid_type
     assert config.config["tcgen05_ab_stages"] == ab_stages
     assert config.config["tcgen05_cluster_m"] == 1
+    # the persistent CTAs walk the batches slowest, ungrouped
+    if pid_type == "persistent_blocked":
+        assert config.config["tcgen05_batch_raster"] == "batch_slowest"
+        assert config.config["l2_groupings"] == [1]
 
 
 # The direct entry over whole 256x256 tiles, and a promoted pair seed over
