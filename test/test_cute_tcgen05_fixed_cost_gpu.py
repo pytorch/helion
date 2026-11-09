@@ -21,7 +21,6 @@ import textwrap
 import pytest
 import torch
 
-from test.test_cute_tcgen05_fixed_chain import _batched_gemm
 from test.test_cute_tcgen05_fixed_chain import _bias_gemm
 from test.test_cute_tcgen05_fixed_chain_gpu import _addmm_gemm
 from test.test_cute_tcgen05_fixed_chain_gpu import _config
@@ -38,6 +37,7 @@ from test.test_cute_tcgen05_fixed_cost import _row_bias_gemm
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_dense_tcgen05 import batched_gemm
 
 pytestmark = [
     skipUnlessBackends(["cute"]),
@@ -139,7 +139,7 @@ def test_direct_store_batched_output() -> None:
     a = torch.randn(8, 256, 512, device=DEVICE, dtype=torch.float16)
     b = torch.randn(8, 512, 256, device=DEVICE, dtype=torch.float16)
     _assert_direct_matches_tma(
-        _batched_gemm,
+        batched_gemm,
         (a, b),
         _config(block_sizes=[1, 128, 64, 64], loop_orders=[[0, 1, 2]]),
         torch.bmm(a, b),
@@ -314,9 +314,7 @@ def test_narrow_n8_inline_store_is_stable_across_streams_and_graph_replay() -> N
     a = torch.randn(4, 64, 128, device=DEVICE, dtype=torch.float16)
     b = torch.randn(4, 128, 128, device=DEVICE, dtype=torch.float16)
     config = helion.Config(**N8_INLINE_CONFIG)
-    bound = helion.kernel(_batched_gemm, backend="cute", static_shapes=True).bind(
-        (a, b)
-    )
+    bound = helion.kernel(batched_gemm, backend="cute", static_shapes=True).bind((a, b))
     bound.set_config(config)
     with bound.env:
         normalized = bound.config_spec.normalized_config(config)
@@ -344,7 +342,7 @@ def test_narrow_n8_inline_store_is_stable_across_streams_and_graph_replay() -> N
         assert torch.equal(out, outputs[0])
 
 
-def _launch_batched_gemm_in_subprocess(
+def _launchbatched_gemm_in_subprocess(
     tmp_path: Path,
     shape: tuple[int, int, int, int],
     config: dict[str, object],
@@ -431,7 +429,7 @@ def test_narrow_n8_one_shot_chain_completes_with_more_k_tiles_than_stages(
     # with 2 K tiles over a 1- or 2-stage ring.  A CTA-wide barrier between
     # the hoisted TMA-load role and the MMA role deadlocked the single-stage
     # ring (every ``tcgen05_ab_stages=1`` autotune sample timed out).
-    _launch_batched_gemm_in_subprocess(
+    _launchbatched_gemm_in_subprocess(
         tmp_path,
         (4, 64, 128, 128),
         {
@@ -456,7 +454,7 @@ def test_narrow_n8_one_shot_chain_completes_with_four_k_tiles_over_two_stages(
 ) -> None:
     # 8 x 2 x 16 = 256 tiles would not be one-shot; 2 x 1 x 32 = 64 tiles of
     # 128x8 are, with 4 K tiles over a 2-stage ring.
-    _launch_batched_gemm_in_subprocess(
+    _launchbatched_gemm_in_subprocess(
         tmp_path,
         (2, 128, 256, 256),
         {

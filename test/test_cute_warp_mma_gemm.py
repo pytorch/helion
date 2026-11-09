@@ -16,7 +16,6 @@ import pytest
 import torch
 
 from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
-from test.test_cute_tcgen05_fixed_chain import _bind_bmm
 from test.test_cute_tcgen05_fixed_chain import _bind_gemm
 from test.test_cute_tcgen05_fixed_chain import _bind_two_output_gemm
 from test.test_cute_tcgen05_fixed_chain import _cpu_only  # noqa: F401
@@ -32,6 +31,7 @@ from helion._compiler.cute import cute_warp_mma_gemm as family
 from helion._testing import import_example
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_dense_tcgen05 import bind_bmm
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -327,7 +327,7 @@ def test_fp16_bias_gemm_renders_four_warp_tiles_with_the_bias_row() -> None:
 
 
 def test_batched_gemm_tiles_every_batch_separately() -> None:
-    bound = _bind_bmm((4, 64, 128, 128), torch.float16)
+    bound = bind_bmm((4, 64, 128, 128), torch.float16)
     source = _source(bound, _warp_config([1, 64, 8, 128], 4))
     kernel = _kernel_body(source)
     assert kernel.count(f"{RT}.mma_f16(") == 8
@@ -448,46 +448,34 @@ def _fragment_low(bound: helion.runtime.kernel.BoundKernel, index: int) -> int:
         return spec.block_sizes[index]._fragment(spec).low
 
 
-def test_batched_m_major_a_is_outside_the_search() -> None:
-    # ``bmm(a.transpose(1, 2), b)``: the tcgen05 search records no static
-    # extents for a batched M-contiguous A, so neither family is offered (the
-    # admission's rank-3 M-major stride case is not reachable from a kernel);
-    # the same bmm with a K-contiguous A admits the family.
-    from test.test_cute_tcgen05_fixed_chain import _batched_gemm
-
-    b = torch.empty((4, 128, 128), dtype=torch.float16, device=CPU_DEVICE)
-    m_major = _bind(
-        _batched_gemm,
-        torch.empty((4, 128, 64), dtype=torch.float16, device=CPU_DEVICE).transpose(
-            1, 2
-        ),
-        b,
-    )
+def test_batched_m_major_a_enters_both_families() -> None:
+    # ``bmm(a.transpose(1, 2), b)``: a batched M-contiguous A loads through
+    # its own strides (tcgen05's (M, K, L) TensorMap view, the register
+    # family's rank-3 M-major stride case), so the search records its static
+    # extents and offers both families, as for a K-contiguous A.
+    m_major = bind_bmm((4, 64, 128, 128), torch.float16, a_m_major=True)
+    k_major = bind_bmm((4, 64, 128, 128), torch.float16)
+    for bound in (m_major, k_major):
+        with bound.env:
+            state = bound.config_spec._cute_tcgen05_config
+            assert state.search_enabled and state.warp_mma_admitted
+            assert state.matmul_compile_time_static_extents == (64, 128, 128)
     with m_major.env:
-        state = m_major.config_spec._cute_tcgen05_config
-        assert not state.search_enabled and not state.warp_mma_admitted
-        assert state.matmul_compile_time_static_extents is None
-        with pytest.raises(InvalidConfig, match="tcgen05-enabled"):
-            m_major.config_spec.normalized_config(_warp_config([1, 16, 8, 128], 1))
-    k_major = _bind(
-        _batched_gemm,
-        torch.empty((4, 64, 128), dtype=torch.float16, device=CPU_DEVICE),
-        b,
-    )
-    with k_major.env:
-        state = k_major.config_spec._cute_tcgen05_config
-        assert state.search_enabled and state.warp_mma_admitted
+        normalized = m_major.config_spec.normalized_config(
+            _warp_config([1, 16, 8, 128], 1)
+        )
+    assert normalized.config[FAMILY] == family.MATMUL_FAMILY_WARP_MMA
 
 
 def test_admitted_problems_widen_the_block_floors_to_the_mma_atom() -> None:
     assert _fragment_low(_bind_gemm((256, 256, 256), torch.float16), 0) == 16
     assert _fragment_low(_bind_gemm((256, 256, 256), torch.float16), 1) == 8
     assert _fragment_low(_bind_fp8_gemm((256, 256, 256)), 1) == 8
-    assert _fragment_low(_bind_bmm((4, 64, 128, 128), torch.float16), 1) == 16
+    assert _fragment_low(bind_bmm((4, 64, 128, 128), torch.float16), 1) == 16
     # Not admitted: a machine-filling grid, the 268M-MAC bmm, fp8 with an
     # N-major B and a dynamic-shape kernel keep the tcgen05 floors.
     assert _fragment_low(_bind_gemm((2048, 2048, 256), torch.float16), 0) == 128
-    assert _fragment_low(_bind_bmm((8, 256, 512, 256), torch.float16), 1) == 64
+    assert _fragment_low(bind_bmm((8, 256, 512, 256), torch.float16), 1) == 64
     assert _fragment_low(_bind_fp8_gemm((256, 256, 256), k_major_b=False), 1) == 16
 
 
@@ -500,7 +488,7 @@ def test_campaign_1024_class_shards_are_not_admitted() -> None:
     for bound in (
         _bind_fp8_gemm((1024, 1024, 1024)),
         _bind_row_bias_gemm((1024, 1024, 1024), torch.float16),
-        _bind_bmm((8, 256, 512, 256), torch.float16),
+        bind_bmm((8, 256, 512, 256), torch.float16),
     ):
         with bound.env:
             spec = bound.config_spec
@@ -515,7 +503,7 @@ def test_campaign_1024_class_shards_are_not_admitted() -> None:
     for bound in (
         _bind_fp8_gemm((256, 256, 256)),
         _bind_row_bias_gemm((256, 256, 256), torch.float16),
-        _bind_bmm((4, 64, 128, 128), torch.float16),
+        bind_bmm((4, 64, 128, 128), torch.float16),
     ):
         with bound.env:
             assert bound.config_spec._cute_tcgen05_config.warp_mma_admitted
@@ -631,7 +619,7 @@ def test_warp_mma_runs_one_cta_per_tile_on_the_flat_grid() -> None:
 
 
 def test_batched_family_configs_pin_the_batch_block() -> None:
-    bound = _bind_bmm((4, 64, 128, 128), torch.float16)
+    bound = bind_bmm((4, 64, 128, 128), torch.float16)
     repaired = _repaired(bound, _warp_config([2, 64, 8, 128], 4))
     assert repaired["block_sizes"][0] == 1
     with pytest.raises(InvalidConfig, match="batch block of 1"):
@@ -655,7 +643,7 @@ def test_seeds_cover_the_measured_tiles() -> None:
         ((64, 16, 128), 4),
     ], tiles
     assert all(seed.config[FAMILY] == "warp_mma" for seed in seeds)
-    bmm = _bind_bmm((4, 64, 128, 128), torch.float16)
+    bmm = bind_bmm((4, 64, 128, 128), torch.float16)
     with bmm.env:
         seeds = bmm.config_spec._cute_tcgen05_config._warp_mma_seed_configs()
     tiles = sorted(tuple(seed.config["block_sizes"]) for seed in seeds)

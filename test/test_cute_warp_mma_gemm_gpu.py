@@ -11,7 +11,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test.test_cute_tcgen05_fixed_chain import _batched_gemm
 from test.test_cute_tcgen05_fixed_chain import _ordinary_gemm
 from test.test_cute_tcgen05_fixed_chain import _two_output_gemm
 from test.test_cute_tcgen05_fixed_cost import _row_bias_gemm
@@ -30,6 +29,7 @@ from helion._compiler.cute import cute_warp_mma_gemm as family
 from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_dense_tcgen05 import batched_gemm
 from helion.exc import BackendUnsupported
 
 pytestmark = [
@@ -200,7 +200,7 @@ def test_batched_gemm(block_sizes: list[int], warps: int) -> None:
     torch.manual_seed(0)
     a = _randn(4, 64, 128, dtype=torch.float16)
     b = _randn(4, 128, 128, dtype=torch.float16)
-    out, _ = _run(_batched_gemm, (a, b), _config(block_sizes, warps))
+    out, _ = _run(batched_gemm, (a, b), _config(block_sizes, warps))
     _check(out, torch.bmm(a.float(), b.float()))
 
 

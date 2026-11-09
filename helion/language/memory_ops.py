@@ -2728,7 +2728,7 @@ def _check_tcgen05_tma_store_destination(
     signature = _bound_vec_alignment_signature(env, env.tensor_input_source(tensor))
     if signature is not None and signature[0] != 0:
         problems.append(f"base address residue {signature[0]} B")
-    # A radix store addresses the destination through its proved row-major
+    # A radix store addresses the destination through its proved hierarchical
     # [M, N] view, whatever the tensor's own orientation.
     if not transposed_store and not radix_store and tensor.ndim in (2, 3):
         expected_major = "col" if output_column_major else "row"
@@ -2803,14 +2803,18 @@ def _codegen_cute_store_tcgen05_tile(
     env = CompileEnvironment.current()
     store_node = state.fx_node
     # A fused view/permute store into a hierarchical [M, N] destination
-    # (``radix_store``): the identity tile store, addressed through the
-    # proved layout by the TMA store.
+    # (``radix_store``; [M, N, L] for a batched matmul's): the tile store,
+    # addressed through the proved layout by the TMA store.
     radix_layout = (
         proven_radix_store_layout(store_node) if store_node is not None else None
     )
     if tensor.ndim not in (2, 3) and radix_layout is None:
         return None
-    leading_passthrough_output = tensor.ndim == 3 and radix_layout is None
+    # A batched store's TMA tile sits at the batch coordinate of its L mode,
+    # the destination's own or the proved layout's.
+    leading_passthrough_output = (
+        tensor.ndim == 3 if radix_layout is None else bool(radix_layout.batch)
+    )
     store_subscripts = store_node.args[1] if store_node is not None else None
     actual_block_ids = None
     if isinstance(store_subscripts, (list, tuple)):
@@ -2846,13 +2850,13 @@ def _codegen_cute_store_tcgen05_tile(
             not tcgen05_value.use_tma_store_epilogue
             or tcgen05_value.tma_store_full_tiles_only
             or not tcgen05_value.has_explicit_epilogue_tile
-            or epilogue_chain is not None
             or grouped_tail_epilogue is not None
             or fragment_epilogue is not None
             or row_union is not None
             or segment_store
             or tcgen05_value.orientation is Tcgen05Orientation.NM
-            or len(expected_block_ids) != 2
+            or len(expected_block_ids) != (3 if radix_layout.batch else 2)
+            or tcgen05_value.output_column_major != radix_layout.column_major
             or not radix_layout.tma_store_supported(
                 rows_per_store=cast("int", tcgen05_value.explicit_epi_tile_m),
                 cols_per_store=cast("int", tcgen05_value.explicit_epi_tile_n),
@@ -2865,7 +2869,7 @@ def _codegen_cute_store_tcgen05_tile(
             raise exc.BackendUnsupported(
                 "cute",
                 "a hierarchical (view/permute) store destination requires the "
-                "identity full-tile TMA-store epilogue, an explicit epilogue "
+                "full-tile TMA-store epilogue, an explicit epilogue "
                 "tile inside the layout's innermost runs and CTA tiles that "
                 "partition the layout",
             )

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
 
@@ -13,13 +15,17 @@ from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_dense_tcgen05 import gb300_target
 from helion._testing.cute_radix_store import HEAD
+from helion._testing.cute_radix_store import HEAD_MERGE_CONFIG
 from helion._testing.cute_radix_store import ONE_CTA_CONFIG
 from helion._testing.cute_radix_store import PAIR_CONFIG
 from helion._testing.cute_radix_store import SEQ
+from helion._testing.cute_radix_store import TRANSPOSED_HEAD_MERGE_CONFIG
 from helion._testing.cute_radix_store import block_size_index_mm
 from helion._testing.cute_radix_store import colliding_mm
 from helion._testing.cute_radix_store import fanout_head_split_mm
 from helion._testing.cute_radix_store import flattened_head_split_mm
+from helion._testing.cute_radix_store import head_merge_args
+from helion._testing.cute_radix_store import head_merge_bmm
 from helion._testing.cute_radix_store import head_split_args
 from helion._testing.cute_radix_store import head_split_mm
 from helion._testing.cute_radix_store import literal_reshape_mm
@@ -28,8 +34,10 @@ from helion._testing.cute_radix_store import pure_view_mm
 from helion._testing.cute_radix_store import seq384_head_split_mm
 from helion._testing.cute_radix_store import short_head_split_mm
 from helion._testing.cute_radix_store import skewed_mm
+from helion._testing.cute_radix_store import transposed_head_merge_bmm
 from helion._testing.cute_radix_store import transposed_store_mm
 from helion.exc import BackendUnsupported
+import helion.language as hl
 from helion.language import memory_ops
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
@@ -42,6 +50,7 @@ def _gb300():
 
 
 def _layout(kernel, args) -> RadixStoreLayout | None:
+    """The proof over the matmul's ``[M, N]`` (a bmm's ``[B, M, N]``)."""
     bound = kernel._bind_isolated(args)
     graphs = bound.host_function.device_ir.graphs
     store = [
@@ -50,9 +59,10 @@ def _layout(kernel, args) -> RadixStoreLayout | None:
         for node in graph.graph.nodes
         if node.op == "call_function" and node.target is memory_ops.store
     ][-1]
+    extents = (*args[0].shape[:-1], args[1].shape[-1])
     with bound.env, bound.host_function:
         return prove_radix_store_layout(
-            store, block_ids=(0, 1), extents=(args[0].shape[0], args[1].shape[1])
+            store, block_ids=tuple(range(len(extents))), extents=extents
         )
 
 
@@ -198,3 +208,113 @@ def test_box_crossing_runs_and_fanout_are_refused():
     ]
     assert len(stores) == 2
     assert all(proven_radix_store_layout(store) is None for store in stores)
+
+
+def test_batched_head_merge_stores_through_the_l_mode():
+    """``out[z // 4, y, (z % 4) * 64 + x]`` of a [2 * 4, 256, 64] bmm into
+    [2, 256, 256]: the batch coordinate is the TMA store's (4, 2) L mode,
+    and the epilogue scale runs on the accumulator before it."""
+    args = head_merge_args()
+    layout = _layout(head_merge_bmm, args)
+    assert layout == RadixStoreLayout(
+        rows=((256, 256),), cols=((64, 1),), batch=((4, 64), (2, 256 * 256))
+    )
+    assert not layout.column_major
+    assert layout.cute_layout_args() == ("(256, 64, (4, 2))", "(256, 1, (64, 65536))")
+    source = head_merge_bmm._bind_isolated(args).to_code(HEAD_MERGE_CONFIG)
+    assert "'d_hier_layout': ['(256, 64, (4, 2))', '(256, 1, (64, 65536))']" in source
+    assert "cute.local_tile(tcgen05_tma_store_tensor, (128, 64, 1)," in source
+    assert "0.125" in source
+
+
+def test_transposed_head_merge_stages_a_column_major_tile():
+    """``out[z // 4, x, (z % 4) * 64 + y]`` puts each 64-row head's rows on
+    the contiguous axis: the column-major D tile, through 64-row tiles and
+    their (64, 32) store boxes."""
+    args = head_merge_args(m=64, n=256, transposed=True)
+    layout = _layout(transposed_head_merge_bmm, args)
+    assert layout == RadixStoreLayout(
+        rows=((64, 1),), cols=((256, 256),), batch=((4, 64), (2, 256 * 256))
+    )
+    assert layout.column_major
+    bound = transposed_head_merge_bmm._bind_isolated(args)
+    source = bound.to_code(TRANSPOSED_HEAD_MERGE_CONFIG)
+    assert "'d_hier_layout': ['(64, 256, (4, 2))', '(1, 256, (64, 65536))']" in source
+    assert "'d_column_major': True" in source
+
+
+# One case per default regime: the narrow tiles on small and large grids,
+# the wider heads and transposed merge on small grids (where the 128-row pairs
+# render no radix subtile), K and M not whole in 64-deep k-blocks or 128-row
+# tiles.
+@pytest.mark.parametrize(
+    ("kernel", "shape", "tile"),
+    (
+        (head_merge_bmm, {"batch": 2}, [1, 128, 64, 64]),
+        (head_merge_bmm, {"batch": 64}, [1, 128, 64, 64]),
+        (
+            transposed_head_merge_bmm,
+            {"batch": 2, "m": 64, "n": 256, "transposed": True},
+            [1, 64, 256, 64],
+        ),
+        (head_merge_bmm, {"batch": 2, "n": 128, "k": 64}, [1, 128, 128, 64]),
+        (
+            transposed_head_merge_bmm,
+            {"batch": 2, "m": 128, "n": 256, "k": 64, "transposed": True},
+            [1, 128, 256, 64],
+        ),
+        (head_merge_bmm, {"batch": 64, "k": 96}, [1, 128, 64, 32]),
+        (head_merge_bmm, {"batch": 64, "m": 192}, [1, 64, 64, 64]),
+    ),
+    ids=(
+        "small_grid",
+        "many_tiles",
+        "transposed",
+        "wide_small_grid",
+        "transposed_small_grid",
+        "k96",
+        "m192",
+    ),
+)
+def test_batched_head_merge_defaults_store_through_the_layout(
+    kernel: helion.Kernel, shape: dict[str, Any], tile: list[int]
+) -> None:
+    """A batched head merge defaults to the widest one-CTA tile whose CTA
+    tiles partition its layout and whose store boxes sit inside its runs
+    (``RadixStoreLayout.one_cta_tile``), at the deepest k-block dividing K,
+    on small grids too (the 128-row pairs' epilogue subtile does not render
+    it): before, the small-grid pair, the 64-row tile of K = 96 and of
+    M = 192 refused the store."""
+    bound = kernel._bind_isolated(head_merge_args(**shape))
+    config = bound.config_spec.default_config()
+    assert config.block_sizes == tile
+    assert config.config["tcgen05_cluster_m"] == 1
+    assert "d_hier_layout" in bound.to_code(config)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _plain_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    batch, m, k = a.shape
+    n = b.shape[2]
+    out = torch.empty([batch, m, n], dtype=a.dtype, device=a.device)
+    for tile_z, tile_y, tile_x in hl.tile([batch, m, n]):
+        acc = hl.zeros([tile_z, tile_y, tile_x], dtype=torch.float32)
+        for tile_r in hl.tile(k):
+            acc = torch.baddbmm(
+                acc, a[tile_z, tile_y, tile_r], b[tile_z, tile_r, tile_x]
+            )
+        out[tile_z, tile_y, tile_x] = acc.to(out.dtype)
+    return out
+
+
+def test_plain_narrow_bmm_small_grid_keeps_the_pair() -> None:
+    """Without a head merge, a narrow bmm's small grid keeps the 128-row
+    pair's deep AB ring (B200, 32 x 128x64x4096: 18.8 us against 31.4 us on
+    the narrow one-CTA tile)."""
+    args = (
+        torch.empty((32, 128, 4096), dtype=torch.bfloat16),
+        torch.empty((32, 4096, 64), dtype=torch.bfloat16),
+    )
+    config = _plain_bmm._bind_isolated(args).config_spec.default_config()
+    assert config.block_sizes[1] == 128
+    assert config.config["tcgen05_cluster_m"] == 2

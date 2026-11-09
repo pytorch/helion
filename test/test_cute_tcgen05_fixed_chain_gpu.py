@@ -12,7 +12,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test.test_cute_tcgen05_fixed_chain import _batched_gemm
 from test.test_cute_tcgen05_fixed_chain import _bias_gemm
 from test.test_cute_tcgen05_fixed_chain import _compact_group4_fragment
 from test.test_cute_tcgen05_fixed_chain import _two_output_gemm
@@ -20,6 +19,7 @@ from test.test_cute_tcgen05_fixed_chain import _two_output_gemm
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_dense_tcgen05 import batched_gemm
 import helion.language as hl
 
 pytestmark = [
@@ -167,7 +167,7 @@ def test_batched_one_tile_per_cta_fp16() -> None:
     a = torch.randn(8, 256, 512, device=DEVICE, dtype=torch.float16)
     b = torch.randn(8, 512, 256, device=DEVICE, dtype=torch.float16)
     _run(
-        _batched_gemm,
+        batched_gemm,
         (a, b),
         _config(
             block_sizes=[1, 128, 128, 64], loop_orders=[[0, 1, 2]], tcgen05_ab_stages=3

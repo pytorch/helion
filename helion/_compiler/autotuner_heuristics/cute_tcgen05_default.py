@@ -54,7 +54,10 @@ from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
+    import torch
+
     from ..compile_environment import CompileEnvironment
+    from ..cute.radix_store import RadixStoreLayout
     from ..cute.tcgen05_config import CuteTcgen05Config
     from ..device_ir import DeviceIR
 
@@ -111,6 +114,9 @@ _EPI_TMA_MIN_AB_STAGES = 4
 # K tiles from which the one-CTA N-edge candidates take an exact-shape
 # auxiliary epilogue (see ``_one_cta_candidate``).
 _ONE_CTA_N_EDGE_EXACT_AUX_MIN_K_TILES = 8
+# K blocks from which a narrow batched GEMM's default runs the persistent loop
+# at four AB stages (``_narrow_batched_default``).
+_NARROW_BATCHED_PERSISTENT_MIN_K_TILES = 8
 # A candidate replaces the FFI default only below this fraction of its cost.
 _FFI_REPLACEMENT_MARGIN = 0.9
 
@@ -133,6 +139,22 @@ def _promotable_seed_view(
     return state._matmul_config_view(values)
 
 
+def _batched_radix_store(device_ir: DeviceIR) -> tuple[RadixStoreLayout, int] | None:
+    """The batched mixed-radix layout the MMA store analysis proved for the
+    kernel's store (a head merge fused into a bmm's store,
+    ``radix_store``), with the destination's element size."""
+    # ``radix_store`` imports ``helion.language``, which imports this module.
+    from ..cute.radix_store import proven_radix_store_layout
+
+    for graph in device_ir.graphs:
+        for node in graph.graph.nodes:
+            layout = proven_radix_store_layout(node)
+            if layout is not None and layout.batch:
+                tensor = cast("torch.fx.Node", node.args[0]).meta["val"]
+                return layout, tensor.element_size()
+    return None
+
+
 def _promoted_values(seed: Config) -> dict[str, Any]:
     """A promoted seed's values; PDL stays a target decision of the base
     default."""
@@ -151,13 +173,13 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        return cls._pick(env) is not None
+        return cls._pick(env, device_ir) is not None
 
     @classmethod
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
-        return cls._pick(env)
+        return cls._pick(env, device_ir)
 
     @staticmethod
     def _direct_entry_staged_row(state: CuteTcgen05Config) -> Config | None:
@@ -403,6 +425,68 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         return Config(**values)
 
     @staticmethod
+    def _narrow_batched_default(
+        env: CompileEnvironment,
+        m: int,
+        n: int,
+        k: int,
+        radix: tuple[RadixStoreLayout, int] | None = None,
+    ) -> Config | None:
+        """The one-CTA tile of a batched GEMM whose per-batch matrices are
+        narrower than 128 rows or columns (attention's ``[B * H, S, 64]``
+        bmms), or whose store merges heads (``radix``: the proved layout and
+        the element size): 128 rows (64 where M is not whole in them) by the
+        widest of 256, 128, 64 or 32 columns dividing N (a head merge's: the
+        widest tile partitioning its layout whose store boxes sit inside its
+        runs, ``RadixStoreLayout.one_cta_tile``), the deepest of 64-, 32- or
+        16-deep k-blocks dividing K; flat with two AB stages, the persistent
+        loop with four from eight k-blocks on.
+
+        The base default ran a 64x16 tile; B200, Inductor corpus, of the ATen
+        GEMM (many batches of one or two tiles each): 1024 x 256x64x256
+        + scale 1.09 (persistent: 1.08), 3072 x 128x64x128 1.35 (1.08),
+        3072 x 64x128x128 1.40 (1.19); eight k-blocks, 64x256 tiles:
+        384 x 64x512x512 flat 1.00 (four AB stages 0.93, two CTAs fit an SM
+        at two), persistent 1.03, 192 x 64x512x512 1.07. A head merge takes
+        it on small grids too, where the 128-row pairs render no radix store
+        subtile; a plain narrow GEMM's small grid keeps the pairs' deep rings
+        (32 x 128x64x4096: 18.8 us against 31.4 us here)."""
+        spec = env.config_spec
+        state = spec._cute_tcgen05_config
+        bk = next((depth for depth in (64, 32, 16) if k % depth == 0), None)
+        if radix is not None:
+            layout, element_bytes = radix
+            tile = layout.one_cta_tile(element_bytes)
+        else:
+            bm = next((rows for rows in (128, 64) if m % rows == 0), None)
+            bn = next((cols for cols in (256, 128, 64, 32) if n % cols == 0), None)
+            tile = None if bm is None or bn is None else (bm, bn)
+        if tile is None or bk is None:
+            return None
+        bm, bn = tile
+        persistent = (
+            k // bk >= _NARROW_BATCHED_PERSISTENT_MIN_K_TILES
+            and "persistent_blocked" in spec.allowed_pid_types
+        )
+        stages = 4 if persistent else 2
+        block_sizes = state._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+        if (
+            block_sizes is None
+            or (not persistent and "flat" not in spec.allowed_pid_types)
+            or state.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=1) < stages
+        ):
+            return None
+        return Config(
+            block_sizes=block_sizes,
+            pid_type="persistent_blocked" if persistent else "flat",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=stages,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+        )
+
+    @staticmethod
     def _persistent_tile_values(
         env: CompileEnvironment,
         k: int,
@@ -577,7 +661,7 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         return Config(**values)
 
     @classmethod
-    def _pick(cls, env: CompileEnvironment) -> Config | None:
+    def _pick(cls, env: CompileEnvironment, device_ir: DeviceIR) -> Config | None:
         spec = env.config_spec
         state = spec._cute_tcgen05_config
         # Only kernels whose pipeline the compiler proved: TMA operands, and
@@ -600,7 +684,15 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             return None
         m, n, k = cast("tuple[int, int, int]", extents)
         batch = state.matmul_leading_work_multiplier
-        if batch * cdiv(m, 128) * cdiv(n, 128) < state.device_sm_count:
+        small_grid = batch * cdiv(m, 128) * cdiv(n, 128) < state.device_sm_count
+        radix = _batched_radix_store(device_ir) if batch > 1 else None
+        if radix is not None or (batch > 1 and min(m, n) < 128 and not small_grid):
+            # A head merge fused into a batched store renders only from a
+            # one-CTA tile's store boxes (not the pairs'), and per-batch
+            # matrices narrower than 128 rows or columns are narrower than
+            # every large-grid candidate below.
+            return cls._narrow_batched_default(env, m, n, k, radix)
+        if small_grid:
             # Fewer 128x128 tiles than SMs: the 128-row pair with the fewest
             # waves, then the most CTAs (``_small_grid_pair_default``).
             return cls._small_grid_pair_default(env, m, n, k, batch)

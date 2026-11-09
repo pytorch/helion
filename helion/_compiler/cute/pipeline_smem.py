@@ -234,10 +234,12 @@ def analyze_pipeline_smem_facts(
     if not isinstance(output_node, torch.fx.Node):
         return None
     output = output_node.meta["val"]
-    radix_store = proven_radix_store_layout(store) is not None
-    if radix_store:
-        # A hierarchical (radix) destination stages the row-major [M, N] tile.
-        output_major = "row"
+    radix_layout = proven_radix_store_layout(store)
+    radix_store = radix_layout is not None
+    if radix_layout is not None:
+        # A hierarchical (radix) destination stages the row-major [M, N] tile,
+        # or the column-major one when its rows hold the contiguous run.
+        output_major = "col" if radix_layout.column_major else "row"
     elif isinstance(output, torch.Tensor):
         output_major = _tcgen05_tma_matrix_major(output)
     else:

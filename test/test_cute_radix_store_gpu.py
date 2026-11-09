@@ -7,12 +7,18 @@ import torch
 
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_radix_store import HEAD_MERGE_CONFIG
 from helion._testing.cute_radix_store import ONE_CTA_CONFIG
 from helion._testing.cute_radix_store import PAIR_CONFIG
+from helion._testing.cute_radix_store import TRANSPOSED_HEAD_MERGE_CONFIG
+from helion._testing.cute_radix_store import head_merge_args
+from helion._testing.cute_radix_store import head_merge_bmm
+from helion._testing.cute_radix_store import head_merge_reference
 from helion._testing.cute_radix_store import head_split_args
 from helion._testing.cute_radix_store import head_split_mm
 from helion._testing.cute_radix_store import head_split_reference
 from helion._testing.cute_radix_store import seq384_head_split_mm
+from helion._testing.cute_radix_store import transposed_head_merge_bmm
 from helion._testing.cute_radix_store import transposed_store_mm
 
 pytestmark = [
@@ -66,3 +72,50 @@ def test_transposed_destination_matches_the_matmul() -> None:
     torch.testing.assert_close(
         storage, (a.float() @ b.float()).to(torch.bfloat16), rtol=2e-2, atol=1e-1
     )
+
+
+@pytest.mark.parametrize("default", (False, True), ids=("pinned", "default"))
+@pytest.mark.parametrize("transposed", (False, True), ids=("rows", "transposed"))
+def test_batched_head_merge_matches_the_bmm(transposed: bool, default: bool) -> None:
+    """A batched bmm's head merge (scaled), row-major and transposed, lands
+    every element where the permuted torch result has it, at a pinned config
+    and at the default."""
+    torch.manual_seed(0)
+    kernel, config, shape = (
+        (transposed_head_merge_bmm, TRANSPOSED_HEAD_MERGE_CONFIG, {"m": 64, "n": 256})
+        if transposed
+        else (head_merge_bmm, HEAD_MERGE_CONFIG, {})
+    )
+    a, b, out = head_merge_args(**shape, transposed=transposed, device=DEVICE)
+    bound = kernel.bind((a, b, out))
+    if default:
+        config = bound.config_spec.default_config()
+    assert "d_hier_layout" in bound.to_code(config)
+    bound.set_config(config)
+    out.fill_(float("nan"))
+    bound(a, b, out)
+    torch.testing.assert_close(
+        out, head_merge_reference(a, b, transposed=transposed), rtol=2e-2, atol=1e-1
+    )
+
+
+# The defaults the store used to refuse: the wide heads' small grid
+# (the 128-row pair before), K and M not whole in 64-deep k-blocks or
+# 128-row tiles (the 64x16 base tile before).
+@pytest.mark.parametrize(
+    "shape",
+    ({"batch": 2, "n": 128, "k": 64}, {"batch": 16, "k": 96}, {"batch": 16, "m": 192}),
+    ids=("wide_small_grid", "k96", "m192"),
+)
+def test_batched_head_merge_default_tiles_match_the_bmm(
+    shape: dict[str, int],
+) -> None:
+    torch.manual_seed(0)
+    a, b, out = head_merge_args(**shape, device=DEVICE)
+    bound = head_merge_bmm.bind((a, b, out))
+    config = bound.config_spec.default_config()
+    assert "d_hier_layout" in bound.to_code(config)
+    bound.set_config(config)
+    out.fill_(float("nan"))
+    bound(a, b, out)
+    torch.testing.assert_close(out, head_merge_reference(a, b), rtol=2e-2, atol=1e-1)

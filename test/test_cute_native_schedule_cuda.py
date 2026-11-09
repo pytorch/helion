@@ -10,7 +10,6 @@ from test.test_cute_epilogue_fanout import bias_gelu_aux
 from test.test_cute_epilogue_fanout import gelu_aux_scaled
 from test.test_cute_epilogue_fanout import paired
 from test.test_cute_shared_rhs_grouped import _plans
-from test.test_cute_tcgen05_fixed_chain import _batched_gemm
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import grouped_row_union_carrier
@@ -30,6 +29,7 @@ from helion._compiler.cute.grouped_row_union import SCHEDULE_KEY
 from helion._compiler.cute.grouped_row_union import TRANSPOSED_SCHEDULE
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_dense_tcgen05 import batched_gemm
 from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
 
 grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
@@ -509,7 +509,7 @@ def test_native_batched_two_cta_paired_cuda(
     a.mul_(0.125)
     b.mul_(0.125)
     kernel = helion.kernel(
-        _batched_gemm, backend="cute", static_shapes=True, autotune_effort="none"
+        batched_gemm, backend="cute", static_shapes=True, autotune_effort="none"
     )
     bound = kernel.bind((a, b))
     requested = helion.Config(

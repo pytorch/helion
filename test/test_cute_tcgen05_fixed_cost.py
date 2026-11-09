@@ -17,7 +17,6 @@ import torch
 from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
 from test.test_cute_tcgen05_fixed_chain import PUBLICATION_HOISTED
 from test.test_cute_tcgen05_fixed_chain import _bind_bias_gemm
-from test.test_cute_tcgen05_fixed_chain import _bind_bmm
 from test.test_cute_tcgen05_fixed_chain import _bind_gemm
 from test.test_cute_tcgen05_fixed_chain import _cpu_only  # noqa: F401
 from test.test_cute_tcgen05_fixed_chain import _kernel_body
@@ -33,6 +32,7 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONF
 from helion._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
 from helion._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUTS
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_dense_tcgen05 import bind_bmm
 from helion._testing.cute_dense_tcgen05 import wrapper_plans
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
@@ -211,7 +211,7 @@ def test_direct_store_mode_renders_vector_register_stores() -> None:
 def test_direct_store_mode_on_a_batched_output() -> None:
     kernel = _kernel_body(
         _source(
-            _bind_bmm((8, 256, 256, 512), torch.float16),
+            bind_bmm((8, 256, 256, 512), torch.float16),
             _plain_config(
                 block_sizes=[1, 128, 64, 64],
                 loop_orders=[[0, 1, 2]],
@@ -292,10 +292,10 @@ def test_normal_store_mode_render_is_unchanged_by_the_knob() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_small_grid_seeds_cover_batched_gemms() -> None:
+def test_small_grid_seeds_coverbatched_gemms() -> None:
     # 4 x 64x128x128: four standard tiles on 148 SMs.  The batch axis is one
     # of the seed's block sizes (pinned to 1) and multiplies the tile count.
-    bound = _bind_bmm((4, 64, 128, 128), torch.float16)
+    bound = bind_bmm((4, 64, 128, 128), torch.float16)
     with bound.env:
         seeds = bound.config_spec._cute_tcgen05_config._small_grid_seed_configs()
     tiles = sorted({tuple(seed.config["block_sizes"]) for seed in seeds})
@@ -309,7 +309,7 @@ def test_small_grid_seeds_cover_batched_gemms() -> None:
 def test_small_grid_seeds_stop_once_the_batched_grid_fills_the_machine() -> None:
     # 64 x 128x128x256: 64 standard tiles would qualify unbatched, but the
     # batch axis fills the machine 64-fold.
-    bound = _bind_bmm((64, 256, 256, 256), torch.float16)
+    bound = bind_bmm((64, 256, 256, 256), torch.float16)
     with bound.env:
         seeds = bound.config_spec._cute_tcgen05_config._small_grid_seed_configs()
     assert seeds == []
@@ -377,10 +377,10 @@ def test_small_grids_admit_64_row_tiles_in_search() -> None:
     # A grid that fills the machine keeps the 128-row floor.
     assert _m_block_fragment_low(_bind_gemm((2048, 2048, 256), torch.float16)) == 128
     # The batch axis counts toward the grid: 64 x 256x256 fills it.
-    assert _m_block_fragment_low(_bind_bmm((64, 256, 256, 256), torch.float16)) == 128
+    assert _m_block_fragment_low(bind_bmm((64, 256, 256, 256), torch.float16)) == 128
     # 8 x 256x512x256 is small-grid but beyond the register-MMA family's
     # latency-bound regime: the 64-row tcgen05 floor stays.
-    assert _m_block_fragment_low(_bind_bmm((8, 256, 512, 256), torch.float16)) == 64
+    assert _m_block_fragment_low(bind_bmm((8, 256, 512, 256), torch.float16)) == 64
 
 
 def test_small_grid_seeds_keep_64_row_tiles_within_one_wave() -> None:
@@ -437,7 +437,7 @@ def test_narrow_n8_tile_launches_exactly_the_role_warps() -> None:
     # pass it before warp 0 had initialized the mbarriers and fault on its
     # first ``try_wait`` (the flaky ``unspecified launch failure`` of this
     # config).  One warp per role row, like every other tile.
-    source = _source(_bind_bmm((4, 64, 128, 128), torch.float16), _inline_n8_config())
+    source = _source(bind_bmm((4, 64, 128, 128), torch.float16), _inline_n8_config())
     kernel = _kernel_body(source)
     assert "block=(32, 6, 1)" in source
     assert "barrier_id=3, num_threads=96)" in kernel
@@ -463,7 +463,7 @@ def test_narrow_n8_one_shot_chain_has_no_cta_wide_barrier(ab_stages: int) -> Non
     # thread-barrier pass put one there for the N=8 family (the 30 s
     # autotuner timeouts of every ``tcgen05_ab_stages=1`` sample).
     source = _source(
-        _bind_bmm((4, 64, 128, 128), torch.float16),
+        bind_bmm((4, 64, 128, 128), torch.float16),
         _plain_config(
             block_sizes=[1, 64, 8, 64],
             loop_orders=[[0, 1, 2]],
@@ -493,7 +493,7 @@ def test_narrow_n8_persistent_chain_has_no_cta_wide_barrier() -> None:
     # 8 x 2 x 32 = 512 tiles of 128x8 over 148 CTAs: the persistent while,
     # several tiles per CTA, four K tiles over a two-stage ring.
     source = _source(
-        _bind_bmm((8, 256, 256, 256), torch.float16),
+        bind_bmm((8, 256, 256, 256), torch.float16),
         _plain_config(
             block_sizes=[1, 128, 8, 64],
             loop_orders=[[0, 1, 2]],
@@ -511,7 +511,7 @@ def test_wider_tiles_render_unchanged_by_the_n8_rule() -> None:
     # six-warp launch with the inline path's three syncs.
     config = _inline_n8_config()
     source = _source(
-        _bind_bmm((4, 64, 128, 128), torch.float16),
+        bind_bmm((4, 64, 128, 128), torch.float16),
         helion.Config(**{**config.config, "block_sizes": [1, 64, 16, 64]}),
     )
     kernel = _kernel_body(source)
