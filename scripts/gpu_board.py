@@ -139,7 +139,7 @@ if TYPE_CHECKING:
 # The script's version: an ISO date, with ".N" for later changes on the same
 # day. Bump it with every change: the published copy is only replaced by a
 # strictly newer version.
-VERSION = "2026-11-07.4"
+VERSION = "2026-11-09"
 # The version of the file formats; see "Compatibility" above.
 PROTOCOL = 1
 DEFAULT_BOARD = Path("/tmp/gpu-board")
@@ -372,6 +372,9 @@ MAX_TIMESTAMP = 1e11
 # stay at the bottom of every log).
 FUTURE_SLACK_SECONDS = 300.0
 LOCK_TIMEOUT_SECONDS = 60.0
+# Opens of a file that is unlinked as it is opened (a claim renewal renames a
+# new file over the old one) before a read gives up on it.
+READ_ATTEMPTS = 3
 TEMP_PREFIX = ".tmp-"
 PUBLISHED = ("AGENTS.md", "gpu_board.py")
 # Errors that mean something is in the way of this account's own file (an
@@ -638,15 +641,20 @@ class BoardDir:
         Dot files (temporary files, editor locks) are skipped and this
         account's stale temporary files removed; other non-regular entries
         are findings."""
-        # List through a fresh descriptor of the same directory: on btrfs a
-        # descriptor's listing can omit entries created after it was opened.
-        list_fd = os.open(
-            ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=dir_fd
-        )
-        try:
-            names = os.listdir(list_fd)
-        finally:
-            os.close(list_fd)
+        # List through fresh descriptors of the same directory, twice, keeping
+        # every name either listing saw: on btrfs a descriptor's listing can
+        # omit entries created after it was opened, and renaming a renewed
+        # claim over its file creates the entry anew, so a single listing
+        # that overlaps a renewal can miss the claim.
+        names: set[str] = set()
+        for _ in range(2):
+            list_fd = os.open(
+                ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=dir_fd
+            )
+            try:
+                names.update(os.listdir(list_fd))
+            finally:
+                os.close(list_fd)
         if len(names) > MAX_ENTRIES:
             self.alerts.append(f"{where}/ holds {len(names)} entries (a flood)")
             return []
@@ -717,37 +725,43 @@ class BoardDir:
     ) -> tuple[bytes, os.stat_result] | None:
         """A file's bytes (at most ``limit``; the last ``limit`` bytes from a
         line start with ``tail``) and its fstat, or None when it is missing,
-        not a regular file, or too large."""
+        not a regular file, too large, or replaced on every attempt."""
         mine = self.mine(name)
         label = f"{where}/{safe_name(name)}" if where else safe_name(name)
-        try:
-            fd = os.open(
-                name,
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                dir_fd=dir_fd,
-            )
-        except FileNotFoundError:
-            return None
-        except OSError as e:
-            if e.errno == errno.ELOOP:
-                self.finding(mine, f"{label} is a symlink")
-            return None
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
-                self.finding(mine, f"{label} is not a regular file")
+        for _ in range(READ_ATTEMPTS):
+            try:
+                fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                    dir_fd=dir_fd,
+                )
+            except FileNotFoundError:
                 return None
-            if info.st_size > limit and not tail:
-                self.notices.append(f"skipped {label}: {info.st_size} bytes")
+            except OSError as e:
+                if e.errno == errno.ELOOP:
+                    self.finding(mine, f"{label} is a symlink")
                 return None
-            if info.st_size > limit:
-                os.lseek(fd, info.st_size - limit, os.SEEK_SET)
-                data = os.read(fd, limit).partition(b"\n")[2]  # from a line start
-            else:
-                data = os.read(fd, limit + 1)[:limit]
-            return data, info
-        finally:
-            os.close(fd)
+            try:
+                info = os.fstat(fd)
+                if info.st_nlink == 0:
+                    # Unlinked since the open: a renewal renamed a new file
+                    # over it (read that one) or its owner removed it.
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    self.finding(mine, f"{label} is not a regular file")
+                    return None
+                if info.st_size > limit and not tail:
+                    self.notices.append(f"skipped {label}: {info.st_size} bytes")
+                    return None
+                if info.st_size > limit:
+                    os.lseek(fd, info.st_size - limit, os.SEEK_SET)
+                    data = os.read(fd, limit).partition(b"\n")[2]  # from a line start
+                else:
+                    data = os.read(fd, limit + 1)[:limit]
+                return data, info
+            finally:
+                os.close(fd)
+        return None
 
     # -- this account's files ------------------------------------------------
 
@@ -1222,16 +1236,16 @@ def load_json(data: bytes) -> object:
 
 def load_claims(board: BoardDir) -> list[Claim]:
     claims = []
-    for name, listed in board.entries(board.claims_fd, "claims"):
+    for name, _ in board.entries(board.claims_fd, "claims"):
         if not name.endswith(".json"):
             continue
         found = board.read(board.claims_fd, name, "claims", MAX_CLAIM_BYTES)
         if found is None:
             continue
         data, info = found
-        if (info.st_dev, info.st_ino) != (listed.st_dev, listed.st_ino):
-            continue  # replaced since the listing; the next read sees it
-        # Identity and authenticity come from the file actually read.
+        # Identity and authenticity come from the file actually read, which a
+        # renewal may have renamed over the listed one since the listing:
+        # skipping it would hide a held claim from this read.
         owner = owner_of(info)
         if not name.startswith(f"{owner}."):
             board.finding(

@@ -387,7 +387,8 @@ def test_board_publishes_only_as_its_owner_and_never_downgrades(board):
     assert gpu_board.published_version(bd) == gpu_board.VERSION
     # An equal version is left alone (two checkouts never swap it back and
     # forth); a newer one, compared numerically, is never replaced.
-    for published in (gpu_board.VERSION, "2026-11-07.10", "2999-01-01"):
+    date, serial = gpu_board.version_key(gpu_board.VERSION)
+    for published in (gpu_board.VERSION, f"{date}.{serial + 10}", "2999-01-01"):
         copy.write_text(f'VERSION = "{published}"\n')
         doc.write_text("newer\n")
         gpu_board.Board()
@@ -481,6 +482,60 @@ def test_hold_claim_renews_and_removes(board):
             time.sleep(0.02)
         assert loaded.expires > start
     assert gpu_board.load_claims(bd) == []
+
+
+def test_load_claims_sees_a_claim_renewed_after_the_listing(board, monkeypatch):
+    # A renewal renames a new file over the claim between the listing and the
+    # read; the claim stays visible, or a concurrent pick could take its GPU.
+    bd = gpu_board.BoardDir(board)
+    claim = gpu_board.new_claim([3], "held", 60, time.time())
+    gpu_board.save_claim(bd, claim)
+    renewed = replace(claim, expires=claim.expires + 60)
+    list_entries = bd.entries
+
+    def list_then_renew(dir_fd, where):
+        listed = list_entries(dir_fd, where)
+        gpu_board.save_claim(bd, renewed)
+        return listed
+
+    monkeypatch.setattr(bd, "entries", list_then_renew)
+    assert gpu_board.load_claims(bd) == [renewed]
+
+
+def test_load_claims_sees_a_claim_one_listing_missed(board, monkeypatch):
+    # On btrfs a listing can omit an entry renamed into place while it runs.
+    bd = gpu_board.BoardDir(board)
+    claim = gpu_board.new_claim([3], "held", 60, time.time())
+    gpu_board.save_claim(bd, claim)
+    listdir = os.listdir
+    listings = []
+
+    def first_listing_misses(fd):
+        listings.append(fd)
+        return [] if len(listings) == 1 else listdir(fd)
+
+    monkeypatch.setattr(gpu_board.os, "listdir", first_listing_misses)
+    assert gpu_board.load_claims(bd) == [claim]
+
+
+def test_load_claims_rereads_a_claim_renewed_as_it_is_opened(board, monkeypatch):
+    # A renewal between the open and the fstat unlinks the opened file: the
+    # claim is read again, not dropped as a file with no links (an alert).
+    bd = gpu_board.BoardDir(board)
+    claim = gpu_board.new_claim([3], "held", 60, time.time())
+    gpu_board.save_claim(bd, claim)
+    renewed = replace(claim, expires=claim.expires + 60)
+    fstat = os.fstat
+    renewals = [renewed]
+
+    def renew_then_fstat(fd):
+        if renewals:
+            gpu_board.save_claim(bd, renewals.pop())
+        return fstat(fd)
+
+    monkeypatch.setattr(gpu_board.os, "fstat", renew_then_fstat)
+    assert gpu_board.load_claims(bd) == [renewed]
+    assert bd.alerts == []
 
 
 # --------------------------------------------------------------------------
