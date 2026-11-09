@@ -709,6 +709,27 @@ class TestCuteTcgen05DefaultTilesGpu(RefEagerTestDisabled, TestCase):
                 atol=1e-1,
             )
 
+    def test_small_grid_without_a_pair_splits_k(self) -> None:
+        # A 64-row M and a K tail over long K loops: the flat 64x64x64 tile
+        # splits K (four slices, eight) and the last arriving CTA adds the
+        # bias once.
+        for m, n, k, split in ((64, 4096, 4096, 4), (32, 1280, 4000, 8)):
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+            bias = torch.randn(n, device=DEVICE, dtype=torch.bfloat16)
+            out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+            bound = bias_mm_into.bind((a, b, bias, out))
+            config = bound.config_spec.default_config()
+            self.assertEqual(config.config["tcgen05_split_k"], split)
+            bound.set_config(config)
+            bound(a, b, bias, out)
+            torch.testing.assert_close(
+                out,
+                (a.float() @ b.float() + bias.float()).to(out.dtype),
+                rtol=1e-2,
+                atol=1e-1,
+            )
+
     def test_residual_pair_defaults_stage_the_residual(self) -> None:
         # Whole tiles: the epilogue-issued TMA ring, four stages deep where
         # the AB ring holds the tile's four k-blocks beside it. An M edge

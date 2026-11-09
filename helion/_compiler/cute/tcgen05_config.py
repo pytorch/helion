@@ -268,6 +268,7 @@ from .tcgen05_constants import TCGEN05_SMALL_GRID_DIRECT_STORE_MAX_BN
 from .tcgen05_constants import TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES
 from .tcgen05_constants import TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES
 from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
 from .tcgen05_constants import TCGEN05_SPLIT_K_SEARCH_CHOICES
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
@@ -296,6 +297,7 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import TCGEN05_TWO_CTA_NARROW_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
 from .tcgen05_constants import TCGEN05_TWO_CTA_PAIR_BLOCK_NS
+from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from .tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
 from .tcgen05_constants import Tcgen05RowvecAuxFacts
@@ -647,6 +649,17 @@ def _stored_block_n(config: Mapping[str, object], bn: int) -> int:
     return width if type(width) is int and width > 0 else bn
 
 
+def long_n_sweep_l2_grouping(
+    n_tiles: int, *, short: int, long: int = TCGEN05_LONG_N_SWEEP_L2_GROUPING
+) -> int:
+    """The M tiles a grouped raster walks per group over ``n_tiles`` N
+    tiles: ``long`` on a long N sweep (at least
+    ``TCGEN05_LONG_N_SWEEP_MIN_TILES`` N tiles: the group's A panels stay
+    resident in L2 while it sweeps N, so B is re-read once per group),
+    ``short`` otherwise."""
+    return long if n_tiles >= TCGEN05_LONG_N_SWEEP_MIN_TILES else short
+
+
 class CuteTcgen05Config:
     """CuTe-owned tcgen05 ConfigSpec state and normalization hooks."""
 
@@ -695,6 +708,9 @@ class CuteTcgen05Config:
         # guards that store alone. Set at bind; a spec that never went
         # through bind keeps the knob off.
         self.split_k_plain_body: bool = False
+        # Split-K runs whole tiles or the flat-edge TMA path: the
+        # ``cute_flat_edge_tma`` setting, recorded at bind.
+        self.split_k_flat_edge_tma: bool = True
         # The device program runs an ``hl.atomic_*`` (``DeviceIR.has_atomic_ops``):
         # codegen refuses it beside the CtaGroup.TWO pair's shared tiles
         # (``reject_atomics_beside_warp_roles``). Set at bind.
@@ -2807,12 +2823,17 @@ class CuteTcgen05Config:
                 splits = [
                     split
                     for split in choices
-                    if k_tiles // split >= 4 and tiles * split >= sm_count
+                    if k_tiles // split >= TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
+                    and tiles * split >= sm_count
                 ][:2]
                 if not splits:
                     # No split reaches one wave with four tiles per split:
                     # the deepest split that keeps four tiles.
-                    splits = [split for split in choices if k_tiles // split >= 4][-1:]
+                    splits = [
+                        split
+                        for split in choices
+                        if k_tiles // split >= TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
+                    ][-1:]
                 fit = self.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=1)
                 block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
                 assert block_sizes is not None
@@ -4333,17 +4354,15 @@ class CuteTcgen05Config:
         )
 
     def _direct_entry_l2_grouping(self) -> int:
-        """The direct-entry pair's M-tile grouping: 2 (the measured
-        direct-entry default), or ``TCGEN05_LONG_N_SWEEP_L2_GROUPING`` on a
-        long N sweep, where grouping 2 re-reads B every two M tiles."""
+        """The direct-entry pair's M-tile grouping
+        (``long_n_sweep_l2_grouping``): 2 (the measured direct-entry
+        default), or ``TCGEN05_LONG_N_SWEEP_L2_GROUPING`` on a long N sweep,
+        where grouping 2 re-reads B every two M tiles."""
         extents = self.matmul_compile_time_static_extents
         n = extents[1] if extents is not None else None
-        if (
-            isinstance(n, int)
-            and -(-n // TCGEN05_TWO_CTA_BLOCK_N) >= TCGEN05_LONG_N_SWEEP_MIN_TILES
-        ):
-            return TCGEN05_LONG_N_SWEEP_L2_GROUPING
-        return 2
+        if not isinstance(n, int):
+            return 2
+        return long_n_sweep_l2_grouping(-(-n // TCGEN05_TWO_CTA_BLOCK_N), short=2)
 
     def full_tile_direct_entry_seed_config(
         self, *, l2_groupings: list[object] | None = None
@@ -4545,7 +4564,7 @@ class CuteTcgen05Config:
             # preserves the interleaved rasterization order it cancels into,
             # and l2_groupings=[1] costs ~13% at fp16 16384^3 (780 vs 899
             # TFLOP/s pinned) vs the measured-good [4].
-            "l2_groupings": [4],
+            "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
             "tcgen05_cluster_m": 2,
             "tcgen05_num_epi_warps": 4,
             "tcgen05_ab_stages": ab_stages,
@@ -4596,7 +4615,7 @@ class CuteTcgen05Config:
         seed_config: dict[str, Any] = {
             "block_sizes": [pair_bm, TCGEN05_TWO_CTA_BLOCK_N, bk],
             "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
-            "l2_groupings": [4],
+            "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
             "tcgen05_cluster_m": 2,
             "tcgen05_cluster_n": 1,
             "tcgen05_num_epi_warps": 4,
@@ -4770,7 +4789,7 @@ class CuteTcgen05Config:
                 bk,
             ],
             "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
-            "l2_groupings": [4],
+            "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
             "tcgen05_cluster_m": 2,
             "tcgen05_num_epi_warps": 4,
             "tcgen05_ab_stages": ab_stages,
@@ -4993,7 +5012,7 @@ class CuteTcgen05Config:
                 bk,
             ],
             "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
-            "l2_groupings": [4],
+            "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
             "tcgen05_cluster_m": 2,
             "tcgen05_cluster_n": 2,
             "tcgen05_num_epi_warps": 4,
@@ -5432,6 +5451,8 @@ class CuteTcgen05Config:
             or extents is None
             or fragments is None
             or self.matmul_leading_work_multiplier != 1
+            # a batch of one: codegen splits no leading passthrough axis
+            or self.matmul_has_leading_passthrough
             or self.grouped_worklist_smem_facts is not None
             or any(value is None or value <= 0 for value in extents)
         ):
@@ -5450,9 +5471,18 @@ class CuteTcgen05Config:
             split for split in TCGEN05_SPLIT_K_SEARCH_CHOICES if 1 < split <= k_tiles
         )
 
+    def split_k_tiles_supported(self, *, bm: int, bn: int, bk: int) -> bool:
+        """Whether split-K runs ``bm x bn x bk`` tiles: whole tiles, or any on
+        the flat-edge TMA path (``split_k_flat_edge_tma``, recorded at bind:
+        the partial tiles' K tails and edges store through it)."""
+        return self.split_k_flat_edge_tma or self._static_full_tiles(
+            bm=bm, bn=bn, bk=bk
+        )
+
     def _fix_split_k_search_config(self, config: dict[str, object]) -> None:
         """Keep ``tcgen05_split_k`` at 1 unless the sampled config is a flat
-        one-CTA GEMM whose K loop has at least ``split`` tiles."""
+        one-CTA GEMM whose K loop has at least ``split`` tiles, on whole tiles
+        or the flat-edge TMA path (``split_k_flat_edge_tma``)."""
         searched = self.search_enabled and bool(self.split_k_search_choices())
         split = config.get(TCGEN05_SPLIT_K_CONFIG_KEY, 1)
         if (
@@ -5480,8 +5510,8 @@ class CuteTcgen05Config:
         )
         if valid:
             assert view is not None and extents is not None
-            block_sizes, m_index, _n_index, k_index = view
-            bm, bk = block_sizes[m_index], block_sizes[k_index]
+            block_sizes, m_index, n_index, k_index = view
+            bm, bn, bk = (block_sizes[index] for index in (m_index, n_index, k_index))
             k = cast("tuple[int, int, int]", extents)[2]
             valid = (
                 # The tile must run the one-CTA tcgen05 MMA (a 256-row flat
@@ -5490,6 +5520,9 @@ class CuteTcgen05Config:
                 and isinstance(bk, int)
                 and bk > 0
                 and -(-k // bk) >= split
+                and isinstance(bm, int)
+                and isinstance(bn, int)
+                and self.split_k_tiles_supported(bm=bm, bn=bn, bk=bk)
             )
         if not valid:
             if searched:
@@ -6165,7 +6198,7 @@ class CuteTcgen05Config:
         outputs of the 256-row pair tile (the codegen store protocol's fact)
         at one of the backend's pair N tiles and leave room for one AB stage
         next to both outputs' C rings in the static arena; the ring depth
-        itself is judged by ``_normalize_multi_output_rings``.
+        itself is judged by ``_normalize_c_rings``.
         """
         if not self.epilogue_fanout_plans or not fanout_schedule_supported(config):
             return "the fanout needs the standard role-local TMA epilogue schedule"
@@ -7992,10 +8025,12 @@ class CuteTcgen05Config:
         if self._store_lowering_stages_rows(config) and facts.rows:
             # ``pre_acc_wait`` rows keep the SIMT epilogue here (the hybrid
             # store's edge tiles would read them from global memory). The
-            # default relies on it to keep few-tile bias GEMMs on the SIMT
-            # store, which wins there (32768x576x128 + bias: 36.9 us, against
-            # 51.3 with the staged row beside the TMA store; see
-            # ``CuteTcgen05DefaultTileHeuristic._pick``).
+            # defaults store an output edge's bias rows after the
+            # accumulator wait (the partial-output store) where it holds
+            # them, and rely on this refusal to keep few-tile rows it does
+            # not hold on the SIMT store, which wins there (32768x576x128 +
+            # bias: 36.9 us, against 51.3 with the staged row beside the TMA
+            # store; see ``CuteTcgen05DefaultTileHeuristic._pick``).
             return False
         return self._config_arena_fits(
             config,
@@ -9019,15 +9054,19 @@ class CuteTcgen05Config:
     def epilogue_group_search_enabled(self) -> bool:
         """Whether the epilogue subtile and warp-group knobs are searched.
 
-        Both act on a heavy epilogue -- several output stores or an
-        exact-shape auxiliary read -- whose per-subtile chain a one-tile
-        per-CTA grid leaves exposed; a plain store's search keeps its
-        surface (an explicit config is validated everywhere).
+        Both act on a heavy epilogue -- several output stores, an exact-shape
+        auxiliary read or a transcendental op (whose default runs two groups,
+        ``CuteTcgen05DefaultTileHeuristic._transcendental_epilogue_values``)
+        -- whose per-subtile chain a one-tile per-CTA grid leaves exposed; a
+        plain store's search keeps its surface (an explicit config is
+        validated everywhere).
         """
         facts = self.rowvec_aux_facts
+        pipeline = self.pipeline_smem_facts
         return self.search_enabled and (
             self.exact_shape_aux_kernel_detected
             or (facts is not None and facts.output_count >= 2)
+            or (pipeline is not None and pipeline.epilogue_transcendental)
         )
 
     def _standard_tma_epilogue_schedule_refusal(
@@ -9535,21 +9574,25 @@ class CuteTcgen05Config:
                 else 0
             )
 
-    def _fix_multi_output_ring_search_config(self, config: dict[str, object]) -> None:
-        """Shallow a multi-output sample's rings to the whole static arena."""
-        self._normalize_multi_output_rings(config, fix_invalid=True)
+    def _fix_c_ring_search_config(self, config: dict[str, object]) -> None:
+        """Shallow the rings of a sample with several C rings (outputs or
+        epilogue warp groups) to the whole static arena."""
+        self._normalize_c_rings(config, fix_invalid=True)
 
-    def _normalize_multi_output_rings(
+    def _normalize_c_rings(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        """Judge a multi-output config's rings against the whole static arena.
+        """Judge the rings of a config with several C rings against the whole
+        static arena.
 
         The single-output gates above calibrate AB + one C ring; a kernel
         with several output stores allocates one C ring per output
-        (``Tcgen05RowvecAuxFacts.output_count``), so a config they admit can
-        still overflow (128x128x64 fp16 with two outputs: ab=6 + c=4 is
-        192 KiB + 64 KiB; 128x128x128 ab=3 + c=4 is 192 KiB + 64 KiB too) and
-        die in the NVVM backend. Judge the final rings with
+        (``Tcgen05RowvecAuxFacts.output_count``), and each epilogue warp group
+        its own ``c_stages`` stages, so a config they admit can still
+        overflow (128x128x64 fp16 with two outputs: ab=6 + c=4 is 192 KiB +
+        64 KiB; 128x128x128 ab=3 + c=4 is 192 KiB + 64 KiB too; the one-CTA
+        128x256x64 tile at ab=4 beside two groups' (128, 64) rings is 262 KB
+        of 232) and die in the NVVM backend. Judge the final rings with
         ``default_layout_smem_fits`` (which charges every ring): a sample
         (``fix_invalid``) takes the deepest AB ring that fits, at the sampled
         C depth first and at the shallow C ring otherwise; an explicit config
@@ -9557,18 +9600,25 @@ class CuteTcgen05Config:
         is proved and the config is left alone.
         """
         facts = self.rowvec_aux_facts
+        groups = self._config_epi_warp_groups(config)
         if (
             not self.search_enabled
             or self.ab_stages_three_search_constraints is None
             or facts is None
-            or facts.output_count < 2
+            or (facts.output_count < 2 and groups < 2)
         ):
             return
-        if config.get(
-            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
-            Tcgen05LayoutStrategy.DEFAULT.value,
-        ) != Tcgen05LayoutStrategy.DEFAULT.value or config.get(
-            TCGEN05_GROUPED_MODE_CONFIG_KEY
+        if (
+            config.get(
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+                Tcgen05LayoutStrategy.DEFAULT.value,
+            )
+            != Tcgen05LayoutStrategy.DEFAULT.value
+            or config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            # The aligned-N plan prices a single output's groups and subtile
+            # at the physical width (``dense_aligned_n``); the public carrier
+            # tile would overcharge it.
+            or (config.get(TILE_N_KEY) and facts.output_count < 2)
         ):
             return
         config_view = self._matmul_config_view(config)
@@ -9604,8 +9654,9 @@ class CuteTcgen05Config:
         if not fix_invalid:
             raise InvalidConfig(
                 f"tcgen05_ab_stages={ab_stages} with tcgen05_c_stages={c_stages} "
-                f"overflows the per-CTA SMEM budget at a {bm}x{bn}x{bk} tile: the "
-                f"kernel's {facts.output_count} output stores keep one C ring each"
+                f"overflows the per-CTA SMEM budget at a {bm}x{bn}x{bk} tile beside "
+                f"{facts.output_count * groups} C rings (one per output store and "
+                f"epilogue warp group: {facts.output_count} x {groups})"
             )
         for c in dict.fromkeys((cast("int", c_stages), 2)):
             for ab in range(cast("int", ab_stages), 0, -1):
@@ -13156,10 +13207,11 @@ class CuteTcgen05Config:
         # feed (a (128, 32) subtile halves each ring; a second group doubles
         # the stages).
         self._normalize_epilogue_groups(config, fix_invalid=True)
-        # A kernel with several output stores keeps one C ring per output;
-        # judge the final rings against the whole arena and shallow them
-        # where the extra rings overflow.
-        self._fix_multi_output_ring_search_config(config)
+        # A kernel with several output stores keeps one C ring per output,
+        # each epilogue warp group its own stages; judge the final rings
+        # against the whole arena and shallow them where the extra rings
+        # overflow.
+        self._fix_c_ring_search_config(config)
         # The epilogue-issued ring was judged before the projections above
         # moved the tile (a C-input warp's neighbour of the ``epi_tma``
         # default widens the pair to ``cta_group="auto"``); re-judge its AB
@@ -13377,10 +13429,11 @@ class CuteTcgen05Config:
         # ring pricing (a dropped second group halves the C rings, a lone
         # group's one-stage ring deepens to two).
         self._normalize_epilogue_groups(config, fix_invalid=fix_invalid)
-        # A kernel with several output stores keeps one C ring per output;
-        # the search's fix pass shallowed its samples above, so this refuses
-        # only an explicit config whose rings provably overflow the arena.
-        self._normalize_multi_output_rings(config, fix_invalid=fix_invalid)
+        # A kernel with several output stores keeps one C ring per output,
+        # each epilogue warp group its own stages; the search's fix pass
+        # shallowed its samples above, so this refuses only an explicit config
+        # whose rings provably overflow the arena.
+        self._normalize_c_rings(config, fix_invalid=fix_invalid)
         if (
             fix_invalid
             and config.get(TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY) is True

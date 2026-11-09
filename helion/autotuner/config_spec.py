@@ -2483,6 +2483,14 @@ class ConfigSpec:
         self._cute_tcgen05_config.split_k_plain_body = value
 
     @property
+    def cute_tcgen05_split_k_flat_edge_tma(self) -> bool:
+        return self._cute_tcgen05_config.split_k_flat_edge_tma
+
+    @cute_tcgen05_split_k_flat_edge_tma.setter
+    def cute_tcgen05_split_k_flat_edge_tma(self, value: bool) -> None:
+        self._cute_tcgen05_config.split_k_flat_edge_tma = value
+
+    @property
     def cute_tcgen05_exact_shape_aux_kernel_detected(self) -> bool:
         return self._cute_tcgen05_config.exact_shape_aux_kernel_detected
 

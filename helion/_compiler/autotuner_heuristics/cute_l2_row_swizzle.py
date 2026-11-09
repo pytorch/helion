@@ -32,6 +32,7 @@ from ..cute.epilogue_fanout import FANOUT_CONFIG_KEY
 from ..cute.epilogue_fanout import schedule_supported
 from ..cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
+from .cute_epilogue_fanout import coverage_seed_carriers
 
 if TYPE_CHECKING:
     from ...autotuner.config_spec import ConfigSpec
@@ -88,8 +89,7 @@ def _carrier_sources(
             CoverageDependency(fanout.mechanism, FANOUT_CONFIG_KEY, "shared"),
         )
     sources = []
-    for seed in spec.compiler_seed_configs:
-        candidate = Config.from_dict(deepcopy(seed.config))
+    for candidate in coverage_seed_carriers(spec):
         try:
             spec.normalize(candidate)
         except InvalidConfig:
