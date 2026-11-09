@@ -101,8 +101,15 @@ jobs:
     with:
       runner: mt-l-x86iamx-22-225-h100
       python-version: "3.12"
-      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
-      runtime-version: cu130
+      image: nvidia/cuda:13.2.0-devel-ubuntu24.04
+      runtime-version: cu132
+      # torch 2.13's Triton 3.7.1 races pipelined sm90 wgmmas whose LHS sits
+      # in registers (triton-lang/triton#9433) and puts the stages of
+      # sub-128-byte TMA loads at misaligned shared-memory addresses: H100
+      # mamba2_chunk_state returned wrong results, and H100/B200 autotuning
+      # lost configs to "misaligned address". Triton 3.9 (torch 2.15, whose
+      # only CUDA 13 wheels are cu132) fixes both.
+      torch-version: "2.15.*"
       container-options: --gpus all
       alias: h100
       kernels: ${{ matrix.kernels }}
@@ -128,8 +135,10 @@ jobs:
     with:
       runner: linux.dgx.b200
       python-version: "3.12"
-      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
-      runtime-version: cu130
+      image: nvidia/cuda:13.2.0-devel-ubuntu24.04
+      runtime-version: cu132
+      # Triton 3.9 for the sub-128-byte TMA misalignment; see run-h100.
+      torch-version: "2.15.*"
       container-options: --gpus all
       alias: b200
       kernels: ${{ matrix.kernels }}
@@ -189,8 +198,7 @@ jobs:
       # (fixed by ROCm/rocm-systems#6509, shipped from ROCm 7.14), so one
       # failed CUDA-graph capture fails every later capture of the process.
       # ROCm 10.0 matches the 10.x line of the MI350X test job; its first
-      # torch is 2.15, which has no cu130 wheel, so the NVIDIA jobs stay on
-      # the 2.13 default.
+      # torch is 2.15.
       torch-version: "2.15.*"
       # Benchmark workloads can retain many ROCm modules; Welford 8192 has
       # exhausted the container's default limit with 1002 open HSACO files.
