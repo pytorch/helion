@@ -2548,7 +2548,10 @@ def render_flex_hook(
     element) is decided over all of the plan's regions regardless of the
     flags, so the two hooks of a stage (masked and unmasked) emit identical
     prelude / prologue lines for shared values and the emitter can
-    deduplicate them by exact text.
+    deduplicate them by exact text.  So are the group width, the staging
+    layout and the prefetch plan: the two hooks' register rings and staging
+    slots of a shared load have one shape, and the emitter's fills serve
+    both.
     """
     if device_function is None:
         device_function = DeviceFunction.current()
@@ -2561,9 +2564,9 @@ def render_flex_hook(
     for _tag, region in regions:
         _ensure_lowerings(region.graph)
     analyzer = _Analyzer(plan, chunk_cols, coord_bounds)
-    infos = [analyzer.analyze(region, tag) for tag, region in regions]
-    _demote_item_values(infos, ITEM_LIVE_CAP)
-    infos = [info for info in infos if info.tag in emit_tags]
+    plan_infos = [analyzer.analyze(region, tag) for tag, region in regions]
+    _demote_item_values(plan_infos, ITEM_LIVE_CAP)
+    infos = [info for info in plan_infos if info.tag in emit_tags]
     if row_coord_expr is None:
         base = re.sub(rf"\b{re.escape(chunk_expr)}\b", "0", coord_tensor)
         row_coord_expr = f"{base}[0][0]"
@@ -2587,16 +2590,25 @@ def render_flex_hook(
             entry.aux_index for entry in flex_aux_smem_layout(plan, aux_smem_budget)
         )
     )
-    # The natural lane counts are powers of two dividing the chunk: the
-    # largest covers every run in whole vectors.
-    emitter.vector_width = _group_width(infos)
+    # The group width, the staging layout and the prefetch plan are decided
+    # over all of the plan's regions regardless of the flags, like
+    # placement: the two hooks of a stage share their register rings by
+    # name and the warp's staging ring (the emitter's fills run both hooks'
+    # prefetch / issue blocks into them, and a step's hook reads what the
+    # previous step's hook issued), so a ring has one shape in both: its
+    # slots (the lead), entries per slot (the groups) and staging stride.
+    # Planned from its own regions, the unmasked hook of a plan with a mask
+    # region took a deeper lead, narrower groups and a smaller staging
+    # stride than the masked hook.  The natural lane counts are powers of
+    # two dividing the chunk: the largest covers every run in whole vectors.
+    emitter.vector_width = _group_width(plan_infos)
     emitter.coop_layout, emitter.coop_warp_bytes = _coop_layout(
-        _coop_runs(plan, infos), coalesce, chunk_cols
+        _coop_runs(plan, plan_infos), coalesce, chunk_cols
     )
     emitter.coop_slots = coop_slots
     emitter.prefetched, emitter.prefetch_depth = _prefetch_plan(
         plan,
-        infos,
+        plan_infos,
         chunk_cols,
         emitter.vector_width,
         prefetch_regs,
