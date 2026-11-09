@@ -336,7 +336,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_handoff
 
-   Enable automatic native-source optimization after configuration search with ``HELION_AUTOTUNE_HANDOFF=1``. Off by default. Uses the existing search budget or search completion, then runs one continuous Codex session and saves standalone kernels beside the autotune logs. Each candidate submission records a round.
+   Enable automatic native-source optimization after configuration search with ``HELION_AUTOTUNE_HANDOFF=1``. Off by default. Uses the existing search budget or search completion, then runs one continuous Codex session and saves standalone kernels beside the autotune logs. Each candidate submission records a round. The agent runs GPU commands with the autotuning process's permissions, outside its own sandbox, unless ``HELION_HANDOFF_GPU_WRAPPER`` confines them.
 
 .. autoattribute:: Settings.autotune_handoff_budget_seconds
 
@@ -503,11 +503,13 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |
-| ``HELION_AUTOTUNE_HANDOFF`` | ``autotune_handoff`` | Automatically hand configuration search to a native-source agent (default off). |
+| ``HELION_AUTOTUNE_HANDOFF`` | ``autotune_handoff`` | Automatically hand configuration search to a native-source agent (default off). The agent runs GPU commands unconfined unless ``HELION_HANDOFF_GPU_WRAPPER`` is set. |
 | ``HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS`` | ``autotune_handoff_budget_seconds`` | Native-source session budget in seconds (default 1500). |
 | ``HELION_HANDOFF_AGENT`` | (source agent) | Agent CLI: ``codex`` (default) or ``claude``. |
 | ``HELION_HANDOFF_MODEL`` | (source agent) | Model override; defaults to ``gpt-6-astra`` for Codex, ``opus`` for Claude. |
 | ``HELION_HANDOFF_EFFORT`` | (source agent) | Reasoning effort supported by the selected CLI; defaults to ``ultra`` for Codex, ``max`` for Claude. |
+| ``HELION_HANDOFF_AGENT_ARGS`` | (source agent) | Extra agent CLI arguments, split like a shell command, after Helion's own (before the ``-`` prompt for Codex), so they override them where the CLI accepts a repeated option, e.g. ``-c model_auto_compact_token_limit=500000`` for a long session with a Codex model that has no default compaction threshold. |
+| ``HELION_HANDOFF_GPU_WRAPPER`` | (source agent) | Command prefix for the commands the agent runs on the GPU with ``gpu_run.py``, split like a shell command, e.g. a sandbox that confines them. Without it they run unconfined, with the autotuning process's environment and permissions, outside the agent CLI's sandbox, on the CUDA device the cases run on (``CUDA_VISIBLE_DEVICES``) when that is one device, and a process a command detaches can outlive it; a sandbox with its own PID namespace also contains those. The prefix runs in the command's directory, with the command's arguments after it, and receives the workspace and record directories as ``HELION_HANDOFF_WORKSPACE`` and ``HELION_HANDOFF_RECORD``, which it should not pass on to the command; its executable is resolved before the agent starts. |
 | ``HELION_AUTOTUNE_ACCURACY_CHECK`` | ``autotune_accuracy_check`` | Toggle baseline validation for candidate configs. |
 | ``HELION_AUTOTUNE_EFFORT`` | ``autotune_effort`` | Select autotuning preset (``"none"``, ``"quick"``, ``"full"``). |
 | ``HELION_AUTOTUNE_SEARCH_ACF`` | ``autotune_search_acf`` | Comma-separated list of PTXAS config file paths to search during autotuning. |

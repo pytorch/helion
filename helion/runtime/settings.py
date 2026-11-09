@@ -791,7 +791,10 @@ class Settings(_Settings):
             "Hand configuration search to a native-source agent automatically. "
             "Off by default; enable with HELION_AUTOTUNE_HANDOFF=1. "
             "Uses the existing search budget or search completion, "
-            "then saves validated standalone source beside the autotune logs."
+            "then saves validated standalone source beside the autotune logs. "
+            "The agent runs GPU commands with this process's permissions, "
+            "outside its own sandbox, unless HELION_HANDOFF_GPU_WRAPPER "
+            "confines them."
         ),
         "autotune_handoff_budget_seconds": (
             "Wall-clock budget for the native-source agent session, excluding "
