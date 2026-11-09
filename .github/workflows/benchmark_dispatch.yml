@@ -19,7 +19,7 @@ on:
         type: boolean
         default: false
       run_xpu:
-        description: 'Run benchmark on XPU (Intel B60)'
+        description: 'Run benchmark on XPU (Intel BMG)'
         required: false
         type: boolean
         default: false
@@ -222,7 +222,7 @@ jobs:
       # -e ZE_AFFINITY_MASK (no value) inherits the runner host's device
       # affinity so the container targets the GPU the host assigned it.
       container-options: --device=/dev/dri --group-add video --ipc=host -e ZE_AFFINITY_MASK
-      alias: b60
+      alias: bmg
       kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
       custom-args: ${{ github.event.inputs.custom_args }}
