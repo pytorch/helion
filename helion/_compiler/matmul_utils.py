@@ -7,6 +7,7 @@ import torch
 from torch.fx.node import Node
 
 from .._compat import min_dot_size
+from .._compat import sm90_dot_register_lhs_broken
 from .._compat import sm100_dot_tmem_lhs_broken
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
@@ -300,6 +301,38 @@ def _dot_lhs_stays_in_smem(node: torch.fx.Node) -> bool:
         return False
 
 
+def _dot_lhs_rebuilt_from_loads(node: torch.fx.Node) -> bool:
+    """Whether this ``tl.dot`` LHS is recomputed from loads in its own graph
+    (the loop body around the dot) rather than from another dot's result.
+
+    Triton's sm90 pipeliner (``rsDotNeedsWait``) needs no wait for a register
+    LHS defined outside the loop or converted straight from another dot's
+    accumulator, so only an LHS rebuilt from loads on every iteration is exposed
+    to the operand-register hazard of ``sm90_dot_register_lhs_broken``.
+    Values passed in from an enclosing graph count as defined outside the loop.
+    """
+    # Imported here to avoid circular imports with helion.language.
+    from ..language.memory_ops import load
+    from .device_ir_analysis import matmul_operand_positions
+
+    dot_targets = matmul_operand_positions()
+    pending = [node]
+    seen: set[torch.fx.Node] = set()
+    rebuilt = False
+    while pending:
+        node = pending.pop()
+        if node in seen or node.op != "call_function":
+            continue
+        seen.add(node)
+        if node.target in dot_targets:
+            return False
+        if node.target is load:
+            rebuilt = True
+            continue
+        pending.extend(node.all_input_nodes)
+    return rebuilt
+
+
 def _pad_tensor(
     tensor: ast.AST,
     pad_dim: int,
@@ -441,6 +474,21 @@ def emit_tl_dot_with_padding(
         and not _dot_lhs_stays_in_smem(lhs_fx_node)
     )
 
+    # On sm90, Triton < 3.9 keeps a dot whose LHS sits in registers in flight
+    # across loop iterations while the next iteration overwrites the operand
+    # registers (triton-lang/triton#9433).  Passing the result through an
+    # identity inline asm gives the dot a use inside the loop, so the MMAv3
+    # pipeliner waits for it right away.  The pipeliner only overlaps fp32
+    # accumulators.
+    sync_register_lhs = (
+        lhs_fx_node is not None
+        and dot_out_dtype == torch.float32
+        and env.backend.name == "triton"
+        and sm90_dot_register_lhs_broken(env.device)
+        and not _dot_lhs_stays_in_smem(lhs_fx_node)
+        and _dot_lhs_rebuilt_from_loads(lhs_fx_node)
+    )
+
     def emit_dot(
         lhs_final: ast.AST,
         rhs_final: ast.AST,
@@ -448,13 +496,20 @@ def emit_tl_dot_with_padding(
         k_final: int | torch.SymInt | sympy.Expr,
     ) -> ast.AST:
         if not split_m:
-            return _emit_tl_dot(
+            dot = _emit_tl_dot(
                 lhs_final,
                 rhs_final,
                 acc=acc_final,
                 input_precision=input_precision,
                 out_dtype=dot_out_dtype,
             )
+            if sync_register_lhs:
+                dot = expr_from_string(
+                    "tl.inline_asm_elementwise('mov.b32 $0, $1;', '=r,r', "
+                    "[{dot}], dtype=tl.float32, is_pure=True, pack=1)",
+                    dot=dot,
+                )
+            return dot
 
         def split_half(x: ast.AST, last_dim: object, index: int) -> ast.AST:
             # pyrefly: ignore [bad-argument-type]

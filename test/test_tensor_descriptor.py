@@ -435,9 +435,9 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     def test_host_tensor_descriptor_contiguous_index_with_scalar_tensor_base(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def gather_block(x: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
-            out = torch.empty([16], dtype=x.dtype, device=x.device)
+            out = torch.empty([32], dtype=x.dtype, device=x.device)
             for row in hl.tile(1, block_size=1):
-                lane = hl.arange(16)
+                lane = hl.arange(32)
                 index = base[()] + lane
                 out[lane] = x[row.begin, index]
             return out
@@ -451,7 +451,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
             host_tensor_descriptors=True,
         )
 
-        torch.testing.assert_close(result, x[0, 16:32])
+        torch.testing.assert_close(result, x[0, 16:48])
         self.assertEqual(code.count("_helion_tensor_descriptor("), 1)
 
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
@@ -1168,6 +1168,44 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         )
         self.assertNotIn(get_tensor_descriptor_fn_name(), code_half)
         torch.testing.assert_close(result_half, x_half + 1.0)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_sub_128_byte_box_load_falls_back(self):
+        # dt[b, h, c, tile_k] with block_k=16 loads a 32-byte [1, 1, 1, 16]
+        # box. num_stages=3 multi-buffers it back to back in shared memory,
+        # where TMA needs each stage 128-byte aligned, so as a descriptor load
+        # it launched with "misaligned address".
+        mod = import_example("mamba2_chunk_state")
+        batch, nheads, seqlen, chunk_size, headdim, dstate = 2, 8, 256, 64, 32, 16
+        nchunks = seqlen // chunk_size
+        args = (
+            torch.rand(batch, seqlen, 1, dstate, dtype=HALF_DTYPE, device=DEVICE),
+            torch.rand(batch, seqlen, nheads, headdim, dtype=HALF_DTYPE, device=DEVICE),
+            torch.rand(
+                batch, nheads, nchunks, chunk_size, dtype=HALF_DTYPE, device=DEVICE
+            ),
+            torch.rand(
+                batch, nheads, nchunks, chunk_size, dtype=HALF_DTYPE, device=DEVICE
+            ),
+        )
+        code, result = code_and_output(
+            mod.helion_mamba2_chunk_state_kernel,
+            args,
+            block_sizes=[16, 16, 16],
+            indexing=[
+                "pointer",
+                "pointer",
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+                "pointer",
+            ],
+            num_stages=3,
+        )
+        self.assertNotIn(get_tensor_descriptor_fn_name(), code)
+        torch.testing.assert_close(
+            result, mod.ref_chunk_state(*args), atol=0.1, rtol=0.1
+        )
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_dynamic_shape_stride_alignment(self):

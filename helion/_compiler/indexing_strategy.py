@@ -4,6 +4,7 @@ import ast
 import collections
 import dataclasses
 import logging
+import math
 import operator
 from typing import TYPE_CHECKING
 from typing import ClassVar
@@ -1468,6 +1469,17 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 descriptor_block_shape.append(block_size)
 
         if len(descriptor_block_shape) != fake_tensor.ndim:
+            return False
+        # TMA writes into a 128-byte aligned shared-memory destination, and a
+        # pipelined loop places the stages of a descriptor load back to back.
+        # A box under 128 bytes therefore misaligns every stage after the
+        # first and the launch fails with "misaligned address", e.g.
+        # dt[b, h, c, tile_k] with block_k=16 loads a 32-byte [1, 1, 1, 16] box.
+        if (
+            not for_store
+            and env.device.type == "cuda"
+            and math.prod(descriptor_block_shape) * element_size % 128 != 0
+        ):
             return False
         # Triton requires the descriptor's contiguous dimension to cover at
         # least 16 bytes. This catches cases like g[batch, tile_t, head], where

@@ -3253,6 +3253,59 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=0.1,
         )
 
+    @skipIfRefEager("runs a compiled config")
+    @onlyBackends(["triton"])
+    @skipIfNotCUDA()
+    @skipIfFn(
+        lambda: torch.cuda.get_device_capability()[0] != 9,
+        "the register-LHS wgmma race (triton-lang/triton#9433) is sm90-only",
+    )
+    def test_mamba2_chunk_state_register_lhs_dot_race(self):
+        # The H100 nightly autotuner picked this config for this shape. Triton
+        # < 3.9 kept its register-LHS dot in flight across loop iterations, so
+        # most runs returned garbage in random 16x128 warp slices of the output.
+        mod = import_path(EXAMPLES_DIR / "mamba2_chunk_state.py")
+        batch, nheads, seqlen, chunk_size, headdim, dstate = 1, 64, 2048, 256, 64, 128
+        nchunks = seqlen // chunk_size
+        B = torch.rand(batch, seqlen, 1, dstate, dtype=torch.float16, device=DEVICE)
+        x = torch.rand(
+            batch, seqlen, nheads, headdim, dtype=torch.float16, device=DEVICE
+        )
+        dt = torch.rand(
+            batch, nheads, nchunks, chunk_size, dtype=torch.float16, device=DEVICE
+        )
+        dA_cumsum = torch.cumsum(-torch.rand_like(dt), dim=-1)
+        config = helion.Config(
+            block_sizes=[64, 128, 64],
+            host_tensor_descriptors=True,
+            indexing=[
+                "tensor_descriptor",
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+            ],
+            l2_groupings=[1],
+            load_eviction_policies=["first", "first", "", "first", ""],
+            loop_orders=[[2, 1, 0, 3, 4]],
+            num_stages=2,
+            num_warps=4,
+            pid_type="flat",
+            range_flattens=[None, False],
+            range_unroll_factors=[0, 2],
+        )
+        kernel = helion.kernel(
+            mod.helion_mamba2_chunk_state_kernel.fn, config=config, static_shapes=True
+        )
+        args = (B, x, dt, dA_cumsum)
+        first = kernel(*args)
+        torch.testing.assert_close(
+            first, mod.ref_chunk_state(*args), atol=2e-2, rtol=1e-2
+        )
+        for _ in range(20):
+            torch.testing.assert_close(kernel(*args), first, atol=0, rtol=0)
+
     @xfailIfPallasTpu("BlockSpec tiling failure")
     def test_mamba2_chunk_scan(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (

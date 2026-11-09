@@ -739,6 +739,35 @@ def _sm100_dot_tmem_lhs_broken(device: torch.device) -> bool:
     return capability is not None and capability[0] == 10
 
 
+def sm90_dot_register_lhs_broken(device: torch.device) -> bool:
+    # call private func we can patch in testing
+    return _sm90_dot_register_lhs_broken(device)
+
+
+def _sm90_dot_register_lhs_broken(device: torch.device) -> bool:
+    """Whether a pipelined ``tl.dot`` on sm90 can read a register LHS after the
+    next loop iteration has overwritten it.
+
+    Triton's MMAv3 pipeliner keeps a dot whose LHS lives in registers in flight
+    across loop iterations: it splits the dot into two wgmmas and waits only for
+    the first, so the next iteration's ``ldmatrix`` rewrites the second wgmma's
+    operand registers while that wgmma may still read them.  Whole 16-row warp
+    slices of the accumulator come out as garbage that varies run to run
+    (triton-lang/triton#9433).  Fixing it takes both the register moves of
+    triton-lang/triton#9514 and ptxas >= 13.3, which Triton first hands to sm90
+    in the 3.9 series; 3.5 through 3.8 give Hopper ptxas 12.8/12.9.  Worked
+    around in ``emit_tl_dot_with_padding``.
+    """
+    if not triton_is_available():
+        return False
+    capability = target_device_capability(device)
+    return (
+        capability is not None
+        and capability[0] == 9
+        and get_triton_version() < version.parse("3.9.0")
+    )
+
+
 @functools.cache
 def _regs_per_block() -> int:
     """Max 32-bit registers per block on the current CUDA device."""

@@ -1449,6 +1449,52 @@ class TestDot(RefEagerTestBase, TestCase):
         ref = (a.float() @ k.float()).to(a.dtype)
         torch.testing.assert_close(result, ref, atol=1.0, rtol=0.02)
 
+    @skipIfRefEager("tests generated code")
+    @skipIfNotTriton("asserts Triton's sm90 register-LHS dot workaround")
+    @skipIfRocm("the workaround emits PTX inline asm")
+    @skipIfXPU("the workaround emits PTX inline asm")
+    @patch.object(_compat, "_sm90_dot_register_lhs_broken", lambda device: True)
+    def test_register_lhs_dot_sync_codegen(self):
+        # With the sm90 workaround forced on, a dot whose LHS is computed in
+        # registers from loads routes its result through an identity inline
+        # asm, so Triton waits for it inside the loop (triton-lang/triton#9433)...
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=True,
+            dot_precision=get_test_dot_precision(),
+        )
+        def scaled_lhs_dot(
+            x: torch.Tensor, scale: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    lhs = (x[tile_m, tile_k] * scale[tile_k][None, :]).to(x.dtype)
+                    acc = hl.dot(lhs, y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=HALF_DTYPE)
+        scale = torch.rand(128, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(128, 64, device=DEVICE, dtype=HALF_DTYPE)
+        code, result = code_and_output(scaled_lhs_dot, (x, scale, y))
+        self.assertIn("mov.b32", code)
+        ref = ((x * scale).float() @ y.float()).to(x.dtype)
+        torch.testing.assert_close(result, ref, atol=0.1, rtol=0.02)
+
+        # ...while a load-fed LHS and an LHS derived from another dot keep
+        # Triton's pipelined dot.
+        kernel = self._make_chained_dot_kernel(with_acc=True)
+        args = self._make_chained_dot_args(with_acc=True)
+        code, result = code_and_output(kernel, args)
+        self.assertNotIn("mov.b32", code)
+        torch.testing.assert_close(
+            result, self._chained_dot_ref(*args), atol=1.0, rtol=0.02
+        )
+
     def test_scalar_arg_specialization_not_reused_across_values(self):
         """A runtime scalar epilogue arg must not poison later calls.
 
