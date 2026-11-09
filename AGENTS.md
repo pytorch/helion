@@ -206,10 +206,11 @@ tests and parametrization grids, so new tests must follow these rules:
 The machine is shared with other people and their agents, and the GPUs are the
 scarce resource. `scripts/gpu_board.py` is how everyone on the machine
 coordinates: a board under `/tmp/gpu-board` that every account reads and writes
-(claims with a purpose and an expiry, plus short messages), with nvidia-smi as
-the ground truth for what is actually running, so GPUs used by people who
-never touch the board count as taken. A machine with a single GPU is not
-shared: skip the board there (`run_tests.py` does so on its own).
+(claims with a purpose and an expiry, plus short messages), with nvidia-smi
+(rocm-smi on AMD machines) as the ground truth for what is actually running,
+so GPUs used by people who never touch the board count as taken. A machine
+with a single GPU is not shared: skip the board there (`run_tests.py` does so
+on its own).
 
 - Before GPU work, `scripts/gpu_board.py status`. Take GPUs with
   `scripts/gpu_board.py pick -n K --purpose "..."` (prints the indices for
@@ -263,11 +264,12 @@ shared: skip the board there (`run_tests.py` does so on its own).
     (umask 077; timeout 10 dd if=/tmp/gpu-board/gpu_board.py iflag=nofollow \
       bs=2000000 count=1 status=none > ~/.cache/gpu-board/gpu_board.py)
   and read the whole copy first: run it only if it uses just the standard
-  library, starts no subprocess but nvidia-smi and the command given to `run`,
-  uses the network only for socket.gethostname, has no builtin eval, exec or
-  compile and no encoded data, and reads only the board, /proc, the account
-  database and its own source (of the environment: GPU_BOARD_DIR and a hashed
-  session id). Then follow
+  library, starts no subprocess but nvidia-smi, rocm-smi and the command
+  given to `run`, uses the network only for socket.gethostname, has no
+  builtin eval, exec or compile and no encoded data, and reads only the
+  board, /proc, the account database and its own source (of the environment:
+  GPU_BOARD_DIR, a hashed session id and, on AMD machines,
+  HIP_VISIBLE_DEVICES and ROCR_VISIBLE_DEVICES). Then follow
   `python3 ~/.cache/gpu-board/gpu_board.py guide`.
   ```
 
