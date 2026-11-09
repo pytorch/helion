@@ -2758,8 +2758,7 @@ class ConfigSpec:
         # A promoted seed only specifies the knobs it cares about (e.g. block_sizes); layer it over
         # the full base defaults so every other key — including user register_tunable defaults — is
         # preserved rather than dropped.
-        merged = dict(self.autotune_reference_config().config)
-        merged.update(self.compiler_default_config.config)
+        merged = self.promoted_default_values(self.compiler_default_config.config)
         config = helion.Config.from_dict(merged)
         # Then normalize, so a promoted compiler default has the same canonical field set as the
         # ``_base_default_config`` path: without this its ``repr``/equality differs from its own
@@ -2769,6 +2768,18 @@ class ConfigSpec:
         self.search_surface.trim_default_config(self, config)
         self._shrink_for_numel_constraints(config)
         return config
+
+    def promoted_default_values(
+        self, promoted: Mapping[str, object]
+    ) -> dict[str, object]:
+        """The base default with ``promoted`` layered over it, as
+        ``default_config`` merges a compiler default: the backend first drops
+        the base keys the promoted knobs re-derive
+        (``BackendSearchSurface.overlay_promoted_default``)."""
+        merged = dict(self.autotune_reference_config().config)
+        self.search_surface.overlay_promoted_default(self, merged, promoted)
+        merged.update(promoted)
+        return merged
 
     def _shrink_for_numel_constraints(self, config: helion.Config) -> None:
         """Shrink block_sizes in *config* in-place so every tensor numel

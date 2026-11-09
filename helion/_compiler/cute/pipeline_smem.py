@@ -83,7 +83,11 @@ class Tcgen05PipelineSmemFacts(NamedTuple):
     auxiliary operand: the staged aux load modes (``tcgen05_aux_load_mode`` in
     ``TCGEN05_AUX_LOAD_MODES_STAGED``) keep one ``tcgen05_aux_stages``-deep
     ring of epilogue subtiles per operand in its own dtype, which the AB ring
-    must leave room for.
+    must leave room for; ``ring_aux_itemsizes`` lists the operands those rings
+    carry (``stages_through_smem_ring``: a boolean mask stays on the direct
+    read, which the register mechanisms still prefetch and hoist).
+    ``epilogue_transcendental`` records a transcendental unary op in the chain
+    (``Tcgen05UnaryEpilogueChain.has_transcendental_op``).
     """
 
     input_dtype_bytes: int
@@ -93,6 +97,8 @@ class Tcgen05PipelineSmemFacts(NamedTuple):
     has_auxiliary_loads: bool = False
     output_column_major: bool = False
     exact_aux_itemsizes: tuple[int, ...] = ()
+    epilogue_transcendental: bool = False
+    ring_aux_itemsizes: tuple[int, ...] = ()
 
 
 def pipeline_region_graphs(
@@ -255,22 +261,28 @@ def analyze_pipeline_smem_facts(
     ):
         return None
     exact_aux_itemsizes: list[int] = []
+    ring_aux_itemsizes: list[int] = []
     for leaf in chain.auxiliary_tensor_loads:
         source = leaf.load_node.args[0]
         tensor = source.meta.get("val") if isinstance(source, torch.fx.Node) else None
-        # a boolean mask stays on the direct read (``stages_through_smem_ring``)
-        if isinstance(tensor, torch.Tensor) and stages_through_smem_ring(
-            leaf.broadcast_axis, tensor
+        if (
+            leaf.broadcast_axis is None
+            and isinstance(tensor, torch.Tensor)
+            and tensor.ndim == 2
         ):
             exact_aux_itemsizes.append(tensor.dtype.itemsize)
+            if stages_through_smem_ring(leaf.broadcast_axis, tensor):
+                ring_aux_itemsizes.append(tensor.dtype.itemsize)
     return Tcgen05PipelineSmemFacts(
         operands.lhs.source_fake.dtype.itemsize,
         output.dtype.itemsize,
         capacity_bytes,
-        tuple(rows),
-        bool(chain.auxiliary_tensor_loads),
-        candidate.output_column_major,
-        tuple(exact_aux_itemsizes),
+        rows=tuple(rows),
+        has_auxiliary_loads=bool(chain.auxiliary_tensor_loads),
+        output_column_major=candidate.output_column_major,
+        exact_aux_itemsizes=tuple(exact_aux_itemsizes),
+        epilogue_transcendental=chain.has_transcendental_op,
+        ring_aux_itemsizes=tuple(ring_aux_itemsizes),
     )
 
 
@@ -300,7 +312,7 @@ def pipeline_smem_bytes(
     pins it (below), and both families use the destination's actual row- or
     column-major layout.
     A staged aux load mode adds one ``aux_stages``-deep ring of epilogue
-    subtiles per exact-shape auxiliary operand (``facts.exact_aux_itemsizes``)
+    subtiles per operand a staged ring carries (``facts.ring_aux_itemsizes``)
     plus its full/empty barriers.  ``epi_warp_groups`` multiplies the C
     stages (each epilogue warp group owns ``c_stages`` stages of the ring,
     ``tcgen05_epi_warp_groups``) and ``epi_subtile_n`` pins the 256-row
@@ -365,7 +377,7 @@ def pipeline_smem_bytes(
             epi_tile_m=epi_m,
             epi_tile_n=epi_n,
             aux_stages=aux_stages,
-            ring_itemsizes=facts.exact_aux_itemsizes,
+            ring_itemsizes=facts.ring_aux_itemsizes,
         )
         if aux_load_mode in TCGEN05_AUX_LOAD_MODES_STAGED
         else 0
@@ -431,11 +443,11 @@ def one_cta_pipeline_smem_bytes(
     and the flat 16-bit launches of an ordered barrier chain run the same
     role-local CtaGroup.ONE schedule).  A staged aux load mode adds one
     ``aux_stages``-deep ring of the DEFAULT epilogue subtile per exact-shape
-    auxiliary operand (``facts.exact_aux_itemsizes``), ``epi_warp_groups``
-    multiplies the C stages and ``epi_subtile_n`` pins the C subtile to
-    ``(min(bm, 128), epi_subtile_n)`` (``tcgen05_epi_subtile_n``), as the
-    paired model does.  This function does not change any legacy one- or
-    two-CTA allocation model.
+    auxiliary operand the ring carries (``facts.ring_aux_itemsizes``),
+    ``epi_warp_groups`` multiplies the C stages and ``epi_subtile_n`` pins
+    the C subtile to ``(min(bm, 128), epi_subtile_n)``
+    (``tcgen05_epi_subtile_n``), as the paired model does.  This function
+    does not change any legacy one- or two-CTA allocation model.
     """
     assert one_cta_pipeline_tile_modeled(
         bm=bm, bn=bn, bk=bk, c_stages=c_stages, acc_stages=acc_stages
@@ -454,7 +466,7 @@ def one_cta_pipeline_smem_bytes(
             epi_tile_m=epi_m,
             epi_tile_n=epi_n,
             aux_stages=aux_stages,
-            ring_itemsizes=facts.exact_aux_itemsizes,
+            ring_itemsizes=facts.ring_aux_itemsizes,
         )
         if aux_load_mode in TCGEN05_AUX_LOAD_MODES_STAGED
         else 0

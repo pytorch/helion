@@ -98,6 +98,7 @@ from .tcgen05_constants import Tcgen05RowvecAuxRow
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from ..device_ir import GraphInfo
@@ -121,11 +122,15 @@ class _UnaryOp:
     more ``{inner}`` placeholders and is the Python source the splice
     substitutes for the prior carrier local. The renderer keeps carriers
     bound at every step, so multi-reference templates can reuse the existing
-    local directly without a second alias.
+    local directly without a second alias. ``transcendental`` marks an op a
+    math library call (or a polynomial) renders: per element it costs tens of
+    instructions, where an add or a cast costs one
+    (``Tcgen05UnaryEpilogueChain.has_transcendental_op``).
     """
 
     op_name: str
     template: str
+    transcendental: bool = False
 
 
 _FLOAT_CAST_TYPES = {
@@ -633,6 +638,8 @@ _LOG2_E = 1.4426950408889634
 _SILU_TEMPLATE = (
     f"(({{inner}}) * (1.0 / (1.0 + cute.math.exp2(-({{inner}}) * {_LOG2_E!r}))))"
 )
+# ``x * sigmoid(x)`` in either of its decomposed forms (``_classify_silu``).
+_SILU_STEP = _UnaryOp(op_name="silu", template=_SILU_TEMPLATE, transcendental=True)
 
 
 def _add_const_template(scalar: float) -> str:
@@ -709,11 +716,21 @@ _ZERO_ARG_TARGETS: dict[object, _UnaryOp] = {
     ),
     torch.ops.aten.abs.default: _UnaryOp(op_name="abs", template=_ABS_TEMPLATE),
     torch.ops.aten.neg.default: _UnaryOp(op_name="neg", template=_NEG_TEMPLATE),
-    torch.ops.aten.tanh.default: _UnaryOp(op_name="tanh", template=_TANH_TEMPLATE),
-    torch.ops.aten.exp.default: _UnaryOp(op_name="exp", template=_EXP_TEMPLATE),
-    torch.ops.aten.log.default: _UnaryOp(op_name="log", template=_LOG_TEMPLATE),
-    torch.ops.aten.sqrt.default: _UnaryOp(op_name="sqrt", template=_SQRT_TEMPLATE),
-    torch.ops.aten.erf.default: _UnaryOp(op_name="erf", template=_ERF_TEMPLATE),
+    torch.ops.aten.tanh.default: _UnaryOp(
+        op_name="tanh", template=_TANH_TEMPLATE, transcendental=True
+    ),
+    torch.ops.aten.exp.default: _UnaryOp(
+        op_name="exp", template=_EXP_TEMPLATE, transcendental=True
+    ),
+    torch.ops.aten.log.default: _UnaryOp(
+        op_name="log", template=_LOG_TEMPLATE, transcendental=True
+    ),
+    torch.ops.aten.sqrt.default: _UnaryOp(
+        op_name="sqrt", template=_SQRT_TEMPLATE, transcendental=True
+    ),
+    torch.ops.aten.erf.default: _UnaryOp(
+        op_name="erf", template=_ERF_TEMPLATE, transcendental=True
+    ),
     # ``aten.sigmoid.default`` is accepted as a standalone unary step so
     # ``out[tile] = sigmoid(acc).to(...)`` fuses end-to-end. Its FP32
     # expression matches the default pointwise sigmoid lowering;
@@ -721,10 +738,12 @@ _ZERO_ARG_TARGETS: dict[object, _UnaryOp] = {
     torch.ops.aten.sigmoid.default: _UnaryOp(
         op_name="sigmoid",
         template=_SIGMOID_TEMPLATE,
+        transcendental=True,
     ),
     _gelu_erf: _UnaryOp(
         op_name="gelu_erf",
         template=gelu_erf_epilogue_unary_step_template(),
+        transcendental=True,
     ),
     # ``F.gelu(x, approximate="tanh")`` (mapped to ``_gelu_tanh_approx``
     # by the device_ir decomp) — single FX node folding the polynomial
@@ -733,6 +752,7 @@ _ZERO_ARG_TARGETS: dict[object, _UnaryOp] = {
     _gelu_tanh_approx: _UnaryOp(
         op_name="gelu_tanh_approx",
         template=epilogue_unary_step_template(),
+        transcendental=True,
     ),
     # Conversions require their dtype argument and are handled separately by
     # _floating_cast_step so intermediate rounding is retained explicitly.
@@ -1189,24 +1209,36 @@ def _tensor_expr_children(expr: _TensorExpr) -> tuple[_TensorExpr, ...]:
     raise AssertionError(f"unexpected tensor expression: {type(expr).__name__}")
 
 
-def _tensor_expr_leaves(
-    expr: _TensorExpr, kind: type[_LeafExpr]
-) -> tuple[_LeafExpr, ...]:
-    """The ``kind`` leaves of a tensor expression, in visit order. A subtree
-    several uses share (a repeated operand, ``y * (1 - y)``) is one subtree:
-    one load per leaf, one binding, and one visit."""
+def _distinct_tensor_expr_nodes(
+    exprs: Sequence[_TensorExpr],
+) -> Iterator[_TensorExpr]:
+    """Every node under ``exprs`` once, in visit order, by identity: a subtree
+    several uses share (a repeated operand, ``y * (1 - y)``) is visited once,
+    and nodes are never hashed (the frozen expression nodes compare by value,
+    so hashing one rehashes its whole subtree)."""
     seen: set[int] = set()
-    leaves: dict[_LeafExpr, None] = {}
-    pending: list[_TensorExpr] = [expr]
+    pending = list(reversed(exprs))
     while pending:
         current = pending.pop()
         if id(current) in seen:
             continue
         seen.add(id(current))
-        if isinstance(current, kind):
-            leaves.setdefault(current, None)
+        yield current
         pending.extend(reversed(_tensor_expr_children(current)))
-    return tuple(leaves)
+
+
+def _tensor_expr_leaves(
+    expr: _TensorExpr, kind: type[_LeafExpr]
+) -> tuple[_LeafExpr, ...]:
+    """The ``kind`` leaves under ``expr``, in visit order: one load per leaf,
+    one binding, and one visit (``_distinct_tensor_expr_nodes``)."""
+    return tuple(
+        dict.fromkeys(
+            node
+            for node in _distinct_tensor_expr_nodes((expr,))
+            if isinstance(node, kind)
+        )
+    )
 
 
 def _auxiliary_tensor_expr_operands(
@@ -1429,6 +1461,16 @@ class Tcgen05UnaryEpilogueChain:
         """
         return tuple(
             dict.fromkeys(operand for step in self.steps for operand in step.operands)
+        )
+
+    @property
+    def has_transcendental_op(self) -> bool:
+        """Whether a step applies a transcendental unary op (``exp``,
+        ``erf``, ``tanh``, ...; ``_UnaryOp.transcendental``), each shared
+        subtree visited once (``_distinct_tensor_expr_nodes``)."""
+        return any(
+            isinstance(node, _UnaryTensorExpr) and node.step.transcendental
+            for node in _distinct_tensor_expr_nodes([step.expr for step in self.steps])
         )
 
     @property
@@ -1659,16 +1701,16 @@ def _classify_silu(
         if not (isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)):
             return None
         if _is_sigmoid_of(rhs, lhs):
-            return _UnaryOp(op_name="silu", template=_SILU_TEMPLATE), lhs
+            return _SILU_STEP, lhs
         if _is_sigmoid_of(lhs, rhs):
-            return _UnaryOp(op_name="silu", template=_SILU_TEMPLATE), rhs
+            return _SILU_STEP, rhs
         return None
     # ``div(carrier, add(exp(neg(carrier)), 1))`` form — inductor decomp.
     if target is torch.ops.aten.div.Tensor:
         if not isinstance(lhs, torch.fx.Node):
             return None
         if _is_one_plus_exp_neg_of(rhs, lhs):
-            return _UnaryOp(op_name="silu", template=_SILU_TEMPLATE), lhs
+            return _SILU_STEP, lhs
         return None
     return None
 

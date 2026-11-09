@@ -115,6 +115,10 @@ class CuteTcgen05Config:
         # guards that store alone. Set at bind; a spec that never went
         # through bind keeps the knob off.
         self.split_k_plain_body: bool = False
+        # The device program runs an ``hl.atomic_*`` (``DeviceIR.has_atomic_ops``):
+        # codegen refuses it beside the CtaGroup.TWO pair's shared tiles
+        # (``reject_atomics_beside_warp_roles``). Set at bind.
+        self.kernel_has_atomics: bool = False
         # Every analyzed store chain loads an auxiliary operand
         # (``aux_tensor.host_function_tcgen05_aux_loads_on_every_store``): the
         # proof that ``pre_acc_wait`` renders on the plain (non-fanout)

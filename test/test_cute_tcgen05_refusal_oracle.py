@@ -87,7 +87,9 @@ SCHEDULER = {
     "tcgen05_strategy": "role_local_with_scheduler",
     "tcgen05_warp_spec_scheduler_warps": 1,
 }
-C_INPUT_AB3 = {"tcgen05_warp_spec_c_input_warps": 1, "tcgen05_ab_stages": 3}
+# Six AB stages beside the producer warp's rings overflow the arena of the
+# 128x128x64 tile (three to five fit there).
+C_INPUT_AB6 = {"tcgen05_warp_spec_c_input_warps": 1, "tcgen05_ab_stages": 6}
 # The flat one-CTA split-K pipeline's config (``test_cute_tcgen05_split_k``).
 FLAT_SPLIT = {
     "block_sizes": [128, 128, 64],
@@ -98,7 +100,7 @@ FLAT_SPLIT = {
     TCGEN05_SPLIT_K_CONFIG_KEY: 2,
 }
 SPLIT_STRICT = "requires the flat one-CTA tcgen05 TMA pipeline over a plain rank-2 GEMM"
-AB3_STRICT = "incompatible with a productive aux producer warp"
+PRODUCER_STRICT = "incompatible with a productive aux producer warp"
 
 
 def fp32_out_single(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -479,38 +481,39 @@ CORPUS: list[Refusal] = [
         SPLIT_STRICT,
     ),
     # ``_normalize_aux_producer_ab_stages``: the C-input warp, or the store
-    # warp staging the auxiliary ring through TMA, beside three AB stages on
-    # a kernel with an exact-shape auxiliary operand of the output's dtype.
+    # warp staging the auxiliary ring through TMA, beside six AB stages on a
+    # kernel with an exact-shape auxiliary operand (the arena model,
+    # ``aux_producer_ring_fits``).
     Refusal(
-        "ab_stages_3_with_a_c_input_warp",
+        "ab_stages_6_with_a_c_input_warp",
         lambda: bind(residual_single),
-        base_config(SCHEDULER, C_INPUT_AB3),
-        AB3_STRICT,
+        base_config(SCHEDULER, C_INPUT_AB6),
+        PRODUCER_STRICT,
     ),
     Refusal(
-        "ab_stages_3_with_the_store_warp_aux_ring",
+        "ab_stages_6_with_the_store_warp_aux_ring",
         lambda: bind(residual_single),
         base_config(
             SCHEDULER,
             {TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: "tma"},
             tcgen05_warp_spec_store_warps=1,
-            tcgen05_ab_stages=3,
+            tcgen05_ab_stages=6,
         ),
-        AB3_STRICT,
+        PRODUCER_STRICT,
     ),
     # The exact-shape fact counts an auxiliary operand of any dtype (an
     # FP32 residual of an FP16 output too), so the strict pass refuses its
     # producer warp before codegen.
     Refusal(
-        "ab_stages_3_with_a_c_input_warp_and_an_fp32_residual",
+        "ab_stages_6_with_a_c_input_warp_and_an_fp32_residual",
         lambda: bind_args(
             residual_aux,
             fp16(4096, 1024),
             fp16(1024, 1024),
             torch.empty(4096, 1024, dtype=torch.float32),
         ),
-        base_config(SCHEDULER, C_INPUT_AB3),
-        AB3_STRICT,
+        base_config(SCHEDULER, C_INPUT_AB6),
+        PRODUCER_STRICT,
     ),
 ]
 
@@ -524,6 +527,18 @@ def test_strict_normalizer_refuses_before_codegen(refusal: Refusal) -> None:
     # The explicit path reports the normalizer's refusal: codegen never ran.
     with pytest.raises(InvalidConfig, match=refusal.strict):
         bound.to_code(config)
+
+
+def test_producer_rings_that_fit_are_admitted() -> None:
+    # The control of the ``ab_stages_6_*`` entries: three AB stages beside
+    # the C-input warp's rings fit the arena and pass the strict pass.
+    bound = bind(residual_single)
+    config = helion.Config(
+        **base_config(
+            SCHEDULER, {"tcgen05_warp_spec_c_input_warps": 1, "tcgen05_ab_stages": 3}
+        )
+    )
+    bound.config_spec.normalized_config(config)
 
 
 def test_split_k_within_the_k_tiles_is_admitted() -> None:

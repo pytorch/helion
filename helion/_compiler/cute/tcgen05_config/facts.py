@@ -76,6 +76,7 @@ from ..tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+from ..tcgen05_constants import TCGEN05_TWO_CTA_NARROW_BLOCK_N
 from ..tcgen05_schedule_facts import Tcgen05FullTileScheduleFacts
 from ..tcgen05_schedule_facts import n_edge_cluster_geometry_supported
 from ..tcgen05_schedule_facts import native_tma_schedule_supported
@@ -611,16 +612,21 @@ def _matmul_config_view(
     return block_sizes, m_index, n_index, k_index
 
 
+def _region_output_facts(
+    state: CuteTcgen05Config, region: int
+) -> Tcgen05PipelineSmemFacts | None:
+    """GEMM launch ``region``'s single-output allocation proof, if any."""
+    if region < len(state.materialized_pipeline_facts):
+        return state.materialized_pipeline_facts[region]
+    return None
+
+
 def region_launch_facts(
     state: CuteTcgen05Config, region: int
 ) -> Tcgen05PipelineSmemFacts | None:
     """Allocation facts of GEMM launch ``region``: the single-output proof,
     else the typed pair proof (two outputs the shared fanout merges)."""
-    facts = (
-        state.materialized_pipeline_facts[region]
-        if region < len(state.materialized_pipeline_facts)
-        else None
-    )
+    facts = _region_output_facts(state, region)
     if facts is None and region < len(state.materialized_pair_budget_facts):
         facts = state.materialized_pair_budget_facts[region]
     return facts
@@ -628,15 +634,44 @@ def region_launch_facts(
 
 def region_has_exact_aux(state: CuteTcgen05Config, region: int) -> bool:
     """Whether GEMM launch ``region``'s epilogue reads an exact-shape
-    auxiliary operand of the output's dtype (the staged and prefetched
-    operand of the aux mechanisms); False without the single-output
-    allocation proof that records it."""
-    facts = (
-        state.materialized_pipeline_facts[region]
-        if region < len(state.materialized_pipeline_facts)
-        else None
-    )
+    auxiliary operand of any dtype (a boolean mask too, which the
+    staged rings leave on the direct read: ``region_has_ring_aux``); False
+    without the single-output allocation proof that records it."""
+    facts = _region_output_facts(state, region)
     return facts is not None and bool(facts.exact_aux_itemsizes)
+
+
+def region_has_ring_aux(state: CuteTcgen05Config, region: int) -> bool:
+    """Whether GEMM launch ``region``'s epilogue reads an operand a staged
+    aux ring (``tma``, ``epi_tma``) carries: an exact-shape one other
+    than a boolean mask, which stays on the direct read
+    (``stages_through_smem_ring``); False without the single-output
+    allocation proof that records it."""
+    facts = _region_output_facts(state, region)
+    return facts is not None and bool(facts.ring_aux_itemsizes)
+
+
+def exact_aux_mask_only(state: CuteTcgen05Config) -> bool:
+    """Whether the kernel's exact-shape operands are all boolean masks,
+    which no staged aux ring (``tma``, ``epi_tma``) carries: a mask stays
+    on the direct read (``stages_through_smem_ring``), so codegen would
+    find nothing to stage. The single-output allocation proof answers,
+    else the row-vector store facts (computed for every analyzed store, a
+    second output's too). False without facts, and without exact-shape
+    operands -- so ``not exact_aux_mask_only()`` alone does not mean an
+    operand rides the ring: each staged mode's gate also requires
+    ``exact_shape_aux_kernel_detected`` (a bias-only kernel's codegen
+    refuses the producer ring; a kernel with no auxiliary read ignores
+    the mode)."""
+    facts = state.pipeline_smem_facts
+    if facts is not None:
+        return bool(facts.exact_aux_itemsizes) and not facts.ring_aux_itemsizes
+    rowvec = state.rowvec_aux_facts
+    return (
+        rowvec is not None
+        and bool(rowvec.exact_aux_itemsizes)
+        and not rowvec.ring_aux_itemsizes
+    )
 
 
 def _configured_region_pid_types(
@@ -671,9 +706,10 @@ def region_launch_config(
     launch sheds the cluster; a non-zero ``tcgen05_region_ab_stages`` /
     ``tcgen05_region_c_stages`` entry replaces the shared ring depth; a
     launch that does not own a shared-fanout pair drops the fanout and
-    its placement; and a launch without an exact-shape auxiliary operand
-    takes the register aux reads (no staged ring, no prefetch ring, no
-    hoist).  ``owns_fanout_pair`` defaults to the pair proof over the
+    its placement; a launch with no operand a staged ring carries (none,
+    or only a boolean mask) takes the register aux reads, and one without
+    an exact-shape auxiliary operand also drops the prefetch ring and the
+    hoist.  ``owns_fanout_pair`` defaults to the pair proof over the
     launch's (m, n) axes.
     """
     launch = dict(config)
@@ -705,11 +741,14 @@ def region_launch_config(
             launch.pop(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY, None)
             if launch.get(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY) == "before_store":
                 launch.pop(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY)
-    if not region_has_exact_aux(state, region):
+    if not region_has_ring_aux(state, region):
+        # A launch whose operands no staged ring carries (none, or only a
+        # boolean mask) takes the register reads.
         if launch.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) in (
             TCGEN05_AUX_LOAD_MODES_STAGED
         ):
             launch[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
+    if not region_has_exact_aux(state, region):
         if launch.get(TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY):
             launch[TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY] = 0
         if launch.get(TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY) is True:
@@ -718,14 +757,21 @@ def region_launch_config(
 
 
 def chain_launches(
-    state: CuteTcgen05Config, config: dict[str, object], *, aux_only: bool = False
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    *,
+    aux_only: bool = False,
+    ring_only: bool = False,
 ) -> list[tuple[int, dict[str, object]]]:
     """``(region, launch config)`` of every GEMM launch of a materialized
-    chain (``aux_only``: those with an exact-shape auxiliary operand)."""
+    chain (``aux_only``: those with an exact-shape auxiliary operand;
+    ``ring_only``: of those, the ones with an operand a staged ring
+    carries)."""
     return [
         (region, region_launch_config(state, config, region))
         for region in range(len(state.materialized_matmul_block_ids))
-        if not aux_only or region_has_exact_aux(state, region)
+        if (not aux_only or region_has_exact_aux(state, region))
+        and (not ring_only or region_has_ring_aux(state, region))
     ]
 
 
@@ -735,14 +781,17 @@ def _chain_launch_refusal(
     judge: Callable[[dict[str, object], int], str | None],
     *,
     aux_only: bool,
+    ring_only: bool = False,
 ) -> str | None:
     """``judge`` over the chain's GEMM launches; the first refusal, named
     by its launch, or the lack of a launch the knob could render on."""
-    launches = chain_launches(state, config, aux_only=aux_only)
+    launches = chain_launches(state, config, aux_only=aux_only, ring_only=ring_only)
     if not launches:
         return (
             "needs a GEMM launch of the materialized chain with an exact-shape "
-            "auxiliary operand and its single-output allocation proof"
+            "auxiliary operand"
+            + (" a staged ring carries (not only a boolean mask)" if ring_only else "")
+            + " and its single-output allocation proof"
         )
     for region, launch in launches:
         reason = judge(launch, region)
@@ -775,6 +824,21 @@ def _matmul_block_fragments(
             )
             for index in indices
         ),
+    )
+
+
+def narrow_n_pair_gemm(state: CuteTcgen05Config) -> bool:
+    """A GEMM one narrow N tile wide (``TCGEN05_TWO_CTA_NARROW_BLOCK_N``),
+    which runs the 256 x N CtaGroup.TWO pair; M may end in a partial pair
+    tile. A registered block size whose range leaves out the pair's tile
+    (``hl.register_block_size(16, 64)`` for N) keeps its range."""
+    extents = state.matmul_compile_time_static_extents
+    if extents is None or extents[1] != TCGEN05_TWO_CTA_NARROW_BLOCK_N:
+        return False
+    fragments = _matmul_block_fragments(state)
+    return fragments is None or (
+        fragments[0].low <= TCGEN05_TWO_CTA_BLOCK_M <= fragments[0].high
+        and fragments[1].low <= TCGEN05_TWO_CTA_NARROW_BLOCK_N <= fragments[1].high
     )
 
 

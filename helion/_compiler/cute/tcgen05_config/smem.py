@@ -535,8 +535,8 @@ def default_layout_smem_bytes(
     least as large as any narrower output's), so an unanalyzed store
     chain is judged conservatively rather than refused. A staged aux load
     mode (``TCGEN05_AUX_LOAD_MODES_STAGED``) adds one ``aux_stages``-deep
-    ring of the with-source epilogue subtile per exact-shape auxiliary
-    operand (``facts.exact_aux_itemsizes``). ``epi_subtile_n`` pins the C
+    ring of the with-source epilogue subtile per operand the ring carries
+    (``facts.ring_aux_itemsizes``). ``epi_subtile_n`` pins the C
     subtile to ``(per-CTA M, epi_subtile_n)`` (``tcgen05_epi_subtile_n``,
     the explicit-tile path) and ``epi_warp_groups`` multiplies the C
     stages (each epilogue warp group owns ``c_stages`` stages of the
@@ -550,7 +550,8 @@ def default_layout_smem_bytes(
         return None
     if facts is None and stage_rows:
         return None
-    if bm <= 0 or bn <= 0 or bk <= 0 or ab_stages <= 0 or c_stages <= 0:
+    # ``c_stages=0``: no C ring (a direct store).
+    if bm <= 0 or bn <= 0 or bk <= 0 or ab_stages <= 0 or c_stages < 0:
         return None
     if acc_stages <= 0 or epi_warps <= 0 or epi_warp_groups <= 0:
         return None
@@ -588,11 +589,15 @@ def default_layout_smem_bytes(
         stage_rows=stage_rows,
         epi_subtile_n=epi_subtile_n,
     )
-    c_bytes = tcgen05_c_smem_bytes_per_cta(
-        epi_tile_m=epi_tile_m,
-        epi_tile_n=epi_tile_n,
-        dtype_bytes=output_itemsize,
-        c_stages=c_stages * epi_warp_groups,
+    c_bytes = (
+        tcgen05_c_smem_bytes_per_cta(
+            epi_tile_m=epi_tile_m,
+            epi_tile_n=epi_tile_n,
+            dtype_bytes=output_itemsize,
+            c_stages=c_stages * epi_warp_groups,
+        )
+        if c_stages
+        else 0
     )
     # One C ring per output store: two fresh outputs of one accumulator
     # (``se_block_fwd``'s ``s`` and ``out``) allocate two rings, with or
@@ -615,7 +620,7 @@ def default_layout_smem_bytes(
             epi_tile_m=ring_tile_m,
             epi_tile_n=ring_tile_n,
             aux_stages=aux_stages,
-            ring_itemsizes=facts.exact_aux_itemsizes,
+            ring_itemsizes=facts.ring_aux_itemsizes,
         )
     return (
         ab_bytes
@@ -674,16 +679,23 @@ def default_layout_smem_fits(
     )
     if arena_bytes is None:
         return False
+    return (
+        arena_bytes + TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES
+        <= _arena_capacity_bytes(state)
+    )
+
+
+def _arena_capacity_bytes(state: CuteTcgen05Config) -> int:
+    """The raw per-CTA SMEM capacity the modelled arena may fill:
+    ``per_cta_smem_budget_bytes`` is the opt-in capacity less the fixed
+    AB-gate reservation (``per_cta_ab_smem_budget_bytes``), and the arena
+    is modelled in full, so the capacity itself."""
     constraints = state.ab_stages_three_search_constraints
     assert constraints is not None
-    # ``per_cta_smem_budget_bytes`` is the opt-in capacity less the fixed
-    # AB-gate reservation (``per_cta_ab_smem_budget_bytes``); the arena is
-    # modelled in full here, so compare against the capacity itself.
-    capacity = (
+    return (
         constraints.per_cta_smem_budget_bytes
         + TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
     )
-    return arena_bytes + TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES <= capacity
 
 
 def c_stages_fits(

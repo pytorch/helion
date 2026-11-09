@@ -201,6 +201,16 @@ class BackendSearchSurface:
         """Drop the inert knobs of a normalized promoted default."""
         return
 
+    def overlay_promoted_default(
+        self,
+        config_spec: ConfigSpec,
+        base: dict[str, object],
+        promoted: Mapping[str, object],
+    ) -> None:
+        """Drop the keys of the base default (``base``) that a promoted
+        default's own knobs (``promoted``, layered over it next) re-derive."""
+        return
+
     def prepare_flat_config(
         self, config_spec: ConfigSpec, config: dict[str, object]
     ) -> None:

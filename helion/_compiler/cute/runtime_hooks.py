@@ -120,6 +120,9 @@ def record_host_structural_facts(
     config_spec.tcgen05.split_k_plain_body = host_function_has_plain_store_body(
         host_function
     )
+    # Codegen refuses an atomic beside the warp roles
+    # (``reject_atomics_beside_warp_roles``); the seeds read this.
+    config_spec.tcgen05.kernel_has_atomics = host_function.device_ir.has_atomic_ops()
     config_spec.tcgen05.exact_shape_aux_kernel_detected = (
         host_function_has_tcgen05_exact_shape_aux_kernel_pattern(host_function)
     )
