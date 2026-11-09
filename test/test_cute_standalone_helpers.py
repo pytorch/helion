@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import ast
 from contextlib import contextmanager
+import copy
 import dataclasses
 import importlib.util
+import inspect
+import math
 import sys
 import textwrap
 import types
@@ -162,6 +165,80 @@ def test_dataclass_field_types_are_not_strings(
         ]
         assert state_type(2.0) == state_type(2.0, 0.5)
         assert state_type.__doc__ == "Softmax state."
+
+
+def _redefine_like_cute_dsl(function: Any, tree: ast.Module) -> Any:
+    """Re-run ``function``'s definition as CuTe DSL's preprocessor does: inside
+    a wrapper that sets the function's free variables to ``None``, with the
+    values of name defaults it cannot resolve taken from the signature."""
+    definition = copy.deepcopy(
+        next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == function.__name__
+        )
+    )
+    definition.decorator_list = []
+    namespace = dict(function.__globals__)
+    for name, cell in zip(
+        function.__code__.co_freevars, function.__closure__ or (), strict=True
+    ):
+        namespace[name] = cell.cell_contents
+    parameters = inspect.signature(function).parameters
+    arguments = definition.args
+    positional = [*arguments.posonlyargs, *arguments.args]
+    defaults = [
+        *zip(
+            positional[len(positional) - len(arguments.defaults) :],
+            arguments.defaults,
+            strict=True,
+        ),
+        *zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True),
+    ]
+    for arg, default in defaults:
+        if isinstance(default, ast.Name) and default.id not in namespace:
+            namespace[default.id] = parameters[arg.arg].default
+    wrapper = ast.parse(f"def _wrapper():\n    return {function.__name__}").body[0]
+    assert isinstance(wrapper, ast.FunctionDef)
+    wrapper.body[:0] = [
+        *(
+            ast.parse(f"{name} = None").body[0]
+            for name in function.__code__.co_freevars
+        ),
+        definition,
+    ]
+    module = ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[]))
+    exec(compile(module, "<cute-dsl>", "exec"), namespace)
+    return namespace["_wrapper"]()
+
+
+def test_jit_helper_defaults_survive_cute_dsl_redefinition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cute = types.ModuleType("_standalone_test_cute")
+    cute.jit = lambda function: function  # pyrefly: ignore [missing-attribute]
+    monkeypatch.setitem(sys.modules, "_standalone_test_cute", cute)
+    sources = {
+        "helion._standalone_test_store": """
+            import math
+            import _standalone_test_cute as cute
+
+            @cute.jit
+            def store(value, scale=math.pi, *, offset=math.e, rounding=None):
+                return math.floor(value * scale + offset)
+        """,
+    }
+    _load_helper_modules(sources, tmp_path, monkeypatch)
+    helpers = _Helpers()
+    store = helpers.require("helion._standalone_test_store", {"store"})
+
+    with _standalone_helpers(helpers, sources, monkeypatch) as exported:
+        function = exported[store].store
+        assert function(1.0) == math.floor(math.pi + math.e)
+        tree = ast.Module(body=helpers.emit(), type_ignores=[])
+        redefined = _redefine_like_cute_dsl(function, tree)
+        assert redefined.__defaults__ == (math.pi,)
+        assert redefined.__kwdefaults__ == {"offset": math.e, "rounding": None}
 
 
 @pytest.mark.parametrize(
