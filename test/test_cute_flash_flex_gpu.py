@@ -23,6 +23,7 @@ import functools
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import TYPE_CHECKING
@@ -790,6 +791,288 @@ def test_rolled_chunk_loop_is_bitwise_the_unrolled_kernel(
         torch.cuda.synchronize()
         assert torch.equal(out, out_ref), coalesce
         assert torch.equal(lse, lse_ref), coalesce
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+def test_cooperative_stream_lead_keeps_the_mask_prefetch_on_its_tile() -> None:
+    """A score_mod streaming a per-column row table (``bias[b, h, q, kv]``
+    through the cooperative ring) beside a mask_mod whose per-column table
+    (``doc[kv_idx]``) rides the register prefetch ring: at 16-column chunks
+    the stream runs four chunks ahead and the register ring two, so the
+    stream moves to the walk's next tile while the ring still fetches
+    in-tile chunks.  Each lead keeps its own tile: the same output and LSE
+    as the in-chunk per-lane loads, and torch's within bf16 tolerance (one
+    shared tile pointed the last chunk's mask at the next tile)."""
+    batch, heads, seq = 2, 4, 256
+    q, k, v = _qkv(batch, heads, seq, seq)
+    torch.manual_seed(3)
+    bias = torch.randn(batch, heads, seq, seq, device=DEVICE)
+    doc = torch.repeat_interleave(torch.arange(4, device=DEVICE), seq // 4)
+
+    def bias_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + hl.load(bias, [b, h, q_idx, kv_idx])
+
+    def bias_mod_ref(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + bias[b, h, q_idx, kv_idx]
+
+    def documents(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (hl.load(doc, [q_idx]) == hl.load(doc, [kv_idx])) & (q_idx >= kv_idx)
+
+    def documents_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (doc[q_idx] == doc[kv_idx]) & (q_idx >= kv_idx)
+
+    block_mask = create_block_mask(
+        documents_ref, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, bias_mod, block_mask, mask_mod=documents)
+    base = {
+        cute_flash.FLASH_S_LOAD_REP_KEY: 16,
+        cute_flash.FLASH_KV_SPLIT_KEY: 1,
+        **UNROLLED,
+    }
+    fn, resolved = _compile_flex(
+        args,
+        {
+            **base,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: 0,
+            cute_flash.FLASH_FLEX_PREFETCH_KEY: 0,
+        },
+    )
+    assert (resolved.flex_coalesce, resolved.flex_prefetch) == (0, 0)
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    bound, normalized, resolved = _bind_flex(
+        args,
+        {
+            **base,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: 64,
+            cute_flash.FLASH_FLEX_PREFETCH_KEY: 64,
+        },
+    )
+    assert (resolved.flex_coalesce, resolved.flex_coalesce_slots) == (64, 4)
+    fn, code = compile_and_source(bound, normalized)
+    # The leads: the register ring two chunks ahead, the stream four.
+    assert "flash_flex_ps = (flash_ci + 2) % 3" in code
+    assert "flash_flex_ps = flash_ci % 4" in code
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+    _assert_close_to_reference(out, lse, *_reference(q, k, v, bias_mod_ref, block_mask))
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("case", "seq", "s_load_rep", "coalesce", "prefetch"),
+    [
+        ("documents", 256, 16, 0, 64),
+        ("keep_table", 256, 16, 64, 0),
+        ("ragged_keep_table", 320, 32, 0, 128),
+    ],
+    ids=["documents", "keep_table", "ragged_keep_table"],
+)
+def test_full_and_masked_hooks_give_their_shared_rings_one_shape(
+    case: str, seq: int, s_load_rep: int, coalesce: int, prefetch: int
+) -> None:
+    """The full tiles' hook (the score_mod alone) and the partial tiles'
+    hook (score_mod and mask_mod) share the register prefetch rings of the
+    score's loads by name and the warp's cooperative staging ring, and the
+    emitter's fills run both hooks' blocks into them, so a ring needs one
+    shape in both hooks.  Planned from its own regions, the full hook got a
+    different one:
+
+    * ``documents`` (``doc[kv_idx]`` gathers, budget 64 at 16 columns): the
+      full hook ran its bias vector four chunks ahead, the masked hook bias
+      and documents one ahead under the same ring name, and the cross-tile
+      fill indexed the masked hook's two-slot ring at slot 2 (IndexError at
+      compile time);
+    * ``keep_table`` (an int32 ``keep[b, h, q, kv]`` streamed beside the
+      bias, two slots): the full hook's staging slot stride was half the
+      masked hook's, so the stream fills wrote its slot-1 bias rows over
+      the masked hook's slot-0 keep rows (max error ~2, no full tile run);
+    * ``ragged_keep_table`` (a bool table, 320 columns: the loads ride the
+      ring with their bounds guards): the full hook's four-lane groups put
+      eight bias guards per slot where the masked hook's sixteen-lane
+      groups put two (IndexError at compile time).
+
+    Each gives the in-chunk per-lane kernel's output and LSE bitwise, and
+    torch's within bf16 tolerance."""
+    batch, heads = 2, 4
+    q, k, v = _qkv(batch, heads, seq, seq)
+    torch.manual_seed(3)
+    bias = torch.randn(batch, heads, seq, seq, device=DEVICE)
+    doc = torch.repeat_interleave(torch.arange(4, device=DEVICE), seq // 4)
+    keep = torch.rand(batch, heads, seq, seq, device=DEVICE) > 0.3
+    keep_i32 = keep.to(torch.int32)
+
+    def bias_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + hl.load(bias, [b, h, q_idx, kv_idx])
+
+    def bias_mod_ref(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + bias[b, h, q_idx, kv_idx]
+
+    def documents(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (hl.load(doc, [q_idx]) == hl.load(doc, [kv_idx])) & (q_idx >= kv_idx)
+
+    def documents_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (doc[q_idx] == doc[kv_idx]) & (q_idx >= kv_idx)
+
+    def keep_table(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (hl.load(keep_i32, [b, h, q_idx, kv_idx]) != 0) & (q_idx >= kv_idx)
+
+    def keep_table_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (keep_i32[b, h, q_idx, kv_idx] != 0) & (q_idx >= kv_idx)
+
+    def keep_bool(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return hl.load(keep, [b, h, q_idx, kv_idx]) & (q_idx >= kv_idx)
+
+    def keep_bool_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return keep[b, h, q_idx, kv_idx] & (q_idx >= kv_idx)
+
+    mask_mod, mask_ref = {
+        "documents": (documents, documents_ref),
+        "keep_table": (keep_table, keep_table_ref),
+        "ragged_keep_table": (keep_bool, keep_bool_ref),
+    }[case]
+    block_mask = create_block_mask(
+        mask_ref, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, bias_mod, block_mask, mask_mod=mask_mod)
+    base = {
+        cute_flash.FLASH_S_LOAD_REP_KEY: s_load_rep,
+        cute_flash.FLASH_KV_SPLIT_KEY: 1,
+        **UNROLLED,
+    }
+    fn, resolved = _compile_flex(
+        args,
+        {
+            **base,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: 0,
+            cute_flash.FLASH_FLEX_PREFETCH_KEY: 0,
+        },
+    )
+    assert (resolved.flex_coalesce, resolved.flex_prefetch) == (0, 0)
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    bound, normalized, resolved = _bind_flex(
+        args,
+        {
+            **base,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: coalesce,
+            cute_flash.FLASH_FLEX_PREFETCH_KEY: prefetch,
+        },
+    )
+    assert (resolved.flex_coalesce, resolved.flex_prefetch) == (coalesce, prefetch)
+    fn, code = compile_and_source(bound, normalized)
+    # One shape for both hooks: the register lead, the groups per prefetched
+    # chunk and the staging slot stride (in elements of the 4-byte tables).
+    leads = set(re.findall(r"flash_flex_ps = \(flash_ci \+ \d+\) % \d+", code))
+    groups = set(
+        re.findall(r"for flash_flex_g in cutlass\.range_constexpr\((\d+)\)", code)
+    )
+    strides = set(re.findall(r"_sp \+ flash_flex_ps \* (\d+)", code))
+    if case == "documents":
+        assert leads == {"flash_flex_ps = (flash_ci + 1) % 2"}, leads
+    elif case == "keep_table":
+        assert resolved.flex_coalesce_slots == 2
+        assert not leads
+        assert len(strides) == 1, strides
+    else:
+        assert leads == {"flash_flex_ps = (flash_ci + 3) % 4"}, leads
+        assert groups == {"2"}, groups
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+    _assert_close_to_reference(out, lse, *_reference(q, k, v, bias_mod_ref, block_mask))
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("score", "order", "rolled"),
+    [
+        ("bias", "ascending", False),
+        ("bias", "descending", False),
+        ("bias", "descending", True),
+        ("identity", "ascending", False),
+    ],
+    ids=["bias_asc", "bias_desc", "bias_desc_rolled", "identity_asc"],
+)
+def test_partial_tile_after_a_full_tile_restages_the_mask_rows(
+    score: str, order: str, rolled: bool
+) -> None:
+    """The cooperative stream issues the walk's next tile's first chunks
+    during the current tile's PASS1, with the current tile's hook: a full
+    tile copies the score's runs only (``bias``: the full hook) or nothing
+    (``identity``: the dense PASS1).  An int32 ``keep[b, h, q, kv]`` table
+    streamed by a causal mask_mod, with KV tile 1 fully kept, makes the last
+    query tile of a 512-long sequence walk partial / full / partial tiles,
+    so in either walk order a partial tile follows a full one and read its
+    first chunks' keep rows from an older tile (max error ~0.8 against
+    torch, no error).  It re-stages them with the masked hook's block: the
+    same output and LSE as the kernel without the stream, and torch's
+    within bf16 tolerance, unrolled and rolled."""
+    batch, heads, seq = 2, 4, 512
+    q, k, v = _qkv(batch, heads, seq, seq)
+    torch.manual_seed(3)
+    bias = torch.randn(batch, heads, seq, seq, device=DEVICE)
+    keep = torch.rand(batch, heads, seq, seq, device=DEVICE) > 0.3
+    keep[..., 128:256] = True
+    keep_i32 = keep.to(torch.int32)
+
+    def bias_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + hl.load(bias, [b, h, q_idx, kv_idx])
+
+    def bias_mod_ref(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + bias[b, h, q_idx, kv_idx]
+
+    def keep_table(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (hl.load(keep_i32, [b, h, q_idx, kv_idx]) != 0) & (q_idx >= kv_idx)
+
+    def keep_table_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (keep_i32[b, h, q_idx, kv_idx] != 0) & (q_idx >= kv_idx)
+
+    score_mod, score_ref = {
+        "bias": (bias_mod, bias_mod_ref),
+        "identity": (_identity, None),
+    }[score]
+    block_mask = create_block_mask(
+        keep_table_ref, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    # The last query tile's walk holds a full tile between partial ones.
+    assert block_mask.full_kv_num_blocks is not None
+    assert block_mask.full_kv_num_blocks[..., 3].min().item() == 1
+    args = _flex_args(q, k, v, score_mod, block_mask, mask_mod=keep_table)
+    base = {
+        cute_flash.FLASH_S_LOAD_REP_KEY: 16,
+        cute_flash.FLASH_KV_SPLIT_KEY: 1,
+        cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: order,
+        cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY: rolled,
+        cute_flash.FLASH_FLEX_PREFETCH_KEY: 0,
+    }
+    fn, resolved = _compile_flex(args, {**base, cute_flash.FLASH_FLEX_COALESCE_KEY: 0})
+    assert resolved.flex_coalesce == 0
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    bound, normalized, resolved = _bind_flex(
+        args, {**base, cute_flash.FLASH_FLEX_COALESCE_KEY: 64}
+    )
+    assert resolved.flex_coalesce == 64 and resolved.flex_rolled_chunks == rolled
+    fn, code = compile_and_source(bound, normalized)
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+    _assert_close_to_reference(out, lse, *_reference(q, k, v, score_ref, block_mask))
+    # The partial steps' re-stage is rendered (the two hooks' issue blocks
+    # differ).
+    assert "(flash_flex_mstaged == cutlass.Int32(0))" in code
 
 
 @skipIfNotCUDA()

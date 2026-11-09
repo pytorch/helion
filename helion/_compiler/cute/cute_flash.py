@@ -17593,7 +17593,7 @@ def _flash_flex_stream_fill(
     lines = [
         f"{indent}cute.arch.cp_async_wait_group(0)",
         f"{indent}cute.arch.sync_warp()",
-        f"{indent}flash_flex_pkv = {tile}",
+        f"{indent}flash_flex_ikv = {tile}",
     ]
     for slot in range(slots):
         lines.extend(
@@ -19484,6 +19484,9 @@ def _flex_softmax_body(
     # in flight through the previous step's PASS2, its prologue and the
     # S wait instead of heading the tile.
     cross_tile = ctx.cfg.flex_prefetch > 0
+    # The stream's issue blocks of a full / partial step (``restage``).
+    full_issue = ""
+    masked_issue = ""
     if with_score:
         full_hook = render_flex_hook(
             ctx.score_plan,
@@ -19493,6 +19496,7 @@ def _flex_softmax_body(
             **hook_kwargs,  # pyrefly: ignore[bad-argument-type]
         )
         hooks.append(full_hook)
+        full_issue = full_hook.chunk_issue
         full_rowmax_block = modifier_rowmax_block(
             "\n" + _flash_flex_hook_lines(full_hook.chunk_body, " " * 16).rstrip(),
             full_hook.chunk_prefetch,
@@ -19527,6 +19531,7 @@ def _flex_softmax_body(
             **hook_kwargs,  # pyrefly: ignore[bad-argument-type]
         )
         hooks.append(masked_hook)
+        masked_issue = masked_hook.chunk_issue
         masked_rowmax_block = modifier_rowmax_block(
             "\n" + _flash_flex_hook_lines(masked_hook.chunk_body, " " * 16).rstrip(),
             masked_hook.chunk_prefetch,
@@ -19627,6 +19632,21 @@ def _flex_softmax_body(
     issue_blocks = list(
         dict.fromkeys(hook.chunk_issue for hook in hooks if hook.chunk_issue)
     )
+    # A step issues the next tile's first chunks by its own kind, not
+    # the next tile's: a full step copies the full hook's runs (the
+    # score's) or nothing (the dense PASS1, or a full hook the stream
+    # does not serve), while a partial tile also reads the mask's runs
+    # of those chunks.  Where the masked hook's issue block carries
+    # more than the full step's, ``flash_flex_mstaged`` records whether
+    # the staged chunks of the upcoming tile hold the masked hook's
+    # runs (set by the fills, which run every block, and by a masked
+    # PASS1; cleared by a full one), and a partial step that finds it
+    # clear re-stages its first chunks with the masked hook's block in
+    # its prologue, ahead of the S wait.  The cost lands on the full ->
+    # partial steps only: a full step after a full one reads what the
+    # previous step issued, and a partial step after a partial or an
+    # absent one finds its chunks staged.
+    restage = bool(coop_slots and masked_issue) and masked_issue != full_issue
     peek_lines: list[str] = []
     first_tile = "0"
     needs_peek = prefetch_depth or coop_slots
@@ -19725,6 +19745,16 @@ def _flex_softmax_body(
     )
     if hook_prologue:
         tile_prologue += "\n" + hook_prologue.rstrip("\n")
+    if restage:
+        # A partial tile after a full one: its first chunks were staged
+        # without the mask's runs (see ``restage``).
+        tile_prologue += (
+            "\n            if (flash_flex_status != 0) & flash_flex_needs_mask & "
+            "(flash_flex_mstaged == cutlass.Int32(0)):\n"
+            + _flash_flex_stream_fill(
+                [masked_issue], coop_slots, "flash_kv", indent=" " * 16
+            )
+        )
     segment = _FlashSoftmaxLoopSegment(
         loop_var="flash_kv_iter", loop_bound=ctx.kv_loop_bound
     )
@@ -19785,6 +19815,15 @@ def _flex_softmax_body(
                 issue_blocks, coop_slots, "flash_kv_peek", indent=" " * 16
             )
         )
+        if restage:
+            # Whether the next tile's staged chunks hold the masked
+            # hook's runs: issued by a masked PASS1 or the absent fill.
+            pre_loop_parts.append("        flash_flex_mstaged = cutlass.Int32(1)")
+            epilogue_parts.append(
+                "            flash_flex_mstaged = cutlass.Int32(cutlass.select_("
+                "flash_flex_needs_mask | (flash_flex_status == 0), "
+                "cutlass.Int32(1), cutlass.Int32(0)))"
+            )
     if pre_loop_parts:
         pre_loop_fill = "\n".join([*first_peek, *pre_loop_parts])
         tile_epilogue = "\n".join(epilogue_parts)
@@ -20698,6 +20737,10 @@ def _softmax_inner(
                     # walk's next tile once past the chunk count -- is
                     # copied into the freed slot.  Rolled, the chunk
                     # index is a runtime value: the tile is a select.
+                    # The stream binds its own tile name: the register
+                    # prefetch above keeps reading ``flash_flex_pkv``
+                    # (bound once ahead of the loop) for in-tile chunks
+                    # after the stream has moved to the next tile.
                     next_tile = (
                         f"cutlass.Int32(cutlass.select_(flash_ci + {slots} < flash_LD_CHUNKS, flash_kv, flash_kv_peek))"
                         if ctx.cfg.flex_rolled_chunks
@@ -20708,7 +20751,7 @@ def _softmax_inner(
                         + _flash_flex_hook_lines(consume, " " * 16).rstrip()
                         + f"\n                flash_flex_pc = (flash_ci + {slots}) % flash_LD_CHUNKS"
                         + f"\n                flash_flex_ps = flash_ci % {slots}"
-                        + f"\n                flash_flex_pkv = {next_tile}\n"
+                        + f"\n                flash_flex_ikv = {next_tile}\n"
                         + _flash_flex_hook_lines(issue, " " * 16).rstrip()
                     )
                 # The rolled loop (``cute_flash_flex_rolled_chunks``):
