@@ -17769,6 +17769,21 @@ def _tcgen05_candidate_exceeds_smem(
     return required > budget
 
 
+def _tcgen05_config_surface_registered() -> bool:
+    """Whether the kernel registered the tcgen05 config surface
+    (``enable_cute_tcgen05_search``: its operands passed the tcgen05 plan).
+    A kernel the plan refused (e.g. a batched 56x32 @ 32x56 window-attention
+    bmm under ``TCGEN05_MANY_SMALL_BATCHES`` matrices: a tiny GEMM, M below
+    64 with N or K below 128) has none of the tcgen05 fields its lowering
+    reads, so a tcgen05-shaped tile there takes another lowering (the warp
+    MMA where its tile matches, the universal one otherwise) instead of
+    failing on a missing ``tcgen05_warp_spec_ab_load_warps``."""
+    return (
+        not CompileEnvironment.has_current()
+        or CompileEnvironment.current().config_spec.tcgen05.search_enabled
+    )
+
+
 def _choose_mma_impl(
     input_dtype: torch.dtype,
     *,
@@ -17844,14 +17859,19 @@ def _choose_mma_impl(
             tcgen05_cluster_m=tcgen05_cluster_m,
             tcgen05_large_bn_proof=tcgen05_large_bn_proof,
         ):
-            if env_choice == "tcgen05" and _tcgen05_candidate_exceeds_smem(
-                input_dtype,
-                input_device=input_device,
-                bm=bm,
-                bn=bn,
-                bk=bk,
-                config=config,
-                defer_grouped_worklist_smem_check=defer_grouped_worklist_smem_check,
+            if env_choice == "tcgen05" and (
+                # a forced tcgen05 over a kernel that never registered the
+                # tcgen05 config surface, as on the automatic path
+                not _tcgen05_config_surface_registered()
+                or _tcgen05_candidate_exceeds_smem(
+                    input_dtype,
+                    input_device=input_device,
+                    bm=bm,
+                    bn=bn,
+                    bk=bk,
+                    config=config,
+                    defer_grouped_worklist_smem_check=defer_grouped_worklist_smem_check,
+                )
             ):
                 return "universal"
             return env_choice
@@ -17865,7 +17885,10 @@ def _choose_mma_impl(
         tcgen05_cluster_m=tcgen05_cluster_m,
         tcgen05_large_bn_proof=tcgen05_large_bn_proof,
     ):
-        tcgen05_ok = tcgen05_supports_input_dtype(support, input_dtype)
+        tcgen05_ok = (
+            tcgen05_supports_input_dtype(support, input_dtype)
+            and _tcgen05_config_surface_registered()
+        )
         if tcgen05_ok and not _tcgen05_candidate_exceeds_smem(
             input_dtype,
             input_device=input_device,

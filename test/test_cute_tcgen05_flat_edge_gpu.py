@@ -78,6 +78,20 @@ def _bias_gemm(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor) -> torch.Te
 
 
 @helion.kernel(static_shapes=True)
+def _bmm_into(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    batch, m, k = a.size()
+    _, _, n = b.size()
+    for tile_b, tile_m, tile_n in hl.tile([batch, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n]
+            )
+        out[tile_b, tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+@helion.kernel(static_shapes=True)
 def _bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     batch, m, k = a.size()
     _, _, n = b.size()
@@ -900,6 +914,79 @@ class TestCuteTcgen05DefaultTilesGpu(RefEagerTestDisabled, TestCase):
                 rtol=1e-2,
                 atol=1e-1,
             )
+
+    def test_batched_pair_default_walks_batches_slowest(self) -> None:
+        # The batched pair defaults walk their batches slowest and match
+        # torch: the 256x256 direct entry, and a promoted 256x128 pair seed.
+        for batch, m, n, k in ((64, 512, 1024, 64), (75, 256, 256, 64)):
+            a = torch.randn(batch, m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(batch, k, n, device=DEVICE, dtype=torch.bfloat16)
+            bound = _bmm.bind((a, b))
+            config = bound.config_spec.default_config()
+            self.assertEqual(config.config["tcgen05_batch_raster"], "batch_slowest")
+            bound.set_config(config)
+            torch.testing.assert_close(
+                bound(a, b),
+                torch.bmm(a.float(), b.float()).to(torch.bfloat16),
+                rtol=1e-2,
+                atol=1e-1,
+            )
+
+    def test_many_small_batched_matrices_match_torch(self) -> None:
+        # Window attention's batches of matrices inside one tile: one
+        # zero-filled one-CTA tile each, whatever TMA can address (98-byte
+        # rows of 49 columns, a K-major B, an M-major A, a K tail, rows past
+        # one tile).
+        for batch, m, n, k, a_m_major, b_k_major in (
+            (256, 56, 56, 32, False, False),
+            (256, 49, 49, 32, False, True),
+            (256, 32, 49, 49, True, False),
+            (256, 200, 64, 200, False, False),
+        ):
+            a = (
+                torch.randn(batch, k, m, device=DEVICE, dtype=torch.bfloat16).transpose(
+                    1, 2
+                )
+                if a_m_major
+                else torch.randn(batch, m, k, device=DEVICE, dtype=torch.bfloat16)
+            )
+            b = (
+                torch.randn(batch, n, k, device=DEVICE, dtype=torch.bfloat16).transpose(
+                    1, 2
+                )
+                if b_k_major
+                else torch.randn(batch, k, n, device=DEVICE, dtype=torch.bfloat16)
+            )
+            bound = _bmm.bind((a, b))
+            config = bound.config_spec.default_config()
+            self.assertEqual(config.config["tcgen05_cluster_m"], 1)
+            bound.set_config(config)
+            torch.testing.assert_close(
+                bound(a, b),
+                torch.bmm(a.float(), b.float()).to(torch.bfloat16),
+                rtol=1e-2,
+                atol=1e-1,
+            )
+
+    def test_unaligned_batched_output_matches_torch(self) -> None:
+        # Scores stored into 1001-element rows: the one-CTA 64x128 tile's
+        # SIMT stores clip each matrix's last row and column tiles.
+        a = torch.randn(8, 1000, 64, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(8, 64, 1000, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.zeros(8, 1000, 1001, device=DEVICE, dtype=torch.bfloat16)
+        view = out[:, :, :1000]
+        bound = _bmm_into.bind((a, b, view))
+        config = bound.config_spec.default_config()
+        self.assertEqual(config.block_sizes, [1, 64, 128, 64])
+        bound.set_config(config)
+        bound(a, b, view)
+        torch.testing.assert_close(
+            view,
+            torch.bmm(a.float(), b.float()).to(torch.bfloat16),
+            rtol=1e-2,
+            atol=1e-1,
+        )
+        self.assertEqual(out[:, :, 1000].abs().max().item(), 0)
 
     def test_residual_pair_defaults_stage_the_residual(self) -> None:
         # Whole tiles: the epilogue-issued TMA ring, four stages deep where

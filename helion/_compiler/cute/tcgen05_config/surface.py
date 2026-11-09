@@ -1603,6 +1603,27 @@ def _clear_target1_tvm_ffi_promotion_surface(config: dict[str, object]) -> None:
             config.pop(key, None)
 
 
+def ungroup_batch_slowest_walk(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> None:
+    """Walk a batch-slowest grid ungrouped: on a batched grid the matmul's
+    L2 grouping groups the batch with the M tiles, so a grouping above 1
+    interleaves two batches' tiles into the walk ``batch_slowest`` orders
+    by batch, as its seeds' ungrouped walk does not (B200, the direct
+    entry over 256 x 512x1024x64 and 512 x 512x512x64: within 2% of the
+    grouping by 2)."""
+    assert state.matmul_block_ids is not None
+    groupings = config.get("l2_groupings")
+    if not isinstance(groupings, list):
+        # A pair seed carries no grouping: the base default's (the
+        # direct entry's 2) would apply under it.
+        groupings = [item._fill_missing() for item in state.config_spec.l2_groupings]
+    index = state.config_spec.l2_groupings.block_id_to_index(state.matmul_block_ids[0])
+    config["l2_groupings"] = [
+        1 if position == index else value for position, value in enumerate(groupings)
+    ]
+
+
 def aux_load_mode_autotune_fragments(
     state: CuteTcgen05Config,
 ) -> dict[str, ConfigSpecFragment]:

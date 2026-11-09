@@ -629,6 +629,13 @@ TCGEN05_SPLIT_K_SEARCH_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
 # K tiles each split-K slice keeps at least (the seeds and the default): a
 # shorter slice loses its AB pipeline.
 TCGEN05_SPLIT_K_MIN_SLICE_K_TILES = 4
+# A static batch from which a batched GEMM of matrices smaller than one tile
+# (fewer than 64 rows, with under 128 columns or a K under 128) takes the
+# tcgen05 search: one zero-filled tile per matrix fills the machine, where
+# the SIMT lowering re-reads every operand per output element. Also the
+# batch count from which a batched GEMM with an operand or output TMA cannot
+# address takes the one-CTA default (``_small_matrix_batch_default``).
+TCGEN05_MANY_SMALL_BATCHES = 256
 # The groups' named barriers: ids 6 .. 9, disjoint from the role-local
 # kernel's TMEM-alloc (1), one-group epilogue (2), pipeline-init (3),
 # row-union publication (4) and CLC throttle (5) barriers (``cute_mma``

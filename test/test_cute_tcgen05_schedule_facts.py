@@ -6,6 +6,7 @@ Also covers the paired TMA K-tail protocol and the Blackwell-only native proofs.
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
@@ -48,6 +49,7 @@ from helion._testing.cute_aux import two_residual_aux
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import full_and_edge_store_bodies
 from helion._testing.cute_dense_tcgen05 import atomic_output_mm
+from helion._testing.cute_dense_tcgen05 import batched_gemm
 from helion._testing.cute_dense_tcgen05 import bias_mm_into
 from helion._testing.cute_dense_tcgen05 import blackwell_capability
 from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
@@ -2189,6 +2191,9 @@ def _scaled_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         ((1024, 256, 64, 256), [1, 128, 64, 64], "flat", 2),
         # 64 rows by the widest dividing N tile; eight k-blocks: persistent
         ((384, 64, 512, 512), [1, 64, 256, 64], "persistent_blocked", 4),
+        # K below one 64-deep k-block, and not whole in them: 32-deep blocks
+        ((1024, 128, 128, 32), [1, 128, 128, 32], "flat", 2),
+        ((1024, 128, 128, 96), [1, 128, 128, 32], "flat", 2),
     ),
 )
 def test_narrow_batched_default_takes_the_one_cta_tile(
@@ -2197,9 +2202,10 @@ def test_narrow_batched_default_takes_the_one_cta_tile(
     pid_type: str,
     ab_stages: int,
 ) -> None:
-    """Per-batch matrices narrower than 128 rows or columns default to the
-    one-CTA tile of their extents (B200, of the ATen GEMM: 1024 x
-    256x64x256 + scale 1.09, 384 x 64x512x512 1.03), not the 64x16 base."""
+    """Per-batch matrices narrower than 128 rows or columns, or with a K not
+    whole in 64-deep k-blocks, default to the one-CTA tile of their extents
+    (B200, of the ATen GEMM: 1024 x 256x64x256 + scale 1.09, 384 x
+    64x512x512 1.03, 1024 x 128x128x32 0.98), not the 64x16 base."""
     batch, m, n, k = shape
     with patch(
         "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
@@ -2217,6 +2223,198 @@ def test_narrow_batched_default_takes_the_one_cta_tile(
     assert config.config["pid_type"] == pid_type
     assert config.config["tcgen05_ab_stages"] == ab_stages
     assert config.config["tcgen05_cluster_m"] == 1
+
+
+# The direct entry over whole 256x256 tiles, and a promoted pair seed over
+# many waves and over one (whose seed carries no grouping).
+@pytest.mark.parametrize(
+    ("shape", "block_sizes", "ffi"),
+    (
+        ((256, 512, 1024, 64), [1, 256, 256, 64], True),
+        ((75, 256, 256, 64), [1, 256, 128, 64], False),
+        ((37, 256, 256, 256), [1, 256, 128, 64], False),
+    ),
+)
+def test_batched_pair_default_walks_batches_slowest(
+    shape: tuple[int, int, int, int], block_sizes: list[int], ffi: bool
+) -> None:
+    """A batched pair default walks its batches slowest and ungrouped, so
+    the pairs share one batch's A and B tiles at the same time (B200, 256 x
+    512x1024x64 on the direct entry: 0.78 -> 0.90 of the ATen bmm)."""
+    batch, m, n, k = shape
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = _scaled_bmm._bind_isolated(
+            (
+                torch.empty((batch, m, k), dtype=torch.bfloat16),
+                torch.empty((batch, k, n), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+        bound.to_code(config)
+    assert config.block_sizes == block_sizes
+    assert config.config["tcgen05_cluster_m"] == 2
+    assert config.config["tcgen05_tvm_ffi_launch"] is ffi
+    assert config.config["tcgen05_batch_raster"] == "batch_slowest"
+    assert config.config["l2_groupings"] == [1]
+
+
+# Window attention's batches of matrices inside one tile.
+@pytest.mark.parametrize(
+    ("shape", "a_m_major", "b_k_major", "block_sizes"),
+    (
+        # 112-byte rows TMA addresses
+        ((4096, 56, 56, 32), False, False, [1, 64, 64, 32]),
+        # 49 columns: 98-byte output rows, a K-major B
+        ((4096, 49, 49, 32), False, True, [1, 64, 64, 32]),
+        # a 49-deep K: two 32-deep k-blocks, an M-major A
+        ((4096, 32, 49, 49), True, False, [1, 64, 64, 32]),
+        # 200 rows: a partial last 64-row tile per matrix
+        ((768, 200, 64, 200), False, False, [1, 64, 64, 64]),
+        # 196 columns (392-byte output rows): 128-wide tiles
+        ((768, 196, 196, 64), False, True, [1, 64, 128, 64]),
+    ),
+)
+def test_many_small_batched_matrices_take_one_tile_each(
+    shape: tuple[int, int, int, int],
+    a_m_major: bool,
+    b_k_major: bool,
+    block_sizes: list[int],
+) -> None:
+    """Many batched matrices smaller than one tile run one zero-filled
+    one-CTA tile each, not the SIMT lowering or the base 64x16x16 tile
+    (B200, of the ATen bmm: 32768 x 56x56x32 0.010 -> 0.59, 32768 x
+    49x49x32 0.023 -> 0.93, 32768 x 32x49x49 0.068 -> 1.34, 768 x
+    200x64x200 0.008 -> 0.73, 768 x 196x196x64 0.016 -> 0.79)."""
+    batch, m, n, k = shape
+    a = (
+        torch.empty((batch, k, m), dtype=torch.bfloat16).transpose(1, 2)
+        if a_m_major
+        else torch.empty((batch, m, k), dtype=torch.bfloat16)
+    )
+    b = (
+        torch.empty((batch, n, k), dtype=torch.bfloat16).transpose(1, 2)
+        if b_k_major
+        else torch.empty((batch, k, n), dtype=torch.bfloat16)
+    )
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = _scaled_bmm._bind_isolated((a, b))
+        config = bound.config_spec.default_config()
+        bound.to_code(config)
+    assert config.block_sizes == block_sizes
+    assert config.config["pid_type"] == "flat"
+    assert config.config["tcgen05_cluster_m"] == 1
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _scores_into(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``out = 0.125 * bmm(a, b)`` into a caller's (padded) output."""
+    batch, m, k = a.shape
+    n = b.shape[2]
+    for tile_b, tile_m, tile_n in hl.tile((batch, m, n)):
+        acc = hl.zeros((tile_b, tile_m, tile_n), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.baddbmm(acc, a[tile_b, tile_m, inner], b[tile_b, inner, tile_n])
+        out[tile_b, tile_m, tile_n] = (acc * 0.125).to(out.dtype)
+    return out
+
+
+def test_unaligned_batched_output_takes_the_one_cta_tile() -> None:
+    """Attention scores stored into 1001-element rows (no TMA store) take
+    the one-CTA 64x128 tile, not the base 64x16x16 one (B200, 64 x
+    1000x1000x64 + mask, of the ATen bmm: 0.008 -> 0.35)."""
+    args = (
+        torch.empty((64, 1000, 64), dtype=torch.bfloat16),
+        torch.empty((64, 1000, 64), dtype=torch.bfloat16).transpose(1, 2),
+        torch.empty((64, 1000, 1001), dtype=torch.bfloat16)[:, :, :1000],
+    )
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = _scores_into._bind_isolated(args)
+        config = bound.config_spec.default_config()
+        bound.to_code(config)
+    assert config.block_sizes == [1, 64, 128, 64]
+    assert config.config["pid_type"] == "flat"
+
+
+def test_partial_narrow_batched_tile_stays_flat() -> None:
+    """N = 16 takes a 32-wide tile, partial in every matrix: a partial
+    batched tile runs only on the flat launch, so the default stays flat
+    over eight k-blocks instead of a persistent tile the generic lowering
+    took."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = helion.kernel(
+            batched_gemm, backend="cute", static_shapes=True
+        )._bind_isolated(
+            (
+                torch.empty((1024, 128, 512), dtype=torch.bfloat16),
+                torch.empty((1024, 512, 16), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+        code = bound.to_code(config)
+    assert config.block_sizes == [1, 128, 32, 64]
+    assert config.config["pid_type"] == "flat"
+    assert "cute.gemm(" in code
+
+
+def test_untma_operand_batched_default_stays_flat() -> None:
+    """A batched A one element into its storage, which TMA cannot load: the
+    small-matrix default keeps the flat 64-row tile at eight k-blocks, where
+    the persistent loop's multi-tile guard refuses a launch of 256 tiles."""
+    storage = torch.empty(256 * 64 * 512 + 1, dtype=torch.bfloat16)
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = helion.kernel(
+            batched_gemm, backend="cute", static_shapes=True
+        )._bind_isolated(
+            (
+                storage[1:].view(256, 64, 512),
+                torch.empty((256, 512, 128), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+        code = bound.to_code(config)
+    assert not bound.config_spec.tcgen05.matmul_operands_tma_provable
+    assert config.config["pid_type"] == "flat"
+    assert "_helion_tcgen05_persistent_total_tiles" not in code
+
+
+@pytest.mark.parametrize("mma_impl", ["auto", "tcgen05"])
+def test_few_small_batched_matrices_keep_the_simt_lowering(mma_impl: str) -> None:
+    """Below ``TCGEN05_MANY_SMALL_BATCHES`` small matrices keep the SIMT
+    lowering, and a tile as large as a tcgen05 one renders there without
+    the tcgen05 fields the kernel never registered, also under a forced
+    ``HELION_CUTE_MMA_IMPL=tcgen05``."""
+    args = (
+        torch.empty((8, 56, 32), dtype=torch.bfloat16),
+        torch.empty((8, 32, 56), dtype=torch.bfloat16),
+    )
+    with (
+        patch(
+            "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+            return_value=148,
+        ),
+        patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": mma_impl}),
+    ):
+        bound = _scaled_bmm._bind_isolated(args)
+        assert not bound.config_spec.tcgen05.search_enabled
+        config = bound.config_spec.default_config()
+        config.config["block_sizes"] = [1, 64, 64, 32]
+        code = bound.to_code(config)
+    assert "blackwell_helpers.make_trivial_tiled_mma" not in code
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

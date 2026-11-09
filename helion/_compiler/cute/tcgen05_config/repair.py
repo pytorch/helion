@@ -74,6 +74,7 @@ from ..split_k_workspace_config import PARTITIONS_KEY
 from ..split_k_workspace_config import STAGES_KEY
 from ..split_k_workspace_config import WORKSPACE_KEY
 from ..strategies import TCGEN05_BATCH_RASTER_CONFIG_KEY
+from ..strategies import TCGEN05_BATCH_RASTER_SLOWEST
 from ..strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ..strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
 from ..strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
@@ -4678,6 +4679,7 @@ def _fix_target1_tvm_ffi_search_config(
             config[key] = None
         return
     placement = config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+    raster = config.get(TCGEN05_BATCH_RASTER_CONFIG_KEY)
     surface._clear_target1_tvm_ffi_promotion_surface(config)
     config.update(seed.config)
     if (
@@ -4687,6 +4689,12 @@ def _fix_target1_tvm_ffi_search_config(
         # The staged promoted bias row rides the direct entry's own rings
         # (``CuteTcgen05DefaultTileHeuristic._direct_entry_staged_row``).
         config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = placement
+    if raster is not None and state.matmul_has_leading_passthrough:
+        # A batched direct entry keeps its walk order (the defaults walk
+        # batches slowest, ``_batch_slowest``), ungrouped there.
+        config[TCGEN05_BATCH_RASTER_CONFIG_KEY] = raster
+        if raster == TCGEN05_BATCH_RASTER_SLOWEST:
+            surface.ungroup_batch_slowest_walk(state, config)
 
 
 def promoted_row_epilogue(state: CuteTcgen05Config) -> bool:
