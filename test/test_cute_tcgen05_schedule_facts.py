@@ -1352,7 +1352,7 @@ def test_one_cta_n_edge_residual_default_needs_k_tiles() -> None:
 def test_one_cta_n_edge_residual_gate_ignores_the_residual_dtype() -> None:
     """A bf16 residual of an FP32 output bounds the 256-wide tile's epilogue
     as much as one of the output's dtype: 25216x576x192 keeps the flat
-    default too, though the aux-TMA detector (dtype match) declines it."""
+    default too."""
     with patch(
         "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
         return_value=148,
@@ -1367,8 +1367,7 @@ def test_one_cta_n_edge_residual_gate_ignores_the_residual_dtype() -> None:
         )
         state = bound.config_spec._cute_tcgen05_config
         config = bound.config_spec.default_config().config
-    assert not state.exact_shape_aux_kernel_detected
-    assert state.exact_shape_aux_operand_detected
+    assert state.exact_shape_aux_kernel_detected
     assert config["pid_type"] == "flat"
 
 

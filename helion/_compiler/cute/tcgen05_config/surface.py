@@ -1577,7 +1577,7 @@ def epi_tma_search_enabled(state: CuteTcgen05Config) -> bool:
     """Whether ``tcgen05_aux_load_mode="epi_tma"`` is on the search surface.
 
     The epilogue-issued aux ring needs an exact-shape rank-2 auxiliary
-    operand of the output's dtype (``exact_shape_aux_kernel_detected``)
+    operand of any dtype (``exact_shape_aux_kernel_detected``)
     on a rank-2 matmul; every per-config condition (static full tiles,
     the standard TMA-store epilogue, the SMEM budget) is judged by
     ``_normalize_epi_tma`` on the sample.

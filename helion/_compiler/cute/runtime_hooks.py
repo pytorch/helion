@@ -45,7 +45,6 @@ from ..inductor_lowering_extra import patch_inductor_lowerings
 from . import grouped_static_tail
 from .aux_tensor import host_function_has_tcgen05_aux_kernel_pattern
 from .aux_tensor import host_function_has_tcgen05_exact_shape_aux_kernel_pattern
-from .aux_tensor import host_function_has_tcgen05_exact_shape_aux_operand
 from .aux_tensor import host_function_matmul_has_non_tcgen05_operand
 from .aux_tensor import host_function_tcgen05_aux_loads_on_every_store
 from .aux_tensor import host_function_tcgen05_rowvec_aux_facts
@@ -123,9 +122,6 @@ def record_host_structural_facts(
     )
     config_spec.tcgen05.exact_shape_aux_kernel_detected = (
         host_function_has_tcgen05_exact_shape_aux_kernel_pattern(host_function)
-    )
-    config_spec.tcgen05.exact_shape_aux_operand_detected = (
-        host_function_has_tcgen05_exact_shape_aux_operand(host_function)
     )
     # ``pre_acc_wait`` renders only where every store chain has per-subtile
     # auxiliary loads (or the shared fanout epilogue merges the chains); the

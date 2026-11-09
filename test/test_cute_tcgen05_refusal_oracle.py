@@ -285,9 +285,7 @@ class Refusal:
 
 
 HOIST_STRICT = "aux_fragment_hoist=True requires an exact-shape auxiliary operand"
-EXACT_AUX_STRICT = (
-    "requires an exact-shape rank-2 auxiliary operand of the output's dtype"
-)
+EXACT_AUX_STRICT = "requires an exact-shape rank-2 auxiliary operand"
 
 CORPUS: list[Refusal] = [
     # ``validate_strategy_invariants``: tcgen05_cluster_n=2 without cluster_m=2
@@ -363,17 +361,6 @@ CORPUS: list[Refusal] = [
         lambda: bind(residual_single),
         base_config(EPI_TMA, CTA_PAIR),
         "is not validated on the bm=128 CtaGroup.TWO epilogue tile",
-    ),
-    Refusal(
-        "epi_tma_dtype_mismatch",
-        lambda: bind_args(
-            residual_aux,
-            fp16(4096, 1024),
-            fp16(1024, 1024),
-            torch.empty((4096, 1024), dtype=torch.float32),
-        ),
-        base_config(EPI_TMA),
-        EXACT_AUX_STRICT,
     ),
     Refusal(
         "epi_tma_strided_aux",
@@ -511,6 +498,20 @@ CORPUS: list[Refusal] = [
         ),
         AB3_STRICT,
     ),
+    # The exact-shape fact counts an auxiliary operand of any dtype (an
+    # FP32 residual of an FP16 output too), so the strict pass refuses its
+    # producer warp before codegen.
+    Refusal(
+        "ab_stages_3_with_a_c_input_warp_and_an_fp32_residual",
+        lambda: bind_args(
+            residual_aux,
+            fp16(4096, 1024),
+            fp16(1024, 1024),
+            torch.empty(4096, 1024, dtype=torch.float32),
+        ),
+        base_config(SCHEDULER, C_INPUT_AB3),
+        AB3_STRICT,
+    ),
 ]
 
 
@@ -622,21 +623,6 @@ LIVE: list[tuple[str, Callable[[], Any], dict[str, Any], type[Exception], str]] 
         base_config(PRE, {PREFETCH: 1}, pid_type="flat"),
         InvalidConfig,
         "need the standard static-full role-local TMA-store epilogue",
-    ),
-    # The bind-time exact-shape fact counts auxiliary operands of the
-    # output's dtype only; the pipeline's AB-depth gate also sees an fp32
-    # residual's descriptors.
-    (
-        "ab_stages_3_with_a_c_input_warp_and_an_fp32_residual",
-        lambda: bind_args(
-            residual_aux,
-            fp16(4096, 1024),
-            fp16(1024, 1024),
-            torch.empty(4096, 1024, dtype=torch.float32),
-        ),
-        base_config(SCHEDULER, C_INPUT_AB3),
-        BackendUnsupported,
-        AB3_STRICT,
     ),
     (
         "sched_stage_count_with_a_residual_shared_loop",

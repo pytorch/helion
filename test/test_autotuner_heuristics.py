@@ -10582,7 +10582,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_aux_tma_seed_rejects_mixed_exact_aux_dtype(self) -> None:
+    def test_cute_tcgen05_aux_tma_seed_admits_mixed_exact_aux_dtype(self) -> None:
+        """Each staged operand keeps its own dtype in its ring: a bf16 and an
+        FP32 residual of a 16-bit output both take the aux-TMA seeds."""
+
         @helion.kernel(backend="cute")
         def cute_matmul_two_residuals(
             x: torch.Tensor,
@@ -10613,8 +10616,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         spec = bound.config_spec
         self.assertTrue(spec.tcgen05.aux_kernel_detected)
-        self.assertFalse(spec.tcgen05.exact_shape_aux_kernel_detected)
-        self.assertFalse(
+        self.assertTrue(spec.tcgen05.exact_shape_aux_kernel_detected)
+        self.assertTrue(
             any(
                 config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
                 == TCGEN05_AUX_LOAD_MODE_TMA

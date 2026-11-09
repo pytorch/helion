@@ -2757,6 +2757,9 @@ def normalize_strategy(
         config,
         fix_invalid=fix_invalid,
     )
+    repair.validate_cp_async_a_config(
+        config_spec.tcgen05, config, fix_invalid=fix_invalid
+    )
     _normalize_cute_flash(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_flash_gated(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_flash_bwd(config_spec, config)

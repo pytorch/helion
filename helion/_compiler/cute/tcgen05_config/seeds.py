@@ -745,7 +745,7 @@ def _paired_pipeline_seed_configs(
                 # model fits beside the rings, with both placements.
                 aux_modes: tuple[str, ...] = (TCGEN05_AUX_LOAD_MODE_SIMT,)
                 if (
-                    pipeline_facts.exact_aux_count > 0
+                    pipeline_facts.exact_aux_itemsizes
                     and state.exact_aux_tma_provable
                     and bm == TCGEN05_TWO_CTA_BLOCK_M
                     and pipeline_facts.input_dtype_bytes == 2

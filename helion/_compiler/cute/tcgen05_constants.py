@@ -390,26 +390,30 @@ def tcgen05_aux_ring_smem_bytes_per_cta(
     *,
     epi_tile_m: int,
     epi_tile_n: int,
-    dtype_bytes: int,
     aux_stages: int,
-    ring_count: int,
+    ring_itemsizes: tuple[int, ...],
 ) -> int:
     """Per-CTA SMEM of the staged exact-shape auxiliary rings plus barriers.
 
     The staged aux load modes (``tcgen05_aux_load_mode`` in
     ``TCGEN05_AUX_LOAD_MODES_STAGED``) allocate one ``make_smem_layout_epi``
-    ring of ``aux_stages`` epilogue subtiles per exact-shape operand
-    (``cute_mma._emit_tcgen05_aux_pipeline_setup``), each 1 KiB aligned, and
+    ring of ``aux_stages`` epilogue subtiles per exact-shape operand, in the
+    operand's dtype (``ring_itemsizes``, one element size per operand;
+    ``cute_mma._emit_tcgen05_aux_pipeline_setup``), each 1 KiB aligned, and
     one full/empty mbarrier pair per stage. Zero without staged operands.
     """
-    assert aux_stages >= 1 and ring_count >= 0
-    if ring_count == 0:
+    assert aux_stages >= 1
+    if not ring_itemsizes:
         return 0
-    stage_bytes = tcgen05_round_up_smem_bytes(
-        epi_tile_m * epi_tile_n * dtype_bytes, TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES
-    )
-    return ring_count * aux_stages * stage_bytes + 2 * aux_stages * (
-        TCGEN05_SMEM_MBARRIER_BYTES
+    return (
+        sum(
+            aux_stages
+            * tcgen05_round_up_smem_bytes(
+                epi_tile_m * epi_tile_n * itemsize, TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES
+            )
+            for itemsize in ring_itemsizes
+        )
+        + 2 * aux_stages * TCGEN05_SMEM_MBARRIER_BYTES
     )
 
 
@@ -683,10 +687,11 @@ class Tcgen05RowvecAuxFacts(NamedTuple):
     output_itemsize: int
     rows: tuple[Tcgen05RowvecAuxRow, ...]
     output_count: int = 1
-    # Exact-shape rank-2 auxiliary operands of the output's dtype on the
-    # store that reads the most of them: the staged aux load modes keep one
-    # ``tcgen05_aux_stages``-deep ring of epilogue subtiles per operand.
-    exact_aux_count: int = 0
+    # Element sizes of the exact-shape rank-2 auxiliary operands on the store
+    # that stages the most bytes of them: the staged aux load modes keep one
+    # ``tcgen05_aux_stages``-deep ring of epilogue subtiles per operand, in
+    # its own dtype.
+    exact_aux_itemsizes: tuple[int, ...] = ()
 
 
 def tcgen05_rowvec_stage_smem_bytes(
@@ -779,15 +784,16 @@ TCGEN05_C_STORE_MODES = (
 TCGEN05_AUX_LOAD_MODE_CONFIG_KEY = "tcgen05_aux_load_mode"
 TCGEN05_AUX_LOAD_MODE_SIMT = "simt"
 TCGEN05_AUX_LOAD_MODE_TMA = "tma"
-# Exact-shape auxiliary tiles of the epilogue chain (a residual, a gate, a
-# mask of the output's shape and dtype) staged per subtile through a TMA ring
-# that the epilogue warps fill themselves: warp 0 issues the first
-# ``tcgen05_aux_stages`` subtiles' bulk loads before the accumulator wait
-# (they land under the tile's MMA) and refills the ring one subtile ahead of
-# the reads. Unlike ``tma`` it needs no producer warp or scheduler, so the
-# monolithic strategy, the static two-CTA pair and the fanout family take it,
-# and the AB ring keeps every stage the SMEM model (``pipeline_smem``,
-# ``default_layout_smem_bytes``) proves fits beside the aux ring.
+# Exact-shape auxiliary tiles of the epilogue chain (a residual or a gate of
+# the output's shape, in any dtype but a boolean mask's) staged per subtile
+# through a TMA ring that the epilogue warps fill themselves: warp 0 issues
+# the first ``tcgen05_aux_stages`` subtiles' bulk loads before the
+# accumulator wait (they land under the tile's MMA) and refills the ring one
+# subtile ahead of the reads. Unlike ``tma`` it needs no producer warp or
+# scheduler, so the monolithic strategy, the static two-CTA pair and the
+# fanout family take it, and the AB ring keeps every stage the SMEM model
+# (``pipeline_smem``, ``default_layout_smem_bytes``) proves fits beside the
+# aux ring.
 TCGEN05_AUX_LOAD_MODE_EPI_TMA = "epi_tma"
 TCGEN05_AUX_LOAD_MODES = (
     TCGEN05_AUX_LOAD_MODE_SIMT,
