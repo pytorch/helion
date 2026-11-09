@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ast
 from contextlib import contextmanager
+import dataclasses
 import importlib.util
 import sys
 import textwrap
 import types
+import typing
 from typing import TYPE_CHECKING
 
 import pytest
@@ -53,7 +55,11 @@ def _load_helper_modules(
 def _standalone_helpers(
     helpers: _Helpers, sources: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[dict[str, Any]]:
-    tree = ast.fix_missing_locations(ast.Module(body=helpers.emit(), type_ignores=[]))
+    # Like an exported module, with ``from __future__ import annotations``.
+    future = ast.parse("from __future__ import annotations").body
+    tree = ast.fix_missing_locations(
+        ast.Module(body=[*future, *helpers.emit()], type_ignores=[])
+    )
     code = compile(tree, "<standalone-helpers>", "exec")
     namespace: dict[str, Any] = {"types": types}
     with monkeypatch.context() as isolated:
@@ -126,6 +132,36 @@ def test_shared_dependency_initializes_before_its_consumers(
         assert exported[dependency].OFFSET == 5
         assert exported[left].value() == 6
         assert exported[right].value() == 7
+
+
+def test_dataclass_field_types_are_not_strings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sources = {
+        "helion._standalone_test_state": """
+            from dataclasses import dataclass
+            import typing
+
+            @dataclass
+            class State:
+                "Softmax state."
+
+                scale: float
+                threshold: typing.Final[float] = 0.5
+        """,
+    }
+    _load_helper_modules(sources, tmp_path, monkeypatch)
+    helpers = _Helpers()
+    state = helpers.require("helion._standalone_test_state", {"State"})
+
+    with _standalone_helpers(helpers, sources, monkeypatch) as exported:
+        state_type = exported[state].State
+        assert [field.type for field in dataclasses.fields(state_type)] == [
+            float,
+            typing.Final[float],
+        ]
+        assert state_type(2.0) == state_type(2.0, 0.5)
+        assert state_type.__doc__ == "Softmax state."
 
 
 @pytest.mark.parametrize(
