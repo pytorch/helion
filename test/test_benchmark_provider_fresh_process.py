@@ -64,9 +64,18 @@ class TestFreshFinalistProcess(unittest.TestCase):
             workers: list[BenchmarkWorker] = []
 
             def new_worker(
-                *, device: int | None, log_warning: Callable[[str], object]
+                *,
+                device: int | None,
+                start_timeout: float,
+                log: Callable[[str], None],
+                log_warning: Callable[[str], object],
             ) -> BenchmarkWorker:
-                worker = BenchmarkWorker(device=device, log_warning=log_warning)
+                worker = BenchmarkWorker(
+                    device=device,
+                    start_timeout=start_timeout,
+                    log=log,
+                    log_warning=log_warning,
+                )
                 workers.append(worker)
                 return worker
 

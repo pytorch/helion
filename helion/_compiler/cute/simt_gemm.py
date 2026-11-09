@@ -41,6 +41,7 @@ import torch
 
 from ... import exc
 from ..ast_extension import expr_from_string
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -246,7 +247,7 @@ def mark_simt_gemm(
         )
         or "cutlass.Int32(0)"
     )
-    sites = df.cute_state.simt_gemm_sites
+    sites = df.cute_state.lanes.simt_gemm_sites
     site = SimtGemmSite(
         identity=len(sites),
         bm=bm,
@@ -297,7 +298,7 @@ def mark_simt_gemm(
     # The scalar operand loads are placeholders now; the late pass is the only
     # reader of these tensors, so keep their arguments through DCE.
     df.placeholder_args.update((lhs_arg_name, rhs_arg_name))
-    cg.cute_uses_matmul = True
+    cute_codegen_state(cg).declare_matmul()
     return expr_from_string(f"{MARKER}({site.identity})")
 
 
@@ -687,7 +688,7 @@ def lower_simt_gemm(
     from ..ast_read_writes import ReadWrites
     from ..ast_read_writes import ast_rename
 
-    sites = df.cute_state.simt_gemm_sites
+    sites = df.cute_state.lanes.simt_gemm_sites
     if not sites:
         return body
     # Phi names must be canonical before the carried result is rebound.

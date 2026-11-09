@@ -11,7 +11,7 @@ import cutlass
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
-from ._flash_row_mma_runtime import _ASM_KW
+from .device.ptx import ASM_KW
 
 
 @dsl_user_op
@@ -28,5 +28,5 @@ def keep_smem_live(
         has_side_effects=True,
         loc=loc,
         ip=ip,
-        **_ASM_KW,
+        **ASM_KW,
     )

@@ -17,11 +17,11 @@ from test.test_cute_register_program import _run
 
 import helion
 from helion._compiler.cute.register_region import plan_register_region
-from helion._compiler.cute.selection_coarse import coarse_rank_full_keys
-from helion._compiler.cute.selection_coarse import coarse_rank_guard
-from helion._compiler.cute.selection_coarse import coarse_rank_keys
-from helion._compiler.cute.selection_coarse import coarse_rank_recover
-from helion._compiler.cute.selection_network import selection_network
+from helion._compiler.cute.selection.selection_coarse import coarse_rank_full_keys
+from helion._compiler.cute.selection.selection_coarse import coarse_rank_guard
+from helion._compiler.cute.selection.selection_coarse import coarse_rank_keys
+from helion._compiler.cute.selection.selection_coarse import coarse_rank_recover
+from helion._compiler.cute.selection.selection_network import selection_network
 from helion._testing import DEVICE
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_codegen import cpu_bind

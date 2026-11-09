@@ -1,6 +1,6 @@
 """The thread-to-element mapping of the addresses an emitted body computes.
 
-``lane_loop_distribution.add_thread_barriers`` separates with barriers the
+``lane_loops.barriers.add_thread_barriers`` separates with barriers the
 accesses of one tensor that the threads of a CTA could race on.  Whether two
 accesses can touch one element from different threads is a question about
 their address mappings, not about the names they read: ``x[t + 1]`` beside

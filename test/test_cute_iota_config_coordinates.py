@@ -22,7 +22,7 @@ from helion._compiler.cute.cute_reshape import _get_dim_local_coord
 from helion._compiler.cute.cute_reshape import _resolve_tile_extent
 from helion._compiler.cute.cute_reshape import codegen_cute_virtual_clone
 from helion._compiler.cute.indexing import CuteShapeChainView
-from helion._testing import skipUnlessBackends
+from helion._compiler.cute.state import CuteCodegenState
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
@@ -241,7 +241,6 @@ def _serial_reference(a: torch.Tensor, packed: torch.Tensor):
         ((13, 9, 34), (16, 8, 8), True),
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_packed_int4_generated_scalar_ast_matches_serial_product(
     shape, blocks, strided
 ):
@@ -257,7 +256,6 @@ def test_packed_int4_generated_scalar_ast_matches_serial_product(
 
 
 @pytest.mark.usefixtures("_cpu_codegen")
-@skipUnlessBackends(["cute"])
 def test_selected_tile_quotients_have_no_shape_env_guards():
     bound = _packed_int4.bind(_inputs(32, 32, 32))
     with bound.env, bound.host_function:
@@ -279,7 +277,6 @@ def test_selected_tile_quotients_have_no_shape_env_guards():
 
 @pytest.mark.usefixtures("_cpu_codegen")
 @pytest.mark.parametrize("sizes", [(32, 128, 64), (128, 32, 64)])
-@skipUnlessBackends(["cute"])
 def test_block_iota_selected_configs_copy_each_element_once(sizes):
     x = torch.arange(257, dtype=torch.float32)
     bound = _copy.bind((x,))
@@ -295,7 +292,6 @@ def test_block_iota_selected_configs_copy_each_element_once(sizes):
     "extent,active,expected",
     [(16, True, True), (15, True, False), (0, True, False), (16, False, False)],
 )
-@skipUnlessBackends(["cute"])
 def test_quotient_coordinate_requires_same_active_divisible_axis(
     extent, active, expected
 ):
@@ -333,7 +329,6 @@ def test_quotient_coordinate_requires_same_active_divisible_axis(
 
 @pytest.mark.usefixtures("_cpu_codegen")
 @pytest.mark.parametrize("k_extent,k_active", [(16, False), (15, True)])
-@skipUnlessBackends(["cute"])
 def test_derived_iota_cannot_borrow_unrelated_axis_with_equal_extent(
     k_extent, k_active
 ):
@@ -358,7 +353,7 @@ def test_derived_iota_cannot_borrow_unrelated_axis_with_equal_extent(
             active_device_loops=loops,
             current_grid_state=None,
             codegen_graphs=[],
-            cute_free_arange_lanes=None,
+            backend_state=CuteCodegenState(),
             device_function=SimpleNamespace(
                 config=config,
                 resolved_block_size=lambda block_id: config.block_sizes[block_id],
@@ -378,7 +373,6 @@ def test_derived_iota_cannot_borrow_unrelated_axis_with_equal_extent(
 @pytest.mark.parametrize(
     "memory_format", [None, torch.contiguous_format, torch.preserve_format]
 )
-@skipUnlessBackends(["cute"])
 def test_virtual_clone_preserves_immutable_leaf_and_shape_chain(memory_format):
     graph = torch.fx.Graph()
     source = graph.placeholder("source")
@@ -401,7 +395,6 @@ def test_virtual_clone_preserves_immutable_leaf_and_shape_chain(memory_format):
 @pytest.mark.parametrize(
     "mutation", ["non_shape_use", "unknown_keyword", "channels_last"]
 )
-@skipUnlessBackends(["cute"])
 def test_virtual_clone_declines_unproved_uses(mutation):
     graph = torch.fx.Graph()
     source = graph.placeholder("source")
@@ -423,7 +416,6 @@ def test_virtual_clone_declines_unproved_uses(mutation):
 
 
 @pytest.mark.parametrize("initialized", [False, True])
-@skipUnlessBackends(["cute"])
 def test_cpu_codegen_fixture_overrides_visible_cuda_metadata(initialized):
     with (
         patch.dict("os.environ", {"HELION_CUTE_FLASH": "1"}),
@@ -461,7 +453,6 @@ def test_cpu_codegen_fixture_overrides_visible_cuda_metadata(initialized):
 @pytest.mark.parametrize(
     "shape,blocks", [((32, 32, 32), [16, 16, 16]), ((7, 13, 30), [8, 16, 4])]
 )
-@skipUnlessBackends(["cute"])
 def test_packed_int4_signed_values_match_exact_matrix_product(shape, blocks):
     m, n, k = shape
     generator = torch.Generator().manual_seed(913)

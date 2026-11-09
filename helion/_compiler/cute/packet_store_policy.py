@@ -7,33 +7,11 @@ from collections import Counter
 from typing import TYPE_CHECKING
 
 from .cutedsl_compat import fixed_l2_evict_last_store_policy_supported
+from .packet_flush_names import PACKET_FLUSH_BY_POLICY
 from .persistent_branch_vec import PACKET_STORE_BYTES
 
 if TYPE_CHECKING:
     from collections.abc import Set as AbstractSet
-
-
-# ``cute_store_policy`` -> packet flush -> its cache-policy form.
-# ``l2_evict_last``: ``st.global.L2::cache_hint`` with the validated retention
-# descriptor (SM103 / CUDA 13).  ``streaming``: the portable ``.cs`` operator
-# (evict-first at L1 and L2), for outputs written once: a 32 MB bf16 output
-# stored by default displaced the two 32 MB inputs of the next launch of a
-# back-to-back elementwise add from the 126 MB L2 (16.5 us per call); streamed,
-# the inputs stay resident (14.9 us, below the Triton backend's 15.1).
-_STORE_HELPERS = {
-    "l2_evict_last": {
-        "_cute_store_u16_vec": "_cute_store_u16x8_l2_evict_last",
-        "_cute_store_u32_vec": "_cute_store_u32x4_l2_evict_last",
-        "_cute_store_fp8e4m3fn_vec": "_cute_store_fp8e4m3fn_vec_l2_evict_last",
-        "_cute_store_fp8e5m2_vec": "_cute_store_fp8e5m2_vec_l2_evict_last",
-    },
-    "streaming": {
-        "_cute_store_u16_vec": "_cute_store_u16x8_streaming",
-        "_cute_store_u32_vec": "_cute_store_u32x4_streaming",
-        "_cute_store_fp8e4m3fn_vec": "_cute_store_fp8e4m3fn_vec_streaming",
-        "_cute_store_fp8e5m2_vec": "_cute_store_fp8e5m2_vec_streaming",
-    },
-}
 
 
 def _store_call(statement: ast.stmt) -> tuple[ast.Call, str, int | None] | None:
@@ -142,7 +120,7 @@ def lower_packet_store_policy(
     keeps the default store.  Flushes the async-store policy already renamed
     are left alone.
     """
-    helpers = _STORE_HELPERS.get(policy)
+    helpers = PACKET_FLUSH_BY_POLICY.get(policy)
     if helpers is None or (
         policy == "l2_evict_last"
         and not fixed_l2_evict_last_store_policy_supported(

@@ -1,13 +1,14 @@
 """Codegen pins for ``cute_pdl`` on the tcgen05 GEMM kernels.
 
-CPU-only (fake CUDA target, the ``test_cute_tcgen05_fixed_chain`` binders and
-fixture): the knob launches the kernel as a programmatic dependent of the
-previous kernel in the stream, waits on that kernel at the top of the body
-(every warp, ahead of every global read of the prologue, the root body and
-the pipelines, on every kernel shape), releases the dependents right after
-each of those waits (``cute_pdl_release`` ``entry``, the ``auto`` resolution
-of a one-wave launch) and again once the MMA warp has issued its last MMA
-(the family's own release, the only one under ``exit`` / ``none``).
+CPU-only (fake CUDA target: the ``test_cute_tcgen05_fixed_chain`` binders and
+the module's ``cpu_render`` marker): the knob launches the kernel as a
+programmatic dependent of the previous kernel in the stream, waits on that
+kernel at the top of the body (every warp, ahead of every global read of the
+prologue, the root body and the pipelines, on every kernel shape), releases
+the dependents right after each of those waits (``cute_pdl_release``
+``entry``, the ``auto`` resolution of a one-wave launch) and again once the
+MMA warp has issued its last MMA (the family's own release, the only one
+under ``exit`` / ``none``).
 """
 
 from __future__ import annotations
@@ -19,17 +20,28 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
 from test.test_cute_tcgen05_fixed_chain import _bind_gemm
-from test.test_cute_tcgen05_fixed_chain import _cpu_only  # noqa: F401
 from test.test_cute_tcgen05_fixed_chain import _kernel_body
 from test.test_cute_tcgen05_fixed_chain import _source
 
 import helion
-from helion._testing import skipUnlessBackends
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import surface
 import helion.language as hl
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
+# The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced
+# as ``cuda:0`` tensors of a 148-SM device, and the reduction SMEM budget.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(
+        mma_support=tcgen05_mma_support(),
+        forbid_native=False,
+        fake_device_sm_count=148,
+        reduction_smem_budget_bytes=232448,
+    ),
+]
 
 WAIT = "cute.arch.griddepcontrol_wait()"
 RELEASE = "cute.arch.griddepcontrol_launch_dependents()"
@@ -149,7 +161,7 @@ def test_knob_defaults_on_and_stays_on_for_sm90_plus_matmul_kernels() -> None:
         spec = bound.config_spec
         fields = spec.flat_config(lambda x: x.default()).config
         assert fields["cute_pdl"] is True
-        fragment = spec._cute_tcgen05_config.flat_fields()["cute_pdl"]
+        fragment = surface.flat_fields(spec._cute_tcgen05_config)["cute_pdl"]
         assert spec.default_config().config["cute_pdl"] is True
         pinned_off = spec.normalized_config(_flat_config(cute_pdl=False))
     assert tuple(fragment.choices) == (True, False)  # pyrefly: ignore[missing-attribute]
@@ -164,8 +176,8 @@ def test_pre_hopper_targets_keep_the_knob_off() -> None:
     with bound.env, patch.object(bound.config_spec, "target_device_capability", (8, 0)):
         spec = bound.config_spec
         state = spec._cute_tcgen05_config
-        assert not state._pdl_searched()
-        fragment = state.flat_fields()["cute_pdl"]
+        assert not surface._pdl_searched(state)
+        fragment = surface.flat_fields(state)["cute_pdl"]
         assert tuple(fragment.choices) == (False, True)  # pyrefly: ignore[missing-attribute]
         assert fragment.search_choices == (False,)  # pyrefly: ignore[missing-attribute]
         assert spec.default_config().config["cute_pdl"] is False
@@ -181,17 +193,19 @@ def test_seeds_carry_the_knob_without_twins_and_normalization_carries_it() -> No
     with bound.env:
         spec = bound.config_spec
         tcgen05 = spec._cute_tcgen05_config
-        seeds = tcgen05.autotune_seed_configs()
-        assert seeds and all(s.config.get("cute_pdl") is True for s in seeds)
+        seed_configs = seeds.autotune_seed_configs(tcgen05)
+        assert seed_configs and all(
+            s.config.get("cute_pdl") is True for s in seed_configs
+        )
         schedules = [
-            {k: v for k, v in s.config.items() if k != "cute_pdl"} for s in seeds
+            {k: v for k, v in s.config.items() if k != "cute_pdl"} for s in seed_configs
         ]
-        assert len(schedules) == len(seeds)
+        assert len(schedules) == len(seed_configs)
         assert all(schedules.count(schedule) == 1 for schedule in schedules), (
             "a seed list must not grow a cute_pdl twin"
         )
-        with patch.object(tcgen05, "_pdl_searched", return_value=False):
-            unsearched = tcgen05.autotune_seed_configs()
+        with patch.object(surface, "_pdl_searched", return_value=False):
+            unsearched = seeds.autotune_seed_configs(tcgen05)
         assert [
             {k: v for k, v in s.config.items() if k != "cute_pdl"} for s in unsearched
         ] == schedules

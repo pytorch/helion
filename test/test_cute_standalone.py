@@ -15,7 +15,6 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 attention_output = import_example("attention").attention_output
@@ -65,10 +64,7 @@ def _run_without_helion(tmp_path: Path, body: str) -> None:
     )
 
 
-pytestmark = [
-    skipUnlessBackends(["cute"]),
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
-]
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
 @pytest.mark.parametrize("layout", ["contiguous", "offset", "transposed"])
@@ -316,6 +312,64 @@ def test_current_stream_and_cuda_graph(tmp_path: Path) -> None:
     x.fill_(2.0)
     graph.replay()
     torch.testing.assert_close(captured, x * 3.0 + 1.0)
+
+
+def test_mma_dag_kernel_exports_the_shared_ptx_rows(tmp_path: Path) -> None:
+    # ``_mma_dag_runtime`` re-exports ``stg_b32`` / ``unpack_f16x2`` from
+    # ``device/ptx.py``: the export has to carry the table builder with its
+    # rows and bind the re-exports to them, and the module must load and run
+    # with ``helion`` unimportable.  (The warp_mma GEMM family renders the
+    # rows too but its launch plan is not exportable yet.)
+    probes = importlib.import_module("test.test_cute_mma_dag")
+    kernel = helion.kernel(
+        probes._accumulating_addmm,
+        backend="cute",
+        autotune_effort="none",
+        static_shapes=True,
+        cute_materialize_transformed_operands=False,
+    )
+    g = torch.rand(1024, 512, device=DEVICE, dtype=torch.float16)
+    c = torch.randn(1024, 256, device=DEVICE, dtype=torch.float16)
+    bound = kernel.bind((g, g, g, c))
+    with bound.env:
+        default = bound.config_spec.default_config()
+        config = bound.config_spec.normalized_config(
+            helion.Config(
+                **{
+                    **default.config,
+                    "cute_mma_dag": "warp",
+                    # The TMA ring adds a descriptor-preparation plan the
+                    # exporter refuses; per-thread packets leave the alias plan.
+                    "cute_mma_dag_loads": "lane",
+                }
+            )
+        )
+    code = bound.to_code(config)
+    for name in ("stg_b32", "unpack_f16x2"):
+        assert f"_helion_mma_dag.{name}(" in code, name
+    code = bound.to_code(
+        config, options=helion.OutputCodeOptions(allow_helion_deps=False)
+    )
+    assert "_make_standalone_ptx" in code
+    assert "_make_standalone_mma_dag_runtime" in code
+    (tmp_path / "native_addmm.py").write_text(code)
+    _run_without_helion(
+        tmp_path,
+        """
+        import native_addmm
+        rows = native_addmm._standalone_ptx
+        runtime = native_addmm._standalone_mma_dag_runtime
+        for name in ("stg_b32", "unpack_f16x2"):
+            assert getattr(runtime, name) is getattr(rows, name), name
+        torch.manual_seed(0)
+        g = torch.rand(1024, 512, device="cuda", dtype=torch.float16)
+        c = torch.randn(1024, 256, device="cuda", dtype=torch.float16)
+        actual = native_addmm._accumulating_addmm(g, g, g, c)
+        gf = g.float()
+        expected = (c.float().T @ (gf * gf * gf * (1.0 - gf))).to(torch.float16)
+        torch.testing.assert_close(actual, expected, atol=5e-2, rtol=2e-2)
+    """,
+    )
 
 
 @pytest.mark.slow

@@ -26,14 +26,12 @@ from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
 
-pytestmark = skipUnlessBackends(["cute"])
 CPU = torch.device("cpu")
 
 VECTOR_ATOMIC = "_cute_red_add_f32_vec("

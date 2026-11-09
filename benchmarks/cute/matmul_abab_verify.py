@@ -80,7 +80,7 @@ def main() -> None:
     helion_config = eval(config_src, {"helion": helion})
     kernel_args = (a, b, IdentityEpilogue())
     bound = matmul.bind(kernel_args)
-    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    bound.env.config_spec.tcgen05.search_enabled = True
     bound.set_config(helion_config)
     helion_fn = lambda: bound(*kernel_args)  # noqa: E731
 

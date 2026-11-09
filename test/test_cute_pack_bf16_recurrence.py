@@ -494,13 +494,47 @@ def test_policy_gates_fail_closed(
     assert result == ast.unparse(ast.parse(SOURCE))
 
 
-def test_incomplete_graph_fails_closed() -> None:
-    source = SOURCE.replace(
+_FAIL_CLOSED_SOURCES = {
+    "incomplete_graph_fails_closed": SOURCE.replace(
         "(key_fragment[lo], key_fragment[hi]),\n            (decayed_lo, decayed_hi),",
         "(unrelated[lo], unrelated[hi]),\n            (decayed_lo, decayed_hi),",
         1,
-    )
+    ),
+    "effect_inside_replaced_qdot_loop_fails_closed": SOURCE.replace(
+        "        (kq_acc_lo, kq_acc_hi),\n    )\n",
+        "        (kq_acc_lo, kq_acc_hi),\n    )\n    observe(kq_acc_lo)\n",
+        1,
+    ),
+    "non_bf16_output_fails_closed": SOURCE.replace(
+        "cutlass.BFloat16(base + delta * kq)", "base + delta * kq", 1
+    ),
+    "fp16_rounded_output_fails_closed": SOURCE.replace(
+        "cutlass.BFloat16(base + delta * kq)",
+        "cutlass.BFloat16(cutlass.Float16(base + delta * kq))",
+        1,
+    ),
+    "fp16_cache_value_fails_closed": SOURCE.replace(
+        "key_fragment[expanded_lane] = key_value * key_norm",
+        "key_fragment[expanded_lane] = cutlass.Float16(key_value * key_norm)",
+        1,
+    ),
+    "noncanonical_shuffle_lane_fails_closed": SOURCE.replace(
+        "shuffle_sync(key_source[source_element], source_lane)",
+        "shuffle_sync(key_source[source_element], source_lane + 1)",
+        1,
+    ),
+    "reassigned_nonuniform_scale_fails_closed": SOURCE.replace(
+        "for expanded_lane in cutlass.range_constexpr(8):",
+        "key_norm = cute.arch.thread_idx()[0]\n"
+        "for expanded_lane in cutlass.range_constexpr(8):",
+        1,
+    ),
+}
 
+
+@pytest.mark.parametrize("case", list(_FAIL_CLOSED_SOURCES))
+def test_fails_closed(case: str) -> None:
+    source = _FAIL_CLOSED_SOURCES[case]
     result, changed = _transform(source)
 
     assert not changed
@@ -594,19 +628,6 @@ def test_recurrence_caches_must_be_distinct(source: str) -> None:
     assert result == ast.unparse(ast.parse(source))
 
 
-def test_effect_inside_replaced_qdot_loop_fails_closed() -> None:
-    source = SOURCE.replace(
-        "        (kq_acc_lo, kq_acc_hi),\n    )\n",
-        "        (kq_acc_lo, kq_acc_hi),\n    )\n    observe(kq_acc_lo)\n",
-        1,
-    )
-
-    result, changed = _transform(source)
-
-    assert not changed
-    assert result == ast.unparse(ast.parse(source))
-
-
 @pytest.mark.parametrize("name", ("kq_acc_lo", "kq_lane"))
 def test_replaced_qdot_temporaries_cannot_escape(name: str) -> None:
     source = SOURCE + f"\nconsumer = consume({name})\n"
@@ -647,30 +668,6 @@ def test_replaced_qdot_temporaries_cannot_escape(name: str) -> None:
     ),
 )
 def test_changed_output_algebra_fails_closed(source: str) -> None:
-    result, changed = _transform(source)
-
-    assert not changed
-    assert result == ast.unparse(ast.parse(source))
-
-
-def test_non_bf16_output_fails_closed() -> None:
-    source = SOURCE.replace(
-        "cutlass.BFloat16(base + delta * kq)", "base + delta * kq", 1
-    )
-
-    result, changed = _transform(source)
-
-    assert not changed
-    assert result == ast.unparse(ast.parse(source))
-
-
-def test_fp16_rounded_output_fails_closed() -> None:
-    source = SOURCE.replace(
-        "cutlass.BFloat16(base + delta * kq)",
-        "cutlass.BFloat16(cutlass.Float16(base + delta * kq))",
-        1,
-    )
-
     result, changed = _transform(source)
 
     assert not changed
@@ -738,19 +735,6 @@ def test_bf16_source_cache_allocation_is_supported(cache: str) -> None:
     _result, changed = _transform(source)
 
     assert changed
-
-
-def test_fp16_cache_value_fails_closed() -> None:
-    source = SOURCE.replace(
-        "key_fragment[expanded_lane] = key_value * key_norm",
-        "key_fragment[expanded_lane] = cutlass.Float16(key_value * key_norm)",
-        1,
-    )
-
-    result, changed = _transform(source)
-
-    assert not changed
-    assert result == ast.unparse(ast.parse(source))
 
 
 def test_fp16_separate_cache_expression_fails_closed() -> None:
@@ -867,19 +851,6 @@ def test_combined_expansion_rejects_extra_consumer_scale() -> None:
     assert result == ast.unparse(ast.parse(source))
 
 
-def test_noncanonical_shuffle_lane_fails_closed() -> None:
-    source = SOURCE.replace(
-        "shuffle_sync(key_source[source_element], source_lane)",
-        "shuffle_sync(key_source[source_element], source_lane + 1)",
-        1,
-    )
-
-    result, changed = _transform(source)
-
-    assert not changed
-    assert result == ast.unparse(ast.parse(source))
-
-
 @pytest.mark.parametrize(
     "source",
     (
@@ -899,20 +870,6 @@ def test_noncanonical_shuffle_lane_fails_closed() -> None:
 def test_replaced_cache_expansion_effects_and_escapes_fail_closed(
     source: str,
 ) -> None:
-    result, changed = _transform(source)
-
-    assert not changed
-    assert result == ast.unparse(ast.parse(source))
-
-
-def test_reassigned_nonuniform_scale_fails_closed() -> None:
-    source = SOURCE.replace(
-        "for expanded_lane in cutlass.range_constexpr(8):",
-        "key_norm = cute.arch.thread_idx()[0]\n"
-        "for expanded_lane in cutlass.range_constexpr(8):",
-        1,
-    )
-
     result, changed = _transform(source)
 
     assert not changed

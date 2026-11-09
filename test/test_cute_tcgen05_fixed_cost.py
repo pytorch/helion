@@ -1,30 +1,44 @@
 """Codegen pins for the fixed-cost trims of the plain tcgen05 GEMM launch.
 
-CPU-only (fake CUDA target), like ``test_cute_tcgen05_fixed_chain.py`` whose
-binders and fixture this file reuses: every test binds a kernel, pins a
-config and inspects the generated CuTe source.  Runtime coverage lives in
-``test_cute_tcgen05_fixed_cost_gpu.py``.
+CPU-only (the fake CUDA target of the module's ``cpu_render`` marker), with
+the binders of ``test_cute_tcgen05_fixed_chain.py``: every test binds a
+kernel, pins a config and inspects the generated CuTe source.  The runtime
+numerics (sm_100 GPU) are at the end of the module.
 """
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 import re
+import subprocess
+import sys
+import textwrap
 from typing import TYPE_CHECKING
 
 import pytest
 import torch
 
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
 from test.test_cute_tcgen05_fixed_chain import PUBLICATION_HOISTED
+from test.test_cute_tcgen05_fixed_chain import _addmm_gemm
+from test.test_cute_tcgen05_fixed_chain import _batched_gemm
+from test.test_cute_tcgen05_fixed_chain import _bias_gemm
 from test.test_cute_tcgen05_fixed_chain import _bind_bias_gemm
 from test.test_cute_tcgen05_fixed_chain import _bind_bmm
 from test.test_cute_tcgen05_fixed_chain import _bind_gemm
-from test.test_cute_tcgen05_fixed_chain import _cpu_only  # noqa: F401
+from test.test_cute_tcgen05_fixed_chain import _config
+from test.test_cute_tcgen05_fixed_chain import _gemm
 from test.test_cute_tcgen05_fixed_chain import _kernel_body
 from test.test_cute_tcgen05_fixed_chain import _plain_config
 from test.test_cute_tcgen05_fixed_chain import _source
 
 import helion
+from helion._compiler.cute.tcgen05_config import facts
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import surface
 from helion._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
@@ -32,13 +46,25 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
 from helion._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUTS
-from helion._testing import skipUnlessBackends
+from helion._testing import DEVICE
+from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotCUDA
 from helion._testing.cute_dense_tcgen05 import wrapper_plans
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
+# The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced
+# as ``cuda:0`` tensors of a 148-SM device, and the reduction SMEM budget.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(
+        mma_support=tcgen05_mma_support(),
+        forbid_native=False,
+        fake_device_sm_count=148,
+        reduction_smem_budget_bytes=232448,
+    ),
+]
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -262,8 +288,8 @@ def test_direct_store_mode_is_exact_and_searchable() -> None:
     bound = _bind_gemm((512, 512, 256), torch.float16)
     tcgen05 = bound.config_spec._cute_tcgen05_config
     with bound.env:
-        search = tcgen05.optional_fragments(for_search=True)
-        validation = tcgen05.optional_fragments(for_search=False)
+        search = surface.optional_fragments(tcgen05, for_search=True)
+        validation = surface.optional_fragments(tcgen05, for_search=False)
     assert search[TCGEN05_C_STORE_MODE_CONFIG_KEY].choices == (
         TCGEN05_C_STORE_MODE_NORMAL,
         TCGEN05_C_STORE_MODE_DIRECT,
@@ -297,10 +323,12 @@ def test_small_grid_seeds_cover_batched_gemms() -> None:
     # of the seed's block sizes (pinned to 1) and multiplies the tile count.
     bound = _bind_bmm((4, 64, 128, 128), torch.float16)
     with bound.env:
-        seeds = bound.config_spec._cute_tcgen05_config._small_grid_seed_configs()
-    tiles = sorted({tuple(seed.config["block_sizes"]) for seed in seeds})
+        seed_configs = seeds._small_grid_seed_configs(
+            bound.config_spec._cute_tcgen05_config
+        )
+    tiles = sorted({tuple(seed.config["block_sizes"]) for seed in seed_configs})
     assert tiles == [(1, 64, 16, 128), (1, 64, 32, 128), (1, 64, 64, 128)], tiles
-    for seed in seeds:
+    for seed in seed_configs:
         assert seed.config["pid_type"] == "persistent_interleaved"
         # K = 128 in one 128-wide step: the ring is never deeper than the loop.
         assert seed.config["tcgen05_ab_stages"] == 1
@@ -311,8 +339,10 @@ def test_small_grid_seeds_stop_once_the_batched_grid_fills_the_machine() -> None
     # batch axis fills the machine 64-fold.
     bound = _bind_bmm((64, 256, 256, 256), torch.float16)
     with bound.env:
-        seeds = bound.config_spec._cute_tcgen05_config._small_grid_seed_configs()
-    assert seeds == []
+        seed_configs = seeds._small_grid_seed_configs(
+            bound.config_spec._cute_tcgen05_config
+        )
+    assert seed_configs == []
 
 
 def test_small_grid_seeds_prefetch_the_bias_row() -> None:
@@ -320,18 +350,22 @@ def test_small_grid_seeds_prefetch_the_bias_row() -> None:
     # accumulator wait (the promoted row stage), like the one-wave seeds.
     bound = _bind_row_bias_gemm((256, 256, 256), torch.float16)
     with bound.env:
-        seeds = bound.config_spec._cute_tcgen05_config._small_grid_seed_configs()
-    assert seeds
-    for seed in seeds:
+        seed_configs = seeds._small_grid_seed_configs(
+            bound.config_spec._cute_tcgen05_config
+        )
+    assert seed_configs
+    for seed in seed_configs:
         assert seed.config["tcgen05_aux_load_placement"] == "pre_acc_wait", seed
 
 
 def test_small_grid_seeds_twin_narrow_tiles_with_the_direct_store() -> None:
     bound = _bind_gemm((256, 256, 256), torch.float16)
     with bound.env:
-        seeds = bound.config_spec._cute_tcgen05_config._small_grid_seed_configs()
+        seed_configs = seeds._small_grid_seed_configs(
+            bound.config_spec._cute_tcgen05_config
+        )
     by_mode: dict[str, list[tuple[int, int]]] = {}
-    for seed in seeds:
+    for seed in seed_configs:
         mode = seed.config.get(
             TCGEN05_C_STORE_MODE_CONFIG_KEY, TCGEN05_C_STORE_MODE_NORMAL
         )
@@ -361,7 +395,9 @@ def test_small_grid_seeds_twin_narrow_tiles_with_the_direct_store() -> None:
 
 def _m_block_fragment_low(bound: BoundKernel) -> int:
     with bound.env:
-        fragments = bound.config_spec._cute_tcgen05_config._matmul_block_fragments()
+        fragments = facts._matmul_block_fragments(
+            bound.config_spec._cute_tcgen05_config
+        )
     assert fragments is not None
     return fragments[0].low
 
@@ -390,8 +426,10 @@ def test_small_grid_seeds_keep_64_row_tiles_within_one_wave() -> None:
     # tile.
     bound = _bind_gemm((512, 1024, 256), torch.float16)
     with bound.env:
-        seeds = bound.config_spec._cute_tcgen05_config._small_grid_seed_configs()
-    tiles = sorted({tuple(seed.config["block_sizes"]) for seed in seeds})
+        seed_configs = seeds._small_grid_seed_configs(
+            bound.config_spec._cute_tcgen05_config
+        )
+    tiles = sorted({tuple(seed.config["block_sizes"]) for seed in seed_configs})
     assert tiles == [
         (64, 64, 128),
         (128, 16, 128),
@@ -958,3 +996,632 @@ def test_direct_store_demotes_a_split_epilogue_layout() -> None:
             _plain_config(**_TWO_CTA_BN256, tcgen05_epilogue_layout="split_first_t2r")
         )
     assert kept[TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY] == "split_first_t2r"
+
+
+# Runtime numerics for the tcgen05 fixed-cost trims (sm_100 GPU).
+#
+# The register-direct output store must be bitwise identical to the
+# SMEM-staged TMA store of the same config (same conversion, same values), the
+# one-shot path reached from a swizzled config must match the swizzle-1 kernel,
+# and the folded L2-grouping decode must visit every tile exactly once.  Every
+# case launches many times: a TMEM leak, a barrier-count mismatch or a bad
+# alignment claim shows up as a hang, a fault or a wrong result within a few
+# launches per SM.
+
+
+def _sm100_gpu(test: Callable[..., object]) -> Callable[..., object]:
+    """Skip ``test`` without a CUDA GPU of capability 10.0 or newer."""
+    return skipIfNotCUDA()(
+        skipIfCudaCapabilityLessThan((10, 0), reason="tcgen05 requires an sm_100 GPU")(
+            test
+        )
+    )
+
+
+LAUNCHES = 40
+
+
+def _outputs(
+    kernel_fn, args: tuple[torch.Tensor, ...], config: helion.Config
+) -> tuple[list[torch.Tensor], str]:
+    kernel = helion.kernel(kernel_fn, backend="cute", static_shapes=True)
+    bound = kernel.bind(args)
+    bound.set_config(config)
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(config)
+    source = bound.to_code(normalized)
+    outputs = [bound(*args) for _ in range(LAUNCHES)]
+    torch.cuda.synchronize()
+    return outputs, source
+
+
+def _assert_direct_matches_tma(
+    kernel_fn,
+    args: tuple[torch.Tensor, ...],
+    config: helion.Config,
+    expected: torch.Tensor,
+    **tol: float,
+) -> None:
+    normal, normal_source = _outputs(kernel_fn, args, config)
+    direct, direct_source = _outputs(
+        kernel_fn,
+        args,
+        helion.Config(**{**config.config, "tcgen05_c_store_mode": "direct"}),
+    )
+    assert "cute.copy(tcgen05_tma_store_atom" in normal_source
+    assert "tcgen05_tma_store_atom" not in direct_source
+    assert "cute.nvgpu.CopyR2GOp()" in direct_source
+    # The 16-byte alignment proof held: vector stores, no per-element loop.
+    assert "assumed_align=min(" in direct_source, direct_source
+    assert "_edge_i" not in direct_source
+    for out in normal:
+        torch.testing.assert_close(out, expected.to(out.dtype), **tol)
+    for out in direct:
+        assert torch.equal(out, normal[0])
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_direct_store_plain_fp16_one_tile_per_cta() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(512, 256, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(256, 512, device=DEVICE, dtype=torch.float16)
+    _assert_direct_matches_tma(
+        _gemm,
+        (a, b),
+        _config(pid_type="persistent_interleaved"),
+        a @ b,
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_direct_store_plain_bf16_128_wide_tile() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(1024, 512, device=DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(512, 1024, device=DEVICE, dtype=torch.bfloat16)
+    # 8 x 8 = 64 tiles of 128x128: four 32-column subtiles per tile.
+    _assert_direct_matches_tma(
+        _addmm_gemm,
+        (a, b),
+        _config(block_sizes=[128, 128, 64], pid_type="persistent_interleaved"),
+        a @ b,
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_direct_store_persistent_tiles() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(2048, 256, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(256, 2048, device=DEVICE, dtype=torch.float16)
+    # 16 x 32 = 512 tiles > 148 SMs: the persistent while, several tiles per
+    # CTA, each stored straight from registers.
+    _assert_direct_matches_tma(
+        _gemm,
+        (a, b),
+        _config(pid_type="persistent_blocked", l2_groupings=[8]),
+        a @ b,
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_direct_store_batched_output() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(8, 256, 512, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(8, 512, 256, device=DEVICE, dtype=torch.float16)
+    _assert_direct_matches_tma(
+        _batched_gemm,
+        (a, b),
+        _config(block_sizes=[1, 128, 64, 64], loop_orders=[[0, 1, 2]]),
+        torch.bmm(a, b),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_direct_store_64_row_tile() -> None:
+    # bm=64 uses a different TMEM load atom (and so a different per-thread
+    # chunk layout); the alignment claim must hold for it too.
+    torch.manual_seed(0)
+    a = torch.randn(256, 256, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(256, 256, device=DEVICE, dtype=torch.float16)
+    _assert_direct_matches_tma(
+        _gemm,
+        (a, b),
+        _config(block_sizes=[64, 16, 128], pid_type="persistent_interleaved"),
+        a @ b,
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_direct_store_fp8_narrow_tile() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(256, 256, device=DEVICE, dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
+    b = (
+        torch.randn(256, 256, device=DEVICE, dtype=torch.float32)
+        .to(torch.float8_e4m3fn)
+        .T.contiguous()
+        .T
+    )
+    expected = a.float() @ b.float()
+    _assert_direct_matches_tma(
+        _gemm,
+        (a, b),
+        _config(
+            block_sizes=[128, 16, 128],
+            indexing=["pointer", "pointer", "pointer"],
+            pid_type="persistent_interleaved",
+        ),
+        expected,
+        rtol=5e-2,
+        atol=5e-2,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_direct_store_bias_row_pre_wait() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(512, 256, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(256, 512, device=DEVICE, dtype=torch.float16)
+    bias = torch.randn(512, 512, device=DEVICE, dtype=torch.float16)
+    _assert_direct_matches_tma(
+        _bias_gemm,
+        (a, b, bias),
+        _config(
+            pid_type="persistent_interleaved",
+            tcgen05_aux_load_placement="pre_acc_wait",
+        ),
+        (a @ b).float() + bias.float(),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_one_shot_path_from_a_swizzled_config_matches_swizzle_one() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(512, 256, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(256, 512, device=DEVICE, dtype=torch.float16)
+    plain, plain_source = _outputs(
+        _gemm,
+        (a, b),
+        _config(pid_type="persistent_interleaved", tcgen05_l2_swizzle_size=1),
+    )
+    swizzled, swizzled_source = _outputs(
+        _gemm,
+        (a, b),
+        _config(pid_type="persistent_interleaved", tcgen05_l2_swizzle_size=4),
+    )
+    assert "while tcgen05_role_local" not in swizzled_source
+    assert "swizzle_size" not in swizzled_source
+    for out in plain:
+        torch.testing.assert_close(out, (a @ b).to(out.dtype), rtol=1e-2, atol=1e-2)
+    for out in swizzled:
+        assert torch.equal(out, plain[0])
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("m", "grouping", "folded"),
+    [
+        (2048, 32, "group_size_m = num_pid_m"),
+        (2048, 2, "group_size_m = 2"),
+        (768, 4, "group_size_m = min(num_pid_m - first_pid_m, 4)"),
+    ],
+    ids=["single_group", "full_groups", "partial_group"],
+)
+def test_folded_l2_grouping_visits_every_tile(
+    m: int, grouping: int, folded: str
+) -> None:
+    torch.manual_seed(0)
+    a = torch.randn(m, 256, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(256, 2048, device=DEVICE, dtype=torch.float16)
+    grouped, source = _outputs(
+        _gemm, (a, b), _config(pid_type="persistent_blocked", l2_groupings=[grouping])
+    )
+    assert folded in source
+    ungrouped, _ = _outputs(
+        _gemm, (a, b), _config(pid_type="persistent_blocked", l2_groupings=[1])
+    )
+    for out in ungrouped:
+        torch.testing.assert_close(out, (a @ b).to(out.dtype), rtol=1e-2, atol=1e-2)
+    # Same tiles, same per-tile math: the raster order cannot change a value.
+    for out in grouped:
+        assert torch.equal(out, ungrouped[0])
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_direct_store_row_vector_bias_pre_wait() -> None:
+    # The matmul s0 winner's shape: a trailing-axis bias row on a 128x16 tile
+    # loaded ahead of the accumulator wait (the promoted FP32 row stage) and
+    # stored straight from registers.
+    torch.manual_seed(0)
+    a = torch.randn(256, 256, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(256, 256, device=DEVICE, dtype=torch.float16)
+    bias = torch.randn(256, device=DEVICE, dtype=torch.float16)
+    _assert_direct_matches_tma(
+        _row_bias_gemm,
+        (a, b, bias),
+        _config(
+            block_sizes=[128, 16, 64],
+            indexing=["tensor_descriptor"] * 4,
+            pid_type="persistent_interleaved",
+            tcgen05_aux_load_placement="pre_acc_wait",
+        ),
+        (a.float() @ b.float() + bias.float()).to(torch.float16),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+# --------------------------------------------------------------------------
+# N=8 tiles: six role warps, no CTA-wide barrier on the role-local chain
+# --------------------------------------------------------------------------
+
+N8_INLINE_CONFIG: dict[str, object] = {
+    # The campaign's bmm s0 winner: 64x8 tiles, inline ``xyz`` path, SMEM-staged
+    # TMA store.  Its N=8 tile used to launch 64-lane rows (twelve warps for six
+    # roles); the spare warps raced the TMA warp through the pipeline-init
+    # barrier ahead of warp 0's mbarrier init, a flaky illegal-instruction
+    # fault on the second launch of a process.
+    "block_sizes": [1, 64, 8, 64],
+    "loop_orders": [[0, 1, 2]],
+    "l2_groupings": [16],
+    "indexing": ["pointer", "tensor_descriptor", "tensor_descriptor"],
+    "pid_type": "xyz",
+    "tcgen05_persistence_model": "non_persistent",
+    "tcgen05_cluster_m": 1,
+    "tcgen05_cluster_n": 1,
+    "tcgen05_ab_stages": 4,
+    "tcgen05_acc_stages": 2,
+    "tcgen05_c_stages": 4,
+    "tcgen05_tvm_ffi_launch": False,
+}
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_narrow_n8_inline_store_is_stable_across_streams_and_graph_replay() -> None:
+    from helion.autotuner.benchmarking import _make_cudagraph_replay
+
+    torch.manual_seed(0)
+    a = torch.randn(4, 64, 128, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(4, 128, 128, device=DEVICE, dtype=torch.float16)
+    config = helion.Config(**N8_INLINE_CONFIG)
+    bound = helion.kernel(_batched_gemm, backend="cute", static_shapes=True).bind(
+        (a, b)
+    )
+    bound.set_config(config)
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(config)
+    source = bound.to_code(normalized)
+    assert "block=(32, 6, 1)" in source
+    assert "cute.copy(tcgen05_tma_store_atom" in source
+    # The fault needed a launch after the first (the launcher's fast relaunch)
+    # on another stream; alternate streams and allocate a fresh output each
+    # time, as the autotuner's capture helper does.
+    side = torch.cuda.Stream()
+    outputs: list[torch.Tensor] = []
+    for launch in range(LAUNCHES):
+        stream = side if launch % 2 else torch.cuda.default_stream()
+        with torch.cuda.stream(stream):
+            outputs.append(bound(a, b))
+    torch.cuda.synchronize()
+    replay = _make_cudagraph_replay(lambda: bound(a, b))
+    torch.cuda.synchronize()
+    replays: list[torch.Tensor] = []
+    for _ in range(5):
+        replays.append(replay().clone())
+        torch.cuda.synchronize()
+    torch.testing.assert_close(outputs[0], torch.bmm(a, b), rtol=1e-2, atol=1e-2)
+    for out in [*outputs[1:], *replays]:
+        assert torch.equal(out, outputs[0])
+
+
+def _launch_batched_gemm_in_subprocess(
+    tmp_path: Path,
+    shape: tuple[int, int, int, int],
+    config: dict[str, object],
+    *,
+    timeout: float,
+) -> None:
+    """Compile, launch and check a bmm config in a child process under a timeout.
+
+    A deadlocked kernel cannot be interrupted in-process (``synchronize``
+    blocks); the child is killed by ``subprocess.run`` instead and the test
+    fails with the timeout.  The probe is a file: Helion reads the kernel's
+    source through ``inspect``.
+    """
+    probe = textwrap.dedent(
+        f"""
+        import json
+        import torch
+        import helion
+        import helion.language as hl
+
+        def bmm(a, b):
+            batch, m, k = a.shape
+            _, _, n = b.shape
+            out = torch.empty((batch, m, n), dtype=a.dtype, device=a.device)
+            for tile_b, tile_m, tile_n in hl.tile((batch, m, n)):
+                acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.baddbmm(
+                        acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n]
+                    )
+                out[tile_b, tile_m, tile_n] = acc.to(out.dtype)
+            return out
+
+        torch.manual_seed(0)
+        batch, m, n, k = {shape!r}
+        a = torch.randn(batch, m, k, device="cuda", dtype=torch.float16)
+        b = torch.randn(batch, k, n, device="cuda", dtype=torch.float16)
+        bound = helion.kernel(bmm, backend="cute", static_shapes=True).bind((a, b))
+        bound.set_config(helion.Config(**json.loads({json.dumps(config)!r})))
+        first = bound(a, b)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(first, torch.bmm(a, b), rtol=1e-2, atol=1e-2)
+        for _ in range(8):
+            assert torch.equal(bound(a, b), first)
+        torch.cuda.synchronize()
+        print("PROBE_OK", helion.__file__)
+        """
+    )
+    probe_path = tmp_path / "n8_probe.py"
+    probe_path.write_text(probe)
+    # A script's own directory heads ``sys.path``, not the cwd: point the child
+    # at the Helion this process imported (the checkout under test), not at an
+    # installed one.
+    helion_root = str(Path(helion.__file__).resolve().parents[1])
+    env = {**os.environ, "HELION_BACKEND": "cute"}
+    env["PYTHONPATH"] = os.pathsep.join(
+        [helion_root, *filter(None, [env.get("PYTHONPATH")])]
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, str(probe_path)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as timed_out:
+        raise AssertionError(
+            f"the launch did not complete within {timeout:.0f}s "
+            f"(stdout={timed_out.stdout!r}, stderr={str(timed_out.stderr)[-2000:]!r})"
+        ) from None
+    assert result.returncode == 0 and "PROBE_OK" in result.stdout, result.stderr[-4000:]
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+@pytest.mark.parametrize("ab_stages", [1, 2], ids=["ab1", "ab2"])
+def test_narrow_n8_one_shot_chain_completes_with_more_k_tiles_than_stages(
+    tmp_path: Path, ab_stages: int
+) -> None:
+    # 4 x 1 x 16 = 64 tiles of 64x8 <= 148 SMs: the one-shot role-local chain
+    # with 2 K tiles over a 1- or 2-stage ring.  A CTA-wide barrier between
+    # the hoisted TMA-load role and the MMA role deadlocked the single-stage
+    # ring (every ``tcgen05_ab_stages=1`` autotune sample timed out).
+    _launch_batched_gemm_in_subprocess(
+        tmp_path,
+        (4, 64, 128, 128),
+        {
+            "block_sizes": [1, 64, 8, 64],
+            "loop_orders": [[0, 1, 2]],
+            "indexing": ["tensor_descriptor"] * 3,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_persistence_model": "static_persistent",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": ab_stages,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 4,
+            "tcgen05_tvm_ffi_launch": False,
+        },
+        timeout=300.0,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_narrow_n8_one_shot_chain_completes_with_four_k_tiles_over_two_stages(
+    tmp_path: Path,
+) -> None:
+    # 8 x 2 x 16 = 256 tiles would not be one-shot; 2 x 1 x 32 = 64 tiles of
+    # 128x8 are, with 4 K tiles over a 2-stage ring.
+    _launch_batched_gemm_in_subprocess(
+        tmp_path,
+        (2, 128, 256, 256),
+        {
+            "block_sizes": [1, 128, 8, 64],
+            "loop_orders": [[0, 1, 2]],
+            "indexing": ["tensor_descriptor"] * 3,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_persistence_model": "static_persistent",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 4,
+            "tcgen05_tvm_ffi_launch": False,
+        },
+        timeout=300.0,
+    )
+
+
+_OUTPUT_VIEW_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float8_e4m3fn,
+)
+
+
+def _bits(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.contiguous().view(torch.uint8)
+
+
+def _assert_column_major_tma_store(source: str) -> None:
+    assert "cute.copy(tcgen05_tma_store_atom" in source
+    assert "cute.nvgpu.CopyR2GOp()" not in source
+    assert "'kind': 'tcgen05_d_tma'" in source
+    assert "'d_column_major': True" in source
+    assert "'rank3_mnl_tensor': True" in source
+    assert "tcgen05_c_layout = cutlass.utils.layout.LayoutEnum.COL_MAJOR" in source
+
+
+def _assert_output_view_stored_exactly(
+    case: str, dtype: torch.dtype, *, column_major_tma: bool
+) -> None:
+    torch.manual_seed(0)
+    in_dtype = torch.bfloat16 if dtype == torch.bfloat16 else torch.float16
+    a = torch.randn(512, 256, device=DEVICE, dtype=in_dtype)
+    b = torch.randn(256, 512, device=DEVICE, dtype=in_dtype)
+    config = _config(pid_type="persistent_interleaved")
+    contiguous = _output_view("contiguous", dtype, device=DEVICE)
+    _, tma_source = _outputs(_gemm_into, (a, b, contiguous), config)
+    assert "cute.copy(tcgen05_tma_store_atom" in tma_source
+    view = _output_view(case, dtype, device=DEVICE)
+    outputs, source = _outputs(_gemm_into, (a, b, view), config)
+    if column_major_tma:
+        _assert_column_major_tma_store(source)
+        assert view.stride(0) == 1
+        assert view.stride(1) * dtype.itemsize % 16 == 0
+    else:
+        assert "tcgen05_tma_store_atom" not in source
+        assert "'kind': 'tcgen05_d_tma'" not in source
+        assert "cute.nvgpu.CopyR2GOp()" in source
+    assert all(out is view for out in outputs)
+    assert torch.equal(_bits(view), _bits(contiguous))
+    # Stores into a padded view must leave the surrounding allocation intact.
+    if case in ("row_stride_8B", "column_major_stride_16B", "column_major_stride_8B"):
+        assert view._base is not None
+        assert torch.count_nonzero(_bits(view._base[:, 512:])).item() == 0
+    elif case == "base_8B":
+        assert view._base is not None
+        pad = 8 // dtype.itemsize
+        assert torch.count_nonzero(_bits(view._base[:pad])).item() == 0
+        assert torch.count_nonzero(_bits(view._base[-pad:])).item() == 0
+    expected = a.float() @ b.float()
+    if dtype == torch.float8_e4m3fn:
+        tolerance = {"rtol": 1e-1, "atol": 5e-1}
+    else:
+        tolerance = {"rtol": 2e-2, "atol": 2e-2}
+    torch.testing.assert_close(view.float(), expected, **tolerance)
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype", _OUTPUT_VIEW_DTYPES, ids=str)
+@pytest.mark.parametrize("case", TMA_STORE_ILLEGAL_OUTPUTS)
+def test_unproven_output_views_are_stored_exactly(
+    case: str, dtype: torch.dtype
+) -> None:
+    # An 8-byte outer stride or base alignment violates a TensorMap constraint.
+    # The SIMT fallback must preserve the exact result and surrounding storage.
+    _assert_output_view_stored_exactly(case, dtype, column_major_tma=False)
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype", _OUTPUT_VIEW_DTYPES, ids=str)
+@pytest.mark.parametrize("case", ["column_major", "column_major_stride_16B"])
+def test_column_major_output_views_keep_the_tma_store(
+    case: str, dtype: torch.dtype
+) -> None:
+    # Proven M-contiguous outputs use a column-major D descriptor and SMEM tile.
+    # The store must remain bitwise equal to the row-major TMA result.
+    _assert_output_view_stored_exactly(case, dtype, column_major_tma=True)
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+@pytest.mark.parametrize("factory", sorted(FRESH_FACTORY_GEMMS))
+def test_tensor_method_factory_outputs_keep_the_tma_store(factory: str) -> None:
+    # An output allocated through ``a.new_*`` or ``torch.empty_strided`` is
+    # proven fresh like ``torch.empty``: the TMA store is kept and every
+    # launch is bitwise the ``torch.empty`` kernel's result.
+    torch.manual_seed(0)
+    a = torch.randn(512, 256, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(256, 512, device=DEVICE, dtype=torch.float16)
+    config = _config(pid_type="persistent_interleaved")
+    reference, reference_source = _outputs(_gemm, (a, b), config)
+    assert "cute.copy(tcgen05_tma_store_atom" in reference_source
+    outputs, source = _outputs(FRESH_FACTORY_GEMMS[factory], (a, b), config)
+    assert "cute.copy(tcgen05_tma_store_atom" in source
+    assert "cute.nvgpu.CopyR2GOp()" not in source
+    for out in outputs:
+        assert torch.equal(out, reference[0])
+    torch.testing.assert_close(
+        outputs[0].float(), a.float() @ b.float(), rtol=2e-2, atol=2e-2
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_fresh_column_major_strided_output_keeps_the_tma_store_on_device() -> None:
+    # A fresh M-contiguous output uses column-major TMA without changing the
+    # logical result or its strides.
+    torch.manual_seed(0)
+    a = torch.randn(512, 256, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(256, 512, device=DEVICE, dtype=torch.float16)
+    config = _config(pid_type="persistent_interleaved")
+    reference, _ = _outputs(_gemm, (a, b), config)
+    outputs, source = _outputs(_gemm_empty_strided_column_major, (a, b), config)
+    _assert_column_major_tma_store(source)
+    for out in outputs:
+        assert out.stride() == (1, 512)
+        assert torch.equal(out.contiguous(), reference[0])
+
+
+# Assigned by the test (a CUDA tensor cannot be created at import time); the
+# epilogue lambda below reads it as a module-level global.
+GPU_GLOBAL_BIAS: torch.Tensor | None = None
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_epilogue_lambda_reading_a_module_global_matches_the_closure_form() -> None:
+    global GPU_GLOBAL_BIAS
+    torch.manual_seed(0)
+    a = torch.randn(512, 256, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(256, 512, device=DEVICE, dtype=torch.float16)
+    GPU_GLOBAL_BIAS = torch.randn(512, device=DEVICE, dtype=torch.float16)
+    config = _config(pid_type="persistent_interleaved")
+    closure, closure_source = _outputs(
+        _gemm_with_epilogue, (a, b, _closure_bias_epilogue(GPU_GLOBAL_BIAS)), config
+    )
+    outputs, source = _outputs(
+        _gemm_with_epilogue,
+        (a, b, lambda acc, tile: acc + GPU_GLOBAL_BIAS[tile[1]]),
+        config,
+    )
+    assert "cute.copy(tcgen05_tma_store_atom" in source
+    assert "cute.copy(tcgen05_tma_store_atom" in closure_source
+    # The global lives in the kernel's own module.
+    assert "_source_module.GPU_GLOBAL_BIAS" in source
+    for out in outputs:
+        assert torch.equal(out, closure[0])
+    expected = a.float() @ b.float() + GPU_GLOBAL_BIAS.float()
+    torch.testing.assert_close(outputs[0].float(), expected, rtol=2e-2, atol=2e-2)

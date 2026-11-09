@@ -381,6 +381,13 @@ _BATCHED_REPLAY_BELOW_US = 64.0
 _BATCHED_REPLAY_MAX_CALLS = 16
 # do_bench times the flush-only graph once per this many batched samples.
 _BATCHED_FLUSH_EVERY = 4
+# HIP keeps accepting launches while the device falls behind, and the process
+# segfaults in a launch once a few tens of thousands are queued (torch 2.13
+# rocm7.2 on MI300X: 20k back-to-back launches of a small kernel run, 40k
+# crash, Triton or eager alike). A final-selection window of a microsecond
+# kernel queues far more, so do_bench drains the queue every this many calls
+# on ROCm; each sample is still timed between its own events.
+_HIP_MAX_QUEUED_CALLS = 1000
 
 
 def _no_cache_clear() -> None:
@@ -1513,9 +1520,12 @@ def do_bench(
     start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
     end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
     flush_events: list[tuple[Any, Any]] = []
+    drain_every = _HIP_MAX_QUEUED_CALLS if torch.version.hip else 0
     # Warm-up
-    for _ in range(n_warmup):
+    for i in range(n_warmup):
         benchmark_function()
+        if drain_every and (i + 1) % drain_every == 0:
+            di.synchronize()
     # Benchmark
     for i in range(n_repeat):
         # we don't want `fn` to accumulate gradient values
@@ -1541,6 +1551,8 @@ def do_bench(
         start_event[i].record()
         benchmark_function()
         end_event[i].record()
+        if drain_every and (i + 1) % drain_every == 0:
+            di.synchronize()
     # Record clocks
     di.synchronize()
     times = [s.elapsed_time(e) for s, e in zip(start_event, end_event, strict=True)]

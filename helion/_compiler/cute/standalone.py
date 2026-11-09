@@ -22,9 +22,9 @@ from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codegen.simd import constant_repr
 from torch.utils._pytree import tree_leaves
 
+from ...runtime.cute.arg_signature import normalize_scalar
 from ...runtime.cute.launcher import _create_cute_wrapper
 from ...runtime.cute.launcher import _cute_kernel_param_is_constexpr
-from ...runtime.cute.launcher import _normalize_cute_scalar
 from ..compile_environment import _replay_tensor_input_source
 from ..output_code_utils import _check_kernel_name_not_shadowed
 from ..output_code_utils import _GlobalToNonlocal
@@ -347,7 +347,7 @@ def _argument_schema(
         if isinstance(arg, (bool, int, float, str, type(None), torch.dtype)):
             return ("constant", arg)
         if isinstance(arg, (torch.SymBool, torch.SymInt, torch.SymFloat)):
-            return ("constant", _normalize_cute_scalar(arg)[1])
+            return ("constant", normalize_scalar(arg)[1])
     for kind, classes in (
         ("bool", (bool, torch.SymBool)),
         ("int", (int, torch.SymInt)),
@@ -446,7 +446,7 @@ def _mma_dag_alias_spec(
     plans: Sequence[dict[str, object]], schema: Sequence[tuple[Any, ...]]
 ) -> tuple[tuple[int, ...], tuple[bool, ...]] | None:
     """The launch positions and store flags of a cute_mma_dag alias plan
-    (the launcher's ``_MmaDagAliasGuard``) for the exported launcher's span
+    (the launcher's ``MmaDagAliasGuard``) for the exported launcher's span
     check; None without the plan."""
     alias = [plan for plan in plans if plan.get("kind") == "helion_mma_dag_alias"]
     if not alias:
@@ -525,7 +525,7 @@ def _capture_launches(
         schema: list[tuple[Any, ...]] = []
         for index, arg in enumerate(args):
             if index < len(flags) and flags[index]:
-                kind, value = _normalize_cute_scalar(arg)
+                kind, value = normalize_scalar(arg)
                 schema.append(("scalar_constexpr", kind, value, value))
             else:
                 schema.append(_argument_schema(arg, pointer_residues))

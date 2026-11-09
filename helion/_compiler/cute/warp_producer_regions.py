@@ -22,9 +22,9 @@ from ..ast_extension import ExtendedAST
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..inductor_lowering import ReductionLowering
-from .completed_scan import pure
 from .pure_producer_regions import opaque_producer
 from .register_loads import host_load_is_readonly
+from .scan_analysis import pure
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -36,8 +36,8 @@ if TYPE_CHECKING:
 
     from ..compile_environment import CompileEnvironment
     from ..device_ir import GraphInfo
-    from .computed_fragment import Fragment
-    from .computed_fragment import FragmentCompiler
+    from .fragment_context import Fragment
+    from .fragment_context import FragmentContext
 
 KEY = "cute_fragment_warp_producer_regions"
 DTYPES = (torch.float32, torch.float64, torch.int32, torch.int64)
@@ -334,7 +334,7 @@ class _Reads(ast.NodeTransformer):
 class WarpProducerRecorder:
     """Current emitter provenance; retained references do not alter held/scopes."""
 
-    def __init__(self, compiler: FragmentCompiler, plan: WarpProducerRegion) -> None:
+    def __init__(self, compiler: FragmentContext, plan: WarpProducerRegion) -> None:
         self.compiler = compiler
         self.plan = plan
         self.nodes = frozenset(plan.nodes)

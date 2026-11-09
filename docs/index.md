@@ -16,22 +16,40 @@ Dashboard <https://helionlang.com/dashboard/>
 ```
 
 **Helion** is a Python-embedded domain-specific language (DSL) for
-authoring machine learning kernels, designed to compile down to [Triton],
-a performant backend for programming GPUs and other devices. Helion aims
-to raise the level of abstraction compared to Triton, making it easier
-to write correct and efficient kernels while enabling more automation
-in the autotuning process.
+authoring machine learning kernels. A Helion kernel expresses an algorithm
+as PyTorch operations over tiles; the compiler derives a configuration
+space for each kernel and hardware target and autotunes it, so the same
+kernel adapts across input shapes and hardware targets.
+
+Helion generates kernels through one of several backends. Select one with
+the `HELION_BACKEND` environment variable or the `backend=` argument of
+`@helion.kernel`:
+
+* [Triton] (default): `HELION_BACKEND=triton`
+* [TileIR](tileir_backend.md), for NVIDIA Blackwell GPUs: `HELION_BACKEND=tileir` (also set `ENABLE_TILE=1`)
+* [CuTe DSL], for NVIDIA Blackwell GPUs: `HELION_BACKEND=cute`
+* [Pallas], for Google TPUs: `HELION_BACKEND=pallas`
+* Metal, for Apple GPUs (experimental): `HELION_BACKEND=metal`
+* FlyDSL, for AMD GPUs (experimental): `HELION_BACKEND=flydsl`
+
+```python
+@helion.kernel(backend="cute")
+def my_kernel(x: torch.Tensor) -> torch.Tensor:
+    ...
+```
 
 [Triton]: https://github.com/triton-lang/triton
+[CuTe DSL]: https://github.com/NVIDIA/cutlass
+[Pallas]: https://docs.jax.dev/en/latest/pallas/index.html
 
 The name *Helion* refers to the nucleus of a helium-3 atom, while *Triton*
 refers to hydrogen-3.
 
-Helion can be viewed either as *PyTorch with tiles* or as *a higher-level Triton*. Compared to
-Triton, Helion reduces manual coding effort through autotuning. Helion spends more time (approx
-10 min) autotuning as it evaluates hundreds of potential Triton implementations generated
-from a single Helion kernel. This larger search space also makes kernels more performance
-portable between different hardware. Helion automates and autotunes over:
+Helion can be viewed as *PyTorch with tiles*. Compared to writing kernels directly in a
+lower-level language such as Triton, Helion reduces manual coding effort through autotuning.
+Helion spends more time autotuning as it evaluates hundreds of potential
+implementations generated from a single Helion kernel. This larger search space also makes
+kernels more performance portable between different hardware. Helion automates and autotunes over:
 
 1. **Tensor Indexing:**
 
@@ -107,9 +125,9 @@ The code outside the `for` loops is standard PyTorch code executed on
 the CPU. It is typically used for tasks like allocating output tensors
 and performing shape computations.
 
-The code inside the `for` loops is compiled into a Triton kernel,
-resulting in a single GPU kernel.  A single Helion kernel is always
-compiled to exactly one GPU kernel.
+The code inside the `for` loops is compiled by the selected backend
+(Triton by default) into a single GPU kernel.  A single Helion kernel is
+always compiled to exactly one GPU kernel.
 
 The `hl.tile` function subdivides the iteration space (in this case `m` by
 `n`) into tiles. These tiles are executed in parallel on the GPU. Tiling
@@ -126,7 +144,7 @@ details can be explicitly specified using the `config=` argument in
   and its tile size is also determined automatically.
 
 Within a Helion kernel, standard PyTorch operators (like
-`torch.addmm`) are automatically mapped to Triton operations using
+`torch.addmm`) are automatically mapped to backend operations using
 [TorchInductor](https://github.com/pytorch/pytorch/tree/main/torch/_inductor).
 Thus, familiarity with PyTorch means you already know most of
 Helion. Helion supports a wide range of operations including pointwise
@@ -243,10 +261,10 @@ do this, set the environment variable `HELION_AUTOTUNE_EFFORT=none` or use the d
 `@helion.kernel(autotune_effort="none")`. **Warning:** The default configuration is slow and not intended for
 production or performance testing.
 
-To view the generated Triton code, set the environment variable `HELION_PRINT_OUTPUT_CODE=1` or include
-`print_output_code=True` in the `@helion.kernel` decorator. This prints the Triton code to `stderr`, which is
+To view the generated code, set the environment variable `HELION_PRINT_OUTPUT_CODE=1` or include
+`print_output_code=True` in the `@helion.kernel` decorator. This prints the generated code to `stderr`, which is
 helpful for debugging and understanding Helion's compilation process.  One can also use
-`foo_kernel.bind(args).to_triton_code(config)` to get the Triton code as a string.
+`foo_kernel.bind(args).to_code(config)` to get the generated code as a string.
 
 To emit a repro script that includes the Helion kernel definition, the config decorator, and a
 `helion_repro_caller()` helper that recreates the runtime inputs before invoking the Helion kernel, set

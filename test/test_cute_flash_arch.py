@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute import flash_knobs
 from helion._compiler.cute import flash_tuning
 from helion._compiler.cute.attention_plan import dense_score_plan
 from helion._compiler.cute.flash_arch import FlashHardwareCapabilities
@@ -628,36 +629,57 @@ def test_target_policy_rejects_tuning_without_hardware_support() -> None:
     )
 
 
-def test_flash_policy_choice_tables_match_codegen_schema() -> None:
-    assert (
-        frozenset(cute_flash.FLASH_PIPELINE_FAMILY_FLAGS)
-        == flash_tuning._FLASH_POLICY_PIPELINE_FAMILIES
-    )
-    assert (
-        frozenset(
-            (
-                *cute_flash._FLASH_EXP2_PACKET_PARAMS,
-                *cute_flash._FLASH_MANUAL_EXP2_PACKET_PARAMS,
-            )
-        )
-        == flash_tuning._FLASH_POLICY_EXP2_PACKETS
-    )
-    assert (
-        frozenset(cute_flash._FLASH_EXP2_PACKET_PARAMS)
-        == flash_tuning._FLASH_POLICY_BASE_EXP2_PACKETS
-    )
-    assert (
-        cute_flash._FLASH_DEG1_EXP2_PACKETS
-        == flash_tuning._FLASH_POLICY_DEGREE1_EXP2_PACKETS
-    )
-    assert (
-        frozenset(
-            family
-            for family, flags in cute_flash.FLASH_PIPELINE_FAMILY_FLAGS.items()
-            if flags.tensor_4d_tma
-        )
-        == flash_tuning._FLASH_POLICY_FP16_HD64_PIPELINE_FAMILIES
-    )
+def test_flash_policy_records_validate_against_the_knob_registry() -> None:
+    """The name-valued fields accept exactly the registry's choices (no
+    mirrored tables), and the FP16/hd64 restriction follows the registry's
+    4D-TMA flag and compound-packet predicate."""
+
+    def dense(**fields: object) -> FlashDenseTuningPolicy:
+        base: dict[str, object] = {
+            "exp2_packet": "1x1",
+            "e2e_schedule": "xu",
+            "stat_transport": "ring2",
+        }
+        return FlashDenseTuningPolicy(
+            256, e2e_offset=0, e2e_offset0=0, **{**base, **fields}
+        )  # type: ignore[arg-type]
+
+    for family in cute_flash.FLASH_PIPELINE_FAMILY_FLAGS:
+        dense(pipeline_family=family)
+    for packet in flash_knobs.FLASH_EXP2_PACKET_CHOICES:
+        dense(exp2_packet=packet)
+    for schedule in flash_knobs.FLASH_E2E_SCHEDULE_CHOICES:
+        dense(e2e_schedule=schedule)
+    for transport in flash_knobs.FLASH_STAT_TRANSPORT_CHOICES:
+        dense(stat_transport=transport)
+    for role_map in flash_knobs.FLASH_ROLE_MAP_CHOICES:
+        dense(role_map=role_map)
+        FlashCausalTuningPolicy(512, 8, role_map=role_map)
+    for name, fields in (
+        ("pipeline family", {"pipeline_family": "fa4_unknown"}),
+        ("exp2 packet", {"exp2_packet": "16x1"}),
+        ("end-to-end schedule", {"e2e_schedule": "32/16"}),
+        ("statistics transport", {"stat_transport": "ring4"}),
+        ("role map", {"role_map": "cutlass"}),
+    ):
+        with pytest.raises(ValueError, match=f"unsupported flash dense {name}"):
+            dense(**fields)
+    with pytest.raises(ValueError, match="unsupported flash causal role map"):
+        FlashCausalTuningPolicy(512, 8, role_map="cutlass")
+    assert {
+        family
+        for family in cute_flash.FLASH_PIPELINE_FAMILY_FLAGS
+        if dense(pipeline_family=family).requires_fp16_hd64
+    } == {
+        family
+        for family, flags in cute_flash.FLASH_PIPELINE_FAMILY_FLAGS.items()
+        if flags.tensor_4d_tma
+    }
+    assert {
+        packet
+        for packet in flash_knobs.FLASH_EXP2_PACKET_CHOICES
+        if dense(exp2_packet=packet).requires_fp16_hd64
+    } == set(cute_flash._FLASH_MANUAL_EXP2_PACKET_PARAMS)
 
 
 def test_flash_policy_accepts_every_compound_exp2_packet() -> None:

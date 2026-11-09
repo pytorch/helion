@@ -24,7 +24,6 @@ from typing import cast
 
 import sympy
 import torch
-from torch._inductor.virtualized import V
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
@@ -489,7 +488,7 @@ def _shape_only_subscript(node: Node) -> bool:
     indices = node.args[1] if len(node.args) > 1 else None
     source_value = source.meta.get("val") if isinstance(source, Node) else None
     output_value = node.meta.get("val")
-    return (
+    return bool(
         isinstance(source_value, torch.Tensor)
         and isinstance(output_value, torch.Tensor)
         and isinstance(indices, (list, tuple))
@@ -2063,7 +2062,7 @@ class _Evaluator:
         return result
 
     def _tile_index(self, node: Node, flat: _Index) -> ast.AST:
-        from ...language.memory_ops import _cute_tile_begin_expr
+        from .emitters.memory_access import _cute_tile_begin_expr
 
         key = ("index", node, flat)
         if key in self.terminals:
@@ -2084,9 +2083,9 @@ class _Evaluator:
         return result
 
     def _host_load(self, node: Node, flat: _Index) -> ast.AST:
-        from ...language.memory_ops import _cute_scalar_load_expr
-        from ...language.memory_ops import _cute_tensor_dim_size_expr
-        from ...language.memory_ops import _cute_tile_begin_expr
+        from .emitters.memory_access import _cute_scalar_load_expr
+        from .emitters.memory_access import _cute_tensor_dim_size_expr
+        from .emitters.memory_access import _cute_tile_begin_expr
 
         key = ("load", node, flat)
         if key in self.terminals:
@@ -2155,8 +2154,8 @@ class _Evaluator:
         return result
 
     def _pointwise(self, node: Node, flat: _Index, inputs: tuple[Node, ...]) -> ast.AST:
-        from ..aten_lowering import LoweringContext
         from ..inductor_lowering import PointwiseLowering
+        from .scalar_lowering import lower_pointwise_scalar
 
         lowering = node.meta.get("lowering")
         if not isinstance(lowering, PointwiseLowering):
@@ -2191,15 +2190,15 @@ class _Evaluator:
                     x=input_values[0],
                 ),
             )
-        ctx = LoweringContext.__new__(LoweringContext)
-        ctx.cg = self.state.codegen
-        ctx.env = self.state.env
         statements: list[ast.AST] = []
-        with (
-            self.state.codegen.set_statements(statements),
-            V.set_current_node(node),
-        ):
-            result = lowering.codegen_from_input_asts(ctx, node, input_values)
+        result = lower_pointwise_scalar(
+            self.state.codegen,
+            node,
+            lowering,
+            input_values,
+            env=self.state.env,
+            statements=statements,
+        )
         if not isinstance(result, ast.AST):
             raise RuntimeError(f"invalid pointwise fragment result for {node.name}")
         self.lines.append(_render_statements(statements, self.indent))

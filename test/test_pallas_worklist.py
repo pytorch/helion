@@ -3146,8 +3146,8 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
             _noprep_ordered_kernel.bind(args).to_triton_code(_worklist_config([8, 8]))
 
     def test_active_resident_cache_requires_range_start_metadata(self):
-        from helion._compiler.backend import PallasBackend
         from helion._compiler.device_function import TensorArg
+        from helion._compiler.pallas.backend import PallasBackend
 
         env = types.SimpleNamespace(
             compact_worklist_plan=self._resident_cache_plan(),

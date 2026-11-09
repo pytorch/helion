@@ -485,17 +485,10 @@ def _check_aligned(
 
 
 def _check_kernel(state: CodegenState) -> None:
-    """``plan_free_aranges``' admission rules, for the same reasons: a kernel
-    with an MPP region, or with a lane-looped carry that isn't a matmul over
-    the loop's block, is wrong at some layouts beside per-thread code."""
-    from .mpp_graph_codegen import MPPGraphInfo
-
+    """``plan_free_aranges``' admission rule, for the same reason: a kernel
+    with a lane-looped carry that isn't a matmul over the loop's block is
+    wrong at some layouts beside per-thread code."""
     graphs = state.codegen.codegen_graphs
-    if any(isinstance(g, MPPGraphInfo) for g in graphs):
-        raise _unsupported(
-            "a store at a widened hl.arange() index in a kernel that also has an "
-            "MPP matmul"
-        )
     check_lane_carries(
         live_graphs(graphs),
         state.tile_strategy,

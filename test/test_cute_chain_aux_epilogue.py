@@ -10,7 +10,7 @@ whole-fragment hoist (``tcgen05_aux_fragment_hoist``), the epilogue-issued
 aux ring (``tcgen05_aux_load_mode="epi_tma"``), the epilogue warp groups and
 the configured subtile -- on its 256-row CtaGroup.TWO pair launch, judged by
 the normalizer exactly as ``materialized_fission_codegen._stage_config``
-renders it (``CuteTcgen05Config.region_launch_config``).  The region AB ring
+renders it (``tcgen05_config.facts.region_launch_config``).  The region AB ring
 is priced beside the rings each mechanism adds; the 128-row pair tile, the
 producer-warp ring and a launch left flat are refused with the launch named;
 search samples outside the envelope repair to fixed points; the chain's
@@ -34,9 +34,10 @@ from test.test_cute_materialized_fission import _sources
 from test.test_cute_phase_mma_roots import _native_cpu_target  # noqa: F401
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_materialized import (
+from helion._compiler.cute.autotune.heuristics.cute_materialized import (
     CuteMaterializedMmaHeuristic,
 )
+from helion._compiler.cute.tcgen05_config import facts
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION,
 )
@@ -150,11 +151,11 @@ def test_chain_launch_config_is_what_the_renderer_sees() -> None:
     bound = _bind_chain()
     state = bound.config_spec._cute_tcgen05_config
     assert state.materialized_matmul_block_ids == ((2, 3, 4),)
-    assert state.region_has_exact_aux(0)
+    assert facts.region_has_exact_aux(state, 0)
     assert state.exact_shape_aux_kernel_detected and state.exact_aux_tma_provable
     config = _strict(bound, _pair_config(bound, tcgen05_aux_load_mode="epi_tma"))
     with bound.env:
-        (launch,) = [cfg for _region, cfg in state.chain_launches(config.config)]
+        (launch,) = [cfg for _region, cfg in facts.chain_launches(state, config.config)]
     # The persistent launch: its pid type, the paired pipeline's fixed
     # coordinates, its region's ring depth and the kernel's aux mode.
     assert launch["pid_type"] == "persistent_blocked"
@@ -394,7 +395,7 @@ def test_two_gemm_fission_plan_without_a_single_output_aux_proof_stays_inert() -
     )
     state = bound.config_spec._cute_tcgen05_config
     assert state.materialized_matmul_block_ids == ((0, 1, 2), (3, 4, 5))
-    assert not any(state.region_has_exact_aux(region) for region in range(2))
+    assert not any(facts.region_has_exact_aux(state, region) for region in range(2))
     values = dict(bound.config_spec.default_config().config)
     for mechanism in ("prefetch_ring", "fragment_hoist", "epi_tma"):
         config = helion.Config.from_dict(values | MECHANISMS[mechanism])
@@ -451,7 +452,7 @@ def test_the_render_of_a_pinned_record_is_unchanged() -> None:
     # config equals the kernel's minus the region keys.
     state = bound.config_spec._cute_tcgen05_config
     with bound.env:
-        (launch,) = [cfg for _region, cfg in state.chain_launches(config.config)]
+        (launch,) = [cfg for _region, cfg in facts.chain_launches(state, config.config)]
     expected = {
         key: value
         for key, value in winner.items()

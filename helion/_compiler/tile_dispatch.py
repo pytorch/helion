@@ -11,9 +11,6 @@ from .._compat import shape_env_size_hint
 from .._utils import next_power_of_2
 from .compile_environment import CompileEnvironment
 from .compile_environment import _symint_sympy_expr
-from .cute.layout import CuTeGridExecutionPlan
-from .cute.matmul_utils import cute_matmul_root_placements
-from .cute.packed_matmul import contraction_axis_for_fact
 from .device_function import DeviceFunction
 from .device_function import find_block_size_symbols
 from .device_ir import ForLoopGraphInfo
@@ -21,8 +18,8 @@ from .device_ir import ReductionLoopGraphInfo
 from .device_ir import RootGraphInfo
 from .host_function import HostFunction
 from .reduction_strategy import LoopedReductionStrategy
+from .reduction_strategy import PersistentReductionStrategy
 from .reduction_strategy import ReductionStrategy
-from .reduction_strategy import cute_looped_reduction_block_size
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import PerThreadNDTileStrategy
@@ -34,7 +31,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from .. import Config
-    from .cute.loop_nesting import TileLoopPath
+    from .cute.execution_plans import CuTeGridExecutionPlan
     from .inductor_lowering import CodegenState
 
     SymIntLike = torch.SymInt | int
@@ -83,28 +80,18 @@ class TileStrategyDispatch:
         self._device_function = fn
         self.strategies: list[TileStrategy] = []
         self.block_id_to_strategy = BlockIDStrategyMapping()
-        self._cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
-        self._constexpr_live_graph_ids: frozenset[int] | None = None
         self._collective_sibling_thread_axes: dict[TileStrategy, int] = {}
-        if CompileEnvironment.current().backend.name == "cute":
-            from .cute.loop_nesting import constexpr_live_graph_ids
-            from .cute.loop_nesting import tile_loop_paths
-
-            device_ir = HostFunction.current().device_ir
-            self._cute_tile_loop_paths = tile_loop_paths(
-                device_ir, fn.codegen.codegen_graphs
-            )
-            self._constexpr_live_graph_ids = constexpr_live_graph_ids(
-                device_ir, fn.codegen.codegen_graphs, fn
-            )
+        backend = CompileEnvironment.current().backend
+        self._tile_loop_paths = backend.tile_loop_paths(fn)
+        self._constexpr_live_graph_ids = backend.constexpr_live_graph_ids(fn)
         self._add_loop_strategies(fn, config)
-        if CompileEnvironment.current().backend.name == "cute":
+        if backend.shares_sibling_thread_axes():
             if CompileEnvironment.current().config_spec.matmul_facts:
                 self._normalize_collective_sibling_threads(config)
             else:
                 self._normalize_shared_tile_thread_extents()
         self._add_reduction_strategies(fn, config)
-        if CompileEnvironment.current().backend.name == "cute":
+        if backend.shares_sibling_thread_axes():
             self._normalize_shared_reduction_thread_extents()
 
     def _normalize_shared_reduction_thread_extents(self) -> None:
@@ -120,7 +107,7 @@ class TileStrategyDispatch:
         ``hl.barrier()`` phases refuse the surplus at launch instead
         (``_reject_multi_root_reduction_surplus``, ``_multi_phase_block_dims``),
         and a sibling branch's free ``hl.arange`` may not widen the axis later
-        (``GenerateAST.allocate_cute_synthetic_arange_axis``).
+        (``cute.synthetic_axes.allocate_arange_axis``).
         """
         device_ir = HostFunction.current().device_ir
         if len(device_ir.grid_block_ids) != 1 or len(device_ir.phases) > 1:
@@ -141,29 +128,17 @@ class TileStrategyDispatch:
 
     def _normalize_collective_sibling_threads(self, config: Config) -> None:
         """Fit independent SIMT loops to the collective's physical launch."""
-        if not config.get("cute_collective_mma"):
-            return
         env = CompileEnvironment.current()
-        device_ir = HostFunction.current().device_ir
-        placements = cute_matmul_root_placements(env, device_ir)
-        if not placements:
+        collective = env.backend.collective_sibling_blocks(env, config)
+        if collective is None:
             return
-        collective_blocks = {
-            bid
-            for fact, _root in placements
-            for bid in (fact.m_block_id, fact.n_block_id)
-            if bid is not None
-        }
-        for fact, _root in placements:
-            axis = contraction_axis_for_fact(env, device_ir, fact)
-            if axis is not None:
-                collective_blocks.add(axis.block_id)
+        collective_blocks, matmul_roots = collective
+        device_ir = HostFunction.current().device_ir
         # Ancestors and other loops in a matmul root own its layout too.
         # Only loops in separate roots may be fitted to the collective launch.
-        matmul_roots = {root for _fact, root in placements}
         matmul_blocks = collective_blocks | {
             bid
-            for path in self._cute_tile_loop_paths
+            for path in self._tile_loop_paths
             if path[0] in matmul_roots
             for block_ids in path
             for bid in block_ids
@@ -179,7 +154,7 @@ class TileStrategyDispatch:
         # Tracing can register inner loops first. Finalize their parents before
         # a child queries its lexical thread-axis offset.
         depths: dict[tuple[int, ...], int] = {}
-        for path in self._cute_tile_loop_paths:
+        for path in self._tile_loop_paths:
             for depth, block_ids in enumerate(path):
                 depths[block_ids] = max(depths.get(block_ids, 0), depth)
         for strategy in sorted(
@@ -204,7 +179,7 @@ class TileStrategyDispatch:
                 and list(block_ids) in device_ir.grid_block_ids
                 and not any(
                     path[0] == block_ids and len(path) > 1
-                    for path in self._cute_tile_loop_paths
+                    for path in self._tile_loop_paths
                 )
             ):
                 # Separate root loops execute sequentially and reuse the same
@@ -223,8 +198,7 @@ class TileStrategyDispatch:
                     config.num_threads, bid, 0
                 )
                 if requested > cap:
-                    raise exc.BackendUnsupported(
-                        "cute",
+                    raise env.backend.unsupported(
                         f"sibling block {bid} requests {requested} threads on CUDA axis {axis}, "
                         f"but the collective launch allows {cap}",
                     )
@@ -310,25 +284,13 @@ class TileStrategyDispatch:
         env = CompileEnvironment.current()
         max_threads = env.backend.max_reduction_threads()
         active_block_ids = HostFunction.current().device_ir.codegen_active_block_ids
-        inactive_aliases = self._inactive_cute_broadcast_aliases(fn)
+        inactive_aliases = self._inactive_broadcast_aliases(fn)
 
         if self._constexpr_live_graph_ids is not None:
-            from .active_blocks import active_block_ids as live_block_ids
-
             # A reduction dim used only on the untaken side of a constant
             # branch is never emitted; its strategy would only claim an axis.
-            live = live_block_ids(
-                [
-                    graph
-                    for graph in fn.codegen.codegen_graphs
-                    if graph.graph_id in self._constexpr_live_graph_ids
-                ],
-                (
-                    block_id
-                    for ids in HostFunction.current().device_ir.grid_block_ids
-                    for block_id in ids
-                ),
-                env,
+            live = env.backend.constexpr_live_block_ids(
+                fn, self._constexpr_live_graph_ids
             )
             active_block_ids = (
                 live if active_block_ids is None else active_block_ids & live
@@ -361,87 +323,22 @@ class TileStrategyDispatch:
                 if reduction_loop is None:
                     if size_hint > max_threads:
                         # Too many elements for a single warp; force a looped
-                        # reduction. CuTe can cover a wider chunk with either
-                        # more live lanes or per-thread scalar lanes.
-                        reduction_loop = (
-                            cute_looped_reduction_block_size(size_hint, max_threads)
-                            if env.backend.name == "cute"
-                            else max_threads
+                        # reduction. A thread-level backend may cover a wider
+                        # chunk per trip (``Backend.default_reduction_loop``).
+                        reduction_loop = env.backend.default_reduction_loop(
+                            size_hint, max_threads
                         )
             strategy = env.backend.create_reduction_strategy(
                 fn, block_id, reduction_loop
             )
             self._register_strategy([block_id], strategy)
 
-    def _inactive_cute_broadcast_aliases(self, fn: DeviceFunction) -> set[int]:
-        """Drop duplicate output-range reservations before physical allocation.
-
-        Register broadcasting can allocate a reduction block whose variable is
-        exactly an existing tile variable. The canonical tile already owns
-        those coordinates. Nested tile loops may reuse an outer root's tile,
-        but cannot establish ownership for sibling or child-only tile axes.
-        Never elide executable reductions, free-iota or matrix dimensions.
-        """
-        env = CompileEnvironment.current()
-        spec = env.config_spec
-        graphs = fn.codegen.codegen_graphs
-        if (
-            env.backend_name != "cute"
-            or spec.matmul_facts
-            or any(
-                isinstance(node.target, torch._ops.OpOverload)
-                and node.target.overloadpacket is torch.ops.aten.arange
-                for graph in graphs
-                for node in graph.graph.nodes
-            )
-        ):
-            return set()
-        tile_blocks = {
-            block_id for strategy in self.strategies for block_id in strategy.block_ids
-        }
-        if not (
-            spec.pointwise_facts
-            and all(isinstance(graph, RootGraphInfo) for graph in graphs)
-        ):
-            # One root's grid tiles dominate its tiled child graphs. Restrict
-            # the extension to those outer coordinates: a child loop's tile
-            # may be inactive in a sibling, even with an identical extent.
-            grid_blocks = HostFunction.current().device_ir.grid_block_ids
-            if (
-                len(grid_blocks) != 1
-                or sum(isinstance(graph, RootGraphInfo) for graph in graphs) != 1
-                or not any(type(graph) is ForLoopGraphInfo for graph in graphs)
-                or any(
-                    not isinstance(graph, RootGraphInfo)
-                    and not (type(graph) is ForLoopGraphInfo and graph.block_ids)
-                    for graph in graphs
-                )
-            ):
-                return set()
-            tile_blocks &= set(grid_blocks[0])
-        executable = set(spec.reduction_loops.valid_block_ids())
-        if spec.reduction_kernel_fact is not None:
-            executable.update(
-                reduction.block_id
-                for reduction in spec.reduction_kernel_fact.reductions
-            )
-        if spec.kernel_matmul_fact is not None:
-            executable.update(
-                matmul.fact.k_block_id
-                for matmul in spec.kernel_matmul_fact.matmuls
-                if matmul.fact.k_block_id is not None
-            )
-        return {
-            block.block_id
-            for block in env.block_sizes
-            if block.reduction
-            and block.block_id not in executable
-            and (canonical := env.canonical_block_id(block.block_id)) != block.block_id
-            and canonical in tile_blocks
-            and env.block_sizes[canonical].is_tile
-            and block.symbol() == env.block_sizes[canonical].symbol()
-            and block.numel == env.block_sizes[canonical].symbol()
-        }
+    def _inactive_broadcast_aliases(self, fn: DeviceFunction) -> set[int]:
+        """Reduction blocks that alias a registered tile's coordinates; they get
+        no strategy (``Backend.inactive_broadcast_alias_block_ids``)."""
+        return CompileEnvironment.current().backend.inactive_broadcast_alias_block_ids(
+            fn, self.strategies
+        )
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
         strategy = self.block_id_to_strategy[tuple(block_ids)]
@@ -575,25 +472,7 @@ class TileStrategyDispatch:
             )
         if not plans:
             return None
-        block_axis_priority: dict[int, int] = {}
-        disable_reduction_axis_reservation_for: set[int] = set()
-        scoped_block_ids: set[int] = set()
-        for plan in plans:
-            scoped_block_ids.update(plan.scoped_block_ids)
-            disable_reduction_axis_reservation_for.update(
-                plan.disable_reduction_axis_reservation_for
-            )
-            for block_id, priority in plan.block_axis_priority.items():
-                previous = block_axis_priority.get(block_id)
-                if previous is None or priority < previous:
-                    block_axis_priority[block_id] = priority
-        return CuTeGridExecutionPlan(
-            scoped_block_ids=frozenset(scoped_block_ids),
-            block_axis_priority=block_axis_priority,
-            disable_reduction_axis_reservation_for=frozenset(
-                disable_reduction_axis_reservation_for
-            ),
-        )
+        return plans[0].merged_with(plans[1:])
 
     def _ordered_strategies_for_branch(
         self, branch: list[TileStrategy]
@@ -677,7 +556,7 @@ class TileStrategyDispatch:
         self, branches: list[list[TileStrategy]]
     ) -> list[list[TileStrategy]]:
         """Let sibling CuTe tile passes reuse their nesting-level axes."""
-        paths = self._cute_tile_loop_paths
+        paths = self._tile_loop_paths
         if not paths:
             return branches
         result: list[list[TileStrategy]] = []
@@ -711,7 +590,7 @@ class TileStrategyDispatch:
         """
         from .device_ir import DeviceIR
 
-        if CompileEnvironment.current().backend.name != "cute":
+        if not CompileEnvironment.current().backend.shares_sibling_thread_axes():
             return None
         red_paths = self.reduction_branch_paths()
         if len(red_paths) < 2:
@@ -795,11 +674,13 @@ class TileStrategyDispatch:
         sibling_axis = self.collective_sibling_thread_axis(target)
         if sibling_axis is not None:
             return sibling_axis
-        partner = getattr(target, "_cute_axis_partner", None)
-        if partner is not None:
+        if (
+            isinstance(target, PersistentReductionStrategy)
+            and target._cute_axis_partner is not None
+        ):
             # A sibling full-slice block indexing another's axis
-            # (``PersistentReductionStrategy._cute_sibling_axis_partner``).
-            return self.thread_axis_for_strategy(partner)
+            # (``CutePersistentReductionEmitter.plan_axis_partner``).
+            return self.thread_axis_for_strategy(target._cute_axis_partner)
         reserved_axes = self.reserved_reduction_axes()
         reduction_axis_first = (
             CompileEnvironment.current().backend.reduction_axis_first()
@@ -1020,7 +901,7 @@ class TileStrategyDispatch:
         axis fits its extent. Equal-width roots retain mask elision.
         """
         if (
-            CompileEnvironment.current().backend_name != "cute"
+            not CompileEnvironment.current().backend.roots_may_reserve_distinct_thread_axes()
             or len(HostFunction.current().device_ir.grid_block_ids) <= 1
         ):
             return False

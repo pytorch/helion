@@ -15,9 +15,9 @@ from ..ast_extension import ExtendedAST
 from ..ast_extension import LoopType
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
-from ..output_header import get_needed_import_lines
 from ..type_info import CallableType
 from .materialized_fission_codegen import _empty_graph
+from .materialized_fission_codegen import prepend_missing_imports
 from .memory_ops import tensor_has_specialized_tma_alignment
 from .split_k_cluster import CLUSTER_K_SCHEDULE
 from .split_k_cluster import checked_cluster_proof
@@ -317,14 +317,5 @@ def generate_split_k_cluster(
         ],
         type_ignores=[],
     )
-    imports = {
-        ast.unparse(statement)
-        for statement in result.body
-        if isinstance(statement, (ast.Import, ast.ImportFrom))
-    }
-    result.body[:0] = [
-        statement_from_string(line)
-        for line in get_needed_import_lines(result)
-        if line not in imports
-    ]
+    prepend_missing_imports(result)
     return result

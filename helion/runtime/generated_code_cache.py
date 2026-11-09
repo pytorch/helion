@@ -861,7 +861,7 @@ class GeneratedCodeState:
         if schema["compiler_seed_facts"] or any(guard[0] != "fact" for guard in guards):
             return None
         from .cached_kernel import _guard_fact
-        from .kernel import _PreparedMetadataSpecializationExtractor
+        from .kernel import PreparedMetadataSpecializationExtractor
 
         try:
             param_names = tuple(bound.kernel.signature.parameters)
@@ -880,7 +880,7 @@ class GeneratedCodeState:
         if artifact is None:
             return None
         selected, normalized, source_key, source = artifact
-        extractors = [_PreparedMetadataSpecializationExtractor(fact) for fact in facts]
+        extractors = [PreparedMetadataSpecializationExtractor(fact) for fact in facts]
         expected_key = _generated_code_cache_key(
             bound,
             config,

@@ -4,6 +4,18 @@ Run ``--help`` for the CLI. Optional baseline packages are used when installed;
 their failures remain in the result. Each implementation gets a fresh process
 and private compiler caches. FULL searches have no time or generation budget.
 This is a comparison tool, not the historical hillclimb qualification protocol.
+
+Record statuses: ``ok`` (measured and correct; a baseline that synchronizes
+with the host carries ``graph_capturable: false`` with its eager ``event_ms``
+only and ``graph_ms: null``), ``error`` (a failed computation, correctness
+check or measurement; the traceback is in ``error``), ``reference_error`` (the
+case's reference produced NaN values, so no implementation could be
+checked), ``baseline_unavailable`` (a baseline that cannot run here: missing
+optional package, no library kernel for these inputs, no fullgraph
+``torch.compile`` of a data-dependent reference, or a baseline worker that died
+with ``returncode``), ``process_error`` (a Helion or inventory worker that
+died) and ``skipped`` (an inventory for a shape index the module does not
+define).
 """
 
 from __future__ import annotations
@@ -41,6 +53,13 @@ SCHEMA = "example-backend-comparison-v1"
 # while the L2-flushing cold bench swings 6-12% with the clock state). The
 # single-call replay time and the autotuner's cold bench stay as diagnostics.
 GRAPH_CALLS = 16
+# The providers a run compares; a worker additionally accepts "inventory".
+PROVIDERS = ("cute", "triton", "baselines")
+
+
+def _case_impls(case: dict[str, Any], provider: str) -> list[str]:
+    """The implementation names a case offers under ``provider``."""
+    return case["baselines"] if provider == "baselines" else case["kernels"]
 
 
 def write_json(path: Path, value: object) -> None:
@@ -52,6 +71,7 @@ def worker(args: argparse.Namespace) -> None:
     from benchmarks.cute.example_cases import collect
     from benchmarks.cute.example_cases import shape_count
     import torch
+    from torch.utils._pytree import tree_leaves
     from torch.utils._pytree import tree_map_only
 
     from helion.autotuner.metrics import register_post_autotune_hook
@@ -86,6 +106,7 @@ def worker(args: argparse.Namespace) -> None:
             )
             return
         case = next(case for case in cases if case.name == args.case)
+        case = case.for_impl(args.provider, args.impl)
         torch.set_grad_enabled(case.mode == "backward")
         result.update(
             input_seed=20260911 + args.shape,
@@ -98,8 +119,20 @@ def worker(args: argparse.Namespace) -> None:
             check=case.check,
             device=torch.cuda.get_device_name(0),
         )
-        expected = baseline.make_callable(next(iter(case.baselines.values())), case)()
+        reference_name, reference_fn = next(iter(case.baselines.items()))
+        expected = baseline.make_callable(reference_fn, case)()
         expected = tree_map_only(torch.Tensor, lambda t: t.detach().clone(), expected)
+        if any(
+            isinstance(leaf, torch.Tensor) and torch.isnan(leaf).any()
+            for leaf in tree_leaves(expected)
+        ):
+            # Every provider of this cell would otherwise fail its accuracy
+            # check against a NaN; name the reference instead.
+            result["status"] = "reference_error"
+            raise RuntimeError(
+                f"The reference baseline {reference_name!r} produced NaN values; "
+                "no provider can be checked against it"
+            )
         output_dtype = case.output_dtypes.get(f"{args.provider}:{args.impl}")
         result.update(
             reference_output=baseline.metadata(expected),
@@ -110,16 +143,21 @@ def worker(args: argparse.Namespace) -> None:
         )
         autotunes: list[dict[str, Any]] = []
         register_post_autotune_hook(lambda metrics: autotunes.append(metrics.to_dict()))
-        candidate = (
-            baseline.baseline_factories(case)[args.impl]()
-            if args.provider == "baselines"
-            else case.kernels[args.impl]
-        )
-        if isinstance(candidate, baseline.PreparedCandidate):
-            result["baseline_config"] = candidate.details
-            candidate = candidate.fn
-        call = baseline.make_callable(candidate, case)
-        actual = call()
+        try:
+            candidate = (
+                baseline.baseline_factories(case)[args.impl]()
+                if args.provider == "baselines"
+                else case.kernels[args.impl]
+            )
+            if isinstance(candidate, baseline.PreparedCandidate):
+                result["baseline_config"] = candidate.details
+                candidate = candidate.fn
+            call = baseline.make_callable(candidate, case)
+            actual = call()
+        except Exception as error:
+            if args.provider == "baselines" and baseline.baseline_unavailable(error):
+                result["status"] = "baseline_unavailable"
+            raise
         result["output"] = baseline.metadata(actual)
         baseline.assert_correct(actual, expected, case, output_dtype=output_dtype)
         result["eager_correctness"] = "pass"
@@ -128,17 +166,22 @@ def worker(args: argparse.Namespace) -> None:
                 call, args.repetitions, expected, case, output_dtype=output_dtype
             )
         )
-        result.update(
-            baseline.measure_batched(
-                call,
-                args.repetitions,
-                GRAPH_CALLS,
-                expected,
-                case,
-                output_dtype=output_dtype,
+        # A baseline that synchronizes with the host cannot be replayed from
+        # a CUDA graph: its record keeps the eager ``event_ms`` only and is
+        # not compared with graph timings. Helion kernels must capture.
+        eager_only = args.provider == "baselines" and not result["graph_capturable"]
+        if not eager_only:
+            result.update(
+                baseline.measure_batched(
+                    call,
+                    args.repetitions,
+                    GRAPH_CALLS,
+                    expected,
+                    case,
+                    output_dtype=output_dtype,
+                )
             )
-        )
-        result.update(baseline.measure_cold(call, args.repetitions))
+            result.update(baseline.measure_cold(call, args.repetitions))
         actual = call()
         result["post_measurement_output"] = baseline.metadata(actual)
         baseline.assert_correct(actual, expected, case, output_dtype=output_dtype)
@@ -149,7 +192,7 @@ def worker(args: argparse.Namespace) -> None:
             kernel["backend"] != args.provider for kernel in result["bound_kernels"]
         ):
             raise RuntimeError("An example used a different Helion backend")
-        if result.get("graph_correctness") != "pass":
+        if not eager_only and result.get("graph_correctness") != "pass":
             raise RuntimeError("CUDA graph measurement or correctness failed")
         result["status"] = "ok"
     except Exception:
@@ -305,6 +348,10 @@ def run(args: argparse.Namespace) -> None:
     if not shapes or len(set(shapes)) != len(shapes) or min(shapes) < 0:
         raise ValueError("Shapes must be distinct non-negative workload indices")
     cases = set(args.cases.split(",")) if args.cases else set()
+    providers = args.providers.split(",") if args.providers else list(PROVIDERS)
+    if set(providers) - set(PROVIDERS) or len(set(providers)) != len(providers):
+        raise ValueError(f"--providers must name distinct providers in {PROVIDERS}")
+    impls = set(args.impls.split(",")) if args.impls else set()
     seed = args.seed if args.seed is not None else secrets.randbits(63)
     args.output.mkdir(parents=True, exist_ok=False)
     raw = args.output / "raw"
@@ -328,9 +375,13 @@ def run(args: argparse.Namespace) -> None:
         ),
         "modules": modules,
         "cases": sorted(cases) or None,
+        "providers": providers,
+        "impls": sorted(impls) or None,
         "shapes": shapes,
         "gpu": args.gpu,
-        "gpu_uuid": check_gpu_idle(args.gpu),
+        # The previous holder of the GPU may have just exited: wait out its
+        # departing CUDA context as ``execute`` does before each worker.
+        "gpu_uuid": check_gpu_idle(args.gpu, grace_seconds=30.0),
         "effort": "full",
         "budget_seconds": None,
         "repetitions": args.repetitions,
@@ -415,7 +466,20 @@ def run(args: argparse.Namespace) -> None:
                 }
             )
             if process.returncode:
-                result.update(status="process_error", returncode=process.returncode)
+                # The worker's own record wins when it wrote one before dying
+                # (a correctness ``error`` is a finding, not an unavailable
+                # baseline); only a worker that left no record is classified
+                # here.  A baseline worker that dies without a record (a
+                # host-side reference backward that segfaults, an optional
+                # package's compile pool that aborts) is a baseline this
+                # machine cannot provide.
+                if result["status"] == "process_error":
+                    result["status"] = (
+                        "baseline_unavailable"
+                        if provider == "baselines"
+                        else "process_error"
+                    )
+                result["returncode"] = process.returncode
                 write_json(output, result)
         record["jobs"].append(
             {
@@ -434,22 +498,45 @@ def run(args: argparse.Namespace) -> None:
         return result
 
     try:
-        for module in modules:
-            for shape in shapes:
-                inventory = execute(module, shape, "inventory")
-                if inventory["status"] != "ok":
+        inventories = {
+            (module, shape): execute(module, shape, "inventory")
+            for module in modules
+            for shape in shapes
+        }
+        # The implementation names exist only in the inventories: a name no
+        # requested case offers under the requested providers (a baseline
+        # under `--providers cute`) is a misspelling, not an empty run.  With
+        # every inventory failed there is nothing to check against; the run
+        # completes with the failures recorded.
+        offered = {
+            name
+            for inventory in inventories.values()
+            if inventory["status"] == "ok"
+            for case in inventory["cases"]
+            if not cases or case["name"] in cases
+            for provider in providers
+            for name in _case_impls(case, provider)
+        }
+        if offered and impls - offered:
+            raise ValueError(
+                "--impls names no implementation of the requested cases and "
+                f"providers: {sorted(impls - offered)}"
+            )
+        for (module, shape), inventory in inventories.items():
+            if inventory["status"] != "ok":
+                continue
+            for case in inventory["cases"]:
+                if cases and case["name"] not in cases:
                     continue
-                for case in inventory["cases"]:
-                    if cases and case["name"] not in cases:
-                        continue
-                    jobs = [
-                        (provider, name)
-                        for provider in ("cute", "triton")
-                        for name in case["kernels"]
-                    ] + [("baselines", name) for name in case["baselines"]]
-                    random.Random(seed + shape).shuffle(jobs)
-                    for provider, name in jobs:
-                        execute(module, shape, provider, case["name"], name)
+                jobs = [
+                    (provider, name)
+                    for provider in providers
+                    for name in _case_impls(case, provider)
+                    if not impls or name in impls
+                ]
+                random.Random(seed + shape).shuffle(jobs)
+                for provider, name in jobs:
+                    execute(module, shape, provider, case["name"], name)
         record["status"] = "complete"
     finally:
         write_json(args.output / "results.json", record)
@@ -477,6 +564,16 @@ def main() -> None:
         default="",
         help="Comma-separated case names (e.g. 01_backward); default: all",
     )
+    runner.add_argument(
+        "--providers",
+        default="",
+        help=f"Comma-separated providers among {', '.join(PROVIDERS)}; default: all",
+    )
+    runner.add_argument(
+        "--impls",
+        default="",
+        help="Comma-separated implementation names (e.g. helion,aten); default: all",
+    )
     runner.add_argument("--output", required=True, type=Path)
     runner.add_argument("--repetitions", type=int, default=5)
     child = commands.add_parser("worker", help=argparse.SUPPRESS)
@@ -486,7 +583,7 @@ def main() -> None:
     child.add_argument(
         "--provider",
         required=True,
-        choices=["inventory", "baselines", "cute", "triton"],
+        choices=["inventory", *PROVIDERS],
     )
     child.add_argument("--case", default="")
     child.add_argument("--impl", default="")

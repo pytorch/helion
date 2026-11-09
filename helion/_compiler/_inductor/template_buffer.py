@@ -49,7 +49,9 @@ from .._dynamo.variables import _HOST_SEMANTIC_FINGERPRINT
 from .._dynamo.variables import _HOST_SEMANTIC_INPUT_NORMALIZATION
 from .._dynamo.variables import _REQUIRES_ISOLATED_LOWERING
 from .._dynamo.variables import _get_flat_output
+from ..ast_extension import ExtendedAST
 from ..ast_extension import unparse
+from ..ast_read_writes import ReadWrites
 from ..compile_environment import HELION_STATIC_DIMS_ATTR
 from ..generate_ast import generate_ast
 from ..indexing_strategy import SubscriptIndexing
@@ -60,6 +62,7 @@ from helion.runtime.config import Config
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Sequence
     from contextlib import AbstractContextManager
     from typing import Any
@@ -344,7 +347,10 @@ class HelionTemplateBuffer(TemplateBuffer):
         )
         root, source = self._build_and_unparse(cfg, rename_with_placeholders=True)
 
-        call_order, constant_repr = self._call_order_and_constant_repr()
+        host_def = _function_def(root, str(Placeholder.KERNEL_NAME))
+        call_order, constant_repr = self._call_order_and_constant_repr(
+            ReadWrites.from_list(host_def.body).reads
+        )
         call_preamble, call_args = self._build_call_args(
             call_order, constant_repr, self._prologue_source_buffers, self._extra_params
         )
@@ -615,13 +621,16 @@ class HelionTemplateBuffer(TemplateBuffer):
     # Metadata helpers                                                   #
     # ------------------------------------------------------------------ #
 
-    def _call_order_and_constant_repr(self) -> tuple[list[str], dict[str, str]]:
+    def _call_order_and_constant_repr(
+        self, host_reads: Collection[str]
+    ) -> tuple[list[str], dict[str, str]]:
         """Compute the kernel call order and pre-repr'd non-tensor args.
 
         ``call_order`` lists every parameter name in signature order.
         ``constant_repr`` maps non-tensor param names to their ``repr()``-ready
         strings (scalars, defaults, and rebuilt container args) so the inherited
         ``call_kernel`` can emit them without calling back into this class.
+        ``host_reads`` are the names the generated host function's body reads.
         """
         # Both tensor inputs AND constant args must be combined before
         # _rebuild_container_args so it can pop 'param.0', 'param.1' etc.
@@ -631,8 +640,26 @@ class HelionTemplateBuffer(TemplateBuffer):
             for n, inp in named_inputs.items()
         }
         for n, v in self._constant_args_dict.items():
-            if n not in all_args:
-                all_args[n] = v if n == "__container_specs" else _CodeExpr(repr(v))
+            if n in all_args:
+                continue
+            if n == "__container_specs":
+                all_args[n] = v
+            elif _is_traced_callable(v):
+                # The kernel traces a callable argument (a function, an
+                # fx.GraphModule) into its device code, so the host function
+                # does not read it and the call passes None: a callable's repr
+                # is not Python source.
+                param = n.partition(".")[0]
+                if param in host_reads:
+                    raise RuntimeError(
+                        f"Helion kernel {self._helion_kernel.name!r} reads its "
+                        f"callable argument {param!r} in host code; torch.compile "
+                        "can only lower a callable argument used inside device "
+                        "loops (hl.tile / hl.grid)"
+                    )
+                all_args[n] = _CodeExpr("None")
+            else:
+                all_args[n] = _CodeExpr(repr(v))
         _rebuild_container_args(all_args)
 
         tensor_flat_params = frozenset(named_inputs.keys())
@@ -712,6 +739,7 @@ class HelionTemplateBuffer(TemplateBuffer):
                 else None,
                 extra_params=extra_params,
             )
+        _strip_host_annotations(root, self._helion_kernel.name)
         if rename_with_placeholders:
             self._rename_with_placeholders(root)
         source = unparse(
@@ -940,6 +968,42 @@ class HelionTemplateBuffer(TemplateBuffer):
 
         # Return variable reference (hook will assign fused value to this name).
         return ast.Name(id=result_name, ctx=ast.Load())
+
+
+def _function_def(root: ast.Module, name: str) -> ast.FunctionDef:
+    return next(
+        node
+        for node in root.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+
+
+def _strip_host_annotations(root: ast.Module, host_name: str) -> None:
+    """Drop the parameter annotations of the generated host function.
+
+    Inductor's output module imports only the libraries the generated code
+    reads, so an annotation naming anything else (``Callable``, a ``Tensor``
+    imported ``from torch``, a user type) raises ``NameError`` when the module
+    loads; annotations carry nothing at runtime.  The ``ast.arg`` nodes are
+    shared with the bound kernel's host function, so they are copied.
+    """
+    args = _function_def(root, host_name).args
+
+    def strip(arg: ast.arg | None) -> ast.arg | None:
+        if arg is None or arg.annotation is None:
+            return arg
+        return cast("ast.arg", cast("ExtendedAST", arg).copy(annotation=None))
+
+    args.posonlyargs = [cast("ast.arg", strip(a)) for a in args.posonlyargs]
+    args.args = [cast("ast.arg", strip(a)) for a in args.args]
+    args.kwonlyargs = [cast("ast.arg", strip(a)) for a in args.kwonlyargs]
+    args.vararg = strip(args.vararg)
+    args.kwarg = strip(args.kwarg)
+
+
+def _is_traced_callable(value: object) -> bool:
+    """Whether a constant kernel argument is a callable the kernel traces."""
+    return callable(value) and not isinstance(value, type)
 
 
 def _flatten_return_ast(

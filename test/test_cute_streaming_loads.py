@@ -21,10 +21,13 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.triton.backend import TritonBackend
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion.autotuner.config_spec import get_valid_eviction_policies
 import helion.language as hl
 
 cutlass = pytest.importorskip("cutlass")
@@ -74,10 +77,8 @@ def _logsumexp_vec_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["cute"])
 class TestCuteStreamingLoads(TestCase):
     def test_streaming_in_choices(self) -> None:
-        from helion.autotuner.config_spec import get_valid_eviction_policies
-
-        self.assertIn("streaming", get_valid_eviction_policies("cute"))
-        self.assertNotIn("streaming", get_valid_eviction_policies("triton"))
+        self.assertIn("streaming", get_valid_eviction_policies(CuteBackend()))
+        self.assertNotIn("streaming", get_valid_eviction_policies(TritonBackend()))
 
     def test_scalar_streaming_load_keeps_fusion(self) -> None:
         x = torch.randn(64, 2048, device=DEVICE, dtype=torch.float32)

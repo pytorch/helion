@@ -21,7 +21,6 @@ from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
-
 PACKET = "ir.VectorType.get([8], cutlass.Uint16.mlir_type)"
 STORE = "_cute_store_u16_vec("
 

@@ -77,6 +77,7 @@ class Config(Mapping[str, object]):
         cute_vector_packet_unroll: bool | None = None,
         cute_vloop_sink: bool | None = None,
         cute_lane_unroll: int | None = None,
+        cute_wide_packet_hints: bool | None = None,
         cute_pdl: bool | None = None,
         cute_pdl_release: CutePdlReleaseLiteral | None = None,
         cute_pdl_spread: bool | None = None,
@@ -166,6 +167,12 @@ class Config(Mapping[str, object]):
             cute_lane_unroll: Unroll factor (1, 2, 4, 8, 16) for the row lane
                 loop of a sunk vector nest; every copy's vector loads issue
                 before any copy's accumulates. Only applies with cute_vloop_sink.
+            cute_wide_packet_hints: Carry the ``l2_last`` / ``l1_l2_first`` /
+                ``l1_l2_last`` load eviction policies onto 32-byte CuTe packets
+                (``cute_vector_widths`` 8 for fp32, 16 for bf16/fp16) through
+                one 256-bit cache-hinted load; SM100+ with CUDA 13 or newer,
+                elsewhere inert. Off by default: a hinted 32-byte packet then
+                loads without the hint, as it always has.
             cute_pdl: Launch the kernel as a programmatic dependent of the
                 previous kernel in the stream: its launch and prologue overlap
                 that kernel's tail and it waits (``griddepcontrol.wait``) ahead
@@ -317,6 +324,7 @@ class Config(Mapping[str, object]):
             "cute_vector_packet_unroll": cute_vector_packet_unroll,
             "cute_vloop_sink": cute_vloop_sink,
             "cute_lane_unroll": cute_lane_unroll,
+            "cute_wide_packet_hints": cute_wide_packet_hints,
             "cute_pdl": cute_pdl,
             "cute_pdl_release": cute_pdl_release,
             "cute_pdl_spread": cute_pdl_spread,
@@ -599,6 +607,10 @@ class Config(Mapping[str, object]):
             "CuteStorePolicyLiteral",
             self.config.get("cute_store_policy", "default"),
         )
+
+    @property
+    def cute_wide_packet_hints(self) -> bool:
+        return self.config.get("cute_wide_packet_hints") is True
 
     @property
     def cute_exact_div_form(self) -> CuteExactDivFormLiteral:

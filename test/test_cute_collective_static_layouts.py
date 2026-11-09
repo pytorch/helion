@@ -11,9 +11,11 @@ import torch
 from test.cute_population_contracts import checked_initial_population
 
 import helion
+from helion._compiler.cute.host_metadata import has_complete_static_collectives
+from helion._compiler.cute.state import CuteCodegenState
+from helion._compiler.cute.state import cute_codegen_state
 from helion._compiler.generate_ast import GenerateAST
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.pattern_search import InitialPopulationStrategy
@@ -65,7 +67,6 @@ def _config():
 
 
 @pytest.mark.parametrize("shape", ((32, 4096, 64), (37, 4123, 69)))
-@skipUnlessBackends(["cute"])
 def test_only_layout_guard_changes_on_complete_warp_lowering(shape):
     bound = _bound(*shape)
     config = _config()
@@ -86,28 +87,27 @@ def test_only_layout_guard_changes_on_complete_warp_lowering(shape):
 
 def test_incomplete_or_mixed_lowerings_keep_runtime_layouts():
     codegen = GenerateAST.__new__(GenerateAST)
-    codegen._cute_uses_matmul = False
-    codegen._cute_matmul_declaration_count = 0
-    codegen.cute_wrapper_plans = []
+    codegen.backend_state = CuteCodegenState()
     state = SimpleNamespace(
-        collective_mma_static_layouts=True, collective_mma_sites=[object()]
+        lanes=SimpleNamespace(
+            collective_mma_static_layouts=True, collective_mma_sites=[object()]
+        )
     )
     codegen.device_function = SimpleNamespace(config={KEY: True}, cute_state=state)
-    codegen.cute_uses_matmul = True
-    assert codegen._cute_has_complete_static_collectives()
+    cute_codegen_state(codegen).declare_matmul()
+    assert has_complete_static_collectives(codegen)
     # A second matmul declaration must not inherit the first site's proof.
-    codegen.cute_uses_matmul = True
-    assert not codegen._cute_has_complete_static_collectives()
-    state.collective_mma_sites.append(object())
-    assert codegen._cute_has_complete_static_collectives()
-    state.collective_mma_static_layouts = False
-    assert not codegen._cute_has_complete_static_collectives()
-    state.collective_mma_static_layouts = True
-    codegen.cute_wrapper_plans = [{"kind": "unrelated"}]
-    assert not codegen._cute_has_complete_static_collectives()
+    cute_codegen_state(codegen).declare_matmul()
+    assert not has_complete_static_collectives(codegen)
+    state.lanes.collective_mma_sites.append(object())
+    assert has_complete_static_collectives(codegen)
+    state.lanes.collective_mma_static_layouts = False
+    assert not has_complete_static_collectives(codegen)
+    state.lanes.collective_mma_static_layouts = True
+    cute_codegen_state(codegen).wrapper_plans = [{"kind": "unrelated"}]
+    assert not has_complete_static_collectives(codegen)
 
 
-@skipUnlessBackends(["cute"])
 def test_option_validation_and_full_search_seeds():
     bound = _bound()
     config = _config()
@@ -140,7 +140,6 @@ def test_option_validation_and_full_search_seeds():
                 assert generation.unflatten(flat) == seed
 
 
-@skipUnlessBackends(["cute"])
 def test_full_search_retains_old_population_and_transfers_static_witness():
     bound = _bound()
     args = (
@@ -198,7 +197,6 @@ def test_full_search_retains_old_population_and_transfers_static_witness():
 
 @pytest.mark.parametrize("disabled", (False, True))
 @pytest.mark.parametrize("requested", (False, True))
-@skipUnlessBackends(["cute"])
 def test_explicit_override_and_disabled_seed_use(disabled, requested):
     bound = _bound(disable_autotuner_heuristics=disabled)
     args = (
@@ -248,12 +246,11 @@ def test_explicit_override_and_disabled_seed_use(disabled, requested):
             assert admitted is requested
 
 
-@skipUnlessBackends(["cute"])
 def test_nonwarp_carriers_do_not_declare_static_coverage():
     nonwarp = _config()
     nonwarp.config["cute_collective_compute"] = "tcgen05"
     with patch(
-        "helion._compiler.autotuner_heuristics.CuteCollectiveMatmulHeuristic.get_seed_configs",
+        "helion._compiler.cute.autotune.heuristics.CuteCollectiveMatmulHeuristic.get_seed_configs",
         return_value=[nonwarp],
     ):
         bound = _bound(disable_autotuner_heuristics=True)

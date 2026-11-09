@@ -8,14 +8,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from test._cute_grouped_gemm_split_sizes import _device_offsets_kernel
+from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from test.cute_population_contracts import _target
 from test.test_cute_grouped_ab_k import _unsupported_k_loop
 from test.test_cute_grouped_d_shift import _args
 from test.test_cute_grouped_d_shift import _config as _d_shift_config
 from test.test_cute_grouped_d_shift import _plans
 from test.test_cute_grouped_d_shift import _unsafe_output
-from test.test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
-from test.test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 
 from helion._compiler.cute.grouped_balanced_workers import GroupedBalancedWorkersPlan
 from helion._compiler.cute.grouped_balanced_workers import balanced_workers_index_domain

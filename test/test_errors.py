@@ -51,7 +51,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                     autotune_precompile=False,
                     autotune_log_level=0,
                 )
-                from helion._compiler.backend import TritonBackend
+                from helion._compiler.triton.backend import TritonBackend
                 from helion.autotuner.config_spec import ConfigSpec
 
                 self.config_spec = ConfigSpec(backend=TritonBackend())
@@ -956,7 +956,7 @@ def _make_fake_kernel():
                 autotune_precompile=False,
                 autotune_log_level=0,
             )
-            from helion._compiler.backend import TritonBackend
+            from helion._compiler.triton.backend import TritonBackend
             from helion.autotuner.config_spec import ConfigSpec
 
             self.config_spec = ConfigSpec(backend=TritonBackend())

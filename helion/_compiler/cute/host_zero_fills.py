@@ -62,6 +62,8 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from typing import Protocol
+from typing import TypeVar
 from typing import cast
 
 import sympy
@@ -81,10 +83,12 @@ from ..type_info import LiteralType
 from ..type_info import TensorType
 from ..variable_origin import BlockSizeOrigin
 from ..variable_origin import TileIdOrigin
-from .host_paired_sum import _constant_condition
-from .host_paired_sum import _folded_body
+from .host_sum_site import _constant_condition
+from .host_sum_site import fold_constexpr_branches
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ...runtime.config import Config
@@ -106,6 +110,9 @@ class ZeroFill:
     statement: str
     target: str
     factory: str
+
+
+_F = TypeVar("_F", bound="_ProvenFill")
 
 
 def _zero_factory(statement: ast.AST) -> tuple[str, str, ast.Call] | None:
@@ -589,55 +596,128 @@ def _is_load(user: Node, tensor: Node) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class HostFillElision:
+    """The device-side facts a host-fill elision proof reads (analysis).
+
+    Shared by the two provers -- the zero-fill one (drop the factory's
+    memset) and the remainder-fill one (move the constant fill of the
+    unwritten rows onto the device): which root graphs count as coverage
+    of ``[0, extent)`` and with which blocks (``roots``), the control-flow
+    parents of every graph, the position of the last device loop in the
+    host body, and the ``_host_tensor`` nodes of every host tensor the
+    device reads or writes.  ``analyze`` is None for a kernel without root
+    graphs or device loops, where neither proof applies.
+    """
+
+    host: HostFunction
+    env: CompileEnvironment
+    config: Config
+    graphs: list[GraphInfo]
+    roots: dict[torch.fx.Graph, set[int]]
+    parents: dict[int, tuple[Node, int]]
+    last_device_loop: int
+    host_tensors: dict[torch.Tensor, list[Node]]
+    # The host body read through the typed constexpr branches the
+    # specialization fixes (``fold_constexpr_branches``): only the selected
+    # branch exists for this variant, so a fill under it is a top-level
+    # binding.  ``last_device_loop`` indexes this view.
+    body: list[ast.AST]
+
+    @classmethod
+    def analyze(
+        cls, host: HostFunction, env: CompileEnvironment, config: Config
+    ) -> HostFillElision | None:
+        device_ir = host.device_ir
+        graphs = device_ir.graphs
+        # A root ``hl.tile(begin, end)`` with a nonzero begin (or a step)
+        # indexes ``[begin, end)`` and numbers its tiles from ``begin //
+        # block_size``; its blocks never count as coverage of ``[0, extent)``.
+        skewed = device_ir.noncanonical_task_origin_block_ids
+        roots = {
+            graphs[root_id].graph: set(block_ids) - skewed
+            for root_id, block_ids in zip(
+                device_ir.root_ids, device_ir.grid_block_ids, strict=True
+            )
+            if isinstance(graphs[root_id], RootGraphInfo)
+        }
+        if not roots:
+            return None
+        conditions = {
+            node._location: (ast.dump(node.test), condition)
+            for node in ast.walk(ast.Module(body=host.body, type_ignores=[]))
+            if isinstance(node, ast.If)
+            and isinstance(node, ExtendedAST)
+            and (condition := _constant_condition(node.test, host)) is not None
+        }
+        body = fold_constexpr_branches(host.body, conditions)
+        device_loops = [
+            index
+            for index, statement in enumerate(body)
+            if isinstance(statement, ExtendedAST)
+            and statement._loop_type == LoopType.GRID
+        ]
+        if not device_loops:
+            return None
+        host_tensors: dict[torch.Tensor, list[Node]] = {}
+        for info in graphs:
+            for node in info.graph.nodes:
+                if node.target is _tracing_ops._host_tensor:
+                    value = node.meta.get("val")
+                    if isinstance(value, torch.Tensor):
+                        host_tensors.setdefault(value, []).append(node)
+        return cls(
+            host,
+            env,
+            config,
+            graphs,
+            roots,
+            control_flow_parent_entries(graphs),
+            device_loops[-1],
+            host_tensors,
+            body,
+        )
+
+    def top_graph(self, node: Node) -> GraphInfo:
+        return _top_graph(node, self.graphs, self.parents)
+
+    def store_coverage(
+        self, node: Node, tensor: Node, fake: torch.Tensor
+    ) -> tuple[int | _Range, ...] | None:
+        return _store_coverage(
+            node,
+            tensor,
+            fake,
+            self.env,
+            self.graphs,
+            self.parents,
+            self.roots,
+            self.host,
+            self.config,
+        )
+
+    def host_statements_after_device_loops(self) -> range:
+        """Positions (in ``body``) of the host statements after the last
+        device loop."""
+        return range(self.last_device_loop + 1, len(self.body))
+
+
 def prove_host_zero_fills(
     host: HostFunction, env: CompileEnvironment, config: Config
 ) -> list[ZeroFill]:
-    device_ir = host.device_ir
-    graphs = device_ir.graphs
-    # A root ``hl.tile(begin, end)`` with a nonzero begin (or a step) indexes
-    # ``[begin, end)`` and numbers its tiles from ``begin // block_size``; its
-    # blocks never count as coverage of ``[0, extent)``.
-    skewed = device_ir.noncanonical_task_origin_block_ids
-    roots = {
-        graphs[root_id].graph: set(block_ids) - skewed
-        for root_id, block_ids in zip(
-            device_ir.root_ids, device_ir.grid_block_ids, strict=True
-        )
-        if isinstance(graphs[root_id], RootGraphInfo)
-    }
-    if not roots:
+    analysis = HostFillElision.analyze(host, env, config)
+    if analysis is None:
         return []
+    graphs = analysis.graphs
     # Keyed by graph object: a config that rolls a reduction replaces a root's
     # graph payload and appends a second info for it without the phase.
     root_phases: dict[torch.fx.Graph, int] = {}
-    for root_id in device_ir.root_ids:
+    for root_id in host.device_ir.root_ids:
         root = graphs[root_id]
         if isinstance(root, RootGraphInfo):
             root_phases[root.graph] = root.phase_index
-    conditions = {
-        node._location: (ast.dump(node.test), condition)
-        for node in ast.walk(ast.Module(body=host.body, type_ignores=[]))
-        if isinstance(node, ast.If)
-        and isinstance(node, ExtendedAST)
-        and (condition := _constant_condition(node.test, host)) is not None
-    }
-    body = _folded_body(host.body, conditions)
-    device_loops = [
-        index
-        for index, statement in enumerate(body)
-        if isinstance(statement, ExtendedAST) and statement._loop_type == LoopType.GRID
-    ]
-    if not device_loops:
-        return []
-    last_device_loop = device_loops[-1]
-    host_tensors: dict[torch.Tensor, list[Node]] = {}
-    for info in graphs:
-        for node in info.graph.nodes:
-            if node.target is _tracing_ops._host_tensor:
-                value = node.meta.get("val")
-                if isinstance(value, torch.Tensor):
-                    host_tensors.setdefault(value, []).append(node)
-    parents = control_flow_parent_entries(graphs)
+    last_device_loop = analysis.last_device_loop
+    body = analysis.body
     result: list[ZeroFill] = []
     for index, statement in enumerate(body):
         if index >= last_device_loop:
@@ -661,7 +741,7 @@ def prove_host_zero_fills(
         target_type = statement.value._type_info
         assert isinstance(target_type, TensorType)
         fake = target_type.fake_value
-        nodes = host_tensors.get(fake, [])
+        nodes = analysis.host_tensors.get(fake, [])
         if not nodes:
             continue
         coverages: list[tuple[int | _Range, ...] | None] = []
@@ -670,7 +750,7 @@ def prove_host_zero_fills(
         ordered = True
         for tensor in nodes:
             for user in tensor.users:
-                top = _top_graph(user, graphs, parents)
+                top = analysis.top_graph(user)
                 phase = root_phases.get(top.graph)
                 if phase is None:
                     if isinstance(top, ReductionLoopGraphInfo):
@@ -683,11 +763,7 @@ def prove_host_zero_fills(
                     continue
                 else:
                     store_phases.append(phase)
-                coverages.append(
-                    _store_coverage(
-                        user, tensor, fake, env, graphs, parents, roots, host, config
-                    )
-                )
+                coverages.append(analysis.store_coverage(user, tensor, fake))
         if not ordered or not coverages or None in coverages:
             continue
         if load_phases and (not store_phases or max(store_phases) >= min(load_phases)):
@@ -707,7 +783,7 @@ def prove_host_zero_fills(
             fill = next(
                 (
                     position
-                    for position in range(last_device_loop + 1, len(body))
+                    for position in analysis.host_statements_after_device_loops()
                     if _remainder_fill(body[position], name, remainders)
                 ),
                 None,
@@ -737,12 +813,27 @@ def lower_host_zero_fills(
     return _rewrite_fills(body, proven)
 
 
-def _rewrite_fills(
-    body: Sequence[ast.AST], proven: dict[SourceLocation, ZeroFill]
+class _ProvenFill(Protocol):
+    @property
+    def statement(self) -> str: ...
+
+
+def walk_proven_fills(
+    body: Sequence[ast.AST],
+    proven: Mapping[SourceLocation, _F],
+    replace: Callable[[ast.AST, _F], Sequence[ast.AST]],
 ) -> list[ast.AST]:
-    """Replace the proven fills in ``body`` and, in place, in the branches of
-    its ``if`` statements (a proven fill under a constexpr branch is matched by
-    its own location and text; the other branch's statements never match)."""
+    """``body`` with every proven fill replaced by ``replace(statement, fill)``.
+
+    A statement is a proven fill when ``proven`` has its ``_location`` and the
+    fill's recorded text is the statement's unparsed text; the walk descends in
+    place into both branches of every ``if`` (a fill under a constexpr branch
+    is matched by its own location and text, the other branch never matches),
+    padding a branch the replacement emptied with ``pass``.  The remainder
+    fills (``host_remainder_fills``) and the zero fills share this traversal so
+    the matching rule stays in step with ``fold_constexpr_branches`` in one
+    place.
+    """
     result: list[ast.AST] = []
     for statement in body:
         fill = (
@@ -750,25 +841,37 @@ def _rewrite_fills(
             if isinstance(statement, ExtendedAST)
             else None
         )
-        if fill is None or ast.unparse(statement) != fill.statement:
-            if isinstance(statement, ast.If):
-                statement.body = cast(
-                    "list[ast.stmt]", _rewrite_fills(statement.body, proven)
-                )
-                statement.orelse = cast(
-                    "list[ast.stmt]", _rewrite_fills(statement.orelse, proven)
-                )
-            result.append(statement)
+        if fill is not None and ast.unparse(statement) == fill.statement:
+            result.extend(replace(statement, fill))
             continue
+        if isinstance(statement, ast.If):
+            statement.body = cast(
+                "list[ast.stmt]", walk_proven_fills(statement.body, proven, replace)
+            ) or [ast.Pass()]
+            statement.orelse = cast(
+                "list[ast.stmt]", walk_proven_fills(statement.orelse, proven, replace)
+            )
+        result.append(statement)
+    return result
+
+
+def _rewrite_fills(
+    body: Sequence[ast.AST], proven: dict[SourceLocation, ZeroFill]
+) -> list[ast.AST]:
+    """Replace the proven fills in ``body`` (and under its ``if`` branches) by
+    their empty-factory form."""
+
+    def replace(statement: ast.AST, fill: ZeroFill) -> list[ast.AST]:
         assert isinstance(statement, ast.Assign)
         value = statement.value
         assert isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
-        result.append(
+        return [
             statement_from_string(
                 f"{fill.target} = {_factory_call_source(value, _EMPTY_FACTORY[fill.factory])}"
             )
-        )
-    return result
+        ]
+
+    return walk_proven_fills(body, proven, replace)
 
 
 def _factory_call_source(call: ast.Call, attr: str) -> str:

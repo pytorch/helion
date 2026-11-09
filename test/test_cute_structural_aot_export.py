@@ -22,7 +22,6 @@ from test.test_cute_structural_aot import _module
 from test.test_cute_structural_cache import _cpu_only  # noqa: F401
 
 import helion
-from helion._testing import skipUnlessBackends
 from helion.autotuner.aot_cache import AOTAutotuneCache
 from helion.autotuner.aot_compile import generate_standalone_file
 from helion.autotuner.aot_structural_export import _export_classifiers
@@ -31,9 +30,9 @@ from helion.autotuner.aot_structural_policy import attach_model_policy
 from helion.autotuner.aot_structural_policy import policy_path
 from helion.autotuner.base_search import BaseSearch
 import helion.language as hl
-from helion.runtime.cute_structural_config import StructuralPolicyError
-from helion.runtime.cute_structural_policy import CUTE_STRUCTURAL_SETTINGS
-from helion.runtime.cute_structural_policy import CuteStructuralPolicy
+from helion.runtime.cute.structural_config import StructuralPolicyError
+from helion.runtime.cute.structural_policy import CUTE_STRUCTURAL_SETTINGS
+from helion.runtime.cute.structural_policy import CuteStructuralPolicy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -46,7 +45,7 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _shared_budget() -> Iterator[None]:
     with patch(
-        "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+        "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
         return_value=232448,
     ):
         yield
@@ -110,7 +109,6 @@ def _call(
 
 @pytest.mark.parametrize("setting", CUTE_STRUCTURAL_SETTINGS)
 @pytest.mark.parametrize("static", [False, True])
-@skipUnlessBackends(["cute"])
 def test_actual_public_export_keeps_all_structural_source_closures(
     setting: str,
     static: bool,
@@ -238,7 +236,6 @@ def test_actual_public_export_keeps_all_structural_source_closures(
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_dynamic_specialized_export_accumulates_exact_metadata_groups(
     tmp_path: Path,
 ) -> None:
@@ -277,7 +274,6 @@ def _size_key(x: torch.Tensor) -> tuple[int, torch.dtype]:
     return (x.numel(), x.dtype)
 
 
-@skipUnlessBackends(["cute"])
 def test_dynamic_user_key_snapshot_and_named_argument_dispatch(tmp_path: Path) -> None:
     function = _function(tmp_path)
     policy = CuteStructuralPolicy()
@@ -336,7 +332,6 @@ def test_bad_model_and_unrelocatable_user_key_do_not_replace_export(
 
 
 @pytest.mark.parametrize("setting", CUTE_STRUCTURAL_SETTINGS)
-@skipUnlessBackends(["cute"])
 def test_static_export_accumulates_selected_configs_and_own_constants(
     setting: str, tmp_path: Path
 ) -> None:
@@ -402,7 +397,6 @@ def _constant_scale(x: torch.Tensor, factor: hl.constexpr) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("static", [False, True])
-@skipUnlessBackends(["cute"])
 def test_export_guards_tensor_identity_and_accepts_fresh_pointers(
     static: bool, tmp_path: Path
 ) -> None:
@@ -486,7 +480,6 @@ def test_export_guards_tensor_identity_and_accepts_fresh_pointers(
         hold.assert_not_called()
 
 
-@skipUnlessBackends(["cute"])
 def test_dynamic_constexpr_export_requires_the_observed_bound_signature(
     tmp_path: Path,
 ) -> None:
@@ -515,7 +508,6 @@ def test_dynamic_constexpr_export_requires_the_observed_bound_signature(
     hold.assert_not_called()
 
 
-@skipUnlessBackends(["cute"])
 def test_compile_deduplication_includes_original_source_bytes(tmp_path: Path) -> None:
     function = _function(tmp_path)
     policy = CuteStructuralPolicy()
@@ -545,7 +537,6 @@ def test_compile_deduplication_includes_original_source_bytes(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize("kind", ["content", "opaque", "projection", "storage_changed"])
-@skipUnlessBackends(["cute"])
 def test_unrelocatable_bound_guard_cannot_replace_an_existing_export(
     kind: str, tmp_path: Path
 ) -> None:
@@ -590,7 +581,6 @@ def test_unrelocatable_bound_guard_cannot_replace_an_existing_export(
     assert path.read_bytes() == previous
 
 
-@skipUnlessBackends(["cute"])
 def test_export_classifier_identity_and_input_projection_match_bound_kernel(
     tmp_path: Path,
 ) -> None:

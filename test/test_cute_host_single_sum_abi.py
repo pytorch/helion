@@ -23,7 +23,7 @@ from test.test_cute_host_single_sum_seeds import _original
 
 import helion
 from helion._compiler.cute.single_sum_runtime import single_sum_cast_kernel
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing import cpu_render_target
 from helion.runtime.cute import launcher
 from helion.runtime.cute import paired_sum
 from helion.runtime.cute import single_sum
@@ -44,14 +44,9 @@ _requires_pinned_aten_build = pytest.mark.skipif(
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        cpu_render_target(reduction_smem_budget_bytes=232448),
         patch(
             "torch.cuda._exchange_device", side_effect=AssertionError("GPU forbidden")
-        ),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
         ),
     ):
         yield

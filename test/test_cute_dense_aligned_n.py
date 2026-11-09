@@ -22,6 +22,10 @@ from helion._compiler.cute.dense_aligned_n import dense_aligned_n_defaults
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import tcgen05_two_cta_m128_epilogue_tile_expr
+from helion._compiler.cute.tcgen05_config import facts
+from helion._compiler.cute.tcgen05_config import repair
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import surface
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_dense_tcgen05 import gb300_target
@@ -134,7 +138,7 @@ def test_native_selection_uses_physical_n(mode, acc_stages):
         state = bound.config_spec._cute_tcgen05_config
         with bound.env:
             config = _config(tcgen05_acc_stages=acc_stages)
-            plan = state._dense_aligned_n_plan(config.config)
+            plan = facts._dense_aligned_n_plan(state, config.config)
             assert plan is not None
             assert plan.public_tile == (128, 128, 128)
             assert plan.physical_tile == (128, 80, 128)
@@ -251,7 +255,9 @@ def test_projection_preserves_live_n_bounds(restriction):
     before = (spec.min_size, spec.max_size, spec.max_size_revision)
     assert all(
         seed.config["tcgen05_tile_n"] != 80
-        for seed in bound.config_spec._cute_tcgen05_config.dense_aligned_n_seed_configs()
+        for seed in seeds.dense_aligned_n_seed_configs(
+            bound.config_spec._cute_tcgen05_config
+        )
     )
     with pytest.raises(InvalidConfig, match="tcgen05_tile_n"):
         bound.to_code(_config())
@@ -275,7 +281,9 @@ def test_fixed_override_and_independent_pid_veto():
             bad.unflatten(bad.flatten(ordinary))
     for pid in ("persistent_blocked", "persistent_interleaved"):
         bound.config_spec.disallow_pid_type(pid, "independent veto")
-    assert not bound.config_spec._cute_tcgen05_config.dense_aligned_n_seed_configs()
+    assert not seeds.dense_aligned_n_seed_configs(
+        bound.config_spec._cute_tcgen05_config
+    )
     with pytest.raises(InvalidConfig, match="tcgen05_tile_n"):
         bound.to_code(_config())
 
@@ -287,14 +295,14 @@ def test_plan_ownership_tracks_live_mma_facts(store_mode):
     original = state.dense_gemm_facts
     assert original is not None
     config = _config(tcgen05_c_store_mode=store_mode)
-    assert state._dense_aligned_n_plan(config.config) is not None
+    assert facts._dense_aligned_n_plan(state, config.config) is not None
     for changed in (
         replace(original, block_ids=(2, 1, 0)),
         replace(original, shape=(256, 5120, 2880)),
         replace(original, input_dtype=torch.bfloat16),
     ):
         with patch.object(state, "dense_gemm_facts", changed):
-            assert state._dense_aligned_n_plan(config.config) is None
+            assert facts._dense_aligned_n_plan(state, config.config) is None
 
 
 @pytest.mark.parametrize(
@@ -313,7 +321,9 @@ def test_actual_d_ring_and_complete_stage_limit(
         tcgen05_acc_stages=acc_stages,
         tcgen05_ab_stages=expected_max,
     )
-    plan = bound.config_spec._cute_tcgen05_config._dense_aligned_n_plan(config.config)
+    plan = facts._dense_aligned_n_plan(
+        bound.config_spec._cute_tcgen05_config, config.config
+    )
     assert plan is not None
     assert plan.max_ab_stages == expected_max
     used = _smem_bytes(
@@ -491,7 +501,7 @@ def test_every_advertised_width_emits_native_complete_budget(width, acc_stages):
         tcgen05_acc_stages=acc_stages,
     )
     state = bound.config_spec._cute_tcgen05_config
-    plan = state._dense_aligned_n_plan(config.config)
+    plan = facts._dense_aligned_n_plan(state, config.config)
     assert plan is not None
     config.config["tcgen05_ab_stages"] = plan.max_ab_stages
     source = bound.to_code(config)
@@ -518,13 +528,13 @@ def test_seed_and_coordinate_search_share_the_same_physical_plan():
     state = bound.config_spec._cute_tcgen05_config
     with bound.env:
         generation = ConfigGeneration(bound.config_spec)
-        fragments = state.optional_fragments(for_search=True)
+        fragments = surface.optional_fragments(state, for_search=True)
         assert fragments["tcgen05_tile_n"].choices == (0, 80, 160)
-        for seed in state.dense_aligned_n_seed_configs():
+        for seed in seeds.dense_aligned_n_seed_configs(state):
             flat, canonical = generation.canonicalize_flat(generation.flatten(seed))
             assert canonical.config["tcgen05_tile_n"] == seed.config["tcgen05_tile_n"]
             assert canonical.block_sizes == seed.block_sizes
-            assert state._dense_aligned_n_plan(canonical.config) is not None
+            assert facts._dense_aligned_n_plan(state, canonical.config) is not None
             assert generation.canonicalize_flat(flat) == (flat, canonical)
         # A raw coordinate mutation repairs the carrier/protocol and
         # retains the advertised physical width.
@@ -537,8 +547,8 @@ def test_seed_and_coordinate_search_share_the_same_physical_plan():
 def test_wrapper_uses_device_exact_d_layout():
     bound = scaled_mm._bind_isolated(_args(3))
     source = bound.to_code(_config())
-    plan = bound.config_spec._cute_tcgen05_config._dense_aligned_n_plan(
-        _config().config
+    plan = facts._dense_aligned_n_plan(
+        bound.config_spec._cute_tcgen05_config, _config().config
     )
     assert plan is not None
     wrapper = []
@@ -560,15 +570,15 @@ def test_explicit_native_implementation_contract(implementation, monkeypatch):
         monkeypatch.setenv("HELION_CUTE_MMA_IMPL", implementation)
     bound = scaled_mm._bind_isolated(_args())
     state = bound.config_spec._cute_tcgen05_config
-    seeds = state.dense_aligned_n_seed_configs()
-    fragments = state.optional_fragments(for_search=True)
+    seed_configs = seeds.dense_aligned_n_seed_configs(state)
+    fragments = surface.optional_fragments(state, for_search=True)
     if implementation in ("warp", "universal"):
-        assert not seeds
+        assert not seed_configs
         assert "tcgen05_tile_n" not in fragments
         with pytest.raises(BackendUnsupported, match="requires its supported native"):
             bound.to_code(_config())
     else:
-        assert seeds and fragments["tcgen05_tile_n"].choices == (0, 80, 160)
+        assert seed_configs and fragments["tcgen05_tile_n"].choices == (0, 80, 160)
         code = bound.to_code(_config())
         assert "make_tma_umma_pipeline(" in code
     ordinary = _config(tcgen05_tile_n=0, tcgen05_ab_stages=2)
@@ -642,10 +652,10 @@ def test_unproved_graphs_never_advertise_or_admit_physical_width(kind, store_mod
         args[2:] = [tensor.to(torch.bfloat16) for tensor in args[2:]]
     bound = kernel._bind_isolated(args)
     state = bound.config_spec._cute_tcgen05_config
-    assert not state.dense_aligned_n_seed_configs()
-    assert "tcgen05_tile_n" not in state.optional_fragments(for_search=True)
+    assert not seeds.dense_aligned_n_seed_configs(state)
+    assert "tcgen05_tile_n" not in surface.optional_fragments(state, for_search=True)
     if kind == "fixed_n":
-        assert state._matmul_block_fragments() is None
+        assert facts._matmul_block_fragments(state) is None
         config = _config(block_sizes=[128, 128], tcgen05_c_store_mode=store_mode)
     else:
         config = _config(tcgen05_c_store_mode=store_mode)
@@ -674,8 +684,8 @@ def test_direct_roundtrip_keeps_budget_and_collective_release(
     )
     normal_values = direct.config | {"tcgen05_c_store_mode": "normal"}
     with bound.env:
-        normal_plan = state._dense_aligned_n_plan(normal_values)
-        plan = state._dense_aligned_n_plan(direct.config)
+        normal_plan = facts._dense_aligned_n_plan(state, normal_values)
+        plan = facts._dense_aligned_n_plan(state, direct.config)
         assert plan is not None and plan == normal_plan
         direct.config["tcgen05_ab_stages"] = plan.max_ab_stages
         generation = ConfigGeneration(bound.config_spec)
@@ -686,13 +696,14 @@ def test_direct_roundtrip_keeps_budget_and_collective_release(
         assert generation.unflatten(flat) == canonical
         for fix in (False, True):
             values = dict(direct.config)
-            state._normalize_dense_aligned_n(values, fix_invalid=fix)
+            repair._normalize_dense_aligned_n(state, values, fix_invalid=fix)
             assert values["tcgen05_c_store_mode"] == "direct"
         with pytest.raises(
             InvalidConfig,
             match=rf"tcgen05_tile_n .* AB stages 1\.\.{plan.max_ab_stages}$",
         ):
-            state._normalize_dense_aligned_n(
+            repair._normalize_dense_aligned_n(
+                state,
                 direct.config | {"tcgen05_ab_stages": plan.max_ab_stages + 1},
                 fix_invalid=False,
             )
@@ -718,20 +729,20 @@ def test_direct_roundtrip_keeps_budget_and_collective_release(
 def test_direct_seeds_append_exact_normal_counterparts():
     bound = scaled_mm._bind_isolated(_args())
     state = bound.config_spec._cute_tcgen05_config
-    seeds = state.dense_aligned_n_seed_configs()
+    seed_configs = seeds.dense_aligned_n_seed_configs(state)
     direct_at = next(
         i
-        for i, seed in enumerate(seeds)
+        for i, seed in enumerate(seed_configs)
         if seed.config["tcgen05_c_store_mode"] == "direct"
     )
-    normal, direct = seeds[:direct_at], seeds[direct_at:]
+    normal, direct = seed_configs[:direct_at], seed_configs[direct_at:]
     assert normal and len(normal) == len(direct)
     assert all(s.config["tcgen05_c_store_mode"] == "normal" for s in normal)
     for before, after in zip(normal, direct, strict=True):
         assert after.config == before.config | {"tcgen05_c_store_mode": "direct"}
-        assert state._dense_aligned_n_plan(after.config) == state._dense_aligned_n_plan(
-            before.config
-        )
+        assert facts._dense_aligned_n_plan(
+            state, after.config
+        ) == facts._dense_aligned_n_plan(state, before.config)
     assert dense_aligned_n_defaults()["tcgen05_c_store_mode"] == "normal"
 
 
@@ -741,13 +752,13 @@ def test_invalid_store_mode_rejects_explicit_and_repairs_search(store_mode):
     state = bound.config_spec._cute_tcgen05_config
     values = _config(tcgen05_c_store_mode=store_mode).config
     with bound.env:
-        assert state._dense_aligned_n_plan(values) is None
+        assert facts._dense_aligned_n_plan(state, values) is None
         with pytest.raises(InvalidConfig, match="tcgen05_tile_n"):
-            state._normalize_dense_aligned_n(dict(values), fix_invalid=False)
+            repair._normalize_dense_aligned_n(state, dict(values), fix_invalid=False)
         repaired = dict(values)
-        state._normalize_dense_aligned_n(repaired, fix_invalid=True)
+        repair._normalize_dense_aligned_n(state, repaired, fix_invalid=True)
         assert repaired["tcgen05_c_store_mode"] == "normal"
-        assert state._dense_aligned_n_plan(repaired) is not None
+        assert facts._dense_aligned_n_plan(state, repaired) is not None
 
 
 @pytest.mark.parametrize(

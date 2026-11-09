@@ -8,20 +8,18 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_grouped_coverage_search import _bound
 from test.test_cute_grouped_row_union_cluster4 import selected
 from test.test_cute_grouped_row_union_cluster4 import wrapper
-from test.test_cute_shared_rhs_grouped import _target
 
+from helion._compiler.cute import target_facts
 from helion._compiler.cute.cute_mma import _tcgen05_candidate_exceeds_smem
 from helion._compiler.cute.grouped_row_union import CONFIG_KEY
 from helion._compiler.cute.grouped_row_union import SCHEDULE_KEY
 from helion._compiler.cute.grouped_row_union import TRANSPOSED
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
-from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing import cpu_render_target
 from helion.exc import BackendUnsupported
 
 pytestmark = pytest.mark.cpu_only
@@ -39,8 +37,6 @@ def cpu_only() -> Generator[None, None, None]:
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
     with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")),
         patch("torch.cuda.current_device", side_effect=AssertionError("CUDA metadata")),
         patch(
             "torch.cuda.get_device_properties",
@@ -50,8 +46,7 @@ def cpu_only() -> Generator[None, None, None]:
             "torch.cuda.get_device_capability",
             side_effect=AssertionError("CUDA metadata"),
         ),
-        forbid_native_compile(),
-        _target(),
+        cpu_render_target(mma_support=tcgen05_mma_support()),
     ):
         yield
     assert torch.cuda.is_initialized() is initialized
@@ -66,11 +61,11 @@ def case() -> tuple[BoundKernel, Config]:
 
 def test_capacity_is_not_the_ordinary_ab_budget() -> None:
     device = torch.device("cuda", 0)
-    capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(device)
-    budget = CuteTcgen05Config.per_cta_smem_budget_bytes(device)
+    capacity = target_facts.per_cta_smem_capacity_bytes(device)
+    budget = target_facts.per_cta_smem_budget_bytes(device)
     assert capacity == 232448
     assert budget == 203776
-    assert CuteTcgen05Config.per_cta_ab_smem_budget_bytes(device) == 203776
+    assert target_facts.per_cta_ab_smem_budget_bytes(device) == 203776
     required = tcgen05_ab_smem_bytes_per_cta(
         bm=TRANSPOSED.mma_m,
         bn=TRANSPOSED.mma_n,
@@ -84,7 +79,6 @@ def test_capacity_is_not_the_ordinary_ab_budget() -> None:
     assert budget < required < TRANSPOSED.shared_upper_bound < capacity
 
 
-@skipUnlessBackends(["cute"])
 def test_actual_set_config_keeps_normalization_and_ordinary_budget(
     case: tuple[BoundKernel, Config],
 ) -> None:
@@ -126,7 +120,6 @@ def test_actual_set_config_keeps_normalization_and_ordinary_budget(
     assert "StaticPersistentTileScheduler.create(" in emitted[0]
 
 
-@skipUnlessBackends(["cute"])
 def test_exact_source_and_wrapper_match_prior_capacity_facade(
     case: tuple[BoundKernel, Config],
 ) -> None:
@@ -134,16 +127,13 @@ def test_exact_source_and_wrapper_match_prior_capacity_facade(
     ordinary = bound.to_code(config)
     # Retain the former facade only as a comparison witness, never as the
     # admission target. Both complete generated modules must be identical.
-    with patch.object(
-        CuteTcgen05Config, "per_cta_smem_budget_bytes", return_value=232448
-    ):
+    with patch.object(target_facts, "per_cta_smem_budget_bytes", return_value=232448):
         former_facade = bound.to_code(config)
     assert ordinary == former_facade
     assert ast.dump(wrapper(ordinary)) == ast.dump(wrapper(former_facade))
 
 
 @pytest.mark.parametrize("defer", (False, True))
-@skipUnlessBackends(["cute"])
 def test_only_explicit_defer_uses_the_complete_ledger(
     case: tuple[BoundKernel, Config], defer: bool
 ) -> None:
@@ -202,7 +192,6 @@ def test_existing_worklist_deferral_is_preserved(defer: bool) -> None:
         ({}, torch.bfloat16, 128),
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_unproved_protocols_retain_the_ordinary_budget(
     case: tuple[BoundKernel, Config],
     changes: dict[str, object],
@@ -225,14 +214,13 @@ def test_unproved_protocols_retain_the_ordinary_budget(
 
 
 @pytest.mark.parametrize("capacity", (0, 203776, TRANSPOSED.shared_upper_bound - 1))
-@skipUnlessBackends(["cute"])
 def test_complete_capacity_failure_still_rejects(
     case: tuple[BoundKernel, Config], capacity: int
 ) -> None:
     bound, config = case
     with (
         patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=capacity
+            target_facts, "per_cta_smem_capacity_bytes", return_value=capacity
         ),
         pytest.raises(BackendUnsupported, match="row-union"),
     ):

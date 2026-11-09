@@ -31,12 +31,12 @@ def _helion_warp_work_field(work_tile, index):
 
 @cute.kernel
 def _helion_native_grouped_rna(offsets, a_packed, b_grouped, bias, out, tcgen05_grouped_ab_tensormaps, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b, tcgen05_tma_store_atom, tcgen05_tma_store_tensor):
-    tcgen05_storage_pool = cute.arch.alloc_smem(cutlass.Uint8, __native_rna_plan_0, alignment=1024)
-    tcgen05_converted_full_ptr = cute.recast_ptr(tcgen05_storage_pool + __native_rna_plan_1, dtype=cutlass.Int64)
+    tcgen05_storage_pool = cute.arch.alloc_smem(cutlass.Uint8, __native_rna_storage_bytes, alignment=1024)
+    tcgen05_converted_full_ptr = cute.recast_ptr(tcgen05_storage_pool + __native_rna_offset_converted_full, dtype=cutlass.Int64)
     tcgen05_work_tile_smem_ptr = cute.recast_ptr(tcgen05_storage_pool + __native_rna_offset_work_tile, dtype=cutlass.Int32)
     tcgen05_work_tile_smem_tensor = cute.make_tensor(tcgen05_work_tile_smem_ptr, cute.make_layout((9,), stride=(1,)))
     tcgen05_work_tile_smem = tcgen05_work_tile_smem_tensor
-    symnode_0 = __native_rna_plan_2
+    symnode_0 = __native_rna_reduction
     tcgen05_warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tcgen05_lane_idx = cute.arch.lane_idx()
     mma_tidx = cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(cute.arch.thread_idx()[1]) * cutlass.Int32(32)
@@ -50,27 +50,27 @@ def _helion_native_grouped_rna(offsets, a_packed, b_grouped, bias, out, tcgen05_
     tiled_mma = cutlass.utils.blackwell_helpers.make_trivial_tiled_mma(cutlass.TFloat32, cutlass.TFloat32, cute.nvgpu.OperandMajorMode.MN, cute.nvgpu.OperandMajorMode.K, cutlass.Float32, cute.nvgpu.tcgen05.CtaGroup.ONE, (128, 128), cute.nvgpu.tcgen05.OperandSource.SMEM)
     thr_mma = tiled_mma.get_slice(mma_slice_tidx)
     tcgen05_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout((1, 1, 1)), (tiled_mma.thr_id.shape,))
-    sA_layout = cutlass.utils.blackwell_helpers.make_smem_layout_a(tiled_mma, (128, 128, __native_rna_plan_3), cutlass.Float32, __native_rna_plan_4, is_k_major=False)
-    sB_layout = cutlass.utils.blackwell_helpers.make_smem_layout_b(tiled_mma, (128, 128, __native_rna_plan_3), cutlass.Float32, __native_rna_plan_4, is_k_major=True)
+    sA_layout = cutlass.utils.blackwell_helpers.make_smem_layout_a(tiled_mma, (128, 128, __native_rna_block_k), cutlass.Float32, __native_rna_ab_stages, is_k_major=False)
+    sB_layout = cutlass.utils.blackwell_helpers.make_smem_layout_b(tiled_mma, (128, 128, __native_rna_block_k), cutlass.Float32, __native_rna_ab_stages, is_k_major=True)
     tcgen05_c_layout = cutlass.utils.layout.LayoutEnum.COL_MAJOR
     tcgen05_epi_tile = (cute.make_layout(128), cute.make_layout(32))
     tcgen05_tmem_load_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
     tcgen05_epilogue_rest_mode = cute.make_layout(1, stride=0)
     acc_frag_base = tiled_mma.make_fragment_C(cute.append(tiled_mma.partition_shape_C((128, 128)), 2))
     tcgen05_acc_tmem_cols = cutlass.utils.get_num_tmem_alloc_cols(acc_frag_base, arch='sm_100')
-    tcgen05_tmem_holding_buf = cute.recast_ptr(tcgen05_storage_pool + __native_rna_plan_5, dtype=cutlass.Int32)
-    tcgen05_tmem_dealloc_mbar_ptr = cute.recast_ptr(tcgen05_storage_pool + __native_rna_plan_6, dtype=cutlass.Int64)
+    tcgen05_tmem_holding_buf = cute.recast_ptr(tcgen05_storage_pool + __native_rna_offset_tmem_holding, dtype=cutlass.Int32)
+    tcgen05_tmem_dealloc_mbar_ptr = cute.recast_ptr(tcgen05_storage_pool + __native_rna_offset_tmem_dealloc_mbar, dtype=cutlass.Int64)
     tcgen05_tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(barrier_id=1, num_threads=160)
     tcgen05_tmem_allocator = cutlass.utils.TmemAllocator(tcgen05_tmem_holding_buf, barrier_for_retrieve=tcgen05_tmem_alloc_barrier, allocator_warp_id=0, is_two_cta=False, two_cta_tmem_dealloc_mbar_ptr=tcgen05_tmem_dealloc_mbar_ptr)
-    tcgen05_acc_pipeline_barriers = cute.recast_ptr(tcgen05_storage_pool + __native_rna_plan_7, dtype=cutlass.Int64)
+    tcgen05_acc_pipeline_barriers = cute.recast_ptr(tcgen05_storage_pool + __native_rna_offset_acc_pipeline_barriers, dtype=cutlass.Int64)
     tcgen05_acc_pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
     tcgen05_acc_pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, cutlass.Int32(4))
     tcgen05_acc_pipeline = cutlass.pipeline.PipelineUmmaAsync.create(num_stages=2, producer_group=tcgen05_acc_pipeline_producer_group, consumer_group=tcgen05_acc_pipeline_consumer_group, barrier_storage=tcgen05_acc_pipeline_barriers, cta_layout_vmnk=tcgen05_cluster_layout_vmnk)
     tcgen05_acc_producer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, 2)
     tcgen05_acc_consumer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, 2)
-    tcgen05_sched_pipeline_mbars = cute.recast_ptr(tcgen05_storage_pool + __native_rna_plan_8, dtype=cutlass.Int64)
+    tcgen05_sched_pipeline_mbars = cute.recast_ptr(tcgen05_storage_pool + __native_rna_offset_sched_pipeline_mbars, dtype=cutlass.Int64)
     tcgen05_sched_pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, 1)
-    tcgen05_sched_pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, cutlass.Int32(__native_rna_plan_9))
+    tcgen05_sched_pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, cutlass.Int32(__native_rna_scheduler_warp))
     tcgen05_sched_pipeline = cutlass.pipeline.PipelineAsync.create(num_stages=1, producer_group=tcgen05_sched_pipeline_producer_group, consumer_group=tcgen05_sched_pipeline_consumer_group, barrier_storage=tcgen05_sched_pipeline_mbars)
     tcgen05_sched_pipeline_producer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, 1)
     tcgen05_sched_pipeline_consumer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, 1)
@@ -104,13 +104,13 @@ def _helion_native_grouped_rna(offsets, a_packed, b_grouped, bias, out, tcgen05_
         tcgen05_grouped_tensormap_init_done = cutlass.Boolean(False)
         tcgen05_grouped_tensormap_last_group = cutlass.Int32(-1)
     tma_cta_layout = cute.make_layout(1)
-    tcgen05_ab_pipeline_mbars = cute.recast_ptr(tcgen05_storage_pool + __native_rna_plan_10, dtype=cutlass.Int64)
+    tcgen05_ab_pipeline_mbars = cute.recast_ptr(tcgen05_storage_pool + __native_rna_offset_ab_pipeline_mbars, dtype=cutlass.Int64)
     tcgen05_ab_pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, 1)
     tcgen05_ab_pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, cutlass.Int32(1))
     tcgen05_ab_pipeline_tx_count = cute.size_in_bytes(cutlass.Float32, sA_tma_layout) + cute.size_in_bytes(cutlass.Float32, sB_tma_layout)
-    tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create(num_stages=__native_rna_plan_4, producer_group=tcgen05_ab_pipeline_producer_group, consumer_group=tcgen05_ab_pipeline_consumer_group, tx_count=tcgen05_ab_pipeline_tx_count, barrier_storage=tcgen05_ab_pipeline_mbars, cta_layout_vmnk=tcgen05_cluster_layout_vmnk)
-    tcgen05_ab_producer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, __native_rna_plan_4)
-    tcgen05_ab_consumer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, __native_rna_plan_4)
+    tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create(num_stages=__native_rna_ab_stages, producer_group=tcgen05_ab_pipeline_producer_group, consumer_group=tcgen05_ab_pipeline_consumer_group, tx_count=tcgen05_ab_pipeline_tx_count, barrier_storage=tcgen05_ab_pipeline_mbars, cta_layout_vmnk=tcgen05_cluster_layout_vmnk)
+    tcgen05_ab_producer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, __native_rna_ab_stages)
+    tcgen05_ab_consumer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, __native_rna_ab_stages)
     if tcgen05_epi_active:
         tcgen05_tmem_allocator.allocate(tcgen05_acc_tmem_cols)
     tcgen05_exec_acc_tmem_ptr = cute.make_ptr(cutlass.Float32, 0, cute.AddressSpace.tmem, assumed_align=16)
@@ -139,28 +139,28 @@ def _helion_native_grouped_rna(offsets, a_packed, b_grouped, bias, out, tcgen05_
         tcgen05_grouped_d_tensormap_manager.init_tensormap_from_atom(tcgen05_tma_store_atom, tcgen05_grouped_d_tensormap_smem_ptr, 0)
         tcgen05_grouped_d_tensormap_manager.fence_tensormap_initialization()
         tcgen05_grouped_d_tensormap_last_group = cutlass.Int32(-1)
-    tcgen05_kernel_desc = type('Tcgen05KernelDesc', (), {'cta_tile_shape_mnk': (128, 128, __native_rna_plan_3), 'c_layout': cutlass.utils.layout.LayoutEnum.COL_MAJOR, 'c_dtype': cutlass.Float32, 'acc_dtype': cutlass.Float32, 'epilog_sync_bar_id': cutlass.Int32(2), 'epilogue_warp_id': (cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(2), cutlass.Int32(3)), 'num_c_stage': cutlass.Int32(2), 'use_2cta_instrs': False})()
+    tcgen05_kernel_desc = type('Tcgen05KernelDesc', (), {'cta_tile_shape_mnk': (128, 128, __native_rna_block_k), 'c_layout': cutlass.utils.layout.LayoutEnum.COL_MAJOR, 'c_dtype': cutlass.Float32, 'acc_dtype': cutlass.Float32, 'epilog_sync_bar_id': cutlass.Int32(2), 'epilogue_warp_id': (cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(2), cutlass.Int32(3)), 'num_c_stage': cutlass.Int32(2), 'use_2cta_instrs': False})()
     tcgen05_store_epi_tile = (cute.make_layout(128), cute.make_layout(32))
     tcgen05_sD_layout = cutlass.utils.blackwell_helpers.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.COL_MAJOR, tcgen05_store_epi_tile, 2)
     tcgen05_sD_ptr = cute.recast_ptr(tcgen05_storage_pool + __native_rna_offset_d, dtype=cutlass.Float32)
     tcgen05_sD = cute.make_tensor(cute.recast_ptr(tcgen05_sD_ptr, tcgen05_sD_layout.inner, dtype=cutlass.Float32), tcgen05_sD_layout.outer)
     tcgen05_tAcc = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout(tcgen05_epi_acc_frag_base)
-    tcgen05_converted_pipeline = make_converted_operand_pipeline(tcgen05_ab_pipeline, __native_rna_plan_4, __native_rna_plan_11, defer_sync=True, barrier_storage=tcgen05_converted_full_ptr)
-    tcgen05_converter_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, __native_rna_plan_4)
+    tcgen05_converted_pipeline = make_converted_operand_pipeline(tcgen05_ab_pipeline, __native_rna_ab_stages, __native_rna_converter_warps, defer_sync=True, barrier_storage=tcgen05_converted_full_ptr)
+    tcgen05_converter_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, __native_rna_ab_stages)
     tcgen05_prefix_ptr = cute.recast_ptr(tcgen05_storage_pool + __native_rna_offset_prefix, dtype=cutlass.Int32)
-    tcgen05_prefix = cute.make_tensor(tcgen05_prefix_ptr, cute.make_layout((__native_rna_plan_12,), stride=(1,)))
+    tcgen05_prefix = cute.make_tensor(tcgen05_prefix_ptr, cute.make_layout((__native_rna_groups,), stride=(1,)))
     if __native_block_prefix:
         tcgen05_prefix_chunk_summaries_ptr = cute.recast_ptr(tcgen05_storage_pool + __native_prefix_summary_offset, dtype=cutlass.Int32)
         tcgen05_prefix_chunk_summaries = cute.make_tensor(tcgen05_prefix_chunk_summaries_ptr, cute.make_layout((__native_prefix_summary_words,), stride=(1,)))
     assert cute.cosize(sA_layout.outer) == __native_rna_operand_words
     assert cute.cosize(sB_layout.outer) == __native_rna_operand_words
-    assert sA.layout.stride[3] == __native_rna_plan_13
-    assert sB.layout.stride[3] == __native_rna_plan_13
+    assert sA.layout.stride[3] == __native_rna_ab_stage_words
+    assert sB.layout.stride[3] == __native_rna_ab_stage_words
     if __native_block_prefix:
-        build_flat_tile_prefix(offsets, tcgen05_prefix, tcgen05_prefix_chunk_summaries, __native_prefix_warps, __native_rna_plan_12, __native_rna_plan_14, __native_rna_plan_2, __native_rna_plan_15, __native_rna_plan_16, __native_rna_plan_17, __native_rna_plan_18, 128, 128)
+        build_flat_tile_prefix(offsets, tcgen05_prefix, tcgen05_prefix_chunk_summaries, __native_prefix_warps, __native_rna_groups, __native_rna_a_elements, __native_rna_reduction, __native_rna_a_row_stride, __native_rna_output_elements, __native_rna_columns, __native_rna_output_row_stride, 128, 128)
     else:
         if cutlass.Int32(cute.arch.thread_idx()[1]) == 0:
-            build_flat_tile_prefix(offsets, tcgen05_prefix, __native_rna_plan_12, __native_rna_plan_14, __native_rna_plan_2, __native_rna_plan_15, __native_rna_plan_16, __native_rna_plan_17, __native_rna_plan_18, 128, 128)
+            build_flat_tile_prefix(offsets, tcgen05_prefix, __native_rna_groups, __native_rna_a_elements, __native_rna_reduction, __native_rna_a_row_stride, __native_rna_output_elements, __native_rna_columns, __native_rna_output_row_stride, 128, 128)
     cute.arch.mbarrier_init_fence()
     cute.arch.sync_threads()
     if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5):
@@ -184,10 +184,10 @@ def _helion_native_grouped_rna(offsets, a_packed, b_grouped, bias, out, tcgen05_
             tcgen05_sched_pipeline_consumer_state.advance()
             cute.arch.sync_warp()
             if __native_wrapped_descriptors:
-                gA_tma = cute.local_tile(tma_tensor_a[None, None, tcgen05_grouped_group_idx], (128, __native_rna_plan_3), (tcgen05_grouped_cta_tile_idx_n, None))
+                gA_tma = cute.local_tile(tma_tensor_a[None, None, tcgen05_grouped_group_idx], (128, __native_rna_block_k), (tcgen05_grouped_cta_tile_idx_n, None))
                 tcgen05_grouped_a_row_base = cutlass.Int64(tcgen05_grouped_a_element_base) // cutlass.Int64(a_packed.layout.stride[0])
                 tcgen05_grouped_b_tma = cute.domain_offset((cutlass.Int32(__native_rna_wrap_extent) - tcgen05_grouped_problem_m, None), tma_tensor_b[None, None, cutlass.Int32(__native_rna_wrap_extent), tcgen05_grouped_a_row_base + cutlass.Int64(tcgen05_grouped_problem_m)])
-                gB_tma = cute.local_tile(tcgen05_grouped_b_tma, (128, __native_rna_plan_3), (tcgen05_grouped_cta_tile_idx_m, None))
+                gB_tma = cute.local_tile(tcgen05_grouped_b_tma, (128, __native_rna_block_k), (tcgen05_grouped_cta_tile_idx_m, None))
             else:
                 tcgen05_grouped_tensormap_group_changed = tcgen05_grouped_metadata_idx != tcgen05_grouped_tensormap_last_group
                 if tcgen05_grouped_tensormap_group_changed:
@@ -202,15 +202,15 @@ def _helion_native_grouped_rna(offsets, a_packed, b_grouped, bias, out, tcgen05_
                     tcgen05_grouped_tensormap_real_b = cute.make_tensor(tcgen05_grouped_tensormap_b_base, cute.make_layout((tcgen05_grouped_problem_m, tcgen05_grouped_problem_k), stride=(a_packed.layout.stride[0], a_packed.layout.stride[1])))
                     tcgen05_grouped_tensormap_manager.update_tensormap((tcgen05_grouped_tensormap_real_a, tcgen05_grouped_tensormap_real_b), (tma_atom_a, tma_atom_b), (tcgen05_grouped_tensormap_a_ptr, tcgen05_grouped_tensormap_b_ptr), 5, (tcgen05_grouped_tensormap_a_smem_ptr, tcgen05_grouped_tensormap_b_smem_ptr))
                     tcgen05_grouped_tensormap_last_group = tcgen05_grouped_metadata_idx
-                gA_tma = cute.local_tile(tma_tensor_a, (128, __native_rna_plan_3), (tcgen05_grouped_cta_tile_idx_n, None))
-                gB_tma = cute.local_tile(tma_tensor_b, (128, __native_rna_plan_3), (tcgen05_grouped_cta_tile_idx_m, None))
+                gA_tma = cute.local_tile(tma_tensor_a, (128, __native_rna_block_k), (tcgen05_grouped_cta_tile_idx_n, None))
+                gB_tma = cute.local_tile(tma_tensor_b, (128, __native_rna_block_k), (tcgen05_grouped_cta_tile_idx_m, None))
             gA_tma_part = tma_thr_mma.partition_A(gA_tma)
             gB_tma_part = tma_thr_mma.partition_B(gB_tma)
             tma_sA, tma_gA = cute.nvgpu.cpasync.tma_partition(tma_atom_a, 0, tma_cta_layout, cute.group_modes(sA, 0, cute.rank(sA) - 1), cute.group_modes(gA_tma_part, 0, cute.rank(gA_tma_part) - 1))
             tma_sB, tma_gB = cute.nvgpu.cpasync.tma_partition(tma_atom_b, 0, tma_cta_layout, cute.group_modes(sB, 0, cute.rank(sB) - 1), cute.group_modes(gB_tma_part, 0, cute.rank(gB_tma_part) - 1))
-            for tile_offset_2 in range(cutlass.Int32(0), cutlass.Int32(cutlass.Int32(symnode_0)), cutlass.Int32(__native_rna_plan_3)):
-                tcgen05_tma_k_tile = tile_offset_2 // cutlass.Int32(__native_rna_plan_3)
-                tcgen05_tma_full_tile = tcgen05_grouped_cta_tile_idx_m * cutlass.Int32(128) < tcgen05_grouped_problem_m and tcgen05_grouped_cta_tile_idx_n * cutlass.Int32(128) < tcgen05_grouped_problem_n and (tile_offset_2 < cutlass.Int32(__native_rna_plan_2))
+            for tile_offset_2 in range(cutlass.Int32(0), cutlass.Int32(cutlass.Int32(symnode_0)), cutlass.Int32(__native_rna_block_k)):
+                tcgen05_tma_k_tile = tile_offset_2 // cutlass.Int32(__native_rna_block_k)
+                tcgen05_tma_full_tile = tcgen05_grouped_cta_tile_idx_m * cutlass.Int32(128) < tcgen05_grouped_problem_m and tcgen05_grouped_cta_tile_idx_n * cutlass.Int32(128) < tcgen05_grouped_problem_n and (tile_offset_2 < cutlass.Int32(__native_rna_reduction))
                 tcgen05_ab_producer_try_token = cutlass.Boolean(0)
                 if tcgen05_tma_full_tile:
                     tcgen05_ab_producer_try_token = tcgen05_ab_pipeline.producer_try_acquire(tcgen05_ab_producer_state)
@@ -235,7 +235,7 @@ def _helion_native_grouped_rna(offsets, a_packed, b_grouped, bias, out, tcgen05_
             tcgen05_sched_pipeline.consumer_release(tcgen05_sched_pipeline_consumer_state)
         tcgen05_sched_pipeline_consumer_state.advance()
         cute.arch.sync_warp()
-    if cutlass.Int32(6) <= cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(__native_rna_plan_9):
+    if cutlass.Int32(6) <= cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(__native_rna_scheduler_warp):
         tcgen05_sched_pipeline.consumer_wait(tcgen05_sched_pipeline_consumer_state)
         cute.arch.fence_view_async_shared()
         cute.arch.sync_warp()
@@ -250,8 +250,8 @@ def _helion_native_grouped_rna(offsets, a_packed, b_grouped, bias, out, tcgen05_
                 tcgen05_sched_pipeline.consumer_release(tcgen05_sched_pipeline_consumer_state)
             tcgen05_sched_pipeline_consumer_state.advance()
             cute.arch.sync_warp()
-            for tile_offset_2 in range(cutlass.Int32(0), cutlass.Int32(__native_rna_plan_2), cutlass.Int32(__native_rna_plan_3)):
-                convert_and_publish_operand_stage(tcgen05_ab_pipeline, tcgen05_converted_pipeline, tcgen05_converter_state, sA, sB, __native_rna_plan_13, __native_rna_plan_13, 128, __native_rna_plan_13, __native_rna_plan_13, 128, __native_rna_plan_11, tcgen05_warp_idx - cutlass.Int32(6))
+            for tile_offset_2 in range(cutlass.Int32(0), cutlass.Int32(__native_rna_reduction), cutlass.Int32(__native_rna_block_k)):
+                convert_and_publish_operand_stage(tcgen05_ab_pipeline, tcgen05_converted_pipeline, tcgen05_converter_state, sA, sB, __native_rna_ab_stage_words, __native_rna_ab_stage_words, 128, __native_rna_ab_stage_words, __native_rna_ab_stage_words, 128, __native_rna_converter_warps, tcgen05_warp_idx - cutlass.Int32(6))
                 tcgen05_converter_state.advance()
             tcgen05_sched_pipeline.consumer_wait(tcgen05_sched_pipeline_consumer_state)
             cute.arch.fence_view_async_shared()
@@ -280,11 +280,11 @@ def _helion_native_grouped_rna(offsets, a_packed, b_grouped, bias, out, tcgen05_
             acc_frag = tcgen05_exec_acc_frag_base[None, None, None, tcgen05_acc_producer_state.index]
             tcgen05_acc_pipeline.producer_acquire(tcgen05_acc_producer_state)
             tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)
-            for tile_offset_2 in range(cutlass.Int32(0), cutlass.Int32(cutlass.Int32(symnode_0)), cutlass.Int32(__native_rna_plan_3)):
+            for tile_offset_2 in range(cutlass.Int32(0), cutlass.Int32(cutlass.Int32(symnode_0)), cutlass.Int32(__native_rna_block_k)):
                 mma_stage = tcgen05_ab_consumer_state.index
                 sA_mma = sA[None, None, None, mma_stage]
                 sB_mma = sB[None, None, None, mma_stage]
-                tcgen05_tma_full_tile = tcgen05_grouped_cta_tile_idx_m * cutlass.Int32(128) < tcgen05_grouped_problem_m and tcgen05_grouped_cta_tile_idx_n * cutlass.Int32(128) < tcgen05_grouped_problem_n and (tile_offset_2 < cutlass.Int32(__native_rna_plan_2))
+                tcgen05_tma_full_tile = tcgen05_grouped_cta_tile_idx_m * cutlass.Int32(128) < tcgen05_grouped_problem_m and tcgen05_grouped_cta_tile_idx_n * cutlass.Int32(128) < tcgen05_grouped_problem_n and (tile_offset_2 < cutlass.Int32(__native_rna_reduction))
                 tcgen05_ab_consumer_try_token = cutlass.Boolean(0)
                 if tcgen05_tma_full_tile:
                     tcgen05_ab_consumer_try_token = tcgen05_converted_pipeline.consumer_try_wait(tcgen05_ab_consumer_state)
@@ -415,13 +415,13 @@ def _helion_native_grouped_rna(offsets, a_packed, b_grouped, bias, out, tcgen05_
             tcgen05_sched_pipeline.consumer_release(tcgen05_sched_pipeline_consumer_state)
         tcgen05_sched_pipeline_consumer_state.advance()
         cute.arch.sync_warp()
-    if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(__native_rna_plan_9):
+    if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(__native_rna_scheduler_warp):
         tcgen05_ordinal = cutlass.Int64(cute.arch.block_idx()[2])
         tcgen05_stride = cutlass.Int64(cute.arch.grid_dim()[2])
         tcgen05_continue = cutlass.Boolean(True)
         while tcgen05_continue:
             tcgen05_sched_pipeline.producer_acquire(tcgen05_sched_pipeline_producer_state)
-            tcgen05_record = resolve_flat_nm_work(offsets, tcgen05_prefix, tcgen05_ordinal, __native_rna_plan_12, __native_rna_plan_14, __native_rna_plan_2, __native_rna_plan_15, __native_rna_plan_16, __native_rna_plan_17, __native_rna_plan_18, 128, 128)
+            tcgen05_record = resolve_flat_nm_work(offsets, tcgen05_prefix, tcgen05_ordinal, __native_rna_groups, __native_rna_a_elements, __native_rna_reduction, __native_rna_a_row_stride, __native_rna_output_elements, __native_rna_columns, __native_rna_output_row_stride, 128, 128)
             if cute.arch.lane_idx() == cutlass.Int32(0):
                 for _record_i in cutlass.range_constexpr(9):
                     tcgen05_work_tile_smem[cutlass.Int32(_record_i)] = tcgen05_record[_record_i]
@@ -465,29 +465,39 @@ def render_flat_grouped_rna_kernel(schedule: FlatGroupedRnaSchedule) -> str:
             else {}
         ),
         "__native_rna_wrap_extent": WRAP_EXTENT,
-        "__native_rna_plan_0": schedule.storage.bytes,
+        "__native_rna_storage_bytes": schedule.storage.bytes,
         **(
-            {"__native_rna_plan_1": offsets["tcgen05_converted_full_ptr"]}
+            {
+                "__native_rna_offset_converted_full": offsets[
+                    "tcgen05_converted_full_ptr"
+                ]
+            }
             if not schedule.tma_rn
             else {}
         ),
-        "__native_rna_plan_2": schedule.reduction,
-        "__native_rna_plan_3": schedule.block_k,
-        "__native_rna_plan_4": schedule.ab_stages,
-        "__native_rna_plan_5": offsets["tcgen05_tmem_holding_buf"],
-        "__native_rna_plan_6": offsets["tcgen05_tmem_dealloc_mbar_ptr"],
-        "__native_rna_plan_7": offsets["tcgen05_acc_pipeline_barriers"],
-        "__native_rna_plan_8": offsets["tcgen05_sched_pipeline_mbars"],
-        "__native_rna_plan_9": schedule.roles.scheduler_warp,
-        "__native_rna_plan_10": offsets["tcgen05_ab_pipeline_mbars"],
-        "__native_rna_plan_11": schedule.roles.converter_warps,
-        "__native_rna_plan_12": schedule.provider.groups,
-        "__native_rna_plan_13": 128 * schedule.block_k,
-        "__native_rna_plan_14": schedule.provider.a.elements,
-        "__native_rna_plan_15": schedule.provider.a.row_stride,
-        "__native_rna_plan_16": schedule.provider.output.elements,
-        "__native_rna_plan_17": schedule.columns,
-        "__native_rna_plan_18": schedule.provider.output.row_stride,
+        "__native_rna_reduction": schedule.reduction,
+        "__native_rna_block_k": schedule.block_k,
+        "__native_rna_ab_stages": schedule.ab_stages,
+        "__native_rna_offset_tmem_holding": offsets["tcgen05_tmem_holding_buf"],
+        "__native_rna_offset_tmem_dealloc_mbar": offsets[
+            "tcgen05_tmem_dealloc_mbar_ptr"
+        ],
+        "__native_rna_offset_acc_pipeline_barriers": offsets[
+            "tcgen05_acc_pipeline_barriers"
+        ],
+        "__native_rna_offset_sched_pipeline_mbars": offsets[
+            "tcgen05_sched_pipeline_mbars"
+        ],
+        "__native_rna_scheduler_warp": schedule.roles.scheduler_warp,
+        "__native_rna_offset_ab_pipeline_mbars": offsets["tcgen05_ab_pipeline_mbars"],
+        "__native_rna_converter_warps": schedule.roles.converter_warps,
+        "__native_rna_groups": schedule.provider.groups,
+        "__native_rna_ab_stage_words": 128 * schedule.block_k,
+        "__native_rna_a_elements": schedule.provider.a.elements,
+        "__native_rna_a_row_stride": schedule.provider.a.row_stride,
+        "__native_rna_output_elements": schedule.provider.output.elements,
+        "__native_rna_columns": schedule.columns,
+        "__native_rna_output_row_stride": schedule.provider.output.row_stride,
         "__native_rna_operand_words": 128 * schedule.block_k * schedule.ab_stages,
         "__native_rna_offset_work_tile": offsets["tcgen05_work_tile_smem_ptr"],
         "__native_rna_offset_a": offsets["smem_a"],
@@ -563,7 +573,8 @@ def render_flat_grouped_rna_kernel(schedule: FlatGroupedRnaSchedule) -> str:
                 and isinstance(node.test.ops[1], ast.Lt)
                 and isinstance(node.test.comparators[-1], ast.Call)
                 and any(
-                    isinstance(arg, ast.Name) and arg.id == "__native_rna_plan_9"
+                    isinstance(arg, ast.Name)
+                    and arg.id == "__native_rna_scheduler_warp"
                     for arg in node.test.comparators[-1].args
                 )
             ):

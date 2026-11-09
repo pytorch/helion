@@ -10,29 +10,38 @@ rendered host prologue; no GPU is used.
 from __future__ import annotations
 
 import ast
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from test.test_cute_shared_rhs_grouped import _target
+from test._cute_kernels import _gemm
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_tcgen05_ordinary_exploration import _ordinary_gemm
 
 import helion
 from helion._compiler.cute.stage_aligned_operands import _needs_staging
-from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import cuda_fake
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
+from helion._testing import TestCase
+from helion._testing import onlyBackends
+from helion._testing import skipIfNotCUDA
 import helion.language as hl
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
-
     from helion.runtime.kernel import BoundKernel
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends("cute")]
+# The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced
+# as ``cuda:0`` tensors of a 148-SM device, and the reduction SMEM budget.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(
+        mma_support=tcgen05_mma_support(),
+        forbid_native=False,
+        fake_device_sm_count=148,
+        reduction_smem_budget_bytes=232448,
+    ),
+]
 
 CPU_DEVICE = "cpu"
 
@@ -169,38 +178,6 @@ def _bias_rows(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@pytest.fixture(autouse=True)
-def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    monkeypatch.setenv("HELION_BACKEND", "cute")
-    monkeypatch.setenv("HELION_AUTOTUNE_EFFORT", "full")
-    with (
-        _target(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        mock_cuda_unavailable(),
-        patch("torch.cuda.current_device", return_value=0),
-        patch("torch.cuda.get_device_capability", return_value=(10, 0)),
-        patch(
-            "helion.runtime.kernel._find_device", return_value=torch.device("cuda:0")
-        ),
-        patch(
-            "helion._compiler.cute.backend.CuteBackend.normalize_input_fake_tensor",
-            new=cuda_fake,
-        ),
-        patch(
-            "torch._inductor.runtime.hints.DeviceProperties.create",
-            return_value=SimpleNamespace(
-                type="cuda", index=0, cc=100, warp_size=32, multi_processor_count=148
-            ),
-        ),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
-        yield
-
-
 def _bind(fn: object, *args: torch.Tensor, **settings: object) -> BoundKernel:
     return helion.kernel(fn, backend="cute", static_shapes=True, **settings).bind(args)  # pyrefly: ignore[bad-argument-type]
 
@@ -250,8 +227,8 @@ def test_odd_gemm_operands_are_staged_and_tma_proven() -> None:
         "b = torch.constant_pad_nd(b, [0, 63])[:, :1025]",
     ]
     assert bound.host_function.backend_rewrote_ast
-    # The TMA producers the staged layout unlocks are checked on a GPU in
-    # test_cute_stage_aligned_operands_gpu.py; the CPU target renders the
+    # The TMA producers the staged layout unlocks are checked on a GPU by
+    # ``TestCuteStageAlignedOperandsGpu`` below; the CPU target renders the
     # host prologue only.
     code = bound.to_code(bound.config_spec.default_config())
     assert "constant_pad_nd(a, [0, 63])" in code
@@ -337,3 +314,49 @@ def test_setting_disables_the_pass() -> None:
     assert "cute_stage_unaligned_operands=False" in bound.format_kernel_decorator(
         bound.config_spec.default_config(), bound.settings
     )
+
+
+# GPU tests of the CuTe unaligned-operand staging pass.
+#
+# A GEMM over odd-sized rows (``K = 1025`` bf16: 2050-byte strides) fails the
+# TensorMap proof; with the staging pass the host pads the operands and the
+# tcgen05 default config keeps its TMA producers, and the result matches torch.
+
+
+@pytest.mark.cuda
+@onlyBackends(["cute"])
+@skipIfNotCUDA()
+class TestCuteStageAlignedOperandsGpu(RefEagerTestDisabled, TestCase):
+    def _check(self, a: torch.Tensor, b: torch.Tensor, staged: tuple[str, ...]) -> None:
+        bound = _gemm.bind((a, b))
+        config = bound.config_spec.default_config()
+        code = bound.to_code(config)
+        for name in ("a", "b"):
+            self.assertEqual(f"{name} = torch.constant_pad_nd(" in code, name in staged)
+        if staged:
+            self.assertIn("tma_tensor_a", code)
+            self.assertIn("tma_tensor_b", code)
+        bound.set_config(config)
+        torch.testing.assert_close(bound(a, b), a @ b, rtol=1e-2, atol=1e-1)
+
+    def test_odd_rows_both_operands(self) -> None:
+        a = torch.randn(1025, 1025, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(1025, 1025, device=DEVICE, dtype=torch.bfloat16)
+        self._check(a, b, ("a", "b"))
+
+    def test_odd_k_stages_a_only(self) -> None:
+        a = torch.randn(512, 1025, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(1025, 512, device=DEVICE, dtype=torch.bfloat16)
+        self._check(a, b, ("a",))
+
+    def test_transposed_odd_operand(self) -> None:
+        a = torch.randn(1025, 512, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(512, 1025, device=DEVICE, dtype=torch.bfloat16)
+        # ``a.T`` ([512, 1025], strides (1, 512)) has 1024-byte outer strides
+        # and stays in place; ``b.T`` ([1025, 512], strides (1, 1025)) has
+        # 2050-byte outer strides and is relaid out row-major.
+        self._check(a.T, b.T, ("b",))
+
+    def test_aligned_operands_untouched(self) -> None:
+        a = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        self._check(a, a, ())

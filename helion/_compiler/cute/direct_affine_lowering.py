@@ -19,19 +19,20 @@ import ast
 import dataclasses
 import itertools
 from typing import TYPE_CHECKING
-from typing import TypeVar
 from typing import cast
 
 import sympy
 import torch
 from torch._subclasses import FakeTensor
 
-from ..ast_extension import ExtendedAST
 from ..compile_environment import CompileEnvironment
 from ..device_function import TensorArg
 from ..device_function import TensorDescriptorArg
 from ..indexing_strategy import subscript_tile_info
+from ._ast_pass_utils import call_path_str
 from .cutedsl_compat import cp_async_supported
+from .direct_affine_emission import compose_direct_affine_replacement
+from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .direct_affine_plan import STATE_VECTOR_BYTES
 from .direct_affine_plan import DirectAffinePlan
 from .direct_affine_plan import DirectAffineSchedule
@@ -39,14 +40,17 @@ from .direct_affine_plan import DirectAffineStateAccessProof
 from .direct_affine_plan import DirectAffineStateIngress
 from .direct_affine_plan import decode_direct_affine_schedule
 from .direct_affine_plan import resolve_direct_affine_plan
-from .direct_affine_replay import DirectAffineCoordinates
-from .direct_affine_replay import DirectAffineEmission
-from .direct_affine_replay import DirectAffineOrdinaryAxis
-from .direct_affine_replay import DirectAffineReplay
-from .direct_affine_replay import DirectAffineReplayProof
-from .direct_affine_replay import compose_direct_affine_replacement
-from .direct_affine_replay import resolve_direct_affine_coordinates
-from .direct_affine_replay import resolve_direct_affine_replay
+from .direct_affine_replay_core import DirectAffineCoordinates
+from .direct_affine_replay_core import DirectAffineEmission
+from .direct_affine_replay_core import DirectAffineOrdinaryAxis
+from .direct_affine_replay_core import DirectAffineReplay
+from .direct_affine_replay_core import DirectAffineReplayProof
+from .direct_affine_replay_core import _bound_names
+from .direct_affine_replay_core import _clone_ast
+from .direct_affine_replay_core import _dump
+from .direct_affine_replay_core import resolve_direct_affine_coordinates
+from .direct_affine_replay_core import resolve_direct_affine_replay
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -62,7 +66,6 @@ if TYPE_CHECKING:
 
 _INT32_MIN = -(1 << 31)
 _INT32_MAX = (1 << 31) - 1
-_A = TypeVar("_A", bound=ast.AST)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -106,47 +109,6 @@ def _static_size(value: object) -> int | None:
         if isinstance(symbolic, sympy.Integer):
             return int(symbolic)
     return None
-
-
-def _qualified_name(node: ast.AST) -> str | None:
-    parts: list[str] = []
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
-    if not isinstance(node, ast.Name):
-        return None
-    parts.append(node.id)
-    return ".".join(reversed(parts))
-
-
-def _dump(node: ast.AST) -> str:
-    return ast.dump(node, include_attributes=False)
-
-
-def _clone_ast(node: _A) -> _A:
-    """Clone generated AST without invoking ``ExtendedAST.__init__`` directly."""
-
-    def clone(value: object) -> object:
-        if isinstance(value, list):
-            return [clone(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(clone(item) for item in value)
-        if isinstance(value, ast.AST):
-            fields = {field: clone(getattr(value, field)) for field in value._fields}
-            result = (
-                value.copy(**fields)
-                if isinstance(value, ExtendedAST)
-                else ast.copy_location(type(value)(**fields), value)
-            )
-            for name, metadata in vars(value).items():
-                if name not in value._fields:
-                    setattr(result, name, metadata)
-            return result
-        return value
-
-    result = clone(node)
-    assert isinstance(result, ast.AST)
-    return cast("_A", result)
 
 
 def _depends_on_node(value: object, target: torch.fx.Node) -> bool:
@@ -473,7 +435,10 @@ def _source_cta_shape(
     grid: DeviceGridState,
 ) -> tuple[int, int, int] | None:
     sizes = [1, 1, 1]
-    for mapping in (grid.thread_axis_sizes, codegen.cute_synthetic_arange_axis_sizes):
+    for mapping in (
+        grid.thread_axis_sizes,
+        cute_codegen_state(codegen).synthetic_arange_axis_sizes,
+    ):
         for axis, extent in mapping.items():
             if (
                 not isinstance(axis, int)
@@ -810,15 +775,6 @@ def _resolve_memory_proof(
     return state_access, replay_proof
 
 
-def _stored_names(statements: Iterable[ast.AST]) -> set[str]:
-    return {
-        node.id
-        for statement in statements
-        for node in ast.walk(statement)
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
-    }
-
-
 def _visible_grid_names(grid: DeviceGridState) -> set[str]:
     statements = (
         *(grid.hoist_parent_statements or ()),
@@ -846,10 +802,10 @@ def _prefix_is_lane_independent(
 ) -> bool:
     """Prove a retained pre-region prefix is safe for any added source warp."""
 
-    from ..tile_strategy import _is_proven_relocatable_assignment
+    from ._ast_pass_utils import _is_proven_relocatable_assignment
 
     lane_names = {name for name, _extent in grid.lane_loops}
-    lane_names.update(_stored_names(grid.lane_setup_statements))
+    lane_names.update(_bound_names(grid.lane_setup_statements))
     for statement in statements:
         if not _is_proven_relocatable_assignment(statement, allow_load=True):
             return False
@@ -862,7 +818,7 @@ def _prefix_is_lane_independent(
                 return False
             if not isinstance(node, ast.Call):
                 continue
-            name = _qualified_name(node.func)
+            name = call_path_str(node.func)
             if name in {
                 "cute.arch.lane_idx",
                 "cute.arch.thread_idx",
@@ -880,7 +836,7 @@ def _emission_has_old_schedule_names(
     grid: DeviceGridState,
 ) -> bool:
     forbidden = {name for name, _extent in grid.lane_loops}
-    forbidden.update(_stored_names(grid.lane_setup_statements))
+    forbidden.update(_bound_names(grid.lane_setup_statements))
     for wrapper in grid.vec_lane_wrappers.values():
         forbidden.update((wrapper.vec_lane_var, wrapper.base_index_var))
     for source in (coordinates.row.source, coordinates.feature.source):
@@ -899,7 +855,7 @@ def _emission_has_old_schedule_names(
         )
         or (
             isinstance(node, ast.Call)
-            and _qualified_name(node.func) == "cute.arch.lane_idx"
+            and call_path_str(node.func) == "cute.arch.lane_idx"
         )
         for statement in emission.replacement_statements
         for node in ast.walk(statement)
@@ -937,7 +893,7 @@ def resolve_direct_affine_lowering(
     """Resolve a direct lowering without mutating codegen or ``root_body``.
 
     The caller may commit ``result.emission.replacement_statements`` through
-    :func:`direct_affine_replay.replace_direct_affine_replay` only after it has
+    :func:`direct_affine_replay_core.replace_direct_affine_replay` only after it has
     installed the returned CTA and module-import metadata.
     """
 
@@ -1059,3 +1015,90 @@ __all__ = [
     "DirectAffineResolvedLowering",
     "resolve_direct_affine_lowering",
 ]
+
+
+def try_lower_direct_affine_root(
+    codegen: GenerateAST,
+    grid: DeviceGridState,
+    root_body: list[ast.AST],
+) -> bool:
+    """Replace one proven affine-scan root after ordinary CuTe lowering
+    (``CuteBackend.rewrite_lowered_root``).  ``resolve_direct_affine_lowering``
+    and ``replace_direct_affine_replay`` are looked up at call time so the
+    tests' monkeypatches intercept them."""
+
+    if (
+        codegen.device_function.config.cute_affine_scan_schedule
+        == DIRECT_AFFINE_ORDINARY_SCHEDULE
+    ):
+        return False
+    root = codegen.current_root_graph_info
+    if root is None:
+        raise codegen.backend.unsupported("direct affine scan has no active root")
+    candidates = tuple(
+        candidate
+        for candidate in codegen.device_function.cute_state.root_plans.direct_affine_candidates
+        if candidate.graph_id == root.graph_id
+    )
+    if len(candidates) != 1:
+        raise codegen.backend.unsupported(
+            "direct affine scan requires one candidate in its root"
+        )
+
+    from .direct_affine_replay_core import replace_direct_affine_replay
+
+    resolved = resolve_direct_affine_lowering(
+        candidates[0],
+        root,
+        codegen,
+        grid,
+        root_body,
+        name_prefix=codegen.device_function.new_var("_helion_direct_affine"),
+    )
+    if resolved is None:
+        raise codegen.backend.unsupported("direct affine scan failed late validation")
+
+    existing_module_statements = {
+        ast.dump(statement, include_attributes=False)
+        for statement in codegen.module_statements
+    }
+    module_additions: list[ast.stmt] = []
+    for statement in resolved.emission.module_statements:
+        key = ast.dump(statement, include_attributes=False)
+        if key not in existing_module_statements:
+            module_additions.append(statement)
+            existing_module_statements.add(key)
+
+    body_snapshot = tuple(root_body)
+    owner_snapshot = {
+        owner: list(entries)
+        for owner, entries in codegen._statements_by_owner_node_id.items()
+    }
+    thread_dims_snapshot = tuple(codegen.referenced_thread_block_dims)
+    module_snapshot = tuple(codegen.module_statements)
+    previous_plan = codegen.device_function.cute_state.root_plans.direct_affine_plan
+    previous_has_barrier = codegen.device_function.has_barrier
+    try:
+        if not replace_direct_affine_replay(
+            resolved.replay,
+            root,
+            codegen,
+            root_body,
+            resolved.emission.replacement_statements,
+        ):
+            raise codegen.backend.unsupported(
+                "direct affine scan failed late validation"
+            )
+        codegen.module_statements.extend(module_additions)
+        codegen.device_function.cute_state.root_plans.direct_affine_plan = resolved.plan
+        codegen.device_function.has_barrier = True
+    except Exception:
+        root_body[:] = body_snapshot
+        codegen._statements_by_owner_node_id.clear()
+        codegen._statements_by_owner_node_id.update(owner_snapshot)
+        codegen.referenced_thread_block_dims[:] = thread_dims_snapshot
+        codegen.module_statements[:] = module_snapshot
+        codegen.device_function.cute_state.root_plans.direct_affine_plan = previous_plan
+        codegen.device_function.has_barrier = previous_has_barrier
+        raise
+    return True

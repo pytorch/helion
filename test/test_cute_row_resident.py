@@ -18,7 +18,6 @@ from helion._compiler.cute.row_resident import _matrix
 from helion._compiler.cute.row_resident import prove_row_resident
 from helion._compiler.cute.row_resident_codegen import _scalar_epilogue
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.language import _tracing_ops
@@ -138,7 +137,6 @@ def row_config(bound: BoundKernel[Any], mode: object = "warp_rows2") -> helion.C
 
 
 @pytest.mark.parametrize("rows", (1, 2, 3, 17, 255, 256, 257))
-@skipUnlessBackends(["cute"])
 def test_two_row_tails_are_a_general_static_domain(rows: int) -> None:
     bound = bind(rows=rows)
     found = plan(bound)
@@ -166,7 +164,6 @@ def test_two_row_tails_are_a_general_static_domain(rows: int) -> None:
         (64, 64, 80, False),
     ),
 )
-@skipUnlessBackends(["cute"])
 def test_packet_and_shared_memory_domains(
     reduction: int, middle: int, columns: int, admitted: bool
 ) -> None:
@@ -185,14 +182,12 @@ def test_packet_and_shared_memory_domains(
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
-@skipUnlessBackends(["cute"])
 def test_other_arithmetic_domains_keep_old_path(dtype: torch.dtype) -> None:
     bound = bind(dtype=dtype)
     assert plan(bound) is None
     assert not bound.config_spec.cute_materialized_schedule_available
 
 
-@skipUnlessBackends(["cute"])
 def test_original_and_renamed_materialized_graphs() -> None:
     for bound in (bind(), bind(original=True, rows=256, middle=64, columns=256)):
         found = plan(bound)
@@ -208,7 +203,6 @@ def test_original_and_renamed_materialized_graphs() -> None:
         assert bound.to_code(row_config(bound)) != bound.to_code(ordinary)
 
 
-@skipUnlessBackends(["cute"])
 def test_actual_effectful_host_metadata_keeps_the_original_path() -> None:
     args = tuple(torch.empty((64, 64), dtype=torch.float16) for _ in range(3))
     kernel = helion.kernel(
@@ -229,7 +223,6 @@ def test_actual_effectful_host_metadata_keeps_the_original_path() -> None:
 
 
 @pytest.mark.parametrize("value", (None, False, True, 0, 1, "auto", "rows2", [], {}))
-@skipUnlessBackends(["cute"])
 def test_strict_mode_and_roundtrip(value: object) -> None:
     bound = bind()
     with pytest.raises(InvalidConfig, match=ROW_RESIDENT_KEY):
@@ -255,7 +248,6 @@ def mutate(node: torch.fx.Node, **values: Any) -> Iterator[None]:
 
 
 @pytest.mark.parametrize("value", (1, -1.0, -0.0, float("nan")))
-@skipUnlessBackends(["cute"])
 def test_accumulator_initialization_is_exact_positive_zero(value: float) -> None:
     bound = bind()
     assert plan(bound)
@@ -288,7 +280,6 @@ def test_accumulator_initialization_is_exact_positive_zero(value: float) -> None
         "unregistered_alignment",
     ),
 )
-@skipUnlessBackends(["cute"])
 def test_complete_typed_proof_rechecks_late_changes(fault: str) -> None:
     bound = bind()
     assert plan(bound)

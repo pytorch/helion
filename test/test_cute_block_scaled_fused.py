@@ -18,7 +18,6 @@ from helion._compiler.cute.block_scaled_fused import fused_geometry
 from helion._compiler.cute.block_scaled_prepare import preparation_source
 from helion._testing import DEVICE
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
@@ -31,8 +30,6 @@ quantize_fp4_e2m1 = _examples_nvfp4_gemm.quantize_fp4_e2m1
 reference_nvfp4_w4a4_matmul = _examples_nvfp4_gemm.reference_nvfp4_w4a4_matmul
 swizzle_fp8_scales = _examples_nvfp4_gemm.swizzle_fp8_scales
 swizzled_scale_offsets = _examples_nvfp4_gemm.swizzled_scale_offsets
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 def _fused_plan(shape: tuple[int, int, int], **config: object) -> dict[str, object]:
@@ -212,7 +209,7 @@ def test_cuda_fused_matches_the_reference_with_signed_scales(
             static_shapes=True,
             config=config,
         )
-        plan = _wrapper_plan(kernel.bind(args).to_triton_code(config))
+        plan = _wrapper_plan(kernel.bind(args).to_code(config))
         assert plan["prepare"] == prepare and plan["stages"] == stages
         kernel(*args)
         torch.cuda.synchronize()
@@ -349,7 +346,7 @@ def test_cuda_epilogue_chunk_width_matches(bn: int, prepare: str) -> None:
             static_shapes=True,
             config=config,
         )
-        plan = _wrapper_plan(kernel.bind(args).to_triton_code(config))
+        plan = _wrapper_plan(kernel.bind(args).to_code(config))
         assert plan["prepare"] == prepare and plan["epilogue_n"] == epilogue_n
         kernel(*args)
         torch.cuda.synchronize()
@@ -496,7 +493,7 @@ def test_cuda_fused_pdl_chain_in_a_graph_reads_completed_outputs(
         buffers[0].copy_(seed)
         buffers[1].zero_()
 
-    plan = _wrapper_plan(kernel.bind(args(0)).to_triton_code(config))
+    plan = _wrapper_plan(kernel.bind(args(0)).to_code(config))
     assert plan["prepare"] == "fused" and plan["pdl"] is True
     calls = 9
     reset()
@@ -574,10 +571,7 @@ def test_cuda_fused_masks_the_sources_padding_scales(bn: int, bk: int) -> None:
             static_shapes=True,
             config=config,
         )
-        assert (
-            _wrapper_plan(kernel.bind(args).to_triton_code(config))["prepare"]
-            == prepare
-        )
+        assert _wrapper_plan(kernel.bind(args).to_code(config))["prepare"] == prepare
         kernel(*args)
         torch.cuda.synchronize()
         outputs[prepare] = args[4].clone()
@@ -649,7 +643,7 @@ def test_cuda_under_aligned_source_is_staged(prepare: str, offset: int) -> None:
                 outputs[0],
                 1.0,
             )
-        ).to_triton_code(config)
+        ).to_code(config)
     )
     assert plan["prepare"] == prepare
     if prepare == "linear":

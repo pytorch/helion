@@ -1,3 +1,14 @@
+"""Free ``hl.arange`` (iota) analysis: which arange dims are lanes, indices or free.
+
+Role: analysis.  A free ``hl.arange`` that only indexes loads / stores
+(``cute_iota_is_free_memory_index``) or feeds atomic tensor indices needs no
+thread axis of its own; ``cute_free_arange_lanes`` builds the kernel's
+``FreeArangeLanes`` (the positional lane classes of the arange dims of every
+value) once per device function, and the memory emitters
+(``memory_ops``, ``emitters/memory_access``) and ``aten_lowering`` read it.
+Pure graph reading; nothing is rewritten.
+"""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -14,6 +25,7 @@ from ..compile_environment import CompileEnvironment
 from ..compile_environment import _symint_expr
 from ..host_function import HostFunction
 from ..variable_origin import BlockSizeOrigin
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -792,6 +804,7 @@ class FreeArangeLanes:
 
 def cute_free_arange_lanes(cg: GenerateAST) -> FreeArangeLanes:
     """The kernel's :class:`FreeArangeLanes`, built on first use."""
-    if cg.cute_free_arange_lanes is None:
-        cg.cute_free_arange_lanes = FreeArangeLanes(cg.codegen_graphs)
-    return cg.cute_free_arange_lanes
+    state = cute_codegen_state(cg)
+    if state.free_arange_lanes is None:
+        state.free_arange_lanes = FreeArangeLanes(cg.codegen_graphs)
+    return state.free_arange_lanes

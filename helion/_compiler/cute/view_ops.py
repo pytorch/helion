@@ -29,6 +29,7 @@ from ..ast_read_writes import HELION_LANE_ORDERED_ATTR
 from ..compile_environment import CompileEnvironment
 from ..loop_dependency_checker import HOST_UNKNOWN_ROOT
 from ..loop_dependency_checker import collect_host_tensor_roots
+from .target_facts import static_smem_budget
 
 if TYPE_CHECKING:
     from ..aten_lowering import LoweringContext
@@ -46,7 +47,7 @@ _CAST_TARGETS = frozenset(
 
 # Static ``alloc_smem`` without an opt-in carve-out; a larger exchange buffer
 # fails in the NVVM backend rather than at this check.
-_SPLIT_SMEM_BUDGET_BYTES = 48 * 1024
+_SPLIT_SMEM_BUDGET_BYTES = static_smem_budget()
 
 
 @_decorators.codegen(subscript, "cute")

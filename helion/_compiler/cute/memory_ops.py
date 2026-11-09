@@ -2,8 +2,11 @@
 
 Backend-specific codegen bodies live here (not in the backend-neutral language
 module).  Importing this module runs the ``@_decorators.codegen(op, "cute")``
-registrations; ``memory_ops`` imports it at the bottom so registration keeps
-the same eager timing as before.
+registrations; ``helion/_compiler/cute/_codegen_modules.py`` imports it once
+from ``backend_registry.import_backend_codegen`` after the language ops exist.
+The index/mask and lane-packet helpers live in ``..emitters.memory_access`` /
+``..emitters.lane_packets`` and the tcgen05 store emitter in
+``..tcgen05.store_epilogue``.
 """
 
 from __future__ import annotations
@@ -34,31 +37,6 @@ from ...language.atomic_ops import ATOMIC_OPS
 from ...language.creation_ops import full
 from ...language.matmul_ops import dot as hl_dot
 from ...language.matmul_ops import dot_scaled as hl_dot_scaled
-from ...language.memory_ops import _CUTE_VECTOR_DTYPES
-from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
-from ...language.memory_ops import _CUTE_VECTOR_UNROLL_DTYPES
-from ...language.memory_ops import _FLAT_GATHER_SINK_MAX_BYTES
-from ...language.memory_ops import CuteTileVecStoreSite
-from ...language.memory_ops import _codegen_cute_store_tcgen05_tile
-from ...language.memory_ops import _cute_access_regions
-from ...language.memory_ops import _cute_active_index_var
-from ...language.memory_ops import _cute_active_mask_var
-from ...language.memory_ops import _cute_combined_mask
-from ...language.memory_ops import _cute_index_exprs
-from ...language.memory_ops import _cute_index_tuple
-from ...language.memory_ops import _cute_is_unroll_dtype
-from ...language.memory_ops import _cute_lane_axis_pos
-from ...language.memory_ops import _cute_register_reduction_unroll_vec_store
-from ...language.memory_ops import _cute_register_tile_unroll_vec_hoist
-from ...language.memory_ops import _cute_register_tile_unroll_vec_store
-from ...language.memory_ops import _cute_scalar_load_expr
-from ...language.memory_ops import _cute_scalar_pointer_expr
-from ...language.memory_ops import _cute_tag_access_regions
-from ...language.memory_ops import _cute_tensor_dim_size_expr
-from ...language.memory_ops import _cute_unique_graph_block_id
-from ...language.memory_ops import _cute_unroll_vec_load_expr
-from ...language.memory_ops import _matching_block_ids
-from ...language.memory_ops import _maybe_codegen_cute_packed_affine_lhs_load
 from ...language.memory_ops import load
 from ...language.memory_ops import store
 from ..ast_extension import expr_from_string
@@ -70,10 +48,14 @@ from ..compile_environment import _replay_tensor_input_source
 from ..compile_environment import _symint_expr
 from ..compile_environment import _to_sympy
 from ..indexing_strategy import _get_tile_with_offset_info
+from ..lane_loop_context import lane_context
 from ..runtime_tensor_guards import _prepared_guard_source
 from ..utils import compute_slice_size
-from .cache_policy_loads import _CUTE_NC_L2_FIRST_SUFFIX
-from .cache_policy_loads import is_cache_policy_suffix
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import call_path_str
+from ._ast_pass_utils import names_read
+from .cache_policy_loads import CachePolicy
+from .cache_policy_loads import hint_wide_packets
 from .cute_epilogue import _ZERO_ARG_TARGETS
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import build_inner_outputs_index
@@ -91,6 +73,31 @@ from .cute_reshape import is_cute_thread_moving_reshape_value
 from .cute_reshape import run_deferred_rebound_checks
 from .cute_reshape import store_rebound_dims
 from .cute_reshape import tcgen05_rebound_store_error
+from .emitters.lane_packets import _CUTE_VECTOR_DTYPES
+from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_CARRIER
+from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_DTYPES
+from .emitters.lane_packets import _FLAT_GATHER_SINK_MAX_BYTES
+from .emitters.lane_packets import CuteTileVecStoreSite
+from .emitters.lane_packets import LanePacketEmitter
+from .emitters.lane_packets import PacketGuard
+from .emitters.lane_packets import _cute_is_unroll_dtype
+from .emitters.lane_packets import _cute_register_reduction_unroll_vec_store
+from .emitters.lane_packets import _cute_register_tile_unroll_vec_hoist
+from .emitters.lane_packets import _cute_register_tile_unroll_vec_store
+from .emitters.memory_access import AccessSite
+from .emitters.memory_access import _cute_access_regions
+from .emitters.memory_access import _cute_active_index_var
+from .emitters.memory_access import _cute_active_mask_var
+from .emitters.memory_access import _cute_combined_mask
+from .emitters.memory_access import _cute_index_exprs
+from .emitters.memory_access import _cute_index_tuple
+from .emitters.memory_access import _cute_scalar_load_expr
+from .emitters.memory_access import _cute_scalar_pointer_expr
+from .emitters.memory_access import _cute_tag_access_regions
+from .emitters.memory_access import _cute_tensor_dim_size_expr
+from .emitters.memory_access import _cute_unique_graph_block_id
+from .emitters.memory_access import _matching_block_ids
+from .emitters.memory_access import _maybe_codegen_cute_packed_affine_lhs_load
 from .indexing import CUTE_SCALAR_LOAD_SITE_META
 from .indexing import CuteScalarLoadSite
 from .indexing import is_cute_direct_iota_index
@@ -98,10 +105,12 @@ from .indexing import is_cute_unit_stride_iota_index
 from .indexing import match_cute_shifted_tile_index
 from .indexing import unwrap_cute_broadcast_index
 from .iota_utils import cute_free_arange_lanes
+from .tcgen05.store_epilogue import _codegen_cute_store_tcgen05_tile
 from .tile_ops import cute_masked_block_end
 from .tile_ops import cute_tile_begin_expr
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Hashable
     from collections.abc import Sequence
 
@@ -113,7 +122,10 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
+    from ..lane_loop_context import LaneLoopContext
     from ..reduction_strategy import LoopedReductionStrategy
+    from ..reduction_strategy import PersistentReductionStrategy
+    from ..reduction_strategy import ReductionStrategy
     from ..tile_strategy import DeviceGridState
     from ..tile_strategy import DeviceLoopOrGridState
     from ..tile_strategy import PerThreadFlattenedTileStrategy
@@ -528,26 +540,6 @@ def stores_into_input_storage(
     return False
 
 
-def _log_cute_layout(state: CodegenState, op_name: str) -> None:
-    """Log the CuTe layout annotation for the current node, if any.
-
-    This is used during CuTe load/store codegen to make layout info
-    visible for debugging and future codegen integration.
-    """
-    layout = state.cute_layout
-    if layout is None:
-        return
-    node_name = state.fx_node.name if state.fx_node else "?"
-    log.debug(
-        "cute %s %s: layout tag=%s thread=%s value=%s",
-        op_name,
-        node_name,
-        layout.tag.value,
-        layout.thread_shape,
-        layout.value_shape,
-    )
-
-
 def _maybe_codegen_cute_packed_rhs_load(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -630,6 +622,51 @@ def _cute_scalar_storage_dtype(dtype: torch.dtype) -> str:
     return CompileEnvironment.current().backend.dtype_str(dtype)
 
 
+def _cute_masked_value_expr(
+    load_expr: str,
+    mask_expr: str | None,
+    *,
+    dtype: torch.dtype,
+    zero: str,
+    **placeholders: ast.AST,
+) -> ast.AST:
+    """The value of a scalar load: ``load_expr`` where ``mask_expr`` holds,
+    ``zero(0)`` elsewhere (the plain load without a mask).  A bool load reads
+    a byte and compares it against zero; its masked-off value is
+    ``cutlass.Boolean(0)``."""
+    if dtype is torch.bool:
+        load_expr = f"({load_expr} != cutlass.Uint8(0))"
+        zero = "cutlass.Boolean"
+    if mask_expr is None:
+        return expr_from_string(load_expr, **placeholders)
+    return expr_from_string(
+        f"({load_expr} if {mask_expr} else {zero}(0))", **placeholders
+    )
+
+
+def _cute_guarded_store(
+    state: CodegenState, store_expr: ast.AST, mask_expr: str | None
+) -> ast.AST:
+    """Emit ``store_expr`` as a statement under ``if mask_expr:`` and return
+    the store op's (None) value; without a mask the store expression itself
+    is the op's value."""
+    if mask_expr is None:
+        return store_expr
+    mask_ast = expr_from_string(mask_expr)
+    assert isinstance(mask_ast, ast.expr)
+    assert isinstance(store_expr, ast.expr)
+    state.add_statement(
+        ast.fix_missing_locations(
+            ast.If(
+                test=mask_ast,
+                body=[ast.Expr(value=store_expr)],
+                orelse=[],
+            )
+        )
+    )
+    return ast.Constant(value=None)
+
+
 _PERSISTENT_BRANCH_VEC_LOAD = "_helion_persistent_branch_vec_load"
 _PERSISTENT_BRANCH_VEC_STORE = "_helion_persistent_branch_vec_store"
 
@@ -702,53 +739,9 @@ def _cute_scalar_store_expr(
     return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.store({value})"
 
 
-_CUTE_EVICTION_POLICY_MAP = {
-    "": "",
-    "first": "evict_first",
-    "last": "evict_last",
-}
-
-
-def _cute_vector_load_expr(
-    tensor_name: str,
-    index_exprs: list[str],
-    dtype: torch.dtype,
-    *,
-    vec_width: int,
-    eviction_suffix: str = "",
-) -> str:
-    elem_str, _ = _CUTE_VECTOR_DTYPES[dtype]
-    ptr = _cute_scalar_pointer_expr(tensor_name, index_exprs)
-    if is_cache_policy_suffix(eviction_suffix):
-        # Explicit-vec ("vec" mode) loads return FLOAT vectors, not the
-        # carrier form the L2 helper produces; drop the hint here.
-        eviction_suffix = ""
-    return (
-        f"cute.arch.load({ptr}, "
-        f"ir.VectorType.get([{vec_width}], {elem_str}.mlir_type)"
-        f"{eviction_suffix})"
-    )
-
-
-def _cute_vector_store_expr(
-    tensor_name: str,
-    index_exprs: list[str],
-    value: str,
-    dtype: torch.dtype,
-    *,
-    vec_width: int,
-) -> str:
-    elem_str, _ = _CUTE_VECTOR_DTYPES[dtype]
-    ptr = _cute_scalar_pointer_expr(tensor_name, index_exprs)
-    return (
-        f"cute.arch.store({ptr}, {value}, "
-        f"ir.VectorType.get([{vec_width}], {elem_str}.mlir_type))"
-    )
-
-
 def _cute_register_unroll_vec_hoist(
     state: CodegenState,
-    strategy: object,  # Looped/PersistentReductionStrategy at runtime
+    strategy: LoopedReductionStrategy | PersistentReductionStrategy,
     tensor: torch.Tensor,
     tensor_name: str,
     index_exprs: list[str],
@@ -765,10 +758,10 @@ def _cute_register_unroll_vec_hoist(
     """
     elem_dtype = _CUTE_VECTOR_UNROLL_DTYPES[tensor.dtype]
     carrier = _CUTE_VECTOR_UNROLL_CARRIER[tensor.dtype]
-    base_index_var = getattr(strategy, "_cute_lane_base_index_var", None)
-    lane_body = getattr(strategy, "_cute_lane_body", None)
-    assert isinstance(base_index_var, str)
-    assert isinstance(lane_body, list)
+    context = strategy.lane_context
+    lane_body = context.lane_body
+    assert context.base_index_var is not None
+    assert lane_body is not None
     from ..reduction_strategy import PersistentReductionStrategy
 
     if isinstance(strategy, PersistentReductionStrategy):
@@ -788,9 +781,8 @@ def _cute_register_unroll_vec_hoist(
     _cute_relocate_above_vloop(scope, definitions.moved)
     # Looped reductions expose their reduction index directly in the last
     # position, so replacing that component is sufficient.
-    base_exprs = list(index_exprs)
-    base_exprs[-1] = base_index_var
-    base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
+    emitter = LanePacketEmitter(context)
+    base_ptr_expr = emitter.base_pointer(tensor_name, index_exprs, len(index_exprs) - 1)
     # A mask predicates the whole packet.  Outer terms such as the row mask
     # (proven uniform across the chunk by the caller) apply whether or not
     # the roll itself is masked: a partially filled row tile must not read
@@ -812,42 +804,34 @@ def _cute_register_unroll_vec_hoist(
     if strategy._mask_var is not None:
         guard_terms.append(strategy.cute_chunk_in_bounds_expr(state))
     guard = " and ".join(f"({term})" for term in guard_terms) or None
-    cache_key = (tensor_name, base_ptr_expr, guard)
-    cache = getattr(strategy, "_cute_lane_vec_loads", None)
-    if cache is None:
-        cache = {}
-        # pyrefly: ignore [missing-attribute]
-        strategy._cute_lane_vec_loads = cache
-    # Locate the constexpr V-loop: prefer the node recorded by
-    # codegen_device_loop (vec-store flushes may sit after it, so it is not
-    # guaranteed to be the last lane_body entry).
-    constexpr_loop = getattr(strategy, "_cute_lane_vloop", None)
+    anchor_ptr_expr = (
+        _cute_scalar_pointer_expr(tensor_name, ["0"] * len(index_exprs))
+        if guard is not None
+        else ""
+    )
+    hoist_var, _hoist_stmt = emitter.hoist_load(
+        state,
+        tensor_name=tensor_name,
+        dtype=tensor.dtype,
+        base_ptr_expr=base_ptr_expr,
+        vec_width=vec_width,
+        eviction_suffix=eviction_suffix,
+        cache_tag=guard,
+        guard=PacketGuard(guard, anchor_ptr_expr),
+        var_prefix="_unroll_vec_",
+        wide_packets=hint_wide_packets(state.config.cute_wide_packet_hints),
+    )
+    # The constexpr V-loop: the node recorded by codegen_device_loop (vec-store
+    # flushes may sit after it, so it is not guaranteed to be the last
+    # lane_body entry).
+    constexpr_loop = context.vloop
     if constexpr_loop is None or constexpr_loop not in lane_body:
         constexpr_loop = lane_body[-1]
-    if cache_key not in cache:
-        hoist_var = state.device_function.new_var(
-            f"_unroll_vec_{len(cache)}", dce=False
-        )
-        cache[cache_key] = (hoist_var, tensor.dtype)
-        load_ptr_expr = base_ptr_expr
-        if guard is not None:
-            anchor_ptr_expr = _cute_scalar_pointer_expr(
-                tensor_name, ["0"] * len(index_exprs)
-            )
-            load_ptr_expr = f"({base_ptr_expr} if {guard} else {anchor_ptr_expr})"
-        hoist_stmt = statement_from_string(
-            f"{hoist_var} = "
-            f"{_cute_unroll_vec_load_expr(load_ptr_expr, tensor.dtype, vec_width, eviction_suffix)}"
-        )
-        # Insert the hoist just BEFORE the constexpr V-loop.
-        lane_body.insert(lane_body.index(constexpr_loop), hoist_stmt)
-    else:
-        hoist_var, _ = cache[cache_key]
     assert isinstance(constexpr_loop, ast.For)
     assert isinstance(constexpr_loop.target, ast.Name)
     vec_lane_var = constexpr_loop.target.id
     extract = f"{carrier}({hoist_var}[{vec_lane_var}]).bitcast({elem_dtype})"
-    chunk_full_var = strategy._cute_reduction_chunk_full_var
+    chunk_full_var = context.chunk_full_var
     if strategy._mask_var is not None and chunk_full_var is not None:
         # The straddling tail chunk holds anchor bytes: its in-bounds lanes
         # re-read their element individually (at most one chunk per row).
@@ -913,7 +897,7 @@ def _persistent_expr_depends_on_inner_lane(
 
 def _persistent_vec_base_index_exprs(
     state: CodegenState,
-    strategy: object,
+    strategy: ReductionStrategy,
     index_exprs: list[str],
     *,
     preserve_lane_independent_aliases: bool = False,
@@ -926,7 +910,7 @@ def _persistent_vec_base_index_exprs(
     aliases.  Inline pure assignment chains and replace the reduction index by
     its chunk base.  A chain containing a memory load remains scalar.
     """
-    base_index_var = getattr(strategy, "_cute_lane_base_index_var", None)
+    base_index_var = strategy.lane_context.base_index_var
     block_index = getattr(strategy, "block_index", None)
     if not isinstance(base_index_var, str) or not isinstance(block_index, int):
         return None
@@ -1034,7 +1018,7 @@ def _persistent_vec_base_index_exprs(
 
 def _persistent_vec_is_exact_aligned(
     state: CodegenState,
-    strategy: object,
+    strategy: ReductionStrategy,
     index_exprs: list[str],
     tensor: torch.Tensor,
     vec_width: int,
@@ -1048,8 +1032,8 @@ def _persistent_vec_is_exact_aligned(
     coordinate plus an offset provably divisible by the vector width.  The
     late pass separately turns the scalar bounds into a whole-fragment guard.
     """
-    base_var = getattr(strategy, "_cute_lane_base_index_var", None)
-    if not isinstance(base_var, str):
+    base_var = strategy.lane_context.base_index_var
+    if base_var is None:
         return False
     rebased = _persistent_vec_base_index_exprs(
         state,
@@ -1156,7 +1140,7 @@ def _persistent_vec_is_exact_aligned(
 
 def _persistent_vec_scope_safe(
     state: CodegenState,
-    strategy: object,
+    strategy: ReductionStrategy,
     expression: str,
 ) -> bool:
     """Whether ``expression`` is available outside a persistent V-loop.
@@ -1205,7 +1189,7 @@ def _persistent_vec_scope_safe(
     if grid is None:
         return False
     lane_var = getattr(strategy, "_synthetic_cute_lane_var", None)
-    base_var = getattr(strategy, "_cute_lane_base_index_var", None)
+    base_var = strategy.lane_context.base_index_var
 
     # A persistent wrapper is inserted according to ``lane_loops`` nesting.
     # Targets belonging to a deeper lane loop do not exist at its hoist site.
@@ -1381,6 +1365,54 @@ def _cute_stack_tensor_pointer_expr(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class StackTensorAddress:
+    """The address and mask of one stack-tensor (pointer table) access.
+
+    ``hl.load`` / ``hl.store`` on ``(tensor_like, dev_ptrs)`` read the device
+    pointer out of the table and offset it by ``tensor_like[subscript]``:
+    ``pointer`` is ``cute.make_ptr(T, cutlass.Int64(<table entry>), gmem) +
+    offset`` with ``T`` the ``target_dtype``, and ``mask`` the conjunction of
+    ``tensor_like``'s and the table's bounds, None when both are complete.
+    Built in the order the load and store lowerings always used (offset, then
+    mask), which fixes the numbering of the lifted ``tile_begin_N`` /
+    ``mask_N`` names.
+    """
+
+    target_dtype: str
+    pointer: ast.AST
+    mask: str | None
+
+    @classmethod
+    def from_site(
+        cls,
+        state: CodegenState,
+        tensor: tuple[torch.Tensor, torch.Tensor],
+        subscript: list[object] | tuple[object, ...],
+        ast_subscript: list[object] | tuple[object, ...],
+        extra_mask: ast.AST | None,
+        *,
+        for_store: bool,
+    ) -> StackTensorAddress:
+        stack_tensor_ast = state.ast_args[0]
+        assert isinstance(stack_tensor_ast, tuple)
+        assert len(stack_tensor_ast) == 2
+        _tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
+        assert isinstance(dev_ptrs_ast, ast.AST)
+        tensor_like, dev_ptrs = tensor
+        offset_expr = _cute_stack_tensor_offset_expr(
+            state, tensor_like, [*subscript], ast_subscript, for_store=for_store
+        )
+        target_dtype = CompileEnvironment.current().backend.dtype_str(tensor_like.dtype)
+        pointer = _cute_stack_tensor_pointer_expr(
+            target_dtype, dev_ptrs_ast, offset_expr
+        )
+        mask = _cute_stack_tensor_mask_expr(
+            state, tensor_like, dev_ptrs, [*subscript], extra_mask, for_store=for_store
+        )
+        return cls(target_dtype, pointer, mask)
+
+
 def _codegen_cute_store_stack_load(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -1552,21 +1584,7 @@ def _codegen_cute_store_stack_load(
     mask_expr = _cute_combined_mask(
         state, [*subscript], extra_mask, tensor=tensor, for_store=True
     )
-    if mask_expr is None:
-        return store_expr
-    mask_ast = expr_from_string(mask_expr)
-    assert isinstance(mask_ast, ast.expr)
-    assert isinstance(store_expr, ast.expr)
-    state.add_statement(
-        ast.fix_missing_locations(
-            ast.If(
-                test=mask_ast,
-                body=[ast.Expr(value=store_expr)],
-                orelse=[],
-            )
-        )
-    )
-    return ast.Constant(value=None)
+    return _cute_guarded_store(state, store_expr, mask_expr)
 
 
 def _cute_affine_range_block_id(state: CodegenState, affine: object) -> int | None:
@@ -2021,13 +2039,11 @@ def _codegen_cute_affine_reshape_store(
     )
 
 
-def _is_cute_affine_range_load_for_store(
-    state: CodegenState,
-    subscript: list[object] | tuple[object, ...],
-    ast_subscript: list[object] | tuple[object, ...],
+def _cute_load_only_feeds_stores(
+    state: CodegenState, store_predicate: Callable[[torch.fx.Node], bool]
 ) -> bool:
-    from .indexing import CuteAffineRangeIndex
-    from .indexing import match_cute_affine_range_iota
+    """Every user of the load is an unmasked ``store`` of the loaded value whose
+    site also satisfies ``store_predicate`` (the per-path subscript check)."""
 
     def compatible_store_user(user: torch.fx.Node) -> bool:
         if (
@@ -2038,6 +2054,24 @@ def _is_cute_affine_range_load_for_store(
             or user.args[3] is not None
         ):
             return False
+        return store_predicate(user)
+
+    return (
+        state.fx_node is not None
+        and len(state.fx_node.users) > 0
+        and all(compatible_store_user(user) for user in state.fx_node.users)
+    )
+
+
+def _is_cute_affine_range_load_for_store(
+    state: CodegenState,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+) -> bool:
+    from .indexing import CuteAffineRangeIndex
+    from .indexing import match_cute_affine_range_iota
+
+    def stores_affine_range(user: torch.fx.Node) -> bool:
         store_subscript = user.args[1]
         return (
             isinstance(store_subscript, (list, tuple))
@@ -2047,9 +2081,7 @@ def _is_cute_affine_range_load_for_store(
         )
 
     return (
-        state.fx_node is not None
-        and len(state.fx_node.users) > 0
-        and all(compatible_store_user(user) for user in state.fx_node.users)
+        _cute_load_only_feeds_stores(state, stores_affine_range)
         and len(subscript) == 1
         and len(ast_subscript) == 1
         and isinstance(ast_subscript[0], CuteAffineRangeIndex)
@@ -2076,15 +2108,7 @@ def _is_cute_strided_slice_load_for_store(
     tensor: torch.Tensor,
     subscript: list[object] | tuple[object, ...],
 ) -> bool:
-    def compatible_store_user(user: torch.fx.Node) -> bool:
-        if (
-            user.op != "call_function"
-            or user.target is not store
-            or len(user.args) < 4
-            or user.args[2] is not state.fx_node
-            or user.args[3] is not None
-        ):
-            return False
+    def stores_positive_1d_slice(user: torch.fx.Node) -> bool:
         target_node = user.args[0]
         if not isinstance(target_node, torch.fx.Node):
             return False
@@ -2100,9 +2124,7 @@ def _is_cute_strided_slice_load_for_store(
         )
 
     return (
-        state.fx_node is not None
-        and len(state.fx_node.users) > 0
-        and all(compatible_store_user(user) for user in state.fx_node.users)
+        _cute_load_only_feeds_stores(state, stores_positive_1d_slice)
         and tensor.ndim == 1
         and len(subscript) == 1
         and _cute_positive_1d_slice_bounds(tensor, subscript[0]) is not None
@@ -2881,7 +2903,7 @@ def _try_splice_tcgen05_unary_epilogue(
     loud-failure backstop then catches them.
     """
     cute_state = state.device_function.cute_state
-    if not cute_state.matmul_fx_nodes:
+    if not cute_state.tcgen05.matmul_fx_nodes:
         return None
     if value_node is None:
         return None
@@ -2895,7 +2917,7 @@ def _try_splice_tcgen05_unary_epilogue(
     chain, anchor = analyzed
     if not chain.steps:
         return None
-    anchor_result_var = cute_state.matmul_fx_node_result_vars.get(anchor)
+    anchor_result_var = cute_state.tcgen05.matmul_fx_node_result_vars.get(anchor)
     if anchor_result_var is None:
         return None
     rewritten_stmt = _codegen_cute_store_tcgen05_tile(
@@ -2947,7 +2969,7 @@ def _try_codegen_tcgen05_fragment_epilogue(
         return None
     if not isinstance(tensor, torch.Tensor):
         raise exc.BackendUnsupported("cute", "planned tcgen05 store is not a tensor")
-    from ..inductor_lowering import is_deferred_tcgen05_fragment_epilogue
+    from .device_state import is_deferred_tcgen05_fragment_epilogue
 
     value_node = state.fx_node.args[2] if state.fx_node is not None else None
     if value_node is not plan.value_node or not is_deferred_tcgen05_fragment_epilogue(
@@ -2957,8 +2979,10 @@ def _try_codegen_tcgen05_fragment_epilogue(
             "cute",
             "committed tcgen05 thread-local epilogue received the wrong store value",
         )
-    result_var = state.device_function.cute_state.matmul_fx_node_result_vars.get(
-        plan.anchor
+    result_var = (
+        state.device_function.cute_state.tcgen05.matmul_fx_node_result_vars.get(
+            plan.anchor
+        )
     )
     if result_var is None:
         raise exc.BackendUnsupported(
@@ -2992,7 +3016,7 @@ def _try_splice_tcgen05_grouped_tail_epilogue(
 ) -> ast.AST | None:
     """Splice grouped preserve-output M/N tail stores into tcgen05."""
     cute_state = state.device_function.cute_state
-    if not cute_state.matmul_fx_nodes:
+    if not cute_state.tcgen05.matmul_fx_nodes:
         return None
     if value_node is None or state.fx_node is None:
         return None
@@ -3007,7 +3031,9 @@ def _try_splice_tcgen05_grouped_tail_epilogue(
         # The proved grouped scheduler/store extent owns this exact M/N mask.
         # Its producer nodes are removed after the collective store is emitted.
         extra_mask = None
-    anchor_result_var = cute_state.matmul_fx_node_result_vars.get(grouped_tail.anchor)
+    anchor_result_var = cute_state.tcgen05.matmul_fx_node_result_vars.get(
+        grouped_tail.anchor
+    )
     if anchor_result_var is None:
         return None
     rewritten_stmt = _codegen_cute_store_tcgen05_tile(
@@ -3026,6 +3052,110 @@ def _try_splice_tcgen05_grouped_tail_epilogue(
     for stmt in stmts:
         state.add_statement(stmt)
     return ast.Constant(value=None)
+
+
+@dataclasses.dataclass(frozen=True)
+class _TopkStoreLanes:
+    """A store of a ``topk`` result: each thread's ``k`` lanes hold its
+    selected values (``cute_topk_lane_expr`` counts them), so the store is
+    guarded by ``lane < k`` and, past a partial tile, ``bound``."""
+
+    lane_expr: str
+    k: int
+    bound: str | None
+
+    @property
+    def mask(self) -> str:
+        mask = f"({self.lane_expr}) < {self.k}"
+        if self.bound is not None:
+            mask = f"{mask} and {self.bound}"
+        return mask
+
+
+def _load_access_site(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+) -> AccessSite:
+    """The ``AccessSite`` of an ``hl.load``: an inactive full slice reads
+    ``None`` (a ``T[...]`` subscript form), a singleton one ``0``; the mask
+    is bound to the same axes that supply the addresses
+    (``_cute_resolved_load_mask``)."""
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    index_exprs = _cute_index_exprs(
+        state,
+        subscript,
+        ast_subscript,
+        tensor=tensor,
+        inactive_slice_expr="None",
+        inactive_singleton_slice_expr="0",
+    )
+    regions = _cute_access_regions(state, subscript, tensor)
+    mask_expr = _cute_resolved_load_mask(
+        state, tensor, subscript, index_exprs, extra_mask
+    )
+    return AccessSite(tensor_name, index_exprs, regions, mask_expr)
+
+
+def _store_access_site(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+) -> tuple[AccessSite, bool, _TopkStoreLanes | None]:
+    """The ``AccessSite`` of an ``hl.store`` and the two value-driven
+    re-addressings: whether an ``hl.split`` view coordinate replaced a
+    full-slice address (``_apply_cute_value_coord_meta``; the mask then
+    treats that dim as always in bounds) and the topk lane guard
+    (``_cute_topk_store_index_exprs``)."""
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    index_exprs = _cute_index_exprs(
+        state,
+        subscript,
+        ast_subscript,
+        tensor=tensor,
+        inactive_singleton_slice_expr="0",
+        for_store=True,
+    )
+    # Regions come from the subscript as written: a re-addressed full-slice
+    # dim (below) stays inside the slice's extent, so they remain an
+    # over-approximation of the elements this store touches.
+    regions = _cute_access_regions(state, subscript, tensor)
+    mask_subscript: list[object] | tuple[object, ...] = subscript
+    if state.fx_node is not None and len(state.fx_node.args) > 2:
+        mask_subscript = _apply_cute_value_coord_meta(
+            state, tensor, subscript, index_exprs, state.fx_node.args[2]
+        )
+    value_readdressed = mask_subscript != list(subscript)
+    topk: _TopkStoreLanes | None = None
+    if state.fx_node is not None and len(state.fx_node.args) > 2:
+        value_node = state.fx_node.args[2]
+        while isinstance(value_node, torch.fx.Node):
+            source = _cute_topk_cast_input(value_node)
+            if source is None:
+                break
+            value_node = source
+        if (
+            isinstance(value_node, torch.fx.Node)
+            and value_node.target is operator.getitem
+            and isinstance(value_node.args[0], torch.fx.Node)
+            and value_node.args[0].target is torch.ops.aten.topk.default
+        ):
+            topk_lane_expr = value_node.args[0].meta.get("cute_topk_lane_expr")
+            topk_k = value_node.args[0].meta.get("cute_topk_k")
+            if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
+                index_exprs, topk_bound = _cute_topk_store_index_exprs(
+                    state, tensor, index_exprs, value_node, topk_lane_expr
+                )
+                topk = _TopkStoreLanes(topk_lane_expr, topk_k, topk_bound)
+    mask_expr = _cute_combined_mask(
+        state, mask_subscript, extra_mask, tensor=tensor, for_store=True
+    )
+    site = AccessSite(tensor_name, index_exprs, regions, mask_expr)
+    return site, value_readdressed, topk
 
 
 @_decorators.codegen(store, "cute")
@@ -3094,7 +3224,7 @@ def _(state: CodegenState) -> ast.AST:
     if rebound:
         rebound_tcgen05 = bool(
             value_node is not None
-            and state.device_function.cute_state.matmul_fx_nodes
+            and state.device_function.cute_state.tcgen05.matmul_fx_nodes
             and reach_tcgen05_matmul_anchors(state, value_node)
         )
         if not rebound_tcgen05:
@@ -3202,58 +3332,20 @@ def _(state: CodegenState) -> ast.AST:
                     return rewritten_stmt
 
     if isinstance(tensor, tuple):
-        stack_tensor_ast = state.ast_args[0]
-        assert isinstance(stack_tensor_ast, tuple)
-        assert len(stack_tensor_ast) == 2
-        _tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
-        assert isinstance(dev_ptrs_ast, ast.AST)
-        tensor_like, dev_ptrs = tensor
-        offset_expr = _cute_stack_tensor_offset_expr(
-            state,
-            tensor_like,
-            [*subscript],
-            ast_subscript,
-            for_store=True,
+        address = StackTensorAddress.from_site(
+            state, tensor, subscript, ast_subscript, extra_mask, for_store=True
         )
         backend = CompileEnvironment.current().backend
-        target_dtype = backend.dtype_str(tensor_like.dtype)
         value = expr_from_string(
-            backend.ast_to_dtype_expr("{value}", target_dtype),
+            backend.ast_to_dtype_expr("{value}", address.target_dtype),
             value=value,
         )
-        ptr_expr = _cute_stack_tensor_pointer_expr(
-            target_dtype, dev_ptrs_ast, offset_expr
-        )
         store_expr = expr_from_string(
-            "({ptr}).store({value})", ptr=ptr_expr, value=value
+            "({ptr}).store({value})", ptr=address.pointer, value=value
         )
-        mask_expr = _cute_stack_tensor_mask_expr(
-            state,
-            tensor_like,
-            dev_ptrs,
-            [*subscript],
-            extra_mask,
-            for_store=True,
-        )
-        if mask_expr is None:
-            return store_expr
-        mask_ast = expr_from_string(mask_expr)
-        assert isinstance(mask_ast, ast.expr)
-        assert isinstance(store_expr, ast.expr)
-        state.add_statement(
-            ast.fix_missing_locations(
-                ast.If(
-                    test=mask_ast,
-                    body=[ast.Expr(value=store_expr)],
-                    orelse=[],
-                )
-            )
-        )
-        return ast.Constant(value=None)
+        return _cute_guarded_store(state, store_expr, address.mask)
     if not isinstance(tensor, torch.Tensor):
         raise exc.BackendUnsupported("cute", f"store target type: {type(tensor)}")
-
-    _log_cute_layout(state, "store")
 
     if isinstance(value, ast.Name):
         rewritten_stmt = _codegen_cute_store_tcgen05_tile(
@@ -3306,7 +3398,7 @@ def _(state: CodegenState) -> ast.AST:
     # to emit per-block-id index/mask vars, or (b) per-subtile lambda
     # emission in `_codegen_cute_store_tcgen05_tile`.
     if (
-        state.device_function.cute_state.matmul_fx_nodes
+        state.device_function.cute_state.tcgen05.matmul_fx_nodes
         and value_node is not None
         and reach_tcgen05_matmul_anchors(state, value_node)
     ):
@@ -3358,7 +3450,9 @@ def _(state: CodegenState) -> ast.AST:
 
     drain_deferred_rebound_checks()
 
-    tensor_name = state.device_function.tensor_arg(tensor).name
+    site, value_readdressed, topk = _store_access_site(
+        state, tensor, subscript, ast_subscript, extra_mask
+    )
     backend = CompileEnvironment.current().backend
     target_dtype = backend.dtype_str(tensor.dtype)
     value = expr_from_string(
@@ -3366,72 +3460,29 @@ def _(state: CodegenState) -> ast.AST:
         value=value,
     )
     assert isinstance(value, ast.expr)
-    index_exprs = _cute_index_exprs(
-        state,
-        subscript,
-        ast_subscript,
-        tensor=tensor,
-        inactive_singleton_slice_expr="0",
-        for_store=True,
-    )
-    # Regions come from the subscript as written: a re-addressed full-slice
-    # dim (below) stays inside the slice's extent, so they remain an
-    # over-approximation of the elements this store touches.
-    regions = _cute_access_regions(state, subscript, tensor)
-    mask_subscript: list[object] | tuple[object, ...] = subscript
-    if state.fx_node is not None and len(state.fx_node.args) > 2:
-        mask_subscript = _apply_cute_value_coord_meta(
-            state, tensor, subscript, index_exprs, state.fx_node.args[2]
-        )
-    value_readdressed = mask_subscript != list(subscript)
-    topk_lane_expr: object | None = None
-    topk_k: object | None = None
-    topk_bound: str | None = None
-    if state.fx_node is not None and len(state.fx_node.args) > 2:
-        value_node = state.fx_node.args[2]
-        while isinstance(value_node, torch.fx.Node):
-            source = _cute_topk_cast_input(value_node)
-            if source is None:
-                break
-            value_node = source
-        if (
-            isinstance(value_node, torch.fx.Node)
-            and value_node.target is operator.getitem
-            and isinstance(value_node.args[0], torch.fx.Node)
-            and value_node.args[0].target is torch.ops.aten.topk.default
-        ):
-            topk_lane_expr = value_node.args[0].meta.get("cute_topk_lane_expr")
-            topk_k = value_node.args[0].meta.get("cute_topk_k")
-    if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
-        assert isinstance(value_node, torch.fx.Node)
-        index_exprs, topk_bound = _cute_topk_store_index_exprs(
-            state, tensor, index_exprs, value_node, topk_lane_expr
-        )
-    store_uses_pointer = "None" not in index_exprs
-    mask_expr = _cute_combined_mask(
-        state, mask_subscript, extra_mask, tensor=tensor, for_store=True
-    )
+    store_uses_pointer = "None" not in site.index_exprs
     branch_vec_store_candidate: tuple[int, int] | None = None
 
     if (
         store_uses_pointer
-        and topk_lane_expr is None
+        and topk is None
         and not value_readdressed
         and tensor.dtype in _CUTE_PACKET_STORE_DTYPES
     ):
         packet_context = _cute_vector_load_ctx(
-            state, tensor, subscript, index_exprs, extra_mask, for_store=True
+            state, tensor, subscript, site.index_exprs, extra_mask, for_store=True
         )
         if packet_context is not None and packet_context[2] == "unroll":
+            from ..reduction_strategy import ReductionStrategy
+
             width, block_id, _mode = packet_context
-            if width in (2, 4, 8, 16) and _persistent_vec_is_exact_aligned(
-                state,
-                _cute_lane_strategy(state, block_id),
-                index_exprs,
-                tensor,
-                width,
-            ):
-                branch_vec_store_candidate = (block_id, width)
+            if width in (2, 4, 8, 16):
+                packet_strategy = _cute_lane_strategy(state, block_id)
+                assert isinstance(packet_strategy, ReductionStrategy)
+                if _persistent_vec_is_exact_aligned(
+                    state, packet_strategy, site.index_exprs, tensor, width
+                ):
+                    branch_vec_store_candidate = (block_id, width)
 
     # Vectorized store: when this store's stride-1 axis is a vec-partitioned
     # lane loop (same predicates as the vec-load hoist, so the per-element
@@ -3440,55 +3491,57 @@ def _(state: CodegenState) -> ast.AST:
     # V scalar 2-byte stores.
     if (
         store_uses_pointer
-        and topk_lane_expr is None
+        and topk is None
         and not value_readdressed
         and extra_mask is None
         and tensor.dtype in (torch.float16, torch.bfloat16, torch.float32)
     ):
-        vec_ctx = _cute_vector_load_ctx(state, tensor, subscript, index_exprs, None)
+        vec_ctx = _cute_vector_load_ctx(
+            state, tensor, subscript, site.index_exprs, None
+        )
         if vec_ctx is not None and vec_ctx[2] == "tile_unroll":
             from ..tile_strategy import BlockSizeTileStrategy
 
             _vec_width, vec_block_id, _mode = vec_ctx
             strategy = _cute_lane_strategy(state, vec_block_id)
             assert isinstance(strategy, BlockSizeTileStrategy)
+            context = lane_context(state, vec_block_id)
+            assert context is not None
             from .signed_bitfield import packed_store_value
             from .signed_bitfield import signed_byte_site
 
-            lane_axis_pos = _cute_lane_axis_pos(strategy, vec_block_id, index_exprs)
+            lane_axis_pos = context.lane_axis(site.index_exprs)
             # A grid-owned flush is emitted when the root body is wrapped, after
             # the deferred hoist has recorded its signed-byte packet. Resolve the
             # packed value then, but prove scope with this store's own site.
             store_site = signed_byte_site(state)
             scalar_store = statement_from_string(
-                _cute_scalar_store_expr(tensor_name, index_exprs, "{value}"),
+                _cute_scalar_store_expr(site.tensor_name, site.index_exprs, "{value}"),
                 value=value,
             )
-            _cute_tag_access_regions(scalar_store, tensor_name, regions)
-            if mask_expr is not None:
+            _cute_tag_access_regions(scalar_store, site.tensor_name, site.regions)
+            if site.mask_expr is not None:
                 scalar_store = statement_from_string(
-                    f"if {mask_expr}:\n    {{store}}", store=scalar_store
+                    f"if {site.mask_expr}:\n    {{store}}", store=scalar_store
                 )
 
             def emit_tile_store() -> ast.AST | None:
                 packed_values = packed_store_value(
                     state,
-                    strategy,
-                    vec_block_id,
+                    context,
                     _vec_width,
                     tensor,
-                    index_exprs,
-                    mask_expr,
+                    site.index_exprs,
+                    site.mask_expr,
                     site=store_site,
                 )
                 return _cute_register_tile_unroll_vec_store(
                     state,
-                    strategy,
-                    vec_block_id,
-                    tensor_name,
-                    index_exprs,
+                    context,
+                    site.tensor_name,
+                    site.index_exprs,
                     ast.unparse(value),
-                    mask_expr,
+                    site.mask_expr,
                     tensor.dtype,
                     scalar_stmt=scalar_store,
                     lane_axis_pos=lane_axis_pos,
@@ -3496,7 +3549,7 @@ def _(state: CodegenState) -> ast.AST:
                 )
 
             if _cute_defer_grid_vector_op(
-                state, strategy, vec_block_id, scalar_store, emit_tile_store
+                state, context, scalar_store, emit_tile_store
             ):
                 state.add_statement(scalar_store)
                 return ast.Constant(value=None)
@@ -3524,33 +3577,33 @@ def _(state: CodegenState) -> ast.AST:
                     if _persistent_vec_is_exact_aligned(
                         state,
                         red_strategy,
-                        index_exprs,
+                        site.index_exprs,
                         tensor,
                         _vec_width,
                     ):
                         branch_vec_store_candidate = (vec_block_id, _vec_width)
                 tail_store: ast.stmt | None = None
-                flush_mask = mask_expr
+                flush_mask = site.mask_expr
                 if can_vectorize:
                     assert isinstance(red_strategy, LoopedReductionStrategy)
                     mask_var = red_strategy._mask_var
                     if mask_var is not None and not _cute_looped_vec_mask_is_uniform(
-                        red_strategy, mask_expr, mask_var
+                        red_strategy, site.mask_expr, mask_var
                     ):
                         # A per-element outer term cannot predicate the
                         # whole flush; keep the scalar stores.
                         can_vectorize = False
                     elif (
                         mask_var is not None
-                        and red_strategy._cute_reduction_chunk_full_var is not None
+                        and red_strategy.lane_context.chunk_full_var is not None
                     ):
                         # Unknown ``numel % V``: full chunks flush one vector,
                         # the straddling tail chunk stores its in-bounds
                         # elements individually.
-                        chunk_full = red_strategy._cute_reduction_chunk_full_var
+                        chunk_full = red_strategy.lane_context.chunk_full_var
                         non_lane = (
-                            _cute_vector_load_non_lane_mask(mask_expr, mask_var)
-                            if mask_expr is not None
+                            _cute_vector_load_non_lane_mask(site.mask_expr, mask_var)
+                            if site.mask_expr is not None
                             else None
                         )
                         flush_mask = (
@@ -3559,15 +3612,15 @@ def _(state: CodegenState) -> ast.AST:
                             else chunk_full
                         )
                         tail_predicate = (
-                            f"not {chunk_full} and ({mask_expr})"
-                            if mask_expr is not None
+                            f"not {chunk_full} and ({site.mask_expr})"
+                            if site.mask_expr is not None
                             else f"not {chunk_full}"
                         )
                         tail_store = statement_from_string(
                             f"if {tail_predicate}:\n    {{store}}",
                             store=statement_from_string(
                                 _cute_scalar_store_expr(
-                                    tensor_name, index_exprs, "{value}"
+                                    site.tensor_name, site.index_exprs, "{value}"
                                 ),
                                 value=value,
                             ),
@@ -3576,9 +3629,9 @@ def _(state: CodegenState) -> ast.AST:
                     assert isinstance(red_strategy, LoopedReductionStrategy)
                     append_stmt = _cute_register_reduction_unroll_vec_store(
                         state,
-                        red_strategy,
-                        tensor_name,
-                        index_exprs,
+                        red_strategy.lane_context,
+                        site.tensor_name,
+                        site.index_exprs,
                         ast.unparse(value),
                         flush_mask,
                         tensor.dtype,
@@ -3596,21 +3649,21 @@ def _(state: CodegenState) -> ast.AST:
                 vec_block_id,
                 vec_width,
                 tensor.dtype,
-                _cute_scalar_pointer_expr(tensor_name, index_exprs),
+                _cute_scalar_pointer_expr(site.tensor_name, site.index_exprs),
                 value,
-                mask_expr,
+                site.mask_expr,
             )
         )
         return ast.Constant(value=None)
 
-    store_expr = _cute_scalar_store_expr(tensor_name, index_exprs, "{value}")
+    store_expr = _cute_scalar_store_expr(site.tensor_name, site.index_exprs, "{value}")
     if (
         store_uses_pointer
-        and topk_lane_expr is None
+        and topk is None
         and not value_readdressed
         and (
             flat_gather := _cute_flat_gather_sink_pointer(
-                state, tensor, subscript, index_exprs, tensor_name
+                state, tensor, subscript, site.index_exprs, site.tensor_name
             )
         )
         is not None
@@ -3619,39 +3672,27 @@ def _(state: CodegenState) -> ast.AST:
 
         pointer, wrapper, _whole_chunks = flat_gather
         store_expr = f"({pointer}).store({{value}})"
-        state.device_function.cute_state.vloop_sink_stores[pointer] = (
+        state.device_function.cute_state.lanes.vloop_sink_stores[pointer] = (
             CuteVloopStoreFact(
                 vec_lane_var=wrapper.vec_lane_var,
-                tensor_name=tensor_name,
+                tensor_name=site.tensor_name,
                 vec_width=wrapper.vec_width,
                 dtype=tensor.dtype,
             )
         )
     assign_expr = expr_from_string(store_expr, value=value)
-    _cute_tag_access_regions(assign_expr, tensor_name, regions)
-    if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
-        topk_mask = f"({topk_lane_expr}) < {topk_k}"
-        if topk_bound is not None:
-            topk_mask = f"{topk_mask} and {topk_bound}"
-        mask_expr = topk_mask if mask_expr is None else f"({mask_expr}) and {topk_mask}"
-    if mask_expr is None:
-        return assign_expr
-    if store_uses_pointer:
-        mask_ast = expr_from_string(mask_expr)
-        assert isinstance(mask_ast, ast.expr)
-        assert isinstance(assign_expr, ast.expr)
-        state.add_statement(
-            ast.fix_missing_locations(
-                ast.If(
-                    test=mask_ast,
-                    body=[ast.Expr(value=assign_expr)],
-                    orelse=[],
-                )
-            )
+    _cute_tag_access_regions(assign_expr, site.tensor_name, site.regions)
+    if topk is not None:
+        topk_mask = topk.mask
+        site.mask_expr = (
+            topk_mask
+            if site.mask_expr is None
+            else f"({site.mask_expr}) and {topk_mask}"
         )
-        return ast.Constant(value=None)
+    if site.mask_expr is None or store_uses_pointer:
+        return _cute_guarded_store(state, assign_expr, site.mask_expr)
     return expr_from_string(
-        f"({store_expr} if {mask_expr} else None)",
+        f"({store_expr} if {site.mask_expr} else None)",
         value=value,
     )
 
@@ -3746,8 +3787,7 @@ def _cute_flat_multi_cover_ok(
 
 def _cute_tile_unroll_scope_safe(
     state: CodegenState,
-    strategy: object,
-    block_id: int,
+    context: LaneLoopContext,
     index_exprs: list[str],
     lane_axis_pos: int,
 ) -> bool:
@@ -3760,14 +3800,14 @@ def _cute_tile_unroll_scope_safe(
     from ..tile_strategy import DeviceGridState
     from ..tile_strategy import DeviceLoopState
 
-    loops = state.codegen.active_device_loops.get(block_id)
+    loops = state.codegen.active_device_loops.get(context.block_id)
     if not loops:
         return False
     owner = loops[-1]
     stack = state.codegen.statements_stack
     body = stack[-1]
-    vloop = getattr(strategy, "_cute_lane_vloop_by_block", {}).get(block_id)
-    if not isinstance(vloop, ast.For):
+    vloop = context.vloop
+    if vloop is None:
         return False
     if isinstance(owner, DeviceGridState):
         if len(stack) < 2 or stack[-2] is not owner.hoist_parent_statements:
@@ -3797,17 +3837,17 @@ def _cute_tile_unroll_scope_safe(
 
 def _cute_defer_grid_vector_op(
     state: CodegenState,
-    strategy: object,
-    block_id: int,
+    context: LaneLoopContext,
     scalar: ast.AST,
     emit: Callable[[], ast.AST | None],
 ) -> bool:
     from ..tile_strategy import DeviceGridState
 
-    owner = state.codegen.active_device_loops[block_id][-1]
+    owner = state.codegen.active_device_loops[context.block_id][-1]
     if not isinstance(owner, DeviceGridState):
         return False
-    vloop = getattr(strategy, "_cute_lane_vloop_by_block", {})[block_id]
+    vloop = context.vloop
+    assert vloop is not None
     owner.deferred_vector_ops.append((vloop, scalar, emit))
     return True
 
@@ -3851,15 +3891,13 @@ def _cute_reduction_masked_vec_ok(strategy: object, tensor: torch.Tensor) -> boo
 
     if not isinstance(strategy, LoopedReductionStrategy):
         return False
-    if strategy._cute_reduction_vec_mode != "unroll":
-        return False
     if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
         return False
-    if strategy._cute_lane_base_index_var is None:
+    if strategy.lane_context.base_index_var is None:
         return False
     return (
         strategy._cute_reduction_chunk_uniform_mask
-        or strategy._cute_reduction_chunk_full_var is not None
+        or strategy.lane_context.chunk_full_var is not None
     )
 
 
@@ -3878,7 +3916,7 @@ def _cute_looped_vec_mask_is_uniform(
     non_lane = _cute_vector_load_non_lane_mask(mask_expr, lane_mask)
     if non_lane is None:
         return True
-    lane_body = strategy._cute_lane_body
+    lane_body = strategy.lane_context.lane_body
     if lane_body is None:
         return False
     written: set[str] = set()
@@ -4032,10 +4070,10 @@ def _cute_looped_unroll_uniform_definitions(
     copies and their dependencies. The actual lane index and constexpr lane
     stay unavailable; a mask or row gather depending on either remains scalar.
     """
-    from ..tile_strategy import _is_proven_relocatable_assignment
+    from ._ast_pass_utils import _is_proven_relocatable_assignment
 
-    vloop = strategy._cute_lane_vloop
-    lane_body = strategy._cute_lane_body
+    vloop = strategy.lane_context.vloop
+    lane_body = strategy.lane_context.lane_body
     if (
         vloop is None
         or lane_body is None
@@ -4126,8 +4164,9 @@ def _cute_tile_unroll_vloop_scope(
     owner = loops[-1]
     stack = state.codegen.statements_stack
     body = stack[-1]
-    vloop = strategy._cute_lane_vloop_by_block.get(block_id)
-    vec_lane_var = strategy._cute_vec_lane_var_by_block.get(block_id)
+    context = strategy.lane_context(block_id)
+    vloop = context.vloop
+    vec_lane_var = context.vec_lane_var
     if vloop is None or vec_lane_var is None:
         return None
     unavailable = {vec_lane_var}
@@ -4152,11 +4191,13 @@ def _cute_tile_unroll_vloop_scope(
     else:
         return None
     setup = owner.lane_setup_statements if isinstance(owner, DeviceGridState) else body
+    lane_body = context.lane_body
+    assert lane_body is not None
     return _CuteVloopScope(
         body,
         frozenset(unavailable),
         deferred,
-        strategy._cute_lane_body_by_block[block_id],
+        lane_body,
         vloop,
         _cute_lane_index_facts(state, strategy, block_id, owner, setup),
         relocations,
@@ -4171,18 +4212,16 @@ def _cute_lane_index_facts(
     setup: list[ast.AST],
 ) -> _CuteLaneIndexFacts | None:
     """Recognize ``index = base + cutlass.Int32(vec_lane)`` in the lane setup."""
-    from ..tile_strategy import _plain_assignment_name
 
     index_var = _cute_active_index_var(state, block_id)
-    base_var = strategy._cute_lane_base_index_var_by_block.get(block_id)
-    vec_lane_var = strategy._cute_vec_lane_var_by_block.get(block_id)
-    vec_width = strategy._cute_lane_vec_width_by_block.get(block_id, 1)
+    context = strategy.lane_context(block_id)
+    base_var = context.base_index_var
+    vec_lane_var = context.vec_lane_var
+    vec_width = context.vec_width
     if index_var is None or base_var is None or vec_lane_var is None or vec_width <= 1:
         return None
     definitions = [
-        statement
-        for statement in setup
-        if _plain_assignment_name(statement) == index_var
+        statement for statement in setup if assigned_name(statement) == index_var
     ]
     if len(definitions) != 1:
         return None
@@ -4230,7 +4269,7 @@ def _cute_lane_base_is_vec_aligned(
         return False
     if strategy._elements_per_thread_for_block(block_id) % vec_width != 0:
         return False
-    cluster_n = strategy._cute_cluster_by_block.get(block_id, 1)
+    cluster_n = strategy.lane_context(block_id).cluster_n
     if cluster_n > 1 and (static_block // cluster_n) % vec_width != 0:
         return False
     info = owner.block_id_to_info.get(block_id)
@@ -4241,14 +4280,6 @@ def _cute_lane_base_is_vec_aligned(
         # without a symbolic value is data dependent.
         return info.begin_var_name is None
     return info.begin_expr == 0 or env.known_multiple(info.begin_expr, vec_width)
-
-
-def _cute_names_read(node: ast.AST) -> set[str]:
-    return {
-        child.id
-        for child in ast.walk(node)
-        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
-    }
 
 
 def _cute_clone_expr(node: ast.AST) -> ast.expr:
@@ -4268,13 +4299,12 @@ def _cute_single_definitions(
     definitions.  ``exclude`` keeps the per-element lane index a name as well
     (a device loop defines it in the body) so the uniformity proof sees it.
     """
-    from ..tile_strategy import _is_proven_relocatable_assignment
-    from ..tile_strategy import _plain_assignment_name
+    from ._ast_pass_utils import _is_proven_relocatable_assignment
 
     definitions: dict[str, ast.expr] = {}
     opaque: set[str] = set()
     for statement in body:
-        plain = _plain_assignment_name(statement)
+        plain = assigned_name(statement)
         for name in ReadWrites.from_ast(statement).writes:
             if (
                 name in definitions
@@ -4341,15 +4371,6 @@ def _cute_at_lane_base(node: ast.expr, lane: _CuteLaneIndexFacts) -> str:
     return ast.unparse(result)
 
 
-def _cute_qualified_call_name(node: ast.expr) -> str | None:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        prefix = _cute_qualified_call_name(node.value)
-        return f"{prefix}.{node.attr}" if prefix is not None else None
-    return None
-
-
 _CUTE_LANE_INT_CASTS = frozenset({"cutlass.Int32", "cutlass.Int64"})
 _CUTE_LANE_COMPARE_CALLS: dict[str, type[ast.cmpop]] = {
     "operator.lt": ast.Lt,
@@ -4405,7 +4426,7 @@ def _cute_lane_affine_form(node: ast.expr, index_var: str) -> tuple[int, int] | 
             1 if isinstance(node.op, ast.Add) else -1,
         )
     if isinstance(node, ast.Call) and not node.keywords:
-        name = _cute_qualified_call_name(node.func)
+        name = call_path_str(node.func)
         if name in _CUTE_LANE_INT_CASTS and len(node.args) == 1:
             return _cute_lane_affine_form(node.args[0], index_var)
         if name in ("operator.add", "operator.sub") and len(node.args) == 2:
@@ -4433,7 +4454,7 @@ def _cute_lane_uniform_compare(
     to be one.  Equality is never uniform.  Comparisons that do not read the
     index are uniform trivially.
     """
-    reads = _cute_names_read(left) | _cute_names_read(right)
+    reads = names_read(left) | names_read(right)
     if lane.index_var not in reads:
         return True
     left_form = _cute_lane_affine_form(left, lane.index_var)
@@ -4482,7 +4503,7 @@ def _cute_lane_affine_alignment(
     if isinstance(node, ast.Constant) and type(node.value) is int:
         return 0, abs(node.value)
     if isinstance(node, ast.Call) and not node.keywords:
-        name = _cute_qualified_call_name(node.func)
+        name = call_path_str(node.func)
         if name in _CUTE_LANE_INT_CASTS and len(node.args) == 1:
             return _cute_lane_affine_alignment(node.args[0], lane)
         if name in ("operator.add", "operator.sub") and len(node.args) == 2:
@@ -4516,7 +4537,7 @@ def _cute_lane_uniform_predicate(node: ast.expr, lane: _CuteLaneIndexFacts) -> b
     uniform when every operand is; comparisons are decided by
     ``_cute_lane_uniform_compare``.
     """
-    if lane.index_var not in _cute_names_read(node):
+    if lane.index_var not in names_read(node):
         return True
     if isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
         return all(_cute_lane_uniform_predicate(value, lane) for value in node.values)
@@ -4533,7 +4554,7 @@ def _cute_lane_uniform_predicate(node: ast.expr, lane: _CuteLaneIndexFacts) -> b
             node.left, type(node.ops[0]), node.comparators[0], lane
         )
     if isinstance(node, ast.Call) and not node.keywords:
-        name = _cute_qualified_call_name(node.func)
+        name = call_path_str(node.func)
         if (
             name in ("operator.and_", "operator.or_", "operator.xor")
             and len(node.args) == 2
@@ -4578,7 +4599,7 @@ def _cute_lane_uniform_mask(scope: _CuteVloopScope, uniform_mask: str) -> str | 
     terms: list[str] = []
     for term in _cute_and_terms(ast.parse(uniform_mask, mode="eval").body):
         expanded = _cute_inline_definitions(term, definitions)
-        if lane is None or lane.index_var not in _cute_names_read(expanded):
+        if lane is None or lane.index_var not in names_read(expanded):
             terms.append(ast.unparse(term))
             continue
         if not lane.aligned or not _cute_lane_uniform_predicate(expanded, lane):
@@ -4677,10 +4698,9 @@ def _cute_statement_written_tensors(
     unknown.  The cross-thread reduction helpers synchronize the CTA like a
     barrier and are left unknown too.
     """
-    from ..tile_strategy import _is_proven_relocatable_assignment
-    from ..tile_strategy import _is_proven_relocatable_call
-    from ..tile_strategy import _memory_write_calls
-    from ..tile_strategy import _qualified_name
+    from ._ast_pass_utils import _is_proven_relocatable_assignment
+    from ._ast_pass_utils import _is_proven_relocatable_call
+    from .lane_loops.owner_guards import _memory_write_calls
 
     for site in sites:
         if statement is site.body_stmt or statement is site.scalar_stmt:
@@ -4710,7 +4730,7 @@ def _cute_statement_written_tensors(
                 written |= roots
             elif not (
                 _is_proven_relocatable_call(node, allow_load=True)
-                or _qualified_name(node.func) in _CUTE_EFFECT_FREE_CALLS
+                or call_path_str(node.func) in _CUTE_EFFECT_FREE_CALLS
             ):
                 return None
     return written
@@ -4736,8 +4756,7 @@ def _cute_tile_unroll_preceding_statements(
 
 def _cute_tile_unroll_hoist_allowed(
     state: CodegenState,
-    strategy: CuteLaneTileStrategy,
-    block_id: int,
+    context: LaneLoopContext,
     preceding: list[ast.AST],
     tensor_name: str,
 ) -> bool:
@@ -4749,7 +4768,7 @@ def _cute_tile_unroll_hoist_allowed(
     unknown effect (a barrier, a helper call), a write to the same tensor, or a
     write to a tensor that may alias it keeps the site on its scalar load.
     """
-    sites = strategy._cute_lane_vec_stores_by_block.get(block_id, [])
+    sites = context.vec_stores
     disjoint: set[frozenset[str]] | None = None
     for statement in preceding:
         written = _cute_statement_written_tensors(statement, sites)
@@ -4766,17 +4785,16 @@ def _cute_tile_unroll_hoist_allowed(
 
 
 def demote_reordered_tile_vec_stores(
-    strategy: CuteLaneTileStrategy,
+    context: LaneLoopContext,
     device_function: DeviceFunction,
-    block_id: int,
     body: list[ast.AST] | list[ast.stmt],
     *,
     inside: Sequence[ast.AST] | None = None,
 ) -> list[CuteTileVecStoreSite]:
     """Restore scalar stores whose deferred flush would run past a later access.
 
-    A tile-vector store of ``block_id`` runs after the V-loop instead of in its
-    lane, so a later statement of its lane loop (nested statements included)
+    A tile-vector store of ``context``'s block runs after the V-loop instead of
+    in its lane, so a later statement of its lane loop (nested statements included)
     that names the stored tensor, or a tensor not proven disjoint from it,
     would observe memory before the store.  ``inside`` lists the statements of
     ``body`` that run inside the loop, in order, when the caller has placed
@@ -4788,10 +4806,11 @@ def demote_reordered_tile_vec_stores(
     """
     from ..device_function import TensorArg
 
-    sites = strategy._cute_lane_vec_stores_by_block.get(block_id)
+    sites = context.vec_stores
     if not sites:
         return []
-    lane_body = strategy._cute_lane_body_by_block[block_id]
+    lane_body = context.lane_body
+    assert lane_body is not None
     scope = body if inside is None else inside
     tensor_names = {
         arg.name for arg in device_function.arguments if isinstance(arg, TensorArg)
@@ -4829,6 +4848,7 @@ def demote_reordered_tile_vec_stores(
         position = next(
             i for i, statement in enumerate(body) if statement is site.body_stmt
         )
+        assert site.scalar_stmt is not None
         body[position] = site.scalar_stmt
         if site.init_stmt is not None:
             lane_body.remove(site.init_stmt)
@@ -4861,8 +4881,8 @@ def _cute_tile_unroll_uniform_definitions(
     or depends on something that cannot move -- the site then keeps its
     scalar load.
     """
-    from ..tile_strategy import _is_proven_relocatable_assignment
-    from ..tile_strategy import _memory_write_calls
+    from ._ast_pass_utils import _is_proven_relocatable_assignment
+    from .lane_loops.owner_guards import _memory_write_calls
 
     lane_base_expr: str | None = None
     if scope.lane is not None and index_exprs[lane_axis_pos] != scope.lane.index_var:
@@ -5017,8 +5037,8 @@ def _cute_vector_load_ctx(
 ) -> tuple[int, int, str] | None:
     """Return (vec_width, lane_block_id, mode) when a vec load may be emitted.
 
-    ``mode`` is one of ``"vec"`` (explicit ``cute.arch.load(..., V)``) or
-    ``"unroll"`` (per-element scalar bitcast inside a constexpr V-loop).
+    ``mode`` is ``"unroll"`` (per-element scalar bitcast inside a constexpr
+    V-loop) on a reduction lane loop or ``"tile_unroll"`` on a tile lane loop.
     Returns None when any predicate for a 128-bit gmem load fails, in which
     case the caller falls back to ``_cute_scalar_load_expr``.
 
@@ -5053,45 +5073,13 @@ def _cute_vector_load_ctx(
         and not packet_store
     ):
         return None
-    # Only enable the vec path when the load's result eventually feeds a
-    # reduction op.  The consume-sweep mixes the loaded vector with scalar
-    # values (e.g. the post-reduction inverse-RMS), and broadcasting
-    # scalar->vec is not supported by the CuTe DSL today.  When the load's
-    # immediate user is a dtype cast (``to(torch.float32)``), the
-    # ``"unroll"`` mode further down keeps the strategy on a per-element
-    # scalar pipeline and the explicit-vec path is skipped — the explicit
-    # ``cute.arch.load(ptr, ir.VectorType.get([V], dtype.mlir_type))`` form
-    # would otherwise crash inside the CuTe DSL when subscripting bf16/fp16
-    # vectors.
-    fx_node = state.fx_node
-    if fx_node is None:
+    if state.fx_node is None:
         return None
-    visited: set[torch.fx.Node] = set()
-    pending = list(fx_node.users.keys())
-    feeds_reduction = False
-    while pending:
-        user = pending.pop()
-        if user in visited:
-            continue
-        visited.add(user)
-        target_name = getattr(user.target, "__name__", "") or ""
-        target_qualname = getattr(user.target, "_qualname", "") or ""
-        if (
-            "reduction" in target_name
-            or "_inductor_lowering_extra" in target_name
-            or "reduction" in target_qualname
-        ):
-            feeds_reduction = True
-            break
-        pending.extend(user.users.keys())
-    # Note: ``feeds_reduction`` is required ONLY for the ``vec`` mode below;
-    # the ``unroll`` mode also applies to the consume sweep where the load
-    # result feeds an elementwise pipeline (no reduction).
     # The lane/vec axis must be a tensor dim that is stride-1 so that
     # consecutive lane iters fetch consecutive bytes.  For a row-major lhs
     # the reduction axis is the LAST subscript position; for a column-major
     # rhs (e.g. the K-major ``y`` of a tcgen05 fp8 matmul) it is the FIRST.
-    # ``_cute_lane_axis_pos`` records the index_exprs position of that
+    # ``LaneLoopContext.lane_axis_pos`` records the index_exprs position of that
     # stride-1 lane axis so the hoist substitutes the per-lane base there
     # (not blindly at ``[-1]``).
     # Find the stride-1 dim without implicitly specializing a symbolic
@@ -5283,7 +5271,6 @@ def _cute_vector_load_ctx(
                 gathered_index
                 and not (
                     isinstance(strategy, LoopedReductionStrategy)
-                    and strategy._cute_reduction_vec_mode == "unroll"
                     and lane_axis_pos == len(index_exprs) - 1
                 )
             )
@@ -5293,10 +5280,7 @@ def _cute_vector_load_ctx(
                 and not (
                     isinstance(extra_mask, ast.Constant) and extra_mask.value is True
                 )
-                and not (
-                    isinstance(strategy, LoopedReductionStrategy)
-                    and strategy._cute_reduction_vec_mode == "unroll"
-                )
+                and not isinstance(strategy, LoopedReductionStrategy)
                 # A packet store keeps a user mask only where the persistent
                 # vectorizer proves it uniform across the packet
                 # (``_uniform_guard``); other stores stay scalar.
@@ -5321,37 +5305,26 @@ def _cute_vector_load_ctx(
             return None
         if strategy._cute_reduction_lane_extent <= 0:
             return None
-        mode = getattr(strategy, "_cute_reduction_vec_mode", "unroll")
-        if mode == "vec":
-            if not feeds_reduction:
-                return None
-            if tensor.dtype not in _CUTE_VECTOR_DTYPES:
-                return None
-            return vec_width, inner_block_id, "vec"
-        if mode == "unroll":
-            if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES and not packet_store:
-                return None
-            capability = env.config_spec.target_device_capability
-            max_bytes = 32 if capability is not None and capability >= (10, 0) else 16
-            if vec_width * tensor.dtype.itemsize > max_bytes:
-                return None
-            # Need a lane base index var + a constexpr V-loop var; both
-            # are set up by the strategy's codegen_device_loop.
-            if (
-                getattr(strategy, "_cute_lane_base_index_var", None) is None
-                or getattr(strategy, "_cute_lane_body", None) is None
-            ):
-                return None
-            return vec_width, inner_block_id, "unroll"
-        return None
+        if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES and not packet_store:
+            return None
+        capability = env.config_spec.target_device_capability
+        max_bytes = 32 if capability is not None and capability >= (10, 0) else 16
+        if vec_width * tensor.dtype.itemsize > max_bytes:
+            return None
+        # Need a lane base index var + a constexpr V-loop var; both
+        # are set up by the strategy's codegen_device_loop.
+        reduction_context = strategy.lane_context
+        if (
+            reduction_context.base_index_var is None
+            or reduction_context.lane_body is None
+        ):
+            return None
+        return vec_width, inner_block_id, "unroll"
     # CuTe N-D tile strategy with lane loops: vec is set up per-block in
     # ``PerThreadNDTileStrategy.__init__`` when the autotuner picks
-    # ``cute_vector_widths[block_id]`` > 1 and EPT is divisible by V.  Mode
-    # is forced to ``"unroll"`` (per-element bitcast) for fp16/bf16 since
-    # subscripting a bf16/fp16 vector in the CuTe DSL is unsafe; fp32
-    # could in principle use ``"vec"`` but the per-element pipeline runs
-    # most of the consume-sweep code after a cast, so unroll is the
-    # robust choice.
+    # ``cute_vector_widths[block_id]`` > 1 and EPT is divisible by V.  The
+    # per-element bitcast keeps the consume-sweep code on the scalar
+    # pipeline (subscripting a bf16/fp16 vector in the CuTe DSL is unsafe).
     from ..tile_strategy import BlockSizeTileStrategy
 
     if isinstance(strategy, BlockSizeTileStrategy):
@@ -5369,10 +5342,10 @@ def _cute_vector_load_ctx(
         subtile = state.config.config.get("epilogue_subtile")
         if isinstance(subtile, int) and subtile > 1:
             return None
-        vec_by_block = getattr(strategy, "_cute_lane_vec_width_by_block", None)
-        if not isinstance(vec_by_block, dict):
+        context = lane_context(state, inner_block_id)
+        if context is None:
             return None
-        vec_width = vec_by_block.get(inner_block_id, 1)
+        vec_width = context.vec_width
         if vec_width <= 1:
             return None
         if not _cute_is_unroll_dtype(tensor.dtype):
@@ -5383,7 +5356,7 @@ def _cute_vector_load_ctx(
             return None
         if lane_shift_terms is not None and (
             tensor.dtype is torch.int8
-            or getattr(strategy, "_cute_flat_multi", False)
+            or context.flat_multi
             or not all(
                 env.known_multiple(_to_sympy(term), vec_width)
                 for term in lane_shift_terms
@@ -5393,22 +5366,14 @@ def _cute_vector_load_ctx(
             # multiple of V; signed-byte packets and flat bases place the
             # canonical lane base and cannot carry a shift.
             return None
-        base_var_by_block = getattr(
-            strategy, "_cute_lane_base_index_var_by_block", None
-        )
-        lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", None)
-        vec_lane_var_by_block = getattr(strategy, "_cute_vec_lane_var_by_block", None)
         if (
-            not isinstance(base_var_by_block, dict)
-            or not isinstance(lane_body_by_block, dict)
-            or not isinstance(vec_lane_var_by_block, dict)
-            or inner_block_id not in base_var_by_block
-            or inner_block_id not in lane_body_by_block
-            or inner_block_id not in vec_lane_var_by_block
+            context.base_index_var is None
+            or context.lane_body is None
+            or context.vec_lane_var is None
         ):
             return None
         if lane_shift_terms is not None or not _cute_tile_unroll_scope_safe(
-            state, strategy, inner_block_id, index_exprs, lane_axis_pos
+            state, context, index_exprs, lane_axis_pos
         ):
             # The non-lane coordinates read definitions of this V-loop body
             # (a gathered row index loaded in the same body, a per-thread row
@@ -5436,7 +5401,7 @@ def _cute_vector_load_ctx(
             # The hoist substitutes the canonical lane base. Do not discard
             # an affine/gather offset for a signed input.
             return None
-        flat_multi = bool(getattr(strategy, "_cute_flat_multi", False))
+        flat_multi = context.flat_multi
         if flat_multi:
             # Flattened multi-dim tile: the hoist emits FLAT base pointers
             # (``t.iterator + lane_base``), which is only sound when the
@@ -5475,12 +5440,7 @@ def _cute_vector_load_ctx(
         # hoist substitutes the per-lane base there.  Row-major lhs loads
         # use the last position; a column-major rhs (K-major ``y``) uses
         # position 0.
-        pos_by_block = getattr(strategy, "_cute_lane_axis_pos_by_block", None)
-        if not isinstance(pos_by_block, dict):
-            pos_by_block = {}
-            # pyrefly: ignore [missing-attribute]
-            strategy._cute_lane_axis_pos_by_block = pos_by_block
-        pos_by_block[inner_block_id] = lane_axis_pos
+        context.lane_axis_pos = lane_axis_pos
         return vec_width, inner_block_id, "tile_unroll"
     return None
 
@@ -5520,7 +5480,7 @@ def _cute_flat_gather_sink_pointer(
         # run without it (barrier placement, lane confinement) know the
         # lifted form.
         return None
-    wrappers = state.device_function.cute_state.vloop_sink_wrappers
+    wrappers = state.device_function.cute_state.lanes.vloop_sink_wrappers
     if (
         state.fx_node is None
         or not wrappers
@@ -5601,12 +5561,12 @@ def _cute_scalar_load_through_pointer(
     pointer: str, dtype: torch.dtype, eviction_suffix: str
 ) -> str:
     """``_cute_scalar_load_expr`` for an explicit pointer of a 2- or 4-byte dtype."""
-    if is_cache_policy_suffix(eviction_suffix):
-        # The L2 policy helper only exists in 16-byte vector form.
-        eviction_suffix = ""
-    if eviction_suffix and dtype.itemsize >= 4:
+    # The L2 policy helpers only exist in vector form: their marker renders
+    # no keyword.
+    kwargs = CachePolicy.from_suffix(eviction_suffix).load_kwargs
+    if kwargs and dtype.itemsize >= 4:
         dtype_str = CompileEnvironment.current().backend.dtype_str(dtype)
-        return f"cute.arch.load({pointer}, {dtype_str}{eviction_suffix})"
+        return f"cute.arch.load({pointer}, {dtype_str}{kwargs})"
     return f"({pointer}).load()"
 
 
@@ -5638,7 +5598,7 @@ def _cute_record_sinkable_scalar_load(
     from ..tile_strategy import DeviceGridState
 
     env = CompileEnvironment.current()
-    wrappers = state.device_function.cute_state.vloop_sink_wrappers
+    wrappers = state.device_function.cute_state.lanes.vloop_sink_wrappers
     if (
         env.backend.name != "cute"
         or not wrappers
@@ -5697,7 +5657,7 @@ def _cute_record_sinkable_scalar_load(
             _cute_scalar_pointer_expr(tensor_name, list(index_exprs)), mode="eval"
         )
     )
-    state.device_function.cute_state.vloop_sink_loads[key] = CuteVloopLoadFact(
+    state.device_function.cute_state.lanes.vloop_sink_loads[key] = CuteVloopLoadFact(
         vec_lane_var=wrapper.vec_lane_var,
         tensor_name=tensor_name,
         vec_width=wrapper.vec_width,
@@ -6022,15 +5982,12 @@ def cute_reindexed_scalar_load_expr(
         value.dtype,
         eviction_suffix=site.eviction_suffix,
     )
-    if value.dtype is torch.bool:
-        load_expr = f"({load_expr} != cutlass.Uint8(0))"
-        zero = "cutlass.Boolean"
-    else:
-        zero = _cute_scalar_storage_dtype(value.dtype)
-    if not mask_terms:
-        return expr_from_string(load_expr)
-    mask_expr = " and ".join(mask_terms)
-    return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
+    return _cute_masked_value_expr(
+        load_expr,
+        " and ".join(mask_terms) if mask_terms else None,
+        dtype=value.dtype,
+        zero=_cute_scalar_storage_dtype(value.dtype),
+    )
 
 
 def _cute_load_eviction_slot(state: CodegenState) -> int:
@@ -6140,7 +6097,7 @@ def _cute_load_has_placeholder_value(state: CodegenState) -> bool:
     if cute_state.is_collective_handled_load(node):
         return True
     reject_reads_of_collective_placeholders(state, f"{node.name}'s index")
-    if not cute_state.suppress_root_lane_loops:
+    if not cute_state.lanes.suppress_root_lane_loops:
         return False
     val = node.meta["val"]
     if isinstance(val, torch.Tensor) and val.ndim == 0:
@@ -6242,45 +6199,17 @@ def _(state: CodegenState) -> object:
         )
 
     if isinstance(tensor, tuple):
-        stack_tensor_ast = state.ast_args[0]
-        assert isinstance(stack_tensor_ast, tuple)
-        assert len(stack_tensor_ast) == 2
-        tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
-        assert isinstance(dev_ptrs_ast, ast.AST)
-        tensor_like, dev_ptrs = tensor
-        offset_expr = _cute_stack_tensor_offset_expr(
-            state,
-            tensor_like,
-            [*subscript],
-            ast_subscript,
+        address = StackTensorAddress.from_site(
+            state, tensor, subscript, ast_subscript, extra_mask, for_store=False
         )
-        backend = CompileEnvironment.current().backend
-        target_dtype = backend.dtype_str(tensor_like.dtype)
-        ptr_expr = _cute_stack_tensor_pointer_expr(
-            target_dtype, dev_ptrs_ast, offset_expr
+        return _cute_masked_value_expr(
+            f"({ast.unparse(address.pointer)}).load()",
+            address.mask,
+            dtype=tensor[0].dtype,
+            zero=address.target_dtype,
         )
-        load_expr = f"({ast.unparse(ptr_expr)}).load()"
-        mask_expr = _cute_stack_tensor_mask_expr(
-            state,
-            tensor_like,
-            dev_ptrs,
-            [*subscript],
-            extra_mask,
-        )
-        if tensor_like.dtype is torch.bool:
-            load_expr = f"({load_expr} != cutlass.Uint8(0))"
-            if mask_expr is None:
-                return expr_from_string(load_expr)
-            return expr_from_string(
-                f"({load_expr} if {mask_expr} else cutlass.Boolean(0))"
-            )
-        if mask_expr is None:
-            return expr_from_string(load_expr)
-        return expr_from_string(f"({load_expr} if {mask_expr} else {target_dtype}(0))")
     if not isinstance(tensor, torch.Tensor):
         raise exc.BackendUnsupported("cute", f"load tensor type: {type(tensor)}")
-
-    _log_cute_layout(state, "load")
 
     from ...language import tile_index
 
@@ -6328,19 +6257,7 @@ def _(state: CodegenState) -> object:
         zero = _cute_scalar_storage_dtype(tensor.dtype)
         return expr_from_string(f"{zero}(0)")
 
-    tensor_name = state.device_function.tensor_arg(tensor).name
-    index_exprs = _cute_index_exprs(
-        state,
-        subscript,
-        ast_subscript,
-        tensor=tensor,
-        inactive_slice_expr="None",
-        inactive_singleton_slice_expr="0",
-    )
-    regions = _cute_access_regions(state, subscript, tensor)
-    mask_expr = _cute_resolved_load_mask(
-        state, tensor, subscript, index_exprs, extra_mask
-    )
+    site = _load_access_site(state, tensor, subscript, ast_subscript, extra_mask)
     # Autotunable per-load-site cache hint, applied to the ``cute.arch.load``
     # forms (vectorized, and scalar when a hint is set).  "first"/"last" are
     # L1 eviction priorities; "streaming" is the ``ld.global.cs`` cache
@@ -6350,12 +6267,11 @@ def _(state: CodegenState) -> object:
     # explicit ``hl.load(eviction_policy=...)`` (Triton's ``evict_*`` L1
     # priority spelling, which ``cute.arch.load`` shares) wins over the tunable
     # and owns no tunable slot.
-    eviction_suffix = ""
+    cache_policy = CachePolicy.NONE
     if state.codegen.on_device:
         if explicit_policy is not None:
             assert isinstance(explicit_policy, str)
-            if explicit_policy:
-                eviction_suffix = f", level1_eviction_priority={explicit_policy!r}"
+            cache_policy = CachePolicy.explicit(explicit_policy)
         else:
             assert eviction_slot is not None
             policies = state.config.load_eviction_policies
@@ -6365,24 +6281,22 @@ def _(state: CodegenState) -> object:
                 policy = (
                     policies[eviction_slot] if eviction_slot < len(policies) else ""
                 )
-            if policy == "streaming":
-                eviction_suffix = ", cop='cs'"
-            elif policy == "nc_l2_first":
-                if _cute_load_source_is_readonly(state):
-                    eviction_suffix = _CUTE_NC_L2_FIRST_SUFFIX
-            elif policy in ("l2_last", "l1_l2_first", "l1_l2_last"):
-                # Inline-PTX L2 hints apply only to aligned 16-byte packets.
-                eviction_suffix = f"__{policy}__"
-            elif mapped := _CUTE_EVICTION_POLICY_MAP.get(policy, ""):
-                eviction_suffix = f", level1_eviction_priority={mapped!r}"
+            if policy == "nc_l2_first" and not _cute_load_source_is_readonly(state):
+                # The noncoherent packet load needs a source no write in the
+                # kernel can alias.
+                policy = ""
+            # Inline-PTX L2 hints apply to aligned packets of 16, 8 and
+            # 4 bytes (32 under ``cute_wide_packet_hints``).
+            cache_policy = CachePolicy.tunable(policy)
+    eviction_suffix = cache_policy.suffix
     if state.fx_node is not None:
         _record_cute_scalar_load_site(
             state,
             tensor,
             subscript,
-            tensor_name,
-            index_exprs,
-            mask_expr,
+            site.tensor_name,
+            site.index_exprs,
+            site.mask_expr,
             extra_mask is not None,
             eviction_suffix,
         )
@@ -6390,13 +6304,18 @@ def _(state: CodegenState) -> object:
     load_placeholders: dict[str, ast.AST] = {}
     branch_vec_candidate: tuple[int, int] | None = None
     vec_ctx = _cute_vector_load_ctx(
-        state, tensor, subscript, index_exprs, extra_mask, allow_gathered_index=True
+        state,
+        tensor,
+        subscript,
+        site.index_exprs,
+        extra_mask,
+        allow_gathered_index=True,
     )
     # Mask terms other than the lane mask that predicate the whole packet of a
     # ``tile_unroll`` site (see below); None when the mask is lane-only.
     uniform_mask: str | None = None
     if vec_ctx is not None and not _cute_vector_load_mask_is_lane_only(
-        mask_expr, _cute_active_mask_var(state, vec_ctx[1])
+        site.mask_expr, _cute_active_mask_var(state, vec_ctx[1])
     ):
         from ..reduction_strategy import LoopedReductionStrategy
         from ..reduction_strategy import PersistentReductionStrategy
@@ -6404,6 +6323,8 @@ def _(state: CodegenState) -> object:
         vec_width, vec_block_id, vec_mode = vec_ctx
         strategy = _cute_lane_strategy(state, vec_block_id)
         if vec_mode == "tile_unroll":
+            context = lane_context(state, vec_block_id)
+            assert context is not None
             # An outer tile mask or the bound of a gathered coordinate is
             # uniform across the V lanes when it only reads values available
             # above the constexpr V-loop.  Such a site keeps its packet: the
@@ -6411,9 +6332,9 @@ def _(state: CodegenState) -> object:
             # ``_cute_register_tile_unroll_vec_hoist``) while the per-element
             # gate below still zeroes the masked values.  Anything else stays
             # behind its scalar predicate.
-            assert mask_expr is not None
+            assert site.mask_expr is not None
             uniform_mask = _cute_vector_load_non_lane_mask(
-                mask_expr, _cute_active_mask_var(state, vec_block_id)
+                site.mask_expr, _cute_active_mask_var(state, vec_block_id)
             )
             scope = _cute_tile_unroll_vloop_scope(state, strategy, vec_block_id)
             if (
@@ -6421,8 +6342,8 @@ def _(state: CodegenState) -> object:
                 or scope is None
                 or _cute_tile_unroll_uniform_definitions(
                     scope,
-                    index_exprs,
-                    _cute_lane_axis_pos(strategy, vec_block_id, index_exprs),
+                    site.index_exprs,
+                    context.lane_axis(site.index_exprs),
                     uniform_mask,
                 )
                 is None
@@ -6434,10 +6355,10 @@ def _(state: CodegenState) -> object:
             and isinstance(strategy, LoopedReductionStrategy)
             and (
                 _cute_looped_vec_mask_is_uniform(
-                    strategy, mask_expr, _cute_active_mask_var(state, vec_block_id)
+                    strategy, site.mask_expr, _cute_active_mask_var(state, vec_block_id)
                 )
                 or _cute_looped_unroll_uniform_definitions(
-                    state, strategy, index_exprs, mask_expr
+                    state, strategy, site.index_exprs, site.mask_expr
                 )
                 is not None
             )
@@ -6450,7 +6371,7 @@ def _(state: CodegenState) -> object:
                 vec_mode == "unroll"
                 and isinstance(strategy, PersistentReductionStrategy)
                 and _persistent_vec_is_exact_aligned(
-                    state, strategy, index_exprs, tensor, vec_width
+                    state, strategy, site.index_exprs, tensor, vec_width
                 )
             ):
                 # A resolved tensor-index mask can protect an outer row/gather
@@ -6466,24 +6387,7 @@ def _(state: CodegenState) -> object:
         from ..reduction_strategy import PersistentReductionStrategy
 
         strategy = _cute_lane_strategy(state, vec_block_id)
-        if vec_mode == "vec":
-            load_expr = _cute_vector_load_expr(
-                tensor_name,
-                index_exprs,
-                tensor.dtype,
-                vec_width=vec_width,
-                eviction_suffix=eviction_suffix,
-            )
-            # The mask is deferred to the post-fold scalar in
-            # codegen_reduction.  The vec load itself is unconditional; the
-            # mask is recorded on the active LoopedReductionStrategy and
-            # applied around the folded sum.
-            if isinstance(strategy, LoopedReductionStrategy):
-                strategy._cute_emitted_vec_load = True
-                if mask_expr is not None:
-                    strategy._cute_pending_vec_masks.append(mask_expr)
-            mask_expr = None
-        elif vec_mode == "unroll":
+        if vec_mode == "unroll":
             # Register (or reuse) a hoisted U16 vec load for this (tensor,
             # base_index) pair, then return ``hoist_var[vi].bitcast(dtype)``
             # so the existing scalar pipeline sees a scalar of the original
@@ -6496,10 +6400,10 @@ def _(state: CodegenState) -> object:
                 state,
                 strategy,
                 tensor,
-                tensor_name,
-                index_exprs,
+                site.tensor_name,
+                site.index_exprs,
                 vec_width,
-                mask_expr=mask_expr,
+                mask_expr=site.mask_expr,
                 eviction_suffix=eviction_suffix,
             )
             # A persistent vec wrapper cannot hoist an address component
@@ -6509,7 +6413,7 @@ def _(state: CodegenState) -> object:
                 load_expr is None
                 and isinstance(strategy, PersistentReductionStrategy)
                 and _persistent_vec_is_exact_aligned(
-                    state, strategy, index_exprs, tensor, vec_width
+                    state, strategy, site.index_exprs, tensor, vec_width
                 )
             ):
                 branch_vec_candidate = (vec_block_id, vec_width)
@@ -6524,7 +6428,9 @@ def _(state: CodegenState) -> object:
             assert isinstance(
                 strategy, (PerThreadNDTileStrategy, PerThreadFlattenedTileStrategy)
             )
-            lane_axis_pos = _cute_lane_axis_pos(strategy, vec_block_id, index_exprs)
+            context = lane_context(state, vec_block_id)
+            assert context is not None
+            lane_axis_pos = context.lane_axis(site.index_exprs)
             # The hoist may be emitted when the root body is wrapped; record a
             # signed-byte packet against the load's original lowering site.
             load_site = None
@@ -6542,10 +6448,10 @@ def _(state: CodegenState) -> object:
             # existing lowering untouched.
             needs_hoist_plan = (
                 uniform_mask is not None
-                or index_exprs[lane_axis_pos]
+                or site.index_exprs[lane_axis_pos]
                 != _cute_active_index_var(state, vec_block_id)
                 or not _cute_tile_unroll_scope_safe(
-                    state, strategy, vec_block_id, index_exprs, lane_axis_pos
+                    state, context, site.index_exprs, lane_axis_pos
                 )
             )
             # The memory-effect gate in ``emit_tile_load`` reads the V-loop
@@ -6559,8 +6465,8 @@ def _(state: CodegenState) -> object:
             )
             scalar_load = expr_from_string(
                 _cute_scalar_load_expr(
-                    tensor_name,
-                    index_exprs,
+                    site.tensor_name,
+                    site.index_exprs,
                     tensor.dtype,
                     eviction_suffix=eviction_suffix,
                 )
@@ -6578,7 +6484,7 @@ def _(state: CodegenState) -> object:
                     else None
                 )
                 if preceding is None or not _cute_tile_unroll_hoist_allowed(
-                    state, strategy, vec_block_id, preceding, tensor_name
+                    state, context, preceding, site.tensor_name
                 ):
                     return None
                 packet_mask = uniform_mask
@@ -6587,7 +6493,7 @@ def _(state: CodegenState) -> object:
                     if relocation_scope is None:
                         return None
                     plan = _cute_tile_unroll_uniform_definitions(
-                        relocation_scope, index_exprs, lane_axis_pos, uniform_mask
+                        relocation_scope, site.index_exprs, lane_axis_pos, uniform_mask
                     )
                     if plan is None:
                         # The body changed since admission; keep the scalar load.
@@ -6598,24 +6504,22 @@ def _(state: CodegenState) -> object:
                 return expr_from_string(
                     _cute_register_tile_unroll_vec_hoist(
                         state,
+                        context,
                         strategy,
-                        vec_block_id,
                         tensor,
-                        tensor_name,
-                        index_exprs,
+                        site.tensor_name,
+                        site.index_exprs,
                         vec_width,
                         eviction_suffix=eviction_suffix,
                         lane_axis_pos=lane_axis_pos,
-                        mask_expr=mask_expr,
+                        mask_expr=site.mask_expr,
                         signed_byte_site=load_site,
                         uniform_mask=packet_mask,
                         lane_base_expr=lane_base_expr,
                     )
                 )
 
-            if _cute_defer_grid_vector_op(
-                state, strategy, vec_block_id, scalar_load, emit_tile_load
-            ):
+            if _cute_defer_grid_vector_op(state, context, scalar_load, emit_tile_load):
                 load_placeholders["tile_vector_load"] = scalar_load
                 load_expr = "{tile_vector_load}"
             else:
@@ -6624,7 +6528,7 @@ def _(state: CodegenState) -> object:
                     load_expr = ast.unparse(vector_load)
     if load_expr is None:
         flat_gather = _cute_flat_gather_sink_pointer(
-            state, tensor, subscript, index_exprs, tensor_name
+            state, tensor, subscript, site.index_exprs, site.tensor_name
         )
         if flat_gather is not None:
             from .device_state import CuteVloopLoadFact
@@ -6633,10 +6537,10 @@ def _(state: CodegenState) -> object:
             load_expr = _cute_scalar_load_through_pointer(
                 pointer, tensor.dtype, eviction_suffix
             )
-            state.device_function.cute_state.vloop_sink_loads[pointer] = (
+            state.device_function.cute_state.lanes.vloop_sink_loads[pointer] = (
                 CuteVloopLoadFact(
                     vec_lane_var=wrapper.vec_lane_var,
-                    tensor_name=tensor_name,
+                    tensor_name=site.tensor_name,
                     vec_width=wrapper.vec_width,
                     dtype=tensor.dtype,
                     eviction_suffix=eviction_suffix,
@@ -6645,20 +6549,28 @@ def _(state: CodegenState) -> object:
             )
         else:
             load_expr = _cute_scalar_load_expr(
-                tensor_name,
-                index_exprs,
+                site.tensor_name,
+                site.index_exprs,
                 tensor.dtype,
                 eviction_suffix=eviction_suffix,
             )
             _cute_record_sinkable_scalar_load(
-                state, tensor, subscript, index_exprs, tensor_name, eviction_suffix
+                state,
+                tensor,
+                subscript,
+                site.index_exprs,
+                site.tensor_name,
+                eviction_suffix,
             )
+    zero = _cute_scalar_storage_dtype(tensor.dtype)
     if tensor.dtype is torch.bool:
-        load_expr = f"({load_expr} != cutlass.Uint8(0))"
-        if mask_expr is None:
-            return expr_from_string(load_expr, **load_placeholders)
-        return expr_from_string(
-            f"({load_expr} if {mask_expr} else cutlass.Boolean(0))",
+        # A bool load is neither sortable nor a branch-vec candidate and
+        # carries no access site.regions.
+        return _cute_masked_value_expr(
+            load_expr,
+            site.mask_expr,
+            dtype=tensor.dtype,
+            zero=zero,
             **load_placeholders,
         )
     if state.fx_node is not None and _cute_load_feeds_sort_or_scan(state.fx_node):
@@ -6667,43 +6579,28 @@ def _(state: CodegenState) -> object:
         extra_mask_value = state.proxy_arg(2)
         assert isinstance(extra_mask_value, (torch.Tensor, type(None)))
         sortable_load = CuteSortableLoad(
-            expr=expr_from_string(
-                load_expr
-                if mask_expr is None
-                else f"({load_expr} if {mask_expr} else {_cute_scalar_storage_dtype(tensor.dtype)}(0))",
+            expr=_cute_masked_value_expr(
+                load_expr,
+                site.mask_expr,
+                dtype=tensor.dtype,
+                zero=zero,
                 **load_placeholders,
             ),
             tensor=tensor,
             value=state.fx_node.meta["val"],
             extra_mask=extra_mask_value,
-            tensor_name=tensor_name,
-            index_exprs=tuple(index_exprs),
-            mask_expr=mask_expr,
+            tensor_name=site.tensor_name,
+            index_exprs=tuple(site.index_exprs),
+            mask_expr=site.mask_expr,
             dtype=tensor.dtype,
         )
         state.fx_node.meta["cute_sortable_load"] = sortable_load
         return sortable_load.expr
-    if mask_expr is None:
-        result = expr_from_string(load_expr, **load_placeholders)
-        assert isinstance(result, ast.expr)
-        _cute_tag_access_regions(result, tensor_name, regions)
-        if branch_vec_candidate is not None:
-            vec_block_id, vec_width = branch_vec_candidate
-            return _persistent_branch_vec_load_marker(
-                vec_block_id,
-                vec_width,
-                tensor.dtype,
-                eviction_suffix,
-                _cute_scalar_pointer_expr(tensor_name, index_exprs),
-                result,
-            )
-        return result
-    zero = _cute_scalar_storage_dtype(tensor.dtype)
-    result = expr_from_string(
-        f"({load_expr} if {mask_expr} else {zero}(0))", **load_placeholders
+    result = _cute_masked_value_expr(
+        load_expr, site.mask_expr, dtype=tensor.dtype, zero=zero, **load_placeholders
     )
     assert isinstance(result, ast.expr)
-    _cute_tag_access_regions(result, tensor_name, regions)
+    _cute_tag_access_regions(result, site.tensor_name, site.regions)
     if branch_vec_candidate is not None:
         vec_block_id, vec_width = branch_vec_candidate
         return _persistent_branch_vec_load_marker(
@@ -6711,7 +6608,7 @@ def _(state: CodegenState) -> object:
             vec_width,
             tensor.dtype,
             eviction_suffix,
-            _cute_scalar_pointer_expr(tensor_name, index_exprs),
+            _cute_scalar_pointer_expr(site.tensor_name, site.index_exprs),
             result,
         )
     return result

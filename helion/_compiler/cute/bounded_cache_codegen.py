@@ -28,6 +28,8 @@ from .bounded_loop_cache import attach_variant
 from .bounded_loop_cache import cache_single_tile_loads
 from .bounded_loop_cache import specialize_single_tile_sweeps
 from .duplicate_tile_maxima import deduplicate_bounded_maxima
+from .state import cute_codegen_state
+from .state import cute_env_state
 from .tensor_layout_relations import TensorLayoutRelation
 from .tensor_layout_relations import prove_tensor_layout_relations
 
@@ -38,9 +40,6 @@ if TYPE_CHECKING:
 
     from ..device_function import Argument
     from ..device_function import DeviceFunction
-
-
-BOUNDED_SEQUENCE_MODES = frozenset({"bounded", "bounded_layout"})
 
 
 def _launch_block(df: DeviceFunction) -> tuple[int, int, int] | None:
@@ -102,10 +101,11 @@ class BoundedCacheRequest:
         from ..device_function import TensorDescriptorArg
         from ..device_function import TensorPropertyArg
 
+        codegen_state = cute_codegen_state(df.codegen)
         if (
-            df.codegen.cute_wrapper_plans
-            or df.codegen.cute_uses_matmul
-            or df.cute_state.simt_cluster_n != 1
+            codegen_state.wrapper_plans
+            or codegen_state.uses_matmul
+            or df.cute_state.lanes.simt_cluster_n != 1
             or df.has_rng_ops()
             or df._scratch_args
             or df.wrapper_only_params
@@ -219,9 +219,10 @@ def generate_bounded_cache(
     scalar = Config.from_dict({**config.config, "cute_reduction_sequence": "scalar"})
     original = generate_ast(host, scalar, emit_repro_caller)
     env = CompileEnvironment.current()
+    env_state = cute_env_state(env)
     if (
-        env.cute_resolved_wrapper_plans
-        or env.cute_fission_plan is not None
+        env_state.resolved_wrapper_plans
+        or env_state.fission_plan is not None
         or env.config_spec.matmul_facts
         or len(host.device_ir.root_ids) != 1
         or len(host.device_ir.phases) != 1

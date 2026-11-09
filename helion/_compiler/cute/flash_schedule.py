@@ -1,3 +1,17 @@
+"""The structural schedule of an FA4-style flash-attention body: nodes, barriers, SMEM.
+
+Role: planner.  ``build_fa4_schedule`` builds, from a ``FlashScheduleSpec``
+(head dim, KV depth, CTA count, the pipeline flags), the graph of a local
+schedule -- ``FlashNode`` / ``FlashEdge`` / ``FlashBarrier`` /
+``FlashMemoryRegion`` records in a ``FlashSchedule`` -- and
+``fa4_schedule_fits`` prices its shared memory against
+``FlashScheduleLimits``; ``build_fa4_alt_schedule`` is the
+alternating-warpgroup variant.  ``cute_flash`` and ``cute_flash_alt`` consult
+the schedule when they resolve a config's KV ring depth and staging;
+``FlashScheduleError`` is the refusal.  Pure planning: nothing is rendered
+here.
+"""
+
 from __future__ import annotations
 
 from collections import defaultdict

@@ -181,7 +181,7 @@ def test_norm_backward_reuses_coarse_grid_threads(norm_bound: BoundKernel) -> No
     assert _inactive(norm_bound) == {0}
     config = norm_bound.env.config_spec.default_config()
     with patch(
-        "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+        "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
         return_value=128 * 1024,
     ):
         code = norm_bound.to_code(config)
@@ -244,7 +244,7 @@ def test_norm_backward_does_not_create_unused_coarse_lanes(
     # unused coarse tile. Inactivity must suppress both threads and lane loops.
     config = helion.Config(block_sizes=[64, 64], num_threads=[1, 64, 16])
     with patch(
-        "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+        "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
         return_value=128 * 1024,
     ):
         code = norm_bound.to_code(config)

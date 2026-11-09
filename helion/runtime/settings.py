@@ -22,14 +22,15 @@ from torch._environment import is_fbcode
 from .. import exc
 from .._compat import is_hip
 from .._compat import supports_tf32_precision_on_amd
+from .._compiler.backend_registry import get_backend
 from .._compiler.backend_registry import list_backends
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import InitialPopulation
 from ..autotuner.effort_profile import get_effort_profile
-from .cute_structural_policy import CUTE_STRUCTURAL_SETTINGS
-from .cute_structural_policy import CuteStructuralOrigins
-from .cute_structural_policy import CuteStructuralPolicy
-from .cute_structural_policy import StructuralSettingOrigin
+from .cute.structural_policy import CUTE_STRUCTURAL_SETTINGS
+from .cute.structural_policy import CuteStructuralOrigins
+from .cute.structural_policy import CuteStructuralPolicy
+from .cute.structural_policy import StructuralSettingOrigin
 from .ref_mode import RefMode
 
 if TYPE_CHECKING:
@@ -37,7 +38,7 @@ if TYPE_CHECKING:
     from ..autotuner.base_search import BaseSearch
     from ..autotuner.pattern_search import InitialPopulationStrategy
     from .config import Config
-    from .cute_structural_config import CuteStructuralConfig
+    from .cute.structural_config import CuteStructuralConfig
     from .kernel import BoundKernel
 
     _T = TypeVar("_T")
@@ -421,6 +422,7 @@ class _Settings:
     fast_math: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_FAST_MATH", False)
     )
+    cute_flash_env_overrides: dict[str, str] = dataclasses.field(default_factory=dict)
     static_shapes: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
@@ -483,6 +485,11 @@ class _Settings:
             # Higher default when the first benchmark call has to absorb a
             # heavier subprocess cold-start (slower spawn/imports, CUPTI init).
             90 if is_fbcode() else 30,
+        )
+    )
+    autotune_worker_start_timeout: int | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_optional_int, "HELION_AUTOTUNE_WORKER_START_TIMEOUT"
         )
     )
     autotune_precompile: PrecompileMode = dataclasses.field(
@@ -760,6 +767,12 @@ class Settings(_Settings):
             "May reduce numerical precision and change NaN/Inf behavior. "
             "Set HELION_FAST_MATH=1 to enable."
         ),
+        "cute_flash_env_overrides": (
+            "CuTe flash-attention knob channel: HELION_CUTE_FLASH_* variables the "
+            "kernel resolves as if set in the environment. The channel is captured "
+            "once when the kernel binds (the process environment overlaid with this "
+            "mapping); later environment changes do not reach the bound kernel."
+        ),
         "static_shapes": (
             "If True, use static shapes for all tensors. This is a performance optimization. "
             "Set HELION_STATIC_SHAPES=0 to disable."
@@ -823,7 +836,9 @@ class Settings(_Settings):
             "and its config rendered in-process instead (never failed for the "
             "timeout alone). Also the benchmark worker's deadline for a "
             "candidate's compile and first call (the backend JIT; never below "
-            "autotune_benchmark_timeout): a candidate past it is killed and "
+            "autotune_benchmark_timeout, armed once the worker is ready so a "
+            "fresh worker's start is not the candidate's; lowered along with the "
+            "setting by autotune_adaptive_timeout): a candidate past it is killed and "
             "recorded as failed to compile, and the search goes on. Default "
             "is 60 seconds. In-process compiles cannot be interrupted by it; "
             "the autotune budget bounds them instead."
@@ -836,6 +851,16 @@ class Settings(_Settings):
             "when autotune_benchmark_subprocess is enabled. Default 30 seconds, "
             "raised automatically on environments with a heavier subprocess "
             "cold-start."
+        ),
+        "autotune_worker_start_timeout": (
+            "Seconds a fresh benchmark worker may take to start (the spawned "
+            "interpreter, its imports and the device initialization) before "
+            "it is killed and the candidate recorded as a worker failure. The "
+            "start is never charged to the candidate's compile deadline "
+            "(autotune_compile_timeout), which is armed once the worker "
+            "reports ready. Default None: twice the worker's compile "
+            "deadline, at least 120 seconds. Set "
+            "HELION_AUTOTUNE_WORKER_START_TIMEOUT to override."
         ),
         "autotune_precompile": (
             "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to "
@@ -919,7 +944,8 @@ class Settings(_Settings):
             "Applies only to a Triton-style precompile pool: CuTe render workers keep "
             "the configured autotune_compile_timeout (a worker past it is rendered "
             "in-process), and a timeout fitted on one shape's render times would be "
-            "shared by every shape of the kernel."
+            "shared by every shape of the kernel. The benchmark worker's compile "
+            "deadline follows the lowered setting."
         ),
         "pallas_collective_id": (
             "Optional Pallas collective namespace override. Distributed kernels "
@@ -1171,9 +1197,10 @@ class Settings(_Settings):
         if "backend" not in settings:
             settings["backend"] = _get_backend()
         if "cute_rng_stream" not in settings:
+            backend = get_backend(cast("str", settings["backend"]))
             settings["cute_rng_stream"] = _env_get_literal(
                 "HELION_CUTE_RNG_STREAM",
-                "auto" if settings["backend"] == "cute" else "word0",
+                backend.rng_streams()[0],
                 mapping={"auto": "auto", "word0": "word0", "philox4": "philox4"},
             )
         origins: dict[str, StructuralSettingOrigin] = {}
@@ -1220,6 +1247,25 @@ class Settings(_Settings):
 
         if self.autotune_handoff_budget_seconds < 1:
             raise ValueError("autotune_handoff_budget_seconds must be positive")
+
+        if (
+            self.autotune_worker_start_timeout is not None
+            and self.autotune_worker_start_timeout <= 0
+        ):
+            raise ValueError(
+                "autotune_worker_start_timeout must be a positive number of "
+                f"seconds, got {self.autotune_worker_start_timeout!r}; a "
+                "non-positive timeout would kill every fresh benchmark worker "
+                "before it reports ready (leave it None for the default, or set "
+                "HELION_AUTOTUNE_WORKER_START_TIMEOUT to a positive integer)"
+            )
+
+        for name, value in self.cute_flash_env_overrides.items():
+            if not name.startswith("HELION_CUTE_FLASH_") or not isinstance(value, str):
+                raise ValueError(
+                    "cute_flash_env_overrides maps HELION_CUTE_FLASH_* names to "
+                    f"strings, got {name!r}={value!r}"
+                )
 
         if self.autotune_fp8_accuracy not in ("ulp", "bitwise"):
             raise ValueError(
@@ -1279,9 +1325,7 @@ class Settings(_Settings):
 
     def get_cute_structural_policy(self) -> CuteStructuralPolicy:
         """Snapshot effective booleans without resolving or activating a policy."""
-        return CuteStructuralPolicy(
-            **{name: getattr(self, name) for name in CUTE_STRUCTURAL_SETTINGS}
-        )
+        return CuteStructuralPolicy.from_settings(self)
 
     def to_dict(self) -> dict[str, object]:
         """

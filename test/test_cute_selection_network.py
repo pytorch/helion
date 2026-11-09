@@ -8,12 +8,12 @@ import torch
 from test.cute_population_contracts import _target
 
 import helion
-from helion._compiler.cute.selection_coarse import coarse_rank_full_keys
-from helion._compiler.cute.selection_coarse import coarse_rank_guard
-from helion._compiler.cute.selection_coarse import coarse_rank_keys
-from helion._compiler.cute.selection_coarse import coarse_rank_recover
-from helion._compiler.cute.selection_coarse import trace_coarse_rank_selection
-from helion._compiler.cute.selection_network import selection_network
+from helion._compiler.cute.selection.selection_coarse import coarse_rank_full_keys
+from helion._compiler.cute.selection.selection_coarse import coarse_rank_guard
+from helion._compiler.cute.selection.selection_coarse import coarse_rank_keys
+from helion._compiler.cute.selection.selection_coarse import coarse_rank_recover
+from helion._compiler.cute.selection.selection_coarse import trace_coarse_rank_selection
+from helion._compiler.cute.selection.selection_network import selection_network
 from helion._compiler.device_ir import IfGraphInfo
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile

@@ -18,8 +18,10 @@ from .proven_loop_bounds import _Context
 from .proven_loop_bounds import _Form
 from .proven_loop_bounds import _Proof
 from .proven_loop_bounds import _Value
+from .proven_loop_bounds import supported_statements
 from .simplify_proven_bounds import _assigned_names
 from .simplify_proven_bounds import _call_path
+from .state import cute_codegen_state
 from .tensor_layout_relations import TensorLayoutRelation
 from .tensor_layout_relations import prove_tensor_layout_relations
 
@@ -366,29 +368,6 @@ class _FullTileProof(_Proof):
         return result
 
 
-def _supported(body: Sequence[ast.stmt]) -> bool:
-    for statement in body:
-        if isinstance(statement, ast.Assign):
-            if len(statement.targets) != 1:
-                return False
-            target = statement.targets[0]
-            if isinstance(target, (ast.Tuple, ast.List)):
-                if not all(isinstance(item, ast.Name) for item in target.elts):
-                    return False
-            elif not isinstance(target, (ast.Name, ast.Subscript)):
-                return False
-        elif isinstance(statement, (ast.If, ast.For)):
-            if isinstance(statement, ast.For) and not isinstance(
-                statement.target, ast.Name
-            ):
-                return False
-            if not _supported(statement.body) or not _supported(statement.orelse):
-                return False
-        elif not isinstance(statement, (ast.Expr, ast.Pass)):
-            return False
-    return True
-
-
 def specialize_full_tile_bounds(
     body: list[ast.stmt],
     plan: FullTilePlan,
@@ -401,7 +380,7 @@ def specialize_full_tile_bounds(
 ) -> list[ast.stmt]:
     module = ast.Module(body=body, type_ignores=[])
     nodes = list(ast.walk(module))
-    if len(nodes) > 32768 or not _supported(body):
+    if len(nodes) > 32768 or not supported_statements(body, with_blocks=False):
         return body
     immutable = {
         rename_groups.get(name, name)
@@ -501,11 +480,12 @@ def lower_full_tile_bounds(
     from ..host_function import HostFunction
 
     env = CompileEnvironment.current()
+    codegen_state = cute_codegen_state(function.codegen)
     if (
         not env.config_spec.pointwise_facts
-        or function.codegen.cute_wrapper_plans
-        or function.codegen.cute_uses_matmul
-        or function.cute_state.simt_cluster_n != 1
+        or codegen_state.wrapper_plans
+        or codegen_state.uses_matmul
+        or function.cute_state.lanes.simt_cluster_n != 1
         or function._scratch_args
         or function.wrapper_only_params
         or function.codegen._extra_params

@@ -57,7 +57,7 @@ def test_owned_coordinates_follow_implementation_and_keep_lowering_switch(
     _specification, generation, base, parent = _surface(
         causal=causal, dtype=dtype, mode=mode
     )
-    owned = generation.flash_owned_coordinate_indices(parent)
+    owned = generation.extension.flash_owned_coordinate_indices(parent)
     identities = generation._flat_coordinate_identities()
     required = _flash_resident_softmax_overrides(mode)
     assert owned == [
@@ -87,7 +87,9 @@ def test_owned_coordinates_follow_implementation_and_keep_lowering_switch(
             # The causal launch group is a free coordinate of every lowering.
             assert [
                 identities[index][0]
-                for index in generation.flash_owned_coordinate_indices(switch.config)
+                for index in generation.extension.flash_owned_coordinate_indices(
+                    switch.config
+                )
             ] == ["cute_flash_row_sum_schedule"]
 
 
@@ -96,7 +98,7 @@ def test_ordinary_modes_retain_original_coordinates_and_skip_inactive_rowsum(
     mode, protected_cpu
 ):
     _specification, generation, base, parent = _surface(mode=mode)
-    owned = generation.flash_owned_coordinate_indices(parent)
+    owned = generation.extension.flash_owned_coordinate_indices(parent)
     identities = generation._flat_coordinate_identities()
     assert [identities[index][0] for index in owned] == [
         "cute_flash_row_sum_schedule",

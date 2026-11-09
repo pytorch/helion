@@ -19,16 +19,47 @@ from test.test_cute_interchanged_store_dce import _program
 from test.test_cute_sibling_layout_safety import _config
 
 import helion
-from helion._compiler import reduction_strategy as reductions
-from helion._compiler import tile_strategy as lanes
 from helion._compiler.ast_read_writes import HELION_VEC_LANE_OF_ATTR
 from helion._compiler.ast_read_writes import ast_rename
+from helion._compiler.cute.lane_loops import split as lane_split
+from helion._compiler.cute.lane_loops.markers import _create_lane_loop
+from helion._compiler.cute.lane_loops.markers import _is_lane_reduce_marker_assign
+from helion._compiler.cute.lane_loops.markers import _lane_reduce_marker_expr
+from helion._compiler.cute.lane_loops.markers import _LaneReduceMarker
+from helion._compiler.cute.lane_loops.markers import (
+    restore_unprocessed_lane_reduce_markers,
+)
+from helion._compiler.cute.lane_loops.markers import set_marker_owner
+from helion._compiler.cute.lane_loops.markers import validate_lane_reduce_owners
+from helion._compiler.cute.lane_loops.owner_guards import _atomic_pointer_and_value
+from helion._compiler.cute.lane_loops.owner_guards import _clone_stmt
+from helion._compiler.cute.lane_loops.owner_guards import _lane_reduce_owner_expr
+from helion._compiler.cute.lane_loops.owner_guards import _loop_body_scalar_definitions
+from helion._compiler.cute.lane_loops.owner_guards import (
+    _loop_invariant_scalar_definitions,
+)
+from helion._compiler.cute.lane_loops.owner_guards import (
+    _predicate_accepts_zero_thread_axis,
+)
+from helion._compiler.cute.lane_loops.owner_guards import _scalar_integer_bounds
+from helion._compiler.cute.lane_loops.owner_guards import _store_thread_axes
+from helion._compiler.cute.lane_loops.owner_guards import _StoreThreadAxes
+from helion._compiler.cute.lane_loops.owner_guards import _update_scalar_definitions
+from helion._compiler.cute.lane_loops.split import _has_extra_cross_lane_carry
+from helion._compiler.cute.lane_loops.split import _is_serial_for
+from helion._compiler.cute.lane_loops.split import _restore_per_lane_markers
+from helion._compiler.cute.lane_loops.split import _split_stmt_lane_reductions
+from helion._compiler.cute.lane_loops.split import (
+    interchange_lane_outside_serial_reductions,
+)
+from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
+from helion._compiler.cute.reduction_emitter import CuteBlockReductionEmitter
+from helion._compiler.tile_strategy import _clone_lane_loop_with_body
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_example
 from helion._testing import onlyBackends
-from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
@@ -227,7 +258,7 @@ def test_tile_id_reduction_store_generated_values(rows, columns, masked):
 
 
 def _marker(owner: str | None, value: str = "partial") -> str:
-    return lanes._lane_reduce_marker_expr(
+    return _lane_reduce_marker_expr(
         value, "sum", "cutlass.Float32(0)", 32, owner_lane=owner
     )
 
@@ -259,7 +290,7 @@ def _body(source: str) -> list[ast.AST]:
 def test_distinct_lane_owner_rejected_even_for_equal_extents(
     outer: str, inner: str, inner_extent: int
 ) -> None:
-    inner_loop = lanes._create_lane_loop(
+    inner_loop = _create_lane_loop(
         inner,
         inner_extent,
         _body(
@@ -268,29 +299,29 @@ def test_distinct_lane_owner_rejected_even_for_equal_extents(
             "sink.store(reduced)"
         ),
     )
-    loop = lanes._create_lane_loop(outer, 8, [inner_loop])
+    loop = _create_lane_loop(outer, 8, [inner_loop])
     with pytest.raises(helion.exc.BackendUnsupported, match="different lane owner"):
-        lanes.validate_lane_reduce_owners([loop])
+        validate_lane_reduce_owners([loop])
     with pytest.raises(helion.exc.BackendUnsupported, match="different lane owner"):
-        lanes.split_lane_loop_reductions([loop])
+        split_lane_loop_reductions([loop])
 
 
 def test_marker_owner_survives_text_and_lane_cloning() -> None:
     statement = ast.parse(f"reduced = {_marker('axis')}").body[0]
-    cloned = lanes._clone_stmt(statement)
-    marker = lanes._is_lane_reduce_marker_assign(cloned)
+    cloned = _clone_stmt(statement)
+    marker = _is_lane_reduce_marker_assign(cloned)
     assert marker is not None and marker.owner_lane == "axis"
-    loop = lanes._create_lane_loop("axis", 8, [statement])
-    copied_loop = lanes._clone_lane_loop_with_body(loop, [cloned])
-    lanes.validate_lane_reduce_owners([copied_loop])
+    loop = _create_lane_loop("axis", 8, [statement])
+    copied_loop = _clone_lane_loop_with_body(loop, [cloned])
+    validate_lane_reduce_owners([copied_loop])
 
 
 def test_missing_lane_owner_cannot_reach_residual_restore() -> None:
     body = _body(f"reduced = {_marker('missing')}")
     with pytest.raises(helion.exc.BackendUnsupported, match="different lane owner"):
-        lanes.validate_lane_reduce_owners(body)
+        validate_lane_reduce_owners(body)
     with pytest.raises(helion.exc.BackendUnsupported, match="no proved lane lowering"):
-        lanes.restore_unprocessed_lane_reduce_markers(body)
+        restore_unprocessed_lane_reduce_markers(body)
 
 
 @pytest.mark.parametrize("guarded", [False, True])
@@ -306,23 +337,23 @@ def test_late_rename_carry_rejected_before_split_subpaths(
     update = f"next_value = {source} + partial"
     text += (f"if external:\n    {update}" if guarded else update) + "\n"
     text += "sink.store(reduced)"
-    loop = lanes._create_lane_loop("lane", 8, _body(text))
+    loop = _create_lane_loop("lane", 8, _body(text))
     body: list[ast.AST] = [loop, *_body("later.store(carried)")]
     monkeypatch.setattr(
-        lanes,
+        lane_split,
         "_split_lane_loop_with_register_stash",
         lambda *_: pytest.fail("subpath selected before carry legality"),
     )
-    lanes.validate_lane_reduce_owners(body)
+    validate_lane_reduce_owners(body)
     with pytest.raises(helion.exc.BackendUnsupported, match="loop-carried value"):
-        lanes.split_lane_loop_reductions(
+        split_lane_loop_reductions(
             body, rename_groups={"next_value": "carried", "carried": "carried"}
         )
 
 
 @pytest.mark.parametrize("owner", [None, "lane"])
 def test_reduced_scalar_can_update_an_existing_online_carry(owner: str | None) -> None:
-    loop = lanes._create_lane_loop(
+    loop = _create_lane_loop(
         "lane",
         8,
         _body(
@@ -330,11 +361,11 @@ def test_reduced_scalar_can_update_an_existing_online_carry(owner: str | None) -
             "next_value = snapshot + reduced\nsink.store(next_value)"
         ),
     )
-    lanes.validate_lane_reduce_owners([loop])
-    result = lanes.split_lane_loop_reductions(
+    validate_lane_reduce_owners([loop])
+    result = split_lane_loop_reductions(
         [loop], rename_groups={"next_value": "carried", "carried": "carried"}
     )
-    code = _source(lanes.restore_unprocessed_lane_reduce_markers(result))
+    code = _source(restore_unprocessed_lane_reduce_markers(result))
     assert "warp_reduction_sum" in code
     assert code.count("next_value = snapshot + reduced") == 1
     assert "_helion_lane_reduce" not in code
@@ -342,7 +373,7 @@ def test_reduced_scalar_can_update_an_existing_online_carry(owner: str | None) -
 
 def test_legacy_per_lane_carry_is_not_an_owned_reduction_proof() -> None:
     def generate(owner: str | None) -> str:
-        loop = lanes._create_lane_loop(
+        loop = _create_lane_loop(
             "lane",
             8,
             _body(
@@ -351,9 +382,9 @@ def test_legacy_per_lane_carry_is_not_an_owned_reduction_proof() -> None:
                 "sink.store(reduced + carried)"
             ),
         )
-        lanes.validate_lane_reduce_owners([loop])
-        result = lanes.split_lane_loop_reductions([loop])
-        return _source(lanes.restore_unprocessed_lane_reduce_markers(result))
+        validate_lane_reduce_owners([loop])
+        result = split_lane_loop_reductions([loop])
+        return _source(restore_unprocessed_lane_reduce_markers(result))
 
     assert "reduced = partial" in generate(None)
     with pytest.raises(helion.exc.BackendUnsupported, match="loop-carried value"):
@@ -442,11 +473,11 @@ def test_mixed_raw_and_renamed_carries_decline_before_stash(
     text = f"partial = {partial}\nsnapshot = late\nnext_late = snapshot + partial\n"
     if has_raw:
         text += "raw = raw + partial\n"
-    marker = lanes._lane_reduce_marker_expr(
+    marker = _lane_reduce_marker_expr(
         "partial", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
     )
     text += f"reduced = {marker}\n(out.iterator + lane).store(partial + reduced)"
-    loop = lanes._create_lane_loop("lane", 8, _body(text))
+    loop = _create_lane_loop("lane", 8, _body(text))
     prefix, suffix = (
         _body("raw = 0.0\nlate = 0.0"),
         _body("raw_out.store(raw)\nlate_out.store(late)"),
@@ -455,7 +486,7 @@ def test_mixed_raw_and_renamed_carries_decline_before_stash(
     expected = 36.0 * (64 if unduplicatable else 1)
     # Give the reference the complete eight-lane reduction, not a raw-input
     # stand-in; both external carry updates are separately observable.
-    reference_loop = lanes._create_lane_loop(
+    reference_loop = _create_lane_loop(
         "lane", 8, _body(text.replace(marker, repr(expected)))
     )
     reference, calls = _execute_scalars([*prefix, reference_loop, *suffix], renames)
@@ -463,24 +494,22 @@ def test_mixed_raw_and_renamed_carries_decline_before_stash(
     assert reference["late_out"][0] == expected
     assert calls == (8 if unduplicatable else 0)
     monkeypatch.setattr(
-        lanes,
+        lane_split,
         "_split_lane_loop_with_register_stash",
         lambda *_: pytest.fail("stash selected before observable carry proof"),
     )
     with pytest.raises(helion.exc.BackendUnsupported, match="loop-carried value"):
-        lanes.split_lane_loop_reductions(
-            [*prefix, loop, *suffix], rename_groups=renames
-        )
+        split_lane_loop_reductions([*prefix, loop, *suffix], rename_groups=renames)
 
 
 def test_owned_raw_restore_would_lose_complete_reduction_numerically() -> None:
     def make(owner: str | None) -> list[ast.AST]:
-        marker = lanes._lane_reduce_marker_expr(
+        marker = _lane_reduce_marker_expr(
             "partial", "sum", "cutlass.Float32(0)", 1, owner_lane=owner
         )
         return [
             *_body("carried = 0.0"),
-            lanes._create_lane_loop(
+            _create_lane_loop(
                 "lane",
                 8,
                 _body(
@@ -492,14 +521,14 @@ def test_owned_raw_restore_would_lose_complete_reduction_numerically() -> None:
             *_body("raw_out.store(carried)"),
         ]
 
-    legacy = lanes.split_lane_loop_reductions(make(None))
+    legacy = split_lane_loop_reductions(make(None))
     observed, calls = _execute_scalars(legacy)
     expected = [36.0 + value for value in accumulate(range(1, 9))]
     assert observed["raw_out"][0] == 36.0 and calls == 0
     assert observed["out"][7] == 44.0 and expected[-1] == 72.0
     assert list(observed["out"].values()) != expected
     with pytest.raises(helion.exc.BackendUnsupported, match="loop-carried value"):
-        lanes.split_lane_loop_reductions(make("lane"))
+        split_lane_loop_reductions(make("lane"))
 
 
 @pytest.mark.parametrize("unduplicatable", [False, True])
@@ -514,10 +543,10 @@ def test_complete_owned_split_has_numeric_and_single_execution_proof(
         if unduplicatable
         else "lane + 1"
     )
-    marker = lanes._lane_reduce_marker_expr(
+    marker = _lane_reduce_marker_expr(
         "partial", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
     )
-    loop = lanes._create_lane_loop(
+    loop = _create_lane_loop(
         "lane",
         8,
         _body(
@@ -525,7 +554,7 @@ def test_complete_owned_split_has_numeric_and_single_execution_proof(
             "(out.iterator + lane).store(partial + reduced)"
         ),
     )
-    lowered = lanes.split_lane_loop_reductions([loop])
+    lowered = split_lane_loop_reductions([loop])
     values, calls = _execute_scalars(lowered)
     scale = 64 if unduplicatable else 1
     assert values["out"] == {
@@ -535,10 +564,10 @@ def test_complete_owned_split_has_numeric_and_single_execution_proof(
 
 
 def test_marker_dependent_online_update_uses_full_lane_sum_once() -> None:
-    marker = lanes._lane_reduce_marker_expr(
+    marker = _lane_reduce_marker_expr(
         "partial", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
     )
-    loop = lanes._create_lane_loop(
+    loop = _create_lane_loop(
         "lane",
         8,
         _body(
@@ -547,7 +576,7 @@ def test_marker_dependent_online_update_uses_full_lane_sum_once() -> None:
         ),
     )
     renames = {"next_value": "carried", "carried": "carried"}
-    lowered = lanes.split_lane_loop_reductions(
+    lowered = split_lane_loop_reductions(
         [*_body("carried = 6.0"), loop], rename_groups=renames
     )
     values, calls = _execute_scalars(lowered, renames)
@@ -560,7 +589,7 @@ def test_marker_dependent_online_update_uses_full_lane_sum_once() -> None:
 def test_mixed_marker_and_partial_carry_remains_lane_varying(
     renamed: bool, indirect: bool, guarded: bool
 ) -> None:
-    marker = lanes._lane_reduce_marker_expr(
+    marker = _lane_reduce_marker_expr(
         "partial", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
     )
     text = f"partial = lane + 1\nsnapshot = carried\nreduced = {marker}\n"
@@ -574,28 +603,26 @@ def test_mixed_marker_and_partial_carry_remains_lane_varying(
     renames = {"next_value": "carried", "carried": "carried"} if renamed else {}
     prefix = _body("carried = 0.0\nflag = True")
     suffix = _body("late_out.store(carried)")
-    reference = lanes._create_lane_loop("lane", 8, _body(text.replace(marker, "36.0")))
+    reference = _create_lane_loop("lane", 8, _body(text.replace(marker, "36.0")))
     values, calls = _execute_scalars([*prefix, reference, *suffix], renames)
     assert values["late_out"][0] == 324.0 and calls == 0
-    loop = lanes._create_lane_loop("lane", 8, _body(text))
+    loop = _create_lane_loop("lane", 8, _body(text))
     indices = {
         index
         for index, statement in enumerate(loop.body)
-        if lanes._is_lane_reduce_marker_assign(statement) is not None
+        if _is_lane_reduce_marker_assign(statement) is not None
     }
-    normalized = [lanes._clone_stmt(statement) for statement in loop.body]
+    normalized = [_clone_stmt(statement) for statement in loop.body]
     for statement in normalized:
         ast_rename(statement, renames)
     # The legacy marker-taint test misses the independent partial in both
     # direct and aliased expressions. Post-finalization variation must not.
-    assert not lanes._has_extra_cross_lane_carry(normalized, "lane", indices)
-    assert lanes._has_extra_cross_lane_carry(
+    assert not _has_extra_cross_lane_carry(normalized, "lane", indices)
+    assert _has_extra_cross_lane_carry(
         normalized, "lane", indices, finalized_markers=True
     )
     with pytest.raises(helion.exc.BackendUnsupported, match="loop-carried value"):
-        lanes.split_lane_loop_reductions(
-            [*prefix, loop, *suffix], rename_groups=renames
-        )
+        split_lane_loop_reductions([*prefix, loop, *suffix], rename_groups=renames)
 
 
 @pytest.mark.parametrize("renamed", [False, True])
@@ -603,7 +630,7 @@ def test_mixed_marker_and_partial_carry_remains_lane_varying(
 def test_finalized_only_carry_is_uniform_after_reduction(
     renamed: bool, indirect: bool
 ) -> None:
-    marker = lanes._lane_reduce_marker_expr(
+    marker = _lane_reduce_marker_expr(
         "partial", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
     )
     text = f"partial = lane + 1\nsnapshot = carried\nreduced = {marker}\n"
@@ -613,8 +640,8 @@ def test_finalized_only_carry_is_uniform_after_reduction(
     text += f"{target} = snapshot + {'copy_reduced' if indirect else 'reduced'}\n"
     text += f"out.store({target})"
     renames = {"next_value": "carried", "carried": "carried"} if renamed else {}
-    loop = lanes._create_lane_loop("lane", 8, _body(text))
-    lowered = lanes.split_lane_loop_reductions(
+    loop = _create_lane_loop("lane", 8, _body(text))
+    lowered = split_lane_loop_reductions(
         [*_body("carried = 6.0"), loop], rename_groups=renames
     )
     values, calls = _execute_scalars(lowered, renames)
@@ -635,13 +662,13 @@ def test_finalized_carry_requires_a_once_per_tile_schedule(
         if unduplicatable
         else "64 * (lane + 1)"
     )
-    marker = lanes._lane_reduce_marker_expr(
+    marker = _lane_reduce_marker_expr(
         "partial", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
     )
     target = "next_value" if renamed else "carried"
     renames = {"carried": "carried", "next_value": "carried"} if renamed else {}
     consumer = target if inside_observed else "reduced"
-    loop = lanes._create_lane_loop(
+    loop = _create_lane_loop(
         "lane",
         8,
         _body(
@@ -653,9 +680,9 @@ def test_finalized_carry_requires_a_once_per_tile_schedule(
     program = [*_body("carried = 6.0"), loop, *_body("late_out.store(carried)")]
     if unduplicatable:
         with pytest.raises(helion.exc.BackendUnsupported, match="once-per-tile"):
-            lanes.split_lane_loop_reductions(program, rename_groups=renames)
+            split_lane_loop_reductions(program, rename_groups=renames)
     else:
-        lowered = lanes.split_lane_loop_reductions(program, rename_groups=renames)
+        lowered = split_lane_loop_reductions(program, rename_groups=renames)
         values, calls = _execute_scalars(lowered, renames)
         assert values["late_out"] == {0: 2310.0} and calls == 0
         assert values["out"] == {
@@ -668,7 +695,7 @@ def test_finalized_carry_requires_a_once_per_tile_schedule(
 def test_finalized_carry_without_a_single_assignment_proof_declines(
     compound: bool,
 ) -> None:
-    marker = lanes._lane_reduce_marker_expr(
+    marker = _lane_reduce_marker_expr(
         "partial", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
     )
     update = (
@@ -676,34 +703,34 @@ def test_finalized_carry_without_a_single_assignment_proof_declines(
         if compound
         else "carried = carried + reduced\ncarried = carried + 1"
     )
-    loop = lanes._create_lane_loop(
+    loop = _create_lane_loop(
         "lane",
         8,
         _body(f"partial = lane + 1\nreduced = {marker}\n{update}"),
     )
     with pytest.raises(helion.exc.BackendUnsupported, match="once-per-tile"):
-        lanes.split_lane_loop_reductions(
+        split_lane_loop_reductions(
             [*_body("carried = 6.0\nflag = True"), loop, *_body("out.store(carried)")]
         )
 
 
 def test_owned_marker_cannot_use_an_unproved_direct_restore() -> None:
-    loop = lanes._create_lane_loop(
+    loop = _create_lane_loop(
         "lane", 8, _body(f"partial = lane + 1\nreduced = {_marker('lane')}")
     )
-    marker = lanes._is_lane_reduce_marker_assign(loop.body[1])
+    marker = _is_lane_reduce_marker_assign(loop.body[1])
     assert marker is not None
     with pytest.raises(
         helion.exc.BackendUnsupported, match="complete per-lane restore"
     ):
-        lanes._restore_per_lane_markers(loop, [(1, marker)])
+        _restore_per_lane_markers(loop, [(1, marker)])
 
 
 def test_strided_restore_marker_is_finalized_per_lane() -> None:
     # A device-lane-loop marker whose body kept the per-element strided
     # semantics is finalized across the thread group in place when the
     # two-pass split is refused, instead of rejecting the config.
-    text = lanes._lane_reduce_marker_expr(
+    text = _lane_reduce_marker_expr(
         "partial",
         "sum",
         "cutlass.Float32(0)",
@@ -711,14 +738,12 @@ def test_strided_restore_marker_is_finalized_per_lane() -> None:
         owner_lane="lane",
         strided_restore=True,
     )
-    loop = lanes._create_lane_loop(
-        "lane", 8, _body(f"partial = lane + 1\nreduced = {text}")
-    )
-    marker = lanes._is_lane_reduce_marker_assign(loop.body[1])
+    loop = _create_lane_loop("lane", 8, _body(f"partial = lane + 1\nreduced = {text}"))
+    marker = _is_lane_reduce_marker_assign(loop.body[1])
     assert marker is not None
     assert marker.owner_lane == "lane"
     assert marker.strided_restore
-    restored = lanes._restore_per_lane_markers(loop, [(1, marker)])
+    restored = _restore_per_lane_markers(loop, [(1, marker)])
     source = _source(list(restored.body))
     assert "_helion_lane_reduce" not in source
     assert "warp_reduction_sum" in source
@@ -745,10 +770,10 @@ def test_ordinary_owner_proof_does_not_change_supported_split(
                     orelse=[],
                 )
             ]
-        loop = lanes._create_lane_loop("lane", 8, body)
-        lanes.validate_lane_reduce_owners([loop])
-        result = lanes.split_lane_loop_reductions([loop], uniform_names={"flag"})
-        return _source(lanes.restore_unprocessed_lane_reduce_markers(result))
+        loop = _create_lane_loop("lane", 8, body)
+        validate_lane_reduce_owners([loop])
+        result = split_lane_loop_reductions([loop], uniform_names={"flag"})
+        return _source(restore_unprocessed_lane_reduce_markers(result))
 
     assert generate(None) == generate("lane")
 
@@ -760,21 +785,18 @@ def test_supported_serial_interchange_preserves_owned_marker() -> None:
             for node in ast.walk(loop):
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                     if node.func.id == "_helion_lane_reduce":
-                        assert len(node.args) == 8
-                        node.args.extend(
-                            [ast.Constant(value=1), ast.Constant(value="lane")]
-                        )
-        lanes.validate_lane_reduce_owners([loop])
-        body = lanes.interchange_lane_outside_serial_reductions(
+                        set_marker_owner(node, "lane")
+        validate_lane_reduce_owners([loop])
+        body = interchange_lane_outside_serial_reductions(
             [loop], proven_disjoint_tensor_pairs=_PAIRS
         )
-        lanes.validate_lane_reduce_owners(body)
-        body = lanes.split_lane_loop_reductions(
+        validate_lane_reduce_owners(body)
+        body = split_lane_loop_reductions(
             body,
             uniform_names={"rows", "valid_rows", "valid_cols"},
             proven_disjoint_tensor_pairs=_PAIRS,
         )
-        return _source(lanes.restore_unprocessed_lane_reduce_markers(body))
+        return _source(restore_unprocessed_lane_reduce_markers(body))
 
     assert generate(False) == generate(True)
 
@@ -792,12 +814,12 @@ def test_owned_serial_interchange_has_complete_numeric_reduction(
             and isinstance(node.func, ast.Name)
             and node.func.id == "_helion_lane_reduce"
         ):
-            node.args.extend([ast.Constant(value=1), ast.Constant(value="lane")])
-    lanes.validate_lane_reduce_owners([loop])
-    lowered = lanes.interchange_lane_outside_serial_reductions(
+            set_marker_owner(node, "lane")
+    validate_lane_reduce_owners([loop])
+    lowered = interchange_lane_outside_serial_reductions(
         [loop], proven_disjoint_tensor_pairs=_PAIRS
     )
-    lanes.validate_lane_reduce_owners(lowered)
+    validate_lane_reduce_owners(lowered)
     actual = _execute_interchange(lowered, rows, valid_rows, valid_cols)
     values = actual["source"].values.reshape(rows, 4)
     mask = (np.arange(rows)[:, None] < valid_rows) & (
@@ -812,7 +834,6 @@ def test_owned_serial_interchange_has_complete_numeric_reduction(
     assert actual["column"].stores == 4
 
 
-@skipUnlessBackends(["cute"])
 def test_exact_rejected_backward_config_declines_before_emission() -> None:
     x = torch.empty((4096, 4096), dtype=torch.bfloat16)
     args = (
@@ -855,7 +876,7 @@ def test_exact_rejected_backward_config_declines_before_emission() -> None:
         mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
@@ -882,7 +903,7 @@ _ROW_SUMS_RENAMES = {
 
 
 def _masked_marker(value: str, *, strided_restore: bool = True) -> str:
-    return lanes._lane_reduce_marker_expr(
+    return _lane_reduce_marker_expr(
         value,
         "sum",
         "cutlass.Float32(0)",
@@ -932,12 +953,12 @@ def _split(
     renames: dict[str, str],
     disjoint: set[frozenset[str]] | None = None,
 ) -> str:
-    loop = lanes._create_lane_loop("lane", 2, _body(text))
-    lanes.validate_lane_reduce_owners([loop])
-    result = lanes.split_lane_loop_reductions(
+    loop = _create_lane_loop("lane", 2, _body(text))
+    validate_lane_reduce_owners([loop])
+    result = split_lane_loop_reductions(
         [loop], rename_groups=renames, proven_disjoint_tensor_pairs=disjoint
     )
-    return _source(lanes.restore_unprocessed_lane_reduce_markers(result))
+    return _source(restore_unprocessed_lane_reduce_markers(result))
 
 
 def _lane_passes(code: str) -> list[str]:
@@ -1269,18 +1290,18 @@ def test_a_strided_reduction_without_a_whole_loop_lowering_is_declined(
 
 
 def test_the_restore_declines_a_stored_strided_reduction() -> None:
-    loop = lanes._create_lane_loop("lane", 2, _body(_restored_rows_body(_STORED_TOTAL)))
+    loop = _create_lane_loop("lane", 2, _body(_restored_rows_body(_STORED_TOTAL)))
     (index,) = [
         i
         for i, stmt in enumerate(loop.body)
-        if lanes._is_lane_reduce_marker_assign(stmt) is not None
+        if _is_lane_reduce_marker_assign(stmt) is not None
     ]
-    marker = lanes._is_lane_reduce_marker_assign(loop.body[index])
+    marker = _is_lane_reduce_marker_assign(loop.body[index])
     assert marker is not None and marker.strided_restore
     with pytest.raises(
         helion.exc.BackendUnsupported, match="no proved complete per-lane restore"
     ):
-        lanes._restore_per_lane_markers(loop, [(index, marker)], _ROW_SUMS_RENAMES)
+        _restore_per_lane_markers(loop, [(index, marker)], _ROW_SUMS_RENAMES)
 
 
 _MAX_CARRY_UPDATES = {
@@ -1318,7 +1339,7 @@ _TWO_TENSORS_DISJOINT = _RESTORED_DISJOINT | {
 
 
 def _max_marker(value: str) -> str:
-    return lanes._lane_reduce_marker_expr(
+    return _lane_reduce_marker_expr(
         value,
         "max",
         "cutlass.Float32(float('-inf'))",
@@ -1489,7 +1510,7 @@ def test_the_atomic_operand_parser_reads_the_keyword_form(
 ) -> None:
     node = ast.parse(call, mode="eval").body
     assert isinstance(node, ast.Call)
-    parts = lanes._atomic_pointer_and_value(node)
+    parts = _atomic_pointer_and_value(node)
     if expected is None:
         assert parts is None
     else:
@@ -1599,28 +1620,26 @@ _ONLINE_SOFTMAX_BLOCKS = [1, 16, 16]
 
 def _emitted_tile_reduction_markers(
     monkeypatch: pytest.MonkeyPatch, config: helion.Config
-) -> tuple[str, list[lanes._LaneReduceMarker]]:
+) -> tuple[str, list[_LaneReduceMarker]]:
     """CPU-only codegen of the online-softmax kernel; capture every lane
     reduction marker ``BlockReductionStrategy`` emits and return the code."""
     captured: list[str] = []
-    original = reductions.BlockReductionStrategy._lane_loop_marker_expr
+    original = CuteBlockReductionEmitter._lane_loop_marker_expr
 
     def capture(
-        self: reductions.BlockReductionStrategy, *args: object, **kwargs: object
+        self: CuteBlockReductionEmitter, *args: object, **kwargs: object
     ) -> str:
         expression = original(self, *args, **kwargs)  # pyrefly: ignore [bad-argument-type]
         captured.append(expression)
         return expression
 
-    monkeypatch.setattr(
-        reductions.BlockReductionStrategy, "_lane_loop_marker_expr", capture
-    )
+    monkeypatch.setattr(CuteBlockReductionEmitter, "_lane_loop_marker_expr", capture)
     q = torch.empty((4, 256, 64), dtype=torch.bfloat16)
     with (
         mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
@@ -1628,7 +1647,7 @@ def _emitted_tile_reduction_markers(
         code = bound.to_code(config)
     markers = []
     for expression in captured:
-        marker = lanes._is_lane_reduce_marker_assign(
+        marker = _is_lane_reduce_marker_assign(
             ast.parse(f"reduced = {expression}").body[0]
         )
         assert marker is not None
@@ -1636,7 +1655,6 @@ def _emitted_tile_reduction_markers(
     return code, markers
 
 
-@skipUnlessBackends(["cute"])
 def test_lane_looped_tile_reduction_marker_uses_full_launch_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1670,7 +1688,6 @@ def test_lane_looped_tile_reduction_marker_uses_full_launch_layout(
     assert "_cute_grouped_reduce_warp(" not in code
 
 
-@skipUnlessBackends(["cute"])
 def test_vectorized_lane_tile_reduction_declines_before_emission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1702,11 +1719,11 @@ def test_constexpr_vector_lane_is_not_a_serial_interchange_loop() -> None:
         f"    carried = carried + reduced"
     ).body[0]
     _stamped([vector_loop])
-    assert not lanes._is_serial_for(vector_loop)
-    loop = lanes._create_lane_loop("lane", 2, [vector_loop])
-    unchanged = lanes.interchange_lane_outside_serial_reductions([loop])
+    assert not _is_serial_for(vector_loop)
+    loop = _create_lane_loop("lane", 2, [vector_loop])
+    unchanged = interchange_lane_outside_serial_reductions([loop])
     assert "_helion_lane_reduce" in _source(unchanged)
-    lowered = lanes.split_lane_loop_reductions(unchanged)
+    lowered = split_lane_loop_reductions(unchanged)
     assert [ast.unparse(stmt) for stmt in lowered] == [
         "reduced_lane_acc = cutlass.Float32(0)",
         (
@@ -1721,7 +1738,7 @@ def test_constexpr_vector_lane_is_not_a_serial_interchange_loop() -> None:
 
 
 def _vector_lane_marker(value: str) -> str:
-    return lanes._lane_reduce_marker_expr(
+    return _lane_reduce_marker_expr(
         value, "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
     )
 
@@ -1757,10 +1774,10 @@ def test_vector_lane_markers_fold_into_the_lane_split() -> None:
         "next_m2_total": "m2_total",
         "m2_total": "m2_total",
     }
-    lowered = lanes.split_lane_loop_reductions(
+    lowered = split_lane_loop_reductions(
         [
             *_body("count = 0.0\nm2_total = 0.0"),
-            lanes._create_lane_loop("lane", 2, _stamped(_body(text))),
+            _create_lane_loop("lane", 2, _stamped(_body(text))),
             *_body("late_out.store(count)\n(late_out.iterator + 1).store(m2_total)"),
         ],
         rename_groups=renames,
@@ -1862,9 +1879,9 @@ def test_vector_lane_markers_outside_the_fold_shape_decline(text: str) -> None:
     space: the scalar analog of the aliasing shape declines as a reordered
     aliasing write) and the constexpr loop is this lane's own ``vec_lane``
     wrapper (any other constexpr loop is a serial unroll)."""
-    loop = lanes._create_lane_loop("lane", 4, _stamped(_body(text)))
+    loop = _create_lane_loop("lane", 4, _stamped(_body(text)))
     with pytest.raises(helion.exc.BackendUnsupported, match="constexpr vector lane"):
-        lanes.split_lane_loop_reductions([loop])
+        split_lane_loop_reductions([loop])
 
 
 def test_owned_marker_in_serial_loop_without_store_declines() -> None:
@@ -1877,11 +1894,11 @@ def test_owned_marker_in_serial_loop_without_store_declines() -> None:
         f"    reduced = {_marker('lane')}\n"
         f"    carried = carried + reduced"
     ).body[0]
-    assert lanes._is_serial_for(serial_loop)
-    loop = lanes._create_lane_loop("lane", 8, [serial_loop])
+    assert _is_serial_for(serial_loop)
+    loop = _create_lane_loop("lane", 8, [serial_loop])
     with pytest.raises(helion.exc.BackendUnsupported, match="no proved complete"):
-        lanes.interchange_lane_outside_serial_reductions([loop])
-    legacy_loop = lanes._create_lane_loop(
+        interchange_lane_outside_serial_reductions([loop])
+    legacy_loop = _create_lane_loop(
         "lane",
         8,
         [
@@ -1893,7 +1910,7 @@ def test_owned_marker_in_serial_loop_without_store_declines() -> None:
             ).body[0]
         ],
     )
-    restored = _source(lanes.interchange_lane_outside_serial_reductions([legacy_loop]))
+    restored = _source(interchange_lane_outside_serial_reductions([legacy_loop]))
     assert "reduced = partial" in restored and "_helion_lane_reduce" not in restored
 
 
@@ -1969,7 +1986,7 @@ class TestLaneLoopedTileReductionNumerics(TestCase):
 def test_owned_marker_input_updated_by_aliased_serial_loop_splits(
     observed: bool,
 ) -> None:
-    marker = lanes._lane_reduce_marker_expr(
+    marker = _lane_reduce_marker_expr(
         "row_sums", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
     )
     # The inner serial loop updates ``row_sums`` through the SSA alias
@@ -1996,7 +2013,7 @@ def test_owned_marker_input_updated_by_aliased_serial_loop_splits(
     def make() -> list[ast.AST]:
         return [
             *_body("total = 6.0"),
-            lanes._create_lane_loop("lane", 8, _body(text)),
+            _create_lane_loop("lane", 8, _body(text)),
             *_body("late_out.store(total)"),
         ]
 
@@ -2004,8 +2021,8 @@ def test_owned_marker_input_updated_by_aliased_serial_loop_splits(
     with pytest.raises(
         helion.exc.BackendUnsupported, match="complete per-lane restore"
     ):
-        lanes.split_lane_loop_reductions(make())
-    lowered = lanes.split_lane_loop_reductions(make(), rename_groups=renames)
+        split_lane_loop_reductions(make())
+    lowered = split_lane_loop_reductions(make(), rename_groups=renames)
     code = _source(lowered)
     assert "_helion_lane_reduce" not in code
     assert code.count("next_total = total_copy + reduced") == 1
@@ -2018,16 +2035,16 @@ def test_owned_marker_input_updated_by_aliased_serial_loop_splits(
 
 
 def test_dependent_markers_with_unduplicatable_producer_decline() -> None:
-    first = lanes._lane_reduce_marker_expr(
+    first = _lane_reduce_marker_expr(
         "acc", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
     )
-    second = lanes._lane_reduce_marker_expr(
+    second = _lane_reduce_marker_expr(
         "centered", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
     )
     # ``acc`` is re-derived by a collective under an SSA alias and feeds a
     # chain of dependent reductions whose result updates a carried scalar, so
     # neither the stash nor the dependent split may re-run the producer.
-    loop = lanes._create_lane_loop(
+    loop = _create_lane_loop(
         "lane",
         8,
         _body(
@@ -2056,7 +2073,7 @@ def test_dependent_markers_with_unduplicatable_producer_decline() -> None:
     with pytest.raises(
         helion.exc.BackendUnsupported, match="complete per-lane restore"
     ):
-        lanes.split_lane_loop_reductions(
+        split_lane_loop_reductions(
             [*_body("total = 6.0"), loop, *_body("late_out.store(total)")],
             rename_groups=renames,
         )
@@ -2064,12 +2081,12 @@ def test_dependent_markers_with_unduplicatable_producer_decline() -> None:
 
 @pytest.mark.parametrize("extent", [8, 512])
 def test_register_stash_declines_beyond_its_lane_extent_limit(extent: int) -> None:
-    marker = lanes._lane_reduce_marker_expr(
+    marker = _lane_reduce_marker_expr(
         "acc", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
     )
     # matmul_layernorm's shape: a collective K loop re-derives the per-lane
     # ``acc`` that the reduction over the lane axis consumes.
-    loop = lanes._create_lane_loop(
+    loop = _create_lane_loop(
         "lane",
         extent,
         _body(
@@ -2093,9 +2110,9 @@ def test_register_stash_declines_beyond_its_lane_extent_limit(extent: int) -> No
         with pytest.raises(
             helion.exc.BackendUnsupported, match="complete per-lane restore"
         ):
-            lanes.split_lane_loop_reductions([loop], rename_groups=renames)
+            split_lane_loop_reductions([loop], rename_groups=renames)
         return
-    lowered = lanes.split_lane_loop_reductions([loop], rename_groups=renames)
+    lowered = split_lane_loop_reductions([loop], rename_groups=renames)
     values, calls = _execute_scalars(lowered, renames)
     # The collective runs once per lane and K step, in the stash pass only.
     assert calls == 2 * extent
@@ -2109,7 +2126,7 @@ def test_register_stash_declines_beyond_its_lane_extent_limit(extent: int) -> No
 def test_collective_outside_the_reduction_slice_runs_once_per_lane(
     feeds_reduction: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    marker = lanes._lane_reduce_marker_expr(
+    marker = _lane_reduce_marker_expr(
         "partial", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
     )
     collective = (
@@ -2129,15 +2146,17 @@ def test_collective_outside_the_reduction_slice_runs_once_per_lane(
     else:
         text = f"partial = lane + 1\nreduced = {marker}\nrow_mean = {collective}\n"
     text += "(out.iterator + lane).store(row_mean + reduced)"
-    loop = lanes._create_lane_loop("lane", 8, _body(text))
-    monkeypatch.setattr(lanes, "_split_lane_loop_with_register_stash", lambda *_: None)
+    loop = _create_lane_loop("lane", 8, _body(text))
+    monkeypatch.setattr(
+        lane_split, "_split_lane_loop_with_register_stash", lambda *_: None
+    )
     if feeds_reduction:
         with pytest.raises(
             helion.exc.BackendUnsupported, match="complete per-lane restore"
         ):
-            lanes.split_lane_loop_reductions([loop])
+            split_lane_loop_reductions([loop])
         return
-    lowered = lanes.split_lane_loop_reductions([loop])
+    lowered = split_lane_loop_reductions([loop])
     code = _source(lowered)
     assert "_helion_lane_reduce" not in code
     assert code.count("_cute_grouped_reduce_shared_two_stage(") == 1
@@ -2192,7 +2211,6 @@ def test_tile_id_empty_domain_has_no_output_writes(shape):
     )
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("masked", [False, True])
 def test_tile_id_reduction_store_native(masked):
     x = torch.arange(7 * 129, device=DEVICE, dtype=torch.float32).reshape(7, 129)
@@ -2208,7 +2226,9 @@ def test_tile_id_reduction_store_native(masked):
 
 
 def test_tile_id_wider_sibling_keeps_original_mask_and_arbitration():
-    from helion.language.memory_ops import _cute_tile_id_thread_extent_is_complete
+    from helion._compiler.cute.emitters.memory_access import (
+        _cute_tile_id_thread_extent_is_complete,
+    )
 
     observed = []
 
@@ -2229,7 +2249,7 @@ def test_tile_id_wider_sibling_keeps_original_mask_and_arbitration():
 
     with (
         patch(
-            "helion.language.memory_ops._cute_tile_id_thread_extent_is_complete",
+            "helion._compiler.cute.emitters.memory_access._cute_tile_id_thread_extent_is_complete",
             side_effect=wider,
         ),
         pytest.raises(helion.exc.BackendUnsupported),
@@ -2272,7 +2292,7 @@ def test_tile_id_serial_tail_preserves_element_mask(begin, end, masked):
         # This serial ownership path must remain byte-identical to the original
         # element-mask route; the root-grid optimization is tested separately.
         with patch(
-            "helion.language.memory_ops._cute_tile_id_thread_extent_is_complete",
+            "helion._compiler.cute.emitters.memory_access._cute_tile_id_thread_extent_is_complete",
             return_value=False,
         ):
             original_mask_code = bound.to_code(config)
@@ -2315,9 +2335,7 @@ def _bounded_store_coordinate_definitions():
         "for base in range(1, 130, _BLOCK_SIZE_1): pass",
         "for serial in range(4): pass",
     ):
-        definitions = lanes._loop_body_scalar_definitions(
-            _body(text)[0], definitions, {}
-        )
+        definitions = _loop_body_scalar_definitions(_body(text)[0], definitions, {})
     return definitions
 
 
@@ -2329,10 +2347,10 @@ def test_bounded_store_predicate_selects_zero_without_losing_live_writes(
     expression = f"base + cutlass.Int32(cute.arch.thread_idx()[0]) * {scale} + serial {comparison} 130"
     predicate = ast.parse(expression, mode="eval").body
     definitions = _bounded_store_coordinate_definitions()
-    assert lanes._predicate_accepts_zero_thread_axis(
+    assert _predicate_accepts_zero_thread_axis(
         predicate, 0, {}, definitions, require_bounded=True
     )
-    assert not lanes._predicate_accepts_zero_thread_axis(predicate, 0, {}, definitions)
+    assert not _predicate_accepts_zero_thread_axis(predicate, 0, {}, definitions)
     # Check the implication, including empty serial tails: an enabled thread
     # implies that thread zero is enabled; an empty lane stays empty.
     for base in (1, 65, 129):
@@ -2364,7 +2382,7 @@ def test_bounded_store_predicate_rejects_unsafe_coordinates(expression):
     definitions["tid"] = ast.parse(
         "cutlass.Int32(cute.arch.thread_idx()[0])", mode="eval"
     ).body
-    assert not lanes._predicate_accepts_zero_thread_axis(
+    assert not _predicate_accepts_zero_thread_axis(
         ast.parse(expression, mode="eval").body,
         0,
         {"tid": frozenset({0})},
@@ -2376,27 +2394,27 @@ def test_bounded_store_predicate_rejects_unsafe_coordinates(expression):
 def test_bounded_store_induction_facts_are_scoped_and_invalidated():
     definitions = _bounded_store_coordinate_definitions()
     expression = ast.parse("base + serial", mode="eval").body
-    assert lanes._scalar_integer_bounds(expression, definitions) == (1, 132)
+    assert _scalar_integer_bounds(expression, definitions) == (1, 132)
     inherited = dict(definitions)
-    unknown = lanes._loop_body_scalar_definitions(
+    unknown = _loop_body_scalar_definitions(
         _body("for base in range(dynamic_end): pass")[0], definitions, {}
     )
-    assert lanes._scalar_integer_bounds(expression, unknown) is None
+    assert _scalar_integer_bounds(expression, unknown) is None
     assert definitions == inherited
     for mutation in ("base = load()", "base = base + 1", "if flag: base = load()"):
         changed = dict(definitions)
-        lanes._update_scalar_definitions(_body(mutation)[0], changed)
-        assert lanes._scalar_integer_bounds(expression, changed) is None
-    marker = lanes._is_lane_reduce_marker_assign(_body(f"total = {_marker('lane')}")[0])
+        _update_scalar_definitions(_body(mutation)[0], changed)
+        assert _scalar_integer_bounds(expression, changed) is None
+    marker = _is_lane_reduce_marker_assign(_body(f"total = {_marker('lane')}")[0])
     assert marker is not None
-    safe = lanes._StoreThreadAxes(set(), set(), {0}, set(), {0}, frozenset({0}))
-    assert lanes._lane_reduce_owner_expr(marker, safe) is not None
+    safe = _StoreThreadAxes(set(), set(), {0}, set(), {0}, frozenset({0}))
+    assert _lane_reduce_owner_expr(marker, safe) is not None
     for axes in (
-        lanes._StoreThreadAxes({0}, set(), {0}, set(), {0}, frozenset({0})),
-        lanes._StoreThreadAxes(set(), set(), {0}, set(), set()),
+        _StoreThreadAxes({0}, set(), {0}, set(), {0}, frozenset({0})),
+        _StoreThreadAxes(set(), set(), {0}, set(), set()),
     ):
         with pytest.raises(helion.exc.BackendUnsupported, match="thread-varying store"):
-            lanes._lane_reduce_owner_expr(marker, axes)
+            _lane_reduce_owner_expr(marker, axes)
 
 
 @pytest.mark.parametrize(
@@ -2411,7 +2429,7 @@ def test_reduced_axis_requires_bounded_proof_for_every_predicate(predicate):
     definitions["tid"] = ast.parse(
         "cutlass.Int32(cute.arch.thread_idx()[0])", mode="eval"
     ).body
-    axes = lanes._store_thread_axes(
+    axes = _store_thread_axes(
         _body(f"if {predicate}: out.store(total)")[0],
         {"tid": frozenset({0})},
         definitions,
@@ -2423,10 +2441,10 @@ def test_reduced_axis_requires_bounded_proof_for_every_predicate(predicate):
         {0} if predicate.startswith("cutlass.Int32") else set()
     )
     assert not axes.bounded_zero_safe_predicate
-    marker = lanes._is_lane_reduce_marker_assign(_body(f"total = {_marker('lane')}")[0])
+    marker = _is_lane_reduce_marker_assign(_body(f"total = {_marker('lane')}")[0])
     assert marker is not None
     with pytest.raises(helion.exc.BackendUnsupported, match="thread-varying store"):
-        lanes._lane_reduce_owner_expr(marker, axes)
+        _lane_reduce_owner_expr(marker, axes)
 
 
 @pytest.mark.parametrize("carry_name", ["base", "phi_base"])
@@ -2446,22 +2464,22 @@ def test_bounded_store_loop_context_drops_backedge_and_else_facts(carry_name, he
         observed.append(kwargs["scalar_definitions"])
         return body
 
-    with patch.object(lanes, "_split_lane_loop_reductions", side_effect=observe):
-        lanes._split_stmt_lane_reductions(
+    with patch.object(lane_split, "_split_lane_loop_reductions", side_effect=observe):
+        _split_stmt_lane_reductions(
             loop, set(), set(), {}, {}, definitions, rename_groups
         )
     assert len(observed) == 2
     for context in observed:
         assert "base" not in context and "alias" not in context
     expected = (0, 1) if header == "for outer in range(2)" else None
-    assert lanes._scalar_integer_bounds(ast.Name(id="outer"), observed[0]) == expected
-    assert lanes._scalar_integer_bounds(ast.Name(id="outer"), observed[1]) is None
+    assert _scalar_integer_bounds(ast.Name(id="outer"), observed[0]) == expected
+    assert _scalar_integer_bounds(ast.Name(id="outer"), observed[1]) is None
     assert "base" in definitions and "alias" in definitions
     shadow = _body("for base in range(200, 201): pass\nelse: consume()")[0]
     assert (
-        lanes._scalar_integer_bounds(
+        _scalar_integer_bounds(
             ast.Name(id="base"),
-            lanes._loop_invariant_scalar_definitions(shadow, definitions, {}),
+            _loop_invariant_scalar_definitions(shadow, definitions, {}),
         )
         is None
     )
@@ -2482,9 +2500,9 @@ def test_bounded_store_induction_rejects_thread_dependent_ranges(loop):
         "start": ast.parse("129 - 2 * tid", mode="eval").body,
     }
     axes = {"tid": frozenset({0}), "start": frozenset({0})}
-    definitions = lanes._loop_body_scalar_definitions(_body(loop)[0], definitions, axes)
+    definitions = _loop_body_scalar_definitions(_body(loop)[0], definitions, axes)
     predicate = ast.parse("base + tid < 129", mode="eval").body
-    assert not lanes._predicate_accepts_zero_thread_axis(
+    assert not _predicate_accepts_zero_thread_axis(
         predicate, 0, axes, definitions, require_bounded=True
     )
     # At each thread's first iteration this enables thread one, not zero.
@@ -2501,9 +2519,9 @@ def test_bounded_store_canonical_alias_write_invalidates_prior_constant(inside):
         "if cutlass.Int32(x + cutlass.Int32(cute.arch.thread_idx()[0])) < 130:\n"
         "    out.store(reduced)"
     )
-    loop = lanes._create_lane_loop("lane", 4, [*assignments, *body] if inside else body)
+    loop = _create_lane_loop("lane", 4, [*assignments, *body] if inside else body)
     with pytest.raises(helion.exc.BackendUnsupported):
-        lanes.split_lane_loop_reductions(
+        split_lane_loop_reductions(
             [loop] if inside else [*assignments, loop], rename_groups={"phi_x": "x"}
         )
 
@@ -2522,13 +2540,13 @@ def test_tile_id_source_load_keeps_uniform_value_with_store_owner_masks(complete
 
     from helion._compiler.backend_registry import repair_backend_codegen
     from helion._compiler.cute import memory_ops as cute_memory_ops
-    import helion.language.memory_ops as memory_ops
+    from helion._compiler.cute.emitters import memory_access
 
     repair_backend_codegen("cute")
     x = torch.empty(3, 129)
     weights = torch.arange(6, dtype=torch.float32).reshape(3, 2) + 11
     observed = []
-    original = memory_ops._cute_combined_mask
+    original = memory_access._cute_combined_mask
 
     def observe(state, subscript, extra_mask, tensor=None, **kwargs):
         result = original(state, subscript, extra_mask, tensor, **kwargs)
@@ -2539,10 +2557,12 @@ def test_tile_id_source_load_keeps_uniform_value_with_store_owner_masks(complete
         mock_cuda_unavailable(),
         _target(),
         forbid_native_compile(),
-        patch.object(memory_ops, "_cute_combined_mask", observe),
+        patch.object(memory_access, "_cute_combined_mask", observe),
         patch.object(cute_memory_ops, "_cute_combined_mask", observe),
         patch.object(
-            memory_ops, "_cute_tile_id_thread_extent_is_complete", return_value=complete
+            memory_access,
+            "_cute_tile_id_thread_extent_is_complete",
+            return_value=complete,
         ),
     ):
         bound = cpu_bind(_tile_id_scalar_copy, (x, weights))
@@ -2571,7 +2591,6 @@ def _group_absmax(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("loop_order", [[0, 1], [1, 0]])
 def test_reduced_device_loop_lane_nests_innermost(loop_order: list[int]) -> None:
     """Both blocks of the inner loop run as serial lanes on one thread.  The

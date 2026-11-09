@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from contextlib import contextmanager
+import random
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -21,7 +22,8 @@ import torch
 from test.cute_population_contracts import _cpu_target
 
 import helion
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute import target_facts
+from helion._compiler.cute.tcgen05_config import surface
 from helion._hardware import HardwareInfo
 from helion._testing import default_cute_mma_support
 from helion._testing import patch_cute_mma_support
@@ -43,7 +45,7 @@ def _sm100_target() -> Iterator[None]:
         stack.enter_context(patch_cute_mma_support(default_cute_mma_support()))
         stack.enter_context(
             patch.object(
-                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+                target_facts, "per_cta_smem_capacity_bytes", return_value=232448
             )
         )
         stack.enter_context(
@@ -58,7 +60,10 @@ def _sm100_target() -> Iterator[None]:
             )
         )
         stack.enter_context(
-            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148)
+            patch(
+                "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+                return_value=148,
+            )
         )
         yield
 
@@ -146,7 +151,7 @@ def test_sampled_splits_stay_on_the_flat_one_cta_envelope(shape, dtype) -> None:
         bound = _bind(*shape, dtype=dtype)
         spec = bound.config_spec
         tcgen05 = spec._cute_tcgen05_config
-        assert tcgen05.split_k_search_choices() == (2, 4, 8, 16)
+        assert surface.split_k_search_choices(tcgen05) == (2, 4, 8, 16)
         gen = ConfigGeneration(spec)
         split = [
             config
@@ -173,7 +178,7 @@ def test_a_full_grid_has_no_split_surface() -> None:
     with _sm100_target():
         bound = _bind(8192, 8192, 8192)
         spec = bound.config_spec
-        assert spec._cute_tcgen05_config.split_k_search_choices() == ()
+        assert surface.split_k_search_choices(spec._cute_tcgen05_config) == ()
         gen = ConfigGeneration(spec)
         assert all("tcgen05_split_k" not in config for config in _samples(gen, 50))
         assert not any(
@@ -191,13 +196,13 @@ def test_a_tile_body_with_another_side_effect_cannot_split() -> None:
         counter = torch.zeros(1, dtype=torch.int32)
         bound = _gemm_with_counter.bind((a, b, counter))
         spec = bound.config_spec
-        assert not spec.cute_tcgen05_split_k_plain_body
-        assert spec._cute_tcgen05_config.split_k_search_choices() == ()
+        assert not spec.tcgen05.split_k_plain_body
+        assert surface.split_k_search_choices(spec._cute_tcgen05_config) == ()
         assert not any(
             seed.get("tcgen05_split_k", 1) > 1 for seed in spec.compiler_seed_configs
         )
         plain = _bind(512, 512, 65536)
-        assert plain.config_spec.cute_tcgen05_split_k_plain_body
+        assert plain.config_spec.tcgen05.split_k_plain_body
 
 
 def test_sampled_splits_render() -> None:
@@ -210,8 +215,17 @@ def test_sampled_splits_render() -> None:
         gen = ConfigGeneration(bound.config_spec)
         # Random samples land on the split envelope a few percent of the time;
         # render the first four such samples (the renders are the slow part).
+        # The sampler draws from ``random``: a fixed seed makes the rendered
+        # configs the same from run to run, restored so the process-wide RNG
+        # is left as found.
+        state = random.getstate()
+        try:
+            random.seed(0)
+            samples = _samples(gen, 400)
+        finally:
+            random.setstate(state)
         rendered = 0
-        for config in _samples(gen, 400):
+        for config in samples:
             if config.get("tcgen05_split_k", 1) > 1:
                 code = bound.to_code(helion.Config(**config))
                 assert "tcgen05_sk_slab" in code

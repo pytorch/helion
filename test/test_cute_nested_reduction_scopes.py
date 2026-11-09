@@ -16,10 +16,22 @@ from helion._compiler import reduction_strategy as reductions
 from helion._compiler import tile_strategy as lanes
 from helion._compiler.ast_read_writes import ast_rename
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute import nested_lane_reductions
+from helion._compiler.cute.lane_loops.markers import _create_lane_loop
+from helion._compiler.cute.lane_loops.markers import _find_lane_reduce_call
+from helion._compiler.cute.lane_loops.markers import _is_lane_reduce_marker_assign
+from helion._compiler.cute.lane_loops.markers import _lane_reduce_marker_expr
+from helion._compiler.cute.lane_loops.markers import (
+    restore_unprocessed_lane_reduce_markers,
+)
+from helion._compiler.cute.lane_loops.markers import validate_lane_reduce_owners
+from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 from helion._compiler.cute.nested_lane_reductions import (
     normalize_nested_lane_reductions,
 )
 from helion._compiler.cute.nested_lane_reductions import resolve_pruned_lane_owners
+from helion._compiler.cute.reduction_emitter import CutePersistentReductionEmitter
+from helion._compiler.cute.reduction_emitter import CuteReductionEmitter
 from helion._compiler.generate_ast import GenerateAST
 from helion._testing import DEVICE
 from helion._testing import skipUnlessCuteAvailable
@@ -31,13 +43,13 @@ def _body(source: str) -> list[ast.AST]:
 
 
 def _marker(value: str, owner: str) -> str:
-    return lanes._lane_reduce_marker_expr(
+    return _lane_reduce_marker_expr(
         value, "sum", "cutlass.Float64(0)", 1, owner_lane=owner
     )
 
 
 def _nested_body(outer_extent: int, inner_extent: int) -> list[ast.AST]:
-    inner = lanes._create_lane_loop(
+    inner = _create_lane_loop(
         "inner",
         inner_extent,
         _body(
@@ -54,7 +66,7 @@ def _nested_body(outer_extent: int, inner_extent: int) -> list[ast.AST]:
             "next_carried = snapshot2 + outer_sum\n"
         ),
     )
-    outer = lanes._create_lane_loop("outer", outer_extent, [inner])
+    outer = _create_lane_loop("outer", outer_extent, [inner])
     inner_tiles = ast.parse(
         f"for tile_j in range(0, end1, {inner_extent}):\n    pass"
     ).body[0]
@@ -99,7 +111,7 @@ def test_marker_free_normalization_preserves_ast_and_skips_dependency_analysis()
     source = ast.unparse(tree)
     node_ids = [id(node) for node in ast.walk(tree)]
     with patch.object(
-        lanes,
+        nested_lane_reductions,
         "_update_scalar_definitions",
         side_effect=AssertionError("marker-free dependency analysis"),
     ):
@@ -139,13 +151,13 @@ def test_complete_nested_sums_with_tails_and_carried_output(
     values = np.random.default_rng(seed).integers(-31, 32, (16, 16)).astype(np.float64)
     output = np.full((1,), np.nan)
     body = _normalize(_nested_body(outer_extent, inner_extent))
-    lanes.validate_lane_reduce_owners(body)
-    body = lanes.split_lane_loop_reductions(
+    validate_lane_reduce_owners(body)
+    body = split_lane_loop_reductions(
         body,
         proven_disjoint_tensor_pairs={frozenset({"x", "out"})},
         rename_groups={"next_carried": "carried", "carried": "carried"},
     )
-    body = lanes.restore_unprocessed_lane_reduce_markers(body)
+    body = restore_unprocessed_lane_reduce_markers(body)
     module = ast.Module(body=cast("list[ast.stmt]", body), type_ignores=[])
     ast_rename(module, {"next_carried": "carried"})
     assert "_helion_lane_reduce" not in ast.unparse(module)
@@ -253,7 +265,7 @@ def test_unproved_nested_schedules_remain_rejected(change: str) -> None:
         inner.body[-4] = _body(f"inner_sum = helper({_marker('value', 'inner')})")[0]
     with pytest.raises(exc.BackendUnsupported):
         normalized = _normalize(program)
-        lanes.validate_lane_reduce_owners(normalized)
+        validate_lane_reduce_owners(normalized)
 
 
 def _loop(
@@ -300,7 +312,8 @@ def test_serial_scope_must_be_proved_outside_reduction_owner(mode: str) -> None:
         codegen.statements_stack.append(second_body)
     strategy = object.__new__(reductions.ReductionStrategy)
     strategy.block_ids = [7]
-    result = strategy._lane_reduce_marker_unsupported(SimpleNamespace(codegen=codegen))
+    emitter = CuteReductionEmitter(strategy)
+    result = emitter._lane_reduce_marker_unsupported(SimpleNamespace(codegen=codegen))
     assert result is (mode != "outside")
 
 
@@ -365,8 +378,10 @@ def test_reshape_records_only_complete_physical_group_proofs(mode: str) -> None:
     strategy._synthetic_cute_lane_var = "synthetic"
     fn = SimpleNamespace(
         cute_state=SimpleNamespace(
-            reshape_lane_fallbacks=fallbacks,
-            simt_cluster_n=2 if mode == "cluster" else 1,
+            lanes=SimpleNamespace(
+                reshape_lane_fallbacks=fallbacks,
+                simt_cluster_n=2 if mode == "cluster" else 1,
+            )
         ),
         tile_strategy=SimpleNamespace(
             thread_axis_for_block_id=lambda value: axes[value][0],
@@ -378,15 +393,14 @@ def test_reshape_records_only_complete_physical_group_proofs(mode: str) -> None:
         codegen=SimpleNamespace(active_device_loops=active, current_grid_state=None)
     )
     fn.codegen = state.codegen
+    emitter = CutePersistentReductionEmitter(strategy)
     with patch.object(CompileEnvironment, "current", return_value=env):
-        group = strategy._reshape_merged_reduction_group_params()
+        group = emitter._reshape_merged_reduction_group_params()
         if mode == "conflict":
             with pytest.raises(exc.BackendUnsupported, match="conflicting lane"):
-                strategy._lane_reduce_owner(state, reshape_group=group)
+                emitter._lane_reduce_owner(state, reshape_group=group)
         else:
-            assert (
-                strategy._lane_reduce_owner(state, reshape_group=group) == "synthetic"
-            )
+            assert emitter._lane_reduce_owner(state, reshape_group=group) == "synthetic"
             assert fallbacks == (
                 {"synthetic": ("physical", 4, 16, "lane_index")}
                 if mode == "concrete"
@@ -408,7 +422,7 @@ def test_reshape_records_only_complete_physical_group_proofs(mode: str) -> None:
     ],
 )
 def test_only_proven_pruned_owner_is_rebound(mode: str) -> None:
-    marker = lanes._lane_reduce_marker_expr(
+    marker = _lane_reduce_marker_expr(
         "value",
         "sum",
         "cutlass.Float32(0)",
@@ -421,23 +435,23 @@ def test_only_proven_pruned_owner_is_rebound(mode: str) -> None:
         owner_lane="synthetic",
     )
     statement = _body(f"reduced = {marker}")[0]
-    physical = lanes._create_lane_loop("physical", 8, [statement])
+    physical = _create_lane_loop("physical", 8, [statement])
     if mode == "live_loop":
-        physical.body = [lanes._create_lane_loop("synthetic", 4, [statement])]
+        physical.body = [_create_lane_loop("synthetic", 4, [statement])]
     elif mode == "wrong_owner":
-        physical.body = [lanes._create_lane_loop("different", 8, [statement])]
+        physical.body = [_create_lane_loop("different", 8, [statement])]
     body: list[ast.AST] = [physical]
     if mode == "live_name":
         body.insert(0, _body("coordinate = synthetic + 1")[0])
     resolve_pruned_lane_owners(body, {"synthetic": ("physical", 4, 16, "lane_index")})
-    parsed = lanes._is_lane_reduce_marker_assign(statement)
+    parsed = _is_lane_reduce_marker_assign(statement)
     assert parsed is not None
     assert parsed.owner_lane == ("physical" if mode == "pruned" else "synthetic")
     if mode in ("pruned", "live_loop"):
-        lanes.validate_lane_reduce_owners(body)
+        validate_lane_reduce_owners(body)
     else:
         with pytest.raises(exc.BackendUnsupported):
-            lanes.validate_lane_reduce_owners(body)
+            validate_lane_reduce_owners(body)
 
 
 @pytest.mark.parametrize(
@@ -462,7 +476,7 @@ def test_only_proven_pruned_owner_is_rebound(mode: str) -> None:
 )
 def test_physical_reshape_reduction_requires_complete_execution(mode: str) -> None:
     span = 1 if mode == "singleton" else 8
-    marker = lanes._lane_reduce_marker_expr(
+    marker = _lane_reduce_marker_expr(
         "value",
         "sum",
         "cutlass.Float32(0)",
@@ -479,9 +493,7 @@ def test_physical_reshape_reduction_requires_complete_execution(mode: str) -> No
     body: list[ast.AST] = [statement]
     if mode in ("live_loop", "serial_lane"):
         body = [
-            lanes._create_lane_loop(
-                "synthetic" if mode == "live_loop" else "other", 4, body
-            )
+            _create_lane_loop("synthetic" if mode == "live_loop" else "other", 4, body)
         ]
     elif mode in ("uniform_loop", "varying_loop", "load_bound"):
         bound = {
@@ -514,13 +526,13 @@ def test_physical_reshape_reduction_requires_complete_execution(mode: str) -> No
         uniform_names={"end", "flag", "x"},
     )
     accepted = mode in ("complete", "uniform_loop", "uniform_branch", "singleton")
-    assert (lanes._find_lane_reduce_call(statement) is None) == accepted
+    assert (_find_lane_reduce_call(statement) is None) == accepted
     if accepted:
-        lanes.validate_lane_reduce_owners(body)
+        validate_lane_reduce_owners(body)
         assert ("_cute_grouped_reduce_warp" in ast.unparse(statement)) == (span > 1)
     elif mode != "live_loop":
         with pytest.raises(exc.BackendUnsupported):
-            lanes.validate_lane_reduce_owners(body)
+            validate_lane_reduce_owners(body)
 
 
 @pytest.mark.parametrize(
@@ -588,7 +600,9 @@ def test_physical_reshape_layout_proof_is_complete(mode: str) -> None:
         canonical_block_id=lambda value: value,
     )
     fn = SimpleNamespace(
-        cute_state=SimpleNamespace(simt_cluster_n=2 if mode == "cluster" else 1),
+        cute_state=SimpleNamespace(
+            lanes=SimpleNamespace(simt_cluster_n=2 if mode == "cluster" else 1)
+        ),
         resolved_block_size=lambda bid: (
             sizes[bid] * (2 if mode == "partial" and bid == 2 else 1)
         ),
@@ -601,8 +615,9 @@ def test_physical_reshape_layout_proof_is_complete(mode: str) -> None:
     strategy.block_ids = [4]
     strategy._fn = lambda: fn
     state = SimpleNamespace(codegen=SimpleNamespace(active_device_loops=active))
+    emitter = CutePersistentReductionEmitter(strategy)
     with patch.object(CompileEnvironment, "current", return_value=env):
-        group = strategy._reshape_physical_reduction_group_params(state)
+        group = emitter._reshape_physical_reduction_group_params(state)
     assert group == {
         "two_axes": (1, 32, "lanes"),
         "one_axis": (1, 8, "lanes"),
@@ -776,7 +791,6 @@ def test_merged_reduction_multiple_serial_sources_stay_rejected() -> None:
 
 def test_merged_reduction_generated_live_coordinate_stays_rejected() -> None:
     from .cute_population_contracts import _target
-    from helion._compiler.cute import nested_lane_reductions
     from helion._testing.cute_codegen import cpu_bind
 
     original = nested_lane_reductions.resolve_pruned_lane_owners

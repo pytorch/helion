@@ -8,7 +8,7 @@ import torch
 
 import helion
 from helion import exc
-from helion._compiler.cute.backend import _live_grid_thread_dims
+from helion._compiler.cute.launch_shape import live_grid_thread_dims
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_aux import cpu_codegen
@@ -229,7 +229,7 @@ def test_explicit_launch_metadata_ignores_expression_spelling_and_dead_names() -
         "    wider = other_expression()\n"
         "unregistered = 99\n"
     ).body
-    assert _live_grid_thread_dims(
+    assert live_grid_thread_dims(
         body,
         {"first": (0, 128), "base": (1, 4), "wider": (0, 256), "dead": (2, 64)},
     ) == [256, 4, 1]

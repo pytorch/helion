@@ -16,6 +16,7 @@ import warnings
 
 import sympy
 import torch
+from torch import SymInt
 from torch._dynamo.source import EphemeralSource
 from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
@@ -40,7 +41,7 @@ from .._compat import target_device_capability
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import BackendState
-from .backend_registry import get_backend_class
+from .backend_registry import get_backend
 from .fake_tensor import create_fake_tensor_mode
 from .source_location import SourceLocation
 from .source_location import current_location
@@ -375,7 +376,6 @@ if TYPE_CHECKING:
     from ..runtime.settings import Settings
     from .autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from .backend import Backend
-    from .cute.materialized_fission import MaterializedFissionPlan
     from .pallas.compact_worklist import CompactWorklistPlan
     from .pallas.compact_worklist import ResidentCacheDecision
     from .pallas.compact_worklist import ResidentPrepHoist
@@ -425,6 +425,41 @@ def shape_env_var_hints(shape_env: ShapeEnv) -> dict[sympy.Symbol, sympy.Integer
     return shape_env.var_to_val  # pyrefly: ignore [deprecated]
 
 
+# Legacy ShapeEnv unifier retained for Helion.
+def _constrain_unify(shape_env: ShapeEnv, a: SymInt, b: SymInt) -> None:
+    """
+    Given two SymInts, constrain them so that they must be equal.  NB:
+    this will not work with SymInts that represent nontrivial expressions
+    (yet!)
+    """
+    if not isinstance(a, SymInt):
+        if not isinstance(b, SymInt):
+            if a != b:
+                raise AssertionError(f"Expected {a} == {b}")
+        else:
+            if not isinstance(b.node.expr, sympy.Symbol):
+                raise AssertionError("constraining non-Symbols NYI")
+            if b.node.shape_env is not shape_env:
+                raise AssertionError("b.node.shape_env must be shape_env")
+            shape_env.replacements[b.node.expr] = sympy.Integer(a)
+    else:
+        # NB: We can't actually do "unification" as our operators are not
+        # injective
+        if not isinstance(a.node.expr, sympy.Symbol):
+            raise AssertionError("constraining non-Symbols NYI")
+        if a.node.shape_env is not shape_env:
+            raise AssertionError("a.node.shape_env must be shape_env")
+        if not isinstance(b, SymInt):
+            shape_env.replacements[a.node.expr] = sympy.Integer(b)
+        else:
+            if a.node.shape_env is not b.node.shape_env:
+                raise AssertionError("a.node.shape_env must be b.node.shape_env")
+            if not isinstance(b.node.expr, sympy.Symbol):
+                raise AssertionError("constraining non-Symbols NYI")
+            new_var = shape_env._find(a.node.expr)
+            shape_env.replacements[b.node.expr] = new_var
+
+
 class CompileEnvironment:
     """
     Global state for the duration of a compilation.
@@ -447,19 +482,23 @@ class CompileEnvironment:
         # pyrefly: ignore [read-only]
         self.device = device
         self.settings = settings
-        if settings.cute_rng_stream not in ("auto", "word0", "philox4"):
-            raise ValueError("cute_rng_stream must be auto, word0 or philox4")
-        if settings.cute_rng_stream != "word0" and settings.backend != "cute":
-            raise ValueError(
-                f"cute_rng_stream={settings.cute_rng_stream} requires the CuTe backend"
-            )
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
         self._is_distributed = is_distributed
         self.process_group_name = None
-        self._backend = get_backend_class(settings.backend)()
+        self._backend = get_backend(settings.backend)
         self._backend.validate_environment()
+        rng_streams = self._backend.rng_streams()
+        if settings.cute_rng_stream not in rng_streams:
+            raise ValueError(
+                f"cute_rng_stream={settings.cute_rng_stream!r} is not supported by "
+                f"the {settings.backend} backend; expected one of "
+                f"{', '.join(rng_streams)}"
+            )
+        # The backend's per-compile state (``Backend.new_env_state``); read
+        # through the backend's typed accessor, never by name from core.
+        self.backend_state: object | None = self._backend.new_env_state()
         if (
             settings.debug_dtype_asserts
             and not self._backend.supports_debug_dtype_asserts
@@ -503,22 +542,6 @@ class CompileEnvironment:
             f"helion_runtime_arg_values_{id(self)}",
             default=None,
         )
-        self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
-        # Dynamic reduction extents whose CuTe persistent thread layout was
-        # sized from the size hint; the bound kernel keys their power-of-2
-        # bucket once code generation has used one.
-        self.cute_hint_sized_reduction_extents: set[sympy.Expr] = set()
-        self.cute_fission_plan: MaterializedFissionPlan | None = None
-        self.cute_half_atomic_output_promotions: dict[str, torch.dtype] = {}
-        # Internal stage compilers may inherit a proved TensorMap-aligned view
-        # of an owning kernel input. Only the stage builder populates this set;
-        # ordinary input tensors still require their runtime cache-key proof.
-        self.cute_proven_tma_inputs: set[torch.Tensor] = set()
-        # Set by ``generate_ast`` while it regenerates a kernel whose
-        # register-tile lane nesting the split-time lowering rejected
-        # (``cute/register_tile_admission.py``); the persistent reduction
-        # strategy then keeps its rolled lane nesting.
-        self.cute_register_tile_disabled: bool = False
         # Host integer helpers such as cdiv/next_power_of_2 deliberately return
         # unbacked SymInts during tracing. Preserve the config expression beside
         # that symbol so a fixed block size derived from a user tunable can still
@@ -1489,7 +1512,7 @@ class CompileEnvironment:
             if isinstance(source.value, torch.SymInt):
                 source_expr = _symint_expr(source.value)
                 if isinstance(source_expr, sympy.Symbol):
-                    self.shape_env._constrain_unify(source.value, info.var)
+                    _constrain_unify(self.shape_env, source.value, info.var)
                     # Match the block var's hint to the size it is now unified
                     # with, so both agree once the shared range is narrowed.
                     shape_env_var_hints(self.shape_env)[info.symbol()] = sympy.Integer(
@@ -2346,7 +2369,7 @@ class CompileEnvironment:
             source = info.block_size_source
             if isinstance(source, FixedBlockSizeSource):
                 value = source.value
-            elif self.backend_name == "cute" and isinstance(
+            elif self.backend.canonicalizes_reduction_loop_blocks() and isinstance(
                 source, ReductionLoopBlockSizeSource
             ):
                 value = info.size

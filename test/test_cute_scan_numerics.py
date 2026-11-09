@@ -22,12 +22,10 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
-pytestmark = skipUnlessBackends(["cute"])
 
 _SERIAL_RESCAN = "for scan_i in range("
 

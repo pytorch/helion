@@ -7,9 +7,9 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from ..ast_extension import expr_from_string
+from ._ast_pass_utils import call_path
 from .scalar_recipe import _MATH_CALLS
 from .scalar_recipe import _clone
-from .scalar_recipe import _path
 from .scalar_recipe import _read_names
 from .scalar_recipe import is_rounded_fp32_multiply
 
@@ -88,7 +88,7 @@ def _pure(expression: ast.expr) -> bool:
         return False
     if is_rounded_fp32_multiply(expression):
         return all(_pure(value) for value in cast("ast.Tuple", expression.args[0]).elts)
-    path = _path(expression.func)
+    path = call_path(expression.func)
     if path is None:
         return False
     allowed = (

@@ -39,22 +39,26 @@ import sympy
 import torch
 
 from ... import exc
-from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
-from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_MMA_M_KEY
-from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_STAGES_KEY
-from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from ...language.matmul_ops import dot
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import FixedBlockSizeSource
+from .autotune.config_keys import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
+from .autotune.config_keys import CUTE_GDN_RECURRENCE_MMA_M_KEY
+from .autotune.config_keys import CUTE_GDN_RECURRENCE_STAGES_KEY
+from .autotune.config_keys import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from .cute_mma_dag import MMA_DAG_KEY
 from .cute_mma_dag import MMA_DAG_OFF
+from .fx_matcher import _binary_args
 from .fx_matcher import _canonical_root_axis_ids
 from .fx_matcher import _is_call
+from .fx_matcher import _is_convert
+from .fx_matcher import _is_full_slice
 from .fx_matcher import _linear_offsets_fit_i32
 from .fx_matcher import _load_ref
 from .fx_matcher import _memory_indices
 from .fx_matcher import _same_ref
 from .fx_matcher import _store_ref
+from .fx_matcher import _tensor_arg
 from .fx_matcher import _TensorRef
 from .fx_matcher import _xyz_grid_fits
 from .gdn_recurrence_geometry import GDN_ADMITTED_BLOCK_V
@@ -71,6 +75,7 @@ from .gdn_recurrence_geometry import gdn_stage_choices
 from .gdn_recurrence_geometry import gdn_state_replicas
 from .gdn_recurrence_geometry import gdn_tmem_layout
 from .gdn_recurrence_geometry import gdn_token_group_choices
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -154,33 +159,6 @@ def _static_shape(fake: torch.Tensor) -> tuple[int, ...] | None:
     if any(dim is None or dim <= 0 for dim in dims):
         return None
     return cast("tuple[int, ...]", dims)
-
-
-def _binary_args(
-    node: object, targets: tuple[object, ...]
-) -> tuple[object, object] | None:
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.op != "call_function"
-        or node.target not in targets
-        or len(node.args) != 2
-    ):
-        return None
-    return node.args[0], node.args[1]
-
-
-def _is_convert(node: object, source: object, dtype: torch.dtype) -> bool:
-    return bool(
-        isinstance(node, torch.fx.Node)
-        and _is_call(node, torch.ops.prims.convert_element_type.default)
-        and len(node.args) == 2
-        and node.args[0] is source
-        and node.args[1] is dtype
-    )
-
-
-def _is_full_slice(value: object) -> bool:
-    return isinstance(value, slice) and value == slice(None)
 
 
 def _is_plain_load(node: object) -> bool:
@@ -899,13 +877,9 @@ def plan_gdn_recurrence(
 ) -> None:
     from ..device_function import DeviceFunction
 
-    DeviceFunction.current().cute_state.gdn_recurrence_plan = _plan_gdn_recurrence(
-        graphs, tile_strategy
+    DeviceFunction.current().cute_state.root_plans.gdn_recurrence_plan = (
+        _plan_gdn_recurrence(graphs, tile_strategy)
     )
-
-
-def _tensor_arg(cg: GenerateAST, ref: _TensorRef) -> str:
-    return cg.device_function.tensor_arg(ref.fake, prefer_name=ref.name).name
 
 
 def _emit_module_imports(cg: GenerateAST) -> None:
@@ -921,7 +895,7 @@ def codegen_gdn_recurrence(cg: GenerateAST) -> bool:
     """Replace the matched root with the SM100 schedule's wrapper plan."""
 
     df = cg.device_function
-    plan = df.cute_state.gdn_recurrence_plan
+    plan = df.cute_state.root_plans.gdn_recurrence_plan
     root = cg.current_root_graph_info
     if plan is None or root is None or root.graph_id != plan.root_graph_id:
         return False
@@ -934,7 +908,8 @@ def codegen_gdn_recurrence(cg: GenerateAST) -> bool:
     k, w, u, g, h = names
     _emit_module_imports(cg)
     geometry = plan.geometry
-    cg.cute_wrapper_plans.append(
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(
         {
             "kind": GDN_RECURRENCE_KIND,
             "k_name": k,
@@ -967,7 +942,7 @@ def codegen_gdn_recurrence(cg: GenerateAST) -> bool:
     df.placeholder_args.update(names)
     df.preamble = []
     df.body = [ast.Pass()]
-    cg.cute_uses_matmul = True
+    codegen_state.declare_matmul()
     return True
 
 

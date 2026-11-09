@@ -30,6 +30,7 @@ import helion
 from helion import _compat
 from helion import exc
 from helion._compat import supports_block_ptr
+from helion._compiler.backend_registry import get_backend_class
 from helion._compiler.cute.printer import cute_texpr
 from helion._compiler.integer_power import lower_integer_powers
 from helion._testing import DEVICE
@@ -58,6 +59,8 @@ from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.runtime.settings import _get_backend
+
+_CUTE_BACKEND = get_backend_class("cute")()
 
 
 @onlyBackends(["triton", "cute"])
@@ -1982,7 +1985,7 @@ class TestHelionCutePrinter(TestCase):
         for base, last in ((2, 62), (4, 31), (8, 20), (16, 15)):
             expression = cast("sympy.Expr", PowByNatural(sympy.Integer(base), exponent))
             lowered = lower_integer_powers(
-                expression, {exponent: ValueRanges(0, last)}, backend="cute"
+                expression, {exponent: ValueRanges(0, last)}, backend=_CUTE_BACKEND
             )
             rendered = cute_texpr(lowered)
             for value in range(last + 1):
@@ -2014,7 +2017,9 @@ class TestHelionCutePrinter(TestCase):
                     ),
                 )
                 with self.assertRaises(exc.BackendUnsupported):
-                    lower_integer_powers(expression, {exponent: bounds}, backend="cute")
+                    lower_integer_powers(
+                        expression, {exponent: bounds}, backend=_CUTE_BACKEND
+                    )
         # Unprepared powers must not fall through to Triton's floating printer.
         with self.assertRaises(exc.BackendUnsupported):
             cute_texpr(cast("sympy.Expr", PowByNatural(2, exponent)))
@@ -2033,7 +2038,7 @@ class TestHelionCutePrinter(TestCase):
         ):
             expression = cast("sympy.Expr", expression)
             rendered = cute_texpr(
-                lower_integer_powers(expression, {index: bounds}, backend="cute")
+                lower_integer_powers(expression, {index: bounds}, backend=_CUTE_BACKEND)
             )
             for value in (3, 17, 30):
                 actual = eval(
@@ -2043,7 +2048,9 @@ class TestHelionCutePrinter(TestCase):
                 )
                 self.assertEqual(actual, expression.subs(index, value))
         unchanged = sympy.Add(sympy.Mul(3, index), 4)
-        self.assertIs(lower_integer_powers(unchanged, {}, backend="cute"), unchanged)
+        self.assertIs(
+            lower_integer_powers(unchanged, {}, backend=_CUTE_BACKEND), unchanged
+        )
 
     @skipIfRefEager("inspects generated device code")
     def test_scalar_loop_integer_power_range_proof(self) -> None:
@@ -2609,7 +2616,7 @@ def test_cute_unsigned_scalar_load_sdk_type(dtype):
     cute = pytest.importorskip("cutlass.cute")
     ir = pytest.importorskip("cutlass._mlir.ir")
     from helion._compiler.cute.backend import CuteBackend
-    from helion.language.memory_ops import _cute_scalar_load_expr
+    from helion._compiler.cute.emitters.memory_access import _cute_scalar_load_expr
 
     logical = cutlass.Uint8 if dtype == torch.uint8 else cutlass.Uint32
     environment = SimpleNamespace(
@@ -2643,8 +2650,8 @@ def test_cute_unsigned_scalar_load_sdk_type(dtype):
 @skipUnlessBackends(["cute"])
 def test_cute_scalar_load_non_unsigned_paths_unchanged():
     from helion._compiler.cute.backend import CuteBackend
-    from helion.language.memory_ops import _cute_scalar_load_expr
-    from helion.language.memory_ops import _cute_scalar_pointer_expr
+    from helion._compiler.cute.emitters.memory_access import _cute_scalar_load_expr
+    from helion._compiler.cute.emitters.memory_access import _cute_scalar_pointer_expr
 
     environment = SimpleNamespace(
         backend=CuteBackend(), index_type=lambda: "cutlass.Int32"

@@ -1,5 +1,8 @@
-"""Disjoint static shared-memory packing for a dormant native composition.
+"""Disjoint static shared-memory packing of the flat grouped RNA kernel.
 
+``tcgen05_flat_grouped_plan`` builds ``NativeSharedAllocation`` /
+``NativeSharedStoragePlan`` for the storage pool the flat grouped kernel
+template carves (``tcgen05_storage_pool`` in ``tcgen05_flat_grouped_kernel.py``).
 All allocations remain live together. This planner reorders aligned storage;
 it never aliases buffers, shortens rings, or changes resource capacity.
 """

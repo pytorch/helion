@@ -27,13 +27,14 @@ from helion._compiler.cute.pdl_release import generic_release_rendered
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import import_example
-from helion._testing import onlyBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from helion._compiler.device_function import DeviceFunction
 
 pytest.importorskip("cutlass")
 
@@ -47,7 +48,7 @@ def cpu_only() -> Iterator[None]:
         mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
@@ -182,7 +183,6 @@ def test_a_dead_fill_stays_an_empty_without_a_fill_kernel(cpu_only: None) -> Non
     assert _WAIT in on and _WAIT not in off
 
 
-@onlyBackends(["cute"])
 def test_the_accumulator_reads_zeros_on_every_call() -> None:
     x = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
     code, out = code_and_output(atomic_column_sum, (x,), **_COLUMN_SUM, cute_pdl=True)
@@ -241,7 +241,6 @@ def _prefix_copy(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -340,7 +339,6 @@ def test_the_split_k_kernel_waits_after_its_operand_loop(cpu_only: None) -> None
     assert f"{fill_name}._helion_cute_use_pdl = True" in on
 
 
-@onlyBackends(["cute"])
 def test_the_split_k_output_is_right_on_every_call_behind_the_late_wait() -> None:
     """GPU: the late-waiting split-K kernel behind its fill kernel, run
     back to back (eager and as a CUDA graph of several calls with inputs
@@ -396,19 +394,19 @@ def test_every_argument_aliasing_the_filled_tensor_bounds_the_late_wait(
     filled tensor's storage, not only the one carrying its name: the host
     view ``flat`` of ``out`` is a separate argument and must count as a
     touch of ``out`` (it has to see the fill's zeros)."""
-    from helion._compiler.device_function import DeviceFunction
+    from helion._compiler.cute.passes import pdl
 
     recorded: list[set[str]] = []
-    original = DeviceFunction._late_pdl_wait_names
+    original = pdl._late_pdl_wait_names
 
-    def record(self: DeviceFunction) -> set[str]:
-        names = original(self)
+    def record(fn: DeviceFunction) -> set[str]:
+        names = original(fn)
         recorded.append(names)
         return names
 
     x = torch.empty(64, dtype=torch.float32)
     y = torch.empty(64, 128, dtype=torch.float32)
-    with patch.object(DeviceFunction, "_late_pdl_wait_names", record):
+    with patch.object(pdl, "_late_pdl_wait_names", record):
         on, off = _codes(
             _alias_and_atomic, (x, y), block_sizes=[16, 64], num_threads=[4, 64]
         )
@@ -504,7 +502,6 @@ def test_a_runtime_sized_fill_launches_behind_a_bound_on_its_element_count(
     assert [ast.unparse(s) for s in guard.orelse] == ["out.zero_()"]
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("static_shapes", [True, False])
 def test_a_fill_of_two_to_the_31_elements_reads_zero(static_shapes: bool) -> None:
     """Static: the memset stays.  Dynamic: the host bound sends the 2**31

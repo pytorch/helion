@@ -8,9 +8,8 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.backend import CuteBackend
+from helion._compiler.cute.backend import CuteBackend
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
@@ -53,7 +52,6 @@ def _round_trip(
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_registered_jagged_seeds_retain_shared_512_thread_launch() -> None:
     kernel = helion.kernel(
         jagged_layer_norm_kernel.fn,
@@ -89,7 +87,7 @@ def test_registered_jagged_seeds_retain_shared_512_thread_launch() -> None:
             assert repaired.block_sizes == seed.block_sizes
             assert repaired.num_threads == seed.num_threads
             with patch(
-                "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+                "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
                 return_value=232448,
             ):
                 assert "block=(512, 1, 1)" in bound.to_code(repaired)

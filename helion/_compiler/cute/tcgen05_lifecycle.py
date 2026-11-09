@@ -25,7 +25,6 @@ class Tcgen05LifecycleContext:
     acc_tmem_cols: str
     is_two_cta: bool
     use_tma: bool
-    skip_ab_producer_advance: bool = False
     tmem_permit_released_early: bool = False
     # Plain single-CTA kernels (merged pipeline init, see
     # ``tcgen05_use_merged_pipeline_init`` in ``cute_mma``) use the short
@@ -135,7 +134,6 @@ class Tcgen05LifecycleContext:
                     self.tma_pipeline,
                     self.tma_producer_state,
                     indent="    ",
-                    skip_advances=self.skip_ab_producer_advance,
                 )
             )
         if self.is_two_cta or self.pdl_release:

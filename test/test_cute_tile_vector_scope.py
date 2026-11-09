@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 from unittest.mock import patch
@@ -11,6 +10,11 @@ import torch
 
 from .test_cute_tile_loop_vec_hoist import _reduction_kernel
 import helion
+from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.emitters.lane_packets import (
+    _cute_register_tile_unroll_vec_store,
+)
+from helion._compiler.lane_loop_context import LaneLoopContext
 from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import PerThreadNDTileStrategy
 from helion._compiler.tile_strategy import VecLaneWrapper
@@ -18,7 +22,6 @@ from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
-from helion.language.memory_ops import _cute_register_tile_unroll_vec_store
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -200,28 +203,28 @@ def test_deferred_sites_preserve_their_own_contiguous_axis(
 @pytest.mark.parametrize("lane_axis", [0, 1])
 def test_store_emitter_uses_captured_axis(lane_axis: int) -> None:
     vloop = ast.parse("for vi in range(8):\n    pass").body[0]
-    strategy = SimpleNamespace(
-        _cute_lane_base_index_var_by_block={1: "base"},
-        _cute_lane_body_by_block={1: [vloop]},
-        _cute_lane_vloop_by_block={1: vloop},
-        _cute_lane_axis_pos_by_block={1: 1 - lane_axis},
+    context = LaneLoopContext(
+        1,
+        base_index_var="base",
+        lane_body=[vloop],
+        vloop=vloop,
+        lane_axis_pos=1 - lane_axis,
     )
     state = Mock()
     state.device_function.new_var.return_value = "values"
     with (
         patch(
-            "helion.language.memory_ops._cute_scalar_pointer_expr",
+            "helion._compiler.cute.emitters.lane_packets._cute_scalar_pointer_expr",
             return_value="pointer",
         ) as pointer,
         patch(
-            "helion.language.memory_ops.statement_from_string",
+            "helion._compiler.cute.emitters.lane_packets.statement_from_string",
             side_effect=lambda source: ast.parse(source).body[0],
         ),
     ):
         _cute_register_tile_unroll_vec_store(
             state,
-            strategy,
-            1,
+            context,
             "out",
             ["row", "col"],
             "value",
@@ -250,10 +253,11 @@ def test_deferred_scope_uses_the_complete_body(inner_live: bool) -> None:
     assert isinstance(outer, ast.For)
     vloop = outer.body[1]
     assert isinstance(vloop, ast.For)
-    # Only the per-thread lane strategies defer vector ops; the wrap consults
-    # the strategy's collected-store registry once the body is complete.
+    # Only the per-thread lane strategies defer vector ops; the CuTe backend's
+    # demotion pass consults the strategy's collected-store registry once the
+    # body is complete (a bare state without a compile environment skips it).
     strategy = Mock(spec=PerThreadNDTileStrategy)
-    strategy._cute_lane_vec_stores_by_block = {}
+    strategy.lane_contexts_with_vec_stores.return_value = []
     grid = DeviceGridState(
         strategy=strategy,
         block_id_to_info={},
@@ -270,7 +274,8 @@ def test_deferred_scope_uses_the_complete_body(inner_live: bool) -> None:
     # liveness check would incorrectly hoist it over the now-live inner loop.
     if inner_live:
         body.extend(ast.parse("consume(other)").body)
-    wrapped = grid.wrap_body(body)
+    with CompileEnvironment(torch.device("cpu"), helion.Settings(backend="cute")):
+        wrapped = grid.wrap_body(body)
     code = "\n".join(ast.unparse(stmt) for stmt in wrapped)
     assert ("vector_load" in code) is not inner_live
     assert ("scalar_load" in code) is inner_live

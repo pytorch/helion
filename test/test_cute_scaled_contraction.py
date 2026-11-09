@@ -12,7 +12,7 @@ import torch
 from test.test_cute_packed_collective_matmul import _ScalarTensor
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_matmul import _tensor_roots
 from helion._compiler.cute.packed_matmul import interleaved_matrix_terms
 from helion._compiler.cute.scaled_contraction import expose_scaled_contractions
@@ -79,7 +79,6 @@ def _config(compute: str = "tcgen05", *, bk: int = 2) -> helion.Config:
 
 
 @pytest.mark.parametrize("shape", [(128, 16, 128), (512, 64, 512), (1024, 128, 1024)])
-@skipUnlessBackends(["cute"])
 def test_original_nvfp4_has_ordinary_mma_seeds(shape: tuple[int, int, int]) -> None:
     bound, inputs = _bind(shape)
     assert bound.host_function is not None
@@ -140,7 +139,6 @@ def _scaled_pairs(
 
 
 @pytest.mark.parametrize("pairs", [1, 2, 3])
-@skipUnlessBackends(["cute"])
 def test_pair_count_and_scale_layout_are_not_fixed(pairs: int) -> None:
     args = (
         torch.empty((73, 7, pairs), dtype=torch.float4_e2m1fn_x2),
@@ -188,7 +186,6 @@ class _StopProbe(Exception):
         "extra_output",
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_refuses_unproved_precision_or_effects(change: str) -> None:
     checked = False
 
@@ -313,7 +310,6 @@ def _scale_offset(row: int, group: int, groups: int) -> int:
 
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
 @pytest.mark.parametrize("bk", [1, 2, 4])
-@skipUnlessBackends(["cute"])
 def test_actual_packed_staging_preserves_scales_and_nan_padding(
     compute: str, bk: int
 ) -> None:
@@ -535,7 +531,6 @@ def _dot_nodes(bound: BoundKernel) -> list[torch.fx.Node]:
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@skipUnlessBackends(["cute"])
 def test_one_scale_narrow_operand_is_exposed(dtype: torch.dtype) -> None:
     """``a_bf16 * w_fp4 * sb``: the activation goes in unchanged, the scaled
     weight is narrowed to the activation's dtype, and the contraction gets an
@@ -563,7 +558,6 @@ def test_one_scale_narrow_operand_is_exposed(dtype: torch.dtype) -> None:
     assert "dot_product" in source
 
 
-@skipUnlessBackends(["cute"])
 def test_w4a16_example_exposes_a_bf16_contraction() -> None:
     _nvfp4_matmul_single_pass_kernel = import_example(
         "nvfp4_gemm"
@@ -600,7 +594,6 @@ def test_w4a16_example_exposes_a_bf16_contraction() -> None:
 
 
 @pytest.mark.parametrize("kernel", [_scaled_narrow_pairs, _narrow_narrow_pairs])
-@skipUnlessBackends(["cute"])
 def test_refuses_scale_on_narrow_operand(kernel: object) -> None:
     sb = torch.empty((7, 41), dtype=torch.float8_e4m3fn)
     if kernel is _scaled_narrow_pairs:

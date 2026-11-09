@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from ...runtime.kernel import BoundKernel
     from ...runtime.settings import DotPrecision
     from ..aten_lowering import Lowering
+    from ..autotuner_heuristics.registry import AutotunerHeuristicType
     from ..device_function import Argument
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
@@ -274,6 +275,18 @@ class PallasBackend(Backend):
     @property
     def name(self) -> str:
         return "pallas"
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Filled by ``build_launcher_args``; the launcher returns these tensors.
+        self._output_only_names: list[str] = []
+
+    def output_only_names(self) -> list[str]:
+        return self._output_only_names
+
+    @property
+    def supports_autotune_multi(self) -> bool:
+        return True
 
     @property
     def state(self) -> BackendState:
@@ -924,6 +937,11 @@ class PallasBackend(Backend):
             if outer_spec is not None:
                 outer_spec.update_min(spec.min_size)
 
+    def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
+        from ..autotuner_heuristics.pallas import PALLAS_HEURISTICS
+
+        return PALLAS_HEURISTICS
+
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
 
@@ -1187,11 +1205,19 @@ class PallasBackend(Backend):
                     continue
                 dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
                 if dims_info is not None:
-                    for dim, (block_id, extra_pad) in dims_info.items():
-                        bsi = env.block_sizes[block_id]
-                        bs = bsi.from_config(config)
-                        if isinstance(bs, int) and bs > 1:
-                            result.append((i, dim, bs, extra_pad))
+                    for dim, blocks in dims_info.items():
+                        # One entry per distinct block size.  The launcher
+                        # pads entries in turn and a pad never shrinks the
+                        # dim, so the result covers every loop's last tile.
+                        extra_by_bs: dict[int, int] = {}
+                        for block_id, extra_pad in blocks.items():
+                            bs = env.block_sizes[block_id].from_config(config)
+                            if isinstance(bs, int) and bs > 1:
+                                extra_by_bs[bs] = max(extra_by_bs.get(bs, 0), extra_pad)
+                        result.extend(
+                            (i, dim, bs, extra_pad)
+                            for bs, extra_pad in extra_by_bs.items()
+                        )
 
         result.extend(self._zero_row_resident_pad_info(sorted_args))
         return result or None
@@ -1754,6 +1780,11 @@ class PallasBackend(Backend):
                     dims.append((position, source[1]))
                 shape_sources.append(dims)
             launcher_args.append(f"_scratch_shape_sources={shape_sources!r}")
+
+        if device_fn.pallas_pipeline_vmem_bytes:
+            launcher_args.append(
+                f"_pipeline_vmem_bytes={device_fn.pallas_pipeline_vmem_bytes}"
+            )
 
         if device_fn.requires_remote_copy:
             launcher_args.append("_uses_remote_copy=True")

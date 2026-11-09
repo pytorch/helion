@@ -8,7 +8,7 @@ the same threads. The tcgen05 lowerings place their waits late (the
 TMA-load warp ahead of its first load, the epilogue warps ahead of their
 first auxiliary read) so the prologue overlaps the previous kernel; this
 module checks, in program order, that nothing reads global memory ahead of
-a wait on its path, and ``DeviceFunction._cute_pdl_applies`` puts a wait at
+a wait on its path, and ``passes.pdl.pdl_applies`` puts a wait at
 the top of the body when something does.
 
 The analysis is structural: a wait at the top level of a statement list

@@ -66,6 +66,7 @@ from .cute_flash_gated import _to_b
 from .cute_flash_gated import _to_i
 from .cute_flash_row_mma import _ROW_MMA_RUNTIME
 from .cute_flash_row_mma import emit_flash_row_mma_module_statements
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -958,7 +959,8 @@ def codegen_gated_row_mma(cg: GenerateAST, plan: GatedAttentionPlan) -> bool:
     body, scalar_tensor_names = emit_gated_row_mma_device_body(df, plan, names=names)
     emit_flash_module_statements(cg)
     emit_flash_row_mma_module_statements(cg)
-    cg.cute_wrapper_plans.append(
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(
         {
             "kind": GATED_ROW_WRAPPER_KIND,
             "q_name": names["q"],
@@ -975,8 +977,8 @@ def codegen_gated_row_mma(cg: GenerateAST, plan: GatedAttentionPlan) -> bool:
     )
     df.placeholder_args.update(names.values())
     df.placeholder_args.update(scalar_tensor_names)
-    cg.cute_uses_matmul = True
-    df.cute_state.attention_flash_threads = plan.threads
+    codegen_state.declare_matmul()
+    df.cute_state.flash.threads = plan.threads
     df.body = body
     df.preamble = []
     return True

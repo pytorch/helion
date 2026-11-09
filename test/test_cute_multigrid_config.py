@@ -15,16 +15,13 @@ from .test_cute_grid_launch_extents import _mixed_rank_copy
 from .test_cute_grid_launch_extents import _opposed_grids
 from .test_cute_grid_launch_extents import _single_thread_axis
 import helion
-from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CutePointwiseVecHeuristic
 from helion._testing import DEVICE
 from helion._testing import patch_cute_mma_support
-from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import KernelGridFact
 from helion.autotuner.config_spec import RootGridFact
 import helion.language as hl
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -138,8 +135,13 @@ def test_nonroot_thread_axis_remains_in_every_group() -> None:
             graph_to_root=(),
         )
         gen = ConfigGeneration(bound.config_spec)
-        groups = gen._cute_coexisting_thread_groups(gen.num_threads_indices)
-        assert groups == [gen.num_threads_indices[:2], gen.num_threads_indices[1:]]
+        groups = gen.extension._coexisting_thread_groups(
+            gen.extension.num_threads_indices
+        )
+        assert groups == [
+            gen.extension.num_threads_indices[:2],
+            gen.extension.num_threads_indices[1:],
+        ]
         result = gen.unflatten(
             gen.flatten(helion.Config(block_sizes=[128] * 4, num_threads=[128] * 4))
         )
@@ -156,8 +158,8 @@ def test_aliased_thread_axis_belongs_to_both_root_groups() -> None:
             graph_to_root=(),
         )
         gen = ConfigGeneration(spec)
-        indices = gen.num_threads_indices
-        assert gen._cute_coexisting_thread_groups(indices) == [
+        indices = gen.extension.num_threads_indices
+        assert gen.extension._coexisting_thread_groups(indices) == [
             indices[:2],
             [indices[0], *indices[2:]],
         ]

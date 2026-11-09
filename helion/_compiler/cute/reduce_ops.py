@@ -271,12 +271,12 @@ def _reduce_along(
     not.  Several dims (``dim=None``) reduce one at a time, innermost first.
     """
     from ..compile_environment import CompileEnvironment
-    from ..reduction_strategy import cute_mark_cross_block_vec_lanes
 
     env = CompileEnvironment.current()
     for dim in sorted(dims, reverse=True):
         strategy = _dim_reduction_strategy(state, fake_input, dim)
-        cute_mark_cross_block_vec_lanes(state, strategy.block_index)
+        if (emitter := strategy.emitter) is not None:
+            emitter.mark_cross_block_vec_lanes(state)
         with env.fake_mode:
             fake_output = _fake_reduce_tensor(fake_input, dim, keep_dims=False)
         input_name = state.codegen.lift(value, dce=True, prefix=prefix).id

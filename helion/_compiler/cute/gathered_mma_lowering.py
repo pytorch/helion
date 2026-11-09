@@ -20,6 +20,7 @@ from .gathered_mma import analyze_gathered_mma_region
 from .gathered_mma_codegen import emit_gathered_mma_region
 from .memory_ops import tensor_has_specialized_base_alignment
 from .promote_output_axis import _fresh_tensors
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from ..device_function import DeviceFunction
@@ -110,7 +111,7 @@ def lower_gathered_matmul(
 ) -> list[ast.stmt]:
     """Lower only an explicitly selected and fully proved pipeline region."""
     env = CompileEnvironment.current()
-    sites = df.cute_state.collective_mma_sites
+    sites = df.cute_state.lanes.collective_mma_sites
     facts = gathered_tensor_facts(df)
     thread_dims = _exact_thread_block_dims(df.tile_strategy)
     if (
@@ -119,9 +120,9 @@ def lower_gathered_matmul(
         or len(sites) != 1
         or facts is None
         or thread_dims is None
-        or df.codegen.cute_wrapper_plans
-        or df.cute_state.matmul_plan is not None
-        or df.cute_state.matmul_fx_nodes
+        or cute_codegen_state(df.codegen).wrapper_plans
+        or df.cute_state.tcgen05.matmul_plan is not None
+        or df.cute_state.tcgen05.matmul_fx_nodes
         or df.cute_state.has_tcgen05_fragment_epilogue_plan
     ):
         raise exc.BackendUnsupported(

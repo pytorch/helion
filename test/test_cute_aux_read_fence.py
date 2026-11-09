@@ -8,7 +8,6 @@ import torch
 import helion
 from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_aux import aux_config as _config
 from helion._testing.cute_aux import aux_inputs as _inputs
@@ -16,8 +15,6 @@ from helion._testing.cute_aux import batched_aux
 from helion._testing.cute_aux import cpu_codegen
 from helion._testing.cute_aux import rank_two_aux
 import helion.language as hl
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

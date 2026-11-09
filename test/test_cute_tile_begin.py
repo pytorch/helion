@@ -13,11 +13,11 @@ from .test_cute_grid_launch_extents import _launch_block
 from .test_cute_grid_launch_extents import _tile_coordinates
 import helion
 from helion import exc
+from helion._compiler.cute import target_facts
 from helion._compiler.cute import tile_ops
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.cute_reshape import _per_thread_nd_tile_offset
 from helion._compiler.cute.memory_ops import _cute_block_tile_begin_expr
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.generate_ast import GenerateAST
 from helion._compiler.indexing_strategy import SubscriptIndexing
 from helion._compiler.inductor_lowering import CodegenState
@@ -28,11 +28,8 @@ from helion._compiler.tile_strategy import TileStrategy
 from helion._testing import DEVICE
 from helion._testing import _example_kernel
 from helion._testing import patch_cute_mma_support
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.language._decorators import is_api_func
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -312,9 +309,7 @@ def test_causal_flash_host_has_no_undefined_block_size(topology: str) -> None:
             return_value=(10, 3),
         ),
         patch("helion.runtime.get_num_sm", return_value=148),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=232448),
     ):
         cute_causal_biased_attention.reset()
         code = cute_causal_biased_attention.bind(tuple(values)).to_code(

@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from torch.fx import Node
 
     from ..device_ir import GraphInfo
-    from .computed_fragment import FragmentCompiler
+    from .fragment_context import FragmentContext
 
 
 def _copy_ast(node: ast.AST) -> ast.AST:
@@ -60,7 +60,7 @@ def private_scalar_loop_nodes(graphs: list[GraphInfo]) -> frozenset[Node]:
 
 
 def privatize_scalar_loop(
-    compiler: FragmentCompiler, loop: ast.For, outgoing: set[str]
+    compiler: FragmentContext, loop: ast.For, outgoing: set[str]
 ) -> list[ast.stmt]:
     """Verify the emitted scalar ownership, then retain only written slots.
 

@@ -15,6 +15,7 @@ from typing import AbstractSet
 from typing import cast
 
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from ._ast_pass_utils import call_path_str
 from .direct_affine_plan import DirectAffineMma
 from .direct_affine_plan import DirectAffinePhaseOrder
 from .direct_affine_plan import DirectAffinePlan
@@ -28,7 +29,6 @@ from .direct_affine_replay_core import DirectAffineReplay
 from .direct_affine_replay_core import DirectAffineReplayProof
 from .direct_affine_replay_core import DirectAffineResolvedTemplates
 from .direct_affine_replay_core import DirectAffineSharedBuffer
-from .direct_affine_replay_core import DirectAffineStateStoreReplay
 from .direct_affine_replay_core import DirectAffineStepReplay
 from .direct_affine_replay_core import DirectAffineValueReplay
 from .direct_affine_replay_core import _ast_identity_set
@@ -37,7 +37,6 @@ from .direct_affine_replay_core import _bound_names
 from .direct_affine_replay_core import _clone_ast
 from .direct_affine_replay_core import _dump
 from .direct_affine_replay_core import _instantiate_bound_nodes
-from .direct_affine_replay_core import _qualified_name
 from .direct_affine_replay_core import _result_snapshots_are_intact
 from .direct_affine_replay_core import instantiate_direct_affine_value
 from .direct_affine_replay_core import resolve_direct_affine_coordinates
@@ -226,60 +225,6 @@ def _instantiate_effect(
     return result[0] if result is not None else None
 
 
-def _instantiate_state_address(
-    replay: DirectAffineStateStoreReplay,
-    *,
-    row: ast.expr,
-    feature: ast.expr,
-    row_local: ast.expr,
-    feature_local: ast.expr,
-    suffix: str,
-    reserved_names: AbstractSet[str],
-) -> tuple[tuple[ast.stmt, ...], ast.expr, ast.expr, ast.expr, ast.expr] | None:
-    result = _instantiate_bound_nodes(
-        replay.bindings,
-        replay.statements,
-        (replay.pointer, replay.slot, replay.slot_extent, replay.valid),
-        row=row,
-        feature=feature,
-        row_local=row_local,
-        feature_local=feature_local,
-        suffix=suffix,
-        reserved_names=reserved_names,
-    )
-    if result is None:
-        return None
-    statements, outputs = result
-    return statements, outputs[0], outputs[1], outputs[2], outputs[3]
-
-
-def _instantiate_async_entry(
-    replay: DirectAffineAsyncEntryReplay,
-    *,
-    row: ast.expr,
-    feature: ast.expr,
-    row_local: ast.expr,
-    feature_local: ast.expr,
-    suffix: str,
-    reserved_names: AbstractSet[str],
-) -> tuple[tuple[ast.stmt, ...], ast.expr, ast.expr, ast.expr] | None:
-    result = _instantiate_bound_nodes(
-        replay.bindings,
-        replay.statements,
-        (replay.pointer, replay.row_stride, replay.valid),
-        row=row,
-        feature=feature,
-        row_local=row_local,
-        feature_local=feature_local,
-        suffix=suffix,
-        reserved_names=reserved_names,
-    )
-    if result is None:
-        return None
-    statements, outputs = result
-    return statements, outputs[0], outputs[1], outputs[2]
-
-
 def _sync_threads() -> ast.Expr:
     return ast.Expr(value=_call(_qualified("cute.arch.sync_threads")))
 
@@ -410,8 +355,10 @@ def _emit_async_state_materialization(
         ),
         ast.Constant(value=8),
     )
-    instantiated = _instantiate_async_entry(
-        entry,
+    instantiated = _instantiate_bound_nodes(
+        entry.bindings,
+        entry.statements,
+        (entry.pointer, entry.row_stride, entry.valid),
         row=_global_coordinate(coordinates.row, _name(local_row_name)),
         feature=_global_coordinate(coordinates.feature, _name(local_feature_name)),
         row_local=_name(local_row_name),
@@ -421,7 +368,7 @@ def _emit_async_state_materialization(
     )
     if instantiated is None:
         return None
-    support, pointer, row_stride, valid = instantiated
+    support, (pointer, row_stride, valid) = instantiated
     call = ast.Expr(
         value=_call(
             _attr(_name(helper_alias), "stage_state_tile8x8_async_bf16"),
@@ -518,9 +465,10 @@ def _split_feature_reduction_loop(
     """Finalize captured feature reductions before their vector consumers."""
 
     from ... import exc
-    from ..tile_strategy import _find_lane_reduce_call
-    from ..tile_strategy import _is_lane_reduce_marker_assign
-    from ..tile_strategy import split_lane_loop_reductions
+    from .lane_loops.markers import _find_lane_reduce_call
+    from .lane_loops.markers import _is_lane_reduce_marker_assign
+    from .lane_loops.markers import set_marker_owner
+    from .lane_loops.split import split_lane_loop_reductions
 
     loop = _clone_ast(loop)
     if source_lane is not None:
@@ -538,9 +486,7 @@ def _split_feature_reduction_loop(
                 return None
             call = _find_lane_reduce_call(statement)
             assert call is not None
-            call.args[9] = ast.copy_location(
-                ast.Constant(value=destination_lane), call.args[9]
-            )
+            set_marker_owner(call, destination_lane)
     markers = tuple(
         marker
         for statement in loop.body
@@ -583,7 +529,7 @@ def _split_feature_reduction_loop(
         for node in ast.walk(statement):
             if not isinstance(node, ast.Call):
                 continue
-            name = _qualified_name(node.func)
+            name = call_path_str(node.func)
             prefix = "cute.arch.warp_reduction_"
             if name is not None and name.startswith(prefix):
                 kind = name.removeprefix(prefix)
@@ -911,8 +857,15 @@ def _emit_state_effects(
         value=checkpoint,
     )
     state_effect = step.state_effect
-    address = _instantiate_state_address(
-        state_effect,
+    address = _instantiate_bound_nodes(
+        state_effect.bindings,
+        state_effect.statements,
+        (
+            state_effect.pointer,
+            state_effect.slot,
+            state_effect.slot_extent,
+            state_effect.valid,
+        ),
         row=_global_coordinate(coordinates.row, local_row),
         feature=_global_coordinate(coordinates.feature, local_feature),
         row_local=local_row,
@@ -922,7 +875,7 @@ def _emit_state_effects(
     )
     if address is None:
         return None
-    address_statements, pointer, slot, slot_extent, valid = address
+    address_statements, (pointer, slot, slot_extent, valid) = address
     packed_values = tuple(
         _subscript(packed_name, ast.Constant(value=index)) for index in range(4)
     )

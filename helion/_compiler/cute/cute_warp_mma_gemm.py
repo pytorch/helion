@@ -42,15 +42,18 @@ import ast
 import dataclasses
 import textwrap
 from typing import TYPE_CHECKING
-from typing import cast
 
 import torch
 
 from ... import exc
 from ..compile_environment import CompileEnvironment
+from ..emitter_protocols import statements_adapter
+from .state import cute_codegen_state
+from .tcgen05.knobs import non_bool_int_knob
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from torch.fx.node import Node
@@ -399,11 +402,6 @@ def _canonical_block_ids(
     return tuple(env.canonical_block_id(block_id) for block_id in block_ids)
 
 
-def _config_int(config: object, key: str, default: int) -> int:
-    value = cast("dict[str, object]", config).get(key, default)  # pyrefly: ignore[missing-attribute]
-    return value if isinstance(value, int) and not isinstance(value, bool) else default
-
-
 def _aux_kind(
     leaf: _AuxiliaryTensorLoadExpr, fake: torch.Tensor, strides: tuple[int, ...]
 ) -> str:
@@ -428,7 +426,7 @@ def _aux_kind(
 
 
 def detect_warp_mma_gemm(
-    fn: DeviceFunction, block_ids: list[int], *, config: object
+    fn: DeviceFunction, block_ids: list[int], *, config: Mapping[str, object]
 ) -> bool:
     """Match the K device loop ``block_ids`` of a plain dense GEMM and record
     the family's plan on ``fn.cute_state``.
@@ -546,7 +544,7 @@ def detect_warp_mma_gemm(
     bk = env.block_sizes[k_block_id].from_config(config)  # pyrefly: ignore[bad-argument-type]
     if not isinstance(bm, int) or not isinstance(bn, int) or not isinstance(bk, int):
         raise _decline("the tile sizes must be static")
-    warps = _config_int(config, WARP_MMA_WARPS_KEY, WARP_MMA_DEFAULT_WARPS)
+    warps = non_bool_int_knob(config, WARP_MMA_WARPS_KEY, WARP_MMA_DEFAULT_WARPS)
     tile_reason = warp_mma_tile_reason(
         m=m, n=n, k=k, bm=bm, bn=bn, bk=bk, warps=warps, dtype=mma_dtype
     )
@@ -562,7 +560,7 @@ def detect_warp_mma_gemm(
         k_block_ids=block_ids,
         store_nodes={store.store_node for store in stores},
     )
-    fn.cute_state.warp_mma_gemm_plan = CuteWarpMmaGemmMatch(
+    fn.cute_state.root_plans.warp_mma_gemm_plan = CuteWarpMmaGemmMatch(
         mma_node=mma_node,
         lhs_fake=lhs_fake,
         rhs_fake=rhs_fake,
@@ -590,7 +588,7 @@ def detect_warp_mma_grouped_gemm(
     block_ids: list[int],
     *,
     root: tuple[int, ...],
-    config: object,
+    config: Mapping[str, object],
 ) -> bool:
     """Match the shared-RHS grouped GEMM (``examples/grouped_gemm.py``'s
     jagged kernel) as the dense row union the family lowers.
@@ -660,7 +658,7 @@ def detect_warp_mma_grouped_gemm(
     bk = env.block_sizes[block_ids[0]].from_config(config)  # pyrefly: ignore[bad-argument-type]
     if not isinstance(bm, int) or not isinstance(bn, int) or not isinstance(bk, int):
         raise _decline("the tile sizes must be static")
-    warps = _config_int(config, WARP_MMA_WARPS_KEY, WARP_MMA_DEFAULT_WARPS)
+    warps = non_bool_int_knob(config, WARP_MMA_WARPS_KEY, WARP_MMA_DEFAULT_WARPS)
     lhs_fake, rhs_fake = proof.lhs.source_fake, proof.rhs.source_fake
     dtype = lhs_fake.dtype
     limit = (1 << 31) - 1
@@ -715,7 +713,7 @@ def detect_warp_mma_grouped_gemm(
     offsets_stride = _static_int(env, offsets.stride(0))
     if offsets_stride is None:
         raise _decline("the group offsets must have a static stride")
-    fn.cute_state.warp_mma_gemm_plan = CuteWarpMmaGemmMatch(
+    fn.cute_state.root_plans.warp_mma_gemm_plan = CuteWarpMmaGemmMatch(
         mma_node=mma_node,
         lhs_fake=lhs_fake,
         rhs_fake=rhs_fake,
@@ -996,7 +994,7 @@ def _require_complete_root(
 
 
 def _device_sm_count(device: torch.device) -> int:
-    from ...language.matmul_ops import _cuda_num_sms_or_zero
+    from .tcgen05.search_plan import _cuda_num_sms_or_zero
 
     return _cuda_num_sms_or_zero(device)
 
@@ -1015,7 +1013,7 @@ def codegen_warp_mma_gemm(cg: GenerateAST) -> bool:
     from .memory_ops import cute_tensor_base_is_aligned
 
     df = cg.device_function
-    match = df.cute_state.warp_mma_gemm_plan
+    match = df.cute_state.root_plans.warp_mma_gemm_plan
     if match is None:
         return False
     env = CompileEnvironment.current()
@@ -1084,15 +1082,15 @@ def codegen_warp_mma_gemm(cg: GenerateAST) -> bool:
     # kernel in the stream; the body waits before its first global access
     # and releases its dependents once the last MMA is issued (the plan's
     # ``use_pdl`` keeps the generic top-of-kernel wait out, see
-    # ``DeviceFunction._cute_pdl_applies``).
+    # ``passes.pdl.pdl_applies``).
     pdl = df.config.get("cute_pdl") is True and (
         (capability := env.config_spec.target_device_capability) is not None
         and capability >= (9, 0)
     )
     if pdl:
         plan["use_pdl"] = True
-    cg.cute_wrapper_plans.append(plan)
-    df.body = emit_warp_mma_gemm_device_body(
+    cute_codegen_state(cg).wrapper_plans.append(plan)
+    df.body = emit_warp_mma_gemm_body(
         df,
         match,
         a_name=a_arg.name,
@@ -1103,7 +1101,7 @@ def codegen_warp_mma_gemm(cg: GenerateAST) -> bool:
         aux_pairs=aux_pairs,
         pdl=pdl,
         offsets_name=offsets_name,
-    )
+    ).statements
     df.preamble = []
     return True
 
@@ -1617,6 +1615,9 @@ def emit_warp_mma_gemm_device_body(
                         )
     source = "\n".join(lines) + "\n"
     return list(ast.parse(textwrap.dedent(source)).body)
+
+
+emit_warp_mma_gemm_body = statements_adapter(emit_warp_mma_gemm_device_body)
 
 
 def _emit_pair_load(

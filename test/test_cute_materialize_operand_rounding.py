@@ -14,7 +14,8 @@ from test.test_cute_materialize_operand import _computed_rhs
 from test.test_cute_materialize_operand import _reference
 
 import helion
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute import target_facts
+from helion._compiler.cute.state import cute_env_state
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
@@ -31,9 +32,7 @@ if TYPE_CHECKING:
 def cpu_b200() -> Iterator[None]:
     with (
         cpu_target(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=232448),
     ):
         yield
 
@@ -111,7 +110,7 @@ def test_materialized_fp32_products_keep_the_halfway_cast_boundary(
         cute_materialize_transformed_operands=True,
     )
     bound = kernel._bind_isolated(args)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     stages = _stage_sources(bound.to_code(bound.config_spec.default_config()))
     assert len(stages) == 2
     assert stages[0].count("mul.rn.f32") == (0 if fast_math else 2)
@@ -157,7 +156,7 @@ def test_materialization_uses_the_product_result_dtype_for_rounding(
         torch.empty((32, 32), dtype=input_dtype),
     )
     bound = kernel._bind_isolated(args)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     stages = _stage_sources(bound.to_code(bound.config_spec.default_config()))
     assert stages[0].count("mul.rn.f32") == (1 if input_dtype is torch.int32 else 0)
 
@@ -175,7 +174,7 @@ def test_ordinary_pointwise_kernel_keeps_existing_emission(cpu_b200: None) -> No
         autotune_effort="none",
     )
     bound = kernel._bind_isolated(args)
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
     source = bound.to_code(bound.config_spec.default_config())
     assert "mul.rn.f32" not in source
 
@@ -229,7 +228,7 @@ def test_materialized_halfway_operand_is_exact_on_cuda(
         cute_materialize_transformed_operands=True,
     )
     bound = kernel._bind_isolated(args)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     bound.set_config(bound.config_spec.default_config())
     expected = torch.full((65, 19), 40, dtype=torch.bfloat16, device=CUDA_DEVICE)
     torch.testing.assert_close(bound(*args), expected, rtol=0, atol=0)

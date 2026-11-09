@@ -10,15 +10,12 @@ from test.test_cute_block_scaled_mma import _plain_scales
 
 import helion
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 
 _examples_nvfp4_gemm = import_example("nvfp4_gemm")
 _nvfp4_w4a4_matmul_kernel = _examples_nvfp4_gemm._nvfp4_w4a4_matmul_kernel
 reference_nvfp4_w4a4_matmul = _examples_nvfp4_gemm.reference_nvfp4_w4a4_matmul
 swizzled_scale_numel = _examples_nvfp4_gemm.swizzled_scale_numel
 swizzled_scale_offsets = _examples_nvfp4_gemm.swizzled_scale_offsets
-
-pytestmark = skipUnlessBackends(["cute"])
 
 CUDA_DEVICE = "cuda"
 

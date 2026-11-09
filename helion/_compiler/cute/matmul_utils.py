@@ -1,3 +1,18 @@
+"""Shared analyses and emitters of the CuTe matmul lowerings outside the tcgen05 pipeline.
+
+Role: analysis and general-purpose emitter.  The analyses read the device IR
+around an ``mm`` / ``dot`` node -- the proven contraction / root placements
+(``cute_matmul_root_placements``), the K-invariant extents, the outer
+accumulator (``cute_outer_accumulator_node``), the atomic consumer of a
+lane-split result (``cute_atomic_consumer_lane_route``), the direct
+grouped-N load plan (``analyze_direct_grouped_n_loads``) -- and the emitters
+render the serial scalar matmul forms (``emit_cute_serial_mm_from_load_views``,
+``emit_cute_serial_scalar_mm_from_loads``) and re-lower operand loads under a
+block remap.  ``matmul_ops``, ``aten_lowering``, the collective / fragment /
+mma_dag emitters, ``execution_plans`` and the tile planner in
+``cute/backend.py`` are the readers.
+"""
+
 from __future__ import annotations
 
 import ast
@@ -26,6 +41,7 @@ from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..dtype_utils import cast_ast
 from ..matmul_utils import _needs_f32_accumulator
+from .fx_matcher import _is_full_slice
 from .indexing import CutePackedAffineLoad
 from .indexing import CutePackedTerms
 from .indexing import match_cute_stack_reshape_rhs
@@ -37,10 +53,13 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ...autotuner.config_spec import MatmulFact
+    from ...runtime.config import Config
     from ..aten_lowering import LoweringContext
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
+    from ..generate_ast import GenerateAST
     from ..helper_function import CodegenInterface
+    from ..inductor_lowering import CodegenState
 
 
 def cute_f32_mma_matches_dot(
@@ -309,26 +328,6 @@ def emit_cute_serial_scalar_mm_from_loads(
     k_extent: int | None,
     out_dtype: torch.dtype | None,
 ) -> ast.AST | None:
-    def active_index_var(block_id: int) -> str | None:
-        active_device_loops = getattr(ctx.cg, "active_device_loops", {})
-        loops = active_device_loops.get(block_id)
-        if loops:
-            return loops[-1].strategy.index_var(block_id)
-        grid_state = getattr(ctx.cg, "current_grid_state", None)
-        if grid_state is not None and block_id in grid_state.block_ids:
-            return grid_state.strategy.index_var(block_id)
-        return None
-
-    def active_mask_var(block_id: int) -> str | None:
-        active_device_loops = getattr(ctx.cg, "active_device_loops", {})
-        loops = active_device_loops.get(block_id)
-        if loops:
-            return loops[-1].strategy.mask_var(block_id)
-        grid_state = getattr(ctx.cg, "current_grid_state", None)
-        if grid_state is not None and block_id in grid_state.block_ids:
-            return grid_state.strategy.mask_var(block_id)
-        return None
-
     def add_offset(index_expr: str, offset: int) -> str:
         if offset == 0:
             return index_expr
@@ -388,12 +387,12 @@ def emit_cute_serial_scalar_mm_from_loads(
     n_block_id = cute_resolve_active_block_id(ctx.cg, rhs_node.meta["val"].shape[-1])
     if m_block_id is None or n_block_id is None:
         return None
-    m_index = active_index_var(m_block_id)
-    n_index = active_index_var(n_block_id)
+    m_index = _cute_active_index_var(ctx.cg, m_block_id)
+    n_index = _cute_active_index_var(ctx.cg, n_block_id)
     if m_index is None or n_index is None:
         return None
-    m_mask = active_mask_var(m_block_id)
-    n_mask = active_mask_var(n_block_id)
+    m_mask = _cute_active_mask_var(ctx.cg, m_block_id)
+    n_mask = _cute_active_mask_var(ctx.cg, n_block_id)
     reduction_dtype = cute_scalar_reduction_dtype(lhs_dtype, rhs_dtype, out_dtype)
     backend = CompileEnvironment.current().backend
     result_var = ctx.cg.device_function.new_var("dot_serial_result")
@@ -464,20 +463,12 @@ def analyze_direct_grouped_n_loads(
     k_extent: int | None,
     n_extent: int | None = None,
 ) -> DirectGroupedNLoadPlan | None:
-    def is_full_slice(index: object) -> bool:
-        return (
-            isinstance(index, slice)
-            and index.start is None
-            and index.stop is None
-            and index.step is None
-        )
-
     def contiguous_index_offset(
         index: object,
         *,
         required_extent: int | None = None,
     ) -> int | None:
-        if is_full_slice(index):
+        if _is_full_slice(index):
             return 0
         if isinstance(index, Node):
             if index.target is not torch.ops.prims.iota.default:
@@ -674,9 +665,9 @@ def emit_cute_serial_mm_from_load_views(
     blocks.  ``lhs_node``/``rhs_node`` are the operands of ``node`` (an mm,
     bmm or hl.dot, or the operands after an addmm/baddbmm accumulator).
     """
-    from ...language.memory_ops import _cute_index_exprs
-    from ...language.memory_ops import _cute_scalar_load_expr
     from ..inductor_lowering import CodegenState
+    from .emitters.memory_access import _cute_index_exprs
+    from .emitters.memory_access import _cute_scalar_load_expr
     from .memory_ops import _cute_tile_axis_block_id
 
     lhs_val = lhs_node.meta["val"]
@@ -1000,6 +991,15 @@ _CUTE_SUBGRAPH_ARG_SLOTS: dict[object, tuple[tuple[int, int], ...]] = {
     _while_loop: ((0, 2), (1, 2)),
     _if: ((1, 3), (2, 4)),
 }
+
+
+def _cute_dot_outer_accumulates_result(fx_node: object, *, is_acc_none: bool) -> bool:
+    """``cute_outer_accumulates_result`` for a node, a lowering state or ``None``."""
+    if not isinstance(fx_node, torch.fx.Node):
+        fx_node = getattr(fx_node, "fx_node", fx_node)
+    if not isinstance(fx_node, torch.fx.Node):
+        fx_node = None
+    return cute_outer_accumulates_result(fx_node, is_acc_none=is_acc_none)
 
 
 class CuteAtomicLaneRoute(enum.Enum):
@@ -1416,19 +1416,13 @@ def cute_rematerialize_rhs_at_contraction_block(
     return new_rhs, lhs_k_block_id
 
 
-def _cute_recodegen_load_with_block_remap(
-    ctx: LoweringContext,
-    load_node: torch.fx.Node,
-    remap: dict[int, int],
-) -> ast.AST | None:
-    """Re-run the CuTe ``load`` codegen for *load_node* under a block remap."""
-    from ..generate_ast import GenerateAST
+def _cute_load_codegen_state(
+    cg: GenerateAST, ctx: LoweringContext, load_node: torch.fx.Node
+) -> CodegenState:
+    """The ``CodegenState`` that re-runs the ``load`` codegen for *load_node*
+    inside the lowering of another node: its fx arguments resolved through
+    *ctx*'s environment (ASTs) and their fake values (proxies)."""
     from ..inductor_lowering import CodegenState
-
-    cg = ctx.cg
-    if not isinstance(cg, GenerateAST):
-        return None
-    cute_state = cg.device_function.cute_state
 
     def env_arg(arg: object) -> object:
         if isinstance(arg, torch.fx.Node):
@@ -1444,25 +1438,43 @@ def _cute_recodegen_load_with_block_remap(
             return type(arg)(proxy_arg(a) for a in arg)
         return arg
 
-    proxy_args = [proxy_arg(a) for a in load_node.args]
-    ast_args = [env_arg(a) for a in load_node.args]
-    state = CodegenState(
+    return CodegenState(
         cg,
         fx_node=load_node,
         env=ctx.env,
-        proxy_args=list(proxy_args),
-        ast_args=list(ast_args),
+        proxy_args=[proxy_arg(a) for a in load_node.args],
+        ast_args=[env_arg(a) for a in load_node.args],
     )
-    previous = dict(cute_state.matmul_operand_block_remap)
-    cute_state.matmul_operand_block_remap = dict(remap)
+
+
+def _cute_recodegen_load(state: CodegenState) -> ast.AST | None:
+    """Run the CuTe ``load`` codegen for *state*; None unless it produced an AST."""
     load_codegen = load._codegen["cute"]  # pyrefly: ignore[missing-attribute]
-    try:
-        result = load_codegen(state)
-    finally:
-        cute_state.matmul_operand_block_remap = previous
+    result = load_codegen(state)
     if isinstance(result, ast.AST):
         return result
     return None
+
+
+def _cute_recodegen_load_with_block_remap(
+    ctx: LoweringContext,
+    load_node: torch.fx.Node,
+    remap: dict[int, int],
+) -> ast.AST | None:
+    """Re-run the CuTe ``load`` codegen for *load_node* under a block remap."""
+    from ..generate_ast import GenerateAST
+
+    cg = ctx.cg
+    if not isinstance(cg, GenerateAST):
+        return None
+    cute_state = cg.device_function.cute_state
+    state = _cute_load_codegen_state(cg, ctx, load_node)
+    previous = dict(cute_state.tcgen05.matmul_operand_block_remap)
+    cute_state.tcgen05.matmul_operand_block_remap = dict(remap)
+    try:
+        return _cute_recodegen_load(state)
+    finally:
+        cute_state.tcgen05.matmul_operand_block_remap = previous
 
 
 # fx view ops whose scalar-fallback lowering is a no-op (the underlying load
@@ -1549,7 +1561,6 @@ def cute_rematerialize_rhs_at_index_override(
     ``rhs[..., n, ...]`` for the loop's current n instead of the diagonal.
     """
     from ..generate_ast import GenerateAST
-    from ..inductor_lowering import CodegenState
 
     cg = ctx.cg
     if not isinstance(cg, GenerateAST):
@@ -1558,149 +1569,13 @@ def cute_rematerialize_rhs_at_index_override(
     if load_node is None or _cute_matmul_reread_unsafe(cg, load_node):
         return None
     cute_state = cg.device_function.cute_state
-
-    def env_arg(arg: object) -> object:
-        if isinstance(arg, torch.fx.Node):
-            return ctx.env[arg]
-        if isinstance(arg, (list, tuple)):
-            return type(arg)(env_arg(a) for a in arg)
-        return arg
-
-    def proxy_arg(arg: object) -> object:
-        if isinstance(arg, torch.fx.Node):
-            return arg.meta["val"]
-        if isinstance(arg, (list, tuple)):
-            return type(arg)(proxy_arg(a) for a in arg)
-        return arg
-
-    proxy_args = [proxy_arg(a) for a in load_node.args]
-    ast_args = [env_arg(a) for a in load_node.args]
-    state = CodegenState(
-        cg,
-        fx_node=load_node,
-        env=ctx.env,
-        proxy_args=list(proxy_args),
-        ast_args=list(ast_args),
-    )
-    previous = dict(cute_state.matmul_operand_index_override)
-    cute_state.matmul_operand_index_override = {n_block_id: index_expr}
-    load_codegen = load._codegen["cute"]  # pyrefly: ignore[missing-attribute]
+    state = _cute_load_codegen_state(cg, ctx, load_node)
+    previous = dict(cute_state.tcgen05.matmul_operand_index_override)
+    cute_state.tcgen05.matmul_operand_index_override = {n_block_id: index_expr}
     try:
-        result = load_codegen(state)
+        return _cute_recodegen_load(state)
     finally:
-        cute_state.matmul_operand_index_override = previous
-    if isinstance(result, ast.AST):
-        return result
-    return None
-
-
-def _cute_matmul_operand_indices() -> dict[object, tuple[int, int]]:
-    """``(lhs_arg_index, rhs_arg_index)`` for each matmul op the CuTe backend
-    lowers through the scalar fallback.
-
-    The contraction (K) axis is ``lhs.shape[-1]`` / ``rhs.shape[-2]``; the free
-    (output) axes are ``lhs.shape[-2]`` (M) and ``rhs.shape[-1]`` (N).  Includes
-    both the aten matmul family and Helion's device-IR ``hl.dot`` / ``dot_scaled``
-    ops, which appear *before* aten lowering when the tile strategies are built.
-    """
-    from ...language import matmul_ops
-
-    return {
-        torch.ops.aten.mm.default: (0, 1),
-        torch.ops.aten.bmm.default: (0, 1),
-        torch.ops.aten.bmm.dtype: (0, 1),
-        torch.ops.aten.addmm.default: (1, 2),
-        torch.ops.aten.baddbmm.default: (1, 2),
-        matmul_ops.dot: (0, 1),
-        matmul_ops.dot_scaled: (0, 3),
-    }
-
-
-def _cute_kernel_matmul_operands() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-    """The fake ``(lhs, rhs)`` operand values of every matmul in the kernel's
-    device IR (the ops of ``_cute_matmul_operand_indices``)."""
-    from ..host_function import HostFunction
-    from ..host_function import NoCurrentFunction
-
-    if not CompileEnvironment.has_current():
-        return
-    try:
-        hf = HostFunction.current()
-    except NoCurrentFunction:
-        return
-    # Guard via getattr so a test double exposing only the public ``device_ir``
-    # (without the private ``_device_ir`` backing field) is handled too; the
-    # real HostFunction.device_ir property asserts when ``_device_ir`` is None,
-    # so we must avoid touching the property in that case.
-    if getattr(hf, "_device_ir", "unset") is None:
-        return
-    device_ir = hf.device_ir
-    operand_indices_by_target = _cute_matmul_operand_indices()
-    for graph_info in getattr(device_ir, "graphs", ()):
-        graph = getattr(graph_info, "graph", None)
-        if not isinstance(graph, torch.fx.Graph):
-            continue
-        for node in graph.nodes:
-            if node.op != "call_function":
-                continue
-            operand_indices = operand_indices_by_target.get(node.target)
-            if operand_indices is None:
-                continue
-            lhs_idx, rhs_idx = operand_indices
-            args = node.args
-            if len(args) <= max(lhs_idx, rhs_idx):
-                continue
-            lhs_arg = args[lhs_idx]
-            rhs_arg = args[rhs_idx]
-            if not isinstance(lhs_arg, Node) or not isinstance(rhs_arg, Node):
-                continue
-            lhs_val = lhs_arg.meta.get("val")
-            rhs_val = rhs_arg.meta.get("val")
-            if not isinstance(lhs_val, torch.Tensor) or not isinstance(
-                rhs_val, torch.Tensor
-            ):
-                continue
-            if lhs_val.ndim < 1 or rhs_val.ndim < 2:
-                continue
-            yield lhs_val, rhs_val
-
-
-def cute_matmul_contraction_block_ids() -> set[int]:
-    """Return block ids that are the *contraction* (K) axis of some matmul.
-
-    A matmul's contraction axis is ``lhs.shape[-1]`` (equivalently
-    ``rhs.shape[-2]``).  When such an axis is also a reduction block that the
-    CuTe backend would otherwise split into ``N`` hardware threads x a synthetic
-    per-thread lane loop, the cross-thread matmul reduction only sums the ``N``
-    thread lanes - never the synthetic-lane partials - so each contracted dot
-    product covers only ``N`` of the ``K`` elements.  The thread-budget planner
-    uses this set to give the contraction axis priority for real threads (so the
-    already-landed cross-warp shared-memory reduction can sum the full ``K``)
-    and pushes the synthetic lanes onto the free / output tile axes instead,
-    where a lane loop is correct.
-
-    Returns the *canonical* block ids so callers can compare against either the
-    raw or canonical form.
-    """
-    result: set[int] = set()
-    env = CompileEnvironment.current()
-    for lhs_val, rhs_val in _cute_kernel_matmul_operands():
-        for k_size in (lhs_val.shape[-1], rhs_val.shape[-2]):
-            block_id = env.resolve_block_id(k_size)
-            if block_id is not None:
-                result.add(env.canonical_block_id(block_id))
-    return result
-
-
-def cute_kernel_has_half_precision_matmul() -> bool:
-    """Whether some matmul of the kernel has a 16-bit float operand, which a
-    warp-MMA plan (the direct grouped-N path) may lower with its own thread
-    layout instead of the scalar fallback."""
-    return any(
-        val.dtype in (torch.float16, torch.bfloat16)
-        for operands in _cute_kernel_matmul_operands()
-        for val in operands
-    )
+        cute_state.tcgen05.matmul_operand_index_override = previous
 
 
 def cute_outer_accumulator_out_dtype(
@@ -2011,9 +1886,9 @@ def emit_cute_synthetic_lane_fold_mm(
     storage is read as bytes and decoded (``_cute_fp8e4m3fn_to_float32``), as
     the scalar fallback does for its own operands.
     """
-    from ...language.memory_ops import _cute_index_exprs
-    from ...language.memory_ops import _cute_scalar_pointer_expr
     from ..inductor_lowering import CodegenState
+    from .emitters.memory_access import _cute_index_exprs
+    from .emitters.memory_access import _cute_scalar_pointer_expr
 
     lhs_fold = _cute_trace_matmul_operand_load(cg, lhs_node, contraction_dim=-1)
     rhs_fold = _cute_trace_matmul_operand_load(cg, rhs_node, contraction_dim=-2)
@@ -2183,3 +2058,32 @@ def cute_lower_rhs_for_matmul(
                 tuple(cast("ast.AST", env[packed_node]) for packed_node in packed_nodes)
             )
     return rhs, packed_rhs
+
+
+def collective_sibling_blocks(
+    env: CompileEnvironment, config: Config
+) -> tuple[set[int], set[tuple[int, ...]]] | None:
+    """The blocks a collective matmul owns and the roots that hold one, for
+    ``TileStrategyDispatch`` to fit the independent SIMT loops to the
+    collective's physical launch (``CuteBackend.collective_sibling_blocks``);
+    ``None`` when ``cute_collective_mma`` is off or no matmul is placed."""
+    from ..host_function import HostFunction
+    from .packed_matmul import contraction_axis_for_fact
+
+    if not config.get("cute_collective_mma"):
+        return None
+    device_ir = HostFunction.current().device_ir
+    placements = cute_matmul_root_placements(env, device_ir)
+    if not placements:
+        return None
+    collective_blocks = {
+        bid
+        for fact, _root in placements
+        for bid in (fact.m_block_id, fact.n_block_id)
+        if bid is not None
+    }
+    for fact, _root in placements:
+        axis = contraction_axis_for_fact(env, device_ir, fact)
+        if axis is not None:
+            collective_blocks.add(axis.block_id)
+    return collective_blocks, {root for _fact, root in placements}

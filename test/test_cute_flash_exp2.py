@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import os
+import re
 from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import MagicMock
@@ -16,7 +17,6 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute.attention_plan import DOCUMENT_MASK_KIND
 from helion._compiler.cute.attention_plan import PREFIX_LM_MASK_KIND
@@ -27,6 +27,9 @@ from helion._compiler.cute.attention_plan import AttentionScoreModifier
 from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._compiler.cute.autotune.flash_surface import _resolve_cute_flash_config
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.causal_range import CausalRangeProof
 from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion._compiler.cute.flash_policy import registered_flash_target_policies
@@ -36,7 +39,6 @@ from helion._compiler.cute.flash_tuning import FlashPackedExp2Mode
 from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
 from helion._testing import DEVICE
 from helion._testing import code_and_output
-from helion._testing import onlyBackends
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -391,7 +393,7 @@ def test_bfloat16_output_epilogue_flash_matcher(
     seeds = [*spec.compiler_seed_configs, *spec.autotune_seed_configs()]
     assert seeds
     for seed in seeds:
-        resolved = spec._resolve_cute_flash_config(seed.config)
+        resolved = _resolve_cute_flash_config(spec, seed.config)
         assert resolved.epi_tma
         assert not resolved.epi_stg
 
@@ -475,10 +477,10 @@ def test_relu_output_epilogue_rejects_auxiliary_attention(auxiliary: str) -> Non
             "fa4_correction_epilogue_handoff_to_smem_scoped",
         ),
         ("fa4_tma_unscoped_handoff", "fa4_correction_epilogue_handoff_to_smem"),
-        ("fa4_tma_2cta", "fa4_correction_epilogue_to_smem_scoped_2cta"),
+        ("fa4_tma_2cta", "fa4_correction_epilogue_to_smem_scoped"),
         (
             "fa4_tma_2cta_scoped_handoff",
-            "fa4_correction_epilogue_handoff_to_smem_scoped_2cta",
+            "fa4_correction_epilogue_handoff_to_smem_scoped",
         ),
     ),
 )
@@ -496,6 +498,11 @@ def test_relu_output_epilogue_is_emitted_for_every_store_route(
         assert f"_helion_flash_rt.{staged_helper}(" in identity
         assert f"_helion_flash_rt.{staged_helper}(" in relu
         assert "relu_output=True" in relu
+        # The pair's 256-row accumulator is the same helper's keyword.
+        two_cta = re.compile(
+            rf"{staged_helper}\((?:[^()]|\([^()]*\))*use_2cta_instrs=True\)"
+        )
+        assert (two_cta.search(relu) is not None) == ("2cta" in route)
     else:
         assert "_helion_flash_rt.relu_fragment_inplace(flash_reg" in relu
 
@@ -515,7 +522,6 @@ def test_flash_relu_fragment_matches_nan_and_signed_zero_semantics() -> None:
         (False, 32_768, "fa4_2cta", True),
     ),
 )
-@onlyBackends(["cute"])
 def test_bfloat16_relu_output_epilogue_runtime_routes(
     is_causal: bool,
     sequence_length: int,
@@ -614,18 +620,10 @@ def _policy_template_seed(
     tuning = cute_flash.get_flash_target_policy(capability).tuning
     if is_causal:
         causal_policy = tuning.causal_policy(num_kv)
-        expected = (
-            cute_flash._flash_causal_tuning_overrides(causal_policy)
-            if causal_policy is not None
-            else None
-        )
+        expected = causal_policy.knob_values() if causal_policy is not None else None
     else:
         dense_policy = tuning.dense_policy(num_kv)
-        expected = (
-            cute_flash._flash_dense_tuning_overrides(dense_policy)
-            if dense_policy is not None
-            else None
-        )
+        expected = dense_policy.knob_values() if dense_policy is not None else None
     if expected is None:
         # Keep generic-lowering fixtures independent of target seed ordering.
         return helion.Config.from_dict(
@@ -1140,20 +1138,22 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
         for node in ast.walk(module)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr
-        in {
-            "fa4_disc_exp_convert_store_pipe",
-            "fa4_disc_exp_convert_store_pipe_causal",
-        }
+        and node.func.attr == "fa4_disc_exp_convert_store_pipe"
     ]
     assert len(pass2_calls) == 4
+    # The masked segment re-applies the mask in PASS2 unless PASS1 stored the
+    # masked scores back (``cute_flash_causal_mask_storeback``).
+    assert sum(_causal_pass2(call) for call in pass2_calls) == (
+        0 if config.causal_mask_storeback else 2
+    )
     for call in pass2_calls:
         assert ast.literal_eval(call.args[8]) == 16
         assert ast.literal_eval(call.args[9]) == 6
-        keywords = {
-            keyword.arg: ast.literal_eval(keyword.value) for keyword in call.keywords
+        assert _pass2_keywords(call) == {
+            "pair_batch": 8,
+            "emu_batch": 3,
+            "degree2": True,
         }
-        assert keywords == {"pair_batch": 8, "emu_batch": 3, "degree2": True}
 
     unmasked_loops = [
         node
@@ -1188,9 +1188,17 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
 
 
 @pytest.mark.parametrize(
-    ("packet", "head_dim", "dtype", "is_causal", "depth", "required_helper"),
+    ("packet", "head_dim", "dtype", "is_causal", "depth", "required_helper", "masked"),
     (
-        (_DEG2_PACKET, 128, torch.bfloat16, False, 1, "fa4_disc_exp_convert_store"),
+        (
+            _DEG2_PACKET,
+            128,
+            torch.bfloat16,
+            False,
+            1,
+            "fa4_disc_exp_convert_store",
+            False,
+        ),
         (
             _DEG2_PACKET,
             128,
@@ -1198,6 +1206,7 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
             False,
             2,
             "fa4_disc_exp_convert_store_pipe",
+            False,
         ),
         (
             _DEG2_PACKET,
@@ -1205,7 +1214,8 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
             torch.float16,
             True,
             1,
-            "fa4_disc_exp_convert_store_pipe_causal",
+            "fa4_disc_exp_convert_store_pipe",
+            True,
         ),
         (
             _DEG2_PACKET,
@@ -1213,9 +1223,18 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
             torch.float16,
             True,
             4,
-            "fa4_disc_exp_convert_store_pipe_causal",
+            "fa4_disc_exp_convert_store_pipe",
+            True,
         ),
-        (_HYBRID_PACKET, 64, torch.float16, True, 1, "fa4_disc_exp_convert_store_pipe"),
+        (
+            _HYBRID_PACKET,
+            64,
+            torch.float16,
+            True,
+            1,
+            "fa4_disc_exp_convert_store_pipe",
+            True,
+        ),
         (
             _HYBRID_PACKET,
             64,
@@ -1223,6 +1242,7 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
             True,
             2,
             "fa4_disc_exp_convert_store_pipe",
+            True,
         ),
         (
             _CAUSAL_HD128_RESIDENT_PACKET,
@@ -1231,6 +1251,7 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
             True,
             1,
             "fa4_disc_exp_convert_store_resident3_013_prefetch2",
+            True,
         ),
     ),
 )
@@ -1242,13 +1263,13 @@ def test_disc_degree_calls_match_runtime_signatures(
     is_causal: bool,
     depth: int,
     required_helper: str,
+    masked: bool,
     storeback: bool,
 ) -> None:
-    # With ``cute_flash_causal_mask_storeback`` PASS1 stores the masked scores
-    # back and the masked PASS2 runs the plain helper; the knob is inert off
-    # the plain causal fa4 disc body.
-    if storeback and required_helper == "fa4_disc_exp_convert_store_pipe_causal":
-        required_helper = "fa4_disc_exp_convert_store_pipe"
+    # ``masked``: the body's masked segment runs the chunked helper under
+    # ``causal=True``. With ``cute_flash_causal_mask_storeback`` PASS1 stores
+    # the masked scores back and the masked PASS2 runs the plain pass; the
+    # knob is inert off the plain causal fa4 disc body.
     with patch.dict(os.environ, {}, clear=True):
         config = cute_flash.resolve_flash_config(
             head_dim,
@@ -1294,9 +1315,10 @@ def test_disc_degree_calls_match_runtime_signatures(
         and node.func.attr.startswith("fa4_disc_exp_convert_store")
     ]
     assert required_helper in {call.func.attr for call in calls}
+    assert any(_causal_pass2(call) for call in calls) == (masked and not storeback)
     degree_keywords = set()
     for call in calls:
-        keywords = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
+        keywords = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
         degree_keywords.update(key for key in keywords if key.startswith("degree"))
         inspect.signature(getattr(_flash_runtime, call.func.attr)).bind(
             *([None] * len(call.args)), **keywords
@@ -1421,7 +1443,8 @@ def test_sm103_scaled_all_xu_probability_shift_fits_the_rescale_threshold() -> N
             for node in ast.walk(module)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "fa4_sp_exp_convert_store_whole_rowsum"
+            and node.func.attr == "fa4_sp_exp_convert_store"
+            and _keyword(node, "whole_row_sum")
         ]
 
     all_xu_calls = _pass2_calls(all_xu_module)
@@ -1504,7 +1527,7 @@ def test_dense_resident_value_graph_codegen_and_barrier_protocol() -> None:
             "pfor_self_cta_rank": "None",
         }
 
-    assert "fa4_sp_exp_convert_store_whole_rowsum" not in source
+    assert "whole_row_sum=True" not in source
     assert "f16x2_xu=True" not in source
     assert "cutlass.Float32(7.0) - flash_row_max_safe * _flash_scale_log2" in source
     assert source.count("flash_s_corr_prod_phase = cutlass.Int32(1)") == 2
@@ -1680,7 +1703,7 @@ def test_dense_resident_value_graph_gate_preserves_fallbacks() -> None:
     )
     for fallback_source in fallback_sources:
         assert "resident_softmax_value_graph" not in fallback_source
-        assert "fa4_sp_exp_convert_store_whole_rowsum" in fallback_source
+        assert "whole_row_sum=True" in fallback_source
 
     # The whole-row statistics protocol is also a dependency, but selecting the
     # fragment row sum picks a different pass-2 body, not the whole-row one.
@@ -1688,7 +1711,7 @@ def test_dense_resident_value_graph_gate_preserves_fallbacks() -> None:
         config_overrides={cute_flash.FLASH_SP_ROW_SUM_KEY: "fragment"}
     )
     assert "resident_softmax_value_graph" not in fragment_source
-    assert "fa4_sp_exp_convert_store_whole_rowsum" not in fragment_source
+    assert "whole_row_sum=True" not in fragment_source
 
     # A field the resident body does NOT depend on must keep the lowering: the
     # exact-seed gate this replaced made every such neighbour ~14% slower and
@@ -1847,7 +1870,7 @@ def test_dense_resident_softmax_lowering_dispatch_is_exhaustive() -> None:
     ):
         standard_source = _emit_dense_resident_value_graph_source()
     assert "resident_softmax_value_graph" not in standard_source
-    assert "fa4_sp_exp_convert_store_whole_rowsum" in standard_source
+    assert "whole_row_sum=True" in standard_source
 
 
 def test_dense_probability_shift_is_rejected_before_fp16_overflow() -> None:
@@ -1872,7 +1895,7 @@ def test_causal_resident_native_codegen_and_single_stat_protocol() -> None:
     assert not value_graph_calls
 
     assert "fa4_disc_exp_convert_store" not in source
-    assert "fa4_sp_exp_convert_store_whole_rowsum" not in source
+    assert "whole_row_sum=True" not in source
     assert "f16x2_xu=True" not in source
     assert "flash_s_corr_prod_index" not in source
     assert "flash_s_corr_cons_index" not in source
@@ -2035,7 +2058,7 @@ def test_causal_resident_softmax_lowering_dispatch_is_exhaustive() -> None:
     ):
         standard_source = _emit_causal_resident_native_source()
     assert "resident_softmax_value_graph" not in standard_source
-    assert "fa4_sp_exp_convert_store_whole_rowsum" in standard_source
+    assert "whole_row_sum=True" in standard_source
 
     value_graph_policy = dataclasses.replace(
         policy,
@@ -2067,7 +2090,7 @@ def test_causal_resident_native_additional_stage_codegen(
 
     assert f"num_stages={kv_stage}" in source
     assert "resident_softmax_value_graph" in source
-    assert "fa4_sp_exp_convert_store_whole_rowsum" not in source
+    assert "whole_row_sum=True" not in source
     assert "fa4_disc_exp_convert_store" not in source
     assert source.count("for flash_kv_mask_iter") == 2
     assert source.count("for flash_kv_unmask_iter") == 2
@@ -2160,7 +2183,6 @@ def test_causal_resident_native_renders_with_the_q_staged_output() -> None:
         assert "storage.sO" in separate
 
 
-@onlyBackends(["cute"])
 def test_causal_resident_native_matches_sdpa_without_deadlock() -> None:
     capability = torch.cuda.get_device_capability()
     target_policy = get_flash_target_policy(capability)
@@ -2185,13 +2207,13 @@ def test_causal_resident_native_matches_sdpa_without_deadlock() -> None:
     assert seed is not None
     config = helion.Config(**seed.config)
     bound = _causal_attention_output_fast_math.bind((q, k, v))
-    code = bound.to_triton_code(config)
+    code = bound.to_code(config)
     compiled = bound.compile_config(config)
 
     assert "ResidentSoftmaxState.create" in code
     assert "resident_softmax_value_graph" not in code
     assert "flash_softmax.update_row_sum(tLDrS.load(), flash_alpha)" in code
-    assert "fa4_sp_exp_convert_store_whole_rowsum" not in code
+    assert "whole_row_sum=True" not in code
     assert "fa4_disc_exp_convert_store" not in code
     assert "flash_s_corr_prod_index" not in code
     assert "f16x2_xu=True" not in code
@@ -2215,7 +2237,6 @@ def test_causal_resident_native_matches_sdpa_without_deadlock() -> None:
         (4096, 3),
     ),
 )
-@onlyBackends(["cute"])
 def test_causal_resident_cross_stage_matches_sdpa_without_deadlock(
     num_kv: int, repeat_count: int
 ) -> None:
@@ -2241,11 +2262,11 @@ def test_causal_resident_cross_stage_matches_sdpa_without_deadlock(
     assert seed is not None
     config = helion.Config(**seed.config)
     bound = _causal_attention_output_fast_math.bind((q, k, v))
-    code = bound.to_triton_code(config)
+    code = bound.to_code(config)
     compiled = bound.compile_config(config)
 
     assert "resident_softmax_value_graph" in code
-    assert "fa4_sp_exp_convert_store_whole_rowsum" not in code
+    assert "whole_row_sum=True" not in code
     assert "fa4_disc_exp_convert_store" not in code
 
     out = compiled(q, k, v)
@@ -2447,7 +2468,8 @@ def test_causal_hd128_resident_seed_roundtrips_and_is_in_population() -> None:
             spec.block_sizes.append(
                 BlockSizeSpec(block_id=block_id, size_hint=size_hint)
             )
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=128,
             num_kv=num_kv,
             dtype=torch.bfloat16,
@@ -2576,7 +2598,6 @@ def test_causal_hd128_resident_runtime_prefetches_chunk2_after_chunk0() -> None:
     )
 
 
-@onlyBackends(["cute"])
 def test_causal_hd128_resident_seed_matches_sdpa() -> None:
     torch.manual_seed(107)
     q, k, v = (
@@ -2587,7 +2608,7 @@ def test_causal_hd128_resident_seed_matches_sdpa() -> None:
     bound = _causal_attention_output_fast_math.bind((q, k, v))
     active_config = helion.Config(**config)
     bound.set_config(active_config)
-    code = bound.to_triton_code(active_config)
+    code = bound.to_code(active_config)
     out = bound(q, k, v)
     repeated = bound(q, k, v)
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -2604,12 +2625,35 @@ def test_causal_hd128_resident_seed_matches_sdpa() -> None:
     assert normalized_rmse.item() < 0.003
 
 
-_HYBRID_PASS2_HELPERS = frozenset(
-    {
-        "fa4_disc_exp_convert_store_pipe",
-        "fa4_disc_exp_convert_store_pipe_causal",
+_HYBRID_PASS2_HELPERS = frozenset({"fa4_disc_exp_convert_store_pipe"})
+_PASS2_MASK_KEYWORDS = ("causal", "m_block", "n_block")
+
+
+def _keyword(call: ast.Call, name: str) -> ast.expr | None:
+    return next((kw.value for kw in call.keywords if kw.arg == name), None)
+
+
+def _causal_pass2(call: ast.Call) -> bool:
+    """Whether a chunked PASS2 call re-applies the causal mask (``causal=True``
+    with the query / key tile coordinates)."""
+    causal = _keyword(call, "causal")
+    if causal is None:
+        return False
+    assert ast.literal_eval(causal) is True
+    assert _keyword(call, "m_block") is not None
+    assert ast.unparse(_keyword(call, "n_block")) == "flash_kv"
+    return True
+
+
+def _pass2_keywords(call: ast.Call) -> dict[str, object]:
+    """The literal keywords of a PASS2 call without the mask operands."""
+    return {
+        kw.arg: ast.literal_eval(kw.value)
+        for kw in call.keywords
+        if kw.arg not in _PASS2_MASK_KEYWORDS
     }
-)
+
+
 _CAUSAL_SPLIT_SEGMENT_LOOP_VARS = {
     "flash_kv_mask_iter": "masked",
     "flash_kv_unmask_iter": "unmasked",
@@ -2623,9 +2667,10 @@ def _disc_pass2_calls_by_segment(
 
     The masked diagonal prefix (``for flash_kv_mask_iter``) and the unmasked
     suffix (``for flash_kv_unmask_iter``) are told apart by the enclosing
-    loop, not by the helper's name: with ``cute_flash_causal_mask_storeback``
-    PASS1 stores the masked scores back and the masked segment runs the plain
-    helper too, at its own (masked) cadence.
+    loop, not by the call's ``causal`` keyword: with
+    ``cute_flash_causal_mask_storeback`` PASS1 stores the masked scores back
+    and the masked segment runs the plain pass too, at its own (masked)
+    cadence.
     """
     calls: dict[str, list[ast.Call]] = {"masked": [], "unmasked": []}
     for loop in ast.walk(module):
@@ -2644,11 +2689,12 @@ def _disc_pass2_calls_by_segment(
     return calls
 
 
-def _assert_hybrid_pass2_routes(module: ast.Module) -> None:
+def _assert_hybrid_pass2_routes(module: ast.Module, *, storeback: bool) -> None:
     """Masked segment: degree-2 emulation; unmasked segment: degree 1.
 
     Holds for both values of ``cute_flash_causal_mask_storeback`` (the knob
-    changes which helper the masked segment calls, not its polynomial).
+    decides whether the masked segment's call re-applies the mask, not its
+    polynomial).
     """
     segments = _disc_pass2_calls_by_segment(module, _HYBRID_PASS2_HELPERS)
     assert {segment: len(calls) for segment, calls in segments.items()} == {
@@ -2660,14 +2706,12 @@ def _assert_hybrid_pass2_routes(module: ast.Module) -> None:
         for call in calls:
             assert ast.literal_eval(call.args[8]) == 16
             assert ast.literal_eval(call.args[9]) == 8
-            keywords = {
-                keyword.arg: ast.literal_eval(keyword.value)
-                for keyword in call.keywords
-            }
-            assert keywords == {"pair_batch": 8, "emu_batch": 4, **polynomial}, (
-                segment,
-                call.func.attr,  # pyrefly: ignore[missing-attribute]
-            )
+            assert _pass2_keywords(call) == {
+                "pair_batch": 8,
+                "emu_batch": 4,
+                **polynomial,
+            }, segment
+            assert _causal_pass2(call) == (segment == "masked" and not storeback)
 
 
 @pytest.mark.parametrize("storeback", (False, True))
@@ -2698,7 +2742,9 @@ def test_hybrid_packet_uses_degree1_only_for_unmasked_pass2(storeback: bool) -> 
         io_dtype="cutlass.Float16",
         score_plan=causal_score_plan(64),
     )
-    _assert_hybrid_pass2_routes(ast.Module(body=body, type_ignores=[]))
+    _assert_hybrid_pass2_routes(
+        ast.Module(body=body, type_ignores=[]), storeback=storeback
+    )
 
 
 @pytest.mark.parametrize("storeback", (False, True))
@@ -2741,7 +2787,9 @@ def test_bfloat16_hybrid_packet_uses_audited_causal_routes(
         io_dtype="cutlass.BFloat16",
         score_plan=causal_score_plan(64),
     )
-    _assert_hybrid_pass2_routes(ast.Module(body=body, type_ignores=[]))
+    _assert_hybrid_pass2_routes(
+        ast.Module(body=body, type_ignores=[]), storeback=storeback
+    )
 
 
 @pytest.mark.parametrize(
@@ -2806,11 +2854,7 @@ def test_polynomial_packet_uses_whole_row_dense_pass2(
         for node in ast.walk(module)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr
-        in {
-            "fa4_sp_exp_convert_store",
-            "fa4_sp_exp_convert_store_whole_rowsum",
-        }
+        and node.func.attr == "fa4_sp_exp_convert_store"
     ]
     assert len(pass2_calls) == 2
     for call in pass2_calls:
@@ -3120,7 +3164,6 @@ def test_dense_nonpersistent_final_only_stat_pipeline_protocol() -> None:
     )
 
 
-@onlyBackends(["cute"])
 def test_dense_degree2_final_only_is_deterministic_on_peaky_inputs() -> None:
     torch.manual_seed(104)
     q, k, v = (
@@ -3148,7 +3191,7 @@ def test_dense_degree2_final_only_is_deterministic_on_peaky_inputs() -> None:
     bound = _dense_attention_output_fast_math.bind((q, k, v))
     active_config = helion.Config(**config)
     bound.set_config(active_config)
-    code = bound.to_triton_code(active_config)
+    code = bound.to_code(active_config)
     out = bound(q, k, v)
     repeated = bound(q, k, v)
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
@@ -3166,7 +3209,6 @@ def test_dense_degree2_final_only_is_deterministic_on_peaky_inputs() -> None:
     assert strict_failures.count_nonzero().item() / out.numel() < 1e-5
 
 
-@onlyBackends(["cute"])
 def test_bfloat16_hd128_degree2_seed_is_deterministic_and_matches_sdpa() -> None:
     config = next(
         seed.config
@@ -3187,7 +3229,7 @@ def test_bfloat16_hd128_degree2_seed_is_deterministic_and_matches_sdpa() -> None
     bound = _dense_attention_output_fast_math.bind(first_args)
     active_config = helion.Config(**config)
     bound.set_config(active_config)
-    code = bound.to_triton_code(active_config)
+    code = bound.to_code(active_config)
     assert "degree2=True" in code
 
     for seed, scale in ((105, 1.0), (106, 2.0)):
@@ -3277,7 +3319,6 @@ def test_bfloat16_hd128_degree2_seed_is_deterministic_and_matches_sdpa() -> None
         ),
     ),
 )
-@onlyBackends(["cute"])
 def test_specialized_flash_family_matches_sdpa_at_boundary_lengths(
     dtype: torch.dtype,
     head_dim: int,
@@ -3377,7 +3418,7 @@ def _run_specialized_flash_family_correctness(
         standard_causal_output=is_causal,
         fast_math=fast_math,
     )
-    code = bound.to_triton_code(active_config)
+    code = bound.to_code(active_config)
     outputs = [bound(q, k, v) for _ in range(3)]
     out = outputs[0]
     expected = torch.nn.functional.scaled_dot_product_attention(
@@ -3466,7 +3507,6 @@ def test_specialized_flash_family_rejects_adjacent_unaligned_length(
     assert (resolved.pipeline_family, resolved.exp2_packet) != (family, packet)
 
 
-@onlyBackends(["cute"])
 def test_dense_bfloat16_final_only_stat_handoff_is_accurate() -> None:
     torch.manual_seed(106)
     q, k, v = (
@@ -3492,7 +3532,7 @@ def test_dense_bfloat16_final_only_stat_handoff_is_accurate() -> None:
     bound = _dense_attention_output.bind((q, k, v))
     active_config = helion.Config(**config)
     bound.set_config(active_config)
-    code = bound.to_triton_code(active_config)
+    code = bound.to_code(active_config)
     out = bound(q, k, v)
     repeated = bound(q, k, v)
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
@@ -3504,7 +3544,6 @@ def test_dense_bfloat16_final_only_stat_handoff_is_accurate() -> None:
     torch.testing.assert_close(out, expected, atol=0.01, rtol=0.02)
 
 
-@onlyBackends(["cute"])
 def test_causal_whole_row_request_uses_safe_disc_pipeline() -> None:
     """Causal ring2 requests must not enter the unacknowledged whole-row path."""
     torch.manual_seed(110)
@@ -3537,7 +3576,6 @@ def test_causal_whole_row_request_uses_safe_disc_pipeline() -> None:
     torch.testing.assert_close(out, expected, atol=0.01, rtol=0.02)
 
 
-@onlyBackends(["cute"])
 def test_dense_ring2_whole_row_request_uses_single_transport() -> None:
     """The autotuner must not emit the whole-row ring2 wait cycle."""
     torch.manual_seed(107)
@@ -3570,7 +3608,7 @@ def test_dense_ring2_whole_row_request_uses_single_transport() -> None:
     bound = _dense_attention_output.bind((q, k, v))
     active_config = helion.Config(**config)
     bound.set_config(active_config)
-    code = bound.to_triton_code(active_config)
+    code = bound.to_code(active_config)
     out = bound(q, k, v)
     repeated = bound(q, k, v)
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
@@ -3584,7 +3622,6 @@ def test_dense_ring2_whole_row_request_uses_single_transport() -> None:
     torch.testing.assert_close(out, expected, atol=0.01, rtol=0.02)
 
 
-@onlyBackends(["cute"])
 def test_persistent_legacy_degree1_final_only_is_accurate_across_work() -> None:
     torch.manual_seed(105)
     # 131_072 rows keep multiple work items per CTA of the num_SM-capped
@@ -3612,7 +3649,7 @@ def test_persistent_legacy_degree1_final_only_is_accurate_across_work() -> None:
     bound = _dense_attention_output_fast_math.bind((q, k, v))
     active_config = helion.Config(**config)
     bound.set_config(active_config)
-    code = bound.to_triton_code(active_config)
+    code = bound.to_code(active_config)
     out = bound(q, k, v)
     repeated = bound(q, k, v)
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
@@ -3736,7 +3773,6 @@ def test_dense_ring2_emits_two_slot_stat_protocol() -> None:
     assert ring2 != single
 
 
-@onlyBackends(["cute"])
 def test_hybrid_packet_runtime_matches_sdpa_at_causal_boundaries() -> None:
     torch.manual_seed(101)
     q, k, v = (
@@ -3766,7 +3802,6 @@ def test_hybrid_packet_runtime_matches_sdpa_at_causal_boundaries() -> None:
     )
 
 
-@onlyBackends(["cute"])
 def test_bfloat16_hybrid_packet_matches_sdpa_beyond_registered_length() -> None:
     torch.manual_seed(108)
     # 4098 is the smallest even num_kv above the largest registered causal
@@ -4126,7 +4161,8 @@ def test_manual_packet_config_spec_is_fixed_not_searched(
             spec.block_sizes.append(
                 BlockSizeSpec(block_id=block_id, size_hint=size_hint)
             )
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=64,
             num_kv=512,
             dtype=torch.float16,
@@ -4924,7 +4960,8 @@ def test_sm103_target_seeds_fall_back_to_exact_packets_without_fast_math(
             spec.block_sizes.append(
                 BlockSizeSpec(block_id=block_id, size_hint=size_hint)
             )
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=64,
             num_kv=num_kv,
             dtype=torch.float16,
@@ -4995,7 +5032,8 @@ def test_pinned_polynomial_config_needs_the_fast_math_spec(
             spec.block_sizes.append(
                 BlockSizeSpec(block_id=block_id, size_hint=size_hint)
             )
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=head_dim,
             num_kv=512,
             dtype=dtype,
@@ -5014,7 +5052,7 @@ def test_pinned_polynomial_config_needs_the_fast_math_spec(
     }
     with patch.dict(os.environ, {}, clear=True):
         resolved = {
-            fast_math: specs[fast_math]._resolve_cute_flash_config(pinned)
+            fast_math: _resolve_cute_flash_config(specs[fast_math], pinned)
             for fast_math in (False, True)
         }
     assert resolved[True].exp2_packet == packet
@@ -5030,7 +5068,6 @@ def test_pinned_polynomial_config_needs_the_fast_math_spec(
     assert normalized.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == family
 
 
-@onlyBackends(["cute"])
 def test_polynomial_packets_on_the_kernels_require_fast_math() -> None:
     """End to end through the device IR: the bound kernel's surface records
     the setting (``ConfigSpec._cute_flash_fast_math``); without it a pinned
@@ -5060,7 +5097,7 @@ def test_polynomial_packets_on_the_kernels_require_fast_math() -> None:
     assert fast.config_spec._cute_flash_fast_math
     active = helion.Config(**dense_config)
     fast.set_config(active)
-    assert "degree2=True" in fast.to_triton_code(active)
+    assert "degree2=True" in fast.to_code(active)
     out = fast(q, k, v)
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
     assert torch.isfinite(out).all()
@@ -5073,7 +5110,7 @@ def test_polynomial_packets_on_the_kernels_require_fast_math() -> None:
     fast_causal = _causal_attention_output_fast_math.bind((q, k, v))
     active = helion.Config(**hybrid_config)
     fast_causal.set_config(active)
-    code = fast_causal.to_triton_code(active)
+    code = fast_causal.to_code(active)
     assert "degree1=True" in code
     assert "degree2=True" in code
     out = fast_causal(q, k, v)

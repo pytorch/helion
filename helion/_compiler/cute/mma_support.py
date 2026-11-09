@@ -1,3 +1,13 @@
+"""Which CuTe MMA atoms the current device and DSL build support.
+
+``get_cute_mma_support`` probes the atoms once per (device, CuTe DSL arch)
+and memoizes the record: the five probes construct MMA ops through the DSL
+and are the measured cost of every ``_choose_mma_impl`` call.  Tests that
+swap the probe (``helion._testing.patch_cute_mma_support``) clear the memo
+around the patch; a process whose ``CUTE_DSL_ARCH`` changes re-probes under
+the new key.
+"""
+
 from __future__ import annotations
 
 import dataclasses
@@ -9,7 +19,6 @@ import torch
 class CuteMmaSupport:
     universal: bool
     warp_f16bf16: bool
-    warpgroup_f16bf16: bool
     tcgen05_f16bf16: bool
     tcgen05_f8: bool = False
     tcgen05_tf32: bool = False
@@ -21,8 +30,6 @@ class CuteMmaSupport:
             impls.append("universal")
         if self.warp_f16bf16:
             impls.append("warp")
-        if self.warpgroup_f16bf16:
-            impls.append("warpgroup")
         if self.tcgen05_f16bf16:
             impls.append("tcgen05")
         return tuple(impls)
@@ -49,25 +56,6 @@ def _probe_warp_f16bf16() -> bool:
         from cutlass.cute.nvgpu import warp
 
         warp.MmaF16BF16Op(cutlass.Float16, cutlass.Float32, (16, 8, 16))
-        return True
-    except Exception:
-        return False
-
-
-def _probe_warpgroup_f16bf16() -> bool:
-    try:
-        import cutlass
-        from cutlass.cute.nvgpu import OperandMajorMode
-        from cutlass.cute.nvgpu import warpgroup
-
-        warpgroup.MmaF16BF16Op(
-            cutlass.Float16,
-            cutlass.Float32,
-            (64, 8, 16),
-            warpgroup.OperandSource.SMEM,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-        )
         return True
     except Exception:
         return False
@@ -135,31 +123,48 @@ def _probe_tcgen05_f8() -> tuple[bool, str | None]:
         return False, f"{type(exc).__name__}: {exc}"
 
 
+_SUPPORT_CACHE: dict[tuple[torch.device, str | None], CuteMmaSupport] = {}
+
+
+def clear_cute_mma_support_cache() -> None:
+    """Forget the probed records (the test seams call this around a patch)."""
+    _SUPPORT_CACHE.clear()
+
+
 def get_cute_mma_support() -> CuteMmaSupport:
+    """The MMA atoms the current CUDA device supports; no device, no atoms.
+
+    Memoized per (device, CuTe DSL arch name); the no-device record is not
+    cached so a process that gains a device re-probes.
+    """
     device = _current_cuda_device()
     if device is None:
         return CuteMmaSupport(
             universal=False,
             warp_f16bf16=False,
-            warpgroup_f16bf16=False,
             tcgen05_f16bf16=False,
             tcgen05_f8=False,
             tcgen05_tf32=False,
         )
 
     cutlass_arch = _current_cutlass_arch_name()
+    key = (device, cutlass_arch)
+    cached = _SUPPORT_CACHE.get(key)
+    if cached is not None:
+        return cached
 
     # The universal atom is the only lowering Helion currently wires up end-to-end.
     universal = cutlass_arch is not None
     tcgen05_f8_ok, _ = _probe_tcgen05_f8()
-    return CuteMmaSupport(
+    support = CuteMmaSupport(
         universal=universal,
         warp_f16bf16=_probe_warp_f16bf16(),
-        warpgroup_f16bf16=_probe_warpgroup_f16bf16(),
         tcgen05_f16bf16=_probe_tcgen05_f16bf16(),
         tcgen05_f8=tcgen05_f8_ok,
         tcgen05_tf32=_probe_tcgen05_tf32(),
     )
+    _SUPPORT_CACHE[key] = support
+    return support
 
 
 def tcgen05_supports_input_dtype(

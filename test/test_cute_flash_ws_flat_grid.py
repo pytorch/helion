@@ -31,13 +31,13 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
-from helion._testing import onlyBackends
 import helion.language as hl
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
 from helion._testing import import_example
 
 _WS = {
@@ -251,7 +251,6 @@ def test_ws_search_surface_measures_the_staged_epilogue() -> None:
 # --------------------------------------------------------------------------
 
 
-@onlyBackends(["cute"])
 def test_flat_grid_issues_loads_before_the_tmem_barrier_and_stages_o() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     code = _code(_attention_kernel(), (q, k, v), **_FLAT)
@@ -317,7 +316,6 @@ def test_flat_grid_issues_loads_before_the_tmem_barrier_and_stages_o() -> None:
     assert "fa4_store_o_smem_to_gmem(" in sliced
 
 
-@onlyBackends(["cute"])
 def test_flat_grid_direct_store_keeps_the_late_teardown() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     code = _code(_attention_kernel(), (q, k, v), **_FLAT, cute_flash_epi_stg=False)
@@ -336,7 +334,6 @@ def test_flat_grid_direct_store_keeps_the_late_teardown() -> None:
     assert "barrier_id=3" not in code
 
 
-@onlyBackends(["cute"])
 def test_persistent_grid_keeps_loads_in_the_producer_loop() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     code = _code(_attention_kernel(), (q, k, v), **_PERSISTENT)
@@ -354,7 +351,6 @@ def test_persistent_grid_keeps_loads_in_the_producer_loop() -> None:
     )
 
 
-@onlyBackends(["cute"])
 def test_causal_flat_grid_guards_the_early_loads_with_the_active_range() -> None:
     q, k, v = _qkv(1, 2, 512, 64, torch.bfloat16)
     code = _code(_causal_attention, (q, k, v), **_FLAT)
@@ -380,7 +376,6 @@ def test_causal_flat_grid_guards_the_early_loads_with_the_active_range() -> None
     assert prelude.count("cute.arch.sync_warp()") == 2
 
 
-@onlyBackends(["cute"])
 def test_row_epilogue_stages_aux_rows_through_smem_ahead_of_the_kv_loop() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     code = _code(_xsa_kernel(), (q, k, v), **_FLAT)
@@ -433,7 +428,6 @@ _RUNTIME_CONFIGS = (
 )
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("config", _RUNTIME_CONFIGS)
 @pytest.mark.parametrize(
     ("shape", "dtype"),
@@ -457,7 +451,6 @@ def test_ws_attention_matches_reference(
     torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
-@onlyBackends(["cute"])
 def test_ws_attention_two_inputs_do_not_alias_the_output() -> None:
     # Two different inputs on the same compiled kernel: guards against a store
     # path that leaves the output buffer stale.
@@ -476,7 +469,6 @@ def test_ws_attention_two_inputs_do_not_alias_the_output() -> None:
     assert not torch.allclose(outs[0], outs[1])
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("config", (_FLAT, {**_FLAT, "cute_flash_epi_stg": False}))
 def test_ws_causal_matches_reference(config: dict[str, object]) -> None:
     q, k, v = _qkv(1, 2, 512, 64, torch.bfloat16)
@@ -486,7 +478,6 @@ def test_ws_causal_matches_reference(config: dict[str, object]) -> None:
     torch.testing.assert_close(out, expected_out, atol=1e-2, rtol=1e-2)
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("config", (_FLAT, _PERSISTENT))
 def test_ws_relu_epilogue_matches_reference(config: dict[str, object]) -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
@@ -496,7 +487,6 @@ def test_ws_relu_epilogue_matches_reference(config: dict[str, object]) -> None:
     torch.testing.assert_close(out, torch.relu(expected), atol=1e-2, rtol=1e-2)
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     "config",
     (
@@ -618,21 +608,20 @@ def test_q_tile_m64_is_canonicalized_away_for_fused_or_modified_rows() -> None:
     assert tuple(fused[cute_flash.FLASH_Q_TILE_M_KEY].search_choices or ()) == (128,)
 
 
-@onlyBackends(["cute"])
 def test_xsa_surface_has_no_64_row_tile() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     xsa = _xsa_kernel().bind((q, k, v))
     spec = xsa.config_spec
     assert spec.cute_flash_search_enabled
     assert spec._cute_flash_plain_row_body is False
-    fragment = spec._cute_flash_autotune_fragments()[cute_flash.FLASH_Q_TILE_M_KEY]
+    fragment = _cute_flash_autotune_fragments(spec)[cute_flash.FLASH_Q_TILE_M_KEY]
     assert tuple(fragment.search_choices or ()) == (128,)
     normalized = xsa._normalized_config_copy(helion.Config(**_M64))
     assert normalized.config[cute_flash.FLASH_Q_TILE_M_KEY] == 128
     # Plain attention on the same shape keeps the knob and records 64.
     attention = _attention_kernel().bind((q, k, v))
     assert attention.config_spec._cute_flash_plain_row_body is True
-    fragment = attention.config_spec._cute_flash_autotune_fragments()[
+    fragment = _cute_flash_autotune_fragments(attention.config_spec)[
         cute_flash.FLASH_Q_TILE_M_KEY
     ]
     assert set(fragment.search_choices or ()) == {64, 128}
@@ -660,7 +649,6 @@ def test_ws_corr_tile_size_is_canonical_unless_the_epilogue_is_staged() -> None:
         assert resolve(cute_flash_corr_tile_size=width, cute_flash_s_stage=1) == 64
 
 
-@onlyBackends(["cute"])
 def test_q_tile_m64_codegen_uses_two_row_tmem_copies_and_quad_reductions() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     code = _code(_attention_kernel(), (q, k, v), **_M64)
@@ -689,7 +677,6 @@ def test_q_tile_m64_codegen_uses_two_row_tmem_copies_and_quad_reductions() -> No
     assert "'q_tile_m': 128" in xsa
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     ("shape", "dtype"),
     (
@@ -724,7 +711,6 @@ def test_q_tile_m64_matches_reference_and_the_128_row_tile(
         torch.testing.assert_close(lse, lse128, atol=2e-2, rtol=2e-2)
 
 
-@onlyBackends(["cute"])
 def test_q_tile_m64_relu_epilogue_matches_reference() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     expected, _ = _reference(q, k, v)
@@ -815,7 +801,6 @@ def test_ws_one_pass_is_legal_only_for_two_kv_tiles_of_the_64_row_body() -> None
         ) == (False,)
 
 
-@onlyBackends(["cute"])
 def test_ws_one_pass_canonicalizes_to_off_where_it_is_illegal() -> None:
     kernel = _attention_kernel()
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
@@ -838,7 +823,6 @@ def test_ws_one_pass_canonicalizes_to_off_where_it_is_illegal() -> None:
     assert xsa.config[cute_flash.FLASH_WS_ONE_PASS_KEY] is False
 
 
-@onlyBackends(["cute"])
 def test_ws_one_pass_codegen_reads_both_score_tiles_before_one_exp2_sweep() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     code = _code(_attention_kernel(), (q, k, v), **_M64_ONE_PASS)
@@ -886,7 +870,6 @@ def test_ws_one_pass_codegen_reads_both_score_tiles_before_one_exp2_sweep() -> N
     assert three.count("flash_k_full = flash_k_cons.wait_and_advance()") == 2
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize(
     ("shape", "dtype"),
     (
@@ -920,7 +903,6 @@ def test_ws_one_pass_matches_reference_and_the_two_pass_tile(
     assert not torch.allclose(outs[0], outs[1])
 
 
-@onlyBackends(["cute"])
 def test_ws_one_pass_relu_epilogue_matches_reference() -> None:
     q, k, v = _qkv(1, 4, 256, 64, torch.bfloat16)
     expected, _ = _reference(q, k, v)
@@ -1013,7 +995,6 @@ def test_flat_ws_overlap_seed_carries_the_staged_epilogue() -> None:
             assert resolved.epi_stg is True
 
 
-@onlyBackends(["cute"])
 def test_small_grid_seed_survives_normalization_and_seed_deduplication() -> None:
     # The bound (1, 4, 256, 64) problem has 8 CTAs of 128 rows on a device
     # with far more SMs, so the compiler seeds carry the one-pass 64-row tile

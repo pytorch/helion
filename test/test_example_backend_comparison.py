@@ -15,6 +15,7 @@ from benchmarks.cute.example_report import aggregate
 from benchmarks.cute.example_report import report_results
 import pytest
 import torch
+import torch._dynamo.exc
 
 pytestmark = pytest.mark.cpu_only
 
@@ -77,6 +78,86 @@ def test_complete_int4_and_splitk_catalogues_without_optional_imports():
     ):
         case = cases.Case(module, name, (), {}, {"aten": torch.add})
         assert expected <= baselines.baseline_factories(case).keys()
+
+
+def test_quack_jagged_bmm_baseline_is_offered_at_every_d():
+    # quack's varlen-M gemm read back 95.7% mismatched at the D=32 workload
+    # and passed at D=64 and D=128: the candidate stays in every inventory, so
+    # the D=32 mismatch is a recorded baseline failure, not a hidden one.
+    offsets = torch.tensor([0, 3, 5])
+    for features in (32, 64, 128):
+        case = cases.Case(
+            "jagged_dense_bmm",
+            "00_forward",
+            (
+                offsets,
+                torch.ones(5, features),
+                torch.ones(2, features, 16),
+                torch.ones(2, 16),
+            ),
+            {},
+            {"aten": torch.add},
+        )
+        factories = baselines.baseline_factories(case)
+        assert {
+            "quack.grouped_mm",
+            "aten.grouped_mm",
+            "aten.padded_bmm",
+            "compile.padded_bmm",
+        } <= factories.keys(), features
+
+
+@pytest.mark.parametrize(
+    ("error", "invalidated"),
+    [
+        (
+            RuntimeError(
+                "CUDA error: operation failed due to a previous error during capture"
+            ),
+            True,
+        ),
+        (
+            RuntimeError(
+                "Cannot copy between CPU and CUDA tensors during CUDA graph capture"
+            ),
+            True,
+        ),
+        (
+            RuntimeError(
+                "CUDA error: operation not permitted when stream is capturing"
+            ),
+            True,
+        ),
+        (torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2 GiB"), False),
+        (ValueError("expected a contiguous tensor"), False),
+        # Naming the capture is not one of CUDA's three messages.
+        (RuntimeError("captured output has the wrong shape"), False),
+    ],
+)
+def test_only_a_host_synchronization_makes_a_call_uncapturable(error, invalidated):
+    # ``measure`` downgrades a baseline to eager-only timings only when CUDA
+    # reports the capture itself invalidated; a failure that would fail
+    # eagerly too stays a graph error the worker fails on.
+    assert baselines.capture_invalidated(error) is invalidated
+
+
+def test_a_previous_capture_error_is_classified_by_its_chained_cause():
+    # CUDA reports "a previous error during capture" after any failure inside
+    # the capture; the failure itself is chained to it and is what the record
+    # names and ``measure`` classifies.
+    previous = "CUDA error: operation failed due to a previous error during capture"
+    oom = torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2 GiB")
+    error = RuntimeError(previous)
+    error.__context__ = oom
+    assert baselines.capture_cause(error) is oom
+    assert baselines.capture_invalidated(error) is False
+    error.__cause__ = RuntimeError("operation not permitted when stream is capturing")
+    assert baselines.capture_cause(error) is error.__cause__
+    assert baselines.capture_invalidated(error) is True
+    # Unchained, the report itself is the host synchronization's symptom.
+    bare = RuntimeError(previous)
+    assert baselines.capture_cause(bare) is bare
+    assert baselines.capture_invalidated(bare) is True
 
 
 def test_backward_callable_uses_identical_upstream_gradients():
@@ -157,12 +238,48 @@ def test_output_shape_and_dtype_are_checked_before_numeric_comparison(check):
         baselines.assert_correct(expected.flatten(), expected, case)
 
 
+def cpu_worker(monkeypatch, tmp_path, case, provider, impl, *, measure, batched, cold):
+    """Run ``compare.worker`` on a CPU case with its CUDA timers replaced."""
+    import helion.autotuner.metrics as metrics
+
+    monkeypatch.setattr(cases, "collect", lambda module, shape: [case])
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "CPU fixture")
+    monkeypatch.setattr(metrics, "register_post_autotune_hook", lambda callback: None)
+    monkeypatch.setattr(baselines, "active_kernel_configs", list)
+    monkeypatch.setattr(baselines, "measure", measure)
+    monkeypatch.setattr(baselines, "measure_batched", batched)
+    monkeypatch.setattr(baselines, "measure_cold", cold)
+    args = SimpleNamespace(
+        module="test",
+        shape=0,
+        case="00_forward",
+        provider=provider,
+        impl=impl,
+        seed=7,
+        repetitions=1,
+        output=tmp_path / f"{provider}-{impl}.json",
+    )
+    compare.worker(args)
+    return json.loads(args.output.read_text())
+
+
+def captured(fn, repetitions, expected, case, *, output_dtype):
+    return {"graph_capturable": True, "graph_correctness": "pass", "graph_ms": 1.0}
+
+
+def batched(fn, repetitions, calls, expected, case, *, output_dtype):
+    return {"graph_calls_ms": 1.0, "graph_long_ms": 1.0, "graph_long_calls": calls}
+
+
+def cold(fn, repetitions):
+    return {"bench_ms": 1.0}
+
+
 @torch.no_grad()
 def test_worker_records_and_enforces_the_selected_output_contract(
     monkeypatch, tmp_path
 ):
-    import helion.autotuner.metrics as metrics
-
     case = cases.Case(
         "test",
         "00_forward",
@@ -172,40 +289,29 @@ def test_worker_records_and_enforces_the_selected_output_contract(
         output_dtypes={"cute:helion": torch.bfloat16},
         reference_note="Test fixture: FP32 reference with BF16 kernel output.",
     )
-    monkeypatch.setattr(cases, "collect", lambda module, shape: [case])
-    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "CPU fixture")
-    monkeypatch.setattr(metrics, "register_post_autotune_hook", lambda callback: None)
-    monkeypatch.setattr(baselines, "active_kernel_configs", list)
 
     def measure(fn, repetitions, expected, case, *, output_dtype):
         # Exercise the propagated contract; no CUDA timer runs in this CPU test.
         assert output_dtype == torch.bfloat16
         baselines.assert_correct(fn(), expected, case, output_dtype=output_dtype)
-        return {"graph_correctness": "pass", "graph_ms": 1.0}
+        return captured(fn, repetitions, expected, case, output_dtype=output_dtype)
 
     def measure_batched(fn, repetitions, calls, expected, case, *, output_dtype):
         assert output_dtype == torch.bfloat16
-        return {"graph_calls_ms": 1.0, "graph_long_ms": 1.0, "graph_long_calls": calls}
+        return batched(
+            fn, repetitions, calls, expected, case, output_dtype=output_dtype
+        )
 
-    def measure_cold(fn, repetitions):
-        return {"bench_ms": 1.0}
-
-    monkeypatch.setattr(baselines, "measure", measure)
-    monkeypatch.setattr(baselines, "measure_batched", measure_batched)
-    monkeypatch.setattr(baselines, "measure_cold", measure_cold)
-    args = SimpleNamespace(
-        module="test",
-        shape=0,
-        case="00_forward",
-        provider="cute",
-        impl="helion",
-        seed=7,
-        repetitions=1,
-        output=tmp_path / "matched.json",
+    result = cpu_worker(
+        monkeypatch,
+        tmp_path,
+        case,
+        "cute",
+        "helion",
+        measure=measure,
+        batched=measure_batched,
+        cold=cold,
     )
-    compare.worker(args)
-    result = json.loads(args.output.read_text())
     assert result["status"] == "ok", result.get("error")
     assert result["output_contract"] == {
         "shape": [2, 3],
@@ -217,14 +323,205 @@ def test_worker_records_and_enforces_the_selected_output_contract(
     assert result["reference_note"] == case.reference_note
 
     # The declaration belongs only to cute:helion, not every implementation.
-    args.provider = "triton"
-    args.output = tmp_path / "undeclared.json"
-    compare.worker(args)
-    rejected = json.loads(args.output.read_text())
+    rejected = cpu_worker(
+        monkeypatch,
+        tmp_path,
+        case,
+        "triton",
+        "helion",
+        measure=measure,
+        batched=measure_batched,
+        cold=cold,
+    )
     assert rejected["status"] == "error"
     assert "eager_correctness" not in rejected
     assert rejected["output"]["dtype"] == "torch.bfloat16"
     assert rejected["output_contract"]["dtype"] == "torch.float32"
+
+
+@torch.no_grad()
+def test_worker_judges_an_implementation_by_its_own_tolerance(monkeypatch, tmp_path):
+    # A baseline the catalogue allows a looser bound (``tolerances`` keyed
+    # like ``output_dtypes``) is checked at that bound and records it; the
+    # Helion kernel off by the same amount is held to the case's bound.
+    case = cases.Case(
+        "test",
+        "00_forward",
+        (torch.zeros(4),),
+        {"helion": lambda value: value + 0.25},
+        {"aten": lambda value: value.clone(), "loose": lambda value: value + 0.25},
+        rtol=0.0,
+        atol=0.1,
+        tolerances={"baselines:loose": (0.0, 0.5)},
+        auto_compile=False,
+    )
+
+    def measure(fn, repetitions, expected, case, *, output_dtype):
+        baselines.assert_correct(fn(), expected, case, output_dtype=output_dtype)
+        return captured(fn, repetitions, expected, case, output_dtype=output_dtype)
+
+    loose = cpu_worker(
+        monkeypatch,
+        tmp_path,
+        case,
+        "baselines",
+        "loose",
+        measure=measure,
+        batched=batched,
+        cold=cold,
+    )
+    assert loose["status"] == "ok", loose.get("error")
+    assert (loose["rtol"], loose["atol"]) == (0.0, 0.5)
+    strict = cpu_worker(
+        monkeypatch,
+        tmp_path,
+        case,
+        "cute",
+        "helion",
+        measure=measure,
+        batched=batched,
+        cold=cold,
+    )
+    assert strict["status"] == "error" and "eager_correctness" not in strict
+    assert (strict["rtol"], strict["atol"]) == (0.0, 0.1)
+
+
+@torch.no_grad()
+def test_worker_keeps_the_eager_timing_of_a_host_syncing_baseline(
+    monkeypatch, tmp_path
+):
+    case = cases.Case(
+        "test",
+        "00_forward",
+        (torch.ones(2, 3),),
+        {"helion": lambda value: value.clone()},
+        {"aten": lambda value: value.clone()},
+        auto_compile=False,
+    )
+
+    def uncaptured(fn, repetitions, expected, case, *, output_dtype):
+        return {
+            "event_ms": 0.7,
+            "graph_capturable": False,
+            "graph_ms": None,
+            "graph_error": "RuntimeError: operation failed during capture",
+        }
+
+    def never(*args, **kwargs):
+        raise AssertionError("an uncapturable call must not be captured again")
+
+    result = cpu_worker(
+        monkeypatch,
+        tmp_path,
+        case,
+        "baselines",
+        "aten",
+        measure=uncaptured,
+        batched=never,
+        cold=never,
+    )
+    assert result["status"] == "ok", result.get("error")
+    assert result["graph_capturable"] is False
+    assert result["graph_ms"] is None and result["event_ms"] == 0.7
+    assert "graph_calls_ms" not in result and "bench_ms" not in result
+    assert result["eager_correctness"] == "pass"
+    assert result["post_measurement_correctness"] == "pass"
+
+    # A Helion kernel that cannot be captured is a failure, not an eager-only
+    # record.
+    def failed(*args, **kwargs):
+        return {"graph_calls_error": "RuntimeError: capture", "bench_error": "same"}
+
+    result = cpu_worker(
+        monkeypatch,
+        tmp_path,
+        case,
+        "cute",
+        "helion",
+        measure=uncaptured,
+        batched=failed,
+        cold=failed,
+    )
+    assert result["status"] == "error"
+    assert "CUDA graph measurement or correctness failed" in result["error"]
+    assert result["graph_capturable"] is False
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        (ImportError("No module named 'quack'"), "baseline_unavailable"),
+        (
+            torch._dynamo.exc.Unsupported("Dynamic control flow is not supported"),
+            "baseline_unavailable",
+        ),
+        (
+            torch._dynamo.exc.UserError(
+                torch._dynamo.exc.UserErrorType.DYNAMIC_CONTROL_FLOW,
+                "Could not guard on data-dependent expression u1 > u0",
+            ),
+            "baseline_unavailable",
+        ),
+        (
+            RuntimeError("No available kernel. Aborting execution."),
+            "baseline_unavailable",
+        ),
+        (RuntimeError("CUDA error: an illegal memory access"), "error"),
+        (AssertionError("Tensor-likes are not close!"), "error"),
+    ],
+)
+@torch.no_grad()
+def test_worker_marks_baselines_this_machine_cannot_provide(
+    monkeypatch, tmp_path, error, status
+):
+    def failing(value):
+        raise error
+
+    case = cases.Case(
+        "test",
+        "00_forward",
+        (torch.ones(2),),
+        {"helion": failing},
+        {"aten": lambda value: value.clone(), "quack": failing},
+        auto_compile=False,
+    )
+    result = cpu_worker(
+        monkeypatch,
+        tmp_path,
+        case,
+        "baselines",
+        "quack",
+        measure=captured,
+        batched=batched,
+        cold=cold,
+    )
+    assert result["status"] == status
+    assert type(error).__name__ in result["error"]
+    # The same exception from a Helion kernel, or from the reference every
+    # implementation is checked against, is a failure of the cell.
+    result = cpu_worker(
+        monkeypatch,
+        tmp_path,
+        case,
+        "cute",
+        "helion",
+        measure=captured,
+        batched=batched,
+        cold=cold,
+    )
+    assert result["status"] == "error"
+    case.baselines = {"aten": failing}
+    result = cpu_worker(
+        monkeypatch,
+        tmp_path,
+        case,
+        "baselines",
+        "aten",
+        measure=captured,
+        batched=batched,
+        cold=cold,
+    )
+    assert result["status"] == "error"
 
 
 @torch.enable_grad()
@@ -356,11 +653,14 @@ def test_pins_match_a_kernel_recorded_with_a_duplicate_suffix(tmp_path):
         )
 
 
-def fixture_records():
+def fixture_records(providers=compare.PROVIDERS):
+    """A complete run of ``providers`` over three shapes: cute 1.0 ms, triton
+    2.0 ms, baselines 1.5 ms on every shape."""
     run = {
         "schema": compare.SCHEMA,
         "status": "complete",
         "modules": ["add"],
+        "providers": list(providers),
         "shapes": [0, 1, 2],
     }
     records = []
@@ -375,6 +675,8 @@ def fixture_records():
             }
         )
         for provider, latency in (("cute", 1.0), ("triton", 2.0), ("baselines", 1.5)):
+            if provider not in providers:
+                continue
             records.append(
                 {
                     "module": "add",
@@ -429,6 +731,80 @@ def test_higher_is_better_and_incomplete_shapes_are_not_dropped():
     assert result["failures"] == [records[-1]]
 
 
+def test_eager_only_baselines_are_listed_not_ranked():
+    run, records = fixture_records()
+    eager_only = {
+        "module": "add",
+        "case": "00_forward",
+        "shape": 0,
+        "provider": "baselines",
+        "impl": "aten.loop",
+        "status": "ok",
+        "graph_capturable": False,
+        "graph_ms": None,
+        "event_ms": 0.9,
+        "eager_correctness": "pass",
+        "post_measurement_correctness": "pass",
+    }
+    data = aggregate(run, [*records, eager_only])
+    assert data["uncapturable"] == [eager_only] and data["failures"] == []
+    shape0 = data["shapes"][0]
+    assert (shape0["baselines_ms"], shape0["baselines_impl"]) == (1.5, "baselines")
+    assert data["variants"][0]["status"] == "ok"
+    # Helion kernels are never eager-only, and an eager-only record still has
+    # to have passed its eager checks.
+    with pytest.raises(ValueError, match="not captured"):
+        aggregate(run, [*records, {**eager_only, "provider": "cute", "impl": "h2"}])
+    with pytest.raises(ValueError, match="missing correctness"):
+        aggregate(run, [*records, {**eager_only, "eager_correctness": "failed"}])
+
+
+def test_completeness_and_speedups_follow_the_runs_providers():
+    # A run restricted to ``--providers cute,baselines`` has no Triton
+    # records by design: its shape rows are complete and ranked against the
+    # baselines, and the Triton speedup is not reported rather than N/A.
+    run, records = fixture_records(["cute", "baselines"])
+    data = aggregate(run, records)
+    assert data["ratios"] == ["cute_vs_best"]
+    for row in data["shapes"]:
+        assert row["status"] == "ok" and "triton_ms" not in row
+        assert row["cute_vs_best"] == pytest.approx(1.5)
+        assert "cute_vs_triton" not in row
+    (variant,) = data["variants"]
+    assert variant["status"] == "ok" and variant["valid_shapes"] == 3
+    assert variant["cute_vs_best"] == pytest.approx(1.5)
+    assert "cute_vs_triton" not in variant
+    # A record from a provider the run did not request is a corrupt run.
+    _, (_, triton, *_) = fixture_records(["triton"])
+    with pytest.raises(ValueError, match="did not request"):
+        aggregate(run, [*records, triton])
+    # Without baselines the best compared implementation is Triton's.
+    run, records = fixture_records(["cute", "triton"])
+    (variant,) = aggregate(run, records)["variants"]
+    assert (variant["cute_vs_triton"], variant["cute_vs_best"]) == (2.0, 2.0)
+    # A run without CuTe compares nothing against CuTe: rows are complete
+    # and carry their latencies, no speedup is defined.
+    run, records = fixture_records(["triton", "baselines"])
+    data = aggregate(run, records)
+    assert data["ratios"] == []
+    assert all(row["status"] == "ok" for row in data["shapes"])
+    assert data["variants"] == [
+        {
+            "variant": "add/00_forward",
+            "valid_shapes": 3,
+            "requested_shapes": 3,
+            "status": "ok",
+        }
+    ]
+    # A results.json from before the field compared exactly PROVIDERS, so it
+    # reports as a run of them.
+    run, records = fixture_records()
+    expected = aggregate(run, records)
+    del run["providers"]
+    assert aggregate(run, records) == expected
+    assert expected["ratios"] == ["cute_vs_triton", "cute_vs_best"]
+
+
 @pytest.mark.parametrize("corruption", ["nan", "zero", "correctness", "duplicate"])
 def test_invalid_results_are_rejected(corruption):
     run, records = fixture_records()
@@ -444,9 +820,16 @@ def test_invalid_results_are_rejected(corruption):
         aggregate(run, records)
 
 
-def test_report_reads_pinned_results_and_generates_matplotlib_chart(tmp_path):
+@pytest.mark.parametrize(
+    "providers",
+    [compare.PROVIDERS, ("cute", "baselines"), ("baselines",)],
+    ids=["all", "cute-baselines", "baselines-only"],
+)
+def test_report_reads_pinned_results_and_generates_matplotlib_chart(
+    providers, tmp_path
+):
     pytest.importorskip("matplotlib")
-    run, records = fixture_records()
+    run, records = fixture_records(providers)
     run["jobs"] = []
     for index, record in enumerate(records):
         path = tmp_path / f"{index}.json"
@@ -458,10 +841,29 @@ def test_report_reads_pinned_results_and_generates_matplotlib_chart(tmp_path):
     source = tmp_path / "results.json"
     source.write_text(json.dumps(run))
     report_results(source, tmp_path / "report")
-    assert (tmp_path / "report/speedups.png").read_bytes().startswith(b"\x89PNG")
     report = (tmp_path / "report/report.md").read_text()
-    assert "higher is better" in report
-    assert "Graph dispatch state of all 9 measured records: 16 eager" in report
+    measured = 3 * len(providers)
+    assert (
+        f"Graph dispatch state of all {measured} measured records: 16 eager" in report
+    )
+    assert "0 baseline jobs synchronize with the host" in report
+    table = [line for line in report.splitlines() if line.startswith("| add/")]
+    if "cute" in providers:
+        # The chart and the table carry one column per reported speedup.
+        png = tmp_path / "report/speedups.png"
+        assert png.read_bytes().startswith(b"\x89PNG")
+        assert "higher is better" in report
+        assert ("vs Triton" in report) is ("triton" in providers)
+        assert table == [
+            "| add/00_forward | 3/3 | 2.000× | 1.500× |"
+            if "triton" in providers
+            else "| add/00_forward | 3/3 | 1.500× |"
+        ]
+    else:
+        assert not (tmp_path / "report/speedups.png").exists()
+        assert "no CuTe speedups are reported" in report
+        assert table == ["| add/00_forward | 3/3 |"]
+    assert json.loads((tmp_path / "report/uncapturable.json").read_text()) == []
     (tmp_path / "0.json").write_text("{}")
     with pytest.raises(ValueError, match="hash changed"):
         report_results(source, tmp_path / "invalid")
@@ -555,6 +957,8 @@ def test_run_restricts_jobs_to_requested_cases(monkeypatch, tmp_path):
         modules="add",
         shapes="0",
         cases="01_backward",
+        providers="",
+        impls="",
         seed=1,
         gpu="0",
         repetitions=1,
@@ -565,6 +969,8 @@ def test_run_restricts_jobs_to_requested_cases(monkeypatch, tmp_path):
     record = json.loads((tmp_path / "run" / "results.json").read_text())
     assert record["status"] == "complete"
     assert record["cases"] == ["01_backward"]
+    assert record["providers"] == ["cute", "triton", "baselines"]
+    assert record["impls"] is None
     assert record["graph_state"].startswith("steady:")
     assert "graph_state" in record["timer"]
     assert sorted(launched) == [
@@ -574,6 +980,116 @@ def test_run_restricts_jobs_to_requested_cases(monkeypatch, tmp_path):
     ]
     # Every worker's session (inventory included) is reaped.
     assert len(reaped) == 4
+
+
+def test_run_filters_jobs_and_marks_a_crashed_baseline_unavailable(
+    monkeypatch, tmp_path
+):
+    from benchmarks.cute import compare_attention_backends
+
+    launched = []
+    inventory = {"status": "ok"}
+
+    def fake_popen(command, **kwargs):
+        option = dict(zip(command[3::2], command[4::2], strict=False))
+        result = {
+            "module": option["--module"],
+            "shape": int(option["--shape"]),
+            "case": option["--case"],
+            "provider": option["--provider"],
+            "impl": option["--impl"],
+            "status": "ok",
+        }
+        returncode = 0
+        if option["--provider"] == "inventory":
+            result["status"] = inventory["status"]
+            result["cases"] = [
+                {
+                    "name": "01_backward",
+                    "kernels": ["helion", "helion_fast"],
+                    "baselines": ["aten", "torch.compile"],
+                }
+            ]
+        else:
+            launched.append((option["--provider"], option["--impl"]))
+            # A worker that dies writes no record.
+            returncode = -11 if option["--impl"] in {"aten", "helion"} else 0
+        if returncode == 0:
+            Path(option["--output"]).write_text(json.dumps(result))
+        return SimpleNamespace(returncode=returncode, pid=-1, wait=lambda: 0)
+
+    monkeypatch.setattr(
+        compare.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1)
+    )
+    monkeypatch.setattr(compare.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(compare.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(compare, "check_gpu_idle", lambda gpu, **kwargs: "GPU-0")
+    monkeypatch.setattr(compare, "provenance", lambda gpu: {})
+    monkeypatch.setattr(
+        compare_attention_backends, "_git_source_snapshot", lambda *args: None
+    )
+    monkeypatch.delenv("HELION_BENCHMARK_GRAPH_WARMUP", raising=False)
+    args = SimpleNamespace(
+        modules="add",
+        shapes="0",
+        cases="",
+        providers="baselines,cute",
+        impls="aten,helion,torch.compile",
+        seed=1,
+        gpu="0",
+        repetitions=1,
+        output=tmp_path / "run",
+    )
+    compare.run(args)
+    record = json.loads((tmp_path / "run" / "results.json").read_text())
+    assert record["providers"] == ["baselines", "cute"]
+    assert record["impls"] == ["aten", "helion", "torch.compile"]
+    assert sorted(launched) == [
+        ("baselines", "aten"),
+        ("baselines", "torch.compile"),
+        ("cute", "helion"),
+    ]
+    statuses = {}
+    for job in record["jobs"][1:]:
+        row = json.loads((tmp_path / "run" / job["path"]).read_text())
+        statuses[(row["provider"], row["impl"])] = (
+            job["status"],
+            row.get("returncode"),
+        )
+    # A dead baseline worker is a baseline this machine cannot provide; a
+    # dead Helion worker is a failure.
+    assert statuses == {
+        ("baselines", "aten"): ("baseline_unavailable", -11),
+        ("baselines", "torch.compile"): ("ok", None),
+        ("cute", "helion"): ("process_error", -11),
+    }
+    args.providers, args.output = "quack", tmp_path / "rejected"
+    with pytest.raises(ValueError, match="--providers"):
+        compare.run(args)
+    # An implementation name no requested case offers is refused after the
+    # inventories, before any job runs.
+    args.providers, args.impls = "baselines,cute", "aten,helion_fastest"
+    args.output = tmp_path / "rejected_impl"
+    launched.clear()
+    with pytest.raises(ValueError, match=r"--impls .*\['helion_fastest'\]"):
+        compare.run(args)
+    assert launched == []
+    # So is a name the requested providers never draw: a baseline under
+    # `--providers cute` would otherwise pass validation and launch nothing.
+    args.providers, args.impls = "cute", "aten"
+    args.output = tmp_path / "rejected_provider_impl"
+    with pytest.raises(ValueError, match=r"--impls .*\['aten'\]"):
+        compare.run(args)
+    assert launched == []
+    # With every inventory failed there is nothing to check --impls against;
+    # the run completes with the inventory failures recorded.
+    inventory["status"] = "error"
+    args.output = tmp_path / "no_inventory"
+    compare.run(args)
+    record = json.loads((args.output / "results.json").read_text())
+    assert record["status"] == "complete"
+    assert [job["status"] for job in record["jobs"]] == ["error"]
+    assert launched == []
 
 
 def test_gpu_idle_check_waits_out_a_departing_process(monkeypatch):

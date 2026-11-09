@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_resident_sequence import (
+from helion._compiler.cute.autotune.heuristics.cute_resident_sequence import (
     CuteResidentSequenceHeuristic,
 )
 from helion._testing import import_example
@@ -37,7 +37,7 @@ def _forbid_cuda() -> Iterator[None]:
         mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):

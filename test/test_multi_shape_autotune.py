@@ -16,7 +16,7 @@ import torch
 
 import helion
 from helion import exc
-from helion._compiler.backend import TritonBackend
+from helion._compiler.triton.backend import TritonBackend
 from helion._testing import DEVICE
 from helion._testing import skipIfRefEager
 from helion.autotuner import PatternSearch
@@ -1364,7 +1364,11 @@ class TestMultiShapeSearchOrchestration(unittest.TestCase):
         search.kernel.format_kernel_decorator.return_value = "@helion.kernel(...)"
         search.kernel.get_cached_path.return_value = None
         search.benchmark_provider = SimpleNamespace(  # pyrefly: ignore [bad-assignment]
-            setup=Mock(), cleanup=Mock()
+            setup=Mock(),
+            cleanup=Mock(),
+            # ``NoConfigFound`` asks the provider whether the worker's compile
+            # deadline dropped every candidate (``BenchmarkProvider`` default).
+            compile_deadline_cascade=Mock(return_value=None),
         )
         search._prepare = Mock()  # type: ignore[method-assign]
         search._autotune = Mock(  # type: ignore[method-assign]

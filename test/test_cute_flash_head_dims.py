@@ -34,6 +34,7 @@ from helion._compiler.cute.attention_plan import FLASH_ASYMMETRIC_HEAD_DIM_PAIRS
 from helion._compiler.cute.attention_plan import flash_head_dim_supported
 from helion._compiler.cute.attention_plan import flash_head_dims_supported
 from helion._compiler.cute.attention_plan import flash_pair_head_dims_supported
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
 from helion._compiler.cute.flash_schedule import FlashScheduleError
 from helion._compiler.cute.flash_schedule import FlashScheduleSpec
 from helion._compiler.cute.flash_schedule import build_fa4_schedule
@@ -43,6 +44,7 @@ from helion._compiler.cute.flash_schedule import verify_flash_schedule
 from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import pairwise
 from helion._testing.cute_aux import cpu_codegen
 from helion._testing.cute_flash import bind_flash_kernel
@@ -523,6 +525,7 @@ def test_flex_render_staged_store_covers_the_tile(
     ) in code
 
 
+@onlyBackends(["cute"])
 class TestRenderPins(TestCase):
     """The 64 and 128 renders of the flex list walk: the device body is
     byte-identical to the commit before the head-dim widening except for two
@@ -1335,8 +1338,13 @@ def test_flex_list_walk_runs_on_the_cooperative_pair_above_128() -> None:
         # (the cell's autotune aborted on the uncovered ones).
         from helion.autotuner.config_generation import ConfigGeneration
 
-        fragments = spec._cute_flash_autotune_fragments()
-        assert ConfigGeneration(spec).flash_structural_coverage_uncovered_values() == []
+        fragments = _cute_flash_autotune_fragments(spec)
+        assert (
+            ConfigGeneration(
+                spec
+            ).extension.flash_structural_coverage_uncovered_values()
+            == []
+        )
     searched = {
         key: set(_active(fragment))
         for key, fragment in fragments.items()
@@ -1773,7 +1781,7 @@ def test_cooperative_pair_cell_space_enumerates_under_the_qualification_floor() 
     exhausted (an unenumerated space left the lanes "incomplete" and aborted
     the autotune of the cell)."""
     from helion.autotuner.config_generation import ConfigGeneration
-    from helion.autotuner.surrogate_pattern_search import _FLASH_EXACT_SPACE_RAW_FLOOR
+    from helion.autotuner.surrogate_pattern_search import FLASH_EXACT_SPACE_RAW_FLOOR
 
     torch.manual_seed(0)
     q, k, v = (torch.randn(4, 8, 4096, 256, dtype=torch.bfloat16) for _ in range(3))
@@ -1781,14 +1789,14 @@ def test_cooperative_pair_cell_space_enumerates_under_the_qualification_floor() 
     with cpu_codegen():
         bound = _dense_causal_attention.bind((q, k, v))
         gen = ConfigGeneration(bound.config_spec)
-        assert gen.flash_structural_coverage_uncovered_values() == []
-        space = gen.flash_exact_effective_search_space_configs(
-            _FLASH_EXACT_SPACE_RAW_FLOOR
+        assert gen.extension.flash_structural_coverage_uncovered_values() == []
+        space = gen.extension.exact_effective_search_space_configs(
+            FLASH_EXACT_SPACE_RAW_FLOOR
         )
     assert space is not None
     families = {c.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] for c in space}
     assert families == {"ws_2cta", "ws_overlap"}
-    assert 30 <= len(space) <= _FLASH_EXACT_SPACE_RAW_FLOOR
+    assert 30 <= len(space) <= FLASH_EXACT_SPACE_RAW_FLOOR
 
 
 def test_mixed_pair_surface_pins_the_score_stage() -> None:
@@ -1969,15 +1977,15 @@ def test_d256_causal_pair_cell_identities_render_distinct_texts(chunk: str) -> N
     group's strategy names does not occur. Each case renders one chunk of
     the space (``_D256_PAIR_CELL_CHUNKS``) and checks the chunk's markers."""
     from helion.autotuner.config_generation import ConfigGeneration
-    from helion.autotuner.surrogate_pattern_search import _FLASH_EXACT_SPACE_RAW_FLOOR
+    from helion.autotuner.surrogate_pattern_search import FLASH_EXACT_SPACE_RAW_FLOOR
 
     arg_key = (4, 8, 4096, 256, torch.bfloat16)
     make_args = functools.partial(_dense_args, 4, 8, 4096, 256)
     bound = bind_flash_kernel(_dense_causal_attention, arg_key, make_args)
     with cpu_codegen():
         gen = ConfigGeneration(bound.config_spec)
-        space = gen.flash_exact_effective_search_space_configs(
-            _FLASH_EXACT_SPACE_RAW_FLOOR
+        space = gen.extension.exact_effective_search_space_configs(
+            FLASH_EXACT_SPACE_RAW_FLOOR
         )
         assert space is not None
         identities: dict[tuple[tuple[str, str], ...], helion.Config] = {}

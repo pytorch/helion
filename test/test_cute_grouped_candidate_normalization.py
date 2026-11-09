@@ -12,18 +12,17 @@ batch (the after4 grouped_gemm s2 failure).
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from test.test_cute_grouped_coverage_search import _target
+from test.cute_population_contracts import tcgen05_mma_support
 
 import helion
 from helion import exc
+from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import mock_cuda_unavailable
 
 grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
@@ -43,11 +42,7 @@ REALLOCATION_KEY = "tcgen05_warp_register_reallocation"
 def _cpu_only() -> Generator[None, None, None]:
     old_threads = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        _target(),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
     torch.set_num_threads(old_threads)
 

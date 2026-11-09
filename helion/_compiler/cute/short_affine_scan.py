@@ -35,6 +35,7 @@ from ...language import memory_ops
 from ...language import view_ops
 from ...language.matmul_ops import _static_dim_value
 from ..compile_environment import CompileEnvironment
+from .analysis.match_common import binary_pair
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -287,20 +288,6 @@ def _freeze_access_value(value: object) -> object:
     return value
 
 
-def _binary_pair(
-    node: object, targets: frozenset[object]
-) -> tuple[object, object] | None:
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.op != "call_function"
-        or node.target not in targets
-        or len(node.args) != 2
-        or node.kwargs
-    ):
-        return None
-    return node.args[0], node.args[1]
-
-
 def _transparent_source(
     node: object,
 ) -> tuple[torch.fx.Node, tuple[torch.fx.Node, ...]] | None:
@@ -466,7 +453,7 @@ def _match_reduction_product(
     if matched_sum is None:
         return None
     product, owned = matched_sum
-    pair = _binary_pair(product, _MUL_TARGETS)
+    pair = binary_pair(product, _MUL_TARGETS)
     if pair is None:
         return None
     for maybe_matrix, maybe_vector_view in (pair, pair[::-1]):
@@ -487,7 +474,7 @@ def _unwrap_optional_scale(
 ) -> tuple[torch.fx.Node, object, frozenset[torch.fx.Node]] | None:
     if not _is_fp32_shape(node, (rows,)):
         return None
-    pair = _binary_pair(node, _MUL_TARGETS)
+    pair = binary_pair(node, _MUL_TARGETS)
     if pair is not None:
         for value, scale in (pair, pair[::-1]):
             if isinstance(value, torch.fx.Node) and _is_scalar(scale):
@@ -516,7 +503,7 @@ def _match_factored_observation(
     rows: int,
     features: int,
 ) -> tuple[torch.fx.Node, torch.fx.Node, frozenset[torch.fx.Node]] | None:
-    outer = _binary_pair(node, _ADD_TARGETS)
+    outer = binary_pair(node, _ADD_TARGETS)
     if outer is None:
         return None
     for base_sum, scaled_sum in (outer, outer[::-1]):
@@ -526,7 +513,7 @@ def _match_factored_observation(
             continue
         observation_vector, _, base_owned = base
         scaled_product, scaled_owned = scaled
-        scaled_pair = _binary_pair(scaled_product, _MUL_TARGETS)
+        scaled_pair = binary_pair(scaled_product, _MUL_TARGETS)
         if scaled_pair is None:
             continue
         dot_sum_view: torch.fx.Node | None = None
@@ -558,7 +545,7 @@ def _match_factored_observation(
         ):
             expanded_owned.add(dot_product)
             dot_product = dot_product.args[0]
-        dot_pair = _binary_pair(dot_product, _MUL_TARGETS)
+        dot_pair = binary_pair(dot_product, _MUL_TARGETS)
         if dot_pair is None:
             continue
         observation_view = next(
@@ -669,7 +656,7 @@ def _match_step(
     state, state_cast_nodes = converted
     if not _is_fp32_shape(state, (rows, features)):
         return None
-    update_pair = _binary_pair(state, _ADD_TARGETS)
+    update_pair = binary_pair(state, _ADD_TARGETS)
     if update_pair is None:
         return None
 
@@ -678,8 +665,8 @@ def _match_step(
             outer, torch.fx.Node
         ):
             continue
-        decay_pair = _binary_pair(decayed, _MUL_TARGETS)
-        outer_pair = _binary_pair(outer, _MUL_TARGETS)
+        decay_pair = binary_pair(decayed, _MUL_TARGETS)
+        outer_pair = binary_pair(outer, _MUL_TARGETS)
         if decay_pair is None or outer_pair is None:
             continue
         diagonal: torch.fx.Node | None = None
@@ -736,7 +723,7 @@ def _match_step(
         assert vector_view_nodes is not None
         assert update_vector_view is not None
 
-        scaled_residual = _binary_pair(row_update, _MUL_TARGETS)
+        scaled_residual = binary_pair(row_update, _MUL_TARGETS)
         if scaled_residual is None:
             continue
         residual: torch.fx.Node | None = None
@@ -747,7 +734,7 @@ def _match_step(
         ):
             if (
                 isinstance(maybe_residual, torch.fx.Node)
-                and _binary_pair(maybe_residual, _SUB_TARGETS) is not None
+                and binary_pair(maybe_residual, _SUB_TARGETS) is not None
                 and _is_scalar(maybe_scale)
             ):
                 residual = maybe_residual
@@ -755,7 +742,7 @@ def _match_step(
                 break
         if residual is None or update_scale is None:
             continue
-        difference = _binary_pair(residual, _SUB_TARGETS)
+        difference = binary_pair(residual, _SUB_TARGETS)
         assert difference is not None
         row_input, prediction = difference
         if (

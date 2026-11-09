@@ -12,13 +12,12 @@ from .test_cute_bounded_loop_cache import SOURCE
 from .test_cute_bounded_loop_cache import _execute
 from .test_cute_bounded_loop_cache import _prepare
 import helion
-from helion._compiler.autotuner_heuristics.cute_bounded_loop_cache import (
+from helion._compiler.cute.autotune.heuristics.cute_bounded_loop_cache import (
     CuteBoundedLoopCacheHeuristic,
 )
 from helion._compiler.cute.bounded_loop_cache import attach_variant
 from helion._compiler.cute.bounded_loop_cache import cache_single_tile_loads
 from helion._compiler.cute.bounded_loop_cache import specialize_single_tile_sweeps
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
@@ -179,7 +178,6 @@ def name_collision(
     return out
 
 
-@skipUnlessBackends(["cute"])
 def test_real_bound_unused_host_argument_cannot_replace_fast_kernel():
     with _cpu_target():
         kernel = helion.kernel(

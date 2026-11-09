@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-from contextlib import ExitStack
 import dataclasses
 import hashlib
 import inspect
@@ -16,6 +15,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test.cute_population_contracts import _cpu_target
 from test.cute_population_contracts import with_flat_min_blocks_default
 
 import helion
@@ -23,10 +23,11 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.mma_support import CuteMmaSupport
 from helion._compiler.cute.promote_output_axis import _access_tensor
+from helion._compiler.cute.state import cute_env_state
+from helion._compiler.cute.target_facts import TargetFacts
 from helion._compiler.device_ir import ForLoopGraphInfo
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.precompile_future import SerializedCompiledFunction
 from helion.autotuner.precompile_future import _load_compiled_fn
@@ -406,28 +407,15 @@ def _transposed_row_read(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _cpu_target() -> ExitStack:
-    stack = ExitStack()
-    for name, value in (
-        ("helion.runtime.kernel.target_device_capability", (10, 0)),
-        ("helion._compiler.compile_environment.target_device_capability", (10, 0)),
-        ("helion.runtime.get_num_sm", 148),
-        ("helion._compat._is_hip", False),
-    ):
-        stack.enter_context(patch(name, return_value=value))
-    return stack
-
-
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Generator[None, None, None]:
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     # Hardware specialization also runs for CPU arguments. Keep these target
-    # mocks independent of whether this pytest worker can see a real GPU.
-    with (
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU use forbidden")),
-    ):
+    # mocks independent of whether this pytest worker can see a real GPU.  No
+    # device facts are modelled here: tests that need the B200 model enter
+    # ``_cpu_target()`` themselves.
+    with cpu_render_target(TargetFacts()):
         yield
     torch.set_num_threads(previous_threads)
 
@@ -599,14 +587,13 @@ def _run_reference(
 
 
 @pytest.mark.parametrize("static_shapes", [False, True])
-@skipUnlessBackends(["cute"])
 def test_fission_gives_each_stage_independent_axis_and_config_slots(
     static_shapes: bool,
 ) -> None:
     bound = _bind(
         squeeze_and_excitation_net_fwd, *_se_args(), static_shapes=static_shapes
     )
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     ir = bound.host_function.device_ir
     assert ir.grid_block_ids == [[0, 1], [3, 4]]
     assert [
@@ -651,7 +638,6 @@ def test_fission_gives_each_stage_independent_axis_and_config_slots(
 @pytest.mark.parametrize(
     "pid_type", ["flat", "persistent_blocked", "persistent_interleaved", "xyz"]
 )
-@skipUnlessBackends(["cute"])
 def test_codegen_isolates_stages_and_inactive_reductions(pid_type: str) -> None:
     bound = _bind(squeeze_and_excitation_net_fwd, *_se_args())
     with _cpu_target():
@@ -670,7 +656,6 @@ def test_codegen_isolates_stages_and_inactive_reductions(pid_type: str) -> None:
     assert "torch.empty(" in source
 
 
-@skipUnlessBackends(["cute"])
 def test_generated_wrapper_preserves_shared_allocations_order_and_compile_cache() -> (
     None
 ):
@@ -738,13 +723,12 @@ def test_generated_wrapper_preserves_shared_allocations_order_and_compile_cache(
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(32, 64, 16), (13, 37, 19)])
-@skipUnlessBackends(["cute"])
 def test_cpu_reference_preserves_materialization_with_independent_tiles(
     dtype: torch.dtype, shape: tuple[int, int, int]
 ) -> None:
     args = _se_args(shape, dtype)
     bound = _bind(squeeze_and_excitation_net_fwd, *args)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     expected = _run_reference(bound, args, False)
     actual = _run_reference(bound, args, True)
     for value, reference in zip(actual, expected, strict=True):
@@ -755,11 +739,10 @@ def test_cpu_reference_preserves_materialization_with_independent_tiles(
     assert actual[0] is not actual[1] and actual[1] is not actual[2]
 
 
-@skipUnlessBackends(["cute"])
 def test_general_pointwise_program_and_default_arguments() -> None:
     x = torch.randn(13, 37)
     bound = _bind(_pointwise_pair, x, 2)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     out, middle = _run_reference(bound, (x, 2), True)
     torch.testing.assert_close(middle, x + 1)
     torch.testing.assert_close(out, (x + 1) * 2)
@@ -793,14 +776,13 @@ def test_general_pointwise_program_and_default_arguments() -> None:
         _masked_producer,
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_rejects_unsafe_fission_and_leaves_original_structure(
     kernel: Kernel[Any],
 ) -> None:
     x = torch.empty(13, 37)
     original = _bind(kernel, x, enabled=False)
     candidate = _bind(kernel, x, enabled=True)
-    assert candidate.env.cute_fission_plan is None
+    assert cute_env_state(candidate.env).fission_plan is None
     assert (
         candidate.host_function.device_ir.grid_block_ids
         == original.host_function.device_ir.grid_block_ids
@@ -810,7 +792,6 @@ def test_rejects_unsafe_fission_and_leaves_original_structure(
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_opt_in_and_reference_mode_do_not_run_analysis_by_default() -> None:
     assert not Settings(cute_region_fission=False).cute_region_fission
     with patch(
@@ -818,7 +799,7 @@ def test_opt_in_and_reference_mode_do_not_run_analysis_by_default() -> None:
         side_effect=AssertionError("unexpected analysis"),
     ):
         bound = _bind(_pointwise_pair, torch.empty(13, 37), 2, enabled=False)
-        assert bound.env.cute_fission_plan is None
+        assert cute_env_state(bound.env).fission_plan is None
         reference = helion.kernel(
             backend="cute", cute_region_fission=True, ref_mode=RefMode.EAGER
         )(_pointwise_pair.fn)
@@ -828,7 +809,6 @@ def test_opt_in_and_reference_mode_do_not_run_analysis_by_default() -> None:
 
 @pytest.mark.parametrize("region_enabled", [False, True])
 @pytest.mark.parametrize("operand_enabled", [False, True])
-@skipUnlessBackends(["cute"])
 def test_planners_respect_independent_opt_outs(
     region_enabled: bool, operand_enabled: bool
 ) -> None:
@@ -851,22 +831,19 @@ def test_planners_respect_independent_opt_outs(
         ) as region_planner,
     ):
         bound = kernel._bind_isolated((torch.empty(13, 37), 2))
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
     assert operand_planner.call_count == int(operand_enabled)
     assert region_planner.call_count == int(region_enabled)
 
 
-@skipUnlessBackends(["cute"])
 def test_second_gemm_exposes_tcgen05_search_after_fission() -> None:
-    support = CuteMmaSupport(
-        universal=True, warp_f16bf16=True, warpgroup_f16bf16=True, tcgen05_f16bf16=True
-    )
+    support = CuteMmaSupport(universal=True, warp_f16bf16=True, tcgen05_f16bf16=True)
     with patch(
         "helion._compiler.cute.mma_support.get_cute_mma_support", return_value=support
     ):
         bound = _bind(squeeze_and_excitation_net_fwd, *_se_args((128, 256, 64)))
-    assert bound.env.cute_fission_plan is not None
-    assert bound.config_spec.cute_tcgen05_search_enabled
+    assert cute_env_state(bound.env).fission_plan is not None
+    assert bound.config_spec.tcgen05.search_enabled
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -878,13 +855,10 @@ def test_second_gemm_exposes_tcgen05_search_after_fission() -> None:
         ((2048, 512, 64), "persistent_interleaved"),
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_tcgen05_codegen_preserves_second_stage_wrapper_metadata(
     shape: tuple[int, int, int], pid_type: str, dtype: torch.dtype
 ) -> None:
-    support = CuteMmaSupport(
-        universal=True, warp_f16bf16=True, warpgroup_f16bf16=True, tcgen05_f16bf16=True
-    )
+    support = CuteMmaSupport(universal=True, warp_f16bf16=True, tcgen05_f16bf16=True)
     with (
         _cpu_target(),
         patch(
@@ -895,7 +869,7 @@ def test_tcgen05_codegen_preserves_second_stage_wrapper_metadata(
             "helion._compiler.cute.cute_mma.get_cute_mma_support", return_value=support
         ),
         patch(
-            "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_budget_bytes",
+            "helion._compiler.cute.target_facts.per_cta_smem_budget_bytes",
             return_value=232448,
         ),
     ):
@@ -917,7 +891,7 @@ def test_tcgen05_codegen_preserves_second_stage_wrapper_metadata(
     assert "cute.gemm(" not in stages[0]
     assert "cute.gemm(" in stages[1]
     assert "tcgen05_ab_tma" in stages[1]
-    plans = bound.env.cute_resolved_wrapper_plans
+    plans = cute_env_state(bound.env).resolved_wrapper_plans
     assert (plans[0]["lhs_idx"], plans[0]["rhs_idx"]) == (0, 1)
     if shape != (73, 88, 56):
         assert [plan["kind"] for plan in plans] == [
@@ -953,7 +927,6 @@ def test_tcgen05_codegen_preserves_second_stage_wrapper_metadata(
     assert "indices_3" not in stages[1] and "indices_4" not in stages[1]
 
 
-@skipUnlessBackends(["cute"])
 def test_forwarding_keeps_the_materialized_cast_and_store() -> None:
     cases = (
         (squeeze_and_excitation_net_fwd, _se_args()),
@@ -993,11 +966,8 @@ def test_forwarding_keeps_the_materialized_cast_and_store() -> None:
         )
 
 
-@skipUnlessBackends(["cute"])
 def test_paired_m_subtiles_reject_multioutput_lifecycle() -> None:
-    support = CuteMmaSupport(
-        universal=True, warp_f16bf16=True, warpgroup_f16bf16=True, tcgen05_f16bf16=True
-    )
+    support = CuteMmaSupport(universal=True, warp_f16bf16=True, tcgen05_f16bf16=True)
     inputs = (
         torch.empty((1024, 128), dtype=torch.bfloat16),
         torch.empty((128, 256), dtype=torch.bfloat16),
@@ -1012,7 +982,7 @@ def test_paired_m_subtiles_reject_multioutput_lifecycle() -> None:
             "helion._compiler.cute.cute_mma.get_cute_mma_support", return_value=support
         ),
         patch(
-            "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_budget_bytes",
+            "helion._compiler.cute.target_facts.per_cta_smem_budget_bytes",
             return_value=232448,
         ),
     ):
@@ -1036,14 +1006,13 @@ def test_paired_m_subtiles_reject_multioutput_lifecycle() -> None:
 @pytest.mark.parametrize(
     "kernel", [_reload_feeds_dot, _reload_feeds_dot_after_pointwise]
 )
-@skipUnlessBackends(["cute"])
 def test_forwarding_retains_zero_padded_reload_before_dot(kernel: Kernel[Any]) -> None:
     args = (
         torch.ones((13, 19), dtype=torch.float16),
         torch.ones((19, 19), dtype=torch.float16),
     )
     bound = _bind(kernel, *args)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     ir = bound.host_function.device_ir
     root = ir.graphs[ir.root_ids[1]].graph
     stores = [node for node in root.nodes if node.target is memory_ops.store]
@@ -1063,7 +1032,6 @@ def test_forwarding_retains_zero_padded_reload_before_dot(kernel: Kernel[Any]) -
     assert torch.isfinite(reloaded @ padded)
 
 
-@skipUnlessBackends(["cute"])
 def test_load_hints_keep_global_positions_across_stages() -> None:
     bound = _bind(squeeze_and_excitation_net_fwd, *_se_args(dtype=torch.float32))
     config = helion.Config(
@@ -1086,7 +1054,6 @@ def test_load_hints_keep_global_positions_across_stages() -> None:
     assert policies == [{"streaming"}, {"last"}]
 
 
-@skipUnlessBackends(["cute"])
 def test_subprocess_roundtrip_and_cleanup_cover_every_stage(tmp_path: Path) -> None:
     bound = _bind(_pointwise_pair, torch.empty(13, 37), 2)
     with _cpu_target():
@@ -1119,7 +1086,6 @@ def test_subprocess_roundtrip_and_cleanup_cover_every_stage(tmp_path: Path) -> N
         assert not marker._helion_cute_launch_arg_cache
 
 
-@skipUnlessBackends(["cute"])
 def test_analysis_does_not_repeat_opaque_host_callbacks() -> None:
     x = torch.empty(13, 37)
     _allocation_calls.clear()
@@ -1128,14 +1094,13 @@ def test_analysis_does_not_repeat_opaque_host_callbacks() -> None:
     assert original_count > 0
     _allocation_calls.clear()
     candidate = _bind(_opaque_host_callback, x, enabled=True)
-    assert candidate.env.cute_fission_plan is None
+    assert cute_env_state(candidate.env).fission_plan is None
     assert len(_allocation_calls) == original_count
 
 
-@skipUnlessBackends(["cute"])
 def test_rejects_input_rows_broadcast_on_a_different_axis() -> None:
     bound = _bind(_transposed_row_read, torch.empty(32, 32))
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
 
 
 def test_single_kernel_cache_helpers_keep_legacy_behavior() -> None:

@@ -55,6 +55,7 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
+from ..emitter_protocols import statements_adapter
 from .flash_schedule import FlashScheduleSpec
 from .flash_schedule import build_fa4_alt_schedule
 from .flash_schedule import verify_flash_schedule
@@ -836,3 +837,6 @@ def emit_flash_fa4_alt_device_body(
     _item_loop_tail(s, 4)
     s.line(4, "_helion_flash_rt.named_barrier_arrive_unaligned(2, 14 * 32)")
     return list(ast.parse(s.text()).body)
+
+
+emit_flash_fa4_alt_body = statements_adapter(emit_flash_fa4_alt_device_body)

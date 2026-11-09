@@ -115,7 +115,7 @@ class PatternSearch(PopulationBasedSearch):
         # A CuTe flash surface measures one parent row per structural leaf;
         # a profile population below that count (``quick`` on the widest
         # small-grid surface) is raised here rather than for every kernel.
-        self.initial_population = self.config_gen.flash_population_floor(
+        self.initial_population = self.config_gen.extension.population_floor(
             initial_population
         )
         self.num_neighbors_cap = num_neighbors_cap
@@ -238,16 +238,18 @@ class PatternSearch(PopulationBasedSearch):
                 )
             )
             if config_gen.config_spec.cute_flash_search_enabled:
-                design = config_gen.flash_deterministic_population_configs()
+                design = config_gen.extension.deterministic_population_configs()
                 population_target = max(0, self.initial_population)
                 budget = min(
                     population_target,
-                    config_gen.flash_structural_population_budget(population_target),
+                    config_gen.extension.structural_population_budget(
+                        population_target
+                    ),
                     len(design),
                 )
                 qualification_count = min(
                     budget,
-                    config_gen.flash_structural_qualification_prefix_count(),
+                    config_gen.extension.structural_qualification_prefix_count(),
                 )
                 pinned: list[FlatConfig] = []
                 optional: list[FlatConfig] = []
@@ -278,8 +280,10 @@ class PatternSearch(PopulationBasedSearch):
                 ]
                 exact_space = None
                 if population_target > 0:
-                    exact_space = config_gen.flash_exact_effective_search_space_configs(
-                        population_target
+                    exact_space = (
+                        config_gen.extension.exact_effective_search_space_configs(
+                            population_target
+                        )
                     )
                     if exact_space is not None:
                         required.extend(

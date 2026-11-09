@@ -18,7 +18,9 @@ import pytest
 import torch
 
 import helion
+from helion._testing import EXAMPLES_DIR
 from helion._testing import import_example
+from helion._testing import import_path
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 
@@ -54,7 +56,6 @@ def _bind(fn, config: helion.Config, args: tuple[object, ...], *, backend: str):
     return cpu_bind(kernel, args)
 
 
-@skipUnlessBackends(["cute"])
 def test_backward_decorator_config_normalizes_onto_the_pin(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -84,7 +85,6 @@ def test_backward_decorator_config_normalizes_onto_the_pin(
     assert spec.shrink_block_sizes_once(normalized) is None
 
 
-@skipUnlessBackends(["cute"])
 def test_forward_decorator_config_normalizes_onto_the_pin() -> None:
     bound = _bind(
         attention.fn,
@@ -101,6 +101,31 @@ def test_forward_decorator_config_normalizes_onto_the_pin() -> None:
     # Too-large tiles normalize down onto the pin as well.
     big = bound._normalized_config_copy(helion.Config(block_sizes=[2, 256, 256]))
     assert big.block_sizes == [1, 128, 128]
+    assert "'kind': 'helion_flash'" in bound.to_code(config)
+
+
+def test_flattened_rows_forward_config_normalizes_onto_the_pin() -> None:
+    """``examples/blackwell_attention.py``'s forward tiles ``B*H*M`` rows on
+    one root axis: the fused surface pins its two blocks to 128."""
+    example = import_path(EXAMPLES_DIR / "blackwell_attention.py")
+    bound = _bind(
+        example.blackwell_attention_kernel.fn,
+        helion.Config(
+            block_sizes=[64, 64],
+            num_warps=4,
+            _triton_range_id_data_partition_factor=0,
+            _triton_range_value_data_partition_factor=2,
+            _triton_config_maxRegAutoWS=152,
+        ),
+        (*_forward_args((1, 2, 256, 64)), 0.125),
+        backend="cute",
+    )
+    spec = bound.config_spec
+    assert spec.cute_flash_search_enabled
+    assert [s.structural_pin for s in spec.block_sizes] == [128, 128]
+    config = bound._implicit_config()
+    assert config is not None
+    assert bound._normalized_config_copy(config).block_sizes == [128, 128]
     assert "'kind': 'helion_flash'" in bound.to_code(config)
 
 

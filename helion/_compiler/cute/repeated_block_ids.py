@@ -20,10 +20,10 @@ from ...language._tracing_ops import _host_tensor
 from ...language.memory_ops import load
 from ...language.memory_ops import store
 from ..compile_environment import CompileEnvironment
+from ..matmul_utils import matmul_operand_indices
 from .completed_matmul_sum import match_matmul_sum_path
 from .cute_reshape import CUTE_DIM_LOCAL_COORD_META
 from .matmul_utils import _CUTE_RHS_VIEW_PASSTHROUGH_TARGETS
-from .matmul_utils import _cute_matmul_operand_indices
 
 if TYPE_CHECKING:
     from torch.fx.node import Node
@@ -150,14 +150,14 @@ def _is_matmul_operand_load(node: Node) -> bool:
     load node itself would produce is never consumed.  A repeated id in the
     matmul *result* is still caught here.  The ``acc`` / scale operands have
     no such re-read, so only the lhs/rhs argument slots of
-    ``_cute_matmul_operand_indices`` qualify.
+    ``matmul_operand_indices`` qualify.
     """
     if (
         node.target is not load
         and node.target not in _CUTE_RHS_VIEW_PASSTHROUGH_TARGETS
     ):
         return False
-    operand_indices = _cute_matmul_operand_indices()
+    operand_indices = matmul_operand_indices()
     stack = [node]
     while stack:
         current = stack.pop()

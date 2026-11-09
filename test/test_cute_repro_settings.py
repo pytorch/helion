@@ -3,12 +3,11 @@ from __future__ import annotations
 import ast
 import json
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_flatten_nested_reductions import _joint_sum
 from test.test_cute_full_slice_matmul import _matmul
 from test.test_cute_graph_cse import _softmax_pair
@@ -16,9 +15,10 @@ from test.test_cute_materialized_fission import _se_args
 from test.test_cute_shared_rhs_grouped import _offset_mm
 
 import helion
+from helion._compiler.cute.state import cute_env_state
+from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
-from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.runtime.settings import Settings
 
@@ -59,14 +59,8 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.delenv("HELION_BACKEND", raising=False)
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        _target(),
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
+    with cpu_render_target(
+        mma_support=tcgen05_mma_support(), reduction_smem_budget_bytes=232448
     ):
         yield
     torch.set_num_threads(previous_threads)
@@ -183,7 +177,7 @@ def test_structural_binding_and_config_roundtrip(
         **switches,
     )._bind_isolated(args)
     if marker == "fission":
-        assert (bound.env.cute_fission_plan is not None) == enabled
+        assert (cute_env_state(bound.env).fission_plan is not None) == enabled
     else:
         assert (marker in _host(bound)) == enabled
     _check_roundtrip(
@@ -353,7 +347,7 @@ def test_materialized_composed_structural_settings_roundtrip(
         autotune_effort="none",
         **switches,
     )._bind_isolated(args)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     assert "_helion_fullslice_k" in _host(bound)
     _check_roundtrip(bound, args, monkeypatch, conflicting_environment=True)
 

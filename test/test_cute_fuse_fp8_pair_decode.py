@@ -22,6 +22,7 @@ import pytest
 from helion._compiler.cute.fuse_fp8_pair_decode import fuse_fp8_pair_decode
 from helion._testing import TestCase
 
+# Pure-AST tests: they run on every backend row.
 pytestmark = pytest.mark.cpu_only
 
 

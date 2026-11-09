@@ -32,9 +32,9 @@ from helion.runtime.cached_kernel import _guard_extractor
 from helion.runtime.kernel import BoundKernel
 from helion.runtime.kernel import Kernel
 from helion.runtime.kernel import KernelCompiler
+from helion.runtime.kernel import PreparedMetadataSpecializationExtractor
 from helion.runtime.kernel import PyCodeCache
 from helion.runtime.kernel import _GuardedInputFact
-from helion.runtime.kernel import _PreparedMetadataSpecializationExtractor
 
 _CONFIG = helion.Config(block_sizes=[32])
 
@@ -509,7 +509,7 @@ class TestGeneratedCodeDispatch(TestCase):
         kernel = self._kernel(_specialized_rows)
         original = BoundKernel._guarded_input_facts
         rows = sympy.Symbol("rows")
-        rows_fact = _PreparedMetadataSpecializationExtractor(
+        rows_fact = PreparedMetadataSpecializationExtractor(
             _GuardedInputFact.create(
                 rows,
                 sympy.Integer(1),
@@ -620,7 +620,7 @@ class TestGeneratedCodeDispatch(TestCase):
             self.assertEqual(guard[0], "fact")
             self.assertTrue(cache._valid_guard(guard))
             rebuilt = _guard_extractor(guard, names)
-            self.assertEqual(rebuilt, _PreparedMetadataSpecializationExtractor(fact))
+            self.assertEqual(rebuilt, PreparedMetadataSpecializationExtractor(fact))
             for x in inputs:
                 self.assertEqual(rebuilt((x, 2)), fact((x, 2)))
         # An expression over sizes has no serialized form.

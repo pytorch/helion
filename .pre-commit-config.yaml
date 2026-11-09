@@ -27,6 +27,12 @@ repos:
       # Run the linter.
       - id: ruff
         args: [--fix]
+      # The linter with ruff's unsafe fixes as well; only `./lint.sh unsafe`
+      # runs it (manual stage).
+      - id: ruff
+        alias: ruff-unsafe
+        args: [--fix, --unsafe-fixes]
+        stages: [manual]
       # Run the formatter.
       - id: ruff-format
 
@@ -42,6 +48,12 @@ repos:
         entry: python scripts/lint_no_hardcoded_device.py
         language: system
         files: ^(?:examples|test)/.*\.py$
+      - id: check-backend-isolation
+        name: core and sibling backends must not name the CuTe backend
+        entry: python scripts/check_backend_isolation.py --strict
+        language: system
+        pass_filenames: false
+        files: ^(helion/.*\.py|scripts/check_backend_isolation\.py)$
 
 -   repo: https://github.com/codespell-project/codespell
     rev: v2.4.2

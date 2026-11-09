@@ -15,21 +15,24 @@ from helion import exc
 from helion._compiler.ast_extension import ExtendedAST
 from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.cute import direct_affine_lowering as lowering
-from helion._compiler.cute import direct_affine_replay as replay_impl
+from helion._compiler.cute import direct_affine_templates as templates_impl
 from helion._compiler.cute.direct_affine_plan import DirectAffineCoefficientLayout
 from helion._compiler.cute.direct_affine_plan import DirectAffineMma
 from helion._compiler.cute.direct_affine_plan import DirectAffinePhaseOrder
 from helion._compiler.cute.direct_affine_plan import DirectAffineStateAccessProof
 from helion._compiler.cute.direct_affine_plan import DirectAffineStateIngress
 from helion._compiler.cute.direct_affine_plan import resolve_direct_affine_plan
-from helion._compiler.cute.direct_affine_replay import DirectAffineCoordinates
-from helion._compiler.cute.direct_affine_replay import DirectAffineEffectReplay
-from helion._compiler.cute.direct_affine_replay import DirectAffineOrdinaryAxis
-from helion._compiler.cute.direct_affine_replay import DirectAffineReplayBindings
-from helion._compiler.cute.direct_affine_replay import DirectAffineResolvedTemplates
-from helion._compiler.cute.direct_affine_replay import DirectAffineStateStoreReplay
-from helion._compiler.cute.direct_affine_replay import DirectAffineStepReplay
-from helion._compiler.cute.direct_affine_replay import DirectAffineValueReplay
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineCoordinates
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineEffectReplay
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineOrdinaryAxis
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineReplayBindings
+from helion._compiler.cute.direct_affine_replay_core import (
+    DirectAffineResolvedTemplates,
+)
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineStateStoreReplay
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineStepReplay
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineValueReplay
+from helion._compiler.cute.state import CuteCodegenState
 from helion._compiler.device_function import TensorArg
 from helion._testing import DEVICE
 from helion._testing import skipUnlessCuteAvailable
@@ -110,7 +113,9 @@ class _CoordinateCodegen:
             row: _expression("_BLOCK_SIZE_10"),
             feature: _expression("ordinary_feature"),
         }
-        self.cute_synthetic_arange_axis_sizes = {0: 32} if synthetic_feature else {}
+        self.backend_state = CuteCodegenState(
+            synthetic_arange_axis_sizes={0: 32} if synthetic_feature else {}
+        )
         if synthetic_feature:
             self.device_function = SimpleNamespace(
                 tile_strategy=SimpleNamespace(block_id_to_strategy=_BlockStrategies())
@@ -200,7 +205,9 @@ def _axis_source_case(*, free_feature: bool = False) -> tuple[Any, Any, Any, Any
         )
     codegen = SimpleNamespace(
         device_function=device_function,
-        cute_synthetic_arange_axis_sizes={0: 32} if free_feature else {},
+        backend_state=CuteCodegenState(
+            synthetic_arange_axis_sizes={0: 32} if free_feature else {}
+        ),
         codegen_result_for_node=lambda node: (
             True,
             _expression("ordinary_feature" if node is feature else "_BLOCK_SIZE_10"),
@@ -431,7 +438,7 @@ def test_output_ownership_is_discharged_but_semantic_guard_is_preserved() -> Non
         "    output(ordinary_row).store(logical_value)",
     )
 
-    normalized = replay_impl._validate_direct_affine_templates(
+    normalized = templates_impl._validate_direct_affine_templates(
         templates,
         cast("Any", replay),
         _plan(),
@@ -480,7 +487,7 @@ def test_output_ownership_rejects_missing_or_non_dominating_guard(
     coordinates = _coordinates()
     templates = _templates(output_source)
     assert (
-        replay_impl._validate_direct_affine_templates(
+        templates_impl._validate_direct_affine_templates(
             templates,
             cast("Any", replay),
             _plan(),
@@ -739,7 +746,7 @@ def test_fixed_rank1_t3_real_codegen_reaches_direct_async_emission() -> None:
             if seed.config.get("cute_affine_scan_schedule") == "direct_m16n8_v1"
             and seed.config.get("block_sizes") == [64]
         )
-        source = bound.to_triton_code(config)
+        source = bound.to_code(config)
 
     assert (
         "import helion._compiler.cute.short_affine_scan_mma "

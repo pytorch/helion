@@ -9,15 +9,14 @@ import torch
 
 import helion
 from helion._compiler.autotuner_heuristics import get_heuristics
-from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
+from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.autotune.heuristics.cute_resident_reductions import (
     CuteResidentReductionHeuristic,
 )
-from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.resident_reductions import proven_resident_tensor_alignments
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_function import TensorArg
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
@@ -52,7 +51,6 @@ def _kernel_and_arguments(
 @pytest.mark.parametrize("kind", ["layer_norm", "rms_norm"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("static_shapes", [False, True])
-@skipUnlessBackends(["cute"])
 def test_original_normalization_seeds_survive_search_and_emit_resident_pipeline(
     kind: str, dtype: torch.dtype, static_shapes: bool
 ) -> None:
@@ -61,7 +59,7 @@ def test_original_normalization_seeds_survive_search_and_emit_resident_pipeline(
         mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
@@ -132,7 +130,6 @@ def test_original_normalization_seeds_survive_search_and_emit_resident_pipeline(
                 assert "_cute_resident_copy_async" not in code
 
 
-@skipUnlessBackends(["cute"])
 def test_resident_knobs_reject_unproved_config_values() -> None:
     kernel, args = _kernel_and_arguments("layer_norm", torch.bfloat16)
     bound = cpu_bind(kernel, args)

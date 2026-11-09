@@ -1,3 +1,14 @@
+"""The SIMT matmul fallback: a cross-thread reduction over K (``_emit_cute_matmul``).
+
+Role: general-purpose emitter.  When no tensor-core family owns an ``mm`` /
+``dot``, ``matmul_ops`` lowers it here: the per-thread products of the lane
+loop are reduced across the K thread axis (``_emit_cute_grouped_sum_reduction``,
+``_emit_cute_owned_product_sum``), the N-collapse form folds a column block
+onto one thread (``_emit_cute_matmul_n_collapse``), and the loop-carried
+rescaled accumulator and computed fp8 operands take their own routes.  Reads
+the matmul facts of ``matmul_utils``; renders through the reduction helpers.
+"""
+
 from __future__ import annotations
 
 import ast
@@ -26,6 +37,9 @@ from .matmul_utils import loop_carries
 from .matmul_utils import reads_loop_carry
 from .matmul_utils import reads_value_of
 from .matmul_utils import strip_new_vars
+from .reduce_call import ReduceCall
+from .reduce_call import ReduceScope
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -352,7 +366,7 @@ def _cute_active_thread_layout(
         block_axes.update(current_grid_state.block_thread_axes)
     # Free ``hl.arange`` dims live on synthetic thread axes outside the
     # strategy loop states, but they are launched thread rows all the same.
-    for axis, size in cg.cute_synthetic_arange_axis_sizes.items():
+    for axis, size in cute_codegen_state(cg).synthetic_arange_axis_sizes.items():
         axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
     return axis_sizes, block_axes
 
@@ -385,52 +399,6 @@ def _cute_launch_layout_matches(
     )
 
 
-def _emit_cute_grouped_sum_reduction_shared_two_stage(
-    cg: CodegenInterface,
-    input_name: str,
-    *,
-    identity_expr: str,
-    lane_var: str,
-    lane_in_group_var: str,
-    lane_mod_pre_var: str,
-    pre: int,
-    group_span: int,
-    group_count: int,
-) -> str:
-    result_var = cg.device_function.new_var("dot_reduce_result")
-    cg.add_statement(
-        f"{result_var} = _cute_grouped_reduce_shared_two_stage("
-        f"{input_name}, 'sum', {identity_expr}, "
-        f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
-        f"pre={pre}, group_span={group_span}, group_count={group_count})"
-    )
-    return result_var
-
-
-def _emit_cute_grouped_sum_reduction_shared_tree(
-    cg: CodegenInterface,
-    input_name: str,
-    *,
-    identity_expr: str,
-    lane_var: str,
-    lane_in_group_var: str,
-    lane_mod_pre_var: str,
-    pre: int,
-    group_span: int,
-    num_threads: int,
-    group_count: int,
-) -> str:
-    result_var = cg.device_function.new_var("dot_reduce_result")
-    cg.add_statement(
-        f"{result_var} = _cute_grouped_reduce_shared_tree("
-        f"{input_name}, 'sum', {identity_expr}, "
-        f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
-        f"pre={pre}, group_span={group_span}, "
-        f"num_threads={num_threads}, group_count={group_count})"
-    )
-    return result_var
-
-
 def _widen_lane_layout_for_barrier_phases(
     cg: CodegenInterface, axis_sizes: dict[int, int], *, subject: str
 ) -> None:
@@ -457,7 +425,7 @@ def _widen_lane_layout_for_barrier_phases(
     for axis in range(3):
         if launch_dims[axis] > axis_sizes.get(axis, 1):
             axis_sizes[axis] = launch_dims[axis]
-    device_function.cute_state.multi_phase_lane_reduce_layouts.append(
+    device_function.cute_state.lanes.multi_phase_lane_reduce_layouts.append(
         (subject, {axis: axis_sizes.get(axis, 1) for axis in range(3)})
     )
 
@@ -544,11 +512,15 @@ def _emit_cute_grouped_sum_reduction(
 
     identity_expr = f"{backend.dtype_str(value_dtype)}(0)"
     if group_span <= 32:
-        return (
-            "_cute_grouped_reduce_warp("
-            f"{input_name}, 'sum', {identity_expr}, {lane_expr}, "
-            f"pre={pre}, group_span={group_span})"
-        )
+        return ReduceCall(
+            scope=ReduceScope.WARP,
+            op="sum",
+            input=input_name,
+            identity=identity_expr,
+            lane_expr=lane_expr,
+            pre=pre,
+            group_span=group_span,
+        ).render()
 
     assert num_threads % group_span == 0, (
         f"num_threads ({num_threads}) must be divisible by group_span ({group_span})"
@@ -559,30 +531,25 @@ def _emit_cute_grouped_sum_reduction(
     cg.add_statement(f"{lane_var} = {lane_expr}")
     cg.add_statement(f"{lane_in_group_var} = ({lane_var}) % {group_span}")
     cg.add_statement(f"{lane_mod_pre_var} = ({lane_in_group_var}) % {pre}")
-    if group_span % 32 == 0:
-        return _emit_cute_grouped_sum_reduction_shared_two_stage(
-            cg,
-            input_name,
-            identity_expr=identity_expr,
-            lane_var=lane_var,
-            lane_in_group_var=lane_in_group_var,
-            lane_mod_pre_var=lane_mod_pre_var,
-            pre=pre,
-            group_span=group_span,
-            group_count=num_threads // group_span,
-        )
-    return _emit_cute_grouped_sum_reduction_shared_tree(
-        cg,
-        input_name,
-        identity_expr=identity_expr,
-        lane_var=lane_var,
-        lane_in_group_var=lane_in_group_var,
-        lane_mod_pre_var=lane_mod_pre_var,
+    # Whole-warp groups reduce in two stages; narrower groups walk the tree,
+    # whose scratch is sized by the launched thread count.
+    two_stage = group_span % 32 == 0
+    result_var = cg.device_function.new_var("dot_reduce_result")
+    reduce = ReduceCall(
+        scope=ReduceScope.SHARED_TWO_STAGE if two_stage else ReduceScope.SHARED_TREE,
+        op="sum",
+        input=input_name,
+        identity=identity_expr,
+        lane_expr=lane_var,
+        lane_in_group=lane_in_group_var,
+        lane_mod_pre=lane_mod_pre_var,
         pre=pre,
         group_span=group_span,
-        num_threads=num_threads,
+        num_threads=None if two_stage else num_threads,
         group_count=num_threads // group_span,
     )
+    cg.add_statement(f"{result_var} = {reduce.render()}")
+    return result_var
 
 
 def _emit_cute_owned_product_sum(
@@ -595,7 +562,7 @@ def _emit_cute_owned_product_sum(
     owner_lane: str,
 ) -> str:
     """Describe a complete serial-K and physical-thread FP32 product sum."""
-    from ..tile_strategy import _lane_reduce_marker_expr
+    from .lane_loops.markers import _lane_reduce_marker_expr
 
     backend = CompileEnvironment.current().backend
     if value_dtype != torch.float32:
@@ -723,8 +690,7 @@ def _emit_cute_matmul_n_collapse(
     from ..generate_ast import GenerateAST
 
     assert isinstance(cg, GenerateAST)
-    if hasattr(cg, "cute_uses_matmul"):
-        cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+    cute_codegen_state(cg).declare_matmul()
 
     reduction_dtype = cute_scalar_reduction_dtype(lhs_dtype, rhs_dtype, acc_dtype)
     value_dtype = reduction_dtype or lhs_dtype or rhs_dtype or torch.float32
@@ -830,7 +796,7 @@ def _cute_product_ignores_lane(
     placement sees it."""
     from ..ast_read_writes import ReadWrites
     from ..tile_strategy import _cute_lane_coordinates
-    from ..tile_strategy import _lane_varying_names
+    from .lane_loops.split import _lane_varying_names
 
     masks = getattr(loop_state, "tile_masks", frozenset())
     statements = [
@@ -1027,14 +993,14 @@ def _cute_product_uses_owned_lane_reduction(
     """
     from ..ast_read_writes import ReadWrites
     from ..generate_ast import GenerateAST
-    from ..tile_strategy import _is_lane_reduce_marker_assign
-    from ..tile_strategy import _is_proven_relocatable_assignment
-    from ..tile_strategy import _plain_assignment_name
+    from ._ast_pass_utils import _is_proven_relocatable_assignment
+    from ._ast_pass_utils import assigned_name
+    from .lane_loops.markers import _is_lane_reduce_marker_assign
 
     if not isinstance(cg, GenerateAST):
         return False
     body = cg.statements_stack[-1]
-    names = [_plain_assignment_name(statement) for statement in body]
+    names = [assigned_name(statement) for statement in body]
     if None in names or len(set(names)) != len(names):
         return False
     all_names = set(names)
@@ -1085,8 +1051,8 @@ def _emit_cute_matmul(
     an ``hl.atomic_*`` user may see per-lane partial sums instead of the
     per-thread running sum (``cute_atomic_consumer_lane_route``).
     """
-    if hasattr(cg, "cute_uses_matmul"):
-        cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+    if isinstance(cg, GenerateAST):
+        cute_codegen_state(cg).declare_matmul()
     reduction_dtype = cute_scalar_reduction_dtype(
         lhs_dtype, rhs_dtype, acc_dtype or out_dtype
     )
@@ -1179,7 +1145,7 @@ def _emit_cute_matmul(
                 # along the loop (and have the lane placement pin it to the
                 # first lane).
                 assert fx_node is not None
-                cg.device_function.cute_state.per_lane_atomic_lane_vars.setdefault(
+                cg.device_function.cute_state.lanes.per_lane_atomic_lane_vars.setdefault(
                     cute_per_lane_atomic_consumer(fx_node), set()
                 ).add(lane_var)
                 lane_var = None
@@ -1291,12 +1257,12 @@ def _emit_cute_matmul(
             # Tell ``hoist_warp_reduce`` this is a per-thread running sum: it
             # already combines across V-lanes, so its FINAL value is reduced
             # once after the loop rather than re-folded per lane.
-            running_sums = getattr(cg.device_function, "cute_matmul_running_sums", None)
-            if isinstance(running_sums, set):
-                running_sums.add(dot_acc)
+            cg.device_function.cute_state.lanes.matmul_running_sums.add(dot_acc)
             if running_sum_route == "recurrence":
                 # Exact only once restructured to update once per tile.
-                cg.device_function.cute_state.chunk_recurrence_running_sums.add(dot_acc)
+                cg.device_function.cute_state.lanes.chunk_recurrence_running_sums.add(
+                    dot_acc
+                )
         else:
             reduction_input = cg.lift(product, dce=True, prefix="dot_product").id
         reduction_value_dtype = (

@@ -6,8 +6,28 @@ from typing import NoReturn
 from typing import cast
 
 from ... import exc
-from .. import tile_strategy as lanes
+from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ..ast_read_writes import ReadWrites
+from ..tile_strategy import _clone_lane_loop_with_body
+from ._ast_pass_utils import _PURE_RELOCATABLE_NAMES
+from ._ast_pass_utils import _is_proven_relocatable_assignment
+from ._ast_pass_utils import _is_proven_relocatable_call
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import call_path_str
+from .lane_loops.markers import _dtype_ctor_from_identity
+from .lane_loops.markers import _find_lane_reduce_call
+from .lane_loops.markers import _grouped_warp_reduce_expr
+from .lane_loops.markers import _is_lane_reduce_marker_assign
+from .lane_loops.markers import _static_lane_loop_extent
+from .lane_loops.markers import set_marker_owner
+from .lane_loops.owner_guards import _is_proven_uniform_name
+from .lane_loops.owner_guards import _update_proven_uniform_names
+from .lane_loops.owner_guards import _update_scalar_definitions
+from .lane_loops.owner_guards import _update_thread_axis_names
+from .lane_loops.split import _lane_varying_names
+from .lane_loops.split import _split_one_lane_loop
+from .lane_loops.split import _validate_owned_lane_carry_schedule
+from .lane_loops.split import _validate_renamed_lane_carries
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -19,7 +39,7 @@ _PROTECTED_GLOBALS = {
     "operator",
     "range",
     "_helion_lane_reduce",
-    *(name.partition(".")[0] for name in lanes._PURE_RELOCATABLE_NAMES),
+    *(name.partition(".")[0] for name in _PURE_RELOCATABLE_NAMES),
 }
 _SCALAR_CASTS = {
     f"cutlass.{name}"
@@ -56,7 +76,7 @@ def resolve_pruned_lane_owners(
     must match its recorded proof and the actual innermost enclosing lane.
     Other markers retain their original owner and all strict validation.
     """
-    if not any(lanes._find_lane_reduce_call(top) for top in body):
+    if not any(_find_lane_reduce_call(top) for top in body):
         # Only a marker's owner is ever rewritten here (or finished by the
         # physical fallback); a body without one is left untouched. (The
         # codegen skips the whole lane-reduction pass group without markers;
@@ -69,16 +89,16 @@ def resolve_pruned_lane_owners(
         lane
         for top in body
         for node in ast.walk(top)
-        if (lane := getattr(node, lanes.HELION_LANE_LOOP_VAR_ATTR, None)) is not None
+        if (lane := getattr(node, HELION_LANE_LOOP_VAR_ATTR, None)) is not None
     )
 
     def visit(node: ast.AST, owners: tuple[str, ...]) -> None:
-        lane = getattr(node, lanes.HELION_LANE_LOOP_VAR_ATTR, None)
+        lane = getattr(node, HELION_LANE_LOOP_VAR_ATTR, None)
         if isinstance(node, ast.For) and lane is not None:
             if not isinstance(node.target, ast.Name) or node.target.id != lane:
                 return
             owners = (*owners, lane)
-        marker = lanes._is_lane_reduce_marker_assign(node)
+        marker = _is_lane_reduce_marker_assign(node)
         if marker is not None and marker.owner_lane in fallbacks:
             original = marker.owner_lane
             assert original is not None
@@ -92,9 +112,9 @@ def resolve_pruned_lane_owners(
                 and marker.group_count == marker.group_cluster_n == 1
                 and not marker.matmul_contribution
             ):
-                call = lanes._find_lane_reduce_call(node)
-                assert call is not None and len(call.args) >= 10
-                call.args[9] = ast.Constant(value=owner)
+                call = _find_lane_reduce_call(node)
+                assert call is not None
+                set_marker_owner(call, owner)
         for child in ast.iter_child_nodes(node):
             visit(child, owners)
 
@@ -129,7 +149,7 @@ def _resolve_physical_reductions(
         if isinstance(expr, ast.Constant):
             return True
         if isinstance(expr, ast.Name):
-            return lanes._is_proven_uniform_name(expr.id, names)
+            return _is_proven_uniform_name(expr.id, names)
         if isinstance(expr, (ast.BinOp, ast.UnaryOp, ast.Compare, ast.BoolOp)):
             return all(
                 uniform(child, names)
@@ -155,7 +175,7 @@ def _resolve_physical_reductions(
 
     def visit(statements: Sequence[ast.AST], names: set[str], complete: bool) -> None:
         for stmt in statements:
-            marker = lanes._is_lane_reduce_marker_assign(stmt)
+            marker = _is_lane_reduce_marker_assign(stmt)
             if marker is not None and marker.owner_lane in proofs:
                 assert marker.owner_lane is not None
                 pre, span, lane_expr = proofs[marker.owner_lane]
@@ -171,11 +191,11 @@ def _resolve_physical_reductions(
                     and not span & (span - 1)
                     and not pre & (pre - 1)
                 ):
-                    dtype = lanes._dtype_ctor_from_identity(marker.identity_expr)
+                    dtype = _dtype_ctor_from_identity(marker.identity_expr)
                     if dtype is not None:
                         value = f"{dtype}({marker.input_name})"
                         reduced = (
-                            lanes._grouped_warp_reduce_expr(
+                            _grouped_warp_reduce_expr(
                                 marker.reduction_type,
                                 value,
                                 marker.identity_expr,
@@ -196,7 +216,7 @@ def _resolve_physical_reductions(
                 loop_uniform = (
                     uniform(stmt.iter, names)
                     and isinstance(stmt.target, ast.Name)
-                    and getattr(stmt, lanes.HELION_LANE_LOOP_VAR_ATTR, None) is None
+                    and getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None) is None
                 )
                 if loop_uniform:
                     assert isinstance(stmt.target, ast.Name)
@@ -238,7 +258,7 @@ def normalize_nested_lane_reductions(
     # Without a marker there is no reduction to move. Avoid building scalar
     # dependency state for ordinary generated loops; their owner validation
     # and subsequent lowering still run unchanged.
-    if not any(lanes._find_lane_reduce_call(statement) for statement in body):
+    if not any(_find_lane_reduce_call(statement) for statement in body):
         return body
 
     shadowed_globals = {
@@ -257,7 +277,7 @@ def normalize_nested_lane_reductions(
     ) -> list[ast.AST]:
         result: list[ast.AST] = []
         for statement in statements:
-            lane = getattr(statement, lanes.HELION_LANE_LOOP_VAR_ATTR, None)
+            lane = getattr(statement, HELION_LANE_LOOP_VAR_ATTR, None)
             is_lane = (
                 isinstance(statement, ast.For)
                 and isinstance(statement.target, ast.Name)
@@ -296,9 +316,9 @@ def normalize_nested_lane_reductions(
                 )
             else:
                 result.append(statement)
-            lanes._update_proven_uniform_names(statement, uniform)
-            lanes._update_thread_axis_names(statement, thread_axes)
-            lanes._update_scalar_definitions(statement, definitions)
+            _update_proven_uniform_names(statement, uniform)
+            _update_thread_axis_names(statement, thread_axes)
+            _update_scalar_definitions(statement, definitions)
         return result
 
     return visit(body, None, set(uniform_names), {}, {})
@@ -319,7 +339,7 @@ def _normalize_one(
     markers = {
         index: marker
         for index, statement in enumerate(loop.body)
-        if (marker := lanes._is_lane_reduce_marker_assign(statement)) is not None
+        if (marker := _is_lane_reduce_marker_assign(statement)) is not None
     }
     foreign = {
         index: marker
@@ -342,7 +362,7 @@ def _normalize_one(
         or bool(shadowed_globals)
         or not own
         or loop.orelse
-        or lanes._static_lane_loop_extent(loop) is None
+        or _static_lane_loop_extent(loop) is None
         or any(marker.owner_lane != parent_lane for marker in foreign.values())
         or any(
             marker.owner_lane is None or marker.matmul_contribution
@@ -362,18 +382,16 @@ def _normalize_one(
     # complete inner reduction slice and are never moved into the suffix.
     writes: set[str] = set()
     for index, statement in enumerate(loop.body):
-        name = lanes._plain_assignment_name(statement)
+        name = assigned_name(statement)
         if name is None or name in writes or name == lane:
             reject()
         writes.add(name)
         marker = markers.get(index)
         if marker is None:
-            if not lanes._is_proven_relocatable_assignment(
-                statement, allow_load=index < cut
-            ):
+            if not _is_proven_relocatable_assignment(statement, allow_load=index < cut):
                 reject()
         else:
-            marker_call = lanes._find_lane_reduce_call(statement)
+            marker_call = _find_lane_reduce_call(statement)
             if not isinstance(ast.parse(marker.input_name, mode="eval").body, ast.Name):
                 reject()
             assert isinstance(statement, ast.Assign)
@@ -381,7 +399,7 @@ def _normalize_one(
             while wrapper is not marker_call:
                 if (
                     not isinstance(wrapper, ast.Call)
-                    or lanes._qualified_name(wrapper.func) not in _SCALAR_CASTS
+                    or call_path_str(wrapper.func) not in _SCALAR_CASTS
                     or len(wrapper.args) != 1
                     or wrapper.keywords
                 ):
@@ -391,13 +409,13 @@ def _normalize_one(
                 if (
                     isinstance(node, ast.Call)
                     and node is not marker_call
-                    and not lanes._is_proven_relocatable_call(node, allow_load=False)
+                    and not _is_proven_relocatable_call(node, allow_load=False)
                 ):
                     reject()
 
     original: list[ast.AST] = list(loop.body)
     phase2 = [statement for index, statement in enumerate(original) if index not in own]
-    varying = {lane, *lanes._lane_varying_names(phase2, lane)}
+    varying = {lane, *_lane_varying_names(phase2, lane)}
     suffix = original[cut:]
     if any(
         (
@@ -417,9 +435,9 @@ def _normalize_one(
         if reads & dependent:
             dependent.update(ReadWrites.from_ast(statement).writes)
 
-    lanes._validate_renamed_lane_carries(original, lane, set(own), renames)
-    prefix_loop = lanes._clone_lane_loop_with_body(loop, original[:cut])
-    lowered = lanes._split_one_lane_loop(
+    _validate_renamed_lane_carries(original, lane, set(own), renames)
+    prefix_loop = _clone_lane_loop_with_body(loop, original[:cut])
+    lowered = _split_one_lane_loop(
         prefix_loop,
         lane,
         uniform,
@@ -430,5 +448,5 @@ def _normalize_one(
         renames,
     )
     result = [*lowered, *suffix]
-    lanes._validate_owned_lane_carry_schedule(original, result, lane, set(own), renames)
+    _validate_owned_lane_carry_schedule(original, result, lane, set(own), renames)
     return result

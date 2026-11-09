@@ -961,7 +961,10 @@ class CallableType(LiteralType):
             try:
                 return self.value.__name__
             except AttributeError:
-                return str(self.value)
+                # A callable object: name it by its type. ``str()`` can span
+                # lines (an fx.GraphModule prints its code), and the name is
+                # printed into one-line type annotations.
+                return type(self.value).__name__
 
     # pyrefly: ignore [bad-override]
     def propagate_call(

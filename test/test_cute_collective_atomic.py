@@ -10,8 +10,8 @@ from test.test_cute_collective_effects import _lower
 import helion
 from helion import exc
 from helion._compiler.cute.collective_matmul import _region_write_roots
+from helion._compiler.cute.state import cute_env_state
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.benchmarking import _make_cudagraph_replay
@@ -129,7 +129,6 @@ def _config(compute: str) -> helion.Config:
 
 
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
-@skipUnlessBackends(["cute"])
 def test_split_k_collective_keeps_atomic_epilogue(compute: str) -> None:
     kernel = helion.kernel(
         matmul_split_k.fn,
@@ -153,7 +152,6 @@ def test_split_k_collective_keeps_atomic_epilogue(compute: str) -> None:
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
 @pytest.mark.parametrize("bias", [False, True])
-@skipUnlessBackends(["cute"])
 def test_collective_atomic_tails_and_mutated_graphs(
     dtype: torch.dtype, compute: str, bias: bool
 ) -> None:
@@ -254,7 +252,6 @@ def _atomic_guards(code: str) -> dict[str, str]:
 
 
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
-@skipUnlessBackends(["cute"])
 def test_tile_counter_beside_a_collective_matmul_runs_at_the_first_lane(
     compute: str,
 ) -> None:
@@ -279,7 +276,6 @@ def test_tile_counter_beside_a_collective_matmul_runs_at_the_first_lane(
 
 
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
-@skipUnlessBackends(["cute"])
 def test_tile_counter_into_the_collective_output_rejects_the_config(
     compute: str,
 ) -> None:
@@ -301,7 +297,6 @@ def test_tile_counter_into_the_collective_output_rejects_the_config(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
-@skipUnlessBackends(["cute"])
 def test_tile_counter_beside_a_collective_matmul_counts_each_tile_once(
     compute: str,
 ) -> None:
@@ -353,7 +348,6 @@ def _red_helper(dtype: torch.dtype, promoted: bool) -> str:
 @pytest.mark.parametrize("promote", [True, False])
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_split_k_vector_epilogue_packs_the_atomic_add(
     promote: bool, bias: bool, dtype: torch.dtype
 ) -> None:
@@ -379,7 +373,7 @@ def test_split_k_vector_epilogue_packs_the_atomic_add(
         code = bound.to_code(_vector_epilogue_config())
     # Only float16 outputs are promoted; a bfloat16 output always keeps its dtype.
     promoted = promote and dtype is torch.float16
-    assert bound.env.cute_half_atomic_output_promotions == (
+    assert cute_env_state(bound.env).half_atomic_output_promotions == (
         {"out": torch.float16} if promoted else {}
     )
     assert code.count(_red_helper(dtype, promoted)) == 1
@@ -402,7 +396,6 @@ def test_split_k_vector_epilogue_packs_the_atomic_add(
 @pytest.mark.parametrize("promote", [True, False])
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_split_k_vector_epilogue_atomics_match_the_reference(
     promote: bool, bias: bool, dtype: torch.dtype
 ) -> None:
@@ -450,7 +443,6 @@ def test_split_k_vector_epilogue_atomics_match_the_reference(
 
 
 @pytest.mark.parametrize("promote", [True, False])
-@skipUnlessBackends(["cute"])
 def test_half_atomic_output_seeds_carry_the_vector_epilogue(promote: bool) -> None:
     """With the promotion off the output stays float16 and every warp seed
     with a scalar epilogue gets a vector twin (the scalar half atomic is a
@@ -527,7 +519,6 @@ def test_half_atomic_output_seeds_carry_the_vector_epilogue(promote: bool) -> No
         (None, torch.float16, False),
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_packed_atomic_epilogue_respects_the_target_capability(
     capability: tuple[int, int] | None, dtype: torch.dtype, packed: bool
 ) -> None:
@@ -554,7 +545,6 @@ def test_packed_atomic_epilogue_respects_the_target_capability(
     assert "cute.arch.atomic_add(" in code
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_half_output_vector_lanes_match_the_reference(dtype: torch.dtype) -> None:
     """GPU: the generic V-loop flush of a half output (segmented reduction, one

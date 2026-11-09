@@ -5,14 +5,17 @@ import ast
 import pytest
 import torch
 
-from .test_cute_grouped_gemm_split_sizes import _assert_device_offsets_output
-from .test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
-from .test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
-from .test_cute_grouped_gemm_split_sizes import _make_device_offsets_args
-from .test_cute_grouped_gemm_split_sizes import _require_runtime_cuda13_sm100
-from .test_cute_grouped_gemm_split_sizes import _selected_config
+from test._cute_grouped_gemm_split_sizes import _assert_device_offsets_output
+from test._cute_grouped_gemm_split_sizes import _device_offsets_kernel
+from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
+from test._cute_grouped_gemm_split_sizes import _make_device_offsets_args
+from test._cute_grouped_gemm_split_sizes import _require_runtime_cuda13_sm100
+from test._cute_grouped_gemm_split_sizes import _selected_config
+
 import helion
-from helion._compiler.program_id import _build_sched_pipeline_consumer_release_block
+from helion._compiler.cute.tcgen05.scheduler_pids import (
+    _build_sched_pipeline_consumer_release_block,
+)
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable

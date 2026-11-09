@@ -5,12 +5,22 @@ from __future__ import annotations
 import ast
 from typing import cast
 
-from .. import tile_strategy
 from ..ast_read_writes import ReadWrites
+from ._ast_pass_utils import _dependency_names
+from ._ast_pass_utils import _is_proven_relocatable_assignment
+from ._ast_pass_utils import _is_proven_relocatable_call
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import call_path_str
+from ._ast_pass_utils import exposed_reads
+from ._ast_pass_utils import tensor_roots_may_alias
 from .fuse_two_pass_loads import _is_store_call
 from .fuse_two_pass_loads import _store_tensor_roots
 from .fuse_two_pass_loads import _tensor_arg_roots
-from .fuse_two_pass_loads import _tensor_roots_may_alias
+from .lane_loops.markers import _is_lane_reduce_marker_assign
+from .lane_loops.markers import _static_lane_loop_extent
+from .lane_loops.owner_guards import _is_isolated_store_statement
+from .lane_loops.owner_guards import _memory_write_calls
+from .lane_loops.owner_guards import _store_enclosing_predicates
 from .persistent_branch_vec import _binding_write_roots
 from .persistent_branch_vec import _definition_snapshots
 from .persistent_branch_vec import _freeze_definition
@@ -33,7 +43,7 @@ def _freeze_coverage(
 
 def _reads(statement: ast.AST) -> set[str]:
     result = set(ReadWrites.from_ast(statement).reads)
-    marker = tile_strategy._is_lane_reduce_marker_assign(statement)
+    marker = _is_lane_reduce_marker_assign(statement)
     if marker is not None and marker.group_lane_expr:
         result.update(
             ReadWrites.from_ast(ast.parse(marker.group_lane_expr, mode="eval")).reads
@@ -41,15 +51,23 @@ def _reads(statement: ast.AST) -> set[str]:
     return result
 
 
+def _plain_assignment(statement: ast.AST) -> tuple[str, ...]:
+    name = assigned_name(statement)
+    return () if name is None else (name,)
+
+
 def _live_in(statements: list[ast.stmt]) -> set[str]:
-    defined: set[str] = set()
-    live: set[str] = set()
-    for statement in statements:
-        live.update(_reads(statement) - defined)
-        name = tile_strategy._plain_assignment_name(statement)
-        if name is not None:
-            defined.add(name)
-    return live
+    """Names read before a plain assignment binds them; compound statements
+    (loops, branches) count as single statements that define nothing."""
+    return set(
+        exposed_reads(
+            statements,
+            reads=_reads,
+            defines=_plain_assignment,
+            loops="opaque",
+            branches="opaque",
+        )
+    )
 
 
 def _single_store(statement: ast.AST) -> ast.Call | None:
@@ -61,14 +79,14 @@ def _single_store(statement: ast.AST) -> ast.Call | None:
     if len(stores) != 1:
         return None
     store = stores[0]
-    if _plain_scalar_store_pointer(
-        store
-    ) is None or not tile_strategy._is_isolated_store_statement(statement, store):
+    if _plain_scalar_store_pointer(store) is None or not _is_isolated_store_statement(
+        statement, store
+    ):
         return None
     if any(
         isinstance(node, ast.Call)
         and node is not store
-        and not tile_strategy._is_proven_relocatable_call(node, allow_load=False)
+        and not _is_proven_relocatable_call(node, allow_load=False)
         for node in ast.walk(statement)
     ):
         return None
@@ -89,9 +107,9 @@ def _known_statements(statements: list[ast.stmt]) -> bool:
             return False
         if isinstance(statement, ast.Pass) or _single_store(statement) is not None:
             continue
-        if tile_strategy._is_lane_reduce_marker_assign(statement) is not None:
+        if _is_lane_reduce_marker_assign(statement) is not None:
             continue
-        if not tile_strategy._is_proven_relocatable_assignment(
+        if not _is_proven_relocatable_assignment(
             statement, allow_load=True, allow_reduction=True
         ):
             return False
@@ -106,7 +124,7 @@ def _known_subscript(node: ast.Subscript) -> bool:
         and node.value.value.attr == "layout"
         and isinstance(node.value.value.value, ast.Name)
     )
-    is_coordinate = isinstance(node.value, ast.Call) and tile_strategy._qualified_name(
+    is_coordinate = isinstance(node.value, ast.Call) and call_path_str(
         node.value.func
     ) in {"cute.arch.thread_idx", "cute.arch.block_idx"}
     return is_stride or is_coordinate
@@ -120,12 +138,12 @@ def _coordinate_expression(
         return False
     for node in ast.walk(expression):
         if isinstance(node, ast.Call):
-            if tile_strategy._qualified_name(node.func) in {
+            if call_path_str(node.func) in {
                 "range",
                 "cutlass.range_constexpr",
             }:
                 continue
-            if not tile_strategy._is_proven_relocatable_call(node, allow_load=False):
+            if not _is_proven_relocatable_call(node, allow_load=False):
                 return False
         elif isinstance(node, ast.Subscript):
             if not _known_subscript(node):
@@ -140,7 +158,7 @@ def _coverage_expressions(statement: ast.stmt, store: ast.Call) -> list[ast.expr
         pointer,
         *cast(
             "list[ast.expr]",
-            tile_strategy._store_enclosing_predicates(statement, store),
+            _store_enclosing_predicates(statement, store),
         ),
     ]
 
@@ -170,11 +188,11 @@ def eliminate_interchanged_stores(
         serial_loop.target, ast.Name
     ):
         return 0
-    if tile_strategy._static_lane_loop_extent(lane_loop) is None:
+    if _static_lane_loop_extent(lane_loop) is None:
         return 0
     if (
         not isinstance(serial_loop.iter, ast.Call)
-        or tile_strategy._qualified_name(serial_loop.iter.func)
+        or call_path_str(serial_loop.iter.func)
         not in {"range", "cutlass.range_constexpr"}
         or not 1 <= len(serial_loop.iter.args) <= 3
         or serial_loop.iter.keywords
@@ -230,7 +248,7 @@ def eliminate_interchanged_stores(
     if ast.unparse(bounds[0]) != ast.unparse(bounds[1]):
         return 0
     if (
-        tile_strategy._dependency_names(
+        _dependency_names(
             cast("list[ast.AST]", original_flat), _reads(serial_loop.iter)
         )
         & protected_names
@@ -271,7 +289,7 @@ def eliminate_interchanged_stores(
         if roots is None or len(roots) != 1:
             continue
         if any(
-            _tensor_roots_may_alias(
+            tensor_roots_may_alias(
                 roots,
                 _store_tensor_roots(other, tensor_names),
                 proven_disjoint_tensor_pairs,
@@ -282,7 +300,7 @@ def eliminate_interchanged_stores(
             continue
         if any(
             (pointer := _plain_scalar_load_pointer(load)) is None
-            or _tensor_roots_may_alias(
+            or tensor_roots_may_alias(
                 roots,
                 _tensor_arg_roots(pointer, tensor_names),
                 proven_disjoint_tensor_pairs,
@@ -301,7 +319,7 @@ def eliminate_interchanged_stores(
         final_index, final_statement, final_store = matches[0]
         original_coverage = _coverage_expressions(statement, store)
         final_coverage = _coverage_expressions(final_statement, final_store)
-        dependency_names = tile_strategy._dependency_names(
+        dependency_names = _dependency_names(
             cast("list[ast.AST]", original_flat),
             {name for expression in original_coverage for name in _reads(expression)},
         )
@@ -348,7 +366,7 @@ def _redefined_names(final_flat: list[ast.stmt], protected_names: set[str]) -> s
     return {
         name
         for statement in final_flat
-        if (name := tile_strategy._plain_assignment_name(statement)) is not None
+        if (name := assigned_name(statement)) is not None
     } - (_live_in(final_flat) | protected_names)
 
 
@@ -362,12 +380,10 @@ def _prune_redefined_bindings(
         dead = [
             statement
             for statement in owner.body
-            if (name := tile_strategy._plain_assignment_name(statement)) is not None
+            if (name := assigned_name(statement)) is not None
             and name in redefined
             and reads.get(name, 0) == ReadWrites.from_ast(statement).reads.get(name, 0)
-            and tile_strategy._is_proven_relocatable_assignment(
-                statement, allow_load=True
-            )
+            and _is_proven_relocatable_assignment(statement, allow_load=True)
         ]
         if not dead:
             break
@@ -386,11 +402,7 @@ def _is_atomic_write(call: ast.Call) -> bool:
 
 def atomic_write_calls(statement: ast.AST) -> list[ast.Call]:
     """The atomic read-modify-writes among ``statement``'s memory writes."""
-    return [
-        call
-        for call in tile_strategy._memory_write_calls(statement)
-        if _is_atomic_write(call)
-    ]
+    return [call for call in _memory_write_calls(statement) if _is_atomic_write(call)]
 
 
 def eliminate_interchanged_atomics(
@@ -443,11 +455,11 @@ def eliminate_interchanged_atomics(
     for statement in candidates:
         if statement not in serial_loop.body:
             continue
-        writes = tile_strategy._memory_write_calls(statement)
+        writes = _memory_write_calls(statement)
         if (
             len(writes) != 1
             or not _is_atomic_write(writes[0])
-            or not tile_strategy._is_isolated_store_statement(statement, writes[0])
+            or not _is_isolated_store_statement(statement, writes[0])
             or final_texts.count(ast.unparse(statement)) != 1
         ):
             continue
@@ -462,7 +474,7 @@ def eliminate_interchanged_atomics(
     # bounds, which nothing in the first pass rebinds, so the final pass's
     # unconditional definitions kill the first pass's bindings
     # (``eliminate_interchanged_stores``).
-    if tile_strategy._static_lane_loop_extent(lane_loop) is None or (
+    if _static_lane_loop_extent(lane_loop) is None or (
         _reads(serial_loop.iter) & set(ReadWrites.from_ast(lane_loop).writes)
     ):
         if not serial_loop.body:

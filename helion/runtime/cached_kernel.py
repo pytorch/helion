@@ -30,18 +30,18 @@ from .._compiler.compile_environment import (
 )
 from .._utils import counters
 from .config import Config
-from .cute_structural_config import CuteStructuralConfig
 from .generated_code_cache import binding_input_key
 from .generated_code_cache import binding_variant_key
 from .generated_code_cache import compiled_kernel_cache_key
 from .generated_code_cache import load_binding_schema
 from .generated_code_cache import load_compiled_kernel
 from .kernel import BoundKernel
+from .kernel import PreparedMetadataSpecializationExtractor
 from .kernel import _CompilerSeedSpecializationExtractor
 from .kernel import _GuardedInputFact
 from .kernel import _load_code
-from .kernel import _PreparedMetadataSpecializationExtractor
 from .kernel import _tensor_descriptor_extent_class
+from .structural_policy import StructuralConfig
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -221,10 +221,10 @@ def _guard_extractor(
     guard: list[object], param_names: tuple[str, ...]
 ) -> Callable[[Sequence[object]], Hashable]:
     if guard[0] == "fact":
-        return _PreparedMetadataSpecializationExtractor(_guard_fact(guard, param_names))
+        return PreparedMetadataSpecializationExtractor(_guard_fact(guard, param_names))
     extractor = _guard_value(guard)
     if guard[0] in ("size", "stride", "td_layout"):
-        return _PreparedMetadataSpecializationExtractor(extractor)
+        return PreparedMetadataSpecializationExtractor(extractor)
     return extractor
 
 
@@ -623,7 +623,7 @@ class _CachedBoundKernel(Generic[_R]):
             return self._config if self._config is not None else self._artifact[0]
         if isinstance(config, Config):
             return config
-        if isinstance(config, CuteStructuralConfig):
+        if isinstance(config, StructuralConfig):
             return self._materialize()._normalize_config(config)
         return Config.from_dict(config)
 

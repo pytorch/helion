@@ -16,7 +16,6 @@ import helion
 from helion._compiler.tile_dispatch import TileStrategyDispatch
 from helion._compiler.tile_strategy import PerThreadNDTileStrategy
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 
@@ -42,7 +41,7 @@ def _code(blocks: list[int], threads: list[int], vec: int = 4) -> str:
             (torch.empty((32641, 128)), torch.empty(257, dtype=torch.int64), 1e-6),
         )
         with patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ):
             return bound.to_code(
@@ -121,7 +120,6 @@ def _coordinates(
         ([4, 128, 128, 128], [4, 4, 8, 8], (4, 8, 1), 1),
     ),
 )
-@skipUnlessBackends(["cute"])
 def test_rejected_jagged_configs_cover_each_tile_once(
     blocks: list[int], threads: list[int], launch: tuple[int, int, int], axis: int
 ) -> None:
@@ -176,11 +174,10 @@ def test_shared_axes_repartition_or_mask_every_tile(
             assert dispatch.has_surplus_threads_for_block_id(block_id) == (
                 widest > block_size
             )
-            actual_vec = strategy._cute_lane_vec_width_by_block.get(block_id, 1)
+            actual_vec = strategy.lane_context(block_id).vec_width
             assert elements % actual_vec == 0
 
 
-@skipUnlessBackends(["cute"])
 def test_jagged_tile_smaller_than_shared_axis_masks_surplus_threads() -> None:
     code = _code([4, 4, 128, 128], [4, 4, 8, 8])
     assert _launch_dims(ast.parse(code)) == (4, 8, 1)

@@ -1,3 +1,16 @@
+"""The grouped row-union tcgen05 family: schedules, knob table and plan record.
+
+Role: knob table and planner facts.  ``RowUnionSchedule`` names the physical
+geometries of the grouped paired-row recipe (``LEGACY_SCHEDULE``,
+``PAIRED_CLC_SCHEDULE``, ``TRANSPOSED_SCHEDULE``; ``schedule_by_name``), the
+``*_KEY`` constants are its config keys (``CONFIG_KEY``, ``SCHEDULE_KEY``,
+``AB_STAGES_KEY``, ``RESIDENT_CTAS_KEY``, ``ROUND_SUBTILES_KEY``,
+``STARTUP_PREFILL_KEY``), the ``*_supported`` predicates say which knobs a
+schedule admits, and ``GroupedRowUnionPlan`` / ``PairedRowUnionProtocol`` are
+the facts the emitter and the host wrapper read.  ``tcgen05_config/`` and
+``autotune/heuristics`` import the keys from here.
+"""
+
 from __future__ import annotations
 
 import dataclasses
@@ -9,6 +22,7 @@ from .tcgen05_constants import SM100_SMEM_PER_BLOCK_OPTIN_BYTES
 from .tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CHOICES
 from .tcgen05_constants import TCGEN05_EPI_ROUND_SUBTILES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .tcgen05_constants import tcgen05_role_local_schedule
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -301,15 +315,10 @@ def index_domain(
     )
 
 
-def schedule_supported(
-    config: Mapping[str, object], blocks: tuple[int, int, int]
-) -> bool:
-    """The ordinary dense pipeline used by the initial row-union carrier.
-
-    These are tile/protocol restrictions, independent of any problem shape or
-    kernel name. Ineligible choices retain the existing grouped lowering.
-    """
-    fixed: dict[str, object] = {
+def carrier_schedule() -> dict[str, object]:
+    """The ordinary dense pipeline's pins; a type template under a physical
+    profile (``schedule_supported``)."""
+    return {
         "pid_type": "persistent_interleaved",
         "num_sm_multiplier": 1,
         "tcgen05_cta_group": "auto",
@@ -318,23 +327,25 @@ def schedule_supported(
         "tcgen05_ab_stages": 2,
         "tcgen05_acc_stages": 2,
         "tcgen05_c_stages": 2,
-        "tcgen05_num_epi_warps": 4,
+        **tcgen05_role_local_schedule(),
         "tcgen05_l2_swizzle_size": 1,
-        "tcgen05_strategy": "role_local_monolithic",
-        "tcgen05_persistence_model": "static_persistent",
-        "tcgen05_warp_spec_ab_load_warps": 1,
-        "tcgen05_warp_spec_mma_warps": 1,
-        "tcgen05_warp_spec_scheduler_warps": 0,
-        "tcgen05_warp_spec_c_input_warps": 0,
-        "tcgen05_warp_spec_epi_load_warps": 0,
-        "tcgen05_warp_spec_store_warps": 0,
         "tcgen05_warp_spec_register_decrease": 120,
         "tcgen05_warp_spec_register_increase": 256,
-        "tcgen05_layout_strategy": "default",
         "tcgen05_grouped_full_coverage": "off",
         "tcgen05_flat_role_coordinates": False,
         "tcgen05_diagnostic_invalid_output": False,
     }
+
+
+def schedule_supported(
+    config: Mapping[str, object], blocks: tuple[int, int, int]
+) -> bool:
+    """The ordinary dense pipeline used by the initial row-union carrier.
+
+    These are tile/protocol restrictions, independent of any problem shape or
+    kernel name. Ineligible choices retain the existing grouped lowering.
+    """
+    fixed = carrier_schedule()
     profile = physical_schedule(config)
     base_profile = schedule_by_name(config.get(SCHEDULE_KEY, LEGACY_SCHEDULE))
     expected_blocks = blocks if legacy_blocks_supported(blocks) else LEGACY_BLOCKS
@@ -406,13 +417,6 @@ def schedule_supported(
         and all(
             config.get(key, "normal") == "normal"
             for key in (
-                "tcgen05_ab_consumer_phase_mode",
-                "tcgen05_ab_consumer_wait_mode",
-                "tcgen05_ab_initial_producer_acquire_mode",
-                "tcgen05_ab_producer_acquire_mode",
-                "tcgen05_ab_producer_advance_mode",
-                "tcgen05_acc_producer_advance_mode",
-                "tcgen05_acc_producer_mode",
                 "tcgen05_c_store_mode",
                 "tcgen05_epilogue_layout",
                 "tcgen05_sched_consumer_wait_mode",

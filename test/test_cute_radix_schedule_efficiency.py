@@ -5,27 +5,25 @@ from __future__ import annotations
 import ast
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_radix_selection import _args
 from test.test_cute_radix_selection import _device_kernel
 from test.test_cute_radix_selection import _payload_selection
 from test.test_cute_radix_selection import _radix_config
 
 from helion import exc
-from helion._compiler.cute.radix_selection import radix_schedule
-from helion._compiler.cute.radix_selection_codegen import _compact
-from helion._compiler.cute.radix_selection_codegen import _compact_packet_work
-from helion._compiler.cute.radix_selection_codegen import _histogram_choose
-from helion._compiler.cute.radix_selection_codegen import _RadixCodegenSpec
-from helion._compiler.cute.radix_selection_codegen import _Writer
+from helion._compiler.cute.selection.radix_selection import radix_schedule
+from helion._compiler.cute.selection.radix_selection_codegen import _compact
+from helion._compiler.cute.selection.radix_selection_codegen import _compact_packet_work
+from helion._compiler.cute.selection.radix_selection_codegen import _histogram_choose
+from helion._compiler.cute.selection.radix_selection_codegen import _RadixCodegenSpec
+from helion._compiler.cute.selection.radix_selection_codegen import _Writer
+from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
 
 pytestmark = pytest.mark.cpu_only
 
@@ -35,12 +33,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with (
-        mock_cuda_unavailable(),
-        _target(),
-        forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
 
 

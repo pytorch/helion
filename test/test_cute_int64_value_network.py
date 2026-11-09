@@ -14,13 +14,12 @@ from test.cute_population_contracts import _target
 from test.test_cute_topk import _simulate_network_topk_fragment
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_fragment_topk_network import (
+from helion._compiler.cute.autotune.heuristics.cute_fragment_topk_network import (
     network_topk_supported,
 )
-from helion._compiler.cute.ordered_selection import selection_values_only
+from helion._compiler.cute.selection.ordered_selection import selection_values_only
+from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
@@ -31,7 +30,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with mock_cuda_unavailable(), forbid_native_compile():
+    with cpu_render_target():
         yield
 
 
@@ -293,7 +292,7 @@ def test_int64_network_default_and_population_prefix_stay_legacy() -> None:
 
     from test.cute_population_contracts import checked_initial_population
 
-    from helion._compiler.autotuner_heuristics import cute_fragment_topk_network
+    from helion._compiler.cute.autotune.heuristics import cute_fragment_topk_network
     from helion.autotuner.pattern_search import PatternSearch
 
     original_support = cute_fragment_topk_network.network_topk_supported

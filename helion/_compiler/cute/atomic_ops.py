@@ -44,6 +44,7 @@ from .thread_budget import MAX_THREADS_PER_BLOCK
 from .warp_atomic import warp_atomic_candidate
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterable
 
     from ..inductor_lowering import CodegenState
@@ -325,9 +326,9 @@ def _codegen_cute_atomic_rmw(
     )
     if tensor_index_stmt is not None:
         return tensor_index_stmt
-    from ...language.memory_ops import _cute_access_regions
-    from ...language.memory_ops import _cute_index_exprs
-    from ...language.memory_ops import _cute_tag_access_regions
+    from .emitters.memory_access import _cute_access_regions
+    from .emitters.memory_access import _cute_index_exprs
+    from .emitters.memory_access import _cute_tag_access_regions
 
     ast_index = state.ast_args[1]
     assert isinstance(ast_index, (list, tuple))
@@ -349,7 +350,7 @@ def _codegen_cute_atomic_rmw(
         **placeholders,
     )
     # The elements the atomic touches, for the barrier analysis
-    # (``lane_loop_distribution``), like a store's.
+    # (``lane_loops/placement.py``), like a store's.
     _cute_tag_access_regions(
         atomic_expr, tensor_name, _cute_access_regions(state, index, target)
     )
@@ -632,12 +633,11 @@ def _cute_vector_atomic_site(
     coordinate and every guard is uniform across the V lanes.  Returns whether
     the site was deferred (the caller then emits nothing else).
     """
-    from ...language.memory_ops import _cute_active_index_var
-    from ...language.memory_ops import _cute_lane_vloop_insert_pos
     from ..compile_environment import CompileEnvironment
+    from ..lane_loop_context import lane_context
     from ..tile_strategy import DeviceGridState
+    from .emitters.memory_access import _cute_active_index_var
     from .memory_ops import _cute_defer_grid_vector_op
-    from .memory_ops import _cute_lane_strategy
     from .memory_ops import _cute_tile_axis_block_id
     from .memory_ops import cute_reduction_vector_layout_aligned
 
@@ -678,28 +678,25 @@ def _cute_vector_atomic_site(
     if len(lane_axes) != 1:
         return False
     pos, block_id = lane_axes[0]
-    strategy = _cute_lane_strategy(state, block_id)
-    vec_by_block = getattr(strategy, "_cute_lane_vec_width_by_block", None)
-    if not isinstance(vec_by_block, dict):
+    context = lane_context(state, block_id)
+    if context is None:
         return False
-    vec_width = vec_by_block.get(block_id, 1)
+    vec_width = context.vec_width
     if vec_width not in (
         _CUTE_VECTOR_ATOMIC_WIDTHS
         if target.dtype is torch.float32
         else _CUTE_VECTOR_HALF_ATOMIC_WIDTHS
     ):
         return False
-    base_index_var = getattr(strategy, "_cute_lane_base_index_var_by_block", {}).get(
-        block_id
-    )
-    lane_body = getattr(strategy, "_cute_lane_body_by_block", {}).get(block_id)
-    vec_lane_var = getattr(strategy, "_cute_vec_lane_var_by_block", {}).get(block_id)
-    vloop = getattr(strategy, "_cute_lane_vloop_by_block", {}).get(block_id)
+    base_index_var = context.base_index_var
+    lane_body = context.lane_body
+    vec_lane_var = context.vec_lane_var
+    vloop = context.vloop
     if (
-        not isinstance(base_index_var, str)
-        or not isinstance(lane_body, list)
-        or not isinstance(vec_lane_var, str)
-        or not isinstance(vloop, ast.For)
+        base_index_var is None
+        or lane_body is None
+        or vec_lane_var is None
+        or vloop is None
     ):
         return False
     if index_exprs[pos] != _cute_active_index_var(state, block_id):
@@ -716,7 +713,7 @@ def _cute_vector_atomic_site(
         )
     ):
         return False
-    fact = state.device_function.cute_state.vloop_sink_wrappers.get(vec_lane_var)
+    fact = state.device_function.cute_state.lanes.vloop_sink_wrappers.get(vec_lane_var)
     if fact is None or fact.block_id != block_id or not fact.uniform_vector_mask:
         return False
     env = CompileEnvironment.current()
@@ -737,17 +734,14 @@ def _cute_vector_atomic_site(
     base_exprs = list(index_exprs)
     base_exprs[pos] = base_index_var
     base_pointer = _cute_coord_pointer_expr(tensor_name, base_exprs)
-    sites_by_block = getattr(strategy, "_cute_lane_vec_stores_by_block", None)
-    if sites_by_block is None:
-        sites_by_block = {}
-        # pyrefly: ignore [missing-attribute]
-        strategy._cute_lane_vec_stores_by_block = sites_by_block
     guard = " and ".join(predicates)
     body = stack[-1]
 
     def emit() -> ast.AST | None:
-        from ...language.memory_ops import CuteTileVecStoreSite
-        from .lane_loop_distribution import _tensor_mentions
+        from .emitters.lane_packets import CuteTileVecStoreSite
+        from .lane_loops.statements import _tensor_mentions
+
+        assert lane_body is not None
 
         # The flush runs after the whole V-loop: a later statement of the
         # body that touches the target would see the atomic out of order.
@@ -758,28 +752,22 @@ def _cute_vector_atomic_site(
         # the store site record so the memory-effect checks see the append as
         # a write of the target (``_cute_statement_written_tensors``) and the
         # flush is restored to the scalar atomic like a store's would be.
-        sites = sites_by_block.setdefault(block_id, [])
-        site_index = len(sites)
+        site_index = len(context.vec_stores)
         list_var = state.device_function.new_var(
             f"_tile_atomic_vals_{block_id}_{site_index}", dce=False
         )
         init_stmt = statement_from_string(f"{list_var} = []")
-        lane_body.insert(
-            _cute_lane_vloop_insert_pos(strategy, block_id, lane_body), init_stmt
-        )
+        lane_body.insert(context.vloop_position(), init_stmt)
         helper = _CUTE_VECTOR_ATOMIC_HELPERS[target.dtype]
         flush = f"{helper}({base_pointer}, {list_var})"
         if guard:
             flush = f"if {guard}:\n    {flush}"
         flush_stmt = statement_from_string(flush)
-        lane_body.insert(
-            _cute_lane_vloop_insert_pos(strategy, block_id, lane_body) + 1 + site_index,
-            flush_stmt,
-        )
+        lane_body.insert(context.vloop_position() + 1 + site_index, flush_stmt)
         body_stmt = statement_from_string(
             f"{list_var}.append({{value}})", value=value_expr
         )
-        sites.append(
+        context.add_vec_store(
             CuteTileVecStoreSite(
                 list_var, tensor_name, body_stmt, scalar, init_stmt, flush_stmt
             )
@@ -793,7 +781,7 @@ def _cute_vector_atomic_site(
         assert isinstance(guard_expr, ast.expr)
         scalar = ast.If(test=guard_expr, body=[scalar], orelse=[])
     scalar = ast.fix_missing_locations(scalar)
-    if not _cute_defer_grid_vector_op(state, strategy, block_id, scalar, emit):
+    if not _cute_defer_grid_vector_op(state, context, scalar, emit):
         return False
     state.codegen.add_statement(scalar)
     return True
@@ -885,7 +873,7 @@ def _cute_leader_broadcast_hazard(state: CodegenState) -> str | None:
     The broadcast (``_cute_broadcast_leader_value``) needs block-wide
     barriers next to the atomic.  A branch or while loop may skip them on
     some threads (its condition can differ between SIMT threads), and the
-    lane-loop placement (``cute/lane_loop_distribution.py``) pins a barrier
+    lane-loop placement (``cute/lane_loops/placement.py``) pins a barrier
     inside every lane loop while it moves a lane-invariant atomic out of
     them, which would split the broadcast from its atomic.
     """
@@ -1134,8 +1122,8 @@ def _cute_atomic_indexed_blocks(
     fx_graph = state.fx_node.graph if state.fx_node is not None else None
 
     if any(isinstance(idx, slice) for idx in index):
-        from ...language.memory_ops import _cute_resolve_active_slice_block_id
         from ..utils import compute_slice_size
+        from .emitters.memory_access import _cute_resolve_active_slice_block_id
 
         target = state.proxy_arg(0)
         assert isinstance(target, torch.Tensor)
@@ -1385,7 +1373,7 @@ def _cute_uniform_lane_vars(
     tensor value's load, or the loop structure nests the atomic's own loop
     inside it.  Recorded on the atomic call for the lane-loop distribution of
     the grid body and the full-nest check of an enclosing device loop's body
-    (``cute/lane_loop_distribution.py``), which pin the atomic to the loop's
+    (``cute/lane_loops/placement.py``), which pin the atomic to the loop's
     first lane, where the thread holds the tile's first element along the
     axis under every lane layout, instead of repeating it once per iteration.
     Empty when the coverage is unknown: the atomic then runs on every thread
@@ -1430,7 +1418,7 @@ def _cute_per_lane_atomic_lane_vars(state: CodegenState) -> set[str]:
     """The K lane loops whose per-lane matmul partials this atomic adds."""
     if state.fx_node is None:
         return set()
-    return state.device_function.cute_state.per_lane_atomic_lane_vars.get(
+    return state.device_function.cute_state.lanes.per_lane_atomic_lane_vars.get(
         state.fx_node, set()
     )
 
@@ -1599,8 +1587,8 @@ def _active_reduction_axis_of_iota(
     thread, as the slice it spans does (``hl.arange(0, k)`` is ``[:k]``), and
     the atomic varies along that axis rather than repeating across it.
     """
-    from ...language.memory_ops import _cute_active_index_var
     from ..compile_environment import CompileEnvironment
+    from .emitters.memory_access import _cute_active_index_var
 
     iota_node = _resolve_tensor_index_iota_node(state, node)
     if iota_node is None or state.fx_node is None:
@@ -1632,8 +1620,8 @@ def _codegen_tensor_index_common_cute(
     *,
     extra_predicates: list[str] | None = None,
 ) -> ast.AST | None:
-    from ...language.memory_ops import _cute_active_index_var
     from ..compile_environment import CompileEnvironment
+    from .emitters.memory_access import _cute_active_index_var
 
     fx_node = state.fx_node
     if fx_node is None or len(fx_node.args) < 2:
@@ -1922,88 +1910,47 @@ def _codegen_tensor_index_loop_common_cute(
     return ast.Constant(value=None)
 
 
-@_decorators.codegen(atomic_add, "cute")
-def _(state: CodegenState) -> ast.AST:
-    value_expr = state.ast_args[2]
-    return _codegen_common_cute(
-        "atomic_add",
-        state,
-        value_exprs=_to_ast_values([value_expr]),
-        keyword_names=["val"],
-    )
+# The read-modify-write ops of ``hl.atomic_*`` on the CuTe backend: the
+# ``cute.arch`` function, the positions of the value operands in the call's
+# AST arguments (``target, index, *values, sem``) and the keyword names
+# ``_resolve_cute_atomic_kwargs`` maps onto the live ``cute.arch`` signature.
+_ATOMIC_RMW_FORMS: tuple[
+    tuple[Callable[..., object], str, tuple[int, ...], tuple[str, ...]], ...
+] = (
+    (atomic_add, "atomic_add", (2,), ("val",)),
+    (atomic_xchg, "atomic_exch", (2,), ("val",)),
+    (atomic_and, "atomic_and", (2,), ("val",)),
+    (atomic_or, "atomic_or", (2,), ("val",)),
+    (atomic_xor, "atomic_xor", (2,), ("val",)),
+    (atomic_max, "atomic_max", (2,), ("val",)),
+    (atomic_min, "atomic_min", (2,), ("val",)),
+    (atomic_cas, "atomic_cas", (2, 3), ("cmp", "val")),
+)
 
 
-@_decorators.codegen(atomic_xchg, "cute")
-def _(state: CodegenState) -> ast.AST:
-    value_expr = state.ast_args[2]
-    return _codegen_common_cute(
-        "atomic_exch",
-        state,
-        value_exprs=_to_ast_values([value_expr]),
-        keyword_names=["val"],
-    )
+def _atomic_rmw_codegen(
+    cute_func: str,
+    value_positions: tuple[int, ...],
+    keyword_names: tuple[str, ...],
+) -> Callable[[CodegenState], ast.AST]:
+    def codegen(state: CodegenState) -> ast.AST:
+        return _codegen_common_cute(
+            cute_func,
+            state,
+            value_exprs=_to_ast_values(
+                [state.ast_args[position] for position in value_positions]
+            ),
+            keyword_names=list(keyword_names),
+        )
+
+    return codegen
 
 
-@_decorators.codegen(atomic_and, "cute")
-def _(state: CodegenState) -> ast.AST:
-    value_expr = state.ast_args[2]
-    return _codegen_common_cute(
-        "atomic_and",
-        state,
-        value_exprs=_to_ast_values([value_expr]),
-        keyword_names=["val"],
-    )
+def _register_atomic_rmw_forms() -> None:
+    for op, cute_func, value_positions, keyword_names in _ATOMIC_RMW_FORMS:
+        _decorators.codegen(op, "cute")(
+            _atomic_rmw_codegen(cute_func, value_positions, keyword_names)
+        )
 
 
-@_decorators.codegen(atomic_or, "cute")
-def _(state: CodegenState) -> ast.AST:
-    value_expr = state.ast_args[2]
-    return _codegen_common_cute(
-        "atomic_or",
-        state,
-        value_exprs=_to_ast_values([value_expr]),
-        keyword_names=["val"],
-    )
-
-
-@_decorators.codegen(atomic_xor, "cute")
-def _(state: CodegenState) -> ast.AST:
-    value_expr = state.ast_args[2]
-    return _codegen_common_cute(
-        "atomic_xor",
-        state,
-        value_exprs=_to_ast_values([value_expr]),
-        keyword_names=["val"],
-    )
-
-
-@_decorators.codegen(atomic_max, "cute")
-def _(state: CodegenState) -> ast.AST:
-    value_expr = state.ast_args[2]
-    return _codegen_common_cute(
-        "atomic_max",
-        state,
-        value_exprs=_to_ast_values([value_expr]),
-        keyword_names=["val"],
-    )
-
-
-@_decorators.codegen(atomic_min, "cute")
-def _(state: CodegenState) -> ast.AST:
-    value_expr = state.ast_args[2]
-    return _codegen_common_cute(
-        "atomic_min",
-        state,
-        value_exprs=_to_ast_values([value_expr]),
-        keyword_names=["val"],
-    )
-
-
-@_decorators.codegen(atomic_cas, "cute")
-def _(state: CodegenState) -> ast.AST:
-    return _codegen_common_cute(
-        "atomic_cas",
-        state,
-        value_exprs=_to_ast_values([state.ast_args[2], state.ast_args[3]]),
-        keyword_names=["cmp", "val"],
-    )
+_register_atomic_rmw_forms()

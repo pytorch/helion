@@ -10,7 +10,6 @@ import torch
 import helion
 from helion._compiler.cute.collective_matmul import _uniform_reuse_names
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
 
@@ -89,7 +88,6 @@ def _grid_config(*, n_first: bool, copy: str = "scalar") -> helion.Config:
 
 
 @pytest.mark.parametrize("n_first", [False, True])
-@skipUnlessBackends(["cute"])
 def test_grid_collective_uses_physical_thread_order(n_first: bool) -> None:
     inputs = (
         torch.empty((193, 78), dtype=torch.float16),
@@ -110,7 +108,6 @@ def test_grid_collective_uses_physical_thread_order(n_first: bool) -> None:
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("n_first", [False, True])
 @pytest.mark.parametrize("copy", ["scalar", "async_cached"])
-@skipUnlessBackends(["cute"])
 def test_grid_collective_correctness(
     dtype: torch.dtype, n_first: bool, copy: str
 ) -> None:
@@ -129,7 +126,6 @@ def test_grid_collective_correctness(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("bk", [16, 32, 64, 128])
-@skipUnlessBackends(["cute"])
 def test_computed_gathered_source_uses_collective(dtype: torch.dtype, bk: int) -> None:
     bound = cpu_bind(
         _computed_gathered_matmul,
@@ -154,7 +150,6 @@ def test_computed_gathered_source_uses_collective(dtype: torch.dtype, bk: int) -
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tile", [(32, 32, 16), (64, 32, 64), (128, 64, 32)])
-@skipUnlessBackends(["cute"])
 def test_computed_gathered_matmul_correctness(
     dtype: torch.dtype, tile: tuple[int, int, int]
 ) -> None:
@@ -173,7 +168,6 @@ def test_computed_gathered_matmul_correctness(
     torch.testing.assert_close(result, expected, rtol=0.02, atol=0.02)
 
 
-@skipUnlessBackends(["cute"])
 def test_input_mutation_keeps_original_serial_schedule() -> None:
     bound = cpu_bind(
         _aliased_matmul,
@@ -187,7 +181,6 @@ def test_input_mutation_keeps_original_serial_schedule() -> None:
     assert "_helion_pending_collective_mma" not in code
 
 
-@skipUnlessBackends(["cute"])
 def test_uniform_metadata_is_read_once_before_row_loop() -> None:
     kernel = helion.kernel(
         moe_matmul_ogs.fn, backend="cute", static_shapes=False, autotune_effort="none"
@@ -241,7 +234,6 @@ def _padded_inputs(device: str, dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
     return a, b, counts, offsets, rows
 
 
-@skipUnlessBackends(["cute"])
 def test_async_copies_have_cache_safe_alignment_and_stride_facts() -> None:
     kernel = helion.kernel(
         moe_matmul_ogs.fn, backend="cute", static_shapes=False, autotune_effort="none"
@@ -255,7 +247,6 @@ def test_async_copies_have_cache_safe_alignment_and_stride_facts() -> None:
     assert "copy_tail_lane" in source
 
 
-@skipUnlessBackends(["cute"])
 def test_cached_copy_keeps_gather_loads_outside_reduction_loop() -> None:
     kernel = helion.kernel(
         moe_matmul_ogs.fn, backend="cute", static_shapes=False, autotune_effort="none"
@@ -280,7 +271,6 @@ def test_cached_copy_keeps_gather_loads_outside_reduction_loop() -> None:
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("unaligned", [False, True])
 @pytest.mark.parametrize("copy", ["async", "async_cached"])
-@skipUnlessBackends(["cute"])
 def test_async_gathered_matmul_preserves_tails_and_empty_groups(
     dtype: torch.dtype, unaligned: bool, copy: str
 ) -> None:

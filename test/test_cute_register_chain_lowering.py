@@ -244,8 +244,10 @@ def test_cloned_dce_retains_annotations_and_leaves_original_ast_unchanged(
         assert copy._location is loop._location
         assert copy._loop_type is loop._loop_type
     state = SimpleNamespace(
-        collective_mma_sites=[replace(_site(), synthetic_k_lane="lane")],
-        collective_mma_pure_stmt_ids={id(loop.body[0])},
+        lanes=SimpleNamespace(
+            collective_mma_sites=[replace(_site(), synthetic_k_lane="lane")],
+            collective_mma_pure_stmt_ids={id(loop.body[0])},
+        )
     )
     df = cast("DeviceFunction", SimpleNamespace(cute_state=state, dce_vars=[]))
     copied_body: list[ast.stmt] = [copy]
@@ -256,7 +258,7 @@ def test_cloned_dce_retains_annotations_and_leaves_original_ast_unchanged(
     assert ast.dump(module, include_attributes=True) == original
     assert getattr(loop, HELION_LANE_LOOP_VAR_ATTR) == "lane"
     assert metadata == {"owner": "scalarization"}
-    assert state.collective_mma_pure_stmt_ids == {id(loop.body[0])}
+    assert state.lanes.collective_mma_pure_stmt_ids == {id(loop.body[0])}
 
 
 def test_late_rejection_does_not_change_source_namespace_or_owned_pure_ids() -> None:
@@ -292,10 +294,12 @@ for row_lane in range(4):
         return f"allocated_{len(namespace_calls)}_{hint}"
 
     state = SimpleNamespace(
-        collective_mma_sites=[_site(0, 32), _site(1, 64)],
-        collective_mma_pure_stmt_ids={31},
-        collective_mma_emitted_stmt_ids=set(),
-        collective_mma_shared_results=set(),
+        lanes=SimpleNamespace(
+            collective_mma_sites=[_site(0, 32), _site(1, 64)],
+            collective_mma_pure_stmt_ids={31},
+            collective_mma_emitted_stmt_ids=set(),
+            collective_mma_shared_results=set(),
+        )
     )
     df = cast(
         "DeviceFunction",
@@ -321,9 +325,9 @@ for row_lane in range(4):
     assert ast.dump(module, include_attributes=True) == original
     assert {id(node) for node in ast.walk(module)} == original_nodes
     assert namespace_calls == []
-    assert state.collective_mma_pure_stmt_ids == {31}
-    assert state.collective_mma_emitted_stmt_ids == set()
-    assert state.collective_mma_shared_results == set()
+    assert state.lanes.collective_mma_pure_stmt_ids == {31}
+    assert state.lanes.collective_mma_emitted_stmt_ids == set()
+    assert state.lanes.collective_mma_shared_results == set()
     assert df.dce_vars == ["old_dead_value"]
 
 

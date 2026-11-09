@@ -1528,6 +1528,31 @@ class TestPallas(TestCase):
                 pallas_load_buffer_count=[2, 2],
             )
 
+    def test_vmem_check_counts_emit_pipeline_buffers(self) -> None:
+        """emit_pipeline allocates its block buffers in-kernel; they must count."""
+        # x, y and out each get two 2048x2048 fp32 pipeline buffers = 96MB.
+        args = (
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+        )
+        code, _ = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[256, 256],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn(f"_pipeline_vmem_bytes={3 * 2 * 256 * 256 * 4}", code)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Ran out of memory in memory space vmem.*Estimated [0-9.]+MB exceeds",
+        ):
+            code_and_output(
+                pallas_inner_loop_add,
+                args,
+                block_sizes=[2048, 2048],
+                pallas_loop_type="emit_pipeline",
+            )
+
     @xfailIfPallasInterpret(
         "torch.float8_e4m3fn has no JAX dtype mapping in interpret mode; "
         "conversion errors before the VMEM check fires"
@@ -4448,6 +4473,38 @@ class TestPallas(TestCase):
             pallas_loop_type=loop_type,
         )
         torch.testing.assert_close(out, a @ b, rtol=1e-2, atol=1e-2)
+
+    @parametrize("loop_type", ("fori_loop", "unroll", "emit_pipeline"))
+    def test_two_loops_tiling_same_dim_pad_to_both_blocks(self, loop_type: str) -> None:
+        """Two inner loops tile N with different block sizes; pad covers both.
+
+        N = 1536 is a multiple of 256 but not of 1024.  Padding x only for
+        the second loop's 256 block lets the first loop's last 1024 tile read
+        past the end of x.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def row_center(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n):
+                    acc = acc + torch.sum(x[tile_m, tile_n], dim=-1)
+                mean = acc / n
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] - mean[:, None]
+            return out
+
+        x = torch.randn(16, 1536, device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(
+            row_center,
+            (x,),
+            block_sizes=[8, 1024, 256],
+            pallas_loop_type=loop_type,
+        )
+        self.assertIn("(0, 1, 1024, 0), (0, 1, 256, 0)", code)
+        torch.testing.assert_close(out, x - x.mean(dim=-1, keepdim=True))
 
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:

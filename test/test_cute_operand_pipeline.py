@@ -18,35 +18,23 @@ from typing import cast
 from typing_extensions import Self
 
 import pytest
-import torch
 
 from helion._testing import skipUnlessCuteAvailable
-from helion._testing.cute_codegen import mock_cuda_unavailable
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 from helion._compiler.cute import tcgen05_operand_pipeline
-from helion._compiler.cute.tcgen05_pipeline import make_pipeline_state
+
+# The SDK swizzle checks compile through the CuTe DSL on the host.
+pytestmark = pytest.mark.cpu_render(forbid_native=False)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from collections.abc import Iterator
 
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
 pipeline = pytest.importorskip("cutlass.pipeline")
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    with mock_cuda_unavailable():
-
-        def forbidden(*args: object, **kwargs: object) -> None:
-            raise AssertionError("GPU forbidden in the operand pipeline proof")
-
-        monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
-        yield
 
 
 class _F32:
@@ -648,9 +636,9 @@ def _record_phases(
     k_counts: cutlass.Constexpr[tuple[int, ...]],
     address: cutlass.Int64,
 ) -> None:
-    producer = make_pipeline_state(pipeline.PipelineUserType.Producer, stages)
-    converter = make_pipeline_state(pipeline.PipelineUserType.Consumer, stages)
-    consumer = make_pipeline_state(pipeline.PipelineUserType.Consumer, stages)
+    producer = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, stages)
+    converter = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, stages)
+    consumer = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, stages)
     output = cute.make_tensor(
         cute.make_ptr(
             cutlass.Int32, address, cute.AddressSpace.generic, assumed_align=4

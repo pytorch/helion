@@ -24,12 +24,12 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.cute.emitters.lane_packets import CuteTileVecStoreSite
 from helion._compiler.cute.memory_ops import _cute_statement_written_tensors
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
-from helion.language.memory_ops import CuteTileVecStoreSite
 
 pytestmark = skipUnlessBackends(["cute"])
 

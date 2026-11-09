@@ -55,6 +55,7 @@ from .._compiler.autotuner_heuristics import compiler_promotion_specialization_k
 from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.autotuner_heuristics import compiler_seed_specialization_facts
 from .._compiler.autotuner_heuristics import register_compiler_coverage_groups
+from .._compiler.backend_registry import get_backend
 from .._compiler.compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _concrete_tensor_satisfies_alignment_guard
@@ -65,14 +66,6 @@ from .._compiler.compile_environment import shape_env_var_hints
 from .._compiler.compile_environment import (
     tensor_descriptor_layout_signature_from_strides,
 )
-from .._compiler.cute.aux_tensor import host_function_has_tcgen05_aux_kernel_pattern
-from .._compiler.cute.aux_tensor import (
-    host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
-)
-from .._compiler.cute.aux_tensor import host_function_matmul_has_non_tcgen05_operand
-from .._compiler.cute.aux_tensor import host_function_tcgen05_aux_loads_on_every_store
-from .._compiler.cute.aux_tensor import host_function_tcgen05_rowvec_aux_facts
-from .._compiler.cute.split_k_exchange import host_function_has_plain_store_body
 from .._compiler.generate_ast import generate_ast
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.kernel_compiler import KernelCompiler
@@ -90,11 +83,9 @@ from ..autotuner.base_search import _AutotunableKernel
 from ..autotuner.benchmark_provider import _SEARCHING_CANDIDATES
 from ..language.constexpr import ConstExpr
 from .config import Config
-from .cute_structural_config import DEFAULT_STRUCTURAL_POLICY
-from .cute_structural_config import CuteStructuralConfig
-from .cute_structural_config import StructuralPolicyError
-from .cute_structural_config import require_same_structural_policy
-from .cute_structural_config import select_structural_policy
+from .cute.structural_config import DEFAULT_STRUCTURAL_POLICY
+from .cute.structural_config import CuteStructuralConfig
+from .cute.structural_config import select_structural_policy
 from .generated_code_cache import GeneratedCodeState
 from .generated_code_cache import binding_input_key
 from .generated_code_cache import compiled_kernel_cache_key
@@ -102,6 +93,9 @@ from .generated_code_cache import serialized_fact
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
+from .structural_policy import StructuralConfig
+from .structural_policy import StructuralPolicyError
+from .structural_policy import require_same_structural_policy
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -117,8 +111,8 @@ if TYPE_CHECKING:
     from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
-    from .cute_structural_config import CuteStructuralPolicyRequest
-    from .cute_structural_policy import CuteStructuralPolicy
+    from .cute.structural_config import CuteStructuralPolicyRequest
+    from .cute.structural_policy import CuteStructuralPolicy
     from .generated_code_cache import GuardSource
 
     ConfigLike = Config | dict[str, object] | CuteStructuralConfig
@@ -565,7 +559,7 @@ class _SpecializationAlias:
 
 
 @dataclasses.dataclass(frozen=True)
-class _PreparedMetadataSpecializationExtractor:
+class PreparedMetadataSpecializationExtractor:
     """Specialization read from input tensor metadata.
 
     Exact metadata, which ``_make_prepared_arg_guard`` checks, implies its
@@ -613,7 +607,7 @@ def _implied_by_exact_metadata(
     dynamic-shape compile), so a guard fact over a storage-offset symbol is
     evaluated on every call like pointer alignment and scalar values.
     """
-    if not isinstance(extractor, _PreparedMetadataSpecializationExtractor):
+    if not isinstance(extractor, PreparedMetadataSpecializationExtractor):
         return False
     inner = extractor.extractor
     return not (
@@ -742,7 +736,7 @@ def _evaluate_specialization_alias(
 def _capture_safe_specialization(
     extractor: Callable[[Sequence[object]], Hashable],
 ) -> bool:
-    if isinstance(extractor, _PreparedMetadataSpecializationExtractor):
+    if isinstance(extractor, PreparedMetadataSpecializationExtractor):
         return True
     if isinstance(extractor, _SpecializationAlias):
         return all(
@@ -1414,6 +1408,9 @@ class Kernel(Generic[_R]):
         self._specialization_generation = 0
         self._reset_generation = 0
         self._has_specialization_extras = False
+        # Descriptors of the input-value specializations a backend registered
+        # from generated code (``Backend.after_codegen`` / ``after_compile``),
+        # per signature, so each is keyed once.
         self._cute_grouped_static_tail_extra_descriptors: dict[
             Hashable, set[Hashable]
         ] = {}
@@ -1482,12 +1479,14 @@ class Kernel(Generic[_R]):
         # Legacy kernels retain their existing mutable Settings behavior. An
         # explicitly policy-bound kernel cannot silently change its IR contract.
         if self.cute_structural_policy is not None:
-            if self.settings.backend != "cute":
+            policy_type = get_backend(self.settings.backend).structural_policy_type()
+            if policy_type is None:
                 raise StructuralPolicyError(
-                    "A policy-bound Kernel requires backend='cute'"
+                    "A policy-bound Kernel requires a backend with a structural "
+                    f"policy (the {self.settings.backend} backend has none)"
                 )
             require_same_structural_policy(
-                self.settings.get_cute_structural_policy(),
+                policy_type.from_settings(self.settings),
                 self.cute_structural_policy,
                 context="Kernel settings",
             )
@@ -1762,7 +1761,7 @@ class Kernel(Generic[_R]):
     def _publish_guard_facts(
         self,
         bound_kernel: BoundKernel,
-        facts: Sequence[_PreparedMetadataSpecializationExtractor],
+        facts: Sequence[PreparedMetadataSpecializationExtractor],
     ) -> None:
         """Append guard facts to a signature's dispatch schema.
 
@@ -2602,7 +2601,7 @@ class Kernel(Generic[_R]):
             raise exc.InvalidAPIUsage(
                 "autotune_multi does not support an initialized distributed process group"
             )
-        if self.settings.backend not in {"triton", "tileir", "cute", "pallas"}:
+        if not get_backend(self.settings.backend).supports_autotune_multi:
             raise exc.InvalidAPIUsage(
                 f"autotune_multi does not support backend {self.settings.backend!r}"
             )
@@ -3078,11 +3077,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         super().__init__()
         kernel._validate_structural_policy()
         self.kernel = kernel
-        self._structural_policy = (
-            kernel.settings.get_cute_structural_policy()
-            if kernel.settings.backend == "cute"
-            else None
-        )
         self._reset_generation = kernel._reset_generation
         # Extending this bound's schema evicts all of its dispatch mappings.
         self._dispatch_generation: int | None = None
@@ -3132,10 +3126,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._render_only_configs: set[Config] = set()
         # Shape guards recorded past this index come from code generation.
         self._bind_guard_count = 0
-        # Hint-sized CuTe reduction extents, per generated config.
-        self._cute_reduction_extents: dict[
-            Config, tuple[_CuteReductionExtent, ...]
-        ] = {}
+        # Backend specialization descriptors recorded per generated config
+        # (``Backend.after_codegen``; CuTe: hint-sized reduction extents).
+        self._cute_reduction_extents: dict[Config, tuple[Hashable, ...]] = {}
         self._cache_path_map: dict[Config, str | None] = {}
         self._host_semantic_fingerprints: dict[
             tuple[_HostSemanticInputNormalization, tuple[object, ...]], str
@@ -3161,40 +3154,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             index_dtype=_resolve_index_dtype(self.kernel.settings, args),
             is_distributed=is_distributed,
         )
+        # The structural policy the traced IR will follow (None for backends
+        # whose config schema does not depend on Settings).
+        policy_type = self._env.backend.structural_policy_type()
+        self._structural_policy = (
+            None if policy_type is None else policy_type.from_settings(kernel.settings)
+        )
 
         if is_ref_mode_enabled(self.kernel.settings):
             self.fake_args = []  # type: ignore[assignment]
             self.host_function = None  # type: ignore[assignment]
             return
 
-        if (
-            rewrite_ast
-            and (
-                self.settings.cute_region_fission
-                or self.settings.cute_materialize_transformed_operands
-            )
-            and self.settings.backend == "cute"
-        ):
-            from .._compiler.cute.materialize_operand import (
-                plan_operand_materialization,
-            )
-            from .._compiler.cute.materialized_fission import plan_materialized_fission
-
-            with (
-                _maybe_skip_dtype_check_in_meta_registrations(),
-                patch_inductor_lowerings(),
-            ):
-                if self.settings.cute_materialize_transformed_operands:
-                    self._env.cute_fission_plan = plan_operand_materialization(
-                        self.kernel, args, self._env
-                    )
-                if (
-                    self.settings.cute_region_fission
-                    and self._env.cute_fission_plan is None
-                ):
-                    self._env.cute_fission_plan = plan_materialized_fission(
-                        self.kernel, args, self._env
-                    )
+        self._env.backend.on_bind(self, args, rewrite_ast=rewrite_ast)
 
         with self.env:
             self._env.process_group_name = _find_process_group_name(
@@ -3230,7 +3202,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
 
             with (
-                _maybe_skip_dtype_check_in_meta_registrations(),
+                maybe_skip_dtype_check_in_meta_registrations(),
                 patch_inductor_lowerings(),
                 measure("BoundKernel.create_host_function"),
             ):
@@ -3254,59 +3226,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
                 self.env.snapshot_tensor_descriptor_alignments(runtime_args)
 
-                # Post-compile FX-graph scan to detect kernels
-                # whose tcgen05 matmul is followed by an
-                # aux-fused store
-                # (``out[tile] = (acc + residual[tile]).to(...)``
-                # and variants — see
-                # ``host_function_has_tcgen05_aux_kernel_pattern``
-                # for the accepted shapes). When detected, the
-                # autotune surface widens to admit
-                # ``tcgen05_strategy=ROLE_LOCAL_WITH_SCHEDULER``
-                # + ``tcgen05_warp_spec_c_input_warps=1`` so the
-                # productive C-input warp lift is reachable from
-                # the normal autotune path. For pure-matmul
-                # kernels the detector returns False and the
-                # autotune surface keeps the narrow
-                # ``MONOLITHIC + c_input_warps=0`` shape so
-                # autotune cannot sample the strictly-worse
-                # inert C-input warp configuration.
-                # The exact-shape detector is narrower: it gates the
-                # ``tcgen05_aux_load_mode=tma`` seed/search axis.
-                # The compiler seeds below read these facts (the FFI
-                # direct-entry gate consults the non-tcgen05 operand
-                # flag, the cluster_m=2 seeds and the search projection
-                # the aux facts), so they are recorded before
-                # ``compiler_seed_configs`` runs; they depend only on the
-                # traced host function, not on the runtime arguments.
-                self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
-                    host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
-                )
-                # ``tcgen05_split_k`` guards only the tcgen05 tile store with
-                # its last-arriver check; the knob needs a body whose only
-                # side effect is that store.
-                self.env.config_spec.cute_tcgen05_split_k_plain_body = (
-                    host_function_has_plain_store_body(self.host_function)
-                )
-                self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
-                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
-                        self.host_function
-                    )
-                )
-                # ``pre_acc_wait`` renders only where every store chain has
-                # per-subtile auxiliary loads (or the shared fanout epilogue
-                # merges the chains); the strict normalizer and the seeds
-                # read this proof so a two-output kernel whose first output
-                # is aux-free never samples the placement into a codegen
-                # refusal.
-                self.env.config_spec.cute_tcgen05_aux_loads_on_every_store = (
-                    host_function_tcgen05_aux_loads_on_every_store(self.host_function)
-                )
-                self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
-                    host_function_matmul_has_non_tcgen05_operand(self.host_function)
-                )
-                self.env.config_spec.cute_tcgen05_rowvec_aux_facts = (
-                    host_function_tcgen05_rowvec_aux_facts(self.host_function)
+                # Structural facts the compiler seeds and the search surface
+                # read off the traced host function (recorded before
+                # ``compiler_seed_configs`` runs; independent of the runtime
+                # arguments).
+                self.env.backend.host_structural_facts(
+                    self.host_function, self.env.config_spec
                 )
                 with self.env.use_runtime_arg_values(runtime_args):
                     self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
@@ -3412,7 +3337,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
     def _normalize_config(self, config: ConfigLike) -> Config:
         self.kernel._validate_structural_policy()
-        if isinstance(config, CuteStructuralConfig):
+        if isinstance(config, StructuralConfig):
             require_same_structural_policy(
                 config.policy, self._structural_policy, context="Late config envelope"
             )
@@ -3443,31 +3368,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         ]
         if settings.index_dtype is not None:
             parts.append(f"index_dtype={settings.index_dtype}")
-        if settings.backend == "cute":
-            # Structural settings determine the config's axis schema at binding.
-            # Record opt-outs too, independent of the replay process's environment.
-            # The graph CSE pass belongs here as well: the merged and the traced
-            # device IR roll different reduction sweeps, so their configs carry a
-            # different number of ``load_eviction_policies`` slots; a repro
-            # printed under HELION_CUTE_GRAPH_CSE=0 must replay the traced graph.
-            parts.extend(
-                [
-                    "backend='cute'",
-                    f"cute_region_fission={settings.cute_region_fission}",
-                    f"cute_full_slice_matmul_tiling={settings.cute_full_slice_matmul_tiling}",
-                    f"cute_segmented_matmul_tiling={settings.cute_segmented_matmul_tiling}",
-                    f"cute_flatten_nested_reductions={settings.cute_flatten_nested_reductions}",
-                    f"cute_materialize_transformed_operands={settings.cute_materialize_transformed_operands}",
-                    f"cute_graph_cse={settings.cute_graph_cse}",
-                ]
-            )
-        if settings.backend == "cute" or settings.cute_rng_stream != "word0":
-            parts.append(f"cute_rng_stream={settings.cute_rng_stream!r}")
-        if not settings.cute_stage_unaligned_operands:
-            # Non-default only: the pass changes the host code, not configs.
-            parts.append("cute_stage_unaligned_operands=False")
-        if not settings.cute_flat_edge_tma:
-            parts.append("cute_flat_edge_tma=False")
+        # Resolved from the settings' backend: callers pass foreign Settings
+        # and ``self`` may be None.
+        parts.extend(get_backend(settings.backend).decorator_settings(settings))
         return f"@helion.kernel({', '.join(parts)})"
 
     def to_code(
@@ -3503,15 +3406,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self._runtime_arg_values_for_codegen(),
                 measure("BoundKernel.generate_ast"),
             ):
-                self.env.cute_hint_sized_reduction_extents.clear()
+                self.env.backend.before_codegen(self, config)
                 # pyrefly: ignore [bad-argument-type]
                 root = generate_ast(self.host_function, config, emit_repro_caller)
                 # Code generation can guard on input sizes too.
                 self._publish_guarded_input_facts()
-                self._register_cute_grouped_static_tail_specializations()
-                self._cute_reduction_extents[config] = (
-                    _cute_reduction_extent_descriptors(self.env)
-                )
+                self.env.backend.after_codegen(self, config)
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
             import_lines: list[str] = []
@@ -3630,7 +3530,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 # records its guard facts and CuTe specializations.
                 del self._compile_cache[config]
             else:
-                self._register_cute_reduction_extent_specializations(config)
+                self.env.backend.after_compile(self, config)
                 return rv
         device_index = (
             self._env.device.index if self._env.device.index is not None else 0
@@ -3704,7 +3604,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         rv = getattr(module, self.kernel.name)
         self._compile_cache[config] = rv
         self._cache_path_map[config] = module.__file__
-        self._register_cute_reduction_extent_specializations(config)
+        self.env.backend.after_compile(self, config)
         return rv
 
     def bench_compile_config(
@@ -3991,7 +3891,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._config = config
         repro_config = (
             requested_config
-            if isinstance(requested_config, CuteStructuralConfig)
+            if isinstance(requested_config, StructuralConfig)
             else config
         )
         counters["best_config_decorator"][
@@ -4107,7 +4007,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             source = self.env.shape_env.var_to_sources[v][0]
             extractor = make_extractor(source)
             if isinstance(source, TensorPropertySource):
-                extractor = _PreparedMetadataSpecializationExtractor(extractor)
+                extractor = PreparedMetadataSpecializationExtractor(extractor)
             extractors.append(extractor)
             guard_sources.append((source, None, None))
             if (
@@ -4120,7 +4020,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if source in extracted_strides:
                 continue
             extractors.append(
-                _PreparedMetadataSpecializationExtractor(make_extractor(source))
+                PreparedMetadataSpecializationExtractor(make_extractor(source))
             )
             guard_sources.append((source, None, None))
         candidate_configs: tuple[Config, ...] | None
@@ -4231,7 +4131,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 )
 
             extractors.append(
-                _PreparedMetadataSpecializationExtractor(td_layout_extractor)
+                PreparedMetadataSpecializationExtractor(td_layout_extractor)
             )
             guard_sources.append((source, guard, extent_cap))
 
@@ -4276,7 +4176,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
     def _guarded_input_facts(
         self,
-    ) -> list[_PreparedMetadataSpecializationExtractor]:
+    ) -> list[PreparedMetadataSpecializationExtractor]:
         """Input-shape guards this dynamic-shape compilation baked into its code.
 
         ``static_shapes=False`` keeps 0/1 sizes symbolic so one bound kernel
@@ -4379,7 +4279,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     )
                 )
         return [
-            _PreparedMetadataSpecializationExtractor(fact)
+            PreparedMetadataSpecializationExtractor(fact)
             for fact in sorted(facts, key=repr)
         ]
 
@@ -4422,13 +4322,17 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         with self.env.use_runtime_arg_values(values):
             yield
 
-    def _extend_cute_descriptor_specializations(
+    def _extend_descriptor_specializations(
         self,
         seen_by_signature: dict[Hashable, set[Hashable]],
         descriptors: Sequence[Hashable],
         make_extractor: Callable[[Any], Callable[[Sequence[object]], Hashable]],
     ) -> None:
-        """Key every descriptor that this signature does not key yet."""
+        """Key every descriptor that this signature does not key yet.
+
+        Backends call this from their ``after_codegen`` / ``after_compile``
+        hooks with a per-kernel ``seen_by_signature`` slot.
+        """
         if not descriptors:
             return
         signature = self._base_spec_key
@@ -4453,45 +4357,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 runtime_args,
             ):
                 seen.update(new_descriptors)
-
-    def _register_cute_grouped_static_tail_specializations(self) -> None:
-        if self.kernel.settings.backend != "cute" or not self._cache_managed:
-            return
-        self._extend_cute_descriptor_specializations(
-            self.kernel._cute_grouped_static_tail_extra_descriptors,
-            _cute_grouped_static_tail_extra_descriptors(
-                self.env.cute_resolved_wrapper_plans
-            ),
-            _make_cute_grouped_static_tail_extractor,
-        )
-
-    def _register_cute_reduction_extent_specializations(self, config: Config) -> None:
-        """Key the power-of-2 bucket of each hint-sized dynamic reduction extent.
-
-        A CuTe persistent reduction sizes its thread layout (and the CTA) from
-        the extent's size hint, while one dynamic-shape bound kernel serves
-        every size: a later call with a larger extent would launch too few
-        threads along that axis and skip the rest of each row.  Every config
-        compiled to run is keyed, whether by set_config or directly through
-        compile_config (whose callable a later bind() would otherwise hand
-        back for any size), but not the configs the autotuner only measures
-        (its reference baseline and candidates), so a looped winner keeps one
-        bound kernel across sizes.
-        """
-        if (
-            self.kernel.settings.backend != "cute"
-            or not self._cache_managed
-            or _SEARCHING_CANDIDATES.get()
-        ):
-            return
-        param_names = tuple(self.kernel.signature.parameters)
-        self._extend_cute_descriptor_specializations(
-            self.kernel._cute_reduction_extent_descriptors,
-            self._cute_reduction_extents.get(self._normalized_config_copy(config), ()),
-            lambda descriptor: _PreparedMetadataSpecializationExtractor(
-                _CuteReductionExtentExtractor(descriptor, param_names)
-            ),
-        )
 
     def _fixed_config_for_td_layout_guards(self) -> Config | None:
         """Return the fixed config if TD layout guards can be filtered safely."""
@@ -5164,45 +5029,7 @@ def _contains_tensor(value: object, visited: set[int]) -> bool:
     return False
 
 
-def _cute_grouped_layout_has_m_tail(
-    layout_values: tuple[int, ...],
-    *,
-    bm: int,
-    group_count: int,
-) -> bool | None:
-    cursor = 0
-    has_m_tail = False
-    for expected_group in range(group_count):
-        if expected_group > 0:
-            next_m_boundary = ((cursor + bm - 1) // bm) * bm
-            while (
-                cursor < len(layout_values)
-                and cursor < next_m_boundary
-                and layout_values[cursor] < 0
-            ):
-                cursor += 1
-            if cursor != next_m_boundary or (
-                cursor < len(layout_values) and layout_values[cursor] < 0
-            ):
-                return None
-        if cursor >= len(layout_values) or layout_values[cursor] != expected_group:
-            return None
-        start = cursor
-        while cursor < len(layout_values) and layout_values[cursor] == expected_group:
-            cursor += 1
-        actual_m = cursor - start
-        if start % bm != 0:
-            return None
-        has_m_tail = has_m_tail or actual_m % bm != 0
-    if cursor != len(layout_values):
-        if all(value < 0 for value in layout_values[cursor:]):
-            cursor = len(layout_values)
-    if cursor != len(layout_values):
-        return None
-    return has_m_tail
-
-
-def _tensor_property(
+def tensor_property_value(
     source: TensorPropertySource, root_values: dict[str, object]
 ) -> int | None:
     tensor = _replay_tensor_input_source(source.base, root_values)
@@ -5216,7 +5043,7 @@ def _tensor_property(
     return int(tensor.stride(source.idx))
 
 
-def _evaluate(expr: sympy.Expr, values: dict[sympy.Symbol, int]) -> int:
+def evaluate_sympy_expr(expr: sympy.Expr, values: dict[sympy.Symbol, int]) -> int:
     if isinstance(expr, sympy.Symbol):
         return values[expr]
     if isinstance(expr, sympy.Integer):
@@ -5278,8 +5105,8 @@ class _GuardedInputFact:
         )
 
     def _holds(self, values: dict[sympy.Symbol, int]) -> bool:
-        lhs = _evaluate(self.lhs, values)
-        same = (next_power_of_2(lhs) if self.block else lhs) == _evaluate(
+        lhs = evaluate_sympy_expr(self.lhs, values)
+        same = (next_power_of_2(lhs) if self.block else lhs) == evaluate_sympy_expr(
             self.rhs, values
         )
         # Branch rather than compare: traced by dynamo the sizes are SymInts,
@@ -5291,7 +5118,7 @@ class _GuardedInputFact:
         root_values = dict(zip(self.param_names, args, strict=False))
         values: dict[sympy.Symbol, int] = {}
         for symbol, source in self.sources:
-            if (value := _tensor_property(source, root_values)) is None:
+            if (value := tensor_property_value(source, root_values)) is None:
                 return None
             values[symbol] = value
         return self._holds(values)
@@ -5334,7 +5161,7 @@ def _bound_guarded_input_facts(
     results: list[Hashable] = []
     for extractor in extractors:
         if not (
-            isinstance(extractor, _PreparedMetadataSpecializationExtractor)
+            isinstance(extractor, PreparedMetadataSpecializationExtractor)
             and isinstance(fact := extractor.extractor, _GuardedInputFact)
         ):
             return None
@@ -5342,190 +5169,6 @@ def _bound_guarded_input_facts(
             return None
         results.append(result)
     return tuple(results)
-
-
-class _CuteReductionExtent(NamedTuple):
-    """A dynamic reduction extent and the input size behind each of its symbols."""
-
-    extent: sympy.Expr
-    symbols: tuple[sympy.Symbol, ...]
-    sizes: tuple[TensorPropertySource, ...]
-
-
-def _input_size_of(
-    env: CompileEnvironment, symbol: sympy.Symbol
-) -> TensorPropertySource | None:
-    for source in env.shape_env.var_to_sources.get(symbol, ()):
-        if (
-            isinstance(source, TensorPropertySource)
-            and source.prop == TensorProperty.SIZE
-            and source.idx is not None
-        ):
-            return source
-    return None
-
-
-def _cute_reduction_extent_descriptors(
-    env: CompileEnvironment,
-) -> tuple[_CuteReductionExtent, ...]:
-    """Describe each recorded reduction extent by the input sizes it reads."""
-    descriptors: list[_CuteReductionExtent] = []
-    for extent in env.cute_hint_sized_reduction_extents:
-        symbols = tuple(
-            sorted(
-                (s for s in extent.free_symbols if isinstance(s, sympy.Symbol)),
-                key=str,
-            )
-        )
-        sizes = [_input_size_of(env, symbol) for symbol in symbols]
-        # A block-size symbol leaves no input size: the config fixes it.
-        if all(size is not None for size in sizes):
-            descriptors.append(
-                _CuteReductionExtent(
-                    extent,
-                    symbols,
-                    tuple(size for size in sizes if size is not None),
-                )
-            )
-    return tuple(sorted(descriptors, key=repr))
-
-
-@dataclasses.dataclass(frozen=True)
-class _CuteReductionExtentExtractor:
-    """Power-of-2 bucket of a dynamic reduction extent read from input sizes."""
-
-    descriptor: _CuteReductionExtent
-    param_names: tuple[str, ...]
-
-    def __call__(self, args: Sequence[object]) -> Hashable:
-        root_values = dict(zip(self.param_names, args, strict=False))
-        values: dict[sympy.Symbol, int] = {}
-        for symbol, source in zip(
-            self.descriptor.symbols, self.descriptor.sizes, strict=True
-        ):
-            if (value := _tensor_property(source, root_values)) is None:
-                return None
-            values[symbol] = value
-        return next_power_of_2(_evaluate(self.descriptor.extent, values))
-
-
-def _cute_grouped_static_tail_extra_descriptors(
-    plans: Sequence[dict[str, object]],
-) -> tuple[Hashable, ...]:
-    descriptors: list[Hashable] = []
-    for plan in plans:
-        if plan.get("kind") != "tcgen05_grouped_static_persistent" or bool(
-            plan.get("worklist_metadata")
-        ):
-            continue
-        if not (
-            isinstance(plan.get("grouped_static_has_m_tail"), bool)
-            or isinstance(plan.get("grouped_static_has_n_tail"), bool)
-        ):
-            continue
-        layout_idx = plan.get("layout_bind_idx")
-        group_count = plan.get("group_count")
-        bm = plan.get("bm")
-        if not (
-            isinstance(layout_idx, int)
-            and isinstance(group_count, int)
-            and isinstance(bm, int)
-        ):
-            continue
-        n_sizes_idx = plan.get("n_sizes_bind_idx")
-        bn = plan.get("bn")
-        descriptors.append(
-            (
-                "cute_grouped_static_tail",
-                layout_idx,
-                group_count,
-                bm,
-                n_sizes_idx if isinstance(n_sizes_idx, int) else None,
-                bn if isinstance(bn, int) else None,
-            )
-        )
-    return tuple(sorted(descriptors, key=repr))
-
-
-def _cute_int_1d_tensor_values(
-    value: object,
-    cache: WeakIdKeyDictionary,
-) -> tuple[int, ...] | None:
-    if not (
-        isinstance(value, torch.Tensor)
-        and value.ndim == 1
-        and value.dtype in (torch.int32, torch.int64)
-    ):
-        return None
-    if torch.is_inference(value):
-        return tuple(int(v) for v in value.detach().cpu().tolist())
-    signature = (
-        int(value._version),
-        int(value.data_ptr()),
-        tuple(value.shape),
-        tuple(value.stride()),
-        value.dtype,
-    )
-    try:
-        cached_signature, cached_values = cache[value]
-    except KeyError:
-        pass
-    else:
-        if cached_signature == signature:
-            return cached_values
-    values = tuple(int(v) for v in value.detach().cpu().tolist())
-    cache[value] = (signature, values)
-    return values
-
-
-def _make_cute_grouped_static_tail_extractor(
-    descriptor: Hashable,
-) -> Callable[[Sequence[object]], Hashable]:
-    (
-        _label,
-        layout_idx,
-        group_count,
-        bm,
-        n_sizes_idx,
-        bn,
-    ) = cast("tuple[object, int, int, int, int | None, int | None]", descriptor)
-    tensor_values_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
-
-    def cute_grouped_static_tail_extractor(
-        args: Sequence[object],
-        *,
-        _descriptor: Hashable = descriptor,
-        _layout_idx: int = layout_idx,
-        _group_count: int = group_count,
-        _bm: int = bm,
-        _n_sizes_idx: int | None = n_sizes_idx,
-        _bn: int | None = bn,
-    ) -> Hashable:
-        layout_has_m_tail: bool | None = None
-        if _layout_idx < len(args):
-            layout_values = _cute_int_1d_tensor_values(
-                args[_layout_idx],
-                tensor_values_cache,
-            )
-            if layout_values is not None:
-                layout_has_m_tail = _cute_grouped_layout_has_m_tail(
-                    layout_values,
-                    bm=_bm,
-                    group_count=_group_count,
-                )
-        n_sizes_has_n_tail: bool | None = None
-        if _n_sizes_idx is not None and _bn is not None and _n_sizes_idx < len(args):
-            n_sizes_values = _cute_int_1d_tensor_values(
-                args[_n_sizes_idx],
-                tensor_values_cache,
-            )
-            if n_sizes_values is not None and len(n_sizes_values) == _group_count:
-                n_sizes_has_n_tail = any(
-                    group_n % _bn != 0 for group_n in n_sizes_values
-                )
-        return (_descriptor, layout_has_m_tail, n_sizes_has_n_tail)
-
-    return cute_grouped_static_tail_extractor
 
 
 def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:
@@ -5588,9 +5231,9 @@ _specialization_extractors: dict[
 }
 
 
-def _maybe_skip_dtype_check_in_meta_registrations() -> (
-    contextlib.AbstractContextManager[None, None]
-):
+def maybe_skip_dtype_check_in_meta_registrations() -> contextlib.AbstractContextManager[
+    None, None
+]:
     # pyrefly: ignore [implicit-import]
     if hasattr(torch.fx.experimental._config, "skip_dtype_check_in_meta_registrations"):
         # pyrefly: ignore [implicit-import, missing-attribute]

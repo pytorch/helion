@@ -12,7 +12,6 @@ from test.test_cute_mxfp8_mma import _wrapper_plan
 
 import helion
 from helion._compiler.cute.mxfp8_mma import _scale
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
 from helion.language import _tracing_ops
@@ -188,7 +187,6 @@ def _packed_mxfp8(
 @pytest.mark.parametrize(
     "m,n,k", [(1, 129, 32), (7, 257, 160), (16, 41, 288), (73, 273, 512)]
 )
-@skipUnlessBackends(["cute"])
 def test_cpu_packed_source_admits_and_preserves_native_geometry(
     m: int, n: int, k: int
 ) -> None:

@@ -9,11 +9,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test._cute_grouped_gemm_split_sizes import _device_offsets_kernel
+from test._cute_grouped_gemm_split_sizes import _require_runtime_cuda13_sm100
+from test._cute_grouped_gemm_split_sizes import _selected_config
+
 from .cute_population_contracts import _target
 from .test_cute_grouped_fp32_output import _grouped_fp32_output
-from .test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
-from .test_cute_grouped_gemm_split_sizes import _require_runtime_cuda13_sm100
-from .test_cute_grouped_gemm_split_sizes import _selected_config
 from .test_cute_grouped_grid_multiplier import _config
 import helion
 from helion import exc

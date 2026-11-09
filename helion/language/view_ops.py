@@ -46,11 +46,10 @@ def _split_dim(tensor: torch.Tensor, dim: int, op: str) -> tuple[int, int]:
 
 
 def _check_split_backend(op: str) -> None:
-    env = CompileEnvironment.current()
-    if env.backend_name not in ("triton", "cute"):
-        raise exc.BackendUnsupported(
-            env.backend_name,
-            f"{op} device lowering. Use hl.split() for a trailing size-two axis",
+    backend = CompileEnvironment.current().backend
+    if not backend.lowers_chunk_unbind:
+        raise backend.unsupported(
+            f"{op} device lowering. Use hl.split() for a trailing size-two axis"
         )
 
 

@@ -184,9 +184,6 @@ def plan_reduced_tile_axes(
     another loop launches the axis wider.  The plan is skipped:
 
     - while a reduction strategy reserves the leading axes (those keep them);
-    - with an MPP graph: ``MetalBackend._config_with_mpp_thread_budget``
-      sizes the root grid's axes around the cooperative matmul's ``tid[0]``
-      in the grid's own block order;
     - when two threaded tile loops are siblings (``for tile_n ...`` next to
       ``for tile_k ...`` with different block ids): the body lets siblings
       share their nesting level's axes, but a plan ranks every block-id set
@@ -198,21 +195,16 @@ def plan_reduced_tile_axes(
     ``hl.tile([m, n])`` stays strided and takes the ``strided`` collective
     (``masked`` when the stride is not a power of two).
     """
-    from ..cute.layout import CuTeGridExecutionPlan
+    from ..cute.execution_plans import CuTeGridExecutionPlan
     from ..cute.loop_nesting import tile_loop_paths
     from ..device_ir import RootGraphInfo
     from ..host_function import HostFunction
     from ..inductor_lowering import ReductionLowering
     from ..reduction_strategy import ReductionStrategy
-    from .mpp_graph_codegen import MPPGraphInfo
 
     device_ir = HostFunction.current().device_ir
-    if (
-        tile_strategy.reserved_reduction_axes()
-        or any(isinstance(graph, MPPGraphInfo) for graph in graphs)
-        or _has_threaded_sibling_loops(
-            tile_loop_paths(device_ir, graphs), tile_strategy
-        )
+    if tile_strategy.reserved_reduction_axes() or _has_threaded_sibling_loops(
+        tile_loop_paths(device_ir, graphs), tile_strategy
     ):
         return
     tile_blocks = [
@@ -502,10 +494,11 @@ def argreduce_loop_update_statements(
 
     Lowest index wins a tie, matching Inductor's MPS semantics (``mps.py``) and
     torch.  The tie is explicit rather than implied by a strict comparison: the
-    accumulator index starts at ``reduction_index_init_expr`` (INT_MAX), so a
-    row that never strictly beats the identity -- an all-``-inf`` row under
-    argmax, say -- would otherwise never write ``acc_index`` and return the
-    sentinel as if it were a position.
+    accumulator index starts at INT_MAX (``backend.full_expr`` over
+    ``torch.iinfo(index_dtype).max`` in ``reduction_strategy``), so a row that
+    never strictly beats the identity -- an all-``-inf`` row under argmax, say
+    -- would otherwise never write ``acc_index`` and return the sentinel as if
+    it were a position.
 
     NaN counts as a new extremum for floats, but only over a non-NaN
     accumulator.  Letting it win against a NaN too would keep moving the index

@@ -292,20 +292,36 @@ def test_lane_dependent_reduction_stays_inside_loop() -> None:
     assert "warp_reduction_sum" in ast.unparse(lifted.orelse[0])
 
 
-def test_atomic_in_lane_loop_rejects_hoist() -> None:
-    source = _POSITIVE.replace(
+_DECLINED_REWRITES = {
+    "atomic_in_lane_loop_rejects_hoist": _POSITIVE.replace(
         "(out.iterator + row).store(norm + state_value)",
         "cute.arch.atomic_add(out.iterator + row, norm + state_value)",
-    )
-    result = _rewrite(source)
-    assert len(result) == 1 and isinstance(result[0], ast.For)
-
-
-def test_unknown_call_in_reduction_slice_rejects_hoist() -> None:
-    source = _POSITIVE.replace(
+    ),
+    "unknown_call_in_reduction_slice_rejects_hoist": _POSITIVE.replace(
         "value = cutlass.Float32(vec[k_lane])",
         "value = opaque_transform(vec[k_lane])",
-    )
+    ),
+    "unknown_effect_in_remainder_rejects_load_motion": _POSITIVE.replace(
+        "(out.iterator + row).store(norm + state_value)",
+        "(out.iterator + row).store(norm + state_value)\n"
+        "        opaque_sync_or_mutation()",
+    ),
+    "operator_setitem_is_not_treated_as_pure": _POSITIVE.replace(
+        "state_value = (state.iterator + row).load()",
+        "operator.setitem(cache, 0, row_lane)\n"
+        "        state_value = (state.iterator + row).load()",
+    ),
+    "cutlass_pipeline_call_is_not_treated_as_pure": _POSITIVE.replace(
+        "state_value = (state.iterator + row).load()",
+        "pipeline = cutlass.pipeline.PipelineAsync.create(storage)\n"
+        "        state_value = (state.iterator + row).load()",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_DECLINED_REWRITES))
+def test_rewrite_declines(case: str) -> None:
+    source = _DECLINED_REWRITES[case]
     result = _rewrite(source)
     assert len(result) == 1 and isinstance(result[0], ast.For)
 
@@ -334,16 +350,6 @@ def test_for_else_is_preserved_by_declining_rewrite() -> None:
     loop = cast("ast.For", result[0])
     assert len(loop.orelse) == 1
     assert "finalize()" in ast.unparse(loop.orelse[0])
-
-
-def test_unknown_effect_in_remainder_rejects_load_motion() -> None:
-    source = _POSITIVE.replace(
-        "(out.iterator + row).store(norm + state_value)",
-        "(out.iterator + row).store(norm + state_value)\n"
-        "        opaque_sync_or_mutation()",
-    )
-    result = _rewrite(source)
-    assert len(result) == 1 and isinstance(result[0], ast.For)
 
 
 def test_selected_cache_backedge_rejects_reduction_hoist() -> None:
@@ -498,16 +504,6 @@ def test_repeated_staging_read_is_not_hoisted_across_append() -> None:
     assert code.index("staged = _persistent_branch_store_values_0[-1]") > row_loop
 
 
-def test_operator_setitem_is_not_treated_as_pure() -> None:
-    source = _POSITIVE.replace(
-        "state_value = (state.iterator + row).load()",
-        "operator.setitem(cache, 0, row_lane)\n"
-        "        state_value = (state.iterator + row).load()",
-    )
-    result = _rewrite(source)
-    assert len(result) == 1 and isinstance(result[0], ast.For)
-
-
 def test_guard_depending_on_outer_thread_value_is_not_unswitched() -> None:
     body = ast.parse(
         "thread_flag = cute.arch.thread_idx()[0] < 16\n"
@@ -606,16 +602,6 @@ def test_identical_repeated_scalar_definitions_hoist_once() -> None:
     row_loop = code.rindex("for row_lane in range(16)")
     assert code.count("factor = cutlass.Float32(seed)") == 1
     assert code.index("factor = cutlass.Float32(seed)") < row_loop
-
-
-def test_cutlass_pipeline_call_is_not_treated_as_pure() -> None:
-    source = _POSITIVE.replace(
-        "state_value = (state.iterator + row).load()",
-        "pipeline = cutlass.pipeline.PipelineAsync.create(storage)\n"
-        "        state_value = (state.iterator + row).load()",
-    )
-    result = _rewrite(source)
-    assert len(result) == 1 and isinstance(result[0], ast.For)
 
 
 def test_fully_hoistable_loop_keeps_loop_target_semantics() -> None:
@@ -781,11 +767,96 @@ def test_nested_constexpr_vector_chain_validates_cache_producer_load_root() -> N
     assert "_lane_invariant_" not in code
 
 
-def test_nested_constexpr_vector_chain_rejects_row_dependency() -> None:
-    source = _VECTOR_CACHE.replace(
+_REJECTED_VECTOR_CHAINS = {
+    "rejects_row_dependency": _VECTOR_CACHE.replace(
         "combined = gate_value + bias_value",
         "combined = gate_value + bias_value + row_lane",
-    )
+    ),
+    "rejects_wrong_cache_dtype": _VECTOR_CACHE.replace(
+        "cute.make_rmem_tensor(4, cutlass.Float32)",
+        "cute.make_rmem_tensor(4, cutlass.BFloat16)",
+    ),
+    "models_input_cache_conversion": _VECTOR_CACHE.replace(
+        "cute.make_rmem_tensor(4, cutlass.BFloat16)",
+        "cute.make_rmem_tensor(4, cutlass.Float16)",
+    ),
+    "rejects_nonidentity_cache_index": _VECTOR_CACHE.replace(
+        "_fuse_cache_11[(element - 0) // 1] = bias_value",
+        "_fuse_cache_11[element // 2] = bias_value",
+    ),
+    "rejects_cache_handle_rebind": _VECTOR_CACHE.replace(
+        "for row_lane in range(16):",
+        "other_cache = cute.make_rmem_tensor(4, cutlass.Float32)\n"
+        "for row_lane in range(16):\n"
+        "    _fuse_cache_11 = other_cache",
+    ),
+    "rejects_control_flow_before_value": _VECTOR_CACHE.replace(
+        "    for element in cutlass.range_constexpr(4):\n"
+        "        index = base + cutlass.Int32(element)",
+        "    for element in cutlass.range_constexpr(4):\n"
+        "        if element == 0:\n"
+        "            continue\n"
+        "        index = base + cutlass.Int32(element)",
+    ),
+    "rejects_induction_variable_write": _VECTOR_CACHE.replace(
+        "    for element in cutlass.range_constexpr(4):\n"
+        "        index = base + cutlass.Int32(element)",
+        "    for element in cutlass.range_constexpr(4):\n"
+        "        element = element + 1\n"
+        "        index = base + cutlass.Int32(element)",
+    ),
+    "rejects_unknown_operand_dtype": _VECTOR_CACHE.replace(
+        "decay = cute.math.exp2(sigmoid * scale)",
+        "decay = cute.math.exp2(bias_value * mystery)",
+    ),
+    "rejects_unknown_arch_load_option": _VECTOR_CACHE.replace(
+        "bias_value = (bias.iterator + index).load()",
+        "bias_value = cute.arch.load("
+        "bias.iterator + index, cutlass.Float32, volatile=True)",
+    ),
+    "rejects_intervening_cache_write": _VECTOR_CACHE.replace(
+        "    for element in cutlass.range_constexpr(4):\n"
+        "        index = base + cutlass.Int32(element)\n"
+        "        raw = _fuse_cache_10[(element - 0) // 1]",
+        "    _fuse_cache_11[0] = cutlass.Float32(row_lane)\n"
+        "    for element in cutlass.range_constexpr(4):\n"
+        "        index = base + cutlass.Int32(element)\n"
+        "        raw = _fuse_cache_10[(element - 0) // 1]",
+        1,
+    ),
+    "rejects_intervening_augassign": _VECTOR_CACHE.replace(
+        "    for element in cutlass.range_constexpr(4):",
+        "    head_scaled += row_lane\n    for element in cutlass.range_constexpr(4):",
+        1,
+    ),
+    "rejects_outer_control_transfer": _VECTOR_CACHE.replace(
+        "    head_value = (head.iterator + base).load()",
+        "    if cond:\n        continue\n"
+        "    head_value = (head.iterator + base).load()",
+        1,
+    ),
+    "rejects_cache_handle_alias": _VECTOR_CACHE.replace(
+        "for row_lane in range(16):",
+        "cache_alias = _fuse_cache_11\nfor row_lane in range(16):",
+    ).replace(
+        "(out.iterator + row_lane).store(sink_0 + sink_1 + sink_2)",
+        "alias_value = cache_alias[0]\n"
+        "    (out.iterator + row_lane).store("
+        "sink_0 + sink_1 + sink_2 + alias_value)",
+    ),
+    "rejects_mutated_external_subscript": _VECTOR_CACHE.replace(
+        "combined = gate_value + bias_value",
+        "combined = gate_value + bias_value + cutlass.Float32(coeff[0])",
+    ).replace(
+        "    (out.iterator + row_lane).store",
+        "    coeff[0] = row_lane\n    (out.iterator + row_lane).store",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_REJECTED_VECTOR_CHAINS))
+def test_nested_constexpr_vector_chain_rejects(case: str) -> None:
+    source = _REJECTED_VECTOR_CHAINS[case]
     code = _source(_rewrite_body(source))
     assert code.count("cute.math.exp2(") == 6
     assert "_lane_invariant_" not in code
@@ -818,129 +889,6 @@ def test_nested_constexpr_vector_chain_rejects_mismatched_bitcast_width() -> Non
     )
     code = _source(_rewrite_body(source))
     assert code.count("bitcast(cutlass.Float32)") == 3
-    assert "_lane_invariant_" not in code
-
-
-def test_nested_constexpr_vector_chain_rejects_wrong_cache_dtype() -> None:
-    source = _VECTOR_CACHE.replace(
-        "cute.make_rmem_tensor(4, cutlass.Float32)",
-        "cute.make_rmem_tensor(4, cutlass.BFloat16)",
-    )
-    code = _source(_rewrite_body(source))
-    assert code.count("cute.math.exp2(") == 6
-    assert "_lane_invariant_" not in code
-
-
-def test_nested_constexpr_vector_chain_models_input_cache_conversion() -> None:
-    source = _VECTOR_CACHE.replace(
-        "cute.make_rmem_tensor(4, cutlass.BFloat16)",
-        "cute.make_rmem_tensor(4, cutlass.Float16)",
-    )
-    code = _source(_rewrite_body(source))
-    assert code.count("cute.math.exp2(") == 6
-    assert "_lane_invariant_" not in code
-
-
-def test_nested_constexpr_vector_chain_rejects_nonidentity_cache_index() -> None:
-    source = _VECTOR_CACHE.replace(
-        "_fuse_cache_11[(element - 0) // 1] = bias_value",
-        "_fuse_cache_11[element // 2] = bias_value",
-    )
-    code = _source(_rewrite_body(source))
-    assert code.count("cute.math.exp2(") == 6
-    assert "_lane_invariant_" not in code
-
-
-def test_nested_constexpr_vector_chain_rejects_intervening_cache_write() -> None:
-    source = _VECTOR_CACHE.replace(
-        "    for element in cutlass.range_constexpr(4):\n"
-        "        index = base + cutlass.Int32(element)\n"
-        "        raw = _fuse_cache_10[(element - 0) // 1]",
-        "    _fuse_cache_11[0] = cutlass.Float32(row_lane)\n"
-        "    for element in cutlass.range_constexpr(4):\n"
-        "        index = base + cutlass.Int32(element)\n"
-        "        raw = _fuse_cache_10[(element - 0) // 1]",
-        1,
-    )
-    code = _source(_rewrite_body(source))
-    assert code.count("cute.math.exp2(") == 6
-    assert "_lane_invariant_" not in code
-
-
-def test_nested_constexpr_vector_chain_rejects_intervening_augassign() -> None:
-    source = _VECTOR_CACHE.replace(
-        "    for element in cutlass.range_constexpr(4):",
-        "    head_scaled += row_lane\n    for element in cutlass.range_constexpr(4):",
-        1,
-    )
-    code = _source(_rewrite_body(source))
-    assert code.count("cute.math.exp2(") == 6
-    assert "_lane_invariant_" not in code
-
-
-def test_nested_constexpr_vector_chain_rejects_cache_handle_alias() -> None:
-    source = _VECTOR_CACHE.replace(
-        "for row_lane in range(16):",
-        "cache_alias = _fuse_cache_11\nfor row_lane in range(16):",
-    ).replace(
-        "(out.iterator + row_lane).store(sink_0 + sink_1 + sink_2)",
-        "alias_value = cache_alias[0]\n"
-        "    (out.iterator + row_lane).store("
-        "sink_0 + sink_1 + sink_2 + alias_value)",
-    )
-    code = _source(_rewrite_body(source))
-    assert code.count("cute.math.exp2(") == 6
-    assert "_lane_invariant_" not in code
-
-
-def test_nested_constexpr_vector_chain_rejects_cache_handle_rebind() -> None:
-    source = _VECTOR_CACHE.replace(
-        "for row_lane in range(16):",
-        "other_cache = cute.make_rmem_tensor(4, cutlass.Float32)\n"
-        "for row_lane in range(16):\n"
-        "    _fuse_cache_11 = other_cache",
-    )
-    code = _source(_rewrite_body(source))
-    assert code.count("cute.math.exp2(") == 6
-    assert "_lane_invariant_" not in code
-
-
-def test_nested_constexpr_vector_chain_rejects_control_flow_before_value() -> None:
-    source = _VECTOR_CACHE.replace(
-        "    for element in cutlass.range_constexpr(4):\n"
-        "        index = base + cutlass.Int32(element)",
-        "    for element in cutlass.range_constexpr(4):\n"
-        "        if element == 0:\n"
-        "            continue\n"
-        "        index = base + cutlass.Int32(element)",
-    )
-    code = _source(_rewrite_body(source))
-    assert code.count("cute.math.exp2(") == 6
-    assert "_lane_invariant_" not in code
-
-
-def test_nested_constexpr_vector_chain_rejects_outer_control_transfer() -> None:
-    source = _VECTOR_CACHE.replace(
-        "    head_value = (head.iterator + base).load()",
-        "    if cond:\n        continue\n"
-        "    head_value = (head.iterator + base).load()",
-        1,
-    )
-    code = _source(_rewrite_body(source))
-    assert code.count("cute.math.exp2(") == 6
-    assert "_lane_invariant_" not in code
-
-
-def test_nested_constexpr_vector_chain_rejects_induction_variable_write() -> None:
-    source = _VECTOR_CACHE.replace(
-        "    for element in cutlass.range_constexpr(4):\n"
-        "        index = base + cutlass.Int32(element)",
-        "    for element in cutlass.range_constexpr(4):\n"
-        "        element = element + 1\n"
-        "        index = base + cutlass.Int32(element)",
-    )
-    code = _source(_rewrite_body(source))
-    assert code.count("cute.math.exp2(") == 6
     assert "_lane_invariant_" not in code
 
 
@@ -1020,29 +968,6 @@ def test_nested_constexpr_vector_fresh_names_cover_future_renames() -> None:
     assert "for _lane_invariant_0 in" not in code
 
 
-def test_nested_constexpr_vector_chain_rejects_unknown_operand_dtype() -> None:
-    source = _VECTOR_CACHE.replace(
-        "decay = cute.math.exp2(sigmoid * scale)",
-        "decay = cute.math.exp2(bias_value * mystery)",
-    )
-    code = _source(_rewrite_body(source))
-    assert code.count("cute.math.exp2(") == 6
-    assert "_lane_invariant_" not in code
-
-
-def test_nested_constexpr_vector_chain_rejects_mutated_external_subscript() -> None:
-    source = _VECTOR_CACHE.replace(
-        "combined = gate_value + bias_value",
-        "combined = gate_value + bias_value + cutlass.Float32(coeff[0])",
-    ).replace(
-        "    (out.iterator + row_lane).store",
-        "    coeff[0] = row_lane\n    (out.iterator + row_lane).store",
-    )
-    code = _source(_rewrite_body(source))
-    assert code.count("cute.math.exp2(") == 6
-    assert "_lane_invariant_" not in code
-
-
 def test_nested_constexpr_vector_chain_rejects_mutated_selected_alias() -> None:
     source = _VECTOR_CACHE.replace(
         "    head_value = (head.iterator + base).load()",
@@ -1120,17 +1045,6 @@ def test_nested_constexpr_vector_chain_accepts_matching_arch_load_dtype() -> Non
     code = _source(_rewrite_body(source))
     assert code.count("cute.math.exp2(") == 2
     assert "_fuse_cache_11[_lane_invariant_0]" in code
-
-
-def test_nested_constexpr_vector_chain_rejects_unknown_arch_load_option() -> None:
-    source = _VECTOR_CACHE.replace(
-        "bias_value = (bias.iterator + index).load()",
-        "bias_value = cute.arch.load("
-        "bias.iterator + index, cutlass.Float32, volatile=True)",
-    )
-    code = _source(_rewrite_body(source))
-    assert code.count("cute.math.exp2(") == 6
-    assert "_lane_invariant_" not in code
 
 
 def test_nested_constexpr_vector_chain_rejects_rename_alias_mutation() -> None:

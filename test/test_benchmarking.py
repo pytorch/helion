@@ -21,6 +21,7 @@ from benchmarks.cute import compare_attention_backends
 import pytest
 import torch
 
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
 from helion._testing import EXAMPLES_PACKAGE
 from helion._testing import import_example
 from helion._testing import skipUnlessCuteAvailable
@@ -40,23 +41,25 @@ def _clear_process_local_cute_library_override(monkeypatch):
 
 @pytest.fixture(scope="module", autouse=True)
 def _share_flash_coverage_across_instances():
-    # _flash_deterministic_coverage_flats costs seconds per ConfigGeneration
-    # instance, and the validator canonicalizes the same fixture configs on
-    # every call; both are deterministic given the spec and override state.
-    # Product paths exercised here build many instances from one spec, so share
-    # the computed results across instances with identical inputs. Keys hold a
-    # strong spec reference so id() values cannot be recycled.
-    from helion._compiler.cute import cute_flash
+    # The flash coverage design costs seconds per ConfigGeneration instance,
+    # and the validator canonicalizes the same fixture configs on every call;
+    # both are deterministic given the spec and override state. Product paths
+    # exercised here build many instances from one spec, so share the computed
+    # results across instances with identical inputs (the design is a frozen
+    # value every accessor copies from). Keys hold a strong spec reference so
+    # id() values cannot be recycled.
+    from helion._compiler.cute.autotune.config_generation_ext import (
+        CuteConfigGenerationExtension,
+    )
+    from helion._testing.cute_flash import memoized_flash_fragments
     from helion.autotuner.config_generation import ConfigGeneration
 
-    original_coverage = ConfigGeneration._flash_deterministic_coverage_flats
+    original_design = CuteConfigGenerationExtension._flash_coverage_design
     original_canonicalize = ConfigGeneration.canonicalize_flat
     original_flatten = ConfigGeneration.flatten
-    original_fragments = cute_flash.flash_autotune_fragments
-    prototypes: dict[tuple[object, ...], tuple[object, dict[str, object]]] = {}
+    designs: dict[tuple[object, ...], tuple[object, object]] = {}
     canonicalize_memo: dict[tuple[object, ...], tuple[object, object]] = {}
     flatten_memo: dict[tuple[object, ...], tuple[object, object]] = {}
-    fragments_memo: dict[tuple[object, ...], list[object]] = {}
 
     def generation_key(self):
         return (
@@ -66,20 +69,17 @@ def _share_flash_coverage_across_instances():
             repr(self._advanced_controls_files),
         )
 
-    def shared_coverage(self):
-        if self._flash_coverage_cache is not None:
-            return original_coverage(self)
-        cached = prototypes.get(generation_key(self))
-        if cached is None:
-            result = original_coverage(self)
-            prototypes[generation_key(self)] = (
-                self.config_spec,
-                {attr: getattr(self, attr) for attr in _FLASH_COVERAGE_CACHE_ATTRS},
-            )
-            return result
-        for attr, value in cached[1].items():
-            setattr(self, attr, copy.deepcopy(value))
-        return original_coverage(self)
+    def shared_design(self):
+        if self._flash_coverage_design_cache is None:
+            cached = designs.get(generation_key(self.generation))
+            if cached is None:
+                designs[generation_key(self.generation)] = (
+                    self.generation.config_spec,
+                    original_design(self),
+                )
+            else:
+                self._flash_coverage_design_cache = cached[1]
+        return original_design(self)
 
     def shared_canonicalize_flat(self, flat_values):
         key = (generation_key(self), repr(flat_values))
@@ -99,29 +99,14 @@ def _share_flash_coverage_across_instances():
             return copy.deepcopy(result)
         return copy.deepcopy(cached[1])
 
-    def shared_fragments(head_dim, num_kv, **kwargs):
-        key = (head_dim, num_kv, tuple(sorted(kwargs.items())))
-        cached = fragments_memo.get(key)
-        if cached is None:
-            result = original_fragments(head_dim, num_kv, **kwargs)
-            fragments_memo[key] = [result, False]
-            return dict(result)
-        if not cached[1]:
-            # Re-verify the first repeat of each key so a nondeterministic
-            # fragment surface still fails instead of being masked.
-            assert original_fragments(head_dim, num_kv, **kwargs) == cached[0]
-            cached[1] = True
-        return dict(cached[0])
-
-    ConfigGeneration._flash_deterministic_coverage_flats = shared_coverage
+    CuteConfigGenerationExtension._flash_coverage_design = shared_design
     ConfigGeneration.canonicalize_flat = shared_canonicalize_flat
     ConfigGeneration.flatten = shared_flatten
-    cute_flash.flash_autotune_fragments = shared_fragments
-    yield
-    ConfigGeneration._flash_deterministic_coverage_flats = original_coverage
+    with memoized_flash_fragments():
+        yield
+    CuteConfigGenerationExtension._flash_coverage_design = original_design
     ConfigGeneration.canonicalize_flat = original_canonicalize
     ConfigGeneration.flatten = original_flatten
-    cute_flash.flash_autotune_fragments = original_fragments
 
 
 def test_mirrored_bench_generic_rotates_balanced_pairs(monkeypatch) -> None:
@@ -1664,40 +1649,21 @@ def test_attention_direct_script_pins_helion_to_benchmark_checkout(tmp_path):
     )
 
 
-# Instance caches populated by ConfigGeneration._flash_deterministic_coverage_flats.
-_FLASH_COVERAGE_CACHE_ATTRS = (
-    "_flash_coverage_cache",
-    "_flash_coverage_active_values_cache",
-    "_flash_coverage_uncovered_cache",
-    "_flash_coverage_underqualified_cache",
-    "_flash_structural_leaf_catalog_cache",
-    "_flash_pipeline_lane_catalog_cache",
-    "_flash_pipeline_lane_witness_cache",
-    "_flash_clc_lane_catalog_cache",
-    "_flash_clc_lane_witness_cache",
-    "_flash_structural_underqualified_leaves_cache",
-    "_flash_coverage_uncovered_interactions_cache",
-    "_flash_coverage_active_interactions_cache",
-    "_flash_parent_coverage_prefix_count_cache",
-    "_flash_qualification_prefix_count_cache",
-)
-
-
 def _fresh_full_autotune_config_generation():
-    """ConfigGeneration for the canonical fixture spec with warm coverage caches.
+    """ConfigGeneration for the canonical fixture spec with a warm coverage design.
 
     The deterministic coverage design costs several seconds per instance and is
     identical for every instance built from _full_autotune_config_spec(), so
-    compute it once on the shared prototype and copy the caches onto each new
-    instance.
+    compute it once on the shared prototype and share the frozen design with
+    each new instance (every accessor copies from it).
     """
     from helion.autotuner.config_generation import ConfigGeneration
 
     generation = ConfigGeneration(_full_autotune_config_spec())
     prototype = _cached_full_autotune_config_generation()
-    prototype._flash_deterministic_coverage_flats()
-    for attr in _FLASH_COVERAGE_CACHE_ATTRS:
-        setattr(generation, attr, copy.deepcopy(getattr(prototype, attr)))
+    generation.extension._flash_coverage_design_cache = (
+        prototype.extension._flash_coverage_design()
+    )
     return generation
 
 
@@ -1721,7 +1687,7 @@ def _full_autotune_trial_configs():
         leaf,
         key,
         value,
-    ), witness in witness_generation.flash_pipeline_lane_witnesses().items():
+    ), witness in witness_generation.extension.flash_pipeline_lane_witnesses().items():
         if (
             leaf.pipeline_family != "fa4_2cta"
             or leaf.compound_exp2_packet is not None
@@ -1922,7 +1888,7 @@ def _full_autotune_terminal_fixture():
 def _full_autotune_terminal_surface_catalog():
     return (
         _fresh_full_autotune_config_generation()
-    ).flash_terminal_coordinate_surface_catalog(radius=2)
+    ).extension.flash_terminal_coordinate_surface_catalog(radius=2)
 
 
 def _synchronize_full_autotune_terminal_boundary(trial):
@@ -2735,7 +2701,7 @@ def _cached_full_autotune_trial_with_complete_schedule_anchors():
     provenance = _full_autotune_trial_provenance()
     phase = cast("dict[str, Any]", trial["search_phase_metrics"])
     generation = _fresh_full_autotune_config_generation()
-    anchors = generation.flash_low_confound_schedule_anchor_configs()
+    anchors = generation.extension.flash_low_confound_schedule_anchor_configs()
     assert len(anchors) == 131
 
     def config_id(config):
@@ -3217,7 +3183,7 @@ def _cached_full_autotune_trial_with_pipeline_repair():
     witness_config = next(
         config
         for (witness_leaf, key, value), config in (
-            witness_generation.flash_pipeline_lane_witnesses().items()
+            witness_generation.extension.flash_pipeline_lane_witnesses().items()
         )
         if witness_leaf.pipeline_family == "fa4_2cta"
         and witness_leaf.compound_exp2_packet is None
@@ -3751,14 +3717,15 @@ def _full_autotune_trial_with_compound_transfer():
 
 
 def _full_autotune_config_spec():
-    from helion._compiler.backend import CuteBackend
+    from helion._compiler.cute.backend import CuteBackend
     from helion.autotuner.config_spec import BlockSizeSpec
     from helion.autotuner.config_spec import ConfigSpec
 
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 0))
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=64,
         num_kv=512,
         num_bh=2,
@@ -3808,10 +3775,10 @@ def test_attention_strict_schedule_anchor_enumerator_rejects_producer_omission(
 ):
 
     generation = _fresh_full_autotune_config_generation()
-    produced = generation.flash_low_confound_schedule_anchor_configs()
+    produced = generation.extension.flash_low_confound_schedule_anchor_configs()
     assert produced
     monkeypatch.setattr(
-        generation,
+        generation.extension,
         "flash_low_confound_schedule_anchor_configs",
         lambda: produced[:-1],
     )
@@ -3856,6 +3823,7 @@ class _FixtureConfigGeneration:
             # Compact legacy fixtures deliberately model a surface without the
             # required protocol axis. Production receives the real layout.
             self._key_to_flat_indices.pop("cute_flash_softmax_disc", None)
+        self.extension = _FixtureGenerationExtension(self)
 
     def __getattr__(self, name):
         return getattr(self.delegate, name)
@@ -3869,20 +3837,31 @@ class _FixtureConfigGeneration:
             for config in self.initial_population_configs
         ]
 
-    def flash_deterministic_population_configs(self):
+
+class _FixtureGenerationExtension:
+    """The fixture generation's flash coverage accessors, replayed from the
+    recorded provenance; everything else is the real CuTe extension's."""
+
+    def __init__(self, fixture):
+        self.fixture = fixture
+
+    def __getattr__(self, name):
+        return getattr(self.fixture.delegate.extension, name)
+
+    def deterministic_population_configs(self):
         return [
-            self.Config.from_dict(item["config"])
-            for item in self.provenance["flash_structural_coverage_design"]
+            self.fixture.Config.from_dict(item["config"])
+            for item in self.fixture.provenance["flash_structural_coverage_design"]
         ]
 
     def flash_low_confound_schedule_anchor_configs(self):
-        return list(self.schedule_anchor_configs)
+        return list(self.fixture.schedule_anchor_configs)
 
     def flash_structural_leaf_catalog(self):
-        return list(self.leaves)
+        return list(self.fixture.leaves)
 
     def flash_pipeline_lane_catalog(self):
-        entries = self.provenance["flash_pipeline_lane_catalog"]
+        entries = self.fixture.provenance["flash_pipeline_lane_catalog"]
         return {
             leaf: tuple(
                 (lane["key"], lane["value"])
@@ -3894,25 +3873,29 @@ class _FixtureConfigGeneration:
                     and entry["softmax_disc"] == leaf.softmax_disc
                 )["pipeline_lanes"]
             )
-            for leaf in self.leaves
+            for leaf in self.fixture.leaves
         }
 
     def flash_structural_coverage_active_values(self):
         return [
             (item["key"], item["value"])
-            for item in self.provenance["flash_structural_coverage_active_values"]
+            for item in self.fixture.provenance[
+                "flash_structural_coverage_active_values"
+            ]
         ]
 
     def flash_structural_coverage_uncovered_values(self):
         return [
             (item["key"], item["value"])
-            for item in self.provenance["flash_structural_coverage_uncovered_values"]
+            for item in self.fixture.provenance[
+                "flash_structural_coverage_uncovered_values"
+            ]
         ]
 
     def flash_structural_coverage_underqualified_values(self):
         return [
             (item["key"], item["value"], item["witness_count"])
-            for item in self.provenance[
+            for item in self.fixture.provenance[
                 "flash_structural_coverage_underqualified_values"
             ]
         ]
@@ -3924,7 +3907,7 @@ class _FixtureConfigGeneration:
                 leaf.compound_exp2_packet,
                 leaf.softmax_disc,
             ): leaf
-            for leaf in self.leaves
+            for leaf in self.fixture.leaves
         }
         return [
             (
@@ -3937,7 +3920,7 @@ class _FixtureConfigGeneration:
                 ],
                 item["witness_count"],
             )
-            for item in self.provenance[
+            for item in self.fixture.provenance[
                 "flash_structural_coverage_underqualified_leaves"
             ]
         ]
@@ -3945,25 +3928,27 @@ class _FixtureConfigGeneration:
     def flash_structural_coverage_active_interactions(self):
         return [
             (tuple(item["keys"]), tuple(item["values"]))
-            for item in self.provenance["flash_structural_coverage_active_interactions"]
+            for item in self.fixture.provenance[
+                "flash_structural_coverage_active_interactions"
+            ]
         ]
 
     def flash_structural_coverage_uncovered_interactions(self):
         return [
             (tuple(item["keys"]), tuple(item["values"]))
-            for item in self.provenance[
+            for item in self.fixture.provenance[
                 "flash_structural_coverage_uncovered_interactions"
             ]
         ]
 
     def flash_structural_parent_coverage_prefix_count(self):
-        return self.provenance["flash_structural_parent_coverage_prefix_count"]
+        return self.fixture.provenance["flash_structural_parent_coverage_prefix_count"]
 
-    def flash_structural_qualification_prefix_count(self):
-        return self.provenance["flash_structural_qualification_prefix_count"]
+    def structural_qualification_prefix_count(self):
+        return self.fixture.provenance["flash_structural_qualification_prefix_count"]
 
-    def flash_structural_population_budget(self, initial_population_size):
-        return self.provenance["flash_structural_population_budget"]
+    def structural_population_budget(self, initial_population_size):
+        return self.fixture.provenance["flash_structural_population_budget"]
 
     def flash_clc_lane_catalog(self):
         by_key = {
@@ -3972,7 +3957,7 @@ class _FixtureConfigGeneration:
                 leaf.compound_exp2_packet,
                 leaf.softmax_disc,
             ): leaf
-            for leaf in self.leaves
+            for leaf in self.fixture.leaves
         }
         return {
             by_key[(item["family"], item["compound_packet"], item["softmax_disc"])]: {
@@ -3982,7 +3967,7 @@ class _FixtureConfigGeneration:
                 "refinement_values": tuple(item["refinement_values"]),
                 "attempted_values": tuple(item["planned_values"]),
             }
-            for item in self.provenance["flash_clc_lane_catalog"]
+            for item in self.fixture.provenance["flash_clc_lane_catalog"]
         }
 
     def flash_clc_lane_witnesses(self):
@@ -3992,9 +3977,9 @@ class _FixtureConfigGeneration:
                 leaf.compound_exp2_packet,
                 leaf.softmax_disc,
             ): leaf
-            for leaf in self.leaves
+            for leaf in self.fixture.leaves
         }
-        manifest = self.trial["search_phase_metrics"]["config_manifest"]
+        manifest = self.fixture.trial["search_phase_metrics"]["config_manifest"]
         return {
             (
                 by_key[
@@ -4005,18 +3990,18 @@ class _FixtureConfigGeneration:
                     )
                 ],
                 int(value),
-            ): (self.Config.from_dict(manifest[config_id]["config"]))
-            for item in self.provenance["flash_clc_lane_catalog"]
+            ): (self.fixture.Config.from_dict(manifest[config_id]["config"]))
+            for item in self.fixture.provenance["flash_clc_lane_catalog"]
             for value, config_id in item["witness_config_ids"].items()
         }
 
-    def flash_exact_effective_search_space_configs(self, initial_population_size):
-        phase = self.trial["search_phase_metrics"]
+    def exact_effective_search_space_configs(self, initial_population_size):
+        phase = self.fixture.trial["search_phase_metrics"]
         if not phase["exact_space_enumerated"]:
             return None
         manifest = phase["config_manifest"]
         return [
-            self.Config.from_dict(manifest[config_id]["config"])
+            self.fixture.Config.from_dict(manifest[config_id]["config"])
             for config_id in phase["exact_space_config_ids"]
         ]
 
@@ -4337,7 +4322,7 @@ def test_attention_compiler_seed_policy_rejects_extra_alias_and_invalid_seed():
 def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
     causal, seq_len
 ):
-    from helion._compiler.backend import CuteBackend
+    from helion._compiler.cute.backend import CuteBackend
     from helion.autotuner.config_generation import ConfigGeneration
     from helion.autotuner.config_spec import BlockSizeSpec
     from helion.autotuner.config_spec import ConfigSpec
@@ -4349,7 +4334,8 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
     )
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=64,
         num_kv=seq_len // 128,
         num_bh=64,
@@ -4396,7 +4382,7 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
 
     coverage_ids = {
         canonical_config_id(config)
-        for config in generation.flash_deterministic_population_configs()
+        for config in generation.extension.deterministic_population_configs()
     }
     assert len(generation_zero_ids) == max(
         100, len(coverage_ids | set(policy["effective_config_ids"]))
@@ -4527,7 +4513,7 @@ def test_attention_bound_varied_b200_compiler_seed_order_and_population(
     assert len(generation_zero_ids) == 100
     assert set(policy["effective_config_ids"]) <= set(generation_zero_ids)
 
-    base = generation.flash_deterministic_population_configs()[0]
+    base = generation.extension.deterministic_population_configs()[0]
     leaf = flash_structural_leaf_from_config(base.config)
     assert leaf is not None
     overrides = {
@@ -4705,8 +4691,8 @@ def test_attention_required_full_autotune_rejects_default_name_spoof():
 
 
 def test_attention_autotune_provenance_records_effective_search(monkeypatch):
-    from helion._compiler.backend import CuteBackend
     from helion._compiler.cute import cute_flash
+    from helion._compiler.cute.backend import CuteBackend
     from helion.autotuner.config_generation import ConfigGeneration
     from helion.autotuner.config_spec import BlockSizeSpec
     from helion.autotuner.config_spec import ConfigSpec
@@ -4725,7 +4711,8 @@ def test_attention_autotune_provenance_records_effective_search(monkeypatch):
         spec = ConfigSpec(backend=CuteBackend())
         for block_id, target in enumerate((1, 128, 128)):
             spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=64,
             num_kv=256,
             num_bh=64,
@@ -4875,19 +4862,19 @@ def test_attention_autotune_provenance_records_effective_search(monkeypatch):
             json.dumps(terminal_policy, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
     )
-    terminal_surface = config_generation.flash_terminal_coordinate_surface_catalog(
-        radius=2
+    terminal_surface = (
+        config_generation.extension.flash_terminal_coordinate_surface_catalog(radius=2)
     )
     assert provenance["flash_terminal_coordinate_surface_catalog"] == terminal_surface
     assert len(terminal_surface["leaves"]) == len(
-        config_generation.flash_structural_leaf_catalog()
+        config_generation.extension.flash_structural_leaf_catalog()
     )
     assert provenance["flash_terminal_coordinate_surface_catalog_sha256"] == (
         hashlib.sha256(
             json.dumps(terminal_surface, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
     )
-    lane_catalog = config_generation.flash_pipeline_lane_catalog()
+    lane_catalog = config_generation.extension.flash_pipeline_lane_catalog()
     assert provenance["flash_pipeline_lane_catalog"] == [
         {
             "family": leaf.pipeline_family,
@@ -4897,7 +4884,7 @@ def test_attention_autotune_provenance_records_effective_search(monkeypatch):
                 {"key": key, "value": value} for key, value in lane_catalog[leaf]
             ],
         }
-        for leaf in config_generation.flash_structural_leaf_catalog()
+        for leaf in config_generation.extension.flash_structural_leaf_catalog()
     ]
     assert provenance["flash_structural_coverage_active_interactions"]
     assert provenance["flash_structural_coverage_uncovered_interactions"] == []
@@ -4914,7 +4901,7 @@ def test_attention_autotune_provenance_records_effective_search(monkeypatch):
     assert provenance["flash_structural_family_probe_candidates_per_path"] == 20
     assert provenance["flash_structural_retained_family_cap"] == 4
     expected_retained_family_limit = (
-        config_generation.flash_structural_effective_family_limit(4)
+        config_generation.extension.flash_structural_effective_family_limit(4)
     )
     assert (
         provenance["flash_structural_retained_family_limit"]
@@ -4922,7 +4909,7 @@ def test_attention_autotune_provenance_records_effective_search(monkeypatch):
     )
     assert provenance["flash_structural_retained_family_slowdown_limit"] == 2.0
     expected_starting_path_limit = (
-        config_generation.flash_structural_starting_path_limit(
+        config_generation.extension.flash_structural_starting_path_limit(
             minimum=14,
             retained_families=4,
             retained_candidates_per_leaf=2,
@@ -4934,7 +4921,7 @@ def test_attention_autotune_provenance_records_effective_search(monkeypatch):
         == expected_starting_path_limit
     )
     expected_probe_path_limit = (
-        config_generation.flash_structural_family_probe_path_limit(4, 1)
+        config_generation.extension.flash_structural_family_probe_path_limit(4, 1)
     )
     assert (
         provenance["flash_structural_family_probe_path_limit"]
@@ -4998,7 +4985,7 @@ def test_attention_autotune_provenance_records_effective_search(monkeypatch):
 
 def test_attention_autotune_provenance_supports_triton_config_spec():
     import helion
-    from helion._compiler.backend import TritonBackend
+    from helion._compiler.triton.backend import TritonBackend
     from helion.autotuner.config_spec import ConfigSpec
 
     baseline = lambda *_args: None  # noqa: E731
@@ -5071,7 +5058,7 @@ def test_attention_autotune_provenance_supports_triton_config_spec():
 def test_attention_compound_projection_uses_shape_config_generation(
     causal, packet, expected_fields
 ):
-    from helion._compiler.backend import CuteBackend
+    from helion._compiler.cute.backend import CuteBackend
     from helion._compiler.cute.cute_flash import flash_structural_leaf_from_config
     from helion.autotuner.config_generation import ConfigGeneration
     from helion.autotuner.config_spec import BlockSizeSpec
@@ -5080,7 +5067,8 @@ def test_attention_compound_projection_uses_shape_config_generation(
     spec = ConfigSpec(backend=CuteBackend())
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=128,
         num_kv=256,
         num_bh=64,
@@ -5097,7 +5085,7 @@ def test_attention_compound_projection_uses_shape_config_generation(
     source_family = "fa4" if causal else "fa4_2cta"
     source = next(
         config.config
-        for config in generation.flash_deterministic_population_configs()
+        for config in generation.extension.deterministic_population_configs()
         if (
             (leaf := flash_structural_leaf_from_config(config.config)) is not None
             and leaf.pipeline_family == source_family
@@ -5299,7 +5287,7 @@ def test_attention_required_full_autotune_rejects_schedule_anchor_producer_omiss
         _full_autotune_trial_with_complete_schedule_anchors()
     )
     monkeypatch.setattr(
-        _FixtureConfigGeneration,
+        _FixtureGenerationExtension,
         "flash_low_confound_schedule_anchor_configs",
         lambda _self: [],
     )
@@ -6571,7 +6559,11 @@ def test_attention_structural_retention_mirror_matches_live_capacity_selector():
     assert policy is not None
     search = LFBOPatternSearch.__new__(LFBOPatternSearch)
     search.config_spec = SimpleNamespace(cute_flash_search_enabled=True)
-    search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+    search.config_gen = SimpleNamespace(
+        extension=SimpleNamespace(
+            flash_pipeline_lane_catalog=dict,
+        ),
+    )
     search.flash_structural_search = policy
     search._autotune_metrics = SimpleNamespace(search_phase_metrics={})
     search.population = population
@@ -6976,7 +6968,10 @@ def _cached_exact_small_space_trial_with_exhausted_clc():
         hashlib.sha256(
             json.dumps(config.config, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()[:16]: dict(config.config)
-        for (leaf, _value), config in generation.flash_clc_lane_witnesses().items()
+        for (
+            leaf,
+            _value,
+        ), config in generation.extension.flash_clc_lane_witnesses().items()
         if leaf.pipeline_family == "fa4_clc"
     }
     clc_configs = [witness_by_id[witness] for witness in witnesses]
@@ -7344,7 +7339,7 @@ def _cached_full_autotune_trial_with_reused_clc_combination():
     witness_configs = {
         config_id(dict(config.config)): dict(config.config)
         for (witness_leaf, _value), config in (
-            generation.flash_clc_lane_witnesses().items()
+            generation.extension.flash_clc_lane_witnesses().items()
         )
         if witness_leaf.pipeline_family == "fa4_clc"
     }
@@ -8230,14 +8225,14 @@ def test_attention_strict_initial_population_replay_uses_seed_without_rng_leak()
     generation = _fresh_full_autotune_config_generation()
     original_state = random.getstate()
     try:
-        required_configs = set(generation.flash_deterministic_population_configs())
+        required_configs = set(generation.extension.deterministic_population_configs())
         required_configs.update(
             config for _flat, config in generation.seed_flat_config_pairs()
         )
         required_ids = {canonical_config_id(config) for config in required_configs}
         initial_population_size = max(100, len(required_ids) + 1)
         assert (
-            generation.flash_exact_effective_search_space_configs(
+            generation.extension.exact_effective_search_space_configs(
                 initial_population_size
             )
             is None

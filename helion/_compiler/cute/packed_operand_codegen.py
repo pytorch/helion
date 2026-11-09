@@ -18,6 +18,7 @@ from .full_slice_matmul import _bound_names
 from .packed_operand import KEY
 from .packed_operand import PackedOperandPlan
 from .packed_operand import prove_packed_operand
+from .state import cute_env_state
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -282,5 +283,5 @@ def generate_packed_operand(
         f"{kernel}._helion_cute_source_hash = {hashlib.sha256(source.encode()).hexdigest()!r}\n"
     ).body
     metadata[0].value = ast.parse(f"({kernel},)", mode="eval").body
-    env.cute_resolved_wrapper_plans = []
+    cute_env_state(env).resolved_wrapper_plans = []
     return module

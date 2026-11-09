@@ -1,6 +1,6 @@
 """The collective MMA lowering issues loop-invariant read-only epilogue loads early.
 
-CPU-only (fake CUDA target, the ``test_cute_tcgen05_fixed_chain`` fixture): the
+CPU-only (the fake CUDA target of the module's ``cpu_render`` marker): the
 jagged dense bmm example's per-column bias is read by the scalar epilogue that
 follows the collective pipeline; the lowering moves that load ahead of the
 loop it is invariant to so its DRAM latency overlaps the operand loads instead
@@ -14,15 +14,24 @@ import ast
 import pytest
 import torch
 
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
-from test.test_cute_tcgen05_fixed_chain import _cpu_only  # noqa: F401
 
 import helion
 from helion._compiler.cute.collective_matmul import _hoist_invariant_epilogue_loads
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
+# The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced
+# as ``cuda:0`` tensors of a 148-SM device, and the reduction SMEM budget.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(
+        mma_support=tcgen05_mma_support(),
+        forbid_native=False,
+        fake_device_sm_count=148,
+        reduction_smem_budget_bytes=232448,
+    ),
+]
 
 
 def _collective_config() -> helion.Config:

@@ -33,6 +33,7 @@ from .block_scaled_provenance import PackedOperand
 from .block_scaled_provenance import operand_fingerprint
 from .fold_noop_stores import _is_read_only
 from .promote_output_axis import _fresh_tensors
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -100,6 +101,91 @@ class BlockScaledMmaPlan:
     # ``cute_scaled_prepare="fused"``: per-side (mode, stride) of the fused
     # consumer (``block_scaled_fused.fused_geometry``), else None.
     fused: dict[str, tuple[str, int]] | None = None
+
+    def to_wrapper_dict(
+        self,
+        *,
+        names: tuple[str, ...],
+        workspace_name: str,
+        alpha: str,
+        size_hint: Callable[[int | torch.SymInt], int],
+    ) -> dict[str, object]:
+        """The ``block_scaled_mma`` wrapper plan the launcher re-proves and binds.
+
+        ``names`` are the lhs / rhs / lhs scale / rhs scale / output tensor
+        argument names; ``alpha`` the scale's literal expression (an
+        identifier binds ``scale_name``, a float literal ``scale_value``).
+        The key set and insertion order are part of the rendered module (the
+        plan is ``repr``'d into ``_helion_cute_wrapper_plans`` and hashed into
+        the compile cache key): the MXFP8-only keys, the TMA-output keys and
+        the fused-scale strides are present only when they apply, and exactly
+        one of ``scale_name`` / ``scale_value`` is.
+        """
+        wrapper_plan: dict[str, object] = {
+            "kind": "block_scaled_mma",
+            "lhs_name": names[0],
+            "rhs_name": names[1],
+            "lhs_scale_name": names[2],
+            "rhs_scale_name": names[3],
+            "out_name": names[4],
+            "workspace_name": workspace_name,
+            "m": self.m,
+            "n": self.n,
+            "k": self.k,
+            "bn": self.bn,
+            "bk": self.bk,
+            "stages": self.stages,
+            "cluster_m": self.cluster_m,
+            "persistent": self.persistent,
+            "num_sm": self.num_sm,
+            "workspace_bytes": self.workspace_bytes,
+            "round_dtypes": tuple(map(str, self.round_dtypes)),
+            "lhs_byte_addresses": self.lhs.byte_addresses,
+            "rhs_byte_addresses": self.rhs.byte_addresses,
+            "lhs_scale_address": self.lhs.scale_address,
+            "rhs_scale_address": self.rhs.scale_address,
+            "lhs_span": self.lhs.tensor_span,
+            "rhs_span": self.rhs.tensor_span,
+            "lhs_scale_span": self.lhs.scale_span,
+            "rhs_scale_span": self.rhs.scale_span,
+            "lhs_row_fast": self.lhs.row_fast,
+            "rhs_row_fast": self.rhs.row_fast,
+            "lhs_qword_address": self.lhs.qword_address,
+            "rhs_qword_address": self.rhs.qword_address,
+            "prepare": self.prepare,
+            "pdl": self.pdl,
+            "prepare_rows": self.prepare_rows,
+            "epilogue_n": self.epilogue_n,
+            "fused": self.fused,
+        }
+        if self.format == "mxfp8":
+            wrapper_plan["format"] = self.format
+            wrapper_plan["rhs_transposed"] = self.rhs_transposed
+            wrapper_plan["fused_scales"] = self.fused_scales
+            wrapper_plan["logical_m_per_cta"] = self.logical_m_per_cta
+            wrapper_plan["swap_ab"] = self.swap_ab
+            wrapper_plan["compact_m"] = self.compact_m
+            wrapper_plan["sf_tma"] = self.sf_tma
+            wrapper_plan["sf_inplace"] = self.sf_inplace
+            if self.tma_output:
+                wrapper_plan["accumulator_stages"] = self.accumulator_stages
+                wrapper_plan["prefetch_output_registers"] = (
+                    self.prefetch_output_registers
+                )
+                wrapper_plan["tma_output"] = self.tma_output
+            if self.fused_scales:
+                for side, operand in (("lhs", self.lhs), ("rhs", self.rhs)):
+                    row_stride, column_stride = operand.source.scale.stride()
+                    wrapper_plan[side + "_scale_row_stride"] = size_hint(row_stride)
+                    wrapper_plan[side + "_scale_column_stride"] = size_hint(
+                        column_stride
+                    )
+        if alpha.isidentifier():
+            wrapper_plan["scale_name"] = alpha
+        else:
+            assert isinstance(self.alpha, float)
+            wrapper_plan["scale_value"] = self.alpha
+        return wrapper_plan
 
     @property
     def workspace_bytes(self) -> int:
@@ -333,14 +419,6 @@ def _prepare_operand(
         scale[1],
         row_fast,
         qword_address,
-    )
-
-
-def has_block_scaled_provenance(graphs: Sequence[GraphInfo]) -> bool:
-    return any(
-        BLOCK_SCALED_PROVENANCE in node.meta
-        for info in graphs
-        for node in info.graph.nodes
     )
 
 
@@ -705,12 +783,12 @@ def plan_block_scaled(graphs: Sequence[GraphInfo]) -> None:
         raise exc.BackendUnsupported(
             "cute", "native block-scaled contraction proof declined"
         )
-    df.cute_state.block_scaled_plan = plan
+    df.cute_state.root_plans.block_scaled_plan = plan
 
 
 def codegen_block_scaled(cg: GenerateAST) -> bool:
     df = cg.device_function
-    plan = df.cute_state.block_scaled_plan
+    plan = df.cute_state.root_plans.block_scaled_plan
     if (
         plan is None
         or cg.current_root_graph_info is None
@@ -741,73 +819,17 @@ def codegen_block_scaled(cg: GenerateAST) -> bool:
         )
     )
     alpha = df.literal_expr(plan.alpha)
-    wrapper_plan: dict[str, object] = {
-        "kind": "block_scaled_mma",
-        "lhs_name": names[0],
-        "rhs_name": names[1],
-        "lhs_scale_name": names[2],
-        "rhs_scale_name": names[3],
-        "out_name": names[4],
-        "workspace_name": workspace_arg,
-        "m": plan.m,
-        "n": plan.n,
-        "k": plan.k,
-        "bn": plan.bn,
-        "bk": plan.bk,
-        "stages": plan.stages,
-        "cluster_m": plan.cluster_m,
-        "persistent": plan.persistent,
-        "num_sm": plan.num_sm,
-        "workspace_bytes": plan.workspace_bytes,
-        "round_dtypes": tuple(map(str, plan.round_dtypes)),
-        "lhs_byte_addresses": plan.lhs.byte_addresses,
-        "rhs_byte_addresses": plan.rhs.byte_addresses,
-        "lhs_scale_address": plan.lhs.scale_address,
-        "rhs_scale_address": plan.rhs.scale_address,
-        "lhs_span": plan.lhs.tensor_span,
-        "rhs_span": plan.rhs.tensor_span,
-        "lhs_scale_span": plan.lhs.scale_span,
-        "rhs_scale_span": plan.rhs.scale_span,
-        "lhs_row_fast": plan.lhs.row_fast,
-        "rhs_row_fast": plan.rhs.row_fast,
-        "lhs_qword_address": plan.lhs.qword_address,
-        "rhs_qword_address": plan.rhs.qword_address,
-        "prepare": plan.prepare,
-        "pdl": plan.pdl,
-        "prepare_rows": plan.prepare_rows,
-        "epilogue_n": plan.epilogue_n,
-        "fused": plan.fused,
-    }
-    if plan.format == "mxfp8":
-        wrapper_plan["format"] = plan.format
-        wrapper_plan["rhs_transposed"] = plan.rhs_transposed
-        wrapper_plan["fused_scales"] = plan.fused_scales
-        wrapper_plan["logical_m_per_cta"] = plan.logical_m_per_cta
-        wrapper_plan["swap_ab"] = plan.swap_ab
-        wrapper_plan["compact_m"] = plan.compact_m
-        wrapper_plan["sf_tma"] = plan.sf_tma
-        wrapper_plan["sf_inplace"] = plan.sf_inplace
-        if plan.tma_output:
-            wrapper_plan["accumulator_stages"] = plan.accumulator_stages
-            wrapper_plan["prefetch_output_registers"] = plan.prefetch_output_registers
-            wrapper_plan["tma_output"] = plan.tma_output
-        if plan.fused_scales:
-            for side, operand in (("lhs", plan.lhs), ("rhs", plan.rhs)):
-                row_stride, column_stride = operand.source.scale.stride()
-                wrapper_plan[side + "_scale_row_stride"] = (
-                    CompileEnvironment.current().size_hint(row_stride)
-                )
-                wrapper_plan[side + "_scale_column_stride"] = (
-                    CompileEnvironment.current().size_hint(column_stride)
-                )
-    if alpha.isidentifier():
-        wrapper_plan["scale_name"] = alpha
-    else:
-        assert isinstance(plan.alpha, float)
-        wrapper_plan["scale_value"] = plan.alpha
-    cg.cute_wrapper_plans.append(wrapper_plan)
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(
+        plan.to_wrapper_dict(
+            names=names,
+            workspace_name=workspace_arg,
+            alpha=alpha,
+            size_hint=CompileEnvironment.current().size_hint,
+        )
+    )
     df.placeholder_args.update((*names, workspace_arg, alpha))
     df.preamble = []
     df.body = [ast.Pass()]
-    cg.cute_uses_matmul = True
+    codegen_state.declare_matmul()
     return True

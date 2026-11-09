@@ -12,6 +12,7 @@ import ast
 from typing import TYPE_CHECKING
 from typing import cast
 
+from ._ast_pass_utils import loop_extent
 from .persistent_branch_vec import _DTYPE_INFO
 from .persistent_branch_vec import _binding_write_roots
 from .persistent_branch_vec import _range_extent
@@ -81,17 +82,7 @@ def _vector_load(value: ast.expr) -> str | None:
 
 
 def _literal_range_extent(loop: ast.For) -> int | None:
-    call = loop.iter
-    if not (
-        isinstance(call, ast.Call)
-        and ast.unparse(call.func) in {"range", "cutlass.range_constexpr"}
-        and len(call.args) == 1
-        and not call.keywords
-        and isinstance(call.args[0], ast.Constant)
-        and type(call.args[0].value) is int
-    ):
-        return None
-    return call.args[0].value
+    return loop_extent(loop, minimum=None)
 
 
 def _compute_stores(

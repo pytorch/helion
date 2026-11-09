@@ -165,7 +165,7 @@ include = [
   "helion/**/*.py",
   "helion/**/*.pyi",
   "helion/**/*.json",
-  "helion/_compiler/cute/sorting_networks.LICENSE",
+  "helion/_compiler/cute/selection/sorting_networks.LICENSE",
   "LICENSE",
 ]
 exclude = [
@@ -180,6 +180,7 @@ source = "vcs"
 
 [tool.pytest.ini_options]
 markers = [
+  # Also routes the item to the GPU lane when its module is ``cpu_only``.
   "cuda: requires an explicitly assigned CUDA device",
   # Selected by the CPU lane (`-m cpu_only`, no accelerator) and deselected by
   # the GPU jobs. Apply at module level only when every test in the module
@@ -188,6 +189,18 @@ markers = [
   # Fresh-interpreter replays, real autotune searches, and stress tests.
   # Pull requests run `-m 'not slow'`; pushes to main run everything.
   "slow: spawns interpreters or runs a real autotune search",
+  # Runs the test under helion._testing.cpu_render_target(**kwargs): CPU code
+  # generation against a fake B200 with CUDA and native compilation forbidden.
+  "cpu_render: run under cpu_render_target (CPU CuTe source generation, fake B200)",
+]
+# The CuTe DSL deprecates names the generated code and the vendored tile
+# schedulers still use; every tcgen05 compile emits them (about 249K records
+# per cute suite run before this filter).  Each entry matches one message.
+filterwarnings = [
+  "ignore:tcgen05.OperandMajorMode is deprecated:DeprecationWarning",
+  "ignore:cute.arch.exp2 is deprecated:DeprecationWarning",
+  "ignore:FastDivmodDivisor is deprecated:DeprecationWarning",
+  "ignore:Migrated to examples/CuTeDSL/helpers:DeprecationWarning",
 ]
 # artifacts/ holds gitignored benchmark and probe outputs, some of them named
 # test_*.py with import-time side effects; pytest must never collect them
@@ -225,6 +238,9 @@ project-excludes = [
 ]
 python-version = "3.10"
 search-path = ["../pytorch"]
+# MLX only installs on macOS; benchmarks/metal imports it as an optional
+# baseline provider.
+ignore-missing-imports = ["mlx", "mlx.*"]
 
 [tool.codespell]
 ignore-words = "scripts/dictionary.txt"

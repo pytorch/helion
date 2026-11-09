@@ -18,6 +18,7 @@ import torch
 
 from ... import exc
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from .tcgen05_constants import tcgen05_role_local_schedule
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -481,23 +482,21 @@ def prove_paired_fanout(
     )
 
 
-def schedule_supported(config: dict[str, object]) -> bool:
-    """Standard role-local stores, with one CTA or an M-paired CTA group."""
-    expected = {
+def fanout_schedule() -> dict[str, object]:
+    """The pins ``schedule_supported`` checks type-strictly (the epilogue-load
+    warp count is left to the strategy's default)."""
+    return {
         "pid_type": "persistent_interleaved",
-        "tcgen05_strategy": "role_local_monolithic",
-        "tcgen05_persistence_model": "static_persistent",
-        "tcgen05_num_epi_warps": 4,
-        "tcgen05_warp_spec_mma_warps": 1,
-        "tcgen05_warp_spec_ab_load_warps": 1,
-        "tcgen05_warp_spec_scheduler_warps": 0,
-        "tcgen05_warp_spec_c_input_warps": 0,
-        "tcgen05_warp_spec_store_warps": 0,
-        "tcgen05_layout_strategy": "default",
+        **tcgen05_role_local_schedule(without=("tcgen05_warp_spec_epi_load_warps",)),
         "tcgen05_epilogue_layout": "normal",
         "tcgen05_c_store_mode": "normal",
         "tcgen05_acc_wait_placement": "subtile_loop",
     }
+
+
+def schedule_supported(config: dict[str, object]) -> bool:
+    """Standard role-local stores, with one CTA or an M-paired CTA group."""
+    expected = fanout_schedule()
     return (
         all(
             type(config.get(key, default)) is type(default)
@@ -525,7 +524,7 @@ def schedule_supported(config: dict[str, object]) -> bool:
         and config.get("tcgen05_aux_load_placement", "post_acc_wait")
         in ("post_acc_wait", "pre_acc_wait")
         # One C stage per epilogue warp group is legal with two or more groups
-        # (``CuteTcgen05Config._normalize_epilogue_groups``); the pair's rings
+        # (``tcgen05_config.repair._normalize_epilogue_groups``); the pair's rings
         # are priced per group by ``_pair_fanout_refusal``.
         and config.get("tcgen05_c_stages", 2) in (1, 2, 4)
         and (
@@ -554,9 +553,8 @@ def store_protocol_supported(value: CuteTcgen05StoreValue) -> bool:
         and value.use_tma_store_epilogue
         and not value.tma_store_full_tiles_only
         and not value.partial_output_tma_store
-        and not value.pure_matmul_role_lifecycle
         # A CTA pair stores its 128-row half of the 256-row pair tile (the
-        # same fact ``CuteTcgen05Config._pair_fanout_refusal`` requires of
+        # same fact ``tcgen05_config.repair._pair_fanout_refusal`` requires of
         # the config, which admits the pair's N tile and ring depth from the
         # SMEM budget); the ring depth is judged per epilogue warp group.
         and (

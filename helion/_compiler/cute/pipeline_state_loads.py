@@ -27,10 +27,16 @@ import torch
 
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ._ast_pass_utils import call_path
+from ._ast_pass_utils import cutlass_scalar_type
+from ._ast_pass_utils import names_stored_or_deleted
+from ._ast_pass_utils import same_expr
+from ._ast_pass_utils import substitute_names
 from .cutedsl_compat import L2_EVICT_LAST_STORE_ABI_VERSION
 from .cutedsl_compat import cp_async_supported
 from .cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .scalar_recipe import PURE_HELPERS
+from .target_facts import static_smem_budget
 
 
 class TensorMetadata(NamedTuple):
@@ -82,19 +88,8 @@ class _Region:
     packed_scalar_load: _PackedScalarLoad | None
 
 
-def _call_path(node: ast.AST) -> tuple[str, ...] | None:
-    path: list[str] = []
-    while isinstance(node, ast.Attribute):
-        path.append(node.attr)
-        node = node.value
-    if not isinstance(node, ast.Name):
-        return None
-    path.append(node.id)
-    return tuple(reversed(path))
-
-
 def _is_cutlass_int_cast(node: ast.AST) -> bool:
-    return isinstance(node, ast.Call) and _call_path(node.func) in {
+    return isinstance(node, ast.Call) and call_path(node.func) in {
         ("cutlass", "Int32"),
         ("cutlass", "Int64"),
         ("cutlass", "Uint32"),
@@ -129,7 +124,7 @@ def _thread_axis(node: ast.expr) -> int | None:
         return None
     if not (
         isinstance(node.value, ast.Call)
-        and _call_path(node.value.func) == ("cute", "arch", "thread_idx")
+        and call_path(node.value.func) == ("cute", "arch", "thread_idx")
         and not node.value.args
         and not node.value.keywords
     ):
@@ -143,7 +138,7 @@ def _block_axis(node: ast.expr) -> int | None:
         return None
     if not (
         isinstance(node.value, ast.Call)
-        and _call_path(node.value.func) == ("cute", "arch", "block_idx")
+        and call_path(node.value.func) == ("cute", "arch", "block_idx")
         and not node.value.args
         and not node.value.keywords
     ):
@@ -238,26 +233,17 @@ def _captured_definitions(
             else:
                 definitions[name] = value
             continue
-        for name in _assigned_names(stmt):
+        for name in names_stored_or_deleted(stmt):
             definitions.pop(name, None)
     return definitions
 
 
-class _Substitute(ast.NodeTransformer):
-    def __init__(self, replacements: dict[str, ast.expr]) -> None:
-        self.replacements = replacements
-
-    def visit_Name(self, node: ast.Name) -> ast.AST:
-        if isinstance(node.ctx, ast.Load) and node.id in self.replacements:
-            return ast.copy_location(
-                expr_from_string(ast.unparse(self.replacements[node.id])), node
-            )
-        return node
-
-
 def _substitute(node: ast.expr, replacements: dict[str, ast.expr]) -> ast.expr:
-    copied = expr_from_string(ast.unparse(node))
-    result = _Substitute(replacements).visit(copied)
+    result = substitute_names(
+        expr_from_string(ast.unparse(node)),
+        replacements,
+        clone=lambda value: expr_from_string(ast.unparse(value)),
+    )
     assert isinstance(result, ast.expr)
     return ast.fix_missing_locations(result)
 
@@ -273,7 +259,7 @@ def _stride_dimension(node: ast.expr, tensor_name: str) -> int | None:
     node = _unwrap_int_cast(node)
     if not isinstance(node, ast.Subscript):
         return None
-    if _call_path(node.value) != (tensor_name, "layout", "stride"):
+    if call_path(node.value) != (tensor_name, "layout", "stride"):
         return None
     return _const_int(node.slice)
 
@@ -303,7 +289,7 @@ def _indices_by_stride(
 def _vector_type_info(node: ast.expr) -> tuple[int, str] | None:
     if not (
         isinstance(node, ast.Call)
-        and _call_path(node.func) == ("ir", "VectorType", "get")
+        and call_path(node.func) == ("ir", "VectorType", "get")
         and len(node.args) == 2
         and not node.keywords
         and isinstance(node.args[0], ast.List)
@@ -311,7 +297,7 @@ def _vector_type_info(node: ast.expr) -> tuple[int, str] | None:
     ):
         return None
     width = _const_int(node.args[0].elts[0])
-    element = _call_path(node.args[1])
+    element = call_path(node.args[1])
     if width is None or element is None or element[-1] != "mlir_type":
         return None
     return width, ".".join(element[:-1])
@@ -345,7 +331,7 @@ def _load_info(stmt: ast.stmt) -> tuple[str, _Pointer, ast.expr, int] | None:
         and len(stmt.targets) == 1
         and isinstance(stmt.targets[0], ast.Name)
         and isinstance(stmt.value, ast.Call)
-        and _call_path(stmt.value.func) == ("cute", "arch", "load")
+        and call_path(stmt.value.func) == ("cute", "arch", "load")
         and len(stmt.value.args) == 2
         and not stmt.value.keywords
     ):
@@ -467,7 +453,7 @@ def _scalar_bf16_tensor_load(
     if isinstance(value, ast.IfExp):
         if not (
             isinstance(value.orelse, ast.Call)
-            and _call_path(value.orelse.func) == ("cutlass", "BFloat16")
+            and call_path(value.orelse.func) == ("cutlass", "BFloat16")
             and len(value.orelse.args) == 1
             and not value.orelse.keywords
             and _const_int(value.orelse.args[0]) == 0
@@ -681,7 +667,7 @@ def _store_pointer(
         and isinstance(append_loop, ast.For)
         and isinstance(append_loop.target, ast.Name)
         and isinstance(append_loop.iter, ast.Call)
-        and _call_path(append_loop.iter.func) == ("cutlass", "range_constexpr")
+        and call_path(append_loop.iter.func) == ("cutlass", "range_constexpr")
         and len(append_loop.iter.args) == 1
         and not append_loop.iter.keywords
         and _const_int(append_loop.iter.args[0]) == vector_width
@@ -760,14 +746,6 @@ def _store_pointer(
     return pointer, predicate, top_level
 
 
-def _assigned_names(node: ast.AST) -> set[str]:
-    return {
-        child.id
-        for child in ast.walk(node)
-        if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del))
-    }
-
-
 _PURE_CUTLASS_SCALAR_CALLS = frozenset(
     (
         "BFloat16",
@@ -843,16 +821,6 @@ _PURE_OPERATOR_CALLS = frozenset(
 )
 
 
-def _is_cutlass_numeric_type(node: ast.AST) -> bool:
-    path = _call_path(node)
-    return (
-        path is not None
-        and len(path) == 2
-        and path[0] == "cutlass"
-        and path[1] in _PURE_CUTLASS_SCALAR_CALLS
-    )
-
-
 def _is_disjoint_tensor_read(
     call: ast.Call,
     *,
@@ -861,7 +829,7 @@ def _is_disjoint_tensor_read(
     proven_disjoint_tensor_pairs: set[frozenset[str]],
 ) -> bool:
     """Prove that ``call`` is a generated read from another tensor argument."""
-    path = _call_path(call.func)
+    path = call_path(call.func)
     if path == ("cute", "arch", "load"):
         if len(call.args) != 2 or call.keywords:
             return False
@@ -892,7 +860,7 @@ def _prefetch_overlap_call_is_safe(
     tensor_names: frozenset[str],
     proven_disjoint_tensor_pairs: set[frozenset[str]],
 ) -> bool:
-    path = _call_path(call.func)
+    path = call_path(call.func)
     if path is not None:
         if len(path) == 1 and path[0] in PURE_HELPERS:
             return True
@@ -919,16 +887,11 @@ def _prefetch_overlap_call_is_safe(
         and call.func.attr == "bitcast"
         and len(call.args) == 1
         and not call.keywords
-        and _is_cutlass_numeric_type(call.args[0])
+        and cutlass_scalar_type(call.args[0]) in _PURE_CUTLASS_SCALAR_CALLS
     ):
         receiver = call.func.value
         return isinstance(receiver, ast.Call) and (
-            (
-                (receiver_path := _call_path(receiver.func)) is not None
-                and len(receiver_path) == 2
-                and receiver_path[0] == "cutlass"
-                and receiver_path[1] in _PURE_CUTLASS_SCALAR_CALLS
-            )
+            cutlass_scalar_type(receiver.func) in _PURE_CUTLASS_SCALAR_CALLS
             or _is_disjoint_tensor_read(
                 receiver,
                 state_tensor=state_tensor,
@@ -994,7 +957,7 @@ def _private_register_tensor_names(
         and isinstance(stmt.targets[0], ast.Name)
         and write_counts.get(stmt.targets[0].id) == 1
         and isinstance(stmt.value, ast.Call)
-        and _call_path(stmt.value.func) == ("cute", "make_rmem_tensor")
+        and call_path(stmt.value.func) == ("cute", "make_rmem_tensor")
     )
 
 
@@ -1055,7 +1018,7 @@ def _prefetch_overlap_statement_is_safe(
         return (
             isinstance(stmt.target, ast.Name)
             and isinstance(stmt.iter, ast.Call)
-            and _call_path(stmt.iter.func) == ("cutlass", "range_constexpr")
+            and call_path(stmt.iter.func) == ("cutlass", "range_constexpr")
             and len(stmt.iter.args) == 1
             and not stmt.iter.keywords
             and _const_int(stmt.iter.args[0]) is not None
@@ -1189,7 +1152,7 @@ def _scalar_preload_expr_is_safe(
         ("cute", "arch", "shuffle_sync"),
     }
     if any(
-        _call_path(call.func) not in extra_pure_calls
+        call_path(call.func) not in extra_pure_calls
         and not _prefetch_overlap_call_is_safe(
             call,
             state_tensor=source_tensor,
@@ -1231,7 +1194,7 @@ def _scalar_preload_expr_is_safe(
             )
             if denominator is None or not _constant_int_expr(denominator):
                 return False
-        if isinstance(node, ast.Call) and _call_path(node.func) in {
+        if isinstance(node, ast.Call) and call_path(node.func) in {
             ("cute", "math", "div"),
             ("operator", "floordiv"),
             ("operator", "mod"),
@@ -1306,7 +1269,7 @@ def _scalar_preload_statement_is_safe(
         return (
             isinstance(stmt.target, ast.Name)
             and isinstance(stmt.iter, ast.Call)
-            and _call_path(stmt.iter.func) == ("cutlass", "range_constexpr")
+            and call_path(stmt.iter.func) == ("cutlass", "range_constexpr")
             and len(stmt.iter.args) == 1
             and not stmt.iter.keywords
             and _const_int(stmt.iter.args[0]) is not None
@@ -1361,7 +1324,7 @@ def _earliest_prefetch_insertion_index(
     )
     insertion_index = 0
     for index, stmt in enumerate(owner[:loop_index]):
-        if _assigned_names(
+        if names_stored_or_deleted(
             stmt
         ) & dependencies or not _prefetch_overlap_statement_is_safe(
             stmt,
@@ -1772,7 +1735,7 @@ def _nonnegative_int32_bounds(
         return None
     if isinstance(node, ast.Call):
         if (
-            _call_path(node.func) != ("cutlass", "Int32")
+            call_path(node.func) != ("cutlass", "Int32")
             or len(node.args) != 1
             or node.keywords
             or not isinstance(node.args[0], ast.expr)
@@ -1873,7 +1836,7 @@ def _packed_scalar_predicate_is_always_true(
             if tensor_name == source
             and argument_name == size_name
             and dim in indices
-            and _same_expr(_unwrap_int_cast(term.left), _unwrap_int_cast(indices[dim]))
+            and same_expr(_unwrap_int_cast(term.left), _unwrap_int_cast(indices[dim]))
         ]
         if len(matching_bounds) != 1 or write_counts.get(size_name):
             return False
@@ -1908,7 +1871,7 @@ def _direct_read_only_tensor_source(body: list[ast.stmt], source: str) -> bool:
         ):
             pointer_node = call.func.value
         elif (
-            _call_path(call.func) == ("cute", "arch", "load")
+            call_path(call.func) == ("cute", "arch", "load")
             and len(call.args) == 2
             and not call.keywords
         ):
@@ -1939,7 +1902,7 @@ def _loop_local_definitions_before(
     """Capture pure straight-line aliases as they exist at one load site."""
     definitions: dict[str, ast.expr] = {}
     for stmt in statements[:stop]:
-        assigned = _assigned_names(stmt)
+        assigned = names_stored_or_deleted(stmt)
         for name in assigned:
             definitions.pop(name, None)
         if not (
@@ -1996,7 +1959,7 @@ def _match_packed_scalar_load(
     if trip_count % 2:
         return None
     loop_writes = frozenset(
-        _assigned_names(ast.Module(body=loop.body, type_ignores=[]))
+        names_stored_or_deleted(ast.Module(body=loop.body, type_ignores=[]))
     )
     sites: list[tuple[ast.Assign, str, _Pointer, ast.expr | None, ast.expr]] = []
     for index, stmt in enumerate(loop.body):
@@ -2315,12 +2278,6 @@ def _constant_int_expr(node: ast.expr) -> int | None:
     return None
 
 
-def _same_expr(left: ast.expr, right: ast.expr) -> bool:
-    return ast.dump(left, include_attributes=False) == ast.dump(
-        right, include_attributes=False
-    )
-
-
 def _predicate_is_cta_uniform(
     node: ast.expr,
     *,
@@ -2460,7 +2417,7 @@ def _nonnegative_int32_column_affine(
         return None
     if isinstance(node, ast.Call):
         if (
-            _call_path(node.func) != ("cutlass", "Int32")
+            call_path(node.func) != ("cutlass", "Int32")
             or len(node.args) != 1
             or node.keywords
             or not isinstance(node.args[0], ast.expr)
@@ -2899,11 +2856,11 @@ def _match_loop(
         if (
             load_offset is None
             or store_offset is None
-            or not _same_expr(load_offset, store_offset)
+            or not same_expr(load_offset, store_offset)
             or (load_predicate is None) != (expanded_store_predicate is None)
             or load_predicate is not None
             and expanded_store_predicate is not None
-            and not _same_expr(load_predicate, expanded_store_predicate)
+            and not same_expr(load_predicate, expanded_store_predicate)
         ):
             continue
         if load_predicate is not None:
@@ -2958,7 +2915,7 @@ def _match_loop(
             node.id for node in ast.walk(row_rhs) if isinstance(node, ast.Name)
         )
         dependencies -= {loop_var, "cutlass", "cute", "ir"}
-        if _assigned_names(loop_module) & dependencies:
+        if names_stored_or_deleted(loop_module) & dependencies:
             continue
         # Start the asynchronous copies as soon as their address dependencies
         # dominate, but remain in the loop's original control-flow branch and
@@ -3526,7 +3483,7 @@ def pipeline_state_loads(
     if (
         region.trip_count % group_rows
         or region.trip_count // group_rows <= lookahead
-        or shared_bytes > 48 * 1024
+        or shared_bytes > static_smem_budget()
         or not _only_allowed_source_uses(
             body, region.tensor_name, region.allowed_source_nodes
         )

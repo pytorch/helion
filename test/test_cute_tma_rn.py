@@ -14,7 +14,7 @@ from test.test_cute_flat_grouped_public import _native_source
 from test.test_cute_flat_grouped_public import _source
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_grouped_rna import (
+from helion._compiler.cute.autotune.heuristics.cute_grouped_rna import (
     CuteGroupedRnaHeuristic,
 )
 from helion._compiler.cute.tcgen05_flat_grouped_codegen import (

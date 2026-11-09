@@ -73,13 +73,16 @@ from torch.multiprocessing.reductions import StorageWeakRef
 from ... import exc
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import FixedBlockSizeSource
+from . import target_facts
 from .cute_warp_mma_gemm import warp_mma_warp_layout
+from .fx_matcher import _is_call
 
 if TYPE_CHECKING:
     from collections.abc import Collection
     from collections.abc import Iterable
     from collections.abc import Mapping
     from collections.abc import Sequence
+    from typing_extensions import Self
 
     from torch.fx.node import Node
 
@@ -121,10 +124,19 @@ ROUTE_SYNC = "sync"
 MMA_DAG_STORE_KEY = "cute_mma_dag_store"
 MMA_DAG_STORE_STAGED = "staged"
 MMA_DAG_STORE_DIRECT = "direct"
+MMA_DAG_STORE_TMA = "tma"
 # ``staged`` writes the carry tile through a double-buffered shared tile as
 # 16-byte packets (the mma.sync C layout alone stores eight scattered 16-byte
 # row segments per warp instruction); ``direct`` stores the fragment pairs.
 MMA_DAG_STORE_CHOICES: tuple[str, ...] = (MMA_DAG_STORE_STAGED, MMA_DAG_STORE_DIRECT)
+# ``tma``: the staged 16-bit snapshots of the warp mode go out as one bulk
+# tensor store per 128-byte slab from one thread instead of every thread's
+# packets (``WarpMmaDagEmitter.plan_tma_stores``; a snapshot it does not
+# admit, an fp32 one, the tensor-memory mode and a direct program keep the
+# ``staged`` render).  Accepted by name, not in the search fragment until
+# measured: ``MMA_DAG_STORE_ACCEPTED`` is what the planner and the config
+# normalizer admit, ``MMA_DAG_STORE_CHOICES`` what the search draws from.
+MMA_DAG_STORE_ACCEPTED: tuple[str, ...] = (*MMA_DAG_STORE_CHOICES, MMA_DAG_STORE_TMA)
 MMA_DAG_EXCHANGE_KEY = "cute_mma_dag_exchange"
 MMA_DAG_EXCHANGE_AUTO = "auto"
 MMA_DAG_EXCHANGE_SMEM = "smem"
@@ -1766,6 +1778,9 @@ class MmaDagPlan:
     # whose box one tensor map covers (the emitter decides per tile),
     # ``lane`` keeps the per-thread cp.async packets.
     loads: str = MMA_DAG_LOADS_TMA
+    # ``MMA_DAG_STORE_TMA`` in the warp mode with staged snapshots: the
+    # emitter stores the snapshots it admits by bulk tensor copies.
+    tma_stores: bool = False
     # Axis index -> the config's block size (the stride between CTAs along a
     # root axis); ``sizes`` pads a ragged root axis below its MMA atom up to
     # it.  Empty: the block sizes are the sizes.
@@ -2913,6 +2928,26 @@ def cluster_split_axis(program: MmaDagProgram) -> Axis | None:
     return candidates[0] if len(candidates) == 1 else None
 
 
+class Reason(str):
+    """Why a config cannot run the program, as ``mma_dag_config_reason`` and
+    the tcgen05 / region admission behind it return it.  A plain ``str`` to
+    every caller (``is None`` checks, ``f"{key}: {reason}"`` wrappers, the
+    exact-text pins), carrying ``knob``: the config key whose smaller or
+    default value may lift the refusal -- ``cute_mma_dag_stages`` for the
+    shared-memory budgets (``mma_dag_repair`` sheds stages on that tag), a
+    knob's own key where the knob is out of its choices or has no subject
+    in the mode; None for the tile rules and the register / tensor-memory
+    budgets, which no single knob owns."""
+
+    __slots__ = ("knob",)
+    knob: str | None
+
+    def __new__(cls, text: str, knob: str | None = None) -> Self:
+        reason = super().__new__(cls, text)
+        reason.knob = knob
+        return reason
+
+
 def epilogue_knob_admitted(facts: CuteMmaDagFacts) -> bool:
     """Whether ``cute_mma_dag_epilogue`` has a subject: a tensor-memory
     region program whose root epilogue stores fragments (the streamed form
@@ -2995,7 +3030,7 @@ def mma_dag_config_reason(
     aux: str = MMA_DAG_AUX_REGISTER,
     persistent: bool = False,
     pass_warps: str = MMA_DAG_PASS_WARPS_OFF,
-) -> str | None:
+) -> Reason | None:
     """Why the block sizes / warps / stages cannot run the program in
     ``mode`` (None: they can).
 
@@ -3019,22 +3054,35 @@ def mma_dag_config_reason(
         if warps_reason is not None:
             return warps_reason
     elif type(warps) is not int or warps not in MMA_DAG_WARP_CHOICES:
-        return f"{MMA_DAG_WARPS_KEY} {warps!r} must be one of {MMA_DAG_WARP_CHOICES}"
+        return Reason(
+            f"{MMA_DAG_WARPS_KEY} {warps!r} must be one of {MMA_DAG_WARP_CHOICES}",
+            MMA_DAG_WARPS_KEY,
+        )
     if persistent and mode != MMA_DAG_TCGEN05:
-        return f"{MMA_DAG_PERSISTENT_KEY} needs the tcgen05 mode"
+        return Reason(
+            f"{MMA_DAG_PERSISTENT_KEY} needs the tcgen05 mode", MMA_DAG_PERSISTENT_KEY
+        )
     if type(stages) is not int or stages not in MMA_DAG_STAGE_CHOICES:
-        return f"{MMA_DAG_STAGES_KEY} {stages!r} must be one of {MMA_DAG_STAGE_CHOICES}"
+        return Reason(
+            f"{MMA_DAG_STAGES_KEY} {stages!r} must be one of {MMA_DAG_STAGE_CHOICES}",
+            MMA_DAG_STAGES_KEY,
+        )
     if aux not in MMA_DAG_AUX_CHOICES:
-        return f"{MMA_DAG_AUX_KEY} {aux!r} must be one of {MMA_DAG_AUX_CHOICES}"
+        return Reason(
+            f"{MMA_DAG_AUX_KEY} {aux!r} must be one of {MMA_DAG_AUX_CHOICES}",
+            MMA_DAG_AUX_KEY,
+        )
     if mode == MMA_DAG_TCGEN05 and aux != MMA_DAG_AUX_REGISTER:
-        return f"{MMA_DAG_AUX_KEY}={aux!r} needs the warp mode"
+        return Reason(f"{MMA_DAG_AUX_KEY}={aux!r} needs the warp mode", MMA_DAG_AUX_KEY)
     resolved: list[int] = []
     for index, axis in enumerate(facts.axes):
         size = facts.block_size(index, sizes)
         if size is None:
-            return f"the block size of tile axis {axis.block_id} must be an integer"
+            return Reason(
+                f"the block size of tile axis {axis.block_id} must be an integer"
+            )
         if size <= 0 or size & (size - 1):
-            return (
+            return Reason(
                 f"block size {size} of tile axis {axis.block_id} must be a power of two"
             )
         if axis.kind in (AXIS_ROOT, AXIS_LOOP) and axis.extent % size:
@@ -3042,11 +3090,15 @@ def mma_dag_config_reason(
             # runs on the warp path where the emitter predicates the ragged
             # rows; the tensor-memory renderers keep whole tiles.
             if not (axis.ragged and mode == MMA_DAG_WARP):
-                return f"block size {size} must divide the extent {axis.extent} of tile axis {axis.block_id}"
+                return Reason(
+                    f"block size {size} must divide the extent {axis.extent} of tile axis {axis.block_id}"
+                )
         resolved.append(size)
     for index in facts.k_axes:
         if resolved[index] % MMA_DAG_K_STEP:
-            return f"the dot K extent {resolved[index]} must be a multiple of {MMA_DAG_K_STEP}"
+            return Reason(
+                f"the dot K extent {resolved[index]} must be a multiple of {MMA_DAG_K_STEP}"
+            )
     for loop in facts.loops:
         if loop.end is None:
             continue
@@ -3055,13 +3107,13 @@ def mma_dag_config_reason(
             # The tcgen05 emitters walk a static trip count (the planner
             # declines the partial trip; the seeds and the search must not
             # offer it).
-            return (
+            return Reason(
                 f"the bound of the loop over tile axis {facts.axes[loop.axis].block_id}"
                 f" is not a multiple of its block size {resolved[loop.axis]} in every"
                 " CTA: the tcgen05 mode runs no partial trip"
             )
         if not aligned and not loop.maskable:
-            return (
+            return Reason(
                 f"the bound of the loop over tile axis {facts.axes[loop.axis].block_id}"
                 f" is not a multiple of its block size {resolved[loop.axis]} in every"
                 " CTA and no operand pass can mask the partial trip"
@@ -3082,11 +3134,20 @@ def mma_dag_config_reason(
             pass_warps=pass_warps,
         )
     if epilogue != MMA_DAG_EPILOGUE_ROW:
-        return f"{MMA_DAG_EPILOGUE_KEY}={epilogue!r} needs the tcgen05 mode"
+        return Reason(
+            f"{MMA_DAG_EPILOGUE_KEY}={epilogue!r} needs the tcgen05 mode",
+            MMA_DAG_EPILOGUE_KEY,
+        )
     if lookahead != MMA_DAG_LOOKAHEAD_OFF:
-        return f"{MMA_DAG_LOOKAHEAD_KEY}={lookahead!r} needs the tcgen05 mode"
+        return Reason(
+            f"{MMA_DAG_LOOKAHEAD_KEY}={lookahead!r} needs the tcgen05 mode",
+            MMA_DAG_LOOKAHEAD_KEY,
+        )
     if facts.cluster_of(sizes) > 1:
-        return f"{MMA_DAG_WARP}: one CTA per root tile (no cluster split)"
+        return Reason(
+            f"{MMA_DAG_WARP}: one CTA per root tile (no cluster split)",
+            MMA_DAG_CLUSTER_KEY,
+        )
     # The warp mode's fragments: a ragged root axis below its atom (a
     # block of one row over M = 1) is computed at the atom.
     resolved = mma_dag_padded_sizes(facts, resolved)
@@ -3094,11 +3155,13 @@ def mma_dag_config_reason(
     for rows, cols in facts.frags:
         bm, bn = resolved[rows], resolved[cols]
         if bm % MMA_DAG_MIN_BM or bn % MMA_DAG_MIN_BN:
-            return (
+            return Reason(
                 f"a {bm}x{bn} fragment needs rows in multiples of 16 and columns of 8"
             )
         if warp_mma_warp_layout(bm, bn, warps) is None:
-            return f"{warps} warps cannot tile a {bm}x{bn} fragment into 16x8 atoms"
+            return Reason(
+                f"{warps} warps cannot tile a {bm}x{bn} fragment into 16x8 atoms"
+            )
         frag_words.append(bm * bn)
     # The budget is the largest set of fragments live at one program point
     # (an attention tile consumed before the next no-acc dot's result exists
@@ -3108,19 +3171,19 @@ def mma_dag_config_reason(
     if facts.vecs:
         layouts, _routes, _bytes = mma_dag_layout_solution(facts, resolved, warps)
         if mma_dag_vec_violations(facts, resolved, layouts, warps):
-            return (
+            return Reason(
                 f"{warps} warps cannot split the fragments of a vector reduction "
                 "the same way"
             )
         regs += mma_dag_vec_regs(facts, resolved, layouts, warps)
     if regs > MMA_DAG_MAX_FRAG_REGS:
-        return (
+        return Reason(
             f"the live fragments need {regs} registers per thread over {warps} "
             f"warps (limit {MMA_DAG_MAX_FRAG_REGS})"
         )
     live = regs + mma_dag_transient_regs(facts, resolved, warps)
     if live > MMA_DAG_MAX_LIVE_REGS:
-        return (
+        return Reason(
             f"the fragments and one dot's operand words need {live} registers "
             f"per thread over {warps} warps (limit {MMA_DAG_MAX_LIVE_REGS})"
         )
@@ -3128,12 +3191,13 @@ def mma_dag_config_reason(
         base = mma_dag_smem_estimate(facts, resolved, stages, warps, derived)
         _bytes, reason = mma_dag_aux_estimate(facts, resolved, stages, 32 * warps, base)
         if reason is not None:
-            return reason
+            return Reason(reason, MMA_DAG_AUX_KEY)
     smem = mma_dag_smem_estimate(facts, resolved, stages, warps, derived, aux)
     if facts.smem_capacity and smem > facts.smem_capacity:
-        return (
+        return Reason(
             f"{stages} stages of operand tiles need {smem} B of shared memory "
-            f"(capacity {facts.smem_capacity})"
+            f"(capacity {facts.smem_capacity})",
+            MMA_DAG_STAGES_KEY,
         )
     return None
 
@@ -3217,12 +3281,12 @@ def mma_dag_repair(
         stages if type(stages) is int and stages in MMA_DAG_STAGE_CHOICES else 4
     )
     for _ in range(64):
-        if mma_dag_config_reason(facts, current, warps_now, stages_now) is None:
+        reason = mma_dag_config_reason(facts, current, warps_now, stages_now)
+        if reason is None:
             return current, warps_now, stages_now
         if stages_now > 1 and (
             mma_dag_config_reason(facts, current, warps_now, 1) is None
-            or "shared memory"
-            in str(mma_dag_config_reason(facts, current, warps_now, stages_now))
+            or (reason is not None and reason.knob == MMA_DAG_STAGES_KEY)
         ):
             stages_now = max(s for s in MMA_DAG_STAGE_CHOICES if s < stages_now)
             continue
@@ -3863,14 +3927,6 @@ def _static_int(value: object) -> int | None:
     if isinstance(value, sympy.Integer):
         return int(value)
     return None
-
-
-def _is_call(node: object, target: object) -> bool:
-    return (
-        isinstance(node, torch.fx.Node)
-        and node.op == "call_function"
-        and node.target is target
-    )
 
 
 # ``torch.matmul`` of two 16-bit tiles: ``aten.mm`` for rank-2 operands and
@@ -5866,7 +5922,7 @@ class _Matcher:
         # collective / warp-MMA search, or a dot their operand analyzer
         # accepts) keep their search surface: this owner exists for the
         # kernels that would otherwise run SIMT.
-        if self.env.config_spec.cute_tcgen05_search_enabled:
+        if self.env.config_spec.tcgen05.search_enabled:
             raise _NotMine
         for graph in graphs:
             for node in graph.graph.nodes:
@@ -7322,7 +7378,6 @@ def mma_dag_load_hints(program: MmaDagProgram, policies: object) -> dict[Node, s
 
 def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
     from .cute_warp_mma_gemm import _device_sm_count
-    from .tcgen05_config import CuteTcgen05Config
 
     env = CompileEnvironment.current()
     ragged = ragged_root_axes(program)
@@ -7421,7 +7476,7 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
         tiles=tuple(tiles),
         staging=staging,
         k_axes=tuple(sorted({dot.k.index for dot in program.dots})),
-        smem_capacity=CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device),
+        smem_capacity=target_facts.per_cta_smem_capacity_bytes(env.device),
         grid_blocks=grid_blocks,
         tcgen05=tcgen05_facts(program),
         live=mma_dag_live_slots(program),
@@ -7924,9 +7979,9 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     )
     if reason is not None:
         raise _decline(reason)
-    if store_mode not in MMA_DAG_STORE_CHOICES:
+    if store_mode not in MMA_DAG_STORE_ACCEPTED:
         raise _decline(
-            f"{MMA_DAG_STORE_KEY} {store_mode!r} must be one of {MMA_DAG_STORE_CHOICES}"
+            f"{MMA_DAG_STORE_KEY} {store_mode!r} must be one of {MMA_DAG_STORE_ACCEPTED}"
         )
     if exchange_mode not in MMA_DAG_EXCHANGE_CHOICES:
         raise _decline(
@@ -8037,7 +8092,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     staged = tuple(
         store
         for store in program.stores
-        if store_mode == MMA_DAG_STORE_STAGED
+        if store_mode in (MMA_DAG_STORE_STAGED, MMA_DAG_STORE_TMA)
         and staged_store_reason(
             env, store, sizes[program.slots[program.frag_slots[store.frag]][1].index]
         )
@@ -8053,7 +8108,11 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
             routes,
             warps,
             stages,
-            cast("str", store_mode),
+            # (The tensor-memory mode stores its staged tiles by TMA on its
+            # own: ``tma`` is ``staged`` there.)
+            MMA_DAG_STORE_DIRECT
+            if store_mode == MMA_DAG_STORE_DIRECT
+            else MMA_DAG_STORE_STAGED,
             pass_warps == MMA_DAG_PASS_WARPS_ON,
             cast("str", loads_mode),
             persistent=bool(persistent),
@@ -8111,6 +8170,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         blocks=blocks,
         derived_mode=cast("str", derived_mode),
         load_hints=mma_dag_load_hints(program, get("load_eviction_policies", [])),
+        tma_stores=store_mode == MMA_DAG_STORE_TMA and bool(staged),
     )
     if aux_mode == MMA_DAG_AUX_RING:
         aux_rings, aux_bytes = mma_dag_aux_rings(plan)
@@ -8385,10 +8445,12 @@ __all__ = [
     "MMA_DAG_SPLIT_KEY",
     "MMA_DAG_STAGES_KEY",
     "MMA_DAG_STAGE_CHOICES",
+    "MMA_DAG_STORE_ACCEPTED",
     "MMA_DAG_STORE_CHOICES",
     "MMA_DAG_STORE_DIRECT",
     "MMA_DAG_STORE_KEY",
     "MMA_DAG_STORE_STAGED",
+    "MMA_DAG_STORE_TMA",
     "MMA_DAG_TCGEN05",
     "MMA_DAG_TMEM_COLUMNS",
     "MMA_DAG_WARP",
@@ -8415,6 +8477,7 @@ __all__ = [
     "MmaDagPlan",
     "MmaDagProgram",
     "Operand",
+    "Reason",
     "Store",
     "Subscript",
     "accumulator_coordinates",

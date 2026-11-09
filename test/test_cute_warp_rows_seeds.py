@@ -8,22 +8,21 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteReductionTileHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteReductionTileHeuristic
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
-pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(autouse=True)
 def _cpu_only():
-    with _target(), mock_cuda_unavailable():
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
 
 

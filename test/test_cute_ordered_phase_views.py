@@ -7,15 +7,14 @@ import sys
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 
 import helion
 from helion import exc
 from helion._testing import DEVICE
+from helion._testing import cpu_render_target
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import forbid_native_compile
-from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 
@@ -77,7 +76,7 @@ def _detach_phases(x: torch.Tensor) -> torch.Tensor:
 
 @pytest.fixture
 def cpu_only():
-    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
 
 

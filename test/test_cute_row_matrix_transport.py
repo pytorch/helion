@@ -21,7 +21,6 @@ from helion._compiler.cute.row_matrix_transport_codegen import row_matrix_module
 from helion._compiler.cute.row_resident import ROW_RESIDENT_KEY
 from helion._compiler.cute.row_resident import ROW_RESIDENT_MODES
 from helion._compiler.cute.row_resident import prove_row_resident
-from helion._testing import skipUnlessBackends
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -319,7 +318,6 @@ def test_unsupported_matrix_geometries(columns, reduction):
 
 
 @pytest.mark.parametrize("function", (materialized_pair, linear_pair))
-@skipUnlessBackends(["cute"])
 def test_typed_admission_additive_config_and_complete_source(function):
     bound = _bind(function)
     found = _plan(bound)
@@ -389,7 +387,6 @@ def test_typed_admission_additive_config_and_complete_source(function):
                 )
 
 
-@skipUnlessBackends(["cute"])
 def test_alignment_architecture_and_late_graph_rejection():
     unaligned = _bind(offset=1)
     assert unaligned.config_spec.cute_materialized_schedule_available
@@ -442,7 +439,6 @@ class _HalfPointer:
         return self.byte_offset
 
 
-@skipUnlessBackends(["cute"])
 def test_emitted_addresses_are_the_proved_layout_expressions():
     found = _plan(_bind(rows=3, dimensions=(256, 64, 256)))
     assert found is not None
@@ -565,7 +561,6 @@ def test_emitted_addresses_are_the_proved_layout_expressions():
             assert actual == base + expected(tid)
 
 
-@skipUnlessBackends(["cute"])
 def test_resource_limit_keeps_previous_path():
     bound = _bind(dimensions=(256, 128, 64))
     assert not bound.config_spec.cute_materialized_schedule_available

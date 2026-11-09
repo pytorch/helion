@@ -24,13 +24,15 @@ from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..inductor_lowering_extra import patch_inductor_lowerings
 from ..kernel_compiler import KernelCompiler
-from ..output_header import get_needed_import_lines
 from ..type_info import CallableType
 from ..variable_origin import ArgumentOrigin
+from . import target_facts
+from ._ast_pass_utils import assigned_name
 from .cute_mma import analyze_cute_mma_node
 from .host_zero_fill_launches import zero_fill_kernel_launch
 from .materialized_fission_codegen import _empty_graph
 from .materialized_fission_codegen import _module_source
+from .materialized_fission_codegen import prepend_missing_imports
 from .memory_ops import tensor_has_specialized_tma_alignment
 from .pdl_release import ZERO_FILL_KERNEL_PREFIX
 from .pipeline_smem import analyze_pipeline_smem_facts
@@ -39,7 +41,8 @@ from .split_k_workspace import atomic_epilogue_geometry
 from .split_k_workspace import cutlass_dtype_name
 from .split_k_workspace import torch_dtype_name
 from .split_k_workspace import workspace_schedule
-from .tcgen05_config import CuteTcgen05Config
+from .state import cute_env_state
+from .tcgen05_config import facts
 
 if TYPE_CHECKING:
     from ..host_function import HostFunction
@@ -72,7 +75,7 @@ def _producer_source(
     capacity: int,
 ) -> tuple[str, list[dict[str, object]]]:
     """Compile metadata-only batch views after proving the owning inputs."""
-    from ...runtime.kernel import _maybe_skip_dtype_check_in_meta_registrations
+    from ...runtime.kernel import maybe_skip_dtype_check_in_meta_registrations
 
     child = CompileEnvironment(
         owner.device,
@@ -109,10 +112,11 @@ def _producer_source(
         # A/B inherit the cache-key-backed base/stride proof checked below;
         # the full chunk is BK-aligned, so every batch offset is 16B-aligned.
         # Partials are a new dense allocation in the outer host function.
-        child.cute_proven_tma_inputs.update(cast("list[torch.Tensor]", arguments))
+        child_state = cute_env_state(child)
+        child_state.proven_tma_inputs.update(cast("list[torch.Tensor]", arguments))
         compiler = KernelCompiler(child)
         with (
-            _maybe_skip_dtype_check_in_meta_registrations(),
+            maybe_skip_dtype_check_in_meta_registrations(),
             patch_inductor_lowerings(),
         ):
             host = compiler.compile(_native_partition_gemm, list(arguments), {})
@@ -129,18 +133,20 @@ def _producer_source(
                     "cute", "native partition producer proof declined"
                 )
             node, candidate = candidates[0]
-            facts = analyze_pipeline_smem_facts(
+            pipeline_facts = analyze_pipeline_smem_facts(
                 candidate,
                 node,
                 host.device_ir.graphs,
                 capacity_bytes=capacity,
                 allow_leading_passthrough=True,
             )
-            if facts is None:
+            if pipeline_facts is None:
                 raise exc.BackendUnsupported(
                     "cute", "native partition producer SMEM proof declined"
                 )
-            child.config_spec._cute_tcgen05_config.register_pipeline_smem_facts(facts)
+            facts.register_pipeline_smem_facts(
+                child.config_spec._cute_tcgen05_config, pipeline_facts
+            )
             config = child.config_spec.normalized_config(
                 Config(
                     block_sizes=[schedule.bm, schedule.bn, schedule.bk],
@@ -156,7 +162,7 @@ def _producer_source(
             from ..generate_ast import generate_ast
 
             module = generate_ast(host, config, False)
-            plans = child.cute_resolved_wrapper_plans
+            plans = child_state.resolved_wrapper_plans
             if schedule.atomic_epilogue:
                 plans = _rewrite_producer_for_atomic_epilogue(
                     module, proof, schedule, plans
@@ -294,16 +300,6 @@ def _kernel_statement_lists(node: ast.AST) -> list[list[ast.stmt]]:
     return found
 
 
-def _assigned_name(statement: ast.stmt) -> str | None:
-    if (
-        isinstance(statement, ast.Assign)
-        and len(statement.targets) == 1
-        and isinstance(statement.targets[0], ast.Name)
-    ):
-        return statement.targets[0].id
-    return None
-
-
 def _rewrite_producer_for_atomic_epilogue(
     module: ast.Module,
     proof: SplitKWorkspaceProof,
@@ -371,7 +367,7 @@ def _rewrite_producer_for_atomic_epilogue(
             if text == "cute.nvgpu.cpasync.prefetch_descriptor(tcgen05_tma_store_atom)":
                 removed_prefetch += 1
                 continue
-            name = _assigned_name(statement)
+            name = assigned_name(statement)
             if name == "tcgen05_tCgC_epi":
                 removed_epi += 1
                 continue
@@ -550,7 +546,7 @@ def _emitted_epilogue_geometry(
         statement.value
         for statement in ast.walk(kernel)
         if isinstance(statement, ast.Assign)
-        and _assigned_name(statement) == "tcgen05_store_epi_tile"
+        and assigned_name(statement) == "tcgen05_store_epi_tile"
         and isinstance(statement.value, ast.Call)
         and ast.unparse(statement.value.func) == _EPILOGUE_TILE_CALL
     ]
@@ -620,7 +616,7 @@ def _emitted_cta_rows(
         statement.value
         for statement in ast.walk(kernel)
         if isinstance(statement, ast.Assign)
-        and _assigned_name(statement) == "tiled_mma"
+        and assigned_name(statement) == "tiled_mma"
         and isinstance(statement.value, ast.Call)
         and ast.unparse(statement.value.func) == _TILED_MMA_CALL
     ]
@@ -649,7 +645,7 @@ def _emitted_cta_rows(
         ast.unparse(statement.value)
         for statement in ast.walk(kernel)
         if isinstance(statement, ast.Assign)
-        and _assigned_name(statement) == "mma_slice_tidx"
+        and assigned_name(statement) == "mma_slice_tidx"
     ]
     if selector != [
         "_helion_tc_pro.mod_nonneg(cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()), 2)"
@@ -680,7 +676,7 @@ def _insert_after_assignment(
     """Place ``statement`` right after the kernel's assignment to ``name``."""
     for statements in _kernel_statement_lists(kernel):
         for index, candidate in enumerate(statements):
-            if _assigned_name(candidate) == name:
+            if assigned_name(candidate) == name:
                 statements.insert(index + 1, statement)
                 return
     raise exc.BackendUnsupported(
@@ -835,7 +831,7 @@ def generate_split_k_workspace(
         raise exc.BackendUnsupported(
             "cute", "private FP32 split-K workspace proof declined"
         )
-    capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device)
+    capacity = target_facts.per_cta_smem_capacity_bytes(env.device)
     schedule = workspace_schedule(proof, env, config, capacity_bytes=capacity)
     if schedule is None:
         raise exc.BackendUnsupported(
@@ -1066,15 +1062,6 @@ def generate_split_k_workspace(
         ],
         type_ignores=[],
     )
-    imports = {
-        ast.unparse(stmt)
-        for stmt in result.body
-        if isinstance(stmt, (ast.Import, ast.ImportFrom))
-    }
-    result.body[:0] = [
-        statement_from_string(line)
-        for line in get_needed_import_lines(result)
-        if line not in imports
-    ]
-    env.cute_resolved_wrapper_plans = plans
+    prepend_missing_imports(result)
+    cute_env_state(env).resolved_wrapper_plans = plans
     return result

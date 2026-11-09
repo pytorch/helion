@@ -12,6 +12,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+from test._cute_kernels import softmax_two_pass_kernel
+
 import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
@@ -22,30 +24,6 @@ import helion.language as hl
 
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
-
-
-@helion.kernel(backend="cute")
-def softmax_two_pass_kernel(x: torch.Tensor) -> torch.Tensor:
-    """Mirrors ``examples/softmax.py::softmax_two_pass``."""
-    m, n = x.size()
-    out = torch.empty_like(x)
-    block_size_m = hl.register_block_size(m)
-    block_size_n = hl.register_block_size(n)
-    for tile_m in hl.tile(m, block_size=block_size_m):
-        mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-        di = hl.zeros([tile_m], dtype=torch.float32)
-        for tile_n in hl.tile(n, block_size=block_size_n):
-            values = x[tile_m, tile_n]
-            local_amax = torch.amax(values, dim=1)
-            mi_next = torch.maximum(mi, local_amax)
-            di = di * torch.exp(mi - mi_next) + torch.exp(
-                values - mi_next[:, None]
-            ).sum(dim=1)
-            mi = mi_next
-        for tile_n in hl.tile(n, block_size=block_size_n):
-            values = x[tile_m, tile_n]
-            out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
-    return out
 
 
 @helion.kernel(backend="cute", fast_math=True)

@@ -16,10 +16,13 @@ import helion
 from helion import exc
 from helion._compiler.cute import cluster_online_pair as pair
 from helion._compiler.cute import register_row_reduction
+from helion._compiler.cute._ast_pass_utils import is_name_assign
+from helion._compiler.cute.analysis.online_pair import _assigned_name
+from helion._compiler.cute.analysis.online_pair import _find_sites
+from helion._compiler.cute.analysis.online_pair import _prove
 from helion._compiler.cute.register_row_tensor_copy import TensorCopyContext
 from helion._compiler.cute.register_row_tensor_copy import _original_vector_element
 from helion._compiler.cute.register_row_tensor_copy import prove_tensor_copy
-from helion._compiler.cute.rolled_cluster_online_pair import _prove
 from helion._compiler.cute.rolled_cluster_online_pair import _wrap_sites
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
@@ -97,16 +100,16 @@ def _graph(dtype: torch.dtype, vector_width: int) -> SimpleNamespace:
 
 def _plan(body, constants, context):
     working, _owners = _wrap_sites(body)
-    sites = pair._find_sites(working)
+    sites = _find_sites(working)
     if sites is None or len(sites) < 2:
         return None
     first, second = sites[:2]
     if _prove(working, first, second) is None:
         return None
     caches = {
-        pair._assigned_name(statement)
+        _assigned_name(statement)
         for statement in working
-        if pair._is_name_assign(statement)
+        if is_name_assign(statement)
         and isinstance(statement.value, ast.Call)
         and ast.unparse(statement.value.func) == "cute.make_rmem_tensor"
     }
@@ -117,8 +120,8 @@ def _plan(body, constants, context):
     fold = next(
         node
         for node in ast.walk(first.for_node)
-        if pair._is_name_assign(node)
-        and pair._assigned_name(node) == cast("ast.Name", first.call.args[0]).id
+        if is_name_assign(node)
+        and _assigned_name(node) == cast("ast.Name", first.call.args[0]).id
         and isinstance(node.value, ast.Call)
         and ast.unparse(node.value.func) == "cute.arch.fmax"
     )
@@ -171,7 +174,7 @@ def test_complete_tensor_copy_uses_proved_thread_geometry(threads: int) -> None:
     assignment = next(
         node
         for node in ast.walk(device)
-        if pair._is_name_assign(node) and pair._assigned_name(node) == lane
+        if is_name_assign(node) and _assigned_name(node) == lane
     )
     assert assignment.lineno < call.lineno
 
@@ -242,7 +245,7 @@ def test_fp32_cache_storage_must_keep_all_uint32_bits(fp32_graph) -> None:
     allocation = next(
         node
         for node in body
-        if pair._is_name_assign(node)
+        if is_name_assign(node)
         and isinstance(node.value, ast.Call)
         and ast.unparse(node.value.func) == "cute.make_rmem_tensor"
     )
@@ -325,6 +328,13 @@ def test_multirow_thread_mapping_declines(graph) -> None:
     assert _plan(graph.body, graph.constants, context) is None
 
 
+def test_unproven_launch_shape_declines(graph) -> None:
+    # ``threads=None`` (no proven launch shape) matches no row copy site; the
+    # ``(0, 0, 0)`` placeholder that once stood in for it is gone.
+    context = replace(graph.context, threads=None)
+    assert _plan(graph.body, graph.constants, context) is None
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -361,8 +371,7 @@ def test_tensor_copy_rejects_changed_values_masks_or_effects(graph, mutation) ->
         mask = next(
             node
             for node in ast.walk(second)
-            if pair._is_name_assign(node)
-            and pair._assigned_name(node).startswith("mask_")
+            if is_name_assign(node) and _assigned_name(node).startswith("mask_")
         )
         cast("ast.Compare", mask.value).comparators[0] = ast.Constant(value=31992)
     elif mutation in ("row_bias", "thread_row", "loaded_row_alias", "impure_row_alias"):
@@ -408,7 +417,7 @@ def test_tensor_copy_rejects_changed_values_masks_or_effects(graph, mutation) ->
     elif mutation in ("narrowing", "arithmetic"):
         for node in list(ast.walk(root)):
             if (
-                pair._is_name_assign(node)
+                is_name_assign(node)
                 and isinstance(node.value, ast.Call)
                 and ast.unparse(node.value.func) == "cutlass.Float32"
                 and isinstance(node.value.args[0], ast.Name)
@@ -453,7 +462,7 @@ def test_tensor_copy_rejects_changed_values_masks_or_effects(graph, mutation) ->
         allocation = next(
             node
             for node in body
-            if pair._is_name_assign(node)
+            if is_name_assign(node)
             and isinstance(node.value, ast.Call)
             and ast.unparse(node.value.func) == "cute.make_rmem_tensor"
         )
@@ -465,17 +474,16 @@ def test_tensor_copy_rejects_changed_values_masks_or_effects(graph, mutation) ->
             cast("ast.Call", allocation.value).args[0] = ast.Constant(value=32)
     elif mutation == "escaped_load":
         name = next(
-            pair._assigned_name(node)
+            _assigned_name(node)
             for node in ast.walk(first)
-            if pair._is_name_assign(node)
-            and pair._assigned_name(node).startswith("load")
+            if is_name_assign(node) and _assigned_name(node).startswith("load")
         )
         body.append(ast.parse(f"observed = {name}").body[0])
     elif mutation == "initial_max":
         node = next(
             node
             for node in body
-            if pair._is_name_assign(node) and pair._assigned_name(node) == "maximum_acc"
+            if is_name_assign(node) and _assigned_name(node) == "maximum_acc"
         )
         node.value = ast.parse("cutlass.Float32(1)", mode="eval").body
     assert _plan(body, graph.constants, graph.context) is None, mutation

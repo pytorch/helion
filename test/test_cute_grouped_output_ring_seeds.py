@@ -9,43 +9,44 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
+from test._cute_grouped_gemm_split_sizes import _device_offsets_kernel
+from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from test.cute_population_contracts import checked_initial_population
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_autotuner_heuristics import _grouped_worklist_kernel_body
-from test.test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
-from test.test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from test.test_cute_shared_rhs_grouped import _plans
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.cute.autotune.heuristics.cute import (
     _TCGEN05_GROUPED_OUTPUT_RING_SMEM_HEADROOM,
 )
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.cute.autotune.heuristics.cute import (
     CuteTcgen05GroupedSource64Heuristic,
 )
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.cute.autotune.heuristics.cute import (
     CuteTcgen05GroupedWorklistHeuristic,
 )
-from helion._compiler.autotuner_heuristics.cute import _block_size_value_reachable
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.cute.autotune.heuristics.cute import _block_size_value_reachable
+from helion._compiler.cute.autotune.heuristics.cute import (
     _bounded_grouped_worklist_seed_families,
 )
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.cute.autotune.heuristics.cute import (
     _tcgen05_grouped_output_ring_seeds,
 )
-from helion._compiler.autotuner_heuristics.cute import _tcgen05_grouped_worklist_config
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.cute.autotune.heuristics.cute import (
+    _tcgen05_grouped_worklist_config,
+)
+from helion._compiler.cute.autotune.heuristics.cute import (
     grouped_row_union_cluster4_carrier,
 )
-from helion._compiler.autotuner_heuristics.cute import (
+from helion._compiler.cute.autotune.heuristics.cute import (
     grouped_row_union_paired_clc_carrier,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from helion._testing import cpu_render_target
 from helion._testing import import_example
-from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessTcgen05RuntimeNPtx
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
@@ -64,22 +65,16 @@ if TYPE_CHECKING:
 
 
 _HELPER = (
-    "helion._compiler.autotuner_heuristics.cute._tcgen05_grouped_output_ring_seeds"
+    "helion._compiler.cute.autotune.heuristics.cute._tcgen05_grouped_output_ring_seeds"
 )
-_BOUNDED_HELPER = (
-    "helion._compiler.autotuner_heuristics.cute._bounded_grouped_worklist_seed_families"
-)
+_BOUNDED_HELPER = "helion._compiler.cute.autotune.heuristics.cute._bounded_grouped_worklist_seed_families"
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_target() -> Iterator[None]:
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        _target(),
-        mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
     torch.set_num_threads(threads)
 
@@ -214,7 +209,6 @@ def _population(
 @pytest.mark.parametrize("shape", range(3))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("static_shapes", [False, True])
-@skipUnlessBackends(["cute"])
 def test_original_shapes_cover_output_ring_and_preserve_seed_prefix(
     shape: int, dtype: torch.dtype, static_shapes: bool
 ) -> None:
@@ -343,7 +337,6 @@ def test_original_shapes_cover_output_ring_and_preserve_seed_prefix(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("offsets", [False, True])
-@skipUnlessBackends(["cute"])
 def test_rank3_device_metadata_reuses_the_same_output_ring_family(
     dtype: torch.dtype, offsets: bool
 ) -> None:
@@ -381,7 +374,6 @@ def test_rank3_device_metadata_reuses_the_same_output_ring_family(
         )
 
 
-@skipUnlessBackends(["cute"])
 @skipUnlessTcgen05RuntimeNPtx
 def test_external_worklist_keeps_its_existing_policy() -> None:
     values = (
@@ -412,7 +404,6 @@ def test_external_worklist_keeps_its_existing_policy() -> None:
         (640, 128, 128, 0, torch.bfloat16),
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_unproven_or_empty_inputs_do_not_gain_grouped_ring_seeds(
     rows: int, k: int, n: int, groups: int, dtype: torch.dtype
 ) -> None:

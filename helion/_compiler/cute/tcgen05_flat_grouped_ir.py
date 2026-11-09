@@ -25,7 +25,9 @@ from ..device_ir import ForLoopGraphInfo
 from ..device_ir import NodeArgsGraphInfo
 from ..device_ir import RootGraphInfo
 from ..indexing_strategy import subscript_tile_info
+from .analysis.match_common import node_tensor
 from .promote_output_axis import _PromotedGridAxisGraphInfo
+from .state import cute_env_state
 from .tcgen05_flat_grouped_host import prove_flat_grouped_host
 
 if TYPE_CHECKING:
@@ -66,14 +68,6 @@ def _call(value: object, target: object, count: int) -> TypeGuard[Node]:
         and not value.kwargs
         and len(value.args) == count
     )
-
-
-def _tensor(value: object) -> torch.Tensor | None:
-    if isinstance(value, Node):
-        result = value.meta.get("val")
-        if isinstance(result, torch.Tensor):
-            return result
-    return None
 
 
 def _output(info: GraphInfo) -> object:
@@ -119,7 +113,7 @@ class _Matcher:
         while _call(value, view_ops.subscript, 2):
             assert isinstance(value, Node)
             source, indices = value.args
-            tensor = _tensor(source)
+            tensor = node_tensor(source)
             if tensor is None or not isinstance(indices, (tuple, list)):
                 return None
             if (
@@ -183,7 +177,7 @@ class _Matcher:
         ):
             return None
         assert isinstance(source, Node)
-        tensor = _tensor(source)
+        tensor = node_tensor(source)
         name = source.args[0]
         if tensor is None or not isinstance(name, str) or not name.isidentifier():
             return None
@@ -201,7 +195,7 @@ class _Matcher:
             return None
         if tensor.ndim != len(axes) or tuple(self.axis(x) for x in indices) != axes:
             return None
-        result = _tensor(node)
+        result = node_tensor(node)
         if result is None or result.dtype is not tensor.dtype:
             return None
         return tensor, name
@@ -210,7 +204,7 @@ class _Matcher:
         self, value: object, target: object, dtype: torch.dtype
     ) -> Node | None:
         value = self.unbroadcast(value)
-        tensor = _tensor(value)
+        tensor = node_tensor(value)
         if not _call(value, target, 2) or tensor is None or tensor.dtype is not dtype:
             return None
         assert isinstance(value, Node)
@@ -295,7 +289,7 @@ def prove_flat_grouped_rna(
         or env.device.type != "cuda"
         or host is None
         or env._is_distributed
-        or env.cute_fission_plan is not None
+        or cute_env_state(env).fission_plan is not None
         or len(ir.root_ids) != 1
         or len(ir.graphs) != 4
         or len(ir.grid_block_ids) != 1
@@ -482,7 +476,7 @@ def prove_flat_grouped_rna(
     value = store.args[2]
     if (
         not _call(value, torch.ops.aten.add.Tensor, 2)
-        or (value_tensor := _tensor(value)) is None
+        or (value_tensor := node_tensor(value)) is None
         or value_tensor.dtype is not torch.float32
     ):
         return None
@@ -502,7 +496,7 @@ def prove_flat_grouped_rna(
         return None
     match.matched.update((value, bias_expand))
     out_node, out_indices = store.args[:2]
-    output = _tensor(out_node)
+    output = node_tensor(out_node)
     if (
         not _call(out_node, _tracing_ops._host_tensor, 1)
         or output is None
@@ -539,7 +533,7 @@ def prove_flat_grouped_rna(
     ):
         return None
     if any(
-        (tensor := _tensor(node)) is None or tensor.dtype is not torch.float32
+        (tensor := node_tensor(node)) is None or tensor.dtype is not torch.float32
         for node in (mm, a_load, mm.args[2], phi, value)
     ):
         return None

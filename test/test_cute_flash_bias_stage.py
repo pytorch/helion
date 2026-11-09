@@ -19,12 +19,12 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import import_example
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
-from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion.exc import InvalidConfig
 
@@ -68,10 +68,9 @@ def _cpu_args(shape, dtype=torch.bfloat16, bias=True):
 
 
 def _bias_stage_fragment(spec):
-    return spec._cute_flash_autotune_fragments()["cute_flash_bias_stage"]
+    return _cute_flash_autotune_fragments(spec)["cute_flash_bias_stage"]
 
 
-@skipUnlessBackends(["cute"])
 def test_biased_plan_stages_the_bias_by_default() -> None:
     bound = cpu_bind(_kernel(biased_attention.fn), _cpu_args((2, 8, 1024, 64)))
     spec = bound.config_spec
@@ -101,7 +100,6 @@ def test_biased_plan_stages_the_bias_by_default() -> None:
     assert "bias_stage" not in direct
 
 
-@skipUnlessBackends(["cute"])
 def test_head_dim_128_keeps_a_two_deep_kv_ring() -> None:
     """At d128 the ring competes with the staged output tiles and the K/V
     ring for shared memory: the d128 default stages the output
@@ -144,7 +142,6 @@ def test_head_dim_128_keeps_a_two_deep_kv_ring() -> None:
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_plans_without_a_tensor_bias_pin_direct() -> None:
     bound = cpu_bind(_kernel(attention.fn), _cpu_args((2, 8, 1024, 64), bias=False))
     spec = bound.config_spec
@@ -163,7 +160,6 @@ def test_plans_without_a_tensor_bias_pin_direct() -> None:
     assert "bias" not in bound.to_code(cfg)
 
 
-@skipUnlessBackends(["cute"])
 @skipIfRefEager("compares the two bias lowerings' kernels")
 @skipIfCudaCapabilityLessThan((10, 0), reason="the fused fa4 flash kernel")
 @pytest.mark.parametrize(

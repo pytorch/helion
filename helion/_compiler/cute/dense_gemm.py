@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from . import target_facts
 from .cute_epilogue import _AuxiliaryTensorLoadExpr
 from .cute_epilogue import _BinaryTensorExpr
 from .cute_epilogue import _CurrentTensorExpr
@@ -14,7 +15,6 @@ from .cute_epilogue import _RuntimeScalarExpr
 from .tcgen05_schedule_facts import prove_full_tile_schedule_facts
 
 if TYPE_CHECKING:
-    from ..compile_environment import CompileEnvironment
     from .tcgen05_schedule_facts import NativeGemm
 
 
@@ -59,9 +59,7 @@ def _scale_view_supported(
     )
 
 
-def prove_dense_gemm_facts(
-    env: CompileEnvironment, gemm: NativeGemm | None
-) -> DenseGemmFacts | None:
+def prove_dense_gemm_facts(gemm: NativeGemm | None) -> DenseGemmFacts | None:
     base = prove_full_tile_schedule_facts(gemm)
     if (
         base is None
@@ -104,7 +102,7 @@ def prove_dense_gemm_facts(
                 return None
         else:
             return None
-    capacity = env.config_spec._cute_tcgen05_config.per_cta_smem_capacity_bytes(
+    capacity = target_facts.per_cta_smem_capacity_bytes(
         gemm.candidate.operands.lhs.source_fake.device
     )
     return DenseGemmFacts(

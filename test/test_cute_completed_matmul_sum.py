@@ -18,7 +18,7 @@ from torch.fx.node import Node
 
 import helion
 from helion._compiler.cute import completed_matmul_sum as completion
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute import target_facts
 from helion._compiler.generate_ast import GenerateAST
 from helion._hardware import HardwareInfo
 from helion._testing import patch_cute_mma_support
@@ -118,7 +118,7 @@ def captured() -> Iterator[_Capture]:
                 snapshot,
                 node,
                 value,
-                ctx.cg.device_function.cute_state.completed_matmul_sums[node],
+                ctx.cg.device_function.cute_state.lanes.completed_matmul_sums[node],
             )
         )
         return value
@@ -130,9 +130,7 @@ def captured() -> Iterator[_Capture]:
         )
         stack.enter_context(patch_cute_mma_support())
         for name in ("per_cta_smem_budget_bytes", "per_cta_smem_capacity_bytes"):
-            stack.enter_context(
-                patch.object(CuteTcgen05Config, name, return_value=232448)
-            )
+            stack.enter_context(patch.object(target_facts, name, return_value=232448))
         for name, value in (
             ("helion.runtime.kernel.target_device_capability", (10, 0)),
             ("helion._compiler.compile_environment.target_device_capability", (10, 0)),
@@ -289,7 +287,7 @@ def test_nonidentity_mask_is_not_removed(captured: _Capture, mask: object) -> No
 def test_record_is_local_to_the_codegen_and_actual_expression(
     captured: _Capture,
 ) -> None:
-    state = captured.ctx.cg.device_function.cute_state.completed_matmul_sums
+    state = captured.ctx.cg.device_function.cute_state.lanes.completed_matmul_sums
     with patch.dict(state, clear=True):
         assert _consume(captured) is None
     with patch.dict(

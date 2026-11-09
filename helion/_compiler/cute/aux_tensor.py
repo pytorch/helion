@@ -32,6 +32,7 @@ import torch
 from ...language import matmul_ops
 from ...language import memory_ops
 from ..compile_environment import CompileEnvironment
+from ..fx_load_trace import trace_to_load
 from .cute_epilogue import Tcgen05UnaryEpilogueChain
 from .cute_epilogue import _AuxiliaryTensorLoadExpr
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
@@ -50,16 +51,6 @@ if TYPE_CHECKING:
     from ..host_function import HostFunction
 
 
-# Mirrors ``cute_mma._TRACE_THROUGH_TARGETS`` — the data-preserving
-# wrappers the MMA codegen walks through when resolving operand
-# loads (``_trace_to_load`` in ``cute_mma``). Duplicated here
-# rather than imported because ``cute_mma`` imports from this
-# module, creating a circular dependency. The single
-# ``convert_element_type`` target is the canonical operand-cast
-# wrapper Helion emits for ``lhs.to(dtype) @ rhs.to(dtype)``
-# patterns; keep this set in sync with ``cute_mma`` if either
-# side adds a new wrapper.
-_MMA_OPERAND_TRACE_THROUGH_TARGETS = (torch.ops.prims.convert_element_type.default,)
 # Include ``matmul_ops.dot`` because Helion's public ``hl.dot`` API lowers to
 # the same tcgen05 MMA path as the aten matmul-family calls.
 _TCGEN05_AUX_DETECTOR_MMA_TARGETS = (
@@ -115,7 +106,7 @@ class Tcgen05AuxTensorDescriptor:
     The descriptor is intentionally minimal — just the fields the
     productive body needs. Per-aux-step splice locals (var names,
     TMEM partition state, etc.) are still owned by the store-codegen
-    splice (``memory_ops._codegen_cute_store_tcgen05_tile``); the
+    splice (``store_epilogue._codegen_cute_store_tcgen05_tile``); the
     descriptor only carries the *identity* of the aux tensor so the
     producer-side TMA atom / SMEM ring can be allocated at MMA
     codegen time. Cross-graph FX node identity (the same load node
@@ -277,9 +268,9 @@ def discover_tcgen05_aux_tensor_descriptors(
     aux steps. The productive-body codegen consumes the tuple as
     an ordered list keyed by aux index (mirroring the existing
     ``_AuxStepRecord``-per-aux-step indexing in
-    ``memory_ops._codegen_cute_store_tcgen05_tile``).
+    ``store_epilogue._codegen_cute_store_tcgen05_tile``).
     """
-    if matmul_fx_node not in cg.device_function.cute_state.matmul_fx_nodes:
+    if matmul_fx_node not in cg.device_function.cute_state.tcgen05.matmul_fx_nodes:
         return ()
 
     analyzed_stores = analyze_tcgen05_matmul_store_chains(
@@ -328,7 +319,7 @@ def tcgen05_promoted_rowvec_epilogue(
     """
     if output_column_major or partial_output_tma_store:
         return False
-    if matmul_fx_node not in cg.device_function.cute_state.matmul_fx_nodes:
+    if matmul_fx_node not in cg.device_function.cute_state.tcgen05.matmul_fx_nodes:
         return False
     analyzed_stores = analyze_tcgen05_matmul_store_chains(
         cg.codegen_graphs, matmul_fx_node
@@ -621,7 +612,7 @@ def host_function_matmul_has_non_tcgen05_operand(
             for arg in node.args:
                 if not isinstance(arg, torch.fx.Node):
                     continue
-                load_node = _trace_to_load_through_casts(arg)
+                load_node = trace_to_load(arg)
                 if load_node is None:
                     continue
                 val = load_node.meta.get("val")
@@ -705,30 +696,3 @@ def _has_tma_compatible_analyzed_aux_store(
         if len(compatible_store_values) > 1:
             return False
     return len(compatible_store_values) == 1
-
-
-def _trace_to_load_through_casts(node: torch.fx.Node) -> torch.fx.Node | None:
-    """Walk backward from ``node`` through accepted operand-cast
-    wrappers to the underlying ``memory_ops.load``.
-
-    Mirrors ``cute_mma._trace_to_load`` for the operand-trace
-    contract: only data-preserving ops in
-    ``_MMA_OPERAND_TRACE_THROUGH_TARGETS`` are walked
-    through, matching the MMA codegen's own operand-resolution
-    behavior. Returns the resolved ``memory_ops.load`` node, or
-    ``None`` if a non-wrapper op (e.g. arithmetic) is
-    encountered before the load — in that case the operand is
-    not a pure load chain and we conservatively decline to
-    treat it as an MMA operand load.
-    """
-    cur = node
-    while cur.op == "call_function" and cur.target is not memory_ops.load:
-        if cur.target not in _MMA_OPERAND_TRACE_THROUGH_TARGETS:
-            return None
-        input_nodes = [a for a in cur.args if isinstance(a, torch.fx.Node)]
-        if len(input_nodes) != 1:
-            return None
-        cur = input_nodes[0]
-    if cur.op != "call_function" or cur.target is not memory_ops.load:
-        return None
-    return cur

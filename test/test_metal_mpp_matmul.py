@@ -1,9 +1,9 @@
 """Cooperative MPP lowering of K-loop matmul accumulators.
 
 Every ``torch.addmm``, ``torch.mm``, ``torch.bmm`` and ``torch.baddbmm``,
-every ``hl.dot`` over a K held as per-thread parts, and the other ``hl.dot``
-calls the MPP graph pass leaves when the planner takes all of them, take
-``metal/mpp_matmul.py``'s path.  Most kernels run their K loop under
+and every ``hl.dot`` the planner admits (a K loop's, one over a K held as
+per-thread parts, or every whole-K ``hl.dot`` of a kernel where each is
+admissible), take ``metal/mpp_matmul.py``'s path.  Most kernels run their K loop under
 ``hl.grid`` or over free ``hl.arange`` rows (grouped_gemm's layout).
 References are float64 on the CPU.
 """
@@ -4210,7 +4210,6 @@ class TestMppMatmul(_MppCase):
             "v = scratch_0[tid]",
             "v = _metal_lane_fold(x)",
             "v = _metal_lane_reduce(x)",
-            "_metal_mpp_threadgroup_barrier()",
             "v = _helion_mpp_run(acc, 0)",
             "v = simd_sum(x)",
             "v = quad_shuffle(x, 1)",
@@ -4508,7 +4507,7 @@ class TestMppStaging(_MppCase):
     def test_factored_k(self) -> None:
         """A K held as parts beyond int4_gemm: a stacked lhs, c = 3, two
         widened views through hl.dot and torch.addmm (under hl.grid and at
-        the root, where the graph pass declines them), a stacked rhs that is
+        the root), a stacked rhs that is
         non-zero past K beside a NaN-padded lhs, and a K loop starting at 3."""
         f16 = torch.float16
         x, w = torch.randn(32, 48, device=DEVICE), torch.randn(96, 40, device=DEVICE)
@@ -6177,7 +6176,7 @@ def root_k_count(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 def dot_then_addmm(
     x: torch.Tensor, y: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """An hl.dot K loop, which the graph pass takes, beside an addmm K loop."""
+    """An hl.dot K loop beside an addmm K loop."""
     m, k = x.size()
     _, n = y.size()
     o1 = torch.empty([m, n], dtype=torch.float32, device=x.device)
@@ -6344,9 +6343,8 @@ def _bk(
 
 @_requires_mps
 class TestMppRootAddmm(unittest.TestCase):
-    """The graph pass takes only ``hl.dot``, so a root K loop's
-    ``torch.addmm`` takes the planner, where each property of the loop is
-    checked rather than assumed."""
+    """A root K loop's ``torch.addmm`` on the planner, where each property
+    of the loop is checked rather than assumed."""
 
     def setUp(self) -> None:
         torch.manual_seed(0)
@@ -6366,7 +6364,6 @@ class TestMppRootAddmm(unittest.TestCase):
             with self.subTest(kernel=kernel.name, config=config):
                 out, code, _ = _run(kernel, args, config)
                 self.assertIn("_helion_mpp_acc(", code)
-                self.assertNotIn("_metal_mpp_setup", code)
                 want = ref(_bk(kernel, args, config)) if callable(ref) else ref
                 outs = out if isinstance(out, tuple) else (out,)
                 wants = want if isinstance(want, tuple) else (want,)
@@ -6438,9 +6435,9 @@ class TestMppRootAddmm(unittest.TestCase):
         y = torch.randn(64, 1, device=DEVICE)
         self._check(root_plain, (x, y), (None,), _mm(x, y))
 
-    def test_beside_the_graph_pass(self) -> None:
-        """An ``hl.dot`` K loop on the graph pass beside an ``addmm`` K loop
-        on the planner, in one root and in two roots."""
+    def test_dot_beside_addmm(self) -> None:
+        """An ``hl.dot`` K loop beside an ``addmm`` K loop, both on the
+        planner, in one root and in two roots."""
         x = self.x.float()
         y = self.y.float()
         mm = _mm(x, y)
@@ -6454,8 +6451,7 @@ class TestMppRootAddmm(unittest.TestCase):
         ):
             with self.subTest(kernel=kernel.name, config=config):
                 (o1, o2), code, _ = _run(kernel, (x, y), config)
-                self.assertIn("_metal_mpp_setup", code)
-                self.assertIn("_helion_mpp_acc(", code)
+                self.assertEqual(code.count("_helion_mpp_acc("), 2)
                 _close(o1, mm)
                 _close(o2, 2 * mm)
 
@@ -12917,24 +12913,21 @@ class TestMppOpDimsRejects(_MppCase):
 _SEED_CONFIGS = (None, helion.Config(block_sizes=[32, 32, 32]))
 
 
-class TestMppGraphPassSeedCodegen(unittest.TestCase):
-    """The MPP graph pass starts its cooperative tensor at zero and never
-    reads the seed, so it takes an ``hl.dot`` K loop only when the acc is
-    seeded by a zero fill.  The planner takes any other seed: a constant
-    fill seeds its ``_helion_mpp_acc``, and a loaded seed is staged through
-    ``_mpp_coop``.  Generated on the CPU."""
+class TestMppDotSeedCodegen(unittest.TestCase):
+    """The planner takes an ``hl.dot`` K loop with any seed: a constant fill,
+    zero included, seeds its ``_helion_mpp_acc``, and a loaded seed is staged
+    through ``_mpp_coop``.  Generated on the CPU."""
 
     def test_seeds(self) -> None:
         x = torch.randn(64, 64, dtype=torch.float16)
         y = torch.randn(64, 64, dtype=torch.float16)
         c = torch.randn(64, 64)
-        for kernel, args, region, seed in (
-            (dot_seed_zeros, (x, y), True, None),
-            (dot_seed_full, (x, y), False, r"_helion_mpp_acc\(.*, 1\.5, \["),
+        for kernel, args, seed in (
+            (dot_seed_zeros, (x, y), r"_helion_mpp_acc\(.*, 0\.0, \["),
+            (dot_seed_full, (x, y), r"_helion_mpp_acc\(.*, 1\.5, \["),
             (
                 dot_seed_load,
                 (x, y, c),
-                False,
                 r"_mpp_coop = _helion_mpp_acc\(.*'_mpp_seed'\)",
             ),
         ):
@@ -12947,14 +12940,12 @@ class TestMppGraphPassSeedCodegen(unittest.TestCase):
                         for line in code.splitlines()
                         if not line.lstrip().startswith("#")
                     )
-                    self.assertEqual("_metal_mpp_setup" in body, region)
-                    if seed is not None:
-                        self.assertIn("_helion_mpp_run(", body)
-                        self.assertRegex(body, seed)
+                    self.assertIn("_helion_mpp_run(", body)
+                    self.assertRegex(body, seed)
 
 
 @_requires_mps
-class TestMppGraphPassSeed(unittest.TestCase):
+class TestMppDotSeed(unittest.TestCase):
     """A seeded ``hl.dot`` accumulator computes seed + x @ y."""
 
     def test_seeds(self) -> None:
@@ -15947,6 +15938,16 @@ class TestMppUniformLaunch(_MppCase):
                 self.assertRegex(msl, r"= _mpp_mat\w*\[")
                 self.assertNotIn("? _mpp_mat", msl)
 
+    def test_dot_k_loop(self) -> None:
+        """An ``hl.dot`` K loop drops its masks like an ``addmm`` one."""
+        x = torch.randn(64, 64, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(64, 64, device=DEVICE, dtype=torch.float16)
+        out, code, msl = _run(dot_seed_zeros, (x, y), _UNIFORM16)
+        _close(out, _mm(x, y))
+        self.assertIn("_helion_mpp_acc(", code)
+        self._launches(code, (16, 16, 1))
+        self.assertNotRegex(msl, r"\bmask_\d+")
+
     def test_reductions(self) -> None:
         """Column sums of one M tile, and attention's row max and sum, read
         the cooperative result unguarded and reduce it with no identity
@@ -15980,8 +15981,7 @@ class TestMppUniformLaunch(_MppCase):
 class TestMppUniformLaunchKeepsMasks(_MppCase):
     """What a uniform launch doesn't prove stays checked: an extent that
     doesn't divide its block, a launch with two thread extents, and kernels
-    whose free ``hl.arange`` or MPP graph pass claims threads no strategy
-    owns."""
+    whose free ``hl.arange`` claims threads no strategy owns."""
 
     def setUp(self) -> None:
         torch.manual_seed(0)
@@ -16019,27 +16019,13 @@ class TestMppUniformLaunchKeepsMasks(_MppCase):
                 self.assertRegex(msl, r"if \(\(\(\(indices_\d+ - offset_\d+\) < 128\)")
 
     def test_threads_no_strategy_owns(self) -> None:
-        """Free ``hl.arange`` rows, and an ``hl.dot`` on the MPP graph pass
-        beside an ``addmm``, keep their masks at launches whose strategies
-        share one extent."""
+        """Free ``hl.arange`` rows keep their masks at a launch whose
+        strategies share one extent."""
         a = torch.randn(64, 48, device=DEVICE, dtype=torch.float16)
         b = torch.randn(48, 64, device=DEVICE, dtype=torch.float16)
-        with self.subTest(kernel="free_rows"):
-            out, code, _ = _run(free_rows, (a, b, 4, 4), _UNIFORM16)
-            _close(out, _mm(a, b))
-            self.assertIn("_block_dims=(16, 16, 1)", code)
-        x = torch.randn(64, 64, device=DEVICE)
-        y = torch.randn(64, 64, device=DEVICE)
-        config = helion.Config(
-            block_sizes=[16, 16, 16, 16], num_threads=[4, 4, 0, 0], num_warps=4
-        )
-        with self.subTest(kernel="dot_then_addmm"):
-            (o1, o2), code, msl = _run(dot_then_addmm, (x, y), config)
-            _close(o1, _mm(x, y))
-            _close(o2, 2 * _mm(x, y))
-            self.assertIn("_metal_mpp_setup", code)
-            self.assertIn("_block_dims=(128, 4, 1)", code)
-            self.assertRegex(msl, r"\bmask_\d+")
+        out, code, _ = _run(free_rows, (a, b, 4, 4), _UNIFORM16)
+        _close(out, _mm(a, b))
+        self.assertIn("_block_dims=(16, 16, 1)", code)
 
 
 # --- Staging lane loops dealt out over the threads that share them ---------

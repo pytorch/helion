@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from typing import TypeGuard
 from typing import cast
 
+from ._ast_pass_utils import substitute_names
 from .philox_stream import PACKET_ASM
 from .philox_stream import PACKET_CONSTRAINTS
 from .philox_stream import SCALAR_ASM
@@ -76,16 +77,6 @@ def _rng_call(node: ast.AST) -> TypeGuard[ast.Call]:
             )
         )
     )
-
-
-class _Substitute(ast.NodeTransformer):
-    def __init__(self, values: dict[str, ast.expr]) -> None:
-        self.values = values
-
-    def visit_Name(self, node: ast.Name) -> ast.AST:
-        if isinstance(node.ctx, ast.Load) and node.id in self.values:
-            return _clone(self.values[node.id])
-        return node
 
 
 class _ReplaceCall(ast.NodeTransformer):
@@ -223,7 +214,9 @@ def lower_philox_packets(
                 found = True
                 break
             name = statement.targets[0].id
-            expression = _Substitute(definitions).visit(_clone(statement.value))
+            expression = substitute_names(
+                _clone(statement.value), definitions, clone=_clone
+            )
             if _integer(expression, available):
                 definitions[name] = expression
             else:
@@ -232,7 +225,7 @@ def lower_philox_packets(
             available.discard(name)
         if not found:
             return None
-        expanded = _Substitute(definitions).visit(_clone(offset))
+        expanded = substitute_names(_clone(offset), definitions, clone=_clone)
         if not _integer(expanded, known | {lane}):
             return None
         # An invariant used in replay cannot be changed anywhere in the loop.
@@ -246,7 +239,9 @@ def lower_philox_packets(
         aligned_adjacency = _aligned_packet_adjacency(expanded, lane, known)
         width = loop.iter.args[0].value
         offsets = [
-            _Substitute({lane: ast.Constant(index)}).visit(_clone(expanded))
+            substitute_names(
+                _clone(expanded), {lane: ast.Constant(index)}, clone=_clone
+            )
             for index in range(width)
         ]
         preamble: list[ast.stmt] = []

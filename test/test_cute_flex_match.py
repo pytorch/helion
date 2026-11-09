@@ -28,11 +28,12 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 import helion
-from helion._compiler import backend as _compiler_backend
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute import flex_match
+from helion._compiler.cute.analysis import attention_match as _attention_match
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
 from helion._compiler.cute.flex_match import FlexMatch
 from helion._compiler.cute.flex_match import flex_host_scalar_symbol
 from helion._compiler.cute.flex_match import match_flex_envelope
@@ -43,6 +44,7 @@ from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import as_sm100
 from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
 from helion.runtime.kernel import Kernel
@@ -144,22 +146,15 @@ def _flex_args(
 
 
 @contextlib.contextmanager
-def _as_sm100(*, flex: bool) -> Iterator[None]:
-    """CPU codegen with the flash gate forced on; ``flex`` sets the flag."""
-    with (
-        cpu_codegen(),
-        patch("helion._compiler.backend._attention_flash_supported", return_value=True),
-        patch(
-            "helion._compiler.backend._attention_flash_gate_enabled", return_value=True
-        ),
-        patch.object(flex_match, "FLEX_PLAN_ENABLED", flex),
-    ):
+def _as_sm100_flex(*, flex: bool) -> Iterator[None]:
+    """The shared SM100 CPU codegen context; ``flex`` sets the flex-plan flag."""
+    with as_sm100(), patch.object(flex_match, "FLEX_PLAN_ENABLED", flex):
         yield
 
 
 def _bind(kernel: Kernel, args: tuple[Any, ...], *, flex: bool = False) -> BoundKernel:
     """Bind on the CPU as if on SM100; ``flex`` turns the integration on."""
-    with _as_sm100(flex=flex):
+    with _as_sm100_flex(flex=flex):
         # ``_bind_isolated``: a fresh BoundKernel per test, independent of the
         # process-wide bind cache (the flag above changes the surface).
         return kernel._bind_isolated(args)
@@ -690,9 +685,9 @@ def test_surface_and_codegen_claim_every_walk_loop() -> None:
 
     def spy(cg: Any) -> bool:
         state = cg.device_function.cute_state
-        captured["block_ids"] = list(state.attention_flash_block_ids or [])
-        captured["plan"] = state.attention_flash_score_plan
-        captured["match"] = state.attention_flex_match
+        captured["block_ids"] = list(state.flash.block_ids or [])
+        captured["plan"] = state.flash.score_plan
+        captured["match"] = state.flash.flex_match
         captured["tensor_plan"] = cute_flash.flash_attention_tensor_plan(
             cg.device_function
         )
@@ -720,8 +715,7 @@ def test_surface_and_codegen_claim_every_walk_loop() -> None:
     assert (tensor_plan.tensor_4d_batch, tensor_plan.tensor_4d_heads) == (2, 4)
     assert (tensor_plan.batch, tensor_plan.seq) == (8, 1024)
     assert (tensor_plan.q_seq, tensor_plan.kv_seq) == (1024, 1024)
-    assert tensor_plan.flex_scale_expr == "cutlass.Float32(scale)"
-    assert tensor_plan.flex_scale_arg_name == "scale"
+    assert tensor_plan.scale_arg_name == "scale"
     assert tensor_plan.flex_scalar_exprs == ()
     assert tensor_plan.flex_scalar_arg_names == ()
     assert tuple(tensor_plan.q_arg.fake_value.shape) == (2, 4, 1024, 64)
@@ -774,8 +768,8 @@ def test_collapsed_envelope_surface_unchanged(name: str) -> None:
         bound = _bind(kernel, args, flex=flex)
         host_function = _host(bound)
         device_ir = host_function.device_ir
-        with _as_sm100(flex=flex), bound.env, host_function:
-            surfaces.append(_compiler_backend.detect_flash_search_surface(device_ir))
+        with _as_sm100_flex(flex=flex), bound.env, host_function:
+            surfaces.append(_attention_match.detect_flash_search_surface(device_ir))
         assert bound.config_spec.cute_flash_search_enabled
     before, after = surfaces
     assert before is not None
@@ -843,12 +837,12 @@ def test_short_query_lengths_enable_the_search(q_seq: int) -> None:
 
     def spy(cg: Any) -> bool:
         state = cg.device_function.cute_state
-        captured["block_ids"] = list(state.attention_flash_block_ids or [])
-        captured["match"] = state.attention_flex_match
+        captured["block_ids"] = list(state.flash.block_ids or [])
+        captured["match"] = state.flash.flex_match
         return real_codegen(cg)
 
     with (
-        _as_sm100(flex=True),
+        _as_sm100_flex(flex=True),
         patch.object(cute_flash, "codegen_attention_flash", spy),
     ):
         code = bound.to_code(config)
@@ -944,7 +938,7 @@ def test_contiguous_operands_keep_the_rank3_maps() -> None:
         match.q_strides == match.k_strides == match.o_strides == (262144, 65536, 64, 1)
     )
     assert match.operand_strides is None
-    with _as_sm100(flex=True):
+    with _as_sm100_flex(flex=True):
         code = bound.to_code(bound.config_spec.default_config())
     plan = _wrapper_plan(code)
     assert "operand_strides" not in plan
@@ -1000,7 +994,7 @@ def test_transposed_operands_take_the_rank4_maps(kv_heads: int) -> None:
     assert sorted(spec._flat_fields()) == sorted(contiguous.config_spec._flat_fields())
     config = spec.default_config()
     assert config == contiguous.config_spec.default_config()
-    with _as_sm100(flex=True):
+    with _as_sm100_flex(flex=True):
         code = bound.to_code(config)
     assert "flash_flex_status" in code
     plan = _wrapper_plan(code)
@@ -1042,7 +1036,7 @@ def test_strided_epilogues_address_o_by_its_strides() -> None:
     bound = _bind(_flex_kernel(), _flex_args(q, k, v, _identity, block_mask), flex=True)
     base = bound.config_spec.default_config().config
     renders: dict[str, str] = {}
-    with _as_sm100(flex=True):
+    with _as_sm100_flex(flex=True):
         for name, overrides in (
             (
                 "tma",
@@ -1098,7 +1092,7 @@ def test_packed_qkv_slices_are_admitted() -> None:
     )
     assert match.o_strides == (262144, 64, 256, 1)
     assert bound.config_spec.cute_flash_search_enabled
-    with _as_sm100(flex=True):
+    with _as_sm100_flex(flex=True):
         code = bound.to_code(bound.config_spec.default_config())
     assert _wrapper_plan(code)["operand_strides"] == match.operand_strides
 
@@ -1176,9 +1170,9 @@ def _without_source_comments(code: str) -> str:
     return re.sub(r"^[ \t]*# src\[.*\n", "", code, flags=re.MULTILINE)
 
 
-# unittest runners ignore pytestmark.
+# unittest runners see neither pytest marks nor the conftest path gate.
 @onlyBackends(["cute"])
-class TestContiguousRenderPin(TestCase):
+class TestContiguousForwardRenderPin(TestCase):
     """The exact text of one contiguous forward render (the
     ``.expected_cute`` journal next to this file): the strided-operand
     support must not change the code contiguous inputs produce."""
@@ -1191,7 +1185,7 @@ class TestContiguousRenderPin(TestCase):
         bound = _bind(
             _flex_kernel(), _flex_args(q, k, v, _identity, block_mask), flex=True
         )
-        with _as_sm100(flex=True):
+        with _as_sm100_flex(flex=True):
             code = bound.to_code(bound.config_spec.default_config())
         assert "'operand_strides'" not in code
         self.assertExpectedJournal(_without_source_comments(code))
@@ -1234,7 +1228,7 @@ def test_long_kv_render_does_not_grow_with_the_sequence() -> None:
         assert bound.config_spec.cute_flash_search_enabled
         config = bound.config_spec.default_config()
         assert config.config[cute_flash.FLASH_FLEX_ITEM_WORDS_KEY] is True
-        with _as_sm100(flex=True):
+        with _as_sm100_flex(flex=True):
             renders[seq] = bound.to_code(config)
     short, long = renders[16384], renders[131072]
     assert short.count("\n") == long.count("\n")
@@ -1351,14 +1345,14 @@ def _attention_kernel() -> Kernel:
 def _bind_dense_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> BoundKernel:
-    with _as_sm100(flex=False):
+    with _as_sm100_flex(flex=False):
         return _attention_kernel()._bind_isolated((q, k, v))
 
 
 def _flash_choices(spec: Any) -> dict[str, tuple[object, ...]]:
     """The searched values of every flash knob of a surface."""
     with patch.dict(os.environ, {}, clear=True):
-        fragments = spec._cute_flash_autotune_fragments()
+        fragments = _cute_flash_autotune_fragments(spec)
     return {
         key: tuple(
             getattr(fragment, "search_choices", None)
@@ -1446,9 +1440,12 @@ def test_dense_flex_plan_takes_the_dense_surface() -> None:
 
     with patch.dict(os.environ, {}, clear=True):
         generation = ConfigGeneration(spec)
-        generation.validate_flash_structural_coverage()
-        assert generation.flash_structural_coverage_uncovered_values() == []
-        assert generation.flash_structural_coverage_uncovered_interactions() == []
+        generation.extension.validate_flash_structural_coverage()
+        assert generation.extension.flash_structural_coverage_uncovered_values() == []
+        assert (
+            generation.extension.flash_structural_coverage_uncovered_interactions()
+            == []
+        )
         messages: list[str] = []
         pairs = generation.seed_flat_config_pairs(messages.append)
     assert not messages
@@ -1489,7 +1486,7 @@ def test_dense_flex_plan_renders_the_dense_bodies() -> None:
     default = spec.default_config()
     assert default.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4"
     assert default.config[cute_flash.FLASH_PERSISTENT_KEY] is True
-    with _as_sm100(flex=True):
+    with _as_sm100_flex(flex=True):
         code = bound.to_code(default)
     assert not any(marker in code for marker in _FLEX_BODY_MARKERS)
     plan = _wrapper_plan(code)
@@ -1502,7 +1499,7 @@ def test_dense_flex_plan_renders_the_dense_bodies() -> None:
     assert (
         "_flash_scale_log2 = _flash_scale * cutlass.Float32(1.4426950408889634)" in host
     )
-    with _as_sm100(flex=True):
+    with _as_sm100_flex(flex=True):
         code = bound.to_code(_seed_of(spec, "ws_overlap", True))
     assert not any(marker in code for marker in _FLEX_BODY_MARKERS)
     plan = _wrapper_plan(code)
@@ -1519,7 +1516,7 @@ def test_dense_flex_plan_renders_the_row_programs_with_the_runtime_scale() -> No
     q, k, v = _qkv(batch=1, heads=4, q_seq=256, kv_seq=256, head_dim=64)
     bound = _bind(_flex_kernel(), _empty_mask_args(q, k, v), flex=True)
     seed = _seed_of(bound.config_spec, "row_mma", False)
-    with _as_sm100(flex=True):
+    with _as_sm100_flex(flex=True):
         code = bound.to_code(seed)
     assert not any(marker in code for marker in _FLEX_BODY_MARKERS)
     plan = _wrapper_plan(code)
@@ -1558,6 +1555,6 @@ def test_trivial_walk_with_a_mask_region_keeps_the_flex_surface() -> None:
     choices = _flash_choices(spec)
     assert choices[cute_flash.FLASH_PERSISTENT_KEY] == (False,)
     assert "row_mma" not in choices[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
-    with _as_sm100(flex=True):
+    with _as_sm100_flex(flex=True):
         code = bound.to_code(spec.default_config())
     assert "flash_flex_needs_mask" in code and "flash_flex_status" in code

@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute import flash_knobs
 from helion._compiler.cute.attention_plan import ALIBI_BIAS_KIND
 from helion._compiler.cute.attention_plan import CAUSAL_MASK_KIND
 from helion._compiler.cute.attention_plan import causal_score_plan
@@ -181,10 +182,10 @@ def test_knob_is_an_appended_schema_axis_with_its_fa4_disc_dependency() -> None:
     # Appended once behind the axes it was introduced after (an inserted axis
     # would reshuffle every later axis's coverage rows); knobs added later
     # append behind it in turn, so the tail itself is not pinned.
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     assert keys.count(KEY) == 1
     assert keys.index(KEY) > keys.index(cute_flash.FLASH_O_OVER_Q_KEY)
-    witness = cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(KEY, True)]
+    witness = flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(KEY, True)]
     assert witness == {
         cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
         cute_flash.FLASH_SOFTMAX_DISC_KEY: True,
@@ -310,42 +311,42 @@ def test_fragment_default_is_the_fa4_family_resolver_default(env: str | None) ->
             )
 
 
+def _pass2_calls(code: str, helper: str) -> tuple[int, int]:
+    """``(plain, masked)`` PASS2 calls of ``helper``: the masked ones carry
+    ``causal=True`` (the helper re-applies the causal mask itself)."""
+    lines = [line for line in code.splitlines() if helper in line]
+    masked = sum("causal=True" in line for line in lines)
+    return len(lines) - masked, masked
+
+
 @pytest.mark.parametrize(
-    ("body", "store_rep", "plain_pass2", "masked_pass2"),
+    ("body", "store_rep", "pass2"),
     [
-        (
-            PAIR_BODY,
-            16,
-            "fa4_disc_exp_convert_store_sload16_pair_pipe(",
-            "fa4_disc_exp_convert_store_sload16_pair_pipe_causal(",
-        ),
-        (
-            REP32_BODY,
-            32,
-            "fa4_disc_exp_convert_store_pipe(",
-            "fa4_disc_exp_convert_store_pipe_causal(",
-        ),
+        (PAIR_BODY, 16, "fa4_disc_exp_convert_store_rep32_pipe("),
+        (REP32_BODY, 32, "fa4_disc_exp_convert_store_pipe("),
     ],
 )
 def test_split_body_masks_once_and_stores_the_scores_back(
-    body: dict[str, object], store_rep: int, plain_pass2: str, masked_pass2: str
+    body: dict[str, object], store_rep: int, pass2: str
 ) -> None:
     off = _render(_resolve({**body, KEY: False}))
     on = _render(_resolve(body))
     assert on == _render(_resolve({**body, KEY: True}))
     # With the knob off both passes mask: PASS1 reduces in place and PASS2
-    # runs the causal helper; no score store atom exists.
+    # runs the helper under ``causal=True``; no score store atom exists.
+    off_plain, off_masked = _pass2_calls(off, pass2)
     assert off.count(MASK_HELPER) == 2
-    assert off.count(masked_pass2) == 2
+    assert off_masked == 2
     assert STORE_HELPER not in off
     assert "flash_score_st_atom" not in off
     # With the knob PASS1 of both query slots masks, reduces and stores back
     # with a store atom matching the load chunking; PASS2 of the masked
-    # segment is the plain helper (the unmasked suffix keeps its own).
+    # segment is the plain pass (the unmasked suffix keeps its own).
+    on_plain, on_masked = _pass2_calls(on, pass2)
     assert on.count(STORE_HELPER) == 2
     assert MASK_HELPER not in on
-    assert masked_pass2 not in on
-    assert on.count(plain_pass2) == off.count(plain_pass2) + 2
+    assert on_masked == 0
+    assert on_plain == off_plain + 2
     assert (
         f"St32x32bOp(cute_tcgen05_flash.Repetition({store_rep})), cutlass.Float32)"
         in on
@@ -367,7 +368,7 @@ def test_unsplit_ascending_body_masks_once_behind_its_tile_predicate() -> None:
     on = _render(_resolve(body))
     assert on.count(STORE_HELPER) == 2
     assert MASK_HELPER not in on
-    assert "fa4_disc_exp_convert_store_pipe_causal(" not in on
+    assert "causal=True" not in on
     # The masked arm of the per-tile predicate stores back; the dense arm
     # reduces in place.
     masked_arm = on.index("if flash_kv >= flash_m_tile0:")

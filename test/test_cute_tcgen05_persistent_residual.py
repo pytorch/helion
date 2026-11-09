@@ -62,14 +62,14 @@ class TestCuteTcgen05PersistentResidual(TestCase):
                     "beside the warp roles of a persistent tcgen05 matmul",
                 ),
             ):
-                bound.to_triton_code(_config(bound, pid_type))
+                bound.to_code(_config(bound, pid_type))
 
     def test_flat_pid_runs_the_statement_exactly(self) -> None:
         args = _args()
         a, b, side = args
         bound = _matmul_and_side_store.bind(args)
         config = _config(bound, "flat")
-        self.assertIn("tcgen05", bound.to_triton_code(config))
+        self.assertIn("tcgen05", bound.to_code(config))
         out = bound.compile_config(config)(*args)
         torch.testing.assert_close(out, a.float() @ b.float(), atol=5e-2, rtol=1e-2)
         torch.testing.assert_close(side[:2, :4], torch.ones(2, 4, device=DEVICE))
