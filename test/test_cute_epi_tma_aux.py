@@ -314,7 +314,9 @@ def _gated_pair(x: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.T
 
 
 def test_smem_model_prices_the_rings() -> None:
-    facts = Tcgen05PipelineSmemFacts(2, 2, 232448, exact_aux_itemsizes=(2, 2))
+    facts = Tcgen05PipelineSmemFacts(
+        2, 2, 232448, exact_aux_itemsizes=(2, 2), ring_aux_itemsizes=(2, 2)
+    )
     kwargs = {"bm": 256, "bn": 128, "bk": 64, "c_stages": 2, "acc_stages": 2}
     simt = pipeline_smem_bytes(facts, ab_stages=6, **kwargs)
     staged = pipeline_smem_bytes(facts, ab_stages=6, aux_load_mode=EPI_TMA, **kwargs)
@@ -330,8 +332,16 @@ def test_smem_model_prices_the_rings() -> None:
     assert max_pipeline_ab_stages(facts, **wide) == 6
     assert max_pipeline_ab_stages(facts, aux_load_mode=EPI_TMA, **wide) == 4
     # A single ring on the same tile leaves one more stage.
-    single = Tcgen05PipelineSmemFacts(2, 2, 232448, exact_aux_itemsizes=(2,))
+    single = Tcgen05PipelineSmemFacts(
+        2, 2, 232448, exact_aux_itemsizes=(2,), ring_aux_itemsizes=(2,)
+    )
     assert max_pipeline_ab_stages(single, aux_load_mode=EPI_TMA, **wide) == 5
+    # A boolean mask beside the staged operand rides no ring: the one ring's
+    # stages.
+    masked = Tcgen05PipelineSmemFacts(
+        2, 2, 232448, exact_aux_itemsizes=(1, 2), ring_aux_itemsizes=(2,)
+    )
+    assert max_pipeline_ab_stages(masked, aux_load_mode=EPI_TMA, **wide) == 5
 
 
 def test_rings_are_priced_in_their_own_dtype() -> None:
@@ -417,10 +427,15 @@ def test_normalizer_keeps_the_ring_at_the_deepest_fitting_depth() -> None:
     # ring and drops the warp (ahead of the aux-TMA full-tile projection,
     # which would otherwise take a repaired SIMT pair sample onto the
     # producer-warp ``tma`` regime); an explicit config is refused.
+    # Dropping the warp widens the pair to ``cta_group="auto"``, whose arena
+    # holds four AB stages beside the rings (strict normalization refuses
+    # five): the ring's stages are judged on that final tile.
     for key in ("tcgen05_warp_spec_c_input_warps", "tcgen05_warp_spec_store_warps"):
         fixed = _normalize(_gated_gemm, args, _pair(**{key: 1}), fix=True)
         assert fixed[MODE] == EPI_TMA and fixed[key] == 0
-        assert fixed["tcgen05_ab_stages"] == 6
+        assert fixed["tcgen05_ab_stages"] == 4
+        # the repaired sample is one strict normalization keeps
+        assert _normalize(_gated_gemm, args, dict(fixed), fix=False) == fixed
         fixed = _normalize(_gated_gemm, args, _one_cta(**{key: 1}), fix=True)
         assert fixed[MODE] == EPI_TMA and fixed[key] == 0
         with pytest.raises(exc.InvalidConfig, match="replaces the aux producer warp"):

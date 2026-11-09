@@ -14972,8 +14972,9 @@ class TestCuteBackend(TestCase):
 
         The one-wave tiles are not seeded for source-C epilogues, so a sampled
         256x64 two-CTA tile projects to 256x256 as before; and since codegen
-        rejects any ``tcgen05_ab_stages >= 3`` with a productive C-input warp,
-        a deep sample keeps its ring and loses the warp (ab=2 keeps it).
+        rejects an AB ring deeper than the C-input warp's ring leaves (six
+        64-deep stages hold more than two 128-deep ones), a deep sample keeps
+        its ring and loses the warp (ab=2 keeps it).
         """
         x = torch.empty((2048, 4096), device=DEVICE, dtype=torch.bfloat16)
         y = torch.empty((4096, 2048), device=DEVICE, dtype=torch.bfloat16)

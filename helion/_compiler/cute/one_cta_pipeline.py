@@ -124,11 +124,11 @@ def one_cta_pipeline_smem_bytes(
     and the flat 16-bit launches of an ordered barrier chain run the same
     role-local CtaGroup.ONE schedule).  A staged aux load mode adds one
     ``aux_stages``-deep ring of the DEFAULT epilogue subtile per exact-shape
-    auxiliary operand (``facts.exact_aux_itemsizes``), ``epi_warp_groups``
-    multiplies the C stages and ``epi_subtile_n`` pins the C subtile to
-    ``(min(bm, 128), epi_subtile_n)`` (``tcgen05_epi_subtile_n``), as the
-    paired model does.  This function does not change any legacy one- or
-    two-CTA allocation model.
+    auxiliary operand the ring carries (``facts.ring_aux_itemsizes``),
+    ``epi_warp_groups`` multiplies the C stages and ``epi_subtile_n`` pins
+    the C subtile to ``(min(bm, 128), epi_subtile_n)``
+    (``tcgen05_epi_subtile_n``), as the paired model does.  This function
+    does not change any legacy one- or two-CTA allocation model.
     """
     assert one_cta_pipeline_tile_modeled(
         bm=bm, bn=bn, bk=bk, c_stages=c_stages, acc_stages=acc_stages
@@ -147,7 +147,7 @@ def one_cta_pipeline_smem_bytes(
             epi_tile_m=epi_m,
             epi_tile_n=epi_n,
             aux_stages=aux_stages,
-            ring_itemsizes=facts.exact_aux_itemsizes,
+            ring_itemsizes=facts.ring_aux_itemsizes,
         )
         if aux_load_mode in TCGEN05_AUX_LOAD_MODES_STAGED
         else 0

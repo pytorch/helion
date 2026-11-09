@@ -35,9 +35,11 @@ def test_ragged_edge_family_keeps_its_128_row_pairs(shape) -> None:
         tcgen05 = spec._cute_tcgen05_config
         assert tcgen05.plain_edge_pair128_admitted()
         gen = ConfigGeneration(spec)
+        # The seeds themselves, ahead of the small-grid default's promoted
+        # copy of one of them.
         pair_seeds = [
             seed
-            for seed in spec.compiler_seed_configs
+            for seed in tcgen05.autotune_seed_configs()
             if seed.get("tcgen05_cta_group") == "two"
         ]
         assert [seed.config["block_sizes"][:3] for seed in pair_seeds] == [
@@ -45,6 +47,8 @@ def test_ragged_edge_family_keeps_its_128_row_pairs(shape) -> None:
             [128, 128, 128],
         ]
         for seed in pair_seeds:
+            # and they reach the autotuner's population
+            assert seed in spec.compiler_seed_configs
             _flat, normalized = gen.strict_config_pair(seed)
             assert normalized.config["block_sizes"] == seed.config["block_sizes"]
             assert normalized.config["tcgen05_cta_group"] == "two"

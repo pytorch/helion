@@ -10717,8 +10717,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # fits (the foundation depth); ab=3 + c=4 overflows (matching the
         # cycle-90 probe where a directly sampled 256x256 ab=3 + c=4 hit a raw
         # ``ptxas: too much shared`` error). Uses a plain (no-epilogue) matmul so
-        # the residual aux-TMA projection (which forces ab=2) does not claim the
-        # sampled candidate — the admission gate is the only thing acting on c=4.
+        # the residual aux-TMA projection (which sets the producer's ring) does
+        # not claim the sampled candidate — the admission gate is the only
+        # thing acting on c=4.
         # The SMEM budget is MOCKED to the B200 value so the gate is exercised
         # deterministically on any cute host (``@onlyBackends`` does not imply
         # B200).

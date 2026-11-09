@@ -1,7 +1,9 @@
-"""GPU tests of tcgen05 kernels over ragged tiles.
+"""GPU tests of tcgen05 kernels over ragged tiles, and of the autotune-off
+default tiles.
 
 The flat one-CTA pipeline, the persistent one-CTA N-edge tiles, the staged
-rows' one-tile lookahead and the ragged two-CTA search.
+rows' one-tile lookahead and the ragged two-CTA search; autotune-off default
+tiles where the B200 defaults promote (``TestCuteTcgen05DefaultTilesGpu``).
 
 Partial M / N output tiles and a K tail used to take the one-warp scalar
 SMEM producer and store 16-bit scalars; the flat pipeline now loads every
@@ -20,12 +22,17 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.autotuner_heuristics.cute_tcgen05_default import (
+    CuteTcgen05DefaultTileHeuristic,
+)
+from helion._hardware import get_hardware_info
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing.cute_aux import rank_two_aux
+from helion._testing.cute_aux import two_residual_aux
 from helion._testing.cute_dense_tcgen05 import bias_mm_into
 from helion._testing.cute_dense_tcgen05 import plain_mm_into
 from helion._testing.cute_dense_tcgen05 import promoted_bias_mm_into
@@ -36,6 +43,22 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="tcgen05 requires an sm_100 GPU",
 )
+
+
+def _promotes_b200_defaults() -> bool:
+    """The default-tile heuristic promotes on its targets only
+    (``CuteTcgen05DefaultTileHeuristic.PROMOTE_TARGETS``), and the default
+    tests pin wave quantization over a B200's 148 SMs."""
+    if not torch.cuda.is_available():
+        return False
+    device = torch.device(DEVICE)
+    hardware = get_hardware_info(device)
+    return (
+        hardware.device_kind,
+        hardware.compute_capability,
+    ) in CuteTcgen05DefaultTileHeuristic.PROMOTE_TARGETS and (
+        torch.cuda.get_device_properties(device).multi_processor_count >= 148
+    )
 
 
 @helion.kernel(static_shapes=True)
@@ -447,6 +470,26 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
                 bound(a, b), (a.float() @ b.float()).to(a.dtype), rtol=1e-2, atol=1e-1
             )
 
+    def test_narrow_n_m_edge_default_runs_the_256xn_pair(self) -> None:
+        # One 128-wide N tile over an M edge (19000 = 74 pairs + 56 rows),
+        # M-major A, FP32 residual: the default 256x128 pair matches torch.
+        m, n, k = 19000, 128, 256
+        a = torch.randn(k, m, device=DEVICE, dtype=torch.bfloat16).T
+        b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        residual = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        bound = rank_two_aux.bind((a, b, residual))
+        config = bound.config_spec.default_config()
+        self.assertEqual(config.block_sizes, [256, 128, 64])
+        self.assertEqual(config.config["tcgen05_cluster_m"], 2)
+        self.assertIn("CtaGroup.TWO", bound.to_code(config))
+        bound.set_config(config)
+        torch.testing.assert_close(
+            bound(a, b, residual),
+            a.float() @ b.float() + residual,
+            rtol=1e-3,
+            atol=1e-2,
+        )
+
     def test_the_wide_k_pair_seed_runs_a_k_tail(self) -> None:
         # The [128, 128, 128] ab6 twin of the plain edge seed on a shape whose
         # K (555) is not a multiple of the K tile.
@@ -586,6 +629,130 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
             out.zero_()
             bound(a, b, bias, out)
             torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-1)
+
+
+@onlyBackends(["cute"])
+@skipIfNotCUDA()
+@unittest.skipUnless(_promotes_b200_defaults(), "pins B200 default tiles")
+class TestCuteTcgen05DefaultTilesGpu(RefEagerTestDisabled, TestCase):
+    def test_small_grid_default_runs_the_128_row_pair(self) -> None:
+        # 36 128x128 tiles: the default is the 128-row pair with the most
+        # CTAs in one wave (on 148 SMs, 72 128x64 pairs: 144 CTAs).
+        m, n, k = 128, 4608, 1024
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(n, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+        bound = bias_mm_into.bind((a, b, bias, out))
+        config = bound.config_spec.default_config()
+        self.assertEqual(config.block_sizes[0], 128)
+        self.assertEqual(config.config["tcgen05_cluster_m"], 2)
+        sms = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        self.assertLessEqual(2 * -(-n // config.block_sizes[1]), sms)
+        bound.set_config(config)
+        bound(a, b, bias, out)
+        torch.testing.assert_close(
+            out,
+            (a.float() @ b.float() + bias.float()).to(out.dtype),
+            rtol=1e-2,
+            atol=1e-1,
+        )
+
+    def test_small_grid_column_major_output_loads_its_row_after_the_wait(
+        self,
+    ) -> None:
+        # A column-major output reads its bias row per subtile: the small
+        # grid's pair loads it after the accumulator wait (the whole-row load
+        # before it did not compile beside the column-major store).
+        for m, n, k in ((128, 128, 128), (256, 2048, 512), (128, 4096, 1024)):
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+            bias = torch.randn(n, device=DEVICE, dtype=torch.bfloat16)
+            out = torch.empty(n, m, device=DEVICE, dtype=torch.bfloat16).T
+            bound = bias_mm_into.bind((a, b, bias, out))
+            config = bound.config_spec.default_config()
+            self.assertEqual(config.config["tcgen05_cluster_m"], 2)
+            self.assertEqual(
+                config.config["tcgen05_aux_load_placement"], "post_acc_wait"
+            )
+            bound.set_config(config)
+            bound(a, b, bias, out)
+            torch.testing.assert_close(
+                out,
+                (a.float() @ b.float() + bias.float()).to(out.dtype),
+                rtol=1e-2,
+                atol=1e-1,
+            )
+
+    def test_residual_pair_defaults_stage_the_residual(self) -> None:
+        # Whole tiles: the epilogue-issued TMA ring, four stages deep where
+        # the AB ring holds the tile's four k-blocks beside it. An M edge
+        # one-CTA 128-row tiles do not cover (1000 rows): the residual's TMA
+        # producer warp on the persistent 256x256 pair.
+        for m, n, k, mode, aux_stages in (
+            (4096, 1024, 1024, "epi_tma", None),
+            (4096, 1024, 256, "epi_tma", 4),
+            (1000, 4096, 1024, "tma", None),
+        ):
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+            residual = torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16)
+            bound = rank_two_aux.bind((a, b, residual))
+            config = bound.config_spec.default_config()
+            self.assertEqual(config.config["tcgen05_cluster_m"], 2)
+            self.assertEqual(config.config["tcgen05_aux_load_mode"], mode)
+            self.assertEqual(config.config.get("tcgen05_aux_stages"), aux_stages)
+            bound.set_config(config)
+            torch.testing.assert_close(
+                bound(a, b, residual),
+                (a.float() @ b.float() + residual.float()).to(residual.dtype),
+                rtol=1e-2,
+                atol=1e-1,
+            )
+
+    def test_m_edge_default_fits_two_residual_rings(self) -> None:
+        # Over an M edge the producer pair's default prices both residuals'
+        # rings: eight 32-deep AB stages beside them and two C stages compile
+        # (with four C stages eight overflowed: 262 KB of 232) and match torch.
+        m, n, k = 1000, 4096, 1088
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        r0 = torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16)
+        r1 = torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16)
+        bound = two_residual_aux.bind((a, b, r0, r1))
+        config = bound.config_spec.default_config()
+        self.assertEqual(config.config["tcgen05_aux_load_mode"], "tma")
+        self.assertEqual(config.config["tcgen05_ab_stages"], 8)
+        self.assertEqual(config.config["tcgen05_c_stages"], 2)
+        bound.set_config(config)
+        torch.testing.assert_close(
+            bound(a, b, r0, r1),
+            (a.float() @ b.float() + r0.float() + r1.float()).to(r0.dtype),
+            rtol=1e-2,
+            atol=1e-1,
+        )
+
+    def test_aux_producer_shallow_rings_match_torch(self) -> None:
+        # The residual's TMA producer warp beside five 64-deep AB stages and
+        # two C stages over an M edge (the 32-deep default's ten stages run
+        # in ``test_residual_pair_defaults_stage_the_residual``).
+        m, n, k = 1000, 4096, 1024
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        residual = torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16)
+        bound = rank_two_aux.bind((a, b, residual))
+        config = bound.config_spec.default_config()
+        config.config.update(block_sizes=[256, 256, 64], tcgen05_ab_stages=4)
+        bound.config_spec.normalize(config, _fix_invalid=True)
+        self.assertEqual(config.config["tcgen05_ab_stages"], 5)
+        self.assertEqual(config.config["tcgen05_aux_load_mode"], "tma")
+        bound.set_config(config)
+        torch.testing.assert_close(
+            bound(a, b, residual),
+            (a.float() @ b.float() + residual.float()).to(residual.dtype),
+            rtol=1e-2,
+            atol=1e-1,
+        )
 
 
 if __name__ == "__main__":

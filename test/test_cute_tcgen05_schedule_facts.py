@@ -14,12 +14,17 @@ import pytest
 import torch
 
 import helion
+from helion import exc
+from helion._compiler.autotuner_heuristics.cute import (
+    CuteTcgen05ThreadLocalEpilogueHeuristic,
+)
 from helion._compiler.autotuner_heuristics.cute_tcgen05_default import (
     CuteTcgen05DefaultTileHeuristic,
 )
 from helion._compiler.autotuner_heuristics.cute_tcgen05_schedule import (
     CuteTcgen05ScheduleHeuristic,
 )
+from helion._compiler.cute import cute_epilogue
 from helion._compiler.cute.dense_gemm import prove_dense_gemm_facts
 from helion._compiler.cute.one_cta_pipeline import prove_one_cta_pipeline_facts
 from helion._compiler.cute.tcgen05_config import _TWO_CTA_PERSISTENT_PID_VETO
@@ -34,6 +39,7 @@ from helion._compiler.cute.tcgen05_schedule_facts import (
 from helion._compiler.cute.tcgen05_schedule_facts import prove_full_tile_schedule_facts
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_aux import rank_two_aux
+from helion._testing.cute_aux import two_residual_aux
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import full_and_edge_store_bodies
 from helion._testing.cute_dense_tcgen05 import atomic_output_mm
@@ -48,13 +54,19 @@ from helion._testing.cute_dense_tcgen05 import scale_bias_mm_into
 from helion._testing.cute_dense_tcgen05 import scaled_args
 from helion._testing.cute_dense_tcgen05 import scaled_mm
 from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
+from helion._testing.cute_inductor_epilogues import INDUCTOR_EPILOGUES
+from helion._testing.cute_inductor_epilogues import dropout_mm_into
+from helion._testing.cute_inductor_epilogues import gelu_tanh_grad_mm_into
+from helion._testing.cute_inductor_epilogues import inductor_epilogue_args
 from helion.autotuner.config_generation import ConfigGeneration
+from helion.exc import InvalidConfig
 import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from helion.runtime.kernel import BoundKernel
+    from helion.runtime.kernel import Kernel
 
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
@@ -385,6 +397,32 @@ def test_k_tail_does_not_widen_other_instruction_families() -> None:
         assert not native_tma_schedule_supported(
             replace(facts, dtype=dtype), (128, 128, 128), cluster_m=2, cluster_n=1
         )
+
+
+@helion.kernel(backend="cute")
+def _addmm_mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def _relu_mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = torch.relu(acc).to(x.dtype)
+    return out
 
 
 def _plain_bind(
@@ -1033,6 +1071,603 @@ def test_one_cta_n_edge_sample_is_judged_on_its_final_epilogue(
     assert values["block_sizes"] == [128, 256, 64]
 
 
+def test_small_grid_default_takes_the_128_row_pair() -> None:
+    """A GEMM with fewer 128x128 tiles than SMs defaults to the paired-pipeline
+    seeds' 128-row pair that fills the most SMs in one wave: 128x9216x4096
+    + bias runs 72 128x128 pairs, 144 CTAs (B200: 0.19 of the ATen GEMM on
+    the flat 64x16 base default, 1.15 on the pair)."""
+    m, n, k = 128, 9216, 4096
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = bias_mm_into._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                torch.empty((n,), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+    assert config.block_sizes == [128, 128, 64]
+    assert config.config["tcgen05_cluster_m"] == 2
+    assert config.config["pid_type"] != "flat"
+
+
+def test_boolean_mask_rides_no_staged_ring() -> None:
+    """A boolean mask stays on the direct read (``stages_through_smem_ring``):
+    it is an exact-shape operand for the register mechanisms, but no staged
+    ring carries it, so neither ``epi_tma`` nor the producer warp's ``tma``
+    ring is searched or seeded (their seeds failed codegen), an explicit
+    ``tma`` config is refused, and the default keeps SIMT loads."""
+    m, n, k = 8192, 1024, 1024
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = dropout_mm_into._bind_isolated(
+            inductor_epilogue_args(
+                next(e for e in INDUCTOR_EPILOGUES if e.kernel is dropout_mm_into),
+                m,
+                n,
+                k,
+                device="cpu",
+                random=False,
+            )
+        )
+        spec = bound.config_spec
+        state = spec._cute_tcgen05_config
+        facts = state.pipeline_smem_facts
+        config = spec.default_config()
+        explicit = dict(config.config, tcgen05_aux_load_mode="tma")
+        with bound.env, pytest.raises(InvalidConfig, match="producer's ring carries"):
+            spec.normalize(explicit)
+    assert facts is not None
+    assert facts.exact_aux_itemsizes == (1,)
+    assert facts.ring_aux_itemsizes == ()
+    assert not state.epi_tma_search_enabled()
+    assert not state._aux_tma_search_enabled()
+    assert all(
+        seed.config.get("tcgen05_aux_load_mode", "simt") == "simt"
+        for seed in spec.compiler_seed_configs
+    )
+    assert config.config.get("tcgen05_aux_load_mode", "simt") == "simt"
+
+
+def test_math_bound_residual_pair_default_keeps_simt_loads() -> None:
+    """A residual read through a transcendental keeps the SIMT loads: staging
+    it buys no latency the math does not already hide (GELU backward,
+    16384x4096x1024: 0.33 of the ATen GEMM on SIMT loads, 0.29 staged)."""
+    m, n, k = 8192, 1024, 1024
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = gelu_tanh_grad_mm_into._bind_isolated(
+            inductor_epilogue_args(
+                next(
+                    e for e in INDUCTOR_EPILOGUES if e.kernel is gelu_tanh_grad_mm_into
+                ),
+                m,
+                n,
+                k,
+                device="cpu",
+                random=False,
+            )
+        )
+        facts = bound.config_spec._cute_tcgen05_config.pipeline_smem_facts
+        config = bound.config_spec.default_config()
+    assert facts is not None
+    assert facts.epilogue_transcendental
+    assert config.config["tcgen05_cluster_m"] == 2
+    assert config.config["tcgen05_aux_load_mode"] == "simt"
+
+
+@pytest.mark.parametrize(
+    "move",
+    ({"tcgen05_c_store_mode": "direct"}, {"tcgen05_warp_spec_c_input_warps": 1}),
+)
+def test_epi_tma_default_neighbours_repair_to_valid_configs(
+    move: dict[str, object],
+) -> None:
+    """A search move off the four-stage ``epi_tma`` default repairs to a
+    config strict normalization accepts: one that leaves the
+    epilogue-issued ring drops its four stages with it, and the ring's AB
+    stages are judged on the tile the projections leave (a C-input warp's
+    neighbour widened the pair to a tile where no ``epi_tma`` stage fits)."""
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        spec = _three_residual_mm._bind_isolated(
+            (
+                torch.empty((16384, 256), dtype=torch.bfloat16),
+                torch.empty((256, 256), dtype=torch.bfloat16),
+                *(torch.empty((16384, 256), dtype=torch.bfloat16) for _ in range(3)),
+            )
+        ).config_spec
+        default = spec.default_config()
+        assert default.config["tcgen05_aux_load_mode"] == "epi_tma"
+        assert default.config["tcgen05_aux_stages"] == 4
+        repaired = helion.Config(**{**default.config, **move})
+        spec.normalize(repaired, _fix_invalid=True)
+        spec.normalize(helion.Config(**repaired.config))
+    if repaired.config["tcgen05_aux_load_mode"] != "epi_tma":
+        assert repaired.config.get("tcgen05_aux_stages", 2) != 4
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _six_residual_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    r0: torch.Tensor,
+    r1: torch.Tensor,
+    r2: torch.Tensor,
+    r3: torch.Tensor,
+    r4: torch.Tensor,
+    r5: torch.Tensor,
+) -> torch.Tensor:
+    """Six exact-shape operands added to the accumulator."""
+    m, k = a.shape
+    n = b.shape[1]
+    out = torch.empty_like(r0)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        acc = acc + r0[rows, cols].to(torch.float32)
+        acc = acc + r1[rows, cols].to(torch.float32)
+        acc = acc + r2[rows, cols].to(torch.float32)
+        acc = acc + r3[rows, cols].to(torch.float32)
+        acc = acc + r4[rows, cols].to(torch.float32)
+        out[rows, cols] = (acc + r5[rows, cols].to(torch.float32)).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _three_residual_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    r0: torch.Tensor,
+    r1: torch.Tensor,
+    r2: torch.Tensor,
+) -> torch.Tensor:
+    """Three exact-shape operands added to the accumulator."""
+    m, k = a.shape
+    n = b.shape[1]
+    out = torch.empty_like(r0)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        acc = acc + r0[rows, cols].to(torch.float32)
+        acc = acc + r1[rows, cols].to(torch.float32)
+        acc = acc + r2[rows, cols].to(torch.float32)
+        out[rows, cols] = acc.to(out.dtype)
+    return out
+
+
+def test_whole_tile_residual_pair_default_stages_through_the_ring() -> None:
+    """A whole-tile residual pair's default loads its exact-shape operands
+    through the epilogue-issued TMA ring, on the widest N tile whose AB ring
+    keeps four stages beside it, the ring deepened where the AB ring still
+    holds a whole tile's K (B200, of the ATen GEMM: 8192x1024x1024 +
+    residual 0.83 on SIMT loads -> 1.05; 32768x256x256 + three operands
+    0.50 -> 0.97, where 256x256 keeps three AB stages and 256x128 runs, its
+    four k-blocks beside a four-stage ring)."""
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        one = rank_two_aux._bind_isolated(
+            (
+                torch.empty((8192, 1024), dtype=torch.bfloat16),
+                torch.empty((1024, 1024), dtype=torch.bfloat16),
+                torch.empty((8192, 1024), dtype=torch.bfloat16),
+            )
+        ).config_spec.default_config()
+        # 16384 rows: two waves of the narrower tile's pairs, one of 256x256
+        m, n, k = 16384, 256, 256
+        three_spec = _three_residual_mm._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                *(torch.empty((m, n), dtype=torch.bfloat16) for _ in range(3)),
+            )
+        ).config_spec
+        three = three_spec.default_config()
+        # the flat search space encodes the promoted ring depth
+        generation = ConfigGeneration(three_spec)
+        round_trip = generation.unflatten(generation.flatten(three))
+    assert one.block_sizes == [256, 256, 64]
+    assert one.config["tcgen05_aux_load_mode"] == "epi_tma"
+    # sixteen k-blocks: the ring keeps its two stages beside five AB stages
+    assert one.config.get("tcgen05_aux_stages") is None
+    assert one.config["tcgen05_ab_stages"] == 5
+    assert three.block_sizes == [256, 128, 64]
+    assert three.config["tcgen05_aux_load_mode"] == "epi_tma"
+    # four k-blocks: the AB ring holds them beside a four-stage ring
+    assert three.config["tcgen05_aux_stages"] == 4
+    assert three.config["tcgen05_ab_stages"] == 4
+    assert round_trip.config["tcgen05_aux_stages"] == 4
+    # the narrower tile's two waves of pairs walk the grouped raster
+    assert three.config["l2_groupings"] == [TCGEN05_TWO_CTA_SEED_L2_GROUPING]
+
+
+def test_staged_residual_long_sweep_groups_eight_m_tiles() -> None:
+    """A long N sweep of a pair staging its exact-shape operands groups 8 M
+    tiles, not the plain sweep's 32: the staged operands stream through L2
+    beside the group's A panels (eleven residuals, 4096x16384x4096: 0.80 of
+    the ATen GEMM grouped by 32, 0.83 by 8)."""
+    m, n, k = 4096, 16384, 4096
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        config = _three_residual_mm._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                *(torch.empty((m, n), dtype=torch.bfloat16) for _ in range(3)),
+            )
+        ).config_spec.default_config()
+    assert config.config["tcgen05_aux_load_mode"] == "epi_tma"
+    assert config.config["l2_groupings"] == [8]
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k", "residual_dtype", "block_k", "ab_stages"),
+    (
+        # a wide N: the shallowest k-blocks, ten 32-deep stages
+        (1000, 4096, 4096, torch.bfloat16, 32, 10),
+        # 512 32-deep K tiles would pass the pair's cap: 64-deep ones
+        (1000, 4096, 16384, torch.bfloat16, 64, 5),
+        # one 256-wide N tile, an FP32 residual
+        (19000, 256, 256, torch.float32, 32, 10),
+    ),
+)
+def test_m_edge_residual_default_takes_the_producer_pair(
+    m: int,
+    n: int,
+    k: int,
+    residual_dtype: torch.dtype,
+    block_k: int,
+    ab_stages: int,
+) -> None:
+    """Rows that one-CTA 128-row tiles do not cover, under a wide N or one
+    256-wide N tile, take the persistent 256x256 pair with the residual's TMA
+    producer warp, at the shallowest k-blocks within the pair's K-tile cap
+    (B200, of the ATen GEMM: 1000x4096x4096 + residual 0.09 on the flat base
+    default -> 0.93; FP32 residual: 30000x256x4096 616 -> 91 us, 19000x256x256
+    47 -> 21 us)."""
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = rank_two_aux._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=residual_dtype),
+            )
+        )
+        config = bound.config_spec.default_config()
+    assert config.block_sizes == [256, 256, block_k]
+    assert config.config["tcgen05_ab_stages"] == ab_stages
+    assert config.config["tcgen05_cluster_m"] == 2
+    assert config.config["tcgen05_aux_load_mode"] == "tma"
+    assert config.config["tcgen05_strategy"] == "role_local_with_scheduler"
+
+
+@pytest.mark.parametrize(
+    ("residuals", "block_sizes", "cluster_m", "ab_stages", "keeps_producer"),
+    (
+        # beside one residual's ring: the bytes of two 128-deep stages of the
+        # BF16 pair, four 64-deep and eight 32-deep ones
+        (1, [256, 256, 64], 2, 4, True),
+        (1, [256, 256, 32], 2, 8, True),
+        # three 128-deep stages overshoot the cap
+        (1, [256, 256, 128], 2, 3, False),
+        # one CTA holds both operands: four 64-deep 128x256 stages are 192 KB
+        (1, [128, 256, 64], 1, 4, False),
+        # three residuals' rings leave room for six 32-deep stages, not eight
+        (3, [256, 256, 32], 2, 8, False),
+        (3, [256, 256, 32], 2, 6, True),
+    ),
+)
+def test_aux_producer_warp_admits_the_ring_the_arena_leaves(
+    residuals: int,
+    block_sizes: list[int],
+    cluster_m: int,
+    ab_stages: int,
+    keeps_producer: bool,
+) -> None:
+    """The residuals' producer warp keeps an AB ring the arena model fits
+    beside its rings (one per residual) and the C ring; a deeper one drops
+    the warp in the search and is refused by codegen."""
+    m, n, k = 4096, 4096, 4096
+    lhs = torch.empty((m, k), dtype=torch.bfloat16)
+    rhs = torch.empty((k, n), dtype=torch.bfloat16)
+    res = [torch.empty((m, n), dtype=torch.bfloat16) for _ in range(residuals)]
+    kernel = rank_two_aux if residuals == 1 else _three_residual_mm
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = kernel._bind_isolated((lhs, rhs, *res))
+        config = {
+            "block_sizes": block_sizes,
+            "tcgen05_cluster_m": cluster_m,
+            "tcgen05_ab_stages": ab_stages,
+            "tcgen05_c_stages": 2,
+            "tcgen05_strategy": "role_local_with_scheduler",
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_warp_spec_c_input_warps": 1,
+        }
+        bound.config_spec._fix_tcgen05_with_scheduler_search_config(config)
+        assert (config["tcgen05_warp_spec_c_input_warps"] == 1) is keeps_producer
+        producer = helion.Config(
+            block_sizes=block_sizes,
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=cluster_m,
+            tcgen05_ab_stages=ab_stages,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+            tcgen05_aux_load_mode="tma",
+        )
+        if not keeps_producer:
+            with pytest.raises(exc.BackendUnsupported, match="bytes per CTA"):
+                bound.to_code(producer)
+            return
+        code = bound.to_code(producer)
+    assert "tcgen05_aux_pipeline.producer_acquire(" in code
+    assert f"make_tma_umma_pipeline(num_stages={ab_stages}" in code
+
+
+@pytest.mark.parametrize(
+    ("kernel", "residuals", "c_stages"),
+    ((two_residual_aux, 2, 4), (_three_residual_mm, 3, 2)),
+)
+def test_direct_store_producer_prices_no_c_ring(
+    kernel: Kernel, residuals: int, c_stages: int
+) -> None:
+    """A direct store allocates no C ring and is priced without one: two
+    128-deep pair stages fit beside two residuals' rings where the TMA
+    store's four C stages overflow (262 KB of 232; NVVM refuses it), and
+    beside three residuals' rings where even two C stages overflow."""
+    m, n, k = 4096, 4096, 4096
+    args = (
+        torch.empty((m, k), dtype=torch.bfloat16),
+        torch.empty((k, n), dtype=torch.bfloat16),
+        *(torch.empty((m, n), dtype=torch.bfloat16) for _ in range(residuals)),
+    )
+    values = {
+        "block_sizes": [256, 256, 128],
+        "l2_groupings": [1],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_ab_stages": 2,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": c_stages,
+        "tcgen05_strategy": "role_local_with_scheduler",
+        "tcgen05_warp_spec_scheduler_warps": 1,
+        "tcgen05_warp_spec_c_input_warps": 1,
+        "tcgen05_aux_load_mode": "tma",
+    }
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = kernel._bind_isolated(args)
+        with pytest.raises(exc.BackendUnsupported, match="bytes per CTA"):
+            bound.to_code(helion.Config(**values))
+        code = bound.to_code(helion.Config(**values, tcgen05_c_store_mode="direct"))
+    assert "tcgen05_aux_pipeline.producer_acquire(" in code
+
+
+def test_m_edge_producer_pair_default_prices_every_residual_ring() -> None:
+    """Over an M edge with two residuals, the producer pair's default takes
+    the deepest AB ring the arena model fits beside both rings: eight 32-deep
+    stages at two C stages (beside four C stages only six fit; eight are 262
+    KB of 232, which NVVM refused). B200, bf16 1000x4096x4096 + two
+    residuals: 32.2 us at six stages and four C stages, 31.3 at eight and
+    two."""
+    m, n, k = 1000, 4096, 1088
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = two_residual_aux._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+    assert config.block_sizes == [256, 256, 32]
+    assert config.config["tcgen05_aux_load_mode"] == "tma"
+    assert config.config["tcgen05_ab_stages"] == 8
+    assert config.config["tcgen05_c_stages"] == 2
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _residual_power_mm(
+    a: torch.Tensor, b: torch.Tensor, r: torch.Tensor
+) -> torch.Tensor:
+    """``acc + r ** 2**24`` as 24 nested squares: every level reads the
+    previous one twice, so the chain is a DAG of 24 shared subtrees with no
+    transcendental, which a classifier must walk to its leaves."""
+    m, k = a.shape
+    n = b.shape[1]
+    out = torch.empty_like(r)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        t = r[rows, cols].to(torch.float32)
+        for _ in hl.static_range(24):
+            t = t * t
+        out[rows, cols] = (acc + t).to(out.dtype)
+    return out
+
+
+def test_transcendental_fact_walks_shared_subtrees_once() -> None:
+    """The transcendental fact walks the whole chain once per node, by
+    identity: a walk without the identity set visits 2**24 nodes here, and
+    hashing the value-compared nodes rehashes each shared subtree. The bind
+    expands each node's children a few dozen times in all (once per walk),
+    not millions."""
+    m, n, k = 8192, 1024, 1024
+    calls = 0
+
+    def counted(expr: object) -> tuple[object, ...]:
+        nonlocal calls
+        calls += 1
+        return children(expr)
+
+    children = cute_epilogue._tensor_expr_children
+    with (
+        patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148),
+        patch.object(cute_epilogue, "_tensor_expr_children", counted),
+    ):
+        bound = _residual_power_mm._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=torch.bfloat16),
+            )
+        )
+        facts = bound.config_spec._cute_tcgen05_config.pipeline_smem_facts
+    assert facts is not None
+    assert not facts.epilogue_transcendental
+    assert 0 < calls < 10_000
+
+
+def test_narrow_n_m_edge_default_takes_the_256xn_pair() -> None:
+    """A GEMM one 128-wide N tile wide over an M edge defaults to the
+    persistent CtaGroup.TWO 256x128 pair: the proved-schedule seeds all ask
+    for whole tiles, and the 256x256 projection would run half of each MMA
+    past N (30000x128x4096 + residual on B200: the flat 128x16 base default
+    0.19 of the ATen GEMM, the 256x128 pair 0.86)."""
+    m, n, k = 19000, 128, 256
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = rank_two_aux._bind_isolated(
+            (
+                torch.empty((k, m), dtype=torch.bfloat16).T,
+                torch.empty((k, n), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=torch.float32),
+            )
+        )
+        config = bound.config_spec.default_config()
+        assert config.block_sizes == [256, 128, 64]
+        assert config.config["tcgen05_cluster_m"] == 2
+        assert config.config["pid_type"] == "persistent_interleaved"
+        # Every two-CTA sample runs the 256 x 128 pair too, whatever its
+        # sampled M and N tiles.
+        for block_sizes in ([128, 128, 64], [128, 64, 64], [512, 128, 64]):
+            sampled = {
+                **config.config,
+                "block_sizes": block_sizes,
+                "tcgen05_ab_stages": 4,
+            }
+            bound.config_spec.normalize(sampled, _fix_invalid=True)
+            assert sampled["block_sizes"] == [256, 128, 64]
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _residual_atomic_mm(
+    a: torch.Tensor, b: torch.Tensor, residual: torch.Tensor, counter: torch.Tensor
+) -> torch.Tensor:
+    """``acc + residual`` beside an atomic counter."""
+    m, k = a.shape
+    n = b.shape[1]
+    out = torch.empty_like(residual)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = (acc + residual[rows, cols].to(torch.float32)).to(out.dtype)
+        hl.atomic_add(counter, [0], 1)
+    return out
+
+
+def test_m_edge_pair_default_keeps_64_deep_blocks_without_a_producer_ring() -> None:
+    """Six residuals' rings leave no room for two AB stages beside them even
+    at 32-deep k-blocks (one ring each: 32 + 32 + 6 x 32 KB of 232), so the
+    projection keeps the pair's register loads, and with them the M-edge
+    default's 64-deep k-blocks (the shallow ones only serve the producer's
+    ring)."""
+    m, n, k = 1000, 4096, 1024
+    args = (
+        torch.empty((m, k), dtype=torch.bfloat16),
+        torch.empty((k, n), dtype=torch.bfloat16),
+        *(torch.empty((m, n), dtype=torch.bfloat16) for _ in range(6)),
+    )
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = _six_residual_mm._bind_isolated(args)
+        config = bound.config_spec.default_config()
+        bound.to_code(config)
+    assert config.block_sizes == [256, 256, 64]
+    assert config.config.get("tcgen05_aux_load_mode") != "tma"
+
+
+def test_m_edge_pair_default_renders_beside_masks_atomics_and_offsets() -> None:
+    """Over an M edge the pair's producer warp takes only an operand its ring
+    carries and a TensorMap proves, and no default runs an atomic beside the
+    warp roles: a boolean mask alone keeps the pair's register loads, an
+    atomic the flat base default, and a residual off its 16-byte alignment
+    the register loads at 64-deep k-blocks. Each default renders its source
+    (CPU codegen; ``test_cute_tcgen05_flat_edge_gpu`` runs the residual
+    defaults)."""
+    m, n, k = 1000, 4096, 1024
+    a = torch.empty((m, k), dtype=torch.bfloat16)
+    b = torch.empty((k, n), dtype=torch.bfloat16)
+    shifted = torch.empty((m * n + 1,), dtype=torch.bfloat16)[1:].view(m, n)
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        configs = []
+        for bound in (
+            dropout_mm_into._bind_isolated(
+                (
+                    a,
+                    b,
+                    torch.empty((m, n), dtype=torch.bool),
+                    torch.empty((m, n), dtype=torch.bfloat16),
+                )
+            ),
+            _residual_atomic_mm._bind_isolated(
+                (
+                    a,
+                    b,
+                    torch.empty((m, n), dtype=torch.bfloat16),
+                    torch.zeros((1,), dtype=torch.int32),
+                )
+            ),
+            rank_two_aux._bind_isolated((a, b, shifted)),
+        ):
+            config = bound.config_spec.default_config()
+            bound.to_code(config)
+            configs.append(config.config)
+    mask, atomic, offset = configs
+    assert mask["tcgen05_cluster_m"] == 2
+    assert mask.get("tcgen05_aux_load_mode", "simt") == "simt"
+    assert atomic.get("tcgen05_cluster_m", 1) == 1
+    assert atomic.get("pid_type", "flat") == "flat"
+    assert offset.get("tcgen05_aux_load_mode", "simt") == "simt"
+    assert offset["block_sizes"][-1] == 64
+
+
+def test_column_major_output_keeps_pre_acc_wait_off_the_128_row_pair() -> None:
+    """Beside a column-major output the 128-row CTA pair loads its rows after
+    the accumulator wait (the whole-row load before it fails in CuTe):
+    normalization repairs or refuses ``pre_acc_wait`` there and the seeds
+    offer only ``post_acc_wait``, while the 256-row pairs keep both."""
+    m, n, k = 512, 2048, 512
+    args = (
+        torch.empty((m, k), dtype=torch.bfloat16),
+        torch.empty((k, n), dtype=torch.bfloat16),
+        torch.empty((n,), dtype=torch.bfloat16),
+        torch.empty((n, m), dtype=torch.bfloat16).T,
+    )
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        spec = bias_mm_into._bind_isolated(args).config_spec
+    placements = {
+        (seed.block_sizes[0], seed.config.get("tcgen05_aux_load_placement"))
+        for seed in spec.compiler_seed_configs
+        if seed.config.get("tcgen05_cluster_m") == 2
+    }
+    assert (128, "pre_acc_wait") not in placements
+    assert {(128, "post_acc_wait"), (256, "pre_acc_wait")} <= placements
+    pair = next(
+        seed
+        for seed in spec.compiler_seed_configs
+        if seed.block_sizes[0] == 128 and seed.config.get("tcgen05_cluster_m") == 2
+    )
+    sampled = helion.Config(
+        **{**pair.config, "tcgen05_aux_load_placement": "pre_acc_wait"}
+    )
+    with pytest.raises(helion.exc.InvalidConfig, match="128-row CTA pair"):
+        spec.normalize(helion.Config(**sampled.config))
+    spec.normalize(sampled, _fix_invalid=True)
+    assert sampled.config["tcgen05_aux_load_placement"] == "post_acc_wait"
+
+
 def test_one_cta_n_edge_admission_needs_known_store_facts() -> None:
     """Two column-major outputs of a biased accumulator leave the search no
     store facts: their persistent one-CTA N-edge sample goes flat instead of
@@ -1344,6 +1979,121 @@ def test_edge_k_tail_default_needs_the_dense_gemm_body() -> None:
     assert config.config.get("tcgen05_persistence_model") != "clc_persistent"
 
 
+@pytest.mark.parametrize(
+    ("m", "n", "k"),
+    (
+        # the small-grid pair, an N-edge 256x256 pair, a persistent one-CTA
+        # 128x256 tile on N-edge tiles, the FFI direct-entry pair of whole
+        # 256x256 tiles
+        (128, 4096, 9216),
+        (4096, 2000, 768),
+        (25216, 576, 192),
+        (4096, 4096, 4096),
+    ),
+)
+def test_default_keeps_atomics_on_the_flat_base_default(m: int, n: int, k: int) -> None:
+    """An atomic beside the warp roles keeps every grid on the flat base
+    default: codegen refuses atomics on two-CTA pairs and on persistent CTAs
+    that own several tiles (``reject_atomics_beside_warp_roles``), the FFI
+    direct-entry base default of whole 256x256 tiles included."""
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = atomic_output_mm._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                torch.zeros((1,), dtype=torch.int32),
+            )
+        )
+        config = bound.config_spec.default_config()
+        bound.to_code(config)
+    assert config.config.get("tcgen05_cluster_m", 1) == 1
+    assert config.config.get("pid_type", "flat") == "flat"
+
+
+def test_small_grid_default_keeps_the_search_bounds() -> None:
+    """Two 128x128 output tiles on 148 SMs: the search admits the 64-row
+    one-CTA tile for grids smaller than the SM count (the 256-row operands
+    alone would pin the floor at 128 rows), and the register-MMA family
+    admitted on this latency-bound problem widens the M floor to its 16-row
+    atom; K tiles reach min(128, K). The small-N problem cannot form the
+    256x256 CtaGroup.TWO tile, so the cluster search stays at one CTA, and
+    the default is the paired-pipeline 128-row pair seed, which the
+    allocation proof validates outside that search."""
+    args = (
+        torch.empty([256, 64], dtype=torch.float16),
+        torch.empty([64, 128], dtype=torch.float16),
+    )
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        spec = _addmm_mm._bind_isolated(args).config_spec
+        default = spec.default_config().config
+    assert [x.min_size for x in spec.block_sizes] == [16, 8, 16]
+    assert [x.max_size for x in spec.block_sizes] == [256, 128, 64]
+    assert default["l2_groupings"] == [1]
+    assert spec._tcgen05_cluster_m_search_choices == (1,)
+    assert default["block_sizes"] == [128, 64, 64]
+    assert default["tcgen05_cluster_m"] == 2
+    assert "persistent_blocked" in spec.allowed_pid_types
+    assert "persistent_interleaved" in spec.allowed_pid_types
+
+
+def test_small_grid_relu_default_is_the_pair_not_a_thread_local_tile() -> None:
+    """A regular (ReLU) epilogue does not take the thread-local epilogue
+    heuristic; the paired-pipeline seeds' 128-row pair is the default."""
+    args = (
+        torch.empty([128, 128], dtype=torch.bfloat16),
+        torch.empty([128, 128], dtype=torch.bfloat16),
+    )
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        spec = _relu_mm._bind_isolated(args).config_spec
+        default = spec.compiler_default_config
+    assert CuteTcgen05ThreadLocalEpilogueHeuristic.name not in spec.autotuner_heuristics
+    assert default is not None
+    assert default.config["tcgen05_cluster_m"] == 2
+    assert default.config["block_sizes"][0] == 128
+
+
+# Fewer 128x128 tiles than SMs, but more pairs than one wave holds: 75 and 81
+# tiles, whose N admits no 128x256 pair.
+@pytest.mark.parametrize(("m", "n", "k"), ((128, 9600, 4096), (1152, 1152, 1024)))
+def test_small_grid_default_takes_the_fewest_waves(m: int, n: int, k: int) -> None:
+    """Where no 128-row pair fits one wave the small-grid default takes the
+    one with the fewest (the 128x128 pair's two), not the flat 64x16 base
+    tile (B200: 128x9600x4096 137 -> 29 us, 1152x1152x1024 37 -> 12 us; ATen
+    27 and 10.8 us)."""
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = plain_mm._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+        bound.to_code(config)
+    assert config.block_sizes[:2] == [128, 128]
+    assert config.config["tcgen05_cluster_m"] == 2
+
+
+def test_small_grid_default_loads_the_row_before_the_accumulator_wait() -> None:
+    """On the small-grid pair the bias row loaded before the accumulator wait
+    (``pre_acc_wait``) wins the tie, and the AB ring stops at the K loop's
+    one 64-deep block."""
+    m, n, k = 128, 9216, 64
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = bias_mm_into._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                torch.empty((n,), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+    assert config.block_sizes[0] == 128
+    assert config.config["tcgen05_cluster_m"] == 2
+    assert config.config["tcgen05_aux_load_placement"] == "pre_acc_wait"
+    assert config.config["tcgen05_ab_stages"] == 2
+
+
 def test_edge_k_tail_cluster_n2_seed_needs_even_n_tiles() -> None:
     """The family's 4-CTA seed pairs N tiles: 1100 columns are 5 tiles of
     256, which the cluster refuses."""
@@ -1449,11 +2199,16 @@ def test_default_tile_promotion_survives_ffi_normalization() -> None:
     assert not config.config.get("tcgen05_tvm_ffi_launch")
 
 
-def test_default_tile_leaves_small_grids_to_their_seeds() -> None:
-    """Fewer 128x128 tiles than SMs: per-CTA latency decides, no promotion."""
+def test_default_tile_gives_small_grids_the_pair_that_fills_one_wave() -> None:
+    """Fewer 128x128 tiles than SMs: the default is the paired-pipeline seeds'
+    128-row pair with the fewest waves, then the most CTAs (1024x1024x4096:
+    64 128x128 pairs, 128 CTAs in one wave; 128x64 pairs would need two)."""
     bound = _plain_bind(1024, 1024, 4096)
     with bound.env:
-        assert CuteTcgen05DefaultTileHeuristic._pick(bound.env) is None
+        config = CuteTcgen05DefaultTileHeuristic._pick(bound.env)
+    assert config is not None
+    assert config.block_sizes == [128, 128, 64]
+    assert config.config["tcgen05_cluster_m"] == 2
 
 
 def test_plain_pair_prices_the_narrow_store_subtile() -> None:

@@ -28,6 +28,7 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_PAIR128_BLOC
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_NARROW_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
 from .._compiler.cute.tcgen05_constants import TCGEN05_WHOLE_K_TILE_MIN
 from .._compiler.matmul_utils import _compute_out_dtype
@@ -907,7 +908,12 @@ def enable_cute_tcgen05_search(
         allow_full_tile_cluster_m2_search = (
             allow_whole_k_persistent_pid_types
             and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
-            and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
+            and (
+                max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
+                # a GEMM one narrow N tile wide runs the 256 x N pair
+                # (``CuteTcgen05Config._narrow_n_gemm``)
+                or static_n == TCGEN05_TWO_CTA_NARROW_BLOCK_N
+            )
             and static_k <= max_cluster_m2_search_k
         )
         allow_edge_cluster_m2_search = (

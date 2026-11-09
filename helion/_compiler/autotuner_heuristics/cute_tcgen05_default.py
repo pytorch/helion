@@ -3,13 +3,20 @@
 Inductor's native-matmul path runs Helion kernels with
 ``autotune_effort="none"``, so the default config is what such a GEMM runs.
 Among the compiler's proved tcgen05 seeds (plus the one-CTA 128x256 tile on
-whole or N-edge tiles -- 128x128 too for a single row of M tiles -- and the
-16-bit dense aligned-N pairs at their physical widths) this heuristic promotes the one whose tile minimizes wave-quantized
-MMA time; whole 256x256-tile shapes keep the FFI direct-entry pair unless a
-candidate is clearly cheaper, with its promoted bias rows staged
-(``pre_acc_wait``) where the heuristic promotes that seed. Plain GEMMs only
-the edge + K-tail family runs (a 16-bit K tail on whole M and N tiles, or a K
-tail with ragged M and N) take that family's CLC pair seed.
+whole or N-edge tiles -- 128x128 too for a single row of M tiles --, the
+256-row pair over an M edge, one N tile or a wide N, and the 16-bit dense
+aligned-N pairs at their physical widths) this heuristic promotes the one
+whose tile minimizes wave-quantized MMA time; whole 256x256-tile shapes keep
+the FFI direct-entry pair unless a candidate is clearly cheaper, with its
+promoted bias rows staged (``pre_acc_wait``) where the heuristic promotes
+that seed. A whole-tile pair stages its exact-shape operands through the
+epilogue-issued TMA ring (``_epi_tma_aux_values``), and a grid with fewer
+128x128 tiles than SMs takes the 128-row pair seed with the fewest waves
+(``_small_grid_pair_default``). Plain GEMMs only the edge + K-tail family
+runs (a 16-bit K tail on whole M and N tiles, or a K tail with ragged M and
+N) take that family's CLC pair seed. A kernel with an atomic keeps the flat
+base default: codegen refuses atomics beside the pairs' shared tiles and the
+persistent CTAs' warp roles.
 """
 
 from __future__ import annotations
@@ -26,9 +33,15 @@ from ..cute.dense_aligned_n import TILE_N_KEY
 from ..cute.strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
 from ..cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from ..cute.strategies import Tcgen05LayoutStrategy
+from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
+from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
 from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+from ..cute.tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
+from ..cute.tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_EPI_TMA_AUX_STAGE_COUNT_CHOICES
 from ..cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_LONG_N_SWEEP_L2_GROUPING
 from ..cute.tcgen05_constants import TCGEN05_LONG_N_SWEEP_MIN_TILES
@@ -36,6 +49,7 @@ from ..cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_NARROW_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from .registry import AutotunerHeuristic
 
@@ -49,8 +63,10 @@ if TYPE_CHECKING:
 # operand bytes per MMA.  Calibrated on B200 bf16 inductor GEMMs
 # (16384x384x768: 256x128 pair 0.89 vs 256x256 pair 0.68 of cuBLAS;
 # 25216x768x3072: one-CTA 128x256 0.98 vs 256x256 pair 0.90).  Tiles below a
-# 128x128 per-SM footprint are not default candidates: their operand traffic,
-# not wave quantization, decides their speed.
+# 128x128 per-SM footprint are not candidates of the wave-quantized default:
+# their operand traffic, not wave quantization, decides their speed (the
+# small-grid default, ``_small_grid_pair_default``, takes the 128-row pair on
+# grids that leave SMs idle).
 _TILE_EFFICIENCY = {
     (2, 256, 256): 1.0,
     (2, 256, 128): 0.92,
@@ -65,9 +81,10 @@ def _aligned_n_efficiency(cluster_m: int, bm: int, width: int) -> float | None:
     and 256x256 pairs: bf16 1000x2560x2048 runs one wave of 64 256x160 pairs
     at 0.93 of cuBLAS where one wave of 40 256x256 pairs runs 0.72;
     4096x2560x2560: 256x160 pairs 0.96 against the 256x256 direct-entry
-    default's 0.85. Narrower widths are not default candidates (16384x960x1024:
-    the 96-wide pair runs 40-42 us against 38 for the 256x256 one), nor is
-    the FP8 family's 128-row pair (64 rows per CTA: below the per-SM floor)."""
+    default's 0.85. Narrower widths are not candidates of the wave-quantized
+    default (16384x960x1024: the 96-wide pair runs 40-42 us against 38 for
+    the 256x256 one), nor is the FP8 family's 128-row pair (64 rows per CTA:
+    below the per-SM floor; only the small-grid default takes it)."""
     if (cluster_m, bm) != (2, TCGEN05_TWO_CTA_BLOCK_M) or width < 128:
         return None
     low = _TILE_EFFICIENCY[(2, TCGEN05_TWO_CTA_BLOCK_M, 128)]
@@ -85,11 +102,43 @@ _EPILOGUE_BOUND_MAX_K_TILES = 2
 # An output-edge auxiliary GEMM's default grouping on sweeps shorter than
 # the long-N-sweep grouping's (``TCGEN05_LONG_N_SWEEP_*``; see ``_pick``).
 _SHORT_N_SWEEP_L2_GROUPING = 4
+# The grouping of a long N sweep whose epilogue stages exact-shape operands
+# through the epilogue-issued ring (see ``_pick``).
+_STAGED_AUX_LONG_N_SWEEP_L2_GROUPING = 8
+# AB stages the epilogue-issued auxiliary TMA ring must leave a pair's tile
+# for the default to stage its exact-shape operands (``_epi_tma_aux_values``).
+_EPI_TMA_MIN_AB_STAGES = 4
 # K tiles from which the one-CTA N-edge candidates take an exact-shape
 # auxiliary epilogue (see ``_one_cta_candidate``).
 _ONE_CTA_N_EDGE_EXACT_AUX_MIN_K_TILES = 8
 # A candidate replaces the FFI default only below this fraction of its cost.
 _FFI_REPLACEMENT_MARGIN = 0.9
+
+
+def _promotable_seed_view(
+    state: CuteTcgen05Config, values: dict[str, Any]
+) -> tuple[list[object], int, int, int] | None:
+    """The matmul block view of a seed the default may promote: one N CTA,
+    the static persistence model, the monolithic role-local strategy and an
+    allowed pid type; ``None`` for any other seed."""
+    if (
+        values.get("tcgen05_cluster_n", 1) != 1
+        or values.get("tcgen05_persistence_model", "static_persistent")
+        != "static_persistent"
+        or values.get("tcgen05_strategy", "role_local_monolithic")
+        != "role_local_monolithic"
+        or values.get("pid_type") not in state.allowed_pid_types
+    ):
+        return None
+    return state._matmul_config_view(values)
+
+
+def _promoted_values(seed: Config) -> dict[str, Any]:
+    """A promoted seed's values; PDL stays a target decision of the base
+    default."""
+    values = dict(seed.config)
+    values.pop("cute_pdl", None)
+    return values
 
 
 class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
@@ -142,10 +191,7 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         seed = state._plain_edge_seed_config()
         if seed is None:
             return None
-        values: dict[str, Any] = dict(seed.config)
-        # PDL stays a target decision of the base default.
-        values.pop("cute_pdl", None)
-        return Config(**values)
+        return Config(**_promoted_values(seed))
 
     @staticmethod
     def _cp_async_a_default(env: CompileEnvironment) -> Config | None:
@@ -189,6 +235,265 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             tcgen05_c_stages=2,
         )
 
+    @staticmethod
+    def _epi_tma_aux_values(
+        env: CompileEnvironment, values: dict[str, Any], *, k: int
+    ) -> dict[str, Any] | None:
+        """A whole-tile pair's exact-shape auxiliary operands staged through
+        the epilogue-issued TMA ring (``epi_tma``), on the widest N tile
+        whose AB ring keeps ``_EPI_TMA_MIN_AB_STAGES`` beside it, or ``None``
+        where none does.
+
+        Register (SIMT) loads leave each exact-shape operand's global latency
+        on every epilogue subtile. B200, of the ATen GEMM, SIMT -> ``epi_tma``:
+        8192x1024x1024 + residual 0.83 -> 1.05 (256x256, ab 6 -> 5);
+        32768x256x256 + three operands 0.50 -> 0.90 on 256x128 (ab 6), where
+        the 256x256 tile keeps 3 AB stages beside the ring (0.59).
+
+        Where the AB ring still holds a whole tile's K beside a deeper ring,
+        the ring takes the depth: such a short-K GEMM is bound by its
+        epilogue, and stages past the tile's k-blocks only prefetch the next
+        tile (32768x256x256 + three operands: four k-blocks, ab 6 -> 4 beside
+        a four-stage ring, 0.92 -> 0.97; 8192x1024x1024 + three operands
+        keeps two: ab 4 -> 3 beside three costs 0.99 -> 0.96).
+        """
+        spec = env.config_spec
+        state = spec._cute_tcgen05_config
+        view = state._matmul_config_view(values)
+        assert view is not None
+        blocks, m_index, n_index, k_index = view
+        bm, bn, bk = (
+            cast("int", blocks[m_index]),
+            cast("int", blocks[n_index]),
+            cast("int", blocks[k_index]),
+        )
+        promoted = spec.promoted_default_values(values)
+
+        def keeps_ring(
+            normalized: dict[str, Any], block_sizes: list[object], min_ab_stages: int
+        ) -> bool:
+            """Whether the search fixups (``_normalize_epi_tma``) kept the
+            ring and the tile, with ``min_ab_stages`` AB stages beside it."""
+            return (
+                normalized.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_EPI_TMA
+                and normalized["block_sizes"] == block_sizes
+                and cast("int", normalized["tcgen05_ab_stages"]) >= min_ab_stages
+            )
+
+        # The narrower pair tile where the 256x256 one keeps too few AB
+        # stages beside the ring.
+        for tile_n in (
+            (bn, TCGEN05_TWO_CTA_NARROW_BLOCK_N)
+            if bn == TCGEN05_TWO_CTA_BLOCK_N
+            else (bn,)
+        ):
+            block_sizes = list(blocks)
+            block_sizes[n_index] = tile_n
+            projected = {
+                **promoted,
+                "block_sizes": block_sizes,
+                "tcgen05_ab_stages": state.max_ab_stages_that_fit(
+                    bm=bm, bn=tile_n, bk=bk, cluster_m=2
+                ),
+                TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_EPI_TMA,
+            }
+            # The search fixups judge the ring (``_normalize_epi_tma``) and
+            # shorten the AB ring beside it.
+            spec.normalize(projected, _fix_invalid=True)
+            if not keeps_ring(projected, block_sizes, _EPI_TMA_MIN_AB_STAGES):
+                continue
+            chosen = {
+                **values,
+                "block_sizes": block_sizes,
+                TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_EPI_TMA,
+                "tcgen05_ab_stages": projected["tcgen05_ab_stages"],
+                "tcgen05_c_stages": projected["tcgen05_c_stages"],
+            }
+            # The AB ring only shortens as the ring deepens: deeper rings are
+            # tried where the default one leaves a whole tile's K in flight.
+            deeper_depths = (
+                sorted(
+                    (
+                        depth
+                        for depth in TCGEN05_EPI_TMA_AUX_STAGE_COUNT_CHOICES
+                        if depth > TCGEN05_AUX_STAGE_COUNT_DEFAULT
+                    ),
+                    reverse=True,
+                )
+                if cast("int", projected["tcgen05_ab_stages"]) >= k // bk
+                else []
+            )
+            for depth in deeper_depths:
+                deeper = {**projected, TCGEN05_AUX_STAGES_CONFIG_KEY: depth}
+                spec.normalize(deeper, _fix_invalid=True)
+                # (normalization resets the depth only off ``epi_tma``)
+                if keeps_ring(
+                    deeper, block_sizes, max(k // bk, _EPI_TMA_MIN_AB_STAGES)
+                ):
+                    chosen[TCGEN05_AUX_STAGES_CONFIG_KEY] = depth
+                    chosen["tcgen05_ab_stages"] = deeper["tcgen05_ab_stages"]
+                    chosen["tcgen05_c_stages"] = deeper["tcgen05_c_stages"]
+                    break
+            return chosen
+        return None
+
+    @staticmethod
+    def _small_grid_pair_default(
+        env: CompileEnvironment, m: int, n: int, k: int, batch: int
+    ) -> Config | None:
+        """The 128-row CtaGroup.TWO pair seed (64 rows per CTA, persistent)
+        that runs in the fewest waves and, among those, fills the most SMs,
+        at its seed's AB ring capped at the K loop: a GEMM with fewer
+        128x128 tiles than SMs leaves most of them idle on one-CTA tiles, and
+        the flat base default ran a 64x16 SIMT kernel (B200, of the ATen
+        GEMM: 128x9216x4096 + bias 0.19, the 128x128 pair at its seed's 13 AB
+        stages 1.15; where no pair fits one wave, 128x9600x4096 137 -> 29 us
+        and 1152x1152x1024 37 -> 12 us on the 128x128 pair's two, against
+        ATen's 27 and 10.8 us).
+
+        The pairs are the paired-pipeline seeds (and, on the ragged edge
+        family, its 128x128 edge pairs): the allocation proof validates
+        them, not the ``cluster_m=2`` search projection, so the default takes
+        them where the cluster search stays at one CTA, as the autotuner's
+        initial population does. On ties the bias row loaded before the
+        accumulator wait (``pre_acc_wait``) wins: one tile per CTA reads it
+        once (128x9216x4096 + bias: 24.1 -> 23.2 us)."""
+        state = env.config_spec._cute_tcgen05_config
+        best: tuple[tuple[int, int, int, bool], Config] | None = None
+        for seed in state.autotune_seed_configs():
+            values = seed.config
+            view = _promotable_seed_view(state, values)
+            if (
+                view is None
+                or values.get("tcgen05_cluster_m", 1) != 2
+                or values.get("pid_type") == "flat"
+            ):
+                continue
+            blocks, m_index, n_index, k_index = view
+            bm, bn, bk = blocks[m_index], blocks[n_index], blocks[k_index]
+            if (
+                bm != 128
+                or bk != 64
+                or not isinstance(bn, int)
+                # the CtaGroup.TWO pair, not the clustered one-CTA family
+                or not state._config_is_two_cta_mma(values, bm=bm, cluster_m=2)
+                # the persistent pair's validated K-tile envelope (the
+                # runtime counts a K tail's tile)
+                or cdiv(k, bk) > TCGEN05_TWO_CTA_MAX_K_TILES
+            ):
+                continue
+            ctas = 2 * batch * cdiv(m, 128) * cdiv(n, bn)
+            key = (
+                -cdiv(ctas, state.device_sm_count),
+                ctas,
+                cast("int", values.get("tcgen05_ab_stages", 2)),
+                values.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+            )
+            if best is None or key > best[0]:
+                best = (key, seed)
+        if best is None:
+            return None
+        values = _promoted_values(best[1])
+        # The K loop caps the seed's AB ring, never deepening it.
+        values["tcgen05_ab_stages"] = min(
+            cast("int", values.get("tcgen05_ab_stages", 2)), max(2, cdiv(k, 64))
+        )
+        return Config(**values)
+
+    @staticmethod
+    def _persistent_tile_values(
+        env: CompileEnvironment,
+        k: int,
+        *,
+        bm: int,
+        bn: int,
+        cluster_m: int,
+        bk: int = 64,
+    ) -> dict[str, Any] | None:
+        """A persistent ``bm x bn x bk`` tile at the deepest AB ring that
+        fits, or ``None`` where the search does not run it."""
+        spec = env.config_spec
+        state = spec._cute_tcgen05_config
+        if "persistent_interleaved" not in spec.allowed_pid_types or (
+            state.cluster_m_search_choices is not None
+            and cluster_m not in state.cluster_m_search_choices
+        ):
+            return None
+        block_sizes = state._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+        stages = state.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=cluster_m)
+        if block_sizes is None or stages < 2:
+            return None
+        return {
+            "block_sizes": block_sizes,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": cluster_m,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": min(stages, k // bk),
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+        }
+
+    @classmethod
+    def _pair_m_edge_candidate(
+        cls, env: CompileEnvironment, m: int, n: int, k: int
+    ) -> list[Config]:
+        """The persistent CtaGroup.TWO pair over an M edge, at the deepest
+        ring that fits: ``256 x N`` for one whole N tile (N = 128 or 256),
+        ``256 x 256`` for a wider N over rows that one-CTA 128-row tiles do
+        not cover either. The proved-schedule seeds all ask for whole tiles,
+        so such a GEMM fell to the flat 128x16 base default (B200, +
+        residual: 30000x128x4096 0.19 of the ATen GEMM, the 256x128 pair
+        0.86; 30000x256x4096 616 -> 91 us and 1000x4096x4096 0.09 -> 0.93 on
+        the 256x256 pair)."""
+        if m % TCGEN05_TWO_CTA_BLOCK_M == 0 or k % 64:
+            return []
+        if n in (TCGEN05_TWO_CTA_NARROW_BLOCK_N, TCGEN05_TWO_CTA_BLOCK_N):
+            bn = n
+        elif n % TCGEN05_TWO_CTA_BLOCK_N == 0 and m % 128:
+            # A wider N over rows that one-CTA 128-row tiles do not cover
+            # either (where M is whole in 128-row tiles, the one-CTA 128x256
+            # candidate's whole tiles cover it).
+            bn = TCGEN05_TWO_CTA_BLOCK_N
+        else:
+            return []
+        state = env.config_spec._cute_tcgen05_config
+        bk = 64
+        if bn == TCGEN05_TWO_CTA_BLOCK_N and state._aux_tma_full_tile_search_enabled():
+            # The 256x256 pair runs an exact-shape operand on its TMA producer
+            # warp, beside whose rings the SMEM arena fits the AB ring
+            # (``aux_producer_ring_fits``, ``_fix_aux_tma_full_tile_search_config``):
+            # the shallowest k-blocks within the pair's K-tile cap keep the
+            # most loads in flight (1000x4096x4096 + residual, of the ATen
+            # GEMM: bk=128 0.79, bk=64 0.91, bk=32 0.93); register loads keep
+            # 64-deep ones.
+            bk = next(
+                (
+                    depth
+                    for depth in (32, 64, 128)
+                    if k % depth == 0 and k // depth <= TCGEN05_TWO_CTA_MAX_K_TILES
+                ),
+                64,
+            )
+        values = cls._persistent_tile_values(
+            env, k, bm=TCGEN05_TWO_CTA_BLOCK_M, bn=bn, cluster_m=2, bk=bk
+        )
+        if values is not None and bk != 64:
+            spec = env.config_spec
+            projected = spec.promoted_default_values(values)
+            spec.normalize(projected, _fix_invalid=True)
+            if (
+                projected.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                != TCGEN05_AUX_LOAD_MODE_TMA
+            ):
+                # The projection left register loads (no AB ring fits beside
+                # the operands' rings): their 64-deep k-blocks.
+                values = cls._persistent_tile_values(
+                    env, k, bm=TCGEN05_TWO_CTA_BLOCK_M, bn=bn, cluster_m=2
+                )
+        return [] if values is None else [Config(**values)]
+
     @classmethod
     def _one_cta_candidates(
         cls, env: CompileEnvironment, m: int, n: int, k: int
@@ -227,25 +532,11 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         state = spec._cute_tcgen05_config
         bm, bk = 128, 64
-        if "persistent_interleaved" not in spec.allowed_pid_types or (
-            state.cluster_m_search_choices is not None
-            and 1 not in state.cluster_m_search_choices
-        ):
+        values = CuteTcgen05DefaultTileHeuristic._persistent_tile_values(
+            env, k, bm=bm, bn=bn, cluster_m=1
+        )
+        if values is None:
             return None
-        block_sizes = state._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
-        stages = state.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=1)
-        if block_sizes is None or stages < 2:
-            return None
-        deepest = min(stages, k // bk)
-        values: dict[str, Any] = {
-            "block_sizes": block_sizes,
-            "pid_type": "persistent_interleaved",
-            "tcgen05_cluster_m": 1,
-            "tcgen05_cluster_n": 1,
-            "tcgen05_ab_stages": deepest,
-            "tcgen05_acc_stages": 2,
-            "tcgen05_c_stages": 2,
-        }
         if state._static_full_tiles(bm=bm, bn=bn, bk=bk):
             return Config(**values)
         if (
@@ -273,7 +564,7 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         # partial-output store (``_fix_one_cta_n_edge_rings_search_config``; bf16
         # 25216x576x768 + bias: ab=3). Promote the projected rings, where
         # the sample stays persistent on that store.
-        projected = {**spec._base_default_config().config, **values}
+        projected = spec.promoted_default_values(values)
         spec.normalize(projected, _fix_invalid=True)
         if projected.get(
             "pid_type"
@@ -296,15 +587,23 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             return None
         if not spec.cute_tcgen05_matmul_operands_tma_provable:
             return cls._cp_async_a_default(env) if state.cp_async_a_provable else None
+        if state.kernel_has_atomics:
+            # Every tile below is a pair or a persistent CTA owning several
+            # tiles, where codegen refuses atomics beside the warp roles
+            # (``reject_atomics_beside_warp_roles``): an atomic kernel keeps
+            # the flat base default (the ``cp.async`` tile above is flat, one
+            # tile per CTA), as the FFI direct-entry seed does
+            # (``full_tile_direct_entry_seed_eligible``).
+            return None
         extents = state.matmul_compile_time_static_extents
         if extents is None or not all(isinstance(v, int) and v > 0 for v in extents):
             return None
         m, n, k = cast("tuple[int, int, int]", extents)
         batch = state.matmul_leading_work_multiplier
         if batch * cdiv(m, 128) * cdiv(n, 128) < state.device_sm_count:
-            # Fewer 128x128 tiles than SMs: per-CTA latency, not wave
-            # quantization, decides the tile (the small-grid seeds' regime).
-            return None
+            # Fewer 128x128 tiles than SMs: the 128-row pair with the fewest
+            # waves, then the most CTAs (``_small_grid_pair_default``).
+            return cls._small_grid_pair_default(env, m, n, k, batch)
         constraints = state.cluster_m2_search_constraints
         if (
             constraints is not None
@@ -339,19 +638,11 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         for seed in [
             *state.autotune_seed_configs(),
             *one_cta,
+            *cls._pair_m_edge_candidate(env, m, n, k),
             *state.dense_aligned_n_seed_configs(),
         ]:
             values: dict[str, Any] = seed.config
-            if (
-                values.get("tcgen05_cluster_n", 1) != 1
-                or values.get("tcgen05_persistence_model", "static_persistent")
-                != "static_persistent"
-                or values.get("tcgen05_strategy", "role_local_monolithic")
-                != "role_local_monolithic"
-                or values.get("pid_type") not in spec.allowed_pid_types
-            ):
-                continue
-            view = state._matmul_config_view(values)
+            view = _promotable_seed_view(state, values)
             if view is None:
                 continue
             blocks, mi, ni, ki = view
@@ -402,9 +693,7 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
                 best_tile = (bm, bn, bk)
         if best is None or (ffi_cost is not None and best[0][0] >= ffi_cost):
             return None if ffi_cost is None else cls._direct_entry_staged_row(state)
-        values = dict(best[1].config)
-        # PDL stays a target decision of the base default.
-        values.pop("cute_pdl", None)
+        values = _promoted_values(best[1])
         if ffi_cost is not None:
             # The base default is the FFI direct-entry config; normalization
             # (``_fix_target1_tvm_ffi_search_config``) restores it unless the
@@ -517,6 +806,29 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             values[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
                 TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
             )
+        waves = best[2]
+        staged_aux = False
+        if (
+            state.epi_tma_search_enabled()
+            # A math-bound epilogue gains nothing from the staged loads and
+            # loses an AB stage to their ring (GELU backward's erf and exp,
+            # 16384x4096x1024: 0.33 of the ATen GEMM on SIMT loads, 0.29
+            # staged).
+            and not pipeline_facts.epilogue_transcendental
+            and values.get("tcgen05_cluster_m", 1) == 2
+            and not values.get(TILE_N_KEY)
+            and state._static_full_tiles(bm=bm, bn=bn, bk=bk)
+            and (staged := cls._epi_tma_aux_values(env, values, k=k)) is not None
+        ):
+            # The ring may narrow the tile: the grouping below reads its tiles.
+            values = staged
+            staged_aux = True
+            view = state._matmul_config_view(values)
+            assert view is not None
+            bn = cast("int", view[0][view[2]])
+            waves = cdiv(
+                batch * cdiv(m, bm) * cdiv(n, bn), max(1, state.device_sm_count // 2)
+            )
         if state.aux_kernel_detected and state._has_any_matmul_fact_edge_tile(values):
             # An output-edge auxiliary GEMM walks its tiles in groups of M
             # tiles: 32 on long N sweeps (at least 32 N tiles: a group's A,
@@ -543,7 +855,7 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             ] = grouping if cdiv(m, bm) > grouping else 1
             values["l2_groupings"] = groupings
         elif (
-            best[2] > 1
+            waves > 1
             and len(spec.l2_groupings) == 1
             and values.get("l2_groupings", [1]) == [1]
         ):
@@ -552,9 +864,18 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             # A/B panels in L2 (bf16 10240x2560x4096 on 256x128 pair tiles:
             # 0.80 -> 1.05 of cuBLAS), and a long N sweep groups 32 M tiles
             # (bf16 8192x32000x1024 + bias on 256x256 pairs: 0.95 grouped by
-            # 8, 1.00 by 32).
+            # 8, 1.00 by 32): the group's A panels stay resident in L2. Staged
+            # exact-shape operands stream through L2 beside them, so such a
+            # sweep groups 8 (eleven residuals on 256x128 pairs, grouped by
+            # 32 / 8: 16384x4096x4096 0.74 / 0.85, 4096x16384x4096 0.80 /
+            # 0.83, 4096^3 0.85 / 0.86; three, 4096^3: 1.01 / 1.00).
+            long_sweep = (
+                _STAGED_AUX_LONG_N_SWEEP_L2_GROUPING
+                if staged_aux
+                else TCGEN05_LONG_N_SWEEP_L2_GROUPING
+            )
             values["l2_groupings"] = [
-                TCGEN05_LONG_N_SWEEP_L2_GROUPING
+                long_sweep
                 if cdiv(n, bn) >= TCGEN05_LONG_N_SWEEP_MIN_TILES
                 else TCGEN05_TWO_CTA_SEED_L2_GROUPING
             ]

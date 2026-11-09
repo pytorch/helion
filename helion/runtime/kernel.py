@@ -3161,6 +3161,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self.env.config_spec.cute_tcgen05_split_k_plain_body = (
                     host_function_has_plain_store_body(self.host_function)
                 )
+                self.env.config_spec.cute_tcgen05_kernel_has_atomics = (
+                    self.host_function.device_ir.has_atomic_ops()
+                )
                 self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
                     host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
                         self.host_function

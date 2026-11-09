@@ -2467,6 +2467,14 @@ class ConfigSpec:
         self._cute_tcgen05_config.aux_kernel_detected = value
 
     @property
+    def cute_tcgen05_kernel_has_atomics(self) -> bool:
+        return self._cute_tcgen05_config.kernel_has_atomics
+
+    @cute_tcgen05_kernel_has_atomics.setter
+    def cute_tcgen05_kernel_has_atomics(self, value: bool) -> None:
+        self._cute_tcgen05_config.kernel_has_atomics = value
+
+    @property
     def cute_tcgen05_split_k_plain_body(self) -> bool:
         return self._cute_tcgen05_config.split_k_plain_body
 
@@ -8921,8 +8929,7 @@ class ConfigSpec:
         # A promoted seed only specifies the knobs it cares about (e.g. block_sizes); layer it over
         # the full base defaults so every other key — including user register_tunable defaults — is
         # preserved rather than dropped.
-        merged = dict(self.autotune_reference_config().config)
-        merged.update(self.compiler_default_config.config)
+        merged = self.promoted_default_values(self.compiler_default_config.config)
         config = helion.Config.from_dict(merged)
         # Then normalize, so a promoted compiler default has the same canonical field set as the
         # ``_base_default_config`` path: without this its ``repr``/equality differs from its own
@@ -8932,6 +8939,18 @@ class ConfigSpec:
         self._drop_inert_workspace_knobs(config)
         self._shrink_for_numel_constraints(config)
         return config
+
+    def promoted_default_values(
+        self, promoted: Mapping[str, object]
+    ) -> dict[str, object]:
+        """The base default with ``promoted`` layered over it, as
+        ``default_config`` merges a compiler default: a promoted ``pid_type``
+        re-derives the base's tcgen05 persistence model
+        (``drop_stale_persistence_model``)."""
+        merged = dict(self.autotune_reference_config().config)
+        self._cute_tcgen05_config.drop_stale_persistence_model(merged, promoted)
+        merged.update(promoted)
+        return merged
 
     @staticmethod
     def _drop_inert_workspace_knobs(config: helion.Config) -> None:

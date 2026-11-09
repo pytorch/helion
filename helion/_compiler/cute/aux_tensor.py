@@ -468,6 +468,7 @@ def host_function_tcgen05_rowvec_aux_facts(
     rows: list[Tcgen05RowvecAuxRow] = []
     output_count = 0
     exact_aux_itemsizes: tuple[int, ...] = ()
+    ring_aux_itemsizes: tuple[int, ...] = ()
     for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
         analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
         if analyzed_stores is None:
@@ -487,6 +488,14 @@ def host_function_tcgen05_rowvec_aux_facts(
             )
             if sum(store_itemsizes) > sum(exact_aux_itemsizes):
                 exact_aux_itemsizes = store_itemsizes
+            store_ring_itemsizes = tuple(
+                host.dtype.itemsize
+                for leaf in chain.auxiliary_tensor_loads
+                for host in (_step_host_tensor(leaf)[1],)
+                if stages_through_smem_ring(leaf.broadcast_axis, host)
+            )
+            if sum(store_ring_itemsizes) > sum(ring_aux_itemsizes):
+                ring_aux_itemsizes = store_ring_itemsizes
             for leaf in chain.auxiliary_tensor_loads:
                 if leaf.broadcast_axis != 1:
                     continue
@@ -505,6 +514,7 @@ def host_function_tcgen05_rowvec_aux_facts(
         rows=tuple(rows),
         output_count=max(output_count, 1),
         exact_aux_itemsizes=exact_aux_itemsizes,
+        ring_aux_itemsizes=ring_aux_itemsizes,
     )
 
 

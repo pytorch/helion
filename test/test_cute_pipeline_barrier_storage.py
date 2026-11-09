@@ -10,7 +10,6 @@ import torch
 from .test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from .test_cute_grouped_gemm_split_sizes import _selected_config
 from .test_cute_scheduler_mailbox import _plain_matmul
-from helion import exc
 from helion._compiler.cute import tcgen05_constants
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_aux import aux_config as _config
@@ -158,15 +157,7 @@ def test_clc_full_empty_allocations(wait_mode: str, sched_stages: int) -> None:
 
 @pytest.mark.parametrize("stages", [1, 2, 3])
 def test_auxiliary_full_empty_allocations(stages: int) -> None:
-    if stages == 3:
-        # Productive AUX currently excludes this depth independently of the
-        # AB storage correction. Preserve that public admission restriction.
-        with pytest.raises(exc.BackendUnsupported, match="incompatible"):
-            rank_two_code(
-                rank_two_inputs(),
-                _config(block_sizes=[128, 128, 64], tcgen05_ab_stages=stages),
-            )
-        return
+    # Three 64-deep 128x128 stages (96 KiB) fit beside the producer's ring.
     code = rank_two_code(
         rank_two_inputs(),
         _config(block_sizes=[128, 128, 64], tcgen05_ab_stages=stages),
