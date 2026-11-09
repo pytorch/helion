@@ -5487,6 +5487,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "operator.mul",
             "operator.floordiv",
             "operator.mod",
+            # Floor-mode integer remainder (``integer_helpers.python_mod``):
+            # a batched store's index arithmetic on the batch coordinate
+            # (``z % 16`` of ``out[z // 16, y, (z % 16) * 64 + x]``), which a
+            # proved mixed-radix TMA store no longer reads.
+            "_cute_python_mod",
             "operator.neg",
             "operator.eq",
             "operator.ne",

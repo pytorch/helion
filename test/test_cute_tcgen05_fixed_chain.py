@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -21,6 +22,8 @@ from helion._compiler.cute.tcgen05_lifecycle import Tcgen05LifecycleContext
 from helion._testing import DEVICE
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_dense_tcgen05 import batched_gemm
+from helion._testing.cute_dense_tcgen05 import bind_bmm
 from helion._testing.cute_mma_dag import CPU_DEVICE
 from helion._testing.cute_mma_dag import bind_cpu_gemm as _bind_gemm
 import helion.language as hl
@@ -42,20 +45,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from helion.runtime.kernel import BoundKernel
-
-
-def _batched_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    batch, m, k = a.shape
-    _, _, n = b.shape
-    out = torch.empty((batch, m, n), dtype=a.dtype, device=a.device)
-    for tile_b, tile_m, tile_n in hl.tile((batch, m, n)):
-        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = torch.baddbmm(
-                acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n]
-            )
-        out[tile_b, tile_m, tile_n] = acc.to(out.dtype)
-    return out
 
 
 def _two_output_gemm(
@@ -118,15 +107,6 @@ def _bias_gemm(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor) -> torch.Te
             acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
         out[tile_m, tile_n] = (acc + bias[tile_m, tile_n]).to(out.dtype)
     return out
-
-
-def _bind_bmm(shape: tuple[int, int, int, int], dtype: torch.dtype) -> BoundKernel:
-    batch, m, n, k = shape
-    args = (
-        torch.empty((batch, m, k), dtype=dtype, device=CPU_DEVICE),
-        torch.empty((batch, k, n), dtype=dtype, device=CPU_DEVICE),
-    )
-    return helion.kernel(_batched_gemm, backend="cute", static_shapes=True).bind(args)
 
 
 def _bind_two_output_gemm(
@@ -316,12 +296,71 @@ def test_one_tile_per_cta_frees_tmem_inside_the_epilogue() -> None:
     assert kernel.rstrip().endswith("tcgen05_c_pipeline.producer_tail()")
 
 
+@pytest.mark.parametrize(
+    ("a_m_major", "b_k_major"), ((True, False), (False, True), (True, True))
+)
+def test_batched_gemm_column_major_operands_load_through_tma(
+    a_m_major: bool, b_k_major: bool
+) -> None:
+    """A batched GEMM's M-major A ([B, K, M] transposed) or K-major B
+    ([B, N, K] transposed) enters the tcgen05 search and loads through the
+    (M, K, L) / (N, K, L) TensorMap views of its own strides, in the major
+    mode the MMA reads (``bmm(q.transpose(1, 2), k)``, ``bmm(p, v.mT)``)."""
+    bound = bind_bmm(
+        (8, 256, 512, 256), torch.float16, a_m_major=a_m_major, b_k_major=b_k_major
+    )
+    assert bound.config_spec.tcgen05.search_enabled
+    source = _source(
+        bound,
+        _plain_config(block_sizes=[1, 128, 128, 64], loop_orders=[[0, 1, 2]]),
+    )
+    assert "'lhs_tma_order': (1, 2, 0)" in source
+    assert "'rhs_tma_order': (2, 1, 0)" in source
+    assert ("'a_k_major': False" in source) is a_m_major
+    assert ("'b_k_major': True" in source) is b_k_major
+    kernel = _kernel_body(source)
+    assert "cute.copy(tma_atom_a" in kernel
+    assert "cute.copy(tma_atom_b" in kernel
+
+
+@pytest.mark.parametrize("n", [16, 24])
+def test_narrow_k_major_b_batched_gemm_default_renders(n: int) -> None:
+    """A K-major B of 24 columns would tile N at 8 on the tcgen05 search,
+    whose 8-column K-major B stage needs 64-byte k-blocks the 16-deep default
+    lacks (``tcgen05 K-major B TMA with block_n=8``): it keeps the other
+    lowerings, and its default config renders. 16 columns tile N at 16 and
+    stay on tcgen05."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = bind_bmm((2, 64, n, 32), torch.float16, b_k_major=True)
+        source = _source(bound, bound.config_spec.default_config())
+    assert ("make_trivial_tiled_mma" in source) is (n == 16)
+
+
+def test_batched_m_major_a_keeps_the_pipeline_facts() -> None:
+    """The operand analysis stages a batched M-major A through TMA as the
+    emitter does (``lhs_tma_major_supported``), so the allocation proof and
+    the default tiles see it: 8 x 2048^3 defaults to the 256x256 pair, not
+    the flat 128x16 tile it ran."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = bind_bmm((8, 2048, 2048, 2048), torch.bfloat16, a_m_major=True)
+        config = bound.config_spec.default_config()
+    assert bound.config_spec._cute_tcgen05_config.pipeline_smem_facts is not None
+    assert config.block_sizes == [1, 256, 256, 64]
+    assert config.config["tcgen05_cluster_m"] == 2
+
+
 def test_batched_gemm_one_tile_per_cta_uses_one_shot_scheduler() -> None:
     # 8 batches x (256/128) x (256/64) = 64 tiles <= 148 SMs; the batch axis
     # is the scheduler's L dimension and counts toward the one-shot proof.
     kernel = _kernel_body(
         _source(
-            _bind_bmm((8, 256, 256, 512), torch.float16),
+            bind_bmm((8, 256, 256, 512), torch.float16),
             _plain_config(block_sizes=[1, 128, 64, 64], loop_orders=[[0, 1, 2]]),
         )
     )
@@ -356,7 +395,7 @@ KLOOP_ACQUIRE = (
     ("bind", "config", "ab_stages", "fresh"),
     [
         (
-            lambda: _bind_bmm((8, 256, 256, 512), torch.float16),
+            lambda: bind_bmm((8, 256, 256, 512), torch.float16),
             lambda: _plain_config(
                 block_sizes=[1, 128, 64, 64],
                 loop_orders=[[0, 1, 2]],
@@ -425,7 +464,7 @@ def test_batched_gemm_rides_the_two_cta_paired_schedule() -> None:
     # the paired family, and the kernel is the role-local two-CTA schedule with
     # the batch as the scheduler's third dimension (bmm 8 x 256x256x512: 8 x
     # (256/128) x (256/64) = 64 pairs). The 2x2 cluster of pairs rides along.
-    bound = _bind_bmm((8, 256, 256, 512), torch.float16)
+    bound = bind_bmm((8, 256, 256, 512), torch.float16)
     with bound.env:
         state = bound.config_spec._cute_tcgen05_config
         assert state.pipeline_smem_facts is not None
@@ -463,7 +502,7 @@ def test_batched_cluster_n2_pairs_need_whole_n_tile_pairs() -> None:
     # search repair projects the sample onto cluster_n=1.  The L2 raster
     # knobs that would re-pair the cluster lanes on (batch, m) are rejected
     # the same way on an even tile count.
-    bound = _bind_bmm((7, 384, 192, 512), torch.float16)
+    bound = bind_bmm((7, 384, 192, 512), torch.float16)
 
     def paired(bn: int, **overrides: object) -> helion.Config:
         values: dict[str, object] = {
@@ -492,7 +531,7 @@ def test_batched_cluster_n2_pairs_need_whole_n_tile_pairs() -> None:
         spec.normalize(repaired, _fix_invalid=True)
         assert repaired["tcgen05_cta_group"] == "two"
         assert repaired["tcgen05_cluster_n"] == 1
-    even = _bind_bmm((8, 256, 256, 512), torch.float16)
+    even = bind_bmm((8, 256, 256, 512), torch.float16)
     with even.env:
         spec = even.config_spec
         for requested in (
@@ -515,7 +554,7 @@ def test_batched_cluster_n2_pairs_need_whole_n_tile_pairs() -> None:
 def test_batched_gemm_with_more_tiles_than_sms_keeps_the_persistent_loop() -> None:
     kernel = _kernel_body(
         _source(
-            _bind_bmm((64, 256, 256, 512), torch.float16),
+            bind_bmm((64, 256, 256, 512), torch.float16),
             _plain_config(block_sizes=[1, 128, 64, 64], loop_orders=[[0, 1, 2]]),
         )
     )
@@ -981,7 +1020,7 @@ def test_batched_one_tile_per_cta_fp16() -> None:
     a = torch.randn(8, 256, 512, device=DEVICE, dtype=torch.float16)
     b = torch.randn(8, 512, 256, device=DEVICE, dtype=torch.float16)
     _run(
-        _batched_gemm,
+        batched_gemm,
         (a, b),
         _config(
             block_sizes=[1, 128, 128, 64], loop_orders=[[0, 1, 2]], tcgen05_ab_stages=3

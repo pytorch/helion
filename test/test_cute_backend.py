@@ -13072,9 +13072,14 @@ class TestCuteBackend(TestCase):
                 )
                 self.assertNotIn("cute.gemm(", code)
 
-    def test_batched_strided_matrix_layouts_fall_back(self) -> None:
+    def test_batched_strided_matrix_layouts_take_tcgen05(self) -> None:
+        """An M-major A or a K-major B of a batched matmul loads through its
+        own strides' TensorMap view: both enter the tcgen05 search and run
+        the native MMA."""
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
         contiguous_x = torch.randn(2, 64, 32, device=DEVICE, dtype=HALF_DTYPE)
-        contiguous_y = torch.randn(2, 32, 8, device=DEVICE, dtype=HALF_DTYPE)
+        contiguous_y = torch.randn(2, 32, 32, device=DEVICE, dtype=HALF_DTYPE)
         cases = (
             (
                 torch.randn(2, 32, 64, device=DEVICE, dtype=HALF_DTYPE).transpose(
@@ -13084,19 +13089,19 @@ class TestCuteBackend(TestCase):
             ),
             (
                 contiguous_x,
-                torch.randn(2, 8, 32, device=DEVICE, dtype=HALF_DTYPE).transpose(
+                torch.randn(2, 32, 32, device=DEVICE, dtype=HALF_DTYPE).transpose(
                     -1, -2
                 ),
             ),
         )
-        config = helion.Config(block_sizes=[1, 64, 8, 16])
+        config = helion.Config(block_sizes=[1, 64, 32, 16])
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
             for args in cases:
                 with self.subTest(
                     lhs_stride=args[0].stride(), rhs_stride=args[1].stride()
                 ):
                     bound = cute_batched_baddbmm_tcgen05.bind(args)
-                    self.assertFalse(bound.config_spec.tcgen05.search_enabled)
+                    self.assertTrue(bound.config_spec.tcgen05.search_enabled)
                     code = bound.to_code(config)
                     out = bound.compile_config(config)(*args)
                     torch.cuda.synchronize()
@@ -13106,7 +13111,59 @@ class TestCuteBackend(TestCase):
                         atol=1e-1,
                         rtol=1e-2,
                     )
-                    self.assertNotIn("cute.gemm(", code)
+                    self.assertIn("cute.gemm(", code)
+
+    def test_batched_layouts_outside_tcgen05_keep_other_lowerings(self) -> None:
+        """Batched matmuls the tcgen05 search does not serve run their default
+        configs correctly on the other lowerings: a K-major B narrower than 32
+        columns and not a multiple of 16, batched or shared by the batches
+        under an M-major A (its 8-column stages need 64-byte k-blocks: N=24
+        raised at the default config), and fp32 operands, row- or
+        column-major (the search's scalar lowering read one k per K tile:
+        relative error 0.97 at 4 x 512x512x512)."""
+
+        def half(*shape: int) -> torch.Tensor:
+            return torch.randn(*shape, device=DEVICE, dtype=HALF_DTYPE)
+
+        x = half(2, 64, 32)
+        m_major_x = half(2, 32, 64).transpose(-1, -2)
+        cases = (
+            (cute_batched_baddbmm_tcgen05, (x, half(2, 8, 32).transpose(-1, -2))),
+            (cute_batched_baddbmm_tcgen05, (x, half(2, 24, 32).transpose(-1, -2))),
+            (cute_mixed_rank_batched_dot_tcgen05, (m_major_x, half(8, 32).T)),
+            (
+                cute_batched_baddbmm_tcgen05,
+                (
+                    torch.randn(4, 512, 512, device=DEVICE),
+                    torch.randn(4, 512, 512, device=DEVICE),
+                ),
+            ),
+            (
+                cute_batched_baddbmm_tcgen05,
+                (
+                    torch.randn(4, 512, 512, device=DEVICE).transpose(-1, -2),
+                    torch.randn(4, 512, 512, device=DEVICE),
+                ),
+            ),
+        )
+        for kernel, args in cases:
+            with self.subTest(
+                kernel=kernel.name,
+                dtype=args[0].dtype,
+                lhs_stride=args[0].stride(),
+                rhs_shape=tuple(args[1].shape),
+            ):
+                kernel.reset()
+                bound = kernel.bind(args)
+                self.assertFalse(bound.config_spec.tcgen05.search_enabled)
+                out = bound.compile_config(bound.config_spec.default_config())(*args)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    out.float(),
+                    torch.matmul(args[0].float(), args[1].float()),
+                    atol=1e-1,
+                    rtol=1e-2,
+                )
 
     def test_mixed_rank_batched_dot_uses_tcgen05(self) -> None:
         support = get_cute_mma_support()
@@ -13137,6 +13194,17 @@ class TestCuteBackend(TestCase):
                     torch.randn(256, 64, device=DEVICE, dtype=HALF_DTYPE).T,
                 ),
                 "'lhs_tma_order': (1, 2, 0)",
+            ),
+            # an M-major A beside the shared B, staged through TMA
+            (
+                cute_mixed_rank_batched_dot_tcgen05,
+                (
+                    torch.randn(4, 64, 256, device=DEVICE, dtype=HALF_DTYPE).transpose(
+                        -1, -2
+                    ),
+                    torch.randn(64, 256, device=DEVICE, dtype=HALF_DTYPE),
+                ),
+                "'a_k_major': False",
             ),
         )
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):

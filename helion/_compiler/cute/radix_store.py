@@ -1,16 +1,21 @@
-"""Mixed-radix destination views for rank-two tcgen05 tile stores.
+"""Mixed-radix destination views for tcgen05 tile stores.
 
 Inductor fuses view and permute ops into the store of a native matmul: a
 head split writes ``acc[y, x]`` to ``out[y // 512, x // 64, y % 512, x % 64]``
 of a ``[16, 16, 512, 64]`` destination.  Every element's address is then
 ``rows(y) + cols(x)``, each a CuTe layout over one tile coordinate
 (``(512, 16):(64, 524288)`` and ``(64, 16):(1, 32768)`` here), so a TMA store
-through one hierarchical ``[M, N]`` tensor addresses the destination and the
-epilogue is otherwise the identity store.
+through one hierarchical ``[M, N]`` tensor addresses the destination.
+
+A batched matmul's store adds the batch coordinate: an attention head merge
+writes ``acc[z, y, x]`` (``z = b * 16 + h`` of a ``[B * 16, S, 64]`` bmm) to
+``out[z // 16, y, (z % 16) * 64 + x]`` of a ``[B, S, 1024]`` destination, and
+the address is ``batch(z) + rows(y) + cols(x)`` (``(16, B):(64, S * 1024)``
+for ``z``), the TMA store's third, L, mode.
 
 The proof interprets the store's index arithmetic on concrete coordinates; it
-never matches an expression pattern.  It evaluates every ``(y, x)`` of the
-problem once (in row chunks), so it is exact for the static shapes it admits.
+never matches an expression pattern.  It evaluates every coordinate of the
+problem once (in chunks), so it is exact for the static shapes it admits.
 Block-size symbols are admitted only as the extents of a coordinate reshape
 (their value differs per config; the proof does not depend on the config).
 """
@@ -18,6 +23,8 @@ Block-size symbols are admitted only as the extents of a coordinate reshape
 from __future__ import annotations
 
 import dataclasses
+import itertools
+import math
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -28,12 +35,13 @@ from torch.utils._python_dispatch import _disable_current_modes
 
 from ...language import tile_index
 from ..compile_environment import CompileEnvironment
+from .tcgen05_constants import TCGEN05_RADIX_STORE_BOX_N
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
 
-# Elements of the (M, N) problem the proof evaluates, and per chunk.
+# Elements of the ([B,] M, N) problem the proof evaluates, and per chunk.
 _MAX_PROOF_ELEMENTS = 1 << 28
 _CHUNK_ELEMENTS = 1 << 22
 # A TMA descriptor addresses at most five dimensions.
@@ -60,10 +68,13 @@ _SHAPE_OPS = (
 
 @dataclasses.dataclass(frozen=True)
 class RadixStoreLayout:
-    """``(extent, stride)`` modes, innermost first, of each tile coordinate."""
+    """``(extent, stride)`` modes, innermost first, of each tile coordinate:
+    the rows and columns of the ``[M, N]`` tile, and a batched matmul's batch
+    coordinate (empty for a rank-two one)."""
 
     rows: tuple[tuple[int, int], ...]
     cols: tuple[tuple[int, int], ...]
+    batch: tuple[tuple[int, int], ...] = ()
 
     @staticmethod
     def _mode_expr(modes: tuple[tuple[int, int], ...], part: int) -> str:
@@ -71,10 +82,18 @@ class RadixStoreLayout:
         return values[0] if len(values) == 1 else f"({', '.join(values)})"
 
     def cute_layout_args(self) -> tuple[str, str]:
-        """``(shape, stride)`` expressions of the hierarchical ``[M, N]`` layout."""
-        shape = f"({self._mode_expr(self.rows, 0)}, {self._mode_expr(self.cols, 0)})"
-        stride = f"({self._mode_expr(self.rows, 1)}, {self._mode_expr(self.cols, 1)})"
-        return shape, stride
+        """``(shape, stride)`` expressions of the hierarchical ``[M, N]``
+        layout, ``[M, N, L]`` with the batch coordinate's L mode."""
+        coordinates = (self.rows, self.cols, *((self.batch,) if self.batch else ()))
+        shape = ", ".join(self._mode_expr(modes, 0) for modes in coordinates)
+        stride = ", ".join(self._mode_expr(modes, 1) for modes in coordinates)
+        return f"({shape})", f"({stride})"
+
+    @property
+    def column_major(self) -> bool:
+        """Whether the rows, not the columns, hold the contiguous run (a
+        batched head merge that writes the tile transposed)."""
+        return self.rows[0][1] == 1 and self.cols[0][1] != 1
 
     @property
     def extents(self) -> tuple[int, int]:
@@ -99,6 +118,22 @@ class RadixStoreLayout:
             tile //= extent
         return tile == 1
 
+    def one_cta_tile(self, element_bytes: int) -> tuple[int, int] | None:
+        """The widest one-CTA ``bm x bn`` tile (``bm`` 128 or 64 rows, ``bn``
+        256, 128, 64 or 32 columns) whose CTA tiles partition the layout and
+        whose epilogue subtile stores ``(bm, 32)`` boxes inside its runs: the
+        tile a batched store's default takes (``_narrow_batched_default``),
+        or ``None``."""
+        for rows in (128, 64):
+            for cols in (256, 128, 64, 32):
+                if self.tiles(rows, cols) and self.tma_store_supported(
+                    rows_per_store=rows,
+                    cols_per_store=TCGEN05_RADIX_STORE_BOX_N,
+                    element_bytes=element_bytes,
+                ):
+                    return rows, cols
+        return None
+
     def tiles(self, rows_per_tile: int, cols_per_tile: int) -> bool:
         """Whether ``cute.local_tile`` partitions the layout into
         ``rows_per_tile x cols_per_tile`` tiles (a tile that neither divides
@@ -112,11 +147,12 @@ class RadixStoreLayout:
     ) -> bool:
         """Whether a ``rows_per_store x cols_per_store`` TMA box stays inside
         one innermost run of each coordinate, with the TensorMap's contiguous
-        innermost dimension and 16-byte outer strides."""
-        modes = (*self.rows, *self.cols)
+        innermost dimension (the columns', or the rows' for the column-major
+        D tile) and 16-byte outer strides."""
+        modes = (*self.rows, *self.cols, *self.batch)
         return (
             len(modes) <= _TMA_MAX_RANK
-            and self.cols[0][1] == 1
+            and (self.rows if self.column_major else self.cols)[0][1] == 1
             and self.rows[0][0] % rows_per_store == 0
             and self.cols[0][0] % cols_per_store == 0
             and all(
@@ -186,7 +222,7 @@ class _IndexEvaluator:
     every intermediate inside its traced dtype), so it stays its own."""
 
     def __init__(
-        self, block_ids: tuple[int, int], coords: tuple[torch.Tensor, torch.Tensor]
+        self, block_ids: tuple[int, ...], coords: tuple[torch.Tensor, ...]
     ) -> None:
         self.env = CompileEnvironment.current()
         self.block_ids = block_ids
@@ -203,7 +239,7 @@ class _IndexEvaluator:
         return self.block_ids.index(block_id)
 
     def _shape(self, shape: object) -> tuple[int, ...]:
-        """A coordinate reshape's extents: block-size symbols of the two tile
+        """A coordinate reshape's extents: block-size symbols of the tile
         axes (the evaluated coordinate counts), ``1`` and ``-1`` only."""
         if not isinstance(shape, (list, tuple)):
             raise _Unsupported
@@ -310,22 +346,25 @@ class _IndexEvaluator:
 
 
 def prove_radix_store_layout(
-    store: Node, *, block_ids: tuple[int, int], extents: tuple[int, int]
+    store: Node, *, block_ids: tuple[int, ...], extents: tuple[int, ...]
 ) -> RadixStoreLayout | None:
     """The mixed-radix layout of ``store``'s destination, or ``None``.
 
-    ``store`` writes a rank-two ``[M, N]`` tile (``block_ids`` and their
-    static ``extents``); its subscript may be any tile-index arithmetic whose
-    address, ``sum(index_d * stride_d)``, separates into injective row and
-    column layouts that stay inside the destination.
+    ``store`` writes an ``[M, N]`` tile, or a batched matmul's ``[1, M, N]``
+    tile of a ``[B, M, N]`` problem (``block_ids`` and their static
+    ``extents``, the batch first); its subscript may be any tile-index
+    arithmetic whose address, ``sum(index_d * stride_d)``, separates into
+    injective (batch,) row and column layouts that stay inside the
+    destination.
     """
     if len(store.args) < 3 or (len(store.args) > 3 and store.args[3] is not None):
         return None
     tensor_node, subscript = store.args[0], store.args[1]
     tensor = tensor_node.meta.get("val") if isinstance(tensor_node, Node) else None
-    m, n = extents
     if (
-        not isinstance(tensor, torch.Tensor)
+        len(block_ids) != len(extents)
+        or len(extents) not in (2, 3)
+        or not isinstance(tensor, torch.Tensor)
         or not isinstance(subscript, (list, tuple))
         or len(subscript) != tensor.ndim
         or not all(isinstance(index, Node) for index in subscript)
@@ -334,23 +373,22 @@ def prove_radix_store_layout(
         or type(tensor.storage_offset()) is not int
         or tensor.storage_offset() != 0
         # an empty problem stores nothing to lay out
-        or m <= 0
-        or n <= 0
-        or m * n > _MAX_PROOF_ELEMENTS
+        or any(extent <= 0 for extent in extents)
+        or math.prod(extents) > _MAX_PROOF_ELEMENTS
     ):
         return None
     indices = cast("list[Node]", list(subscript))
     sizes_and_strides = (tuple(tensor.shape), tuple(tensor.stride()))
 
-    def addresses(rows: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
-        evaluator = _IndexEvaluator(block_ids, (rows, cols))
-        shape = (rows.numel(), cols.numel())
+    def addresses(*coords: torch.Tensor) -> torch.Tensor:
+        evaluator = _IndexEvaluator(block_ids, coords)
+        shape = tuple(coord.numel() for coord in coords)
         values = [evaluator.evaluate(index).to(torch.int64) for index in indices]
         try:
             stacked = torch.stack(
                 [torch.broadcast_to(value, shape) for value in values], dim=-1
             )
-        except RuntimeError as error:  # an index that is not [rows, cols]
+        except RuntimeError as error:  # an index that is not [(batch,) rows, cols]
             raise _Unsupported from error
         sizes, strides = (
             torch.tensor(values, dtype=torch.int64, device="cpu")
@@ -363,32 +401,65 @@ def prove_radix_store_layout(
     # Real CPU tensors: no fake mode, and no Helion factory padding mode.
     with unset_fake_temporarily(), _disable_current_modes():
         try:
-            return _prove(addresses, m, n)
+            return _prove(addresses, extents)
         except _Unsupported:
             return None
 
 
 def _prove(
-    addresses: Callable[[torch.Tensor, torch.Tensor], torch.Tensor], m: int, n: int
+    addresses: Callable[..., torch.Tensor], extents: tuple[int, ...]
 ) -> RadixStoreLayout | None:
-    """Separate the evaluated addresses into row and column layouts."""
-    all_rows = torch.arange(m, dtype=torch.int64, device="cpu")
-    all_cols = torch.arange(n, dtype=torch.int64, device="cpu")
-    if int(addresses(all_rows[:1], all_cols[:1]).item()) != 0:
+    """Separate the evaluated addresses into one layout per coordinate."""
+    ranges = [
+        torch.arange(extent, dtype=torch.int64, device="cpu") for extent in extents
+    ]
+    origin = [coords[:1] for coords in ranges]
+    if int(addresses(*origin).reshape(-1)[0].item()) != 0:
         return None
-    row_map = addresses(all_rows, all_cols[:1])[:, 0]
-    col_map = addresses(all_rows[:1], all_cols)[0, :]
-    rows_per_chunk = max(1, _CHUNK_ELEMENTS // n)
-    for start in range(0, m, rows_per_chunk):
-        chunk = all_rows[start : start + rows_per_chunk]
-        expected = row_map[chunk][:, None] + col_map[None, :]
-        if not torch.equal(addresses(chunk, all_cols), expected):
-            return None
-    rows = _mixed_radix(row_map)
-    cols = _mixed_radix(col_map)
-    if rows is None or cols is None or not _injective((*rows, *cols)):
+    maps = []
+    for axis, coords in enumerate(ranges):
+        line = list(origin)
+        line[axis] = coords
+        maps.append(addresses(*line).reshape(-1))
+    # Every coordinate, in chunks: the trailing axes whole while they fit a
+    # chunk, the next one sliced, any outer ones a coordinate at a time.
+    axis = len(extents) - 1
+    inner = 1
+    while axis > 0 and inner * extents[axis] <= _CHUNK_ELEMENTS:
+        inner *= extents[axis]
+        axis -= 1
+    step = max(1, _CHUNK_ELEMENTS // inner)
+    for prefix in itertools.product(*(range(extent) for extent in extents[:axis])):
+        for start in range(0, extents[axis], step):
+            chunk = [
+                *(
+                    ranges[outer][index : index + 1]
+                    for outer, index in enumerate(prefix)
+                ),
+                ranges[axis][start : start + step],
+                *ranges[axis + 1 :],
+            ]
+            expected = sum(
+                (
+                    maps[dim][coords].reshape(
+                        [-1 if other == dim else 1 for other in range(len(chunk))]
+                    )
+                    for dim, coords in enumerate(chunk)
+                ),
+                torch.zeros((), dtype=torch.int64, device="cpu"),
+            )
+            if not torch.equal(
+                addresses(*chunk), expected.expand(*(c.numel() for c in chunk))
+            ):
+                return None
+    layouts = [_mixed_radix(values) for values in maps]
+    if any(layout is None for layout in layouts):
         return None
-    return RadixStoreLayout(rows, cols)
+    modes = cast("list[tuple[tuple[int, int], ...]]", layouts)
+    if not _injective([mode for layout in modes for mode in layout]):
+        return None
+    *batch, rows, cols = modes
+    return RadixStoreLayout(rows, cols, batch[0] if batch else ())
 
 
 _PROOF_KEY = "helion_radix_store_proof"
@@ -396,7 +467,7 @@ _ACCEPTED_KEY = "helion_radix_store_layout"
 
 
 def radix_store_layout(
-    store: Node, *, block_ids: tuple[int, int], extents: tuple[int, int]
+    store: Node, *, block_ids: tuple[int, ...], extents: tuple[int, ...]
 ) -> RadixStoreLayout | None:
     """``prove_radix_store_layout`` memoized on the store node (the proof
     alone; ``accept_radix_store_layout`` records the store analysis' verdict)."""

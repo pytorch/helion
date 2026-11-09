@@ -1273,9 +1273,11 @@ def _tcgen05_tma_destination_is_legal(
     radix_layout = proven_radix_store_layout(store)
     if radix_layout is not None:
         # The hierarchical destination's TensorMap: its innermost column run
-        # is contiguous and holds whole (128, 32) store boxes.
+        # (row run, for the column-major D tile) is contiguous and holds
+        # whole ``TCGEN05_RADIX_STORE_BOX_M`` x ``TCGEN05_RADIX_STORE_BOX_N``
+        # store boxes.
         return (
-            not output_column_major
+            output_column_major == radix_layout.column_major
             and radix_layout.tma_store_supported(
                 rows_per_store=TCGEN05_RADIX_STORE_BOX_M,
                 cols_per_store=TCGEN05_RADIX_STORE_BOX_N,
@@ -3425,14 +3427,21 @@ class _MmaOperandAnalysis:
     def lhs_tma_major_supported(self) -> bool:
         """Whether the tcgen05 TMA pipeline can stage A in its storage order.
 
-        A K-major (row-major) A always can; an M-major A (``x.T``) only in a
-        plain rank-2 GEMM, mirroring ``_emit_mma_pipeline``'s gate.
+        A K-major (row-major) A always can; an M-major A (``x.T``) in a plain
+        rank-2 GEMM, or in a batched one, whose (M, K, L) TensorMap view
+        (``lhs_tma_order``) carries A's own strides. ``_emit_mma_pipeline``
+        stages A through TMA on this predicate (outside the grouped and
+        row-union schedules, which stage A K-major).
         """
         return self.lhs.matrix_major == "row" or (
             self.lhs.matrix_major == "col"
-            and not self.has_leading_passthrough
-            and self.lhs.logical_fake.ndim == 2
-            and self.rhs.logical_fake.ndim == 2
+            and (
+                # A rank-3 A (not a grouped GEMM's rank-2 A, whose block ids
+                # carry the group).
+                self.lhs.logical_fake.ndim == 3
+                if self.has_leading_passthrough
+                else self.lhs.logical_fake.ndim == 2 and self.rhs.logical_fake.ndim == 2
+            )
         )
 
     @property
@@ -3944,18 +3953,27 @@ def _analyze_mma_operands(
     }
     if len(leading_block_ids) > 1:
         return None
-    leading_passthrough_block_id = (
-        next(iter(leading_block_ids)) if leading_block_ids else None
-    )
-    # Leading-axis TMA descriptors currently require row-major trailing
-    # matrices. Keep other layouts out of the shared search/planning/codegen
-    # capability until their rank-3 descriptor mapping is supported.
-    if leading_passthrough_block_id is not None and any(
-        operand.matrix_major != "row"
-        for operand in (lhs, rhs)
-        if operand.is_leading_passthrough
-    ):
-        return None
+    if leading_block_ids:
+        # local: ``cute_warp_mma_gemm`` imports this module
+        from .cute_warp_mma_gemm import _static_int
+
+        rhs_cols = _static_int(env, rhs.matrix_cols) or 16
+        if (
+            # Batched fp32 never reaches the tcgen05 MMA
+            # (``_tcgen05_fp32_lowering_blocked``): it leaves the tcgen05
+            # search, whose scalar lowering read one k per K tile, for the
+            # other lowerings (an ``hl.dot`` the register-MMA DAG's tf32
+            # MMAs).
+            lhs.mma_dtype == torch.float32
+            # A K-major B (batched or shared by the batches) narrower than 32
+            # columns and not a multiple of 16 tiles N at 8, and an 8-column
+            # K-major B stage needs 64-byte k-blocks (``tcgen05 K-major B TMA
+            # with block_n=8``), which the search's 16-deep default does not
+            # have: N=8 and N=24 raised at the default config. 16 columns
+            # tile N at 16.
+            or (rhs.matrix_major == "col" and rhs_cols % 16 != 0 and rhs_cols < 32)
+        ):
+            return None
     return _MmaOperandAnalysis(lhs=lhs, rhs=rhs)
 
 
@@ -7007,8 +7025,7 @@ def _ragged_batched_tcgen05_config(config: Config, bn: object) -> bool:
     the generic lowering they had before. Operands TMA cannot load (an
     unaligned row stride below the staging floor) take the one-warp scalar
     SMEM producer on this path, which computes them correctly but slowly
-    (``test_ragged_batched_unaligned_rows_take_the_scalar_producer``); an
-    M-major batched A keeps the tcgen05 search off.
+    (``test_ragged_batched_unaligned_rows_take_the_scalar_producer``).
     """
     return (
         CompileEnvironment.current().settings.cute_flat_edge_tma
@@ -7313,11 +7330,12 @@ def _analyze_mma_output_stores(
         if len(store.args) > 3 and store.args[3] is not None:
             return None
         if exact_tile_block_ids(env, subscripts) != analysis.output_block_ids:
-            # A fused view/permute store (the only store of the accumulator,
-            # of the accumulator itself: the store lowering renders the
-            # identity epilogue only) whose address separates into row-major
-            # hierarchical row and column layouts.
-            if len(analyzed_stores) != 1 or chain.steps:
+            # A fused view/permute store (the only store of the accumulator)
+            # whose address separates into hierarchical row and column
+            # layouts (and a batched matmul's batch layout). The epilogue
+            # chain runs on the accumulator's registers as for any store; only
+            # the TMA store addresses the destination.
+            if len(analyzed_stores) != 1:
                 return None
             radix_layout = _mma_output_radix_layout(store, analysis)
             if radix_layout is None:
@@ -7328,9 +7346,11 @@ def _analyze_mma_output_stores(
             and all(step.broadcast_axis == 1 for step in chain.auxiliary_tensor_loads)
         )
         store_major = (
-            "row"
-            if radix_layout is not None
-            else _tcgen05_tma_matrix_major(tensor_fake)
+            _tcgen05_tma_matrix_major(tensor_fake)
+            if radix_layout is None
+            else "col"
+            if radix_layout.column_major
+            else "row"
         )
         if store_major is None:
             return None
@@ -7351,28 +7371,47 @@ def _analyze_mma_output_stores(
 def _mma_output_radix_layout(
     store: Node, analysis: _MmaOperandAnalysis
 ) -> RadixStoreLayout | None:
-    """The hierarchical destination layout of a rank-two MMA store, for a
-    static two-dimensional problem whose column layout is contiguous."""
+    """The hierarchical destination layout of an MMA store, for a static
+    two-dimensional problem (or a batched one of static batch extent) whose
+    column layout is contiguous."""
+    env = CompileEnvironment.current()
     rows, cols = analysis.lhs.matrix_rows, analysis.rhs.matrix_cols
-    if (
-        analysis.has_leading_passthrough
-        or len(analysis.output_block_ids) != 2
-        or type(rows) is not int
-        or type(cols) is not int
+    block_ids = tuple(analysis.output_block_ids)
+    if type(rows) is not int or type(cols) is not int:
+        return None
+    extents: tuple[int, ...] = (rows, cols)
+    if analysis.has_leading_passthrough:
+        # The batch loop's extent, which the grid iterates.
+        batch = env.block_sizes[block_ids[0]].size
+        if type(batch) is not int:
+            return None
+        extents = (batch, rows, cols)
+    layout = radix_store_layout(store, block_ids=block_ids, extents=extents)
+    # Admit only a layout the TMA store can address at all (a contiguous
+    # innermost column run, or a row run under a batched store's
+    # column-major D tile): a refused store leaves the MMA without an
+    # output-store analysis, so its tcgen05 configs are refused and only the
+    # other lowerings' configs compile.
+    if layout is None or not (
+        layout.cols[0][1] == 1 or (layout.column_major and layout.batch)
     ):
         return None
-    layout = radix_store_layout(
-        store,
-        block_ids=cast("tuple[int, int]", tuple(analysis.output_block_ids)),
-        extents=(rows, cols),
-    )
-    # Admit only a layout the TMA store can address at all (a contiguous
-    # innermost column run): a refused store leaves the MMA without an
-    # output-store analysis, so its tcgen05 configs raise
-    # ``BackendUnsupported`` as before and only the other lowerings' configs
-    # compile.
-    if layout is None or layout.cols[0][1] != 1:
-        return None
+    if layout.batch:
+        # A batched store renders from a tile whose store boxes sit inside
+        # its runs: the one-CTA tile its default takes
+        # (``_narrow_batched_default``), at whole k-blocks of the MMA's K
+        # step (32 bytes: 16 for 16-bit operands, 32 for FP8, whose 16-deep
+        # default k-blocks normalize to 32). Without such a tile the kernel
+        # keeps the generic store lowering.
+        tensor = cast("torch.Tensor", cast("Node", store.args[0]).meta["val"])
+        depth = analysis.lhs.matrix_cols
+        mma_k = 32 // analysis.lhs.source_fake.element_size()
+        if (
+            type(depth) is not int
+            or depth % max(mma_k, 16)
+            or layout.one_cta_tile(tensor.element_size()) is None
+        ):
+            return None
     return layout
 
 
@@ -8465,16 +8504,26 @@ def plan_tcgen05_pipeline(
     # A is K-major when its (M, K) storage is K-contiguous (row-major) and
     # M-major when M-contiguous (column-major, e.g. ``x.T``). The grouped
     # schedules stage the original A as a K-major operand, so an M-major A is
-    # staged through TMA only for the plain 2-D GEMM.
+    # staged through TMA only for the plain 2-D GEMM and the batched one,
+    # whose (M, K, L) TensorMap view (``lhs_tma_order``) carries A's own
+    # strides: ``bmm(q.transpose(1, 2), k)`` loads ``q``'s M-contiguous
+    # [B, K, M] storage as an MN-major A, as the rank-2 ``x.T @ w`` does.
+    # The grouped and row-union schedules stage A K-major.
+    a_own_order_schedule = grouped_mode is None and not row_union_requested
     plain_gemm = (
-        grouped_mode is None
-        and not row_union_requested
+        a_own_order_schedule
         and lhs_fake.ndim == 2
         and rhs_fake.ndim == 2
         and not (analysis is not None and analysis.has_leading_passthrough)
     )
     tcgen05_use_tma_a = _dtype_tma_ok and (
-        _lhs_major == "row" or (_lhs_major == "col" and plain_gemm)
+        _lhs_major == "row"
+        or (
+            _lhs_major == "col"
+            and a_own_order_schedule
+            # without an analysis both operands are rank-2 here
+            and (analysis is None or analysis.lhs_tma_major_supported)
+        )
     )
     tcgen05_a_k_major = _lhs_major == "row"
     tcgen05_use_tma_b = _dtype_tma_ok and _rhs_major in ("row", "col")
@@ -12995,6 +13044,41 @@ def _emit_mma_pipeline(
             tcgen05_explicit_epi_tile_m = 128
             tcgen05_explicit_epi_tile_n = TCGEN05_PLAIN_NARROW_SUBTILE_N
             tcgen05_explicit_d_store_box_n = TCGEN05_PLAIN_NARROW_SUBTILE_N
+        # A hierarchical (view/permute) destination (``radix_store``) takes TMA
+        # store boxes that stay inside the layout's innermost runs, which its
+        # admission proved for (64, 32) boxes: with no configured subtile, the
+        # tile stores (128, 32) subtiles, (64, 32) ones on a 64-row tile. A
+        # batched head merge (``out[z // 16, y, (z % 16) * 64 + x]`` of a
+        # [B * 16, S, 64] bmm) stores its 64-column runs through them; without
+        # an explicit subtile the store lowering refuses the destination (the
+        # implicit (128, 64) with-source subtile is not proved inside a run).
+        tcgen05_radix_store_subtile_m = tcgen05_epilogue_subtile_m(
+            bm=plan.tcgen05_mma_bm, is_two_cta=plan.tcgen05_is_two_cta
+        )
+        if (
+            not tcgen05_explicit_epi_tile_configured
+            and not tcgen05_promoted_rowvec_subtile
+            and not tcgen05_plain_narrow_subtile
+            and plan.tcgen05_use_tma_store_epilogue
+            and plan.tcgen05_traced_output_stores is not None
+            and any(
+                proven_radix_store_layout(store) is not None
+                for store in plan.tcgen05_traced_output_stores
+            )
+            and tcgen05_explicit_epilogue_tile_supported(
+                is_two_cta=plan.tcgen05_is_two_cta,
+                bm=plan.tcgen05_mma_bm,
+                bn=plan.tcgen05_mma_bn,
+                tile_shape=(
+                    tcgen05_radix_store_subtile_m,
+                    TCGEN05_RADIX_STORE_BOX_N,
+                    TCGEN05_RADIX_STORE_BOX_N,
+                ),
+            )
+        ):
+            tcgen05_explicit_epi_tile_m = tcgen05_radix_store_subtile_m
+            tcgen05_explicit_epi_tile_n = TCGEN05_RADIX_STORE_BOX_N
+            tcgen05_explicit_d_store_box_n = TCGEN05_RADIX_STORE_BOX_N
         # Both narrow subtiles also take the explicit-store family's no-unroll
         # K loop (``cutlass.range(..., unroll=1)`` on the TMA and MMA warps,
         # ``tcgen05_use_nounroll_k_loop`` below), decided here by name rather

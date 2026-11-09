@@ -23,6 +23,8 @@ import helion.language as hl
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+    from helion.runtime.kernel import BoundKernel
+
 # ``cpu_codegen_target`` reports the full opt-in capacity as the AB budget.
 # ``gb300_target`` restores the production probes, including the 28 KiB AB
 # reserve, so selection is priced on the real budget.
@@ -503,3 +505,35 @@ def unsupported_epilogue_mm(
             result = acc * (aux[cols] * aux[cols])
         out[rows, cols] = result.to(torch.bfloat16)
     return out
+
+
+def batched_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``bmm(a, b)``, undecorated: callers pick the kernel settings."""
+    batch, m, k = a.shape
+    _, _, n = b.shape
+    out = torch.empty((batch, m, n), dtype=a.dtype, device=a.device)
+    for tile_b, tile_m, tile_n in hl.tile((batch, m, n)):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n]
+            )
+        out[tile_b, tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+def bind_bmm(
+    shape: tuple[int, int, int, int],
+    dtype: torch.dtype,
+    *,
+    a_m_major: bool = False,
+    b_k_major: bool = False,
+) -> BoundKernel:
+    """``batched_gemm`` bound on CPU over ``(batch, m, n, k)``; an M-major A
+    is a transposed [B, K, M] tensor, a K-major B a transposed [B, N, K]
+    one."""
+    batch, m, n, k = shape
+    a = torch.empty((batch, k, m) if a_m_major else (batch, m, k), dtype=dtype)
+    b = torch.empty((batch, n, k) if b_k_major else (batch, k, n), dtype=dtype)
+    args = (a.transpose(1, 2) if a_m_major else a, b.mT if b_k_major else b)
+    return helion.kernel(batched_gemm, backend="cute", static_shapes=True).bind(args)

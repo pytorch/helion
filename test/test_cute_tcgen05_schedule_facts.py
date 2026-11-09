@@ -2149,6 +2149,57 @@ def test_column_major_output_keeps_pre_acc_wait_off_the_128_row_pair() -> None:
     assert sampled.config["tcgen05_aux_load_placement"] == "post_acc_wait"
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _scaled_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``0.125 * bmm(a, b)``."""
+    batch, m, k = a.shape
+    n = b.shape[2]
+    out = torch.empty((batch, m, n), dtype=a.dtype, device=a.device)
+    for tile_b, tile_m, tile_n in hl.tile((batch, m, n)):
+        acc = hl.zeros((tile_b, tile_m, tile_n), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.baddbmm(acc, a[tile_b, tile_m, inner], b[tile_b, inner, tile_n])
+        out[tile_b, tile_m, tile_n] = (acc * 0.125).to(out.dtype)
+    return out
+
+
+@pytest.mark.parametrize(
+    ("shape", "block_sizes", "pid_type", "ab_stages"),
+    (
+        # four k-blocks: flat, two AB stages
+        ((1024, 256, 64, 256), [1, 128, 64, 64], "flat", 2),
+        # 64 rows by the widest dividing N tile; eight k-blocks: persistent
+        ((384, 64, 512, 512), [1, 64, 256, 64], "persistent_blocked", 4),
+    ),
+)
+def test_narrow_batched_default_takes_the_one_cta_tile(
+    shape: tuple[int, int, int, int],
+    block_sizes: list[int],
+    pid_type: str,
+    ab_stages: int,
+) -> None:
+    """Per-batch matrices narrower than 128 rows or columns default to the
+    one-CTA tile of their extents (B200, of the ATen GEMM: 1024 x
+    256x64x256 + scale 1.09, 384 x 64x512x512 1.03), not the 64x16 base."""
+    batch, m, n, k = shape
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = _scaled_bmm._bind_isolated(
+            (
+                torch.empty((batch, m, k), dtype=torch.bfloat16),
+                torch.empty((batch, k, n), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+        bound.to_code(config)
+    assert config.block_sizes == block_sizes
+    assert config.config["pid_type"] == pid_type
+    assert config.config["tcgen05_ab_stages"] == ab_stages
+    assert config.config["tcgen05_cluster_m"] == 1
+
+
 def test_one_cta_n_edge_admission_needs_known_store_facts() -> None:
     """Two column-major outputs of a biased accumulator leave the search no
     store facts: their persistent one-CTA N-edge sample goes flat instead of
@@ -2806,7 +2857,9 @@ def test_default_tile_gives_small_grids_the_pair_that_fills_one_wave() -> None:
     64 128x128 pairs, 128 CTAs in one wave; 128x64 pairs would need two)."""
     bound = _plain_bind(1024, 1024, 4096)
     with bound.env:
-        config = CuteTcgen05DefaultTileHeuristic._pick(bound.env)
+        config = CuteTcgen05DefaultTileHeuristic._pick(
+            bound.env, bound.host_function.device_ir
+        )
     assert config is not None
     assert config.block_sizes == [128, 128, 64]
     assert config.config["tcgen05_cluster_m"] == 2
